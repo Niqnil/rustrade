@@ -90,7 +90,7 @@ where
 
 impl<FnTime> ExecutionClient for MockExecution<FnTime>
 where
-    FnTime: Fn() -> DateTime<Utc> + Clone + Sync,
+    FnTime: Fn() -> DateTime<Utc> + Clone + Send + Sync,
 {
     const EXCHANGE: ExchangeId = ExchangeId::Mock;
     type Config = MockExecutionClientConfig<FnTime>;
@@ -289,6 +289,8 @@ where
     async fn fetch_trades(
         &self,
         time_since: DateTime<Utc>,
+        // MockExchange fetch_trades doesn't filter by instrument
+        _instruments: &[InstrumentNameExchange],
     ) -> Result<Vec<Trade<QuoteAsset, InstrumentNameExchange>>, UnindexedClientError> {
         let (response_tx, response_rx) = oneshot::channel();
 

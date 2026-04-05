@@ -375,11 +375,7 @@ mod tests {
 
         // Verify it contains the USDC-USDT instrument
         let usdc_usdt = test_utils::instrument(ExchangeId::Kraken, "USDC", "USDT");
-        assert!(
-            exchange_instruments
-                .iter()
-                .any(|instr| *instr == &usdc_usdt.name_exchange)
-        );
+        assert!(exchange_instruments.contains(&&usdc_usdt.name_exchange));
     }
 
     #[test]

@@ -89,6 +89,17 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
 
     #[error("rate limit exceeded")]
     RateLimit,
+    /// Balance of an asset is insufficient to execute the requested operation.
+    ///
+    /// # Warning: `AssetKey` field may hold an instrument name, not an asset name
+    ///
+    /// Some `ExecutionClient` implementations (e.g. `BinanceSpot`) populate the
+    /// `AssetKey` field with the **instrument name** (e.g. `"BTCUSDT"`) rather than
+    /// the specific low-balance asset (e.g. `"BTC"` or `"USDT"`), because splitting
+    /// a symbol into base/quote requires exchange symbol-info metadata not available
+    /// at error-parse time. Do **not** pattern-match on the `AssetKey` value to
+    /// identify the specific low-balance asset — use the `String` field for
+    /// diagnostics only.
     #[error("asset {0} balance insufficient: {1}")]
     BalanceInsufficient(AssetKey, String),
     #[error("order rejected: {0}")]

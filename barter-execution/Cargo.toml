@@ -12,6 +12,16 @@ keywords = ["trading", "backtesting", "crypto", "stocks", "investment"]
 categories = ["accessibility", "simulation"]
 
 
+[features]
+default = []
+binance = [
+    "dep:binance-sdk",
+    "dep:serde_json",
+    "dep:anyhow",
+    "dep:lru",
+    "dep:parking_lot",
+]
+
 [dependencies]
 # Barter Ecosystem
 barter-integration = { workspace = true, features = ["collection", "error", "stream"] }
@@ -41,4 +51,15 @@ rand = { workspace = true }
 chrono = { workspace = true, features = ["serde"]}
 itertools = { workspace = true }
 derive_more = { workspace = true, features = ["constructor", "from", "display"]}
+
+# Binance (optional, behind "binance" feature)
+binance-sdk = { version = "=44.0.1", features = ["spot"], optional = true }
+serde_json = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }  # Required: binance-sdk's public API returns anyhow::Result
+lru = { workspace = true, optional = true }  # Event deduplication cache for reconnect resilience
+parking_lot = { workspace = true, optional = true }  # Lighter mutex for dedup cache (no poisoning, no OS thread park)
+
+[dev-dependencies]
+# test-util enables tokio::time::pause() and advance() for behavioral timing tests
+tokio = { workspace = true, features = ["test-util"] }
 
