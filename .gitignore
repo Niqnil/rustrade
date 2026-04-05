@@ -10,3 +10,5 @@ Cargo.lock
 CLAUDE.md
 docs/
 .claude/
+.directory
+.megaignore

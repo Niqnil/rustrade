@@ -73,6 +73,8 @@ impl StrategyId {
     }
 
     pub fn unknown() -> Self {
-        Self::new("unknown")
+        // "unknown" is 7 bytes — always inline; new_inline avoids the heap-allocation
+        // branch in SmolStr::new and is safe because the literal fits.
+        Self(SmolStr::new_inline("unknown"))
     }
 }
