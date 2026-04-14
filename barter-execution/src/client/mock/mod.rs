@@ -4,6 +4,7 @@ use crate::{
     client::ExecutionClient,
     error::{ConnectivityError, UnindexedClientError, UnindexedOrderError},
     exchange::mock::request::{MarketPrices, MockExchangeRequest},
+    fee::FeeModelConfig,
     fill::SimFillConfig,
     order::{
         Order, OrderEvent, OrderKey,
@@ -20,7 +21,6 @@ use barter_instrument::{
 use chrono::{DateTime, Utc};
 use derive_more::Constructor;
 use futures::stream::BoxStream;
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
@@ -31,7 +31,12 @@ pub struct MockExecutionConfig {
     pub mocked_exchange: ExchangeId,
     pub initial_state: UnindexedAccountSnapshot,
     pub latency_ms: u64,
-    pub fees_percent: Decimal,
+    /// Fee model used by the mock exchange to compute trading fees.
+    ///
+    /// Defaults to [`FeeModelConfig::Zero`]. Use [`FeeModelConfig::Percentage`]
+    /// for spot/futures simulation (e.g. 0.1% taker fee).
+    #[serde(default)]
+    pub fee_model: FeeModelConfig,
     /// Fill model used by the mock exchange to compute execution prices.
     ///
     /// Defaults to [`SimFillConfig::LastPrice`], which fills at the

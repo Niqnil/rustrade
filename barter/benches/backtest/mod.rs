@@ -70,7 +70,7 @@ const CONFIG: &str = r#"
       {
         "mocked_exchange": "binance_spot",
         "latency_ms": 100,
-        "fees_percent": 0.05,
+        "fee_model": { "Percentage": { "rate": "0.05" } },
         "initial_state": {
           "exchange": "binance_spot",
           "balances": [

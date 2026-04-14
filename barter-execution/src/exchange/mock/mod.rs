@@ -7,6 +7,7 @@ use crate::{
         account::AccountState,
         request::{MarketPrices, MockExchangeRequest, MockExchangeRequestKind},
     },
+    fee::{FeeModel, FeeModelConfig},
     fill::{FillModel, SimFillConfig},
     order::{
         Order, OrderKey, OrderKind, UnindexedOrder,
@@ -41,7 +42,7 @@ pub mod request;
 pub struct MockExchange {
     pub exchange: ExchangeId,
     pub latency_ms: u64,
-    pub fees_percent: Decimal,
+    pub fee_model: FeeModelConfig,
     pub fill_model: SimFillConfig,
     pub request_rx: mpsc::UnboundedReceiver<MockExchangeRequest>,
     pub event_tx: broadcast::Sender<UnindexedAccountEvent>,
@@ -61,7 +62,7 @@ impl MockExchange {
         Self {
             exchange: config.mocked_exchange,
             latency_ms: config.latency_ms,
-            fees_percent: config.fees_percent,
+            fee_model: config.fee_model,
             fill_model: config.fill_model,
             request_rx,
             event_tx,
@@ -338,6 +339,11 @@ impl MockExchange {
 
         let time_exchange = self.time_exchange();
 
+        // Compute fee using the configured FeeModel. For spot, contract_size = 1.
+        let order_fees_quote =
+            self.fee_model
+                .compute_fee(fill_price, request.state.quantity, Decimal::ONE);
+
         let balance_change_result = match request.state.side {
             Side::Buy => {
                 // Buying Instrument requires sufficient QuoteAsset Balance
@@ -350,7 +356,6 @@ impl MockExchange {
                 assert_eq!(current.balance.total, current.balance.free);
 
                 let order_value_quote = fill_price * request.state.quantity.abs();
-                let order_fees_quote = order_value_quote * self.fees_percent;
                 let quote_required = order_value_quote + order_fees_quote;
 
                 let maybe_new_balance = current.balance.free - quote_required;
@@ -382,7 +387,18 @@ impl MockExchange {
                 assert_eq!(current.balance.total, current.balance.free);
 
                 let order_value_base = request.state.quantity.abs();
-                let order_fees_base = order_value_base * self.fees_percent;
+                // Fee is quote-denominated; convert to base for deduction.
+                // Note: For PerContractFeeModel this conversion is nonsensical (flat USD / price),
+                // but MockExchange is spot-only so PerContract isn't used in practice.
+                debug_assert!(
+                    !matches!(self.fee_model, FeeModelConfig::PerContract(_)),
+                    "PerContractFeeModel produces nonsensical base-denominated fees on sell path"
+                );
+                let order_fees_base = if fill_price.is_zero() {
+                    Decimal::ZERO
+                } else {
+                    order_fees_quote / fill_price
+                };
                 let base_required = order_value_base + order_fees_base;
 
                 let maybe_new_balance = current.balance.free - base_required;
@@ -392,9 +408,7 @@ impl MockExchange {
                     current.balance.total = maybe_new_balance;
                     current.time_exchange = time_exchange;
 
-                    let fees_quote = order_fees_base * fill_price;
-
-                    Ok((current.clone(), AssetFees::quote_fees(fees_quote)))
+                    Ok((current.clone(), AssetFees::quote_fees(order_fees_quote)))
                 } else {
                     Err(ApiError::BalanceInsufficient(
                         underlying.base,
@@ -513,13 +527,6 @@ pub struct OpenOrderNotifications {
     pub trade: Trade<QuoteAsset, InstrumentNameExchange>,
 }
 
-// TODO(Q-5): add an integration test that exercises a non-default SimFillConfig
-// with real bid/ask prices through open_order. Both existing tests use
-// SimFillConfig::default() (LastPrice) and MarketPrices::default() (all-None),
-// so the wiring from market_prices → fill_model.fill_price → balance deduction
-// is untested for BidAskFillModel with a configured ask price. A test should
-// assert that BidAskFillModel with a specific ask price fills a market-buy order
-// at that ask price and deducts the correct quote balance.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,6 +535,7 @@ mod tests {
         balance::{AssetBalance, Balance},
         error::{ApiError, UnindexedOrderError},
         exchange::mock::request::MarketPrices,
+        fee::{FeeModelConfig, PercentageFeeModel},
         fill::{BidAskFillModel, SimFillConfig},
         order::{
             OrderEvent, OrderKey, OrderKind, TimeInForce,
@@ -569,6 +577,10 @@ mod tests {
     }
 
     fn make_exchange(btc: &str, usdt: &str) -> MockExchange {
+        make_exchange_with_fee(btc, usdt, FeeModelConfig::default())
+    }
+
+    fn make_exchange_with_fee(btc: &str, usdt: &str, fee_model: FeeModelConfig) -> MockExchange {
         let btc = d(btc);
         let usdt = d(usdt);
         let initial_state = UnindexedAccountSnapshot {
@@ -591,8 +603,8 @@ mod tests {
         let config = MockExecutionConfig::new(
             EXCHANGE,
             initial_state,
-            0,              // latency_ms
-            Decimal::ZERO,  // fees_percent
+            0, // latency_ms
+            fee_model,
             SimFillConfig::default(),
         );
 
@@ -709,10 +721,6 @@ mod tests {
 
     #[test]
     fn bid_ask_fill_model_fills_at_ask_price_and_deducts_correct_balance() {
-        // TODO(Q-5): exercises the path BidAskFillModel with non-None best_ask
-        // → open_order → fill at best_ask → correct quote balance deduction.
-        // Previously both tests used SimFillConfig::default() (LastPrice) with
-        // all-None MarketPrices, leaving this wiring untested.
         let mut exchange = make_exchange("0", "10000"); // 0 BTC, 10 000 USDT
         exchange.fill_model = SimFillConfig::BidAsk(BidAskFillModel);
 
@@ -733,8 +741,80 @@ mod tests {
         // BidAskFillModel: market buy fills at best_ask = 100.5, not last_price 100.0.
         assert_eq!(notifs.trade.price, d("100.5"), "fill price must be best_ask");
 
-        // Balance deduction: 1 * 100.5 = 100.5 USDT; fees_percent = 0.
+        // Balance deduction: 1 * 100.5 = 100.5 USDT; fee_model = Zero.
         let usdt = exchange.account.balance_mut(&quote()).unwrap();
         assert_eq!(usdt.balance.free, d("9899.5"), "quote balance must decrease by fill_price * qty");
+    }
+
+    #[test]
+    fn percentage_fee_model_deducts_correct_fee_on_buy() {
+        // 0.1% fee rate
+        let fee_model = FeeModelConfig::Percentage(PercentageFeeModel { rate: d("0.001") });
+        let mut exchange = make_exchange_with_fee("0", "10000", fee_model);
+
+        // Buy 10 BTC at price 100 USDT each
+        // Notional = 10 * 100 = 1000 USDT
+        // Fee = 1000 * 0.001 = 1 USDT
+        // Total deducted = 1000 + 1 = 1001 USDT
+        let (response, notifications) =
+            exchange.open_order(buy_request("10", "100"), MarketPrices::default());
+
+        assert!(response.state.is_ok(), "buy should succeed: {:?}", response.state);
+        let notifs = notifications.expect("successful buy must produce notifications");
+
+        // Trade must report fee in quote denomination
+        assert_eq!(notifs.trade.fees.fees, d("1"), "trade fee must be 1 USDT");
+
+        // Quote balance: 10000 - 1001 = 8999
+        let usdt = exchange.account.balance_mut(&quote()).unwrap();
+        assert_eq!(usdt.balance.free, d("8999"), "quote balance must decrease by notional + fee");
+    }
+
+    #[test]
+    fn percentage_fee_model_deducts_correct_fee_on_sell() {
+        // 0.1% fee rate
+        let fee_model = FeeModelConfig::Percentage(PercentageFeeModel { rate: d("0.001") });
+        let mut exchange = make_exchange_with_fee("10", "0", fee_model);
+
+        // Sell 1 BTC at price 100 USDT
+        // Notional = 1 * 100 = 100 USDT
+        // Fee (quote) = 100 * 0.001 = 0.1 USDT
+        // Fee (base) = 0.1 / 100 = 0.001 BTC
+        // Total base deducted = 1 + 0.001 = 1.001 BTC
+        let (response, notifications) =
+            exchange.open_order(sell_request("1", "100"), MarketPrices::default());
+
+        assert!(response.state.is_ok(), "sell should succeed: {:?}", response.state);
+        let notifs = notifications.expect("successful sell must produce notifications");
+
+        // Trade must report fee in quote denomination
+        assert_eq!(notifs.trade.fees.fees, d("0.1"), "trade fee must be 0.1 USDT");
+
+        // Base balance: 10 - 1.001 = 8.999
+        let btc = exchange.account.balance_mut(&base()).unwrap();
+        assert_eq!(btc.balance.free, d("8.999"), "base balance must decrease by quantity + fee_in_base");
+    }
+
+    #[test]
+    fn percentage_fee_with_zero_price_returns_zero_fee() {
+        // Edge case: if fill_price is zero, fee computation must not divide by zero
+        let fee_model = FeeModelConfig::Percentage(PercentageFeeModel { rate: d("0.001") });
+        let mut exchange = make_exchange_with_fee("10", "0", fee_model);
+
+        // Sell 1 BTC at price 0 (degenerate case)
+        // Fee (quote) = 0 * 0.001 * 1 = 0
+        // Fee (base) = guarded by is_zero() check, returns 0
+        let (response, notifications) =
+            exchange.open_order(sell_request("1", "0"), MarketPrices::default());
+
+        assert!(response.state.is_ok(), "sell at zero price should succeed: {:?}", response.state);
+        let notifs = notifications.expect("successful sell must produce notifications");
+
+        // Fee must be zero (not NaN or panic from division by zero)
+        assert_eq!(notifs.trade.fees.fees, Decimal::ZERO, "fee must be zero when price is zero");
+
+        // Base balance: 10 - 1 = 9 (no fee deducted)
+        let btc = exchange.account.balance_mut(&base()).unwrap();
+        assert_eq!(btc.balance.free, d("9"), "base balance must decrease by quantity only");
     }
 }

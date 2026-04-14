@@ -78,4 +78,6 @@ parking_lot = { workspace = true, optional = true }  # Lighter mutex for dedup c
 tokio = { workspace = true, features = ["test-util"] }
 # Mock HTTP server for testing REST pagination and truncation logic (H-1, H-3)
 wiremock = { workspace = true }
+# Serde round-trip tests (L2)
+serde_json = { workspace = true }
 

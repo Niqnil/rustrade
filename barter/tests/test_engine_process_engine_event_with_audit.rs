@@ -33,6 +33,7 @@ use barter::{
         on_disconnect::OnDisconnectStrategy,
         on_trading_disabled::OnTradingDisabled,
     },
+    statistic::time::Annual365,
     test_utils::time_plus_days,
 };
 use barter_data::{
@@ -72,7 +73,7 @@ use barter_integration::{
     channel::{UnboundedTx, mpsc_unbounded},
     collection::{none_one_or_many::NoneOneOrMany, one_or_many::OneOrMany, snapshot::Snapshot},
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use fnv::FnvHashMap;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -682,7 +683,30 @@ fn test_engine_process_engine_event_with_audit() {
     let eth_btc_tear = summary.instruments.get_index(1).unwrap().1;
     assert_eq!(eth_btc_tear.pnl_returns.pnl_raw, dec!(-0.065));
 
-    // Todo: Additional assertions + TradingSummary assertions once generated (to test TimeInterval)
+    // Generate TradingSummary with Annual365 interval (crypto 24/7 trading)
+    let trading_summary = summary.generate(Annual365);
+
+    // Verify time bounds are consistent with the generator
+    assert_eq!(trading_summary.time_engine_start, summary.time_engine_start);
+    assert_eq!(trading_summary.time_engine_end, summary.time_engine_now);
+    // Trading duration should be ~5 days (timestamps derived from STARTING_TIMESTAMP,
+    // but engine processing introduces nanosecond-level drift)
+    let duration = trading_summary.trading_duration();
+    let five_days = TimeDelta::days(5);
+    let drift = (five_days - duration).abs();
+    assert!(
+        drift < TimeDelta::milliseconds(1),
+        "Expected ~5 days (within 1ms), got {:?} (drift: {:?})",
+        duration,
+        drift
+    );
+
+    // Verify instrument TearSheets were generated with correct PnL
+    let btc_usdt_sheet = trading_summary.instruments.get_index(0).unwrap().1;
+    assert_eq!(btc_usdt_sheet.pnl, dec!(7000.0));
+
+    let eth_btc_sheet = trading_summary.instruments.get_index(1).unwrap().1;
+    assert_eq!(eth_btc_sheet.pnl, dec!(-0.065));
 }
 
 struct TestBuyAndHoldStrategy {

@@ -48,7 +48,7 @@ pub mod client;
 pub mod error;
 pub mod exchange;
 pub mod fee;
-pub use fee::{FeeModel, FeeModelConfig, PerContractFeeModel, ZeroFeeModel};
+pub use fee::{FeeModel, FeeModelConfig, PerContractFeeModel, PercentageFeeModel, ZeroFeeModel};
 pub mod fill;
 pub use fill::{BidAskFillModel, FillModel, LastPriceFillModel, MidpointFillModel, SimFillConfig};
 pub mod indexer;
