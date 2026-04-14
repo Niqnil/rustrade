@@ -27,9 +27,6 @@
 //   and the fill-recovery REST window
 //
 // Known limitations:
-// - position_intent is mapped heuristically (buy → buy_to_open,
-//   sell → sell_to_close). Correct for directional long-only options trading;
-//   wrong for short-selling or buy-to-close. Extend via OrderRequestOpen if needed.
 // - Only FILL activities are recovered after reconnect; order lifecycle events
 //   (new, cancelled, expired) are not — callers must call fetch_open_orders after
 //   each reconnect to reconcile open-order state.
@@ -329,6 +326,9 @@ pub struct AlpacaConfig {
     secret_key: String,
     /// Use paper trading endpoints instead of production.
     pub paper: bool,
+    /// Test-only: override the REST base URL (e.g., to point at a wiremock server).
+    #[cfg(test)]
+    pub base_url_override: Option<String>,
 }
 
 // Custom Debug to avoid leaking credentials in logs.
@@ -344,7 +344,24 @@ impl std::fmt::Debug for AlpacaConfig {
 
 impl AlpacaConfig {
     pub fn new(api_key: String, secret_key: String, paper: bool) -> Self {
-        Self { api_key, secret_key, paper }
+        Self {
+            api_key,
+            secret_key,
+            paper,
+            #[cfg(test)]
+            base_url_override: None,
+        }
+    }
+
+    /// Test-only: create config with a custom base URL for wiremock testing.
+    #[cfg(test)]
+    pub fn with_base_url(api_key: String, secret_key: String, base_url: String) -> Self {
+        Self {
+            api_key,
+            secret_key,
+            paper: true,
+            base_url_override: Some(base_url),
+        }
     }
 
     pub fn api_key(&self) -> &str {
@@ -352,7 +369,13 @@ impl AlpacaConfig {
     }
 
     /// Base URL for REST API calls.
-    pub fn rest_base_url(&self) -> &'static str {
+    ///
+    /// In test builds, checks `base_url_override` first to allow wiremock testing.
+    pub fn rest_base_url(&self) -> &str {
+        #[cfg(test)]
+        if let Some(ref url) = self.base_url_override {
+            return url.as_str();
+        }
         if self.paper {
             "https://paper-api.alpaca.markets"
         } else {
@@ -601,7 +624,7 @@ impl AlpacaClient {
             .expect("failed to build reqwest client for Alpaca")
     }
 
-    fn base_url(&self) -> &'static str {
+    fn base_url(&self) -> &str {
         self.config.rest_base_url()
     }
 }
@@ -718,10 +741,12 @@ where
         // 5xx / other = server-side failure treated as connectivity error.
         // Callers that pattern-match on UnindexedClientError (e.g. open_order_inner) rely
         // on Api(ApiError) to classify business rejections vs connectivity failures.
+        //
+        // Uses parse_api_error for consistent classification: 422 "insufficient funds"
+        // maps to BalanceInsufficient (not generic OrderRejected), enabling callers to
+        // trigger balance refresh on insufficient-funds rejections.
         if status.is_client_error() {
-            return Err(UnindexedClientError::Api(ApiError::OrderRejected(format!(
-                "Alpaca REST error {status}: {api_err}"
-            ))));
+            return Err(UnindexedClientError::Api(parse_api_error(status, &api_err)));
         }
         return Err(connectivity_err(format!(
             "Alpaca REST error {status}: {api_err}"
@@ -805,6 +830,13 @@ impl ExecutionClient for AlpacaClient {
         }
     }
 
+    /// # Rate limit note
+    ///
+    /// When both USD and non-USD assets are requested (the common startup case), this
+    /// method fetches `/v2/account` and `/v2/positions` in parallel for ~100-300ms
+    /// latency savings. Under rate pressure, both requests may hit 429 simultaneously
+    /// and retry independently. Operators approaching Alpaca rate limits should call
+    /// with explicit asset filters to serialize requests if needed.
     async fn account_snapshot(
         &self,
         assets: &[AssetNameExchange],
@@ -814,16 +846,37 @@ impl ExecutionClient for AlpacaClient {
         let http = self.http.clone();
         let rl = &self.rate_limiter;
 
-        // FIXME(UNR-1): account_snapshot only fetches USD balance via /v2/account; it
-        // does not call /v2/positions to include crypto asset balances (BTC, ETH, etc.).
-        // For crypto-spot accounts, callers must use fetch_balances for complete balance
-        // state. Fix: mirror the wants_non_usd positions-fetch path from fetch_balances.
-        let account: AlpacaAccount = rest_with_retry(rl, || {
-            http.get(format!("{base}/v2/account"))
-        })
-        .await?;
+        let wants_usd = assets.is_empty()
+            || assets.iter().any(|a| a.name().as_str().eq_ignore_ascii_case("usd"));
+        let wants_non_usd = assets.is_empty()
+            || assets.iter().any(|a| !a.name().as_str().eq_ignore_ascii_case("usd"));
 
-        let balances = convert_account_to_balances(&account, assets);
+        // Fetch account + positions in parallel when both are needed (common startup case).
+        // URLs are extracted before the closures to avoid re-allocating on each retry attempt.
+        let account_url = format!("{base}/v2/account");
+        let positions_url = format!("{base}/v2/positions");
+        let balances = match (wants_usd, wants_non_usd) {
+            (true, true) => {
+                let (account, positions): (AlpacaAccount, Vec<AlpacaPosition>) = tokio::try_join!(
+                    rest_with_retry(rl, || http.get(&account_url)),
+                    rest_with_retry(rl, || http.get(&positions_url)),
+                )?;
+                let mut balances = convert_account_to_balances(&account, assets);
+                balances.extend(convert_positions_to_balances(&positions, assets));
+                balances
+            }
+            (true, false) => {
+                let account: AlpacaAccount =
+                    rest_with_retry(rl, || http.get(&account_url)).await?;
+                convert_account_to_balances(&account, assets)
+            }
+            (false, true) => {
+                let positions: Vec<AlpacaPosition> =
+                    rest_with_retry(rl, || http.get(&positions_url)).await?;
+                convert_positions_to_balances(&positions, assets)
+            }
+            (false, false) => Vec::new(),
+        };
 
         let open_orders = fetch_raw_open_orders(&http, rl, base, instruments).await?;
 
@@ -977,19 +1030,19 @@ impl ExecutionClient for AlpacaClient {
         }
     }
 
-    /// # Warning — unsuitable for short options strategies
+    /// # Position intent derivation
     ///
-    /// This impl maps `Buy → BuyToOpen` and `Sell → SellToClose`. This is correct
-    /// for directional long-only options strategies but **wrong** for:
-    /// - Writing (shorting) an option: requires `SellToOpen`
-    /// - Closing a short option by buying: requires `BuyToClose`
+    /// Alpaca options/equities require explicit `position_intent`. This impl derives
+    /// intent from `RequestOpen::reduce_only` and `side`:
     ///
-    /// Sending the wrong intent to Alpaca returns a 422, and the order will be
-    /// silently rejected. Use [`AlpacaClient::open_order_with_intent`] for those cases.
+    /// | reduce_only | side | intent       | use case                          |
+    /// |-------------|------|--------------|-----------------------------------|
+    /// | false       | Buy  | BuyToOpen    | open long / add to long position  |
+    /// | false       | Sell | SellToOpen   | open short / write option         |
+    /// | true        | Buy  | BuyToClose   | close short position              |
+    /// | true        | Sell | SellToClose  | close long position               |
     ///
-    /// FIXME: extend `RequestOpen` with an explicit position_intent hint field so callers
-    /// can signal short-option intent without reaching outside the `ExecutionClient` trait.
-    /// Tracked issue: H-3 (short options position_intent heuristic).
+    /// For explicit control, use [`AlpacaClient::open_order_with_intent`].
     ///
     /// # Market order price
     ///
@@ -1002,9 +1055,17 @@ impl ExecutionClient for AlpacaClient {
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
     ) -> Option<Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>> {
         let side = request.state.side;
-        self.open_order_inner(request, map_position_intent(side)).await
+        let reduce_only = request.state.reduce_only;
+        self.open_order_inner(request, map_position_intent(side, reduce_only)).await
     }
 
+    /// Fetches balances sequentially (unlike `account_snapshot` which parallelizes).
+    ///
+    /// Sequential fetch is intentional for live operation: under rate pressure, parallel
+    /// requests may both hit 429 simultaneously and retry independently, doubling the
+    /// backoff delay. The startup latency savings from `account_snapshot`'s parallel
+    /// fetch are worth the tradeoff there; for periodic balance refreshes during live
+    /// trading, sequential is safer.
     async fn fetch_balances(
         &self,
         assets: &[AssetNameExchange],
@@ -1018,8 +1079,10 @@ impl ExecutionClient for AlpacaClient {
         let wants_usd = assets.is_empty()
             || assets.iter().any(|a| a.name().as_str().eq_ignore_ascii_case("usd"));
         if wants_usd {
+            // Pre-allocate URL to avoid re-allocation on each retry attempt.
+            let account_url = format!("{base}/v2/account");
             let account: AlpacaAccount =
-                rest_with_retry(&self.rate_limiter, || http.get(format!("{base}/v2/account")))
+                rest_with_retry(&self.rate_limiter, || http.get(&account_url))
                     .await?;
             result.extend(convert_account_to_balances(&account, assets));
         }
@@ -1030,8 +1093,10 @@ impl ExecutionClient for AlpacaClient {
                 .iter()
                 .any(|a| !a.name().as_str().eq_ignore_ascii_case("usd"));
         if wants_non_usd {
+            // Pre-allocate URL to avoid re-allocation on each retry attempt.
+            let positions_url = format!("{base}/v2/positions");
             let positions: Vec<AlpacaPosition> = rest_with_retry(&self.rate_limiter, || {
-                http.get(format!("{base}/v2/positions"))
+                http.get(&positions_url)
             })
             .await?;
             result.extend(convert_positions_to_balances(&positions, assets));
@@ -1187,9 +1252,11 @@ impl AlpacaClient {
         let base = self.base_url();
         let http = self.http.clone();
         let rl = &self.rate_limiter;
+        // Pre-allocate URL to avoid re-allocation on each retry attempt.
+        let orders_url = format!("{base}/v2/orders");
 
         let result: Result<AlpacaOrderResponse, UnindexedClientError> =
-            rest_with_retry(rl, || http.post(format!("{base}/v2/orders")).json(&body))
+            rest_with_retry(rl, || http.post(&orders_url).json(&body))
                 .await;
 
         match result {
@@ -1214,14 +1281,6 @@ impl AlpacaClient {
                         UnindexedOrderError::Connectivity(ce)
                     }
                     UnindexedClientError::Api(ae) => UnindexedOrderError::Rejected(ae),
-                    // Note (UNR-2): rest_with_retry maps all non-429 4xx responses to
-                    // ApiError::OrderRejected, so a 422 "insufficient funds" on order open
-                    // arrives here as OrderRejected rather than BalanceInsufficient.
-                    // Callers checking for BalanceInsufficient to trigger balance-refresh
-                    // must also match on OrderRejected message text for the open-order path.
-                    // (cancel_order calls parse_order_error via rest_delete_with_retry and
-                    // correctly classifies 422+insufficient as BalanceInsufficient.)
-                    //
                     // AccountSnapshot, AccountStream, Truncated, and TruncatedSnapshot are not
                     // returned by rest_with_retry (REST-only path for orders), but matching
                     // explicitly ensures any new ClientError variant causes a compile error
@@ -2085,7 +2144,7 @@ fn convert_positions_to_balances(
                 return None;
             }
 
-                    // total and free are in base currency units (e.g., BTC), not USD,
+            // total and free are in base currency units (e.g., BTC), not USD,
             // consistent with AssetBalance semantics for currency/crypto assets.
             let total = Decimal::from_str(&p.qty).unwrap_or(Decimal::ZERO);
             let free = Decimal::from_str(&p.qty_available).unwrap_or(Decimal::ZERO);
@@ -2502,22 +2561,31 @@ fn is_options_or_equity_symbol(symbol: &str) -> bool {
     !symbol.contains('/')
 }
 
-/// Heuristic position_intent mapping for options and equity order placement.
+/// Derives Alpaca's `position_intent` from the generic `reduce_only` flag and `side`.
 ///
-/// Correct for directional long-only strategies (buy to open, sell to close).
-/// For short strategies (sell to open, buy to close), use
-/// `AlpacaClient::open_order_with_intent` and pass `SellToOpen` / `BuyToClose`.
-fn map_position_intent(side: Side) -> AlpacaPositionIntent {
-    match side {
-        Side::Buy => AlpacaPositionIntent::BuyToOpen,
-        Side::Sell => AlpacaPositionIntent::SellToClose,
+/// | reduce_only | side | intent       | use case                          |
+/// |-------------|------|--------------|-----------------------------------|
+/// | false       | Buy  | BuyToOpen    | open long / add to long position  |
+/// | false       | Sell | SellToOpen   | open short / write option         |
+/// | true        | Buy  | BuyToClose   | close short position              |
+/// | true        | Sell | SellToClose  | close long position               |
+fn map_position_intent(side: Side, reduce_only: bool) -> AlpacaPositionIntent {
+    match (reduce_only, side) {
+        (false, Side::Buy) => AlpacaPositionIntent::BuyToOpen,
+        (false, Side::Sell) => AlpacaPositionIntent::SellToOpen,
+        (true, Side::Buy) => AlpacaPositionIntent::BuyToClose,
+        (true, Side::Sell) => AlpacaPositionIntent::SellToClose,
     }
 }
 
-fn parse_order_error(status: reqwest::StatusCode, message: &str) -> UnindexedOrderError {
+/// Classifies an HTTP error status + body into a typed [`ApiError`].
+///
+/// Used by both `rest_with_retry` (for general REST calls) and `rest_delete_with_retry`
+/// (for cancel operations) to ensure consistent error classification across all REST paths.
+fn parse_api_error(status: reqwest::StatusCode, message: &str) -> crate::error::UnindexedApiError {
     // Fast path: 429 doesn't need message parsing.
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return UnindexedOrderError::Rejected(ApiError::RateLimit);
+        return ApiError::RateLimit;
     }
 
     // Compute lowercase once for all match guards that inspect the message body.
@@ -2526,27 +2594,23 @@ fn parse_order_error(status: reqwest::StatusCode, message: &str) -> UnindexedOrd
         // Match "already" before "insufficient": if Alpaca ever sends a 422 body
         // containing both substrings, this arm wins and maps to OrderAlreadyCancelled,
         // which is more specific than BalanceInsufficient.
-        422 if lower.contains("already") => {
-            UnindexedOrderError::Rejected(ApiError::OrderAlreadyCancelled)
-        }
+        422 if lower.contains("already") => ApiError::OrderAlreadyCancelled,
         // Alpaca returns 422 for business-rule rejections including insufficient
         // funds. 403 is *Forbidden* — auth/permission failure — and must NOT be
         // mapped to BalanceInsufficient even if the body happens to contain the
         // substring "insufficient".
         422 if lower.contains("insufficient") => {
-            UnindexedOrderError::Rejected(ApiError::BalanceInsufficient(
-                AssetNameExchange::new("usd"),
-                message.to_owned(),
-            ))
+            ApiError::BalanceInsufficient(AssetNameExchange::new("usd"), message.to_owned())
         }
-        403 => UnindexedOrderError::Rejected(ApiError::OrderRejected(
-            format!("forbidden (auth/permission): {message}"),
-        )),
-        404 => UnindexedOrderError::Rejected(ApiError::OrderRejected(
-            format!("order not found: {message}"),
-        )),
-        _ => UnindexedOrderError::Rejected(ApiError::OrderRejected(message.to_owned())),
+        403 => ApiError::OrderRejected(format!("forbidden (auth/permission): {message}")),
+        404 => ApiError::OrderRejected(format!("order not found: {message}")),
+        _ => ApiError::OrderRejected(message.to_owned()),
     }
+}
+
+/// Wraps [`parse_api_error`] for order-specific error handling (e.g., cancel_order).
+fn parse_order_error(status: reqwest::StatusCode, message: &str) -> UnindexedOrderError {
+    UnindexedOrderError::Rejected(parse_api_error(status, message))
 }
 
 fn connectivity_err(msg: impl Into<String>) -> UnindexedClientError {
@@ -3215,17 +3279,25 @@ mod tests {
         );
     }
 
-    // M-2: map_position_intent heuristic — pins Buy→BuyToOpen, Sell→SellToClose.
-    // Correct for long-only strategies; callers requiring SellToOpen/BuyToClose must
-    // use open_order_with_intent directly.
+    // M-2: map_position_intent derives intent from (reduce_only, side).
     #[test]
-    fn map_position_intent_buy_maps_to_buy_to_open() {
-        assert_eq!(map_position_intent(Side::Buy), AlpacaPositionIntent::BuyToOpen);
+    fn map_position_intent_open_buy_maps_to_buy_to_open() {
+        assert_eq!(map_position_intent(Side::Buy, false), AlpacaPositionIntent::BuyToOpen);
     }
 
     #[test]
-    fn map_position_intent_sell_maps_to_sell_to_close() {
-        assert_eq!(map_position_intent(Side::Sell), AlpacaPositionIntent::SellToClose);
+    fn map_position_intent_open_sell_maps_to_sell_to_open() {
+        assert_eq!(map_position_intent(Side::Sell, false), AlpacaPositionIntent::SellToOpen);
+    }
+
+    #[test]
+    fn map_position_intent_reduce_buy_maps_to_buy_to_close() {
+        assert_eq!(map_position_intent(Side::Buy, true), AlpacaPositionIntent::BuyToClose);
+    }
+
+    #[test]
+    fn map_position_intent_reduce_sell_maps_to_sell_to_close() {
+        assert_eq!(map_position_intent(Side::Sell, true), AlpacaPositionIntent::SellToClose);
     }
 
     // M-1: parse_order_error — pin all status-code branches not covered by existing tests.
@@ -3537,6 +3609,184 @@ mod tests {
                     Err(UnindexedClientError::TruncatedSnapshot { limit }) if limit == MAX_OPEN_ORDERS
                 ),
                 "500 orders must return TruncatedSnapshot, got: {result:?}"
+            );
+        }
+
+        // --- L-2: open_order passes reduce_only through to position_intent ---
+
+        /// Verifies that `open_order` correctly derives `position_intent` from
+        /// `reduce_only` and `side`. This test exercises the full path:
+        /// `open_order` → `map_position_intent` → `open_order_inner` → HTTP request.
+        ///
+        /// Uses wiremock to capture the request body and verify position_intent.
+        #[tokio::test]
+        async fn open_order_reduce_only_sell_sends_sell_to_close_intent() {
+            use wiremock::matchers::{method, path};
+            use crate::client::ExecutionClient;
+            use crate::order::{OrderKey, OrderKind, TimeInForce, id::{ClientOrderId, StrategyId}};
+            use crate::order::request::{OrderRequestOpen, RequestOpen};
+            use barter_instrument::Side;
+            use barter_instrument::exchange::ExchangeId;
+            use barter_instrument::instrument::name::InstrumentNameExchange;
+            use rust_decimal::Decimal;
+
+            let server = MockServer::start().await;
+
+            // Mock POST /v2/orders to return a valid order response.
+            // Use a custom responder to capture and verify the request body.
+            let captured_body = std::sync::Arc::new(parking_lot::Mutex::new(None));
+            let captured_clone = captured_body.clone();
+
+            Mock::given(method("POST"))
+                .and(path("/v2/orders"))
+                .respond_with(move |req: &Request| {
+                    // Capture the request body for later assertion
+                    let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                    *captured_clone.lock() = Some(body);
+
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": "test-order-id",
+                        "client_order_id": "test-cid",
+                        "symbol": "AAPL",
+                        "qty": "10",
+                        "filled_qty": "0",
+                        "side": "sell",
+                        "type": "market",
+                        "time_in_force": "ioc",
+                        "limit_price": null,
+                        "created_at": "2025-04-18T14:30:00Z"
+                    }))
+                })
+                .mount(&server)
+                .await;
+
+            // Create client with base_url_override pointing to mock server
+            let config = AlpacaConfig::with_base_url(
+                "test-key".into(),
+                "test-secret".into(),
+                server.uri(),
+            );
+            let client = AlpacaClient::new(config);
+
+            // Create a Sell order with reduce_only=true (should map to SellToClose)
+            let request = OrderRequestOpen {
+                key: OrderKey {
+                    exchange: ExchangeId::Alpaca,
+                    instrument: InstrumentNameExchange::new("AAPL"),
+                    strategy: StrategyId::new("test-strategy"),
+                    cid: ClientOrderId::new("test-cid"),
+                },
+                state: RequestOpen {
+                    side: Side::Sell,
+                    price: Decimal::ZERO,
+                    quantity: Decimal::new(10, 0),
+                    kind: OrderKind::Market,
+                    time_in_force: TimeInForce::ImmediateOrCancel,
+                    position_id: None,
+                    reduce_only: true, // This should map to SellToClose
+                },
+            };
+
+            // Call open_order (borrows instrument)
+            let result = client.open_order(OrderRequestOpen {
+                key: OrderKey {
+                    exchange: request.key.exchange,
+                    instrument: &request.key.instrument,
+                    strategy: request.key.strategy.clone(),
+                    cid: request.key.cid.clone(),
+                },
+                state: request.state.clone(),
+            }).await;
+
+            // Verify the order was accepted
+            assert!(result.is_some(), "open_order should return a result");
+            let order = result.unwrap();
+            assert!(order.state.is_ok(), "order should be accepted: {:?}", order.state);
+
+            // Verify the request body contained position_intent=sell_to_close
+            let body = captured_body.lock().take().expect("request body should be captured");
+            assert_eq!(
+                body.get("position_intent").and_then(|v| v.as_str()),
+                Some("sell_to_close"),
+                "reduce_only=true + Side::Sell should produce position_intent=sell_to_close, got: {body}"
+            );
+        }
+
+        /// Verifies that reduce_only=false + Buy produces BuyToOpen intent.
+        #[tokio::test]
+        async fn open_order_not_reduce_only_buy_sends_buy_to_open_intent() {
+            use crate::client::ExecutionClient;
+            use crate::order::{OrderKey, OrderKind, TimeInForce, id::{ClientOrderId, StrategyId}};
+            use crate::order::request::{OrderRequestOpen, RequestOpen};
+            use barter_instrument::Side;
+            use barter_instrument::exchange::ExchangeId;
+            use barter_instrument::instrument::name::InstrumentNameExchange;
+            use rust_decimal::Decimal;
+
+            let server = MockServer::start().await;
+
+            let captured_body = std::sync::Arc::new(parking_lot::Mutex::new(None));
+            let captured_clone = captured_body.clone();
+
+            Mock::given(method("POST"))
+                .and(path("/v2/orders"))
+                .respond_with(move |req: &Request| {
+                    let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                    *captured_clone.lock() = Some(body);
+
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": "test-order-id",
+                        "client_order_id": "test-cid",
+                        "symbol": "AAPL",
+                        "qty": "10",
+                        "filled_qty": "0",
+                        "side": "buy",
+                        "type": "market",
+                        "time_in_force": "ioc",
+                        "limit_price": null,
+                        "created_at": "2025-04-18T14:30:00Z"
+                    }))
+                })
+                .mount(&server)
+                .await;
+
+            let config = AlpacaConfig::with_base_url(
+                "test-key".into(),
+                "test-secret".into(),
+                server.uri(),
+            );
+            let client = AlpacaClient::new(config);
+
+            let instrument = InstrumentNameExchange::new("AAPL");
+            let request = OrderRequestOpen {
+                key: OrderKey {
+                    exchange: ExchangeId::Alpaca,
+                    instrument: &instrument,
+                    strategy: StrategyId::new("test-strategy"),
+                    cid: ClientOrderId::new("test-cid"),
+                },
+                state: RequestOpen {
+                    side: Side::Buy,
+                    price: Decimal::ZERO,
+                    quantity: Decimal::new(10, 0),
+                    kind: OrderKind::Market,
+                    time_in_force: TimeInForce::ImmediateOrCancel,
+                    position_id: None,
+                    reduce_only: false, // This should map to BuyToOpen
+                },
+            };
+
+            let result = client.open_order(request).await;
+
+            assert!(result.is_some(), "open_order should return a result");
+            let order = result.unwrap();
+            assert!(order.state.is_ok(), "order should be accepted: {:?}", order.state);
+
+            let body = captured_body.lock().take().expect("request body should be captured");
+            assert_eq!(
+                body.get("position_intent").and_then(|v| v.as_str()),
+                Some("buy_to_open"),
+                "reduce_only=false + Side::Buy should produce position_intent=buy_to_open, got: {body}"
             );
         }
     }

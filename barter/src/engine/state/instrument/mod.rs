@@ -402,13 +402,14 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     ///
     /// At most one `PositionExited` is returned per call. In normal `OmsMode::Hedging`
     /// usage (no position flips), a single order's fills can produce at most one close
-    /// event, so this is sufficient. If position flips occur (quantity crossing zero),
-    /// which is documented as undefined behaviour in Hedging mode, earlier exits in the
-    /// deferred batch would be silently dropped here.
+    /// event, so this is sufficient.
     ///
-    /// FIXME: return `Vec<PositionExited<...>>` so all exits from a deferred replay batch
-    /// are propagated to the engine output stream. This is a breaking API change.
-    /// Tracked issue: M-1 (deferred fill replay drops all but last PositionExited).
+    /// **Edge case (not supported):** If a deferred replay batch contains fills that
+    /// flip positions (quantity crossing zero) multiple times, only the last
+    /// `PositionExited` is returned; earlier exits are silently dropped. This edge
+    /// case requires position flips, which are documented as undefined behaviour in
+    /// `OmsMode::Hedging`. NautilusTrader similarly emits single `PositionClosed`
+    /// events per state transition rather than batching multiple closes.
     pub fn update_from_order_snapshot(
         &mut self,
         order: Snapshot<&Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>>,
@@ -617,35 +618,29 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                 if let Some(pos_id) = fast_pos_id {
                     pos_id
                 } else {
-                    // Slow path: O(active_orders) scan.
+                    // Slow path: O(active_orders) scan via find_map with early exit.
                     // Needed for CancelInFlight orders and any orders not yet in the index
                     // (e.g., pre-existing at startup, or external orders).
                     //
                     // Returns Option<Option<PositionId>>:
-                    //   Some(Some(id)) = found matching order with position_id mapping
-                    //   Some(None)     = found matching order but no position_id mapping
-                    //   None           = no matching Open/CancelInFlight order
-                    let scan = self.orders.0.iter().find_map(|(cid, order)| {
-                        let id_matches = match &order.state {
-                            ActiveOrderState::Open(open) => open.id == trade.order_id,
-                            ActiveOrderState::CancelInFlight(cf) => {
-                                cf.order.as_ref().is_some_and(|o| o.id == trade.order_id)
+                    //   - None: no matching order found
+                    //   - Some(None): match found but no position_id mapping
+                    //   - Some(Some(pos_id)): match found with position_id
+                    let matched = self.orders.0.iter().find_map(|(cid, order)| {
+                        match &order.state {
+                            ActiveOrderState::Open(open) if open.id == trade.order_id => {
+                                Some(self.position_ids.get(cid).cloned())
                             }
-                            // OpenInFlight has no exchange OrderId yet — skipped here,
-                            // checked separately in the None arm below.
-                            ActiveOrderState::OpenInFlight(_) => false,
-                        };
-                        if id_matches {
-                            // Wrap in Some to distinguish "found order, no pos_id" from
-                            // "no matching order". Exchange OrderId is unique, so continuing
-                            // to scan after a match is pointless.
-                            Some(self.position_ids.get(cid).cloned())
-                        } else {
-                            None
+                            ActiveOrderState::CancelInFlight(cf)
+                                if cf.order.as_ref().is_some_and(|o| o.id == trade.order_id) =>
+                            {
+                                Some(self.position_ids.get(cid).cloned())
+                            }
+                            _ => None,
                         }
                     });
 
-                    match scan {
+                    match matched {
                         Some(Some(pos_id)) => pos_id,
                         Some(None) => {
                             // Found matching order but no position_id mapping. This occurs
@@ -672,14 +667,11 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                             //     or removed by snapshot reconciliation). Fall back to raw
                             //     OrderId as a best-effort position key.
                             //
-                            // The scan above skipped OpenInFlight entries (line 636: returns
-                            // false). Re-scan here to check whether any exist.
-                            let has_in_flight = self
-                                .orders
-                                .0
-                                .values()
-                                .any(|o| matches!(o.state, ActiveOrderState::OpenInFlight(_)));
-
+                            // Check for OpenInFlight only in this no-match case (avoids
+                            // unnecessary scan when match is found in the common case).
+                            let has_in_flight = self.orders.0.values().any(|order| {
+                                matches!(order.state, ActiveOrderState::OpenInFlight(_))
+                            });
                             if has_in_flight {
                                 debug!(
                                     order_id = %trade.order_id,

@@ -23,6 +23,10 @@
 //!
 //! See `README.md` for more information and examples.
 
+// Silence unused_crate_dependencies for dev-dependencies used only in tests
+#[cfg(test)]
+use wiremock as _;
+
 use crate::{
     balance::AssetBalance,
     order::{Order, OrderSnapshot, request::OrderResponseCancel},

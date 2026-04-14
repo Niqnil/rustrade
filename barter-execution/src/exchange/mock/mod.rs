@@ -635,6 +635,7 @@ mod tests {
                 kind: OrderKind::Market,
                 time_in_force: TimeInForce::ImmediateOrCancel,
                 position_id: None,
+                reduce_only: false,
             },
         }
     }
@@ -655,6 +656,7 @@ mod tests {
                 kind: OrderKind::Market,
                 time_in_force: TimeInForce::ImmediateOrCancel,
                 position_id: None,
+                reduce_only: false,
             },
         }
     }
@@ -712,7 +714,7 @@ mod tests {
         // Previously both tests used SimFillConfig::default() (LastPrice) with
         // all-None MarketPrices, leaving this wiring untested.
         let mut exchange = make_exchange("0", "10000"); // 0 BTC, 10 000 USDT
-        exchange.fill_model = SimFillConfig::BidAsk(BidAskFillModel::default());
+        exchange.fill_model = SimFillConfig::BidAsk(BidAskFillModel);
 
         let market_prices = MarketPrices {
             best_bid: Some(d("99.5")),

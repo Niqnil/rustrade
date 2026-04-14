@@ -91,6 +91,11 @@
 //!     }
 //! }
 //! ```
+
+// Silence unused_crate_dependencies for dev-dependencies used only in tests
+#[cfg(test)]
+use tracing_subscriber as _;
+
 use crate::{
     error::DataError,
     event::MarketEvent,

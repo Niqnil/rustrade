@@ -139,6 +139,7 @@ fn test_engine_process_engine_event_with_audit() {
             price: dec!(10_000),
             quantity: dec!(1),
             position_id: None,
+            reduce_only: false,
         },
     };
     let eth_btc_buy_order = OrderRequestOpen {
@@ -155,6 +156,7 @@ fn test_engine_process_engine_event_with_audit() {
             price: dec!(0.1),
             quantity: dec!(1),
             position_id: None,
+            reduce_only: false,
         },
     };
     assert_eq!(
@@ -344,6 +346,7 @@ fn test_engine_process_engine_event_with_audit() {
             price: dec!(20_000),
             quantity: dec!(1),
             position_id: Some(PositionId::NETTING),
+            reduce_only: true, // closing position
         },
     };
     assert_eq!(
@@ -503,6 +506,7 @@ fn test_engine_process_engine_event_with_audit() {
             price: dec!(0.05),
             quantity: dec!(1),
             position_id: None,
+            reduce_only: true, // closing position
         },
     };
     let event = EngineEvent::Command(Command::SendOpenRequests(OneOrMany::One(
@@ -727,6 +731,7 @@ impl AlgoStrategy for TestBuyAndHoldStrategy {
                         price,
                         quantity: dec!(1),
                         position_id: None,
+                        reduce_only: false,
                     },
                 })
             });
@@ -865,7 +870,7 @@ fn build_engine(
 
     let clock = HistoricalClock::new(STARTING_TIMESTAMP);
 
-    let state = EngineState::builder(&instruments, DefaultGlobalData::default(), |_| {
+    let state = EngineState::builder(&instruments, DefaultGlobalData, |_| {
         DefaultInstrumentMarketData::default()
     })
     .time_engine_start(STARTING_TIMESTAMP)
@@ -1063,7 +1068,7 @@ fn build_option_engine(
 
     let clock = HistoricalClock::new(STARTING_TIMESTAMP);
 
-    let state = EngineState::builder(&instruments, DefaultGlobalData::default(), |_| {
+    let state = EngineState::builder(&instruments, DefaultGlobalData, |_| {
         DefaultInstrumentMarketData::default()
     })
     .time_engine_start(STARTING_TIMESTAMP)
@@ -1393,7 +1398,7 @@ fn build_put_option_engine(
         .build();
 
     let clock = HistoricalClock::new(STARTING_TIMESTAMP);
-    let state = EngineState::builder(&instruments, DefaultGlobalData::default(), |_| {
+    let state = EngineState::builder(&instruments, DefaultGlobalData, |_| {
         DefaultInstrumentMarketData::default()
     })
     .time_engine_start(STARTING_TIMESTAMP)
@@ -1578,7 +1583,7 @@ fn build_hedging_option_engine(
         .build();
 
     let clock = HistoricalClock::new(STARTING_TIMESTAMP);
-    let state = EngineState::builder(&instruments, DefaultGlobalData::default(), |_| {
+    let state = EngineState::builder(&instruments, DefaultGlobalData, |_| {
         DefaultInstrumentMarketData::default()
     })
     .time_engine_start(STARTING_TIMESTAMP)
@@ -1603,6 +1608,7 @@ fn send_open_order_with_position_id(
     position_id: PositionId,
     side: Side,
     price: Decimal,
+    reduce_only: bool,
 ) {
     let request = OrderRequestOpen {
         key: OrderKey {
@@ -1618,6 +1624,7 @@ fn send_open_order_with_position_id(
             price,
             quantity: dec!(1),
             position_id: Some(position_id),
+            reduce_only,
         },
     };
     let event = EngineEvent::Command(Command::SendOpenRequests(OneOrMany::One(request)));
@@ -1708,7 +1715,7 @@ fn test_hedging_fill_routing_to_correct_position_id() {
     let exchange_id_a = OrderId::new("exch-a");
 
     // Submit order with explicit PositionId → populates position_ids map.
-    send_open_order_with_position_id(&mut engine, cid_a.clone(), pos_id_a.clone(), Side::Buy, dec!(1_000));
+    send_open_order_with_position_id(&mut engine, cid_a.clone(), pos_id_a.clone(), Side::Buy, dec!(1_000), false);
 
     // Verify CID→PositionId was recorded.
     assert!(engine
@@ -1760,7 +1767,7 @@ fn test_hedging_position_ids_cleanup_on_position_exit() {
     let exchange_id_a = OrderId::new("exch-a");
 
     // Open a position.
-    send_open_order_with_position_id(&mut engine, cid_a.clone(), pos_id_a.clone(), Side::Buy, dec!(1_000));
+    send_open_order_with_position_id(&mut engine, cid_a.clone(), pos_id_a.clone(), Side::Buy, dec!(1_000), false);
     send_order_ack(&mut engine, cid_a.clone(), exchange_id_a.clone(), Side::Buy);
     send_fill(&mut engine, exchange_id_a.clone(), Side::Buy, dec!(1_000));
     // Exchange confirms cid_a is fully filled — removes it from orders.0 and cleans up routing tables.
@@ -1770,7 +1777,7 @@ fn test_hedging_position_ids_cleanup_on_position_exit() {
     let cid_b = ClientOrderId::new("cid-b");
     let pos_id_b_same = pos_id_a.clone(); // deliberately route close to same position
     let exchange_id_b = OrderId::new("exch-b");
-    send_open_order_with_position_id(&mut engine, cid_b.clone(), pos_id_b_same, Side::Sell, dec!(2_000));
+    send_open_order_with_position_id(&mut engine, cid_b.clone(), pos_id_b_same, Side::Sell, dec!(2_000), true);
     send_order_ack(&mut engine, cid_b.clone(), exchange_id_b.clone(), Side::Sell);
     send_fill(&mut engine, exchange_id_b, Side::Sell, dec!(2_000));
     // Exchange confirms cid_b is fully filled — removes it from orders.0 and cleans up routing tables.
@@ -1808,11 +1815,11 @@ fn test_contract_expiry_hedging_multi_position() {
     let pos_id_b = PositionId::new("leg-b");
     let exchange_id_b = OrderId::new("exch-b");
 
-    send_open_order_with_position_id(&mut engine, cid_a.clone(), pos_id_a.clone(), Side::Buy, dec!(2_000));
+    send_open_order_with_position_id(&mut engine, cid_a.clone(), pos_id_a.clone(), Side::Buy, dec!(2_000), false);
     send_order_ack(&mut engine, cid_a, exchange_id_a.clone(), Side::Buy);
     send_fill(&mut engine, exchange_id_a, Side::Buy, dec!(2_000));
 
-    send_open_order_with_position_id(&mut engine, cid_b.clone(), pos_id_b.clone(), Side::Buy, dec!(3_000));
+    send_open_order_with_position_id(&mut engine, cid_b.clone(), pos_id_b.clone(), Side::Buy, dec!(3_000), false);
     send_order_ack(&mut engine, cid_b, exchange_id_b.clone(), Side::Buy);
     send_fill(&mut engine, exchange_id_b, Side::Buy, dec!(3_000));
 
@@ -1942,7 +1949,7 @@ fn test_hedging_pending_fill_replayed_on_ack() {
     let exchange_id = OrderId::new("exch-pending");
 
     // Step 1: Submit order — creates OpenInFlight state, records position_ids[cid] = pos_id.
-    send_open_order_with_position_id(&mut engine, cid.clone(), pos_id.clone(), Side::Buy, dec!(1_000));
+    send_open_order_with_position_id(&mut engine, cid.clone(), pos_id.clone(), Side::Buy, dec!(1_000), false);
 
     // Step 2: Fill arrives BEFORE ack — should be buffered in pending_fills.
     send_fill(&mut engine, exchange_id.clone(), Side::Buy, dec!(1_000));
@@ -1986,7 +1993,7 @@ fn test_hedging_pending_fill_drained_on_cancel_ack() {
     let exchange_id = OrderId::new("exch-cancel-race");
 
     // Step 1: Submit order.
-    send_open_order_with_position_id(&mut engine, cid.clone(), pos_id.clone(), Side::Buy, dec!(1_000));
+    send_open_order_with_position_id(&mut engine, cid.clone(), pos_id.clone(), Side::Buy, dec!(1_000), false);
 
     // Step 2: Fill arrives before any ack — buffered.
     send_fill(&mut engine, exchange_id.clone(), Side::Buy, dec!(1_000));
@@ -2022,7 +2029,7 @@ fn test_contract_expiry_clears_pending_fills() {
     let exchange_id = OrderId::new("exch-expiry-pending");
 
     // Submit order and send fill before ack — creates pending_fills entry.
-    send_open_order_with_position_id(&mut engine, cid.clone(), pos_id.clone(), Side::Buy, dec!(1_000));
+    send_open_order_with_position_id(&mut engine, cid.clone(), pos_id.clone(), Side::Buy, dec!(1_000), false);
     send_fill(&mut engine, exchange_id.clone(), Side::Buy, dec!(1_000));
 
     let instr = engine.state.instruments.instrument_index(&InstrumentIndex(0));

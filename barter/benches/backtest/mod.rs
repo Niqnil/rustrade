@@ -324,6 +324,7 @@ impl AlgoStrategy for LoseMoneyStrategy {
                         kind: OrderKind::Market,
                         time_in_force: TimeInForce::ImmediateOrCancel,
                         position_id: None,
+                        reduce_only: false,
                     },
                 })
             });
@@ -399,19 +400,10 @@ impl
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct LoseMoneyInstrumentData {
     last_trade: Option<PublicTrade>,
     market_data: DefaultInstrumentMarketData,
-}
-
-impl Default for LoseMoneyInstrumentData {
-    fn default() -> Self {
-        Self {
-            last_trade: None,
-            market_data: DefaultInstrumentMarketData::default(),
-        }
-    }
 }
 
 impl InstrumentDataState for LoseMoneyInstrumentData {
@@ -465,7 +457,7 @@ fn args_constant(
     let time_engine_start = DateTime::<Utc>::from_str("2025-03-25T23:07:00.773674205Z").unwrap();
 
     // Construct EngineState
-    let engine_state = EngineStateBuilder::new(&instruments, DefaultGlobalData::default(), |_| {
+    let engine_state = EngineStateBuilder::new(&instruments, DefaultGlobalData, |_| {
         LoseMoneyInstrumentData::default()
     })
     .time_engine_start(time_engine_start)

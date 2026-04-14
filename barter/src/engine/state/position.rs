@@ -150,18 +150,18 @@ impl<InstrumentKey> PositionManager<InstrumentKey> {
         // new opposite-side position is re-inserted under the same PositionId.
         // Subsequent fills routed to that ID will update the wrong-direction position.
         // Strategies must close positions explicitly rather than relying on flip semantics.
-        if self.mode == OmsMode::Hedging {
-            if let (Some(new_pos), Some(exited)) = (&updated, &closed) {
-                error!(
-                    %position_id,
-                    closed_side = ?exited.side,
-                    new_side = ?new_pos.side,
-                    "Hedging mode: fill crossed zero — position flipped under same PositionId. \
-                     Subsequent fills routed to this ID will update the opposite-direction \
-                     position silently, corrupting PnL. Strategies MUST close positions \
-                     explicitly; never rely on flip semantics in Hedging mode.",
-                );
-            }
+        if self.mode == OmsMode::Hedging
+            && let (Some(new_pos), Some(exited)) = (&updated, &closed)
+        {
+            error!(
+                %position_id,
+                closed_side = ?exited.side,
+                new_side = ?new_pos.side,
+                "Hedging mode: fill crossed zero — position flipped under same PositionId. \
+                 Subsequent fills routed to this ID will update the opposite-direction \
+                 position silently, corrupting PnL. Strategies MUST close positions \
+                 explicitly; never rely on flip semantics in Hedging mode.",
+            );
         }
 
         // Set the PositionId on the closed PositionExited so upstream consumers
@@ -1393,10 +1393,10 @@ mod tests {
             // Spot instrument: contract_size = 1
             let actual = calculate_pnl_realised(
                 test.side,
-                test.price_entry_average.into(),
-                test.closed_quantity.into(),
-                test.closed_price.into(),
-                test.closed_fee.into(),
+                test.price_entry_average,
+                test.closed_quantity,
+                test.closed_price,
+                test.closed_fee,
                 Decimal::ONE,
             );
 
@@ -1488,9 +1488,9 @@ mod tests {
 
         for (index, test) in cases.into_iter().enumerate() {
             let actual = calculate_pnl_return(
-                test.pnl_realised.into(),
-                test.price_entry_average.into(),
-                test.quantity_abs_max.into(),
+                test.pnl_realised,
+                test.price_entry_average,
+                test.quantity_abs_max,
             );
 
             assert_eq!(actual, test.expected, "TC{} failed", index);
