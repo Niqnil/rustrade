@@ -60,7 +60,7 @@ mod tests {
         }
 
         // dataset = [0.1, -0.2, -0.05, 0.2, 0.15, -0.17]
-        let inputs = vec![
+        let inputs = [
             // TC0
             Input {
                 prev_mean: dec!(0.0),
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn calculate_sample_variance() {
-        let inputs = vec![
+        let inputs = [
             (dec!(0.0), dec!(1)),
             (dec!(1050.0), dec!(5)),
             (dec!(1012.5), dec!(123223)),
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn calculate_population_variance() {
-        let inputs = vec![
+        let inputs = [
             (dec!(0.0), 1),
             (dec!(1050.0), 5),
             (dec!(1012.5), 123223),

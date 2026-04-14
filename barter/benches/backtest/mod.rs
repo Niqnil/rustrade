@@ -70,7 +70,7 @@ const CONFIG: &str = r#"
       {
         "mocked_exchange": "binance_spot",
         "latency_ms": 100,
-        "fees_percent": 0.05,
+        "fee_model": { "Percentage": { "rate": "0.05" } },
         "initial_state": {
           "exchange": "binance_spot",
           "balances": [
@@ -323,6 +323,8 @@ impl AlgoStrategy for LoseMoneyStrategy {
                         quantity: Decimal::from_f64(trade_not_sent_as_order_open.amount).unwrap(),
                         kind: OrderKind::Market,
                         time_in_force: TimeInForce::ImmediateOrCancel,
+                        position_id: None,
+                        reduce_only: false,
                     },
                 })
             });
@@ -347,7 +349,7 @@ impl ClosePositionsStrategy for LoseMoneyStrategy {
         AssetIndex: 'a,
         InstrumentIndex: 'a,
     {
-        close_open_positions_with_market_orders(&self.id, state, filter, |_| {
+        close_open_positions_with_market_orders(&self.id, state, filter, |_, _| {
             ClientOrderId::random()
         })
     }
@@ -398,19 +400,10 @@ impl
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct LoseMoneyInstrumentData {
     last_trade: Option<PublicTrade>,
     market_data: DefaultInstrumentMarketData,
-}
-
-impl Default for LoseMoneyInstrumentData {
-    fn default() -> Self {
-        Self {
-            last_trade: None,
-            market_data: DefaultInstrumentMarketData::default(),
-        }
-    }
 }
 
 impl InstrumentDataState for LoseMoneyInstrumentData {
@@ -464,7 +457,7 @@ fn args_constant(
     let time_engine_start = DateTime::<Utc>::from_str("2025-03-25T23:07:00.773674205Z").unwrap();
 
     // Construct EngineState
-    let engine_state = EngineStateBuilder::new(&instruments, DefaultGlobalData::default(), |_| {
+    let engine_state = EngineStateBuilder::new(&instruments, DefaultGlobalData, |_| {
         LoseMoneyInstrumentData::default()
     })
     .time_engine_start(time_engine_start)

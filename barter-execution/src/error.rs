@@ -41,6 +41,33 @@ pub enum ClientError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// Failed to initialise an AccountStream.
     #[error("failed to init AccountStream: {0}")]
     AccountStream(String),
+
+    /// Activity pagination was truncated at the page limit.
+    ///
+    /// The returned data from the underlying call is a partial result. This error
+    /// indicates that more activities exist beyond the safety limit, typically due
+    /// to a very long outage (>5000 fills). Callers should alert operators and
+    /// consider manual reconciliation.
+    #[error("activity pagination truncated at {limit} pages — data may be incomplete")]
+    Truncated {
+        /// Maximum number of pages that were fetched before truncation.
+        limit: usize,
+    },
+
+    /// Open orders snapshot was truncated at the API's row limit.
+    ///
+    /// Unlike [`Truncated`] (which applies to paginated activity fetches), this
+    /// error indicates a single-request endpoint hit its maximum row count.
+    /// Alpaca's `/v2/orders` endpoint caps results at 500; accounts with more
+    /// concurrent open orders will have an incomplete snapshot.
+    ///
+    /// Callers should alert operators — an incomplete order snapshot can cause
+    /// duplicate submissions, missed cancellations, or incorrect position sizing.
+    #[error("open orders snapshot truncated at {limit} results — data may be incomplete")]
+    TruncatedSnapshot {
+        /// Maximum number of rows returned by the single-request endpoint.
+        limit: usize,
+    },
 }
 
 /// Represents all connectivity-centric errors.

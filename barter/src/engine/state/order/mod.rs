@@ -46,6 +46,18 @@ impl<ExchangeKey, InstrumentKey> Default for Orders<ExchangeKey, InstrumentKey> 
     }
 }
 
+impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
+    /// Remove all tracked orders, discarding any pending state.
+    ///
+    /// Used during contract expiry cleanup where the exchange silently voids all
+    /// open and cancel-in-flight orders at expiry. The normal `cleanup_routing_tables`
+    /// path cannot remove `CancelInFlight` entries because their cancel acks may
+    /// never arrive after expiry, causing unbounded accumulation in a long-running engine.
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
 impl<ExchangeKey, InstrumentKey> OrderManager<ExchangeKey, InstrumentKey>
     for Orders<ExchangeKey, InstrumentKey>
 where
@@ -587,6 +599,8 @@ mod tests {
                 quantity: dec!(1),
                 kind: OrderKind::Limit,
                 time_in_force: TimeInForce::GoodUntilEndOfDay,
+                position_id: None,
+                reduce_only: false,
             },
         }
     }

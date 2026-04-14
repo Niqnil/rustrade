@@ -68,7 +68,7 @@ impl<State> Default for CustomRiskManager<State> {
         Self {
             max_notional_per_order: MAX_USDT_NOTIONAL_PER_ORDER,
             max_market_order_price_percent_from_market: MAX_MARKET_ORDER_PRICE_PERCENT_FROM_MARKET,
-            phantom: PhantomData::default(),
+            phantom: PhantomData,
         }
     }
 }
@@ -219,7 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         DefaultStrategy::default(),
         DefaultRiskManager::default(),
         market_stream,
-        DefaultGlobalData::default(),
+        DefaultGlobalData,
         |_| DefaultInstrumentMarketData::default(),
     );
 

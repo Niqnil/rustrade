@@ -7,6 +7,7 @@ use barter::{
 };
 use barter_execution::{
     balance::{AssetBalance, Balance},
+    order::id::PositionId,
     trade::{AssetFees, TradeId},
 };
 use barter_instrument::{
@@ -51,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let time_now = Utc::now();
 
     // Construct EngineState from IndexedInstruments and hard-coded exchange asset Balances
-    let state = EngineState::builder(&instruments, DefaultGlobalData::default(), |_| {
+    let state = EngineState::builder(&instruments, DefaultGlobalData, |_| {
         DefaultInstrumentMarketData::default()
     })
     .time_engine_start(time_now)
@@ -132,6 +133,7 @@ fn generate_synthetic_updates(base_time: DateTime<Utc>) -> Vec<ContrivedEvents> 
         })),
         // Update 3: PositionExited
         ContrivedEvents::Position(PositionExited {
+            position_id: PositionId::NETTING,
             instrument: InstrumentIndex(0), // BinanceSpot btc_usdt
             side: Side::Buy,
             price_entry_average: dec!(1.0),
@@ -163,6 +165,7 @@ fn generate_synthetic_updates(base_time: DateTime<Utc>) -> Vec<ContrivedEvents> 
         })),
         // Update 6: PositionExited
         ContrivedEvents::Position(PositionExited {
+            position_id: PositionId::NETTING,
             instrument: InstrumentIndex(0), // BinanceSpot btc_usdt
             side: Side::Buy,
             price_entry_average: dec!(1.0),
@@ -188,6 +191,7 @@ fn generate_synthetic_updates(base_time: DateTime<Utc>) -> Vec<ContrivedEvents> 
         })),
         // Update 9: PositionExited
         ContrivedEvents::Position(PositionExited {
+            position_id: PositionId::NETTING,
             instrument: InstrumentIndex(0), // BinanceSpot btc_usdt
             side: Side::Buy,
             price_entry_average: dec!(1.0),
@@ -219,6 +223,7 @@ fn generate_synthetic_updates(base_time: DateTime<Utc>) -> Vec<ContrivedEvents> 
         })),
         // Update 13: PositionExited
         ContrivedEvents::Position(PositionExited {
+            position_id: PositionId::NETTING,
             instrument: InstrumentIndex(1), // BinanceSpot eth_usdt
             side: Side::Buy,
             price_entry_average: dec!(1.0),
@@ -248,6 +253,7 @@ fn generate_synthetic_updates(base_time: DateTime<Utc>) -> Vec<ContrivedEvents> 
         })),
         // Update 16: PositionExited
         ContrivedEvents::Position(PositionExited {
+            position_id: PositionId::NETTING,
             instrument: InstrumentIndex(1), // BinanceSpot eth_usdt
             side: Side::Buy,
             price_entry_average: dec!(1.0),

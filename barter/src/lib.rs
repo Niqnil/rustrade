@@ -37,6 +37,12 @@
 //! ## Getting Started Via Engine Examples
 //! [See Engine Examples](https://github.com/barter-rs/barter-rs/tree/feat/docs_tests_readmes_examples/barter/examples)
 
+// Silence unused_crate_dependencies for dev-dependencies used only in tests
+#[cfg(test)]
+use criterion as _;
+#[cfg(test)]
+use serde_json as _;
+
 use crate::{
     engine::{command::Command, state::trading::TradingState},
     execution::AccountStreamEvent,
@@ -126,6 +132,20 @@ pub enum EngineEvent<
     TradingStateUpdate(TradingState),
     Account(AccountStreamEvent<ExchangeKey, AssetKey, InstrumentKey>),
     Market(MarketStreamEvent<InstrumentKey, MarketKind>),
+
+    /// Signal that an option contract has expired and settlement should be computed.
+    ///
+    /// The library handles: cancelling open orders, computing intrinsic-value settlement,
+    /// synthesising a closing fill, and setting the `expiration_processed` flag.
+    ///
+    /// **Caller obligation**: inject this event when `Utc::now() >= option.expiry`.
+    /// The handler is idempotent — duplicate events for the same instrument are safe.
+    ///
+    /// Note: `From` is skipped here because the generic `InstrumentKey` parameter
+    /// would conflict with the `From<Shutdown>` impl when `InstrumentKey = Shutdown`.
+    /// Construct this variant directly: `EngineEvent::ContractExpiry(key)`.
+    #[from(skip)]
+    ContractExpiry(InstrumentKey),
 }
 
 impl<MarketKind, ExchangeKey, AssetKey, InstrumentKey> Terminal

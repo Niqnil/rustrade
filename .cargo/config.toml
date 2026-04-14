@@ -1,0 +1,4 @@
+[target.x86_64-unknown-linux-gnu]
+# Requires mold linker: https://github.com/rui314/mold
+# Install: sudo apt install mold
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

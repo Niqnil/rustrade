@@ -18,6 +18,10 @@ use chrono::{DateTime, Utc};
 use futures::Stream;
 use std::future::Future;
 
+// Alpaca ExecutionClient implementation (options, equities, crypto — single unified API)
+#[cfg(feature = "alpaca")]
+pub mod alpaca;
+
 // BinanceSpot ExecutionClient implementation
 #[cfg(feature = "binance")]
 pub mod binance;
@@ -99,11 +103,20 @@ where
         )
     }
 
+    /// Fetch current balances for the specified assets.
+    ///
+    /// An empty `assets` slice is the "return all" sentinel: implementations must return
+    /// balances for every asset held. When non-empty, only the listed assets are returned.
     fn fetch_balances(
         &self,
         assets: &[AssetNameExchange],
     ) -> impl Future<Output = Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError>> + Send;
 
+    /// Fetch currently open orders, optionally filtered by instrument.
+    ///
+    /// An empty `instruments` slice is the "return all" sentinel: implementations must
+    /// return open orders across all instruments. When non-empty, only orders for the
+    /// listed instruments are returned.
     fn fetch_open_orders(
         &self,
         instruments: &[InstrumentNameExchange],
@@ -111,8 +124,13 @@ where
         Output = Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError>,
     > + Send;
 
-    // added instruments parameter — Binance (and most exchanges) require
-    // per-symbol queries for trade history. Consistent with fetch_open_orders.
+    /// Fetch trades (fills) since `time_since`, optionally filtered by instrument.
+    ///
+    /// An empty `instruments` slice is the "return all" sentinel: implementations must
+    /// return trades across all instruments. When non-empty, only trades for the listed
+    /// instruments are returned.
+    ///
+    /// Note: `MockExecution` currently ignores `instruments` and always returns all trades.
     fn fetch_trades(
         &self,
         time_since: DateTime<Utc>,

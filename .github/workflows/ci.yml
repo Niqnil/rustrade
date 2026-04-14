@@ -18,6 +18,9 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v3
 
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+
       - name: Install stable toolchain
         uses: actions-rs/toolchain@v1
         with:
@@ -39,6 +42,9 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v3
 
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+
       - name: Install stable toolchain
         uses: actions-rs/toolchain@v1
         with:
@@ -52,6 +58,7 @@ jobs:
         uses: actions-rs/cargo@v1
         with:
           command: test
+          args: --workspace --all-features
 
   lints:
     name: Lint
@@ -59,6 +66,9 @@ jobs:
     steps:
       - name: Checkout sources
         uses: actions/checkout@v3
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
 
       - name: Install stable toolchain
         uses: actions-rs/toolchain@v1

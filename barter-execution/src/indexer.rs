@@ -264,6 +264,10 @@ impl AccountEventIndexer {
             UnindexedClientError::Api(error) => ClientError::Api(self.api_error(error)?),
             UnindexedClientError::AccountSnapshot(value) => ClientError::AccountSnapshot(value),
             UnindexedClientError::AccountStream(value) => ClientError::AccountStream(value),
+            UnindexedClientError::Truncated { limit } => ClientError::Truncated { limit },
+            UnindexedClientError::TruncatedSnapshot { limit } => {
+                ClientError::TruncatedSnapshot { limit }
+            }
         })
     }
 

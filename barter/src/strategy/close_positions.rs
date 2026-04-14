@@ -5,7 +5,7 @@ use crate::engine::state::{
 };
 use barter_execution::order::{
     OrderKey, OrderKind, TimeInForce,
-    id::{ClientOrderId, StrategyId},
+    id::{ClientOrderId, PositionId, StrategyId},
     request::{OrderRequestCancel, OrderRequestOpen, RequestOpen},
 };
 use barter_instrument::{
@@ -64,7 +64,7 @@ pub fn close_open_positions_with_market_orders<'a, GlobalData, InstrumentData>(
     strategy_id: &'a StrategyId,
     state: &'a EngineState<GlobalData, InstrumentData>,
     filter: &'a InstrumentFilter,
-    gen_cid: impl Fn(&InstrumentState<InstrumentData>) -> ClientOrderId + Copy + 'a,
+    gen_cid: impl Fn(&InstrumentState<InstrumentData>, &PositionId) -> ClientOrderId + Copy + 'a,
 ) -> (
     impl IntoIterator<Item = OrderRequestCancel<ExchangeIndex, InstrumentIndex>> + 'a,
     impl IntoIterator<Item = OrderRequestOpen<ExchangeIndex, InstrumentIndex>> + 'a,
@@ -75,21 +75,30 @@ where
     AssetIndex: 'a,
     InstrumentIndex: 'a,
 {
+    // In Hedging mode, gen_cid receives both the InstrumentState and the PositionId so
+    // callers can derive a unique ClientOrderId per position (e.g., by incorporating
+    // pos_id.0 into the CID). Using the same CID for multiple positions in Hedging mode
+    // causes routing collisions and undefined exchange behavior.
     let open_requests = state
         .instruments
         .instruments(filter)
-        .filter_map(move |state| {
-            // Only generate orders if there is a Position and we have market data
-            let position = state.position.current.as_ref()?;
-            let price = state.data.price()?;
-
-            Some(build_ioc_market_order_to_close_position(
-                state.instrument.exchange,
-                position,
-                strategy_id.clone(),
-                price,
-                || gen_cid(state),
-            ))
+        // Filter to instruments with market data, extracting price to avoid re-lookup.
+        .filter_map(|state| state.data.price().map(|price| (state, price)))
+        .flat_map(move |(state, price)| {
+            // Generate one closing order per open position.
+            // In Netting mode there is at most one position; in Hedging mode there may be N.
+            // Each order carries the PositionId so hedging-mode fills route to the right slot.
+            state.position.positions.iter().map(move |(pos_id, position)| {
+                let mut req = build_ioc_market_order_to_close_position(
+                    state.instrument.exchange,
+                    position,
+                    strategy_id.clone(),
+                    price,
+                    || gen_cid(state, pos_id),
+                );
+                req.state.position_id = Some(pos_id.clone());
+                req
+            })
         });
 
     (std::iter::empty(), open_requests)
@@ -126,6 +135,8 @@ where
             quantity: position.quantity_abs,
             kind: OrderKind::Market,
             time_in_force: TimeInForce::ImmediateOrCancel,
+            position_id: None, // caller sets this when hedging-mode routing is required
+            reduce_only: true, // closing existing position
         },
     }
 }

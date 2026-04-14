@@ -3,7 +3,9 @@ use crate::{
     balance::AssetBalance,
     client::ExecutionClient,
     error::{ConnectivityError, UnindexedClientError, UnindexedOrderError},
-    exchange::mock::request::MockExchangeRequest,
+    exchange::mock::request::{MarketPrices, MockExchangeRequest},
+    fee::FeeModelConfig,
+    fill::SimFillConfig,
     order::{
         Order, OrderEvent, OrderKey,
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
@@ -19,20 +21,31 @@ use barter_instrument::{
 use chrono::{DateTime, Utc};
 use derive_more::Constructor;
 use futures::stream::BoxStream;
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::error;
 
-#[derive(
-    Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
-)]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor)]
 pub struct MockExecutionConfig {
     pub mocked_exchange: ExchangeId,
     pub initial_state: UnindexedAccountSnapshot,
     pub latency_ms: u64,
-    pub fees_percent: Decimal,
+    /// Fee model used by the mock exchange to compute trading fees.
+    ///
+    /// Defaults to [`FeeModelConfig::Zero`]. Use [`FeeModelConfig::Percentage`]
+    /// for spot/futures simulation (e.g. 0.1% taker fee).
+    #[serde(default)]
+    pub fee_model: FeeModelConfig,
+    /// Fill model used by the mock exchange to compute execution prices.
+    ///
+    /// Defaults to [`SimFillConfig::LastPrice`], which fills at the
+    /// order price (identical to pre-FillModel behaviour). Switch to
+    /// [`SimFillConfig::BidAsk`] or [`SimFillConfig::Midpoint`] for
+    /// more realistic spread-cost simulation when market prices are injected
+    /// alongside orders.
+    #[serde(default)]
+    pub fill_model: SimFillConfig,
 }
 
 #[derive(Debug, Constructor)]
@@ -204,6 +217,7 @@ where
                 self.time_request(),
                 response_tx,
                 request.clone(),
+                MarketPrices::default(), // no market-data subscription; FillModel uses last_price=Some(request.state.price) as fallback, so fill equals request price
             ))
             .is_err()
         {

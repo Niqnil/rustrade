@@ -62,5 +62,12 @@ where
 
         instrument_state.orders.record_in_flight_open(request);
         instrument_state.data.record_in_flight_open(request);
+
+        // Store CID → PositionId mapping for hedging-mode fill routing.
+        if let Some(position_id) = &request.state.position_id {
+            instrument_state
+                .position_ids
+                .insert(request.key.cid.clone(), position_id.clone());
+        }
     }
 }

@@ -57,7 +57,7 @@ async fn main() {
     let time_engine_start = market_data.time_first_event().await.unwrap();
 
     // Construct EngineState
-    let engine_state = EngineStateBuilder::new(&instruments, DefaultGlobalData::default(), |_| {
+    let engine_state = EngineStateBuilder::new(&instruments, DefaultGlobalData, |_| {
         DefaultInstrumentMarketData::default()
     })
     .time_engine_start(time_engine_start)

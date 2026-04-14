@@ -23,6 +23,10 @@
 //!
 //! See `README.md` for more information and examples.
 
+// Silence unused_crate_dependencies for dev-dependencies used only in tests
+#[cfg(test)]
+use wiremock as _;
+
 use crate::{
     balance::AssetBalance,
     order::{Order, OrderSnapshot, request::OrderResponseCancel},
@@ -43,6 +47,10 @@ pub mod balance;
 pub mod client;
 pub mod error;
 pub mod exchange;
+pub mod fee;
+pub use fee::{FeeModel, FeeModelConfig, PerContractFeeModel, PercentageFeeModel, ZeroFeeModel};
+pub mod fill;
+pub use fill::{BidAskFillModel, FillModel, LastPriceFillModel, MidpointFillModel, SimFillConfig};
 pub mod indexer;
 pub mod map;
 pub mod order;

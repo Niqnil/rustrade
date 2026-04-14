@@ -186,6 +186,8 @@ where
                     quantity,
                     kind,
                     time_in_force,
+                    position_id: _,
+                    reduce_only: _, // used by adapters (e.g., Alpaca) to derive position_intent
                 },
         } = value;
 

@@ -100,7 +100,7 @@ where
         AssetIndex: 'a,
         InstrumentIndex: 'a,
     {
-        close_open_positions_with_market_orders(&self.id, state, filter, |_| {
+        close_open_positions_with_market_orders(&self.id, state, filter, |_, _| {
             ClientOrderId::random()
         })
     }

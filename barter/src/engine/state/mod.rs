@@ -140,9 +140,13 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                     .instruments
                     .instrument_index_mut(&order.value().key.instrument);
 
-                instrument_state.update_from_order_snapshot(order.as_ref());
+                // Propagate any PositionExited from deferred fill replay (fill-before-ack
+                // race in OmsMode::Hedging). update_from_trade side effects (tearsheet,
+                // position removal) are correct regardless; this ensures the output event
+                // also reaches EngineOutput::PositionExit consumers.
+                let exited = instrument_state.update_from_order_snapshot(order.as_ref());
                 instrument_state.data.process(event);
-                None
+                exited
             }
             AccountEventKind::OrderCancelled(response) => {
                 let instrument_state = self

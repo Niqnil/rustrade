@@ -202,7 +202,7 @@ mod tests {
                 .unwrap()
         };
 
-        let cases = vec![
+        let cases = [
             // TC0: Basic case - single event in order
             TestCase {
                 name: "single event in order",
@@ -323,7 +323,7 @@ mod tests {
         let delta_ms = time_2.signed_duration_since(time_1).num_milliseconds();
 
         assert!(
-            delta_ms >= 95 && delta_ms <= 105,
+            (95..=105).contains(&delta_ms),
             "Historical clock time delta outside expected range"
         );
     }
