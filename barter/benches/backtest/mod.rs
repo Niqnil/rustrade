@@ -323,6 +323,7 @@ impl AlgoStrategy for LoseMoneyStrategy {
                         quantity: Decimal::from_f64(trade_not_sent_as_order_open.amount).unwrap(),
                         kind: OrderKind::Market,
                         time_in_force: TimeInForce::ImmediateOrCancel,
+                        position_id: None,
                     },
                 })
             });
@@ -347,7 +348,7 @@ impl ClosePositionsStrategy for LoseMoneyStrategy {
         AssetIndex: 'a,
         InstrumentIndex: 'a,
     {
-        close_open_positions_with_market_orders(&self.id, state, filter, |_| {
+        close_open_positions_with_market_orders(&self.id, state, filter, |_, _| {
             ClientOrderId::random()
         })
     }

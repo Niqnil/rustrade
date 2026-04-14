@@ -2,11 +2,13 @@ use crate::{
     EngineEvent,
     engine::{
         EngineMeta, EngineOutput, Processor,
-        audit::{AuditTick, EngineAudit, context::EngineContext},
+        audit::{AuditTick, EngineAudit, ProcessAudit, context::EngineContext},
         state::{EngineState, instrument::data::InstrumentDataState},
     },
     execution::AccountStreamEvent,
 };
+use barter_integration::collection::none_one_or_many::NoneOneOrMany;
+// (used by `update_from_event` to inspect the live engine's outputs)
 use barter_data::{event::MarketEvent, streams::consumer::MarketStreamEvent};
 use barter_execution::AccountEvent;
 use barter_instrument::instrument::InstrumentIndex;
@@ -87,7 +89,8 @@ where
 
             let shutdown = audit.is_terminal();
 
-            self.update_from_event(audit.event);
+            let ProcessAudit { event, outputs, .. } = audit;
+            self.update_from_event(event, &outputs);
 
             if shutdown {
                 break "EngineEvent::Shutdown";
@@ -114,8 +117,33 @@ where
         Ok(())
     }
 
-    /// Updates the internal `EngineState` using the provided `EngineEvent`.
-    pub fn update_from_event(&mut self, event: EngineEvent<InstrumentData::MarketEventKind>) {
+    /// Updates the internal `EngineState` using the provided `EngineEvent` and the
+    /// `outputs` produced by the live engine for that same event.
+    ///
+    /// # Two distinct replay strategies
+    ///
+    /// Different event types use different update strategies — intentionally:
+    ///
+    /// - **`OrderSnapshot`** (via `Account` arm): replays the event directly on the replica
+    ///   state. This is correct because the replica can independently compute the same state
+    ///   transition as the live engine (order state machine is deterministic given the event).
+    ///   Deferred fill replay (`update_from_order_snapshot`) also runs here, keeping the
+    ///   replica's `pending_fills` in sync without needing the live engine's outputs.
+    ///
+    /// - **`ContractExpiry`**: consults `outputs` from the live engine rather than replaying
+    ///   the event. This is necessary because `process_contract_expiry` is *conditional*: it
+    ///   bails early (returning no exits) when the underlying spot price is unavailable. The
+    ///   replica cannot independently determine which branch the live engine took, so it
+    ///   mirrors the decision by inspecting `PositionExit` outputs.
+    ///
+    /// Adding a new event type: choose event replay (deterministic transition) or output
+    /// mirroring (conditional/non-deterministic) based on whether the replica can reproduce
+    /// the live engine's branching from the event alone.
+    pub fn update_from_event<OnDisable, OnDisconnect>(
+        &mut self,
+        event: EngineEvent<InstrumentData::MarketEventKind>,
+        outputs: &NoneOneOrMany<EngineOutput<OnDisable, OnDisconnect>>,
+    ) {
         match event {
             EngineEvent::Shutdown(_) | EngineEvent::Command(_) => {
                 // No action required
@@ -146,6 +174,61 @@ where
                     self.replica_engine_state_mut().update_from_market(&event);
                 }
             },
+            EngineEvent::ContractExpiry(key) => {
+                // The live engine's `process_contract_expiry` is conditional: if the
+                // underlying spot price is unavailable, it returns early without
+                // mutating state and emits no `PositionExit` outputs. The replica
+                // mirrors this by deciding from the outputs of *this* audit tick:
+                //
+                // - Any `PositionExit` output → live engine processed expiry → clear
+                //   positions and mark processed.
+                // - No `PositionExit` outputs but instrument has no positions → live
+                //   engine took the empty branch and marked it processed → mark only.
+                // - No `PositionExit` outputs and positions exist → live engine bailed
+                //   on missing spot price → leave state untouched (event is retryable).
+                let state = self.replica_engine_state_mut();
+                let instrument_state = state.instruments.instrument_index_mut(&key);
+                let any_exit = outputs
+                    .iter()
+                    .any(|o| matches!(o, EngineOutput::PositionExit(_)));
+                // Mirror the live engine's per-position loop: remove exactly the
+                // positions that were reported as exited via PositionExit outputs,
+                // rather than clearing all positions atomically. This ensures the
+                // replica stays correct even if the live engine's loop skips a
+                // position slot (e.g., due to a race condition or future partial-
+                // settlement logic).
+                if any_exit {
+                    for output in outputs.iter() {
+                        if let EngineOutput::PositionExit(exit) = output {
+                            // Guard: only remove positions that belong to the expiring
+                            // instrument. Without this, if ContractExpiry ever produces
+                            // PositionExit outputs for other instruments (e.g. future
+                            // cross-instrument settlement logic), we would call
+                            // shift_remove on the wrong instrument's position map.
+                            if exit.instrument == key {
+                                instrument_state
+                                    .position
+                                    .positions
+                                    .shift_remove(&exit.position_id);
+                            }
+                        }
+                    }
+                    // Eagerly clear orders in replica: cancel acks for expiry-cancelled
+                    // orders arrive async in the live engine (and are processed benignly),
+                    // but the replica doesn't need to process them.
+                    instrument_state.orders.clear();
+                    instrument_state.exchange_id_to_cid.clear();
+                    instrument_state.position_ids.clear();
+                    instrument_state.pending_fills.clear();
+                    instrument_state.expiration_processed = true;
+                } else if instrument_state.position.positions.is_empty() {
+                    instrument_state.orders.clear();
+                    instrument_state.exchange_id_to_cid.clear();
+                    instrument_state.position_ids.clear();
+                    instrument_state.pending_fills.clear();
+                    instrument_state.expiration_processed = true;
+                }
+            }
         }
     }
 

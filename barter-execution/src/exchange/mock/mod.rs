@@ -5,12 +5,13 @@ use crate::{
     error::{ApiError, UnindexedApiError, UnindexedOrderError},
     exchange::mock::{
         account::AccountState,
-        request::{MockExchangeRequest, MockExchangeRequestKind},
+        request::{MarketPrices, MockExchangeRequest, MockExchangeRequestKind},
     },
+    fill::{FillModel, SimFillConfig},
     order::{
-        Order, OrderKind, UnindexedOrder,
+        Order, OrderKey, OrderKind, UnindexedOrder,
         id::OrderId,
-        request::{OrderRequestCancel, OrderRequestOpen},
+        request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Cancelled, Open},
     },
     trade::{AssetFees, Trade, TradeId},
@@ -41,6 +42,7 @@ pub struct MockExchange {
     pub exchange: ExchangeId,
     pub latency_ms: u64,
     pub fees_percent: Decimal,
+    pub fill_model: SimFillConfig,
     pub request_rx: mpsc::UnboundedReceiver<MockExchangeRequest>,
     pub event_tx: broadcast::Sender<UnindexedAccountEvent>,
     pub instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
@@ -60,6 +62,7 @@ impl MockExchange {
             exchange: config.mocked_exchange,
             latency_ms: config.latency_ms,
             fees_percent: config.fees_percent,
+            fill_model: config.fill_model,
             request_rx,
             event_tx,
             instruments,
@@ -82,10 +85,11 @@ impl MockExchange {
                     response_tx,
                     assets,
                 } => {
+                    // Empty slice means "return all" (consistent with account_snapshot behavior).
                     let balances = self
                         .account
                         .balances()
-                        .filter(|balance| assets.contains(&balance.asset))
+                        .filter(|balance| assets.is_empty() || assets.contains(&balance.asset))
                         .cloned()
                         .collect();
                     self.respond_with_latency(response_tx, balances);
@@ -94,10 +98,14 @@ impl MockExchange {
                     response_tx,
                     instruments,
                 } => {
+                    // Empty slice means "return all" (consistent with account_snapshot behavior).
                     let orders_open = self
                         .account
                         .orders_open()
-                        .filter(|order| instruments.contains(&order.key.instrument))
+                        .filter(|order| {
+                            instruments.is_empty()
+                                || instruments.contains(&order.key.instrument)
+                        })
                         .cloned()
                         .collect();
                     self.respond_with_latency(response_tx, orders_open);
@@ -110,20 +118,36 @@ impl MockExchange {
                     self.respond_with_latency(response_tx, trades);
                 }
                 MockExchangeRequestKind::CancelOrder {
-                    response_tx: _,
+                    response_tx,
                     request,
                 } => {
+                    // MockExchange only supports Market orders which fill immediately,
+                    // so there are never any open orders to cancel. Send a rejection
+                    // response so the caller doesn't hang waiting on the oneshot.
                     error!(
                         exchange = %self.exchange,
                         ?request,
                         "MockExchange received cancel request but only Market orders are supported"
                     );
+                    let key = OrderKey {
+                        exchange: request.key.exchange,
+                        instrument: request.key.instrument,
+                        strategy: request.key.strategy,
+                        cid: request.key.cid,
+                    };
+                    let _ = response_tx.send(UnindexedOrderResponseCancel {
+                        key,
+                        state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
+                            "MockExchange does not support CancelOrder (only Market orders which fill immediately)".into(),
+                        ))),
+                    });
                 }
                 MockExchangeRequestKind::OpenOrder {
                     response_tx,
                     request,
+                    market_prices,
                 } => {
-                    let (response, notifications) = self.open_order(request);
+                    let (response, notifications) = self.open_order(request, market_prices);
                     self.respond_with_latency(response_tx, response);
 
                     if let Some(notifications) = notifications {
@@ -269,6 +293,7 @@ impl MockExchange {
     pub fn open_order(
         &mut self,
         request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
+        market_prices: MarketPrices,
     ) -> (
         Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>,
         Option<OpenOrderNotifications>,
@@ -281,6 +306,35 @@ impl MockExchange {
             Ok(instrument) => instrument.underlying.clone(),
             Err(error) => return (build_open_order_err_response(request, error), None),
         };
+
+        // Compute fill price via the configured FillModel.
+        //
+        // For limit orders, pass the limit price as `order_price`; for market orders pass `None`
+        // so the model can select the best available market price (bid/ask/last).  When no market
+        // data is present (standard MockExecution passes all-None MarketPrices), `request.state.price`
+        // is used as the `last_price` fallback so behaviour is identical to the pre-FillModel path.
+        //
+        // Invariant: `fill_price` is only called for marketable orders. `validate_order_kind_supported`
+        // (called above) currently rejects Limit orders, ensuring FillModel::fill_price never receives
+        // a non-marketable limit order. If Limit support is added later, the fill model must enforce
+        // limit-price semantics (e.g. a limit buy must not fill above the limit price).
+        let fill_price = self
+            .fill_model
+            .fill_price(
+                request.state.side,
+                match request.state.kind {
+                    // unreachable: validate_order_kind_supported (called above) already
+                    // rejects Limit orders with Err, so this arm is never reached.
+                    // Kept for exhaustiveness; passes the limit price so fill models that
+                    // gain Limit support in future behave correctly without a separate change.
+                    OrderKind::Limit => Some(request.state.price),
+                    OrderKind::Market => None,
+                },
+                market_prices.best_bid,
+                market_prices.best_ask,
+                market_prices.last_price.or(Some(request.state.price)),
+            )
+            .unwrap_or(request.state.price);
 
         let time_exchange = self.time_exchange();
 
@@ -295,7 +349,7 @@ impl MockExchange {
                 // Currently we only supported MarketKind orders, so they should be identical
                 assert_eq!(current.balance.total, current.balance.free);
 
-                let order_value_quote = request.state.price * request.state.quantity.abs();
+                let order_value_quote = fill_price * request.state.quantity.abs();
                 let order_fees_quote = order_value_quote * self.fees_percent;
                 let quote_required = order_value_quote + order_fees_quote;
 
@@ -321,7 +375,7 @@ impl MockExchange {
                 // Selling Instrument requires sufficient BaseAsset Balance
                 let current = self
                     .account
-                    .balance_mut(&underlying.quote)
+                    .balance_mut(&underlying.base)
                     .expect("MockExchange has Balance for all configured Instrument assets");
 
                 // Currently we only supported MarketKind orders, so they should be identical
@@ -338,12 +392,12 @@ impl MockExchange {
                     current.balance.total = maybe_new_balance;
                     current.time_exchange = time_exchange;
 
-                    let fees_quote = order_fees_base * request.state.price;
+                    let fees_quote = order_fees_base * fill_price;
 
                     Ok((current.clone(), AssetFees::quote_fees(fees_quote)))
                 } else {
                     Err(ApiError::BalanceInsufficient(
-                        underlying.quote,
+                        underlying.base,
                         format!(
                             "Available Balance: {}, Required Balance inc. fees: {}",
                             current.balance.free, base_required
@@ -364,7 +418,7 @@ impl MockExchange {
         let order_response = Order {
             key: request.key.clone(),
             side: request.state.side,
-            price: request.state.price,
+            price: fill_price,
             quantity: request.state.quantity,
             kind: request.state.kind,
             time_in_force: request.state.time_in_force,
@@ -384,7 +438,7 @@ impl MockExchange {
                 strategy: request.key.strategy,
                 time_exchange: self.time_exchange(),
                 side: request.state.side,
-                price: request.state.price,
+                price: fill_price,
                 quantity: request.state.quantity,
                 fees,
             },
@@ -457,4 +511,228 @@ where
 pub struct OpenOrderNotifications {
     pub balance: Snapshot<AssetBalance<AssetNameExchange>>,
     pub trade: Trade<QuoteAsset, InstrumentNameExchange>,
+}
+
+// TODO(Q-5): add an integration test that exercises a non-default SimFillConfig
+// with real bid/ask prices through open_order. Both existing tests use
+// SimFillConfig::default() (LastPrice) and MarketPrices::default() (all-None),
+// so the wiring from market_prices → fill_model.fill_price → balance deduction
+// is untested for BidAskFillModel with a configured ask price. A test should
+// assert that BidAskFillModel with a specific ask price fills a market-buy order
+// at that ask price and deducts the correct quote balance.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        UnindexedAccountSnapshot,
+        balance::{AssetBalance, Balance},
+        error::{ApiError, UnindexedOrderError},
+        exchange::mock::request::MarketPrices,
+        fill::{BidAskFillModel, SimFillConfig},
+        order::{
+            OrderEvent, OrderKey, OrderKind, TimeInForce,
+            id::{ClientOrderId, StrategyId},
+            request::RequestOpen,
+        },
+    };
+    use barter_instrument::{
+        Side, Underlying,
+        asset::name::AssetNameExchange,
+        exchange::ExchangeId,
+        instrument::{
+            Instrument,
+            kind::InstrumentKind,
+            name::{InstrumentNameExchange, InstrumentNameInternal},
+            quote::InstrumentQuoteAsset,
+        },
+    };
+    use chrono::Utc;
+    use rust_decimal::Decimal;
+    use tokio::sync::{broadcast, mpsc};
+
+    fn d(s: &str) -> Decimal {
+        s.parse().unwrap()
+    }
+
+    const EXCHANGE: ExchangeId = ExchangeId::BinanceSpot;
+
+    fn base() -> AssetNameExchange {
+        AssetNameExchange::new("BTC")
+    }
+
+    fn quote() -> AssetNameExchange {
+        AssetNameExchange::new("USDT")
+    }
+
+    fn instrument_name() -> InstrumentNameExchange {
+        InstrumentNameExchange::new("BTCUSDT")
+    }
+
+    fn make_exchange(btc: &str, usdt: &str) -> MockExchange {
+        let btc = d(btc);
+        let usdt = d(usdt);
+        let initial_state = UnindexedAccountSnapshot {
+            exchange: EXCHANGE,
+            balances: vec![
+                AssetBalance {
+                    asset: base(),
+                    balance: Balance { total: btc, free: btc },
+                    time_exchange: Utc::now(),
+                },
+                AssetBalance {
+                    asset: quote(),
+                    balance: Balance { total: usdt, free: usdt },
+                    time_exchange: Utc::now(),
+                },
+            ],
+            instruments: vec![],
+        };
+
+        let config = MockExecutionConfig::new(
+            EXCHANGE,
+            initial_state,
+            0,              // latency_ms
+            Decimal::ZERO,  // fees_percent
+            SimFillConfig::default(),
+        );
+
+        let (_tx, request_rx) = mpsc::unbounded_channel();
+        let (event_tx, _) = broadcast::channel(1);
+
+        let mut instruments = FnvHashMap::default();
+        instruments.insert(
+            instrument_name(),
+            Instrument {
+                exchange: EXCHANGE,
+                name_internal: InstrumentNameInternal::new("btcusdt"),
+                name_exchange: instrument_name(),
+                underlying: Underlying {
+                    base: base(),
+                    quote: quote(),
+                },
+                quote: InstrumentQuoteAsset::UnderlyingQuote,
+                kind: InstrumentKind::Spot,
+                spec: None,
+            },
+        );
+
+        MockExchange::new(config, request_rx, event_tx, instruments)
+    }
+
+    fn buy_request(quantity: &str, price: &str) -> OrderRequestOpen<ExchangeId, InstrumentNameExchange> {
+        let (quantity, price) = (d(quantity), d(price));
+        OrderEvent {
+            key: OrderKey {
+                exchange: EXCHANGE,
+                instrument: instrument_name(),
+                strategy: StrategyId::new("test"),
+                cid: ClientOrderId::new("test-cid"),
+            },
+            state: RequestOpen {
+                side: Side::Buy,
+                price,
+                quantity,
+                kind: OrderKind::Market,
+                time_in_force: TimeInForce::ImmediateOrCancel,
+                position_id: None,
+            },
+        }
+    }
+
+    fn sell_request(quantity: &str, price: &str) -> OrderRequestOpen<ExchangeId, InstrumentNameExchange> {
+        let (quantity, price) = (d(quantity), d(price));
+        OrderEvent {
+            key: OrderKey {
+                exchange: EXCHANGE,
+                instrument: instrument_name(),
+                strategy: StrategyId::new("test"),
+                cid: ClientOrderId::new("test-cid"),
+            },
+            state: RequestOpen {
+                side: Side::Sell,
+                price,
+                quantity,
+                kind: OrderKind::Market,
+                time_in_force: TimeInForce::ImmediateOrCancel,
+                position_id: None,
+            },
+        }
+    }
+
+    #[test]
+    fn sell_order_decrements_base_balance_not_quote() {
+        let mut exchange = make_exchange("1.0", "10000");
+        let initial_usdt = d("10000");
+
+        let (response, notifications) =
+            exchange.open_order(sell_request("0.5", "50000"), MarketPrices::default());
+
+        assert!(response.state.is_ok(), "sell should succeed: {:?}", response.state);
+        assert!(notifications.is_some(), "successful sell must produce notifications");
+
+        // Base (BTC) must be decremented by the quantity sold.
+        let btc = exchange.account.balance_mut(&base()).unwrap();
+        assert_eq!(btc.balance.free, d("0.5"), "base balance should decrease by quantity sold");
+
+        // Quote (USDT) must be unchanged (fees = 0 in this test).
+        let usdt = exchange.account.balance_mut(&quote()).unwrap();
+        assert_eq!(usdt.balance.free, initial_usdt, "quote balance should be unchanged on sell");
+    }
+
+    #[test]
+    fn sell_order_insufficient_balance_names_base_asset() {
+        // Regression guard for the sell-side balance bug fixed in this branch:
+        // previously `balance_mut(&underlying.quote)` was called for sells, so
+        // BalanceInsufficient would name the quote asset (USDT) instead of the base (BTC).
+        let mut exchange = make_exchange("0.1", "10000");
+
+        let (response, notifications) = exchange.open_order(
+            sell_request("1.0", "50000"), // selling 1 BTC but only 0.1 available
+            MarketPrices::default(),
+        );
+
+        assert!(notifications.is_none(), "failed order must produce no notifications");
+        match response.state {
+            Err(UnindexedOrderError::Rejected(ApiError::BalanceInsufficient(ref asset, _))) => {
+                assert_eq!(
+                    *asset,
+                    base(),
+                    "BalanceInsufficient must name the base asset (BTC), not the quote (USDT)"
+                );
+            }
+            Err(other) => panic!("expected BalanceInsufficient, got: {other:?}"),
+            Ok(_) => panic!("expected error for oversized sell, got Ok"),
+        }
+    }
+
+    #[test]
+    fn bid_ask_fill_model_fills_at_ask_price_and_deducts_correct_balance() {
+        // TODO(Q-5): exercises the path BidAskFillModel with non-None best_ask
+        // → open_order → fill at best_ask → correct quote balance deduction.
+        // Previously both tests used SimFillConfig::default() (LastPrice) with
+        // all-None MarketPrices, leaving this wiring untested.
+        let mut exchange = make_exchange("0", "10000"); // 0 BTC, 10 000 USDT
+        exchange.fill_model = SimFillConfig::BidAsk(BidAskFillModel::default());
+
+        let market_prices = MarketPrices {
+            best_bid: Some(d("99.5")),
+            best_ask: Some(d("100.5")),
+            last_price: Some(d("100.0")),
+        };
+
+        // Market buy of 1 BTC; reference price 100 is only used as a fallback
+        // when fill_model returns None — BidAsk returns best_ask so it is not used.
+        let (response, notifications) =
+            exchange.open_order(buy_request("1", "100"), market_prices);
+
+        assert!(response.state.is_ok(), "buy should succeed: {:?}", response.state);
+        let notifs = notifications.expect("successful buy must produce notifications");
+
+        // BidAskFillModel: market buy fills at best_ask = 100.5, not last_price 100.0.
+        assert_eq!(notifs.trade.price, d("100.5"), "fill price must be best_ask");
+
+        // Balance deduction: 1 * 100.5 = 100.5 USDT; fees_percent = 0.
+        let usdt = exchange.account.balance_mut(&quote()).unwrap();
+        assert_eq!(usdt.balance.free, d("9899.5"), "quote balance must decrease by fill_price * qty");
+    }
 }

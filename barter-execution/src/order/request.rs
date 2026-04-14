@@ -1,6 +1,6 @@
 use crate::{
     error::OrderError,
-    order::{OrderEvent, OrderKind, TimeInForce, id::OrderId, state::Cancelled},
+    order::{OrderEvent, OrderKind, TimeInForce, id::{OrderId, PositionId}, state::Cancelled},
 };
 use barter_instrument::{
     Side,
@@ -27,15 +27,20 @@ pub type OrderResponseCancel<
 pub type UnindexedOrderResponseCancel =
     OrderResponseCancel<ExchangeId, AssetNameExchange, InstrumentNameExchange>;
 
-#[derive(
-    Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
-)]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct RequestOpen {
     pub side: Side,
     pub price: Decimal,
     pub quantity: Decimal,
     pub kind: OrderKind,
     pub time_in_force: TimeInForce,
+    /// Target `PositionId` for this order in `OmsMode::Hedging`.
+    ///
+    /// For opening orders: the position this fill should open or add to.
+    /// For closing orders: the position this fill should reduce or close.
+    /// In `OmsMode::Netting`, leave as `None` (ignored).
+    #[serde(default)]
+    pub position_id: Option<PositionId>,
 }
 
 #[derive(

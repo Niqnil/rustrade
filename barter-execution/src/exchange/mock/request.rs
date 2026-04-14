@@ -9,6 +9,7 @@ use crate::{
     },
     trade::Trade,
 };
+use rust_decimal::Decimal;
 use barter_instrument::{
     asset::{QuoteAsset, name::AssetNameExchange},
     exchange::ExchangeId,
@@ -16,6 +17,25 @@ use barter_instrument::{
 };
 use chrono::{DateTime, Utc};
 use tokio::sync::oneshot;
+
+/// Market price snapshot passed alongside an order request so the
+/// [`FillModel`](crate::fill::FillModel) can compute a realistic fill price.
+///
+/// All fields are optional. When a field is `None` the fill model falls back
+/// to the next available price (see each [`FillModel`](crate::fill::FillModel)
+/// implementation for exact semantics).
+///
+/// The standard [`MockExecution`](crate::client::mock::MockExecution) client
+/// populates all fields as `None` (it has no market-data subscription).
+/// Downstream consumers that want realistic slippage should construct a
+/// custom execution wrapper that injects current bid/ask/last prices before
+/// forwarding the request.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MarketPrices {
+    pub best_bid: Option<Decimal>,
+    pub best_ask: Option<Decimal>,
+    pub last_price: Option<Decimal>,
+}
 
 #[derive(Debug)]
 pub struct MockExchangeRequest {
@@ -100,12 +120,14 @@ impl MockExchangeRequest {
             Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>,
         >,
         request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
+        market_prices: MarketPrices,
     ) -> Self {
         Self::new(
             time_request,
             MockExchangeRequestKind::OpenOrder {
                 response_tx,
                 request,
+                market_prices,
             },
         )
     }
@@ -137,5 +159,6 @@ pub enum MockExchangeRequestKind {
             Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>,
         >,
         request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
+        market_prices: MarketPrices,
     },
 }

@@ -11,7 +11,7 @@ use barter::{
                 filter::InstrumentFilter,
             },
             order::in_flight_recorder::InFlightRequestRecorder,
-            position::PositionManager,
+            position::{PositionId, PositionManager},
             trading::TradingState,
         },
     },
@@ -149,8 +149,7 @@ impl ClosePositionsStrategy for MultiStrategy {
                         .data
                         .strategy_a
                         .position
-                        .current
-                        .as_ref()
+                        .positions.get(&PositionId::NETTING)
                         .map(|position_a| {
                             build_ioc_market_order_to_close_position(
                                 state.instrument.exchange,
@@ -166,8 +165,7 @@ impl ClosePositionsStrategy for MultiStrategy {
                         .data
                         .strategy_b
                         .position
-                        .current
-                        .as_ref()
+                        .positions.get(&PositionId::NETTING)
                         .map(|position_b| {
                             build_ioc_market_order_to_close_position(
                                 state.instrument.exchange,
@@ -280,17 +278,20 @@ impl Processor<&AccountEvent> for MultiStrategyCustomInstrumentData {
             return;
         };
 
+        // For spot instruments, contract_size is always 1
+        let contract_size = rust_decimal::Decimal::ONE;
+
         if trade.strategy == StrategyA::ID {
             self.strategy_a
                 .position
-                .update_from_trade(trade)
+                .update_from_trade(trade, contract_size)
                 .inspect(|closed| self.strategy_a.tear.update_from_position(closed));
         }
 
         if trade.strategy == StrategyB::ID {
             self.strategy_b
                 .position
-                .update_from_trade(trade)
+                .update_from_trade(trade, contract_size)
                 .inspect(|closed| self.strategy_b.tear.update_from_position(closed));
         }
     }

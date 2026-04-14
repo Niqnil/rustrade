@@ -1,3 +1,4 @@
+pub use barter_execution::order::id::PositionId;
 use barter_execution::trade::{AssetFees, Trade, TradeId};
 use barter_instrument::{
     Side,
@@ -6,19 +7,57 @@ use barter_instrument::{
 };
 use chrono::{DateTime, Utc};
 use derive_more::Constructor;
+use indexmap::IndexMap;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use tracing::error;
 
-#[derive(Debug, Clone, PartialEq, PartialOrd, Deserialize, Serialize, Constructor)]
+/// Order Management System mode governing how positions are tracked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub enum OmsMode {
+    /// At most one position per instrument. Trades that cross zero flip the
+    /// position. This is the default and is backward-compatible with the
+    /// original `PositionManager` behaviour.
+    #[default]
+    Netting,
+    /// Multiple concurrent positions per instrument, each identified by a
+    /// `PositionId` derived from the opening order's `ClientOrderId`.
+    ///
+    /// Enable via [`EngineStateBuilder::oms_mode`](crate::engine::state::builder::EngineStateBuilder::oms_mode).
+    /// Note that `OmsMode` is applied uniformly to all instruments; per-instrument
+    /// override is a future enhancement.
+    Hedging,
+}
+
+/// Manages open positions for a single instrument.
+///
+/// Supports two OMS modes (configurable at construction):
+/// - `Netting` (default): at most one entry; same flip/close logic as before.
+/// - `Hedging`: multiple concurrent entries, keyed by `PositionId`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct PositionManager<InstrumentKey = InstrumentIndex> {
-    pub current: Option<Position<QuoteAsset, InstrumentKey>>,
+    pub mode: OmsMode,
+    /// All currently open positions keyed by `PositionId`.
+    pub positions: IndexMap<PositionId, Position<QuoteAsset, InstrumentKey>>,
 }
 
 impl<InstrumentKey> Default for PositionManager<InstrumentKey> {
     fn default() -> Self {
-        Self { current: None }
+        Self::new(OmsMode::Netting)
+    }
+}
+
+impl<InstrumentKey> PositionManager<InstrumentKey> {
+    /// Construct a new `PositionManager` with the given OMS mode and no open positions.
+    pub fn new(mode: OmsMode) -> Self {
+        // Pre-allocate capacity for 1 entry in Netting mode (the common case).
+        // Hedging mode may grow beyond this, but starting at 1 avoids the
+        // reallocation on the first fill for the majority of use cases.
+        Self {
+            mode,
+            positions: IndexMap::with_capacity(1),
+        }
     }
 }
 
@@ -29,26 +68,112 @@ impl<InstrumentKey> PositionManager<InstrumentKey> {
     /// - Opening a new position if none exists
     /// - Updating an existing position (increase/decrease/close)
     /// - Handling position flips (close existing & open new with any remaining trade quantity)
+    ///
+    /// In `Netting` mode the `PositionId` is derived deterministically as `"netting"`.
+    /// In `Hedging` mode the `PositionId` is derived from `trade.order_id`.
+    ///
+    /// # Warning — Hedging mode callers
+    ///
+    /// In `OmsMode::Hedging`, this method derives the `PositionId` directly from
+    /// `trade.order_id`. The engine's actual fill routing instead resolves the
+    /// `PositionId` via a `ClientOrderId → PositionId` lookup table populated at
+    /// order submission time (see `InstrumentState::update_from_trade`). Calling this
+    /// method directly in Hedging mode bypasses that lookup and will open a spurious
+    /// position slot under the exchange order ID rather than the caller's chosen
+    /// `PositionId`. Prefer routing fills through `InstrumentState::update_from_trade`,
+    /// or call `update_from_trade_with_id` with the already-resolved `PositionId`.
+    ///
+    /// # Arguments
+    /// * `trade` - The trade to process
+    /// * `contract_size` - Contract multiplier for derivatives (1 for spot, 100 for standard options)
     pub fn update_from_trade(
         &mut self,
         trade: &Trade<QuoteAsset, InstrumentKey>,
+        contract_size: Decimal,
     ) -> Option<PositionExited<QuoteAsset, InstrumentKey>>
     where
         InstrumentKey: Debug + Clone + PartialEq,
     {
-        let (current, closed) = match self.current.take() {
-            Some(position) => {
-                // Update current Position, maybe closing it, and maybe opening a new Position
-                // with leftover trade.quantity
+        let position_id = match self.mode {
+            // Fixed key: there is at most one netting position per instrument.
+            OmsMode::Netting => PositionId::NETTING,
+            // Derive from the order that caused this fill.
+            OmsMode::Hedging => PositionId::new(trade.order_id.0.clone()),
+        };
+        self.update_from_trade_with_id(trade, &position_id, contract_size)
+    }
+
+    /// Updates position state routing to a specific `PositionId`.
+    ///
+    /// Suitable for callers (e.g. expiry settlement) that have already resolved
+    /// the correct `PositionId` and want to bypass the automatic derivation.
+    ///
+    /// # Arguments
+    /// * `trade` - The trade to process
+    /// * `position_id` - The resolved position ID to route the fill to
+    /// * `contract_size` - Contract multiplier for derivatives (1 for spot, 100 for standard options)
+    ///
+    /// # Fee model
+    ///
+    /// This method does **not** apply a fee model — `trade.fees.fees` is used as-is.
+    /// The caller is responsible for ensuring the fee value is correct before calling.
+    /// For contract expiry settlement the caller must set fees to `Decimal::ZERO` (exchange
+    /// settlement commission, if any, is not modelled and must be tracked separately).
+    pub fn update_from_trade_with_id(
+        &mut self,
+        trade: &Trade<QuoteAsset, InstrumentKey>,
+        position_id: &PositionId,
+        contract_size: Decimal,
+    ) -> Option<PositionExited<QuoteAsset, InstrumentKey>>
+    where
+        InstrumentKey: Debug + Clone + PartialEq,
+    {
+        // Use shift_remove (not swap_remove) to preserve relative order of positions
+        // not touched by this update. Updated positions move to insertion-order tail.
+        // swap_remove would reorder arbitrarily on every fill.
+        let (updated, closed) = match self.positions.shift_remove(position_id) {
+            Some(mut position) => {
+                // Existing position already has contract_size set. Update it in case
+                // the instrument definition changed (rare but possible with dynamic configs).
+                position.contract_size = contract_size;
                 position.update_from_trade(trade)
             }
             None => {
-                // No current Position, so enter a new one with Trade
-                (Some(Position::from(trade)), None)
+                // New position — set contract_size before any PnL calculations.
+                let mut position = Position::from(trade);
+                position.contract_size = contract_size;
+                (Some(position), None)
             }
         };
 
-        self.current = current;
+        // In Hedging mode a fill that crosses zero causes a position flip: the
+        // new opposite-side position is re-inserted under the same PositionId.
+        // Subsequent fills routed to that ID will update the wrong-direction position.
+        // Strategies must close positions explicitly rather than relying on flip semantics.
+        if self.mode == OmsMode::Hedging {
+            if let (Some(new_pos), Some(exited)) = (&updated, &closed) {
+                error!(
+                    %position_id,
+                    closed_side = ?exited.side,
+                    new_side = ?new_pos.side,
+                    "Hedging mode: fill crossed zero — position flipped under same PositionId. \
+                     Subsequent fills routed to this ID will update the opposite-direction \
+                     position silently, corrupting PnL. Strategies MUST close positions \
+                     explicitly; never rely on flip semantics in Hedging mode.",
+                );
+            }
+        }
+
+        // Set the PositionId on the closed PositionExited so upstream consumers
+        // (e.g., StateReplicaManager) can target the correct position slot.
+        let closed = closed.map(|mut e| {
+            e.position_id = position_id.clone();
+            e
+        });
+
+        if let Some(pos) = updated {
+            self.positions.insert(position_id.clone(), pos);
+        }
 
         closed
     }
@@ -205,7 +330,29 @@ pub struct Position<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     pub time_exchange_update: DateTime<Utc>,
 
     /// [`TradeId`]s of all the [`Trade`]s associated with this [`Position`].
+    ///
+    /// # Memory consideration
+    ///
+    /// This vector grows unboundedly with each partial fill. For positions with
+    /// hundreds of partial fills (e.g., algorithmic averaging into a position),
+    /// this can accumulate megabytes of UUID strings. Consider the memory
+    /// implications for long-lived positions with high fill counts.
     pub trades: Vec<TradeId>,
+
+    /// Contract multiplier for derivatives (options, futures, perpetuals).
+    ///
+    /// For spot instruments this is always `1`. For standard equity options it's typically `100`
+    /// (each contract represents 100 shares). PnL calculations multiply the price-based PnL
+    /// by this value to get the true dollar amount.
+    ///
+    /// Set by `PositionManager::update_from_trade_with_id` when opening a new position,
+    /// inherited from the closing position when flipping.
+    #[serde(default = "default_contract_size")]
+    pub contract_size: Decimal,
+}
+
+fn default_contract_size() -> Decimal {
+    Decimal::ONE
 }
 
 impl<InstrumentKey> Position<QuoteAsset, InstrumentKey> {
@@ -318,10 +465,11 @@ impl<InstrumentKey> Position<QuoteAsset, InstrumentKey> {
                 self.quantity_abs = Decimal::ZERO;
                 self.update_pnl_unrealised(trade.price);
 
-                (
-                    Some(Self::from(&next_position_trade)),
-                    Some(PositionExited::from(self)),
-                )
+                // Propagate contract_size from closing position to the new flipped position
+                let mut next_position = Self::from(&next_position_trade);
+                next_position.contract_size = self.contract_size;
+
+                (Some(next_position), Some(PositionExited::from(self)))
             }
             _ => unreachable!("match expression guard statements cover all cases"),
         }
@@ -352,6 +500,7 @@ impl<InstrumentKey> Position<QuoteAsset, InstrumentKey> {
             self.quantity_abs_max,
             self.fees_enter.fees,
             price,
+            self.contract_size,
         );
     }
 
@@ -369,8 +518,10 @@ impl<InstrumentKey> Position<QuoteAsset, InstrumentKey> {
             closed_quantity,
             closed_price,
             closed_fee,
+            self.contract_size,
         );
     }
+
 }
 
 impl<InstrumentKey> From<&Trade<QuoteAsset, InstrumentKey>> for Position<QuoteAsset, InstrumentKey>
@@ -393,6 +544,9 @@ where
             time_enter: trade.time_exchange,
             time_exchange_update: trade.time_exchange,
             trades,
+            // Default to 1; PositionManager::update_from_trade_with_id assigns the
+            // correct value via direct field assignment after creation.
+            contract_size: Decimal::ONE,
         }
     }
 }
@@ -408,6 +562,15 @@ where
     Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
 )]
 pub struct PositionExited<AssetKey, InstrumentKey = InstrumentIndex> {
+    /// The `PositionId` that identified this position in the `PositionManager`.
+    ///
+    /// In `OmsMode::Netting` this is always [`PositionId::NETTING`].
+    /// In `OmsMode::Hedging` this matches the `PositionId` from the opening order's
+    /// `RequestOpen::position_id`, enabling the `StateReplicaManager` to do targeted
+    /// per-position removal rather than clearing all positions at once.
+    #[serde(default)]
+    pub position_id: PositionId,
+
     /// Closed [`Position`] Instrument identifier (eg/ InstrumentIndex, InstrumentNameInternal, etc.).
     pub instrument: InstrumentKey,
 
@@ -446,6 +609,7 @@ impl<AssetKey, InstrumentKey> From<Position<AssetKey, InstrumentKey>>
 {
     fn from(value: Position<AssetKey, InstrumentKey>) -> Self {
         Self {
+            position_id: PositionId::default(),
             instrument: value.instrument,
             side: value.side,
             price_entry_average: value.price_entry_average,
@@ -489,6 +653,9 @@ fn calculate_price_entry_average(
 
 /// Calculate the estimated unrealised PnL from closing a [`Position`] `quantity_abs` at the
 /// provided price.
+///
+/// The `contract_size` multiplier converts price-based PnL to actual dollar PnL for derivatives.
+/// For spot instruments, pass `Decimal::ONE`.
 pub fn calculate_pnl_unrealised(
     position_side: Side,
     price_entry_average: Decimal,
@@ -496,12 +663,13 @@ pub fn calculate_pnl_unrealised(
     quantity_abs_max: Decimal,
     fees_enter: Decimal,
     price: Decimal,
+    contract_size: Decimal,
 ) -> Decimal {
     let approx_exit_fees =
         approximate_remaining_exit_fees(quantity_abs, quantity_abs_max, fees_enter);
 
-    let value_quote_current = quantity_abs * price;
-    let value_quote_entry = quantity_abs * price_entry_average;
+    let value_quote_current = quantity_abs * price * contract_size;
+    let value_quote_entry = quantity_abs * price_entry_average * contract_size;
 
     match position_side {
         Side::Buy => value_quote_current - value_quote_entry - approx_exit_fees,
@@ -519,21 +687,29 @@ fn approximate_remaining_exit_fees(
     quantity_abs_max: Decimal,
     fees_enter: Decimal,
 ) -> Decimal {
+    if quantity_abs_max.is_zero() {
+        return Decimal::ZERO;
+    }
     (quantity_abs / quantity_abs_max) * fees_enter
 }
 
 /// Calculate the realised PnL generated from closing the provided [`Position`] quantity, at the
 /// specified price and closing fee.
+///
+/// The `contract_size` multiplier converts price-based PnL to actual dollar PnL for derivatives.
+/// For spot instruments, pass `Decimal::ONE`. For standard equity options (100 shares/contract),
+/// pass `Decimal::from(100)`.
 pub fn calculate_pnl_realised(
     position_side: Side,
     price_entry_average: Decimal,
     closed_quantity: Decimal,
     closed_price: Decimal,
     closed_fee: Decimal,
+    contract_size: Decimal,
 ) -> Decimal {
     let close_quantity = closed_quantity.abs();
-    let value_quote_closed = close_quantity * closed_price;
-    let value_quote_entry = close_quantity * price_entry_average;
+    let value_quote_closed = close_quantity * closed_price * contract_size;
+    let value_quote_entry = close_quantity * price_entry_average * contract_size;
 
     match position_side {
         Side::Buy => value_quote_closed - value_quote_entry - closed_fee,
@@ -551,6 +727,9 @@ pub fn calculate_pnl_return(
     price_entry_average: Decimal,
     quantity_abs_max: Decimal,
 ) -> Decimal {
+    if price_entry_average.is_zero() || quantity_abs_max.is_zero() {
+        return Decimal::ZERO;
+    }
     pnl_realised / (price_entry_average * quantity_abs_max)
 }
 
@@ -596,6 +775,7 @@ mod tests {
                     time_enter: base_time,
                     time_exchange_update: time_plus_days(base_time, 1),
                     trades: vec![TradeId::new("trade_id"), TradeId::new("trade_id")],
+                    contract_size: Decimal::ONE,
                 }),
                 expected_position_exited: None,
             },
@@ -622,6 +802,7 @@ mod tests {
                     time_enter: base_time,
                     time_exchange_update: time_plus_days(base_time, 1),
                     trades: vec![TradeId::new("trade_id"), TradeId::new("trade_id")],
+                    contract_size: Decimal::ONE,
                 }),
                 expected_position_exited: None,
             },
@@ -631,6 +812,7 @@ mod tests {
                 update_trade: trade(time_plus_days(base_time, 1), Side::Sell, 150.0, 1.0, 10.0),
                 expected_position: None,
                 expected_position_exited: Some(PositionExited {
+                    position_id: PositionId::NETTING,
                     instrument: InstrumentNameInternal::new("instrument"),
                     side: Side::Buy,
                     price_entry_average: dec!(100.0),
@@ -672,8 +854,10 @@ mod tests {
                     time_enter: time_plus_days(base_time, 1),
                     time_exchange_update: time_plus_days(base_time, 1),
                     trades: vec![TradeId::new("trade_id")],
+                    contract_size: Decimal::ONE,
                 }),
                 expected_position_exited: Some(PositionExited {
+                    position_id: PositionId::NETTING,
                     instrument: InstrumentNameInternal::new("instrument"),
                     side: Side::Buy,
                     price_entry_average: dec!(100.0),
@@ -715,6 +899,7 @@ mod tests {
                     time_enter: base_time,
                     time_exchange_update: base_time,
                     trades: vec![TradeId::new("trade_id"), TradeId::new("trade_id")],
+                    contract_size: Decimal::ONE,
                 }),
                 expected_position_exited: None,
             },
@@ -741,6 +926,7 @@ mod tests {
                     time_enter: base_time,
                     time_exchange_update: base_time,
                     trades: vec![TradeId::new("trade_id"), TradeId::new("trade_id")],
+                    contract_size: Decimal::ONE,
                 }),
                 expected_position_exited: None,
             },
@@ -750,6 +936,7 @@ mod tests {
                 update_trade: trade(base_time, Side::Buy, 80.0, 1.0, 10.0),
                 expected_position: None,
                 expected_position_exited: Some(PositionExited {
+                    position_id: PositionId::NETTING,
                     instrument: InstrumentNameInternal::new("instrument"),
                     side: Side::Sell,
                     price_entry_average: dec!(100.0),
@@ -791,8 +978,10 @@ mod tests {
                     time_enter: base_time,
                     time_exchange_update: base_time,
                     trades: vec![TradeId::new("trade_id")],
+                    contract_size: Decimal::ONE,
                 }),
                 expected_position_exited: Some(PositionExited {
+                    position_id: PositionId::NETTING,
                     instrument: InstrumentNameInternal::new("instrument"),
                     side: Side::Sell,
                     price_entry_average: dec!(100.0),
@@ -975,6 +1164,7 @@ mod tests {
         ];
 
         for (index, test) in cases.into_iter().enumerate() {
+            // Spot instrument: contract_size = 1
             let actual = calculate_pnl_unrealised(
                 test.position_side,
                 test.price_entry_average,
@@ -982,10 +1172,41 @@ mod tests {
                 test.quantity_abs_max,
                 test.fees_enter,
                 test.price,
+                Decimal::ONE,
             );
 
             assert_eq!(actual, test.expected, "TC{} failed", index);
         }
+    }
+
+    #[test]
+    fn test_calculate_pnl_unrealised_with_contract_size() {
+        // Standard equity option: contract_size = 100
+        // Long 1 call bought at $10/share, current price $15/share, $1 entry fee
+        // Unrealised PnL = (15 - 10) * 1 * 100 - 1 = 499
+        let pnl = calculate_pnl_unrealised(
+            Side::Buy,
+            dec!(10.0),  // entry price per share
+            dec!(1.0),   // 1 contract
+            dec!(1.0),   // max quantity (for fee approximation)
+            dec!(1.0),   // $1 entry fee
+            dec!(15.0),  // current price per share
+            dec!(100.0), // 100 shares per contract
+        );
+        assert_eq!(pnl, dec!(499.0));
+
+        // Short 2 puts sold at $5/share, current price $3/share, $2 entry fee
+        // Unrealised PnL = (5 - 3) * 2 * 100 - 2 = 398
+        let pnl = calculate_pnl_unrealised(
+            Side::Sell,
+            dec!(5.0),   // entry price per share
+            dec!(2.0),   // 2 contracts
+            dec!(2.0),   // max quantity
+            dec!(2.0),   // $2 entry fee
+            dec!(3.0),   // current price per share
+            dec!(100.0), // 100 shares per contract
+        );
+        assert_eq!(pnl, dec!(398.0));
     }
 
     #[test]
@@ -1025,6 +1246,13 @@ mod tests {
                 quantity_abs_max: dec!(1.0),
                 fees_enter: dec!(10.0),
                 expected: dec!(20.0),
+            },
+            // TC4: Zero max quantity — guard against divide-by-zero
+            TestCase {
+                quantity_abs: dec!(1.0),
+                quantity_abs_max: dec!(0.0),
+                fees_enter: dec!(10.0),
+                expected: dec!(0.0),
             },
         ];
 
@@ -1162,16 +1390,46 @@ mod tests {
         ];
 
         for (index, test) in cases.into_iter().enumerate() {
+            // Spot instrument: contract_size = 1
             let actual = calculate_pnl_realised(
                 test.side,
                 test.price_entry_average.into(),
                 test.closed_quantity.into(),
                 test.closed_price.into(),
                 test.closed_fee.into(),
+                Decimal::ONE,
             );
 
             assert_eq!(actual, test.expected, "TC{} failed", index);
         }
+    }
+
+    #[test]
+    fn test_calculate_pnl_realised_with_contract_size() {
+        // Standard equity option: contract_size = 100
+        // Buy 1 call at $10/share, sell at $15/share, $1 fee
+        // PnL = (15 - 10) * 1 * 100 - 1 = 499
+        let pnl = calculate_pnl_realised(
+            Side::Buy,
+            dec!(10.0),  // entry price per share
+            dec!(1.0),   // 1 contract
+            dec!(15.0),  // exit price per share
+            dec!(1.0),   // $1 fee
+            dec!(100.0), // 100 shares per contract
+        );
+        assert_eq!(pnl, dec!(499.0));
+
+        // SHORT option scenario: sell 2 puts at $5/share, buy back at $3/share, $2 fee
+        // PnL = (5 - 3) * 2 * 100 - 2 = 398
+        let pnl = calculate_pnl_realised(
+            Side::Sell,
+            dec!(5.0),   // entry price per share
+            dec!(2.0),   // 2 contracts
+            dec!(3.0),   // exit price per share
+            dec!(2.0),   // $2 fee
+            dec!(100.0), // 100 shares per contract
+        );
+        assert_eq!(pnl, dec!(398.0));
     }
 
     #[test]
@@ -1211,6 +1469,20 @@ mod tests {
                 price_entry_average: dec!(100.0),
                 quantity_abs_max: dec!(10.0),
                 expected: dec!(0.5), // 500/(100*10)
+            },
+            // TC4: Zero entry price — guard against divide-by-zero
+            TestCase {
+                pnl_realised: dec!(100.0),
+                price_entry_average: dec!(0.0),
+                quantity_abs_max: dec!(1.0),
+                expected: dec!(0.0),
+            },
+            // TC5: Zero max quantity — guard against divide-by-zero
+            TestCase {
+                pnl_realised: dec!(100.0),
+                price_entry_average: dec!(100.0),
+                quantity_abs_max: dec!(0.0),
+                expected: dec!(0.0),
             },
         ];
 

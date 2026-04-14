@@ -13,8 +13,10 @@ use crate::{
         command::Command,
         execution_tx::ExecutionTxMap,
         state::{
-            EngineState, instrument::data::InstrumentDataState,
-            order::in_flight_recorder::InFlightRequestRecorder, position::PositionExited,
+            EngineState,
+            instrument::data::InstrumentDataState,
+            order::{in_flight_recorder::InFlightRequestRecorder, manager::OrderManager},
+            position::{PositionExited, PositionId},
             trading::TradingState,
         },
     },
@@ -28,14 +30,23 @@ use crate::{
     },
 };
 use barter_data::{event::MarketEvent, streams::consumer::MarketStreamEvent};
-use barter_execution::AccountEvent;
-use barter_instrument::{asset::QuoteAsset, exchange::ExchangeIndex, instrument::InstrumentIndex};
+use barter_execution::{
+    AccountEvent,
+    order::Order,
+    trade::{AssetFees, Trade, TradeId},
+};
+use barter_instrument::{
+    Side,
+    asset::QuoteAsset,
+    exchange::ExchangeIndex,
+    instrument::{InstrumentIndex, kind::option::OptionKind},
+};
 use barter_integration::channel::Tx;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Defines how the [`Engine`] actions a [`Command`], and the associated outputs.
 pub mod action;
@@ -166,6 +177,18 @@ where
             EngineEvent::Market(market) => {
                 let output = self.update_from_market_stream(market);
                 ProcessAudit::with_market_update(event, output)
+            }
+            EngineEvent::ContractExpiry(key) => {
+                let exited = self.process_contract_expiry(key);
+                // Fold all closed positions into the audit as separate PositionExit outputs.
+                // In Netting mode this is 0 or 1 entries; in Hedging mode it may be N.
+                let mut audit = ProcessAudit::with_event(event);
+                for position_exited in exited {
+                    audit = audit.add_output(position_exited);
+                }
+                // ContractExpiry settles regardless of TradingState and does not
+                // trigger algo order generation — return early before that check.
+                return EngineAudit::from(audit);
             }
         };
 
@@ -326,6 +349,261 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             &self.state.instruments,
             &self.state.assets,
         )
+    }
+
+    /// Processes a `ContractExpiry` event for the given `InstrumentIndex`.
+    ///
+    /// # Algorithm
+    /// 1. Guards on `expiration_processed` (idempotent).
+    /// 2. Cancels all open orders for the instrument by sending `ExecutionRequest::Cancel` for each.
+    /// 3. Derives settlement price from instrument data and contract specification:
+    ///    - OTM: settlement price = 0
+    ///    - ITM call: settlement = spot - strike (per-contract intrinsic value)
+    ///    - ITM put: settlement = strike - spot (per-contract intrinsic value)
+    /// 4. Synthesises a closing `Trade` at the settlement price and routes it through
+    ///    `instrument_state.update_from_trade`.
+    /// 5. Sets `instrument_state.expiration_processed = true`.
+    ///
+    /// If no position is open for the instrument, steps 3–4 are skipped.
+    /// If no market price is available, settlement cannot be computed and the method
+    /// logs a warning and returns without synthesising a fill. The `expiration_processed`
+    /// flag is **not** set in this case, making the event **retryable** — re-inject
+    /// `ContractExpiry` once the underlying spot instrument has received market data.
+    ///
+    /// # Not modelled (deferred)
+    ///
+    /// - **Assignment for short writers:** short positions at expiry are closed at intrinsic
+    ///   value identical to long positions (OTM at 0, ITM at `|spot − strike|`). True
+    ///   assignment — where the short writer is obligated to deliver the underlying — is not
+    ///   modelled. A future enhancement would detect net-short positions and open a synthetic
+    ///   underlying position instead of (or in addition to) closing the option position.
+    ///
+    /// - **Physical settlement:** all settlements are cash-equivalent (a synthetic fill at the
+    ///   settlement price adjusts PnL). No separate "deliver/receive underlying" position is
+    ///   opened. Physically-settled contracts (e.g. some futures-style options) are out of scope
+    ///   until this is revisited.
+    pub fn process_contract_expiry(
+        &mut self,
+        key: &InstrumentIndex,
+    ) -> Vec<PositionExited<QuoteAsset, InstrumentIndex>>
+    where
+        Clock: EngineClock,
+        InstrumentData: InstrumentDataState + InFlightRequestRecorder,
+        ExecutionTxs: ExecutionTxMap,
+    {
+        let instrument_state = self.state.instruments.instrument_index_mut(key);
+
+        // Guard: idempotent — ignore duplicates after first processing.
+        if instrument_state.expiration_processed {
+            return vec![];
+        }
+
+        // Step 2: Cancel all open orders for this instrument.
+        let cancel_requests: Vec<_> = instrument_state
+            .orders
+            .orders()
+            .filter_map(Order::to_request_cancel)
+            .collect();
+        let cancels = self.send_requests(cancel_requests);
+        self.state.record_in_flight_cancels(&cancels.sent);
+
+        // Re-borrow after send_requests (which takes &self for execution_txs).
+        let instrument_state = self.state.instruments.instrument_index_mut(key);
+
+        // Step 3–4: Synthesise settlement fills only if positions are open.
+        if instrument_state.position.positions.is_empty() {
+            instrument_state.expiration_processed = true;
+            instrument_state.orders.clear();
+            instrument_state.exchange_id_to_cid.clear();
+            instrument_state.position_ids.clear();
+            // Clear pending_fills even when no positions exist — a fill-before-ack race
+            // that was in progress at expiry should not accumulate orphaned fills.
+            instrument_state.pending_fills.clear();
+            return vec![];
+        }
+
+        // Derive settlement price from the underlying spot price and contract spec.
+        // For options, ITM/OTM determination requires the *underlying's* price, not the
+        // option's own market price (which includes premium and would give wrong results).
+        // We find the underlying spot instrument by matching the option's underlying.base.
+        use barter_instrument::instrument::kind::InstrumentKind;
+        // Capture both the underlying base key and the exchange so we can filter
+        // the spot scan to the same exchange. Without the exchange filter, a
+        // multi-exchange setup (e.g. BTC/USD on both Binance and Alpaca) would
+        // silently use the wrong exchange's price.
+        let option_spec = match &instrument_state.instrument.kind {
+            InstrumentKind::Option(_) => Some((
+                instrument_state.instrument.underlying.base,
+                instrument_state.instrument.underlying.quote,
+                instrument_state.instrument.exchange,
+            )),
+            _ => None,
+        };
+
+        let spot_price = match option_spec {
+            Some((base_key, quote_key, exchange)) => {
+                // Find the spot instrument on the same exchange whose underlying matches
+                // the option's underlying base AND quote. Both are required: without the
+                // quote filter, BTC/USDT and BTC/USDC options on the same exchange would
+                // silently share the same spot price (M3).
+                // Single-pass: collect all matching spot instruments so we can both
+                // warn on ambiguity (visible in production) and use the first match,
+                // without scanning the instrument list twice.
+                let spot_matches: Vec<_> = self.state.instruments.0.values()
+                    .filter(|s| {
+                        matches!(&s.instrument.kind, InstrumentKind::Spot)
+                            && s.instrument.underlying.base == base_key
+                            && s.instrument.underlying.quote == quote_key
+                            && s.instrument.exchange == exchange
+                    })
+                    .collect();
+                if spot_matches.len() > 1 {
+                    warn!(
+                        count = spot_matches.len(),
+                        "process_contract_expiry: multiple Spot instruments match the option \
+                         underlying — using the first. Deduplicate your instrument config."
+                    );
+                }
+                spot_matches.into_iter().next().and_then(|s| s.data.price())
+            }
+            // Non-option instruments: use the instrument's own last price.
+            None => {
+                self.state.instruments.instrument_index(key).data.price()
+            }
+        };
+
+        // Re-borrow mutably after the immutable scan above.
+        let instrument_state = self.state.instruments.instrument_index_mut(key);
+
+        let Some(spot_price) = spot_price else {
+            warn!(
+                instrument = ?key,
+                "ContractExpiry: underlying price unavailable — cannot compute settlement. \
+                 Ensure the underlying spot instrument is subscribed. \
+                 Re-inject ContractExpiry once market data arrives."
+            );
+            // Do NOT set expiration_processed — the event is retryable once data is available.
+            return vec![];
+        };
+
+        let settlement_price = match &instrument_state.instrument.kind {
+            InstrumentKind::Option(contract) => {
+                match contract.kind {
+                    OptionKind::Call => {
+                        // ITM call: intrinsic = underlying_spot - strike (per-share)
+                        // ATM (spot == strike): intrinsic = 0 by cash-settlement convention.
+                        if spot_price > contract.strike {
+                            spot_price - contract.strike
+                        } else {
+                            Decimal::ZERO
+                        }
+                    }
+                    OptionKind::Put => {
+                        // ITM put: intrinsic = strike - underlying_spot (per-share)
+                        // ATM (spot == strike): intrinsic = 0 by cash-settlement convention.
+                        if contract.strike > spot_price {
+                            contract.strike - spot_price
+                        } else {
+                            Decimal::ZERO
+                        }
+                    }
+                }
+            }
+            // Non-option instruments: settlement at current market price.
+            _ => spot_price,
+        };
+
+        // Collect all position IDs before iterating so we can re-borrow instrument_state
+        // mutably inside the loop without conflicting with the keys() borrow.
+        let position_ids: Vec<PositionId> = instrument_state
+            .position
+            .positions
+            .keys()
+            .cloned()
+            .collect();
+
+        // Engine clock time for all synthetic trades in this expiry batch.
+        // Using self.time() (not Utc::now()) keeps backtests deterministic.
+        let engine_time = self.time();
+
+        let mut exited = Vec::with_capacity(position_ids.len());
+
+        for pos_id in position_ids {
+            let instrument_state = self.state.instruments.instrument_index_mut(key);
+
+            let Some(open_position) = instrument_state.position.positions.get(&pos_id) else {
+                continue;
+            };
+
+            let closing_side = match open_position.side {
+                Side::Buy => Side::Sell,
+                Side::Sell => Side::Buy,
+            };
+            let closing_quantity = open_position.quantity_abs;
+
+            // Each synthetic trade gets a unique ID derived from its position ID and
+            // the engine clock timestamp. The timestamp component prevents dedup key
+            // collisions across engine restarts where expiration_processed was not
+            // persisted (Netting mode always uses the same pos_id = "netting").
+            // Always heap-allocates (>22 chars): use String directly rather than SmolStr.
+            let trade_tag = format!("expiry-settlement-{}-{}", pos_id, engine_time.timestamp_micros());
+            let settlement_trade = Trade {
+                id: TradeId::new(&trade_tag),
+                order_id: barter_execution::order::id::OrderId::new(&trade_tag),
+                instrument: *key,
+                strategy: barter_execution::order::id::StrategyId::ENGINE_EXPIRY,
+                time_exchange: engine_time,
+                side: closing_side,
+                price: settlement_price,
+                quantity: closing_quantity,
+                fees: AssetFees {
+                    asset: QuoteAsset,
+                    fees: Decimal::ZERO,
+                },
+            };
+
+            // Route settlement directly to the correct position by ID.
+            // We bypass InstrumentState::update_from_trade (which calls update_from_trade
+            // without a PositionId) because in Hedging mode that would derive the ID from
+            // trade.order_id, opening a spurious new position instead of closing the real one.
+            //
+            // Fee model bypass: settlement_trade.fees is always Decimal::ZERO (set above).
+            // The fee model is intentionally not applied — exchange settlement commission,
+            // if any, must be accounted for separately by the caller. Callers that configure
+            // FeeModelConfig::PerContract for options should note this invariant.
+            debug_assert_eq!(
+                settlement_trade.fees.fees,
+                Decimal::ZERO,
+                "settlement trade must carry zero fees before update_from_trade_with_id"
+            );
+            let contract_size = instrument_state.instrument.kind.contract_size();
+            if let Some(exit) = instrument_state
+                .position
+                .update_from_trade_with_id(&settlement_trade, &pos_id, contract_size)
+            {
+                instrument_state.tear_sheet.update_from_position(&exit);
+                exited.push(exit);
+            }
+        }
+
+        // Step 5: Mark as processed and clear all routing tables.
+        // No fills will arrive for this instrument post-expiry. Cancel-ack messages
+        // for the orders cancelled in step 2 may never arrive (exchanges silently void
+        // them), so cleanup_routing_tables() cannot remove the CancelInFlight entries —
+        // they would accumulate indefinitely across expiry cycles in Hedging mode.
+        // Clear orders, position_ids, exchange_id_to_cid, and pending_fills explicitly,
+        // matching the replica's eager-clear logic in StateReplicaManager::update_from_event.
+        let instrument_state = self.state.instruments.instrument_index_mut(key);
+        instrument_state.expiration_processed = true;
+        instrument_state.orders.clear();
+        instrument_state.exchange_id_to_cid.clear();
+        instrument_state.position_ids.clear();
+        // Clear any fills buffered in a fill-before-ack race that was in progress at
+        // expiry. Without this, orphaned pending_fills accumulate across expiry cycles
+        // in a long-running engine with persisted state.
+        instrument_state.pending_fills.clear();
+
+        exited
     }
 }
 

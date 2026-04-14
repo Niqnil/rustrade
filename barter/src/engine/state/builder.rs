@@ -1,7 +1,9 @@
 use crate::engine::state::{
     EngineState, asset::generate_empty_indexed_asset_states,
     connectivity::generate_empty_indexed_connectivity_states,
-    instrument::generate_indexed_instrument_states, order::Orders, position::PositionManager,
+    instrument::generate_indexed_instrument_states,
+    order::Orders,
+    position::{OmsMode, PositionManager},
     trading::TradingState,
 };
 use barter_execution::balance::{AssetBalance, Balance};
@@ -26,6 +28,11 @@ pub struct EngineStateBuilder<'a, GlobalData, FnInstrumentData> {
     global: GlobalData,
     balances: FnvHashMap<ExchangeAsset<AssetNameInternal>, Balance>,
     instrument_data_init: FnInstrumentData,
+    /// OMS mode applied to every instrument's [`PositionManager`] at construction.
+    ///
+    /// Defaults to [`OmsMode::Netting`]. Use [`OmsMode::Hedging`] for strategies that hold
+    /// simultaneous long and short positions on the same instrument (e.g. options writing).
+    oms_mode: OmsMode,
 }
 
 impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInstrumentData> {
@@ -48,6 +55,7 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
             global,
             balances: FnvHashMap::default(),
             instrument_data_init,
+            oms_mode: OmsMode::Netting,
         }
     }
 
@@ -70,6 +78,26 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
     pub fn time_engine_start(self, value: DateTime<Utc>) -> Self {
         Self {
             time_engine_start: Some(value),
+            ..self
+        }
+    }
+
+    /// Optionally set the [`OmsMode`] for all instrument [`PositionManager`]s.
+    ///
+    /// Defaults to [`OmsMode::Netting`] (at most one position per instrument, backward-compatible).
+    /// Set to [`OmsMode::Hedging`] for strategies that simultaneously hold long and short
+    /// positions on the same instrument (e.g. options writing alongside long positions).
+    ///
+    /// # Note — `OmsMode::Hedging` and non-option instruments
+    ///
+    /// `OmsMode` is applied uniformly to all instruments. Hedging mode is intended for
+    /// instruments where multiple concurrent positions are semantically valid (e.g. individual
+    /// options legs). Applying it to spot or futures instruments will track each order's fills
+    /// as a separate position slot (keyed by order ID) rather than a single net position,
+    /// which is almost certainly not what you want for those asset classes.
+    pub fn oms_mode(self, mode: OmsMode) -> Self {
+        Self {
+            oms_mode: mode,
             ..self
         }
     }
@@ -110,6 +138,7 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
             global,
             balances,
             instrument_data_init,
+            oms_mode,
         } = self;
 
         // Default if not provided
@@ -138,7 +167,7 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
         let instruments = generate_indexed_instrument_states(
             instruments,
             time_engine_start,
-            PositionManager::default,
+            move || PositionManager::new(oms_mode),
             Orders::default,
             instrument_data_init,
         );

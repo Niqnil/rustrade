@@ -202,7 +202,7 @@ mod tests {
                 .unwrap()
         };
 
-        let cases = vec![
+        let cases = [
             // TC0: Basic case - single event in order
             TestCase {
                 name: "single event in order",

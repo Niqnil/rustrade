@@ -231,7 +231,7 @@ mod tests {
     fn test_ws_parser_text_message() {
         let msg = Ok(WsMessage::Text("hello".into()));
         let result = WsParser::parse(msg);
-        assert!(matches!(result, Message::Payload(bytes) if bytes == Bytes::from("hello")));
+        assert!(matches!(result, Message::Payload(bytes) if bytes == "hello"));
     }
 
     #[test]

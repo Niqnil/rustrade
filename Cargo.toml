@@ -14,7 +14,7 @@ members = [
 barter-integration = { path = "./barter-integration", version = "0.10" }
 barter-instrument = { path = "./barter-instrument", version = "0.3" }
 barter-data = { path = "./barter-data", version = "0.11" }
-barter-execution = { path = "./barter-execution", version = "0.7" }
+barter-execution = { path = "./barter-execution", version = "0.8" }
 barter-macro = { path = "./barter-macro", version = "0.2.0" }
 
 # Logging
@@ -73,4 +73,5 @@ rust_decimal_macros = { version = "1.29.1" }
 bytes = { version = "1.5.0" }
 spin_sleep = { version = "1.3.0 "}
 criterion = { version = "0.5.1" }
+wiremock = { version = "0.6" }
 prost = { version = "0.12.4" }
