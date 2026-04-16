@@ -449,7 +449,11 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 // Single-pass: collect all matching spot instruments so we can both
                 // warn on ambiguity (visible in production) and use the first match,
                 // without scanning the instrument list twice.
-                let spot_matches: Vec<_> = self.state.instruments.0.values()
+                let spot_matches: Vec<_> = self
+                    .state
+                    .instruments
+                    .0
+                    .values()
                     .filter(|s| {
                         matches!(&s.instrument.kind, InstrumentKind::Spot)
                             && s.instrument.underlying.base == base_key
@@ -467,9 +471,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 spot_matches.into_iter().next().and_then(|s| s.data.price())
             }
             // Non-option instruments: use the instrument's own last price.
-            None => {
-                self.state.instruments.instrument_index(key).data.price()
-            }
+            None => self.state.instruments.instrument_index(key).data.price(),
         };
 
         // Re-borrow mutably after the immutable scan above.
@@ -546,7 +548,11 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             // collisions across engine restarts where expiration_processed was not
             // persisted (Netting mode always uses the same pos_id = "netting").
             // Always heap-allocates (>22 chars): use String directly rather than SmolStr.
-            let trade_tag = format!("expiry-settlement-{}-{}", pos_id, engine_time.timestamp_micros());
+            let trade_tag = format!(
+                "expiry-settlement-{}-{}",
+                pos_id,
+                engine_time.timestamp_micros()
+            );
             let settlement_trade = Trade {
                 id: TradeId::new(&trade_tag),
                 order_id: barter_execution::order::id::OrderId::new(&trade_tag),
@@ -577,10 +583,11 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 "settlement trade must carry zero fees before update_from_trade_with_id"
             );
             let contract_size = instrument_state.instrument.kind.contract_size();
-            if let Some(exit) = instrument_state
-                .position
-                .update_from_trade_with_id(&settlement_trade, &pos_id, contract_size)
-            {
+            if let Some(exit) = instrument_state.position.update_from_trade_with_id(
+                &settlement_trade,
+                &pos_id,
+                contract_size,
+            ) {
                 instrument_state.tear_sheet.update_from_position(&exit);
                 exited.push(exit);
             }

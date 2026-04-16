@@ -1,5 +1,6 @@
 use crate::engine::state::{
-    EngineState, asset::generate_empty_indexed_asset_states,
+    EngineState,
+    asset::generate_empty_indexed_asset_states,
     connectivity::generate_empty_indexed_connectivity_states,
     instrument::generate_indexed_instrument_states,
     order::Orders,

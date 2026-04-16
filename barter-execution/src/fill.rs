@@ -42,7 +42,9 @@ pub trait FillModel {
 /// This is the simplest fill model and is well-suited for RL training where
 /// speed matters more than realism: it eliminates spread noise and keeps
 /// episode reward signals clean.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Deserialize, Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Deserialize, Serialize,
+)]
 pub struct LastPriceFillModel;
 
 impl FillModel for LastPriceFillModel {
@@ -54,12 +56,10 @@ impl FillModel for LastPriceFillModel {
         best_ask: Option<Decimal>,
         last_price: Option<Decimal>,
     ) -> Option<Decimal> {
-        order_price
-            .or(last_price)
-            .or(match side {
-                Side::Buy => best_ask,
-                Side::Sell => best_bid,
-            })
+        order_price.or(last_price).or(match side {
+            Side::Buy => best_ask,
+            Side::Sell => best_bid,
+        })
     }
 }
 
@@ -72,7 +72,9 @@ impl FillModel for LastPriceFillModel {
 /// Falls back to `last_price` if bid/ask are not available. This model is
 /// more realistic than [`LastPriceFillModel`] for strategies that frequently
 /// cross the spread.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Deserialize, Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Deserialize, Serialize,
+)]
 pub struct BidAskFillModel;
 
 impl FillModel for BidAskFillModel {
@@ -118,7 +120,9 @@ impl FillModel for BidAskFillModel {
 /// order is marketable (i.e., the limit has already been crossed). Using
 /// `MidpointFillModel` for strategies that require limit-price guarantees
 /// may result in fills at the midpoint rather than the limit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Deserialize, Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Deserialize, Serialize,
+)]
 pub struct MidpointFillModel;
 
 impl FillModel for MidpointFillModel {
@@ -277,7 +281,10 @@ mod tests {
 
     #[test]
     fn fill_model_config_default_is_last_price() {
-        assert_eq!(SimFillConfig::default(), SimFillConfig::LastPrice(LastPriceFillModel));
+        assert_eq!(
+            SimFillConfig::default(),
+            SimFillConfig::LastPrice(LastPriceFillModel)
+        );
     }
 
     // --- Edge cases ---
@@ -307,7 +314,13 @@ mod tests {
             "Buy with no last_price should fall back to best_ask"
         );
         assert_eq!(
-            LastPriceFillModel.fill_price(Side::Sell, None, Some(d("99.5")), Some(d("100.5")), None),
+            LastPriceFillModel.fill_price(
+                Side::Sell,
+                None,
+                Some(d("99.5")),
+                Some(d("100.5")),
+                None
+            ),
             Some(d("99.5")),
             "Sell with no last_price should fall back to best_bid"
         );
@@ -344,7 +357,13 @@ mod tests {
         // Partial book: only ask present, no bid. Should fall back to last_price
         // (order_price is None, so order_price.or(last_price) = last_price).
         assert_eq!(
-            MidpointFillModel.fill_price(Side::Sell, None, None, Some(d("100.5")), Some(d("100.0"))),
+            MidpointFillModel.fill_price(
+                Side::Sell,
+                None,
+                None,
+                Some(d("100.5")),
+                Some(d("100.0"))
+            ),
             Some(d("100.0"))
         );
     }
@@ -356,7 +375,11 @@ mod tests {
         // could fill a limit buy above its own limit.
         assert_eq!(
             MidpointFillModel.fill_price(
-                Side::Buy, Some(d("100.0")), Some(d("99.5")), None, Some(d("110.0"))
+                Side::Buy,
+                Some(d("100.0")),
+                Some(d("99.5")),
+                None,
+                Some(d("110.0"))
             ),
             Some(d("100.0")),
             "partial book: limit price should beat stale last_price"

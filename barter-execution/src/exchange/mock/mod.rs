@@ -104,8 +104,7 @@ impl MockExchange {
                         .account
                         .orders_open()
                         .filter(|order| {
-                            instruments.is_empty()
-                                || instruments.contains(&order.key.instrument)
+                            instruments.is_empty() || instruments.contains(&order.key.instrument)
                         })
                         .cloned()
                         .collect();
@@ -588,12 +587,18 @@ mod tests {
             balances: vec![
                 AssetBalance {
                     asset: base(),
-                    balance: Balance { total: btc, free: btc },
+                    balance: Balance {
+                        total: btc,
+                        free: btc,
+                    },
                     time_exchange: Utc::now(),
                 },
                 AssetBalance {
                     asset: quote(),
-                    balance: Balance { total: usdt, free: usdt },
+                    balance: Balance {
+                        total: usdt,
+                        free: usdt,
+                    },
                     time_exchange: Utc::now(),
                 },
             ],
@@ -631,7 +636,10 @@ mod tests {
         MockExchange::new(config, request_rx, event_tx, instruments)
     }
 
-    fn buy_request(quantity: &str, price: &str) -> OrderRequestOpen<ExchangeId, InstrumentNameExchange> {
+    fn buy_request(
+        quantity: &str,
+        price: &str,
+    ) -> OrderRequestOpen<ExchangeId, InstrumentNameExchange> {
         let (quantity, price) = (d(quantity), d(price));
         OrderEvent {
             key: OrderKey {
@@ -652,7 +660,10 @@ mod tests {
         }
     }
 
-    fn sell_request(quantity: &str, price: &str) -> OrderRequestOpen<ExchangeId, InstrumentNameExchange> {
+    fn sell_request(
+        quantity: &str,
+        price: &str,
+    ) -> OrderRequestOpen<ExchangeId, InstrumentNameExchange> {
         let (quantity, price) = (d(quantity), d(price));
         OrderEvent {
             key: OrderKey {
@@ -681,16 +692,30 @@ mod tests {
         let (response, notifications) =
             exchange.open_order(sell_request("0.5", "50000"), MarketPrices::default());
 
-        assert!(response.state.is_ok(), "sell should succeed: {:?}", response.state);
-        assert!(notifications.is_some(), "successful sell must produce notifications");
+        assert!(
+            response.state.is_ok(),
+            "sell should succeed: {:?}",
+            response.state
+        );
+        assert!(
+            notifications.is_some(),
+            "successful sell must produce notifications"
+        );
 
         // Base (BTC) must be decremented by the quantity sold.
         let btc = exchange.account.balance_mut(&base()).unwrap();
-        assert_eq!(btc.balance.free, d("0.5"), "base balance should decrease by quantity sold");
+        assert_eq!(
+            btc.balance.free,
+            d("0.5"),
+            "base balance should decrease by quantity sold"
+        );
 
         // Quote (USDT) must be unchanged (fees = 0 in this test).
         let usdt = exchange.account.balance_mut(&quote()).unwrap();
-        assert_eq!(usdt.balance.free, initial_usdt, "quote balance should be unchanged on sell");
+        assert_eq!(
+            usdt.balance.free, initial_usdt,
+            "quote balance should be unchanged on sell"
+        );
     }
 
     #[test]
@@ -705,7 +730,10 @@ mod tests {
             MarketPrices::default(),
         );
 
-        assert!(notifications.is_none(), "failed order must produce no notifications");
+        assert!(
+            notifications.is_none(),
+            "failed order must produce no notifications"
+        );
         match response.state {
             Err(UnindexedOrderError::Rejected(ApiError::BalanceInsufficient(ref asset, _))) => {
                 assert_eq!(
@@ -732,18 +760,29 @@ mod tests {
 
         // Market buy of 1 BTC; reference price 100 is only used as a fallback
         // when fill_model returns None — BidAsk returns best_ask so it is not used.
-        let (response, notifications) =
-            exchange.open_order(buy_request("1", "100"), market_prices);
+        let (response, notifications) = exchange.open_order(buy_request("1", "100"), market_prices);
 
-        assert!(response.state.is_ok(), "buy should succeed: {:?}", response.state);
+        assert!(
+            response.state.is_ok(),
+            "buy should succeed: {:?}",
+            response.state
+        );
         let notifs = notifications.expect("successful buy must produce notifications");
 
         // BidAskFillModel: market buy fills at best_ask = 100.5, not last_price 100.0.
-        assert_eq!(notifs.trade.price, d("100.5"), "fill price must be best_ask");
+        assert_eq!(
+            notifs.trade.price,
+            d("100.5"),
+            "fill price must be best_ask"
+        );
 
         // Balance deduction: 1 * 100.5 = 100.5 USDT; fee_model = Zero.
         let usdt = exchange.account.balance_mut(&quote()).unwrap();
-        assert_eq!(usdt.balance.free, d("9899.5"), "quote balance must decrease by fill_price * qty");
+        assert_eq!(
+            usdt.balance.free,
+            d("9899.5"),
+            "quote balance must decrease by fill_price * qty"
+        );
     }
 
     #[test]
@@ -759,7 +798,11 @@ mod tests {
         let (response, notifications) =
             exchange.open_order(buy_request("10", "100"), MarketPrices::default());
 
-        assert!(response.state.is_ok(), "buy should succeed: {:?}", response.state);
+        assert!(
+            response.state.is_ok(),
+            "buy should succeed: {:?}",
+            response.state
+        );
         let notifs = notifications.expect("successful buy must produce notifications");
 
         // Trade must report fee in quote denomination
@@ -767,7 +810,11 @@ mod tests {
 
         // Quote balance: 10000 - 1001 = 8999
         let usdt = exchange.account.balance_mut(&quote()).unwrap();
-        assert_eq!(usdt.balance.free, d("8999"), "quote balance must decrease by notional + fee");
+        assert_eq!(
+            usdt.balance.free,
+            d("8999"),
+            "quote balance must decrease by notional + fee"
+        );
     }
 
     #[test]
@@ -784,15 +831,27 @@ mod tests {
         let (response, notifications) =
             exchange.open_order(sell_request("1", "100"), MarketPrices::default());
 
-        assert!(response.state.is_ok(), "sell should succeed: {:?}", response.state);
+        assert!(
+            response.state.is_ok(),
+            "sell should succeed: {:?}",
+            response.state
+        );
         let notifs = notifications.expect("successful sell must produce notifications");
 
         // Trade must report fee in quote denomination
-        assert_eq!(notifs.trade.fees.fees, d("0.1"), "trade fee must be 0.1 USDT");
+        assert_eq!(
+            notifs.trade.fees.fees,
+            d("0.1"),
+            "trade fee must be 0.1 USDT"
+        );
 
         // Base balance: 10 - 1.001 = 8.999
         let btc = exchange.account.balance_mut(&base()).unwrap();
-        assert_eq!(btc.balance.free, d("8.999"), "base balance must decrease by quantity + fee_in_base");
+        assert_eq!(
+            btc.balance.free,
+            d("8.999"),
+            "base balance must decrease by quantity + fee_in_base"
+        );
     }
 
     #[test]
@@ -807,14 +866,26 @@ mod tests {
         let (response, notifications) =
             exchange.open_order(sell_request("1", "0"), MarketPrices::default());
 
-        assert!(response.state.is_ok(), "sell at zero price should succeed: {:?}", response.state);
+        assert!(
+            response.state.is_ok(),
+            "sell at zero price should succeed: {:?}",
+            response.state
+        );
         let notifs = notifications.expect("successful sell must produce notifications");
 
         // Fee must be zero (not NaN or panic from division by zero)
-        assert_eq!(notifs.trade.fees.fees, Decimal::ZERO, "fee must be zero when price is zero");
+        assert_eq!(
+            notifs.trade.fees.fees,
+            Decimal::ZERO,
+            "fee must be zero when price is zero"
+        );
 
         // Base balance: 10 - 1 = 9 (no fee deducted)
         let btc = exchange.account.balance_mut(&base()).unwrap();
-        assert_eq!(btc.balance.free, d("9"), "base balance must decrease by quantity only");
+        assert_eq!(
+            btc.balance.free,
+            d("9"),
+            "base balance must decrease by quantity only"
+        );
     }
 }

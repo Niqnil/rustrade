@@ -31,7 +31,6 @@
 //   (new, cancelled, expired) are not — callers must call fetch_open_orders after
 //   each reconnect to reconcile open-order state.
 
-use fnv::FnvHashMap;
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
     UnindexedAccountSnapshot,
@@ -54,6 +53,7 @@ use barter_instrument::{
 };
 use barter_integration::protocol::websocket::{WebSocket, WsMessage};
 use chrono::{DateTime, Utc};
+use fnv::FnvHashMap;
 use futures::{SinkExt as _, StreamExt as _, stream::BoxStream};
 use indexmap::IndexMap;
 use itertools::Itertools as _;
@@ -118,12 +118,15 @@ struct GracefulShutdownStream<S> {
     /// running until `tx.closed()` resolves. Without this field the handle
     /// would be detached immediately at `connection_manager` spawn time,
     /// preventing any future `.await` or abort if the design changes.
-    handle: tokio::task::JoinHandle<()>,
+    _handle: tokio::task::JoinHandle<()>,
 }
 
 impl<S> GracefulShutdownStream<S> {
     fn new(inner: S, handle: tokio::task::JoinHandle<()>) -> Self {
-        Self { inner, handle }
+        Self {
+            inner,
+            _handle: handle,
+        }
     }
 }
 
@@ -159,7 +162,9 @@ struct RateLimitTracker {
 
 impl RateLimitTracker {
     fn new() -> Self {
-        Self { blocked_until: parking_lot::Mutex::new(None) }
+        Self {
+            blocked_until: parking_lot::Mutex::new(None),
+        }
     }
 
     /// Sleep until the current cooldown expires. Returns immediately if not blocked.
@@ -211,9 +216,15 @@ impl RateLimitTracker {
         let was_blocked = guard.is_some();
         *guard = Some(guard.map_or(new_deadline, |existing| existing.max(new_deadline)));
         if was_blocked {
-            debug!(delay_secs = delay.as_secs(), "Alpaca rate-limit cooldown extended");
+            debug!(
+                delay_secs = delay.as_secs(),
+                "Alpaca rate-limit cooldown extended"
+            );
         } else {
-            warn!(delay_secs = delay.as_secs(), "Alpaca entering rate-limit degradation mode");
+            warn!(
+                delay_secs = delay.as_secs(),
+                "Alpaca entering rate-limit degradation mode"
+            );
         }
     }
 }
@@ -311,7 +322,6 @@ fn is_duplicate(cache: &SharedDedupCache, key: &SmolStr) -> bool {
     false
 }
 
-
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -406,7 +416,8 @@ struct AlpacaAccount {
     // available buying power specifically for crypto orders. Not currently used in
     // balance logic (buying_power serves as the general free USD balance), but
     // retained so serde doesn't error on accounts where the field is present.
-    #[allow(dead_code)] // retained for serde completeness; may be used for per-asset-class reporting
+    #[allow(dead_code)]
+    // retained for serde completeness; may be used for per-asset-class reporting
     crypto_buying_power: Option<String>,
 }
 
@@ -704,7 +715,10 @@ where
             }
 
             // Final attempt still rate-limited — return typed error.
-            warn!(max_attempts = MAX_RATE_LIMIT_ATTEMPTS, "Alpaca REST rate-limit retries exhausted");
+            warn!(
+                max_attempts = MAX_RATE_LIMIT_ATTEMPTS,
+                "Alpaca REST rate-limit retries exhausted"
+            );
             return Err(UnindexedClientError::Api(ApiError::RateLimit));
         }
 
@@ -727,7 +741,10 @@ where
             return serde_json::from_slice::<T>(&bytes).map_err(|e| {
                 connectivity_err(format!(
                     "Alpaca REST JSON parse error ({status}): {e} | body: {}",
-                    String::from_utf8_lossy(&bytes).chars().take(200).collect::<String>()
+                    String::from_utf8_lossy(&bytes)
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
                 ))
             });
         }
@@ -764,12 +781,11 @@ async fn rest_delete_with_retry(
 ) -> Result<(), UnindexedOrderError> {
     for attempt in 0..MAX_RATE_LIMIT_ATTEMPTS {
         rate_limiter.wait_if_blocked().await;
-        let response = build_request()
-            .send()
-            .await
-            .map_err(|e| UnindexedOrderError::Connectivity(
-                ConnectivityError::Socket(format!("Alpaca cancel request failed: {e}"))
-            ))?;
+        let response = build_request().send().await.map_err(|e| {
+            UnindexedOrderError::Connectivity(ConnectivityError::Socket(format!(
+                "Alpaca cancel request failed: {e}"
+            )))
+        })?;
 
         let status = response.status();
 
@@ -787,7 +803,10 @@ async fn rest_delete_with_retry(
             }
 
             // Final attempt still rate-limited — return typed error.
-            warn!(max_attempts = MAX_RATE_LIMIT_ATTEMPTS, "Alpaca cancel rate-limit retries exhausted");
+            warn!(
+                max_attempts = MAX_RATE_LIMIT_ATTEMPTS,
+                "Alpaca cancel rate-limit retries exhausted"
+            );
             return Err(UnindexedOrderError::Rejected(ApiError::RateLimit));
         }
 
@@ -796,8 +815,12 @@ async fn rest_delete_with_retry(
             return Ok(());
         }
 
-        let bytes = response.bytes().await
-            .inspect_err(|e| warn!(%e, %status, "Alpaca cancel_order: failed to read error response body"))
+        let bytes = response
+            .bytes()
+            .await
+            .inspect_err(
+                |e| warn!(%e, %status, "Alpaca cancel_order: failed to read error response body"),
+            )
             .unwrap_or_default();
         let msg = serde_json::from_slice::<AlpacaApiError>(&bytes)
             .map(|e| e.message)
@@ -847,9 +870,13 @@ impl ExecutionClient for AlpacaClient {
         let rl = &self.rate_limiter;
 
         let wants_usd = assets.is_empty()
-            || assets.iter().any(|a| a.name().as_str().eq_ignore_ascii_case("usd"));
+            || assets
+                .iter()
+                .any(|a| a.name().as_str().eq_ignore_ascii_case("usd"));
         let wants_non_usd = assets.is_empty()
-            || assets.iter().any(|a| !a.name().as_str().eq_ignore_ascii_case("usd"));
+            || assets
+                .iter()
+                .any(|a| !a.name().as_str().eq_ignore_ascii_case("usd"));
 
         // Fetch account + positions in parallel when both are needed (common startup case).
         // URLs are extracted before the closures to avoid re-allocating on each retry attempt.
@@ -866,8 +893,7 @@ impl ExecutionClient for AlpacaClient {
                 balances
             }
             (true, false) => {
-                let account: AlpacaAccount =
-                    rest_with_retry(rl, || http.get(&account_url)).await?;
+                let account: AlpacaAccount = rest_with_retry(rl, || http.get(&account_url)).await?;
                 convert_account_to_balances(&account, assets)
             }
             (false, true) => {
@@ -952,8 +978,7 @@ impl ExecutionClient for AlpacaClient {
     ) -> Result<Self::AccountStream, UnindexedClientError> {
         // Verify the initial connection before returning the stream; distinguishes
         // "can't connect at all" from "connected but later disconnected".
-        let initial_ws =
-            connect_and_subscribe(&self.config).await?;
+        let initial_ws = connect_and_subscribe(&self.config).await?;
 
         // Unbounded channel — memory grows if the consumer is slow, but fills
         // are never silently dropped. Silent fill loss corrupts position state;
@@ -1005,7 +1030,8 @@ impl ExecutionClient for AlpacaClient {
                 return Some(crate::order::request::OrderResponseCancel {
                     key,
                     state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
-                        "exchange order ID required for cancel (fetch_open_orders to resolve)".into(),
+                        "exchange order ID required for cancel (fetch_open_orders to resolve)"
+                            .into(),
                     ))),
                 });
             }
@@ -1023,10 +1049,7 @@ impl ExecutionClient for AlpacaClient {
                     state: Ok(Cancelled::new(exchange_order_id, Utc::now())),
                 })
             }
-            Err(e) => Some(crate::order::request::OrderResponseCancel {
-                key,
-                state: Err(e),
-            }),
+            Err(e) => Some(crate::order::request::OrderResponseCancel { key, state: Err(e) }),
         }
     }
 
@@ -1056,7 +1079,8 @@ impl ExecutionClient for AlpacaClient {
     ) -> Option<Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>> {
         let side = request.state.side;
         let reduce_only = request.state.reduce_only;
-        self.open_order_inner(request, map_position_intent(side, reduce_only)).await
+        self.open_order_inner(request, map_position_intent(side, reduce_only))
+            .await
     }
 
     /// Fetches balances sequentially (unlike `account_snapshot` which parallelizes).
@@ -1077,13 +1101,14 @@ impl ExecutionClient for AlpacaClient {
         // Only fetch the account (USD balance) when USD is among the requested assets.
         // Crypto-only requests skip this call to conserve rate-limit budget.
         let wants_usd = assets.is_empty()
-            || assets.iter().any(|a| a.name().as_str().eq_ignore_ascii_case("usd"));
+            || assets
+                .iter()
+                .any(|a| a.name().as_str().eq_ignore_ascii_case("usd"));
         if wants_usd {
             // Pre-allocate URL to avoid re-allocation on each retry attempt.
             let account_url = format!("{base}/v2/account");
             let account: AlpacaAccount =
-                rest_with_retry(&self.rate_limiter, || http.get(&account_url))
-                    .await?;
+                rest_with_retry(&self.rate_limiter, || http.get(&account_url)).await?;
             result.extend(convert_account_to_balances(&account, assets));
         }
 
@@ -1095,10 +1120,8 @@ impl ExecutionClient for AlpacaClient {
         if wants_non_usd {
             // Pre-allocate URL to avoid re-allocation on each retry attempt.
             let positions_url = format!("{base}/v2/positions");
-            let positions: Vec<AlpacaPosition> = rest_with_retry(&self.rate_limiter, || {
-                http.get(&positions_url)
-            })
-            .await?;
+            let positions: Vec<AlpacaPosition> =
+                rest_with_retry(&self.rate_limiter, || http.get(&positions_url)).await?;
             result.extend(convert_positions_to_balances(&positions, assets));
         }
 
@@ -1112,7 +1135,8 @@ impl ExecutionClient for AlpacaClient {
         let base = self.base_url();
         let http = self.http.clone();
 
-        let open_orders = fetch_raw_open_orders(&http, &self.rate_limiter, base, instruments).await?;
+        let open_orders =
+            fetch_raw_open_orders(&http, &self.rate_limiter, base, instruments).await?;
 
         let result = open_orders
             .into_iter()
@@ -1130,8 +1154,7 @@ impl ExecutionClient for AlpacaClient {
         let base = self.base_url();
         let http = self.http.clone();
 
-        let page =
-            paginate_activities(&http, &self.rate_limiter, base, &after_str).await?;
+        let page = paginate_activities(&http, &self.rate_limiter, base, &after_str).await?;
 
         // Propagate truncation as an error so callers can detect incomplete results.
         // The crypto repo can match on `Truncated` and alert operators.
@@ -1256,8 +1279,7 @@ impl AlpacaClient {
         let orders_url = format!("{base}/v2/orders");
 
         let result: Result<AlpacaOrderResponse, UnindexedClientError> =
-            rest_with_retry(rl, || http.post(&orders_url).json(&body))
-                .await;
+            rest_with_retry(rl, || http.post(&orders_url).json(&body)).await;
 
         match result {
             Ok(resp) => {
@@ -1277,9 +1299,7 @@ impl AlpacaClient {
             }
             Err(e) => {
                 let order_err = match e {
-                    UnindexedClientError::Connectivity(ce) => {
-                        UnindexedOrderError::Connectivity(ce)
-                    }
+                    UnindexedClientError::Connectivity(ce) => UnindexedOrderError::Connectivity(ce),
                     UnindexedClientError::Api(ae) => UnindexedOrderError::Rejected(ae),
                     // AccountSnapshot, AccountStream, Truncated, and TruncatedSnapshot are not
                     // returned by rest_with_retry (REST-only path for orders), but matching
@@ -1291,7 +1311,9 @@ impl AlpacaClient {
                     | UnindexedClientError::AccountStream(_)
                     | UnindexedClientError::Truncated { .. }
                     | UnindexedClientError::TruncatedSnapshot { .. } => {
-                        unreachable!("rest_with_retry (order path) does not produce Account*/Truncated* variants")
+                        unreachable!(
+                            "rest_with_retry (order path) does not produce Account*/Truncated* variants"
+                        )
                     }
                 };
                 Some(Order {
@@ -1337,13 +1359,13 @@ async fn fetch_raw_open_orders(
         })
         .await?
     } else {
-        let symbols = instruments
-            .iter()
-            .map(|i| i.name().as_str())
-            .join(",");
+        let symbols = instruments.iter().map(|i| i.name().as_str()).join(",");
         rest_with_retry(rate_limiter, || {
-            http.get(format!("{base}/v2/orders"))
-                .query(&[("status", "open"), ("limit", "500"), ("symbols", &symbols)])
+            http.get(format!("{base}/v2/orders")).query(&[
+                ("status", "open"),
+                ("limit", "500"),
+                ("symbols", &symbols),
+            ])
         })
         .await?
     };
@@ -1416,14 +1438,12 @@ async fn paginate_activities(
         // Borrow page_token as &str so the closure can capture by reference without cloning.
         let page_token_ref = page_token.as_deref();
         let activities: Vec<AlpacaActivity> = rest_with_retry(rate_limiter, || {
-            let mut req = http
-                .get(format!("{base}/v2/account/activities"))
-                .query(&[
-                    ("activity_type", "FILL"),
-                    ("after", after),
-                    ("page_size", PAGE_SIZE_STR),
-                    ("direction", "asc"),
-                ]);
+            let mut req = http.get(format!("{base}/v2/account/activities")).query(&[
+                ("activity_type", "FILL"),
+                ("after", after),
+                ("page_size", PAGE_SIZE_STR),
+                ("direction", "asc"),
+            ]);
             if let Some(token) = page_token_ref {
                 req = req.query(&[("page_token", token)]);
             }
@@ -1531,7 +1551,15 @@ async fn connection_manager(
             let after_str = dt.to_rfc3339();
             match tokio::time::timeout(
                 Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS),
-                recover_fills(&http, &*rate_limiter, &instruments, &base, &after_str, &tx, &dedup),
+                recover_fills(
+                    &http,
+                    &rate_limiter,
+                    &instruments,
+                    base,
+                    &after_str,
+                    &tx,
+                    &dedup,
+                ),
             )
             .await
             {
@@ -1566,7 +1594,7 @@ async fn connection_manager(
         macro_rules! reset_heartbeat {
             () => {
                 heartbeat.as_mut().reset(
-                    tokio::time::Instant::now() + Duration::from_secs(HEARTBEAT_TIMEOUT_SECS)
+                    tokio::time::Instant::now() + Duration::from_secs(HEARTBEAT_TIMEOUT_SECS),
                 );
                 last_message_time = Utc::now();
             };
@@ -1636,15 +1664,12 @@ async fn connection_manager(
         // Anchor to last_message_time, not Utc::now(). For heartbeat-triggered
         // disconnects, Utc::now() would be ~HEARTBEAT_TIMEOUT_SECS after the last
         // real message, causing the recovery window to miss fills in that gap.
-        disconnect_time = Some(
-            last_message_time - chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS),
-        );
+        disconnect_time =
+            Some(last_message_time - chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS));
 
         // --- Close stale WS ---
-        let _ = tokio::time::timeout(
-            Duration::from_secs(WS_CLOSE_TIMEOUT_SECS),
-            ws.close(None),
-        ).await;
+        let _ =
+            tokio::time::timeout(Duration::from_secs(WS_CLOSE_TIMEOUT_SECS), ws.close(None)).await;
 
         if tx.is_closed() {
             break;
@@ -1659,9 +1684,7 @@ async fn connection_manager(
 /// Connect to the Alpaca WebSocket, authenticate, and subscribe to trade_updates.
 ///
 /// On auth or subscribe failure the connection is closed cleanly.
-async fn connect_and_subscribe(
-    config: &AlpacaConfig,
-) -> Result<WebSocket, UnindexedClientError> {
+async fn connect_and_subscribe(config: &AlpacaConfig) -> Result<WebSocket, UnindexedClientError> {
     let url = config.ws_url();
     debug!(%url, "Alpaca: connecting to WebSocket");
 
@@ -1764,7 +1787,10 @@ async fn ws_handshake(ws: &mut WebSocket, config: &AlpacaConfig) -> Result<(), S
                         trace!(stream = %msg.stream, "WS message dropped during listen-ack handshake");
                     }
                 } else {
-                    trace!(bytes = text.len(), "WS non-stream message dropped during listen-ack handshake");
+                    trace!(
+                        bytes = text.len(),
+                        "WS non-stream message dropped during listen-ack handshake"
+                    );
                 }
             }
             Some(Ok(WsMessage::Binary(bytes))) => {
@@ -1773,7 +1799,10 @@ async fn ws_handshake(ws: &mut WebSocket, config: &AlpacaConfig) -> Result<(), S
                 {
                     break;
                 }
-                trace!(bytes = bytes.len(), "WS binary message dropped during listen-ack handshake");
+                trace!(
+                    bytes = bytes.len(),
+                    "WS binary message dropped during listen-ack handshake"
+                );
             }
             Some(Err(e)) => return Err(format!("WS error during subscribe: {e}")),
             None => return Err("WS closed before subscribe ack".into()),
@@ -1803,7 +1832,10 @@ fn check_auth_response(text: &str) -> Option<Result<(), String>> {
     if data.status == "authorized" {
         Some(Ok(()))
     } else {
-        Some(Err(format!("Alpaca WS auth failed: status={}", data.status)))
+        Some(Err(format!(
+            "Alpaca WS auth failed: status={}",
+            data.status
+        )))
     }
 }
 
@@ -2024,7 +2056,9 @@ async fn recover_fills(
         // produces exec_qty=ZERO — the counter stalls, causing subsequent fills on
         // the same order to produce dedup keys that diverge from the WS path.
         let exec_qty = Decimal::from_str(&activity.qty).unwrap_or(Decimal::ZERO);
-        let cum = cumulative_qty.entry(activity.order_id.as_str()).or_default();
+        let cum = cumulative_qty
+            .entry(activity.order_id.as_str())
+            .or_default();
         *cum += exec_qty;
         let cumulative = *cum;
 
@@ -2090,7 +2124,9 @@ fn convert_account_to_balances(
         return Vec::new();
     }
 
-    let usd_name = usd_entry.cloned().unwrap_or_else(|| AssetNameExchange::new("usd"));
+    let usd_name = usd_entry
+        .cloned()
+        .unwrap_or_else(|| AssetNameExchange::new("usd"));
 
     let total = Decimal::from_str(&account.equity).unwrap_or(Decimal::ZERO);
     let free = account
@@ -2104,7 +2140,11 @@ fn convert_account_to_balances(
         .filter(|d| !d.is_zero())
         .unwrap_or_else(|| Decimal::from_str(&account.buying_power).unwrap_or(Decimal::ZERO));
 
-    vec![AssetBalance::new(usd_name, Balance::new(total, free), Utc::now())]
+    vec![AssetBalance::new(
+        usd_name,
+        Balance::new(total, free),
+        Utc::now(),
+    )]
 }
 
 /// Convert Alpaca positions to crypto asset balance entries.
@@ -2149,7 +2189,11 @@ fn convert_positions_to_balances(
             let total = Decimal::from_str(&p.qty).unwrap_or(Decimal::ZERO);
             let free = Decimal::from_str(&p.qty_available).unwrap_or(Decimal::ZERO);
             let asset_name = AssetNameExchange::new(base);
-            Some(AssetBalance::new(asset_name, Balance::new(total, free), now))
+            Some(AssetBalance::new(
+                asset_name,
+                Balance::new(total, free),
+                now,
+            ))
         })
         .collect()
 }
@@ -2289,9 +2333,15 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
     let event_str = update.event.as_str();
     if !matches!(
         event_str,
-        "fill" | "partial_fill"
-            | "new" | "accepted" | "pending_new"
-            | "canceled" | "expired" | "replaced" | "done_for_day"
+        "fill"
+            | "partial_fill"
+            | "new"
+            | "accepted"
+            | "pending_new"
+            | "canceled"
+            | "expired"
+            | "replaced"
+            | "done_for_day"
             | "rejected"
     ) {
         trace!(event = %event_str, "Alpaca WS: ignoring trade_updates event type");
@@ -2310,12 +2360,8 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
     match event_str {
         "fill" | "partial_fill" => {
             // Use event-level price/qty for the per-execution trade.
-            let price = update
-                .price
-                .and_then(|s| Decimal::from_str(s).ok())?;
-            let quantity = update
-                .qty
-                .and_then(|s| Decimal::from_str(s).ok())?;
+            let price = update.price.and_then(|s| Decimal::from_str(s).ok())?;
+            let quantity = update.qty.and_then(|s| Decimal::from_str(s).ok())?;
             let side = parse_side(&order.side)?;
             let time_exchange = update
                 .timestamp
@@ -2342,8 +2388,7 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
                     );
                 })
                 .unwrap_or(Decimal::ZERO);
-            let trade_id =
-                TradeId(format_smolstr!("{}:{}", order.id, cum_qty.normalize()));
+            let trade_id = TradeId(format_smolstr!("{}:{}", order.id, cum_qty.normalize()));
 
             // Alpaca equities and options are commission-free. Crypto trades incur
             // maker/taker fees (currently 0.15–0.25%); callers should account for this
@@ -2368,8 +2413,7 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
         "new" | "accepted" | "pending_new" => {
             // Order acknowledged by Alpaca — emit an OrderSnapshot.
             let side = parse_side(&order.side)?;
-            let quantity =
-                Decimal::from_str(order.qty.unwrap_or("0")).unwrap_or(Decimal::ZERO);
+            let quantity = Decimal::from_str(order.qty.unwrap_or("0")).unwrap_or(Decimal::ZERO);
             // Notional orders (placed by dollar value) have qty=null, yielding quantity=0.
             // Emitting an OrderSnapshot with quantity=0 would corrupt OMS state — skip,
             // consistent with convert_open_order which also returns None for zero-qty orders.
@@ -2381,7 +2425,8 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
                 .limit_price
                 .and_then(|s| Decimal::from_str(s).ok())
                 .unwrap_or(Decimal::ZERO);
-            let filled_qty = Decimal::from_str(order.filled_qty.unwrap_or("0")).unwrap_or(Decimal::ZERO);
+            let filled_qty =
+                Decimal::from_str(order.filled_qty.unwrap_or("0")).unwrap_or(Decimal::ZERO);
             let kind = parse_order_kind(&order.order_type)?;
             let time_in_force = parse_time_in_force(&order.time_in_force);
             let time_exchange = update
@@ -2391,12 +2436,7 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
 
             let open_state = Open::new(order_id, time_exchange, filled_qty);
             let order_snapshot = crate::order::Order {
-                key: OrderKey::new(
-                    ExchangeId::Alpaca,
-                    instrument,
-                    StrategyId::unknown(),
-                    cid,
-                ),
+                key: OrderKey::new(ExchangeId::Alpaca, instrument, StrategyId::unknown(), cid),
                 side,
                 price,
                 quantity,
@@ -2406,9 +2446,9 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
             };
             Some(UnindexedAccountEvent::new(
                 ExchangeId::Alpaca,
-                AccountEventKind::OrderSnapshot(barter_integration::collection::snapshot::Snapshot(
-                    order_snapshot,
-                )),
+                AccountEventKind::OrderSnapshot(
+                    barter_integration::collection::snapshot::Snapshot(order_snapshot),
+                ),
             ))
         }
 
@@ -2426,12 +2466,7 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
                 .unwrap_or_else(Utc::now);
             let cancelled = Cancelled::new(order_id, time_exchange);
             let response = crate::order::request::OrderResponseCancel {
-                key: OrderKey::new(
-                    ExchangeId::Alpaca,
-                    instrument,
-                    StrategyId::unknown(),
-                    cid,
-                ),
+                key: OrderKey::new(ExchangeId::Alpaca, instrument, StrategyId::unknown(), cid),
                 state: Ok(cancelled),
             };
             Some(UnindexedAccountEvent::new(
@@ -2442,12 +2477,7 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
 
         "rejected" => {
             let response = crate::order::request::OrderResponseCancel {
-                key: OrderKey::new(
-                    ExchangeId::Alpaca,
-                    instrument,
-                    StrategyId::unknown(),
-                    cid,
-                ),
+                key: OrderKey::new(ExchangeId::Alpaca, instrument, StrategyId::unknown(), cid),
                 state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
                     format!("order rejected: status={}", order.status),
                 ))),
@@ -2630,7 +2660,10 @@ mod tests {
         let cfg = AlpacaConfig::new("my_key".into(), "my_secret".into(), true);
         let debug = format!("{cfg:?}");
         assert!(!debug.contains("my_key"), "api_key should be redacted");
-        assert!(!debug.contains("my_secret"), "secret_key should be redacted");
+        assert!(
+            !debug.contains("my_secret"),
+            "secret_key should be redacted"
+        );
         assert!(debug.contains("paper: true"));
     }
 
@@ -2690,7 +2723,8 @@ mod tests {
 
     #[test]
     fn test_check_auth_response_authorized() {
-        let msg = r#"{"stream":"authorization","data":{"status":"authorized","action":"authenticate"}}"#;
+        let msg =
+            r#"{"stream":"authorization","data":{"status":"authorized","action":"authenticate"}}"#;
         assert!(matches!(check_auth_response(msg), Some(Ok(()))));
     }
 
@@ -2708,8 +2742,7 @@ mod tests {
 
     #[test]
     fn test_check_listen_ack() {
-        let ack =
-            r#"{"stream":"listening","data":{"streams":["trade_updates"]}}"#;
+        let ack = r#"{"stream":"listening","data":{"streams":["trade_updates"]}}"#;
         assert!(check_listen_ack(ack));
 
         let other = r#"{"stream":"authorization","data":{}}"#;
@@ -2720,8 +2753,14 @@ mod tests {
     fn test_dedup_cache() {
         let cache = new_dedup_cache();
         let key = SmolStr::new("order-1:1");
-        assert!(!is_duplicate(&cache, &key), "first time should not be duplicate");
-        assert!(is_duplicate(&cache, &key), "second time should be duplicate");
+        assert!(
+            !is_duplicate(&cache, &key),
+            "first time should not be duplicate"
+        );
+        assert!(
+            is_duplicate(&cache, &key),
+            "second time should be duplicate"
+        );
     }
 
     #[tokio::test]
@@ -2833,7 +2872,12 @@ mod tests {
         ));
     }
 
-    fn make_order_ws<'a>(id: &str, symbol: &str, side: &str, filled_qty: &'a str) -> AlpacaOrderWs<'a> {
+    fn make_order_ws<'a>(
+        id: &str,
+        symbol: &str,
+        side: &str,
+        filled_qty: &'a str,
+    ) -> AlpacaOrderWs<'a> {
         AlpacaOrderWs {
             id: SmolStr::new(id),
             client_order_id: None,
@@ -3034,7 +3078,10 @@ mod tests {
         ];
         let snapshots = build_instrument_snapshots(orders, &[]);
         assert_eq!(snapshots.len(), 2);
-        let symbols: Vec<&str> = snapshots.iter().map(|s| s.instrument.name().as_str()).collect();
+        let symbols: Vec<&str> = snapshots
+            .iter()
+            .map(|s| s.instrument.name().as_str())
+            .collect();
         assert!(symbols.contains(&"AAPL"));
         assert!(symbols.contains(&"SPY"));
     }
@@ -3050,7 +3097,9 @@ mod tests {
         ];
         let snapshots = build_instrument_snapshots(orders, &instruments);
         assert_eq!(snapshots.len(), 2);
-        let spy = snapshots.iter().find(|s| s.instrument.name().as_str() == "SPY")
+        let spy = snapshots
+            .iter()
+            .find(|s| s.instrument.name().as_str() == "SPY")
             .expect("SPY snapshot must be present even with no orders");
         assert!(spy.orders.is_empty());
     }
@@ -3106,8 +3155,10 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(ws_keys, rest_keys,
-            "REST recovery dedup keys must match WS path keys for cross-source dedup to work");
+        assert_eq!(
+            ws_keys, rest_keys,
+            "REST recovery dedup keys must match WS path keys for cross-source dedup to work"
+        );
         assert_eq!(ws_keys[0].as_str(), "ord-1:1");
         assert_eq!(ws_keys[1].as_str(), "ord-1:2");
     }
@@ -3132,11 +3183,14 @@ mod tests {
 
         // Full path: construct event then extract key
         let event = convert_trade_update(update).expect("fill should produce an event");
-        let full_key = fill_dedup_key_from_event(&event)
-            .expect("fill event should have a dedup key");
+        let full_key =
+            fill_dedup_key_from_event(&event).expect("fill event should have a dedup key");
 
-        assert_eq!(early_key.as_str(), full_key.as_str(),
-            "early_dedup_key must produce the same key as the full event path");
+        assert_eq!(
+            early_key.as_str(),
+            full_key.as_str(),
+            "early_dedup_key must produce the same key as the full event path"
+        );
         assert_eq!(early_key.as_str(), "ord-abc:5");
     }
 
@@ -3230,7 +3284,8 @@ mod tests {
             .expect("rejected event without filled_qty must produce an AccountEvent, not be silently dropped");
         assert!(
             matches!(event.kind, AccountEventKind::OrderCancelled(_)),
-            "rejected event must map to OrderCancelled, got: {:?}", event.kind
+            "rejected event must map to OrderCancelled, got: {:?}",
+            event.kind
         );
     }
 
@@ -3253,9 +3308,21 @@ mod tests {
         assert_eq!(from_rest.to_string(), "1");
 
         // More edge cases: various trailing zero representations.
-        assert_eq!(Decimal::from_str("100.000").unwrap().normalize().to_string(), "100");
-        assert_eq!(Decimal::from_str("0.10").unwrap().normalize().to_string(), "0.1");
-        assert_eq!(Decimal::from_str("0.100").unwrap().normalize().to_string(), "0.1");
+        assert_eq!(
+            Decimal::from_str("100.000")
+                .unwrap()
+                .normalize()
+                .to_string(),
+            "100"
+        );
+        assert_eq!(
+            Decimal::from_str("0.10").unwrap().normalize().to_string(),
+            "0.1"
+        );
+        assert_eq!(
+            Decimal::from_str("0.100").unwrap().normalize().to_string(),
+            "0.1"
+        );
     }
 
     // H-2: zero options_buying_power falls back to buying_power (not free=0).
@@ -3282,22 +3349,34 @@ mod tests {
     // M-2: map_position_intent derives intent from (reduce_only, side).
     #[test]
     fn map_position_intent_open_buy_maps_to_buy_to_open() {
-        assert_eq!(map_position_intent(Side::Buy, false), AlpacaPositionIntent::BuyToOpen);
+        assert_eq!(
+            map_position_intent(Side::Buy, false),
+            AlpacaPositionIntent::BuyToOpen
+        );
     }
 
     #[test]
     fn map_position_intent_open_sell_maps_to_sell_to_open() {
-        assert_eq!(map_position_intent(Side::Sell, false), AlpacaPositionIntent::SellToOpen);
+        assert_eq!(
+            map_position_intent(Side::Sell, false),
+            AlpacaPositionIntent::SellToOpen
+        );
     }
 
     #[test]
     fn map_position_intent_reduce_buy_maps_to_buy_to_close() {
-        assert_eq!(map_position_intent(Side::Buy, true), AlpacaPositionIntent::BuyToClose);
+        assert_eq!(
+            map_position_intent(Side::Buy, true),
+            AlpacaPositionIntent::BuyToClose
+        );
     }
 
     #[test]
     fn map_position_intent_reduce_sell_maps_to_sell_to_close() {
-        assert_eq!(map_position_intent(Side::Sell, true), AlpacaPositionIntent::SellToClose);
+        assert_eq!(
+            map_position_intent(Side::Sell, true),
+            AlpacaPositionIntent::SellToClose
+        );
     }
 
     // M-1: parse_order_error — pin all status-code branches not covered by existing tests.
@@ -3317,7 +3396,10 @@ mod tests {
         let UnindexedOrderError::Rejected(ApiError::OrderRejected(msg)) = err else {
             panic!("expected OrderRejected, got {err:?}");
         };
-        assert!(msg.contains("order not found"), "message should contain 'order not found': {msg}");
+        assert!(
+            msg.contains("order not found"),
+            "message should contain 'order not found': {msg}"
+        );
     }
 
     #[test]
@@ -3369,10 +3451,16 @@ mod tests {
         ];
         let snapshots = build_instrument_snapshots(orders, &instruments);
         assert_eq!(snapshots.len(), 2);
-        assert_eq!(snapshots[0].instrument.name().as_str(), "MSFT",
-            "first snapshot must be MSFT (first in instruments slice)");
-        assert_eq!(snapshots[1].instrument.name().as_str(), "AAPL",
-            "second snapshot must be AAPL (second in instruments slice)");
+        assert_eq!(
+            snapshots[0].instrument.name().as_str(),
+            "MSFT",
+            "first snapshot must be MSFT (first in instruments slice)"
+        );
+        assert_eq!(
+            snapshots[1].instrument.name().as_str(),
+            "AAPL",
+            "second snapshot must be AAPL (second in instruments slice)"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -3383,8 +3471,8 @@ mod tests {
     // pagination loop and truncation logic without touching the real Alpaca API.
     mod http_tests {
         use super::super::*;
-        use wiremock::{Mock, MockServer, Respond, Request, ResponseTemplate};
         use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
         /// Serves pre-configured JSON pages in registration order.
         ///
@@ -3399,7 +3487,10 @@ mod tests {
 
         impl Sequential {
             fn new(pages: Vec<serde_json::Value>) -> Self {
-                Self { call: std::sync::atomic::AtomicU32::new(0), pages }
+                Self {
+                    call: std::sync::atomic::AtomicU32::new(0),
+                    pages,
+                }
             }
         }
 
@@ -3421,15 +3512,17 @@ mod tests {
         fn make_activities_json(count: usize, id_prefix: &str) -> serde_json::Value {
             serde_json::Value::Array(
                 (0..count)
-                    .map(|i| serde_json::json!({
-                        "id": format!("{id_prefix}-{i:05}"),
-                        "order_id": "ord-1",
-                        "symbol": "SPY",
-                        "side": "buy",
-                        "price": "100.00",
-                        "qty": "1",
-                        "transaction_time": "2025-04-18T14:30:00Z"
-                    }))
+                    .map(|i| {
+                        serde_json::json!({
+                            "id": format!("{id_prefix}-{i:05}"),
+                            "order_id": "ord-1",
+                            "symbol": "SPY",
+                            "side": "buy",
+                            "price": "100.00",
+                            "qty": "1",
+                            "transaction_time": "2025-04-18T14:30:00Z"
+                        })
+                    })
                     .collect(),
             )
         }
@@ -3438,18 +3531,20 @@ mod tests {
         fn make_orders_json(count: usize) -> serde_json::Value {
             serde_json::Value::Array(
                 (0..count)
-                    .map(|i| serde_json::json!({
-                        "id": format!("order-{i:05}"),
-                        "client_order_id": null,
-                        "symbol": "SPY",
-                        "qty": "1",
-                        "filled_qty": "0",
-                        "side": "buy",
-                        "type": "limit",
-                        "time_in_force": "day",
-                        "limit_price": "100.00",
-                        "created_at": "2025-04-18T14:30:00Z"
-                    }))
+                    .map(|i| {
+                        serde_json::json!({
+                            "id": format!("order-{i:05}"),
+                            "client_order_id": null,
+                            "symbol": "SPY",
+                            "qty": "1",
+                            "filled_qty": "0",
+                            "side": "buy",
+                            "type": "limit",
+                            "time_in_force": "day",
+                            "limit_price": "100.00",
+                            "created_at": "2025-04-18T14:30:00Z"
+                        })
+                    })
                     .collect(),
             )
         }
@@ -3463,7 +3558,9 @@ mod tests {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
                 .and(path("/v2/account/activities"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(make_activities_json(5, "act")))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(make_activities_json(5, "act")),
+                )
                 .mount(&server)
                 .await;
 
@@ -3500,8 +3597,11 @@ mod tests {
 
             assert_eq!(result.activities.len(), ALPACA_MAX_ACTIVITIES);
             assert!(!result.truncated);
-            assert_eq!(server.received_requests().await.unwrap().len(), 2,
-                "exactly 2 requests: first full page + second empty page");
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                2,
+                "exactly 2 requests: first full page + second empty page"
+            );
         }
 
         /// Two-page case: 100 items on page 1, 37 on page 2 — all accumulated,
@@ -3539,8 +3639,10 @@ mod tests {
             // Always return a full page — the loop must enforce the cap itself.
             Mock::given(method("GET"))
                 .and(path("/v2/account/activities"))
-                .respond_with(ResponseTemplate::new(200)
-                    .set_body_json(make_activities_json(ALPACA_MAX_ACTIVITIES, "act")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(make_activities_json(ALPACA_MAX_ACTIVITIES, "act")),
+                )
                 .mount(&server)
                 .await;
 
@@ -3550,7 +3652,10 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert!(result.truncated, "must be truncated after MAX_ACTIVITY_PAGES pages");
+            assert!(
+                result.truncated,
+                "must be truncated after MAX_ACTIVITY_PAGES pages"
+            );
             assert_eq!(
                 result.activities.len(),
                 MAX_ACTIVITY_PAGES * ALPACA_MAX_ACTIVITIES,
@@ -3573,8 +3678,9 @@ mod tests {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
                 .and(path("/v2/orders"))
-                .respond_with(ResponseTemplate::new(200)
-                    .set_body_json(make_orders_json(MAX_OPEN_ORDERS - 1)))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(make_orders_json(MAX_OPEN_ORDERS - 1)),
+                )
                 .mount(&server)
                 .await;
 
@@ -3582,7 +3688,10 @@ mod tests {
             let rl = RateLimitTracker::new();
             let result = fetch_raw_open_orders(&http, &rl, &server.uri(), &[]).await;
 
-            assert!(result.is_ok(), "499 orders must not trigger truncation: {result:?}");
+            assert!(
+                result.is_ok(),
+                "499 orders must not trigger truncation: {result:?}"
+            );
             assert_eq!(result.unwrap().len(), MAX_OPEN_ORDERS - 1);
         }
 
@@ -3594,8 +3703,9 @@ mod tests {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
                 .and(path("/v2/orders"))
-                .respond_with(ResponseTemplate::new(200)
-                    .set_body_json(make_orders_json(MAX_OPEN_ORDERS)))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(make_orders_json(MAX_OPEN_ORDERS)),
+                )
                 .mount(&server)
                 .await;
 
@@ -3621,14 +3731,17 @@ mod tests {
         /// Uses wiremock to capture the request body and verify position_intent.
         #[tokio::test]
         async fn open_order_reduce_only_sell_sends_sell_to_close_intent() {
-            use wiremock::matchers::{method, path};
             use crate::client::ExecutionClient;
-            use crate::order::{OrderKey, OrderKind, TimeInForce, id::{ClientOrderId, StrategyId}};
             use crate::order::request::{OrderRequestOpen, RequestOpen};
+            use crate::order::{
+                OrderKey, OrderKind, TimeInForce,
+                id::{ClientOrderId, StrategyId},
+            };
             use barter_instrument::Side;
             use barter_instrument::exchange::ExchangeId;
             use barter_instrument::instrument::name::InstrumentNameExchange;
             use rust_decimal::Decimal;
+            use wiremock::matchers::{method, path};
 
             let server = MockServer::start().await;
 
@@ -3661,11 +3774,8 @@ mod tests {
                 .await;
 
             // Create client with base_url_override pointing to mock server
-            let config = AlpacaConfig::with_base_url(
-                "test-key".into(),
-                "test-secret".into(),
-                server.uri(),
-            );
+            let config =
+                AlpacaConfig::with_base_url("test-key".into(), "test-secret".into(), server.uri());
             let client = AlpacaClient::new(config);
 
             // Create a Sell order with reduce_only=true (should map to SellToClose)
@@ -3688,23 +3798,32 @@ mod tests {
             };
 
             // Call open_order (borrows instrument)
-            let result = client.open_order(OrderRequestOpen {
-                key: OrderKey {
-                    exchange: request.key.exchange,
-                    instrument: &request.key.instrument,
-                    strategy: request.key.strategy.clone(),
-                    cid: request.key.cid.clone(),
-                },
-                state: request.state.clone(),
-            }).await;
+            let result = client
+                .open_order(OrderRequestOpen {
+                    key: OrderKey {
+                        exchange: request.key.exchange,
+                        instrument: &request.key.instrument,
+                        strategy: request.key.strategy.clone(),
+                        cid: request.key.cid.clone(),
+                    },
+                    state: request.state.clone(),
+                })
+                .await;
 
             // Verify the order was accepted
             assert!(result.is_some(), "open_order should return a result");
             let order = result.unwrap();
-            assert!(order.state.is_ok(), "order should be accepted: {:?}", order.state);
+            assert!(
+                order.state.is_ok(),
+                "order should be accepted: {:?}",
+                order.state
+            );
 
             // Verify the request body contained position_intent=sell_to_close
-            let body = captured_body.lock().take().expect("request body should be captured");
+            let body = captured_body
+                .lock()
+                .take()
+                .expect("request body should be captured");
             assert_eq!(
                 body.get("position_intent").and_then(|v| v.as_str()),
                 Some("sell_to_close"),
@@ -3716,8 +3835,11 @@ mod tests {
         #[tokio::test]
         async fn open_order_not_reduce_only_buy_sends_buy_to_open_intent() {
             use crate::client::ExecutionClient;
-            use crate::order::{OrderKey, OrderKind, TimeInForce, id::{ClientOrderId, StrategyId}};
             use crate::order::request::{OrderRequestOpen, RequestOpen};
+            use crate::order::{
+                OrderKey, OrderKind, TimeInForce,
+                id::{ClientOrderId, StrategyId},
+            };
             use barter_instrument::Side;
             use barter_instrument::exchange::ExchangeId;
             use barter_instrument::instrument::name::InstrumentNameExchange;
@@ -3750,11 +3872,8 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let config = AlpacaConfig::with_base_url(
-                "test-key".into(),
-                "test-secret".into(),
-                server.uri(),
-            );
+            let config =
+                AlpacaConfig::with_base_url("test-key".into(), "test-secret".into(), server.uri());
             let client = AlpacaClient::new(config);
 
             let instrument = InstrumentNameExchange::new("AAPL");
@@ -3780,9 +3899,16 @@ mod tests {
 
             assert!(result.is_some(), "open_order should return a result");
             let order = result.unwrap();
-            assert!(order.state.is_ok(), "order should be accepted: {:?}", order.state);
+            assert!(
+                order.state.is_ok(),
+                "order should be accepted: {:?}",
+                order.state
+            );
 
-            let body = captured_body.lock().take().expect("request body should be captured");
+            let body = captured_body
+                .lock()
+                .take()
+                .expect("request body should be captured");
             assert_eq!(
                 body.get("position_intent").and_then(|v| v.as_str()),
                 Some("buy_to_open"),

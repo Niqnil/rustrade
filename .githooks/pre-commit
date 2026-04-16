@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Pre-commit hook for barter-rs
+# Setup: git config core.hooksPath .githooks
+set -euo pipefail
+
+echo "Running cargo fmt check..."
+if ! cargo fmt --all -- --check; then
+    echo "Auto-formatting with cargo fmt..."
+    cargo fmt --all
+    # Re-stage any formatted files that were already staged
+    git diff --name-only --cached | xargs -r git add
+    echo "✅ Auto-formatted and re-staged files"
+fi
+
+echo "Running cargo clippy..."
+if ! cargo clippy --workspace --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious -D clippy::style -W clippy::complexity -D clippy::perf; then
+    echo "❌ cargo clippy failed. Fix the warnings above."
+    exit 1
+fi
+
+echo "✅ Pre-commit checks passed"

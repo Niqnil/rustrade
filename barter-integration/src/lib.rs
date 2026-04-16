@@ -7,8 +7,7 @@
     clippy::unused_self,
     clippy::useless_let_if_seq,
     missing_debug_implementations,
-    rust_2018_idioms,
-    rust_2024_compatibility
+    rust_2018_idioms
 )]
 #![allow(clippy::type_complexity, clippy::too_many_arguments, type_alias_bounds)]
 

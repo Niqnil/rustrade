@@ -13,7 +13,9 @@ pub trait FeeModel {
 }
 
 /// Zero-fee model. Useful for backtests where fees are excluded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Deserialize, Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Deserialize, Serialize,
+)]
 pub struct ZeroFeeModel;
 
 impl FeeModel for ZeroFeeModel {
@@ -113,19 +115,29 @@ mod tests {
 
     #[test]
     fn zero_fee_model_always_returns_zero() {
-        assert_eq!(ZeroFeeModel.compute_fee(d("100"), d("5"), d("100")), Decimal::ZERO);
-        assert_eq!(ZeroFeeModel.compute_fee(Decimal::ZERO, Decimal::ZERO, Decimal::ONE), Decimal::ZERO);
+        assert_eq!(
+            ZeroFeeModel.compute_fee(d("100"), d("5"), d("100")),
+            Decimal::ZERO
+        );
+        assert_eq!(
+            ZeroFeeModel.compute_fee(Decimal::ZERO, Decimal::ZERO, Decimal::ONE),
+            Decimal::ZERO
+        );
     }
 
     #[test]
     fn per_contract_fee_charges_by_quantity() {
-        let model = PerContractFeeModel { commission_per_contract: d("0.65") };
+        let model = PerContractFeeModel {
+            commission_per_contract: d("0.65"),
+        };
         assert_eq!(model.compute_fee(d("100"), d("10"), d("100")), d("6.5"));
     }
 
     #[test]
     fn per_contract_fee_uses_abs_quantity() {
-        let model = PerContractFeeModel { commission_per_contract: d("0.65") };
+        let model = PerContractFeeModel {
+            commission_per_contract: d("0.65"),
+        };
         // Negative quantity (sell side) should produce the same fee as positive.
         assert_eq!(
             model.compute_fee(d("100"), d("-10"), d("100")),
@@ -143,7 +155,9 @@ mod tests {
 
     #[test]
     fn fee_model_config_per_contract_dispatches() {
-        let model = PerContractFeeModel { commission_per_contract: d("0.65") };
+        let model = PerContractFeeModel {
+            commission_per_contract: d("0.65"),
+        };
         let cfg = FeeModelConfig::PerContract(model);
         assert_eq!(
             cfg.compute_fee(d("100"), d("10"), d("100")),
@@ -153,7 +167,10 @@ mod tests {
 
     #[test]
     fn fee_model_config_default_is_zero() {
-        assert_eq!(FeeModelConfig::default(), FeeModelConfig::Zero(ZeroFeeModel));
+        assert_eq!(
+            FeeModelConfig::default(),
+            FeeModelConfig::Zero(ZeroFeeModel)
+        );
     }
 
     // --- PercentageFeeModel ---
@@ -219,9 +236,14 @@ mod tests {
 
     #[test]
     fn per_contract_fee_model_serde_roundtrip() {
-        let cfg = FeeModelConfig::PerContract(PerContractFeeModel { commission_per_contract: d("0.65") });
+        let cfg = FeeModelConfig::PerContract(PerContractFeeModel {
+            commission_per_contract: d("0.65"),
+        });
         let json = serde_json::to_string(&cfg).unwrap();
-        assert_eq!(json, r#"{"PerContract":{"commission_per_contract":"0.65"}}"#);
+        assert_eq!(
+            json,
+            r#"{"PerContract":{"commission_per_contract":"0.65"}}"#
+        );
         let parsed: FeeModelConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, cfg);
     }

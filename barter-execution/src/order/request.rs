@@ -1,6 +1,10 @@
 use crate::{
     error::OrderError,
-    order::{OrderEvent, OrderKind, TimeInForce, id::{OrderId, PositionId}, state::Cancelled},
+    order::{
+        OrderEvent, OrderKind, TimeInForce,
+        id::{OrderId, PositionId},
+        state::Cancelled,
+    },
 };
 use barter_instrument::{
     Side,
