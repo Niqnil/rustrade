@@ -134,54 +134,55 @@ impl ClosePositionsStrategy for MultiStrategy {
         InstrumentIndex: 'a,
     {
         // Generate a MARKET order for each Strategy's open Position
-        let open_requests =
-            state
-                .instruments
-                .instruments(filter)
-                .flat_map(move |state| {
-                    // Only generate orders if we have a market price
-                    let Some(price) = state.data.price() else {
-                        return itertools::Either::Left(std::iter::empty());
-                    };
+        let open_requests = state
+            .instruments
+            .instruments(filter)
+            .flat_map(move |state| {
+                // Only generate orders if we have a market price
+                let Some(price) = state.data.price() else {
+                    return itertools::Either::Left(std::iter::empty());
+                };
 
-                    // Generate a MARKET order to close StrategyA position
-                    let close_position_a_request = state
-                        .data
-                        .strategy_a
-                        .position
-                        .positions.get(&PositionId::NETTING)
-                        .map(|position_a| {
-                            build_ioc_market_order_to_close_position(
-                                state.instrument.exchange,
-                                position_a,
-                                StrategyA::ID,
-                                price,
-                                ClientOrderId::random,
-                            )
-                        });
+                // Generate a MARKET order to close StrategyA position
+                let close_position_a_request = state
+                    .data
+                    .strategy_a
+                    .position
+                    .positions
+                    .get(&PositionId::NETTING)
+                    .map(|position_a| {
+                        build_ioc_market_order_to_close_position(
+                            state.instrument.exchange,
+                            position_a,
+                            StrategyA::ID,
+                            price,
+                            ClientOrderId::random,
+                        )
+                    });
 
-                    // Generate a MARKET order to close StrategyB position
-                    let close_position_b_request = state
-                        .data
-                        .strategy_b
-                        .position
-                        .positions.get(&PositionId::NETTING)
-                        .map(|position_b| {
-                            build_ioc_market_order_to_close_position(
-                                state.instrument.exchange,
-                                position_b,
-                                StrategyB::ID,
-                                price,
-                                ClientOrderId::random,
-                            )
-                        });
+                // Generate a MARKET order to close StrategyB position
+                let close_position_b_request = state
+                    .data
+                    .strategy_b
+                    .position
+                    .positions
+                    .get(&PositionId::NETTING)
+                    .map(|position_b| {
+                        build_ioc_market_order_to_close_position(
+                            state.instrument.exchange,
+                            position_b,
+                            StrategyB::ID,
+                            price,
+                            ClientOrderId::random,
+                        )
+                    });
 
-                    itertools::Either::Right(
-                        close_position_a_request
-                            .into_iter()
-                            .chain(close_position_b_request),
-                    )
-                });
+                itertools::Either::Right(
+                    close_position_a_request
+                        .into_iter()
+                        .chain(close_position_b_request),
+                )
+            });
 
         (std::iter::empty(), open_requests)
     }

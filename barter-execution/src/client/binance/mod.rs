@@ -162,7 +162,10 @@ const DEDUP_CACHE_SIZE: usize = 10_000;
 /// (`MyTradesParams::limit(i32)`).
 const BINANCE_MAX_TRADES: usize = 1000;
 // Compile-time guard: SDK call sites cast this to i32; ensure it never overflows.
-const _: () = assert!(BINANCE_MAX_TRADES <= i32::MAX as usize, "BINANCE_MAX_TRADES overflows i32");
+const _: () = assert!(
+    BINANCE_MAX_TRADES <= i32::MAX as usize,
+    "BINANCE_MAX_TRADES overflows i32"
+);
 /// Default delay when rate-limited (exponential backoff; Binance's `Retry-After`
 /// header is not accessible through the SDK's `anyhow::Error` chain).
 const DEFAULT_RATE_LIMIT_DELAY_SECS: u64 = 10;
@@ -216,9 +219,11 @@ fn dedup_key_from_event(event: &UnindexedAccountEvent) -> Option<DedupKey> {
     // recover_fills (buffer_unordered), where BTCUSDT trade 9001 and ETHUSDT trade
     // 9001 are distinct fills with otherwise identical IDs.
     match &event.kind {
-        AccountEventKind::Trade(trade) => {
-            Some(DedupKey { instrument: trade.instrument.name().clone(), id: trade.id.0.clone(), kind: DedupEventKind::Trade })
-        }
+        AccountEventKind::Trade(trade) => Some(DedupKey {
+            instrument: trade.instrument.name().clone(),
+            id: trade.id.0.clone(),
+            kind: DedupEventKind::Trade,
+        }),
         AccountEventKind::OrderSnapshot(snap) => {
             // OrderSnapshot wraps Order<..., OrderState<...>>
             // For NEW events the state is Active(Open { id, .. })
@@ -228,9 +233,11 @@ fn dedup_key_from_event(event: &UnindexedAccountEvent) -> Option<DedupKey> {
                     // We only get OrderSnapshot for NEW events (Open state)
                     use crate::order::state::ActiveOrderState;
                     match active {
-                        ActiveOrderState::Open(open) => {
-                            Some(DedupKey { instrument: snap.0.key.instrument.name().clone(), id: open.id.0.clone(), kind: DedupEventKind::New })
-                        }
+                        ActiveOrderState::Open(open) => Some(DedupKey {
+                            instrument: snap.0.key.instrument.name().clone(),
+                            id: open.id.0.clone(),
+                            kind: DedupEventKind::New,
+                        }),
                         _ => None,
                     }
                 }
@@ -238,9 +245,11 @@ fn dedup_key_from_event(event: &UnindexedAccountEvent) -> Option<DedupKey> {
             }
         }
         AccountEventKind::OrderCancelled(resp) => match &resp.state {
-            Ok(cancelled) => {
-                Some(DedupKey { instrument: resp.key.instrument.name().clone(), id: cancelled.id.0.clone(), kind: DedupEventKind::Cancelled })
-            }
+            Ok(cancelled) => Some(DedupKey {
+                instrument: resp.key.instrument.name().clone(),
+                id: cancelled.id.0.clone(),
+                kind: DedupEventKind::Cancelled,
+            }),
             Err(_) => None, // error responses don't need dedup
         },
         _ => None, // BalanceSnapshot, Snapshot — no dedup needed
@@ -335,9 +344,15 @@ impl RateLimitTracker {
         // only warn on mode entry; subsequent calls from the retry loop extend
         // the cooldown silently to avoid duplicate "entering degradation mode" lines.
         if was_blocked {
-            debug!(delay_secs = delay.as_secs(), "BinanceSpot rate-limit cooldown extended");
+            debug!(
+                delay_secs = delay.as_secs(),
+                "BinanceSpot rate-limit cooldown extended"
+            );
         } else {
-            warn!(delay_secs = delay.as_secs(), "BinanceSpot entering rate-limit degradation mode");
+            warn!(
+                delay_secs = delay.as_secs(),
+                "BinanceSpot entering rate-limit degradation mode"
+            );
         }
     }
 
@@ -454,7 +469,11 @@ impl std::fmt::Debug for BinanceSpotConfig {
 
 impl BinanceSpotConfig {
     pub fn new(api_key: String, secret_key: String, testnet: bool) -> Self {
-        Self { api_key, secret_key, testnet }
+        Self {
+            api_key,
+            secret_key,
+            testnet,
+        }
     }
 
     /// Read-only access to the API key (e.g. for logging or header construction).
@@ -555,7 +574,9 @@ impl BinanceSpot {
             self.ws_handle.connect(),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("BinanceSpot WS connect timed out after {CONNECT_TIMEOUT_SECS}s"))??;
+        .map_err(|_| {
+            anyhow::anyhow!("BinanceSpot WS connect timed out after {CONNECT_TIMEOUT_SECS}s")
+        })??;
         *guard = Some(ws.clone());
         Ok(ws)
     }
@@ -585,7 +606,6 @@ impl BinanceSpot {
             }
         }
     }
-
 }
 
 /// Execute a REST call with rate-limit awareness and retry.
@@ -595,7 +615,9 @@ impl BinanceSpot {
 async fn rest_call_with_retry<T>(
     rest: &Arc<RestApi>,
     rate_limiter: &RateLimitTracker,
-    mut make_call: impl FnMut(Arc<RestApi>) -> std::pin::Pin<
+    mut make_call: impl FnMut(
+        Arc<RestApi>,
+    ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = anyhow::Result<T>> + Send>,
     >,
 ) -> anyhow::Result<T> {
@@ -613,9 +635,7 @@ async fn rest_call_with_retry<T>(
                 // The retry loop uses an aggressive initial delay to recover quickly from
                 // transient bursts. DEFAULT_RATE_LIMIT_DELAY_SECS is for the externally-set
                 // "blocked" state (e.g. Retry-After header), not for per-call retries.
-                let delay = Duration::from_secs(
-                    2u64.saturating_pow(attempt).min(30),
-                );
+                let delay = Duration::from_secs(2u64.saturating_pow(attempt).min(30));
                 warn!(
                     attempt = attempt + 1,
                     max = MAX_RATE_LIMIT_RETRIES,
@@ -640,15 +660,19 @@ async fn fetch_open_orders_for_instrument(
     rest: Arc<RestApi>,
     rate_limiter: Arc<RateLimitTracker>,
     instrument: InstrumentNameExchange,
-) -> Result<(InstrumentNameExchange, Vec<Order<ExchangeId, InstrumentNameExchange, Open>>), UnindexedClientError> {
+) -> Result<
+    (
+        InstrumentNameExchange,
+        Vec<Order<ExchangeId, InstrumentNameExchange, Open>>,
+    ),
+    UnindexedClientError,
+> {
     // Convert once before the retry closure to avoid a String allocation on every retry.
     let symbol_str = instrument.name().to_string();
     let response = rest_call_with_retry(&rest, &rate_limiter, |rest| {
         let sym = symbol_str.clone();
         Box::pin(async move {
-            let params = GetOpenOrdersParams::builder()
-                .symbol(sym)
-                .build()?;
+            let params = GetOpenOrdersParams::builder().symbol(sym).build()?;
             rest.get_open_orders(params).await
         })
     })
@@ -695,8 +719,7 @@ async fn paginate_my_trades(
             let sym = symbol_str.clone();
             let stm = start_time_ms;
             Box::pin(async move {
-                let builder = MyTradesParams::builder(sym)
-                    .limit(BINANCE_MAX_TRADES as i32);
+                let builder = MyTradesParams::builder(sym).limit(BINANCE_MAX_TRADES as i32);
                 let params = if let Some(id) = fid {
                     builder.from_id(id).build()?
                 } else {
@@ -792,25 +815,29 @@ impl ExecutionClient for BinanceSpot {
         // account_snapshot wraps Open orders in OrderState::active(); fetch_open_orders
         // returns them without the wrapper — both use fetch_open_orders_for_instrument.
         use futures::{StreamExt as _, TryStreamExt};
-        let instrument_snapshots: Vec<_> = futures::stream::iter(instruments.iter().cloned().map(|instrument| {
-            fetch_open_orders_for_instrument(
-                self.rest.clone(),
-                self.rate_limiter.clone(),
-                instrument,
-            )
-        }))
+        let instrument_snapshots: Vec<_> =
+            futures::stream::iter(instruments.iter().cloned().map(|instrument| {
+                fetch_open_orders_for_instrument(
+                    self.rest.clone(),
+                    self.rate_limiter.clone(),
+                    instrument,
+                )
+            }))
             .buffer_unordered(8)
             .map(|result| {
                 let (inst, orders) = result?;
-                let wrapped = orders.into_iter().map(|o| Order {
-                    key: o.key,
-                    side: o.side,
-                    price: o.price,
-                    quantity: o.quantity,
-                    kind: o.kind,
-                    time_in_force: o.time_in_force,
-                    state: OrderState::active(o.state),
-                }).collect();
+                let wrapped = orders
+                    .into_iter()
+                    .map(|o| Order {
+                        key: o.key,
+                        side: o.side,
+                        price: o.price,
+                        quantity: o.quantity,
+                        kind: o.kind,
+                        time_in_force: o.time_in_force,
+                        state: OrderState::active(o.state),
+                    })
+                    .collect();
                 Ok::<_, UnindexedClientError>(InstrumentAccountSnapshot::new(inst, wrapped))
             })
             .try_collect()
@@ -887,7 +914,10 @@ impl ExecutionClient for BinanceSpot {
             .build()
             .map_err(|e| UnindexedClientError::AccountStream(e.to_string()))?;
 
-        match initial_ws.user_data_stream_subscribe_signature(params).await {
+        match initial_ws
+            .user_data_stream_subscribe_signature(params)
+            .await
+        {
             Ok(_) => {}
             Err(e) => {
                 // binance-sdk has no Drop impl for TCP close — must disconnect
@@ -895,8 +925,12 @@ impl ExecutionClient for BinanceSpot {
                 // Awaiting inline (rather than spawning) ensures the socket is cleaned
                 // up before returning Err, matching the pattern used in clear_ws_api.
                 match tokio::time::timeout(Duration::from_secs(5), initial_ws.disconnect()).await {
-                    Ok(Err(de)) => warn!(%de, "BinanceSpot failed to disconnect WS after subscribe failure"),
-                    Err(_) => warn!("BinanceSpot WS disconnect timed out (5s) after subscribe failure"),
+                    Ok(Err(de)) => {
+                        warn!(%de, "BinanceSpot failed to disconnect WS after subscribe failure")
+                    }
+                    Err(_) => {
+                        warn!("BinanceSpot WS disconnect timed out (5s) after subscribe failure")
+                    }
                     Ok(Ok(())) => {}
                 }
                 return Err(UnindexedClientError::AccountStream(e.to_string()));
@@ -974,12 +1008,10 @@ impl ExecutionClient for BinanceSpot {
                     order_id = %order_id.0,
                     "BinanceSpot cancel: exchange orderId not parseable as i64, falling back to clientOrderId"
                 );
-                params_builder =
-                    params_builder.orig_client_order_id(request.key.cid.0.to_string());
+                params_builder = params_builder.orig_client_order_id(request.key.cid.0.to_string());
             }
         } else {
-            params_builder =
-                params_builder.orig_client_order_id(request.key.cid.0.to_string());
+            params_builder = params_builder.orig_client_order_id(request.key.cid.0.to_string());
         }
 
         let params = match params_builder.build() {
@@ -988,9 +1020,9 @@ impl ExecutionClient for BinanceSpot {
                 error!(%e, "BinanceSpot failed to build cancel order params");
                 return Some(UnindexedOrderResponseCancel {
                     key,
-                    state: Err(UnindexedOrderError::Rejected(
-                        ApiError::OrderRejected(e.to_string()),
-                    )),
+                    state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
+                        e.to_string(),
+                    ))),
                 });
             }
         };
@@ -1009,11 +1041,9 @@ impl ExecutionClient for BinanceSpot {
                             error!("BinanceSpot cancel response missing orderId");
                             return Some(UnindexedOrderResponseCancel {
                                 key,
-                                state: Err(UnindexedOrderError::Rejected(
-                                    ApiError::OrderRejected(
-                                        "cancel response missing orderId".into(),
-                                    ),
-                                )),
+                                state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
+                                    "cancel response missing orderId".into(),
+                                ))),
                             });
                         }
                     };
@@ -1122,13 +1152,10 @@ impl ExecutionClient for BinanceSpot {
         // distinguish — this is a known semantic difference from Binance convention.
         // SDK constraint — OrderPlaceParams::builder takes String, not &str.
         // Allocates two Strings (symbol + client_order_id); unavoidable without SDK changes.
-        let mut params_builder = OrderPlaceParams::builder(
-            instrument.name().to_string(),
-            binance_side,
-            binance_type,
-        )
-        .quantity(quantity)
-        .new_client_order_id(cid.0.to_string());
+        let mut params_builder =
+            OrderPlaceParams::builder(instrument.name().to_string(), binance_side, binance_type)
+                .quantity(quantity)
+                .new_client_order_id(cid.0.to_string());
 
         // Set price for limit orders
         if matches!(kind, OrderKind::Limit) {
@@ -1176,11 +1203,9 @@ impl ExecutionClient for BinanceSpot {
                                 quantity,
                                 kind,
                                 time_in_force,
-                                state: Err(UnindexedOrderError::Rejected(
-                                    ApiError::OrderRejected(
-                                        "open_order response missing orderId".into(),
-                                    ),
-                                )),
+                                state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
+                                    "open_order response missing orderId".into(),
+                                ))),
                             });
                         }
                     };
@@ -1289,7 +1314,10 @@ impl ExecutionClient for BinanceSpot {
             .await
             .map_err(|e| connectivity_error(e.into()))?;
 
-        Ok(filter_and_convert_balances(account.balances.unwrap_or_default(), assets))
+        Ok(filter_and_convert_balances(
+            account.balances.unwrap_or_default(),
+            assets,
+        ))
     }
 
     async fn fetch_open_orders(
@@ -1328,7 +1356,9 @@ impl ExecutionClient for BinanceSpot {
         use futures::StreamExt;
 
         if instruments.is_empty() {
-            debug!("BinanceSpot fetch_trades called with empty instruments slice — returning empty result");
+            debug!(
+                "BinanceSpot fetch_trades called with empty instruments slice — returning empty result"
+            );
             return Ok(Vec::new());
         }
         let start_time_ms = time_since.timestamp_millis();
@@ -1346,7 +1376,8 @@ impl ExecutionClient for BinanceSpot {
                 let pages = paginate_my_trades(&rest, &rate_limiter, &inst, start_time_ms).await?;
                 Ok::<_, UnindexedClientError>((inst, pages))
             }
-        })).buffer_unordered(8);
+        }))
+        .buffer_unordered(8);
         while let Some(result) = stream.next().await {
             let (instrument, trades_data) = result?;
             for t in trades_data {
@@ -1568,7 +1599,9 @@ async fn connection_manager(
             match tokio::time::timeout(
                 Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS),
                 recover_fills(&rest, &rate_limiter, &instruments, dt, &tx, &dedup),
-            ).await {
+            )
+            .await
+            {
                 Ok(()) => {}
                 Err(_) => {
                     // Timeout fires when REST calls are slow (rate-limited, network latency).
@@ -1584,7 +1617,11 @@ async fn connection_manager(
         }
 
         // --- Monitor: wait for disconnect, heartbeat timeout, or consumer drop ---
-        enum DisconnectReason { Signal, HeartbeatTimeout, ConsumerDropped }
+        enum DisconnectReason {
+            Signal,
+            HeartbeatTimeout,
+            ConsumerDropped,
+        }
         let reason = {
             let mut signal_rx = signal_rx;
             loop {
@@ -1681,7 +1718,9 @@ async fn recover_fills(
     use futures::StreamExt;
 
     if instruments.is_empty() {
-        debug!("BinanceSpot recover_fills called with empty instruments slice — no fills will be recovered");
+        debug!(
+            "BinanceSpot recover_fills called with empty instruments slice — no fills will be recovered"
+        );
         return;
     }
     info!(
@@ -1712,10 +1751,14 @@ async fn recover_fills(
                     return None;
                 }
             };
-            let trades: Vec<_> = raw.into_iter().filter_map(|t| convert_my_trade(&t, &inst)).collect();
+            let trades: Vec<_> = raw
+                .into_iter()
+                .filter_map(|t| convert_my_trade(&t, &inst))
+                .collect();
             Some(trades)
         }
-    })).buffer_unordered(8);
+    }))
+    .buffer_unordered(8);
     while let Some(result) = stream.next().await {
         let trades = match result {
             Some(t) => t,
@@ -1727,10 +1770,8 @@ async fn recover_fills(
         for trade in trades {
             // Construct the event first so dedup_key_from_event can be reused,
             // keeping key construction in one place.
-            let event = UnindexedAccountEvent::new(
-                ExchangeId::BinanceSpot,
-                AccountEventKind::Trade(trade),
-            );
+            let event =
+                UnindexedAccountEvent::new(ExchangeId::BinanceSpot, AccountEventKind::Trade(trade));
             // Only Trade events are deduped during recovery — we don't recover NEW/CANCELLED
             // lifecycle events here (those require fetch_open_orders reconciliation).
             if let Some(key) = dedup_key_from_event(&event)
@@ -1758,11 +1799,7 @@ async fn recover_fills(
             "BinanceSpot fill recovery complete with failures — some fills may be permanently missed"
         );
     } else {
-        info!(
-            recovered,
-            duplicates,
-            "BinanceSpot fill recovery complete"
-        );
+        info!(recovered, duplicates, "BinanceSpot fill recovery complete");
     }
 }
 
@@ -1798,7 +1835,11 @@ fn convert_balance_entry(
             return None;
         }
     };
-    Some(AssetBalance::new(asset_name, Balance::new(free + locked, free), now))
+    Some(AssetBalance::new(
+        asset_name,
+        Balance::new(free + locked, free),
+        now,
+    ))
 }
 
 fn filter_and_convert_balances(
@@ -1861,8 +1902,9 @@ fn convert_open_order(
         warn!(%instrument, order_id = %order_id_raw, "BinanceSpot open order missing clientOrderId, using orderId as fallback — order may not reconcile with engine state");
     }
     let cid = ClientOrderId::new(
-        o.client_order_id.as_deref()
-            .unwrap_or(&format_smolstr!("{}", order_id_raw))
+        o.client_order_id
+            .as_deref()
+            .unwrap_or(&format_smolstr!("{}", order_id_raw)),
     );
     let side = match o.side.as_deref() {
         // parse_side already logs a warning on unknown values
@@ -1879,7 +1921,11 @@ fn convert_open_order(
             return None;
         }
     };
-    let quantity = match o.orig_qty.as_deref().and_then(|s| Decimal::from_str(s).ok()) {
+    let quantity = match o
+        .orig_qty
+        .as_deref()
+        .and_then(|s| Decimal::from_str(s).ok())
+    {
         Some(v) => v,
         None => {
             warn!(%instrument, order_id = %order_id_raw, "BinanceSpot open order missing/unparseable origQty");
@@ -1952,7 +1998,13 @@ fn convert_my_trade(
         }
     };
     let side = match t.is_buyer {
-        Some(is_buyer) => if is_buyer { Side::Buy } else { Side::Sell },
+        Some(is_buyer) => {
+            if is_buyer {
+                Side::Buy
+            } else {
+                Side::Sell
+            }
+        }
         None => {
             warn!(%instrument, trade_id = %trade_id_raw, "BinanceSpot trade missing isBuyer");
             return None;
@@ -1972,7 +2024,9 @@ fn convert_my_trade(
             return None;
         }
     };
-    let commission = t.commission.as_deref()
+    let commission = t
+        .commission
+        .as_deref()
         .and_then(|s| Decimal::from_str(s).ok())
         .unwrap_or(Decimal::ZERO);
     let time_exchange = match t.time.and_then(|ms| Utc.timestamp_millis_opt(ms).single()) {
@@ -2095,7 +2149,10 @@ fn convert_execution_report(
     };
 
     // binance-sdk renames single-letter fields: `t_uppercase` = Binance JSON field `T`
-    let time_exchange = match report.t_uppercase.and_then(|ms| Utc.timestamp_millis_opt(ms).single()) {
+    let time_exchange = match report
+        .t_uppercase
+        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+    {
         Some(t) => t,
         None => {
             warn!(%symbol, "BinanceSpot executionReport missing/unparseable transaction time (T), using now");
@@ -2211,15 +2268,10 @@ fn convert_execution_report(
                 "BinanceSpot order REJECTED by matching engine"
             );
             let response = UnindexedOrderResponseCancel {
-                key: OrderKey::new(
-                    ExchangeId::BinanceSpot,
-                    symbol,
-                    StrategyId::unknown(),
-                    cid,
-                ),
-                state: Err(UnindexedOrderError::Rejected(
-                    ApiError::OrderRejected(reject_reason),
-                )),
+                key: OrderKey::new(ExchangeId::BinanceSpot, symbol, StrategyId::unknown(), cid),
+                state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
+                    reject_reason,
+                ))),
             };
 
             Some(UnindexedAccountEvent::new(
@@ -2236,12 +2288,7 @@ fn convert_execution_report(
             // engine removes it from its open-order book.
             let cancelled = Cancelled::new(order_id, time_exchange);
             let response = UnindexedOrderResponseCancel {
-                key: OrderKey::new(
-                    ExchangeId::BinanceSpot,
-                    symbol,
-                    StrategyId::unknown(),
-                    cid,
-                ),
+                key: OrderKey::new(ExchangeId::BinanceSpot, symbol, StrategyId::unknown(), cid),
                 state: Ok(cancelled),
             };
             Some(UnindexedAccountEvent::new(
@@ -2330,9 +2377,9 @@ fn convert_new_order(
 
     Some(UnindexedAccountEvent::new(
         ExchangeId::BinanceSpot,
-        AccountEventKind::OrderSnapshot(
-            barter_integration::collection::snapshot::Snapshot::new(order),
-        ),
+        AccountEventKind::OrderSnapshot(barter_integration::collection::snapshot::Snapshot::new(
+            order,
+        )),
     ))
 }
 
@@ -2373,11 +2420,7 @@ fn convert_account_position(
                 continue;
             }
         };
-        let balance = AssetBalance::new(
-            asset,
-            Balance::new(free + locked, free),
-            time_exchange,
-        );
+        let balance = AssetBalance::new(asset, Balance::new(free + locked, free), time_exchange);
         buf.push(UnindexedAccountEvent::new(
             ExchangeId::BinanceSpot,
             AccountEventKind::BalanceSnapshot(
@@ -2410,7 +2453,10 @@ fn parse_order_kind(t: &str) -> Option<OrderKind> {
         // Drop them: mapping to Market would misrepresent conditional orders as
         // immediately executable in snapshots, which is more dangerous than omitting.
         "STOP_LOSS" | "TAKE_PROFIT" => {
-            warn!(order_type = t, "dropping conditional Binance order type (no OrderKind equivalent)");
+            warn!(
+                order_type = t,
+                "dropping conditional Binance order type (no OrderKind equivalent)"
+            );
             None
         }
         // STOP_LOSS_LIMIT and TAKE_PROFIT_LIMIT are conditional orders
@@ -2419,9 +2465,7 @@ fn parse_order_kind(t: &str) -> Option<OrderKind> {
         // but preserves visibility into open orders. Dropping them (like the
         // pure stop variants above) would lose order tracking entirely.
         // Acceptable for Phase 1: the crypto repo wrapper doesn't place stop orders.
-        "LIMIT" | "LIMIT_MAKER" | "STOP_LOSS_LIMIT" | "TAKE_PROFIT_LIMIT" => {
-            Some(OrderKind::Limit)
-        }
+        "LIMIT" | "LIMIT_MAKER" | "STOP_LOSS_LIMIT" | "TAKE_PROFIT_LIMIT" => Some(OrderKind::Limit),
         _ => {
             warn!(order_type = t, "unsupported Binance order type");
             None
@@ -2437,7 +2481,10 @@ fn parse_time_in_force(tif: &str) -> TimeInForce {
         "FOK" => TimeInForce::FillOrKill,
         "GTD" => TimeInForce::GoodUntilEndOfDay,
         _ => {
-            warn!(time_in_force = tif, "unknown Binance TimeInForce, defaulting to GTC");
+            warn!(
+                time_in_force = tif,
+                "unknown Binance TimeInForce, defaulting to GTC"
+            );
             TimeInForce::GoodUntilCancelled { post_only: false }
         }
     }
@@ -2450,23 +2497,29 @@ fn convert_order_kind_tif(
     match kind {
         OrderKind::Market => (OrderPlaceTypeEnum::Market, None),
         OrderKind::Limit => match tif {
-            TimeInForce::GoodUntilCancelled { post_only: false } => {
-                (OrderPlaceTypeEnum::Limit, Some(OrderPlaceTimeInForceEnum::Gtc))
-            }
+            TimeInForce::GoodUntilCancelled { post_only: false } => (
+                OrderPlaceTypeEnum::Limit,
+                Some(OrderPlaceTimeInForceEnum::Gtc),
+            ),
             TimeInForce::GoodUntilCancelled { post_only: true } => {
                 // LIMIT_MAKER is Binance's post-only order type (rejects if
                 // it would immediately match as taker)
                 (OrderPlaceTypeEnum::LimitMaker, None)
             }
-            TimeInForce::FillOrKill => {
-                (OrderPlaceTypeEnum::Limit, Some(OrderPlaceTimeInForceEnum::Fok))
-            }
-            TimeInForce::ImmediateOrCancel => {
-                (OrderPlaceTypeEnum::Limit, Some(OrderPlaceTimeInForceEnum::Ioc))
-            }
+            TimeInForce::FillOrKill => (
+                OrderPlaceTypeEnum::Limit,
+                Some(OrderPlaceTimeInForceEnum::Fok),
+            ),
+            TimeInForce::ImmediateOrCancel => (
+                OrderPlaceTypeEnum::Limit,
+                Some(OrderPlaceTimeInForceEnum::Ioc),
+            ),
             TimeInForce::GoodUntilEndOfDay => {
                 warn!("Binance Spot does not support GTD; coercing to GTC");
-                (OrderPlaceTypeEnum::Limit, Some(OrderPlaceTimeInForceEnum::Gtc))
+                (
+                    OrderPlaceTypeEnum::Limit,
+                    Some(OrderPlaceTimeInForceEnum::Gtc),
+                )
             }
         },
     }
@@ -2531,9 +2584,14 @@ fn parse_binance_api_error(
 
     // Fall back to case-insensitive message text heuristics (avoid to_lowercase allocation)
     fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
-        haystack.as_bytes().windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+        haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
     }
-    if contains_ignore_case(&error_msg, "insufficient") || contains_ignore_case(&error_msg, "not enough") {
+    if contains_ignore_case(&error_msg, "insufficient")
+        || contains_ignore_case(&error_msg, "not enough")
+    {
         // the AssetNameExchange field here holds the *instrument* name (e.g.
         // "BTCUSDT"), NOT an actual asset name ("BTC" or "USDT"). Splitting the pair
         // into base/quote is unreliable without exchange symbol-info metadata.
@@ -2589,7 +2647,10 @@ mod tests {
         assert_eq!(parse_order_kind("STOP_LOSS"), None);
         assert_eq!(parse_order_kind("TAKE_PROFIT"), None);
         assert_eq!(parse_order_kind("STOP_LOSS_LIMIT"), Some(OrderKind::Limit));
-        assert_eq!(parse_order_kind("TAKE_PROFIT_LIMIT"), Some(OrderKind::Limit));
+        assert_eq!(
+            parse_order_kind("TAKE_PROFIT_LIMIT"),
+            Some(OrderKind::Limit)
+        );
         assert_eq!(parse_order_kind("UNKNOWN_TYPE"), None);
     }
 
@@ -2625,7 +2686,10 @@ mod tests {
                 OrderKind::Limit,
                 TimeInForce::GoodUntilCancelled { post_only: false }
             ),
-            (OrderPlaceTypeEnum::Limit, Some(OrderPlaceTimeInForceEnum::Gtc))
+            (
+                OrderPlaceTypeEnum::Limit,
+                Some(OrderPlaceTimeInForceEnum::Gtc)
+            )
         ));
         assert!(matches!(
             convert_order_kind_tif(
@@ -2636,16 +2700,25 @@ mod tests {
         ));
         assert!(matches!(
             convert_order_kind_tif(OrderKind::Limit, TimeInForce::FillOrKill),
-            (OrderPlaceTypeEnum::Limit, Some(OrderPlaceTimeInForceEnum::Fok))
+            (
+                OrderPlaceTypeEnum::Limit,
+                Some(OrderPlaceTimeInForceEnum::Fok)
+            )
         ));
         assert!(matches!(
             convert_order_kind_tif(OrderKind::Limit, TimeInForce::ImmediateOrCancel),
-            (OrderPlaceTypeEnum::Limit, Some(OrderPlaceTimeInForceEnum::Ioc))
+            (
+                OrderPlaceTypeEnum::Limit,
+                Some(OrderPlaceTimeInForceEnum::Ioc)
+            )
         ));
         // GoodUntilEndOfDay coerces to GTC on Binance Spot
         assert!(matches!(
             convert_order_kind_tif(OrderKind::Limit, TimeInForce::GoodUntilEndOfDay),
-            (OrderPlaceTypeEnum::Limit, Some(OrderPlaceTimeInForceEnum::Gtc))
+            (
+                OrderPlaceTypeEnum::Limit,
+                Some(OrderPlaceTimeInForceEnum::Gtc)
+            )
         ));
     }
 
@@ -2715,22 +2788,43 @@ mod tests {
     #[test]
     fn test_contains_error_code_suffix_guard() {
         // Suffix digit guard: "-2013" must not match "-20130" or "-20131"
-        assert!(!contains_error_code("-20130", "-2013"), "-20130 should not match -2013");
-        assert!(!contains_error_code("-20131", "-2013"), "-20131 should not match -2013");
+        assert!(
+            !contains_error_code("-20130", "-2013"),
+            "-20130 should not match -2013"
+        );
+        assert!(
+            !contains_error_code("-20131", "-2013"),
+            "-20131 should not match -2013"
+        );
         // Exact match and match with trailing text should succeed
         assert!(contains_error_code("-2013", "-2013"), "exact match");
-        assert!(contains_error_code("Error -2013: text", "-2013"), "match with trailing text");
+        assert!(
+            contains_error_code("Error -2013: text", "-2013"),
+            "match with trailing text"
+        );
     }
 
     #[test]
     fn test_contains_error_code_prefix_guard() {
         // Prefix digit guard: "-2013" must not match a string where the code
         // is immediately preceded by a digit (e.g. "1-2013" in some error context).
-        assert!(!contains_error_code("1-2013", "-2013"), "1-2013 should not match -2013");
-        assert!(!contains_error_code("error 1-2013 text", "-2013"), "embedded 1-2013 should not match");
+        assert!(
+            !contains_error_code("1-2013", "-2013"),
+            "1-2013 should not match -2013"
+        );
+        assert!(
+            !contains_error_code("error 1-2013 text", "-2013"),
+            "embedded 1-2013 should not match"
+        );
         // Non-digit prefix should still match
-        assert!(contains_error_code("code=-2013,", "-2013"), "=-2013 prefix should match");
-        assert!(contains_error_code(" -2013 ", "-2013"), "space prefix should match");
+        assert!(
+            contains_error_code("code=-2013,", "-2013"),
+            "=-2013 prefix should match"
+        );
+        assert!(
+            contains_error_code(" -2013 ", "-2013"),
+            "space prefix should match"
+        );
     }
 
     #[test]
@@ -2751,16 +2845,28 @@ mod tests {
     #[test]
     fn test_dedup_cache() {
         let cache = new_dedup_cache();
-        let key = DedupKey { instrument: SmolStr::from("BTCUSDT"), id: SmolStr::from("12345"), kind: DedupEventKind::Trade };
+        let key = DedupKey {
+            instrument: SmolStr::from("BTCUSDT"),
+            id: SmolStr::from("12345"),
+            kind: DedupEventKind::Trade,
+        };
 
         // First time: not a duplicate
         assert!(!is_duplicate(&cache, key));
         // Second time: is a duplicate
-        let key = DedupKey { instrument: SmolStr::from("BTCUSDT"), id: SmolStr::from("12345"), kind: DedupEventKind::Trade };
+        let key = DedupKey {
+            instrument: SmolStr::from("BTCUSDT"),
+            id: SmolStr::from("12345"),
+            kind: DedupEventKind::Trade,
+        };
         assert!(is_duplicate(&cache, key));
 
         // Different key (same id, different kind): not a duplicate
-        let key2 = DedupKey { instrument: SmolStr::from("BTCUSDT"), id: SmolStr::from("12345"), kind: DedupEventKind::New };
+        let key2 = DedupKey {
+            instrument: SmolStr::from("BTCUSDT"),
+            id: SmolStr::from("12345"),
+            kind: DedupEventKind::New,
+        };
         assert!(!is_duplicate(&cache, key2));
     }
 
@@ -2775,17 +2881,25 @@ mod tests {
             "The IP address has been banned for exceeding rate limits. Contact support."
         )));
         // Binance error codes in the msg body
-        assert!(is_rate_limit_error(&anyhow::anyhow!("Error -1015: too many new orders")));
-        assert!(is_rate_limit_error(&anyhow::anyhow!("Error -1003: too many requests")));
+        assert!(is_rate_limit_error(&anyhow::anyhow!(
+            "Error -1015: too many new orders"
+        )));
+        assert!(is_rate_limit_error(&anyhow::anyhow!(
+            "Error -1003: too many requests"
+        )));
         // Non-rate-limit errors
         assert!(!is_rate_limit_error(&anyhow::anyhow!("order 4290 failed")));
         assert!(!is_rate_limit_error(&anyhow::anyhow!("connection timeout")));
         assert!(!is_rate_limit_error(&anyhow::anyhow!("unknown error")));
         // Digit-boundary false-positive guard: longer codes must NOT match
-        assert!(!is_rate_limit_error(&anyhow::anyhow!("Error -10150: some other error")),
-            "-10150 should not match -1015");
-        assert!(!is_rate_limit_error(&anyhow::anyhow!("Error -10030: some other error")),
-            "-10030 should not match -1003");
+        assert!(
+            !is_rate_limit_error(&anyhow::anyhow!("Error -10150: some other error")),
+            "-10150 should not match -1015"
+        );
+        assert!(
+            !is_rate_limit_error(&anyhow::anyhow!("Error -10030: some other error")),
+            "-10030 should not match -1003"
+        );
     }
 
     #[test]
@@ -2817,12 +2931,12 @@ mod tests {
 
     #[test]
     fn test_dedup_key_from_event_trade_includes_instrument() {
-        use crate::trade::{AssetFees, Trade, TradeId};
         use crate::order::id::{OrderId, StrategyId};
+        use crate::trade::{AssetFees, Trade, TradeId};
         use barter_instrument::Side;
+        use barter_instrument::asset::QuoteAsset;
         use chrono::Utc;
         use rust_decimal::Decimal;
-        use barter_instrument::asset::QuoteAsset;
 
         let instrument = InstrumentNameExchange::new("BTCUSDT");
         let trade = Trade::<QuoteAsset, InstrumentNameExchange>::new(
@@ -2836,15 +2950,17 @@ mod tests {
             Decimal::ZERO,
             AssetFees::quote_fees(Decimal::ZERO),
         );
-        let event = UnindexedAccountEvent::new(
-            ExchangeId::BinanceSpot,
-            AccountEventKind::Trade(trade),
-        );
+        let event =
+            UnindexedAccountEvent::new(ExchangeId::BinanceSpot, AccountEventKind::Trade(trade));
 
         let key = dedup_key_from_event(&event).expect("Trade should produce a DedupKey");
         assert_eq!(key.kind, DedupEventKind::Trade);
         assert_eq!(key.id.as_str(), "9001", "key.id should be the trade ID");
-        assert_eq!(key.instrument.as_str(), "BTCUSDT", "key.instrument should be the symbol");
+        assert_eq!(
+            key.instrument.as_str(),
+            "BTCUSDT",
+            "key.instrument should be the symbol"
+        );
 
         // Same trade ID on a different instrument must produce a different key (cross-symbol collision prevention)
         let instrument2 = InstrumentNameExchange::new("ETHUSDT");
@@ -2859,21 +2975,24 @@ mod tests {
             Decimal::ZERO,
             AssetFees::quote_fees(Decimal::ZERO),
         );
-        let event2 = UnindexedAccountEvent::new(
-            ExchangeId::BinanceSpot,
-            AccountEventKind::Trade(trade2),
-        );
+        let event2 =
+            UnindexedAccountEvent::new(ExchangeId::BinanceSpot, AccountEventKind::Trade(trade2));
         let key2 = dedup_key_from_event(&event2).expect("Trade should produce a DedupKey");
-        assert_ne!(key, key2, "same trade ID on different symbols must produce distinct keys");
+        assert_ne!(
+            key, key2,
+            "same trade ID on different symbols must produce distinct keys"
+        );
     }
 
     // ---------------------------------------------------------------------------
     // convert_account_position tests
     // ---------------------------------------------------------------------------
 
-    fn make_balance_inner(asset: &str, free: &str, locked: &str)
-        -> binance_sdk::spot::websocket_api::OutboundAccountPositionBInner
-    {
+    fn make_balance_inner(
+        asset: &str,
+        free: &str,
+        locked: &str,
+    ) -> binance_sdk::spot::websocket_api::OutboundAccountPositionBInner {
         binance_sdk::spot::websocket_api::OutboundAccountPositionBInner {
             a: Some(asset.to_string()),
             f: Some(free.to_string()),
@@ -2980,7 +3099,10 @@ mod tests {
         };
         let mut buf = Vec::new();
         convert_account_position(position, &mut buf);
-        assert!(buf.is_empty(), "empty balance list should produce no events");
+        assert!(
+            buf.is_empty(),
+            "empty balance list should produce no events"
+        );
     }
 
     #[test]
@@ -3010,10 +3132,7 @@ mod tests {
         }
 
         // The next call must return false (exhausted)
-        assert!(
-            !backoff.wait().await,
-            "expected false after max attempts"
-        );
+        assert!(!backoff.wait().await, "expected false after max attempts");
     }
 
     #[tokio::test]
@@ -3262,9 +3381,11 @@ mod tests {
     // filter_and_convert_balances tests
     // ---------------------------------------------------------------------------
 
-    fn make_balance(asset: &str, free: &str, locked: &str)
-        -> binance_sdk::spot::rest_api::GetAccountResponseBalancesInner
-    {
+    fn make_balance(
+        asset: &str,
+        free: &str,
+        locked: &str,
+    ) -> binance_sdk::spot::rest_api::GetAccountResponseBalancesInner {
         binance_sdk::spot::rest_api::GetAccountResponseBalancesInner {
             asset: Some(asset.to_string()),
             free: Some(free.to_string()),
@@ -3305,7 +3426,10 @@ mod tests {
         ];
         let assets = vec![AssetNameExchange::new("USDT")];
         let result = filter_and_convert_balances(balances, &assets);
-        assert!(result.is_empty(), "non-matching asset should be filtered out");
+        assert!(
+            result.is_empty(),
+            "non-matching asset should be filtered out"
+        );
     }
 
     #[test]
@@ -3319,7 +3443,11 @@ mod tests {
             make_balance("USDT", "100.0", "0.0"),
         ];
         let result = filter_and_convert_balances(balances, &[]);
-        assert_eq!(result.len(), 1, "entry with missing asset should be skipped");
+        assert_eq!(
+            result.len(),
+            1,
+            "entry with missing asset should be skipped"
+        );
         assert_eq!(result[0].asset, AssetNameExchange::new("USDT"));
     }
 
@@ -3333,7 +3461,10 @@ mod tests {
             },
         ];
         let result = filter_and_convert_balances(balances, &[]);
-        assert!(result.is_empty(), "unparseable free field should be skipped");
+        assert!(
+            result.is_empty(),
+            "unparseable free field should be skipped"
+        );
     }
 
     #[test]
@@ -3346,7 +3477,10 @@ mod tests {
         ];
         let result = filter_and_convert_balances(balances, &[]);
         assert_eq!(result.len(), 2, "zero-balance entries must be included");
-        let btc = result.iter().find(|b| b.asset == AssetNameExchange::new("BTC")).unwrap();
+        let btc = result
+            .iter()
+            .find(|b| b.asset == AssetNameExchange::new("BTC"))
+            .unwrap();
         assert_eq!(btc.balance.total, Decimal::ZERO);
         assert_eq!(btc.balance.free, Decimal::ZERO);
     }
@@ -3361,7 +3495,11 @@ mod tests {
             make_balance("BTC", "2.0", "0.0"),
         ];
         let result = filter_and_convert_balances(balances, &[]);
-        assert_eq!(result.len(), 2, "duplicate asset entries produce two AssetBalance entries");
+        assert_eq!(
+            result.len(),
+            2,
+            "duplicate asset entries produce two AssetBalance entries"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -3384,8 +3522,8 @@ mod tests {
     #[test]
     fn test_convert_my_trade_happy_path() {
         let instrument = InstrumentNameExchange::new("BTCUSDT");
-        let trade = convert_my_trade(&make_base_trade(), &instrument)
-            .expect("valid trade should convert");
+        let trade =
+            convert_my_trade(&make_base_trade(), &instrument).expect("valid trade should convert");
         assert_eq!(trade.instrument, instrument);
         assert_eq!(trade.side, Side::Buy);
         assert_eq!(trade.price, Decimal::from_str("50000.00").unwrap());
@@ -3410,7 +3548,10 @@ mod tests {
             id: None,
             ..make_base_trade()
         };
-        assert!(convert_my_trade(&t, &instrument).is_none(), "missing id should return None");
+        assert!(
+            convert_my_trade(&t, &instrument).is_none(),
+            "missing id should return None"
+        );
     }
 
     #[test]
@@ -3446,7 +3587,8 @@ mod tests {
             commission: None,
             ..make_base_trade()
         };
-        let trade = convert_my_trade(&t, &instrument).expect("None commission should still convert");
+        let trade =
+            convert_my_trade(&t, &instrument).expect("None commission should still convert");
         assert_eq!(trade.fees.fees, Decimal::ZERO);
     }
 
@@ -3528,9 +3670,13 @@ mod tests {
             executed_qty: None,
             ..make_base_open_order()
         };
-        let order = convert_open_order(&o, &instrument)
-            .expect("None executedQty should still convert");
-        assert_eq!(order.state.filled_quantity, Decimal::ZERO, "None executedQty should default to zero");
+        let order =
+            convert_open_order(&o, &instrument).expect("None executedQty should still convert");
+        assert_eq!(
+            order.state.filled_quantity,
+            Decimal::ZERO,
+            "None executedQty should default to zero"
+        );
     }
 
     #[test]
@@ -3555,8 +3701,10 @@ mod tests {
 
     #[test]
     fn test_dedup_key_from_event_non_open_states_return_none() {
+        use crate::order::state::{
+            ActiveOrderState, CancelInFlight, InactiveOrderState, OpenInFlight,
+        };
         use barter_integration::collection::snapshot::Snapshot;
-        use crate::order::state::{ActiveOrderState, CancelInFlight, InactiveOrderState, OpenInFlight};
 
         let key = OrderKey::new(
             ExchangeId::BinanceSpot,
@@ -3635,8 +3783,7 @@ mod tests {
             r: Some("INSUFFICIENT_FUNDS".to_string()),
             ..make_base_report()
         };
-        let event = convert_execution_report(report)
-            .expect("REJECTED report should produce Some");
+        let event = convert_execution_report(report).expect("REJECTED report should produce Some");
         assert!(
             matches!(&event.kind, AccountEventKind::OrderCancelled(r) if r.state.is_err()),
             "prerequisite: event is OrderCancelled with Err"
@@ -3668,7 +3815,10 @@ mod tests {
             UserDataStreamEventsResponse::ExecutionReport(Box::new(report)),
             &mut buf,
         );
-        assert!(!terminated, "ExecutionReport should not signal stream termination");
+        assert!(
+            !terminated,
+            "ExecutionReport should not signal stream termination"
+        );
         assert_eq!(buf.len(), 1, "ExecutionReport should push one event");
         assert!(matches!(buf[0].kind, AccountEventKind::OrderSnapshot(_)));
     }
@@ -3685,8 +3835,15 @@ mod tests {
             UserDataStreamEventsResponse::OutboundAccountPosition(Box::new(position)),
             &mut buf,
         );
-        assert!(!terminated, "OutboundAccountPosition should not signal stream termination");
-        assert_eq!(buf.len(), 1, "OutboundAccountPosition should push one balance event");
+        assert!(
+            !terminated,
+            "OutboundAccountPosition should not signal stream termination"
+        );
+        assert_eq!(
+            buf.len(),
+            1,
+            "OutboundAccountPosition should push one balance event"
+        );
     }
 
     #[test]
@@ -3699,7 +3856,10 @@ mod tests {
             UserDataStreamEventsResponse::BalanceUpdate(Box::new(update)),
             &mut buf,
         );
-        assert!(!terminated, "BalanceUpdate should not signal stream termination");
+        assert!(
+            !terminated,
+            "BalanceUpdate should not signal stream termination"
+        );
         assert!(buf.is_empty(), "BalanceUpdate should push no events");
     }
 
@@ -3710,8 +3870,14 @@ mod tests {
             UserDataStreamEventsResponse::EventStreamTerminated(Default::default()),
             &mut buf,
         );
-        assert!(terminated, "EventStreamTerminated must signal stream termination");
-        assert!(buf.is_empty(), "EventStreamTerminated should push no events");
+        assert!(
+            terminated,
+            "EventStreamTerminated must signal stream termination"
+        );
+        assert!(
+            buf.is_empty(),
+            "EventStreamTerminated should push no events"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -3723,9 +3889,12 @@ mod tests {
         tokio::time::pause();
         let tracker = RateLimitTracker::new();
         // wait_if_blocked should return immediately (no cooldown set)
-        tokio::time::timeout(std::time::Duration::from_millis(1), tracker.wait_if_blocked())
-            .await
-            .expect("wait_if_blocked should return immediately when not blocked");
+        tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            tracker.wait_if_blocked(),
+        )
+        .await
+        .expect("wait_if_blocked should return immediately when not blocked");
     }
 
     #[tokio::test]
@@ -3809,7 +3978,8 @@ mod tests {
                 // Splitting the instrument into base/quote requires symbol-info metadata.
                 // Do NOT pattern-match on this field to identify the low-balance asset.
                 assert_eq!(
-                    asset_field.name().as_str(), "BTCUSDT",
+                    asset_field.name().as_str(),
+                    "BTCUSDT",
                     "BalanceInsufficient.0 holds the instrument name, not an asset name"
                 );
             }
@@ -3843,5 +4013,4 @@ mod tests {
             "context-wrapped ResponseError must still be detected — anyhow::downcast_ref searches the full chain"
         );
     }
-
 }

@@ -9,13 +9,13 @@ use crate::{
     },
     trade::Trade,
 };
-use rust_decimal::Decimal;
 use barter_instrument::{
     asset::{QuoteAsset, name::AssetNameExchange},
     exchange::ExchangeId,
     instrument::name::InstrumentNameExchange,
 };
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use tokio::sync::oneshot;
 
 /// Market price snapshot passed alongside an order request so the

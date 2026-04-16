@@ -27,13 +27,13 @@ use barter::{
     },
     execution::{AccountStreamEvent, request::ExecutionRequest},
     risk::DefaultRiskManager,
+    statistic::time::Annual365,
     strategy::{
         algo::AlgoStrategy,
         close_positions::{ClosePositionsStrategy, close_open_positions_with_market_orders},
         on_disconnect::OnDisconnectStrategy,
         on_trading_disabled::OnTradingDisabled,
     },
-    statistic::time::Annual365,
     test_utils::time_plus_days,
 };
 use barter_data::{
@@ -93,6 +93,15 @@ const STARTING_BALANCE_ETH: Balance = Balance {
     free: dec!(10.0),
 };
 const QUOTE_FEES_PERCENT: f64 = 0.1; // 10%
+
+// Type alias to avoid clippy::type_complexity warnings in test helper functions
+type TestEngine = Engine<
+    HistoricalClock,
+    EngineState<DefaultGlobalData, DefaultInstrumentMarketData>,
+    MultiExchangeTxMap<UnboundedTx<ExecutionRequest>>,
+    TestBuyAndHoldStrategy,
+    DefaultRiskManager<EngineState<DefaultGlobalData, DefaultInstrumentMarketData>>,
+>;
 
 #[test]
 fn test_engine_process_engine_event_with_audit() {
@@ -856,13 +865,7 @@ impl
 fn build_engine(
     trading_state: TradingState,
     execution_tx: UnboundedTx<ExecutionRequest>,
-) -> Engine<
-    HistoricalClock,
-    EngineState<DefaultGlobalData, DefaultInstrumentMarketData>,
-    MultiExchangeTxMap<UnboundedTx<ExecutionRequest>>,
-    TestBuyAndHoldStrategy,
-    DefaultRiskManager<EngineState<DefaultGlobalData, DefaultInstrumentMarketData>>,
-> {
+) -> TestEngine {
     let instruments = IndexedInstruments::builder()
         .add_instrument(Instrument::spot(
             ExchangeId::BinanceSpot,
@@ -1051,13 +1054,7 @@ fn command_close_position(instrument: usize) -> EngineEvent<DataKind> {
 fn build_option_engine(
     trading_state: TradingState,
     execution_tx: UnboundedTx<ExecutionRequest>,
-) -> Engine<
-    HistoricalClock,
-    EngineState<DefaultGlobalData, DefaultInstrumentMarketData>,
-    MultiExchangeTxMap<UnboundedTx<ExecutionRequest>>,
-    TestBuyAndHoldStrategy,
-    DefaultRiskManager<EngineState<DefaultGlobalData, DefaultInstrumentMarketData>>,
-> {
+) -> TestEngine {
     let expiry = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
         .unwrap()
         .with_timezone(&Utc);
@@ -1116,33 +1113,13 @@ fn build_option_engine(
 }
 
 /// Send a market trade event to set the spot price for instrument at index `instrument`.
-fn send_spot_price(
-    engine: &mut Engine<
-        HistoricalClock,
-        EngineState<DefaultGlobalData, DefaultInstrumentMarketData>,
-        MultiExchangeTxMap<UnboundedTx<ExecutionRequest>>,
-        TestBuyAndHoldStrategy,
-        DefaultRiskManager<EngineState<DefaultGlobalData, DefaultInstrumentMarketData>>,
-    >,
-    instrument: usize,
-    price: f64,
-) {
+fn send_spot_price(engine: &mut TestEngine, instrument: usize, price: f64) {
     let event = market_event_trade(1, instrument, price);
     engine.process(event);
 }
 
 /// Open a long position in the option instrument (index 0) by sending a buy trade.
-fn open_option_position(
-    engine: &mut Engine<
-        HistoricalClock,
-        EngineState<DefaultGlobalData, DefaultInstrumentMarketData>,
-        MultiExchangeTxMap<UnboundedTx<ExecutionRequest>>,
-        TestBuyAndHoldStrategy,
-        DefaultRiskManager<EngineState<DefaultGlobalData, DefaultInstrumentMarketData>>,
-    >,
-    quantity: f64,
-    price: f64,
-) {
+fn open_option_position(engine: &mut TestEngine, quantity: f64, price: f64) {
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
         kind: AccountEventKind::Trade(Trade {
@@ -1172,13 +1149,15 @@ fn test_contract_expiry_otm_call() {
     open_option_position(&mut engine, 2.0, 1_000.0);
 
     // Verify position exists before expiry (option is at index 0)
-    assert!(!engine
-        .state
-        .instruments
-        .instrument_index(&InstrumentIndex(0))
-        .position
-        .positions
-        .is_empty());
+    assert!(
+        !engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .position
+            .positions
+            .is_empty()
+    );
 
     // Process ContractExpiry
     let exited = engine.process_contract_expiry(&InstrumentIndex(0));
@@ -1188,20 +1167,24 @@ fn test_contract_expiry_otm_call() {
     assert_eq!(exited[0].pnl_realised, dec!(-2_000)); // bought at 1000*2, settled at 0
 
     // Position should be cleared
-    assert!(engine
-        .state
-        .instruments
-        .instrument_index(&InstrumentIndex(0))
-        .position
-        .positions
-        .is_empty());
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .position
+            .positions
+            .is_empty()
+    );
 
     // expiration_processed flag should be set
-    assert!(engine
-        .state
-        .instruments
-        .instrument_index(&InstrumentIndex(0))
-        .expiration_processed);
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .expiration_processed
+    );
 }
 
 #[test]
@@ -1224,19 +1207,23 @@ fn test_contract_expiry_itm_call() {
     assert_eq!(exited[0].pnl_realised, dec!(3_000));
 
     // Position should be cleared (consistency with OTM test)
-    assert!(engine
-        .state
-        .instruments
-        .instrument_index(&InstrumentIndex(0))
-        .position
-        .positions
-        .is_empty());
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .position
+            .positions
+            .is_empty()
+    );
 
-    assert!(engine
-        .state
-        .instruments
-        .instrument_index(&InstrumentIndex(0))
-        .expiration_processed);
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .expiration_processed
+    );
 }
 
 #[test]
@@ -1250,11 +1237,13 @@ fn test_contract_expiry_idempotent() {
     // First expiry processes the position
     let exited_first = engine.process_contract_expiry(&InstrumentIndex(0));
     assert_eq!(exited_first.len(), 1);
-    assert!(engine
-        .state
-        .instruments
-        .instrument_index(&InstrumentIndex(0))
-        .expiration_processed);
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .expiration_processed
+    );
 
     // Second call: idempotent — returns empty vec, does not panic
     let exited_second = engine.process_contract_expiry(&InstrumentIndex(0));
@@ -1271,11 +1260,13 @@ fn test_contract_expiry_no_position() {
     // No position open — expiry should still mark as processed
     let exited = engine.process_contract_expiry(&InstrumentIndex(0));
     assert!(exited.is_empty());
-    assert!(engine
-        .state
-        .instruments
-        .instrument_index(&InstrumentIndex(0))
-        .expiration_processed);
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .expiration_processed
+    );
 }
 
 #[test]
@@ -1293,11 +1284,13 @@ fn test_contract_expiry_missing_spot_price() {
     assert!(exited.is_empty());
 
     // expiration_processed must NOT be set (event is retryable)
-    assert!(!engine
-        .state
-        .instruments
-        .instrument_index(&InstrumentIndex(0))
-        .expiration_processed);
+    assert!(
+        !engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .expiration_processed
+    );
 }
 
 #[test]
@@ -1333,29 +1326,43 @@ fn test_contract_expiry_replica_state_cleared() {
         context: seed_context,
     };
 
-    let dummy_updates: std::iter::Empty<AuditTick<EngineAudit<EngineEvent<DataKind>, EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>>>> = std::iter::empty();
+    // Type annotation required for StateReplicaManager::new to infer the iterator element type
+    #[allow(clippy::type_complexity)]
+    let dummy_updates: std::iter::Empty<
+        AuditTick<
+            EngineAudit<
+                EngineEvent<DataKind>,
+                EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>,
+            >,
+        >,
+    > = std::iter::empty();
     let mut replica_manager = StateReplicaManager::new(seed_tick, dummy_updates);
 
     // Extract outputs from the audit to drive the replica update_from_event.
     // We reconstruct the outputs as a fresh NoneOneOrMany from the PositionExit items.
-    let outputs: NoneOneOrMany<EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>> = match &audit_tick.event {
-        EngineAudit::Process(audit) => {
-            let exits: Vec<_> = audit.outputs.iter()
-                .filter_map(|o| match o {
-                    EngineOutput::PositionExit(p) => Some(EngineOutput::PositionExit(p.clone())),
-                    _ => None,
-                })
-                .collect();
-            if exits.is_empty() {
-                NoneOneOrMany::None
-            } else if exits.len() == 1 {
-                NoneOneOrMany::One(exits.into_iter().next().unwrap())
-            } else {
-                NoneOneOrMany::Many(exits)
+    let outputs: NoneOneOrMany<EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>> =
+        match &audit_tick.event {
+            EngineAudit::Process(audit) => {
+                let exits: Vec<_> = audit
+                    .outputs
+                    .iter()
+                    .filter_map(|o| match o {
+                        EngineOutput::PositionExit(p) => {
+                            Some(EngineOutput::PositionExit(p.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if exits.is_empty() {
+                    NoneOneOrMany::None
+                } else if exits.len() == 1 {
+                    NoneOneOrMany::One(exits.into_iter().next().unwrap())
+                } else {
+                    NoneOneOrMany::Many(exits)
+                }
             }
-        }
-        _ => NoneOneOrMany::None,
-    };
+            _ => NoneOneOrMany::None,
+        };
 
     // Directly call update_from_event (same path the StateReplicaManager::run uses).
     replica_manager.update_from_event(expiry_event, &outputs);
@@ -1384,13 +1391,7 @@ fn test_contract_expiry_replica_state_cleared() {
 fn build_put_option_engine(
     trading_state: TradingState,
     execution_tx: UnboundedTx<ExecutionRequest>,
-) -> Engine<
-    HistoricalClock,
-    EngineState<DefaultGlobalData, DefaultInstrumentMarketData>,
-    MultiExchangeTxMap<UnboundedTx<ExecutionRequest>>,
-    TestBuyAndHoldStrategy,
-    DefaultRiskManager<EngineState<DefaultGlobalData, DefaultInstrumentMarketData>>,
-> {
+) -> TestEngine {
     let expiry = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
         .unwrap()
         .with_timezone(&Utc);
@@ -1440,18 +1441,7 @@ fn build_put_option_engine(
 }
 
 /// Open a long or short option position at instrument index 0.
-fn open_option_position_side(
-    engine: &mut Engine<
-        HistoricalClock,
-        EngineState<DefaultGlobalData, DefaultInstrumentMarketData>,
-        MultiExchangeTxMap<UnboundedTx<ExecutionRequest>>,
-        TestBuyAndHoldStrategy,
-        DefaultRiskManager<EngineState<DefaultGlobalData, DefaultInstrumentMarketData>>,
-    >,
-    side: Side,
-    quantity: f64,
-    price: f64,
-) {
+fn open_option_position_side(engine: &mut TestEngine, side: Side, quantity: f64, price: f64) {
     let trade_id = match side {
         Side::Buy => TradeId::new("opt-trade-open-buy"),
         Side::Sell => TradeId::new("opt-trade-open-sell"),
@@ -1489,18 +1479,22 @@ fn test_contract_expiry_itm_put() {
     // Entry: 1 * 2_000, Exit: 1 * 5_000 → pnl = 3_000
     assert_eq!(exited[0].pnl_realised, dec!(3_000));
     assert_eq!(exited[0].side, Side::Buy);
-    assert!(engine
-        .state
-        .instruments
-        .instrument_index(&InstrumentIndex(0))
-        .position
-        .positions
-        .is_empty());
-    assert!(engine
-        .state
-        .instruments
-        .instrument_index(&InstrumentIndex(0))
-        .expiration_processed);
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .position
+            .positions
+            .is_empty()
+    );
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .expiration_processed
+    );
 }
 
 #[test]
@@ -1657,7 +1651,12 @@ fn send_open_order_with_position_id(
 
 /// Simulate the exchange acknowledging an open order (assigns exchange OrderId).
 /// `side` must match the side of the original open request to reflect real exchange behaviour.
-fn send_order_ack(engine: &mut HedgingTestEngine, cid: ClientOrderId, exchange_order_id: OrderId, side: Side) {
+fn send_order_ack(
+    engine: &mut HedgingTestEngine,
+    cid: ClientOrderId,
+    exchange_order_id: OrderId,
+    side: Side,
+) {
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
         kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
@@ -1683,7 +1682,12 @@ fn send_order_ack(engine: &mut HedgingTestEngine, cid: ClientOrderId, exchange_o
 }
 
 /// Send a fill for an order identified by its exchange OrderId.
-fn send_fill(engine: &mut HedgingTestEngine, exchange_order_id: OrderId, side: Side, price: Decimal) {
+fn send_fill(
+    engine: &mut HedgingTestEngine,
+    exchange_order_id: OrderId,
+    side: Side,
+    price: Decimal,
+) {
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
         kind: AccountEventKind::Trade(Trade {
@@ -1739,15 +1743,24 @@ fn test_hedging_fill_routing_to_correct_position_id() {
     let exchange_id_a = OrderId::new("exch-a");
 
     // Submit order with explicit PositionId → populates position_ids map.
-    send_open_order_with_position_id(&mut engine, cid_a.clone(), pos_id_a.clone(), Side::Buy, dec!(1_000), false);
+    send_open_order_with_position_id(
+        &mut engine,
+        cid_a.clone(),
+        pos_id_a.clone(),
+        Side::Buy,
+        dec!(1_000),
+        false,
+    );
 
     // Verify CID→PositionId was recorded.
-    assert!(engine
-        .state
-        .instruments
-        .instrument_index(&InstrumentIndex(0))
-        .position_ids
-        .contains_key(&cid_a));
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .position_ids
+            .contains_key(&cid_a)
+    );
 
     // Exchange ack: order now has an exchange OrderId.
     send_order_ack(&mut engine, cid_a.clone(), exchange_id_a.clone(), Side::Buy);
@@ -1755,7 +1768,10 @@ fn test_hedging_fill_routing_to_correct_position_id() {
     // Fill arrives with exchange OrderId → routes to pos_id_a.
     send_fill(&mut engine, exchange_id_a, Side::Buy, dec!(1_000));
 
-    let instr = engine.state.instruments.instrument_index(&InstrumentIndex(0));
+    let instr = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
     assert!(
         instr.position.positions.contains_key(&pos_id_a),
         "position should exist under the caller-supplied PositionId"
@@ -1770,9 +1786,17 @@ fn test_hedging_fill_routing_fallback_for_unknown_order() {
 
     // Send fill with an OrderId that has no matching entry in orders map.
     let unknown_order_id = OrderId::new("external-order-99");
-    send_fill(&mut engine, unknown_order_id.clone(), Side::Buy, dec!(1_000));
+    send_fill(
+        &mut engine,
+        unknown_order_id.clone(),
+        Side::Buy,
+        dec!(1_000),
+    );
 
-    let instr = engine.state.instruments.instrument_index(&InstrumentIndex(0));
+    let instr = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
     // Fallback: position opened under the raw order ID.
     let expected_pos_id = PositionId::new(unknown_order_id.0.clone());
     assert!(
@@ -1791,7 +1815,14 @@ fn test_hedging_position_ids_cleanup_on_position_exit() {
     let exchange_id_a = OrderId::new("exch-a");
 
     // Open a position.
-    send_open_order_with_position_id(&mut engine, cid_a.clone(), pos_id_a.clone(), Side::Buy, dec!(1_000), false);
+    send_open_order_with_position_id(
+        &mut engine,
+        cid_a.clone(),
+        pos_id_a.clone(),
+        Side::Buy,
+        dec!(1_000),
+        false,
+    );
     send_order_ack(&mut engine, cid_a.clone(), exchange_id_a.clone(), Side::Buy);
     send_fill(&mut engine, exchange_id_a.clone(), Side::Buy, dec!(1_000));
     // Exchange confirms cid_a is fully filled — removes it from orders.0 and cleans up routing tables.
@@ -1801,15 +1832,33 @@ fn test_hedging_position_ids_cleanup_on_position_exit() {
     let cid_b = ClientOrderId::new("cid-b");
     let pos_id_b_same = pos_id_a.clone(); // deliberately route close to same position
     let exchange_id_b = OrderId::new("exch-b");
-    send_open_order_with_position_id(&mut engine, cid_b.clone(), pos_id_b_same, Side::Sell, dec!(2_000), true);
-    send_order_ack(&mut engine, cid_b.clone(), exchange_id_b.clone(), Side::Sell);
+    send_open_order_with_position_id(
+        &mut engine,
+        cid_b.clone(),
+        pos_id_b_same,
+        Side::Sell,
+        dec!(2_000),
+        true,
+    );
+    send_order_ack(
+        &mut engine,
+        cid_b.clone(),
+        exchange_id_b.clone(),
+        Side::Sell,
+    );
     send_fill(&mut engine, exchange_id_b, Side::Sell, dec!(2_000));
     // Exchange confirms cid_b is fully filled — removes it from orders.0 and cleans up routing tables.
     send_fully_filled_snapshot(&mut engine, cid_b.clone());
 
-    let instr = engine.state.instruments.instrument_index(&InstrumentIndex(0));
+    let instr = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
     // Position exited — no open positions.
-    assert!(instr.position.positions.is_empty(), "position should be closed");
+    assert!(
+        instr.position.positions.is_empty(),
+        "position should be closed"
+    );
     // All position_ids entries that routed to the closed position are cleaned up once
     // both orders' terminal snapshots have arrived (mirroring real exchange behaviour).
     assert!(
@@ -1839,16 +1888,36 @@ fn test_contract_expiry_hedging_multi_position() {
     let pos_id_b = PositionId::new("leg-b");
     let exchange_id_b = OrderId::new("exch-b");
 
-    send_open_order_with_position_id(&mut engine, cid_a.clone(), pos_id_a.clone(), Side::Buy, dec!(2_000), false);
+    send_open_order_with_position_id(
+        &mut engine,
+        cid_a.clone(),
+        pos_id_a.clone(),
+        Side::Buy,
+        dec!(2_000),
+        false,
+    );
     send_order_ack(&mut engine, cid_a, exchange_id_a.clone(), Side::Buy);
     send_fill(&mut engine, exchange_id_a, Side::Buy, dec!(2_000));
 
-    send_open_order_with_position_id(&mut engine, cid_b.clone(), pos_id_b.clone(), Side::Buy, dec!(3_000), false);
+    send_open_order_with_position_id(
+        &mut engine,
+        cid_b.clone(),
+        pos_id_b.clone(),
+        Side::Buy,
+        dec!(3_000),
+        false,
+    );
     send_order_ack(&mut engine, cid_b, exchange_id_b.clone(), Side::Buy);
     send_fill(&mut engine, exchange_id_b, Side::Buy, dec!(3_000));
 
     assert_eq!(
-        engine.state.instruments.instrument_index(&InstrumentIndex(0)).position.positions.len(),
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .position
+            .positions
+            .len(),
         2,
         "two open positions before expiry"
     );
@@ -1856,7 +1925,11 @@ fn test_contract_expiry_hedging_multi_position() {
     let exited = engine.process_contract_expiry(&InstrumentIndex(0));
 
     // Both positions must be settled.
-    assert_eq!(exited.len(), 2, "both positions should be settled at expiry");
+    assert_eq!(
+        exited.len(),
+        2,
+        "both positions should be settled at expiry"
+    );
 
     // Collect pnls regardless of order.
     let mut pnls: Vec<Decimal> = exited.iter().map(|e| e.pnl_realised).collect();
@@ -1865,7 +1938,10 @@ fn test_contract_expiry_hedging_multi_position() {
     // leg-b: bought 3_000, settled 5_000 → +2_000
     assert_eq!(pnls, vec![dec!(2_000), dec!(3_000)]);
 
-    let instr = engine.state.instruments.instrument_index(&InstrumentIndex(0));
+    let instr = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
     assert!(instr.position.positions.is_empty());
     assert!(instr.expiration_processed);
     // position_ids must be cleared post-expiry (H2 fix).
@@ -1908,7 +1984,10 @@ fn test_fee_model_per_contract_augments_trade_fees() {
     }));
     engine.process(event);
 
-    let instr = engine.state.instruments.instrument_index(&InstrumentIndex(0));
+    let instr = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
     let pos = instr
         .position
         .positions
@@ -1928,7 +2007,10 @@ fn test_fee_model_zero_no_fees_on_trade() {
     // Default fee model is Zero — exchange-reported zero fees stay zero.
     open_option_position(&mut engine, 1.0, 1_000.0);
 
-    let instr = engine.state.instruments.instrument_index(&InstrumentIndex(0));
+    let instr = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
     let pos = instr
         .position
         .positions
@@ -1973,13 +2055,23 @@ fn test_hedging_pending_fill_replayed_on_ack() {
     let exchange_id = OrderId::new("exch-pending");
 
     // Step 1: Submit order — creates OpenInFlight state, records position_ids[cid] = pos_id.
-    send_open_order_with_position_id(&mut engine, cid.clone(), pos_id.clone(), Side::Buy, dec!(1_000), false);
+    send_open_order_with_position_id(
+        &mut engine,
+        cid.clone(),
+        pos_id.clone(),
+        Side::Buy,
+        dec!(1_000),
+        false,
+    );
 
     // Step 2: Fill arrives BEFORE ack — should be buffered in pending_fills.
     send_fill(&mut engine, exchange_id.clone(), Side::Buy, dec!(1_000));
 
     // Verify: no position yet (fill is buffered), pending_fills should have the fill.
-    let instr = engine.state.instruments.instrument_index(&InstrumentIndex(0));
+    let instr = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
     assert!(
         instr.position.positions.is_empty(),
         "position should NOT be created yet — fill is pending"
@@ -1994,7 +2086,10 @@ fn test_hedging_pending_fill_replayed_on_ack() {
     send_order_ack(&mut engine, cid.clone(), exchange_id.clone(), Side::Buy);
 
     // Verify: position now exists under the correct PositionId, pending_fills drained.
-    let instr = engine.state.instruments.instrument_index(&InstrumentIndex(0));
+    let instr = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
     assert!(
         instr.position.positions.contains_key(&pos_id),
         "position should exist under caller-supplied PositionId after ack"
@@ -2017,12 +2112,22 @@ fn test_hedging_pending_fill_drained_on_cancel_ack() {
     let exchange_id = OrderId::new("exch-cancel-race");
 
     // Step 1: Submit order.
-    send_open_order_with_position_id(&mut engine, cid.clone(), pos_id.clone(), Side::Buy, dec!(1_000), false);
+    send_open_order_with_position_id(
+        &mut engine,
+        cid.clone(),
+        pos_id.clone(),
+        Side::Buy,
+        dec!(1_000),
+        false,
+    );
 
     // Step 2: Fill arrives before any ack — buffered.
     send_fill(&mut engine, exchange_id.clone(), Side::Buy, dec!(1_000));
 
-    let instr = engine.state.instruments.instrument_index(&InstrumentIndex(0));
+    let instr = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
     assert_eq!(instr.pending_fills.len(), 1, "fill should be buffered");
 
     // Step 3: Cancel ack arrives (order was cancelled, not opened).
@@ -2031,7 +2136,10 @@ fn test_hedging_pending_fill_drained_on_cancel_ack() {
     send_cancel_ack(&mut engine, cid.clone(), exchange_id.clone());
 
     // Verify: pending_fills cleared, no position created (the fill is orphaned).
-    let instr = engine.state.instruments.instrument_index(&InstrumentIndex(0));
+    let instr = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
     // Note: with current logic, pending_fills is only drained when no OpenInFlight orders remain.
     // After cancel ack, the order is removed from orders.0, so no OpenInFlight remains.
     // The drain path in update_from_cancel checks `still_has_in_flight` and clears if false.
@@ -2053,10 +2161,20 @@ fn test_contract_expiry_clears_pending_fills() {
     let exchange_id = OrderId::new("exch-expiry-pending");
 
     // Submit order and send fill before ack — creates pending_fills entry.
-    send_open_order_with_position_id(&mut engine, cid.clone(), pos_id.clone(), Side::Buy, dec!(1_000), false);
+    send_open_order_with_position_id(
+        &mut engine,
+        cid.clone(),
+        pos_id.clone(),
+        Side::Buy,
+        dec!(1_000),
+        false,
+    );
     send_fill(&mut engine, exchange_id.clone(), Side::Buy, dec!(1_000));
 
-    let instr = engine.state.instruments.instrument_index(&InstrumentIndex(0));
+    let instr = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
     assert_eq!(instr.pending_fills.len(), 1, "setup: pending fill exists");
 
     // Set spot price for ITM settlement and trigger expiry.
@@ -2066,7 +2184,10 @@ fn test_contract_expiry_clears_pending_fills() {
     engine.process(expiry_event);
 
     // Verify: expiry processed to completion (not early-returned due to missing spot price).
-    let instr = engine.state.instruments.instrument_index(&InstrumentIndex(0));
+    let instr = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
     assert!(
         instr.expiration_processed,
         "expiry should be processed — if this fails, the spot price lookup failed"

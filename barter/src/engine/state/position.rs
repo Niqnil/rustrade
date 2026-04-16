@@ -521,7 +521,6 @@ impl<InstrumentKey> Position<QuoteAsset, InstrumentKey> {
             self.contract_size,
         );
     }
-
 }
 
 impl<InstrumentKey> From<&Trade<QuoteAsset, InstrumentKey>> for Position<QuoteAsset, InstrumentKey>

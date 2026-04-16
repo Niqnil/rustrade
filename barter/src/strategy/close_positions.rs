@@ -88,17 +88,21 @@ where
             // Generate one closing order per open position.
             // In Netting mode there is at most one position; in Hedging mode there may be N.
             // Each order carries the PositionId so hedging-mode fills route to the right slot.
-            state.position.positions.iter().map(move |(pos_id, position)| {
-                let mut req = build_ioc_market_order_to_close_position(
-                    state.instrument.exchange,
-                    position,
-                    strategy_id.clone(),
-                    price,
-                    || gen_cid(state, pos_id),
-                );
-                req.state.position_id = Some(pos_id.clone());
-                req
-            })
+            state
+                .position
+                .positions
+                .iter()
+                .map(move |(pos_id, position)| {
+                    let mut req = build_ioc_market_order_to_close_position(
+                        state.instrument.exchange,
+                        position,
+                        strategy_id.clone(),
+                        price,
+                        || gen_cid(state, pos_id),
+                    );
+                    req.state.position_id = Some(pos_id.clone());
+                    req
+                })
         });
 
     (std::iter::empty(), open_requests)

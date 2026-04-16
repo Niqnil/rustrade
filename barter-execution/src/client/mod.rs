@@ -135,5 +135,7 @@ where
         &self,
         time_since: DateTime<Utc>,
         instruments: &[InstrumentNameExchange],
-    ) -> impl Future<Output = Result<Vec<Trade<QuoteAsset, InstrumentNameExchange>>, UnindexedClientError>> + Send;
+    ) -> impl Future<
+        Output = Result<Vec<Trade<QuoteAsset, InstrumentNameExchange>>, UnindexedClientError>,
+    > + Send;
 }

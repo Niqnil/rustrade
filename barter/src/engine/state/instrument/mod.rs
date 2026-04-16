@@ -8,8 +8,7 @@ use crate::{
 };
 use barter_data::event::MarketEvent;
 use barter_execution::{
-    FeeModel, FeeModelConfig,
-    InstrumentAccountSnapshot,
+    FeeModel, FeeModelConfig, InstrumentAccountSnapshot,
     order::{
         Order, OrderKey,
         id::{ClientOrderId, OrderId, PositionId},
@@ -18,8 +17,6 @@ use barter_execution::{
     },
     trade::Trade,
 };
-use fnv::FnvHashMap;
-use tracing::{debug, warn};
 use barter_instrument::{
     Keyed,
     asset::{AssetIndex, QuoteAsset, name::AssetNameExchange},
@@ -32,9 +29,11 @@ use barter_instrument::{
 };
 use barter_integration::collection::{FnvIndexMap, snapshot::Snapshot};
 use chrono::{DateTime, Utc};
+use fnv::FnvHashMap;
 use itertools::Either;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
+use tracing::{debug, warn};
 
 /// Defines the state interface [`InstrumentDataState`] that can be implemented for custom
 /// instrument level data state.
@@ -466,7 +465,8 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             // OpenInFlight→Open transition, not on every call.
             let cid = order.0.key.cid.clone();
             // (a) PERF-1: O(1) reverse index for subsequent fill routing.
-            self.exchange_id_to_cid.insert(exchange_id.clone(), cid.clone());
+            self.exchange_id_to_cid
+                .insert(exchange_id.clone(), cid.clone());
 
             // C1 fix: restore the CID → PositionId entry if cleanup_routing_tables removed it
             // because the order was fully filled (removed from orders.0) before deferred replay.
@@ -612,8 +612,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             OmsMode::Hedging => {
                 // Fast path: O(1) via the reverse index built in update_from_order_snapshot.
                 let fast_cid = self.exchange_id_to_cid.get(&trade.order_id);
-                let fast_pos_id =
-                    fast_cid.and_then(|cid| self.position_ids.get(cid)).cloned();
+                let fast_pos_id = fast_cid.and_then(|cid| self.position_ids.get(cid)).cloned();
 
                 if let Some(pos_id) = fast_pos_id {
                     pos_id
@@ -626,19 +625,24 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                     //   - None: no matching order found
                     //   - Some(None): match found but no position_id mapping
                     //   - Some(Some(pos_id)): match found with position_id
-                    let matched = self.orders.0.iter().find_map(|(cid, order)| {
-                        match &order.state {
-                            ActiveOrderState::Open(open) if open.id == trade.order_id => {
-                                Some(self.position_ids.get(cid).cloned())
-                            }
-                            ActiveOrderState::CancelInFlight(cf)
-                                if cf.order.as_ref().is_some_and(|o| o.id == trade.order_id) =>
-                            {
-                                Some(self.position_ids.get(cid).cloned())
-                            }
-                            _ => None,
-                        }
-                    });
+                    let matched =
+                        self.orders
+                            .0
+                            .iter()
+                            .find_map(|(cid, order)| match &order.state {
+                                ActiveOrderState::Open(open) if open.id == trade.order_id => {
+                                    Some(self.position_ids.get(cid).cloned())
+                                }
+                                ActiveOrderState::CancelInFlight(cf)
+                                    if cf
+                                        .order
+                                        .as_ref()
+                                        .is_some_and(|o| o.id == trade.order_id) =>
+                                {
+                                    Some(self.position_ids.get(cid).cloned())
+                                }
+                                _ => None,
+                            });
 
                     match matched {
                         Some(Some(pos_id)) => pos_id,
@@ -703,9 +707,9 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         // For spot instruments this is 1. Used for both fee computation and PnL calculation.
         let contract_size = self.instrument.kind.contract_size();
 
-        let computed_fee =
-            self.fee_model
-                .compute_fee(trade.price, trade.quantity, contract_size);
+        let computed_fee = self
+            .fee_model
+            .compute_fee(trade.price, trade.quantity, contract_size);
 
         let augmented;
         let effective_trade = if computed_fee.is_zero() {
