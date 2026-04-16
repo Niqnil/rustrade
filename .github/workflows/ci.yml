@@ -79,7 +79,8 @@ jobs:
           shared-key: "barter-ci-test"
 
       - name: Run cargo test
-        run: cargo test --workspace --all-features
+        # Exclude examples to avoid mold linker hitting .debug_str section size limits
+        run: cargo test --workspace --all-features --lib --bins --tests
 
   clippy:
     name: cargo clippy
