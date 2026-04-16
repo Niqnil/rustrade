@@ -118,12 +118,15 @@ struct GracefulShutdownStream<S> {
     /// running until `tx.closed()` resolves. Without this field the handle
     /// would be detached immediately at `connection_manager` spawn time,
     /// preventing any future `.await` or abort if the design changes.
-    handle: tokio::task::JoinHandle<()>,
+    _handle: tokio::task::JoinHandle<()>,
 }
 
 impl<S> GracefulShutdownStream<S> {
     fn new(inner: S, handle: tokio::task::JoinHandle<()>) -> Self {
-        Self { inner, handle }
+        Self {
+            inner,
+            _handle: handle,
+        }
     }
 }
 
@@ -1550,9 +1553,9 @@ async fn connection_manager(
                 Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS),
                 recover_fills(
                     &http,
-                    &*rate_limiter,
+                    &rate_limiter,
                     &instruments,
-                    &base,
+                    base,
                     &after_str,
                     &tx,
                     &dedup,
