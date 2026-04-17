@@ -175,7 +175,7 @@ This project is licensed under the [MIT license].
 
 ### Contribution License Agreement
 
-Any contribution you intentionally submit for inclusion in Barter workspace crates shall be:
+Any contribution you submit shall be:
 1. Licensed under MIT
 2. Subject to the disclaimer above
 3. Provided without any additional terms or conditions
