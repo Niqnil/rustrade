@@ -177,6 +177,7 @@ pub fn generate_execution_instrument_map(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
     use barter_instrument::{exchange::ExchangeId, test_utils};

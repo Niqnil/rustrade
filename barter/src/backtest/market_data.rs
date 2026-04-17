@@ -60,6 +60,10 @@ where
 
 impl<Kind> MarketDataInMemory<Kind> {
     /// Create a new in-memory market data source from a vector of market events.
+    ///
+    /// # Panics
+    /// Panics if `events` contains no `MarketStreamEvent::Item` variant.
+    #[allow(clippy::expect_used)] // Caller contract: events must contain at least one MarketStreamEvent::Item variant
     pub fn new(events: Arc<Vec<MarketStreamEvent<InstrumentIndex, Kind>>>) -> Self {
         let time_first_event = events
             .iter()

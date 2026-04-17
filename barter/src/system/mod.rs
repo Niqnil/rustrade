@@ -91,6 +91,9 @@ where
     ///
     /// **Note that for live & paper-trading this market stream will never end, so use
     /// System::shutdown() for that use case**.
+    ///
+    /// # Panics
+    /// Panics if the Engine task has already dropped its receiver (i.e., panicked).
     pub async fn shutdown_after_backtest(self) -> Result<(Engine, Engine::Audit), JoinError>
     where
         Event: From<Shutdown>,
@@ -110,6 +113,7 @@ where
         // Wait for MarketStream to finish forwarding to Engine before initiating Shutdown
         market_to_engine.await?;
 
+        #[allow(clippy::expect_used)] // Critical invariant: Engine must be alive during shutdown
         feed_tx
             .send(Shutdown)
             .expect("Engine cannot drop Feed receiver");
@@ -179,6 +183,7 @@ where
     }
 
     /// Send an `Event` to the `Engine`.
+    #[allow(clippy::expect_used)] // Critical invariant: Engine must be alive to receive events
     fn send<T>(&self, event: T)
     where
         T: Into<Event>,

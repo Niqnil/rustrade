@@ -615,6 +615,7 @@ impl AlpacaClient {
     ///
     /// Panics if the API key or secret contains characters that are invalid
     /// in an HTTP header value (non-ASCII or control characters).
+    #[allow(clippy::expect_used)] // Documented panic: invalid credentials detected at startup
     fn build_http(config: &AlpacaConfig) -> reqwest::Client {
         use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
         let mut headers = HeaderMap::new();
@@ -2652,6 +2653,7 @@ fn connectivity_err(msg: impl Into<String>) -> UnindexedClientError {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
 

@@ -79,6 +79,8 @@ impl<Output> MultiStreamBuilder<Output> {
                 .for_each(|(exchange, exchange_rx)| {
                     // Remove exchange_tx<Output> from HashMap that's associated with this tuple:
                     // (ExchangeId, exchange_rx<MarketStreamResult<InstrumentKey, SubscriptionKind::Event>>)
+                    #[allow(clippy::expect_used)]
+                    // Invariant: exchange_txs created with same keys as builder.streams produces
                     let exchange_tx = exchange_txs
                         .remove(&exchange)
                         .expect("all exchange_txs should be present here");

@@ -223,6 +223,7 @@ pub fn is_websocket_disconnected(error: &WsError) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;

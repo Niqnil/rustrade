@@ -174,6 +174,7 @@ pub fn generate_empty_indexed_asset_states(instruments: &IndexedInstruments) -> 
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
     use crate::test_utils::asset_state;

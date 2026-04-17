@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics acceptable
+
 use barter::{
     EngineEvent, Sequence, Timed,
     engine::{

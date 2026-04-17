@@ -517,6 +517,7 @@ impl std::fmt::Debug for BinanceSpot {
 impl BinanceSpot {
     /// # Panics
     /// Panics if the binance-sdk configuration builder fails (invalid credentials format).
+    #[allow(clippy::expect_used)] // Documented panic: invalid credentials detected at startup
     fn build_rest(config: &BinanceSpotConfig) -> Arc<RestApi> {
         let rest_config = ConfigurationRestApi::builder()
             .api_key(config.api_key.clone())
@@ -533,6 +534,7 @@ impl BinanceSpot {
 
     /// # Panics
     /// Panics if the binance-sdk configuration builder fails (invalid credentials format).
+    #[allow(clippy::expect_used)] // Documented panic: invalid credentials detected at startup
     fn build_ws_handle(config: &BinanceSpotConfig) -> WebsocketApiHandle {
         let ws_config = ConfigurationWebsocketApi::builder()
             .api_key(config.api_key.clone())
@@ -2628,6 +2630,7 @@ fn connectivity_error(e: anyhow::Error) -> UnindexedClientError {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
 

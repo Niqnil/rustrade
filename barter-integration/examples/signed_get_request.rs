@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // Example code: panics acceptable for demonstration
+
 use barter_instrument::asset::name::AssetNameInternal;
 use barter_integration::{
     error::SocketError,
