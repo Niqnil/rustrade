@@ -198,10 +198,10 @@ impl RateLimitTracker {
                         // Deadline was expired and cleared above; no sleep needed.
                         return;
                     }
-                    debug!(
-                        delay_ms = (until - now).as_millis() as u64,
-                        "Alpaca REST rate-limited, waiting before request"
-                    );
+                    // as_millis() returns u128; truncation impossible (u64::MAX ms ≈ 584M years)
+                    #[allow(clippy::cast_possible_truncation)]
+                    let delay_ms = (until - now).as_millis() as u64;
+                    debug!(delay_ms, "Alpaca REST rate-limited, waiting before request");
                     tokio::time::sleep_until(until).await;
                 }
             }
