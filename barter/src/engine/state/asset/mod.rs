@@ -49,7 +49,7 @@ impl<'de> Deserialize<'de> for AssetStates {
         impl<'de> Visitor<'de> for AssetStatesVisitor {
             type Value = AssetStates;
 
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 write!(f, "a sequence of (ExchangeAsset, AssetState) pairs")
             }
 
@@ -323,8 +323,8 @@ mod tests {
         );
 
         // Serialise → deserialise round-trip.
-        let json = serde_json::to_string(&original).expect("serialisation failed");
-        let restored: AssetStates = serde_json::from_str(&json).expect("deserialisation failed");
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: AssetStates = serde_json::from_str(&json).unwrap();
 
         // Full equality check — sequence is preserved.
         assert_eq!(original, restored);
