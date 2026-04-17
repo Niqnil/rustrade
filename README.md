@@ -1,14 +1,14 @@
 # Barter
 
 > **This is a public fork of [barter-rs/barter-rs](https://github.com/barter-rs/barter-rs).**
-> It adds live execution clients for **Binance** and **Alpaca** that are not available in the upstream repository.
+> It adds execution clients for **Binance** and **Alpaca**.
 > For questions or discussion, please use [GitHub Discussions](https://github.com/Niqnil/barter-rs/discussions).
 
 Barter is an algorithmic trading ecosystem of Rust libraries for building high-performance live-trading, paper-trading
 and back-testing systems.
 * **Fast**: Written in native Rust. Minimal allocations. Data-oriented state management system with direct index lookups.
 * **Robust**: Strongly typed. Thread safe. Extensive test coverage.
-* **Customisable**: Plug and play Strategy and RiskManager components that facilitates most trading strategies (MarketMaking, StatArb, HFT, etc.).
+* **Customisable**: Plug and play Strategy and RiskManager components that facilitates most trading strategies.
 * **Scalable**: Multithreaded architecture with modular design. Leverages Tokio for I/O. Memory efficient data structures.
 
 [![MIT licensed][mit-badge]][mit-url]
@@ -32,7 +32,7 @@ and back-testing systems. It is made up of several easy-to-use, extensible crate
 ## Notable Features
 - Stream public market data from financial venues via the [`Barter-Data`] library.
 - Stream private account data, execute orders (live or mock) via the [`Barter-Execution`] library.
-- **Live execution clients for Binance (spot) and Alpaca** — not available in the upstream repo.
+- Live execution clients for Binance (spot) and Alpaca.
 - Plug and play Strategy and RiskManager components that facilitate most trading strategies.
 - Backtest utilities for efficiently running thousands of concurrent backtests.
 - Flexible Engine that facilitates trading strategies that execute on many exchanges simultaneously.
