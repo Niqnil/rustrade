@@ -386,6 +386,7 @@ impl IntoIterator for ExecutionHandles {
     }
 }
 
+#[allow(clippy::unwrap_used)] // Invariant: IndexedInstruments - all referenced assets exist; panics for unsupported InstrumentKind
 fn generate_mock_exchange_instruments(
     instruments: &IndexedInstruments,
     exchange: ExchangeId,

@@ -1,3 +1,10 @@
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+
 extern crate proc_macro;
 
 use convert_case::{Boundary, Case, Casing};
@@ -8,6 +15,7 @@ use syn::DeriveInput;
 #[proc_macro_derive(DeExchange)]
 pub fn de_exchange_derive(input: TokenStream) -> TokenStream {
     // Parse Rust code abstract syntax tree with Syn from TokenStream -> DeriveInput
+    #[allow(clippy::expect_used)] // Proc-macro: panic produces compile error (idiomatic)
     let ast: DeriveInput =
         syn::parse(input).expect("de_exchange_derive() failed to parse input TokenStream");
 
@@ -42,6 +50,7 @@ pub fn de_exchange_derive(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(SerExchange)]
 pub fn ser_exchange_derive(input: TokenStream) -> TokenStream {
     // Parse Rust code abstract syntax tree with Syn from TokenStream -> DeriveInput
+    #[allow(clippy::expect_used)] // Proc-macro: panic produces compile error (idiomatic)
     let ast: DeriveInput =
         syn::parse(input).expect("ser_exchange_derive() failed to parse input TokenStream");
 
@@ -65,6 +74,7 @@ pub fn ser_exchange_derive(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(DeSubKind)]
 pub fn de_sub_kind_derive(input: TokenStream) -> TokenStream {
     // Parse Rust code abstract syntax tree with Syn from TokenStream -> DeriveInput
+    #[allow(clippy::expect_used)] // Proc-macro: panic produces compile error (idiomatic)
     let ast: DeriveInput =
         syn::parse(input).expect("de_sub_kind_derive() failed to parse input TokenStream");
 
@@ -103,6 +113,7 @@ pub fn de_sub_kind_derive(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(SerSubKind)]
 pub fn ser_sub_kind_derive(input: TokenStream) -> TokenStream {
     // Parse Rust code abstract syntax tree with Syn from TokenStream -> DeriveInput
+    #[allow(clippy::expect_used)] // Proc-macro: panic produces compile error (idiomatic)
     let ast: DeriveInput =
         syn::parse(input).expect("ser_sub_kind_derive() failed to parse input TokenStream");
 

@@ -99,6 +99,7 @@ impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, GateioFuturesTrades)
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
 

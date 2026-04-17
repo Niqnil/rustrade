@@ -91,11 +91,15 @@ impl IndexedInstrumentsBuilder {
             .enumerate()
             .map(|(index, instrument)| {
                 let exchange_id = instrument.exchange;
+                #[allow(clippy::expect_used)]
+                // Invariant: add_instrument populates exchanges alongside each instrument
                 let exchange_key = find_exchange_by_exchange_id(&exchanges, &exchange_id)
                     .expect("every exchange related to every instrument has been added");
 
                 let instrument = instrument.map_exchange_key(Keyed::new(exchange_key, exchange_id));
 
+                #[allow(clippy::expect_used)]
+                // Invariant: add_instrument populates assets alongside each instrument
                 let instrument = instrument
                     .map_asset_key_with_lookup(|asset: &Asset| {
                         find_asset_by_exchange_and_name_internal(
@@ -119,6 +123,7 @@ impl IndexedInstrumentsBuilder {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
     use crate::{

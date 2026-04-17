@@ -32,6 +32,7 @@ where
             }
         } else {
             let excess_returns = mean_return - risk_free_return;
+            #[allow(clippy::unwrap_used)] // Invariant: else branch guarantees std_dev_returns != 0
             let ratio = excess_returns.checked_div(std_dev_returns).unwrap();
             Self {
                 value: ratio,
@@ -51,12 +52,14 @@ where
         let target_secs = Decimal::from(target.interval().num_seconds());
         let current_secs = Decimal::from(self.interval.interval().num_seconds());
 
+        #[allow(clippy::expect_used)]
+        // Zero-duration intervals yield Decimal::MAX (via unwrap_or); abs() ensures valid sqrt() input
         let scale = target_secs
             .abs()
             .checked_div(current_secs.abs())
             .unwrap_or(Decimal::MAX)
             .sqrt()
-            .expect("ensured seconds are Positive");
+            .expect("abs() ensures non-negative input");
 
         SharpeRatio {
             value: self.value.checked_mul(scale).unwrap_or(Decimal::MAX),
@@ -66,6 +69,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
     use crate::statistic::time::{Annual252, Daily};

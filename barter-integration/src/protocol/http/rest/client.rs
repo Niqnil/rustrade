@@ -98,9 +98,12 @@ where
         Request: RestRequest,
     {
         // Construct Http request duration Metric
+        // timestamps are post-1970 (positive)
+        #[allow(clippy::cast_sign_loss)]
+        let time = Utc::now().timestamp_millis() as u64;
         let mut latency = Metric {
             name: "http_request_duration",
-            time: Utc::now().timestamp_millis() as u64,
+            time,
             tags: vec![
                 Tag::new("http_method", Request::method().as_str()),
                 Tag::new("base_url", self.base_url.as_ref()),
@@ -112,6 +115,8 @@ where
         // Measure the HTTP request round trip duration
         let start = std::time::Instant::now();
         let response = self.http_client.execute(request).await?;
+        // as_millis() returns u128; truncation impossible (u64::MAX ms ≈ 584M years)
+        #[allow(clippy::cast_possible_truncation)]
         let duration = start.elapsed().as_millis() as u64;
 
         // Update Metric with response status and request duration

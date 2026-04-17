@@ -346,6 +346,8 @@ impl MockExchange {
         let balance_change_result = match request.state.side {
             Side::Buy => {
                 // Buying Instrument requires sufficient QuoteAsset Balance
+                #[allow(clippy::expect_used)]
+                // Invariant: MockExchange - balances exist for all configured instruments
                 let current = self
                     .account
                     .balance_mut(&underlying.quote)
@@ -377,6 +379,8 @@ impl MockExchange {
             }
             Side::Sell => {
                 // Selling Instrument requires sufficient BaseAsset Balance
+                #[allow(clippy::expect_used)]
+                // Invariant: MockExchange - balances exist for all configured instruments
                 let current = self
                     .account
                     .balance_mut(&underlying.base)
@@ -527,6 +531,7 @@ pub struct OpenOrderNotifications {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
     use crate::{

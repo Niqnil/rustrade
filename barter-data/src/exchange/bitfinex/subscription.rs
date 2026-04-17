@@ -180,7 +180,7 @@ impl<'de> Deserialize<'de> for Status {
     {
         #[derive(Deserialize)]
         struct Outer {
-            #[serde(deserialize_with = "de_status_from_u8")]
+            #[serde(deserialize_with = "de_status_from_integer")]
             status: Status,
         }
 
@@ -191,12 +191,12 @@ impl<'de> Deserialize<'de> for Status {
     }
 }
 
-/// Deserialize a `u8` as a `Bitfinex` platform [`Status`].
+/// Deserialize an integer as a `Bitfinex` platform [`Status`].
 ///
-/// 0u8 => [`Status::Maintenance`](Status), <br>
-/// 1u8 => [`Status::Operative`](Status), <br>
+/// 0 => [`Status::Maintenance`](Status), <br>
+/// 1 => [`Status::Operative`](Status), <br>
 /// other => [`de::Error`]
-fn de_status_from_u8<'de, D>(deserializer: D) -> Result<Status, D::Error>
+fn de_status_from_integer<'de, D>(deserializer: D) -> Result<Status, D::Error>
 where
     D: serde::de::Deserializer<'de>,
 {
@@ -204,7 +204,7 @@ where
         0 => Ok(Status::Maintenance),
         1 => Ok(Status::Operative),
         other => Err(serde::de::Error::invalid_value(
-            serde::de::Unexpected::Unsigned(other as u64),
+            serde::de::Unexpected::Signed(other),
             &"0 or 1",
         )),
     }

@@ -212,6 +212,7 @@ fn find_asset_by_exchange_and_name_internal(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
 

@@ -319,8 +319,11 @@ impl RateLimitTracker {
                     // debug! not warn! — on_rate_limited already logs the event;
                     // multiple concurrent callers all hitting wait_if_blocked during
                     // recover_fills would otherwise flood the log with identical lines.
+                    // as_millis() returns u128; truncation impossible (u64::MAX ms ≈ 584M years)
+                    #[allow(clippy::cast_possible_truncation)]
+                    let delay_ms = (until - now).as_millis() as u64;
                     debug!(
-                        delay_ms = (until - now).as_millis() as u64,
+                        delay_ms,
                         "BinanceSpot REST rate-limited, waiting before request"
                     );
                     tokio::time::sleep_until(until).await;
@@ -517,6 +520,7 @@ impl std::fmt::Debug for BinanceSpot {
 impl BinanceSpot {
     /// # Panics
     /// Panics if the binance-sdk configuration builder fails (invalid credentials format).
+    #[allow(clippy::expect_used)] // Documented panic: invalid credentials detected at startup
     fn build_rest(config: &BinanceSpotConfig) -> Arc<RestApi> {
         let rest_config = ConfigurationRestApi::builder()
             .api_key(config.api_key.clone())
@@ -533,6 +537,7 @@ impl BinanceSpot {
 
     /// # Panics
     /// Panics if the binance-sdk configuration builder fails (invalid credentials format).
+    #[allow(clippy::expect_used)] // Documented panic: invalid credentials detected at startup
     fn build_ws_handle(config: &BinanceSpotConfig) -> WebsocketApiHandle {
         let ws_config = ConfigurationWebsocketApi::builder()
             .api_key(config.api_key.clone())
@@ -719,6 +724,8 @@ async fn paginate_my_trades(
             let sym = symbol_str.clone();
             let stm = start_time_ms;
             Box::pin(async move {
+                // const_assert! above guarantees BINANCE_MAX_TRADES fits in i32
+                #[allow(clippy::cast_possible_truncation)]
                 let builder = MyTradesParams::builder(sym).limit(BINANCE_MAX_TRADES as i32);
                 let params = if let Some(id) = fid {
                     builder.from_id(id).build()?
@@ -2628,6 +2635,7 @@ fn connectivity_error(e: anyhow::Error) -> UnindexedClientError {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
 
