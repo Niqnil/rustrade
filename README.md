@@ -1,30 +1,48 @@
 # Barter
-Barter is an algorithmic trading ecosystem of Rust libraries for building high-performance live-trading, paper-trading 
+
+> **This is a public fork of [barter-rs/barter-rs](https://github.com/barter-rs/barter-rs).**
+> It adds live execution clients for **Binance** and **Alpaca** that are not available in the upstream repository.
+> For questions or discussion, please use [GitHub Discussions](https://github.com/Niqnil/barter-rs/discussions).
+
+Barter is an algorithmic trading ecosystem of Rust libraries for building high-performance live-trading, paper-trading
 and back-testing systems.
 * **Fast**: Written in native Rust. Minimal allocations. Data-oriented state management system with direct index lookups.
 * **Robust**: Strongly typed. Thread safe. Extensive test coverage.
 * **Customisable**: Plug and play Strategy and RiskManager components that facilitates most trading strategies (MarketMaking, StatArb, HFT, etc.).
-* **Scalable**: Multithreaded architecture with modular design. Leverages Tokio for I/O. Memory efficient data structures.  
+* **Scalable**: Multithreaded architecture with modular design. Leverages Tokio for I/O. Memory efficient data structures.
 
-**See: [`Barter`], [`Barter-Data`], [`Barter-Instrument`], [`Barter-Execution`] & [`Barter-Integration`] for 
-comprehensive documentation and examples for each library.**
-
-[![Crates.io][crates-badge]][crates-url]
 [![MIT licensed][mit-badge]][mit-url]
-[![Discord chat][discord-badge]][discord-url]
-[![DeepWiki][deepwiki-badge]][deepwiki-url]
-
-[crates-badge]: https://img.shields.io/crates/v/barter.svg
-[crates-url]: https://crates.io/crates/barter
 
 [mit-badge]: https://img.shields.io/badge/license-MIT-blue.svg
-[mit-url]: https://github.com/barter-rs/barter-rs/blob/develop/LICENSE
+[mit-url]: https://github.com/Niqnil/barter-rs/blob/develop/LICENSE
 
-[discord-badge]: https://img.shields.io/discord/910237311332151317.svg?logo=discord&style=flat-square
-[discord-url]: https://discord.gg/wE7RqhnQMV
+## Disclaimer
 
-[deepwiki-badge]: https://deepwiki.com/badge.svg
-[deepwiki-url]: https://deepwiki.com/barter-rs/barter-rs
+This software is for educational purposes only. USE THE SOFTWARE AT YOUR OWN RISK. THE AUTHORS AND ALL AFFILIATES ASSUME NO RESPONSIBILITY FOR YOUR TRADING RESULTS.
+
+## Overview
+Barter is an algorithmic trading ecosystem of Rust libraries for building high-performance live-trading, paper-trading
+and back-testing systems. It is made up of several easy-to-use, extensible crates:
+* **Barter**: Algorithmic trading Engine with feature rich state management system.
+* **Barter-Instrument**: Exchange, Instrument and Asset data structures and utilities.
+* **Barter-Data**: Stream public market data from financial venues. Easily extensible via the MarketStream interface.
+* **Barter-Execution**: Stream private account data and execute orders. Includes live clients for **Binance** (spot) and **Alpaca** (equities, options, crypto). Easily extensible via the ExecutionClient interface.
+* **Barter-Integration**: Low-level frameworks for flexible REST/WebSocket integrations.
+
+## Notable Features
+- Stream public market data from financial venues via the [`Barter-Data`] library.
+- Stream private account data, execute orders (live or mock) via the [`Barter-Execution`] library.
+- **Live execution clients for Binance (spot) and Alpaca** — not available in the upstream repo.
+- Plug and play Strategy and RiskManager components that facilitate most trading strategies.
+- Backtest utilities for efficiently running thousands of concurrent backtests.
+- Flexible Engine that facilitates trading strategies that execute on many exchanges simultaneously.
+- Use mock MarketStream or Execution components to enable back-testing on a near-identical trading system as live-trading.
+- Centralised cache friendly state management system with O(1) constant lookups using indexed data structures.
+- Robust Order management system - use stand-alone or with Barter.
+- Trading summaries with comprehensive performance metrics (PnL, Sharpe, Sortino, Drawdown, etc.).
+- Turn on/off algorithmic trading from an external process (eg/ UI, Telegram, etc.) whilst still processing market/account data.
+- Issue Engine Commands from an external process (eg/ UI, Telegram, etc.) to initiate actions (CloseAllPositions, OpenOrders, CancelOrders, etc.).
+- EngineState replica manager that processes the Engine AuditStream to facilitate non-hot path monitoring components (eg/ UI, Telegram, etc.).
 
 [`Barter`]: https://crates.io/crates/barter
 [`Barter-Instrument`]: https://crates.io/crates/barter-instrument
@@ -32,32 +50,7 @@ comprehensive documentation and examples for each library.**
 [`Barter-Execution`]: https://crates.io/crates/barter-execution
 [`Barter-Integration`]: https://crates.io/crates/barter-integration
 [API Documentation]: https://docs.rs/barter/latest/barter/
-[Chat]: https://discord.gg/wE7RqhnQMV
-
-## Overview
-Barter is an algorithmic trading ecosystem of Rust libraries for building high-performance live-trading, paper-trading 
-and back-testing systems. It is made up of several easy-to-use, extensible crates:
-* **Barter**: Algorithmic trading Engine with feature rich state management system.
-* **Barter-Instrument**: Exchange, Instrument and Asset data structures and utilities. 
-* **Barter-Data**: Stream public market data from financial venues. Easily extensible via the MarketStream interface.
-* **Barter-Execution**: Stream private account data and execute orders. Easily extensible via the ExecutionClient interface. 
-* **Barter-Integration**: Low-level frameworks for flexible REST/WebSocket integrations.
-
-## Notable Features
-- Stream public market data from financial venues via the [`Barter-Data`] library. 
-- Stream private account data, execute orders (live or mock)** via the [`Barter-Execution`] library.
-- Plug and play Strategy and RiskManager components that facilitate most trading strategies. 
-- Backtest utilities for efficiently running thousands of concurrent backtests.
-- Flexible Engine that facilitates trading strategies that execute on many exchanges simultaneously.
-- Use mock MarketStream or Execution components to enable back-testing on a near-identical trading system as live-trading.  
-- Centralised cache friendly state management system with O(1) constant lookups using indexed data structures.
-- Robust Order management system - use stand-alone or with Barter. 
-- Trading summaries with comprehensive performance metrics (PnL, Sharpe, Sortino, Drawdown, etc.).
-- Turn on/off algorithmic trading from an external process (eg/ UI, Telegram, etc.) whilst still processing market/account data. 
-- Issue Engine Commands from an external process (eg/ UI, Telegram, etc.) to initiate actions (CloseAllPositions, OpenOrders, CancelOrders, etc.).
-- EngineState replica manager that processes the Engine AuditStream to facilitate non-hot path monitoring components (eg/ UI, Telegram, etc.).
-
-[barter-examples]: https://github.com/barter-rs/barter-rs/tree/develop/barter/examples
+[barter-examples]: https://github.com/Niqnil/barter-rs/tree/develop/barter/examples
 
 ## Examples
 * See [here][barter-examples] for the compilable example including imports.
@@ -170,86 +163,21 @@ fn load_config() -> Result<SystemConfig, Box<dyn std::error::Error>> {
 ```
 
 ## Getting Help
-Firstly, see if the answer to your question can be found in the [API Documentation]. If the answer is not there, I'd be
-happy to help via [Chat] and try answer your question via Discord.
-
-## Support Barter Development
-Help us advance Barter's capabilities by becoming a sponsor (or supporting me with a tip!).
-
-Your contribution will allow me to dedicate more time to Barter, accelerating feature development and improvements.
-
-**Please email *justastream.code@gmail.com* for all inquiries**
-
-### Sponsorship Tiers
-* 🥇 **Sponsor** - Your name, logo, and website link will be displayed below.
-* 🥈 **Supporter** - Your name listed as supporter.
-
-### Current Sponsors
-*Your name, logo and website link could be here*
-
-### Current Supporters
-*Your name could be here*
-
----
-**Thank you to all our sponsors and supporters! 🫶**
+See if the answer to your question can be found in the [API Documentation]. If not, open a [Discussion](https://github.com/Niqnil/barter-rs/discussions) on GitHub.
 
 ## Contributing
-Thanks in advance for helping to develop the Barter ecosystem! Please do not hesitate to get touch via the Discord [Chat] to discuss development,
-new features, and the future roadmap.
+Contributions are welcome. Please open a PR targeting the `develop` branch. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow.
 
 ### Licence
 This project is licensed under the [MIT license].
 
-[MIT license]: https://github.com/barter-rs/barter-rs/blob/develop/LICENSE
+[MIT license]: https://github.com/Niqnil/barter-rs/blob/develop/LICENSE
 
 ### Contribution License Agreement
 
 Any contribution you intentionally submit for inclusion in Barter workspace crates shall be:
 1. Licensed under MIT
-2. Subject to all disclaimers and limitations of liability stated below
+2. Subject to the disclaimer above
 3. Provided without any additional terms or conditions
-4. Submitted with the understanding that the educational-only purpose and risk warnings apply
 
 By submitting a contribution, you certify that you have the right to do so under these terms.
-
-## LEGAL DISCLAIMER AND LIMITATION OF LIABILITY
-
-PLEASE READ THIS DISCLAIMER CAREFULLY BEFORE USING THE SOFTWARE. BY ACCESSING OR USING THE SOFTWARE, YOU ACKNOWLEDGE AND AGREE TO BE BOUND BY THE TERMS HEREIN.
-
-1. EDUCATIONAL PURPOSE
-   This software and related documentation ("Software") are provided solely for educational and research purposes. The Software is not intended, designed, tested, verified or certified for commercial deployment, live trading, or production use of any kind.
-
-2. NO FINANCIAL ADVICE
-   Nothing contained in the Software constitutes financial, investment, legal, or tax advice. No aspect of the Software should be relied upon for trading decisions or financial planning. Users are strongly advised to consult qualified professionals for investment guidance specific to their circumstances.
-
-3. ASSUMPTION OF RISK
-   Trading in financial markets, including but not limited to cryptocurrencies, securities, derivatives, and other financial instruments, carries substantial risk of loss. Users acknowledge that:
-   a) They may lose their entire investment;
-   b) Past performance does not indicate future results;
-   c) Hypothetical or simulated performance results have inherent limitations and biases.
-
-4. DISCLAIMER OF WARRANTIES
-   THE SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED. TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE AUTHORS AND COPYRIGHT HOLDERS EXPRESSLY DISCLAIM ALL WARRANTIES, INCLUDING BUT NOT LIMITED TO:
-   a) MERCHANTABILITY
-   b) FITNESS FOR A PARTICULAR PURPOSE
-   c) NON-INFRINGEMENT
-   d) ACCURACY OR RELIABILITY OF RESULTS
-   e) SYSTEM INTEGRATION
-   f) QUIET ENJOYMENT
-
-5. LIMITATION OF LIABILITY
-   IN NO EVENT SHALL THE AUTHORS, COPYRIGHT HOLDERS, CONTRIBUTORS, OR ANY AFFILIATED PARTIES BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING BUT NOT LIMITED TO PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES, LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
-6. REGULATORY COMPLIANCE
-   The Software is not registered with, endorsed by, or approved by any financial regulatory authority. Users are solely responsible for:
-   a) Determining whether their use complies with applicable laws and regulations
-   b) Obtaining any required licenses, permits, or registrations
-   c) Meeting any regulatory obligations in their jurisdiction
-
-7. INDEMNIFICATION
-   Users agree to indemnify, defend, and hold harmless the authors, copyright holders, and any affiliated parties from and against any claims, liabilities, damages, losses, and expenses arising from their use of the Software.
-
-8. ACKNOWLEDGMENT
-   BY USING THE SOFTWARE, USERS ACKNOWLEDGE THAT THEY HAVE READ THIS DISCLAIMER, UNDERSTOOD IT, AND AGREE TO BE BOUND BY ITS TERMS AND CONDITIONS.
-
-THE ABOVE LIMITATIONS MAY NOT APPLY IN JURISDICTIONS THAT DO NOT ALLOW THE EXCLUSION OF CERTAIN WARRANTIES OR LIMITATIONS OF LIABILITY.
