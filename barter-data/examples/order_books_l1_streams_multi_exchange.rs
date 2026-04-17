@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // Example code: panics acceptable for demonstration
+
 use barter_data::{
     exchange::binance::{futures::BinanceFuturesUsd, spot::BinanceSpot},
     streams::{Streams, reconnect::stream::ReconnectingStream},

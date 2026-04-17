@@ -72,6 +72,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
     /// ## Examples
     /// Please see barter-data-rs/examples/dynamic_multi_stream_multi_exchange.rs for a
     /// comprehensive example of how to use this market data stream initialiser.
+    #[allow(clippy::unwrap_used)] // Invariant: Channels::try_from creates entries for all exchanges in batches; lookups iterate over the same exchanges
     pub async fn init<SubBatchIter, SubIter, Sub, Instrument>(
         subscription_batches: SubBatchIter,
     ) -> Result<Self, DataError>

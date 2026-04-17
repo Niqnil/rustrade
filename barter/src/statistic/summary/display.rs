@@ -110,13 +110,7 @@ where
         // Add metric rows
         self.add_instrument_metric_row(&mut table, "PnL", |ts| format!("{:.2}", ts.pnl));
         self.add_instrument_metric_row(&mut table, &format!("Return {interval}"), |ts| {
-            format!(
-                "{:.2}%",
-                ts.pnl_return
-                    .value
-                    .checked_mul(Decimal::ONE_HUNDRED)
-                    .unwrap()
-            )
+            format_percentage(ts.pnl_return.value, 2)
         });
         self.add_instrument_metric_row(&mut table, &format!("Sharpe {interval}"), |ts| {
             format_ratio(ts.sharpe_ratio.value)
@@ -129,47 +123,28 @@ where
         });
         self.add_instrument_metric_row(&mut table, "PnL Drawdown", |ts| {
             if let Some(drawdown) = &ts.pnl_drawdown {
-                format!(
-                    "{:.2}%",
-                    drawdown.value.checked_mul(Decimal::ONE_HUNDRED).unwrap()
-                )
+                format_percentage(drawdown.value, 2)
             } else {
                 "N/A".to_string()
             }
         });
         self.add_instrument_metric_row(&mut table, "PnL Drawdown Avg", |ts| {
             if let Some(mean_drawdown) = &ts.pnl_drawdown_mean {
-                format!(
-                    "{:.2}%",
-                    mean_drawdown
-                        .mean_drawdown
-                        .checked_mul(Decimal::ONE_HUNDRED)
-                        .unwrap()
-                )
+                format_percentage(mean_drawdown.mean_drawdown, 2)
             } else {
                 "N/A".to_string()
             }
         });
         self.add_instrument_metric_row(&mut table, "PnL Drawdown Max", |ts| {
             if let Some(max_drawdown) = &ts.pnl_drawdown_max {
-                format!(
-                    "{:.2}%",
-                    max_drawdown
-                        .0
-                        .value
-                        .checked_mul(Decimal::ONE_HUNDRED)
-                        .unwrap()
-                )
+                format_percentage(max_drawdown.0.value, 2)
             } else {
                 "N/A".to_string()
             }
         });
         self.add_instrument_metric_row(&mut table, "Win Rate", |ts| {
             if let Some(win_rate) = &ts.win_rate {
-                format!(
-                    "{:.1}%",
-                    win_rate.value.checked_mul(Decimal::ONE_HUNDRED).unwrap()
-                )
+                format_percentage(win_rate.value, 1)
             } else {
                 "N/A".to_string()
             }
@@ -231,37 +206,21 @@ where
         });
         self.add_asset_metric_row(&mut table, "Drawdown", |ts| {
             if let Some(drawdown) = &ts.drawdown {
-                format!(
-                    "{:.2}%",
-                    drawdown.value.checked_mul(Decimal::ONE_HUNDRED).unwrap()
-                )
+                format_percentage(drawdown.value, 2)
             } else {
                 "N/A".to_string()
             }
         });
         self.add_asset_metric_row(&mut table, "Drawdown Avg", |ts| {
             if let Some(mean_drawdown) = &ts.drawdown_mean {
-                format!(
-                    "{:.2}%",
-                    mean_drawdown
-                        .mean_drawdown
-                        .checked_mul(Decimal::ONE_HUNDRED)
-                        .unwrap()
-                )
+                format_percentage(mean_drawdown.mean_drawdown, 2)
             } else {
                 "N/A".to_string()
             }
         });
         self.add_asset_metric_row(&mut table, "Drawdown Max", |ts| {
             if let Some(max_drawdown) = &ts.drawdown_max {
-                format!(
-                    "{:.2}%",
-                    max_drawdown
-                        .0
-                        .value
-                        .checked_mul(Decimal::ONE_HUNDRED)
-                        .unwrap()
-                )
+                format_percentage(max_drawdown.0.value, 2)
             } else {
                 "N/A".to_string()
             }
@@ -289,5 +248,12 @@ fn format_ratio(value: Decimal) -> String {
         "-∞".to_string()
     } else {
         format!("{value:.4}")
+    }
+}
+
+fn format_percentage(value: Decimal, precision: usize) -> String {
+    match value.checked_mul(Decimal::ONE_HUNDRED) {
+        Some(pct) => format!("{pct:.precision$}%"),
+        None => "∞%".to_string(),
     }
 }

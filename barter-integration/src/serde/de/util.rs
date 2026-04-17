@@ -41,14 +41,24 @@ where
 }
 
 /// Deserialise a &str "f64" milliseconds value as `DateTime<Utc>`.
+// cast_sign_loss: guard below ensures epoch_ms >= 0.0
+// cast_possible_truncation: f64 as u64 saturates per Rust 1.45+; sub-ms precision discarded intentionally
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn de_str_f64_epoch_ms_as_datetime_utc<'de, D>(
     deserializer: D,
 ) -> Result<chrono::DateTime<chrono::Utc>, D::Error>
 where
     D: serde::de::Deserializer<'de>,
 {
-    de_str(deserializer).map(|epoch_ms: f64| {
-        datetime_utc_from_epoch_duration(std::time::Duration::from_millis(epoch_ms as u64))
+    de_str(deserializer).and_then(|epoch_ms: f64| {
+        if !epoch_ms.is_finite() || epoch_ms < 0.0 {
+            return Err(serde::de::Error::custom(format!(
+                "invalid epoch_ms: {epoch_ms}"
+            )));
+        }
+        Ok(datetime_utc_from_epoch_duration(
+            std::time::Duration::from_millis(epoch_ms as u64),
+        ))
     })
 }
 
@@ -59,8 +69,15 @@ pub fn de_str_f64_epoch_s_as_datetime_utc<'de, D>(
 where
     D: serde::de::Deserializer<'de>,
 {
-    de_str(deserializer).map(|epoch_s: f64| {
-        datetime_utc_from_epoch_duration(std::time::Duration::from_secs_f64(epoch_s))
+    de_str(deserializer).and_then(|epoch_s: f64| {
+        if !epoch_s.is_finite() || epoch_s < 0.0 {
+            return Err(serde::de::Error::custom(format!(
+                "invalid epoch_s: {epoch_s}"
+            )));
+        }
+        Ok(datetime_utc_from_epoch_duration(
+            std::time::Duration::from_secs_f64(epoch_s),
+        ))
     })
 }
 

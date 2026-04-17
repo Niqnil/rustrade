@@ -150,10 +150,10 @@ impl<T> From<Option<T>> for NoneOneOrMany<T> {
 
 // Convert from Vec into NoneOneOrMany
 impl<T> From<Vec<T>> for NoneOneOrMany<T> {
-    fn from(items: Vec<T>) -> Self {
+    fn from(mut items: Vec<T>) -> Self {
         match items.len() {
             0 => NoneOneOrMany::None,
-            1 => NoneOneOrMany::One(items.into_iter().next().unwrap()),
+            1 => NoneOneOrMany::One(items.swap_remove(0)),
             _ => NoneOneOrMany::Many(items),
         }
     }

@@ -83,6 +83,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
     use crate::stream::ext::BarterStreamExt;

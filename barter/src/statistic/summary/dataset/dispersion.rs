@@ -37,11 +37,15 @@ impl Dispersion {
             welford_online::calculate_population_variance(self.recurrence_relation_m, value_count);
 
         // Update Standard Deviation
-        self.std_dev = self
-            .variance
-            .abs()
-            .sqrt()
-            .expect("variance cannot be negative");
+        // Welford variance can be slightly negative due to Decimal rounding; abs() guards sqrt input
+        #[allow(clippy::expect_used)]
+        {
+            self.std_dev = self
+                .variance
+                .abs()
+                .sqrt()
+                .expect("abs() ensures non-negative input");
+        }
     }
 }
 
@@ -88,6 +92,7 @@ impl Range {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
@@ -199,7 +204,7 @@ mod tests {
 
         let outputs = vec![output_1, output_2, output_3, output_4, output_5];
 
-        for (input, out) in inputs.into_iter().zip(outputs.into_iter()) {
+        for (input, out) in inputs.into_iter().zip(outputs) {
             dispersion.update(
                 input.prev_mean,
                 input.new_mean,

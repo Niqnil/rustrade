@@ -1,4 +1,10 @@
 #![forbid(unsafe_code)]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 #![warn(
     unused,
     clippy::cognitive_complexity,
@@ -199,6 +205,7 @@ impl Sequence {
 }
 
 /// Barter core test utilities.
+#[allow(clippy::unwrap_used)] // Test utilities: callers provide valid inputs
 pub mod test_utils {
     use crate::{
         Timed, engine::state::asset::AssetState, statistic::summary::asset::TearSheetAssetGenerator,

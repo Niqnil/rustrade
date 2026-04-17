@@ -165,6 +165,7 @@ impl<MarketEventKind: Debug> TimeExchange for EngineEvent<MarketEventKind> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
     use barter_data::event::MarketEvent;

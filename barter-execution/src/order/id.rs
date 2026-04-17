@@ -30,6 +30,7 @@ impl ClientOrderId<SmolStr> {
 
         let mut thread_rng = rand::rng();
 
+        #[allow(clippy::expect_used)] // Invariant: URL_SAFE_SYMBOLS is a const 64-element array
         let random_utf8: [u8; LEN_NON_ALLOCATING_CID] = std::array::from_fn(|_| {
             let symbol = URL_SAFE_SYMBOLS
                 .choose(&mut thread_rng)
@@ -38,6 +39,7 @@ impl ClientOrderId<SmolStr> {
             *symbol as u8
         });
 
+        #[allow(clippy::expect_used)] // Invariant: all URL_SAFE_SYMBOLS chars are ASCII
         let random_utf8_str =
             std::str::from_utf8(&random_utf8).expect("URL_SAFE_SYMBOLS are valid utf8");
 

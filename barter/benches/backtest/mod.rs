@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // Benchmark code: panics acceptable
+
 use barter::{
     backtest,
     backtest::{BacktestArgsConstant, BacktestArgsDynamic, market_data::MarketDataInMemory},
