@@ -2,10 +2,9 @@
 name = "barter-instrument"
 version = "0.3.1"
 edition = "2024"
-authors = ["JustAStream <justastream.code@gmail.com>"]
 license = "MIT"
 documentation = "https://docs.rs/barter-instrument"
-repository = "https://github.com/barter-rs/barter-rs"
+repository = "https://github.com/Niqnil/barter-rs"
 readme = "README.md"
 description = "Core Barter Exchange, Instrument and Asset data structures and associated utilities."
 keywords = ["trading", "backtesting", "crypto", "stocks", "investment"]

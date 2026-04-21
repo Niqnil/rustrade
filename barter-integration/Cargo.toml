@@ -2,10 +2,9 @@
 name = "barter-integration"
 version = "0.10.0"
 edition = "2024"
-authors = ["JustAStream <justastream.code@gmail.com>"]
 license = "MIT"
 documentation = "https://docs.rs/barter-integration"
-repository = "https://github.com/barter-rs/barter-rs"
+repository = "https://github.com/Niqnil/barter-rs"
 readme = "README.md"
 description = "Low-level framework for composing flexible web integrations, especially with financial exchanges"
 keywords = ["trading", "backtesting", "crypto", "stocks", "investment"]

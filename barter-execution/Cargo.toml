@@ -2,10 +2,10 @@
 name = "barter-execution"
 version = "0.8.0"
 edition = "2024"
-authors = ["JustAStream <justastream.code@gmail.com>"]
+rust-version = "1.95"
 license = "MIT"
 documentation = "https://docs.rs/barter-execution/"
-repository = "https://github.com/barter-rs/barter-rs"
+repository = "https://github.com/Niqnil/barter-rs"
 readme = "README.md"
 description = "Stream private account data from financial venues, and execute (live or mock) orders."
 keywords = ["trading", "backtesting", "crypto", "stocks", "investment"]
@@ -17,7 +17,7 @@ default = []
 alpaca = [
     "dep:reqwest",
     "dep:serde_json",
-    "serde_json/raw_value",  # RawValue borrow for zero-copy WS data field parsing
+    "serde_json/raw_value", # RawValue borrow for zero-copy WS data field parsing
     "dep:lru",
     "dep:parking_lot",
     "dep:indexmap",
@@ -29,10 +29,15 @@ binance = [
     "dep:lru",
     "dep:parking_lot",
 ]
+ibkr = ["dep:ibapi", "dep:parking_lot", "dep:chrono-tz"]
 
 [dependencies]
 # Barter Ecosystem
-barter-integration = { workspace = true, features = ["collection", "error", "stream"] }
+barter-integration = { workspace = true, features = [
+    "collection",
+    "error",
+    "stream",
+] }
 barter-instrument = { workspace = true }
 
 # Logging
@@ -57,21 +62,31 @@ serde = { workspace = true, features = ["derive"] }
 
 # Misc
 rand = { workspace = true }
-chrono = { workspace = true, features = ["serde"]}
+chrono = { workspace = true, features = ["serde"] }
 itertools = { workspace = true }
-derive_more = { workspace = true, features = ["constructor", "from", "display"]}
+derive_more = { workspace = true, features = [
+    "constructor",
+    "from",
+    "display",
+] }
 
 # Alpaca (optional, behind "alpaca" feature)
-reqwest = { workspace = true, optional = true }  # HTTP client for Alpaca REST API
+reqwest = { workspace = true, optional = true } # HTTP client for Alpaca REST API
 
 # Binance (optional, behind "binance" feature)
 binance-sdk = { version = "=44.0.1", features = ["spot"], optional = true }
-anyhow = { workspace = true, optional = true }  # Required: binance-sdk's public API returns anyhow::Result
+anyhow = { workspace = true, optional = true }                              # Required: binance-sdk's public API returns anyhow::Result
 
 # Shared between "alpaca" and "binance" features
 serde_json = { workspace = true, optional = true }
-lru = { workspace = true, optional = true }  # Event deduplication cache for reconnect resilience
-parking_lot = { workspace = true, optional = true }  # Lighter mutex for dedup cache (no poisoning, no OS thread park)
+lru = { workspace = true, optional = true }         # Event deduplication cache for reconnect resilience
+parking_lot = { workspace = true, optional = true } # Lighter mutex for dedup cache (no poisoning, no OS thread park)
+
+# IBKR (optional, behind "ibkr" feature)
+ibapi = { version = "=2.11.0", optional = true, default-features = false, features = [
+    "sync",
+] }
+chrono-tz = { workspace = true, optional = true }
 
 [dev-dependencies]
 # test-util enables tokio::time::pause() and advance() for behavioral timing tests
@@ -80,4 +95,3 @@ tokio = { workspace = true, features = ["test-util"] }
 wiremock = { workspace = true }
 # Serde round-trip tests (L2)
 serde_json = { workspace = true }
-
