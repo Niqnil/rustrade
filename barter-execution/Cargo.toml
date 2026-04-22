@@ -29,7 +29,7 @@ binance = [
     "dep:lru",
     "dep:parking_lot",
 ]
-ibkr = ["dep:ibapi", "dep:parking_lot", "dep:chrono-tz"]
+ibkr = ["dep:ibapi", "dep:parking_lot", "dep:chrono-tz", "barter-instrument/ibkr"]
 
 [dependencies]
 # Barter Ecosystem

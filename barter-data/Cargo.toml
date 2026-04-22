@@ -10,9 +10,14 @@ description = "High performance & normalised WebSocket intergration for leading 
 keywords = ["trading", "backtesting", "crypto", "stocks", "investment"]
 categories = ["accessibility", "simulation"]
 
+[features]
+default = []
+ibkr = ["dep:ibapi", "barter-instrument/ibkr"]
+
 [dev-dependencies]
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 rust_decimal_macros = { workspace = true }
+time = { version = "0.3" }  # For ibkr tests only (ibapi uses time::OffsetDateTime)
 
 [dependencies]
 # Barter Ecosystem
@@ -52,3 +57,6 @@ derive_more = { workspace = true }
 itertools = { workspace = true }
 vecmap-rs = { workspace = true }
 fnv = { workspace = true }
+
+# IBKR (optional, behind "ibkr" feature)
+ibapi = { version = "=2.11.0", optional = true, default-features = false, features = ["sync"] }

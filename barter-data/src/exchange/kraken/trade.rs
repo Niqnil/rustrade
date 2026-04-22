@@ -11,6 +11,7 @@ use barter_integration::{
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use smol_str::{SmolStr, format_smolstr};
 
 /// Terse type alias for an [`Kraken`](super::Kraken) real-time trades WebSocket message.
 pub type KrakenTrades = KrakenMessage<KrakenTradesInner>;
@@ -47,9 +48,9 @@ impl Identifier<Option<SubscriptionId>> for KrakenTradesInner {
 }
 
 /// Generate a custom [`Kraken`](super::Kraken) trade identifier since it is not provided in the
-/// [`KrakenTrade`] model.
-fn custom_kraken_trade_id(trade: &KrakenTrade) -> String {
-    format!(
+/// [`KrakenTrade`] model. Returns [`SmolStr`] (typically heap-allocated due to ID length).
+fn custom_kraken_trade_id(trade: &KrakenTrade) -> SmolStr {
+    format_smolstr!(
         "{}_{}_{}_{}",
         trade.time.timestamp_micros(),
         trade.side,

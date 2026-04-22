@@ -9,6 +9,7 @@ use barter_instrument::{Side, exchange::ExchangeId};
 use barter_integration::subscription::SubscriptionId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use smol_str::format_smolstr;
 
 /// Terse type alias for an [`GateioSpot`](super::GateioSpot) real-time trades WebSocket message.
 pub type GateioSpotTrade = GateioMessage<GateioSpotTradeInner>;
@@ -69,7 +70,7 @@ impl<InstrumentKey> From<(ExchangeId, InstrumentKey, GateioSpotTrade)>
             exchange: exchange_id,
             instrument,
             kind: PublicTrade {
-                id: trade.data.id.to_string(),
+                id: format_smolstr!("{}", trade.data.id),
                 price: trade.data.price,
                 amount: trade.data.amount,
                 side: trade.data.side,

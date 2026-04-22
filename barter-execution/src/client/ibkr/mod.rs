@@ -40,10 +40,10 @@ use barter_instrument::{
     Side,
     asset::{QuoteAsset, name::AssetNameExchange},
     exchange::ExchangeId,
+    ibkr::ContractRegistry,
     instrument::name::InstrumentNameExchange,
 };
 use chrono::{DateTime, Utc};
-use contract::ContractRegistry;
 use execution::{ExecutionBuffer, parse_decimal_or_warn, parse_ib_side};
 use futures::stream::BoxStream;
 use ibapi::{accounts::types::AccountGroup, client::blocking::Client};

@@ -953,7 +953,7 @@ fn market_event_trade(time_plus: u64, instrument: usize, price: f64) -> EngineEv
         exchange: ExchangeId::BinanceSpot,
         instrument: InstrumentIndex(instrument),
         kind: DataKind::Trade(PublicTrade {
-            id: time_plus.to_string(),
+            id: time_plus.to_string().into(),
             price,
             amount: 1.0,
             side: Side::Buy,
