@@ -406,7 +406,7 @@ pub mod test_utils {
             exchange: ExchangeId::BinanceSpot,
             instrument,
             kind: DataKind::Trade(PublicTrade {
-                id: "trade_id".to_string(),
+                id: "trade_id".into(),
                 price,
                 amount: quantity,
                 side: Side::Buy,

@@ -45,6 +45,32 @@ impl OrderBook {
         }
     }
 
+    /// Construct an [`OrderBook`] from pre-sorted [`OrderBookSide`]s.
+    ///
+    /// Use this when you already have sorted sides to avoid re-sorting overhead.
+    /// Caller must ensure sides are correctly sorted (bids descending, asks ascending).
+    pub fn from_sides(
+        sequence: u64,
+        time_engine: Option<DateTime<Utc>>,
+        bids: OrderBookSide<Bids>,
+        asks: OrderBookSide<Asks>,
+    ) -> Self {
+        debug_assert!(
+            bids.levels().windows(2).all(|w| w[0].price >= w[1].price),
+            "bids must be sorted descending by price"
+        );
+        debug_assert!(
+            asks.levels().windows(2).all(|w| w[0].price <= w[1].price),
+            "asks must be sorted ascending by price"
+        );
+        Self {
+            sequence,
+            time_engine,
+            bids,
+            asks,
+        }
+    }
+
     /// Current `u64` sequence number associated with the [`OrderBook`].
     pub fn sequence(&self) -> u64 {
         self.sequence

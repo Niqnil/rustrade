@@ -6,6 +6,7 @@ use barter_instrument::{Side, exchange::ExchangeId};
 use barter_integration::serde::de::{datetime_utc_from_epoch_duration, extract_next};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use smol_str::format_smolstr;
 
 /// [`Bitfinex`](super::Bitfinex) real-time trade message.
 ///
@@ -52,7 +53,7 @@ impl<InstrumentKey> From<(ExchangeId, InstrumentKey, BitfinexTrade)>
             exchange: exchange_id,
             instrument,
             kind: PublicTrade {
-                id: trade.id.to_string(),
+                id: format_smolstr!("{}", trade.id),
                 price: trade.price,
                 amount: trade.amount,
                 side: trade.side,

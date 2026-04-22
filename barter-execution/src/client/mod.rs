@@ -25,6 +25,11 @@ pub mod alpaca;
 // BinanceSpot ExecutionClient implementation
 #[cfg(feature = "binance")]
 pub mod binance;
+
+// Interactive Brokers ExecutionClient implementation (equities, futures, options, forex)
+#[cfg(feature = "ibkr")]
+pub mod ibkr;
+
 pub mod mock;
 
 // `+ Send` bounds on async method return types required for multi-threaded

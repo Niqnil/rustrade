@@ -1,11 +1,10 @@
 [package]
 name = "barter-macro"
 version = "0.2.0"
-authors = ["JustAStream"]
 edition = "2024"
 license = "MIT"
 documentation = "https://docs.rs/barter-macro/"
-repository = "https://github.com/barter-rs/barter-rs"
+repository = "https://github.com/Niqnil/barter-rs"
 description = "Barter ecosystem macros"
 keywords = ["trading", "backtesting", "crypto", "stocks", "investment"]
 categories = ["accessibility", "simulation"]
