@@ -1302,18 +1302,18 @@ impl AlpacaClient {
                 let order_err = match e {
                     UnindexedClientError::Connectivity(ce) => UnindexedOrderError::Connectivity(ce),
                     UnindexedClientError::Api(ae) => UnindexedOrderError::Rejected(ae),
-                    // AccountSnapshot, AccountStream, Truncated, and TruncatedSnapshot are not
+                    // TaskFailed, Internal, Truncated, and TruncatedSnapshot are not
                     // returned by rest_with_retry (REST-only path for orders), but matching
                     // explicitly ensures any new ClientError variant causes a compile error
                     // here rather than being silently misclassified. If a future refactor
                     // makes them reachable, the panic surfaces the bug loudly rather than
                     // producing a wrong error type.
-                    UnindexedClientError::AccountSnapshot(_)
-                    | UnindexedClientError::AccountStream(_)
+                    UnindexedClientError::TaskFailed(_)
+                    | UnindexedClientError::Internal(_)
                     | UnindexedClientError::Truncated { .. }
                     | UnindexedClientError::TruncatedSnapshot { .. } => {
                         unreachable!(
-                            "rest_with_retry (order path) does not produce Account*/Truncated* variants"
+                            "rest_with_retry (order path) does not produce TaskFailed/Internal/Truncated/TruncatedSnapshot variants"
                         )
                     }
                 };
@@ -1682,6 +1682,20 @@ async fn connection_manager(
     }
 }
 
+/// Error during WebSocket handshake (auth + subscribe).
+///
+/// Separates transport errors (network issues, connection drops) from auth errors
+/// (invalid credentials) so callers can apply appropriate retry logic.
+#[derive(Debug)]
+enum HandshakeError {
+    /// Network-level failure (WS send failed, connection dropped).
+    /// Transient — retry with backoff.
+    Transport(String),
+    /// Authentication rejected by Alpaca (invalid/expired credentials).
+    /// Not transient — do not retry without credential changes.
+    Auth(String),
+}
+
 /// Connect to the Alpaca WebSocket, authenticate, and subscribe to trade_updates.
 ///
 /// On auth or subscribe failure the connection is closed cleanly.
@@ -1691,7 +1705,11 @@ async fn connect_and_subscribe(config: &AlpacaConfig) -> Result<WebSocket, Unind
 
     let mut ws = barter_integration::protocol::websocket::connect(url)
         .await
-        .map_err(|e| UnindexedClientError::AccountStream(format!("WS connect: {e}")))?;
+        .map_err(|e| {
+            UnindexedClientError::Connectivity(ConnectivityError::Socket(format!(
+                "WS connect: {e}"
+            )))
+        })?;
 
     // auth + subscribe with overall timeout
     let result = tokio::time::timeout(
@@ -1702,15 +1720,21 @@ async fn connect_and_subscribe(config: &AlpacaConfig) -> Result<WebSocket, Unind
 
     match result {
         Ok(Ok(())) => Ok(ws),
-        Ok(Err(e)) => {
+        Ok(Err(HandshakeError::Transport(e))) => {
             let _ = ws.close(None).await;
-            Err(UnindexedClientError::AccountStream(e))
+            Err(UnindexedClientError::Connectivity(
+                ConnectivityError::Socket(e),
+            ))
+        }
+        Ok(Err(HandshakeError::Auth(e))) => {
+            let _ = ws.close(None).await;
+            Err(UnindexedClientError::Internal(e))
         }
         Err(_) => {
             let _ = ws.close(None).await;
-            Err(UnindexedClientError::AccountStream(format!(
-                "WS handshake timed out after {WS_HANDSHAKE_TIMEOUT_SECS}s"
-            )))
+            Err(UnindexedClientError::Connectivity(
+                ConnectivityError::Timeout,
+            ))
         }
     }
 }
@@ -1722,7 +1746,7 @@ async fn connect_and_subscribe(config: &AlpacaConfig) -> Result<WebSocket, Unind
 /// 2. Await `{"stream":"authorization","data":{"status":"authorized",...}}`
 /// 3. Send `{"action":"listen","data":{"streams":["trade_updates"]}}`
 /// 4. Await `{"stream":"listening","data":{"streams":["trade_updates"]}}`
-async fn ws_handshake(ws: &mut WebSocket, config: &AlpacaConfig) -> Result<(), String> {
+async fn ws_handshake(ws: &mut WebSocket, config: &AlpacaConfig) -> Result<(), HandshakeError> {
     // Step 1: send auth
     let auth = serde_json::json!({
         "action": "auth",
@@ -1734,7 +1758,7 @@ async fn ws_handshake(ws: &mut WebSocket, config: &AlpacaConfig) -> Result<(), S
     .to_string();
     ws.send(WsMessage::Text(auth.into()))
         .await
-        .map_err(|e| format!("WS auth send: {e}"))?;
+        .map_err(|e| HandshakeError::Transport(format!("WS auth send: {e}")))?;
 
     // Step 2: wait for authorization message
     loop {
@@ -1753,8 +1777,16 @@ async fn ws_handshake(ws: &mut WebSocket, config: &AlpacaConfig) -> Result<(), S
                     break;
                 }
             }
-            Some(Err(e)) => return Err(format!("WS error during auth: {e}")),
-            None => return Err("WS closed before auth response".into()),
+            Some(Err(e)) => {
+                return Err(HandshakeError::Transport(format!(
+                    "WS error during auth: {e}"
+                )));
+            }
+            None => {
+                return Err(HandshakeError::Transport(
+                    "WS closed before auth response".into(),
+                ));
+            }
             _ => {} // ping/pong during auth — ignore
         }
     }
@@ -1767,7 +1799,7 @@ async fn ws_handshake(ws: &mut WebSocket, config: &AlpacaConfig) -> Result<(), S
     .to_string();
     ws.send(WsMessage::Text(sub.into()))
         .await
-        .map_err(|e| format!("WS subscribe send: {e}"))?;
+        .map_err(|e| HandshakeError::Transport(format!("WS subscribe send: {e}")))?;
 
     // Step 4: wait for listening acknowledgment (optional but confirms subscription)
     loop {
@@ -1805,8 +1837,16 @@ async fn ws_handshake(ws: &mut WebSocket, config: &AlpacaConfig) -> Result<(), S
                     "WS binary message dropped during listen-ack handshake"
                 );
             }
-            Some(Err(e)) => return Err(format!("WS error during subscribe: {e}")),
-            None => return Err("WS closed before subscribe ack".into()),
+            Some(Err(e)) => {
+                return Err(HandshakeError::Transport(format!(
+                    "WS error during subscribe: {e}"
+                )));
+            }
+            None => {
+                return Err(HandshakeError::Transport(
+                    "WS closed before subscribe ack".into(),
+                ));
+            }
             _ => {}
         }
     }
@@ -1817,10 +1857,10 @@ async fn ws_handshake(ws: &mut WebSocket, config: &AlpacaConfig) -> Result<(), S
 
 /// Parse a WS message to check for authorization response.
 /// Returns `None` if the message is not an authorization response.
-/// Returns `Some(Ok(()))` on success, `Some(Err(...))` on auth failure.
+/// Returns `Some(Ok(()))` on success, `Some(Err(HandshakeError::Auth(...)))` on auth failure.
 ///
 /// Uses `AlpacaStreamMessage` for consistency with the rest of the WS parsing pipeline.
-fn check_auth_response(text: &str) -> Option<Result<(), String>> {
+fn check_auth_response(text: &str) -> Option<Result<(), HandshakeError>> {
     let msg = serde_json::from_str::<AlpacaStreamMessage<'_>>(text).ok()?;
     if msg.stream != "authorization" {
         return None;
@@ -1833,10 +1873,10 @@ fn check_auth_response(text: &str) -> Option<Result<(), String>> {
     if data.status == "authorized" {
         Some(Ok(()))
     } else {
-        Some(Err(format!(
+        Some(Err(HandshakeError::Auth(format!(
             "Alpaca WS auth failed: status={}",
             data.status
-        )))
+        ))))
     }
 }
 
@@ -2733,7 +2773,10 @@ mod tests {
     #[test]
     fn test_check_auth_response_unauthorized() {
         let msg = r#"{"stream":"authorization","data":{"status":"unauthorized"}}"#;
-        assert!(matches!(check_auth_response(msg), Some(Err(_))));
+        assert!(matches!(
+            check_auth_response(msg),
+            Some(Err(HandshakeError::Auth(_)))
+        ));
     }
 
     #[test]

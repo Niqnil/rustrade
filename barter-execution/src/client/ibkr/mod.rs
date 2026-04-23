@@ -313,9 +313,13 @@ impl ExecutionClient for IbkrClient {
         let instrument_snapshots = tokio::task::spawn_blocking(move || {
             use ibapi::accounts::PositionUpdate;
 
+            // ibapi::Error is unstructured — we cannot distinguish connection failures
+            // (transient, should retry) from API errors (e.g., invalid request).
+            // Mapped to Internal (non-transient) conservatively; the crypto repo wrapper
+            // should implement reconnect logic based on connection state, not error type.
             let positions_sub = client
                 .positions()
-                .map_err(|e| UnindexedClientError::AccountSnapshot(format!("positions: {e}")))?;
+                .map_err(|e| UnindexedClientError::Internal(format!("positions: {e}")))?;
 
             let mut snapshots = Vec::new();
             let mut seen = HashSet::new();
@@ -334,7 +338,7 @@ impl ExecutionClient for IbkrClient {
             Ok::<_, UnindexedClientError>(snapshots)
         })
         .await
-        .map_err(|e| UnindexedClientError::AccountSnapshot(format!("task join: {e}")))??;
+        .map_err(|e| UnindexedClientError::TaskFailed(format!("task join: {e}")))??;
 
         Ok(AccountSnapshot {
             exchange: ExchangeId::Ibkr,
@@ -379,10 +383,11 @@ impl ExecutionClient for IbkrClient {
         let client = self.client.clone();
 
         // M-8 fix: Wrap blocking subscription call in spawn_blocking
+        // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
         let order_sub = tokio::task::spawn_blocking(move || client.order_update_stream())
             .await
-            .map_err(|e| UnindexedClientError::AccountStream(format!("task join: {e}")))?
-            .map_err(|e| UnindexedClientError::AccountStream(format!("order updates: {e}")))?;
+            .map_err(|e| UnindexedClientError::TaskFailed(format!("task join: {e}")))?
+            .map_err(|e| UnindexedClientError::Internal(format!("order updates: {e}")))?;
 
         let contracts_clone = self.contracts.clone();
         let order_ids_clone = self.order_ids.clone();
@@ -461,7 +466,7 @@ impl ExecutionClient for IbkrClient {
                     }
                 }
             })
-            .map_err(|e| UnindexedClientError::AccountStream(format!("thread spawn: {e}")))?;
+            .map_err(|e| UnindexedClientError::TaskFailed(format!("thread spawn: {e}")))?;
 
         Ok(Box::pin(
             tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
@@ -772,11 +777,10 @@ impl ExecutionClient for IbkrClient {
 
         tokio::task::spawn_blocking(move || {
             let group = AccountGroup(account);
+            // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
             let sub = client
                 .account_summary(&group, &["TotalCashValue", "AvailableFunds"])
-                .map_err(|e| {
-                    UnindexedClientError::AccountSnapshot(format!("account_summary: {e}"))
-                })?;
+                .map_err(|e| UnindexedClientError::Internal(format!("account_summary: {e}")))?;
 
             let mut aggregator = BalanceAggregator::new();
             for summary in sub {
@@ -792,7 +796,7 @@ impl ExecutionClient for IbkrClient {
             Ok(balances)
         })
         .await
-        .map_err(|e| UnindexedClientError::AccountSnapshot(format!("task join: {e}")))?
+        .map_err(|e| UnindexedClientError::TaskFailed(format!("task join: {e}")))?
     }
 
     /// Fetch open orders.
@@ -819,9 +823,10 @@ impl ExecutionClient for IbkrClient {
         tokio::task::spawn_blocking(move || {
             use ibapi::orders::Orders;
 
+            // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
             let sub = client
                 .all_open_orders()
-                .map_err(|e| UnindexedClientError::AccountSnapshot(format!("open_orders: {e}")))?;
+                .map_err(|e| UnindexedClientError::Internal(format!("open_orders: {e}")))?;
 
             let mut orders = Vec::new();
             for order_item in sub {
@@ -891,7 +896,7 @@ impl ExecutionClient for IbkrClient {
             Ok(orders)
         })
         .await
-        .map_err(|e| UnindexedClientError::AccountSnapshot(format!("task join: {e}")))?
+        .map_err(|e| UnindexedClientError::TaskFailed(format!("task join: {e}")))?
     }
 
     /// Fetch historical trades (executions).
@@ -921,9 +926,10 @@ impl ExecutionClient for IbkrClient {
             use ibapi::orders::Executions;
 
             let filter = ibapi::orders::ExecutionFilter::default();
+            // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
             let sub = client
                 .executions(filter)
-                .map_err(|e| UnindexedClientError::AccountSnapshot(format!("executions: {e}")))?;
+                .map_err(|e| UnindexedClientError::Internal(format!("executions: {e}")))?;
 
             let mut trades = Vec::new();
             for exec_item in sub {
@@ -991,7 +997,7 @@ impl ExecutionClient for IbkrClient {
             Ok(trades)
         })
         .await
-        .map_err(|e| UnindexedClientError::AccountSnapshot(format!("task join: {e}")))?
+        .map_err(|e| UnindexedClientError::TaskFailed(format!("task join: {e}")))?
     }
 }
 
