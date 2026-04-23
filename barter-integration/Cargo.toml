@@ -1,14 +1,15 @@
 [package]
 name = "barter-integration"
 version = "0.10.0"
-edition = "2024"
-license = "MIT"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 documentation = "https://docs.rs/barter-integration"
-repository = "https://github.com/Niqnil/barter-rs"
 readme = "README.md"
 description = "Low-level framework for composing flexible web integrations, especially with financial exchanges"
-keywords = ["trading", "backtesting", "crypto", "stocks", "investment"]
-categories = ["accessibility", "simulation"]
 
 [features]
 default = ["collection", "error", "protocol", "serde", "subscription", "socket", "stream"]

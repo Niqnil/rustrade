@@ -3,16 +3,34 @@
 //! Uses the `ibapi` crate for IB TWS/Gateway connectivity. Supports equities,
 //! futures, options, and forex.
 //!
+//! # Connection
+//!
+//! Requires TWS or IB Gateway running locally with API enabled:
+//!
+//! | Application | Live Port | Paper Port |
+//! |-------------|-----------|------------|
+//! | TWS         | 7496      | 7497       |
+//! | IB Gateway  | 4001      | 4002       |
+//!
+//! Enable API in TWS/Gateway: Configure → API → Settings → Enable ActiveX and Socket Clients.
+//! For order placement, uncheck "Read-Only API".
+//!
 //! # Architecture
 //!
-//! - Connection: TCP socket to TWS (7496/7497) or IB Gateway (4001/4002)
+//! - Connection: TCP socket to TWS/Gateway
 //! - Orders: Subscription-based events (OrderStatus, ExecutionData, CommissionReport)
 //! - Account: Subscription-based position and balance updates
 //!
-//! # No Auto-Reconnect
+//! # Limitations
 //!
-//! Per library philosophy, reconnection is caller responsibility. The client
-//! does not automatically reconnect on disconnect.
+//! - **Order types**: Only Market and Limit supported (no Stop, Trailing, Algo)
+//! - **TimeInForce**: No `post_only` (IB has no maker-only orders)
+//! - **No auto-reconnect**: Caller responsibility per library philosophy
+//!
+//! # See Also
+//!
+//! - [IB API Documentation](https://www.interactivebrokers.com/campus/ibkr-api-page/trader-workstation-api/)
+//! - [`barter_data::exchange::ibkr`] for market data
 
 pub mod account;
 pub mod contract;
@@ -52,7 +70,11 @@ use parking_lot::Mutex;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use smol_str::format_smolstr;
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::Arc,
+};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -276,6 +298,7 @@ impl ExecutionClient for IbkrClient {
     /// Panics if connection fails. The `ExecutionClient` trait doesn't allow
     /// `new()` to return `Result`. Use `IbkrClient::connect_sync()` directly
     /// for fallible construction.
+    #[track_caller]
     fn new(config: Self::Config) -> Self {
         #[allow(clippy::expect_used)] // Trait signature doesn't allow Result
         Self::connect_sync(config).expect("failed to connect to IB")
@@ -398,72 +421,93 @@ impl ExecutionClient for IbkrClient {
         std::thread::Builder::new()
             .name("ibkr-order-stream".to_string())
             .spawn(move || {
-                use ibapi::orders::OrderUpdate;
+                // Panic safety: parking_lot mutexes do not poison on panic, so shared state
+                // (ContractRegistry, OrderIdMap, etc.) remains usable. On panic the
+                // thread exits, tx is dropped, and the stream closes — caller observes EOF.
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    use ibapi::orders::OrderUpdate;
 
-                for update in order_sub {
-                    let event = match update {
-                        OrderUpdate::OrderStatus(status) => {
-                            let ib_id = status.order_id;
-                            // Use single-lock method for terminal status to avoid read+write
-                            let is_terminal =
-                                matches!(status.status.as_str(), "Cancelled" | "Inactive");
+                    for update in order_sub {
+                        let event = match update {
+                            OrderUpdate::OrderStatus(status) => {
+                                let ib_id = status.order_id;
+                                // Use single-lock method for terminal status to avoid read+write
+                                let is_terminal =
+                                    matches!(status.status.as_str(), "Cancelled" | "Inactive");
 
-                            let lookup_result = if is_terminal {
-                                order_ids_clone.remove_and_get_context(ib_id)
-                            } else {
-                                order_ids_clone.get_client_id_and_context(ib_id)
-                            };
+                                let lookup_result = if is_terminal {
+                                    order_ids_clone.remove_and_get_context(ib_id)
+                                } else {
+                                    order_ids_clone.get_client_id_and_context(ib_id)
+                                };
 
-                            if let Some((client_id, ctx)) = lookup_result {
-                                let order =
-                                    make_order_from_status(&status, client_id, &ctx, is_terminal);
-                                Some(UnindexedAccountEvent {
-                                    exchange: ExchangeId::Ibkr,
-                                    kind: AccountEventKind::OrderSnapshot(Snapshot::new(order)),
-                                })
-                            } else {
-                                debug!(ib_order_id = ib_id, "OrderStatus for unknown order ID");
+                                if let Some((client_id, ctx)) = lookup_result {
+                                    let order = make_order_from_status(
+                                        &status,
+                                        client_id,
+                                        &ctx,
+                                        is_terminal,
+                                    );
+                                    Some(UnindexedAccountEvent {
+                                        exchange: ExchangeId::Ibkr,
+                                        kind: AccountEventKind::OrderSnapshot(Snapshot::new(order)),
+                                    })
+                                } else {
+                                    debug!(ib_order_id = ib_id, "OrderStatus for unknown order ID");
+                                    None
+                                }
+                            }
+                            OrderUpdate::ExecutionData(exec) => {
+                                let order_id = exec.execution.order_id;
+                                let con_id = exec.contract.contract_id;
+
+                                // Fail-fast: skip second lookup if first fails
+                                let Some(client_id) = order_ids_clone.get_client_id(order_id)
+                                else {
+                                    debug!(
+                                        ib_order_id = order_id,
+                                        con_id, "ExecutionData for unknown order ID, dropping"
+                                    );
+                                    continue;
+                                };
+                                let Some(instrument) = contracts_clone.get_name_by_con_id(con_id)
+                                else {
+                                    debug!(
+                                        ib_order_id = order_id,
+                                        con_id, "ExecutionData for unknown contract ID, dropping"
+                                    );
+                                    continue;
+                                };
+
+                                exec_buffer_clone.add_execution(exec, instrument, client_id);
                                 None
                             }
+                            OrderUpdate::CommissionReport(report) => exec_buffer_clone
+                                .complete_with_commission(&report)
+                                .map(|trade| UnindexedAccountEvent {
+                                    exchange: ExchangeId::Ibkr,
+                                    kind: AccountEventKind::Trade(trade),
+                                }),
+                            _ => None,
+                        };
+
+                        if let Some(e) = event
+                            && tx.send(e).is_err()
+                        {
+                            break;
                         }
-                        OrderUpdate::ExecutionData(exec) => {
-                            let order_id = exec.execution.order_id;
-                            let con_id = exec.contract.contract_id;
-
-                            // Fail-fast: skip second lookup if first fails
-                            let Some(client_id) = order_ids_clone.get_client_id(order_id) else {
-                                debug!(
-                                    ib_order_id = order_id,
-                                    con_id, "ExecutionData for unknown order ID, dropping"
-                                );
-                                continue;
-                            };
-                            let Some(instrument) = contracts_clone.get_name_by_con_id(con_id)
-                            else {
-                                debug!(
-                                    ib_order_id = order_id,
-                                    con_id, "ExecutionData for unknown contract ID, dropping"
-                                );
-                                continue;
-                            };
-
-                            exec_buffer_clone.add_execution(exec, instrument, client_id);
-                            None
-                        }
-                        OrderUpdate::CommissionReport(report) => exec_buffer_clone
-                            .complete_with_commission(&report)
-                            .map(|trade| UnindexedAccountEvent {
-                                exchange: ExchangeId::Ibkr,
-                                kind: AccountEventKind::Trade(trade),
-                            }),
-                        _ => None,
-                    };
-
-                    if let Some(e) = event
-                        && tx.send(e).is_err()
-                    {
-                        break;
                     }
+                }));
+
+                if let Err(panic_info) = result {
+                    let msg = panic_info
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic_info.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_string());
+                    error!("Order stream worker panicked: {msg}");
+                    // Channel type is UnindexedAccountEvent, not Result — cannot send error.
+                    // Caller observes stream close; they can check logs for panic message.
                 }
             })
             .map_err(|e| UnindexedClientError::TaskFailed(format!("thread spawn: {e}")))?;
@@ -594,22 +638,19 @@ impl ExecutionClient for IbkrClient {
 
         let quantity: f64 = match request.state.quantity.try_into() {
             Ok(q) => q,
-            Err(_) => match request.state.quantity.to_string().parse() {
-                Ok(q) => q,
-                Err(_) => {
-                    return Some(Order {
-                        key,
-                        side: request.state.side,
-                        price: request.state.price,
-                        quantity: request.state.quantity,
-                        kind: request.state.kind,
-                        time_in_force: request.state.time_in_force,
-                        state: Err(crate::error::OrderError::Rejected(ApiError::OrderRejected(
-                            format!("invalid quantity: {}", request.state.quantity),
-                        ))),
-                    });
-                }
-            },
+            Err(_) => {
+                return Some(Order {
+                    key,
+                    side: request.state.side,
+                    price: request.state.price,
+                    quantity: request.state.quantity,
+                    kind: request.state.kind,
+                    time_in_force: request.state.time_in_force,
+                    state: Err(crate::error::OrderError::Rejected(ApiError::OrderRejected(
+                        format!("quantity {} exceeds f64 range", request.state.quantity),
+                    ))),
+                });
+            }
         };
 
         let ib_order = match build_ib_order(

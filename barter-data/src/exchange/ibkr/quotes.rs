@@ -39,12 +39,16 @@ impl QuoteAggregator {
     ///
     /// Returns `Some(OrderBookL1)` when any quote data is available after
     /// processing this tick.
-    pub fn update(&mut self, tick: &TickTypes) -> Option<OrderBookL1> {
+    ///
+    /// # Arguments
+    ///
+    /// * `tick` - The tick update from IB
+    /// * `now` - Current timestamp (caller provides to avoid redundant syscalls)
+    pub fn update(&mut self, tick: &TickTypes, now: DateTime<Utc>) -> Option<OrderBookL1> {
         match tick {
-            TickTypes::Price(price) => self.update_price(price, Utc::now()),
-            TickTypes::Size(size) => self.update_size(size, Utc::now()),
+            TickTypes::Price(price) => self.update_price(price, now),
+            TickTypes::Size(size) => self.update_size(size, now),
             TickTypes::PriceSize(ps) => {
-                let now = Utc::now();
                 self.process_price_tick_type(&ps.price_tick_type, ps.price, now);
                 self.process_size_tick_type(&ps.size_tick_type, ps.size, now);
                 self.try_emit()
@@ -149,8 +153,9 @@ mod tests {
     #[test]
     fn partial_update_emits_partial() {
         let mut agg = QuoteAggregator::new();
+        let now = Utc::now();
 
-        let result = agg.update(&tick_price(TickType::Bid, 100.0));
+        let result = agg.update(&tick_price(TickType::Bid, 100.0), now);
         assert!(result.is_some());
         let l1 = result.unwrap();
         assert!(l1.best_bid.is_some());
@@ -160,11 +165,12 @@ mod tests {
     #[test]
     fn complete_quote_emits() {
         let mut agg = QuoteAggregator::new();
+        let now = Utc::now();
 
-        agg.update(&tick_price(TickType::Bid, 100.0));
-        agg.update(&tick_size(TickType::BidSize, 10.0));
-        agg.update(&tick_price(TickType::Ask, 101.0));
-        let result = agg.update(&tick_size(TickType::AskSize, 5.0));
+        agg.update(&tick_price(TickType::Bid, 100.0), now);
+        agg.update(&tick_size(TickType::BidSize, 10.0), now);
+        agg.update(&tick_price(TickType::Ask, 101.0), now);
+        let result = agg.update(&tick_size(TickType::AskSize, 5.0), now);
 
         assert!(result.is_some());
         let l1 = result.unwrap();
@@ -181,9 +187,10 @@ mod tests {
     #[test]
     fn delayed_ticks_handled() {
         let mut agg = QuoteAggregator::new();
+        let now = Utc::now();
 
-        agg.update(&tick_price(TickType::DelayedBid, 99.0));
-        let result = agg.update(&tick_price(TickType::DelayedAsk, 100.0));
+        agg.update(&tick_price(TickType::DelayedBid, 99.0), now);
+        let result = agg.update(&tick_price(TickType::DelayedAsk, 100.0), now);
 
         assert!(result.is_some());
         let l1 = result.unwrap();
@@ -194,18 +201,20 @@ mod tests {
     #[test]
     fn irrelevant_tick_ignored() {
         let mut agg = QuoteAggregator::new();
+        let now = Utc::now();
 
-        let result = agg.update(&tick_price(TickType::Last, 100.0));
+        let result = agg.update(&tick_price(TickType::Last, 100.0), now);
         assert!(result.is_none());
     }
 
     #[test]
     fn invalid_price_skipped() {
         let mut agg = QuoteAggregator::new();
+        let now = Utc::now();
 
         // NaN price should result in None
-        agg.update(&tick_price(TickType::Bid, f64::NAN));
-        let result = agg.update(&tick_price(TickType::Ask, 100.0));
+        agg.update(&tick_price(TickType::Bid, f64::NAN), now);
+        let result = agg.update(&tick_price(TickType::Ask, 100.0), now);
 
         // Ask should be present, bid should be None (NaN skipped)
         assert!(result.is_some());
@@ -217,14 +226,17 @@ mod tests {
     #[test]
     fn nan_does_not_overwrite_valid_price() {
         let mut agg = QuoteAggregator::new();
+        let now = Utc::now();
 
         // Set valid bid price
-        agg.update(&tick_price(TickType::Bid, 100.0));
-        let l1 = agg.update(&tick_price(TickType::Ask, 101.0)).unwrap();
+        agg.update(&tick_price(TickType::Bid, 100.0), now);
+        let l1 = agg.update(&tick_price(TickType::Ask, 101.0), now).unwrap();
         assert_eq!(l1.best_bid.unwrap().price, dec!(100));
 
         // NaN bid should NOT overwrite valid price
-        let l1 = agg.update(&tick_price(TickType::Bid, f64::NAN)).unwrap();
+        let l1 = agg
+            .update(&tick_price(TickType::Bid, f64::NAN), now)
+            .unwrap();
         assert_eq!(
             l1.best_bid.unwrap().price,
             dec!(100),

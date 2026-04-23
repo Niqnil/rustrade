@@ -1,18 +1,19 @@
 [package]
 name = "barter-data"
 version = "0.11.0"
-edition = "2024"
-license = "MIT"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 documentation = "https://docs.rs/barter-data"
-repository = "https://github.com/Niqnil/barter-rs"
 readme = "README.md"
 description = "High performance & normalised WebSocket intergration for leading cryptocurrency exchanges - batteries included."
-keywords = ["trading", "backtesting", "crypto", "stocks", "investment"]
-categories = ["accessibility", "simulation"]
 
 [features]
 default = []
-ibkr = ["dep:ibapi", "barter-instrument/ibkr"]
+ibkr = ["dep:ibapi", "dep:time", "barter-instrument/ibkr"]
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
@@ -60,3 +61,4 @@ fnv = { workspace = true }
 
 # IBKR (optional, behind "ibkr" feature)
 ibapi = { version = "=2.11.0", optional = true, default-features = false, features = ["sync"] }
+time = { version = "0.3", optional = true, features = ["macros"] }
