@@ -1,0 +1,78 @@
+name: "Dependabot Auto-Merge"
+
+on:
+  pull_request:
+    types: [ opened, synchronize, reopened, labeled ]
+    branches:
+      - develop
+
+jobs:
+  auto-merge:
+    name: Auto-merge patch updates
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    if: github.actor == 'dependabot[bot]'
+    timeout-minutes: 5
+    steps:
+      - name: Checkout for tier-2 config
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          sparse-checkout: .github/tier2-dependencies.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@ffa630c65fa7e0ecfa0625b5ceda64399aea1b36 # v3.0.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for tier-2 dependencies
+        id: tier2-check
+        env:
+          DEP_NAMES: ${{ steps.metadata.outputs.dependency-names }}
+        run: |
+          # Read tier-2 list: extract crate names only (strip =version and # comments)
+          if [ -f .github/tier2-dependencies.txt ]; then
+            TIER2_DEPS=$(grep -v '^#' .github/tier2-dependencies.txt \
+              | grep -v '^$' \
+              | sed 's/=.*//' \
+              | sed 's/[[:space:]].*//' \
+              | sort -u \
+              | tr '\n' '|' \
+              | sed 's/|$//')
+            # Word-boundary matching: DEP_NAMES is comma-separated from fetch-metadata
+            if [ -n "$TIER2_DEPS" ] && echo "$DEP_NAMES" | grep -qE "(^|, )($TIER2_DEPS)(,|$)"; then
+              echo "match=true" >> $GITHUB_OUTPUT
+              echo "::notice::Tier-2 dependency detected: requires manual review"
+            fi
+          fi
+
+      - name: Add tier-2 label for high-risk dependencies
+        if: steps.tier2-check.outputs.match == 'true'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr edit "$PR_URL" --add-label "tier-2"
+
+      - name: Disable auto-merge for tier-2 dependencies
+        if: |
+          contains(github.event.pull_request.labels.*.name, 'tier-2') ||
+          steps.tier2-check.outputs.match == 'true'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge --disable-auto "$PR_URL" || true
+
+      - name: Auto-merge patch updates
+        if: |
+          steps.metadata.outputs.update-type == 'version-update:semver-patch' &&
+          !contains(github.event.pull_request.labels.*.name, 'tier-2') &&
+          steps.tier2-check.outputs.match != 'true'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr review --approve "$PR_URL"
+          gh pr merge --auto --squash "$PR_URL"
