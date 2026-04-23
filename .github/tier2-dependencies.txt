@@ -1,0 +1,15 @@
+# Tier-2 Dependencies - Require Manual Review Before Merge
+#
+# Criteria (any match triggers tier-2):
+# - New direct dependencies (not transitive)
+# - Handles: network/IO, cryptography, unsafe code, financial data
+# - Repo signals: <100 GitHub stars, unmaintained (>1yr), single maintainer
+#
+# Format:
+#   crate           - tier-2, any version change needs review
+#   crate=x.y.z     - PINNED, exact version required
+#
+# Pinned entries include: # review-date | risk-factors
+# The auto-merge workflow reads this file and applies 'tier-2' label.
+
+ibapi=2.11.0  # 2026-04-18 | Financial protocol, community-maintained, no official SDK
