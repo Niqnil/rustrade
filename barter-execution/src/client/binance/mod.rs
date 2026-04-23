@@ -912,14 +912,14 @@ impl ExecutionClient for BinanceSpot {
         // Verify initial connection succeeds before returning the stream.
         // This lets the caller distinguish "can't connect at all" from "connected
         // but later disconnected" (the latter is handled by auto-reconnect).
-        let initial_ws = ws_handle
-            .connect()
-            .await
-            .map_err(|e| UnindexedClientError::AccountStream(e.to_string()))?;
+        let initial_ws = ws_handle.connect().await.map_err(|e| {
+            UnindexedClientError::Connectivity(ConnectivityError::Socket(e.to_string()))
+        })?;
 
+        #[allow(clippy::expect_used)] // Builder has no required fields; infallible
         let params = UserDataStreamSubscribeSignatureParams::builder()
             .build()
-            .map_err(|e| UnindexedClientError::AccountStream(e.to_string()))?;
+            .expect("UserDataStreamSubscribeSignatureParams has no required fields");
 
         match initial_ws
             .user_data_stream_subscribe_signature(params)
@@ -940,7 +940,7 @@ impl ExecutionClient for BinanceSpot {
                     }
                     Ok(Ok(())) => {}
                 }
-                return Err(UnindexedClientError::AccountStream(e.to_string()));
+                return Err(UnindexedClientError::Internal(e.to_string()));
             }
         }
 
@@ -1406,9 +1406,10 @@ impl ExecutionClient for BinanceSpot {
 /// On failure, disconnects the WS to avoid leaking the TCP connection.
 async fn connect_and_subscribe(ws_handle: &WebsocketApiHandle) -> anyhow::Result<WebsocketApi> {
     let ws = ws_handle.connect().await?;
+    #[allow(clippy::expect_used)] // Builder has no required fields; infallible
     let params = UserDataStreamSubscribeSignatureParams::builder()
         .build()
-        .map_err(|e| anyhow::anyhow!("failed to build subscribe params: {e}"))?;
+        .expect("UserDataStreamSubscribeSignatureParams has no required fields");
     match ws.user_data_stream_subscribe_signature(params).await {
         Ok(_) => Ok(ws),
         Err(e) => {
