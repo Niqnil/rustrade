@@ -2,20 +2,27 @@
 name = "barter-instrument"
 version = "0.3.1"
 edition = "2024"
-authors = ["JustAStream <justastream.code@gmail.com>"]
 license = "MIT"
 documentation = "https://docs.rs/barter-instrument"
-repository = "https://github.com/barter-rs/barter-rs"
+repository = "https://github.com/Niqnil/barter-rs"
 readme = "README.md"
 description = "Core Barter Exchange, Instrument and Asset data structures and associated utilities."
 keywords = ["trading", "backtesting", "crypto", "stocks", "investment"]
 categories = ["accessibility", "simulation"]
+
+[features]
+default = []
+ibkr = ["dep:ibapi", "dep:fnv", "dep:parking_lot"]
 
 [dev-dependencies]
 rust_decimal_macros = { workspace = true }
 serde_json = { workspace = true }
 
 [dependencies]
+# IBKR (optional, behind "ibkr" feature)
+ibapi = { version = "=2.11.0", optional = true, default-features = false, features = ["sync"] }
+fnv = { workspace = true, optional = true }
+parking_lot = { workspace = true, optional = true }
 # SerDe
 serde = { workspace = true, features = ["derive"] }
 

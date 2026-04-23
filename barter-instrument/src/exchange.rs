@@ -69,6 +69,8 @@ pub enum ExchangeId {
     Hitbtc,
     #[serde(alias = "huobi")]
     Htx,
+    /// Interactive Brokers — equities, futures, options, forex
+    Ibkr,
     Kraken,
     Kucoin,
     Liquid,
@@ -118,6 +120,7 @@ impl ExchangeId {
             ExchangeId::Gemini => "gemini",
             ExchangeId::Hitbtc => "hitbtc",
             ExchangeId::Htx => "htx", // huobi alias
+            ExchangeId::Ibkr => "ibkr",
             ExchangeId::Kraken => "kraken",
             ExchangeId::Kucoin => "kucoin",
             ExchangeId::Liquid => "liquid",

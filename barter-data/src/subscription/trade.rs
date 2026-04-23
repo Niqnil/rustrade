@@ -2,6 +2,7 @@ use super::SubscriptionKind;
 use barter_instrument::Side;
 use barter_macro::{DeSubKind, SerSubKind};
 use serde::{Deserialize, Serialize};
+use smol_str::SmolStr;
 
 /// Barter [`Subscription`](super::Subscription) [`SubscriptionKind`] that yields [`PublicTrade`]
 /// [`MarketEvent<T>`](crate::event::MarketEvent) events.
@@ -25,9 +26,13 @@ impl std::fmt::Display for PublicTrades {
 }
 
 /// Normalised Barter [`PublicTrade`] model.
+///
+/// Uses [`SmolStr`] for `id` to avoid heap allocation for typical trade IDs
+/// (up to 23 bytes on 64-bit systems are stored inline). Exceptions that
+/// heap-allocate: Bitmex UUIDs (36 bytes), Kraken composite IDs (~34 bytes).
 #[derive(Clone, PartialEq, PartialOrd, Debug, Deserialize, Serialize)]
 pub struct PublicTrade {
-    pub id: String,
+    pub id: SmolStr,
     pub price: f64,
     pub amount: f64,
     pub side: Side,

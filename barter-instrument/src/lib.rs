@@ -44,6 +44,10 @@ pub mod instrument;
 /// indexing non-indexed collections.
 pub mod index;
 
+/// Interactive Brokers support types (behind `ibkr` feature).
+#[cfg(feature = "ibkr")]
+pub mod ibkr;
+
 /// A keyed value.
 ///
 /// eg/ Keyed<InstrumentIndex, Instrument>

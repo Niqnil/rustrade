@@ -9,6 +9,7 @@ use barter_instrument::{Side, exchange::ExchangeId};
 use barter_integration::subscription::SubscriptionId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use smol_str::format_smolstr;
 
 /// Coinbase real-time trade WebSocket message.
 ///
@@ -62,7 +63,7 @@ impl<InstrumentKey> From<(ExchangeId, InstrumentKey, CoinbaseTrade)>
             exchange: exchange_id,
             instrument,
             kind: PublicTrade {
-                id: trade.id.to_string(),
+                id: format_smolstr!("{}", trade.id),
                 price: trade.price,
                 amount: trade.amount,
                 side: trade.side,
