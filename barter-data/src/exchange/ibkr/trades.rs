@@ -13,8 +13,17 @@ use barter_instrument::Side;
 use chrono::{DateTime, Utc};
 use ibapi::market_data::realtime::Trade;
 use smol_str::{SmolStr, format_smolstr};
-use std::hash::{Hash, Hasher};
+use std::{
+    hash::{Hash, Hasher},
+    sync::atomic::{AtomicU64, Ordering},
+};
 use tracing::warn;
+
+// Process-global counters aggregated across all instruments. Never reset, so
+// rate-limiting persists even after instrument reconnects. The `total_bad_*`
+// log field reflects cumulative errors, not per-instrument counts.
+static BAD_PRICE_COUNT: AtomicU64 = AtomicU64::new(0);
+static BAD_SIZE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Convert an IB trade to a PublicTrade.
 ///
@@ -29,14 +38,25 @@ use tracing::warn;
 /// Returns `None` if price or size is NaN/Inf (invalid trade data from IB).
 pub fn from_ib_trade(trade: &Trade) -> Option<PublicTrade> {
     if !trade.price.is_finite() {
-        warn!(
-            price = trade.price,
-            "IB trade has non-finite price, skipping"
-        );
+        let count = BAD_PRICE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if count == 1 || count.is_multiple_of(1000) {
+            warn!(
+                price = trade.price,
+                total_bad_prices = count,
+                "IB trade has non-finite price, skipping"
+            );
+        }
         return None;
     }
     if !trade.size.is_finite() {
-        warn!(size = trade.size, "IB trade has non-finite size, skipping");
+        let count = BAD_SIZE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if count == 1 || count.is_multiple_of(1000) {
+            warn!(
+                size = trade.size,
+                total_bad_sizes = count,
+                "IB trade has non-finite size, skipping"
+            );
+        }
         return None;
     }
 
@@ -50,15 +70,25 @@ pub fn from_ib_trade(trade: &Trade) -> Option<PublicTrade> {
 
 /// Parse the trade timestamp.
 ///
-/// Falls back to current time if the timestamp is invalid, with a warning.
-pub fn parse_trade_time(trade: &Trade) -> DateTime<Utc> {
+/// # Arguments
+///
+/// * `trade` - The IB trade tick
+/// * `now` - Fallback timestamp (caller's current time, avoids redundant syscalls)
+///
+/// # Fallback behavior
+///
+/// Falls back to `now` if the timestamp is out of range. In practice this is
+/// unreachable: `time::OffsetDateTime` (IB's type) has range year ±9999, while
+/// `chrono::DateTime<Utc>` has range year ±262143 — any valid IB timestamp
+/// converts successfully. The fallback exists for defensive safety.
+pub fn parse_trade_time(trade: &Trade, now: DateTime<Utc>) -> DateTime<Utc> {
     let unix_ts = trade.time.unix_timestamp();
     DateTime::from_timestamp(unix_ts, 0).unwrap_or_else(|| {
         warn!(
             unix_timestamp = unix_ts,
             "Invalid trade timestamp from IB, using current time"
         );
-        Utc::now()
+        now
     })
 }
 
@@ -165,8 +195,14 @@ mod tests {
     #[test]
     fn parses_valid_timestamp() {
         let trade = make_trade(1700000000, 100.0, 10.0);
-        let time = parse_trade_time(&trade);
+        let fallback = Utc::now();
+        let time = parse_trade_time(&trade, fallback);
 
+        // Should use trade timestamp, not fallback
         assert_eq!(time.timestamp(), 1700000000);
     }
+
+    // Note: No test for fallback path — it's unreachable. See parse_trade_time docs.
+    // time::OffsetDateTime range (±9999 years) is a subset of chrono::DateTime<Utc>
+    // range (±262143 years), so any valid IB timestamp always converts successfully.
 }

@@ -2,7 +2,6 @@ use crate::balance::{AssetBalance, Balance};
 use barter_instrument::asset::name::AssetNameExchange;
 use chrono::Utc;
 use fnv::FnvHashMap;
-use ibapi::accounts::AccountSummaryResult;
 use rust_decimal::Decimal;
 use smol_str::SmolStr;
 use std::str::FromStr;
@@ -26,13 +25,8 @@ impl BalanceAggregator {
         Self::default()
     }
 
-    /// Process an AccountSummaryResult event.
-    pub fn process(&mut self, result: &AccountSummaryResult) {
-        let summary = match result {
-            AccountSummaryResult::Summary(s) => s,
-            AccountSummaryResult::End => return,
-        };
-
+    /// Process an AccountSummary event.
+    pub fn process(&mut self, summary: &ibapi::accounts::AccountSummary) {
         let currency = SmolStr::new(&summary.currency);
         let entry = self.balances.entry(currency).or_default();
 
@@ -87,13 +81,13 @@ mod tests {
     use ibapi::accounts::AccountSummary;
     use std::str::FromStr;
 
-    fn mock_account_summary(tag: &str, value: &str, currency: &str) -> AccountSummaryResult {
-        AccountSummaryResult::Summary(AccountSummary {
+    fn mock_account_summary(tag: &str, value: &str, currency: &str) -> AccountSummary {
+        AccountSummary {
             account: "DU123456".to_string(),
             tag: tag.to_string(),
             value: value.to_string(),
             currency: currency.to_string(),
-        })
+        }
     }
 
     #[test]

@@ -1,14 +1,15 @@
 [package]
 name = "barter"
 version = "0.13.0"
-edition = "2024"
-license = "MIT"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 documentation = "https://docs.rs/barter"
-repository = "https://github.com/Niqnil/barter-rs"
 readme = "README.md"
 description = "Framework for building high-performance live-trading, paper-trading and back-testing systems"
-keywords = ["trading", "backtesting", "crypto", "stocks", "investment"]
-categories = ["accessibility", "simulation"]
 
 [[bench]]
 name = "backtest"
