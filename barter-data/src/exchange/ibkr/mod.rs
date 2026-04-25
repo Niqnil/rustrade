@@ -2,6 +2,17 @@
 //!
 //! Provides streaming market data from IB TWS/Gateway via the `ibapi` crate.
 //!
+//! # Connection
+//!
+//! Requires TWS or IB Gateway running locally with API enabled:
+//!
+//! | Application | Live Port | Paper Port |
+//! |-------------|-----------|------------|
+//! | TWS         | 7496      | 7497       |
+//! | IB Gateway  | 4001      | 4002       |
+//!
+//! Enable API in TWS/Gateway: Configure → API → Settings → Enable ActiveX and Socket Clients.
+//!
 //! # Architecture
 //!
 //! Unlike WebSocket-based exchanges, IB uses TCP sockets with a blocking API.
@@ -13,19 +24,28 @@
 //! - **Quotes** ([`OrderBookL1`]): Best bid/ask via `market_data()` subscription
 //! - **Depth** ([`OrderBookEvent`]): L2 order book via `market_depth()` subscription
 //! - **Trades** ([`PublicTrade`]): Tick-by-tick trades via `tick_by_tick_all_last()` subscription
+//! - **Historical** ([`Candle`]): OHLCV bars via [`historical::IbkrHistoricalData`]
 //!
 //! # Limitations
 //!
 //! - **Market depth limit**: IB allows max 3 concurrent depth subscriptions (error 309)
 //! - **Trade side**: IB doesn't provide trade side; defaults to `Side::Buy`
 //! - **Blocking API**: Uses `std::thread::spawn` for long-lived subscriptions
+//! - **No auto-reconnect**: Caller responsibility per library philosophy
+//!
+//! # See Also
+//!
+//! - [IB API Documentation](https://www.interactivebrokers.com/campus/ibkr-api-page/trader-workstation-api/)
+//! - [`barter_execution::client::ibkr`] for order execution
 //!
 //! [`Connector`]: crate::exchange::Connector
 //! [`OrderBookL1`]: crate::subscription::book::OrderBookL1
 //! [`OrderBookEvent`]: crate::subscription::book::OrderBookEvent
 //! [`PublicTrade`]: crate::subscription::trade::PublicTrade
+//! [`Candle`]: crate::subscription::candle::Candle
 
 pub mod depth;
+pub mod historical;
 pub mod quotes;
 pub mod subscription;
 pub mod trades;
@@ -213,6 +233,9 @@ where
         std::thread::Builder::new()
             .name(format!("ibkr-quotes-{symbol}"))
             .spawn(move || {
+                // Panic safety: parking_lot mutexes do not poison on panic, so shared state
+                // (ContractRegistry, etc.) remains usable. On panic the thread exits,
+                // tx is dropped, and the stream closes — caller observes EOF.
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     debug!(symbol = %symbol, "Starting quotes subscription");
 
@@ -230,8 +253,8 @@ where
                     let mut aggregator = QuoteAggregator::new();
 
                     for tick in sub {
-                        if let Some(l1) = aggregator.update(&tick) {
-                            let now = Utc::now();
+                        let now = Utc::now();
+                        if let Some(l1) = aggregator.update(&tick, now) {
                             let event = MarketEvent {
                                 time_exchange: l1.last_update_time,
                                 time_received: now,
@@ -279,6 +302,9 @@ where
         std::thread::Builder::new()
             .name(format!("ibkr-depth-{symbol}"))
             .spawn(move || {
+                // Panic safety: parking_lot mutexes do not poison on panic, so shared state
+                // (ContractRegistry, etc.) remains usable. On panic the thread exits,
+                // tx is dropped, and the stream closes — caller observes EOF.
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     debug!(symbol = %symbol, rows, "Starting depth subscription");
 
@@ -349,6 +375,9 @@ where
         std::thread::Builder::new()
             .name(format!("ibkr-trades-{symbol}"))
             .spawn(move || {
+                // Panic safety: parking_lot mutexes do not poison on panic, so shared state
+                // (ContractRegistry, etc.) remains usable. On panic the thread exits,
+                // tx is dropped, and the stream closes — caller observes EOF.
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     debug!(symbol = %symbol, "Starting trades subscription");
 
@@ -364,15 +393,16 @@ where
                     };
 
                     for trade in sub {
+                        let now = Utc::now();
                         let public_trade = match trades::from_ib_trade(&trade) {
                             Some(t) => t,
                             None => continue, // Skip invalid trades (NaN/Inf price or size)
                         };
-                        let time_exchange = trades::parse_trade_time(&trade);
+                        let time_exchange = trades::parse_trade_time(&trade, now);
 
                         let event = MarketEvent {
                             time_exchange,
-                            time_received: Utc::now(),
+                            time_received: now,
                             exchange: ExchangeId::Ibkr,
                             instrument: key.clone(),
                             kind: DataKind::Trade(public_trade),

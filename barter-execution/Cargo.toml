@@ -1,15 +1,15 @@
 [package]
 name = "barter-execution"
 version = "0.8.0"
-edition = "2024"
-rust-version = "1.95"
-license = "MIT"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 documentation = "https://docs.rs/barter-execution/"
-repository = "https://github.com/Niqnil/barter-rs"
 readme = "README.md"
 description = "Stream private account data from financial venues, and execute (live or mock) orders."
-keywords = ["trading", "backtesting", "crypto", "stocks", "investment"]
-categories = ["accessibility", "simulation"]
 
 
 [features]
@@ -93,5 +93,9 @@ chrono-tz = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["test-util"] }
 # Mock HTTP server for testing REST pagination and truncation logic (H-1, H-3)
 wiremock = { workspace = true }
+# Tracing for examples
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+# Decimal literals for examples
+rust_decimal_macros = { workspace = true }
 # Serde round-trip tests (L2)
 serde_json = { workspace = true }
