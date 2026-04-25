@@ -64,7 +64,10 @@ use barter_instrument::{
 use chrono::{DateTime, Utc};
 use execution::{ExecutionBuffer, parse_decimal_or_warn, parse_ib_side};
 use futures::stream::BoxStream;
-use ibapi::{accounts::types::AccountGroup, client::blocking::Client};
+use ibapi::{
+    accounts::{AccountSummaryResult, types::AccountGroup},
+    client::blocking::Client,
+};
 use order::{OrderContext, OrderIdMap, build_ib_order};
 use parking_lot::Mutex;
 use rust_decimal::Decimal;
@@ -76,7 +79,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Configuration for the IBKR execution client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,7 +90,10 @@ pub struct IbkrConfig {
     pub port: u16,
     /// Client ID (must be unique per connection)
     pub client_id: i32,
-    /// Account ID (e.g., "DU123456" for paper)
+    /// Account ID (e.g., "DU123456" for paper).
+    ///
+    /// Currently unused — balance/position queries use "All" group.
+    /// Reserved for future multi-account routing (advisor accounts).
     pub account: String,
     /// Pre-configured contracts to register on startup
     #[serde(default)]
@@ -137,6 +143,14 @@ impl ContractConfig {
         }
     }
 }
+
+/// Account group for "All" accounts (used by reqAccountSummary).
+static ACCOUNT_GROUP_ALL: std::sync::LazyLock<AccountGroup> =
+    std::sync::LazyLock::new(|| AccountGroup("All".to_string()));
+
+/// Timeout for position stream iteration.
+/// Workaround for ibapi bug where `PositionEnd` isn't routed to subscription.
+const POSITION_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Interactive Brokers execution client.
 ///
@@ -317,23 +331,37 @@ impl ExecutionClient for IbkrClient {
     ///   instruments have positions, not the position sizes. This is a
     ///   limitation of the `InstrumentAccountSnapshot` type, not the IB API.
     ///
+    /// # Known Issue: ibapi Decode Errors
+    ///
+    /// You may see log errors like `"error decoding message: error occurred:
+    /// unexpected message: Error"`. This is an upstream ibapi limitation where
+    /// IB Error messages (type 4) on subscription channels aren't properly
+    /// routed — they're logged but don't affect functionality.
+    ///
     /// # Timeout
     ///
-    /// This method blocks on IB's position subscription until IB sends an
-    /// end-of-data marker. If IB is stalled, this will block indefinitely.
+    /// Uses 5-second timeout between position updates. If IB stalls mid-stream
+    /// (e.g., due to the ibapi `PositionEnd` routing bug), returns partial results
+    /// after 5s of inactivity rather than blocking indefinitely.
+    ///
+    /// **For accounts with no positions, this method waits the full 5-second
+    /// timeout before returning an empty position list.**
     async fn account_snapshot(
         &self,
         assets: &[AssetNameExchange],
         instruments: &[InstrumentNameExchange],
     ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
-        let balances = self.fetch_balances(assets).await?;
-
+        // H-2 fix: Run balances and positions concurrently (independent IB requests)
         let client = self.client.clone();
         let contracts = self.contracts.clone();
-        // M-10 fix: Use HashSet for O(1) lookup
-        let instruments_filter: HashSet<_> = instruments.iter().cloned().collect();
+        let instruments_filter: Option<HashSet<_>> = if instruments.is_empty() {
+            None
+        } else {
+            Some(instruments.iter().cloned().collect())
+        };
 
-        let instrument_snapshots = tokio::task::spawn_blocking(move || {
+        let balances_future = self.fetch_balances(assets);
+        let positions_future = tokio::task::spawn_blocking(move || {
             use ibapi::accounts::PositionUpdate;
 
             // ibapi::Error is unstructured — we cannot distinguish connection failures
@@ -346,22 +374,47 @@ impl ExecutionClient for IbkrClient {
 
             let mut snapshots = Vec::new();
             let mut seen = HashSet::new();
-            for pos_update in positions_sub {
-                if let PositionUpdate::Position(pos) = pos_update
-                    && let Some(instrument) = contracts.get_name_by_con_id(pos.contract.contract_id)
-                    && (instruments_filter.is_empty() || instruments_filter.contains(&instrument))
-                    && seen.insert(instrument.clone())
+
+            // Use next_timeout() instead of blocking iterator to avoid hang.
+            // ibapi bug: PositionEnd has no request_id so it's not routed to the
+            // subscription, causing the iterator to block forever.
+            while let Some(pos_update) = positions_sub.next_timeout(POSITION_STREAM_TIMEOUT) {
+                let PositionUpdate::Position(pos) = pos_update else {
+                    trace!(?pos_update, "Ignoring non-Position variant");
+                    continue;
+                };
+                let Some(instrument) = contracts.get_name_by_con_id(pos.contract.contract_id)
+                else {
+                    continue;
+                };
+                if instruments_filter
+                    .as_ref()
+                    .is_some_and(|f| !f.contains(&instrument))
                 {
-                    snapshots.push(InstrumentAccountSnapshot {
-                        instrument,
-                        orders: Vec::new(),
-                    });
+                    continue;
                 }
+                if seen.contains(&instrument) {
+                    debug!(
+                        instrument = %instrument,
+                        "Duplicate position for instrument (multi-account?), skipping"
+                    );
+                    continue;
+                }
+                seen.insert(instrument.clone());
+                snapshots.push(InstrumentAccountSnapshot {
+                    instrument,
+                    orders: Vec::new(),
+                });
             }
             Ok::<_, UnindexedClientError>(snapshots)
-        })
-        .await
-        .map_err(|e| UnindexedClientError::TaskFailed(format!("task join: {e}")))??;
+        });
+
+        // ibapi routes responses by request_id via thread-safe channels (RwLock<HashMap>),
+        // so concurrent requests on the same client are safe.
+        let (balances_result, positions_result) = tokio::join!(balances_future, positions_future);
+        let balances = balances_result?;
+        let instrument_snapshots = positions_result
+            .map_err(|e| UnindexedClientError::TaskFailed(format!("task join: {e}")))??;
 
         Ok(AccountSnapshot {
             exchange: ExchangeId::Ibkr,
@@ -812,26 +865,32 @@ impl ExecutionClient for IbkrClient {
         assets: &[AssetNameExchange],
     ) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError> {
         let client = self.client.clone();
-        let account = self.config.account.clone();
-        // M-10 fix: Use HashSet for O(1) lookup instead of O(n) linear scan
-        let assets_filter: HashSet<AssetNameExchange> = assets.iter().cloned().collect();
+        let assets_filter: Option<HashSet<AssetNameExchange>> = if assets.is_empty() {
+            None
+        } else {
+            Some(assets.iter().cloned().collect())
+        };
 
         tokio::task::spawn_blocking(move || {
-            let group = AccountGroup(account);
+            // IB's reqAccountSummary expects a group name ("All" for all linked accounts),
+            // not an account ID. Using account ID causes error 321 "Unified group name is invalid".
             // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
             let sub = client
-                .account_summary(&group, &["TotalCashValue", "AvailableFunds"])
+                .account_summary(&ACCOUNT_GROUP_ALL, &["TotalCashValue", "AvailableFunds"])
                 .map_err(|e| UnindexedClientError::Internal(format!("account_summary: {e}")))?;
 
             let mut aggregator = BalanceAggregator::new();
             for summary in sub {
-                aggregator.process(&summary);
+                match summary {
+                    AccountSummaryResult::Summary(s) => aggregator.process(&s),
+                    AccountSummaryResult::End => break,
+                }
             }
 
             let mut balances = aggregator.to_balances();
 
-            if !assets_filter.is_empty() {
-                balances.retain(|b| assets_filter.contains(&b.asset));
+            if let Some(ref filter) = assets_filter {
+                balances.retain(|b| filter.contains(&b.asset));
             }
 
             Ok(balances)
@@ -858,8 +917,11 @@ impl ExecutionClient for IbkrClient {
         let client = self.client.clone();
         let contracts = self.contracts.clone();
         let order_ids = self.order_ids.clone();
-        // M-10 fix: Use HashSet for O(1) lookup
-        let instruments_filter: HashSet<_> = instruments.iter().cloned().collect();
+        let instruments_filter: Option<HashSet<_>> = if instruments.is_empty() {
+            None
+        } else {
+            Some(instruments.iter().cloned().collect())
+        };
 
         tokio::task::spawn_blocking(move || {
             use ibapi::orders::Orders;
@@ -882,7 +944,10 @@ impl ExecutionClient for IbkrClient {
                     None => continue,
                 };
 
-                if !instruments_filter.is_empty() && !instruments_filter.contains(&instrument) {
+                if instruments_filter
+                    .as_ref()
+                    .is_some_and(|f| !f.contains(&instrument))
+                {
                     continue;
                 }
 
@@ -960,16 +1025,19 @@ impl ExecutionClient for IbkrClient {
         let client = self.client.clone();
         let contracts = self.contracts.clone();
         let order_ids = self.order_ids.clone();
-        // M-10 fix: Use HashSet for O(1) lookup
-        let instruments_filter: HashSet<_> = instruments.iter().cloned().collect();
+        let instruments_filter: Option<HashSet<_>> = if instruments.is_empty() {
+            None
+        } else {
+            Some(instruments.iter().cloned().collect())
+        };
 
         tokio::task::spawn_blocking(move || {
             use ibapi::orders::Executions;
 
-            let filter = ibapi::orders::ExecutionFilter::default();
+            let exec_filter = ibapi::orders::ExecutionFilter::default();
             // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
             let sub = client
-                .executions(filter)
+                .executions(exec_filter)
                 .map_err(|e| UnindexedClientError::Internal(format!("executions: {e}")))?;
 
             let mut trades = Vec::new();
@@ -985,7 +1053,10 @@ impl ExecutionClient for IbkrClient {
                     None => continue,
                 };
 
-                if !instruments_filter.is_empty() && !instruments_filter.contains(&instrument) {
+                if instruments_filter
+                    .as_ref()
+                    .is_some_and(|f| !f.contains(&instrument))
+                {
                     continue;
                 }
 

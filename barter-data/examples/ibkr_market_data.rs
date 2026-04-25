@@ -4,7 +4,12 @@
 //!
 //! Demonstrates streaming market data from Interactive Brokers:
 //! - Quotes (OrderBookL1) for best bid/ask
-//! - Trades (PublicTrade) for tick-by-tick executions
+//!
+//! # Trades Subscription
+//!
+//! Tick-by-tick trades (`IbkrSubscriptionKind::Trades`) require a separate IB
+//! market data subscription (NASDAQ TotalView-OpenView or similar). Without it,
+//! the subscription will fail. This example only subscribes to quotes.
 //!
 //! # Prerequisites
 //!
@@ -51,21 +56,12 @@ async fn main() {
 
     let registry = Arc::new(registry);
 
-    // Define subscriptions
-    let subscriptions = vec![
-        // Subscribe to quotes (best bid/ask)
-        IbkrSubscription {
-            instrument: "AAPL".into(),
-            key: "AAPL".to_string(),
-            kind: IbkrSubscriptionKind::Quotes,
-        },
-        // Subscribe to tick-by-tick trades
-        IbkrSubscription {
-            instrument: "AAPL".into(),
-            key: "AAPL".to_string(),
-            kind: IbkrSubscriptionKind::Trades,
-        },
-    ];
+    // Define subscriptions (see module docs for Trades subscription requirements)
+    let subscriptions = vec![IbkrSubscription {
+        instrument: "AAPL".into(),
+        key: "AAPL".to_string(),
+        kind: IbkrSubscriptionKind::Quotes,
+    }];
 
     info!("Connecting to IB Gateway...");
 
