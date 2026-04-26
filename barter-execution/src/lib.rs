@@ -35,6 +35,7 @@ use wiremock as _;
 use crate::{
     balance::AssetBalance,
     order::{Order, OrderSnapshot, request::OrderResponseCancel},
+    position::Position,
     trade::Trade,
 };
 use barter_instrument::{
@@ -59,6 +60,7 @@ pub use fill::{BidAskFillModel, FillModel, LastPriceFillModel, MidpointFillModel
 pub mod indexer;
 pub mod map;
 pub mod order;
+pub mod position;
 pub mod trade;
 
 /// Convenient type alias for an [`AccountEvent`] keyed with [`ExchangeId`],
@@ -150,6 +152,10 @@ pub struct InstrumentAccountSnapshot<
     pub instrument: InstrumentKey,
     #[serde(default = "Vec::new")]
     pub orders: Vec<OrderSnapshot<ExchangeKey, AssetKey, InstrumentKey>>,
+    /// Open position for derivative instruments (perpetuals, futures, margin).
+    /// `None` for spot instruments where position is implicit in balances.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<Position>,
 }
 
 impl<ExchangeKey, AssetKey, InstrumentKey> AccountSnapshot<ExchangeKey, AssetKey, InstrumentKey> {

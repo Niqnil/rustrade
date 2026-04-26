@@ -26,6 +26,10 @@ pub mod alpaca;
 #[cfg(feature = "binance")]
 pub mod binance;
 
+// Hyperliquid perpetual futures ExecutionClient implementation
+#[cfg(feature = "hyperliquid")]
+pub mod hyperliquid;
+
 // Interactive Brokers ExecutionClient implementation (equities, futures, options, forex)
 #[cfg(feature = "ibkr")]
 pub mod ibkr;

@@ -404,6 +404,7 @@ impl ExecutionClient for IbkrClient {
                 snapshots.push(InstrumentAccountSnapshot {
                     instrument,
                     orders: Vec::new(),
+                    position: None,
                 });
             }
             Ok::<_, UnindexedClientError>(snapshots)

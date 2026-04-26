@@ -88,7 +88,11 @@ impl AccountEventIndexer {
         let instruments = instruments
             .into_iter()
             .map(|snapshot| {
-                let InstrumentAccountSnapshot { instrument, orders } = snapshot;
+                let InstrumentAccountSnapshot {
+                    instrument,
+                    orders,
+                    position,
+                } = snapshot;
 
                 let instrument = self.map.find_instrument_index(&instrument)?;
 
@@ -97,7 +101,11 @@ impl AccountEventIndexer {
                     .map(|order| self.order_snapshot(order))
                     .collect::<Result<Vec<_>, _>>()?;
 
-                Ok(InstrumentAccountSnapshot { instrument, orders })
+                Ok(InstrumentAccountSnapshot {
+                    instrument,
+                    orders,
+                    position,
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
 
