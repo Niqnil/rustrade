@@ -121,6 +121,44 @@ fn coin_to_instrument(coin: &str) -> InstrumentNameExchange {
     InstrumentNameExchange::from(format_smolstr!("{}-USD-PERP", coin))
 }
 
+/// Extract coin name from instrument (e.g., "BTC-USD-PERP" -> "BTC").
+fn instrument_to_coin(instrument: &InstrumentNameExchange) -> String {
+    let s = instrument.as_ref();
+    // Expected format: "COIN-USD-PERP" or just "COIN"
+    s.split('-').next().unwrap_or(s).to_string()
+}
+
+/// Round a price to 5 significant figures (Hyperliquid requirement).
+///
+/// Uses string formatting to get exact significant figure count.
+fn round_to_5_sig_figs(value: Decimal) -> f64 {
+    if value.is_zero() {
+        return 0.0;
+    }
+
+    let f = value.to_string().parse::<f64>().unwrap_or(0.0);
+    if f == 0.0 {
+        return 0.0;
+    }
+
+    // Clamp magnitude to prevent overflow when casting to i32
+    #[allow(clippy::cast_possible_truncation)]
+    let magnitude = f.abs().log10().floor().clamp(-30.0, 30.0) as i32;
+    let scale = 10_f64.powi(4 - magnitude);
+    (f * scale).round() / scale
+}
+
+/// Map barter TimeInForce to Hyperliquid TIF string.
+fn map_tif(tif: &TimeInForce) -> &'static str {
+    match tif {
+        TimeInForce::GoodUntilCancelled { post_only: true } => "Alo",
+        TimeInForce::GoodUntilCancelled { post_only: false } => "Gtc",
+        TimeInForce::ImmediateOrCancel => "Ioc",
+        TimeInForce::FillOrKill => "Ioc", // Hyperliquid doesn't have FOK, use IOC
+        TimeInForce::GoodUntilEndOfDay => "Gtc", // No EOD on Hyperliquid
+    }
+}
+
 impl ExecutionClient for HyperliquidClient {
     const EXCHANGE: ExchangeId = ExchangeId::HyperliquidPerp;
 
@@ -339,20 +377,210 @@ impl ExecutionClient for HyperliquidClient {
 
     async fn cancel_order(
         &self,
-        _request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
+        request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
     ) -> Option<UnindexedOrderResponseCancel> {
-        // TODO: Implement using ExchangeClient::cancel
-        debug!("cancel_order not yet implemented");
-        None
+        use crate::order::{request::OrderResponseCancel, state::Cancelled};
+        use hyperliquid_rust_sdk::ClientCancelRequest;
+
+        let coin = instrument_to_coin(request.key.instrument);
+
+        // Get order ID from request
+        let order_id = match &request.state.id {
+            Some(id) => id,
+            None => {
+                warn!("Cancel request missing order ID");
+                return Some(OrderResponseCancel {
+                    key: OrderKey {
+                        exchange: ExchangeId::HyperliquidPerp,
+                        instrument: request.key.instrument.clone(),
+                        strategy: request.key.strategy.clone(),
+                        cid: request.key.cid.clone(),
+                    },
+                    state: Err(UnindexedOrderError::Rejected(
+                        crate::error::ApiError::OrderRejected("Missing order ID".to_string()),
+                    )),
+                });
+            }
+        };
+
+        // Parse order ID to u64
+        let oid: u64 = match order_id.0.parse() {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(?order_id, %e, "Failed to parse order ID as u64");
+                return Some(OrderResponseCancel {
+                    key: OrderKey {
+                        exchange: ExchangeId::HyperliquidPerp,
+                        instrument: request.key.instrument.clone(),
+                        strategy: request.key.strategy.clone(),
+                        cid: request.key.cid.clone(),
+                    },
+                    state: Err(UnindexedOrderError::Rejected(
+                        crate::error::ApiError::OrderRejected(format!("Invalid order ID: {e}")),
+                    )),
+                });
+            }
+        };
+
+        let cancel_request = ClientCancelRequest { asset: coin, oid };
+
+        match self.exchange_client.cancel(cancel_request, None).await {
+            Ok(response) => {
+                debug!(?response, "Cancel order response");
+                Some(OrderResponseCancel {
+                    key: OrderKey {
+                        exchange: ExchangeId::HyperliquidPerp,
+                        instrument: request.key.instrument.clone(),
+                        strategy: request.key.strategy.clone(),
+                        cid: request.key.cid.clone(),
+                    },
+                    state: Ok(Cancelled {
+                        id: order_id.clone(),
+                        time_exchange: Utc::now(),
+                    }),
+                })
+            }
+            Err(e) => {
+                warn!(%e, "Cancel order failed");
+                Some(OrderResponseCancel {
+                    key: OrderKey {
+                        exchange: ExchangeId::HyperliquidPerp,
+                        instrument: request.key.instrument.clone(),
+                        strategy: request.key.strategy.clone(),
+                        cid: request.key.cid.clone(),
+                    },
+                    state: Err(error::map_order_error(e, request.key.instrument)),
+                })
+            }
+        }
     }
 
     async fn open_order(
         &self,
-        _request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
+        request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
     ) -> Option<Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>> {
-        // TODO: Implement using ExchangeClient::order
-        debug!("open_order not yet implemented");
-        None
+        use hyperliquid_rust_sdk::{
+            ClientLimit, ClientOrder, ClientOrderRequest, ExchangeDataStatus,
+            ExchangeResponseStatus,
+        };
+
+        let coin = instrument_to_coin(request.key.instrument);
+        let is_buy = request.state.side == Side::Buy;
+
+        // Round price and quantity to 5 significant figures
+        let limit_px = round_to_5_sig_figs(request.state.price);
+        let sz = round_to_5_sig_figs(request.state.quantity);
+
+        // Map time-in-force
+        let tif = map_tif(&request.state.time_in_force).to_string();
+
+        // Build order request
+        let order_request = ClientOrderRequest {
+            asset: coin,
+            is_buy,
+            reduce_only: request.state.reduce_only,
+            limit_px,
+            sz,
+            cloid: None, // Could use request.key.cid if it's a valid UUID
+            order_type: ClientOrder::Limit(ClientLimit { tif }),
+        };
+
+        let response = match self.exchange_client.order(order_request, None).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(%e, "Open order failed");
+                return Some(Order {
+                    key: OrderKey {
+                        exchange: ExchangeId::HyperliquidPerp,
+                        instrument: request.key.instrument.clone(),
+                        strategy: request.key.strategy.clone(),
+                        cid: request.key.cid.clone(),
+                    },
+                    side: request.state.side,
+                    price: request.state.price,
+                    quantity: request.state.quantity,
+                    kind: request.state.kind,
+                    time_in_force: request.state.time_in_force,
+                    state: Err(error::map_order_error(e, request.key.instrument)),
+                });
+            }
+        };
+
+        // Parse response
+        let state = match response {
+            ExchangeResponseStatus::Ok(exchange_resp) => {
+                // Check status from response data
+                let status = exchange_resp
+                    .data
+                    .and_then(|d| d.statuses.into_iter().next());
+
+                match status {
+                    Some(ExchangeDataStatus::Resting(resting)) => {
+                        debug!(oid = resting.oid, "Order resting");
+                        Ok(Open {
+                            id: OrderId::new(format_smolstr!("{}", resting.oid)),
+                            time_exchange: Utc::now(),
+                            filled_quantity: Decimal::ZERO,
+                        })
+                    }
+                    Some(ExchangeDataStatus::Filled(filled)) => {
+                        debug!(oid = filled.oid, avg_px = %filled.avg_px, "Order filled");
+                        Ok(Open {
+                            id: OrderId::new(format_smolstr!("{}", filled.oid)),
+                            time_exchange: Utc::now(),
+                            filled_quantity: parse_decimal(&filled.total_sz, "total_sz")
+                                .unwrap_or(request.state.quantity),
+                        })
+                    }
+                    Some(ExchangeDataStatus::Error(msg)) => {
+                        warn!(%msg, "Order rejected by exchange");
+                        Err(UnindexedOrderError::Rejected(
+                            crate::error::ApiError::OrderRejected(msg),
+                        ))
+                    }
+                    Some(ExchangeDataStatus::WaitingForFill)
+                    | Some(ExchangeDataStatus::WaitingForTrigger) => {
+                        // Trigger/conditional orders - not fully supported yet
+                        debug!("Order waiting for trigger/fill");
+                        Ok(Open {
+                            id: OrderId::new(SmolStr::new("pending")),
+                            time_exchange: Utc::now(),
+                            filled_quantity: Decimal::ZERO,
+                        })
+                    }
+                    Some(ExchangeDataStatus::Success) | None => {
+                        // Generic success without specific order ID
+                        debug!("Order submitted successfully");
+                        Ok(Open {
+                            id: OrderId::new(SmolStr::new("unknown")),
+                            time_exchange: Utc::now(),
+                            filled_quantity: Decimal::ZERO,
+                        })
+                    }
+                }
+            }
+            ExchangeResponseStatus::Err(msg) => {
+                warn!(%msg, "Order rejected");
+                Err(UnindexedOrderError::Rejected(
+                    crate::error::ApiError::OrderRejected(msg),
+                ))
+            }
+        };
+
+        Some(Order {
+            key: OrderKey {
+                exchange: ExchangeId::HyperliquidPerp,
+                instrument: request.key.instrument.clone(),
+                strategy: request.key.strategy.clone(),
+                cid: request.key.cid.clone(),
+            },
+            side: request.state.side,
+            price: request.state.price,
+            quantity: request.state.quantity,
+            kind: request.state.kind,
+            time_in_force: request.state.time_in_force,
+            state,
+        })
     }
 
     async fn fetch_balances(
