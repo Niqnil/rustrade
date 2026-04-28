@@ -21,5 +21,6 @@ WebSocket integration library for streaming public market data from exchanges.
 | **GateioOptions** | `GateioOptions::default()` | Option | PublicTrades |
 | **Kraken** | `Kraken` | Spot | PublicTrades, OrderBooksL1 |
 | **Okx** | `Okx` | Spot, Future, Perpetual, Option | PublicTrades |
+| **Hyperliquid** | `Hyperliquid::default()` | Perpetual | PublicTrades, OrderBooksL2 |
 
 See the [workspace README](../README.md) for documentation, examples, and contributing guidelines.
