@@ -158,6 +158,7 @@ impl<MarketEventKind: Debug> TimeExchange for EngineEvent<MarketEventKind> {
                     .map(|cancelled| cancelled.time_exchange)
                     .ok(),
                 AccountEventKind::Trade(trade) => Some(trade.time_exchange),
+                _ => None,
             },
             _ => None,
         }

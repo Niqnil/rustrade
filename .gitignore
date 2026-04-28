@@ -2,8 +2,9 @@
 Cargo.lock
 /target
 
-# Environment secrets
+# Environment secrets (protect all .env variants except template)
 .env*
+!.env.template
 
 # IDE
 .idea/

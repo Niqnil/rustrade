@@ -63,6 +63,7 @@ impl AccountEventIndexer {
                 AccountEventKind::OrderCancelled(self.order_response_cancel(response)?)
             }
             AccountEventKind::Trade(trade) => AccountEventKind::Trade(self.trade(trade)?),
+            AccountEventKind::StreamError(msg) => AccountEventKind::StreamError(msg),
         };
 
         Ok(AccountEvent { exchange, kind })
@@ -212,6 +213,7 @@ impl AccountEventIndexer {
     pub fn api_error(&self, error: UnindexedApiError) -> Result<ApiError, IndexError> {
         Ok(match error {
             UnindexedApiError::RateLimit => ApiError::RateLimit,
+            UnindexedApiError::Unauthenticated(msg) => ApiError::Unauthenticated(msg),
             UnindexedApiError::AssetInvalid(asset, value) => {
                 ApiError::AssetInvalid(self.map.find_asset_index(&asset)?, value)
             }

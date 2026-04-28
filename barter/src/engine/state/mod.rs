@@ -163,6 +163,7 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                 instrument_state.data.process(event);
                 instrument_state.update_from_trade(trade)
             }
+            _ => None,
         };
 
         // Update any user provided GlobalData State

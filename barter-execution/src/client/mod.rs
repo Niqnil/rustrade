@@ -68,6 +68,13 @@ where
     /// open-order state, but TRADE fills in this window are not recoverable from the stream
     /// alone. Callers that require fill completeness at startup **must** call
     /// [`ExecutionClient::fetch_trades`] with at least a 1-second lookback after this method returns.
+    ///
+    /// # Backpressure
+    ///
+    /// Implementations use unbounded internal channels. If the consumer cannot keep up,
+    /// events queue in memory rather than being dropped — per library philosophy, OOM
+    /// crashes are preferable to silent data loss. Consumers requiring backpressure
+    /// should implement it at their boundary (e.g., bounded channel with overflow policy).
     fn account_stream(
         &self,
         assets: &[AssetNameExchange],

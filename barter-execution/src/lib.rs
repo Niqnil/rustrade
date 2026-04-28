@@ -30,6 +30,8 @@
 
 // Silence unused_crate_dependencies for dev-dependencies used only in tests
 #[cfg(test)]
+use tracing_subscriber as _;
+#[cfg(test)]
 use wiremock as _;
 
 use crate::{
@@ -96,6 +98,7 @@ impl<ExchangeKey, AssetKey, InstrumentKey> AccountEvent<ExchangeKey, AssetKey, I
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, From)]
+#[non_exhaustive]
 pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
     /// Full [`AccountSnapshot`] - replaces all existing state.
     Snapshot(AccountSnapshot<ExchangeKey, AssetKey, InstrumentKey>),
@@ -113,6 +116,13 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
 
     /// [`Order<ExchangeKey, InstrumentKey, Open>`] partial or full-fill.
     Trade(Trade<QuoteAsset, InstrumentKey>),
+
+    /// WebSocket-level error from exchange. Connection may have dropped.
+    ///
+    /// Implementations send this when the underlying stream encounters an error.
+    /// Consumers should treat this as a signal that events may have been missed
+    /// and consider re-syncing via REST (e.g., `fetch_trades`, `account_snapshot`).
+    StreamError(String),
 }
 
 impl<ExchangeKey, AssetKey, InstrumentKey> AccountEvent<ExchangeKey, AssetKey, InstrumentKey>

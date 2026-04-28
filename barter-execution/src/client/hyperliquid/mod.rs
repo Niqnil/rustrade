@@ -12,11 +12,12 @@
 //!
 //! - REST (`InfoClient`): account_snapshot, fetch_balances, fetch_open_orders, fetch_trades
 //! - REST (`ExchangeClient`): open_order, cancel_order
-//! - WebSocket (`WsManager`): account_stream via UserFills + OrderUpdates subscriptions
+//! - WebSocket (`InfoClient` with `with_reconnect`): account_stream via UserFills + OrderUpdates subscriptions
 //!
 //! # Limitations
 //!
-//! - **No auto-reconnect**: Per library philosophy, reconnection is caller responsibility
+//! - **SDK-managed reconnect**: WebSocket streams use `InfoClient::with_reconnect()` for automatic
+//!   reconnection. REST clients (`InfoClient::new()`, `ExchangeClient::new()`) do not auto-reconnect.
 //! - **Perpetuals only**: Spot trading is future work
 //! - **Price precision**: Hyperliquid requires 5 significant figures for prices
 
@@ -24,10 +25,11 @@ pub mod config;
 pub mod error;
 
 use crate::{
-    AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent, UnindexedAccountSnapshot,
+    AccountEvent, AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot,
+    UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance},
     client::ExecutionClient,
-    error::{UnindexedClientError, UnindexedOrderError},
+    error::{ConnectivityError, UnindexedClientError, UnindexedOrderError},
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, OrderId, StrategyId},
@@ -43,19 +45,48 @@ use barter_instrument::{
     exchange::ExchangeId,
     instrument::name::InstrumentNameExchange,
 };
+use barter_integration::collection::snapshot::Snapshot;
 use chrono::{DateTime, TimeZone, Utc};
 use config::HyperliquidConfig;
 use error::map_sdk_error;
 use ethers::signers::Signer;
-use futures::stream::BoxStream;
-use hyperliquid_rust_sdk::{BaseUrl, ExchangeClient, InfoClient};
+use futures::{Stream, StreamExt, stream::BoxStream};
+use hyperliquid_rust_sdk::{BaseUrl, ExchangeClient, InfoClient, Message, Subscription};
 use rust_decimal::Decimal;
 use smol_str::{SmolStr, format_smolstr};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::{collections::HashSet, str::FromStr, sync::Arc};
-use tracing::{debug, info, warn};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 /// USDC asset name on Hyperliquid (the only collateral asset for perps).
 const USDC_ASSET: &str = "USDC";
+
+/// Stream wrapper that cancels background tasks when dropped.
+///
+/// Ensures spawned WebSocket processing tasks are cleaned up when the consumer
+/// drops the account stream, preventing task leaks.
+struct CancelOnDropStream<S> {
+    inner: S,
+    cancel_token: CancellationToken,
+}
+
+impl<S: Stream + Unpin> Stream for CancelOnDropStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl<S> Drop for CancelOnDropStream<S> {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+    }
+}
 
 /// Hyperliquid perpetual futures execution client.
 ///
@@ -69,8 +100,40 @@ pub struct HyperliquidClient {
 }
 
 impl HyperliquidClient {
+    /// Create a new client asynchronously.
+    ///
+    /// Use this when calling from an async context (e.g., tokio tests).
+    /// For sync contexts, use `ExecutionClient::new()`.
+    pub async fn connect(config: HyperliquidConfig) -> Result<Self, ConnectivityError> {
+        let base_url = if config.testnet {
+            BaseUrl::Testnet
+        } else {
+            BaseUrl::Mainnet
+        };
+
+        let info_client = InfoClient::new(None, Some(base_url))
+            .await
+            .map_err(|e| ConnectivityError::Socket(format!("InfoClient: {e}")))?;
+
+        let wallet = config.wallet.clone();
+        let exchange_client = ExchangeClient::new(None, wallet, Some(base_url), None, None)
+            .await
+            .map_err(|e| ConnectivityError::Socket(format!("ExchangeClient: {e}")))?;
+
+        info!(
+            testnet = config.testnet,
+            wallet = %config.wallet_address_hex(),
+            "Created HyperliquidClient"
+        );
+
+        Ok(Self {
+            config,
+            info_client: Arc::new(info_client),
+            exchange_client: Arc::new(exchange_client),
+        })
+    }
+
     /// Returns the base URL for the configured network (mainnet or testnet).
-    #[allow(dead_code)] // Will be used for WS reconnection
     fn base_url(&self) -> BaseUrl {
         if self.config.testnet {
             BaseUrl::Testnet
@@ -97,11 +160,14 @@ fn parse_decimal(value: &str, field: &str) -> Option<Decimal> {
         .ok()
 }
 
-/// Parse SDK side string ("B" = buy/long, "A" or "S" = sell/short) to barter Side.
+/// Parse SDK side string to barter Side.
+///
+/// Hyperliquid API returns "B" for buy/long and "A" for sell/short (ask-side).
+/// Extra variants included for defensive parsing of potential future API changes.
 fn parse_side(side: &str) -> Option<Side> {
-    match side.to_uppercase().as_str() {
-        "B" | "BUY" => Some(Side::Buy),
-        "A" | "S" | "SELL" => Some(Side::Sell),
+    match side {
+        "B" | "b" | "BUY" | "Buy" | "buy" => Some(Side::Buy),
+        "A" | "a" | "S" | "s" | "SELL" | "Sell" | "sell" => Some(Side::Sell),
         _ => {
             warn!(%side, "Unknown side string");
             None
@@ -110,10 +176,10 @@ fn parse_side(side: &str) -> Option<Side> {
 }
 
 /// Convert milliseconds timestamp to DateTime<Utc>.
-fn millis_to_datetime(millis: u64) -> DateTime<Utc> {
-    Utc.timestamp_millis_opt(millis as i64)
-        .single()
-        .unwrap_or_else(Utc::now)
+///
+/// Returns `None` for timestamps outside the representable range (year 292M+).
+fn millis_to_datetime(millis: u64) -> Option<DateTime<Utc>> {
+    Utc.timestamp_millis_opt(millis as i64).single()
 }
 
 /// Build instrument name from Hyperliquid coin name (e.g., "BTC" -> "BTC-USD-PERP").
@@ -122,21 +188,26 @@ fn coin_to_instrument(coin: &str) -> InstrumentNameExchange {
 }
 
 /// Extract coin name from instrument (e.g., "BTC-USD-PERP" -> "BTC").
+///
+/// Returns `String` because Hyperliquid SDK requires `String` for asset fields.
 fn instrument_to_coin(instrument: &InstrumentNameExchange) -> String {
     let s = instrument.as_ref();
     // Expected format: "COIN-USD-PERP" or just "COIN"
-    s.split('-').next().unwrap_or(s).to_string()
+    match s.split_once('-') {
+        Some((coin, _)) => coin.to_string(),
+        None => s.to_string(),
+    }
 }
 
 /// Round a price to 5 significant figures (Hyperliquid requirement).
-///
-/// Uses string formatting to get exact significant figure count.
 fn round_to_5_sig_figs(value: Decimal) -> f64 {
+    use rust_decimal::prelude::ToPrimitive;
+
     if value.is_zero() {
         return 0.0;
     }
 
-    let f = value.to_string().parse::<f64>().unwrap_or(0.0);
+    let f = value.to_f64().unwrap_or(0.0);
     if f == 0.0 {
         return 0.0;
     }
@@ -159,12 +230,38 @@ fn map_tif(tif: &TimeInForce) -> &'static str {
     }
 }
 
+/// Convert a ClientOrderId to SDK cloid format (UUID) if valid.
+///
+/// Returns `Some(Uuid)` if the cid is a valid UUID, `None` otherwise.
+/// Non-UUID CIDs are logged at debug level since they're common in tests/examples.
+fn cid_to_cloid(cid: &ClientOrderId) -> Option<Uuid> {
+    match Uuid::parse_str(cid.0.as_str()) {
+        Ok(uuid) => Some(uuid),
+        Err(_) => {
+            debug!(cid = %cid.0, "CID is not a valid UUID, cloid will be None");
+            None
+        }
+    }
+}
+
 impl ExecutionClient for HyperliquidClient {
     const EXCHANGE: ExchangeId = ExchangeId::HyperliquidPerp;
 
     type Config = HyperliquidConfig;
     type AccountStream = BoxStream<'static, UnindexedAccountEvent>;
 
+    /// Creates a new Hyperliquid client synchronously.
+    ///
+    /// # Panics
+    ///
+    /// - If no Tokio runtime is available on the current thread
+    /// - If called from within an async context (e.g., inside `async fn`, `spawn`, or `block_on`)
+    /// - If SDK initialization fails (network error, invalid credentials)
+    ///
+    /// # Recommended Usage
+    ///
+    /// Use [`HyperliquidClient::connect`] instead — it's async-safe and returns `Result`.
+    /// This method exists only for trait compliance; prefer `connect()` in all new code.
     fn new(config: Self::Config) -> Self {
         let base_url = if config.testnet {
             BaseUrl::Testnet
@@ -173,7 +270,7 @@ impl ExecutionClient for HyperliquidClient {
         };
 
         // SDK initialization is async; block on it since ExecutionClient::new is sync.
-        // Safe because callers are already in a tokio runtime context.
+        // WARNING: This will panic if called from within an async context.
         let handle = tokio::runtime::Handle::current();
 
         let info_client = handle.block_on(async {
@@ -237,9 +334,12 @@ impl ExecutionClient for HyperliquidClient {
         )
         .unwrap_or(Decimal::ZERO);
 
+        // Free balance can go negative during liquidation (margin_used > account_value).
+        // Clamp to zero since negative free balance has no meaningful interpretation.
+        let free_balance = (account_value - margin_used).max(Decimal::ZERO);
         let balances = vec![AssetBalance::new(
             AssetNameExchange::from(USDC_ASSET),
-            Balance::new(account_value, account_value - margin_used),
+            Balance::new(account_value, free_balance),
             now,
         )];
 
@@ -247,14 +347,16 @@ impl ExecutionClient for HyperliquidClient {
         let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
             None
         } else {
-            Some(instruments.iter().cloned().collect())
+            let mut set = HashSet::with_capacity(instruments.len());
+            set.extend(instruments.iter().cloned());
+            Some(set)
         };
 
         // Group open orders by instrument
         let mut orders_by_instrument: std::collections::HashMap<InstrumentNameExchange, Vec<_>> =
-            std::collections::HashMap::new();
+            std::collections::HashMap::with_capacity(open_orders.len());
 
-        for order in open_orders {
+        for order in &open_orders {
             let instrument = coin_to_instrument(&order.coin);
             if instrument_filter
                 .as_ref()
@@ -272,13 +374,22 @@ impl ExecutionClient for HyperliquidClient {
             let Some(quantity) = parse_decimal(&order.sz, "sz") else {
                 continue;
             };
+            let Some(time_exchange) = millis_to_datetime(order.timestamp) else {
+                warn!(
+                    oid = order.oid,
+                    timestamp = order.timestamp,
+                    "Invalid order timestamp, skipping"
+                );
+                continue;
+            };
 
+            let order_id = format_smolstr!("{}", order.oid);
             let order_snapshot = Order {
                 key: OrderKey {
                     exchange: ExchangeId::HyperliquidPerp,
                     instrument: instrument.clone(),
                     strategy: StrategyId::unknown(),
-                    cid: ClientOrderId::new(format_smolstr!("{}", order.oid)),
+                    cid: ClientOrderId::new(order_id.clone()),
                 },
                 side,
                 price,
@@ -286,8 +397,8 @@ impl ExecutionClient for HyperliquidClient {
                 kind: OrderKind::Limit,
                 time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
                 state: crate::order::state::OrderState::active(Open {
-                    id: OrderId::new(format_smolstr!("{}", order.oid)),
-                    time_exchange: millis_to_datetime(order.timestamp),
+                    id: OrderId(order_id),
+                    time_exchange,
                     filled_quantity: Decimal::ZERO,
                 }),
             };
@@ -363,16 +474,158 @@ impl ExecutionClient for HyperliquidClient {
         })
     }
 
+    /// Returns a live stream of account events (fills, order updates).
+    ///
+    /// # Instrument filtering
+    ///
+    /// The `instruments` parameter is **ignored** — Hyperliquid's WebSocket API does not
+    /// support per-instrument subscriptions for user events. All fills and order updates
+    /// across all instruments are delivered. Consumers requiring instrument filtering
+    /// must filter client-side.
+    ///
+    /// # Task lifecycle
+    ///
+    /// Spawns two background tasks (fills, orders) that are automatically cancelled
+    /// when the returned stream is dropped. The `ws_client` is held by the orders task;
+    /// when cancelled, both tasks exit and the WebSocket connection closes.
     async fn account_stream(
         &self,
         _assets: &[AssetNameExchange],
         _instruments: &[InstrumentNameExchange],
     ) -> Result<Self::AccountStream, UnindexedClientError> {
-        // TODO: Implement using WsManager subscriptions
-        debug!("account_stream not yet implemented");
-        Err(UnindexedClientError::Internal(
-            "Hyperliquid account_stream not yet implemented".to_string(),
-        ))
+        let user = self.wallet_h160();
+        let base_url = self.base_url();
+
+        // Create a dedicated InfoClient for WebSocket streaming.
+        // Using with_reconnect() enables SDK-managed reconnection.
+        let mut ws_client = InfoClient::with_reconnect(None, Some(base_url))
+            .await
+            .map_err(|e| ConnectivityError::Socket(e.to_string()))?;
+
+        // Create channels for subscriptions
+        let (fills_tx, mut fills_rx) = mpsc::unbounded_channel::<Message>();
+        let (orders_tx, mut orders_rx) = mpsc::unbounded_channel::<Message>();
+
+        // Subscribe to user fills
+        ws_client
+            .subscribe(Subscription::UserFills { user }, fills_tx)
+            .await
+            .map_err(|e| ConnectivityError::Socket(format!("UserFills subscribe: {e}")))?;
+
+        // Subscribe to order updates
+        ws_client
+            .subscribe(Subscription::OrderUpdates { user }, orders_tx)
+            .await
+            .map_err(|e| ConnectivityError::Socket(format!("OrderUpdates subscribe: {e}")))?;
+
+        info!(%user, "Subscribed to Hyperliquid account stream");
+
+        // Create output channel for merged events
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<UnindexedAccountEvent>();
+
+        // CancellationToken ensures tasks exit when stream is dropped
+        let cancel_token = CancellationToken::new();
+
+        // Spawn task to process fills
+        let fills_event_tx = event_tx.clone();
+        let fills_cancel = cancel_token.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = fills_cancel.cancelled() => {
+                        debug!("Fills task cancelled");
+                        return;
+                    }
+                    msg = fills_rx.recv() => {
+                        let Some(msg) = msg else {
+                            debug!("Fills receiver closed");
+                            return;
+                        };
+                        match msg {
+                            Message::UserFills(fills) => {
+                                for fill in fills.data.fills {
+                                    if let Some(event) = fill_to_account_event(&fill)
+                                        && fills_event_tx.send(event).is_err()
+                                    {
+                                        debug!("Fills event channel closed");
+                                        return;
+                                    }
+                                }
+                            }
+                            Message::NoData => {
+                                warn!("UserFills WebSocket disconnected");
+                            }
+                            Message::HyperliquidError(e) => {
+                                error!(%e, "UserFills WebSocket error");
+                                let _ = fills_event_tx.send(AccountEvent::new(
+                                    ExchangeId::HyperliquidPerp,
+                                    AccountEventKind::StreamError(e),
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
+
+        // Spawn task to process order updates
+        // NOTE: ws_client is moved here to keep the WebSocket alive. When this task
+        // exits (via cancellation or channel close), the WebSocket connection closes,
+        // which causes fills_rx to also close.
+        let orders_event_tx = event_tx;
+        let orders_cancel = cancel_token.clone();
+        tokio::spawn(async move {
+            let _ws_client = ws_client;
+
+            loop {
+                tokio::select! {
+                    biased;
+                    () = orders_cancel.cancelled() => {
+                        debug!("Orders task cancelled");
+                        return;
+                    }
+                    msg = orders_rx.recv() => {
+                        let Some(msg) = msg else {
+                            debug!("Orders receiver closed");
+                            return;
+                        };
+                        match msg {
+                            Message::OrderUpdates(updates) => {
+                                for update in updates.data {
+                                    if let Some(event) = order_update_to_account_event(&update)
+                                        && orders_event_tx.send(event).is_err()
+                                    {
+                                        debug!("Orders event channel closed");
+                                        return;
+                                    }
+                                }
+                            }
+                            Message::NoData => {
+                                warn!("OrderUpdates WebSocket disconnected");
+                            }
+                            Message::HyperliquidError(e) => {
+                                error!(%e, "OrderUpdates WebSocket error");
+                                let _ = orders_event_tx.send(AccountEvent::new(
+                                    ExchangeId::HyperliquidPerp,
+                                    AccountEventKind::StreamError(e),
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
+
+        // Wrap stream with drop guard that cancels tasks
+        let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(event_rx);
+        let guarded_stream = CancelOnDropStream {
+            inner: stream,
+            cancel_token,
+        };
+        Ok(guarded_stream.boxed())
     }
 
     async fn cancel_order(
@@ -424,9 +677,28 @@ impl ExecutionClient for HyperliquidClient {
 
         let cancel_request = ClientCancelRequest { asset: coin, oid };
 
-        match self.exchange_client.cancel(cancel_request, None).await {
-            Ok(response) => {
-                debug!(?response, "Cancel order response");
+        use hyperliquid_rust_sdk::ExchangeResponseStatus;
+
+        let response = match self.exchange_client.cancel(cancel_request, None).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(%e, "Cancel order failed (transport)");
+                return Some(OrderResponseCancel {
+                    key: OrderKey {
+                        exchange: ExchangeId::HyperliquidPerp,
+                        instrument: request.key.instrument.clone(),
+                        strategy: request.key.strategy.clone(),
+                        cid: request.key.cid.clone(),
+                    },
+                    state: Err(error::map_order_error(e, request.key.instrument)),
+                });
+            }
+        };
+
+        match response {
+            ExchangeResponseStatus::Ok(_) => {
+                debug!("Cancel order accepted");
+                // Hyperliquid cancel response doesn't include an exchange timestamp
                 Some(OrderResponseCancel {
                     key: OrderKey {
                         exchange: ExchangeId::HyperliquidPerp,
@@ -440,8 +712,8 @@ impl ExecutionClient for HyperliquidClient {
                     }),
                 })
             }
-            Err(e) => {
-                warn!(%e, "Cancel order failed");
+            ExchangeResponseStatus::Err(msg) => {
+                warn!(%msg, "Cancel rejected by exchange");
                 Some(OrderResponseCancel {
                     key: OrderKey {
                         exchange: ExchangeId::HyperliquidPerp,
@@ -449,7 +721,9 @@ impl ExecutionClient for HyperliquidClient {
                         strategy: request.key.strategy.clone(),
                         cid: request.key.cid.clone(),
                     },
-                    state: Err(error::map_order_error(e, request.key.instrument)),
+                    state: Err(UnindexedOrderError::Rejected(
+                        crate::error::ApiError::OrderRejected(msg),
+                    )),
                 })
             }
         }
@@ -471,17 +745,25 @@ impl ExecutionClient for HyperliquidClient {
         let limit_px = round_to_5_sig_figs(request.state.price);
         let sz = round_to_5_sig_figs(request.state.quantity);
 
-        // Map time-in-force
+        // Map time-in-force (warn if FOK is substituted with IOC)
+        if matches!(request.state.time_in_force, TimeInForce::FillOrKill) {
+            warn!(
+                instrument = %request.key.instrument,
+                "FillOrKill not supported by Hyperliquid, using ImmediateOrCancel (may result in partial fills)"
+            );
+        }
         let tif = map_tif(&request.state.time_in_force).to_string();
 
         // Build order request
+        // Pass cloid if cid is a valid UUID (enables order correlation via client ID)
+        let cloid = cid_to_cloid(&request.key.cid);
         let order_request = ClientOrderRequest {
             asset: coin,
             is_buy,
             reduce_only: request.state.reduce_only,
             limit_px,
             sz,
-            cloid: None, // Could use request.key.cid if it's a valid UUID
+            cloid,
             order_type: ClientOrder::Limit(ClientLimit { tif }),
         };
 
@@ -518,7 +800,7 @@ impl ExecutionClient for HyperliquidClient {
                     Some(ExchangeDataStatus::Resting(resting)) => {
                         debug!(oid = resting.oid, "Order resting");
                         Ok(Open {
-                            id: OrderId::new(format_smolstr!("{}", resting.oid)),
+                            id: OrderId(format_smolstr!("{}", resting.oid)),
                             time_exchange: Utc::now(),
                             filled_quantity: Decimal::ZERO,
                         })
@@ -526,7 +808,7 @@ impl ExecutionClient for HyperliquidClient {
                     Some(ExchangeDataStatus::Filled(filled)) => {
                         debug!(oid = filled.oid, avg_px = %filled.avg_px, "Order filled");
                         Ok(Open {
-                            id: OrderId::new(format_smolstr!("{}", filled.oid)),
+                            id: OrderId(format_smolstr!("{}", filled.oid)),
                             time_exchange: Utc::now(),
                             filled_quantity: parse_decimal(&filled.total_sz, "total_sz")
                                 .unwrap_or(request.state.quantity),
@@ -540,22 +822,24 @@ impl ExecutionClient for HyperliquidClient {
                     }
                     Some(ExchangeDataStatus::WaitingForFill)
                     | Some(ExchangeDataStatus::WaitingForTrigger) => {
-                        // Trigger/conditional orders - not fully supported yet
-                        debug!("Order waiting for trigger/fill");
-                        Ok(Open {
-                            id: OrderId::new(SmolStr::new("pending")),
-                            time_exchange: Utc::now(),
-                            filled_quantity: Decimal::ZERO,
-                        })
+                        // Trigger/conditional orders return no usable order ID.
+                        // Reject since we can't track or cancel these orders.
+                        warn!("Trigger/conditional orders not supported");
+                        Err(UnindexedOrderError::Rejected(
+                            crate::error::ApiError::OrderRejected(
+                                "trigger/conditional orders not supported".to_string(),
+                            ),
+                        ))
                     }
                     Some(ExchangeDataStatus::Success) | None => {
-                        // Generic success without specific order ID
-                        debug!("Order submitted successfully");
-                        Ok(Open {
-                            id: OrderId::new(SmolStr::new("unknown")),
-                            time_exchange: Utc::now(),
-                            filled_quantity: Decimal::ZERO,
-                        })
+                        // Generic success without order ID — SDK didn't return structured data.
+                        // This shouldn't happen for limit orders; reject to avoid silent failures.
+                        warn!("Order accepted but no order ID returned");
+                        Err(UnindexedOrderError::Rejected(
+                            crate::error::ApiError::OrderRejected(
+                                "no order ID in response".to_string(),
+                            ),
+                        ))
                     }
                 }
             }
@@ -607,9 +891,11 @@ impl ExecutionClient for HyperliquidClient {
         )
         .unwrap_or(Decimal::ZERO);
 
+        // Free balance can go negative during liquidation; clamp to zero
+        let free_balance = (account_value - margin_used).max(Decimal::ZERO);
         Ok(vec![AssetBalance::new(
             AssetNameExchange::from(USDC_ASSET),
-            Balance::new(account_value, account_value - margin_used),
+            Balance::new(account_value, free_balance),
             now,
         )])
     }
@@ -629,7 +915,9 @@ impl ExecutionClient for HyperliquidClient {
         let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
             None
         } else {
-            Some(instruments.iter().cloned().collect())
+            let mut set = HashSet::with_capacity(instruments.len());
+            set.extend(instruments.iter().cloned());
+            Some(set)
         };
 
         let mut result = Vec::new();
@@ -652,13 +940,22 @@ impl ExecutionClient for HyperliquidClient {
             let Some(quantity) = parse_decimal(&order.sz, "sz") else {
                 continue;
             };
+            let Some(time_exchange) = millis_to_datetime(order.timestamp) else {
+                warn!(
+                    oid = order.oid,
+                    timestamp = order.timestamp,
+                    "Invalid order timestamp, skipping"
+                );
+                continue;
+            };
 
+            let order_id = format_smolstr!("{}", order.oid);
             result.push(Order {
                 key: OrderKey {
                     exchange: ExchangeId::HyperliquidPerp,
                     instrument,
                     strategy: StrategyId::unknown(),
-                    cid: ClientOrderId::new(format_smolstr!("{}", order.oid)),
+                    cid: ClientOrderId::new(order_id.clone()),
                 },
                 side,
                 price,
@@ -666,8 +963,8 @@ impl ExecutionClient for HyperliquidClient {
                 kind: OrderKind::Limit,
                 time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
                 state: Open {
-                    id: OrderId::new(format_smolstr!("{}", order.oid)),
-                    time_exchange: millis_to_datetime(order.timestamp),
+                    id: OrderId(order_id),
+                    time_exchange,
                     filled_quantity: Decimal::ZERO,
                 },
             });
@@ -696,7 +993,9 @@ impl ExecutionClient for HyperliquidClient {
         let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
             None
         } else {
-            Some(instruments.iter().cloned().collect())
+            let mut set = HashSet::with_capacity(instruments.len());
+            set.extend(instruments.iter().cloned());
+            Some(set)
         };
 
         let mut result = Vec::new();
@@ -726,12 +1025,17 @@ impl ExecutionClient for HyperliquidClient {
             };
             let fee = parse_decimal(&fill.fee, "fee").unwrap_or(Decimal::ZERO);
 
+            let Some(time_exchange) = millis_to_datetime(fill.time) else {
+                warn!(time = fill.time, "Invalid fill timestamp, skipping");
+                continue;
+            };
+
             result.push(Trade {
-                id: TradeId::new(SmolStr::new(&fill.hash)),
-                order_id: OrderId::new(format_smolstr!("{}", fill.oid)),
+                id: TradeId(SmolStr::new(&fill.hash)),
+                order_id: OrderId(format_smolstr!("{}", fill.oid)),
                 instrument,
                 strategy: StrategyId::unknown(),
-                time_exchange: millis_to_datetime(fill.time),
+                time_exchange,
                 side,
                 price,
                 quantity,
@@ -743,5 +1047,388 @@ impl ExecutionClient for HyperliquidClient {
         }
 
         Ok(result)
+    }
+}
+
+/// Convert SDK TradeInfo (fill) to AccountEvent::Trade.
+fn fill_to_account_event(fill: &hyperliquid_rust_sdk::TradeInfo) -> Option<UnindexedAccountEvent> {
+    let side = parse_side(&fill.side)?;
+    let price = parse_decimal(&fill.px, "fill.px")?;
+    let quantity = parse_decimal(&fill.sz, "fill.sz")?;
+    let fee = parse_decimal(&fill.fee, "fill.fee").unwrap_or(Decimal::ZERO);
+    let time_exchange = millis_to_datetime(fill.time)?;
+    let instrument = coin_to_instrument(&fill.coin);
+    let order_id = OrderId(format_smolstr!("{}", fill.oid));
+
+    let trade = Trade {
+        id: TradeId(SmolStr::new(&fill.hash)),
+        order_id,
+        instrument,
+        strategy: StrategyId::unknown(),
+        time_exchange,
+        side,
+        price,
+        quantity,
+        fees: AssetFees {
+            asset: QuoteAsset,
+            fees: fee,
+        },
+    };
+
+    Some(AccountEvent::new(
+        ExchangeId::HyperliquidPerp,
+        AccountEventKind::Trade(trade),
+    ))
+}
+
+/// Convert SDK OrderUpdate to AccountEvent::OrderSnapshot.
+fn order_update_to_account_event(
+    update: &hyperliquid_rust_sdk::OrderUpdate,
+) -> Option<UnindexedAccountEvent> {
+    let order = &update.order;
+    let side = parse_side(&order.side)?;
+    let price = parse_decimal(&order.limit_px, "order.limit_px")?;
+    let orig_sz = parse_decimal(&order.orig_sz, "order.orig_sz")?;
+    let time_exchange = millis_to_datetime(update.status_timestamp)?;
+    let instrument = coin_to_instrument(&order.coin);
+
+    // Use cloid (client order ID) if available, fall back to OID
+    let order_id_smol = format_smolstr!("{}", order.oid);
+    let cid = order
+        .cloid
+        .as_deref()
+        .map(|c| ClientOrderId::new(SmolStr::new(c)))
+        .unwrap_or_else(|| ClientOrderId::new(order_id_smol.clone()));
+
+    // Determine order state from status — parse current_sz only when needed for filled_quantity
+    let state = match update.status.as_str() {
+        "open" | "resting" => {
+            let current_sz = parse_decimal(&order.sz, "order.sz")?;
+            let filled_quantity = (orig_sz - current_sz).max(Decimal::ZERO);
+            crate::order::state::OrderState::active(Open {
+                id: OrderId(order_id_smol),
+                time_exchange,
+                filled_quantity,
+            })
+        }
+        "filled" => crate::order::state::OrderState::fully_filled(),
+        "canceled" | "cancelled" => {
+            crate::order::state::OrderState::inactive(crate::order::state::Cancelled {
+                id: OrderId(order_id_smol),
+                time_exchange,
+            })
+        }
+        status => {
+            warn!(%status, "Unknown order status");
+            return None;
+        }
+    };
+
+    // SDK's OrderUpdate doesn't include original order type or TIF, so we default
+    // to Limit/GTC. This is a known limitation — IOC/FOK orders will be misrepresented.
+    let order_snapshot = Order {
+        key: OrderKey {
+            exchange: ExchangeId::HyperliquidPerp,
+            instrument,
+            strategy: StrategyId::unknown(),
+            cid,
+        },
+        side,
+        price,
+        quantity: orig_sz,
+        kind: OrderKind::Limit,
+        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+        state,
+    };
+
+    Some(AccountEvent::new(
+        ExchangeId::HyperliquidPerp,
+        AccountEventKind::OrderSnapshot(Snapshot(order_snapshot)),
+    ))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn test_parse_decimal_valid() {
+        assert_eq!(parse_decimal("123.456", "test"), Some(dec!(123.456)));
+        assert_eq!(parse_decimal("0", "test"), Some(dec!(0)));
+        assert_eq!(parse_decimal("-50.5", "test"), Some(dec!(-50.5)));
+    }
+
+    #[test]
+    fn test_parse_decimal_invalid() {
+        assert_eq!(parse_decimal("", "test"), None);
+        assert_eq!(parse_decimal("abc", "test"), None);
+        assert_eq!(parse_decimal("12.34.56", "test"), None);
+    }
+
+    #[test]
+    fn test_parse_side() {
+        assert_eq!(parse_side("B"), Some(Side::Buy));
+        assert_eq!(parse_side("BUY"), Some(Side::Buy));
+        assert_eq!(parse_side("buy"), Some(Side::Buy));
+        assert_eq!(parse_side("A"), Some(Side::Sell));
+        assert_eq!(parse_side("S"), Some(Side::Sell));
+        assert_eq!(parse_side("SELL"), Some(Side::Sell));
+        assert_eq!(parse_side("sell"), Some(Side::Sell));
+        assert_eq!(parse_side("X"), None);
+        assert_eq!(parse_side(""), None);
+    }
+
+    #[test]
+    fn test_coin_to_instrument() {
+        let inst = coin_to_instrument("BTC");
+        assert_eq!(inst.as_ref(), "BTC-USD-PERP");
+
+        let inst = coin_to_instrument("ETH");
+        assert_eq!(inst.as_ref(), "ETH-USD-PERP");
+    }
+
+    #[test]
+    fn test_instrument_to_coin() {
+        let coin = instrument_to_coin(&InstrumentNameExchange::from("BTC-USD-PERP"));
+        assert_eq!(coin, "BTC");
+
+        let coin = instrument_to_coin(&InstrumentNameExchange::from("ETH-USD-PERP"));
+        assert_eq!(coin, "ETH");
+
+        // Just coin name without suffix
+        let coin = instrument_to_coin(&InstrumentNameExchange::from("SOL"));
+        assert_eq!(coin, "SOL");
+    }
+
+    #[test]
+    fn test_round_to_5_sig_figs() {
+        assert_eq!(round_to_5_sig_figs(dec!(0)), 0.0);
+        assert_eq!(round_to_5_sig_figs(dec!(12345)), 12345.0);
+        assert_eq!(round_to_5_sig_figs(dec!(123456)), 123460.0);
+        assert_eq!(round_to_5_sig_figs(dec!(0.00012345)), 0.00012345);
+        assert_eq!(round_to_5_sig_figs(dec!(0.000123456)), 0.00012346);
+        assert_eq!(round_to_5_sig_figs(dec!(1.23456789)), 1.2346);
+    }
+
+    #[test]
+    fn test_map_tif() {
+        assert_eq!(
+            map_tif(&TimeInForce::GoodUntilCancelled { post_only: false }),
+            "Gtc"
+        );
+        assert_eq!(
+            map_tif(&TimeInForce::GoodUntilCancelled { post_only: true }),
+            "Alo"
+        );
+        assert_eq!(map_tif(&TimeInForce::ImmediateOrCancel), "Ioc");
+        assert_eq!(map_tif(&TimeInForce::FillOrKill), "Ioc");
+        assert_eq!(map_tif(&TimeInForce::GoodUntilEndOfDay), "Gtc");
+    }
+
+    #[test]
+    fn test_millis_to_datetime() {
+        let dt = millis_to_datetime(1714100000000).unwrap();
+        assert_eq!(dt.timestamp_millis(), 1714100000000);
+
+        // Zero timestamp (Unix epoch) is valid
+        assert!(millis_to_datetime(0).is_some());
+    }
+
+    #[test]
+    fn test_fill_to_account_event() {
+        let fill_json = r#"{
+            "coin": "BTC",
+            "side": "B",
+            "px": "65000.5",
+            "sz": "0.1",
+            "time": 1714100000000,
+            "hash": "0xabc123",
+            "startPosition": "0",
+            "dir": "Open Long",
+            "closedPnl": "0",
+            "oid": 12345,
+            "cloid": null,
+            "crossed": false,
+            "fee": "0.65",
+            "feeToken": "USDC",
+            "tid": 99999
+        }"#;
+
+        let fill: hyperliquid_rust_sdk::TradeInfo = serde_json::from_str(fill_json).unwrap();
+        let event = fill_to_account_event(&fill).unwrap();
+
+        assert_eq!(event.exchange, ExchangeId::HyperliquidPerp);
+        match event.kind {
+            AccountEventKind::Trade(trade) => {
+                assert_eq!(trade.instrument.as_ref(), "BTC-USD-PERP");
+                assert_eq!(trade.side, Side::Buy);
+                assert_eq!(trade.price, dec!(65000.5));
+                assert_eq!(trade.quantity, dec!(0.1));
+                assert_eq!(trade.fees.fees, dec!(0.65));
+            }
+            _ => panic!("Expected Trade event"),
+        }
+    }
+
+    #[test]
+    fn test_fill_to_account_event_sell() {
+        let fill_json = r#"{
+            "coin": "ETH",
+            "side": "A",
+            "px": "3200",
+            "sz": "1.5",
+            "time": 1714100000000,
+            "hash": "0xdef456",
+            "startPosition": "1.5",
+            "dir": "Close Long",
+            "closedPnl": "150.0",
+            "oid": 12346,
+            "cloid": null,
+            "crossed": true,
+            "fee": "4.8",
+            "feeToken": "USDC",
+            "tid": 100000
+        }"#;
+
+        let fill: hyperliquid_rust_sdk::TradeInfo = serde_json::from_str(fill_json).unwrap();
+        let event = fill_to_account_event(&fill).unwrap();
+
+        match event.kind {
+            AccountEventKind::Trade(trade) => {
+                assert_eq!(trade.instrument.as_ref(), "ETH-USD-PERP");
+                assert_eq!(trade.side, Side::Sell);
+                assert_eq!(trade.price, dec!(3200));
+                assert_eq!(trade.quantity, dec!(1.5));
+            }
+            _ => panic!("Expected Trade event"),
+        }
+    }
+
+    #[test]
+    fn test_order_update_to_account_event_open() {
+        let update_json = r#"{
+            "order": {
+                "coin": "BTC",
+                "side": "B",
+                "limitPx": "64000",
+                "sz": "0.5",
+                "oid": 12345,
+                "timestamp": 1714100000000,
+                "origSz": "0.5",
+                "cloid": null
+            },
+            "status": "open",
+            "statusTimestamp": 1714100000000
+        }"#;
+
+        let update: hyperliquid_rust_sdk::OrderUpdate = serde_json::from_str(update_json).unwrap();
+        let event = order_update_to_account_event(&update).unwrap();
+
+        assert_eq!(event.exchange, ExchangeId::HyperliquidPerp);
+        match event.kind {
+            AccountEventKind::OrderSnapshot(Snapshot(order)) => {
+                assert_eq!(order.key.instrument.as_ref(), "BTC-USD-PERP");
+                assert_eq!(order.side, Side::Buy);
+                assert_eq!(order.price, dec!(64000));
+                assert_eq!(order.quantity, dec!(0.5));
+                assert!(matches!(
+                    order.state,
+                    crate::order::state::OrderState::Active(_)
+                ));
+            }
+            _ => panic!("Expected OrderSnapshot event"),
+        }
+    }
+
+    #[test]
+    fn test_order_update_to_account_event_filled() {
+        let update_json = r#"{
+            "order": {
+                "coin": "ETH",
+                "side": "A",
+                "limitPx": "3250",
+                "sz": "0",
+                "oid": 12346,
+                "timestamp": 1714100000000,
+                "origSz": "2.0",
+                "cloid": null
+            },
+            "status": "filled",
+            "statusTimestamp": 1714100001000
+        }"#;
+
+        let update: hyperliquid_rust_sdk::OrderUpdate = serde_json::from_str(update_json).unwrap();
+        let event = order_update_to_account_event(&update).unwrap();
+
+        match event.kind {
+            AccountEventKind::OrderSnapshot(Snapshot(order)) => {
+                assert_eq!(order.side, Side::Sell);
+                assert!(matches!(
+                    order.state,
+                    crate::order::state::OrderState::Inactive(
+                        crate::order::state::InactiveOrderState::FullyFilled
+                    )
+                ));
+            }
+            _ => panic!("Expected OrderSnapshot event"),
+        }
+    }
+
+    #[test]
+    fn test_order_update_to_account_event_cancelled() {
+        let update_json = r#"{
+            "order": {
+                "coin": "SOL",
+                "side": "B",
+                "limitPx": "150",
+                "sz": "10",
+                "oid": 12347,
+                "timestamp": 1714100000000,
+                "origSz": "10",
+                "cloid": null
+            },
+            "status": "canceled",
+            "statusTimestamp": 1714100002000
+        }"#;
+
+        let update: hyperliquid_rust_sdk::OrderUpdate = serde_json::from_str(update_json).unwrap();
+        let event = order_update_to_account_event(&update).unwrap();
+
+        match event.kind {
+            AccountEventKind::OrderSnapshot(Snapshot(order)) => {
+                assert_eq!(order.key.instrument.as_ref(), "SOL-USD-PERP");
+                assert!(matches!(
+                    order.state,
+                    crate::order::state::OrderState::Inactive(
+                        crate::order::state::InactiveOrderState::Cancelled(_)
+                    )
+                ));
+            }
+            _ => panic!("Expected OrderSnapshot event"),
+        }
+    }
+
+    #[test]
+    fn test_order_update_unknown_status_returns_none() {
+        let update_json = r#"{
+            "order": {
+                "coin": "BTC",
+                "side": "B",
+                "limitPx": "64000",
+                "sz": "0.5",
+                "oid": 12345,
+                "timestamp": 1714100000000,
+                "origSz": "0.5",
+                "cloid": null
+            },
+            "status": "unknown_status",
+            "statusTimestamp": 1714100000000
+        }"#;
+
+        let update: hyperliquid_rust_sdk::OrderUpdate = serde_json::from_str(update_json).unwrap();
+        let event = order_update_to_account_event(&update);
+        assert!(event.is_none());
     }
 }

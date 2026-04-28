@@ -5,17 +5,17 @@
 //! # Prerequisites
 //!
 //! 1. IB Gateway or TWS running with API enabled
-//! 2. Paper trading account (set IBKR_ACCOUNT env var)
+//! 2. Paper trading account (set IBKR_PAPER_ACCOUNT env var)
 //! 3. Port 4002 (Gateway paper) or 7497 (TWS paper)
 //!
 //! # Running
 //!
 //! ```bash
 //! # Run all IBKR integration tests
-//! IBKR_ACCOUNT=<account_id> cargo test --test ibkr_execution --features ibkr -- --ignored
+//! IBKR_PAPER_ACCOUNT=<account_id> cargo test --test ibkr_execution --features ibkr -- --ignored
 //!
 //! # Run specific test
-//! IBKR_ACCOUNT=<account_id> cargo test --test ibkr_execution --features ibkr test_connection -- --ignored
+//! IBKR_PAPER_ACCOUNT=<account_id> cargo test --test ibkr_execution --features ibkr test_connection -- --ignored
 //! ```
 //!
 //! Tests are marked `#[ignore]` to avoid CI failures without IB connectivity.
@@ -68,7 +68,7 @@ fn test_config(client_id_offset: i32) -> IbkrConfig {
             .and_then(|p| p.parse().ok())
             .unwrap_or(4002),
         client_id: test_client_id_base() + client_id_offset,
-        account: std::env::var("IBKR_ACCOUNT").expect("IBKR_ACCOUNT env var required"),
+        account: std::env::var("IBKR_PAPER_ACCOUNT").expect("IBKR_PAPER_ACCOUNT env var required"),
         contracts: vec![],
     }
 }

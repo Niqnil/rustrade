@@ -56,7 +56,7 @@ async fn main() {
         host: "127.0.0.1".to_string(),
         port: 4002,     // Gateway paper; use 7497 for TWS paper
         client_id: 102, // Use different ID from market data connections
-        account: std::env::var("IBKR_ACCOUNT")
+        account: std::env::var("IBKR_PAPER_ACCOUNT")
             .unwrap_or_else(|_| "YOUR_PAPER_ACCOUNT_ID".to_string()),
         contracts: vec![], // We'll register contracts manually
     };

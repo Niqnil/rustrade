@@ -62,7 +62,7 @@ impl HyperliquidConfig {
 
     /// Returns the wallet address as a hex string (0x-prefixed).
     pub fn wallet_address_hex(&self) -> String {
-        format!("{:?}", self.wallet.address())
+        format!("{:#x}", self.wallet.address())
     }
 }
 
@@ -88,7 +88,7 @@ pub enum ConfigError {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
 

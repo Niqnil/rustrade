@@ -33,8 +33,8 @@ ibkr = ["dep:ibapi", "dep:parking_lot", "dep:chrono-tz", "barter-instrument/ibkr
 hyperliquid = [
     "dep:hyperliquid_rust_sdk",
     "dep:ethers",
-    "dep:serde_json",
-    "dep:parking_lot",
+    "dep:tokio-util",
+    "dep:uuid",
 ]
 
 [dependencies]
@@ -97,6 +97,8 @@ chrono-tz = { workspace = true, optional = true }
 # Hyperliquid (optional, behind "hyperliquid" feature)
 hyperliquid_rust_sdk = { version = "0.6", optional = true }
 ethers = { version = "2.0", optional = true, default-features = false }
+tokio-util = { version = "0.7", optional = true }
+uuid = { version = "1.0", optional = true }
 
 [dev-dependencies]
 # test-util enables tokio::time::pause() and advance() for behavioral timing tests
