@@ -12,6 +12,16 @@ ignore = [
     { id = "RUSTSEC-2026-0002", reason = "lru IterMut unsoundness doesn't affect our peek/put usage" },
     # rand unsoundness requires log feature + custom logger + reseed; log feature not enabled
     { id = "RUSTSEC-2026-0097", reason = "rand's log feature not enabled in this workspace (required for vulnerability)" },
+
+    # hyperliquid_rust_sdk transitive dependencies (no direct control)
+    { id = "RUSTSEC-2025-0057", reason = "fxhash unmaintained; transitive via hyperliquid_rust_sdk" },
+    { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; transitive via hyperliquid_rust_sdk" },
+    { id = "RUSTSEC-2025-0009", reason = "ring AES panic; transitive via hyperliquid_rust_sdk; overflow checks disabled in release" },
+    { id = "RUSTSEC-2025-0010", reason = "ring < 0.17 unmaintained; transitive via hyperliquid_rust_sdk" },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; transitive via hyperliquid_rust_sdk" },
+    { id = "RUSTSEC-2026-0098", reason = "webpki URI name constraints; transitive via hyperliquid_rust_sdk; low impact for API client" },
+    { id = "RUSTSEC-2026-0099", reason = "webpki wildcard name constraints; transitive via hyperliquid_rust_sdk; low impact for API client" },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki CRL panic; transitive via hyperliquid_rust_sdk; CRLs not used" },
 ]
 
 # Licenses - strict permissive only
@@ -29,10 +39,24 @@ allow = [
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
 ]
-exceptions = []
+
+# hyperliquid_rust_sdk transitive dependencies with non-standard licenses
+# tiny-keccak: CC0-1.0 is public domain; transitive via hyperliquid_rust_sdk
+# webpki-roots: MPL-2.0 is permissive for linking; Mozilla root certs; transitive via hyperliquid_rust_sdk
+exceptions = [
+    { name = "tiny-keccak", allow = ["CC0-1.0"] },
+    { name = "webpki-roots", allow = ["MPL-2.0"] },
+]
 
 # ring 0.17.x: Cargo.toml declares "Apache-2.0 AND ISC", both allowlisted.
-# No clarify block needed (previous block was stale from ring 0.16.x).
+# ring 0.16.x: Used by hyperliquid_rust_sdk; has LICENSE files but no Cargo.toml field.
+[[licenses.clarify]]
+name = "ring"
+version = "0.16.20"
+expression = "ISC AND MIT"
+license-files = [
+    { path = "LICENSE", hash = 0xbd0eed23 },
+]
 
 # Bans - minimal, rely on review process instead
 [bans]

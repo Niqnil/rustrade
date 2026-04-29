@@ -1,7 +1,7 @@
 # Barter
 
 > **This is a public fork of [barter-rs/barter-rs](https://github.com/barter-rs/barter-rs).**
-> It adds execution clients for **Binance** and **Alpaca**.
+> It adds execution clients for **Binance**, **Alpaca**, and **Hyperliquid**.
 > For questions or discussion, please use [GitHub Discussions](https://github.com/Niqnil/barter-rs/discussions).
 
 Barter is an algorithmic trading ecosystem of Rust libraries for building high-performance live-trading, paper-trading
@@ -26,13 +26,13 @@ and back-testing systems. It is made up of several easy-to-use, extensible crate
 * **Barter**: Algorithmic trading Engine with feature rich state management system.
 * **Barter-Instrument**: Exchange, Instrument and Asset data structures and utilities.
 * **Barter-Data**: Stream public market data from financial venues. Easily extensible via the MarketStream interface.
-* **Barter-Execution**: Stream private account data and execute orders. Includes live clients for **Binance** (spot) and **Alpaca** (equities, options, crypto). Easily extensible via the ExecutionClient interface.
+* **Barter-Execution**: Stream private account data and execute orders. Includes live clients for **Binance** (spot), **Alpaca** (equities, options, crypto), and **Hyperliquid** (perpetuals). Easily extensible via the ExecutionClient interface.
 * **Barter-Integration**: Low-level frameworks for flexible REST/WebSocket integrations.
 
 ## Notable Features
 - Stream public market data from financial venues via the [`Barter-Data`] library.
 - Stream private account data, execute orders (live or mock) via the [`Barter-Execution`] library.
-- Live execution clients for Binance (spot) and Alpaca.
+- Live execution clients for Binance (spot), Alpaca, and Hyperliquid (perpetuals).
 - Plug and play Strategy and RiskManager components that facilitate most trading strategies.
 - Backtest utilities for efficiently running thousands of concurrent backtests.
 - Flexible Engine that facilitates trading strategies that execute on many exchanges simultaneously.

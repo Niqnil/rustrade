@@ -36,6 +36,10 @@ pub mod kraken;
 /// `Okx` [`Connector`] and [`StreamSelector`] implementations.
 pub mod okx;
 
+/// `Hyperliquid` [`Connector`] and [`StreamSelector`] implementations (behind `hyperliquid` feature).
+#[cfg(feature = "hyperliquid")]
+pub mod hyperliquid;
+
 /// `Ibkr` market data stream (behind `ibkr` feature).
 #[cfg(feature = "ibkr")]
 pub mod ibkr;

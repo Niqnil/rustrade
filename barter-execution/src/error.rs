@@ -33,6 +33,7 @@ pub type UnindexedApiError = ApiError<AssetNameExchange, InstrumentNameExchange>
 pub type UnindexedOrderError = OrderError<AssetNameExchange, InstrumentNameExchange>;
 
 /// Represents all errors produced by an [`ExecutionClient`](super::client::ExecutionClient).
+#[non_exhaustive]
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]
 pub enum ClientError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// Connectivity based error.
@@ -128,6 +129,7 @@ impl<AssetKey, InstrumentKey> ClientError<AssetKey, InstrumentKey> {
 ///
 /// Connectivity errors are generally intermittent / non-deterministic (eg/ Timeout).
 /// All variants are transient — retry with exponential backoff (typically 1-30s).
+#[non_exhaustive]
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]
 pub enum ConnectivityError {
     /// Exchange is offline, likely due to scheduled maintenance.
@@ -178,6 +180,7 @@ impl ConnectivityError {
 /// These typically indicate a request is invalid for some reason (eg/ BalanceInsufficient).
 /// Most variants are **not transient** — the same request will fail identically on retry.
 /// The exception is [`RateLimit`](Self::RateLimit), which is transient.
+#[non_exhaustive]
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]
 pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// Provided asset identifier is invalid or not supported.
@@ -209,6 +212,16 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// respect exchange-specific guidance if available.
     #[error("rate limit exceeded")]
     RateLimit,
+
+    /// Authentication failed (invalid credentials, expired key, bad signature).
+    ///
+    /// Unlike other API errors which affect a single request, authentication
+    /// failures indicate that **all** subsequent requests will fail until
+    /// credentials are corrected. Callers should halt trading and alert operators.
+    ///
+    /// Not transient — do not retry. Fix credentials and restart.
+    #[error("authentication failed: {0}")]
+    Unauthenticated(String),
 
     /// Balance of an asset is insufficient to execute the requested operation.
     ///
@@ -259,6 +272,7 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
 ///
 /// This is a subset of [`ClientError`] for order-specific operations. Use
 /// [`is_transient()`](Self::is_transient) to determine retry eligibility.
+#[non_exhaustive]
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]
 pub enum OrderError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// Connectivity-based error (timeout, socket failure, exchange offline).
@@ -362,6 +376,10 @@ mod tests {
         assert!(!err.is_transient(), "expected non-transient for {:?}", err);
 
         let err: ClientError = ClientError::Api(ApiError::OrderAlreadyFullyFilled);
+        assert!(!err.is_transient(), "expected non-transient for {:?}", err);
+
+        let err: ClientError =
+            ClientError::Api(ApiError::Unauthenticated("invalid signature".into()));
         assert!(!err.is_transient(), "expected non-transient for {:?}", err);
     }
 

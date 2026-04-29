@@ -30,11 +30,14 @@
 
 // Silence unused_crate_dependencies for dev-dependencies used only in tests
 #[cfg(test)]
+use tracing_subscriber as _;
+#[cfg(test)]
 use wiremock as _;
 
 use crate::{
     balance::AssetBalance,
     order::{Order, OrderSnapshot, request::OrderResponseCancel},
+    position::Position,
     trade::Trade,
 };
 use barter_instrument::{
@@ -59,6 +62,7 @@ pub use fill::{BidAskFillModel, FillModel, LastPriceFillModel, MidpointFillModel
 pub mod indexer;
 pub mod map;
 pub mod order;
+pub mod position;
 pub mod trade;
 
 /// Convenient type alias for an [`AccountEvent`] keyed with [`ExchangeId`],
@@ -94,6 +98,7 @@ impl<ExchangeKey, AssetKey, InstrumentKey> AccountEvent<ExchangeKey, AssetKey, I
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, From)]
+#[non_exhaustive]
 pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
     /// Full [`AccountSnapshot`] - replaces all existing state.
     Snapshot(AccountSnapshot<ExchangeKey, AssetKey, InstrumentKey>),
@@ -111,6 +116,13 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
 
     /// [`Order<ExchangeKey, InstrumentKey, Open>`] partial or full-fill.
     Trade(Trade<QuoteAsset, InstrumentKey>),
+
+    /// WebSocket-level error from exchange. Connection may have dropped.
+    ///
+    /// Implementations send this when the underlying stream encounters an error.
+    /// Consumers should treat this as a signal that events may have been missed
+    /// and consider re-syncing via REST (e.g., `fetch_trades`, `account_snapshot`).
+    StreamError(String),
 }
 
 impl<ExchangeKey, AssetKey, InstrumentKey> AccountEvent<ExchangeKey, AssetKey, InstrumentKey>
@@ -150,6 +162,10 @@ pub struct InstrumentAccountSnapshot<
     pub instrument: InstrumentKey,
     #[serde(default = "Vec::new")]
     pub orders: Vec<OrderSnapshot<ExchangeKey, AssetKey, InstrumentKey>>,
+    /// Open position for derivative instruments (perpetuals, futures, margin).
+    /// `None` for spot instruments where position is implicit in balances.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<Position>,
 }
 
 impl<ExchangeKey, AssetKey, InstrumentKey> AccountSnapshot<ExchangeKey, AssetKey, InstrumentKey> {

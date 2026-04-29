@@ -199,6 +199,7 @@ impl MockExchange {
             .map(|(instrument, orders)| InstrumentAccountSnapshot {
                 instrument,
                 orders: orders.into_iter().collect(),
+                position: None,
             })
             .collect();
 

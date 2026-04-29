@@ -63,6 +63,7 @@ impl AccountEventIndexer {
                 AccountEventKind::OrderCancelled(self.order_response_cancel(response)?)
             }
             AccountEventKind::Trade(trade) => AccountEventKind::Trade(self.trade(trade)?),
+            AccountEventKind::StreamError(msg) => AccountEventKind::StreamError(msg),
         };
 
         Ok(AccountEvent { exchange, kind })
@@ -88,7 +89,11 @@ impl AccountEventIndexer {
         let instruments = instruments
             .into_iter()
             .map(|snapshot| {
-                let InstrumentAccountSnapshot { instrument, orders } = snapshot;
+                let InstrumentAccountSnapshot {
+                    instrument,
+                    orders,
+                    position,
+                } = snapshot;
 
                 let instrument = self.map.find_instrument_index(&instrument)?;
 
@@ -97,7 +102,11 @@ impl AccountEventIndexer {
                     .map(|order| self.order_snapshot(order))
                     .collect::<Result<Vec<_>, _>>()?;
 
-                Ok(InstrumentAccountSnapshot { instrument, orders })
+                Ok(InstrumentAccountSnapshot {
+                    instrument,
+                    orders,
+                    position,
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -204,6 +213,7 @@ impl AccountEventIndexer {
     pub fn api_error(&self, error: UnindexedApiError) -> Result<ApiError, IndexError> {
         Ok(match error {
             UnindexedApiError::RateLimit => ApiError::RateLimit,
+            UnindexedApiError::Unauthenticated(msg) => ApiError::Unauthenticated(msg),
             UnindexedApiError::AssetInvalid(asset, value) => {
                 ApiError::AssetInvalid(self.map.find_asset_index(&asset)?, value)
             }

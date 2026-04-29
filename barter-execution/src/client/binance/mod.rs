@@ -845,7 +845,7 @@ impl ExecutionClient for BinanceSpot {
                         state: OrderState::active(o.state),
                     })
                     .collect();
-                Ok::<_, UnindexedClientError>(InstrumentAccountSnapshot::new(inst, wrapped))
+                Ok::<_, UnindexedClientError>(InstrumentAccountSnapshot::new(inst, wrapped, None))
             })
             .try_collect()
             .await?;

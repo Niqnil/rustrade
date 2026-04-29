@@ -209,7 +209,7 @@ pub fn exchange_supports_instrument_kind(
         // Perpetual
         (
             BinanceFuturesUsd | Bitmex | Okx | BybitPerpetualsUsd | GateioPerpetualsUsd
-            | GateioPerpetualsBtc,
+            | GateioPerpetualsBtc | HyperliquidPerp,
             Perpetual,
         ) => true,
         (_, Perpetual) => false,
@@ -277,6 +277,7 @@ pub fn exchange_supports_instrument_kind_sub_kind(
         (GateioOptions, Option { .. }, PublicTrades) => true,
         (Kraken, Spot, PublicTrades | OrderBooksL1) => true,
         (Okx, Spot | Future { .. } | Perpetual | Option { .. }, PublicTrades) => true,
+        (HyperliquidPerp, Perpetual, PublicTrades | OrderBooksL2) => true,
 
         (_, _, _) => false,
     }
