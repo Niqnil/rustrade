@@ -1728,7 +1728,7 @@ async fn connect_and_subscribe(config: &AlpacaConfig) -> Result<WebSocket, Unind
         }
         Ok(Err(HandshakeError::Auth(e))) => {
             let _ = ws.close(None).await;
-            Err(UnindexedClientError::Internal(e))
+            Err(UnindexedClientError::Api(ApiError::Unauthenticated(e)))
         }
         Err(_) => {
             let _ = ws.close(None).await;
@@ -2673,7 +2673,8 @@ fn parse_api_error(status: reqwest::StatusCode, message: &str) -> crate::error::
         422 if lower.contains("insufficient") => {
             ApiError::BalanceInsufficient(AssetNameExchange::new("usd"), message.to_owned())
         }
-        403 => ApiError::OrderRejected(format!("forbidden (auth/permission): {message}")),
+        401 => ApiError::Unauthenticated(format!("unauthorized: {message}")),
+        403 => ApiError::Unauthenticated(format!("forbidden: {message}")),
         404 => ApiError::OrderRejected(format!("order not found: {message}")),
         _ => ApiError::OrderRejected(message.to_owned()),
     }
@@ -3426,12 +3427,21 @@ mod tests {
 
     // M-1: parse_order_error — pin all status-code branches not covered by existing tests.
     #[test]
-    fn parse_order_error_403_with_insufficient_body_maps_to_order_rejected_not_balance() {
-        // A suspended/forbidden account should NOT route to BalanceInsufficient
-        // (which could trigger a balance-retry loop). Must be OrderRejected.
+    fn parse_order_error_401_maps_to_unauthenticated() {
+        // 401 Unauthorized: invalid/expired API credentials.
         assert!(matches!(
-            parse_order_error(reqwest::StatusCode::FORBIDDEN, "insufficient permissions"),
-            UnindexedOrderError::Rejected(ApiError::OrderRejected(_))
+            parse_order_error(reqwest::StatusCode::UNAUTHORIZED, "bad credentials"),
+            UnindexedOrderError::Rejected(ApiError::Unauthenticated(_))
+        ));
+    }
+
+    #[test]
+    fn parse_order_error_403_maps_to_unauthenticated() {
+        // 403 Forbidden indicates auth/permission failure — use Unauthenticated, not
+        // OrderRejected or BalanceInsufficient (which could trigger incorrect retry logic).
+        assert!(matches!(
+            parse_order_error(reqwest::StatusCode::FORBIDDEN, "account suspended"),
+            UnindexedOrderError::Rejected(ApiError::Unauthenticated(_))
         ));
     }
 

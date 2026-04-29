@@ -2533,6 +2533,14 @@ fn convert_order_kind_tif(
     }
 }
 
+/// Case-insensitive substring search that avoids the `to_lowercase` allocation.
+fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
 /// Returns true if `msg` contains `code` as a standalone numeric token:
 /// not immediately preceded or followed by another ASCII digit.
 /// Prevents "-2013" from matching "-20130" (suffix guard) or "1-2013" (prefix guard).
@@ -2564,6 +2572,12 @@ fn parse_binance_api_error(
     instrument: &InstrumentNameExchange,
 ) -> ApiError<AssetNameExchange, InstrumentNameExchange> {
     // Match on Binance error codes first — these are stable numeric identifiers
+    if contains_error_code(&error_msg, "-1002") || contains_error_code(&error_msg, "-2015") {
+        // -1002: "You are not authorized to execute this request"
+        // -2015: "Invalid API-key, IP, or permissions for action"
+        // Auth failures must not be retried as order rejections.
+        return ApiError::Unauthenticated(error_msg);
+    }
     if contains_error_code(&error_msg, "-1003") || contains_error_code(&error_msg, "-1015") {
         // -1003: too many requests; -1015: IP rate-limit ban. Both are transient throttles.
         return ApiError::RateLimit;
@@ -2591,12 +2605,6 @@ fn parse_binance_api_error(
     }
 
     // Fall back to case-insensitive message text heuristics (avoid to_lowercase allocation)
-    fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
-        haystack
-            .as_bytes()
-            .windows(needle.len())
-            .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
-    }
     if contains_ignore_case(&error_msg, "insufficient")
         || contains_ignore_case(&error_msg, "not enough")
     {
@@ -2626,13 +2634,21 @@ fn parse_binance_api_error(
 }
 
 fn connectivity_error(e: anyhow::Error) -> UnindexedClientError {
-    // use alternate display {:#} to preserve the full anyhow error chain.
-    // Known limitation: all SDK errors (auth failures, HTTP 5xx, malformed responses,
-    // network errors) are uniformly classified as ConnectivityError::Socket. The SDK
-    // uses anyhow::Error, making it impractical to distinguish error categories without
-    // parsing the string — callers cannot distinguish "network unavailable" from
-    // "auth rejected" without inspecting the error message.
-    UnindexedClientError::Connectivity(ConnectivityError::Socket(format!("{e:#}")))
+    let msg = format!("{e:#}");
+
+    // Check for auth failures before falling back to generic connectivity error.
+    // -1002: "You are not authorized to execute this request"
+    // -2015: "Invalid API-key, IP, or permissions for action"
+    if contains_error_code(&msg, "-1002")
+        || contains_error_code(&msg, "-2015")
+        || contains_ignore_case(&msg, "invalid api-key")
+        || contains_ignore_case(&msg, "invalid signature")
+        || contains_ignore_case(&msg, "signature for this request is not valid")
+    {
+        return UnindexedClientError::Api(ApiError::Unauthenticated(msg));
+    }
+
+    UnindexedClientError::Connectivity(ConnectivityError::Socket(msg))
 }
 
 #[cfg(test)]
@@ -2935,6 +2951,54 @@ mod tests {
         assert!(
             !is_api_rejection_error(&rate_limit),
             "rate-limit string error should not be detected as API rejection"
+        );
+    }
+
+    #[test]
+    fn test_connectivity_error_detects_auth_failures() {
+        // -1002: "You are not authorized to execute this request"
+        let err = connectivity_error(anyhow::anyhow!("Error -1002: unauthorized"));
+        assert!(
+            matches!(err, UnindexedClientError::Api(ApiError::Unauthenticated(_))),
+            "expected Unauthenticated for -1002, got {err:?}"
+        );
+
+        // -2015: "Invalid API-key, IP, or permissions for action"
+        // Use a code-only body (no auth text keyword) to isolate the numeric-code branch.
+        let err = connectivity_error(anyhow::anyhow!("Error -2015: permission denied for action"));
+        assert!(
+            matches!(err, UnindexedClientError::Api(ApiError::Unauthenticated(_))),
+            "expected Unauthenticated for -2015, got {err:?}"
+        );
+
+        // Text-based detection: "invalid signature"
+        let err = connectivity_error(anyhow::anyhow!("invalid signature provided"));
+        assert!(
+            matches!(err, UnindexedClientError::Api(ApiError::Unauthenticated(_))),
+            "expected Unauthenticated for 'invalid signature', got {err:?}"
+        );
+
+        // Text-based detection: "signature for this request is not valid"
+        let err = connectivity_error(anyhow::anyhow!(
+            "The signature for this request is not valid."
+        ));
+        assert!(
+            matches!(err, UnindexedClientError::Api(ApiError::Unauthenticated(_))),
+            "expected Unauthenticated for 'signature for this request is not valid', got {err:?}"
+        );
+
+        // Text-based detection: "invalid api-key"
+        let err = connectivity_error(anyhow::anyhow!("Invalid API-key format"));
+        assert!(
+            matches!(err, UnindexedClientError::Api(ApiError::Unauthenticated(_))),
+            "expected Unauthenticated for 'invalid api-key', got {err:?}"
+        );
+
+        // Non-auth errors should remain as Connectivity
+        let err = connectivity_error(anyhow::anyhow!("connection timeout"));
+        assert!(
+            matches!(err, UnindexedClientError::Connectivity(_)),
+            "expected Connectivity for timeout, got {err:?}"
         );
     }
 
