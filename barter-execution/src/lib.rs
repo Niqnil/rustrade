@@ -41,7 +41,7 @@ use crate::{
     trade::Trade,
 };
 use barter_instrument::{
-    asset::{AssetIndex, QuoteAsset, name::AssetNameExchange},
+    asset::{AssetIndex, name::AssetNameExchange},
     exchange::{ExchangeId, ExchangeIndex},
     instrument::{InstrumentIndex, name::InstrumentNameExchange},
 };
@@ -115,7 +115,11 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
     OrderCancelled(OrderResponseCancel<ExchangeKey, AssetKey, InstrumentKey>),
 
     /// [`Order<ExchangeKey, InstrumentKey, Open>`] partial or full-fill.
-    Trade(Trade<QuoteAsset, InstrumentKey>),
+    ///
+    /// The fee asset (`AssetKey`) may be the quote asset, base asset, or a third-party
+    /// asset (e.g., BNB on Binance). Use `fees.fees_quote` for quote-equivalent value
+    /// when available.
+    Trade(Trade<AssetKey, InstrumentKey>),
 
     /// WebSocket-level error from exchange. Connection may have dropped.
     ///

@@ -96,6 +96,24 @@ const STARTING_BALANCE_ETH: Balance = Balance {
 };
 const QUOTE_FEES_PERCENT: f64 = 0.1; // 10%
 
+// Asset indices after alphabetical sorting: btc(0), eth(1), usdt(2)
+// For BTCUSDT (instrument 0): quote = usdt = AssetIndex(2)
+// For ETHBTC (instrument 1): quote = btc = AssetIndex(0)
+fn quote_asset_index(instrument: usize) -> AssetIndex {
+    match instrument {
+        0 => AssetIndex(2), // BTCUSDT → usdt
+        1 => AssetIndex(0), // ETHBTC → btc
+        other => panic!(
+            "quote_asset_index: unknown instrument index {other}; update test setup if a new instrument is added"
+        ),
+    }
+}
+
+/// Create AssetFees with proper AssetIndex (simulates quote-denominated fees)
+fn asset_fees(instrument: usize, amount: Decimal) -> AssetFees<AssetIndex> {
+    AssetFees::new(quote_asset_index(instrument), amount, Some(amount))
+}
+
 // Type alias to avoid clippy::type_complexity warnings in test helper functions
 type TestEngine = Engine<
     HistoricalClock,
@@ -468,8 +486,8 @@ fn test_engine_process_engine_event_with_audit() {
                 price_entry_average: dec!(10_000.0),
                 quantity_abs_max: dec!(1.0),
                 pnl_realised: dec!(7000.0), // (-10k entry - 1k fees)+(20k exit - 2k fees) = 7k
-                fees_enter: AssetFees::quote_fees(dec!(1_000.0)),
-                fees_exit: AssetFees::quote_fees(dec!(2_000.0)),
+                fees_enter: asset_fees(0, dec!(1_000.0)),
+                fees_exit: asset_fees(0, dec!(2_000.0)),
                 time_enter: time_plus_days(STARTING_TIMESTAMP, 2),
                 time_exit: time_plus_days(STARTING_TIMESTAMP, 3),
                 trades: vec![gen_trade_id(0), gen_trade_id(0)],
@@ -656,8 +674,8 @@ fn test_engine_process_engine_event_with_audit() {
                 price_entry_average: dec!(0.1),
                 quantity_abs_max: dec!(1.0),
                 pnl_realised: dec!(-0.065), // 0.05 - 0.01 - 0.01 entry fees - 0.005 exit fees
-                fees_enter: AssetFees::quote_fees(dec!(0.01)), // 0.01 btc
-                fees_exit: AssetFees::quote_fees(dec!(0.005)), // 0.005 btc
+                fees_enter: asset_fees(1, dec!(0.01)), // 0.01 btc
+                fees_exit: asset_fees(1, dec!(0.005)), // 0.005 btc
                 time_enter: time_plus_days(STARTING_TIMESTAMP, 2),
                 time_exit: time_plus_days(STARTING_TIMESTAMP, 5),
                 trades: vec![gen_trade_id(1), gen_trade_id(1)],
@@ -1034,7 +1052,8 @@ fn account_event_trade(
             side,
             price: Decimal::try_from(price).unwrap(),
             quantity: Decimal::try_from(quantity).unwrap(),
-            fees: AssetFees::quote_fees(
+            fees: asset_fees(
+                instrument,
                 Decimal::try_from(price * quantity * QUOTE_FEES_PERCENT).unwrap(),
             ),
         }),
@@ -1138,7 +1157,8 @@ fn open_option_position(engine: &mut TestEngine, quantity: f64, price: f64) {
             side: Side::Buy,
             price: Decimal::try_from(price).unwrap(),
             quantity: Decimal::try_from(quantity).unwrap(),
-            fees: AssetFees::quote_fees(Decimal::ZERO),
+            // Option instrument quote is USD = AssetIndex(1) in option engine
+            fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
         }),
     }));
     engine.process(event);
@@ -1464,7 +1484,8 @@ fn open_option_position_side(engine: &mut TestEngine, side: Side, quantity: f64,
             side,
             price: Decimal::try_from(price).unwrap(),
             quantity: Decimal::try_from(quantity).unwrap(),
-            fees: AssetFees::quote_fees(Decimal::ZERO),
+            // Put option instrument quote is USD = AssetIndex(1)
+            fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
         }),
     }));
     engine.process(event);
@@ -1706,7 +1727,8 @@ fn send_fill(
             side,
             price,
             quantity: dec!(1),
-            fees: AssetFees::quote_fees(Decimal::ZERO),
+            // Hedging option engine: quote is USD = AssetIndex(1)
+            fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
         }),
     }));
     engine.process(event);
@@ -1991,7 +2013,8 @@ fn test_fee_model_per_contract_augments_trade_fees() {
             side: Side::Buy,
             price: dec!(1_000),
             quantity: dec!(1),
-            fees: AssetFees::quote_fees(Decimal::ZERO), // Exchange reports zero commission
+            // Option engine: quote is USD = AssetIndex(1). Exchange reports zero commission.
+            fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
         }),
     }));
     engine.process(event);

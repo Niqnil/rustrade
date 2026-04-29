@@ -40,9 +40,7 @@ use crate::{
     trade::{AssetFees, Trade, TradeId},
 };
 use barter_instrument::{
-    Side,
-    asset::{QuoteAsset, name::AssetNameExchange},
-    exchange::ExchangeId,
+    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
     instrument::name::InstrumentNameExchange,
 };
 use barter_integration::collection::snapshot::Snapshot;
@@ -981,7 +979,7 @@ impl ExecutionClient for HyperliquidClient {
         &self,
         time_since: DateTime<Utc>,
         instruments: &[InstrumentNameExchange],
-    ) -> Result<Vec<Trade<QuoteAsset, InstrumentNameExchange>>, UnindexedClientError> {
+    ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError> {
         let address = self.wallet_h160();
 
         let fills = self
@@ -1044,8 +1042,9 @@ impl ExecutionClient for HyperliquidClient {
                 price,
                 quantity,
                 fees: AssetFees {
-                    asset: QuoteAsset,
+                    asset: AssetNameExchange::from("USDC"),
                     fees: fee,
+                    fees_quote: Some(fee),
                 },
             });
         }
@@ -1074,8 +1073,9 @@ fn fill_to_account_event(fill: &hyperliquid_rust_sdk::TradeInfo) -> Option<Unind
         price,
         quantity,
         fees: AssetFees {
-            asset: QuoteAsset,
+            asset: AssetNameExchange::from("USDC"),
             fees: fee,
+            fees_quote: Some(fee),
         },
     };
 

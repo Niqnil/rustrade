@@ -37,7 +37,7 @@ use barter_execution::{
 };
 use barter_instrument::{
     Side,
-    asset::QuoteAsset,
+    asset::AssetIndex,
     exchange::ExchangeIndex,
     instrument::{InstrumentIndex, kind::option::OptionKind},
 };
@@ -385,7 +385,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     pub fn process_contract_expiry(
         &mut self,
         key: &InstrumentIndex,
-    ) -> Vec<PositionExited<QuoteAsset, InstrumentIndex>>
+    ) -> Vec<PositionExited<AssetIndex, InstrumentIndex>>
     where
         Clock: EngineClock,
         InstrumentData: InstrumentDataState + InFlightRequestRecorder,
@@ -553,6 +553,8 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 pos_id,
                 engine_time.timestamp_micros()
             );
+            // Use the instrument's quote asset for fee tracking (amount is zero)
+            let quote_asset = instrument_state.instrument.underlying.quote;
             let settlement_trade = Trade {
                 id: TradeId::new(&trade_tag),
                 order_id: barter_execution::order::id::OrderId::new(&trade_tag),
@@ -563,8 +565,9 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 price: settlement_price,
                 quantity: closing_quantity,
                 fees: AssetFees {
-                    asset: QuoteAsset,
+                    asset: quote_asset,
                     fees: Decimal::ZERO,
+                    fees_quote: Some(Decimal::ZERO),
                 },
             };
 
@@ -664,7 +667,7 @@ pub enum EngineOutput<
     Commanded(ActionOutput<ExchangeKey, InstrumentKey>),
     OnTradingDisabled(OnTradingDisabled),
     AccountDisconnect(OnDisconnect),
-    PositionExit(PositionExited<QuoteAsset, InstrumentKey>),
+    PositionExit(PositionExited<AssetIndex, InstrumentKey>),
     MarketDisconnect(OnDisconnect),
     AlgoOrders(GenerateAlgoOrdersOutput<ExchangeKey, InstrumentKey>),
 }
@@ -680,10 +683,11 @@ pub enum UpdateTradingStateOutput<OnTradingDisabled> {
 /// Output produced by the [`Engine`] updating from an [`AccountStreamEvent`], used to construct
 /// an `Engine` [`EngineAudit`].
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+#[allow(clippy::large_enum_variant)] // PositionExit is rare; avoiding Box keeps API simple
 pub enum UpdateFromAccountOutput<OnDisconnect, InstrumentKey = InstrumentIndex> {
     None,
     OnDisconnect(OnDisconnect),
-    PositionExit(PositionExited<QuoteAsset, InstrumentKey>),
+    PositionExit(PositionExited<AssetIndex, InstrumentKey>),
 }
 
 /// Output produced by the [`Engine`] updating from an [`MarketStreamEvent`], used to construct
@@ -704,10 +708,10 @@ impl<OnTradingDisabled, OnDisconnect, ExchangeKey, InstrumentKey>
 }
 
 impl<OnTradingDisabled, OnDisconnect, ExchangeKey, InstrumentKey>
-    From<PositionExited<QuoteAsset, InstrumentKey>>
+    From<PositionExited<AssetIndex, InstrumentKey>>
     for EngineOutput<OnTradingDisabled, OnDisconnect, ExchangeKey, InstrumentKey>
 {
-    fn from(value: PositionExited<QuoteAsset, InstrumentKey>) -> Self {
+    fn from(value: PositionExited<AssetIndex, InstrumentKey>) -> Self {
         Self::PositionExit(value)
     }
 }

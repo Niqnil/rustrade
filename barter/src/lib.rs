@@ -274,6 +274,7 @@ pub mod test_utils {
             fees: AssetFees {
                 asset: QuoteAsset,
                 fees: fees.try_into().unwrap(),
+                fees_quote: Some(fees.try_into().unwrap()),
             },
         }
     }

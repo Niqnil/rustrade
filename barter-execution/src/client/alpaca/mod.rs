@@ -46,9 +46,7 @@ use crate::{
     trade::{AssetFees, Trade, TradeId},
 };
 use barter_instrument::{
-    Side,
-    asset::{QuoteAsset, name::AssetNameExchange},
-    exchange::ExchangeId,
+    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
     instrument::name::InstrumentNameExchange,
 };
 use barter_integration::protocol::websocket::{WebSocket, WsMessage};
@@ -1152,7 +1150,7 @@ impl ExecutionClient for AlpacaClient {
         &self,
         time_since: DateTime<Utc>,
         instruments: &[InstrumentNameExchange],
-    ) -> Result<Vec<Trade<QuoteAsset, InstrumentNameExchange>>, UnindexedClientError> {
+    ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError> {
         let after_str = time_since.to_rfc3339();
         let base = self.base_url();
         let http = self.http.clone();
@@ -2354,7 +2352,7 @@ fn convert_open_order(
 /// Convert an Alpaca FILL activity into a barter Trade.
 fn convert_activity_to_trade(
     a: &AlpacaActivity,
-) -> Option<Trade<QuoteAsset, InstrumentNameExchange>> {
+) -> Option<Trade<AssetNameExchange, InstrumentNameExchange>> {
     let trade_id = TradeId::new(&a.id);
     let order_id = OrderId(SmolStr::new(&a.order_id));
     let instrument = InstrumentNameExchange::new(&a.symbol);
@@ -2367,8 +2365,9 @@ fn convert_activity_to_trade(
     });
 
     // Alpaca equities and options are commission-free. Crypto trades incur
-    // maker/taker fees (currently 0.15–0.25%); callers should account for this
-    // separately if accurate PnL tracking for crypto is required.
+    // maker/taker fees (currently 0.15–0.25%) charged in the credited asset,
+    // but fee info is not available in trade responses — use Activities API
+    // for end-of-day fee reconciliation.
     Some(Trade::new(
         trade_id,
         order_id,
@@ -2378,7 +2377,11 @@ fn convert_activity_to_trade(
         side,
         price,
         quantity,
-        AssetFees::quote_fees(Decimal::ZERO),
+        AssetFees::new(
+            AssetNameExchange::from("USD"),
+            Decimal::ZERO,
+            Some(Decimal::ZERO),
+        ),
     ))
 }
 
@@ -2447,8 +2450,8 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
             let trade_id = TradeId(format_smolstr!("{}:{}", order.id, cum_qty.normalize()));
 
             // Alpaca equities and options are commission-free. Crypto trades incur
-            // maker/taker fees (currently 0.15–0.25%); callers should account for this
-            // separately if accurate PnL tracking for crypto is required.
+            // maker/taker fees (currently 0.15–0.25%) in the credited asset, but
+            // fee info is not available in WebSocket updates.
             let trade = Trade::new(
                 trade_id,
                 order_id,
@@ -2458,7 +2461,11 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
                 side,
                 price,
                 quantity,
-                AssetFees::quote_fees(Decimal::ZERO),
+                AssetFees::new(
+                    AssetNameExchange::from("USD"),
+                    Decimal::ZERO,
+                    Some(Decimal::ZERO),
+                ),
             );
             Some(UnindexedAccountEvent::new(
                 ExchangeId::Alpaca,

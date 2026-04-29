@@ -12,10 +12,10 @@ use crate::{
         request::OrderResponseCancel,
         state::{InactiveOrderState, OrderState, UnindexedOrderState},
     },
-    trade::Trade,
+    trade::{AssetFees, Trade},
 };
 use barter_instrument::{
-    asset::{AssetIndex, QuoteAsset, name::AssetNameExchange},
+    asset::{AssetIndex, name::AssetNameExchange},
     exchange::{ExchangeId, ExchangeIndex},
     index::error::IndexError,
     instrument::{InstrumentIndex, name::InstrumentNameExchange},
@@ -287,10 +287,21 @@ impl AccountEventIndexer {
         })
     }
 
+    /// Index a trade, converting fee asset and computing `fees_quote`.
+    ///
+    /// Computes `fees_quote` based on fee asset relationship to instrument:
+    /// - Fee in quote asset: `fees_quote = Some(fees)`
+    /// - Fee in base asset: `fees_quote = Some(fees * price)`
+    /// - Fee in third-party asset (e.g., BNB): `fees_quote = None`
+    ///
+    /// # Errors
+    /// Returns `IndexError` if fee asset is not in the map. Some integrations use
+    /// "UNKNOWN" as a placeholder when fee data is unavailable (e.g., IBKR `fetch_trades`,
+    /// Binance when API omits `commission_asset`). These trades will fail indexing.
     pub fn trade(
         &self,
-        trade: Trade<QuoteAsset, InstrumentNameExchange>,
-    ) -> Result<Trade<QuoteAsset, InstrumentIndex>, IndexError> {
+        trade: Trade<AssetNameExchange, InstrumentNameExchange>,
+    ) -> Result<Trade<AssetIndex, InstrumentIndex>, IndexError> {
         let Trade {
             id,
             order_id,
@@ -298,12 +309,31 @@ impl AccountEventIndexer {
             strategy,
             time_exchange,
             side,
-            price,
+            price: trade_price,
             quantity,
             fees,
         } = trade;
 
         let instrument_index = self.map.find_instrument_index(&instrument)?;
+        let fee_asset_index = self.map.find_asset_index(&fees.asset)?;
+
+        // Compute fees_quote based on fee asset relationship to instrument
+        let fees_quote = self
+            .map
+            .instruments
+            .get_index(instrument_index.index())
+            .and_then(|instr| {
+                if fee_asset_index == instr.underlying.quote {
+                    // Fee is in quote asset — no conversion needed
+                    Some(fees.fees)
+                } else if fee_asset_index == instr.underlying.base {
+                    // Fee is in base asset — convert using trade price
+                    Some(fees.fees * trade_price)
+                } else {
+                    // Fee is in third-party asset (e.g., BNB) — needs external price
+                    None
+                }
+            });
 
         Ok(Trade {
             id,
@@ -312,9 +342,13 @@ impl AccountEventIndexer {
             strategy,
             time_exchange,
             side,
-            price,
+            price: trade_price,
             quantity,
-            fees,
+            fees: AssetFees {
+                asset: fee_asset_index,
+                fees: fees.fees,
+                fees_quote,
+            },
         })
     }
 }

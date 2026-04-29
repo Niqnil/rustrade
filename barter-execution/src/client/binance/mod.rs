@@ -42,9 +42,7 @@ use crate::{
     trade::{AssetFees, Trade, TradeId},
 };
 use barter_instrument::{
-    Side,
-    asset::{QuoteAsset, name::AssetNameExchange},
-    exchange::ExchangeId,
+    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
     instrument::name::InstrumentNameExchange,
 };
 use binance_sdk::{
@@ -1380,7 +1378,7 @@ impl ExecutionClient for BinanceSpot {
         &self,
         time_since: DateTime<Utc>,
         instruments: &[InstrumentNameExchange],
-    ) -> Result<Vec<Trade<QuoteAsset, InstrumentNameExchange>>, UnindexedClientError> {
+    ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError> {
         use futures::StreamExt;
 
         if instruments.is_empty() {
@@ -2010,7 +2008,7 @@ fn convert_open_order(
 fn convert_my_trade(
     t: &binance_sdk::spot::rest_api::MyTradesResponseInner,
     instrument: &InstrumentNameExchange,
-) -> Option<Trade<QuoteAsset, InstrumentNameExchange>> {
+) -> Option<Trade<AssetNameExchange, InstrumentNameExchange>> {
     let trade_id_raw = match t.id {
         Some(id) => id,
         None => {
@@ -2066,17 +2064,16 @@ fn convert_my_trade(
         }
     };
 
-    // known limitation — the trait's Trade<QuoteAsset, _> hardcodes QuoteAsset,
-    // so BNB fee-discount commission cannot be represented. BNB fees are the default
-    // for active traders; debug! avoids log flooding on every REST trade.
-    if let Some(ref comm_asset) = t.commission_asset
-        && comm_asset == "BNB"
-    {
-        debug!(
-            %instrument, commission_asset = %comm_asset,
-            "BinanceSpot REST trade fee paid in BNB (not quote asset) — P&L commission will be misattributed"
-        );
-    }
+    // Use actual commission asset from Binance (e.g., BNB, USDT, BTC).
+    // fees_quote is set to None here; the indexer will compute it if fee is in
+    // quote or base asset. For third-party assets (BNB), downstream must convert.
+    // "UNKNOWN" fallback (rare: API omits commission_asset) will fail indexing.
+    let fee_asset = t
+        .commission_asset
+        .as_deref()
+        .map(AssetNameExchange::from)
+        .unwrap_or_else(|| AssetNameExchange::from("UNKNOWN"));
+
     Some(Trade::new(
         trade_id,
         order_id,
@@ -2086,7 +2083,7 @@ fn convert_my_trade(
         side,
         price,
         quantity,
-        AssetFees::quote_fees(commission),
+        AssetFees::new(fee_asset, commission, None),
     ))
 }
 
@@ -2242,17 +2239,15 @@ fn convert_execution_report(
                 }
             };
 
-            // known limitation — the trait's Trade<QuoteAsset, _> hardcodes
-            // QuoteAsset, so BNB fee-discount commission cannot be represented.
-            // BNB fees are the default for active traders; see module-level FORK comment.
-            if let Some(ref comm_asset) = report.n_uppercase
-                && comm_asset == "BNB"
-            {
-                debug!(
-                    %symbol, commission_asset = %comm_asset,
-                    "BinanceSpot WS TRADE fee paid in BNB (not quote asset) — P&L commission will be misattributed"
-                );
-            }
+            // Use actual commission asset from Binance (N field: e.g., BNB, USDT, BTC).
+            // fees_quote is None here; indexer computes if fee is in quote/base asset.
+            // "UNKNOWN" fallback (rare: API omits N field) will fail indexing.
+            let fee_asset = report
+                .n_uppercase
+                .as_deref()
+                .map(AssetNameExchange::from)
+                .unwrap_or_else(|| AssetNameExchange::from("UNKNOWN"));
+
             let trade = Trade::new(
                 trade_id,
                 order_id,
@@ -2262,7 +2257,7 @@ fn convert_execution_report(
                 side,
                 last_price,
                 last_qty,
-                AssetFees::quote_fees(commission),
+                AssetFees::new(fee_asset, commission, None),
             );
 
             Some(UnindexedAccountEvent::new(
@@ -3038,12 +3033,11 @@ mod tests {
         use crate::order::id::{OrderId, StrategyId};
         use crate::trade::{AssetFees, Trade, TradeId};
         use barter_instrument::Side;
-        use barter_instrument::asset::QuoteAsset;
         use chrono::Utc;
         use rust_decimal::Decimal;
 
         let instrument = InstrumentNameExchange::new("BTCUSDT");
-        let trade = Trade::<QuoteAsset, InstrumentNameExchange>::new(
+        let trade = Trade::<AssetNameExchange, InstrumentNameExchange>::new(
             TradeId::new("9001"),
             OrderId::new("4242"),
             instrument.clone(),
@@ -3052,7 +3046,11 @@ mod tests {
             Side::Buy,
             Decimal::ZERO,
             Decimal::ZERO,
-            AssetFees::quote_fees(Decimal::ZERO),
+            AssetFees::new(
+                AssetNameExchange::from("USDT"),
+                Decimal::ZERO,
+                Some(Decimal::ZERO),
+            ),
         );
         let event =
             UnindexedAccountEvent::new(ExchangeId::BinanceSpot, AccountEventKind::Trade(trade));
@@ -3068,7 +3066,7 @@ mod tests {
 
         // Same trade ID on a different instrument must produce a different key (cross-symbol collision prevention)
         let instrument2 = InstrumentNameExchange::new("ETHUSDT");
-        let trade2 = Trade::<QuoteAsset, InstrumentNameExchange>::new(
+        let trade2 = Trade::<AssetNameExchange, InstrumentNameExchange>::new(
             TradeId::new("9001"),
             OrderId::new("7777"),
             instrument2,
@@ -3077,7 +3075,11 @@ mod tests {
             Side::Buy,
             Decimal::ZERO,
             Decimal::ZERO,
-            AssetFees::quote_fees(Decimal::ZERO),
+            AssetFees::new(
+                AssetNameExchange::from("USDT"),
+                Decimal::ZERO,
+                Some(Decimal::ZERO),
+            ),
         );
         let event2 =
             UnindexedAccountEvent::new(ExchangeId::BinanceSpot, AccountEventKind::Trade(trade2));

@@ -55,10 +55,7 @@ use crate::{
 };
 use account::BalanceAggregator;
 use barter_instrument::{
-    Side,
-    asset::{QuoteAsset, name::AssetNameExchange},
-    exchange::ExchangeId,
-    ibkr::ContractRegistry,
+    Side, asset::name::AssetNameExchange, exchange::ExchangeId, ibkr::ContractRegistry,
     instrument::name::InstrumentNameExchange,
 };
 use chrono::{DateTime, Utc};
@@ -1022,7 +1019,7 @@ impl ExecutionClient for IbkrClient {
         &self,
         time_since: DateTime<Utc>,
         instruments: &[InstrumentNameExchange],
-    ) -> Result<Vec<Trade<QuoteAsset, InstrumentNameExchange>>, UnindexedClientError> {
+    ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError> {
         let client = self.client.clone();
         let contracts = self.contracts.clone();
         let order_ids = self.order_ids.clone();
@@ -1103,7 +1100,9 @@ impl ExecutionClient for IbkrClient {
                     side,
                     price: parse_decimal_or_warn(exec.price, "exec.price"),
                     quantity: parse_decimal_or_warn(exec.shares, "exec.shares"),
-                    fees: AssetFees::default(),
+                    // IBKR executions API lacks commission data (available via CommissionReport callback).
+                    // "UNKNOWN" placeholder will fail indexing - use unindexed or correlate with WS.
+                    fees: AssetFees::new(AssetNameExchange::from("UNKNOWN"), Decimal::ZERO, None),
                 });
             }
 

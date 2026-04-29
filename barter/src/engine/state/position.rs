@@ -1,10 +1,6 @@
 pub use barter_execution::order::id::PositionId;
 use barter_execution::trade::{AssetFees, Trade, TradeId};
-use barter_instrument::{
-    Side,
-    asset::{AssetIndex, QuoteAsset},
-    instrument::InstrumentIndex,
-};
+use barter_instrument::{Side, asset::AssetIndex, instrument::InstrumentIndex};
 use chrono::{DateTime, Utc};
 use derive_more::Constructor;
 use indexmap::IndexMap;
@@ -36,19 +32,19 @@ pub enum OmsMode {
 /// - `Netting` (default): at most one entry; same flip/close logic as before.
 /// - `Hedging`: multiple concurrent entries, keyed by `PositionId`.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-pub struct PositionManager<InstrumentKey = InstrumentIndex> {
+pub struct PositionManager<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     pub mode: OmsMode,
     /// All currently open positions keyed by `PositionId`.
-    pub positions: IndexMap<PositionId, Position<QuoteAsset, InstrumentKey>>,
+    pub positions: IndexMap<PositionId, Position<AssetKey, InstrumentKey>>,
 }
 
-impl<InstrumentKey> Default for PositionManager<InstrumentKey> {
+impl<AssetKey, InstrumentKey> Default for PositionManager<AssetKey, InstrumentKey> {
     fn default() -> Self {
         Self::new(OmsMode::Netting)
     }
 }
 
-impl<InstrumentKey> PositionManager<InstrumentKey> {
+impl<AssetKey, InstrumentKey> PositionManager<AssetKey, InstrumentKey> {
     /// Construct a new `PositionManager` with the given OMS mode and no open positions.
     pub fn new(mode: OmsMode) -> Self {
         // Pre-allocate capacity for 1 entry in Netting mode (the common case).
@@ -61,7 +57,7 @@ impl<InstrumentKey> PositionManager<InstrumentKey> {
     }
 }
 
-impl<InstrumentKey> PositionManager<InstrumentKey> {
+impl<AssetKey: Debug + Clone, InstrumentKey> PositionManager<AssetKey, InstrumentKey> {
     /// Updates the current position state based on a new trade.
     ///
     /// This method handles:
@@ -88,9 +84,9 @@ impl<InstrumentKey> PositionManager<InstrumentKey> {
     /// * `contract_size` - Contract multiplier for derivatives (1 for spot, 100 for standard options)
     pub fn update_from_trade(
         &mut self,
-        trade: &Trade<QuoteAsset, InstrumentKey>,
+        trade: &Trade<AssetKey, InstrumentKey>,
         contract_size: Decimal,
-    ) -> Option<PositionExited<QuoteAsset, InstrumentKey>>
+    ) -> Option<PositionExited<AssetKey, InstrumentKey>>
     where
         InstrumentKey: Debug + Clone + PartialEq,
     {
@@ -121,10 +117,10 @@ impl<InstrumentKey> PositionManager<InstrumentKey> {
     /// settlement commission, if any, is not modelled and must be tracked separately).
     pub fn update_from_trade_with_id(
         &mut self,
-        trade: &Trade<QuoteAsset, InstrumentKey>,
+        trade: &Trade<AssetKey, InstrumentKey>,
         position_id: &PositionId,
         contract_size: Decimal,
-    ) -> Option<PositionExited<QuoteAsset, InstrumentKey>>
+    ) -> Option<PositionExited<AssetKey, InstrumentKey>>
     where
         InstrumentKey: Debug + Clone + PartialEq,
     {
@@ -355,7 +351,7 @@ fn default_contract_size() -> Decimal {
     Decimal::ONE
 }
 
-impl<InstrumentKey> Position<QuoteAsset, InstrumentKey> {
+impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
     /// Updates the [`Position`] state based on a new [`Trade`].
     ///
     /// This method handles various scenarios:
@@ -373,12 +369,13 @@ impl<InstrumentKey> Position<QuoteAsset, InstrumentKey> {
     /// - `Option<PositionExited>`: The closed [`PositionExited`], if the [`Position`] was closed.
     pub fn update_from_trade(
         mut self,
-        trade: &Trade<QuoteAsset, InstrumentKey>,
+        trade: &Trade<AssetKey, InstrumentKey>,
     ) -> (
         Option<Self>,
-        Option<PositionExited<QuoteAsset, InstrumentKey>>,
+        Option<PositionExited<AssetKey, InstrumentKey>>,
     )
     where
+        AssetKey: Debug + Clone,
         InstrumentKey: Debug + Clone + PartialEq,
     {
         // Sanity check
@@ -403,8 +400,18 @@ impl<InstrumentKey> Position<QuoteAsset, InstrumentKey> {
                 if self.quantity_abs > self.quantity_abs_max {
                     self.quantity_abs_max = self.quantity_abs;
                 }
-                self.pnl_realised -= trade.fees.fees;
+                // Use fees_quote when computable; falls back to raw fees.fees only for
+                // third-party fee assets (e.g., BNB) where the indexer cannot derive a
+                // quote-equivalent. Downstream is responsible for applying a converted
+                // fee impact when accurate quote-denominated P&L is required for those
+                // assets (see `AssetFees::fees_quote` doc).
+                self.pnl_realised -= trade.fees.fees_quote.unwrap_or(trade.fees.fees);
                 self.fees_enter.fees += trade.fees.fees;
+                self.fees_enter.fees_quote =
+                    match (self.fees_enter.fees_quote, trade.fees.fees_quote) {
+                        (Some(a), Some(b)) => Some(a + b),
+                        _ => None,
+                    };
                 self.time_exchange_update = trade.time_exchange;
                 self.update_pnl_unrealised(trade.price);
 
@@ -412,12 +419,19 @@ impl<InstrumentKey> Position<QuoteAsset, InstrumentKey> {
             }
             // Reduce LONG/SHORT Position
             (Buy, Sell) | (Sell, Buy) if self.quantity_abs > trade.quantity.abs() => {
-                // Update pnl_realised
-                self.update_pnl_realised(trade.quantity, trade.price, trade.fees.fees);
+                // Use quote-equivalent fee for P&L; fall back to raw fees.fees for
+                // third-party fee assets (caller must layer their own conversion).
+                let closed_fee_quote = trade.fees.fees_quote.unwrap_or(trade.fees.fees);
+                self.update_pnl_realised(trade.quantity, trade.price, closed_fee_quote);
 
                 // Update remaining Position state
                 self.quantity_abs -= trade.quantity.abs();
                 self.fees_exit.fees += trade.fees.fees;
+                self.fees_exit.fees_quote = match (self.fees_exit.fees_quote, trade.fees.fees_quote)
+                {
+                    (Some(a), Some(b)) => Some(a + b),
+                    _ => None,
+                };
                 self.time_exchange_update = trade.time_exchange;
 
                 // Update pnl_unrealised for remaining Position
@@ -429,8 +443,14 @@ impl<InstrumentKey> Position<QuoteAsset, InstrumentKey> {
             (Buy, Sell) | (Sell, Buy) if self.quantity_abs == trade.quantity.abs() => {
                 self.quantity_abs -= trade.quantity.abs();
                 self.fees_exit.fees += trade.fees.fees;
+                self.fees_exit.fees_quote = match (self.fees_exit.fees_quote, trade.fees.fees_quote)
+                {
+                    (Some(a), Some(b)) => Some(a + b),
+                    _ => None,
+                };
                 self.time_exchange_update = trade.time_exchange;
-                self.update_pnl_realised(trade.quantity, trade.price, trade.fees.fees);
+                let closed_fee_quote = trade.fees.fees_quote.unwrap_or(trade.fees.fees);
+                self.update_pnl_realised(trade.quantity, trade.price, closed_fee_quote);
                 self.update_pnl_unrealised(trade.price);
 
                 (None, Some(PositionExited::from(self)))
@@ -454,14 +474,30 @@ impl<InstrumentKey> Position<QuoteAsset, InstrumentKey> {
                     fees: AssetFees {
                         asset: trade.fees.asset.clone(),
                         fees: next_position_fee_enter,
+                        fees_quote: trade
+                            .fees
+                            .fees_quote
+                            .map(|fq| fq * (next_position_quantity / trade.quantity.abs())),
                     },
                 };
 
                 // Update closing Position with appropriate ratio of fees for theoretical quantity
                 let fee_exit = trade.fees.fees * (self.quantity_abs / trade.quantity.abs());
+                let fee_exit_quote = trade
+                    .fees
+                    .fees_quote
+                    .map(|fq| fq * (self.quantity_abs / trade.quantity.abs()));
                 self.fees_exit.fees += fee_exit;
+                self.fees_exit.fees_quote = match (self.fees_exit.fees_quote, fee_exit_quote) {
+                    (Some(a), Some(b)) => Some(a + b),
+                    _ => None,
+                };
                 self.time_exchange_update = trade.time_exchange;
-                self.update_pnl_realised(self.quantity_abs, trade.price, fee_exit);
+                self.update_pnl_realised(
+                    self.quantity_abs,
+                    trade.price,
+                    fee_exit_quote.unwrap_or(fee_exit),
+                );
                 self.quantity_abs = Decimal::ZERO;
                 self.update_pnl_unrealised(trade.price);
 
@@ -478,7 +514,7 @@ impl<InstrumentKey> Position<QuoteAsset, InstrumentKey> {
     /// Updates the volume-weighted average entry price of the [`Position`].
     ///
     /// Internally uses the logic defined in [`calculate_price_entry_average`].
-    fn update_price_entry_average(&mut self, trade: &Trade<QuoteAsset, InstrumentKey>) {
+    fn update_price_entry_average(&mut self, trade: &Trade<AssetKey, InstrumentKey>) {
         self.price_entry_average = calculate_price_entry_average(
             self.price_entry_average,
             self.quantity_abs,
@@ -523,11 +559,13 @@ impl<InstrumentKey> Position<QuoteAsset, InstrumentKey> {
     }
 }
 
-impl<InstrumentKey> From<&Trade<QuoteAsset, InstrumentKey>> for Position<QuoteAsset, InstrumentKey>
+impl<AssetKey, InstrumentKey> From<&Trade<AssetKey, InstrumentKey>>
+    for Position<AssetKey, InstrumentKey>
 where
+    AssetKey: Clone,
     InstrumentKey: Clone,
 {
-    fn from(trade: &Trade<QuoteAsset, InstrumentKey>) -> Self {
+    fn from(trade: &Trade<AssetKey, InstrumentKey>) -> Self {
         let mut trades = Vec::with_capacity(2);
         trades.push(trade.id.clone());
         Self {
@@ -537,9 +575,9 @@ where
             quantity_abs: trade.quantity.abs(),
             quantity_abs_max: trade.quantity.abs(),
             pnl_unrealised: Decimal::ZERO,
-            pnl_realised: -trade.fees.fees,
+            pnl_realised: -trade.fees.fees_quote.unwrap_or(trade.fees.fees),
             fees_enter: trade.fees.clone(),
-            fees_exit: AssetFees::default(),
+            fees_exit: AssetFees::new(trade.fees.asset.clone(), Decimal::ZERO, Some(Decimal::ZERO)),
             time_enter: trade.time_exchange,
             time_exchange_update: trade.time_exchange,
             trades,
@@ -736,7 +774,7 @@ pub fn calculate_pnl_return(
 mod tests {
     use super::*;
     use crate::test_utils::{time_plus_days, trade};
-    use barter_instrument::instrument::name::InstrumentNameInternal;
+    use barter_instrument::{asset::QuoteAsset, instrument::name::InstrumentNameInternal};
     use rust_decimal_macros::dec;
 
     #[test]
@@ -766,10 +804,12 @@ mod tests {
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(20.0),
+                        fees_quote: Some(dec!(20.0)),
                     },
                     fees_exit: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(0.0),
+                        fees_quote: Some(dec!(0.0)),
                     },
                     time_enter: base_time,
                     time_exchange_update: time_plus_days(base_time, 1),
@@ -793,10 +833,12 @@ mod tests {
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
+                        fees_quote: Some(dec!(10.0)),
                     },
                     fees_exit: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(5.0),
+                        fees_quote: Some(dec!(5.0)),
                     },
                     time_enter: base_time,
                     time_exchange_update: time_plus_days(base_time, 1),
@@ -820,10 +862,12 @@ mod tests {
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
+                        fees_quote: Some(dec!(10.0)),
                     },
                     fees_exit: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
+                        fees_quote: Some(dec!(10.0)),
                     },
                     time_enter: base_time,
                     time_exit: time_plus_days(base_time, 1),
@@ -845,10 +889,12 @@ mod tests {
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
+                        fees_quote: Some(dec!(10.0)),
                     },
                     fees_exit: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(0.0),
+                        fees_quote: Some(dec!(0.0)),
                     },
                     time_enter: time_plus_days(base_time, 1),
                     time_exchange_update: time_plus_days(base_time, 1),
@@ -865,10 +911,12 @@ mod tests {
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
+                        fees_quote: Some(dec!(10.0)),
                     },
                     fees_exit: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
+                        fees_quote: Some(dec!(10.0)),
                     },
                     time_enter: base_time,
                     time_exit: time_plus_days(base_time, 1),
@@ -890,10 +938,12 @@ mod tests {
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(20.0),
+                        fees_quote: Some(dec!(20.0)),
                     },
                     fees_exit: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(0.0),
+                        fees_quote: Some(dec!(0.0)),
                     },
                     time_enter: base_time,
                     time_exchange_update: base_time,
@@ -917,10 +967,12 @@ mod tests {
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
+                        fees_quote: Some(dec!(10.0)),
                     },
                     fees_exit: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(5.0),
+                        fees_quote: Some(dec!(5.0)),
                     },
                     time_enter: base_time,
                     time_exchange_update: base_time,
@@ -944,10 +996,12 @@ mod tests {
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
+                        fees_quote: Some(dec!(10.0)),
                     },
                     fees_exit: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
+                        fees_quote: Some(dec!(10.0)),
                     },
                     time_enter: base_time,
                     time_exit: base_time,
@@ -969,10 +1023,12 @@ mod tests {
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
+                        fees_quote: Some(dec!(10.0)),
                     },
                     fees_exit: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(0.0),
+                        fees_quote: Some(dec!(0.0)),
                     },
                     time_enter: base_time,
                     time_exchange_update: base_time,
@@ -989,10 +1045,12 @@ mod tests {
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
+                        fees_quote: Some(dec!(10.0)),
                     },
                     fees_exit: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
+                        fees_quote: Some(dec!(10.0)),
                     },
                     time_enter: base_time,
                     time_exit: base_time,

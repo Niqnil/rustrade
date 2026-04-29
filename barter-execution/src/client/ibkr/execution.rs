@@ -2,7 +2,9 @@ use crate::{
     order::id::{ClientOrderId, StrategyId},
     trade::{AssetFees, Trade, TradeId},
 };
-use barter_instrument::{Side, asset::QuoteAsset, instrument::name::InstrumentNameExchange};
+use barter_instrument::{
+    Side, asset::name::AssetNameExchange, instrument::name::InstrumentNameExchange,
+};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use fnv::FnvHashMap;
@@ -87,7 +89,7 @@ impl ExecutionBuffer {
     pub fn complete_with_commission(
         &self,
         report: &CommissionReport,
-    ) -> Option<Trade<QuoteAsset, InstrumentNameExchange>> {
+    ) -> Option<Trade<AssetNameExchange, InstrumentNameExchange>> {
         let pending = {
             let mut inner = self.inner.lock();
             inner.pending.remove(&report.execution_id)?
@@ -142,7 +144,7 @@ impl Default for ExecutionBuffer {
 fn build_trade(
     pending: PendingExecution,
     commission: &CommissionReport,
-) -> Option<Trade<QuoteAsset, InstrumentNameExchange>> {
+) -> Option<Trade<AssetNameExchange, InstrumentNameExchange>> {
     let exec = &pending.execution.execution;
 
     let side = match parse_ib_side(&exec.side) {
@@ -173,8 +175,9 @@ fn build_trade(
         price,
         quantity,
         fees: AssetFees {
-            asset: QuoteAsset,
+            asset: AssetNameExchange::from(commission.currency.as_str()),
             fees: commission_amount,
+            fees_quote: None, // Indexer computes based on fee asset vs instrument quote
         },
     })
 }

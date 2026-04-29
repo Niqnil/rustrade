@@ -13,13 +13,13 @@ use crate::{
         Order, OrderKey, OrderKind, UnindexedOrder,
         id::OrderId,
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::{Cancelled, Filled, InactiveOrderState, OrderState, UnindexedOrderState},
+        state::{Cancelled, Filled, OrderState, UnindexedOrderState},
     },
     trade::{AssetFees, Trade, TradeId},
 };
 use barter_instrument::{
     Side,
-    asset::{QuoteAsset, name::AssetNameExchange},
+    asset::name::AssetNameExchange,
     exchange::ExchangeId,
     instrument::{Instrument, name::InstrumentNameExchange},
 };
@@ -262,7 +262,7 @@ impl MockExchange {
             if tx.send(trade).is_err() {
                 error!(
                     %exchange,
-                    kind = "Trade<QuoteAsset, InstrumentNameExchange>",
+                    kind = "Trade<AssetNameExchange, InstrumentNameExchange>",
                     "MockExchange failed to send AccountEvent notification to client"
                 );
             }
@@ -367,10 +367,17 @@ impl MockExchange {
                     current.balance.total = maybe_new_balance;
                     current.time_exchange = time_exchange;
 
-                    Ok((current.clone(), AssetFees::quote_fees(order_fees_quote)))
+                    Ok((
+                        current.clone(),
+                        AssetFees::new(
+                            underlying.quote.clone(),
+                            order_fees_quote,
+                            Some(order_fees_quote),
+                        ),
+                    ))
                 } else {
                     Err(ApiError::BalanceInsufficient(
-                        underlying.quote,
+                        underlying.quote.clone(),
                         format!(
                             "Available Balance: {}, Required Balance inc. fees: {}",
                             current.balance.free, quote_required
@@ -412,7 +419,14 @@ impl MockExchange {
                     current.balance.total = maybe_new_balance;
                     current.time_exchange = time_exchange;
 
-                    Ok((current.clone(), AssetFees::quote_fees(order_fees_quote)))
+                    Ok((
+                        current.clone(),
+                        AssetFees::new(
+                            underlying.quote.clone(),
+                            order_fees_quote,
+                            Some(order_fees_quote),
+                        ),
+                    ))
                 } else {
                     Err(ApiError::BalanceInsufficient(
                         underlying.base,
@@ -529,7 +543,7 @@ where
 #[derive(Debug)]
 pub struct OpenOrderNotifications {
     pub balance: Snapshot<AssetBalance<AssetNameExchange>>,
-    pub trade: Trade<QuoteAsset, InstrumentNameExchange>,
+    pub trade: Trade<AssetNameExchange, InstrumentNameExchange>,
 }
 
 #[cfg(test)]
@@ -547,6 +561,7 @@ mod tests {
             OrderEvent, OrderKey, OrderKind, TimeInForce,
             id::{ClientOrderId, StrategyId},
             request::RequestOpen,
+            state::InactiveOrderState,
         },
     };
     use barter_instrument::{

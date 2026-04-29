@@ -10,9 +10,7 @@ use crate::{
     trade::Trade,
 };
 use barter_instrument::{
-    asset::{QuoteAsset, name::AssetNameExchange},
-    exchange::ExchangeId,
-    instrument::name::InstrumentNameExchange,
+    asset::name::AssetNameExchange, exchange::ExchangeId, instrument::name::InstrumentNameExchange,
 };
 use chrono::{DateTime, Utc};
 use futures::Stream;
@@ -153,12 +151,18 @@ where
     /// return trades across all instruments. When non-empty, only trades for the listed
     /// instruments are returned.
     ///
+    /// The fee asset (`AssetNameExchange`) may be quote, base, or third-party (e.g., BNB).
+    /// Use `fees.fees_quote` for quote-equivalent value when available.
+    ///
     /// Note: `MockExecution` currently ignores `instruments` and always returns all trades.
     fn fetch_trades(
         &self,
         time_since: DateTime<Utc>,
         instruments: &[InstrumentNameExchange],
     ) -> impl Future<
-        Output = Result<Vec<Trade<QuoteAsset, InstrumentNameExchange>>, UnindexedClientError>,
+        Output = Result<
+            Vec<Trade<AssetNameExchange, InstrumentNameExchange>>,
+            UnindexedClientError,
+        >,
     > + Send;
 }
