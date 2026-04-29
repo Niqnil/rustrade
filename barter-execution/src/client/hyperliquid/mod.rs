@@ -29,12 +29,12 @@ use crate::{
     UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance},
     client::ExecutionClient,
-    error::{ConnectivityError, UnindexedClientError, UnindexedOrderError},
+    error::{ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, OrderId, StrategyId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::Open,
+        state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
     },
     position::Position,
     trade::{AssetFees, Trade, TradeId},
@@ -706,10 +706,11 @@ impl ExecutionClient for HyperliquidClient {
                         strategy: request.key.strategy.clone(),
                         cid: request.key.cid.clone(),
                     },
-                    state: Ok(Cancelled {
-                        id: order_id.clone(),
-                        time_exchange: Utc::now(),
-                    }),
+                    state: Ok(Cancelled::new(
+                        order_id.clone(),
+                        Utc::now(),
+                        Decimal::ZERO, // Cancel response doesn't include filled quantity
+                    )),
                 })
             }
             ExchangeResponseStatus::Err(msg) => {
@@ -732,7 +733,7 @@ impl ExecutionClient for HyperliquidClient {
     async fn open_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
-    ) -> Option<Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>> {
+    ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
         use hyperliquid_rust_sdk::{
             ClientLimit, ClientOrder, ClientOrderRequest, ExchangeDataStatus,
             ExchangeResponseStatus,
@@ -783,7 +784,7 @@ impl ExecutionClient for HyperliquidClient {
                     quantity: request.state.quantity,
                     kind: request.state.kind,
                     time_in_force: request.state.time_in_force,
-                    state: Err(error::map_order_error(e, request.key.instrument)),
+                    state: OrderState::inactive(error::map_order_error(e, request.key.instrument)),
                 });
             }
         };
@@ -799,7 +800,7 @@ impl ExecutionClient for HyperliquidClient {
                 match status {
                     Some(ExchangeDataStatus::Resting(resting)) => {
                         debug!(oid = resting.oid, "Order resting");
-                        Ok(Open {
+                        OrderState::active(Open {
                             id: OrderId(format_smolstr!("{}", resting.oid)),
                             time_exchange: Utc::now(),
                             filled_quantity: Decimal::ZERO,
@@ -807,16 +808,19 @@ impl ExecutionClient for HyperliquidClient {
                     }
                     Some(ExchangeDataStatus::Filled(filled)) => {
                         debug!(oid = filled.oid, avg_px = %filled.avg_px, "Order filled");
-                        Ok(Open {
-                            id: OrderId(format_smolstr!("{}", filled.oid)),
-                            time_exchange: Utc::now(),
-                            filled_quantity: parse_decimal(&filled.total_sz, "total_sz")
+                        // Hyperliquid provides avg_px for filled orders
+                        let avg_price = parse_decimal(&filled.avg_px, "avg_px");
+                        OrderState::fully_filled(Filled::new(
+                            OrderId(format_smolstr!("{}", filled.oid)),
+                            Utc::now(),
+                            parse_decimal(&filled.total_sz, "total_sz")
                                 .unwrap_or(request.state.quantity),
-                        })
+                            avg_price,
+                        ))
                     }
                     Some(ExchangeDataStatus::Error(msg)) => {
                         warn!(%msg, "Order rejected by exchange");
-                        Err(UnindexedOrderError::Rejected(
+                        OrderState::inactive(OrderError::Rejected(
                             crate::error::ApiError::OrderRejected(msg),
                         ))
                     }
@@ -825,7 +829,7 @@ impl ExecutionClient for HyperliquidClient {
                         // Trigger/conditional orders return no usable order ID.
                         // Reject since we can't track or cancel these orders.
                         warn!("Trigger/conditional orders not supported");
-                        Err(UnindexedOrderError::Rejected(
+                        OrderState::inactive(OrderError::Rejected(
                             crate::error::ApiError::OrderRejected(
                                 "trigger/conditional orders not supported".to_string(),
                             ),
@@ -835,7 +839,7 @@ impl ExecutionClient for HyperliquidClient {
                         // Generic success without order ID — SDK didn't return structured data.
                         // This shouldn't happen for limit orders; reject to avoid silent failures.
                         warn!("Order accepted but no order ID returned");
-                        Err(UnindexedOrderError::Rejected(
+                        OrderState::inactive(OrderError::Rejected(
                             crate::error::ApiError::OrderRejected(
                                 "no order ID in response".to_string(),
                             ),
@@ -845,9 +849,9 @@ impl ExecutionClient for HyperliquidClient {
             }
             ExchangeResponseStatus::Err(msg) => {
                 warn!(%msg, "Order rejected");
-                Err(UnindexedOrderError::Rejected(
-                    crate::error::ApiError::OrderRejected(msg),
-                ))
+                OrderState::inactive(OrderError::Rejected(crate::error::ApiError::OrderRejected(
+                    msg,
+                )))
             }
         };
 
@@ -1100,7 +1104,7 @@ fn order_update_to_account_event(
         .map(|c| ClientOrderId::new(SmolStr::new(c)))
         .unwrap_or_else(|| ClientOrderId::new(order_id_smol.clone()));
 
-    // Determine order state from status — parse current_sz only when needed for filled_quantity
+    // Determine order state from status
     let state = match update.status.as_str() {
         "open" | "resting" => {
             let current_sz = parse_decimal(&order.sz, "order.sz")?;
@@ -1111,12 +1115,20 @@ fn order_update_to_account_event(
                 filled_quantity,
             })
         }
-        "filled" => crate::order::state::OrderState::fully_filled(),
+        "filled" => crate::order::state::OrderState::fully_filled(Filled::new(
+            OrderId(order_id_smol),
+            time_exchange,
+            orig_sz, // Fully filled means filled_quantity == orig_sz
+            None,    // OrderUpdate doesn't include avg_price
+        )),
         "canceled" | "cancelled" => {
-            crate::order::state::OrderState::inactive(crate::order::state::Cancelled {
-                id: OrderId(order_id_smol),
+            let current_sz = parse_decimal(&order.sz, "order.sz")?;
+            let filled_quantity = (orig_sz - current_sz).max(Decimal::ZERO);
+            crate::order::state::OrderState::inactive(Cancelled::new(
+                OrderId(order_id_smol),
                 time_exchange,
-            })
+                filled_quantity,
+            ))
         }
         status => {
             warn!(%status, "Unknown order status");
@@ -1368,7 +1380,7 @@ mod tests {
                 assert!(matches!(
                     order.state,
                     crate::order::state::OrderState::Inactive(
-                        crate::order::state::InactiveOrderState::FullyFilled
+                        crate::order::state::InactiveOrderState::FullyFilled(_)
                     )
                 ));
             }

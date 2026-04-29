@@ -1,11 +1,11 @@
 use crate::{
     UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::AssetBalance,
-    error::{UnindexedClientError, UnindexedOrderError},
+    error::UnindexedClientError,
     order::{
         Order,
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::Open,
+        state::{Open, UnindexedOrderState},
     },
     trade::Trade,
 };
@@ -98,22 +98,29 @@ where
         )
     }
 
+    /// Place an order on the exchange.
+    ///
+    /// # Return value
+    ///
+    /// Returns `OrderState` directly rather than `Result<Open, OrderError>`:
+    /// - `OrderState::Active(Open)` - order is resting on the order book
+    /// - `OrderState::Inactive(FullyFilled)` - order was immediately filled (includes `avg_price` when available)
+    /// - `OrderState::Inactive(OpenFailed)` - order placement failed (API error, connectivity, etc.)
+    ///
+    /// This design allows immediate fills to carry metadata (e.g., `avg_price`) that
+    /// would be lost if we had to infer terminal state from `Open::filled_quantity`.
     fn open_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
-    ) -> impl Future<
-        Output = Option<
-            Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>,
-        >,
-    > + Send;
+    ) -> impl Future<Output = Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>>>
+    + Send;
 
     // `+ Send` on default method return types for multi-threaded Tokio runtime
     fn open_orders<'a>(
         &self,
         requests: impl IntoIterator<Item = OrderRequestOpen<ExchangeId, &'a InstrumentNameExchange>>,
-    ) -> impl Stream<
-        Item = Option<Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>>,
-    > + Send {
+    ) -> impl Stream<Item = Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>>> + Send
+    {
         futures::stream::FuturesUnordered::from_iter(
             requests.into_iter().map(|request| self.open_order(request)),
         )

@@ -414,7 +414,9 @@ mod tests {
             Order, OrderKey, OrderKind, TimeInForce,
             id::{ClientOrderId, OrderId, StrategyId},
             request::{RequestCancel, RequestOpen},
-            state::{ActiveOrderState, CancelInFlight, Cancelled, Open, OpenInFlight},
+            state::{
+                ActiveOrderState, CancelInFlight, Cancelled, Expired, Filled, Open, OpenInFlight,
+            },
         },
     };
     use barter_instrument::{Side, exchange::ExchangeId};
@@ -475,6 +477,7 @@ mod tests {
             state: OrderState::inactive(Cancelled {
                 id: OrderId(SmolStr::default()),
                 time_exchange: Default::default(),
+                filled_quantity: Default::default(),
             }),
         })
     }
@@ -494,7 +497,12 @@ mod tests {
             quantity: Default::default(),
             kind: OrderKind::Market,
             time_in_force: TimeInForce::GoodUntilEndOfDay,
-            state: OrderState::fully_filled(),
+            state: OrderState::fully_filled(Filled::new(
+                OrderId(SmolStr::default()),
+                DateTime::<Utc>::MIN_UTC,
+                Default::default(),
+                None,
+            )),
         })
     }
 
@@ -532,7 +540,11 @@ mod tests {
             quantity: Default::default(),
             kind: OrderKind::Market,
             time_in_force: TimeInForce::GoodUntilEndOfDay,
-            state: OrderState::expired(),
+            state: OrderState::expired(Expired::new(
+                OrderId(SmolStr::default()),
+                DateTime::<Utc>::MIN_UTC,
+                Default::default(),
+            )),
         })
     }
 
@@ -616,6 +628,7 @@ mod tests {
             state: Ok(Cancelled {
                 id: OrderId(SmolStr::default()),
                 time_exchange: DateTime::<Utc>::MIN_UTC,
+                filled_quantity: Default::default(),
             }),
         }
     }
