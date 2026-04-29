@@ -32,12 +32,12 @@ use crate::{
     UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance},
     client::ExecutionClient,
-    error::{ApiError, ConnectivityError, UnindexedClientError, UnindexedOrderError},
+    error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, OrderId, StrategyId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::{Cancelled, Open, OrderState},
+        state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
     },
     trade::{AssetFees, Trade, TradeId},
 };
@@ -1055,9 +1055,15 @@ impl ExecutionClient for BinanceSpot {
                         }
                     };
 
+                    let filled_qty = data
+                        .executed_qty
+                        .as_deref()
+                        .and_then(|q| Decimal::from_str(q).ok())
+                        .unwrap_or(Decimal::ZERO);
+
                     Some(UnindexedOrderResponseCancel {
                         key,
-                        state: Ok(Cancelled::new(exchange_order_id, time_exchange)),
+                        state: Ok(Cancelled::new(exchange_order_id, time_exchange, filled_qty)),
                     })
                 }
                 Err(e) => {
@@ -1113,7 +1119,7 @@ impl ExecutionClient for BinanceSpot {
     async fn open_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
-    ) -> Option<Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>> {
+    ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
         let instrument = request.key.instrument.clone();
         let side = request.state.side;
         let price = request.state.price;
@@ -1139,7 +1145,7 @@ impl ExecutionClient for BinanceSpot {
                     quantity,
                     kind,
                     time_in_force,
-                    state: Err(UnindexedOrderError::Connectivity(
+                    state: OrderState::inactive(OrderError::Connectivity(
                         ConnectivityError::Socket(format!("{e:#}")),
                     )),
                 });
@@ -1184,7 +1190,7 @@ impl ExecutionClient for BinanceSpot {
                     quantity,
                     kind,
                     time_in_force,
-                    state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
+                    state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
                         e.to_string(),
                     ))),
                 });
@@ -1210,9 +1216,11 @@ impl ExecutionClient for BinanceSpot {
                                 quantity,
                                 kind,
                                 time_in_force,
-                                state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
-                                    "open_order response missing orderId".into(),
-                                ))),
+                                state: OrderState::inactive(OrderError::Rejected(
+                                    ApiError::OrderRejected(
+                                        "open_order response missing orderId".into(),
+                                    ),
+                                )),
                             });
                         }
                     };
@@ -1223,6 +1231,19 @@ impl ExecutionClient for BinanceSpot {
                         .and_then(|q| Decimal::from_str(q).ok())
                         .unwrap_or(Decimal::ZERO);
 
+                    let state = if filled_qty >= quantity {
+                        // Order was fully filled immediately
+                        OrderState::fully_filled(Filled::new(
+                            exchange_order_id,
+                            time_exchange,
+                            filled_qty,
+                            None, // Binance SDK response doesn't expose avg_price directly
+                        ))
+                    } else {
+                        // Order is resting on the order book
+                        OrderState::active(Open::new(exchange_order_id, time_exchange, filled_qty))
+                    };
+
                     Some(Order {
                         key: order_key,
                         side,
@@ -1230,7 +1251,7 @@ impl ExecutionClient for BinanceSpot {
                         quantity,
                         kind,
                         time_in_force,
-                        state: Ok(Open::new(exchange_order_id, time_exchange, filled_qty)),
+                        state,
                     })
                 }
                 Err(e) => {
@@ -1242,7 +1263,7 @@ impl ExecutionClient for BinanceSpot {
                         quantity,
                         kind,
                         time_in_force,
-                        state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
+                        state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
                             e.to_string(),
                         ))),
                     })
@@ -1269,7 +1290,7 @@ impl ExecutionClient for BinanceSpot {
                         quantity,
                         kind,
                         time_in_force,
-                        state: Err(UnindexedOrderError::from(api_err)),
+                        state: OrderState::inactive(OrderError::from(api_err)),
                     })
                 } else if is_rate_limit_error(&e) {
                     // WS-level 429 — update the shared rate limiter so REST calls also back off.
@@ -1281,7 +1302,7 @@ impl ExecutionClient for BinanceSpot {
                         quantity,
                         kind,
                         time_in_force,
-                        state: Err(UnindexedOrderError::from(ApiError::RateLimit)),
+                        state: OrderState::inactive(OrderError::from(ApiError::RateLimit)),
                     })
                 } else {
                     // Transport-level error — clear cached session so next call reconnects.
@@ -1294,7 +1315,7 @@ impl ExecutionClient for BinanceSpot {
                         quantity,
                         kind,
                         time_in_force,
-                        state: Err(UnindexedOrderError::Connectivity(
+                        state: OrderState::inactive(OrderError::Connectivity(
                             ConnectivityError::Socket(format!("{e:#}")),
                         )),
                     })
@@ -2250,7 +2271,12 @@ fn convert_execution_report(
             ))
         }
         "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH" => {
-            let cancelled = Cancelled::new(order_id, time_exchange);
+            let filled_qty = report
+                .z
+                .as_deref()
+                .and_then(|s| Decimal::from_str(s).ok())
+                .unwrap_or(Decimal::ZERO);
+            let cancelled = Cancelled::new(order_id, time_exchange, filled_qty);
             let response = UnindexedOrderResponseCancel {
                 key: OrderKey::new(
                     ExchangeId::BinanceSpot,
@@ -2294,7 +2320,12 @@ fn convert_execution_report(
             // The replacement order arrives as a subsequent NEW execution report with
             // its own order ID. We emit OrderCancelled for the original order so the
             // engine removes it from its open-order book.
-            let cancelled = Cancelled::new(order_id, time_exchange);
+            let filled_qty = report
+                .z
+                .as_deref()
+                .and_then(|s| Decimal::from_str(s).ok())
+                .unwrap_or(Decimal::ZERO);
+            let cancelled = Cancelled::new(order_id, time_exchange, filled_qty);
             let response = UnindexedOrderResponseCancel {
                 key: OrderKey::new(ExchangeId::BinanceSpot, symbol, StrategyId::unknown(), cid),
                 state: Ok(cancelled),
@@ -3832,12 +3863,17 @@ mod tests {
             AccountEventKind::OrderSnapshot(Snapshot(Order::new(
                 key,
                 Side::Buy,
-                Decimal::ZERO,
-                Decimal::ZERO,
+                Decimal::ONE,
+                Decimal::ONE,
                 OrderKind::Market,
                 TimeInForce::ImmediateOrCancel,
                 OrderState::<AssetNameExchange, InstrumentNameExchange>::Inactive(
-                    InactiveOrderState::FullyFilled,
+                    InactiveOrderState::FullyFilled(crate::order::state::Filled::new(
+                        OrderId::new("123"),
+                        Utc::now(),
+                        Decimal::ONE, // FullyFilled must have non-zero filled_quantity
+                        None,
+                    )),
                 ),
             ))),
         );

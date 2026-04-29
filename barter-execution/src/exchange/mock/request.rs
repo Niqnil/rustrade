@@ -1,11 +1,10 @@
 use crate::{
     UnindexedAccountSnapshot,
     balance::AssetBalance,
-    error::UnindexedOrderError,
     order::{
         Order,
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::Open,
+        state::{Open, UnindexedOrderState},
     },
     trade::Trade,
 };
@@ -117,7 +116,7 @@ impl MockExchangeRequest {
     pub fn open_order(
         time_request: DateTime<Utc>,
         response_tx: oneshot::Sender<
-            Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>,
+            Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
         >,
         request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
         market_prices: MarketPrices,
@@ -155,9 +154,8 @@ pub enum MockExchangeRequestKind {
         request: OrderRequestCancel<ExchangeId, InstrumentNameExchange>,
     },
     OpenOrder {
-        response_tx: oneshot::Sender<
-            Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>,
-        >,
+        response_tx:
+            oneshot::Sender<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>>,
         request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
         market_prices: MarketPrices,
     },

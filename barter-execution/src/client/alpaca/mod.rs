@@ -36,12 +36,12 @@ use crate::{
     UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance},
     client::ExecutionClient,
-    error::{ApiError, ConnectivityError, UnindexedClientError, UnindexedOrderError},
+    error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, OrderId, StrategyId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::{Cancelled, Open, OrderState},
+        state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
     },
     trade::{AssetFees, Trade, TradeId},
 };
@@ -1045,9 +1045,11 @@ impl ExecutionClient for AlpacaClient {
         match rest_delete_with_retry(&self.rate_limiter, || http.delete(&url)).await {
             Ok(()) => {
                 let exchange_order_id = OrderId(order_id);
+                // REST DELETE returns no response body, so filled_qty unavailable.
+                // Use ZERO; downstream can reconcile via WS events or fetch_open_orders.
                 Some(crate::order::request::OrderResponseCancel {
                     key,
-                    state: Ok(Cancelled::new(exchange_order_id, Utc::now())),
+                    state: Ok(Cancelled::new(exchange_order_id, Utc::now(), Decimal::ZERO)),
                 })
             }
             Err(e) => Some(crate::order::request::OrderResponseCancel { key, state: Err(e) }),
@@ -1077,7 +1079,7 @@ impl ExecutionClient for AlpacaClient {
     async fn open_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
-    ) -> Option<Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>> {
+    ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
         let side = request.state.side;
         let reduce_only = request.state.reduce_only;
         self.open_order_inner(request, map_position_intent(side, reduce_only))
@@ -1207,7 +1209,7 @@ impl AlpacaClient {
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
         intent: AlpacaPositionIntent,
-    ) -> Option<Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>> {
+    ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
         self.open_order_inner(request, intent).await
     }
 
@@ -1215,7 +1217,7 @@ impl AlpacaClient {
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
         intent: AlpacaPositionIntent,
-    ) -> Option<Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>> {
+    ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
         let instrument = request.key.instrument.clone();
         let side = request.state.side;
         let price = request.state.price;
@@ -1242,7 +1244,7 @@ impl AlpacaClient {
                     quantity,
                     kind,
                     time_in_force,
-                    state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
+                    state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
                         msg.to_string(),
                     ))),
                 });
@@ -1288,6 +1290,19 @@ impl AlpacaClient {
                 let time_exchange = parse_timestamp(&resp.created_at).unwrap_or_else(Utc::now);
                 let filled_qty = Decimal::from_str(&resp.filled_qty).unwrap_or(Decimal::ZERO);
 
+                let state = if filled_qty >= quantity {
+                    // Order was fully filled immediately (market order or aggressive limit)
+                    OrderState::fully_filled(Filled::new(
+                        exchange_order_id,
+                        time_exchange,
+                        filled_qty,
+                        None, // Alpaca order response doesn't include avg_price
+                    ))
+                } else {
+                    // Order is resting on the order book (partially filled or unfilled)
+                    OrderState::active(Open::new(exchange_order_id, time_exchange, filled_qty))
+                };
+
                 Some(Order {
                     key: order_key,
                     side,
@@ -1295,13 +1310,13 @@ impl AlpacaClient {
                     quantity,
                     kind,
                     time_in_force,
-                    state: Ok(Open::new(exchange_order_id, time_exchange, filled_qty)),
+                    state,
                 })
             }
             Err(e) => {
                 let order_err = match e {
-                    UnindexedClientError::Connectivity(ce) => UnindexedOrderError::Connectivity(ce),
-                    UnindexedClientError::Api(ae) => UnindexedOrderError::Rejected(ae),
+                    UnindexedClientError::Connectivity(ce) => OrderError::Connectivity(ce),
+                    UnindexedClientError::Api(ae) => OrderError::Rejected(ae),
                     // TaskFailed, Internal, Truncated, and TruncatedSnapshot are not
                     // returned by rest_with_retry (REST-only path for orders), but matching
                     // explicitly ensures any new ClientError variant causes a compile error
@@ -1324,7 +1339,7 @@ impl AlpacaClient {
                     quantity,
                     kind,
                     time_in_force,
-                    state: Err(order_err),
+                    state: OrderState::inactive(order_err),
                 })
             }
         }
@@ -2505,7 +2520,9 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
                 .timestamp
                 .and_then(parse_timestamp)
                 .unwrap_or_else(Utc::now);
-            let cancelled = Cancelled::new(order_id, time_exchange);
+            let filled_qty =
+                Decimal::from_str(order.filled_qty.unwrap_or("0")).unwrap_or(Decimal::ZERO);
+            let cancelled = Cancelled::new(order_id, time_exchange, filled_qty);
             let response = crate::order::request::OrderResponseCancel {
                 key: OrderKey::new(ExchangeId::Alpaca, instrument, StrategyId::unknown(), cid),
                 state: Ok(cancelled),
@@ -3869,7 +3886,7 @@ mod tests {
             assert!(result.is_some(), "open_order should return a result");
             let order = result.unwrap();
             assert!(
-                order.state.is_ok(),
+                order.state.is_accepted(),
                 "order should be accepted: {:?}",
                 order.state
             );
@@ -3955,7 +3972,7 @@ mod tests {
             assert!(result.is_some(), "open_order should return a result");
             let order = result.unwrap();
             assert!(
-                order.state.is_ok(),
+                order.state.is_accepted(),
                 "order should be accepted: {:?}",
                 order.state
             );

@@ -150,23 +150,7 @@ impl AccountEventIndexer {
         } = order;
 
         let key = self.order_key(key)?;
-
-        let state = match state {
-            UnindexedOrderState::Active(active) => OrderState::Active(active),
-            UnindexedOrderState::Inactive(inactive) => match inactive {
-                InactiveOrderState::OpenFailed(failed) => match failed {
-                    OrderError::Rejected(rejected) => {
-                        OrderState::inactive(OrderError::Rejected(self.api_error(rejected)?))
-                    }
-                    OrderError::Connectivity(error) => {
-                        OrderState::inactive(OrderError::Connectivity(error))
-                    }
-                },
-                InactiveOrderState::Cancelled(cancelled) => OrderState::inactive(cancelled),
-                InactiveOrderState::FullyFilled => OrderState::fully_filled(),
-                InactiveOrderState::Expired => OrderState::expired(),
-            },
-        };
+        let state = self.order_state(state)?;
 
         Ok(Order {
             key,
@@ -207,6 +191,28 @@ impl AccountEventIndexer {
             instrument: self.map.find_instrument_index(&instrument)?,
             strategy,
             cid,
+        })
+    }
+
+    /// Index an [`UnindexedOrderState`] to an [`OrderState`].
+    ///
+    /// Used by [`ExecutionManager`] to index `open_order` responses.
+    pub fn order_state(&self, state: UnindexedOrderState) -> Result<OrderState, IndexError> {
+        Ok(match state {
+            UnindexedOrderState::Active(active) => OrderState::Active(active),
+            UnindexedOrderState::Inactive(inactive) => match inactive {
+                InactiveOrderState::OpenFailed(failed) => match failed {
+                    OrderError::Rejected(rejected) => {
+                        OrderState::inactive(OrderError::Rejected(self.api_error(rejected)?))
+                    }
+                    OrderError::Connectivity(error) => {
+                        OrderState::inactive(OrderError::Connectivity(error))
+                    }
+                },
+                InactiveOrderState::Cancelled(cancelled) => OrderState::inactive(cancelled),
+                InactiveOrderState::FullyFilled(filled) => OrderState::fully_filled(filled),
+                InactiveOrderState::Expired(expired) => OrderState::expired(expired),
+            },
         })
     }
 

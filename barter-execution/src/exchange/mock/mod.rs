@@ -13,7 +13,7 @@ use crate::{
         Order, OrderKey, OrderKind, UnindexedOrder,
         id::OrderId,
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::{Cancelled, Open},
+        state::{Cancelled, Filled, InactiveOrderState, OrderState, UnindexedOrderState},
     },
     trade::{AssetFees, Trade, TradeId},
 };
@@ -296,7 +296,7 @@ impl MockExchange {
         request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
         market_prices: MarketPrices,
     ) -> (
-        Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>,
+        Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
         Option<OpenOrderNotifications>,
     ) {
         if let Err(error) = self.validate_order_kind_supported(request.state.kind) {
@@ -440,11 +440,12 @@ impl MockExchange {
             quantity: request.state.quantity,
             kind: request.state.kind,
             time_in_force: request.state.time_in_force,
-            state: Ok(Open {
-                id: order_id.clone(),
-                time_exchange: self.time_exchange(),
-                filled_quantity: request.state.quantity,
-            }),
+            state: OrderState::fully_filled(Filled::new(
+                order_id.clone(),
+                self.time_exchange(),
+                request.state.quantity,
+                Some(fill_price),
+            )),
         };
 
         let notifications = OpenOrderNotifications {
@@ -510,7 +511,7 @@ impl MockExchange {
 fn build_open_order_err_response<E>(
     request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
     error: E,
-) -> Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>
+) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>
 where
     E: Into<UnindexedOrderError>,
 {
@@ -521,7 +522,7 @@ where
         quantity: request.state.quantity,
         kind: request.state.kind,
         time_in_force: request.state.time_in_force,
-        state: Err(error.into()),
+        state: OrderState::inactive(error.into()),
     }
 }
 
@@ -538,7 +539,7 @@ mod tests {
     use crate::{
         UnindexedAccountSnapshot,
         balance::{AssetBalance, Balance},
-        error::{ApiError, UnindexedOrderError},
+        error::ApiError,
         exchange::mock::request::MarketPrices,
         fee::{FeeModelConfig, PercentageFeeModel},
         fill::{BidAskFillModel, SimFillConfig},
@@ -699,7 +700,7 @@ mod tests {
             exchange.open_order(sell_request("0.5", "50000"), MarketPrices::default());
 
         assert!(
-            response.state.is_ok(),
+            response.state.is_accepted(),
             "sell should succeed: {:?}",
             response.state
         );
@@ -741,15 +742,16 @@ mod tests {
             "failed order must produce no notifications"
         );
         match response.state {
-            Err(UnindexedOrderError::Rejected(ApiError::BalanceInsufficient(ref asset, _))) => {
+            OrderState::Inactive(InactiveOrderState::OpenFailed(
+                crate::error::OrderError::Rejected(ApiError::BalanceInsufficient(ref asset, _)),
+            )) => {
                 assert_eq!(
                     *asset,
                     base(),
                     "BalanceInsufficient must name the base asset (BTC), not the quote (USDT)"
                 );
             }
-            Err(other) => panic!("expected BalanceInsufficient, got: {other:?}"),
-            Ok(_) => panic!("expected error for oversized sell, got Ok"),
+            other => panic!("expected BalanceInsufficient, got: {other:?}"),
         }
     }
 
@@ -769,7 +771,7 @@ mod tests {
         let (response, notifications) = exchange.open_order(buy_request("1", "100"), market_prices);
 
         assert!(
-            response.state.is_ok(),
+            response.state.is_accepted(),
             "buy should succeed: {:?}",
             response.state
         );
@@ -805,7 +807,7 @@ mod tests {
             exchange.open_order(buy_request("10", "100"), MarketPrices::default());
 
         assert!(
-            response.state.is_ok(),
+            response.state.is_accepted(),
             "buy should succeed: {:?}",
             response.state
         );
@@ -838,7 +840,7 @@ mod tests {
             exchange.open_order(sell_request("1", "100"), MarketPrices::default());
 
         assert!(
-            response.state.is_ok(),
+            response.state.is_accepted(),
             "sell should succeed: {:?}",
             response.state
         );
@@ -873,7 +875,7 @@ mod tests {
             exchange.open_order(sell_request("1", "0"), MarketPrices::default());
 
         assert!(
-            response.state.is_ok(),
+            response.state.is_accepted(),
             "sell at zero price should succeed: {:?}",
             response.state
         );

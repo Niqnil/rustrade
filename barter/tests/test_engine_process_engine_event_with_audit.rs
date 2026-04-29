@@ -50,7 +50,7 @@ use barter_execution::{
         Order, OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, OrderId, PositionId, StrategyId},
         request::{OrderRequestCancel, OrderRequestOpen, OrderResponseCancel, RequestOpen},
-        state::{ActiveOrderState, Cancelled, Open, OrderState},
+        state::{ActiveOrderState, Cancelled, Filled, Open, OrderState},
     },
     trade::{AssetFees, Trade, TradeId},
 };
@@ -620,7 +620,12 @@ fn test_engine_process_engine_event_with_audit() {
             quantity: dec!(1),
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: true },
-            state: OrderState::fully_filled(),
+            state: OrderState::fully_filled(Filled::new(
+                OrderId::new("eth_btc_sell_order"),
+                time_plus_days(STARTING_TIMESTAMP, 4),
+                dec!(1),
+                None,
+            )),
         })),
     }));
     let audit = process_with_audit(&mut engine, event.clone());
@@ -1729,7 +1734,12 @@ fn send_fully_filled_snapshot(engine: &mut HedgingTestEngine, cid: ClientOrderId
             quantity: dec!(1),
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-            state: OrderState::fully_filled(),
+            state: OrderState::fully_filled(Filled::new(
+                OrderId::new("test_order"),
+                time_plus_days(STARTING_TIMESTAMP, 2),
+                dec!(1),
+                None,
+            )),
         })),
     }));
     engine.process(event);
@@ -2039,6 +2049,7 @@ fn send_cancel_ack(engine: &mut HedgingTestEngine, cid: ClientOrderId, exchange_
             state: Ok(Cancelled {
                 id: exchange_order_id,
                 time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
+                filled_quantity: dec!(0),
             }),
         }),
     }));

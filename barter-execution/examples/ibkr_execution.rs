@@ -38,6 +38,7 @@ use barter_execution::{
         OrderEvent, OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, StrategyId},
         request::{RequestCancel, RequestOpen},
+        state::{ActiveOrderState, OrderState},
     },
 };
 use barter_instrument::{
@@ -150,7 +151,7 @@ async fn main() {
     match client.open_order(open_request).await {
         Some(response) => {
             match &response.state {
-                Ok(open_state) => {
+                OrderState::Active(ActiveOrderState::Open(open_state)) => {
                     info!("Order placed successfully!");
                     info!("  Client Order ID: {}", response.key.cid);
                     info!("  Exchange Order ID: {:?}", open_state.id);
@@ -188,12 +189,15 @@ async fn main() {
                         }
                     }
                 }
-                Err(e) => {
-                    warn!("Order rejected: {e:?}");
+                OrderState::Inactive(inactive) => {
+                    warn!("Order rejected: {inactive:?}");
                     warn!("This may be due to:");
                     warn!("  - 'Read-Only API' is checked in TWS settings");
                     warn!("  - Account not authorized for AAPL trading");
                     warn!("  - Invalid order parameters");
+                }
+                other => {
+                    info!("Unexpected order state: {other:?}");
                 }
             }
         }

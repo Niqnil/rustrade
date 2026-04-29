@@ -43,6 +43,7 @@ use barter_execution::{
         OrderEvent, OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, StrategyId},
         request::{RequestCancel, RequestOpen},
+        state::{ActiveOrderState, OrderState},
     },
 };
 use barter_instrument::{
@@ -181,7 +182,7 @@ async fn main() {
     match client.open_order(open_request).await {
         Some(response) => {
             match &response.state {
-                Ok(open_state) => {
+                OrderState::Active(ActiveOrderState::Open(open_state)) => {
                     info!("Order placed successfully!");
                     info!("  Client Order ID: {}", response.key.cid);
                     info!("  Exchange Order ID: {}", open_state.id);
@@ -219,12 +220,15 @@ async fn main() {
                         }
                     }
                 }
-                Err(e) => {
+                OrderState::Inactive(e) => {
                     warn!("Order rejected: {e:?}");
                     warn!("This may be due to:");
                     warn!("  - Insufficient margin/balance");
                     warn!("  - Price more than 80% from market");
                     warn!("  - Invalid order parameters");
+                }
+                other => {
+                    info!("Unexpected order state: {other:?}");
                 }
             }
         }
