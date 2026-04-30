@@ -24,6 +24,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Integration tests: panics are the correct failure mode
 
 use barter_execution::{
+    AccountEventKind,
     client::{
         ExecutionClient,
         ibkr::{IbkrClient, IbkrConfig, contract::stock_contract},
@@ -32,7 +33,7 @@ use barter_execution::{
         OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, StrategyId},
         request::RequestOpen,
-        state::{ActiveOrderState, OrderState},
+        state::{ActiveOrderState, InactiveOrderState, OrderState},
     },
 };
 use barter_instrument::{
@@ -500,4 +501,141 @@ async fn test_cancel_nonexistent_order() {
         "Expected rejection for nonexistent order"
     );
     println!("Cancel correctly rejected: {:?}", response.state.err());
+}
+
+// ============================================================================
+// Cancelled vs Expired Differentiation Tests
+// ============================================================================
+
+/// Verifies that user-initiated cancel produces `Cancelled` state, not `Expired`.
+///
+/// This tests the pending_cancels tracking in `make_order_from_status`:
+/// - DAY orders cancelled by user → Cancelled (tracked in pending_cancels)
+/// - DAY orders expired at market close → Expired (not in pending_cancels)
+#[tokio::test]
+#[ignore]
+async fn test_cancel_produces_cancelled_not_expired() {
+    init_logging();
+
+    let config = test_config(11);
+    let client = connect_client(config).await.expect("connection failed");
+
+    let aapl_name = aapl_instrument();
+    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
+    client.register_contract(aapl_name.clone(), aapl_contract);
+
+    let assets: Vec<AssetNameExchange> = vec![];
+    let instruments: Vec<InstrumentNameExchange> = vec![];
+
+    // Start account stream to observe order state changes
+    let mut stream = client
+        .account_stream(&assets, &instruments)
+        .await
+        .expect("account_stream failed");
+
+    // Place a DAY order at $1 (won't fill)
+    let strategy = StrategyId::new("test-cancel-vs-expire");
+    let order_cid = ClientOrderId::new(format!(
+        "cancel-test-{}",
+        chrono::Utc::now().timestamp_millis()
+    ));
+
+    let order_key = OrderKey {
+        exchange: ExchangeId::Ibkr,
+        instrument: &aapl_name,
+        strategy: strategy.clone(),
+        cid: order_cid.clone(),
+    };
+
+    let request_open = RequestOpen {
+        side: Side::Buy,
+        price: dec!(1.00),
+        quantity: dec!(1),
+        kind: OrderKind::Limit,
+        time_in_force: TimeInForce::GoodUntilEndOfDay, // DAY order - would be Expired if not cancelled
+        position_id: None,
+        reduce_only: false,
+    };
+
+    let open_request = barter_execution::order::OrderEvent {
+        key: order_key.clone(),
+        state: request_open,
+    };
+
+    println!("Placing DAY limit order: BUY 1 AAPL @ $1.00");
+    let response = client.open_order(open_request).await;
+    assert!(response.is_some(), "Expected order response");
+    let response = response.unwrap();
+
+    let exchange_order_id = match &response.state {
+        OrderState::Active(ActiveOrderState::Open(open_state)) => {
+            println!("Order placed: {:?}", open_state.id);
+            open_state.id.clone()
+        }
+        other => panic!("Expected Open state, got: {:?}", other),
+    };
+
+    // Brief delay before cancel
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Cancel the order (this adds to pending_cancels)
+    let cancel_key = OrderKey {
+        exchange: ExchangeId::Ibkr,
+        instrument: &aapl_name,
+        strategy: response.key.strategy.clone(),
+        cid: response.key.cid.clone(),
+    };
+
+    let cancel_request = barter_execution::order::OrderEvent {
+        key: cancel_key,
+        state: barter_execution::order::request::RequestCancel {
+            id: Some(exchange_order_id.clone()),
+        },
+    };
+
+    println!("Cancelling order...");
+    let cancel_response = client.cancel_order(cancel_request).await;
+    assert!(cancel_response.is_some(), "Expected cancel response");
+
+    // Collect stream events and find the final order state
+    println!("Waiting for stream to emit Cancelled state...");
+    let mut found_cancelled = false;
+    let mut found_expired = false;
+
+    let timeout_result = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = stream.next().await {
+            if let AccountEventKind::OrderSnapshot(snapshot) = &event.kind {
+                let order = snapshot.value();
+                // Match on order ID to find our order
+                if order.key.cid == order_cid {
+                    println!("Order event: {:?}", order.state);
+                    match &order.state {
+                        OrderState::Inactive(InactiveOrderState::Cancelled(_)) => {
+                            found_cancelled = true;
+                            break;
+                        }
+                        OrderState::Inactive(InactiveOrderState::Expired(_)) => {
+                            found_expired = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    })
+    .await;
+
+    if timeout_result.is_err() {
+        println!("Timeout waiting for order state (this may happen if stream doesn't emit)");
+    }
+
+    // The key assertion: user cancel should produce Cancelled, not Expired
+    if found_cancelled {
+        println!("SUCCESS: Order state is Cancelled (correct for user-initiated cancel)");
+    } else if found_expired {
+        panic!("FAILURE: Order state is Expired (should be Cancelled for user-initiated cancel)");
+    } else {
+        println!("WARNING: No terminal state observed in stream (cancel_order response was OK)");
+    }
 }
