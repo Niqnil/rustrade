@@ -51,19 +51,36 @@ where
     }
 }
 
-#[derive(
-    Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
-)]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct AssetFees<AssetKey> {
     pub asset: AssetKey,
     pub fees: Decimal,
+    /// Fee value in quote currency when computable.
+    /// - `Some(fees)` if fee asset == quote asset
+    /// - `Some(fees * price)` if fee asset == base asset (computed by indexer)
+    /// - `None` if fee asset is third-party (e.g., BNB) — requires external price data
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fees_quote: Option<Decimal>,
+}
+
+impl<AssetKey> AssetFees<AssetKey> {
+    pub fn new(asset: AssetKey, fees: Decimal, fees_quote: Option<Decimal>) -> Self {
+        Self {
+            asset,
+            fees,
+            fees_quote,
+        }
+    }
 }
 
 impl AssetFees<QuoteAsset> {
+    /// Construct fees already denominated in quote asset.
+    /// Sets `fees_quote = Some(fees)` since no conversion needed.
     pub fn quote_fees(fees: Decimal) -> Self {
         Self {
             asset: QuoteAsset,
             fees,
+            fees_quote: Some(fees),
         }
     }
 }
@@ -73,6 +90,7 @@ impl Default for AssetFees<QuoteAsset> {
         Self {
             asset: QuoteAsset,
             fees: Decimal::ZERO,
+            fees_quote: Some(Decimal::ZERO),
         }
     }
 }
@@ -82,6 +100,7 @@ impl<AssetKey> Default for AssetFees<Option<AssetKey>> {
         Self {
             asset: None,
             fees: Decimal::ZERO,
+            fees_quote: None,
         }
     }
 }

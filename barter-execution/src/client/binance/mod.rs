@@ -32,19 +32,17 @@ use crate::{
     UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance},
     client::ExecutionClient,
-    error::{ApiError, ConnectivityError, UnindexedClientError, UnindexedOrderError},
+    error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, OrderId, StrategyId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::{Cancelled, Open, OrderState},
+        state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
     },
     trade::{AssetFees, Trade, TradeId},
 };
 use barter_instrument::{
-    Side,
-    asset::{QuoteAsset, name::AssetNameExchange},
-    exchange::ExchangeId,
+    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
     instrument::name::InstrumentNameExchange,
 };
 use binance_sdk::{
@@ -1055,9 +1053,15 @@ impl ExecutionClient for BinanceSpot {
                         }
                     };
 
+                    let filled_qty = data
+                        .executed_qty
+                        .as_deref()
+                        .and_then(|q| Decimal::from_str(q).ok())
+                        .unwrap_or(Decimal::ZERO);
+
                     Some(UnindexedOrderResponseCancel {
                         key,
-                        state: Ok(Cancelled::new(exchange_order_id, time_exchange)),
+                        state: Ok(Cancelled::new(exchange_order_id, time_exchange, filled_qty)),
                     })
                 }
                 Err(e) => {
@@ -1113,7 +1117,7 @@ impl ExecutionClient for BinanceSpot {
     async fn open_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
-    ) -> Option<Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>> {
+    ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
         let instrument = request.key.instrument.clone();
         let side = request.state.side;
         let price = request.state.price;
@@ -1139,7 +1143,7 @@ impl ExecutionClient for BinanceSpot {
                     quantity,
                     kind,
                     time_in_force,
-                    state: Err(UnindexedOrderError::Connectivity(
+                    state: OrderState::inactive(OrderError::Connectivity(
                         ConnectivityError::Socket(format!("{e:#}")),
                     )),
                 });
@@ -1184,7 +1188,7 @@ impl ExecutionClient for BinanceSpot {
                     quantity,
                     kind,
                     time_in_force,
-                    state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
+                    state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
                         e.to_string(),
                     ))),
                 });
@@ -1210,9 +1214,11 @@ impl ExecutionClient for BinanceSpot {
                                 quantity,
                                 kind,
                                 time_in_force,
-                                state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
-                                    "open_order response missing orderId".into(),
-                                ))),
+                                state: OrderState::inactive(OrderError::Rejected(
+                                    ApiError::OrderRejected(
+                                        "open_order response missing orderId".into(),
+                                    ),
+                                )),
                             });
                         }
                     };
@@ -1223,6 +1229,19 @@ impl ExecutionClient for BinanceSpot {
                         .and_then(|q| Decimal::from_str(q).ok())
                         .unwrap_or(Decimal::ZERO);
 
+                    let state = if filled_qty >= quantity {
+                        // Order was fully filled immediately
+                        OrderState::fully_filled(Filled::new(
+                            exchange_order_id,
+                            time_exchange,
+                            filled_qty,
+                            None, // Binance SDK response doesn't expose avg_price directly
+                        ))
+                    } else {
+                        // Order is resting on the order book
+                        OrderState::active(Open::new(exchange_order_id, time_exchange, filled_qty))
+                    };
+
                     Some(Order {
                         key: order_key,
                         side,
@@ -1230,7 +1249,7 @@ impl ExecutionClient for BinanceSpot {
                         quantity,
                         kind,
                         time_in_force,
-                        state: Ok(Open::new(exchange_order_id, time_exchange, filled_qty)),
+                        state,
                     })
                 }
                 Err(e) => {
@@ -1242,7 +1261,7 @@ impl ExecutionClient for BinanceSpot {
                         quantity,
                         kind,
                         time_in_force,
-                        state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
+                        state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
                             e.to_string(),
                         ))),
                     })
@@ -1269,7 +1288,7 @@ impl ExecutionClient for BinanceSpot {
                         quantity,
                         kind,
                         time_in_force,
-                        state: Err(UnindexedOrderError::from(api_err)),
+                        state: OrderState::inactive(OrderError::from(api_err)),
                     })
                 } else if is_rate_limit_error(&e) {
                     // WS-level 429 — update the shared rate limiter so REST calls also back off.
@@ -1281,7 +1300,7 @@ impl ExecutionClient for BinanceSpot {
                         quantity,
                         kind,
                         time_in_force,
-                        state: Err(UnindexedOrderError::from(ApiError::RateLimit)),
+                        state: OrderState::inactive(OrderError::from(ApiError::RateLimit)),
                     })
                 } else {
                     // Transport-level error — clear cached session so next call reconnects.
@@ -1294,7 +1313,7 @@ impl ExecutionClient for BinanceSpot {
                         quantity,
                         kind,
                         time_in_force,
-                        state: Err(UnindexedOrderError::Connectivity(
+                        state: OrderState::inactive(OrderError::Connectivity(
                             ConnectivityError::Socket(format!("{e:#}")),
                         )),
                     })
@@ -1359,7 +1378,7 @@ impl ExecutionClient for BinanceSpot {
         &self,
         time_since: DateTime<Utc>,
         instruments: &[InstrumentNameExchange],
-    ) -> Result<Vec<Trade<QuoteAsset, InstrumentNameExchange>>, UnindexedClientError> {
+    ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError> {
         use futures::StreamExt;
 
         if instruments.is_empty() {
@@ -1989,7 +2008,7 @@ fn convert_open_order(
 fn convert_my_trade(
     t: &binance_sdk::spot::rest_api::MyTradesResponseInner,
     instrument: &InstrumentNameExchange,
-) -> Option<Trade<QuoteAsset, InstrumentNameExchange>> {
+) -> Option<Trade<AssetNameExchange, InstrumentNameExchange>> {
     let trade_id_raw = match t.id {
         Some(id) => id,
         None => {
@@ -2045,17 +2064,16 @@ fn convert_my_trade(
         }
     };
 
-    // known limitation — the trait's Trade<QuoteAsset, _> hardcodes QuoteAsset,
-    // so BNB fee-discount commission cannot be represented. BNB fees are the default
-    // for active traders; debug! avoids log flooding on every REST trade.
-    if let Some(ref comm_asset) = t.commission_asset
-        && comm_asset == "BNB"
-    {
-        debug!(
-            %instrument, commission_asset = %comm_asset,
-            "BinanceSpot REST trade fee paid in BNB (not quote asset) — P&L commission will be misattributed"
-        );
-    }
+    // Use actual commission asset from Binance (e.g., BNB, USDT, BTC).
+    // fees_quote is set to None here; the indexer will compute it if fee is in
+    // quote or base asset. For third-party assets (BNB), downstream must convert.
+    // "UNKNOWN" fallback (rare: API omits commission_asset) will fail indexing.
+    let fee_asset = t
+        .commission_asset
+        .as_deref()
+        .map(AssetNameExchange::from)
+        .unwrap_or_else(|| AssetNameExchange::from("UNKNOWN"));
+
     Some(Trade::new(
         trade_id,
         order_id,
@@ -2065,7 +2083,7 @@ fn convert_my_trade(
         side,
         price,
         quantity,
-        AssetFees::quote_fees(commission),
+        AssetFees::new(fee_asset, commission, None),
     ))
 }
 
@@ -2221,17 +2239,15 @@ fn convert_execution_report(
                 }
             };
 
-            // known limitation — the trait's Trade<QuoteAsset, _> hardcodes
-            // QuoteAsset, so BNB fee-discount commission cannot be represented.
-            // BNB fees are the default for active traders; see module-level FORK comment.
-            if let Some(ref comm_asset) = report.n_uppercase
-                && comm_asset == "BNB"
-            {
-                debug!(
-                    %symbol, commission_asset = %comm_asset,
-                    "BinanceSpot WS TRADE fee paid in BNB (not quote asset) — P&L commission will be misattributed"
-                );
-            }
+            // Use actual commission asset from Binance (N field: e.g., BNB, USDT, BTC).
+            // fees_quote is None here; indexer computes if fee is in quote/base asset.
+            // "UNKNOWN" fallback (rare: API omits N field) will fail indexing.
+            let fee_asset = report
+                .n_uppercase
+                .as_deref()
+                .map(AssetNameExchange::from)
+                .unwrap_or_else(|| AssetNameExchange::from("UNKNOWN"));
+
             let trade = Trade::new(
                 trade_id,
                 order_id,
@@ -2241,7 +2257,7 @@ fn convert_execution_report(
                 side,
                 last_price,
                 last_qty,
-                AssetFees::quote_fees(commission),
+                AssetFees::new(fee_asset, commission, None),
             );
 
             Some(UnindexedAccountEvent::new(
@@ -2250,7 +2266,12 @@ fn convert_execution_report(
             ))
         }
         "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH" => {
-            let cancelled = Cancelled::new(order_id, time_exchange);
+            let filled_qty = report
+                .z
+                .as_deref()
+                .and_then(|s| Decimal::from_str(s).ok())
+                .unwrap_or(Decimal::ZERO);
+            let cancelled = Cancelled::new(order_id, time_exchange, filled_qty);
             let response = UnindexedOrderResponseCancel {
                 key: OrderKey::new(
                     ExchangeId::BinanceSpot,
@@ -2294,7 +2315,12 @@ fn convert_execution_report(
             // The replacement order arrives as a subsequent NEW execution report with
             // its own order ID. We emit OrderCancelled for the original order so the
             // engine removes it from its open-order book.
-            let cancelled = Cancelled::new(order_id, time_exchange);
+            let filled_qty = report
+                .z
+                .as_deref()
+                .and_then(|s| Decimal::from_str(s).ok())
+                .unwrap_or(Decimal::ZERO);
+            let cancelled = Cancelled::new(order_id, time_exchange, filled_qty);
             let response = UnindexedOrderResponseCancel {
                 key: OrderKey::new(ExchangeId::BinanceSpot, symbol, StrategyId::unknown(), cid),
                 state: Ok(cancelled),
@@ -2533,6 +2559,14 @@ fn convert_order_kind_tif(
     }
 }
 
+/// Case-insensitive substring search that avoids the `to_lowercase` allocation.
+fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
 /// Returns true if `msg` contains `code` as a standalone numeric token:
 /// not immediately preceded or followed by another ASCII digit.
 /// Prevents "-2013" from matching "-20130" (suffix guard) or "1-2013" (prefix guard).
@@ -2564,6 +2598,12 @@ fn parse_binance_api_error(
     instrument: &InstrumentNameExchange,
 ) -> ApiError<AssetNameExchange, InstrumentNameExchange> {
     // Match on Binance error codes first — these are stable numeric identifiers
+    if contains_error_code(&error_msg, "-1002") || contains_error_code(&error_msg, "-2015") {
+        // -1002: "You are not authorized to execute this request"
+        // -2015: "Invalid API-key, IP, or permissions for action"
+        // Auth failures must not be retried as order rejections.
+        return ApiError::Unauthenticated(error_msg);
+    }
     if contains_error_code(&error_msg, "-1003") || contains_error_code(&error_msg, "-1015") {
         // -1003: too many requests; -1015: IP rate-limit ban. Both are transient throttles.
         return ApiError::RateLimit;
@@ -2591,12 +2631,6 @@ fn parse_binance_api_error(
     }
 
     // Fall back to case-insensitive message text heuristics (avoid to_lowercase allocation)
-    fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
-        haystack
-            .as_bytes()
-            .windows(needle.len())
-            .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
-    }
     if contains_ignore_case(&error_msg, "insufficient")
         || contains_ignore_case(&error_msg, "not enough")
     {
@@ -2626,13 +2660,21 @@ fn parse_binance_api_error(
 }
 
 fn connectivity_error(e: anyhow::Error) -> UnindexedClientError {
-    // use alternate display {:#} to preserve the full anyhow error chain.
-    // Known limitation: all SDK errors (auth failures, HTTP 5xx, malformed responses,
-    // network errors) are uniformly classified as ConnectivityError::Socket. The SDK
-    // uses anyhow::Error, making it impractical to distinguish error categories without
-    // parsing the string — callers cannot distinguish "network unavailable" from
-    // "auth rejected" without inspecting the error message.
-    UnindexedClientError::Connectivity(ConnectivityError::Socket(format!("{e:#}")))
+    let msg = format!("{e:#}");
+
+    // Check for auth failures before falling back to generic connectivity error.
+    // -1002: "You are not authorized to execute this request"
+    // -2015: "Invalid API-key, IP, or permissions for action"
+    if contains_error_code(&msg, "-1002")
+        || contains_error_code(&msg, "-2015")
+        || contains_ignore_case(&msg, "invalid api-key")
+        || contains_ignore_case(&msg, "invalid signature")
+        || contains_ignore_case(&msg, "signature for this request is not valid")
+    {
+        return UnindexedClientError::Api(ApiError::Unauthenticated(msg));
+    }
+
+    UnindexedClientError::Connectivity(ConnectivityError::Socket(msg))
 }
 
 #[cfg(test)]
@@ -2939,16 +2981,63 @@ mod tests {
     }
 
     #[test]
+    fn test_connectivity_error_detects_auth_failures() {
+        // -1002: "You are not authorized to execute this request"
+        let err = connectivity_error(anyhow::anyhow!("Error -1002: unauthorized"));
+        assert!(
+            matches!(err, UnindexedClientError::Api(ApiError::Unauthenticated(_))),
+            "expected Unauthenticated for -1002, got {err:?}"
+        );
+
+        // -2015: "Invalid API-key, IP, or permissions for action"
+        // Use a code-only body (no auth text keyword) to isolate the numeric-code branch.
+        let err = connectivity_error(anyhow::anyhow!("Error -2015: permission denied for action"));
+        assert!(
+            matches!(err, UnindexedClientError::Api(ApiError::Unauthenticated(_))),
+            "expected Unauthenticated for -2015, got {err:?}"
+        );
+
+        // Text-based detection: "invalid signature"
+        let err = connectivity_error(anyhow::anyhow!("invalid signature provided"));
+        assert!(
+            matches!(err, UnindexedClientError::Api(ApiError::Unauthenticated(_))),
+            "expected Unauthenticated for 'invalid signature', got {err:?}"
+        );
+
+        // Text-based detection: "signature for this request is not valid"
+        let err = connectivity_error(anyhow::anyhow!(
+            "The signature for this request is not valid."
+        ));
+        assert!(
+            matches!(err, UnindexedClientError::Api(ApiError::Unauthenticated(_))),
+            "expected Unauthenticated for 'signature for this request is not valid', got {err:?}"
+        );
+
+        // Text-based detection: "invalid api-key"
+        let err = connectivity_error(anyhow::anyhow!("Invalid API-key format"));
+        assert!(
+            matches!(err, UnindexedClientError::Api(ApiError::Unauthenticated(_))),
+            "expected Unauthenticated for 'invalid api-key', got {err:?}"
+        );
+
+        // Non-auth errors should remain as Connectivity
+        let err = connectivity_error(anyhow::anyhow!("connection timeout"));
+        assert!(
+            matches!(err, UnindexedClientError::Connectivity(_)),
+            "expected Connectivity for timeout, got {err:?}"
+        );
+    }
+
+    #[test]
     fn test_dedup_key_from_event_trade_includes_instrument() {
         use crate::order::id::{OrderId, StrategyId};
         use crate::trade::{AssetFees, Trade, TradeId};
         use barter_instrument::Side;
-        use barter_instrument::asset::QuoteAsset;
         use chrono::Utc;
         use rust_decimal::Decimal;
 
         let instrument = InstrumentNameExchange::new("BTCUSDT");
-        let trade = Trade::<QuoteAsset, InstrumentNameExchange>::new(
+        let trade = Trade::<AssetNameExchange, InstrumentNameExchange>::new(
             TradeId::new("9001"),
             OrderId::new("4242"),
             instrument.clone(),
@@ -2957,7 +3046,11 @@ mod tests {
             Side::Buy,
             Decimal::ZERO,
             Decimal::ZERO,
-            AssetFees::quote_fees(Decimal::ZERO),
+            AssetFees::new(
+                AssetNameExchange::from("USDT"),
+                Decimal::ZERO,
+                Some(Decimal::ZERO),
+            ),
         );
         let event =
             UnindexedAccountEvent::new(ExchangeId::BinanceSpot, AccountEventKind::Trade(trade));
@@ -2973,7 +3066,7 @@ mod tests {
 
         // Same trade ID on a different instrument must produce a different key (cross-symbol collision prevention)
         let instrument2 = InstrumentNameExchange::new("ETHUSDT");
-        let trade2 = Trade::<QuoteAsset, InstrumentNameExchange>::new(
+        let trade2 = Trade::<AssetNameExchange, InstrumentNameExchange>::new(
             TradeId::new("9001"),
             OrderId::new("7777"),
             instrument2,
@@ -2982,7 +3075,11 @@ mod tests {
             Side::Buy,
             Decimal::ZERO,
             Decimal::ZERO,
-            AssetFees::quote_fees(Decimal::ZERO),
+            AssetFees::new(
+                AssetNameExchange::from("USDT"),
+                Decimal::ZERO,
+                Some(Decimal::ZERO),
+            ),
         );
         let event2 =
             UnindexedAccountEvent::new(ExchangeId::BinanceSpot, AccountEventKind::Trade(trade2));
@@ -3768,12 +3865,17 @@ mod tests {
             AccountEventKind::OrderSnapshot(Snapshot(Order::new(
                 key,
                 Side::Buy,
-                Decimal::ZERO,
-                Decimal::ZERO,
+                Decimal::ONE,
+                Decimal::ONE,
                 OrderKind::Market,
                 TimeInForce::ImmediateOrCancel,
                 OrderState::<AssetNameExchange, InstrumentNameExchange>::Inactive(
-                    InactiveOrderState::FullyFilled,
+                    InactiveOrderState::FullyFilled(crate::order::state::Filled::new(
+                        OrderId::new("123"),
+                        Utc::now(),
+                        Decimal::ONE, // FullyFilled must have non-zero filled_quantity
+                        None,
+                    )),
                 ),
             ))),
         );

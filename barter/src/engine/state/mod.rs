@@ -18,7 +18,7 @@ use barter_execution::{
 };
 use barter_instrument::{
     Keyed,
-    asset::{AssetIndex, QuoteAsset},
+    asset::AssetIndex,
     exchange::{ExchangeId, ExchangeIndex},
     index::IndexedInstruments,
     instrument::{Instrument, InstrumentIndex},
@@ -104,7 +104,7 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     pub fn update_from_account(
         &mut self,
         event: &AccountEvent,
-    ) -> Option<PositionExited<QuoteAsset>>
+    ) -> Option<PositionExited<AssetIndex>>
     where
         GlobalData: for<'a> Processor<&'a AccountEvent>,
         InstrumentData: for<'a> Processor<&'a AccountEvent>,

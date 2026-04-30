@@ -144,10 +144,12 @@ fn generate_synthetic_updates(base_time: DateTime<Utc>) -> Vec<ContrivedEvents> 
             fees_enter: AssetFees {
                 asset: QuoteAsset,
                 fees: dec!(0.0),
+                fees_quote: Some(dec!(0.0)),
             },
             fees_exit: AssetFees {
                 asset: QuoteAsset,
                 fees: dec!(0.0),
+                fees_quote: Some(dec!(0.0)),
             },
             time_enter: base_time.checked_add_days(Days::new(1)).unwrap(),
             time_exit: base_time.checked_add_days(Days::new(2)).unwrap(),

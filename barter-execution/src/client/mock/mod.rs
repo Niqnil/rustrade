@@ -2,21 +2,19 @@ use crate::{
     UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::AssetBalance,
     client::ExecutionClient,
-    error::{ConnectivityError, UnindexedClientError, UnindexedOrderError},
+    error::{ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
     exchange::mock::request::{MarketPrices, MockExchangeRequest},
     fee::FeeModelConfig,
     fill::SimFillConfig,
     order::{
         Order, OrderEvent, OrderKey,
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::Open,
+        state::{Open, OrderState, UnindexedOrderState},
     },
     trade::Trade,
 };
 use barter_instrument::{
-    asset::{QuoteAsset, name::AssetNameExchange},
-    exchange::ExchangeId,
-    instrument::name::InstrumentNameExchange,
+    asset::name::AssetNameExchange, exchange::ExchangeId, instrument::name::InstrumentNameExchange,
 };
 use chrono::{DateTime, Utc};
 use derive_more::Constructor;
@@ -208,7 +206,7 @@ where
     async fn open_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
-    ) -> Option<Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>> {
+    ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
         let (response_tx, response_rx) = oneshot::channel();
 
         let request = into_owned_request(request);
@@ -230,7 +228,7 @@ where
                 quantity: request.state.quantity,
                 kind: request.state.kind,
                 time_in_force: request.state.time_in_force,
-                state: Err(UnindexedOrderError::Connectivity(
+                state: OrderState::inactive(OrderError::Connectivity(
                     ConnectivityError::ExchangeOffline(self.mocked_exchange),
                 )),
             });
@@ -245,7 +243,7 @@ where
                 quantity: request.state.quantity,
                 kind: request.state.kind,
                 time_in_force: request.state.time_in_force,
-                state: Err(UnindexedOrderError::Connectivity(
+                state: OrderState::inactive(OrderError::Connectivity(
                     ConnectivityError::ExchangeOffline(self.mocked_exchange),
                 )),
             },
@@ -307,7 +305,7 @@ where
         time_since: DateTime<Utc>,
         // MockExchange fetch_trades doesn't filter by instrument
         _instruments: &[InstrumentNameExchange],
-    ) -> Result<Vec<Trade<QuoteAsset, InstrumentNameExchange>>, UnindexedClientError> {
+    ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError> {
         let (response_tx, response_rx) = oneshot::channel();
 
         self.request_tx

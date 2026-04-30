@@ -10,7 +10,7 @@ use barter_data::streams::{
 use barter_execution::{
     AccountEvent, AccountEventKind,
     client::ExecutionClient,
-    error::{ConnectivityError, OrderError, UnindexedOrderError},
+    error::{ConnectivityError, OrderError},
     indexer::{AccountEventIndexer, IndexedAccountStream},
     map::ExecutionInstrumentMap,
     order::{
@@ -18,7 +18,7 @@ use barter_execution::{
         request::{
             OrderRequestCancel, OrderRequestOpen, OrderResponseCancel, UnindexedOrderResponseCancel,
         },
-        state::{Open, OrderState},
+        state::{OrderState, UnindexedOrderState},
     },
 };
 use barter_instrument::{
@@ -375,7 +375,7 @@ where
 
     fn process_open_response(
         &self,
-        order: Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>,
+        order: Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
     ) -> Result<AccountStreamEvent, IndexError> {
         let Order {
             key,
@@ -388,12 +388,7 @@ where
         } = order;
 
         let key = self.indexer.order_key(key)?;
-
-        let state = match state {
-            Ok(open) if open.quantity_remaining(quantity).is_zero() => OrderState::fully_filled(),
-            Ok(open) => OrderState::active(open),
-            Err(error) => OrderState::inactive(self.indexer.order_error(error)?),
-        };
+        let state = self.indexer.order_state(state)?;
 
         Ok(AccountStreamEvent::Item(AccountEvent {
             exchange: key.exchange,

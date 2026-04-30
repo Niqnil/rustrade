@@ -36,19 +36,17 @@ use crate::{
     UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance},
     client::ExecutionClient,
-    error::{ApiError, ConnectivityError, UnindexedClientError, UnindexedOrderError},
+    error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, OrderId, StrategyId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::{Cancelled, Open, OrderState},
+        state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
     },
     trade::{AssetFees, Trade, TradeId},
 };
 use barter_instrument::{
-    Side,
-    asset::{QuoteAsset, name::AssetNameExchange},
-    exchange::ExchangeId,
+    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
     instrument::name::InstrumentNameExchange,
 };
 use barter_integration::protocol::websocket::{WebSocket, WsMessage};
@@ -1045,9 +1043,11 @@ impl ExecutionClient for AlpacaClient {
         match rest_delete_with_retry(&self.rate_limiter, || http.delete(&url)).await {
             Ok(()) => {
                 let exchange_order_id = OrderId(order_id);
+                // REST DELETE returns no response body, so filled_qty unavailable.
+                // Use ZERO; downstream can reconcile via WS events or fetch_open_orders.
                 Some(crate::order::request::OrderResponseCancel {
                     key,
-                    state: Ok(Cancelled::new(exchange_order_id, Utc::now())),
+                    state: Ok(Cancelled::new(exchange_order_id, Utc::now(), Decimal::ZERO)),
                 })
             }
             Err(e) => Some(crate::order::request::OrderResponseCancel { key, state: Err(e) }),
@@ -1077,7 +1077,7 @@ impl ExecutionClient for AlpacaClient {
     async fn open_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
-    ) -> Option<Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>> {
+    ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
         let side = request.state.side;
         let reduce_only = request.state.reduce_only;
         self.open_order_inner(request, map_position_intent(side, reduce_only))
@@ -1150,7 +1150,7 @@ impl ExecutionClient for AlpacaClient {
         &self,
         time_since: DateTime<Utc>,
         instruments: &[InstrumentNameExchange],
-    ) -> Result<Vec<Trade<QuoteAsset, InstrumentNameExchange>>, UnindexedClientError> {
+    ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError> {
         let after_str = time_since.to_rfc3339();
         let base = self.base_url();
         let http = self.http.clone();
@@ -1207,7 +1207,7 @@ impl AlpacaClient {
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
         intent: AlpacaPositionIntent,
-    ) -> Option<Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>> {
+    ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
         self.open_order_inner(request, intent).await
     }
 
@@ -1215,7 +1215,7 @@ impl AlpacaClient {
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
         intent: AlpacaPositionIntent,
-    ) -> Option<Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>> {
+    ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
         let instrument = request.key.instrument.clone();
         let side = request.state.side;
         let price = request.state.price;
@@ -1242,7 +1242,7 @@ impl AlpacaClient {
                     quantity,
                     kind,
                     time_in_force,
-                    state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
+                    state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
                         msg.to_string(),
                     ))),
                 });
@@ -1288,6 +1288,19 @@ impl AlpacaClient {
                 let time_exchange = parse_timestamp(&resp.created_at).unwrap_or_else(Utc::now);
                 let filled_qty = Decimal::from_str(&resp.filled_qty).unwrap_or(Decimal::ZERO);
 
+                let state = if filled_qty >= quantity {
+                    // Order was fully filled immediately (market order or aggressive limit)
+                    OrderState::fully_filled(Filled::new(
+                        exchange_order_id,
+                        time_exchange,
+                        filled_qty,
+                        None, // Alpaca order response doesn't include avg_price
+                    ))
+                } else {
+                    // Order is resting on the order book (partially filled or unfilled)
+                    OrderState::active(Open::new(exchange_order_id, time_exchange, filled_qty))
+                };
+
                 Some(Order {
                     key: order_key,
                     side,
@@ -1295,13 +1308,13 @@ impl AlpacaClient {
                     quantity,
                     kind,
                     time_in_force,
-                    state: Ok(Open::new(exchange_order_id, time_exchange, filled_qty)),
+                    state,
                 })
             }
             Err(e) => {
                 let order_err = match e {
-                    UnindexedClientError::Connectivity(ce) => UnindexedOrderError::Connectivity(ce),
-                    UnindexedClientError::Api(ae) => UnindexedOrderError::Rejected(ae),
+                    UnindexedClientError::Connectivity(ce) => OrderError::Connectivity(ce),
+                    UnindexedClientError::Api(ae) => OrderError::Rejected(ae),
                     // TaskFailed, Internal, Truncated, and TruncatedSnapshot are not
                     // returned by rest_with_retry (REST-only path for orders), but matching
                     // explicitly ensures any new ClientError variant causes a compile error
@@ -1324,7 +1337,7 @@ impl AlpacaClient {
                     quantity,
                     kind,
                     time_in_force,
-                    state: Err(order_err),
+                    state: OrderState::inactive(order_err),
                 })
             }
         }
@@ -1728,7 +1741,7 @@ async fn connect_and_subscribe(config: &AlpacaConfig) -> Result<WebSocket, Unind
         }
         Ok(Err(HandshakeError::Auth(e))) => {
             let _ = ws.close(None).await;
-            Err(UnindexedClientError::Internal(e))
+            Err(UnindexedClientError::Api(ApiError::Unauthenticated(e)))
         }
         Err(_) => {
             let _ = ws.close(None).await;
@@ -2339,7 +2352,7 @@ fn convert_open_order(
 /// Convert an Alpaca FILL activity into a barter Trade.
 fn convert_activity_to_trade(
     a: &AlpacaActivity,
-) -> Option<Trade<QuoteAsset, InstrumentNameExchange>> {
+) -> Option<Trade<AssetNameExchange, InstrumentNameExchange>> {
     let trade_id = TradeId::new(&a.id);
     let order_id = OrderId(SmolStr::new(&a.order_id));
     let instrument = InstrumentNameExchange::new(&a.symbol);
@@ -2352,8 +2365,9 @@ fn convert_activity_to_trade(
     });
 
     // Alpaca equities and options are commission-free. Crypto trades incur
-    // maker/taker fees (currently 0.15–0.25%); callers should account for this
-    // separately if accurate PnL tracking for crypto is required.
+    // maker/taker fees (currently 0.15–0.25%) charged in the credited asset,
+    // but fee info is not available in trade responses — use Activities API
+    // for end-of-day fee reconciliation.
     Some(Trade::new(
         trade_id,
         order_id,
@@ -2363,7 +2377,11 @@ fn convert_activity_to_trade(
         side,
         price,
         quantity,
-        AssetFees::quote_fees(Decimal::ZERO),
+        AssetFees::new(
+            AssetNameExchange::from("USD"),
+            Decimal::ZERO,
+            Some(Decimal::ZERO),
+        ),
     ))
 }
 
@@ -2432,8 +2450,8 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
             let trade_id = TradeId(format_smolstr!("{}:{}", order.id, cum_qty.normalize()));
 
             // Alpaca equities and options are commission-free. Crypto trades incur
-            // maker/taker fees (currently 0.15–0.25%); callers should account for this
-            // separately if accurate PnL tracking for crypto is required.
+            // maker/taker fees (currently 0.15–0.25%) in the credited asset, but
+            // fee info is not available in WebSocket updates.
             let trade = Trade::new(
                 trade_id,
                 order_id,
@@ -2443,7 +2461,11 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
                 side,
                 price,
                 quantity,
-                AssetFees::quote_fees(Decimal::ZERO),
+                AssetFees::new(
+                    AssetNameExchange::from("USD"),
+                    Decimal::ZERO,
+                    Some(Decimal::ZERO),
+                ),
             );
             Some(UnindexedAccountEvent::new(
                 ExchangeId::Alpaca,
@@ -2505,7 +2527,9 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
                 .timestamp
                 .and_then(parse_timestamp)
                 .unwrap_or_else(Utc::now);
-            let cancelled = Cancelled::new(order_id, time_exchange);
+            let filled_qty =
+                Decimal::from_str(order.filled_qty.unwrap_or("0")).unwrap_or(Decimal::ZERO);
+            let cancelled = Cancelled::new(order_id, time_exchange, filled_qty);
             let response = crate::order::request::OrderResponseCancel {
                 key: OrderKey::new(ExchangeId::Alpaca, instrument, StrategyId::unknown(), cid),
                 state: Ok(cancelled),
@@ -2673,7 +2697,8 @@ fn parse_api_error(status: reqwest::StatusCode, message: &str) -> crate::error::
         422 if lower.contains("insufficient") => {
             ApiError::BalanceInsufficient(AssetNameExchange::new("usd"), message.to_owned())
         }
-        403 => ApiError::OrderRejected(format!("forbidden (auth/permission): {message}")),
+        401 => ApiError::Unauthenticated(format!("unauthorized: {message}")),
+        403 => ApiError::Unauthenticated(format!("forbidden: {message}")),
         404 => ApiError::OrderRejected(format!("order not found: {message}")),
         _ => ApiError::OrderRejected(message.to_owned()),
     }
@@ -3426,12 +3451,21 @@ mod tests {
 
     // M-1: parse_order_error — pin all status-code branches not covered by existing tests.
     #[test]
-    fn parse_order_error_403_with_insufficient_body_maps_to_order_rejected_not_balance() {
-        // A suspended/forbidden account should NOT route to BalanceInsufficient
-        // (which could trigger a balance-retry loop). Must be OrderRejected.
+    fn parse_order_error_401_maps_to_unauthenticated() {
+        // 401 Unauthorized: invalid/expired API credentials.
         assert!(matches!(
-            parse_order_error(reqwest::StatusCode::FORBIDDEN, "insufficient permissions"),
-            UnindexedOrderError::Rejected(ApiError::OrderRejected(_))
+            parse_order_error(reqwest::StatusCode::UNAUTHORIZED, "bad credentials"),
+            UnindexedOrderError::Rejected(ApiError::Unauthenticated(_))
+        ));
+    }
+
+    #[test]
+    fn parse_order_error_403_maps_to_unauthenticated() {
+        // 403 Forbidden indicates auth/permission failure — use Unauthenticated, not
+        // OrderRejected or BalanceInsufficient (which could trigger incorrect retry logic).
+        assert!(matches!(
+            parse_order_error(reqwest::StatusCode::FORBIDDEN, "account suspended"),
+            UnindexedOrderError::Rejected(ApiError::Unauthenticated(_))
         ));
     }
 
@@ -3859,7 +3893,7 @@ mod tests {
             assert!(result.is_some(), "open_order should return a result");
             let order = result.unwrap();
             assert!(
-                order.state.is_ok(),
+                order.state.is_accepted(),
                 "order should be accepted: {:?}",
                 order.state
             );
@@ -3945,7 +3979,7 @@ mod tests {
             assert!(result.is_some(), "open_order should return a result");
             let order = result.unwrap();
             assert!(
-                order.state.is_ok(),
+                order.state.is_accepted(),
                 "order should be accepted: {:?}",
                 order.state
             );

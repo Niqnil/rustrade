@@ -1,18 +1,15 @@
 use crate::{
     UnindexedAccountSnapshot,
     balance::AssetBalance,
-    error::UnindexedOrderError,
     order::{
         Order,
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::Open,
+        state::{Open, UnindexedOrderState},
     },
     trade::Trade,
 };
 use barter_instrument::{
-    asset::{QuoteAsset, name::AssetNameExchange},
-    exchange::ExchangeId,
-    instrument::name::InstrumentNameExchange,
+    asset::name::AssetNameExchange, exchange::ExchangeId, instrument::name::InstrumentNameExchange,
 };
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -88,7 +85,7 @@ impl MockExchangeRequest {
 
     pub fn fetch_trades(
         time_request: DateTime<Utc>,
-        response_tx: oneshot::Sender<Vec<Trade<QuoteAsset, InstrumentNameExchange>>>,
+        response_tx: oneshot::Sender<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>>,
         time_since: DateTime<Utc>,
     ) -> Self {
         Self::new(
@@ -117,7 +114,7 @@ impl MockExchangeRequest {
     pub fn open_order(
         time_request: DateTime<Utc>,
         response_tx: oneshot::Sender<
-            Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>,
+            Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
         >,
         request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
         market_prices: MarketPrices,
@@ -147,7 +144,7 @@ pub enum MockExchangeRequestKind {
         response_tx: oneshot::Sender<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>>,
     },
     FetchTrades {
-        response_tx: oneshot::Sender<Vec<Trade<QuoteAsset, InstrumentNameExchange>>>,
+        response_tx: oneshot::Sender<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>>,
         time_since: DateTime<Utc>,
     },
     CancelOrder {
@@ -155,9 +152,8 @@ pub enum MockExchangeRequestKind {
         request: OrderRequestCancel<ExchangeId, InstrumentNameExchange>,
     },
     OpenOrder {
-        response_tx: oneshot::Sender<
-            Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>,
-        >,
+        response_tx:
+            oneshot::Sender<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>>,
         request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
         market_prices: MarketPrices,
     },

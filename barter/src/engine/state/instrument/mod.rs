@@ -19,7 +19,7 @@ use barter_execution::{
 };
 use barter_instrument::{
     Keyed,
-    asset::{AssetIndex, QuoteAsset, name::AssetNameExchange},
+    asset::{AssetIndex, name::AssetNameExchange},
     exchange::{ExchangeId, ExchangeIndex},
     index::IndexedInstruments,
     instrument::{
@@ -262,7 +262,7 @@ pub struct InstrumentState<
     pub tear_sheet: TearSheetGenerator,
 
     /// Current `PositionManager`.
-    pub position: PositionManager<InstrumentKey>,
+    pub position: PositionManager<AssetKey, InstrumentKey>,
 
     /// Active orders and associated order management.
     pub orders: Orders<ExchangeKey, InstrumentKey>,
@@ -321,7 +321,7 @@ pub struct InstrumentState<
     /// In `OmsMode::Netting` this field is always empty (netting positions use a fixed key;
     /// fill-before-ack does not cause split slots).
     #[serde(default = "Vec::new")]
-    pub pending_fills: Vec<Trade<QuoteAsset, InstrumentKey>>,
+    pub pending_fills: Vec<Trade<AssetKey, InstrumentKey>>,
 
     /// Reverse index: exchange `OrderId` → `ClientOrderId` for O(1) fill routing in
     /// `OmsMode::Hedging`.
@@ -412,7 +412,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     pub fn update_from_order_snapshot(
         &mut self,
         order: Snapshot<&Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>>,
-    ) -> Option<PositionExited<QuoteAsset, InstrumentKey>>
+    ) -> Option<PositionExited<AssetKey, InstrumentKey>>
     where
         ExchangeKey: Debug + Clone,
         AssetKey: Debug + Clone,
@@ -478,7 +478,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             if !self.pending_fills.is_empty() {
                 // Collect matching fills first to avoid borrow-checker conflict
                 // between pending_fills drain and update_from_trade's &mut self.
-                let deferred: Vec<Trade<QuoteAsset, InstrumentKey>> = self
+                let deferred: Vec<Trade<AssetKey, InstrumentKey>> = self
                     .pending_fills
                     .iter()
                     .filter(|f| f.order_id == exchange_id)
@@ -594,9 +594,10 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// positions explicitly rather than rely on flip semantics.
     pub fn update_from_trade(
         &mut self,
-        trade: &Trade<QuoteAsset, InstrumentKey>,
-    ) -> Option<PositionExited<QuoteAsset, InstrumentKey>>
+        trade: &Trade<AssetKey, InstrumentKey>,
+    ) -> Option<PositionExited<AssetKey, InstrumentKey>>
     where
+        AssetKey: Debug + Clone,
         InstrumentKey: Debug + Clone + PartialEq,
     {
         // Step 1: Resolve PositionId.
@@ -719,6 +720,8 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                 fees: barter_execution::trade::AssetFees {
                     asset: trade.fees.asset.clone(),
                     fees: trade.fees.fees + computed_fee,
+                    // computed_fee is in quote terms; add to fees_quote if available
+                    fees_quote: trade.fees.fees_quote.map(|fq| fq + computed_fee),
                 },
                 ..trade.clone()
             };

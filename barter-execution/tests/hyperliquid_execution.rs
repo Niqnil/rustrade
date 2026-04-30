@@ -41,6 +41,7 @@ use barter_execution::{
         OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, StrategyId},
         request::RequestOpen,
+        state::{ActiveOrderState, OrderState},
     },
 };
 use barter_instrument::{
@@ -364,7 +365,7 @@ async fn test_place_and_cancel_limit_order() {
     let response = response.unwrap();
 
     match &response.state {
-        Ok(open_state) => {
+        OrderState::Active(ActiveOrderState::Open(open_state)) => {
             println!("Order placed successfully!");
             println!("  Client Order ID: {}", response.key.cid);
             println!("  Exchange Order ID: {}", open_state.id);
@@ -403,8 +404,11 @@ async fn test_place_and_cancel_limit_order() {
                 }
             }
         }
-        Err(e) => {
+        OrderState::Inactive(e) => {
             panic!("Order rejected: {:?}", e);
+        }
+        other => {
+            panic!("Unexpected order state: {:?}", other);
         }
     }
 }
@@ -522,12 +526,12 @@ async fn test_account_stream_with_order() {
     let response = response.unwrap();
 
     let order_id = match &response.state {
-        Ok(open_state) => {
+        OrderState::Active(ActiveOrderState::Open(open_state)) => {
             println!("Order placed: {}", open_state.id);
             Some(open_state.id.clone())
         }
-        Err(e) => {
-            println!("Order failed (may still get stream events): {:?}", e);
+        other => {
+            println!("Order failed (may still get stream events): {:?}", other);
             None
         }
     };

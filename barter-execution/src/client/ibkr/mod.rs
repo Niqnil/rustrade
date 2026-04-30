@@ -42,23 +42,20 @@ use crate::{
     UnindexedAccountSnapshot,
     balance::AssetBalance,
     client::ExecutionClient,
-    error::{ApiError, ConnectivityError, UnindexedClientError, UnindexedOrderError},
+    error::{ApiError, ConnectivityError, OrderError, UnindexedClientError},
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, OrderId, StrategyId},
         request::{
             OrderRequestCancel, OrderRequestOpen, OrderResponseCancel, UnindexedOrderResponseCancel,
         },
-        state::{Cancelled, Open, OrderState},
+        state::{Cancelled, Expired, Filled, Open, OrderState, UnindexedOrderState},
     },
     trade::{AssetFees, Trade, TradeId},
 };
 use account::BalanceAggregator;
 use barter_instrument::{
-    Side,
-    asset::{QuoteAsset, name::AssetNameExchange},
-    exchange::ExchangeId,
-    ibkr::ContractRegistry,
+    Side, asset::name::AssetNameExchange, exchange::ExchangeId, ibkr::ContractRegistry,
     instrument::name::InstrumentNameExchange,
 };
 use chrono::{DateTime, Utc};
@@ -68,7 +65,7 @@ use ibapi::{
     accounts::{AccountSummaryResult, types::AccountGroup},
     client::blocking::Client,
 };
-use order::{OrderContext, OrderIdMap, build_ib_order};
+use order::{OrderContext, OrderIdMap, PendingCancels, build_ib_order};
 use parking_lot::Mutex;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -165,6 +162,7 @@ pub struct IbkrClient {
     client: Arc<Client>,
     contracts: ContractRegistry,
     order_ids: OrderIdMap,
+    pending_cancels: PendingCancels,
     execution_buffer: ExecutionBuffer,
     next_order_id: Arc<Mutex<i32>>,
 }
@@ -225,6 +223,7 @@ impl IbkrClient {
             client: Arc::new(client),
             contracts,
             order_ids: OrderIdMap::new(),
+            pending_cancels: PendingCancels::new(),
             execution_buffer: ExecutionBuffer::new(),
             next_order_id: Arc::new(Mutex::new(next_id)),
         })
@@ -290,6 +289,18 @@ impl IbkrClient {
     /// interval is 5-10 minutes with a max_age of 1 hour.
     pub fn clear_stale_order_ids(&self, max_age: std::time::Duration) -> usize {
         self.order_ids.clear_stale(max_age)
+    }
+
+    /// Clear pending cancel entries older than the given duration.
+    ///
+    /// Returns the number of cleared entries.
+    ///
+    /// Pending cancels are tracked to differentiate user-initiated cancellation
+    /// from time-based expiration. If a cancel request is submitted but the order
+    /// never receives terminal status (e.g., network disconnect), the entry would
+    /// remain indefinitely. Call this alongside other stale cleanup methods.
+    pub fn clear_stale_pending_cancels(&self, max_age: std::time::Duration) -> usize {
+        self.pending_cancels.clear_stale(max_age)
     }
 }
 
@@ -468,6 +479,7 @@ impl ExecutionClient for IbkrClient {
 
         let contracts_clone = self.contracts.clone();
         let order_ids_clone = self.order_ids.clone();
+        let pending_cancels_clone = self.pending_cancels.clone();
         let exec_buffer_clone = self.execution_buffer.clone();
 
         let (tx, rx) = mpsc::unbounded_channel();
@@ -500,7 +512,7 @@ impl ExecutionClient for IbkrClient {
                                         &status,
                                         client_id,
                                         &ctx,
-                                        is_terminal,
+                                        &pending_cancels_clone,
                                     );
                                     Some(UnindexedAccountEvent {
                                         exchange: ExchangeId::Ibkr,
@@ -612,15 +624,23 @@ impl ExecutionClient for IbkrClient {
 
         match result {
             Ok(Ok(_sub)) => {
+                // Track user-initiated cancel for Cancelled vs Expired differentiation.
+                // Insert only after cancel request succeeded — avoids stale entries if
+                // the future is dropped before reaching this branch.
+                self.pending_cancels.insert(ib_order_id);
+
                 // H-3 fix: Do NOT remove order_ids here. The mapping is needed to
                 // correlate any fill events that arrive between now and when IB
                 // confirms the cancel. Removal happens in account_stream when
                 // OrderStatus::Cancelled is received.
+                // IBKR cancel_order returns no filled qty; use ZERO and let
+                // subsequent OrderStatus events provide accurate fill info.
                 Some(OrderResponseCancel {
                     key,
                     state: Ok(Cancelled::new(
                         OrderId::new(format_smolstr!("{}", ib_order_id)),
                         Utc::now(),
+                        Decimal::ZERO,
                     )),
                 })
             }
@@ -662,7 +682,7 @@ impl ExecutionClient for IbkrClient {
     async fn open_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
-    ) -> Option<Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>> {
+    ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
         let key = OrderKey {
             exchange: ExchangeId::Ibkr,
             instrument: request.key.instrument.clone(),
@@ -680,12 +700,10 @@ impl ExecutionClient for IbkrClient {
                     quantity: request.state.quantity,
                     kind: request.state.kind,
                     time_in_force: request.state.time_in_force,
-                    state: Err(crate::error::OrderError::Rejected(
-                        ApiError::InstrumentInvalid(
-                            request.key.instrument.clone(),
-                            "contract not registered".to_string(),
-                        ),
-                    )),
+                    state: OrderState::inactive(OrderError::Rejected(ApiError::InstrumentInvalid(
+                        request.key.instrument.clone(),
+                        "contract not registered".to_string(),
+                    ))),
                 });
             }
         };
@@ -700,7 +718,7 @@ impl ExecutionClient for IbkrClient {
                     quantity: request.state.quantity,
                     kind: request.state.kind,
                     time_in_force: request.state.time_in_force,
-                    state: Err(crate::error::OrderError::Rejected(ApiError::OrderRejected(
+                    state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
                         format!("quantity {} exceeds f64 range", request.state.quantity),
                     ))),
                 });
@@ -723,7 +741,7 @@ impl ExecutionClient for IbkrClient {
                     quantity: request.state.quantity,
                     kind: request.state.kind,
                     time_in_force: request.state.time_in_force,
-                    state: Err(crate::error::OrderError::Rejected(ApiError::OrderRejected(
+                    state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
                         e.to_string(),
                     ))),
                 });
@@ -787,19 +805,23 @@ impl ExecutionClient for IbkrClient {
         .await;
 
         match result {
-            Ok(Ok(Some((order_id, filled)))) => Some(Order {
-                key,
-                side,
-                price,
-                quantity: req_quantity,
-                kind,
-                time_in_force: tif,
-                state: Ok(Open::new(
-                    OrderId::new(format_smolstr!("{}", order_id)),
-                    Utc::now(),
-                    filled,
-                )),
-            }),
+            Ok(Ok(Some((order_id, filled)))) => {
+                // IB always returns order status via subscription - never immediate fills.
+                // The filled quantity here is from the OrderStatus event, not a complete fill.
+                Some(Order {
+                    key,
+                    side,
+                    price,
+                    quantity: req_quantity,
+                    kind,
+                    time_in_force: tif,
+                    state: OrderState::active(Open::new(
+                        OrderId::new(format_smolstr!("{}", order_id)),
+                        Utc::now(),
+                        filled,
+                    )),
+                })
+            }
             Ok(Ok(None)) => {
                 // Subscription exhausted without terminal status. The order WAS submitted
                 // (we have an IB order ID), but we lost tracking. Return Open with zero
@@ -815,7 +837,7 @@ impl ExecutionClient for IbkrClient {
                     quantity: req_quantity,
                     kind,
                     time_in_force: tif,
-                    state: Ok(Open::new(
+                    state: OrderState::active(Open::new(
                         OrderId::new(format_smolstr!("{}", ib_order_id)),
                         Utc::now(),
                         Decimal::ZERO,
@@ -832,7 +854,7 @@ impl ExecutionClient for IbkrClient {
                     quantity: req_quantity,
                     kind,
                     time_in_force: tif,
-                    state: Err(crate::error::OrderError::Rejected(ApiError::OrderRejected(
+                    state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
                         status,
                     ))),
                 })
@@ -846,7 +868,7 @@ impl ExecutionClient for IbkrClient {
                     quantity: req_quantity,
                     kind,
                     time_in_force: tif,
-                    state: Err(crate::error::OrderError::Rejected(ApiError::OrderRejected(
+                    state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
                         e.to_string(),
                     ))),
                 })
@@ -1022,7 +1044,7 @@ impl ExecutionClient for IbkrClient {
         &self,
         time_since: DateTime<Utc>,
         instruments: &[InstrumentNameExchange],
-    ) -> Result<Vec<Trade<QuoteAsset, InstrumentNameExchange>>, UnindexedClientError> {
+    ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError> {
         let client = self.client.clone();
         let contracts = self.contracts.clone();
         let order_ids = self.order_ids.clone();
@@ -1103,7 +1125,9 @@ impl ExecutionClient for IbkrClient {
                     side,
                     price: parse_decimal_or_warn(exec.price, "exec.price"),
                     quantity: parse_decimal_or_warn(exec.shares, "exec.shares"),
-                    fees: AssetFees::default(),
+                    // IBKR executions API lacks commission data (available via CommissionReport callback).
+                    // "UNKNOWN" placeholder will fail indexing - use unindexed or correlate with WS.
+                    fees: AssetFees::new(AssetNameExchange::from("UNKNOWN"), Decimal::ZERO, None),
                 });
             }
 
@@ -1116,28 +1140,69 @@ impl ExecutionClient for IbkrClient {
 
 /// Build an Order from IB OrderStatus using stored OrderContext.
 ///
-/// `is_terminal` indicates Cancelled/Inactive status (caller determines this before
-/// choosing the lookup method, so we take it as a parameter to avoid re-matching).
+/// # IBKR Status Mapping
+///
+/// | IB Status    | → OrderState          | Rationale                                    |
+/// |--------------|-----------------------|----------------------------------------------|
+/// | "Inactive"   | OpenFailed(Rejected)  | Order blocked by validation/margin/exchange  |
+/// | "Cancelled"  | Cancelled or Expired  | See differentiation logic below              |
+/// | "Filled"     | FullyFilled           | Order fully executed                         |
+/// | Other        | Active(Open)          | Order working on exchange                    |
+///
+/// # Cancelled vs Expired Differentiation
+///
+/// IBKR sends `"Cancelled"` status for both user-initiated cancellation and
+/// time-based expiration. We differentiate using:
+///
+/// 1. If order ID is in `pending_cancels` (set by `cancel_order`) → `Cancelled`
+/// 2. Else if `time_in_force == GoodUntilEndOfDay` → `Expired` (DAY order expired)
+/// 3. Else → `Cancelled` (broker-initiated or external cancellation)
+///
+/// # Known Limitation
+///
+/// If the broker cancels a DAY order before market close (e.g., insufficient margin),
+/// it will be misclassified as `Expired`. This is rare and acceptable given the
+/// alternative (forking ibapi to preserve order_id in error callbacks).
 fn make_order_from_status(
     status: &ibapi::orders::OrderStatus,
     client_id: ClientOrderId,
     ctx: &OrderContext,
-    is_terminal: bool,
+    pending_cancels: &PendingCancels,
 ) -> Order<ExchangeId, InstrumentNameExchange, OrderState<AssetNameExchange, InstrumentNameExchange>>
 {
     let ib_id = status.order_id;
     let order_id = OrderId::new(format_smolstr!("{}", ib_id));
 
-    let state = if is_terminal {
-        OrderState::inactive(Cancelled::new(order_id, Utc::now()))
-    } else if status.status.as_str() == "Filled" {
-        OrderState::fully_filled()
-    } else {
-        OrderState::active(Open::new(
-            order_id,
-            Utc::now(),
-            parse_decimal_or_warn(status.filled, "status.filled"),
-        ))
+    let filled_qty = parse_decimal_or_warn(status.filled, "status.filled");
+    let state = match status.status.as_str() {
+        "Inactive" => {
+            // "Inactive" means the order was accepted by IB but is not working:
+            // validation failure, margin issue, exchange closed, share location hold.
+            // This is a placement failure, not a cancellation.
+            OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
+                "IB status: Inactive (order blocked by validation/margin/exchange)".into(),
+            )))
+        }
+        "Cancelled" => {
+            // Differentiate user-cancel from time-expiration
+            let was_user_cancel = pending_cancels.remove(ib_id);
+
+            if was_user_cancel {
+                // User called cancel_order() — definitely a cancellation
+                OrderState::inactive(Cancelled::new(order_id, Utc::now(), filled_qty))
+            } else if matches!(ctx.time_in_force, TimeInForce::GoodUntilEndOfDay) {
+                // DAY order without pending cancel — expired at market close
+                OrderState::inactive(Expired::new(order_id, Utc::now(), filled_qty))
+            } else {
+                // GTC/IOC/FOK without pending cancel — broker or exchange cancelled
+                OrderState::inactive(Cancelled::new(order_id, Utc::now(), filled_qty))
+            }
+        }
+        "Filled" => OrderState::fully_filled(Filled::new(order_id, Utc::now(), filled_qty, None)),
+        _ => {
+            // "Submitted", "PreSubmitted", "PendingSubmit", "PendingCancel", etc.
+            OrderState::active(Open::new(order_id, Utc::now(), filled_qty))
+        }
     };
 
     Order {
