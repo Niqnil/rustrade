@@ -2,7 +2,7 @@ use crate::order::{OrderKind, TimeInForce, id::ClientOrderId};
 use barter_instrument::{Side, instrument::name::InstrumentNameExchange};
 use fnv::FnvHashMap;
 use ibapi::orders::{Action, Order, TimeInForce as IbTimeInForce, order_builder};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rust_decimal::Decimal;
 use std::{sync::Arc, time::Instant};
 
@@ -155,6 +155,70 @@ impl OrderIdMap {
 }
 
 impl Default for OrderIdMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Tracks IB order IDs with pending cancel requests.
+///
+/// Used to differentiate user-initiated cancellation from time-based expiration.
+/// IBKR sends `"Cancelled"` status for both cases; this map tracks which cancels
+/// were user-initiated via `cancel_order()`.
+#[derive(Debug, Clone)]
+pub struct PendingCancels {
+    inner: Arc<Mutex<FnvHashMap<i32, Instant>>>,
+}
+
+impl PendingCancels {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(FnvHashMap::with_capacity_and_hasher(
+                8,
+                Default::default(),
+            ))),
+        }
+    }
+
+    /// Record a pending cancel request for the given IB order ID.
+    pub fn insert(&self, ib_id: i32) {
+        self.inner.lock().insert(ib_id, Instant::now());
+    }
+
+    /// Check if a cancel was user-initiated and remove from tracking.
+    ///
+    /// Returns `true` if the order ID was in the pending set (user-initiated cancel).
+    #[must_use]
+    pub fn remove(&self, ib_id: i32) -> bool {
+        self.inner.lock().remove(&ib_id).is_some()
+    }
+
+    /// Clear entries older than the given duration.
+    ///
+    /// Returns the number of cleared entries. Call periodically to prevent
+    /// memory leaks from orphaned cancel requests (e.g., network issues).
+    #[must_use]
+    pub fn clear_stale(&self, max_age: std::time::Duration) -> usize {
+        let mut map = self.inner.lock();
+        let before = map.len();
+        map.retain(|_, registered_at| registered_at.elapsed() < max_age);
+        before - map.len()
+    }
+
+    /// Number of pending cancel requests being tracked.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.lock().len()
+    }
+
+    /// Check if there are no pending cancel requests.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().is_empty()
+    }
+}
+
+impl Default for PendingCancels {
     fn default() -> Self {
         Self::new()
     }
@@ -401,5 +465,80 @@ mod tests {
         let cleared = map.clear_stale(Duration::from_secs(3600));
         assert_eq!(cleared, 0);
         assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn test_pending_cancels_insert_remove() {
+        let cancels = PendingCancels::new();
+        assert!(cancels.is_empty());
+
+        // Insert a cancel request
+        cancels.insert(42);
+        assert_eq!(cancels.len(), 1);
+        assert!(!cancels.is_empty());
+
+        // Remove returns true for tracked ID
+        assert!(cancels.remove(42));
+        assert!(cancels.is_empty());
+
+        // Remove returns false for untracked ID
+        assert!(!cancels.remove(42));
+        assert!(!cancels.remove(999));
+    }
+
+    #[test]
+    fn test_pending_cancels_multiple() {
+        let cancels = PendingCancels::new();
+
+        cancels.insert(1);
+        cancels.insert(2);
+        cancels.insert(3);
+        assert_eq!(cancels.len(), 3);
+
+        // Remove middle one
+        assert!(cancels.remove(2));
+        assert_eq!(cancels.len(), 2);
+
+        // Other IDs still tracked
+        assert!(cancels.remove(1));
+        assert!(cancels.remove(3));
+        assert!(cancels.is_empty());
+    }
+
+    #[test]
+    fn test_pending_cancels_clear_stale() {
+        use std::time::Duration;
+
+        let cancels = PendingCancels::new();
+
+        cancels.insert(1);
+        cancels.insert(2);
+
+        // With zero max_age, all entries are stale
+        let cleared = cancels.clear_stale(Duration::ZERO);
+        assert_eq!(cleared, 2);
+        assert!(cancels.is_empty());
+
+        // Insert new ones
+        cancels.insert(10);
+        cancels.insert(20);
+
+        // With large max_age, nothing is stale
+        let cleared = cancels.clear_stale(Duration::from_secs(3600));
+        assert_eq!(cleared, 0);
+        assert_eq!(cancels.len(), 2);
+    }
+
+    #[test]
+    fn test_pending_cancels_duplicate_insert() {
+        let cancels = PendingCancels::new();
+
+        cancels.insert(42);
+        cancels.insert(42);
+
+        // HashMap deduplicates by ID; second insert updates timestamp
+        assert_eq!(cancels.len(), 1);
+        assert!(cancels.remove(42));
+        assert!(cancels.is_empty());
     }
 }
