@@ -61,7 +61,7 @@ vecmap-rs = { workspace = true }
 fnv = { workspace = true }
 
 # IBKR (optional, behind "ibkr" feature)
-ibapi = { version = "=2.11.0", optional = true, default-features = false, features = ["sync"] }
+ibapi = { version = "=2.11.2", optional = true, default-features = false, features = ["sync"] }
 time = { version = "0.3", optional = true, features = ["macros"] }
 
 # Hyperliquid (optional, behind "hyperliquid" feature)
