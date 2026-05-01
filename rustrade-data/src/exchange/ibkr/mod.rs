@@ -24,7 +24,7 @@
 //! - **Quotes** ([`OrderBookL1`]): Best bid/ask via `market_data()` subscription
 //! - **Depth** ([`OrderBookEvent`]): L2 order book via `market_depth()` subscription
 //! - **Trades** ([`PublicTrade`]): Tick-by-tick trades via `tick_by_tick_all_last()` subscription
-//! - **Historical** ([`Candle`]): OHLCV bars via [`historical::IbkrHistoricalData`]
+//! - **Historical** ([`Candle`]): OHLCV bars via `historical::IbkrHistoricalData`
 //!
 //! # Limitations
 //!
@@ -36,7 +36,7 @@
 //! # See Also
 //!
 //! - [IB API Documentation](https://www.interactivebrokers.com/campus/ibkr-api-page/trader-workstation-api/)
-//! - [`rustrade_execution::client::ibkr`] for order execution
+//! - `rustrade_execution::client::ibkr` for order execution
 //!
 //! [`Connector`]: crate::exchange::Connector
 //! [`OrderBookL1`]: crate::subscription::book::OrderBookL1

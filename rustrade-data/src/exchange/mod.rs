@@ -36,7 +36,7 @@ pub mod kraken;
 /// `Okx` [`Connector`] and [`StreamSelector`] implementations.
 pub mod okx;
 
-/// `Hyperliquid` and `HyperliquidSpot` [`Connector`] and [`StreamSelector`] implementations (behind `hyperliquid` feature).
+/// `Hyperliquid` and `HyperliquidSpot` `Connector` and `StreamSelector` implementations (behind `hyperliquid` feature).
 #[cfg(feature = "hyperliquid")]
 pub mod hyperliquid;
 

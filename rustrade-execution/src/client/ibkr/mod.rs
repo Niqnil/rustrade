@@ -30,7 +30,7 @@
 //! # See Also
 //!
 //! - [IB API Documentation](https://www.interactivebrokers.com/campus/ibkr-api-page/trader-workstation-api/)
-//! - [`rustrade_data::exchange::ibkr`] for market data
+//! - `rustrade_data::exchange::ibkr` for market data
 
 pub mod account;
 pub mod contract;

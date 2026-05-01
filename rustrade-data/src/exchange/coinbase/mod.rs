@@ -37,7 +37,7 @@ pub mod trade;
 /// See docs: <https://docs.cloud.coinbase.com/exchange/docs/websocket-overview>
 pub const BASE_URL_COINBASE: &str = "wss://ws-feed.exchange.coinbase.com";
 
-/// Convenient type alias for a Coinbase [`ExchangeWsStream`] using [`WebSocketSerdeParser`](rustrade_integration::protocol::websocket::WebSocketSerdeParser).
+/// Convenient type alias for a Coinbase [`ExchangeWsStream`] using [`WebSocketSerdeParser`].
 pub type CoinbaseWsStream<Transformer> = ExchangeWsStream<WebSocketSerdeParser, Transformer>;
 
 /// [`Coinbase`] exchange.

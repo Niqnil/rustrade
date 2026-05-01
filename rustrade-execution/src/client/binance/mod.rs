@@ -777,8 +777,7 @@ impl ExecutionClient for BinanceSpot {
     /// # Panics
     ///
     /// Panics if the binance-sdk REST or WebSocket configuration builder fails
-    /// (e.g. empty or malformed API key/secret). See [`BinanceSpot::build_rest`]
-    /// and [`BinanceSpot::build_ws_handle`] for details.
+    /// (e.g. empty or malformed API key/secret).
     fn new(config: Self::Config) -> Self {
         let rest = Self::build_rest(&config);
         let ws_handle = Self::build_ws_handle(&config);

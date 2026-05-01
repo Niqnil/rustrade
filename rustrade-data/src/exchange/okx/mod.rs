@@ -42,7 +42,7 @@ pub const BASE_URL_OKX: &str = "wss://ws.okx.com:8443/ws/v5/public";
 /// See docs: <https://www.okx.com/docs-v5/en/#websocket-api-connect>
 pub const PING_INTERVAL_OKX: Duration = Duration::from_secs(29);
 
-/// Convenient type alias for an Okx [`ExchangeWsStream`] using [`WebSocketSerdeParser`](rustrade_integration::protocol::websocket::WebSocketSerdeParser).
+/// Convenient type alias for an Okx [`ExchangeWsStream`] using [`WebSocketSerdeParser`].
 pub type OkxWsStream<Transformer> = ExchangeWsStream<WebSocketSerdeParser, Transformer>;
 
 /// [`Okx`] exchange.

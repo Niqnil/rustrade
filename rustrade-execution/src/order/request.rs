@@ -44,7 +44,7 @@ pub type UnindexedOrderResponseCancel =
 /// - On non-margin accounts: result in a 422 rejection from the exchange
 /// - On margin accounts: silently open a short position instead of closing the long
 ///
-/// The [`close_open_positions_with_market_orders`](crate::strategy::close_positions::close_open_positions_with_market_orders)
+/// The `close_open_positions_with_market_orders`
 /// helper sets this correctly. Direct `RequestOpen` construction must handle it manually.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct RequestOpen {

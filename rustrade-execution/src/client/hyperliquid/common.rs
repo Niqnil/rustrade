@@ -74,7 +74,7 @@ pub fn parse_side(side: &str) -> Option<Side> {
     }
 }
 
-/// Convert milliseconds timestamp to DateTime<Utc>.
+/// Convert milliseconds timestamp to `DateTime<Utc>`.
 ///
 /// Returns `None` for timestamps outside the representable range (year 292M+).
 pub fn millis_to_datetime(millis: u64) -> Option<DateTime<Utc>> {

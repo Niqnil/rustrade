@@ -38,7 +38,7 @@ pub mod subscription;
 /// Public trade types for [`Bitmex`].
 pub mod trade;
 
-/// Convenient type alias for a Bitmex [`ExchangeWsStream`] using [`WebSocketSerdeParser`](rustrade_integration::protocol::websocket::WebSocketSerdeParser).
+/// Convenient type alias for a Bitmex [`ExchangeWsStream`] using [`WebSocketSerdeParser`].
 pub type BitmexWsStream<Transformer> = ExchangeWsStream<WebSocketSerdeParser, Transformer>;
 
 /// [`Bitmex`] server base url.

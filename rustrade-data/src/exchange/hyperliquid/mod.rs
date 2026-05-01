@@ -5,8 +5,8 @@
 //!
 //! # Connectors
 //!
-//! - [`Hyperliquid`]: Perpetual futures market data
-//! - [`HyperliquidSpot`]: Spot trading market data
+//! - `Hyperliquid`: Perpetual futures market data
+//! - `HyperliquidSpot`: Spot trading market data
 //!
 //! # Supported Streams
 //! - [`PublicTrades`](crate::subscription::trade::PublicTrades): Real-time trade feed
@@ -15,7 +15,7 @@
 //! # Spot Market Subscriptions
 //!
 //! Hyperliquid spot uses `@{index}` format for WebSocket subscriptions.
-//! Use [`SpotMetaResolver`] to convert pair names to indices:
+//! Use `SpotMetaResolver` to convert pair names to indices:
 //!
 //! ```ignore
 //! use rustrade_data::exchange::hyperliquid::{HyperliquidSpot, resolve_spot_pair};

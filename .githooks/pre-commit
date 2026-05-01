@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pre-commit hook for barter-rs
+# Pre-commit hook for rustrade
 # Setup: git config core.hooksPath .githooks
 set -euo pipefail
 

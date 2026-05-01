@@ -1,4 +1,4 @@
-# Dependabot configuration for barter-rs
+# Dependabot configuration for rustrade
 # https://docs.github.com/github/administering-a-repository/configuration-options-for-dependency-updates
 
 version: 2

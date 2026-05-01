@@ -196,7 +196,7 @@ impl AccountEventIndexer {
 
     /// Index an [`UnindexedOrderState`] to an [`OrderState`].
     ///
-    /// Used by [`ExecutionManager`] to index `open_order` responses.
+    /// Used by `ExecutionManager` to index `open_order` responses.
     pub fn order_state(&self, state: UnindexedOrderState) -> Result<OrderState, IndexError> {
         Ok(match state {
             UnindexedOrderState::Active(active) => OrderState::Active(active),

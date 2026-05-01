@@ -842,7 +842,7 @@ impl ExecutionClient for AlpacaClient {
     /// # Panics
     ///
     /// Panics if the API key or secret key contains characters invalid in an
-    /// HTTP header value. See [`AlpacaClient::build_http`] for details.
+    /// HTTP header value.
     fn new(config: Self::Config) -> Self {
         let http = Self::build_http(&config);
         Self {
@@ -964,7 +964,7 @@ impl ExecutionClient for AlpacaClient {
     /// Dropping the returned `BoxStream` initiates a graceful shutdown of the
     /// background `connection_manager` task: the channel close causes the task
     /// to send a WebSocket close frame and exit within the current heartbeat
-    /// window (≤60 s). Any [`AccountEvent`] items already queued but not yet
+    /// window (≤60 s). Any `AccountEvent` items already queued but not yet
     /// polled are discarded. Callers who drop and re-subscribe must call
     /// [`ExecutionClient::fetch_trades`] with a short lookback to recover the gap.
     async fn account_stream(

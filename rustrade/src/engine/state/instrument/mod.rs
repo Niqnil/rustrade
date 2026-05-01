@@ -295,7 +295,7 @@ pub struct InstrumentState<
 
     /// Maps `ClientOrderId` → `PositionId` for hedging-mode fill routing.
     ///
-    /// Populated by [`InFlightRequestRecorder::record_in_flight_open`] when an order carrying
+    /// Populated by `InFlightRequestRecorder::record_in_flight_open` when an order carrying
     /// a [`RequestOpen::position_id`](rustrade_execution::order::request::RequestOpen::position_id)
     /// is submitted. Used by [`Self::update_from_trade`] to resolve the correct position slot
     /// for a fill in `OmsMode::Hedging`.
@@ -327,7 +327,7 @@ pub struct InstrumentState<
     /// `OmsMode::Hedging`.
     ///
     /// Populated in [`Self::update_from_order_snapshot`] on every `OpenInFlight → Open`
-    /// transition. Cleaned up by [`Self::cleanup_routing_tables`] when orders leave
+    /// transition. Cleaned up by `cleanup_routing_tables` when orders leave
     /// `self.orders`.
     ///
     /// Without this index, `update_from_trade` must scan all active orders on every fill

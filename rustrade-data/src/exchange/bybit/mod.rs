@@ -56,7 +56,7 @@ pub mod trade;
 /// [`BybitFuturesUsd`](futures::BybitPerpetualsUsd).
 pub mod book;
 
-/// Convenient type alias for a Bybit [`ExchangeWsStream`] using [`WebSocketSerdeParser`](rustrade_integration::protocol::websocket::WebSocketSerdeParser).
+/// Convenient type alias for a Bybit [`ExchangeWsStream`] using [`WebSocketSerdeParser`].
 pub type BybitWsStream<Transformer> = ExchangeWsStream<WebSocketSerdeParser, Transformer>;
 
 /// Generic [`Bybit<Server>`](Bybit) exchange.

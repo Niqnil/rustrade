@@ -43,7 +43,7 @@ pub mod trade;
 /// See docs: <https://docs.kraken.com/websockets/#overview>
 pub const BASE_URL_KRAKEN: &str = "wss://ws.kraken.com/";
 
-/// Convenient type alias for a Kraken [`ExchangeWsStream`] using [`WebSocketSerdeParser`](rustrade_integration::protocol::websocket::WebSocketSerdeParser).
+/// Convenient type alias for a Kraken [`ExchangeWsStream`] using [`WebSocketSerdeParser`].
 pub type KrakenWsStream<Transformer> = ExchangeWsStream<WebSocketSerdeParser, Transformer>;
 
 /// [`Kraken`] exchange.
