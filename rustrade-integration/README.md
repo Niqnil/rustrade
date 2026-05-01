@@ -1,4 +1,4 @@
-# Barter-Integration
+# rustrade-integration
 
 High-performance, low-level framework for composing flexible web integrations. 
 

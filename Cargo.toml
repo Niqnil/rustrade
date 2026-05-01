@@ -14,8 +14,9 @@ edition = "2024"
 rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/Niqnil/rustrade"
-keywords = ["trading", "backtesting", "crypto", "stocks", "investment"]
-categories = ["accessibility", "simulation"]
+homepage = "https://github.com/Niqnil/rustrade"
+keywords = ["trading", "backtesting", "crypto", "stocks", "algorithmic"]
+categories = ["finance", "simulation"]
 
 [workspace.dependencies]
 # Rustrade Ecosystem

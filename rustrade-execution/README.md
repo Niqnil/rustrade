@@ -1,4 +1,4 @@
-# Barter-Execution
+# rustrade-execution
 
 Execution client library for streaming private account data and executing orders (live or mock).
 

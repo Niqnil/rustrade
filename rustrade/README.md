@@ -1,4 +1,4 @@
-# Barter
+# rustrade
 
 Core trading engine with state management, strategy/risk components, and backtest utilities.
 

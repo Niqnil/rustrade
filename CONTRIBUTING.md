@@ -1,6 +1,6 @@
-# Contributing to Barter-RS
+# Contributing to rustrade
 
-Thank you for your interest in contributing to Barter-RS!
+Thank you for your interest in contributing to rustrade!
 
 ## Branching Strategy
 
@@ -60,8 +60,8 @@ Before submitting a PR, ensure:
 
 This is a generic trading engine library. The following belong in downstream consumers, not here:
 
+- Trading strategy
 - Exchange-specific business logic (margin routing, position tracking)
-- RL/ML integration code
 - Greeks computation
 - Market hours logic
 

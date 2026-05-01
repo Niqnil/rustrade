@@ -1,4 +1,4 @@
-# Barter-Instrument
+# rustrade-instrument
 
 Core Exchange, Instrument, and Asset data structures and utilities.
 

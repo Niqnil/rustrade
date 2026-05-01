@@ -1,4 +1,4 @@
-# Barter-Data
+# rustrade-data
 
 WebSocket integration library for streaming public market data from exchanges.
 
