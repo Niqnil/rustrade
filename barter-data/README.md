@@ -22,5 +22,7 @@ WebSocket integration library for streaming public market data from exchanges.
 | **Kraken** | `Kraken` | Spot | PublicTrades, OrderBooksL1 |
 | **Okx** | `Okx` | Spot, Future, Perpetual, Option | PublicTrades |
 | **Hyperliquid** | `Hyperliquid::default()` | Perpetual | PublicTrades, OrderBooksL2 |
+| **HyperliquidSpot** | `HyperliquidSpot::default()` | Spot | PublicTrades, OrderBooksL2 |
+| **IBKR** | `IbkrMarketStream::connect()` | Spot, Future, Option | PublicTrades, OrderBooksL1, OrderBooksL2, Candles |
 
 See the [workspace README](../README.md) for documentation, examples, and contributing guidelines.

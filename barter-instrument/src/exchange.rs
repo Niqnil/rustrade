@@ -71,6 +71,8 @@ pub enum ExchangeId {
     Htx,
     /// Hyperliquid perpetual futures (decentralized, EVM-based)
     HyperliquidPerp,
+    /// Hyperliquid spot trading (decentralized, EVM-based)
+    HyperliquidSpot,
     /// Interactive Brokers — equities, futures, options, forex
     Ibkr,
     Kraken,
@@ -123,6 +125,7 @@ impl ExchangeId {
             ExchangeId::Hitbtc => "hitbtc",
             ExchangeId::Htx => "htx", // huobi alias
             ExchangeId::HyperliquidPerp => "hyperliquid_perp",
+            ExchangeId::HyperliquidSpot => "hyperliquid_spot",
             ExchangeId::Ibkr => "ibkr",
             ExchangeId::Kraken => "kraken",
             ExchangeId::Kucoin => "kucoin",

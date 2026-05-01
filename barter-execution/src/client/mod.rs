@@ -24,7 +24,7 @@ pub mod alpaca;
 #[cfg(feature = "binance")]
 pub mod binance;
 
-// Hyperliquid perpetual futures ExecutionClient implementation
+// Hyperliquid perpetual futures and spot ExecutionClient implementations
 #[cfg(feature = "hyperliquid")]
 pub mod hyperliquid;
 
