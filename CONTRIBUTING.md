@@ -56,6 +56,22 @@ Before submitting a PR, ensure:
    - Note: `complexity` is `-W` (warn) not `-D` (deny) because the codebase intentionally allows `type_complexity` and `too_many_arguments` in some areas.
 3. **Tests pass:** `cargo test --workspace --all-features` (or specific test files)
 
+## Testing
+
+**Unit tests** run in CI and require no API keys:
+```bash
+cargo test --workspace --lib
+```
+
+**Integration tests** require exchange credentials and run locally only:
+```bash
+cp .env.template .env
+# Edit .env with your API keys
+cargo test --workspace --all-features
+```
+
+Integration tests are marked with `#[ignore]` by default to avoid running in CI.
+
 ## What NOT to Contribute
 
 This is a generic trading engine library. The following belong in downstream consumers, not here:
