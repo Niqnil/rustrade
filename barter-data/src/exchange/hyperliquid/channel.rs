@@ -1,4 +1,4 @@
-use super::Hyperliquid;
+use super::{Hyperliquid, HyperliquidSpot};
 use crate::{
     Identifier,
     subscription::{Subscription, book::OrderBooksL2, trade::PublicTrades},
@@ -46,6 +46,22 @@ impl<Instrument> Identifier<HyperliquidChannel>
 
 impl<Instrument> Identifier<HyperliquidChannel>
     for Subscription<Hyperliquid, Instrument, OrderBooksL2>
+{
+    fn id(&self) -> HyperliquidChannel {
+        HyperliquidChannel::L2Book
+    }
+}
+
+impl<Instrument> Identifier<HyperliquidChannel>
+    for Subscription<HyperliquidSpot, Instrument, PublicTrades>
+{
+    fn id(&self) -> HyperliquidChannel {
+        HyperliquidChannel::Trades
+    }
+}
+
+impl<Instrument> Identifier<HyperliquidChannel>
+    for Subscription<HyperliquidSpot, Instrument, OrderBooksL2>
 {
     fn id(&self) -> HyperliquidChannel {
         HyperliquidChannel::L2Book
