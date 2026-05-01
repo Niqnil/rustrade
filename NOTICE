@@ -1,0 +1,16 @@
+rustrade
+========
+
+This project is a fork of barter-rs (https://github.com/barter-rs/barter-rs),
+originally developed by Just A Stream, Inc. and the Barter Ecosystem Contributors.
+
+Fork history:
+- Original: https://github.com/barter-rs/barter-rs (v0.12.4)
+- Intermediate: https://github.com/Niqnil/barter-rs
+- Current: https://github.com/Niqnil/rustrade
+
+The original work is licensed under the MIT License. This fork maintains the
+same license and adds the "rustrade Contributors" as additional copyright holders
+for modifications made after the fork.
+
+See LICENSE for the full license text.
