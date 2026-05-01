@@ -7,6 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  MOLD_VERSION: "2.35.1"
 
 jobs:
   validate:
@@ -16,6 +17,11 @@ jobs:
     steps:
       - name: Checkout sources
         uses: actions/checkout@v6
+
+      - name: Install mold linker
+        uses: rui314/setup-mold@v1
+        with:
+          mold-version: ${{ env.MOLD_VERSION }}
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -49,40 +55,70 @@ jobs:
           CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
 
       - name: Publish rustrade-macro
-        run: cargo publish -p rustrade-macro --no-verify
-        continue-on-error: false
+        run: |
+          VERSION=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | select(.name=="rustrade-macro") | .version')
+          if cargo search rustrade-macro --limit 1 | grep -q "rustrade-macro = \"$VERSION\""; then
+            echo "rustrade-macro@$VERSION already published, skipping"
+          else
+            cargo publish -p rustrade-macro --no-verify
+          fi
 
       - name: Wait for crates.io index
-        run: sleep 30
+        run: sleep 60
 
       - name: Publish rustrade-instrument
-        run: cargo publish -p rustrade-instrument --no-verify
-        continue-on-error: false
+        run: |
+          VERSION=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | select(.name=="rustrade-instrument") | .version')
+          if cargo search rustrade-instrument --limit 1 | grep -q "rustrade-instrument = \"$VERSION\""; then
+            echo "rustrade-instrument@$VERSION already published, skipping"
+          else
+            cargo publish -p rustrade-instrument --no-verify
+          fi
 
       - name: Wait for crates.io index
-        run: sleep 30
+        run: sleep 60
 
       - name: Publish rustrade-integration
-        run: cargo publish -p rustrade-integration --no-verify
-        continue-on-error: false
+        run: |
+          VERSION=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | select(.name=="rustrade-integration") | .version')
+          if cargo search rustrade-integration --limit 1 | grep -q "rustrade-integration = \"$VERSION\""; then
+            echo "rustrade-integration@$VERSION already published, skipping"
+          else
+            cargo publish -p rustrade-integration --no-verify
+          fi
 
       - name: Wait for crates.io index
-        run: sleep 30
+        run: sleep 60
 
       - name: Publish rustrade-execution
-        run: cargo publish -p rustrade-execution --no-verify
-        continue-on-error: false
+        run: |
+          VERSION=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | select(.name=="rustrade-execution") | .version')
+          if cargo search rustrade-execution --limit 1 | grep -q "rustrade-execution = \"$VERSION\""; then
+            echo "rustrade-execution@$VERSION already published, skipping"
+          else
+            cargo publish -p rustrade-execution --no-verify
+          fi
 
       - name: Publish rustrade-data
-        run: cargo publish -p rustrade-data --no-verify
-        continue-on-error: false
+        run: |
+          VERSION=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | select(.name=="rustrade-data") | .version')
+          if cargo search rustrade-data --limit 1 | grep -q "rustrade-data = \"$VERSION\""; then
+            echo "rustrade-data@$VERSION already published, skipping"
+          else
+            cargo publish -p rustrade-data --no-verify
+          fi
 
       - name: Wait for crates.io index
-        run: sleep 30
+        run: sleep 60
 
       - name: Publish rustrade
-        run: cargo publish -p rustrade --no-verify
-        continue-on-error: false
+        run: |
+          VERSION=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | select(.name=="rustrade") | .version')
+          if cargo search rustrade --limit 1 | grep -q "rustrade = \"$VERSION\""; then
+            echo "rustrade@$VERSION already published, skipping"
+          else
+            cargo publish -p rustrade --no-verify
+          fi
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
