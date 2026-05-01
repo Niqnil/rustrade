@@ -1,0 +1,726 @@
+use crate::{
+    EngineEvent, Sequence,
+    engine::{
+        action::{
+            ActionOutput,
+            cancel_orders::CancelOrders,
+            close_positions::ClosePositions,
+            generate_algo_orders::{GenerateAlgoOrders, GenerateAlgoOrdersOutput},
+            send_requests::SendRequests,
+        },
+        audit::{AuditTick, Auditor, EngineAudit, ProcessAudit, context::EngineContext},
+        clock::EngineClock,
+        command::Command,
+        execution_tx::ExecutionTxMap,
+        state::{
+            EngineState,
+            instrument::data::InstrumentDataState,
+            order::{in_flight_recorder::InFlightRequestRecorder, manager::OrderManager},
+            position::{PositionExited, PositionId},
+            trading::TradingState,
+        },
+    },
+    execution::{AccountStreamEvent, request::ExecutionRequest},
+    risk::RiskManager,
+    shutdown::SyncShutdown,
+    statistic::summary::TradingSummaryGenerator,
+    strategy::{
+        algo::AlgoStrategy, close_positions::ClosePositionsStrategy,
+        on_disconnect::OnDisconnectStrategy, on_trading_disabled::OnTradingDisabled,
+    },
+};
+use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
+use rustrade_data::{event::MarketEvent, streams::consumer::MarketStreamEvent};
+use rustrade_execution::{
+    AccountEvent,
+    order::Order,
+    trade::{AssetFees, Trade, TradeId},
+};
+use rustrade_instrument::{
+    Side,
+    asset::AssetIndex,
+    exchange::ExchangeIndex,
+    instrument::{InstrumentIndex, kind::option::OptionKind},
+};
+use rustrade_integration::channel::Tx;
+use serde::{Deserialize, Serialize};
+use std::fmt::Debug;
+use tracing::{info, warn};
+
+/// Defines how the [`Engine`] actions a [`Command`], and the associated outputs.
+pub mod action;
+
+/// Defines an `Engine` audit types as well as utilities for handling the `Engine` `AuditStream`.
+///
+/// eg/ `StateReplicaManager` component can be used to maintain an `EngineState` replica.
+pub mod audit;
+
+/// Defines the [`EngineClock`] interface used to determine the current `Engine` time.
+///
+/// This flexibility enables back-testing runs to use approximately correct historical timestamps.
+pub mod clock;
+
+/// Defines an [`Engine`] [`Command`] - used to give trading directives to the `Engine` from an
+/// external process (eg/ ClosePositions).
+pub mod command;
+
+/// Defines all possible errors that can occur in the [`Engine`].
+pub mod error;
+
+/// Defines the [`ExecutionTxMap`] interface that models a collection of transmitters used to route
+/// can `ExecutionRequest` to the appropriate `ExecutionManagers`.
+pub mod execution_tx;
+
+/// Defines all state used by the`Engine` to algorithmically trade.
+///
+/// eg/ `ConnectivityStates`, `AssetStates`, `InstrumentStates`, `Position`, etc.
+pub mod state;
+
+/// `Engine` runners for processing input `Events`.
+///
+/// eg/ `fn sync_run`, `fn sync_run_with_audit`, `fn async_run`, `fn async_run_with_audit`,
+pub mod run;
+
+/// Defines how a component processing an input Event and generates an appropriate Audit.
+pub trait Processor<Event> {
+    type Audit;
+    fn process(&mut self, event: Event) -> Self::Audit;
+}
+
+/// Process and `Event` with the `Engine` and product an [`AuditTick`] of work done.
+pub fn process_with_audit<Event, Engine>(
+    engine: &mut Engine,
+    event: Event,
+) -> AuditTick<Engine::Audit, EngineContext>
+where
+    Engine: Processor<Event> + Auditor<Engine::Audit, Context = EngineContext>,
+{
+    let output = engine.process(event);
+    engine.audit(output)
+}
+
+/// Algorithmic trading `Engine`.
+///
+/// The `Engine`:
+/// * Processes input [`EngineEvent`] (or custom events if implemented).
+/// * Maintains the internal [`EngineState`] (instrument data state, open orders, positions, etc.).
+/// * Generates algo orders (if `TradingState::Enabled`).
+///
+/// # Type Parameters
+/// * `Clock` - [`EngineClock`] implementation.
+/// * `State` - Engine `State` implementation (eg/ [`EngineState`]).
+/// * `ExecutionTxs` - [`ExecutionTxMap`] implementation for sending execution requests.
+/// * `Strategy` - Trading Strategy implementation (see [`super::strategy`]).
+/// * `Risk` - [`RiskManager`] implementation.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct Engine<Clock, State, ExecutionTxs, Strategy, Risk> {
+    pub clock: Clock,
+    pub meta: EngineMeta,
+    pub state: State,
+    pub execution_txs: ExecutionTxs,
+    pub strategy: Strategy,
+    pub risk: Risk,
+}
+
+/// Running [`Engine`] metadata.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub struct EngineMeta {
+    /// [`EngineClock`] start timestamp of the current [`Engine`] `run`.
+    pub time_start: DateTime<Utc>,
+    /// Monotonically increasing [`Sequence`] associated with the number of events processed.
+    pub sequence: Sequence,
+}
+
+impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
+    Processor<EngineEvent<InstrumentData::MarketEventKind>>
+    for Engine<Clock, EngineState<GlobalData, InstrumentData>, ExecutionTxs, Strategy, Risk>
+where
+    Clock: EngineClock + for<'a> Processor<&'a EngineEvent<InstrumentData::MarketEventKind>>,
+    InstrumentData: InstrumentDataState,
+    GlobalData: for<'a> Processor<&'a AccountEvent>
+        + for<'a> Processor<&'a MarketEvent<InstrumentIndex, InstrumentData::MarketEventKind>>,
+    ExecutionTxs: ExecutionTxMap<ExchangeIndex, InstrumentIndex>,
+    Strategy: OnTradingDisabled<Clock, EngineState<GlobalData, InstrumentData>, ExecutionTxs, Risk>
+        + OnDisconnectStrategy<Clock, EngineState<GlobalData, InstrumentData>, ExecutionTxs, Risk>
+        + AlgoStrategy<State = EngineState<GlobalData, InstrumentData>>
+        + ClosePositionsStrategy<State = EngineState<GlobalData, InstrumentData>>,
+    Risk: RiskManager<State = EngineState<GlobalData, InstrumentData>>,
+{
+    type Audit = EngineAudit<
+        EngineEvent<InstrumentData::MarketEventKind>,
+        EngineOutput<Strategy::OnTradingDisabled, Strategy::OnDisconnect>,
+    >;
+
+    fn process(&mut self, event: EngineEvent<InstrumentData::MarketEventKind>) -> Self::Audit {
+        self.clock.process(&event);
+
+        let process_audit = match &event {
+            EngineEvent::Shutdown(_) => return EngineAudit::process(event),
+            EngineEvent::Command(command) => {
+                let output = self.action(command);
+
+                if let Some(unrecoverable) = output.unrecoverable_errors() {
+                    return EngineAudit::process_with_output_and_errs(event, unrecoverable, output);
+                } else {
+                    ProcessAudit::with_output(event, output)
+                }
+            }
+            EngineEvent::TradingStateUpdate(trading_state) => {
+                let trading_disabled = self.update_from_trading_state_update(*trading_state);
+                ProcessAudit::with_trading_state_update(event, trading_disabled)
+            }
+            EngineEvent::Account(account) => {
+                let output = self.update_from_account_stream(account);
+                ProcessAudit::with_account_update(event, output)
+            }
+            EngineEvent::Market(market) => {
+                let output = self.update_from_market_stream(market);
+                ProcessAudit::with_market_update(event, output)
+            }
+            EngineEvent::ContractExpiry(key) => {
+                let exited = self.process_contract_expiry(key);
+                // Fold all closed positions into the audit as separate PositionExit outputs.
+                // In Netting mode this is 0 or 1 entries; in Hedging mode it may be N.
+                let mut audit = ProcessAudit::with_event(event);
+                for position_exited in exited {
+                    audit = audit.add_output(position_exited);
+                }
+                // ContractExpiry settles regardless of TradingState and does not
+                // trigger algo order generation — return early before that check.
+                return EngineAudit::from(audit);
+            }
+        };
+
+        if let TradingState::Enabled = self.state.trading {
+            let output = self.generate_algo_orders();
+
+            if output.is_empty() {
+                EngineAudit::from(process_audit)
+            } else if let Some(unrecoverable) = output.unrecoverable_errors() {
+                EngineAudit::Process(process_audit.add_errors(unrecoverable))
+            } else {
+                EngineAudit::from(process_audit.add_output(output))
+            }
+        } else {
+            EngineAudit::from(process_audit)
+        }
+    }
+}
+
+impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk> SyncShutdown
+    for Engine<Clock, EngineState<GlobalData, InstrumentData>, ExecutionTxs, Strategy, Risk>
+where
+    ExecutionTxs: ExecutionTxMap,
+{
+    type Result = ();
+
+    fn shutdown(&mut self) -> Self::Result {
+        self.execution_txs.iter().for_each(|execution_tx| {
+            let _send_result = execution_tx.send(ExecutionRequest::Shutdown);
+        });
+    }
+}
+
+impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
+    Engine<Clock, EngineState<GlobalData, InstrumentData>, ExecutionTxs, Strategy, Risk>
+{
+    /// Action an `Engine` [`Command`], producing an [`ActionOutput`] of work done.
+    pub fn action(&mut self, command: &Command) -> ActionOutput
+    where
+        InstrumentData: InFlightRequestRecorder,
+        ExecutionTxs: ExecutionTxMap,
+        Strategy: ClosePositionsStrategy<State = EngineState<GlobalData, InstrumentData>>,
+        Risk: RiskManager,
+    {
+        match &command {
+            Command::SendCancelRequests(requests) => {
+                info!(
+                    ?requests,
+                    "Engine actioning user Command::SendCancelRequests"
+                );
+                let output = self.send_requests(requests.clone());
+                self.state.record_in_flight_cancels(&output.sent);
+                ActionOutput::CancelOrders(output)
+            }
+            Command::SendOpenRequests(requests) => {
+                info!(?requests, "Engine actioning user Command::SendOpenRequests");
+                let output = self.send_requests(requests.clone());
+                self.state.record_in_flight_opens(&output.sent);
+                ActionOutput::OpenOrders(output)
+            }
+            Command::ClosePositions(filter) => {
+                info!(?filter, "Engine actioning user Command::ClosePositions");
+                ActionOutput::ClosePositions(self.close_positions(filter))
+            }
+            Command::CancelOrders(filter) => {
+                info!(?filter, "Engine actioning user Command::CancelOrders");
+                ActionOutput::CancelOrders(self.cancel_orders(filter))
+            }
+        }
+    }
+
+    /// Update the `Engine` [`TradingState`].
+    ///
+    /// If the `TradingState` transitions to `TradingState::Disabled`, the `Engine` will call
+    /// the configured [`OnTradingDisabled`] strategy logic.
+    pub fn update_from_trading_state_update(
+        &mut self,
+        update: TradingState,
+    ) -> Option<Strategy::OnTradingDisabled>
+    where
+        Strategy:
+            OnTradingDisabled<Clock, EngineState<GlobalData, InstrumentData>, ExecutionTxs, Risk>,
+    {
+        self.state
+            .trading
+            .update(update)
+            .transitioned_to_disabled()
+            .then(|| Strategy::on_trading_disabled(self))
+    }
+
+    /// Update the [`Engine`] from an [`AccountStreamEvent`].
+    ///
+    /// If the input `AccountStreamEvent` indicates the exchange execution link has disconnected,
+    /// the `Engine` will call the configured [`OnDisconnectStrategy`] strategy logic.
+    pub fn update_from_account_stream(
+        &mut self,
+        event: &AccountStreamEvent,
+    ) -> UpdateFromAccountOutput<Strategy::OnDisconnect>
+    where
+        InstrumentData: for<'a> Processor<&'a AccountEvent>,
+        GlobalData: for<'a> Processor<&'a AccountEvent>,
+        Strategy: OnDisconnectStrategy<Clock, EngineState<GlobalData, InstrumentData>, ExecutionTxs, Risk>,
+    {
+        match event {
+            AccountStreamEvent::Reconnecting(exchange) => {
+                self.state
+                    .connectivity
+                    .update_from_account_reconnecting(exchange);
+
+                UpdateFromAccountOutput::OnDisconnect(Strategy::on_disconnect(self, *exchange))
+            }
+            AccountStreamEvent::Item(event) => self
+                .state
+                .update_from_account(event)
+                .map(UpdateFromAccountOutput::PositionExit)
+                .unwrap_or(UpdateFromAccountOutput::None),
+        }
+    }
+
+    /// Update the [`Engine`] from a [`MarketStreamEvent`].
+    ///
+    /// If the input `MarketStreamEvent` indicates the exchange market data link has disconnected,
+    /// the `Engine` will call the configured [`OnDisconnectStrategy`] strategy logic.
+    pub fn update_from_market_stream(
+        &mut self,
+        event: &MarketStreamEvent<InstrumentIndex, InstrumentData::MarketEventKind>,
+    ) -> UpdateFromMarketOutput<Strategy::OnDisconnect>
+    where
+        InstrumentData: InstrumentDataState,
+        GlobalData:
+            for<'a> Processor<&'a MarketEvent<InstrumentIndex, InstrumentData::MarketEventKind>>,
+        Strategy: OnDisconnectStrategy<Clock, EngineState<GlobalData, InstrumentData>, ExecutionTxs, Risk>,
+    {
+        match event {
+            MarketStreamEvent::Reconnecting(exchange) => {
+                self.state
+                    .connectivity
+                    .update_from_market_reconnecting(exchange);
+
+                UpdateFromMarketOutput::OnDisconnect(Strategy::on_disconnect(self, *exchange))
+            }
+            MarketStreamEvent::Item(event) => {
+                self.state.update_from_market(event);
+                UpdateFromMarketOutput::None
+            }
+        }
+    }
+
+    /// Returns a [`TradingSummaryGenerator`] for the current trading session.
+    pub fn trading_summary_generator(&self, risk_free_return: Decimal) -> TradingSummaryGenerator
+    where
+        Clock: EngineClock,
+    {
+        TradingSummaryGenerator::init(
+            risk_free_return,
+            self.meta.time_start,
+            self.time(),
+            &self.state.instruments,
+            &self.state.assets,
+        )
+    }
+
+    /// Processes a `ContractExpiry` event for the given `InstrumentIndex`.
+    ///
+    /// # Algorithm
+    /// 1. Guards on `expiration_processed` (idempotent).
+    /// 2. Cancels all open orders for the instrument by sending `ExecutionRequest::Cancel` for each.
+    /// 3. Derives settlement price from instrument data and contract specification:
+    ///    - OTM: settlement price = 0
+    ///    - ITM call: settlement = spot - strike (per-contract intrinsic value)
+    ///    - ITM put: settlement = strike - spot (per-contract intrinsic value)
+    /// 4. Synthesises a closing `Trade` at the settlement price and routes it through
+    ///    `instrument_state.update_from_trade`.
+    /// 5. Sets `instrument_state.expiration_processed = true`.
+    ///
+    /// If no position is open for the instrument, steps 3–4 are skipped.
+    /// If no market price is available, settlement cannot be computed and the method
+    /// logs a warning and returns without synthesising a fill. The `expiration_processed`
+    /// flag is **not** set in this case, making the event **retryable** — re-inject
+    /// `ContractExpiry` once the underlying spot instrument has received market data.
+    ///
+    /// # Not modelled (deferred)
+    ///
+    /// - **Assignment for short writers:** short positions at expiry are closed at intrinsic
+    ///   value identical to long positions (OTM at 0, ITM at `|spot − strike|`). True
+    ///   assignment — where the short writer is obligated to deliver the underlying — is not
+    ///   modelled. A future enhancement would detect net-short positions and open a synthetic
+    ///   underlying position instead of (or in addition to) closing the option position.
+    ///
+    /// - **Physical settlement:** all settlements are cash-equivalent (a synthetic fill at the
+    ///   settlement price adjusts PnL). No separate "deliver/receive underlying" position is
+    ///   opened. Physically-settled contracts (e.g. some futures-style options) are out of scope
+    ///   until this is revisited.
+    pub fn process_contract_expiry(
+        &mut self,
+        key: &InstrumentIndex,
+    ) -> Vec<PositionExited<AssetIndex, InstrumentIndex>>
+    where
+        Clock: EngineClock,
+        InstrumentData: InstrumentDataState + InFlightRequestRecorder,
+        ExecutionTxs: ExecutionTxMap,
+    {
+        let instrument_state = self.state.instruments.instrument_index_mut(key);
+
+        // Guard: idempotent — ignore duplicates after first processing.
+        if instrument_state.expiration_processed {
+            return vec![];
+        }
+
+        // Step 2: Cancel all open orders for this instrument.
+        let cancel_requests: Vec<_> = instrument_state
+            .orders
+            .orders()
+            .filter_map(Order::to_request_cancel)
+            .collect();
+        let cancels = self.send_requests(cancel_requests);
+        self.state.record_in_flight_cancels(&cancels.sent);
+
+        // Re-borrow after send_requests (which takes &self for execution_txs).
+        let instrument_state = self.state.instruments.instrument_index_mut(key);
+
+        // Step 3–4: Synthesise settlement fills only if positions are open.
+        if instrument_state.position.positions.is_empty() {
+            instrument_state.expiration_processed = true;
+            instrument_state.orders.clear();
+            instrument_state.exchange_id_to_cid.clear();
+            instrument_state.position_ids.clear();
+            // Clear pending_fills even when no positions exist — a fill-before-ack race
+            // that was in progress at expiry should not accumulate orphaned fills.
+            instrument_state.pending_fills.clear();
+            return vec![];
+        }
+
+        // Derive settlement price from the underlying spot price and contract spec.
+        // For options, ITM/OTM determination requires the *underlying's* price, not the
+        // option's own market price (which includes premium and would give wrong results).
+        // We find the underlying spot instrument by matching the option's underlying.base.
+        use rustrade_instrument::instrument::kind::InstrumentKind;
+        // Capture both the underlying base key and the exchange so we can filter
+        // the spot scan to the same exchange. Without the exchange filter, a
+        // multi-exchange setup (e.g. BTC/USD on both Binance and Alpaca) would
+        // silently use the wrong exchange's price.
+        let option_spec = match &instrument_state.instrument.kind {
+            InstrumentKind::Option(_) => Some((
+                instrument_state.instrument.underlying.base,
+                instrument_state.instrument.underlying.quote,
+                instrument_state.instrument.exchange,
+            )),
+            _ => None,
+        };
+
+        let spot_price = match option_spec {
+            Some((base_key, quote_key, exchange)) => {
+                // Find the spot instrument on the same exchange whose underlying matches
+                // the option's underlying base AND quote. Both are required: without the
+                // quote filter, BTC/USDT and BTC/USDC options on the same exchange would
+                // silently share the same spot price (M3).
+                // Single-pass: collect all matching spot instruments so we can both
+                // warn on ambiguity (visible in production) and use the first match,
+                // without scanning the instrument list twice.
+                let spot_matches: Vec<_> = self
+                    .state
+                    .instruments
+                    .0
+                    .values()
+                    .filter(|s| {
+                        matches!(&s.instrument.kind, InstrumentKind::Spot)
+                            && s.instrument.underlying.base == base_key
+                            && s.instrument.underlying.quote == quote_key
+                            && s.instrument.exchange == exchange
+                    })
+                    .collect();
+                if spot_matches.len() > 1 {
+                    warn!(
+                        count = spot_matches.len(),
+                        "process_contract_expiry: multiple Spot instruments match the option \
+                         underlying — using the first. Deduplicate your instrument config."
+                    );
+                }
+                spot_matches.into_iter().next().and_then(|s| s.data.price())
+            }
+            // Non-option instruments: use the instrument's own last price.
+            None => self.state.instruments.instrument_index(key).data.price(),
+        };
+
+        // Re-borrow mutably after the immutable scan above.
+        let instrument_state = self.state.instruments.instrument_index_mut(key);
+
+        let Some(spot_price) = spot_price else {
+            warn!(
+                instrument = ?key,
+                "ContractExpiry: underlying price unavailable — cannot compute settlement. \
+                 Ensure the underlying spot instrument is subscribed. \
+                 Re-inject ContractExpiry once market data arrives."
+            );
+            // Do NOT set expiration_processed — the event is retryable once data is available.
+            return vec![];
+        };
+
+        let settlement_price = match &instrument_state.instrument.kind {
+            InstrumentKind::Option(contract) => {
+                match contract.kind {
+                    OptionKind::Call => {
+                        // ITM call: intrinsic = underlying_spot - strike (per-share)
+                        // ATM (spot == strike): intrinsic = 0 by cash-settlement convention.
+                        if spot_price > contract.strike {
+                            spot_price - contract.strike
+                        } else {
+                            Decimal::ZERO
+                        }
+                    }
+                    OptionKind::Put => {
+                        // ITM put: intrinsic = strike - underlying_spot (per-share)
+                        // ATM (spot == strike): intrinsic = 0 by cash-settlement convention.
+                        if contract.strike > spot_price {
+                            contract.strike - spot_price
+                        } else {
+                            Decimal::ZERO
+                        }
+                    }
+                }
+            }
+            // Non-option instruments: settlement at current market price.
+            _ => spot_price,
+        };
+
+        // Collect all position IDs before iterating so we can re-borrow instrument_state
+        // mutably inside the loop without conflicting with the keys() borrow.
+        let position_ids: Vec<PositionId> = instrument_state
+            .position
+            .positions
+            .keys()
+            .cloned()
+            .collect();
+
+        // Engine clock time for all synthetic trades in this expiry batch.
+        // Using self.time() (not Utc::now()) keeps backtests deterministic.
+        let engine_time = self.time();
+
+        let mut exited = Vec::with_capacity(position_ids.len());
+
+        for pos_id in position_ids {
+            let instrument_state = self.state.instruments.instrument_index_mut(key);
+
+            let Some(open_position) = instrument_state.position.positions.get(&pos_id) else {
+                continue;
+            };
+
+            let closing_side = match open_position.side {
+                Side::Buy => Side::Sell,
+                Side::Sell => Side::Buy,
+            };
+            let closing_quantity = open_position.quantity_abs;
+
+            // Each synthetic trade gets a unique ID derived from its position ID and
+            // the engine clock timestamp. The timestamp component prevents dedup key
+            // collisions across engine restarts where expiration_processed was not
+            // persisted (Netting mode always uses the same pos_id = "netting").
+            // Always heap-allocates (>22 chars): use String directly rather than SmolStr.
+            let trade_tag = format!(
+                "expiry-settlement-{}-{}",
+                pos_id,
+                engine_time.timestamp_micros()
+            );
+            // Use the instrument's quote asset for fee tracking (amount is zero)
+            let quote_asset = instrument_state.instrument.underlying.quote;
+            let settlement_trade = Trade {
+                id: TradeId::new(&trade_tag),
+                order_id: rustrade_execution::order::id::OrderId::new(&trade_tag),
+                instrument: *key,
+                strategy: rustrade_execution::order::id::StrategyId::ENGINE_EXPIRY,
+                time_exchange: engine_time,
+                side: closing_side,
+                price: settlement_price,
+                quantity: closing_quantity,
+                fees: AssetFees {
+                    asset: quote_asset,
+                    fees: Decimal::ZERO,
+                    fees_quote: Some(Decimal::ZERO),
+                },
+            };
+
+            // Route settlement directly to the correct position by ID.
+            // We bypass InstrumentState::update_from_trade (which calls update_from_trade
+            // without a PositionId) because in Hedging mode that would derive the ID from
+            // trade.order_id, opening a spurious new position instead of closing the real one.
+            //
+            // Fee model bypass: settlement_trade.fees is always Decimal::ZERO (set above).
+            // The fee model is intentionally not applied — exchange settlement commission,
+            // if any, must be accounted for separately by the caller. Callers that configure
+            // FeeModelConfig::PerContract for options should note this invariant.
+            debug_assert_eq!(
+                settlement_trade.fees.fees,
+                Decimal::ZERO,
+                "settlement trade must carry zero fees before update_from_trade_with_id"
+            );
+            let contract_size = instrument_state.instrument.kind.contract_size();
+            if let Some(exit) = instrument_state.position.update_from_trade_with_id(
+                &settlement_trade,
+                &pos_id,
+                contract_size,
+            ) {
+                instrument_state.tear_sheet.update_from_position(&exit);
+                exited.push(exit);
+            }
+        }
+
+        // Step 5: Mark as processed and clear all routing tables.
+        // No fills will arrive for this instrument post-expiry. Cancel-ack messages
+        // for the orders cancelled in step 2 may never arrive (exchanges silently void
+        // them), so cleanup_routing_tables() cannot remove the CancelInFlight entries —
+        // they would accumulate indefinitely across expiry cycles in Hedging mode.
+        // Clear orders, position_ids, exchange_id_to_cid, and pending_fills explicitly,
+        // matching the replica's eager-clear logic in StateReplicaManager::update_from_event.
+        let instrument_state = self.state.instruments.instrument_index_mut(key);
+        instrument_state.expiration_processed = true;
+        instrument_state.orders.clear();
+        instrument_state.exchange_id_to_cid.clear();
+        instrument_state.position_ids.clear();
+        // Clear any fills buffered in a fill-before-ack race that was in progress at
+        // expiry. Without this, orphaned pending_fills accumulate across expiry cycles
+        // in a long-running engine with persisted state.
+        instrument_state.pending_fills.clear();
+
+        exited
+    }
+}
+
+impl<Clock, State, ExecutionTxs, Strategy, Risk> Engine<Clock, State, ExecutionTxs, Strategy, Risk>
+where
+    Clock: EngineClock,
+{
+    /// Construct a new `Engine`.
+    ///
+    /// An initial [`EngineMeta`] is constructed form the provided `clock` and `Sequence(0)`.
+    pub fn new(
+        clock: Clock,
+        state: State,
+        execution_txs: ExecutionTxs,
+        strategy: Strategy,
+        risk: Risk,
+    ) -> Self {
+        Self {
+            meta: EngineMeta {
+                time_start: clock.time(),
+                sequence: Sequence(0),
+            },
+            clock,
+            state,
+            execution_txs,
+            strategy,
+            risk,
+        }
+    }
+
+    /// Return `Engine` clock time.
+    pub fn time(&self) -> DateTime<Utc> {
+        self.clock.time()
+    }
+
+    /// Reset the internal `EngineMeta` to the `clock` time and `Sequence(0)`.
+    pub fn reset_metadata(&mut self) {
+        self.meta.time_start = self.clock.time();
+        self.meta.sequence = Sequence(0);
+    }
+}
+
+/// Output produced by [`Engine`] operations, used to construct an `Engine` [`EngineAudit`].
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub enum EngineOutput<
+    OnTradingDisabled,
+    OnDisconnect,
+    ExchangeKey = ExchangeIndex,
+    InstrumentKey = InstrumentIndex,
+> {
+    Commanded(ActionOutput<ExchangeKey, InstrumentKey>),
+    OnTradingDisabled(OnTradingDisabled),
+    AccountDisconnect(OnDisconnect),
+    PositionExit(PositionExited<AssetIndex, InstrumentKey>),
+    MarketDisconnect(OnDisconnect),
+    AlgoOrders(GenerateAlgoOrdersOutput<ExchangeKey, InstrumentKey>),
+}
+
+/// Output produced by the [`Engine`] updating from an [`TradingState`], used to construct
+/// an `Engine` [`EngineAudit`].
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub enum UpdateTradingStateOutput<OnTradingDisabled> {
+    None,
+    OnTradingDisabled(OnTradingDisabled),
+}
+
+/// Output produced by the [`Engine`] updating from an [`AccountStreamEvent`], used to construct
+/// an `Engine` [`EngineAudit`].
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+#[allow(clippy::large_enum_variant)] // PositionExit is rare; avoiding Box keeps API simple
+pub enum UpdateFromAccountOutput<OnDisconnect, InstrumentKey = InstrumentIndex> {
+    None,
+    OnDisconnect(OnDisconnect),
+    PositionExit(PositionExited<AssetIndex, InstrumentKey>),
+}
+
+/// Output produced by the [`Engine`] updating from an [`MarketStreamEvent`], used to construct
+/// an `Engine` [`EngineAudit`].
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub enum UpdateFromMarketOutput<OnDisconnect> {
+    None,
+    OnDisconnect(OnDisconnect),
+}
+
+impl<OnTradingDisabled, OnDisconnect, ExchangeKey, InstrumentKey>
+    From<ActionOutput<ExchangeKey, InstrumentKey>>
+    for EngineOutput<OnTradingDisabled, OnDisconnect, ExchangeKey, InstrumentKey>
+{
+    fn from(value: ActionOutput<ExchangeKey, InstrumentKey>) -> Self {
+        Self::Commanded(value)
+    }
+}
+
+impl<OnTradingDisabled, OnDisconnect, ExchangeKey, InstrumentKey>
+    From<PositionExited<AssetIndex, InstrumentKey>>
+    for EngineOutput<OnTradingDisabled, OnDisconnect, ExchangeKey, InstrumentKey>
+{
+    fn from(value: PositionExited<AssetIndex, InstrumentKey>) -> Self {
+        Self::PositionExit(value)
+    }
+}
+
+impl<OnTradingDisabled, OnDisconnect, ExchangeKey, InstrumentKey>
+    From<GenerateAlgoOrdersOutput<ExchangeKey, InstrumentKey>>
+    for EngineOutput<OnTradingDisabled, OnDisconnect, ExchangeKey, InstrumentKey>
+{
+    fn from(value: GenerateAlgoOrdersOutput<ExchangeKey, InstrumentKey>) -> Self {
+        Self::AlgoOrders(value)
+    }
+}

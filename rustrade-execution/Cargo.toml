@@ -1,0 +1,113 @@
+[package]
+name = "rustrade-execution"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+documentation = "https://docs.rs/rustrade-execution/"
+readme = "README.md"
+description = "Stream private account data from financial venues, and execute (live or mock) orders."
+
+
+[features]
+default = []
+alpaca = [
+    "dep:reqwest",
+    "dep:serde_json",
+    "serde_json/raw_value", # RawValue borrow for zero-copy WS data field parsing
+    "dep:lru",
+    "dep:parking_lot",
+    "dep:indexmap",
+]
+binance = [
+    "dep:binance-sdk",
+    "dep:serde_json",
+    "dep:anyhow",
+    "dep:lru",
+    "dep:parking_lot",
+]
+ibkr = ["dep:ibapi", "dep:parking_lot", "dep:chrono-tz", "rustrade-instrument/ibkr"]
+hyperliquid = [
+    "dep:hyperliquid_rust_sdk",
+    "dep:ethers",
+    "dep:tokio-util",
+    "dep:uuid",
+]
+
+[dependencies]
+# Rustrade Ecosystem
+rustrade-integration = { workspace = true, features = [
+    "collection",
+    "error",
+    "stream",
+] }
+rustrade-instrument = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Async
+tokio = { workspace = true, features = ["sync", "macros", "rt-multi-thread"] }
+tokio-stream = { workspace = true, features = ["sync"] }
+futures = { workspace = true }
+
+# Data Structures
+smol_str = { workspace = true }
+fnv = { workspace = true }
+indexmap = { workspace = true, optional = true }
+rust_decimal = { workspace = true }
+
+# Error
+thiserror = { workspace = true }
+
+# SerDe
+serde = { workspace = true, features = ["derive"] }
+
+# Misc
+rand = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+itertools = { workspace = true }
+derive_more = { workspace = true, features = [
+    "constructor",
+    "from",
+    "display",
+] }
+
+# Alpaca (optional, behind "alpaca" feature)
+reqwest = { workspace = true, optional = true } # HTTP client for Alpaca REST API
+
+# Binance (optional, behind "binance" feature)
+binance-sdk = { version = "=44.0.1", features = ["spot"], optional = true }
+anyhow = { workspace = true, optional = true }                              # Required: binance-sdk's public API returns anyhow::Result
+
+# Shared between "alpaca" and "binance" features
+serde_json = { workspace = true, optional = true }
+lru = { workspace = true, optional = true }         # Event deduplication cache for reconnect resilience
+parking_lot = { workspace = true, optional = true } # Lighter mutex for dedup cache (no poisoning, no OS thread park)
+
+# IBKR (optional, behind "ibkr" feature)
+ibapi = { version = "=2.11.0", optional = true, default-features = false, features = [
+    "sync",
+] }
+chrono-tz = { workspace = true, optional = true }
+
+# Hyperliquid (optional, behind "hyperliquid" feature)
+hyperliquid_rust_sdk = { version = "0.6", optional = true }
+ethers = { version = "2.0", optional = true, default-features = false }
+tokio-util = { version = "0.7", optional = true }
+uuid = { version = "1.0", optional = true }
+
+[dev-dependencies]
+# test-util enables tokio::time::pause() and advance() for behavioral timing tests
+tokio = { workspace = true, features = ["test-util"] }
+# Mock HTTP server for testing REST pagination and truncation logic (H-1, H-3)
+wiremock = { workspace = true }
+# Tracing for examples
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+# Decimal literals for examples
+rust_decimal_macros = { workspace = true }
+# Serde round-trip tests (L2)
+serde_json = { workspace = true }
