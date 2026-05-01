@@ -1,0 +1,90 @@
+name: "Publish to crates.io"
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Run cargo fmt check
+        run: cargo fmt --all -- --check
+
+      - name: Run cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious -D clippy::style -W clippy::complexity -D clippy::perf
+
+      - name: Run cargo test
+        run: cargo test --workspace --all-features --lib --bins --tests
+
+  publish:
+    name: Publish crates
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Login to crates.io
+        run: cargo login "$CRATES_IO_TOKEN"
+        env:
+          CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+
+      - name: Publish rustrade-macro
+        run: cargo publish -p rustrade-macro --no-verify
+        continue-on-error: false
+
+      - name: Wait for crates.io index
+        run: sleep 30
+
+      - name: Publish rustrade-instrument
+        run: cargo publish -p rustrade-instrument --no-verify
+        continue-on-error: false
+
+      - name: Wait for crates.io index
+        run: sleep 30
+
+      - name: Publish rustrade-integration
+        run: cargo publish -p rustrade-integration --no-verify
+        continue-on-error: false
+
+      - name: Wait for crates.io index
+        run: sleep 30
+
+      - name: Publish rustrade-execution
+        run: cargo publish -p rustrade-execution --no-verify
+        continue-on-error: false
+
+      - name: Publish rustrade-data
+        run: cargo publish -p rustrade-data --no-verify
+        continue-on-error: false
+
+      - name: Wait for crates.io index
+        run: sleep 30
+
+      - name: Publish rustrade
+        run: cargo publish -p rustrade --no-verify
+        continue-on-error: false
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true

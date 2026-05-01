@@ -1,183 +1,90 @@
-# Barter
+# rustrade
 
-> **This is a public fork of [barter-rs/barter-rs](https://github.com/barter-rs/barter-rs).**
-> It adds execution clients for **Binance**, **Alpaca**, **Hyperliquid**, and **IBKR**.
-> For questions or discussion, please use [GitHub Discussions](https://github.com/Niqnil/barter-rs/discussions).
-
-Barter is an algorithmic trading ecosystem of Rust libraries for building high-performance live-trading, paper-trading
-and back-testing systems.
-* **Fast**: Written in native Rust. Minimal allocations. Data-oriented state management system with direct index lookups.
-* **Robust**: Strongly typed. Thread safe. Extensive test coverage.
-* **Customisable**: Plug and play Strategy and RiskManager components that facilitates most trading strategies.
-* **Scalable**: Multithreaded architecture with modular design. Leverages Tokio for I/O. Memory efficient data structures.
+A Rust ecosystem for building high-performance algorithmic trading systems.
 
 [![MIT licensed][mit-badge]][mit-url]
+[![Crates.io][crates-badge]][crates-url]
+[![docs.rs][docs-badge]][docs-url]
 
 [mit-badge]: https://img.shields.io/badge/license-MIT-blue.svg
-[mit-url]: https://github.com/Niqnil/barter-rs/blob/develop/LICENSE
+[mit-url]: https://github.com/Niqnil/rustrade/blob/main/LICENSE
+[crates-badge]: https://img.shields.io/crates/v/rustrade.svg
+[crates-url]: https://crates.io/crates/rustrade
+[docs-badge]: https://img.shields.io/docsrs/rustrade
+[docs-url]: https://docs.rs/rustrade
+
+## Overview
+
+rustrade is a collection of Rust libraries for live-trading, paper-trading, and backtesting. It provides:
+
+* **Fast**: Native Rust with minimal allocations. Data-oriented state management with O(1) lookups.
+* **Robust**: Strongly typed, thread-safe, with extensive test coverage.
+* **Customisable**: Plug-and-play Strategy and RiskManager components.
+* **Scalable**: Multithreaded architecture leveraging Tokio for async I/O.
+
+### Crates
+
+| Crate | Description |
+|-------|-------------|
+| [`rustrade`][rustrade-crate] | Algorithmic trading engine with state management |
+| [`rustrade-data`][rustrade-data-crate] | Stream public market data from exchanges |
+| [`rustrade-execution`][rustrade-execution-crate] | Stream account data and execute orders |
+| [`rustrade-instrument`][rustrade-instrument-crate] | Exchange, instrument, and asset data structures |
+| [`rustrade-integration`][rustrade-integration-crate] | Low-level REST/WebSocket integration framework |
+
+[rustrade-crate]: https://crates.io/crates/rustrade
+[rustrade-data-crate]: https://crates.io/crates/rustrade-data
+[rustrade-execution-crate]: https://crates.io/crates/rustrade-execution
+[rustrade-instrument-crate]: https://crates.io/crates/rustrade-instrument
+[rustrade-integration-crate]: https://crates.io/crates/rustrade-integration
+
+### Supported Exchanges
+
+| Exchange | Market Data | Execution | Notes |
+|----------|-------------|-----------|-------|
+| **Binance** | ✅ Spot | ✅ Spot | WebSocket + REST |
+| **Alpaca** | — | ✅ Equities, Options, Crypto | REST + WebSocket |
+| **Hyperliquid** | ✅ Perps, Spot | ✅ Perps, Spot | WebSocket + REST |
+| **Interactive Brokers** | ✅ All asset classes | ✅ All asset classes | TWS/Gateway API |
+
+## Quick Start
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+rustrade = "0.1"
+rustrade-data = { version = "0.1", features = ["hyperliquid"] }
+rustrade-execution = { version = "0.1", features = ["binance"] }
+```
+
+See the [examples](https://github.com/Niqnil/rustrade/tree/main/rustrade/examples) for complete working code.
+
+## Minimum Supported Rust Version
+
+Rust 1.95 or later.
 
 ## Disclaimer
 
 This software is for educational purposes only. USE THE SOFTWARE AT YOUR OWN RISK. THE AUTHORS AND ALL AFFILIATES ASSUME NO RESPONSIBILITY FOR YOUR TRADING RESULTS.
 
-## Overview
-Barter is an algorithmic trading ecosystem of Rust libraries for building high-performance live-trading, paper-trading
-and back-testing systems. It is made up of several easy-to-use, extensible crates:
-* **Barter**: Algorithmic trading Engine with feature rich state management system.
-* **Barter-Instrument**: Exchange, Instrument and Asset data structures and utilities.
-* **Barter-Data**: Stream public market data from financial venues. Easily extensible via the MarketStream interface.
-* **Barter-Execution**: Stream private account data and execute orders. Includes live clients for **Binance** (spot), **Alpaca** (equities, options, crypto), **Hyperliquid** (spot, perpetuals), and **IBKR** (equities, futures, options, forex). Easily extensible via the ExecutionClient interface.
-* **Barter-Integration**: Low-level frameworks for flexible REST/WebSocket integrations.
+## Fork Attribution
 
-## Notable Features
-- Stream public market data from financial venues via the [`Barter-Data`] library.
-- Stream private account data, execute orders (live or mock) via the [`Barter-Execution`] library.
-- Live execution clients for Binance (spot), Alpaca, Hyperliquid (spot, perpetuals), and IBKR.
-- Plug and play Strategy and RiskManager components that facilitate most trading strategies.
-- Backtest utilities for efficiently running thousands of concurrent backtests.
-- Flexible Engine that facilitates trading strategies that execute on many exchanges simultaneously.
-- Use mock MarketStream or Execution components to enable back-testing on a near-identical trading system as live-trading.
-- Centralised cache friendly state management system with O(1) constant lookups using indexed data structures.
-- Robust Order management system - use stand-alone or with Barter.
-- Trading summaries with comprehensive performance metrics (PnL, Sharpe, Sortino, Drawdown, etc.).
-- Turn on/off algorithmic trading from an external process (eg/ UI, Telegram, etc.) whilst still processing market/account data.
-- Issue Engine Commands from an external process (eg/ UI, Telegram, etc.) to initiate actions (CloseAllPositions, OpenOrders, CancelOrders, etc.).
-- EngineState replica manager that processes the Engine AuditStream to facilitate non-hot path monitoring components (eg/ UI, Telegram, etc.).
+This project is a fork of [barter-rs](https://github.com/barter-rs/barter-rs), originally developed by Just A Stream, Inc. and the Barter Ecosystem Contributors. See [NOTICE](NOTICE) for full attribution.
 
-[`Barter`]: https://crates.io/crates/barter
-[`Barter-Instrument`]: https://crates.io/crates/barter-instrument
-[`Barter-Data`]: https://crates.io/crates/barter-data
-[`Barter-Execution`]: https://crates.io/crates/barter-execution
-[`Barter-Integration`]: https://crates.io/crates/barter-integration
-[API Documentation]: https://docs.rs/barter/latest/barter/
-[barter-examples]: https://github.com/Niqnil/barter-rs/tree/develop/barter/examples
-
-## Examples
-* See [here][barter-examples] for the compilable example including imports.
-* See sub-crates for further examples of each library.
-
-#### Paper Trading With Live Market Data & Mock Execution
-
-```rust,no_run
-const FILE_PATH_SYSTEM_CONFIG: &str = "barter/examples/config/system_config.json";
-const RISK_FREE_RETURN: Decimal = dec!(0.05);
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialise Tracing
-    init_logging();
-
-    // Load SystemConfig
-    let SystemConfig {
-        instruments,
-        executions,
-    } = load_config()?;
-
-    // Construct IndexedInstruments
-    let instruments = IndexedInstruments::new(instruments);
-
-    // Initialise MarketData Stream
-    let market_stream = init_indexed_multi_exchange_market_stream(
-        &instruments,
-        &[SubKind::PublicTrades, SubKind::OrderBooksL1],
-    )
-    .await?;
-
-    // Construct System Args
-    let args = SystemArgs::new(
-        &instruments,
-        executions,
-        LiveClock,
-        DefaultStrategy::default(),
-        DefaultRiskManager::default(),
-        market_stream,
-    );
-
-    // Build & run full system:
-    // See SystemBuilder for all configuration options
-    let mut system = SystemBuilder::new(args)
-        // Engine feed in Sync mode (Iterator input)
-        .engine_feed_mode(EngineFeedMode::Iterator)
-
-        // Audit feed is enabled (Engine sends audits)
-        .audit_mode(AuditMode::Enabled)
-
-        // Engine starts with TradingState::Disabled
-        .trading_state(TradingState::Disabled)
-
-        // Build System, but don't start spawning tasks yet
-        .build::<EngineEvent, DefaultGlobalData, DefaultInstrumentMarketData>()?
-
-        // Init System, spawning component tasks on the current runtime
-        .init_with_runtime(tokio::runtime::Handle::current())
-        .await?;
-
-    // Take ownership of Engine audit receiver
-    let audit_rx = system.audit_rx.take().unwrap();
-
-    // Run dummy asynchronous AuditStream consumer
-    // Note: you probably want to use this Stream to replicate EngineState, or persist events, etc.
-    //  --> eg/ see examples/engine_sync_with_audit_replica_engine_state
-    let audit_task = tokio::spawn(async move {
-        let mut audit_stream = audit_rx.into_stream();
-        while let Some(audit) = audit_stream.next().await {
-            debug!(?audit, "AuditStream consumed AuditTick");
-            if let EngineAudit::Shutdown(_) = audit.event {
-                break;
-            }
-        }
-        audit_stream
-    });
-
-    // Enable trading
-    system.trading_state(TradingState::Enabled);
-
-    // Let the example run for 5 seconds...
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    // Before shutting down, CancelOrders and then ClosePositions
-    system.cancel_orders(InstrumentFilter::None);
-    system.close_positions(InstrumentFilter::None);
-
-    // Shutdown
-    let (engine, _shutdown_audit) = system.shutdown().await?;
-    let _audit_stream = audit_task.await?;
-
-    // Generate TradingSummary<Daily>
-    let trading_summary = engine
-        .trading_summary_generator(RISK_FREE_RETURN)
-        .generate(Daily);
-
-    // Print TradingSummary<Daily> to terminal (could save in a file, send somewhere, etc.)
-    trading_summary.print_summary();
-
-    Ok(())
-}
-
-fn load_config() -> Result<SystemConfig, Box<dyn std::error::Error>> {
-    let file = File::open(FILE_PATH_SYSTEM_CONFIG)?;
-    let reader = BufReader::new(file);
-    let config = serde_json::from_reader(reader)?;
-    Ok(config)
-}
-```
+Fork history:
+- Original: [barter-rs/barter-rs](https://github.com/barter-rs/barter-rs)
+- Intermediate: [Niqnil/barter-rs](https://github.com/Niqnil/barter-rs)
+- Current: [Niqnil/rustrade](https://github.com/Niqnil/rustrade)
 
 ## Getting Help
-See if the answer to your question can be found in the [API Documentation]. If not, open a [Discussion](https://github.com/Niqnil/barter-rs/discussions) on GitHub.
+
+Check the [API Documentation](https://docs.rs/rustrade). If your question isn't answered there, open a [Discussion](https://github.com/Niqnil/rustrade/discussions) on GitHub.
 
 ## Contributing
-Contributions are welcome. Please open a PR targeting the `develop` branch. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow.
 
-### Licence
-This project is licensed under the [MIT license].
+Contributions welcome! Please open a PR targeting the `develop` branch. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-[MIT license]: https://github.com/Niqnil/barter-rs/blob/develop/LICENSE
+## License
 
-### Contribution License Agreement
-
-Any contribution you submit shall be:
-1. Licensed under MIT
-2. Subject to the disclaimer above
-3. Provided without any additional terms or conditions
-
-By submitting a contribution, you certify that you have the right to do so under these terms.
+MIT License. See [LICENSE](LICENSE).
