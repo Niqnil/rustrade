@@ -72,6 +72,29 @@ cargo test --workspace --all-features
 
 Integration tests are marked with `#[ignore]` by default to avoid running in CI.
 
+## Changelog & Versioning
+
+We follow [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
+
+**For contributors:**
+- Add notable changes under `## [Unreleased]` in CHANGELOG.md
+- Use sections: `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`
+- Don't bump version numbers — maintainers handle this at release time
+
+**Deprecation policy:**
+This is a library crate — avoid breaking downstream users unnecessarily.
+- Use `#[deprecated(since = "x.y.z", note = "Use X instead")]` before removing APIs
+- Keep deprecated items for at least one minor version
+- Document migration paths in CHANGELOG.md under `Deprecated`
+- Only remove in the next major version (or minor version pre-1.0)
+
+**Release process (maintainers):**
+1. Create release prep PR: bump versions in all Cargo.toml files
+2. Rename `[Unreleased]` → `[x.y.z] - YYYY-MM-DD`, add new empty `[Unreleased]`
+3. Merge to main
+4. Tag: `git tag v0.1.0 && git push origin v0.1.0`
+5. Publish workflow runs automatically
+
 ## What NOT to Contribute
 
 This is a generic trading engine library. The following belong in downstream consumers, not here:
