@@ -1,4 +1,4 @@
-name: "Barter CI"
+name: "rustrade CI"
 
 on:
   push:
@@ -52,7 +52,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
-          shared-key: "barter-ci-check"
+          shared-key: "rustrade-ci-check"
 
       - name: Run cargo check
         run: cargo check --workspace --all-targets --all-features
@@ -76,7 +76,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
-          shared-key: "barter-ci-test"
+          shared-key: "rustrade-ci-test"
 
       - name: Run cargo test
         # Exclude examples to avoid mold linker hitting .debug_str section size limits
@@ -103,7 +103,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
-          shared-key: "barter-ci-check"
+          shared-key: "rustrade-ci-check"
 
       - name: Run cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious -D clippy::style -W clippy::complexity -D clippy::perf
