@@ -21,7 +21,7 @@ serde_json = { workspace = true }
 
 [dependencies]
 # IBKR (optional, behind "ibkr" feature)
-ibapi = { version = "=2.11.0", optional = true, default-features = false, features = ["sync"] }
+ibapi = { version = "=2.11.2", optional = true, default-features = false, features = ["sync"] }
 fnv = { workspace = true, optional = true }
 parking_lot = { workspace = true, optional = true }
 # SerDe
