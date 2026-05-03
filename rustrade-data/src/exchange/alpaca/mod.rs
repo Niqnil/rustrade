@@ -7,7 +7,7 @@
 //!
 //! # Authentication
 //!
-//! Requires `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY` environment variables.
+//! Requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` environment variables.
 //! Auth message is sent immediately after WebSocket connection, before subscriptions.
 //!
 //! # Connectors
@@ -22,8 +22,8 @@
 //! - [`Quotes`](crate::subscription::quote::Quotes): Real-time quotes (NBBO for equities, bid/ask for crypto)
 
 use self::{
-    channel::AlpacaChannel, market::AlpacaMarket, quote::AlpacaQuote,
-    subscription::AlpacaSubResponse, trade::AlpacaTrade,
+    channel::AlpacaChannel, market::AlpacaMarket, quote::AlpacaQuoteTransformer,
+    subscription::AlpacaSubResponse, trade::AlpacaTradeTransformer,
 };
 use crate::{
     ExchangeWsStream, NoInitialSnapshots,
@@ -34,7 +34,6 @@ use crate::{
         validator::{SubscriptionValidator, WebSocketSubValidator},
     },
     subscription::{quote::Quotes, trade::PublicTrades},
-    transformer::stateless::StatelessTransformer,
 };
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
@@ -169,8 +168,7 @@ where
     Server: ExchangeServer + Debug + Send + Sync,
 {
     type SnapFetcher = NoInitialSnapshots;
-    type Stream =
-        AlpacaWsStream<StatelessTransformer<Self, Instrument::Key, PublicTrades, AlpacaTrade>>;
+    type Stream = AlpacaWsStream<AlpacaTradeTransformer<Self, Instrument::Key>>;
 }
 
 impl<Instrument, Server> StreamSelector<Instrument, Quotes> for Alpaca<Server>
@@ -179,7 +177,7 @@ where
     Server: ExchangeServer + Debug + Send + Sync,
 {
     type SnapFetcher = NoInitialSnapshots;
-    type Stream = AlpacaWsStream<StatelessTransformer<Self, Instrument::Key, Quotes, AlpacaQuote>>;
+    type Stream = AlpacaWsStream<AlpacaQuoteTransformer<Self, Instrument::Key>>;
 }
 
 impl<'de, Server> Deserialize<'de> for Alpaca<Server>
@@ -276,16 +274,16 @@ impl crate::subscriber::Subscriber for AlpacaSubscriber {
 /// Authenticate to Alpaca WebSocket using env credentials.
 ///
 /// # Note
-/// Reads `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY` from environment.
+/// Reads `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` from environment.
 /// This is a Phase 2 expedient — other market data connectors use unauthenticated
 /// public streams. A proper credential-injection mechanism should be designed
 /// when another authenticated market data connector is added.
 // FIXME: Design credential-injection mechanism for Subscriber trait instead of env::var
 async fn alpaca_authenticate(ws: &mut WebSocket) -> Result<(), SocketError> {
-    let api_key = env::var("APCA_API_KEY_ID")
-        .map_err(|e| SocketError::Subscribe(format!("APCA_API_KEY_ID: {e}")))?;
-    let api_secret = env::var("APCA_API_SECRET_KEY")
-        .map_err(|e| SocketError::Subscribe(format!("APCA_API_SECRET_KEY: {e}")))?;
+    let api_key = env::var("ALPACA_API_KEY")
+        .map_err(|e| SocketError::Subscribe(format!("ALPACA_API_KEY: {e}")))?;
+    let api_secret = env::var("ALPACA_SECRET_KEY")
+        .map_err(|e| SocketError::Subscribe(format!("ALPACA_SECRET_KEY: {e}")))?;
 
     let auth_msg = json!({
         "action": "auth",
@@ -344,12 +342,15 @@ fn check_alpaca_auth_response(text: &str) -> Option<Result<(), SocketError>> {
     }
 
     // Alpaca sends messages as JSON arrays: [{"T":"success",...}]
+    // On connect, Alpaca sends [{"T":"success","msg":"connected"}]
+    // After auth, Alpaca sends [{"T":"success","msg":"authenticated"}]
+    // We must wait for "authenticated", not just any "success"
     let messages: Vec<AuthMsg<'_>> = serde_json::from_str(text).ok()?;
 
     for msg in &messages {
-        match msg.msg_type {
-            "success" => return Some(Ok(())),
-            "error" => {
+        match (msg.msg_type, msg.msg) {
+            ("success", Some("authenticated")) => return Some(Ok(())),
+            ("error", _) => {
                 return Some(Err(SocketError::Subscribe(format!(
                     "Alpaca auth failed: {}",
                     msg.msg.unwrap_or("unknown error")

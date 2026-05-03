@@ -1,15 +1,22 @@
 use super::channel::AlpacaChannel;
 use crate::{
     Identifier,
-    event::{MarketEvent, MarketIter},
+    error::DataError,
+    event::MarketEvent,
     exchange::ExchangeSub,
-    subscription::trade::PublicTrade,
+    subscription::{Map, trade::PublicTrade},
+    transformer::ExchangeTransformer,
 };
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rustrade_instrument::{Side, exchange::ExchangeId};
-use rustrade_integration::subscription::SubscriptionId;
-use serde::{Deserialize, Serialize};
+use rustrade_integration::{
+    Transformer, protocol::websocket::WsMessage, subscription::SubscriptionId,
+};
+use serde::{Deserialize, Deserializer};
 use smol_str::{SmolStr, format_smolstr};
+use std::marker::PhantomData;
+use tokio::sync::mpsc;
 
 /// Deserialize "S" (symbol) field as the associated [`SubscriptionId`] for trades.
 fn de_trade_subscription_id<'de, D>(deserializer: D) -> Result<SubscriptionId, D::Error>
@@ -33,7 +40,7 @@ where
 /// ```json
 /// {"T":"t","S":"BTC/USD","i":456,"p":60000.50,"s":0.5,"tks":"B","t":"2026-05-02T14:00:00Z"}
 /// ```
-#[derive(Clone, PartialEq, Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 pub struct AlpacaTrade {
     /// Subscription ID constructed from symbol during deserialization.
     /// Avoids per-event `format!` allocation in hot path.
@@ -72,28 +79,110 @@ impl AlpacaTrade {
     }
 }
 
-impl Identifier<Option<SubscriptionId>> for AlpacaTrade {
-    fn id(&self) -> Option<SubscriptionId> {
-        Some(self.subscription_id.clone())
+/// Alpaca WebSocket message wrapper.
+///
+/// Alpaca sends all messages as JSON arrays: `[{"T":"t",...},{"T":"t",...}]`.
+/// This wrapper deserializes the array and extracts trade messages.
+#[derive(Debug)]
+pub struct AlpacaTradeMessage(Vec<AlpacaTrade>);
+
+/// Internal enum for single-pass deserialization of Alpaca array messages.
+/// Uses `#[serde(tag = "T")]` to dispatch on message type in one parse pass,
+/// avoiding the intermediate `Vec<serde_json::Value>` allocation.
+#[derive(Deserialize)]
+#[serde(tag = "T")]
+enum AlpacaArrayTradeMsg {
+    #[serde(rename = "t")]
+    Trade(AlpacaTrade),
+    #[serde(other)]
+    Other,
+}
+
+impl<'de> Deserialize<'de> for AlpacaTradeMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let messages = Vec::<AlpacaArrayTradeMsg>::deserialize(deserializer)?;
+        let mut trades = Vec::with_capacity(messages.len());
+        for msg in messages {
+            if let AlpacaArrayTradeMsg::Trade(trade) = msg {
+                trades.push(trade);
+            }
+        }
+        Ok(AlpacaTradeMessage(trades))
     }
 }
 
-impl<InstrumentKey> From<(ExchangeId, InstrumentKey, AlpacaTrade)>
-    for MarketIter<InstrumentKey, PublicTrade>
+/// Custom transformer for Alpaca trade messages.
+///
+/// Handles array-wrapped messages and processes each trade individually,
+/// looking up the correct instrument for each symbol.
+#[derive(Debug)]
+pub struct AlpacaTradeTransformer<Exchange, InstrumentKey> {
+    instrument_map: Map<InstrumentKey>,
+    exchange_id: ExchangeId,
+    phantom: PhantomData<Exchange>,
+}
+
+#[async_trait]
+impl<Exchange, InstrumentKey>
+    ExchangeTransformer<Exchange, InstrumentKey, crate::subscription::trade::PublicTrades>
+    for AlpacaTradeTransformer<Exchange, InstrumentKey>
+where
+    Exchange: crate::exchange::Connector + Send,
+    InstrumentKey: Clone + Send,
 {
-    fn from((exchange_id, instrument, trade): (ExchangeId, InstrumentKey, AlpacaTrade)) -> Self {
-        Self(vec![Ok(MarketEvent {
-            time_exchange: trade.timestamp,
-            time_received: Utc::now(),
-            exchange: exchange_id,
-            instrument,
-            kind: PublicTrade {
-                id: format_smolstr!("{}", trade.id),
-                price: trade.price,
-                amount: trade.size,
-                side: trade.side(),
-            },
-        })])
+    async fn init(
+        instrument_map: Map<InstrumentKey>,
+        _: &[MarketEvent<InstrumentKey, PublicTrade>],
+        _: mpsc::UnboundedSender<WsMessage>,
+    ) -> Result<Self, DataError> {
+        Ok(Self {
+            instrument_map,
+            exchange_id: Exchange::ID,
+            phantom: PhantomData,
+        })
+    }
+}
+
+impl<Exchange, InstrumentKey> Transformer for AlpacaTradeTransformer<Exchange, InstrumentKey>
+where
+    Exchange: crate::exchange::Connector,
+    InstrumentKey: Clone,
+{
+    type Error = DataError;
+    type Input = AlpacaTradeMessage;
+    type Output = MarketEvent<InstrumentKey, PublicTrade>;
+    type OutputIter = Vec<Result<Self::Output, Self::Error>>;
+
+    fn transform(&mut self, input: Self::Input) -> Self::OutputIter {
+        let mut results = Vec::with_capacity(input.0.len());
+        let time_received = Utc::now();
+
+        for trade in input.0 {
+            match self.instrument_map.find(&trade.subscription_id) {
+                Ok(instrument) => {
+                    results.push(Ok(MarketEvent {
+                        time_exchange: trade.timestamp,
+                        time_received,
+                        exchange: self.exchange_id,
+                        instrument: instrument.clone(),
+                        kind: PublicTrade {
+                            id: format_smolstr!("{}", trade.id),
+                            price: trade.price,
+                            amount: trade.size,
+                            side: trade.side(),
+                        },
+                    }));
+                }
+                Err(unidentified) => {
+                    results.push(Err(DataError::Socket(unidentified.to_string())));
+                }
+            }
+        }
+
+        results
     }
 }
 
