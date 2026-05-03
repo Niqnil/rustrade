@@ -15,6 +15,7 @@ description = "High performance & normalised WebSocket intergration for leading 
 default = []
 ibkr = ["dep:ibapi", "dep:time", "rustrade-instrument/ibkr"]
 hyperliquid = ["dep:hyperliquid_rust_sdk"]
+alpaca = []
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }

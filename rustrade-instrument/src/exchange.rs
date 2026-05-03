@@ -34,6 +34,10 @@ pub enum ExchangeId {
     Other,
     Simulated,
     Mock,
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use AlpacaIex, AlpacaSip, or AlpacaCrypto instead"
+    )]
     Alpaca,
     BinanceFuturesCoin,
     BinanceFuturesUsd,
@@ -73,6 +77,14 @@ pub enum ExchangeId {
     HyperliquidPerp,
     /// Hyperliquid spot trading (decentralized, EVM-based)
     HyperliquidSpot,
+    /// Alpaca Broker API (execution for equities, options, and crypto)
+    AlpacaBroker,
+    /// Alpaca crypto market data (wss://stream.data.alpaca.markets/v1beta3/crypto/us)
+    AlpacaCrypto,
+    /// Alpaca IEX equities market data (free feed)
+    AlpacaIex,
+    /// Alpaca SIP equities market data (paid consolidated feed)
+    AlpacaSip,
     /// Interactive Brokers — equities, futures, options, forex
     Ibkr,
     Kraken,
@@ -86,11 +98,16 @@ pub enum ExchangeId {
 impl ExchangeId {
     /// Return the &str representation of this [`ExchangeId`]
     pub fn as_str(&self) -> &'static str {
+        #[allow(deprecated)] // Alpaca variant retained for serialization until removal
         match self {
             ExchangeId::Other => "other",
             ExchangeId::Simulated => "simulated",
             ExchangeId::Mock => "mock",
             ExchangeId::Alpaca => "alpaca",
+            ExchangeId::AlpacaBroker => "alpaca_broker",
+            ExchangeId::AlpacaCrypto => "alpaca_crypto",
+            ExchangeId::AlpacaIex => "alpaca_iex",
+            ExchangeId::AlpacaSip => "alpaca_sip",
             ExchangeId::BinanceFuturesCoin => "binance_futures_coin",
             ExchangeId::BinanceFuturesUsd => "binance_futures_usd",
             ExchangeId::BinanceOptions => "binance_options",
