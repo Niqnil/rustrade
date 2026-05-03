@@ -43,7 +43,7 @@ rustrade is a collection of Rust libraries for live-trading, paper-trading, and 
 | Exchange | Market Data | Execution | Notes |
 |----------|-------------|-----------|-------|
 | **Binance** | ✅ Spot | ✅ Spot | WebSocket + REST |
-| **Alpaca** | — | ✅ Equities, Options, Crypto | REST + WebSocket |
+| **Alpaca** | ✅ Equities (IEX/SIP), Crypto | ✅ Equities, Options, Crypto | WebSocket + REST |
 | **Hyperliquid** | ✅ Perps, Spot | ✅ Perps, Spot | WebSocket + REST |
 | **Interactive Brokers** | ✅ All asset classes | ✅ All asset classes | TWS/Gateway API |
 

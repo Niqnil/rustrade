@@ -44,6 +44,10 @@ pub mod hyperliquid;
 #[cfg(feature = "ibkr")]
 pub mod ibkr;
 
+/// `Alpaca` market data stream (behind `alpaca` feature).
+#[cfg(feature = "alpaca")]
+pub mod alpaca;
+
 /// Defines the generic [`ExchangeSub`] containing a market and channel combination used by an
 /// exchange [`Connector`] to build [`WsMessage`] subscription payloads.
 pub mod subscription;

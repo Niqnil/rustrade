@@ -835,7 +835,7 @@ async fn rest_delete_with_retry(
 // ---------------------------------------------------------------------------
 
 impl ExecutionClient for AlpacaClient {
-    const EXCHANGE: ExchangeId = ExchangeId::Alpaca;
+    const EXCHANGE: ExchangeId = ExchangeId::AlpacaBroker;
     type Config = AlpacaConfig;
     type AccountStream = BoxStream<'static, UnindexedAccountEvent>;
 
@@ -909,7 +909,7 @@ impl ExecutionClient for AlpacaClient {
         let instrument_snapshots = build_instrument_snapshots(open_orders, instruments);
 
         Ok(AccountSnapshot::new(
-            ExchangeId::Alpaca,
+            ExchangeId::AlpacaBroker,
             balances,
             instrument_snapshots,
         ))
@@ -1225,7 +1225,7 @@ impl AlpacaClient {
         let cid = request.key.cid.clone();
 
         let order_key = crate::order::OrderKey::new(
-            ExchangeId::Alpaca,
+            ExchangeId::AlpacaBroker,
             instrument.clone(),
             request.key.strategy.clone(),
             cid.clone(),
@@ -2134,7 +2134,8 @@ async fn recover_fills(
             cumulative.normalize()
         ));
 
-        let event = UnindexedAccountEvent::new(ExchangeId::Alpaca, AccountEventKind::Trade(trade));
+        let event =
+            UnindexedAccountEvent::new(ExchangeId::AlpacaBroker, AccountEventKind::Trade(trade));
 
         // Re-use fill_dedup_key_from_event so the key logic is in one place.
         if fill_dedup_key_from_event(&event).is_some_and(|k| is_duplicate(dedup, k)) {
@@ -2334,7 +2335,7 @@ fn convert_open_order(
 
     Some(Order {
         key: OrderKey::new(
-            ExchangeId::Alpaca,
+            ExchangeId::AlpacaBroker,
             instrument,
             // Alpaca doesn't carry strategy IDs in any response field.
             StrategyId::unknown(),
@@ -2468,7 +2469,7 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
                 ),
             );
             Some(UnindexedAccountEvent::new(
-                ExchangeId::Alpaca,
+                ExchangeId::AlpacaBroker,
                 AccountEventKind::Trade(trade),
             ))
         }
@@ -2499,7 +2500,12 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
 
             let open_state = Open::new(order_id, time_exchange, filled_qty);
             let order_snapshot = crate::order::Order {
-                key: OrderKey::new(ExchangeId::Alpaca, instrument, StrategyId::unknown(), cid),
+                key: OrderKey::new(
+                    ExchangeId::AlpacaBroker,
+                    instrument,
+                    StrategyId::unknown(),
+                    cid,
+                ),
                 side,
                 price,
                 quantity,
@@ -2508,7 +2514,7 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
                 state: OrderState::active(open_state),
             };
             Some(UnindexedAccountEvent::new(
-                ExchangeId::Alpaca,
+                ExchangeId::AlpacaBroker,
                 AccountEventKind::OrderSnapshot(
                     rustrade_integration::collection::snapshot::Snapshot(order_snapshot),
                 ),
@@ -2531,24 +2537,34 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
                 Decimal::from_str(order.filled_qty.unwrap_or("0")).unwrap_or(Decimal::ZERO);
             let cancelled = Cancelled::new(order_id, time_exchange, filled_qty);
             let response = crate::order::request::OrderResponseCancel {
-                key: OrderKey::new(ExchangeId::Alpaca, instrument, StrategyId::unknown(), cid),
+                key: OrderKey::new(
+                    ExchangeId::AlpacaBroker,
+                    instrument,
+                    StrategyId::unknown(),
+                    cid,
+                ),
                 state: Ok(cancelled),
             };
             Some(UnindexedAccountEvent::new(
-                ExchangeId::Alpaca,
+                ExchangeId::AlpacaBroker,
                 AccountEventKind::OrderCancelled(response),
             ))
         }
 
         "rejected" => {
             let response = crate::order::request::OrderResponseCancel {
-                key: OrderKey::new(ExchangeId::Alpaca, instrument, StrategyId::unknown(), cid),
+                key: OrderKey::new(
+                    ExchangeId::AlpacaBroker,
+                    instrument,
+                    StrategyId::unknown(),
+                    cid,
+                ),
                 state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
                     format!("order rejected: status={}", order.status),
                 ))),
             };
             Some(UnindexedAccountEvent::new(
-                ExchangeId::Alpaca,
+                ExchangeId::AlpacaBroker,
                 AccountEventKind::OrderCancelled(response),
             ))
         }
@@ -3860,7 +3876,7 @@ mod tests {
             // Create a Sell order with reduce_only=true (should map to SellToClose)
             let request = OrderRequestOpen {
                 key: OrderKey {
-                    exchange: ExchangeId::Alpaca,
+                    exchange: ExchangeId::AlpacaBroker,
                     instrument: InstrumentNameExchange::new("AAPL"),
                     strategy: StrategyId::new("test-strategy"),
                     cid: ClientOrderId::new("test-cid"),
@@ -3958,7 +3974,7 @@ mod tests {
             let instrument = InstrumentNameExchange::new("AAPL");
             let request = OrderRequestOpen {
                 key: OrderKey {
-                    exchange: ExchangeId::Alpaca,
+                    exchange: ExchangeId::AlpacaBroker,
                     instrument: &instrument,
                     strategy: StrategyId::new("test-strategy"),
                     cid: ClientOrderId::new("test-cid"),

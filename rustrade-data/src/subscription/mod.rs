@@ -23,6 +23,9 @@ pub mod candle;
 /// Liquidation [`SubscriptionKind`] and the associated Barter output data model.
 pub mod liquidation;
 
+/// Quote [`SubscriptionKind`] and the associated Barter output data model.
+pub mod quote;
+
 /// Public trade [`SubscriptionKind`] and the associated Barter output data model.
 pub mod trade;
 
@@ -87,6 +90,9 @@ pub enum SubKind {
     OrderBooksL3,
     Liquidations,
     Candles,
+    /// Real-time top-of-book quotes (best bid/ask). Generic subscription kind
+    /// that may be supported by multiple exchanges providing quote data.
+    Quotes,
 }
 
 impl<Exchange, S, Kind> From<(Exchange, S, S, MarketDataInstrumentKind, Kind)>

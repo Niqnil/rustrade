@@ -1,6 +1,7 @@
 use crate::{Identifier, subscription::Subscription};
 use rustrade_integration::subscription::SubscriptionId;
 use serde::Deserialize;
+use smol_str::format_smolstr;
 
 /// Defines an exchange specific market and channel combination used by an exchange
 /// [`Connector`](super::Connector) to build the
@@ -47,7 +48,7 @@ where
     Market: AsRef<str>,
 {
     fn id(&self) -> SubscriptionId {
-        SubscriptionId::from(format!(
+        SubscriptionId(format_smolstr!(
             "{}|{}",
             self.channel.as_ref(),
             self.market.as_ref()
