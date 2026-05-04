@@ -48,6 +48,10 @@ pub mod ibkr;
 #[cfg(feature = "alpaca")]
 pub mod alpaca;
 
+/// `Databento` historical and live market data (behind `databento` feature).
+#[cfg(feature = "databento")]
+pub mod databento;
+
 /// Defines the generic [`ExchangeSub`] containing a market and channel combination used by an
 /// exchange [`Connector`] to build [`WsMessage`] subscription payloads.
 pub mod subscription;

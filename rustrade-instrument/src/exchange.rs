@@ -62,6 +62,16 @@ pub enum ExchangeId {
     Coinbase,
     CoinbaseInternational,
     Cryptocom,
+    /// Databento DBEQ.MAX — Composite US equities (all venues)
+    DatabentoDbeq,
+    /// Databento GLBX.MDP3 — CME Globex futures
+    DatabentoGlbx,
+    /// Databento OPRA.PILLAR — US options consolidated
+    DatabentoOpra,
+    /// Databento XNAS.ITCH — Nasdaq equities
+    DatabentoXnas,
+    /// Databento XNYS.PILLAR — NYSE equities
+    DatabentoXnys,
     Deribit,
     GateioFuturesBtc,
     GateioFuturesUsd,
@@ -131,6 +141,11 @@ impl ExchangeId {
             ExchangeId::Coinbase => "coinbase",
             ExchangeId::CoinbaseInternational => "coinbase_international",
             ExchangeId::Cryptocom => "cryptocom",
+            ExchangeId::DatabentoDbeq => "databento_dbeq",
+            ExchangeId::DatabentoGlbx => "databento_glbx",
+            ExchangeId::DatabentoOpra => "databento_opra",
+            ExchangeId::DatabentoXnas => "databento_xnas",
+            ExchangeId::DatabentoXnys => "databento_xnys",
             ExchangeId::Deribit => "deribit",
             ExchangeId::GateioFuturesBtc => "gateio_futures_btc",
             ExchangeId::GateioFuturesUsd => "gateio_futures_usd",
