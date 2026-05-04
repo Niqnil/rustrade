@@ -9,7 +9,13 @@
 //! client wrappers that handle connection management internally:
 //!
 //! - [`DatabentoHistorical`]: One-shot queries for data older than 24 hours
-//! - Live streaming and intraday replay support is planned.
+//! - [`DatabentoLive`]: Real-time streaming for live and intraday replay data
+//!
+//! # Connection Model
+//!
+//! - **One connection per dataset**: Each client connects to one dataset (e.g., GLBX.MDP3)
+//! - **Multiple symbols per connection**: Databento recommends consolidating subscriptions
+//! - **Connection limits**: 10/dataset (standard) or 50/dataset (enterprise)
 //!
 //! # Authentication
 //!
@@ -27,6 +33,8 @@
 
 mod error;
 pub mod historical;
+pub mod live;
 pub(crate) mod transformer;
 
 pub use historical::{DatabentoHistorical, load_quotes_from_dbn, load_trades_from_dbn};
+pub use live::DatabentoLive;

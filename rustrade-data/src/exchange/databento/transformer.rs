@@ -5,7 +5,10 @@
 //! # Price Format
 //!
 //! DBN uses fixed-point `i64` with 1e-9 scaling (9 decimal places).
-//! Convert via `price as f64 / FIXED_PRICE_SCALE`.
+//!
+//! - **Lossless (preferred)**: `Decimal::new(px, 9)` — used by [`dbn_mbp1_to_orderbook_l1`].
+//! - **f64**: `price as f64 / FIXED_PRICE_SCALE` — used by [`dbn_trade_to_public_trade`]
+//!   and [`dbn_mbp1_to_quote`] where `f64` output is required.
 //!
 //! # Timestamp Format
 //!
@@ -13,9 +16,11 @@
 //! - `ts_event`: Exchange timestamp (used as `time_exchange`)
 //! - `ts_recv`: Databento receive timestamp
 
-use crate::subscription::{quote::Quote, trade::PublicTrade};
+use crate::books::Level;
+use crate::subscription::{book::OrderBookL1, quote::Quote, trade::PublicTrade};
 use chrono::{DateTime, TimeZone, Utc};
 use databento::dbn::{Mbp1Msg, TradeMsg};
+use rust_decimal::Decimal;
 use rustrade_instrument::Side;
 use smol_str::format_smolstr;
 
@@ -99,6 +104,55 @@ pub fn dbn_mbp1_to_quote(msg: &Mbp1Msg) -> Result<(DateTime<Utc>, Quote), &'stat
     ))
 }
 
+/// Convert a DBN Mbp1Msg (top-of-book) to an OrderBookL1.
+///
+/// Returns the exchange timestamp and the converted order book snapshot, or an error description.
+///
+/// Unlike [`dbn_mbp1_to_quote`] which returns f64 prices, this returns [`OrderBookL1`] with
+/// [`Decimal`] prices suitable for use with [`DataKind`](crate::event::DataKind).
+///
+/// Prices are converted losslessly from DBN's fixed-point `i64` (9 decimal places) to `Decimal`.
+pub fn dbn_mbp1_to_orderbook_l1(
+    msg: &Mbp1Msg,
+) -> Result<(DateTime<Utc>, OrderBookL1), &'static str> {
+    let [level] = &msg.levels;
+
+    let time_exchange = nanos_to_datetime(msg.hd.ts_event)?;
+
+    let best_bid = if level.bid_px != UNDEF_PRICE {
+        let price = Decimal::new(level.bid_px, 9);
+        let amount = if level.bid_sz == UNDEF_SIZE {
+            Decimal::ZERO
+        } else {
+            Decimal::from(level.bid_sz)
+        };
+        Some(Level { price, amount })
+    } else {
+        None
+    };
+
+    let best_ask = if level.ask_px != UNDEF_PRICE {
+        let price = Decimal::new(level.ask_px, 9);
+        let amount = if level.ask_sz == UNDEF_SIZE {
+            Decimal::ZERO
+        } else {
+            Decimal::from(level.ask_sz)
+        };
+        Some(Level { price, amount })
+    } else {
+        None
+    };
+
+    Ok((
+        time_exchange,
+        OrderBookL1 {
+            last_update_time: time_exchange,
+            best_bid,
+            best_ask,
+        },
+    ))
+}
+
 fn nanos_to_datetime(nanos: u64) -> Result<DateTime<Utc>, &'static str> {
     let secs = i64::try_from(nanos / 1_000_000_000).map_err(|_| "timestamp out of i64 range")?;
     let nsecs = (nanos % 1_000_000_000) as u32;
@@ -113,6 +167,7 @@ fn nanos_to_datetime(nanos: u64) -> Result<DateTime<Utc>, &'static str> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn test_trade_conversion() {
@@ -181,5 +236,42 @@ mod tests {
         assert_eq!(quote.bid_amount, 1000.0);
         assert_eq!(quote.ask_amount, 500.0);
         assert_eq!(time.timestamp(), 1_700_000_000);
+    }
+
+    #[test]
+    fn test_orderbook_l1_conversion() {
+        let mut msg = Mbp1Msg::default();
+        msg.hd.ts_event = 1_700_000_000_000_000_000;
+        msg.levels[0].bid_px = 100_000_000_000;
+        msg.levels[0].ask_px = 100_500_000_000;
+        msg.levels[0].bid_sz = 1000;
+        msg.levels[0].ask_sz = 500;
+
+        let (time, l1) = dbn_mbp1_to_orderbook_l1(&msg).unwrap();
+
+        let best_bid = l1.best_bid.unwrap();
+        let best_ask = l1.best_ask.unwrap();
+
+        assert_eq!(best_bid.price, Decimal::from(100));
+        assert_eq!(best_ask.price, Decimal::from_str("100.5").unwrap());
+        assert_eq!(best_bid.amount, Decimal::from(1000));
+        assert_eq!(best_ask.amount, Decimal::from(500));
+        assert_eq!(time.timestamp(), 1_700_000_000);
+        assert_eq!(l1.last_update_time.timestamp(), 1_700_000_000);
+    }
+
+    #[test]
+    fn test_orderbook_l1_undefined_prices() {
+        let mut msg = Mbp1Msg::default();
+        msg.hd.ts_event = 1_700_000_000_000_000_000;
+        msg.levels[0].bid_px = i64::MAX; // UNDEF_PRICE
+        msg.levels[0].ask_px = i64::MAX; // UNDEF_PRICE
+        msg.levels[0].bid_sz = 1000;
+        msg.levels[0].ask_sz = 500;
+
+        let (_, l1) = dbn_mbp1_to_orderbook_l1(&msg).unwrap();
+
+        assert!(l1.best_bid.is_none());
+        assert!(l1.best_ask.is_none());
     }
 }

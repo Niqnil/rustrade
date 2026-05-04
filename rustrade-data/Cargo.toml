@@ -21,7 +21,7 @@ databento = ["dep:databento"]
 [dev-dependencies]
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 rust_decimal_macros = { workspace = true }
-time = { version = "0.3" }  # For ibkr tests only (ibapi uses time::OffsetDateTime)
+time = { version = "0.3", features = ["macros"] }  # For ibkr tests and databento examples
 
 [dependencies]
 # Rustrade Ecosystem

@@ -39,7 +39,6 @@ use tracing::{debug, info};
 /// Historical data fetcher for Databento.
 ///
 /// Wraps [`HistoricalClient`] for fetching historical market data older than 24 hours.
-/// Live streaming support for real-time or intraday data is planned.
 #[derive(Debug)]
 pub struct DatabentoHistorical {
     client: HistoricalClient,
