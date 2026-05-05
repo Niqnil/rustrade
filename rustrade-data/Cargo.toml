@@ -16,11 +16,12 @@ default = []
 ibkr = ["dep:ibapi", "dep:time", "rustrade-instrument/ibkr"]
 hyperliquid = ["dep:hyperliquid_rust_sdk"]
 alpaca = []
+databento = ["dep:databento"]
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 rust_decimal_macros = { workspace = true }
-time = { version = "0.3" }  # For ibkr tests only (ibapi uses time::OffsetDateTime)
+time = { version = "0.3", features = ["macros"] }  # For ibkr tests and databento examples
 
 [dependencies]
 # Rustrade Ecosystem
@@ -67,3 +68,7 @@ time = { version = "0.3", optional = true, features = ["macros"] }
 
 # Hyperliquid (optional, behind "hyperliquid" feature)
 hyperliquid_rust_sdk = { version = "0.6", optional = true }
+
+# Databento (optional, behind "databento" feature)
+# Note: databento re-exports dbn, so we don't need a separate dbn dependency
+databento = { version = "0.49", optional = true }
