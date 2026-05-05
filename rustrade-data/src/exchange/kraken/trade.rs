@@ -5,6 +5,7 @@ use crate::{
     subscription::trade::PublicTrade,
 };
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use rustrade_instrument::{Side, exchange::ExchangeId};
 use rustrade_integration::{
     serde::de::{datetime_utc_from_epoch_duration, extract_next},
@@ -34,9 +35,9 @@ pub struct KrakenTradesInner {
 /// See docs: <https://docs.kraken.com/websockets/#message-trade>
 #[derive(Copy, Clone, PartialEq, PartialOrd, Debug, Serialize)]
 pub struct KrakenTrade {
-    pub price: f64,
+    pub price: Decimal,
     #[serde(rename = "quantity")]
-    pub amount: f64,
+    pub amount: Decimal,
     pub time: DateTime<Utc>,
     pub side: Side,
 }
@@ -77,7 +78,7 @@ impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, KrakenTrades)>
                             id: custom_kraken_trade_id(&trade),
                             price: trade.price,
                             amount: trade.amount,
-                            side: trade.side,
+                            side: Some(trade.side),
                         },
                     })
                 })
@@ -166,20 +167,20 @@ impl<'de> serde::de::Deserialize<'de> for KrakenTrade {
                 // [price, volume, time, side, orderType, misc]
                 // <https://docs.kraken.com/websockets/#message-trade>
 
-                // Extract String price & parse to f64
+                // Extract String price & parse to Decimal
                 let price = extract_next::<SeqAccessor, String>(&mut seq, "price")?
                     .parse()
                     .map_err(serde::de::Error::custom)?;
 
-                // Extract String amount & parse to f64
+                // Extract String amount & parse to Decimal
                 let amount = extract_next::<SeqAccessor, String>(&mut seq, "quantity")?
                     .parse()
                     .map_err(serde::de::Error::custom)?;
 
-                // Extract String price, parse to f64, map to DateTime<Utc>
+                // Extract String time, parse to f64, map to DateTime<Utc>
                 let time = extract_next::<SeqAccessor, String>(&mut seq, "time")?
                     .parse()
-                    .map(|time| {
+                    .map(|time: f64| {
                         datetime_utc_from_epoch_duration(std::time::Duration::from_secs_f64(time))
                     })
                     .map_err(serde::de::Error::custom)?;
@@ -211,6 +212,7 @@ mod tests {
 
     mod de {
         use super::*;
+        use rust_decimal_macros::dec;
         use rustrade_instrument::Side;
         use rustrade_integration::{
             error::SocketError, serde::de::datetime_utc_from_epoch_duration,
@@ -255,16 +257,16 @@ mod tests {
                     subscription_id: SubscriptionId::from("trade|XBT/USD"),
                     trades: vec![
                         KrakenTrade {
-                            price: 5541.2,
-                            amount: 0.15850568,
+                            price: dec!(5541.20000),
+                            amount: dec!(0.15850568),
                             time: datetime_utc_from_epoch_duration(
                                 std::time::Duration::from_secs_f64(1534614057.321597),
                             ),
                             side: Side::Sell,
                         },
                         KrakenTrade {
-                            price: 6060.0,
-                            amount: 0.02455000,
+                            price: dec!(6060.00000),
+                            amount: dec!(0.02455000),
                             time: datetime_utc_from_epoch_duration(
                                 std::time::Duration::from_secs_f64(1534614057.324998),
                             ),

@@ -391,14 +391,15 @@ pub mod test_utils {
         subscription::trade::PublicTrade,
     };
     use chrono::{DateTime, Utc};
+    use rust_decimal::Decimal;
     use rustrade_instrument::{Side, exchange::ExchangeId};
 
     pub fn market_event_trade_buy<InstrumentKey>(
         time_exchange: DateTime<Utc>,
         time_received: DateTime<Utc>,
         instrument: InstrumentKey,
-        price: f64,
-        quantity: f64,
+        price: Decimal,
+        quantity: Decimal,
     ) -> MarketEvent<InstrumentKey, DataKind> {
         MarketEvent {
             time_exchange,
@@ -409,7 +410,7 @@ pub mod test_utils {
                 id: "trade_id".into(),
                 price,
                 amount: quantity,
-                side: Side::Buy,
+                side: Some(Side::Buy),
             }),
         }
     }

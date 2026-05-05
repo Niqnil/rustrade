@@ -6,6 +6,7 @@ use crate::{
     subscription::trade::PublicTrade,
 };
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use rustrade_instrument::{Side, exchange::ExchangeId};
 use rustrade_integration::subscription::SubscriptionId;
 use serde::{Deserialize, Serialize};
@@ -40,13 +41,13 @@ pub struct GateioSpotTradeInner {
     pub time: DateTime<Utc>,
     pub id: u64,
     #[serde(deserialize_with = "rustrade_integration::serde::de::de_str")]
-    pub price: f64,
+    pub price: Decimal,
 
     #[serde(
         alias = "size",
         deserialize_with = "rustrade_integration::serde::de::de_str"
     )]
-    pub amount: f64,
+    pub amount: Decimal,
 
     /// Taker [`Side`] of the trade.
     pub side: Side,
@@ -73,7 +74,7 @@ impl<InstrumentKey> From<(ExchangeId, InstrumentKey, GateioSpotTrade)>
                 id: format_smolstr!("{}", trade.data.id),
                 price: trade.data.price,
                 amount: trade.data.amount,
-                side: trade.data.side,
+                side: Some(trade.data.side),
             },
         })])
     }
