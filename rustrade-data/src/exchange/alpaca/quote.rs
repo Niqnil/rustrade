@@ -9,6 +9,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use rustrade_instrument::exchange::ExchangeId;
 use rustrade_integration::{
     Transformer, protocol::websocket::WsMessage, subscription::SubscriptionId,
@@ -47,13 +48,13 @@ pub struct AlpacaQuote {
     #[serde(rename = "S", deserialize_with = "de_quote_subscription_id")]
     pub subscription_id: SubscriptionId,
     #[serde(rename = "bp")]
-    pub bid_price: f64,
+    pub bid_price: Decimal,
     #[serde(rename = "bs")]
-    pub bid_size: f64,
+    pub bid_size: Decimal,
     #[serde(rename = "ap")]
-    pub ask_price: f64,
+    pub ask_price: Decimal,
     #[serde(rename = "as")]
-    pub ask_size: f64,
+    pub ask_size: Decimal,
     #[serde(rename = "t")]
     pub timestamp: DateTime<Utc>,
     #[serde(rename = "bx", default)]
@@ -175,6 +176,7 @@ where
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
 
     #[test]
     fn test_de_equities_quote() {
@@ -182,10 +184,10 @@ mod tests {
         let quote: AlpacaQuote = serde_json::from_str(input).unwrap();
 
         assert_eq!(quote.subscription_id.as_ref(), "quotes|AAPL");
-        assert_eq!(quote.bid_price, 150.20);
-        assert_eq!(quote.bid_size, 200.0);
-        assert_eq!(quote.ask_price, 150.25);
-        assert_eq!(quote.ask_size, 100.0);
+        assert_eq!(quote.bid_price, dec!(150.20));
+        assert_eq!(quote.bid_size, dec!(200));
+        assert_eq!(quote.ask_price, dec!(150.25));
+        assert_eq!(quote.ask_size, dec!(100));
         assert_eq!(quote.bid_exchange, Some(SmolStr::new("Q")));
         assert_eq!(quote.ask_exchange, Some(SmolStr::new("V")));
         assert_eq!(quote.tape, Some(SmolStr::new("C")));
@@ -197,10 +199,10 @@ mod tests {
         let quote: AlpacaQuote = serde_json::from_str(input).unwrap();
 
         assert_eq!(quote.subscription_id.as_ref(), "quotes|BTC/USD");
-        assert_eq!(quote.bid_price, 60000.00);
-        assert_eq!(quote.bid_size, 2.0);
-        assert_eq!(quote.ask_price, 60000.50);
-        assert_eq!(quote.ask_size, 1.0);
+        assert_eq!(quote.bid_price, dec!(60000.00));
+        assert_eq!(quote.bid_size, dec!(2.0));
+        assert_eq!(quote.ask_price, dec!(60000.50));
+        assert_eq!(quote.ask_size, dec!(1.0));
         assert!(quote.bid_exchange.is_none());
         assert!(quote.ask_exchange.is_none());
         assert!(quote.tape.is_none());

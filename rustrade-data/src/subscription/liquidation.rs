@@ -1,5 +1,6 @@
 use super::SubscriptionKind;
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use rustrade_instrument::Side;
 use serde::{Deserialize, Serialize};
 
@@ -28,7 +29,7 @@ impl std::fmt::Display for Liquidations {
 #[derive(Clone, Copy, PartialEq, PartialOrd, Debug, Deserialize, Serialize)]
 pub struct Liquidation {
     pub side: Side,
-    pub price: f64,
-    pub quantity: f64,
+    pub price: Decimal,
+    pub quantity: Decimal,
     pub time: DateTime<Utc>,
 }

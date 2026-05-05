@@ -9,6 +9,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use rustrade_instrument::{Side, exchange::ExchangeId};
 use rustrade_integration::{
     Transformer, protocol::websocket::WsMessage, subscription::SubscriptionId,
@@ -49,9 +50,9 @@ pub struct AlpacaTrade {
     #[serde(rename = "i")]
     pub id: u64,
     #[serde(rename = "p")]
-    pub price: f64,
+    pub price: Decimal,
     #[serde(rename = "s")]
-    pub size: f64,
+    pub size: Decimal,
     #[serde(rename = "t")]
     pub timestamp: DateTime<Utc>,
     #[serde(rename = "x", default)]
@@ -63,18 +64,15 @@ pub struct AlpacaTrade {
 }
 
 impl AlpacaTrade {
-    /// Returns the taker side for crypto trades, or `Side::Buy` as a sentinel for equities.
+    /// Returns the taker side for crypto trades, or `None` for equities.
     ///
-    /// # Note
     /// Alpaca equities (IEX/SIP) do not provide taker side information — the `tks` field
-    /// is only present on crypto trades. For equities, this returns `Side::Buy` as a
-    /// placeholder. Downstream consumers should not rely on `side` for equity trades.
-    // FIXME: Migrate PublicTrade::side to Option<Side> to properly represent this
-    fn side(&self) -> Side {
+    /// is only present on crypto trades.
+    fn side(&self) -> Option<Side> {
         match self.taker_side.as_deref() {
-            Some("B") => Side::Buy,
-            Some("S") => Side::Sell,
-            _ => Side::Buy,
+            Some("B") => Some(Side::Buy),
+            Some("S") => Some(Side::Sell),
+            _ => None,
         }
     }
 }
@@ -190,6 +188,7 @@ where
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
 
     #[test]
     fn test_de_equities_trade() {
@@ -198,8 +197,8 @@ mod tests {
 
         assert_eq!(trade.subscription_id.as_ref(), "trades|AAPL");
         assert_eq!(trade.id, 123);
-        assert_eq!(trade.price, 150.25);
-        assert_eq!(trade.size, 100.0);
+        assert_eq!(trade.price, dec!(150.25));
+        assert_eq!(trade.size, dec!(100));
         assert_eq!(trade.exchange, Some(SmolStr::new("V")));
         assert_eq!(trade.tape, Some(SmolStr::new("C")));
         assert!(trade.taker_side.is_none());
@@ -212,19 +211,26 @@ mod tests {
 
         assert_eq!(trade.subscription_id.as_ref(), "trades|BTC/USD");
         assert_eq!(trade.id, 456);
-        assert_eq!(trade.price, 60000.50);
-        assert_eq!(trade.size, 0.5);
+        assert_eq!(trade.price, dec!(60000.50));
+        assert_eq!(trade.size, dec!(0.5));
         assert!(trade.exchange.is_none());
         assert!(trade.tape.is_none());
         assert_eq!(trade.taker_side, Some(SmolStr::new("B")));
-        assert_eq!(trade.side(), Side::Buy);
+        assert_eq!(trade.side(), Some(Side::Buy));
     }
 
     #[test]
     fn test_crypto_side_sell() {
         let input = r#"{"T":"t","S":"ETH/USD","i":789,"p":3000.0,"s":1.0,"tks":"S","t":"2026-05-02T14:00:00Z"}"#;
         let trade: AlpacaTrade = serde_json::from_str(input).unwrap();
-        assert_eq!(trade.side(), Side::Sell);
+        assert_eq!(trade.side(), Some(Side::Sell));
+    }
+
+    #[test]
+    fn test_equities_side_none() {
+        let input = r#"{"T":"t","S":"AAPL","i":123,"x":"V","p":150.25,"s":100,"c":["@"],"z":"C","t":"2026-05-02T14:00:00Z"}"#;
+        let trade: AlpacaTrade = serde_json::from_str(input).unwrap();
+        assert!(trade.side().is_none());
     }
 
     #[test]

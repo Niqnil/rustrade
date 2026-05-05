@@ -27,6 +27,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use futures_util::StreamExt;
+use rust_decimal::Decimal;
 use rustrade_data::{
     exchange::hyperliquid::HyperliquidSpot,
     streams::{
@@ -109,8 +110,8 @@ async fn test_spot_trade_stream_receives_data() {
         match timeout {
             Ok(Some(Event::Item(trade))) => {
                 tracing::info!(?trade, "Received spot trade");
-                assert!(trade.kind.price > 0.0, "Invalid trade price");
-                assert!(trade.kind.amount > 0.0, "Invalid trade amount");
+                assert!(trade.kind.price > Decimal::ZERO, "Invalid trade price");
+                assert!(trade.kind.amount > Decimal::ZERO, "Invalid trade amount");
                 return;
             }
             Ok(Some(Event::Reconnecting(info))) => {

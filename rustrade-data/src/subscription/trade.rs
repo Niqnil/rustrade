@@ -1,4 +1,5 @@
 use super::SubscriptionKind;
+use rust_decimal::Decimal;
 use rustrade_instrument::Side;
 use rustrade_macro::{DeSubKind, SerSubKind};
 use serde::{Deserialize, Serialize};
@@ -30,10 +31,20 @@ impl std::fmt::Display for PublicTrades {
 /// Uses [`SmolStr`] for `id` to avoid heap allocation for typical trade IDs
 /// (up to 23 bytes on 64-bit systems are stored inline). Exceptions that
 /// heap-allocate: Bitmex UUIDs (36 bytes), Kraken composite IDs (~34 bytes).
+///
+/// # Side Field
+///
+/// The `side` field indicates the taker/aggressor side of the trade:
+/// - `Some(Side::Buy)`: Taker was buying (lifted the ask)
+/// - `Some(Side::Sell)`: Taker was selling (hit the bid)
+/// - `None`: Side information not available from the data source
+///
+/// Crypto exchanges typically provide side info. Equities feeds (e.g., Alpaca IEX/SIP)
+/// often do not, as consolidated tape data doesn't include aggressor information.
 #[derive(Clone, PartialEq, PartialOrd, Debug, Deserialize, Serialize)]
 pub struct PublicTrade {
     pub id: SmolStr,
-    pub price: f64,
-    pub amount: f64,
-    pub side: Side,
+    pub price: Decimal,
+    pub amount: Decimal,
+    pub side: Option<Side>,
 }

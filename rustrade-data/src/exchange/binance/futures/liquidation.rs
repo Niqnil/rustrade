@@ -5,6 +5,7 @@ use crate::{
     subscription::liquidation::Liquidation,
 };
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use rustrade_instrument::{Side, exchange::ExchangeId};
 use rustrade_integration::subscription::SubscriptionId;
 use serde::{Deserialize, Serialize};
@@ -68,12 +69,12 @@ pub struct BinanceLiquidationOrder {
         alias = "p",
         deserialize_with = "rustrade_integration::serde::de::de_str"
     )]
-    pub price: f64,
+    pub price: Decimal,
     #[serde(
         alias = "q",
         deserialize_with = "rustrade_integration::serde::de::de_str"
     )]
-    pub quantity: f64,
+    pub quantity: Decimal,
     #[serde(
         alias = "T",
         deserialize_with = "rustrade_integration::serde::de::de_u64_epoch_ms_as_datetime_utc"
@@ -128,6 +129,7 @@ mod tests {
 
     mod de {
         use super::*;
+        use rust_decimal_macros::dec;
         use rustrade_integration::serde::de::datetime_utc_from_epoch_duration;
         use std::time::Duration;
 
@@ -159,8 +161,8 @@ mod tests {
                     order: BinanceLiquidationOrder {
                         subscription_id: SubscriptionId::from("@forceOrder|BTCUSDT"),
                         side: Side::Sell,
-                        price: 18917.15,
-                        quantity: 0.009,
+                        price: dec!(18917.15),
+                        quantity: dec!(0.009),
                         time: datetime_utc_from_epoch_duration(Duration::from_millis(
                             1665523974217,
                         )),
