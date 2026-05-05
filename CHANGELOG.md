@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING**: `PublicTrade::side` changed from `Side` to `Option<Side>`.
+  - Crypto connectors (Binance, Hyperliquid, Alpaca Crypto, etc.): `Some(side)`
+  - Equities connectors (Alpaca IEX/SIP, IBKR): `None` — taker side not available
+  - Databento: `Some(side)` for 'A'/'B', `None` for 'N' (no side specified)
+  - Migration: Match on `Some(side)` to handle the `None` case explicitly, or use
+    `.is_some_and(|s| s == Side::Buy)` for boolean checks. (`Side` does not implement
+    `Default`, so `unwrap_or_default()` will not compile.)
 - **BREAKING**: `PublicTrade`, `Quote`, `Candle`, and `Liquidation` price/amount fields
   changed from `f64` to `rust_decimal::Decimal` for financial precision.
   - `PublicTrade`: `price`, `amount` now `Decimal`

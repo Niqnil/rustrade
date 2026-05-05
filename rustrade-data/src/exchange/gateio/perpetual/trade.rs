@@ -97,11 +97,11 @@ impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, GateioFuturesTrades)
                         id: format_smolstr!("{}", trade.id),
                         price: trade.price,
                         amount: trade.amount.abs(),
-                        side: if trade.amount.is_sign_positive() {
+                        side: Some(if trade.amount.is_sign_positive() {
                             Side::Buy
                         } else {
                             Side::Sell
-                        },
+                        }),
                     },
                 })
             })

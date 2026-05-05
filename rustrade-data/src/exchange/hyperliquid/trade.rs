@@ -151,7 +151,7 @@ where
                         id: format_smolstr!("{}", trade.tid),
                         price: trade.px,
                         amount: trade.sz,
-                        side,
+                        side: Some(side),
                     },
                 })
             })
@@ -231,7 +231,7 @@ mod tests {
         let market_iter: MarketIter<&str, PublicTrade> =
             (ExchangeId::HyperliquidPerp, "BTC", hl_trade).into();
         let event = market_iter.0[0].as_ref().unwrap();
-        assert_eq!(event.kind.side, Side::Sell);
+        assert_eq!(event.kind.side, Some(Side::Sell));
     }
 
     #[test]
@@ -244,7 +244,7 @@ mod tests {
         let market_iter: MarketIter<&str, PublicTrade> =
             (ExchangeId::HyperliquidPerp, "BTC", hl_trade).into();
         let event = market_iter.0[0].as_ref().unwrap();
-        assert_eq!(event.kind.side, Side::Buy);
+        assert_eq!(event.kind.side, Some(Side::Buy));
     }
 
     #[test]

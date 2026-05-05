@@ -78,7 +78,7 @@ impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, KrakenTrades)>
                             id: custom_kraken_trade_id(&trade),
                             price: trade.price,
                             amount: trade.amount,
-                            side: trade.side,
+                            side: Some(trade.side),
                         },
                     })
                 })

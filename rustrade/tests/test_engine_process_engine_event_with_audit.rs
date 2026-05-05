@@ -979,7 +979,7 @@ fn market_event_trade(time_plus: u64, instrument: usize, price: Decimal) -> Engi
             id: time_plus.to_string().into(),
             price,
             amount: Decimal::ONE,
-            side: Side::Buy,
+            side: Some(Side::Buy),
         }),
     }))
 }
