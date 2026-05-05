@@ -27,6 +27,14 @@ const UNDEF_SIZE: u32 = u32::MAX;
 /// Convert a DBN TradeMsg to a PublicTrade.
 ///
 /// Returns the exchange timestamp and the converted trade, or an error description.
+///
+/// # Side Field
+///
+/// DBN side values:
+/// - `'A'` (65): Sell aggressor → `Some(Side::Sell)`
+/// - `'B'` (66): Buy aggressor → `Some(Side::Buy)`
+/// - `'N'` (78): No side specified by source → `None`
+/// - Other values: Returns error (malformed data)
 pub fn dbn_trade_to_public_trade(
     trade: &TradeMsg,
 ) -> Result<(DateTime<Utc>, PublicTrade), &'static str> {
@@ -42,9 +50,10 @@ pub fn dbn_trade_to_public_trade(
     // DBN guarantees Side is ASCII (range [0, 127]); i8 -> u8 cast is lossless.
     #[allow(clippy::cast_sign_loss)]
     let side = match trade.side as u8 {
-        b'A' => Side::Sell,
-        b'B' => Side::Buy,
-        _ => return Err("unknown or undefined trade side"),
+        b'A' => Some(Side::Sell),
+        b'B' => Some(Side::Buy),
+        b'N' => None,
+        _ => return Err("unknown trade side value"),
     };
 
     Ok((
@@ -179,7 +188,7 @@ mod tests {
 
         assert_eq!(public_trade.price, dec!(150.25));
         assert_eq!(public_trade.amount, dec!(100));
-        assert_eq!(public_trade.side, Side::Buy);
+        assert_eq!(public_trade.side, Some(Side::Buy));
         assert_eq!(public_trade.id.as_str(), "12345");
         assert_eq!(time.timestamp(), 1_700_000_000);
     }
@@ -194,16 +203,29 @@ mod tests {
         trade.sequence = 1;
 
         let (_, public_trade) = dbn_trade_to_public_trade(&trade).unwrap();
-        assert_eq!(public_trade.side, Side::Sell);
+        assert_eq!(public_trade.side, Some(Side::Sell));
     }
 
     #[test]
-    fn test_trade_unknown_side_rejected() {
+    fn test_trade_no_side() {
         let mut trade = TradeMsg::default();
         trade.hd.ts_event = 1_700_000_000_000_000_000;
         trade.price = 100_000_000_000;
         trade.size = 10;
         trade.side = b'N' as i8;
+        trade.sequence = 1;
+
+        let (_, public_trade) = dbn_trade_to_public_trade(&trade).unwrap();
+        assert!(public_trade.side.is_none());
+    }
+
+    #[test]
+    fn test_trade_invalid_side_rejected() {
+        let mut trade = TradeMsg::default();
+        trade.hd.ts_event = 1_700_000_000_000_000_000;
+        trade.price = 100_000_000_000;
+        trade.size = 10;
+        trade.side = b'X' as i8;
 
         assert!(dbn_trade_to_public_trade(&trade).is_err());
     }

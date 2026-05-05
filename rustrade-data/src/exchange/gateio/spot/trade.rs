@@ -74,7 +74,7 @@ impl<InstrumentKey> From<(ExchangeId, InstrumentKey, GateioSpotTrade)>
                 id: format_smolstr!("{}", trade.data.id),
                 price: trade.data.price,
                 amount: trade.data.amount,
-                side: trade.data.side,
+                side: Some(trade.data.side),
             },
         })])
     }

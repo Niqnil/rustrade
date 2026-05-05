@@ -57,7 +57,7 @@ impl<InstrumentKey> From<(ExchangeId, InstrumentKey, BitfinexTrade)>
                 id: format_smolstr!("{}", trade.id),
                 price: trade.price,
                 amount: trade.amount,
-                side: trade.side,
+                side: Some(trade.side),
             },
         })])
     }

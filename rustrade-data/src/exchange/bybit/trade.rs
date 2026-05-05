@@ -74,7 +74,7 @@ impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, BybitTrade)>
                             id: trade.id.into(),
                             price: trade.price,
                             amount: trade.amount,
-                            side: trade.side,
+                            side: Some(trade.side),
                         },
                     })
                 })

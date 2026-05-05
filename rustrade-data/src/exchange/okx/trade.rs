@@ -116,7 +116,7 @@ impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, OkxTrades)>
                         id: trade.id.into(),
                         price: trade.price,
                         amount: trade.amount,
-                        side: trade.side,
+                        side: Some(trade.side),
                     },
                 })
             })

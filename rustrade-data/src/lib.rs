@@ -410,7 +410,7 @@ pub mod test_utils {
                 id: "trade_id".into(),
                 price,
                 amount: quantity,
-                side: Side::Buy,
+                side: Some(Side::Buy),
             }),
         }
     }
