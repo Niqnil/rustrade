@@ -1,4 +1,5 @@
 use super::SubscriptionKind;
+use rust_decimal::Decimal;
 use rustrade_instrument::Side;
 use rustrade_macro::{DeSubKind, SerSubKind};
 use serde::{Deserialize, Serialize};
@@ -33,7 +34,7 @@ impl std::fmt::Display for PublicTrades {
 #[derive(Clone, PartialEq, PartialOrd, Debug, Deserialize, Serialize)]
 pub struct PublicTrade {
     pub id: SmolStr,
-    pub price: f64,
-    pub amount: f64,
+    pub price: Decimal,
+    pub amount: Decimal,
     pub side: Side,
 }

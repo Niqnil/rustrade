@@ -5,10 +5,7 @@
 //! # Price Format
 //!
 //! DBN uses fixed-point `i64` with 1e-9 scaling (9 decimal places).
-//!
-//! - **Lossless (preferred)**: `Decimal::new(px, 9)` — used by [`dbn_mbp1_to_orderbook_l1`].
-//! - **f64**: `price as f64 / FIXED_PRICE_SCALE` — used by [`dbn_trade_to_public_trade`]
-//!   and [`dbn_mbp1_to_quote`] where `f64` output is required.
+//! All conversions use `Decimal::new(px, 9)` for lossless representation.
 //!
 //! # Timestamp Format
 //!
@@ -24,8 +21,6 @@ use rust_decimal::Decimal;
 use rustrade_instrument::Side;
 use smol_str::format_smolstr;
 
-const FIXED_PRICE_SCALE: f64 = 1_000_000_000.0;
-
 const UNDEF_PRICE: i64 = i64::MAX;
 const UNDEF_SIZE: u32 = u32::MAX;
 
@@ -39,8 +34,8 @@ pub fn dbn_trade_to_public_trade(
         return Err("undefined price");
     }
 
-    let price = trade.price as f64 / FIXED_PRICE_SCALE;
-    let amount = trade.size as f64;
+    let price = Decimal::new(trade.price, 9);
+    let amount = Decimal::from(trade.size);
 
     let time_exchange = nanos_to_datetime(trade.hd.ts_event)?;
 
@@ -68,7 +63,7 @@ pub fn dbn_trade_to_public_trade(
 /// Returns the exchange timestamp and the converted quote, or an error description.
 ///
 /// Note: When DBN provides `UNDEF_SIZE` (`u32::MAX`) for bid/ask size, the
-/// corresponding `bid_amount`/`ask_amount` is set to `0.0`. Callers cannot
+/// corresponding `bid_amount`/`ask_amount` is set to zero. Callers cannot
 /// distinguish "empty book level" from "size unavailable in feed."
 pub fn dbn_mbp1_to_quote(msg: &Mbp1Msg) -> Result<(DateTime<Utc>, Quote), &'static str> {
     let [level] = &msg.levels;
@@ -77,18 +72,18 @@ pub fn dbn_mbp1_to_quote(msg: &Mbp1Msg) -> Result<(DateTime<Utc>, Quote), &'stat
         return Err("undefined bid or ask price");
     }
 
-    let bid_price = level.bid_px as f64 / FIXED_PRICE_SCALE;
-    let ask_price = level.ask_px as f64 / FIXED_PRICE_SCALE;
-    // UNDEF_SIZE (u32::MAX) means size unavailable; map to 0.0 (see rustdoc note)
+    let bid_price = Decimal::new(level.bid_px, 9);
+    let ask_price = Decimal::new(level.ask_px, 9);
+    // UNDEF_SIZE (u32::MAX) means size unavailable; map to zero (see rustdoc note)
     let bid_amount = if level.bid_sz == UNDEF_SIZE {
-        0.0
+        Decimal::ZERO
     } else {
-        level.bid_sz as f64
+        Decimal::from(level.bid_sz)
     };
     let ask_amount = if level.ask_sz == UNDEF_SIZE {
-        0.0
+        Decimal::ZERO
     } else {
-        level.ask_sz as f64
+        Decimal::from(level.ask_sz)
     };
 
     let time_exchange = nanos_to_datetime(msg.hd.ts_event)?;
@@ -108,8 +103,8 @@ pub fn dbn_mbp1_to_quote(msg: &Mbp1Msg) -> Result<(DateTime<Utc>, Quote), &'stat
 ///
 /// Returns the exchange timestamp and the converted order book snapshot, or an error description.
 ///
-/// Unlike [`dbn_mbp1_to_quote`] which returns f64 prices, this returns [`OrderBookL1`] with
-/// [`Decimal`] prices suitable for use with [`DataKind`](crate::event::DataKind).
+/// Unlike [`dbn_mbp1_to_quote`] which returns a flat [`Quote`], this returns [`OrderBookL1`]
+/// with `Option<Level>` fields, allowing callers to distinguish "no data" from "level exists."
 ///
 /// Prices are converted losslessly from DBN's fixed-point `i64` (9 decimal places) to `Decimal`.
 pub fn dbn_mbp1_to_orderbook_l1(
@@ -171,6 +166,8 @@ mod tests {
 
     #[test]
     fn test_trade_conversion() {
+        use rust_decimal_macros::dec;
+
         let mut trade = TradeMsg::default();
         trade.hd.ts_event = 1_700_000_000_000_000_000;
         trade.price = 150_250_000_000;
@@ -180,8 +177,8 @@ mod tests {
 
         let (time, public_trade) = dbn_trade_to_public_trade(&trade).unwrap();
 
-        assert_eq!(public_trade.price, 150.25);
-        assert_eq!(public_trade.amount, 100.0);
+        assert_eq!(public_trade.price, dec!(150.25));
+        assert_eq!(public_trade.amount, dec!(100));
         assert_eq!(public_trade.side, Side::Buy);
         assert_eq!(public_trade.id.as_str(), "12345");
         assert_eq!(time.timestamp(), 1_700_000_000);
@@ -222,6 +219,8 @@ mod tests {
 
     #[test]
     fn test_quote_conversion() {
+        use rust_decimal_macros::dec;
+
         let mut msg = Mbp1Msg::default();
         msg.hd.ts_event = 1_700_000_000_000_000_000;
         msg.levels[0].bid_px = 100_000_000_000;
@@ -231,10 +230,10 @@ mod tests {
 
         let (time, quote) = dbn_mbp1_to_quote(&msg).unwrap();
 
-        assert_eq!(quote.bid_price, 100.0);
-        assert_eq!(quote.ask_price, 100.5);
-        assert_eq!(quote.bid_amount, 1000.0);
-        assert_eq!(quote.ask_amount, 500.0);
+        assert_eq!(quote.bid_price, dec!(100));
+        assert_eq!(quote.ask_price, dec!(100.5));
+        assert_eq!(quote.bid_amount, dec!(1000));
+        assert_eq!(quote.ask_amount, dec!(500));
         assert_eq!(time.timestamp(), 1_700_000_000);
     }
 

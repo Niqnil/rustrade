@@ -7,6 +7,7 @@ use crate::{
     subscription::trade::PublicTrade,
 };
 use chrono::{TimeZone, Utc};
+use rust_decimal::Decimal;
 use rustrade_instrument::{Side, exchange::ExchangeId};
 use rustrade_integration::subscription::SubscriptionId;
 use serde::{Deserialize, Serialize};
@@ -47,9 +48,9 @@ pub struct HyperliquidTradeData {
     pub coin: SmolStr,
     pub side: SmolStr,
     #[serde(deserialize_with = "rustrade_integration::serde::de::de_str")]
-    pub px: f64,
+    pub px: Decimal,
     #[serde(deserialize_with = "rustrade_integration::serde::de::de_str")]
-    pub sz: f64,
+    pub sz: Decimal,
     pub time: u64,
     pub tid: u64,
 }
@@ -164,6 +165,7 @@ where
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
 
     #[test]
     fn test_de_hyperliquid_trade_message() {
@@ -187,8 +189,8 @@ mod tests {
         let trade: HyperliquidTrade = serde_json::from_str(input).unwrap();
         assert_eq!(trade.trades.len(), 1);
         assert_eq!(trade.trades[0].coin, "BTC");
-        assert_eq!(trade.trades[0].px, 45250.5);
-        assert_eq!(trade.trades[0].sz, 0.5);
+        assert_eq!(trade.trades[0].px, dec!(45250.5));
+        assert_eq!(trade.trades[0].sz, dec!(0.5));
         assert_eq!(trade.trades[0].side, "A");
     }
 
@@ -212,8 +214,8 @@ mod tests {
         HyperliquidTradeData {
             coin: SmolStr::new_static("BTC"),
             side: SmolStr::new(side),
-            px: 100.0,
-            sz: 1.0,
+            px: dec!(100),
+            sz: dec!(1),
             time: 1704067200000,
             tid: 1,
         }

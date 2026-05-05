@@ -3,6 +3,7 @@ use crate::{
     subscription::trade::PublicTrade,
 };
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use rustrade_instrument::{Side, exchange::ExchangeId};
 use rustrade_integration::serde::de::{datetime_utc_from_epoch_duration, extract_next};
 use serde::Serialize;
@@ -39,8 +40,8 @@ pub struct BitfinexTrade {
     pub id: u64,
     pub time: DateTime<Utc>,
     pub side: Side,
-    pub price: f64,
-    pub amount: f64,
+    pub price: Decimal,
+    pub amount: Decimal,
 }
 
 impl<InstrumentKey> From<(ExchangeId, InstrumentKey, BitfinexTrade)>
@@ -86,7 +87,7 @@ impl<'de> serde::Deserialize<'de> for BitfinexTrade {
                 // Trade: [ID, TIME, AMOUNT,PRICE]
                 let id = extract_next(&mut seq, "id")?;
                 let time_millis = extract_next(&mut seq, "time")?;
-                let amount: f64 = extract_next(&mut seq, "amount")?;
+                let amount: Decimal = extract_next(&mut seq, "amount")?;
                 let price = extract_next(&mut seq, "price")?;
                 let side = match amount.is_sign_positive() {
                     true => Side::Buy,

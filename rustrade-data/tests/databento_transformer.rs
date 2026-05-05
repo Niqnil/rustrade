@@ -3,6 +3,8 @@
 //! Uses pre-downloaded DBN fixtures to test transformation logic without API calls.
 //! These tests run in CI.
 
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use rustrade_data::exchange::databento::{load_quotes_from_dbn, load_trades_from_dbn};
 use rustrade_instrument::exchange::ExchangeId;
 use std::path::Path;
@@ -47,12 +49,18 @@ fn test_load_trades_from_dbn_fixture() {
 
     assert_eq!(first_trade.exchange, ExchangeId::DatabentoGlbx);
     assert_eq!(first_trade.instrument, "ESM4");
-    assert!(first_trade.kind.price > 0.0, "Price should be positive");
-    assert!(first_trade.kind.amount > 0.0, "Amount should be positive");
+    assert!(
+        first_trade.kind.price > Decimal::ZERO,
+        "Price should be positive"
+    );
+    assert!(
+        first_trade.kind.amount > Decimal::ZERO,
+        "Amount should be positive"
+    );
 
     // ES futures trade around June 2024 should be in 5000-6000 range
     assert!(
-        first_trade.kind.price > 1000.0 && first_trade.kind.price < 10000.0,
+        first_trade.kind.price > dec!(1000) && first_trade.kind.price < dec!(10000),
         "ES price {} outside expected range",
         first_trade.kind.price
     );
@@ -96,8 +104,14 @@ fn test_load_quotes_from_dbn_fixture() {
     assert_eq!(first_quote.instrument, "ESM4");
 
     let quote = &first_quote.kind;
-    assert!(quote.bid_price > 0.0, "Bid price should be positive");
-    assert!(quote.ask_price > 0.0, "Ask price should be positive");
+    assert!(
+        quote.bid_price > Decimal::ZERO,
+        "Bid price should be positive"
+    );
+    assert!(
+        quote.ask_price > Decimal::ZERO,
+        "Ask price should be positive"
+    );
     assert!(
         quote.ask_price >= quote.bid_price,
         "Ask should be >= bid, got bid={} ask={}",
@@ -107,7 +121,7 @@ fn test_load_quotes_from_dbn_fixture() {
 
     // ES futures around June 2024
     assert!(
-        quote.bid_price > 1000.0 && quote.bid_price < 10000.0,
+        quote.bid_price > dec!(1000) && quote.bid_price < dec!(10000),
         "ES bid {} outside expected range",
         quote.bid_price
     );
@@ -154,7 +168,7 @@ fn test_quote_spread_is_reasonable() {
         let spread = quote.kind.ask_price - quote.kind.bid_price;
         // ES spread should be small (typically 0.25 = 1 tick, sometimes 0.50)
         assert!(
-            (0.0..10.0).contains(&spread),
+            spread >= Decimal::ZERO && spread < dec!(10),
             "Spread {} is unreasonable for ES futures",
             spread
         );

@@ -5,6 +5,7 @@ use crate::{
     subscription::trade::PublicTrade,
 };
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use rustrade_instrument::{Side, exchange::ExchangeId};
 use rustrade_integration::subscription::SubscriptionId;
 use serde::{Deserialize, Serialize};
@@ -84,12 +85,12 @@ pub struct OkxTrade {
         rename = "px",
         deserialize_with = "rustrade_integration::serde::de::de_str"
     )]
-    pub price: f64,
+    pub price: Decimal,
     #[serde(
         rename = "sz",
         deserialize_with = "rustrade_integration::serde::de::de_str"
     )]
-    pub amount: f64,
+    pub amount: Decimal,
     pub side: Side,
     #[serde(
         rename = "ts",
@@ -147,6 +148,7 @@ mod tests {
 
     mod de {
         use super::*;
+        use rust_decimal_macros::dec;
         use rustrade_integration::{
             error::SocketError, serde::de::datetime_utc_from_epoch_duration,
         };
@@ -178,8 +180,8 @@ mod tests {
                 subscription_id: SubscriptionId::from("trades|BTC-USDT"),
                 data: vec![OkxTrade {
                     id: "130639474".to_string(),
-                    price: 42219.9,
-                    amount: 0.12060306,
+                    price: dec!(42219.9),
+                    amount: dec!(0.12060306),
                     side: Side::Buy,
                     time: datetime_utc_from_epoch_duration(Duration::from_millis(1630048897897)),
                 }],

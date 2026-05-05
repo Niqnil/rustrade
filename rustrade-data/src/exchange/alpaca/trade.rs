@@ -9,6 +9,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use rustrade_instrument::{Side, exchange::ExchangeId};
 use rustrade_integration::{
     Transformer, protocol::websocket::WsMessage, subscription::SubscriptionId,
@@ -49,9 +50,9 @@ pub struct AlpacaTrade {
     #[serde(rename = "i")]
     pub id: u64,
     #[serde(rename = "p")]
-    pub price: f64,
+    pub price: Decimal,
     #[serde(rename = "s")]
-    pub size: f64,
+    pub size: Decimal,
     #[serde(rename = "t")]
     pub timestamp: DateTime<Utc>,
     #[serde(rename = "x", default)]
@@ -190,6 +191,7 @@ where
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
 
     #[test]
     fn test_de_equities_trade() {
@@ -198,8 +200,8 @@ mod tests {
 
         assert_eq!(trade.subscription_id.as_ref(), "trades|AAPL");
         assert_eq!(trade.id, 123);
-        assert_eq!(trade.price, 150.25);
-        assert_eq!(trade.size, 100.0);
+        assert_eq!(trade.price, dec!(150.25));
+        assert_eq!(trade.size, dec!(100));
         assert_eq!(trade.exchange, Some(SmolStr::new("V")));
         assert_eq!(trade.tape, Some(SmolStr::new("C")));
         assert!(trade.taker_side.is_none());
@@ -212,8 +214,8 @@ mod tests {
 
         assert_eq!(trade.subscription_id.as_ref(), "trades|BTC/USD");
         assert_eq!(trade.id, 456);
-        assert_eq!(trade.price, 60000.50);
-        assert_eq!(trade.size, 0.5);
+        assert_eq!(trade.price, dec!(60000.50));
+        assert_eq!(trade.size, dec!(0.5));
         assert!(trade.exchange.is_none());
         assert!(trade.tape.is_none());
         assert_eq!(trade.taker_side, Some(SmolStr::new("B")));
