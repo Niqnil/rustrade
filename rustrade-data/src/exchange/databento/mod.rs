@@ -19,7 +19,18 @@
 //!
 //! # Authentication
 //!
-//! Requires `DATABENTO_API_KEY` environment variable. All endpoints are authenticated.
+//! Requires `DATABENTO_API_KEY` environment variable from an active Databento
+//! subscription.
+//!
+//! # Testing
+//!
+//! **Live data integration is NOT TESTED** — Databento does not offer development/sandbox
+//! keys and we do not have a subscription.
+//!
+//! - **Offline tests** (`databento_transformer.rs`): Verify DBN-to-rustrade
+//!   transformation using fixture files. Runs in CI.
+//! - **Integration tests** (`databento_integration.rs`): Written but not run.
+//!   Network calls (auth, API, WebSocket) are unverified.
 //!
 //! # Datasets
 //!

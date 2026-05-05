@@ -2,9 +2,17 @@
 //!
 //! These tests verify connectivity and data reception from Databento APIs.
 //!
+//! # Status
+//!
+//! **Live data integration is NOT TESTED.** Databento does not offer sandbox or
+//! development API keys, and we do not have a subscription. The transformation
+//! logic (DBN → rustrade events) is tested via fixtures in
+//! `databento_transformer.rs`, but the network integration (authentication,
+//! API calls, WebSocket streaming) has not been verified against real endpoints.
+//!
 //! # Prerequisites
 //!
-//! 1. Databento account (https://databento.com)
+//! 1. Databento account with active subscription
 //! 2. Environment variable set (see .env.template):
 //!    - DATABENTO_API_KEY: API key from Databento dashboard
 //!
@@ -20,8 +28,6 @@
 //! # Run specific test
 //! cargo test --test databento_integration --features databento test_historical_fetch_trades -- --ignored
 //! ```
-//!
-//! Tests are marked `#[ignore]` to avoid CI failures without credentials.
 //!
 //! # Market Hours Note
 //!

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Databento market data connector**: Historical and live data via `databento` feature
+  - `DatabentoHistorical`: One-shot queries for trades and quotes in DBN format
+  - `DatabentoLive<K>`: Real-time WebSocket streaming with `PitSymbolMap` symbol resolution
+  - `ExchangeId` variants: `DatabentoGlbx`, `DatabentoXnas`, `DatabentoXnys`, `DatabentoDbeq`, `DatabentoOpra`
+  - Nanosecond-precision timestamps, both f64 and Decimal price support
+  - **Note**: Live data integration is NOT TESTED — Databento does not offer development/sandbox keys and we do not have a subscription.
+    Offline fixture tests verify transformation logic; network integration is unverified.
 - **Alpaca market data connector**: Real-time trades and quotes via WebSocket
   - `AlpacaIex`: Free IEX feed for US equities
   - `AlpacaSip`: Paid consolidated SIP feed for US equities
