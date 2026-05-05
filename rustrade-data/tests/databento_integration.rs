@@ -44,6 +44,7 @@
 use databento::dbn::Schema;
 use databento::historical::timeseries::GetRangeParams;
 use futures_util::StreamExt;
+use rust_decimal::Decimal;
 use rustrade_data::exchange::databento::{DatabentoHistorical, DatabentoLive};
 use rustrade_instrument::exchange::ExchangeId;
 use std::collections::HashMap;
@@ -113,11 +114,17 @@ async fn test_historical_fetch_trades() {
     if !trades.is_empty() {
         let first = &trades[0];
         assert_eq!(first.exchange, ExchangeId::DatabentoGlbx);
-        assert!(first.kind.price > 0.0, "Trade price should be positive");
-        assert!(first.kind.amount > 0.0, "Trade amount should be positive");
+        assert!(
+            first.kind.price > Decimal::ZERO,
+            "Trade price should be positive"
+        );
+        assert!(
+            first.kind.amount > Decimal::ZERO,
+            "Trade amount should be positive"
+        );
         tracing::info!(
-            price = first.kind.price,
-            amount = first.kind.amount,
+            price = %first.kind.price,
+            amount = %first.kind.amount,
             "First trade"
         );
     }
@@ -155,15 +162,21 @@ async fn test_historical_fetch_quotes() {
     if !quotes.is_empty() {
         let first = &quotes[0];
         assert_eq!(first.exchange, ExchangeId::DatabentoGlbx);
-        assert!(first.kind.bid_price > 0.0, "Bid price should be positive");
-        assert!(first.kind.ask_price > 0.0, "Ask price should be positive");
+        assert!(
+            first.kind.bid_price > Decimal::ZERO,
+            "Bid price should be positive"
+        );
+        assert!(
+            first.kind.ask_price > Decimal::ZERO,
+            "Ask price should be positive"
+        );
         assert!(
             first.kind.ask_price >= first.kind.bid_price,
             "Ask should be >= bid"
         );
         tracing::info!(
-            bid = first.kind.bid_price,
-            ask = first.kind.ask_price,
+            bid = %first.kind.bid_price,
+            ask = %first.kind.ask_price,
             "First quote"
         );
     }

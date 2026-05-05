@@ -181,8 +181,8 @@ async fn test_historical_daily_bars() {
         first.close
     );
     assert!(
-        first.volume >= 0.0,
-        "Volume {:.2} should be non-negative",
+        !first.volume.is_sign_negative(),
+        "Volume {} should be non-negative",
         first.volume
     );
 }

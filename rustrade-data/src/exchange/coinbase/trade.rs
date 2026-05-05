@@ -6,6 +6,7 @@ use crate::{
     subscription::trade::PublicTrade,
 };
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use rustrade_instrument::{Side, exchange::ExchangeId};
 use rustrade_integration::subscription::SubscriptionId;
 use serde::{Deserialize, Serialize};
@@ -41,9 +42,9 @@ pub struct CoinbaseTrade {
         alias = "size",
         deserialize_with = "rustrade_integration::serde::de::de_str"
     )]
-    pub amount: f64,
+    pub amount: Decimal,
     #[serde(deserialize_with = "rustrade_integration::serde::de::de_str")]
-    pub price: f64,
+    pub price: Decimal,
     pub side: Side,
 }
 
@@ -87,6 +88,7 @@ where
 mod tests {
     use super::*;
     use chrono::NaiveDateTime;
+    use rust_decimal_macros::dec;
     use rustrade_integration::error::SocketError;
     use serde::de::Error;
     use std::str::FromStr;
@@ -120,8 +122,8 @@ mod tests {
                 expected: Ok(CoinbaseTrade {
                     subscription_id: SubscriptionId::from("matches|BTC-USD"),
                     id: 10,
-                    price: 400.23,
-                    amount: 5.23512,
+                    price: dec!(400.23),
+                    amount: dec!(5.23512),
                     side: Side::Sell,
                     time: NaiveDateTime::from_str("2014-11-07T08:19:27.028459")
                         .unwrap()

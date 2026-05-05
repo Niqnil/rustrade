@@ -6,10 +6,20 @@ use crate::{
     subscription::trade::PublicTrade,
 };
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use rustrade_instrument::{Side, exchange::ExchangeId};
 use rustrade_integration::subscription::SubscriptionId;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use smol_str::format_smolstr;
+
+/// Deserialize a signed integer (i64) as Decimal.
+/// Gate.io Futures sends `size` as a bare JSON integer (e.g., -108 for sells).
+fn de_i64_as_decimal<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    i64::deserialize(deserializer).map(Decimal::from)
+}
 
 /// Terse type alias for a `GateioFuturesUsdt`, `GateioFuturesBtc`, `GateioPerpetualUsdt` and
 /// `GateioPerpetualBtc` real-time trades WebSocket message.
@@ -55,9 +65,9 @@ pub struct GateioFuturesTradeInner {
     pub time: DateTime<Utc>,
     pub id: u64,
     #[serde(deserialize_with = "rustrade_integration::serde::de::de_str")]
-    pub price: f64,
-    #[serde(rename = "size")]
-    pub amount: f64,
+    pub price: Decimal,
+    #[serde(rename = "size", deserialize_with = "de_i64_as_decimal")]
+    pub amount: Decimal,
 }
 
 impl Identifier<Option<SubscriptionId>> for GateioFuturesTrades {
@@ -86,7 +96,7 @@ impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, GateioFuturesTrades)
                     kind: PublicTrade {
                         id: format_smolstr!("{}", trade.id),
                         price: trade.price,
-                        amount: trade.amount,
+                        amount: trade.amount.abs(),
                         side: if trade.amount.is_sign_positive() {
                             Side::Buy
                         } else {

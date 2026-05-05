@@ -4,6 +4,7 @@ use crate::{
     subscription::trade::PublicTrade,
 };
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use rustrade_instrument::{Side, exchange::ExchangeId};
 use serde::{Deserialize, Serialize};
 
@@ -43,13 +44,13 @@ pub struct BybitTradeInner {
         alias = "v",
         deserialize_with = "rustrade_integration::serde::de::de_str"
     )]
-    pub amount: f64,
+    pub amount: Decimal,
 
     #[serde(
         alias = "p",
         deserialize_with = "rustrade_integration::serde::de::de_str"
     )]
-    pub price: f64,
+    pub price: Decimal,
 
     #[serde(rename = "i")]
     pub id: String,
@@ -90,6 +91,7 @@ mod tests {
         use crate::exchange::bybit::message::BybitPayloadKind;
 
         use super::*;
+        use rust_decimal_macros::dec;
         use rustrade_integration::{
             error::SocketError, serde::de::datetime_utc_from_epoch_duration,
             subscription::SubscriptionId,
@@ -125,8 +127,8 @@ mod tests {
                         )),
                         market: "BTCUSDT".to_string(),
                         side: Side::Buy,
-                        amount: 0.001,
-                        price: 16578.50,
+                        amount: dec!(0.001),
+                        price: dec!(16578.50),
                         id: "20f43950-d8dd-5b31-9112-a178eb6023af".to_string(),
                     }),
                 },
@@ -150,8 +152,8 @@ mod tests {
                         )),
                         market: "BTCUSDT".to_string(),
                         side: Side::Sell,
-                        amount: 0.001,
-                        price: 16578.50,
+                        amount: dec!(0.001),
+                        price: dec!(16578.50),
                         id: "20f43950-d8dd-5b31-9112-a178eb6023af".to_string(),
                     }),
                 },
@@ -247,8 +249,8 @@ mod tests {
                                 )),
                                 market: "BTCUSDT".to_string(),
                                 side: Side::Buy,
-                                amount: 0.001,
-                                price: 16578.50,
+                                amount: dec!(0.001),
+                                price: dec!(16578.50),
                                 id: "20f43950-d8dd-5b31-9112-a178eb6023af".to_string(),
                             },
                             BybitTradeInner {
@@ -257,8 +259,8 @@ mod tests {
                                 )),
                                 market: "BTCUSDT".to_string(),
                                 side: Side::Sell,
-                                amount: 0.001,
-                                price: 16578.50,
+                                amount: dec!(0.001),
+                                price: dec!(16578.50),
                                 id: "20f43950-d8dd-5b31-9112-a178eb6023af".to_string(),
                             },
                         ],

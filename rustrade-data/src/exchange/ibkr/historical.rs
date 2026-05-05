@@ -36,6 +36,7 @@ use ibapi::{
         historical::{BarSize, Duration, WhatToShow},
     },
 };
+use rust_decimal::Decimal;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tracing::{debug, info};
@@ -231,6 +232,9 @@ impl HistoricalRequest {
 ///
 /// Note: `Bar::wap` (volume-weighted average price) is not mapped to `Candle`
 /// as rustrade's `Candle` type does not include VWAP.
+///
+/// Returns `Err(DataError::Socket(...))` if any price/volume value cannot be
+/// converted to Decimal (e.g., NaN, Infinity from the IB API).
 fn bar_to_candle(bar: &ibapi::market_data::historical::Bar) -> Result<Candle, DataError> {
     let close_time = DateTime::from_timestamp(bar.date.unix_timestamp(), bar.date.nanosecond())
         .ok_or_else(|| {
@@ -240,13 +244,24 @@ fn bar_to_candle(bar: &ibapi::market_data::historical::Bar) -> Result<Candle, Da
             ))
         })?;
 
+    let open =
+        Decimal::try_from(bar.open).map_err(|e| DataError::Socket(format!("parse open: {e}")))?;
+    let high =
+        Decimal::try_from(bar.high).map_err(|e| DataError::Socket(format!("parse high: {e}")))?;
+    let low =
+        Decimal::try_from(bar.low).map_err(|e| DataError::Socket(format!("parse low: {e}")))?;
+    let close =
+        Decimal::try_from(bar.close).map_err(|e| DataError::Socket(format!("parse close: {e}")))?;
+    let volume = Decimal::try_from(bar.volume)
+        .map_err(|e| DataError::Socket(format!("parse volume: {e}")))?;
+
     Ok(Candle {
         close_time,
-        open: bar.open,
-        high: bar.high,
-        low: bar.low,
-        close: bar.close,
-        volume: bar.volume,
+        open,
+        high,
+        low,
+        close,
+        volume,
         #[allow(clippy::cast_sign_loss)] // IB returns -1 when unavailable; .max(0) guarantees non-negative
         trade_count: bar.count.max(0) as u64,
     })
@@ -262,6 +277,8 @@ mod tests {
 
     #[test]
     fn bar_to_candle_converts_all_fields() {
+        use rust_decimal_macros::dec;
+
         let bar = ibapi::market_data::historical::Bar {
             date: datetime!(2024-01-15 16:00 UTC),
             open: 150.0,
@@ -275,11 +292,11 @@ mod tests {
 
         let candle = bar_to_candle(&bar).unwrap();
 
-        assert_eq!(candle.open, 150.0);
-        assert_eq!(candle.high, 155.0);
-        assert_eq!(candle.low, 149.0);
-        assert_eq!(candle.close, 153.5);
-        assert_eq!(candle.volume, 1_000_000.0);
+        assert_eq!(candle.open, dec!(150));
+        assert_eq!(candle.high, dec!(155));
+        assert_eq!(candle.low, dec!(149));
+        assert_eq!(candle.close, dec!(153.5));
+        assert_eq!(candle.volume, dec!(1_000_000));
         assert_eq!(candle.trade_count, 50_000);
 
         // Check timestamp conversion
