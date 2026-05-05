@@ -2,16 +2,16 @@
 //!
 //! Transforms IB's `realtime::Trade` into rustrade's [`PublicTrade`].
 //!
-//! # Side Inference
+//! # Side Field
 //!
 //! IB tick-by-tick trades do not include trade side (buyer/seller initiated).
-//! This implementation defaults to `Side::Buy`. For more accurate side
-//! inference, consumers can compare trade price to concurrent bid/ask quotes.
+//! The `side` field is set to `None`. For side inference, consumers can compare
+//! the trade price to concurrent bid/ask quotes.
 
 use crate::subscription::trade::PublicTrade;
 use chrono::{DateTime, Utc};
 use ibapi::market_data::realtime::Trade;
-use rustrade_instrument::Side;
+use rust_decimal::Decimal;
 use smol_str::{SmolStr, format_smolstr};
 use std::{
     hash::{Hash, Hasher},
@@ -27,11 +27,10 @@ static BAD_SIZE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Convert an IB trade to a PublicTrade.
 ///
-/// # Side Inference
+/// # Side Field
 ///
-/// Trade side is not provided by IB. This function defaults to `Side::Buy`.
-/// For more accurate inference, compare the trade price to the current
-/// bid/ask spread.
+/// Trade side is not provided by IB, so `side` is set to `None`.
+/// For side inference, compare the trade price to the current bid/ask spread.
 ///
 /// # Returns
 ///
@@ -60,11 +59,16 @@ pub fn from_ib_trade(trade: &Trade) -> Option<PublicTrade> {
         return None;
     }
 
+    // is_finite guards above handle NaN/Inf with rate-limited logging.
+    // try_from is a safety net — can only fail for |x| > 7.9e28 (impossible for prices).
+    let price = Decimal::try_from(trade.price).ok()?;
+    let amount = Decimal::try_from(trade.size).ok()?;
+
     Some(PublicTrade {
         id: generate_trade_id(trade),
-        price: trade.price,
-        amount: trade.size,
-        side: Side::Buy,
+        price,
+        amount,
+        side: None,
     })
 }
 
@@ -142,12 +146,14 @@ mod tests {
 
     #[test]
     fn converts_trade_fields() {
+        use rust_decimal_macros::dec;
+
         let ib_trade = make_trade(1700000000, 150.25, 100.0);
         let trade = from_ib_trade(&ib_trade).unwrap();
 
-        assert_eq!(trade.price, 150.25);
-        assert_eq!(trade.amount, 100.0);
-        assert_eq!(trade.side, Side::Buy);
+        assert_eq!(trade.price, dec!(150.25));
+        assert_eq!(trade.amount, dec!(100));
+        assert!(trade.side.is_none());
         assert!(!trade.id.is_empty());
     }
 

@@ -3,7 +3,7 @@ use crate::{
     engine::{Processor, state::order::in_flight_recorder::InFlightRequestRecorder},
 };
 use derive_more::Constructor;
-use rust_decimal::{Decimal, prelude::FromPrimitive};
+use rust_decimal::Decimal;
 use rustrade_data::{
     event::{DataKind, MarketEvent},
     subscription::book::OrderBookL1,
@@ -84,16 +84,14 @@ impl<InstrumentKey> Processor<&MarketEvent<InstrumentKey, DataKind>>
 
     fn process(&mut self, event: &MarketEvent<InstrumentKey, DataKind>) -> Self::Audit {
         match &event.kind {
-            DataKind::Trade(trade) => {
+            DataKind::Trade(trade)
                 if self
                     .last_traded_price
                     .as_ref()
-                    .is_none_or(|price| price.time < event.time_exchange)
-                    && let Some(price) = Decimal::from_f64(trade.price)
-                {
-                    self.last_traded_price
-                        .replace(Timed::new(price, event.time_exchange));
-                }
+                    .is_none_or(|price| price.time < event.time_exchange) =>
+            {
+                self.last_traded_price
+                    .replace(Timed::new(trade.price, event.time_exchange));
             }
             DataKind::OrderBookL1(l1) if self.l1.last_update_time < event.time_exchange => {
                 self.l1 = l1.clone()

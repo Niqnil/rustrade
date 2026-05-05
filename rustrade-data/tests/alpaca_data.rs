@@ -38,6 +38,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use futures_util::StreamExt;
+use rust_decimal::Decimal;
 use rustrade_data::{
     exchange::alpaca::{AlpacaCrypto, AlpacaIex},
     streams::{
@@ -120,8 +121,8 @@ async fn test_crypto_trade_stream_receives_data() {
 
         if let Event::Item(trade) = event.unwrap() {
             tracing::info!(?trade, "Received crypto trade");
-            assert!(trade.kind.price > 0.0, "Invalid trade price");
-            assert!(trade.kind.amount > 0.0, "Invalid trade amount");
+            assert!(trade.kind.price > Decimal::ZERO, "Invalid trade price");
+            assert!(trade.kind.amount > Decimal::ZERO, "Invalid trade amount");
             return;
         }
     }
@@ -185,8 +186,8 @@ async fn test_crypto_quote_stream_receives_data() {
 
         if let Event::Item(quote) = event.unwrap() {
             tracing::info!(?quote, "Received crypto quote");
-            assert!(quote.kind.bid_price > 0.0, "Invalid bid price");
-            assert!(quote.kind.ask_price > 0.0, "Invalid ask price");
+            assert!(quote.kind.bid_price > Decimal::ZERO, "Invalid bid price");
+            assert!(quote.kind.ask_price > Decimal::ZERO, "Invalid ask price");
             assert!(
                 quote.kind.ask_price >= quote.kind.bid_price,
                 "Ask < Bid (crossed market)"
@@ -379,8 +380,8 @@ async fn test_iex_trade_stream_receives_data() {
         match timeout {
             Ok(Some(Event::Item(trade))) => {
                 tracing::info!(?trade, "Received IEX trade");
-                assert!(trade.kind.price > 0.0, "Invalid trade price");
-                assert!(trade.kind.amount > 0.0, "Invalid trade amount");
+                assert!(trade.kind.price > Decimal::ZERO, "Invalid trade price");
+                assert!(trade.kind.amount > Decimal::ZERO, "Invalid trade amount");
                 return;
             }
             Ok(Some(_)) => continue,
@@ -432,8 +433,8 @@ async fn test_iex_quote_stream_receives_data() {
         match timeout {
             Ok(Some(Event::Item(quote))) => {
                 tracing::info!(?quote, "Received IEX quote");
-                assert!(quote.kind.bid_price > 0.0, "Invalid bid price");
-                assert!(quote.kind.ask_price > 0.0, "Invalid ask price");
+                assert!(quote.kind.bid_price > Decimal::ZERO, "Invalid bid price");
+                assert!(quote.kind.ask_price > Decimal::ZERO, "Invalid ask price");
                 return;
             }
             Ok(Some(_)) => continue,
