@@ -57,10 +57,15 @@
 
 mod error;
 pub(crate) mod live;
+pub(crate) mod reference;
 pub(crate) mod rest;
 pub(crate) mod transformer;
 
 pub use error::MassiveError;
 pub use live::{ChannelType, Market, MassiveLive};
+pub use reference::{
+    Address, CurrencyStatus, Exchange, MarketHoliday, MarketStatus, SortOrder, Ticker,
+    TickerDetails, TickerQuery,
+};
 pub use rest::MassiveRestClient;
 pub use transformer::FairMarketValue;

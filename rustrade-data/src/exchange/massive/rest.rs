@@ -24,34 +24,6 @@ fn truncate_body(body: &str) -> String {
     body[..boundary].to_owned()
 }
 
-/// Validate ticker doesn't contain URL-breaking characters.
-fn validate_ticker(ticker: &str) -> Result<(), MassiveError> {
-    if ticker.is_empty() {
-        return Err(MassiveError::InvalidInput {
-            message: "ticker must not be empty".into(),
-        });
-    }
-    if ticker.contains(['/', '?', '#', ' ', '%']) {
-        return Err(MassiveError::InvalidInput {
-            message: "ticker contains invalid URL characters".into(),
-        });
-    }
-    Ok(())
-}
-
-/// Validate next_url is from the expected origin to prevent token leakage.
-fn validate_next_url(next_url: &str, base_url: &str) -> Result<(), MassiveError> {
-    if !next_url.starts_with(base_url) {
-        return Err(MassiveError::InvalidInput {
-            message: format!(
-                "next_url origin mismatch: expected {}, got {}",
-                base_url, next_url
-            ),
-        });
-    }
-    Ok(())
-}
-
 /// REST client for Massive historical and intraday market data.
 ///
 /// # Example
@@ -129,8 +101,41 @@ impl MassiveRestClient {
         self
     }
 
+    /// Get the base URL.
+    pub(super) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Validate ticker doesn't contain URL-breaking characters.
+    pub(super) fn validate_ticker(ticker: &str) -> Result<(), MassiveError> {
+        if ticker.is_empty() {
+            return Err(MassiveError::InvalidInput {
+                message: "ticker must not be empty".into(),
+            });
+        }
+        if ticker.contains(['/', '?', '#', ' ', '%']) {
+            return Err(MassiveError::InvalidInput {
+                message: "ticker contains invalid URL characters".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate next_url is from the expected origin to prevent token leakage.
+    pub(super) fn validate_next_url(next_url: &str, base_url: &str) -> Result<(), MassiveError> {
+        if !next_url.starts_with(base_url) {
+            return Err(MassiveError::InvalidInput {
+                message: format!(
+                    "next_url origin mismatch: expected {}, got {}",
+                    base_url, next_url
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Fetch a page body from the given URL with standard error handling.
-    async fn fetch_page_body(&self, url: &str) -> Result<String, MassiveError> {
+    pub(super) async fn fetch_page_body(&self, url: &str) -> Result<String, MassiveError> {
         let response = self.client.get(url).send().await?;
         let status = response.status();
 
@@ -198,7 +203,7 @@ impl MassiveRestClient {
         to: chrono::DateTime<chrono::Utc>,
     ) -> impl Stream<Item = Result<Candle, MassiveError>> + 'a {
         try_stream! {
-            validate_ticker(ticker)?;
+            Self::validate_ticker(ticker)?;
 
             let from_ms = from.timestamp_millis();
             let to_ms = to.timestamp_millis();
@@ -232,7 +237,7 @@ impl MassiveRestClient {
 
                 // Validate next_url origin before following
                 if let Some(ref url) = parsed.next_url {
-                    validate_next_url(url, &self.base_url)?;
+                    Self::validate_next_url(url, &self.base_url)?;
                 }
                 next_url = parsed.next_url;
             }
@@ -255,7 +260,7 @@ impl MassiveRestClient {
         to: chrono::DateTime<chrono::Utc>,
     ) -> impl Stream<Item = Result<PublicTrade, MassiveError>> + 'a {
         try_stream! {
-            validate_ticker(ticker)?;
+            Self::validate_ticker(ticker)?;
 
             let from_ns = from.timestamp_nanos_opt().ok_or_else(|| MassiveError::InvalidInput {
                 message: "from timestamp out of nanosecond range (~1678-2262)".into(),
@@ -290,7 +295,7 @@ impl MassiveRestClient {
 
                 // Validate next_url origin before following
                 if let Some(ref url) = parsed.next_url {
-                    validate_next_url(url, &self.base_url)?;
+                    Self::validate_next_url(url, &self.base_url)?;
                 }
                 next_url = parsed.next_url;
             }
@@ -319,7 +324,7 @@ impl MassiveRestClient {
         to: chrono::DateTime<chrono::Utc>,
     ) -> impl Stream<Item = Result<OrderBookL1, MassiveError>> + 'a {
         try_stream! {
-            validate_ticker(ticker)?;
+            Self::validate_ticker(ticker)?;
 
             let from_ns = from.timestamp_nanos_opt().ok_or_else(|| MassiveError::InvalidInput {
                 message: "from timestamp out of nanosecond range (~1678-2262)".into(),
@@ -354,7 +359,7 @@ impl MassiveRestClient {
 
                 // Validate next_url origin before following
                 if let Some(ref url) = parsed.next_url {
-                    validate_next_url(url, &self.base_url)?;
+                    Self::validate_next_url(url, &self.base_url)?;
                 }
                 next_url = parsed.next_url;
             }
