@@ -17,7 +17,7 @@ ibkr = ["dep:ibapi", "dep:time", "rustrade-instrument/ibkr"]
 hyperliquid = ["dep:hyperliquid_rust_sdk"]
 alpaca = []
 databento = ["dep:databento"]
-massive = ["dep:tokio-tungstenite", "dep:async-stream", "rust_decimal/serde-float"]
+massive = ["dep:tokio-tungstenite", "dep:async-stream", "rust_decimal/serde-float", "serde_json/raw_value"]
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }

@@ -11,13 +11,42 @@ use rustrade_instrument::Side;
 use serde::{Deserialize, Deserializer, Serialize};
 use smol_str::SmolStr;
 
-/// Deserialize only the first element of a conditions array.
+/// Deserialize only the first element of a conditions array without allocating a Vec.
 fn deserialize_first_condition<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let conditions: Option<Vec<i32>> = Option::deserialize(deserializer)?;
-    Ok(conditions.and_then(|v| v.into_iter().next()))
+    use serde::de::{SeqAccess, Visitor};
+
+    struct FirstElementVisitor;
+
+    impl<'de> Visitor<'de> for FirstElementVisitor {
+        type Value = Option<i32>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an array of integers or null")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_seq(self)
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let first = seq.next_element()?;
+            // Drain remaining elements without storing them
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            Ok(first)
+        }
+    }
+
+    deserializer.deserialize_option(FirstElementVisitor)
 }
 
 /// Raw aggregates response from Massive REST API.
@@ -363,6 +392,323 @@ pub fn parse_quotes_response(body: &str) -> Result<QuotesResponse, MassiveError>
 }
 
 // ============================================================================
+// WebSocket Messages
+// ============================================================================
+
+/// Parsed WebSocket message variants.
+///
+/// Uses serde's internally-tagged enum for single-pass deserialization.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "ev")]
+pub(crate) enum WsMessage {
+    /// Stock trade
+    #[serde(rename = "T")]
+    TradeStocks(WsTradeMsg),
+    /// Crypto trade
+    #[serde(rename = "XT")]
+    TradeCrypto(WsTradeMsg),
+    /// Stock quote
+    #[serde(rename = "Q")]
+    QuoteStocks(WsQuoteMsg),
+    /// Crypto quote
+    #[serde(rename = "XQ")]
+    QuoteCrypto(WsQuoteMsg),
+    /// Forex quote
+    #[serde(rename = "C")]
+    QuoteForex(WsQuoteMsg),
+    /// Stock per-second aggregate
+    #[serde(rename = "A")]
+    AggSecondStocks(WsAggregateMsg),
+    /// Stock per-minute aggregate
+    #[serde(rename = "AM")]
+    AggMinuteStocks(WsAggregateMsg),
+    /// Crypto per-second aggregate
+    #[serde(rename = "XA")]
+    AggSecondCrypto(WsAggregateMsg),
+    /// Crypto per-minute aggregate
+    #[serde(rename = "XAM")]
+    AggMinuteCrypto(WsAggregateMsg),
+    /// Forex per-second aggregate
+    #[serde(rename = "CA")]
+    AggSecondForex(WsAggregateMsg),
+    /// Forex per-minute aggregate
+    #[serde(rename = "CAM")]
+    AggMinuteForex(WsAggregateMsg),
+    /// Status message (auth, subscription confirmations).
+    /// Inner fields are populated by serde but not inspected directly; we only match the variant
+    /// and return None from ws_message_to_event.
+    #[serde(rename = "status")]
+    #[allow(dead_code)]
+    // variant matched but inner type not inspected; serde needs the type for deserialization
+    Status(WsStatusMsg),
+}
+
+/// WebSocket trade message.
+///
+/// Stocks: `{"ev":"T","sym":"AAPL","p":150.25,"s":100,"t":1682592000000,...}`
+/// Crypto: `{"ev":"XT","pair":"BTC-USD","p":45230.50,"s":0.5,"t":1682592000000,...}`
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct WsTradeMsg {
+    /// Symbol (stocks: "sym", crypto: "pair")
+    #[serde(alias = "sym", alias = "pair")]
+    pub symbol: String,
+
+    /// Trade price
+    #[serde(rename = "p", with = "rust_decimal::serde::float")]
+    pub price: Decimal,
+
+    /// Trade size
+    #[serde(rename = "s", with = "rust_decimal::serde::float")]
+    pub size: Decimal,
+
+    /// Timestamp in milliseconds
+    #[serde(rename = "t")]
+    pub timestamp: i64,
+
+    /// First trade condition (optional). Crypto: 1 = sell, 2 = buy.
+    #[serde(
+        rename = "c",
+        default,
+        deserialize_with = "deserialize_first_condition"
+    )]
+    pub condition: Option<i32>,
+
+    /// Trade ID (optional)
+    #[serde(rename = "i", default)]
+    pub id: Option<String>,
+}
+
+impl WsTradeMsg {
+    /// Convert to PublicTrade with exchange timestamp.
+    pub fn into_public_trade(self) -> (DateTime<Utc>, PublicTrade) {
+        let time = millis_to_datetime(self.timestamp);
+
+        // Crypto condition codes: 1 = sell, 2 = buy
+        let side = self.condition.and_then(|c| match c {
+            1 => Some(Side::Sell),
+            2 => Some(Side::Buy),
+            _ => None,
+        });
+
+        let trade = PublicTrade {
+            id: SmolStr::from(self.id.unwrap_or_default()),
+            price: self.price,
+            amount: self.size,
+            side,
+        };
+
+        (time, trade)
+    }
+}
+
+/// WebSocket quote message.
+///
+/// Stocks: `{"ev":"Q","sym":"AAPL","bp":150.20,"bs":500,"ap":150.30,"as":1000,"t":1682592000000,...}`
+/// Crypto: `{"ev":"XQ","pair":"BTC-USD","bp":45220.00,"bs":2.5,"ap":45240.00,"as":3.0,"t":1682592000000,...}`
+/// Forex: `{"ev":"C","p":"EUR-USD","b":1.0850,"a":1.0852,"t":1682592000000,...}`
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct WsQuoteMsg {
+    /// Symbol (stocks: "sym", crypto: "pair", forex: "p").
+    ///
+    /// The `"p"` alias is for forex quotes (`ev="C"`), where it denotes the currency pair.
+    /// This is distinct from `WsTradeMsg` where `"p"` is the trade price.
+    ///
+    /// No canonical `#[serde(rename)]` — wire name differs per market; all real names are aliases.
+    /// This struct is deserialize-only; the canonical field name is never serialized.
+    #[serde(alias = "sym", alias = "pair", alias = "p")]
+    pub symbol: String,
+
+    /// Bid price (stocks/crypto: "bp", forex: "b")
+    #[serde(
+        alias = "bp",
+        alias = "b",
+        with = "rust_decimal::serde::float",
+        default
+    )]
+    pub bid_price: Decimal,
+
+    /// Bid size (stocks/crypto: "bs", forex: not available)
+    #[serde(alias = "bs", with = "rust_decimal::serde::float_option", default)]
+    pub bid_size: Option<Decimal>,
+
+    /// Ask price (stocks/crypto: "ap", forex: "a")
+    #[serde(
+        alias = "ap",
+        alias = "a",
+        with = "rust_decimal::serde::float",
+        default
+    )]
+    pub ask_price: Decimal,
+
+    /// Ask size (stocks/crypto: "as", forex: not available)
+    #[serde(alias = "as", with = "rust_decimal::serde::float_option", default)]
+    pub ask_size: Option<Decimal>,
+
+    /// Timestamp in milliseconds
+    #[serde(rename = "t")]
+    pub timestamp: i64,
+}
+
+impl WsQuoteMsg {
+    /// Convert to OrderBookL1 with exchange timestamp.
+    pub fn into_order_book_l1(self) -> (DateTime<Utc>, OrderBookL1) {
+        let time = millis_to_datetime(self.timestamp);
+
+        let l1 = OrderBookL1 {
+            last_update_time: time,
+            best_bid: Some(Level {
+                price: self.bid_price,
+                amount: self.bid_size.unwrap_or(Decimal::ZERO),
+            }),
+            best_ask: Some(Level {
+                price: self.ask_price,
+                amount: self.ask_size.unwrap_or(Decimal::ZERO),
+            }),
+        };
+
+        (time, l1)
+    }
+}
+
+/// WebSocket aggregate message.
+///
+/// Stocks: `{"ev":"A","sym":"AAPL","o":150.10,"h":150.50,"l":150.05,"c":150.25,"v":1000,"s":1682592000000,"e":1682592001000,...}`
+/// Crypto: `{"ev":"XA","pair":"BTC-USD","o":45200.0,"h":45250.0,"l":45180.0,"c":45230.0,"v":10.5,"s":1682592000000,"e":1682592001000,...}`
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct WsAggregateMsg {
+    /// Symbol (stocks: "sym", crypto: "pair", forex: "pair")
+    #[serde(alias = "sym", alias = "pair")]
+    pub symbol: String,
+
+    /// Open price
+    #[serde(rename = "o", with = "rust_decimal::serde::float")]
+    pub open: Decimal,
+
+    /// High price
+    #[serde(rename = "h", with = "rust_decimal::serde::float")]
+    pub high: Decimal,
+
+    /// Low price
+    #[serde(rename = "l", with = "rust_decimal::serde::float")]
+    pub low: Decimal,
+
+    /// Close price
+    #[serde(rename = "c", with = "rust_decimal::serde::float")]
+    pub close: Decimal,
+
+    /// Volume
+    #[serde(rename = "v", with = "rust_decimal::serde::float")]
+    pub volume: Decimal,
+
+    /// Window start timestamp in milliseconds.
+    /// Deserialized for API completeness but unused; candle uses end_timestamp.
+    #[serde(rename = "s")]
+    #[allow(dead_code)] // deserialized for API completeness; candle uses end_timestamp
+    pub start_timestamp: i64,
+
+    /// Window end timestamp in milliseconds
+    #[serde(rename = "e")]
+    pub end_timestamp: i64,
+
+    /// Number of trades (optional)
+    #[serde(rename = "z", default)]
+    pub trade_count: Option<u64>,
+}
+
+impl WsAggregateMsg {
+    /// Convert to Candle with exchange timestamp.
+    pub fn into_candle(self) -> (DateTime<Utc>, Candle) {
+        let time = millis_to_datetime(self.end_timestamp);
+
+        let candle = Candle {
+            close_time: time,
+            open: self.open,
+            high: self.high,
+            low: self.low,
+            close: self.close,
+            volume: self.volume,
+            trade_count: self.trade_count.unwrap_or(0),
+        };
+
+        (time, candle)
+    }
+}
+
+/// WebSocket status message.
+///
+/// Fields are deserialized for completeness but not read directly.
+/// Auth/subscribe verification uses manual JSON parsing instead.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct WsStatusMsg {
+    /// Status: "auth_success", "auth_failed", "success", etc.
+    pub status: String,
+
+    /// Optional message
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// Convert millisecond timestamp to DateTime<Utc>.
+fn millis_to_datetime(millis: i64) -> DateTime<Utc> {
+    Utc.timestamp_millis_opt(millis)
+        .single()
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                millis,
+                "out-of-range millisecond timestamp; using UNIX_EPOCH"
+            );
+            DateTime::<Utc>::UNIX_EPOCH
+        })
+}
+
+/// Parse a WebSocket message JSON string, skipping unknown event types.
+///
+/// Massive sends messages as JSON arrays: `[{...}, {...}, ...]`
+/// Each element is parsed individually; unknown event types (e.g. "lagg") are
+/// logged at trace level and skipped rather than failing the entire frame.
+///
+/// # Why RawValue
+///
+/// `&serde_json::value::RawValue` is a zero-copy borrowed slice into `text`.
+/// Parsing the outer array to `Vec<&RawValue>` allocates only the Vec itself
+/// (one allocation per frame regardless of element count). Each element's typed
+/// parse is then independent.
+pub(crate) fn parse_ws_message(text: &str) -> Result<Vec<WsMessage>, MassiveError> {
+    // Parse the outer array, borrowing each element as a raw JSON slice.
+    let raw_elements: Vec<&serde_json::value::RawValue> =
+        serde_json::from_str(text).map_err(|e| MassiveError::Deserialize {
+            message: e.to_string(),
+            payload: text[..text.floor_char_boundary(512)].to_owned(),
+        })?;
+
+    let mut messages = Vec::with_capacity(raw_elements.len());
+    for raw in raw_elements {
+        match serde_json::from_str::<WsMessage>(raw.get()) {
+            Ok(msg) => messages.push(msg),
+            Err(_) => {
+                // Extract the "ev" field for logging without allocating a full Value DOM.
+                let ev = extract_ev_tag(raw.get());
+                tracing::trace!(
+                    ev = ev.unwrap_or("<missing>"),
+                    "Skipping unknown WS event type"
+                );
+            }
+        }
+    }
+    Ok(messages)
+}
+
+/// Extract the `"ev"` field value from a JSON object string without full Value allocation.
+fn extract_ev_tag(json: &str) -> Option<&str> {
+    #[derive(Deserialize)]
+    struct EvOnly<'a> {
+        ev: &'a str,
+    }
+    serde_json::from_str::<EvOnly<'_>>(json).ok().map(|e| e.ev)
+}
+
+// ============================================================================
 // Fair Market Value
 // ============================================================================
 
@@ -569,5 +915,269 @@ mod tests {
             dec!(65150.0),
         );
         assert_eq!(fmv.price, dec!(65150.0));
+    }
+
+    // ========================================================================
+    // WebSocket Message Tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_ws_crypto_trade() {
+        let json = r#"[{
+            "ev": "XT",
+            "pair": "BTC-USD",
+            "p": 45230.50,
+            "s": 0.5,
+            "t": 1704067200000,
+            "c": [2],
+            "i": "trade123"
+        }]"#;
+
+        let messages = parse_ws_message(json).unwrap();
+        assert_eq!(messages.len(), 1);
+
+        match &messages[0] {
+            WsMessage::TradeCrypto(trade) => {
+                assert_eq!(trade.symbol, "BTC-USD");
+                assert_eq!(trade.price, dec!(45230.50));
+                assert_eq!(trade.size, dec!(0.5));
+                assert_eq!(trade.condition, Some(2));
+            }
+            _ => panic!("Expected crypto trade message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ws_stock_trade() {
+        let json = r#"[{
+            "ev": "T",
+            "sym": "AAPL",
+            "p": 150.25,
+            "s": 100,
+            "t": 1704067200000,
+            "c": [],
+            "i": "12345"
+        }]"#;
+
+        let messages = parse_ws_message(json).unwrap();
+        assert_eq!(messages.len(), 1);
+
+        match &messages[0] {
+            WsMessage::TradeStocks(trade) => {
+                assert_eq!(trade.symbol, "AAPL");
+                assert_eq!(trade.price, dec!(150.25));
+                assert_eq!(trade.size, dec!(100));
+            }
+            _ => panic!("Expected stock trade message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ws_crypto_quote() {
+        let json = r#"[{
+            "ev": "XQ",
+            "pair": "BTC-USD",
+            "bp": 45220.00,
+            "bs": 2.5,
+            "ap": 45240.00,
+            "as": 3.0,
+            "t": 1704067200000
+        }]"#;
+
+        let messages = parse_ws_message(json).unwrap();
+        assert_eq!(messages.len(), 1);
+
+        match &messages[0] {
+            WsMessage::QuoteCrypto(quote) => {
+                assert_eq!(quote.symbol, "BTC-USD");
+                assert_eq!(quote.bid_price, dec!(45220.00));
+                assert_eq!(quote.ask_price, dec!(45240.00));
+            }
+            _ => panic!("Expected crypto quote message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ws_forex_quote() {
+        let json = r#"[{
+            "ev": "C",
+            "p": "EUR-USD",
+            "b": 1.0850,
+            "a": 1.0852,
+            "t": 1704067200000
+        }]"#;
+
+        let messages = parse_ws_message(json).unwrap();
+        assert_eq!(messages.len(), 1);
+
+        match &messages[0] {
+            WsMessage::QuoteForex(quote) => {
+                assert_eq!(quote.symbol, "EUR-USD");
+                assert_eq!(quote.bid_price, dec!(1.0850));
+                assert_eq!(quote.ask_price, dec!(1.0852));
+            }
+            _ => panic!("Expected forex quote message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ws_aggregate() {
+        let json = r#"[{
+            "ev": "XAM",
+            "pair": "BTC-USD",
+            "o": 45200.0,
+            "h": 45250.0,
+            "l": 45180.0,
+            "c": 45230.0,
+            "v": 10.5,
+            "s": 1704067200000,
+            "e": 1704067260000,
+            "z": 150
+        }]"#;
+
+        let messages = parse_ws_message(json).unwrap();
+        assert_eq!(messages.len(), 1);
+
+        match &messages[0] {
+            WsMessage::AggMinuteCrypto(agg) => {
+                assert_eq!(agg.symbol, "BTC-USD");
+                assert_eq!(agg.open, dec!(45200.0));
+                assert_eq!(agg.high, dec!(45250.0));
+                assert_eq!(agg.low, dec!(45180.0));
+                assert_eq!(agg.close, dec!(45230.0));
+                assert_eq!(agg.volume, dec!(10.5));
+                assert_eq!(agg.trade_count, Some(150));
+            }
+            _ => panic!("Expected crypto aggregate message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ws_status() {
+        let json = r#"[{
+            "ev": "status",
+            "status": "auth_success",
+            "message": "authenticated"
+        }]"#;
+
+        let messages = parse_ws_message(json).unwrap();
+        assert_eq!(messages.len(), 1);
+
+        match &messages[0] {
+            WsMessage::Status(status) => {
+                assert_eq!(status.status, "auth_success");
+                assert_eq!(status.message, Some("authenticated".to_string()));
+            }
+            _ => panic!("Expected status message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ws_multiple_messages() {
+        let json = r#"[
+            {"ev": "XT", "pair": "BTC-USD", "p": 45230.50, "s": 0.5, "t": 1704067200000, "c": []},
+            {"ev": "XQ", "pair": "BTC-USD", "bp": 45220.0, "bs": 2.5, "ap": 45240.0, "as": 3.0, "t": 1704067200000}
+        ]"#;
+
+        let messages = parse_ws_message(json).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(&messages[0], WsMessage::TradeCrypto(_)));
+        assert!(matches!(&messages[1], WsMessage::QuoteCrypto(_)));
+    }
+
+    #[test]
+    fn test_ws_trade_to_public_trade() {
+        let trade = WsTradeMsg {
+            symbol: "BTC-USD".to_string(),
+            price: dec!(45230.50),
+            size: dec!(0.5),
+            timestamp: 1704067200000,
+            condition: Some(2),
+            id: Some("trade123".to_string()),
+        };
+
+        let (time, public_trade) = trade.into_public_trade();
+
+        assert_eq!(public_trade.price, dec!(45230.50));
+        assert_eq!(public_trade.amount, dec!(0.5));
+        assert_eq!(public_trade.side, Some(Side::Buy));
+        assert_eq!(
+            time,
+            Utc.timestamp_millis_opt(1704067200000).single().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_ws_quote_to_order_book_l1() {
+        let quote = WsQuoteMsg {
+            symbol: "BTC-USD".to_string(),
+            bid_price: dec!(45220.00),
+            bid_size: Some(dec!(2.5)),
+            ask_price: dec!(45240.00),
+            ask_size: Some(dec!(3.0)),
+            timestamp: 1704067200000,
+        };
+
+        let (time, l1) = quote.into_order_book_l1();
+
+        assert_eq!(l1.best_bid.unwrap().price, dec!(45220.00));
+        assert_eq!(l1.best_bid.unwrap().amount, dec!(2.5));
+        assert_eq!(l1.best_ask.unwrap().price, dec!(45240.00));
+        assert_eq!(l1.best_ask.unwrap().amount, dec!(3.0));
+        assert_eq!(
+            time,
+            Utc.timestamp_millis_opt(1704067200000).single().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_ws_aggregate_to_candle() {
+        let agg = WsAggregateMsg {
+            symbol: "BTC-USD".to_string(),
+            open: dec!(45200.0),
+            high: dec!(45250.0),
+            low: dec!(45180.0),
+            close: dec!(45230.0),
+            volume: dec!(10.5),
+            start_timestamp: 1704067200000,
+            end_timestamp: 1704067260000,
+            trade_count: Some(150),
+        };
+
+        let (time, candle) = agg.into_candle();
+
+        assert_eq!(candle.open, dec!(45200.0));
+        assert_eq!(candle.high, dec!(45250.0));
+        assert_eq!(candle.low, dec!(45180.0));
+        assert_eq!(candle.close, dec!(45230.0));
+        assert_eq!(candle.volume, dec!(10.5));
+        assert_eq!(candle.trade_count, 150);
+        assert_eq!(
+            time,
+            Utc.timestamp_millis_opt(1704067260000).single().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_parse_ws_unknown_event_skipped() {
+        // A frame with known trades plus an unknown "lagg" event.
+        // The trades must be returned; "lagg" must be silently skipped.
+        let json = r#"[
+            {"ev":"XT","pair":"BTC-USD","p":45000.0,"s":0.1,"t":1704067200000,"c":[]},
+            {"ev":"lagg","data":"some lag info"},
+            {"ev":"XT","pair":"ETH-USD","p":2500.0,"s":1.0,"t":1704067200001,"c":[]}
+        ]"#;
+
+        let messages = parse_ws_message(json).unwrap();
+        assert_eq!(messages.len(), 2, "expected 2 known messages, lagg skipped");
+        assert!(matches!(&messages[0], WsMessage::TradeCrypto(t) if t.symbol == "BTC-USD"));
+        assert!(matches!(&messages[1], WsMessage::TradeCrypto(t) if t.symbol == "ETH-USD"));
+    }
+
+    #[test]
+    fn test_parse_ws_malformed_outer_array_is_error() {
+        // Malformed JSON is a hard error, not a skip.
+        let result = parse_ws_message("{not an array}");
+        assert!(result.is_err());
     }
 }
