@@ -337,17 +337,25 @@ pub struct QuoteRecord {
     #[serde(rename = "ask_price", with = "rust_decimal::serde::float")]
     pub ask_price: Decimal,
 
-    /// Ask size
-    #[serde(rename = "ask_size", with = "rust_decimal::serde::float")]
-    pub ask_size: Decimal,
+    /// Ask size (optional - forex quotes don't include size)
+    #[serde(
+        rename = "ask_size",
+        default,
+        with = "rust_decimal::serde::float_option"
+    )]
+    pub ask_size: Option<Decimal>,
 
     /// Bid price
     #[serde(rename = "bid_price", with = "rust_decimal::serde::float")]
     pub bid_price: Decimal,
 
-    /// Bid size
-    #[serde(rename = "bid_size", with = "rust_decimal::serde::float")]
-    pub bid_size: Decimal,
+    /// Bid size (optional - forex quotes don't include size)
+    #[serde(
+        rename = "bid_size",
+        default,
+        with = "rust_decimal::serde::float_option"
+    )]
+    pub bid_size: Option<Decimal>,
 
     /// Participant timestamp (nanoseconds)
     #[serde(rename = "participant_timestamp", default)]
@@ -361,6 +369,11 @@ pub struct QuoteRecord {
 
 impl QuoteRecord {
     /// Convert to rustrade OrderBookL1 type.
+    ///
+    /// Forex quotes from Massive omit `bid_size`/`ask_size`; absent sizes are
+    /// represented as `Decimal::ZERO` to satisfy the shared `Level` type.
+    /// Callers handling venues that may report zero-size quotes should
+    /// disambiguate via the source feed if required.
     pub fn into_order_book_l1(self) -> OrderBookL1 {
         let timestamp = self.timestamp();
 
@@ -368,11 +381,11 @@ impl QuoteRecord {
             last_update_time: timestamp,
             best_bid: Some(Level {
                 price: self.bid_price,
-                amount: self.bid_size,
+                amount: self.bid_size.unwrap_or(Decimal::ZERO),
             }),
             best_ask: Some(Level {
                 price: self.ask_price,
-                amount: self.ask_size,
+                amount: self.ask_size.unwrap_or(Decimal::ZERO),
             }),
         }
     }

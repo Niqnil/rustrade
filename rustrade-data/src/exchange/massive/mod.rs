@@ -3,6 +3,25 @@
 //! Provides access to institutional-grade market data across all major asset classes:
 //! stocks, options, indices, forex, crypto, and futures.
 //!
+//! # Testing Status
+//!
+//! **Partially integration-tested.** We have a currencies subscription (crypto + forex)
+//! but not stocks, options, indices, or futures subscriptions. Verified endpoints:
+//!
+//! - ✅ REST aggregates (crypto, forex, stocks, options, futures via free tier)
+//! - ✅ REST tick trades (crypto)
+//! - ✅ REST quotes (forex)
+//! - ✅ WebSocket streaming (crypto)
+//! - ✅ Reference data (tickers, exchanges, market status, holidays)
+//! - ✅ Corporate actions (dividends, splits)
+//! - ❌ REST aggregates (indices) — requires indices subscription
+//! - ❌ REST tick trades (stocks) — requires stocks subscription
+//! - ❌ REST quotes (stocks) — requires stocks subscription
+//! - ❌ WebSocket (stocks) — requires stocks subscription
+//!
+//! Unit tests for JSON transformation live inline in `reference.rs` and `transformer.rs`.
+//! Live API integration tests are in `tests/massive_integration.rs`.
+//!
 //! # Architecture
 //!
 //! - [`MassiveRestClient`]: Historical and intraday data via REST API
@@ -64,8 +83,8 @@ pub(crate) mod transformer;
 pub use error::MassiveError;
 pub use live::{ChannelType, Market, MassiveLive};
 pub use reference::{
-    Address, CurrencyStatus, Exchange, MarketHoliday, MarketStatus, SortOrder, Ticker,
-    TickerDetails, TickerQuery,
+    Address, CurrencyStatus, Dividend, DividendFrequency, DividendQuery, Exchange, MarketHoliday,
+    MarketStatus, SortOrder, SplitQuery, StockSplit, Ticker, TickerDetails, TickerQuery,
 };
 pub use rest::MassiveRestClient;
 pub use transformer::FairMarketValue;
