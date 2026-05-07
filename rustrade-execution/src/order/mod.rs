@@ -152,12 +152,54 @@ where
     }
 }
 
+/// Specifies how the trailing offset is measured for trailing stop orders.
+///
+/// Different exchanges support different offset types:
+/// - IBKR: Absolute (dollar amount) and Percentage
+/// - Binance: BasisPoints (1/100th of 1%)
+/// - Alpaca/Coinbase: Do not support trailing stops
+#[derive(
+    Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Display,
+)]
+pub enum TrailingOffsetType {
+    /// Absolute dollar/currency amount (e.g., $2.00 trailing distance).
+    Absolute,
+    /// Percentage of the current price (e.g., 5% trailing distance).
+    Percentage,
+    /// Basis points (1/100th of 1%). Used by Binance.
+    BasisPoints,
+}
+
 #[derive(
     Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Display,
 )]
 pub enum OrderKind {
     Market,
     Limit,
+    /// Stop (market) order - triggers a market order when trigger_price is reached.
+    #[display("Stop({trigger_price})")]
+    Stop {
+        trigger_price: Decimal,
+    },
+    /// Stop-limit order - triggers a limit order at Order.price when trigger_price is reached.
+    #[display("StopLimit({trigger_price})")]
+    StopLimit {
+        trigger_price: Decimal,
+    },
+    /// Trailing stop order - stop price trails the market by a specified offset.
+    #[display("TrailingStop({offset}, {offset_type})")]
+    TrailingStop {
+        offset: Decimal,
+        offset_type: TrailingOffsetType,
+    },
+    /// Trailing stop-limit order - when triggered, submits a limit order offset from the stop.
+    #[display("TrailingStopLimit({offset}, {offset_type}, {limit_offset})")]
+    TrailingStopLimit {
+        offset: Decimal,
+        offset_type: TrailingOffsetType,
+        /// Offset from the triggered stop price to set the limit price.
+        limit_offset: Decimal,
+    },
 }
 
 #[derive(

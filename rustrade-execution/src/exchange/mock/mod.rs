@@ -325,11 +325,18 @@ impl MockExchange {
                 request.state.side,
                 match request.state.kind {
                     // unreachable: validate_order_kind_supported (called above) already
-                    // rejects Limit orders with Err, so this arm is never reached.
-                    // Kept for exhaustiveness; passes the limit price so fill models that
-                    // gain Limit support in future behave correctly without a separate change.
-                    OrderKind::Limit => Some(request.state.price),
+                    // rejects non-Market orders with Err, so these arms are never reached.
+                    // Kept for exhaustiveness; passes the limit/trigger price so fill models
+                    // that gain support in future behave correctly without a separate change.
                     OrderKind::Market => None,
+                    OrderKind::Limit
+                    | OrderKind::StopLimit { .. }
+                    | OrderKind::TrailingStopLimit { .. } => Some(request.state.price),
+                    OrderKind::Stop { trigger_price }
+                    | OrderKind::TrailingStop {
+                        offset: trigger_price,
+                        ..
+                    } => Some(trigger_price),
                 },
                 market_prices.best_bid,
                 market_prices.best_ask,
@@ -488,7 +495,7 @@ impl MockExchange {
             Ok(())
         } else {
             Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
-                format!("MockExchange does not supported OrderKind: {order_kind}"),
+                format!("MockExchange does not support OrderKind::{order_kind:?}"),
             )))
         }
     }

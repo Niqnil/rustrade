@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Stop and Trailing Stop order types** (TG13 Phase 1+2):
+  - `OrderKind::Stop { trigger_price }`: Stop market orders
+  - `OrderKind::StopLimit { trigger_price }`: Stop-limit orders
+  - `OrderKind::TrailingStop { offset, offset_type }`: Trailing stop orders
+  - `OrderKind::TrailingStopLimit { offset, offset_type, limit_offset }`: Trailing stop-limit orders
+  - `TrailingOffsetType` enum: `Absolute`, `Percentage`, `BasisPoints`
+  - IBKR connector: Full support for all stop/trailing order types
+  - Binance/Alpaca connectors: Return `UnsupportedOrderType` error (support planned)
+- `OrderError::UnsupportedOrderType`: New error variant for connectors that don't support certain order types
 - **Massive market data connector**: Historical, live, and reference data via `massive` feature
   - `MassiveRestClient`: Historical aggregates, trades, quotes with streaming pagination
   - `MassiveLive`: Real-time WebSocket streaming for trades, quotes, and aggregates

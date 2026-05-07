@@ -208,6 +208,9 @@ impl AccountEventIndexer {
                     OrderError::Connectivity(error) => {
                         OrderState::inactive(OrderError::Connectivity(error))
                     }
+                    OrderError::UnsupportedOrderType(msg) => {
+                        OrderState::inactive(OrderError::UnsupportedOrderType(msg))
+                    }
                 },
                 InactiveOrderState::Cancelled(cancelled) => OrderState::inactive(cancelled),
                 InactiveOrderState::FullyFilled(filled) => OrderState::fully_filled(filled),
@@ -271,6 +274,7 @@ impl AccountEventIndexer {
         Ok(match error {
             UnindexedOrderError::Connectivity(error) => OrderError::Connectivity(error),
             UnindexedOrderError::Rejected(error) => OrderError::Rejected(self.api_error(error)?),
+            UnindexedOrderError::UnsupportedOrderType(msg) => OrderError::UnsupportedOrderType(msg),
         })
     }
 

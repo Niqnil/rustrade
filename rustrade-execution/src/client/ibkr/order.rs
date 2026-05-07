@@ -1,4 +1,4 @@
-use crate::order::{OrderKind, TimeInForce, id::ClientOrderId};
+use crate::order::{OrderKind, TimeInForce, TrailingOffsetType, id::ClientOrderId};
 use fnv::FnvHashMap;
 use ibapi::orders::{Action, Order, TimeInForce as IbTimeInForce, order_builder};
 use parking_lot::{Mutex, RwLock};
@@ -238,6 +238,8 @@ pub enum OrderMappingError {
     PostOnlyNotSupported,
     /// Price conversion to f64 failed (overflow or invalid decimal).
     InvalidPrice(String),
+    /// Trailing offset type not supported by IBKR.
+    UnsupportedOffsetType(TrailingOffsetType),
 }
 
 impl std::fmt::Display for OrderMappingError {
@@ -245,6 +247,9 @@ impl std::fmt::Display for OrderMappingError {
         match self {
             Self::PostOnlyNotSupported => write!(f, "post_only not supported by IB"),
             Self::InvalidPrice(p) => write!(f, "invalid price for f64 conversion: {p}"),
+            Self::UnsupportedOffsetType(t) => {
+                write!(f, "trailing offset type {t:?} not supported by IBKR")
+            }
         }
     }
 }
@@ -267,7 +272,29 @@ pub fn time_in_force_to_ib(tif: &TimeInForce) -> Result<IbTimeInForce, OrderMapp
     }
 }
 
+/// Convert a Decimal to f64, returning an error if conversion fails.
+fn decimal_to_f64(value: rust_decimal::Decimal) -> Result<f64, OrderMappingError> {
+    value.try_into().or_else(|_| {
+        value
+            .to_string()
+            .parse()
+            .map_err(|_| OrderMappingError::InvalidPrice(value.to_string()))
+    })
+}
+
 /// Build an IB Order from rustrade order parameters.
+///
+/// # Order Type Mapping
+///
+/// - `Market` → IB "MKT"
+/// - `Limit` → IB "LMT" with `limit_price`
+/// - `Stop` → IB "STP" with `aux_price` as trigger
+/// - `StopLimit` → IB "STP LMT" with `aux_price` as trigger, `limit_price` from Order.price
+/// - `TrailingStop` (Percentage) → IB "TRAIL" with `trailing_percent`
+/// - `TrailingStop` (Absolute) → IB "TRAIL" with `aux_price`
+/// - `TrailingStopLimit` (Absolute) → IB "TRAIL LIMIT" with `aux_price`, `limit_price_offset`
+/// - `TrailingStopLimit` (Percentage) → IB "TRAIL LIMIT" with `trailing_percent`, `limit_price_offset`
+/// - `BasisPoints` offset type → Error (not supported by IBKR)
 pub fn build_ib_order(
     side: rustrade_instrument::Side,
     quantity: f64,
@@ -280,14 +307,98 @@ pub fn build_ib_order(
 
     let mut order = match kind {
         OrderKind::Market => order_builder::market_order(action, quantity),
+
         OrderKind::Limit => {
-            let price_f64: f64 = price.try_into().or_else(|_| {
-                price
-                    .to_string()
-                    .parse()
-                    .map_err(|_| OrderMappingError::InvalidPrice(price.to_string()))
-            })?;
+            let price_f64 = decimal_to_f64(price)?;
             order_builder::limit_order(action, quantity, price_f64)
+        }
+
+        OrderKind::Stop { trigger_price } => {
+            let trigger_f64 = decimal_to_f64(*trigger_price)?;
+            order_builder::stop(action, quantity, trigger_f64)
+        }
+
+        OrderKind::StopLimit { trigger_price } => {
+            let limit_f64 = decimal_to_f64(price)?;
+            let trigger_f64 = decimal_to_f64(*trigger_price)?;
+            order_builder::stop_limit(action, quantity, limit_f64, trigger_f64)
+        }
+
+        OrderKind::TrailingStop {
+            offset,
+            offset_type,
+        } => {
+            let offset_f64 = decimal_to_f64(*offset)?;
+            match offset_type {
+                TrailingOffsetType::Percentage => {
+                    // Use the builder for percentage-based trailing stop.
+                    // trail_stop_price is None, letting IB derive it from market price.
+                    Order {
+                        action,
+                        order_type: "TRAIL".to_owned(),
+                        total_quantity: quantity,
+                        trailing_percent: Some(offset_f64),
+                        trail_stop_price: None,
+                        ..Order::default()
+                    }
+                }
+                TrailingOffsetType::Absolute => {
+                    // Manual construction for absolute trailing stop.
+                    // aux_price holds the trailing amount.
+                    Order {
+                        action,
+                        order_type: "TRAIL".to_owned(),
+                        total_quantity: quantity,
+                        aux_price: Some(offset_f64),
+                        trail_stop_price: None,
+                        ..Order::default()
+                    }
+                }
+                TrailingOffsetType::BasisPoints => {
+                    return Err(OrderMappingError::UnsupportedOffsetType(
+                        TrailingOffsetType::BasisPoints,
+                    ));
+                }
+            }
+        }
+
+        OrderKind::TrailingStopLimit {
+            offset,
+            offset_type,
+            limit_offset,
+        } => {
+            let offset_f64 = decimal_to_f64(*offset)?;
+            let limit_offset_f64 = decimal_to_f64(*limit_offset)?;
+            match offset_type {
+                TrailingOffsetType::Absolute => {
+                    // Use builder for absolute trailing stop-limit.
+                    // aux_price = trailing_amount, limit_price_offset = limit offset from stop.
+                    order_builder::trailing_stop_limit(
+                        action,
+                        quantity,
+                        limit_offset_f64,
+                        offset_f64,
+                        0.0, // trail_stop_price: let IB derive from market
+                    )
+                }
+                TrailingOffsetType::Percentage => {
+                    // Manual construction for percentage-based trailing stop-limit.
+                    Order {
+                        action,
+                        order_type: "TRAIL LIMIT".to_owned(),
+                        total_quantity: quantity,
+                        trailing_percent: Some(offset_f64),
+                        limit_price_offset: Some(limit_offset_f64),
+                        trail_stop_price: None,
+                        ..Order::default()
+                    }
+                }
+                TrailingOffsetType::BasisPoints => {
+                    return Err(OrderMappingError::UnsupportedOffsetType(
+                        TrailingOffsetType::BasisPoints,
+                    ));
+                }
+            }
         }
     };
 
@@ -540,5 +651,178 @@ mod tests {
         assert_eq!(cancels.len(), 1);
         assert!(cancels.remove(42));
         assert!(cancels.is_empty());
+    }
+
+    #[test]
+    fn test_build_stop_order() {
+        let order = build_ib_order(
+            rustrade_instrument::Side::Sell,
+            100.0,
+            &OrderKind::Stop {
+                trigger_price: Decimal::from(45),
+            },
+            Decimal::ZERO,
+            &TimeInForce::GoodUntilCancelled { post_only: false },
+        )
+        .unwrap();
+
+        assert_eq!(order.action, Action::Sell);
+        assert_eq!(order.total_quantity, 100.0);
+        assert_eq!(order.order_type, "STP");
+        assert_eq!(order.aux_price, Some(45.0));
+        assert_eq!(order.limit_price, None);
+    }
+
+    #[test]
+    fn test_build_stop_limit_order() {
+        let order = build_ib_order(
+            rustrade_instrument::Side::Sell,
+            100.0,
+            &OrderKind::StopLimit {
+                trigger_price: Decimal::from(44),
+            },
+            Decimal::from(45), // limit price
+            &TimeInForce::GoodUntilCancelled { post_only: false },
+        )
+        .unwrap();
+
+        assert_eq!(order.action, Action::Sell);
+        assert_eq!(order.total_quantity, 100.0);
+        assert_eq!(order.order_type, "STP LMT");
+        assert_eq!(order.aux_price, Some(44.0)); // trigger/stop price
+        assert_eq!(order.limit_price, Some(45.0)); // limit price
+    }
+
+    #[test]
+    fn test_build_trailing_stop_percentage() {
+        let order = build_ib_order(
+            rustrade_instrument::Side::Sell,
+            100.0,
+            &OrderKind::TrailingStop {
+                offset: Decimal::from(5),
+                offset_type: TrailingOffsetType::Percentage,
+            },
+            Decimal::ZERO,
+            &TimeInForce::GoodUntilCancelled { post_only: false },
+        )
+        .unwrap();
+
+        assert_eq!(order.action, Action::Sell);
+        assert_eq!(order.total_quantity, 100.0);
+        assert_eq!(order.order_type, "TRAIL");
+        assert_eq!(order.trailing_percent, Some(5.0));
+        assert_eq!(order.aux_price, None); // percentage uses trailing_percent, not aux_price
+        assert_eq!(order.trail_stop_price, None); // let IB derive from market
+    }
+
+    #[test]
+    fn test_build_trailing_stop_absolute() {
+        let order = build_ib_order(
+            rustrade_instrument::Side::Sell,
+            100.0,
+            &OrderKind::TrailingStop {
+                offset: Decimal::from(2),
+                offset_type: TrailingOffsetType::Absolute,
+            },
+            Decimal::ZERO,
+            &TimeInForce::GoodUntilCancelled { post_only: false },
+        )
+        .unwrap();
+
+        assert_eq!(order.action, Action::Sell);
+        assert_eq!(order.total_quantity, 100.0);
+        assert_eq!(order.order_type, "TRAIL");
+        assert_eq!(order.aux_price, Some(2.0)); // absolute uses aux_price
+        assert_eq!(order.trailing_percent, None);
+        assert_eq!(order.trail_stop_price, None);
+    }
+
+    #[test]
+    fn test_build_trailing_stop_limit_absolute() {
+        let order = build_ib_order(
+            rustrade_instrument::Side::Sell,
+            100.0,
+            &OrderKind::TrailingStopLimit {
+                offset: Decimal::from(2),
+                offset_type: TrailingOffsetType::Absolute,
+                limit_offset: Decimal::try_from(0.5).unwrap(),
+            },
+            Decimal::ZERO,
+            &TimeInForce::GoodUntilCancelled { post_only: false },
+        )
+        .unwrap();
+
+        assert_eq!(order.action, Action::Sell);
+        assert_eq!(order.total_quantity, 100.0);
+        assert_eq!(order.order_type, "TRAIL LIMIT");
+        assert_eq!(order.aux_price, Some(2.0)); // trailing amount
+        assert_eq!(order.limit_price_offset, Some(0.5)); // limit offset from stop
+        assert_eq!(order.trailing_percent, None);
+    }
+
+    #[test]
+    fn test_build_trailing_stop_limit_percentage() {
+        let order = build_ib_order(
+            rustrade_instrument::Side::Sell,
+            100.0,
+            &OrderKind::TrailingStopLimit {
+                offset: Decimal::from(5),
+                offset_type: TrailingOffsetType::Percentage,
+                limit_offset: Decimal::try_from(0.5).unwrap(),
+            },
+            Decimal::ZERO,
+            &TimeInForce::GoodUntilCancelled { post_only: false },
+        )
+        .unwrap();
+
+        assert_eq!(order.action, Action::Sell);
+        assert_eq!(order.total_quantity, 100.0);
+        assert_eq!(order.order_type, "TRAIL LIMIT");
+        assert_eq!(order.trailing_percent, Some(5.0));
+        assert_eq!(order.limit_price_offset, Some(0.5));
+        assert_eq!(order.aux_price, None); // percentage doesn't use aux_price
+    }
+
+    #[test]
+    fn test_build_trailing_stop_basis_points_unsupported() {
+        let result = build_ib_order(
+            rustrade_instrument::Side::Sell,
+            100.0,
+            &OrderKind::TrailingStop {
+                offset: Decimal::from(50), // 50 basis points
+                offset_type: TrailingOffsetType::BasisPoints,
+            },
+            Decimal::ZERO,
+            &TimeInForce::GoodUntilCancelled { post_only: false },
+        );
+
+        assert!(matches!(
+            result,
+            Err(OrderMappingError::UnsupportedOffsetType(
+                TrailingOffsetType::BasisPoints
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_build_trailing_stop_limit_basis_points_unsupported() {
+        let result = build_ib_order(
+            rustrade_instrument::Side::Sell,
+            100.0,
+            &OrderKind::TrailingStopLimit {
+                offset: Decimal::from(50),
+                offset_type: TrailingOffsetType::BasisPoints,
+                limit_offset: Decimal::try_from(0.5).unwrap(),
+            },
+            Decimal::ZERO,
+            &TimeInForce::GoodUntilCancelled { post_only: false },
+        );
+
+        assert!(matches!(
+            result,
+            Err(OrderMappingError::UnsupportedOffsetType(
+                TrailingOffsetType::BasisPoints
+            ))
+        ));
     }
 }

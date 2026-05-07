@@ -287,6 +287,13 @@ pub enum OrderError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// [`ApiError::RateLimit`] is transient; other variants are not.
     #[error("order rejected: {0}")]
     Rejected(#[from] ApiError<AssetKey, InstrumentKey>),
+
+    /// The order type is not supported by this connector.
+    ///
+    /// Non-transient — the connector does not support this order type (e.g.,
+    /// trailing stop orders on a connector that only supports market/limit).
+    #[error("unsupported order type: {0}")]
+    UnsupportedOrderType(String),
 }
 
 impl<AssetKey, InstrumentKey> OrderError<AssetKey, InstrumentKey> {
@@ -304,6 +311,7 @@ impl<AssetKey, InstrumentKey> OrderError<AssetKey, InstrumentKey> {
             Self::Connectivity(e) => e.is_transient(),
             Self::Rejected(ApiError::RateLimit) => true,
             Self::Rejected(_) => false,
+            Self::UnsupportedOrderType(_) => false,
         }
     }
 }
