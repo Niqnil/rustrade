@@ -3,6 +3,8 @@
 //! Uses pre-downloaded DBN fixtures to test transformation logic without API calls.
 //! These tests run in CI.
 
+#![cfg(feature = "databento")]
+
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use rustrade_data::exchange::databento::{load_quotes_from_dbn, load_trades_from_dbn};

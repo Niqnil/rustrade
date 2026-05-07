@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Massive market data connector**: Historical, live, and reference data via `massive` feature
+  - `MassiveRestClient`: Historical aggregates, trades, quotes with streaming pagination
+  - `MassiveLive`: Real-time WebSocket streaming for trades, quotes, and aggregates
+  - Reference data: `fetch_tickers()`, `fetch_ticker_details()`, `fetch_exchanges()`, `fetch_market_status()`, `fetch_market_holidays()`
+  - Corporate actions: `fetch_dividends()`, `fetch_splits()` for stocks/ETFs
+  - `TickerQuery` builder for filtering ticker searches
+  - `ExchangeId::Massive` variant
+  - Supports all asset classes: stocks, crypto, forex, options, indices, futures
 - **Databento market data connector**: Historical and live data via `databento` feature
   - `DatabentoHistorical`: One-shot queries for trades and quotes in DBN format
   - `DatabentoLive<K>`: Real-time WebSocket streaming with `PitSymbolMap` symbol resolution

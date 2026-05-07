@@ -100,6 +100,8 @@ pub enum ExchangeId {
     Kraken,
     Kucoin,
     Liquid,
+    /// Massive (formerly Polygon.io) — consolidated market data across all asset classes
+    Massive,
     Mexc,
     Okx,
     Poloniex,
@@ -162,6 +164,7 @@ impl ExchangeId {
             ExchangeId::Kraken => "kraken",
             ExchangeId::Kucoin => "kucoin",
             ExchangeId::Liquid => "liquid",
+            ExchangeId::Massive => "massive",
             ExchangeId::Mexc => "mexc",
             ExchangeId::Okx => "okx",
             ExchangeId::Poloniex => "poloniex",

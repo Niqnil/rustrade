@@ -52,6 +52,10 @@ pub mod alpaca;
 #[cfg(feature = "databento")]
 pub mod databento;
 
+/// `Massive` (formerly Polygon.io) market data (behind `massive` feature).
+#[cfg(feature = "massive")]
+pub mod massive;
+
 /// Defines the generic [`ExchangeSub`] containing a market and channel combination used by an
 /// exchange [`Connector`] to build [`WsMessage`] subscription payloads.
 pub mod subscription;
