@@ -31,7 +31,7 @@ use rustrade_execution::{
         ibkr::{IbkrClient, IbkrConfig, contract::stock_contract},
     },
     order::{
-        OrderKey, OrderKind, TimeInForce,
+        OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
         id::{ClientOrderId, StrategyId},
         request::RequestOpen,
         state::{ActiveOrderState, InactiveOrderState, OrderState},
@@ -637,5 +637,417 @@ async fn test_cancel_produces_cancelled_not_expired() {
         panic!("FAILURE: Order state is Expired (should be Cancelled for user-initiated cancel)");
     } else {
         println!("WARNING: No terminal state observed in stream (cancel_order response was OK)");
+    }
+}
+
+// ============================================================================
+// Stop and Trailing Stop Order Tests (TG13 Phase 1 & 2)
+// ============================================================================
+
+/// Test placing and cancelling a Stop order.
+///
+/// Uses a Sell Stop with trigger at $0.01 - since AAPL trades far above this,
+/// the stop will never trigger and the order remains open for cancellation.
+#[tokio::test]
+#[ignore]
+async fn test_place_and_cancel_stop_order() {
+    init_logging();
+
+    let config = test_config(12);
+    let client = connect_client(config).await.expect("connection failed");
+
+    let aapl_name = aapl_instrument();
+    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
+    client.register_contract(aapl_name.clone(), aapl_contract);
+
+    let strategy = StrategyId::new("test-stop-order");
+    let order_cid = ClientOrderId::new(format!(
+        "stop-order-{}",
+        chrono::Utc::now().timestamp_millis()
+    ));
+
+    let order_key = OrderKey {
+        exchange: ExchangeId::Ibkr,
+        instrument: &aapl_name,
+        strategy: strategy.clone(),
+        cid: order_cid.clone(),
+    };
+
+    // Sell Stop at $0.01 trigger - won't trigger since AAPL >> $0.01
+    let request_open = RequestOpen {
+        side: Side::Sell,
+        price: dec!(0.00), // Not used for Stop (market) orders
+        quantity: dec!(1),
+        kind: OrderKind::Stop {
+            trigger_price: dec!(0.01),
+        },
+        time_in_force: TimeInForce::GoodUntilEndOfDay,
+        position_id: None,
+        reduce_only: false,
+    };
+
+    let open_request = rustrade_execution::order::OrderEvent {
+        key: order_key.clone(),
+        state: request_open,
+    };
+
+    println!("Placing Stop order: SELL 1 AAPL @ Stop $0.01 (won't trigger)");
+
+    let response = client.open_order(open_request).await;
+
+    assert!(response.is_some(), "Expected order response");
+    let response = response.unwrap();
+
+    match &response.state {
+        OrderState::Active(ActiveOrderState::Open(open_state)) => {
+            println!("Stop order placed successfully!");
+            println!("  Client Order ID: {}", response.key.cid);
+            println!("  Exchange Order ID: {:?}", open_state.id);
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let cancel_key = OrderKey {
+                exchange: ExchangeId::Ibkr,
+                instrument: &aapl_name,
+                strategy: response.key.strategy.clone(),
+                cid: response.key.cid.clone(),
+            };
+
+            let cancel_request = rustrade_execution::order::OrderEvent {
+                key: cancel_key,
+                state: rustrade_execution::order::request::RequestCancel {
+                    id: Some(open_state.id.clone()),
+                },
+            };
+
+            println!("Canceling Stop order...");
+            let cancel_response = client.cancel_order(cancel_request).await;
+
+            assert!(cancel_response.is_some(), "Expected cancel response");
+            let cancel_response = cancel_response.unwrap();
+
+            match &cancel_response.state {
+                Ok(_cancelled) => {
+                    println!("Stop order canceled successfully!");
+                }
+                Err(e) => {
+                    panic!("Cancel rejected: {:?}", e);
+                }
+            }
+        }
+        OrderState::Inactive(e) => {
+            panic!("Stop order rejected: {:?}", e);
+        }
+        other => {
+            panic!("Unexpected order state: {:?}", other);
+        }
+    }
+}
+
+/// Test placing and cancelling a Stop-Limit order.
+///
+/// Uses a Sell StopLimit with trigger at $0.01 and limit at $0.01 -
+/// since AAPL trades far above this, the stop will never trigger.
+#[tokio::test]
+#[ignore]
+async fn test_place_and_cancel_stop_limit_order() {
+    init_logging();
+
+    let config = test_config(13);
+    let client = connect_client(config).await.expect("connection failed");
+
+    let aapl_name = aapl_instrument();
+    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
+    client.register_contract(aapl_name.clone(), aapl_contract);
+
+    let strategy = StrategyId::new("test-stop-limit-order");
+    let order_cid = ClientOrderId::new(format!(
+        "stop-limit-{}",
+        chrono::Utc::now().timestamp_millis()
+    ));
+
+    let order_key = OrderKey {
+        exchange: ExchangeId::Ibkr,
+        instrument: &aapl_name,
+        strategy: strategy.clone(),
+        cid: order_cid.clone(),
+    };
+
+    // Sell StopLimit: trigger at $0.01, limit at $0.01 - won't trigger
+    let request_open = RequestOpen {
+        side: Side::Sell,
+        price: dec!(0.01), // Limit price (used when stop triggers)
+        quantity: dec!(1),
+        kind: OrderKind::StopLimit {
+            trigger_price: dec!(0.01),
+        },
+        time_in_force: TimeInForce::GoodUntilEndOfDay,
+        position_id: None,
+        reduce_only: false,
+    };
+
+    let open_request = rustrade_execution::order::OrderEvent {
+        key: order_key.clone(),
+        state: request_open,
+    };
+
+    println!("Placing StopLimit order: SELL 1 AAPL @ Stop $0.01, Limit $0.01 (won't trigger)");
+
+    let response = client.open_order(open_request).await;
+
+    assert!(response.is_some(), "Expected order response");
+    let response = response.unwrap();
+
+    match &response.state {
+        OrderState::Active(ActiveOrderState::Open(open_state)) => {
+            println!("StopLimit order placed successfully!");
+            println!("  Client Order ID: {}", response.key.cid);
+            println!("  Exchange Order ID: {:?}", open_state.id);
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let cancel_key = OrderKey {
+                exchange: ExchangeId::Ibkr,
+                instrument: &aapl_name,
+                strategy: response.key.strategy.clone(),
+                cid: response.key.cid.clone(),
+            };
+
+            let cancel_request = rustrade_execution::order::OrderEvent {
+                key: cancel_key,
+                state: rustrade_execution::order::request::RequestCancel {
+                    id: Some(open_state.id.clone()),
+                },
+            };
+
+            println!("Canceling StopLimit order...");
+            let cancel_response = client.cancel_order(cancel_request).await;
+
+            assert!(cancel_response.is_some(), "Expected cancel response");
+            let cancel_response = cancel_response.unwrap();
+
+            match &cancel_response.state {
+                Ok(_cancelled) => {
+                    println!("StopLimit order canceled successfully!");
+                }
+                Err(e) => {
+                    panic!("Cancel rejected: {:?}", e);
+                }
+            }
+        }
+        OrderState::Inactive(e) => {
+            panic!("StopLimit order rejected: {:?}", e);
+        }
+        other => {
+            panic!("Unexpected order state: {:?}", other);
+        }
+    }
+}
+
+/// Test placing and cancelling a TrailingStop order with percentage offset.
+///
+/// Uses a Sell TrailingStop with 50% trail - the stop price trails 50% below
+/// the highest price seen. Since this creates a very wide trail, the order
+/// won't trigger and remains open for cancellation.
+#[tokio::test]
+#[ignore]
+async fn test_place_and_cancel_trailing_stop_percentage() {
+    init_logging();
+
+    let config = test_config(14);
+    let client = connect_client(config).await.expect("connection failed");
+
+    let aapl_name = aapl_instrument();
+    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
+    client.register_contract(aapl_name.clone(), aapl_contract);
+
+    let strategy = StrategyId::new("test-trailing-stop-pct");
+    let order_cid = ClientOrderId::new(format!(
+        "trail-stop-pct-{}",
+        chrono::Utc::now().timestamp_millis()
+    ));
+
+    let order_key = OrderKey {
+        exchange: ExchangeId::Ibkr,
+        instrument: &aapl_name,
+        strategy: strategy.clone(),
+        cid: order_cid.clone(),
+    };
+
+    // Sell TrailingStop with 50% percentage offset - won't trigger
+    let request_open = RequestOpen {
+        side: Side::Sell,
+        price: dec!(0.00), // Not used for trailing stop (market) orders
+        quantity: dec!(1),
+        kind: OrderKind::TrailingStop {
+            offset: dec!(50), // 50% trailing offset
+            offset_type: TrailingOffsetType::Percentage,
+        },
+        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+        position_id: None,
+        reduce_only: false,
+    };
+
+    let open_request = rustrade_execution::order::OrderEvent {
+        key: order_key.clone(),
+        state: request_open,
+    };
+
+    println!("Placing TrailingStop order: SELL 1 AAPL @ 50% trail (won't trigger)");
+
+    let response = client.open_order(open_request).await;
+
+    assert!(response.is_some(), "Expected order response");
+    let response = response.unwrap();
+
+    match &response.state {
+        OrderState::Active(ActiveOrderState::Open(open_state)) => {
+            println!("TrailingStop (percentage) order placed successfully!");
+            println!("  Client Order ID: {}", response.key.cid);
+            println!("  Exchange Order ID: {:?}", open_state.id);
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let cancel_key = OrderKey {
+                exchange: ExchangeId::Ibkr,
+                instrument: &aapl_name,
+                strategy: response.key.strategy.clone(),
+                cid: response.key.cid.clone(),
+            };
+
+            let cancel_request = rustrade_execution::order::OrderEvent {
+                key: cancel_key,
+                state: rustrade_execution::order::request::RequestCancel {
+                    id: Some(open_state.id.clone()),
+                },
+            };
+
+            println!("Canceling TrailingStop order...");
+            let cancel_response = client.cancel_order(cancel_request).await;
+
+            assert!(cancel_response.is_some(), "Expected cancel response");
+            let cancel_response = cancel_response.unwrap();
+
+            match &cancel_response.state {
+                Ok(_cancelled) => {
+                    println!("TrailingStop (percentage) order canceled successfully!");
+                }
+                Err(e) => {
+                    panic!("Cancel rejected: {:?}", e);
+                }
+            }
+        }
+        OrderState::Inactive(e) => {
+            panic!("TrailingStop order rejected: {:?}", e);
+        }
+        other => {
+            panic!("Unexpected order state: {:?}", other);
+        }
+    }
+}
+
+/// Test placing and cancelling a TrailingStopLimit order with absolute offset.
+///
+/// Uses a Sell TrailingStopLimit with $500 absolute trail and $1 limit offset -
+/// the stop price trails $500 below the highest price seen. A $500 trailing
+/// distance is far wider than typical intraday AAPL moves, so the stop won't
+/// trigger and the order remains open for cancellation.
+#[tokio::test]
+#[ignore]
+async fn test_place_and_cancel_trailing_stop_limit_absolute() {
+    init_logging();
+
+    let config = test_config(15);
+    let client = connect_client(config).await.expect("connection failed");
+
+    let aapl_name = aapl_instrument();
+    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
+    client.register_contract(aapl_name.clone(), aapl_contract);
+
+    let strategy = StrategyId::new("test-trailing-stop-limit-abs");
+    let order_cid = ClientOrderId::new(format!(
+        "trail-stop-limit-{}",
+        chrono::Utc::now().timestamp_millis()
+    ));
+
+    let order_key = OrderKey {
+        exchange: ExchangeId::Ibkr,
+        instrument: &aapl_name,
+        strategy: strategy.clone(),
+        cid: order_cid.clone(),
+    };
+
+    // Sell TrailingStopLimit: $500 absolute trail, $1 limit offset from stop
+    let request_open = RequestOpen {
+        side: Side::Sell,
+        price: dec!(0.00), // Not used directly; limit_offset determines limit price
+        quantity: dec!(1),
+        kind: OrderKind::TrailingStopLimit {
+            offset: dec!(500), // $500 trailing amount
+            offset_type: TrailingOffsetType::Absolute,
+            limit_offset: dec!(1), // Limit price = stop price - $1
+        },
+        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+        position_id: None,
+        reduce_only: false,
+    };
+
+    let open_request = rustrade_execution::order::OrderEvent {
+        key: order_key.clone(),
+        state: request_open,
+    };
+
+    println!(
+        "Placing TrailingStopLimit order: SELL 1 AAPL @ $500 trail, $1 limit offset (won't trigger)"
+    );
+
+    let response = client.open_order(open_request).await;
+
+    assert!(response.is_some(), "Expected order response");
+    let response = response.unwrap();
+
+    match &response.state {
+        OrderState::Active(ActiveOrderState::Open(open_state)) => {
+            println!("TrailingStopLimit (absolute) order placed successfully!");
+            println!("  Client Order ID: {}", response.key.cid);
+            println!("  Exchange Order ID: {:?}", open_state.id);
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let cancel_key = OrderKey {
+                exchange: ExchangeId::Ibkr,
+                instrument: &aapl_name,
+                strategy: response.key.strategy.clone(),
+                cid: response.key.cid.clone(),
+            };
+
+            let cancel_request = rustrade_execution::order::OrderEvent {
+                key: cancel_key,
+                state: rustrade_execution::order::request::RequestCancel {
+                    id: Some(open_state.id.clone()),
+                },
+            };
+
+            println!("Canceling TrailingStopLimit order...");
+            let cancel_response = client.cancel_order(cancel_request).await;
+
+            assert!(cancel_response.is_some(), "Expected cancel response");
+            let cancel_response = cancel_response.unwrap();
+
+            match &cancel_response.state {
+                Ok(_cancelled) => {
+                    println!("TrailingStopLimit (absolute) order canceled successfully!");
+                }
+                Err(e) => {
+                    panic!("Cancel rejected: {:?}", e);
+                }
+            }
+        }
+        OrderState::Inactive(e) => {
+            panic!("TrailingStopLimit order rejected: {:?}", e);
+        }
+        other => {
+            panic!("Unexpected order state: {:?}", other);
+        }
     }
 }
