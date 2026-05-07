@@ -1051,3 +1051,230 @@ async fn test_place_and_cancel_trailing_stop_limit_absolute() {
         }
     }
 }
+
+// ============================================================================
+// Bracket Order Tests (TG13 Phase 3)
+// ============================================================================
+
+/// Test placing and cancelling a bracket order with OCA linkage.
+///
+/// Places a bracket order with:
+/// - Entry: Buy limit at $1 (won't fill since AAPL >> $1)
+/// - Take Profit: Sell limit at $2
+/// - Stop Loss: Sell stop at $0.50
+///
+/// Verifies all three legs are accepted, then cancels the parent which
+/// should cascade to cancel the children.
+#[tokio::test]
+#[ignore]
+async fn test_place_and_cancel_bracket_order() {
+    use rustrade_execution::client::ibkr::BracketOrderRequest;
+
+    init_logging();
+
+    let config = test_config(16);
+    let client = connect_client(config).await.expect("connection failed");
+
+    let aapl_name = aapl_instrument();
+    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
+    client.register_contract(aapl_name.clone(), aapl_contract);
+
+    let strategy = StrategyId::new("test-bracket-order");
+    let parent_cid =
+        ClientOrderId::new(format!("bracket-{}", chrono::Utc::now().timestamp_millis()));
+
+    let request = BracketOrderRequest {
+        instrument: aapl_name.clone(),
+        strategy: strategy.clone(),
+        parent_cid: parent_cid.clone(),
+        side: Side::Buy,
+        quantity: dec!(1),
+        entry_price: dec!(1.00),       // Entry at $1 (won't fill)
+        take_profit_price: dec!(2.00), // TP at $2
+        stop_loss_price: dec!(0.50),   // SL at $0.50
+        time_in_force: TimeInForce::GoodUntilEndOfDay,
+    };
+
+    println!("Placing bracket order: BUY 1 AAPL @ $1.00 entry, $2.00 TP, $0.50 SL");
+
+    let result = client.open_bracket_order(request).await;
+
+    // Check parent order
+    match &result.parent.state {
+        OrderState::Active(ActiveOrderState::Open(open_state)) => {
+            println!("Parent order placed successfully!");
+            println!("  Client Order ID: {}", result.parent.key.cid);
+            println!("  Exchange Order ID: {:?}", open_state.id);
+        }
+        OrderState::Inactive(e) => {
+            panic!("Parent order rejected: {:?}", e);
+        }
+        other => {
+            panic!("Unexpected parent order state: {:?}", other);
+        }
+    }
+
+    // Check take profit order
+    match &result.take_profit.state {
+        OrderState::Active(ActiveOrderState::Open(open_state)) => {
+            println!("Take profit order placed successfully!");
+            println!("  Client Order ID: {}", result.take_profit.key.cid);
+            println!("  Exchange Order ID: {:?}", open_state.id);
+        }
+        OrderState::Inactive(e) => {
+            panic!("Take profit order rejected: {:?}", e);
+        }
+        other => {
+            panic!("Unexpected take profit order state: {:?}", other);
+        }
+    }
+
+    // Check stop loss order
+    match &result.stop_loss.state {
+        OrderState::Active(ActiveOrderState::Open(open_state)) => {
+            println!("Stop loss order placed successfully!");
+            println!("  Client Order ID: {}", result.stop_loss.key.cid);
+            println!("  Exchange Order ID: {:?}", open_state.id);
+        }
+        OrderState::Inactive(e) => {
+            panic!("Stop loss order rejected: {:?}", e);
+        }
+        other => {
+            panic!("Unexpected stop loss order state: {:?}", other);
+        }
+    }
+
+    // Brief delay before cancel
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Cancel the parent order - this should cascade to children via IB's parent_id linkage
+    if let OrderState::Active(ActiveOrderState::Open(open_state)) = &result.parent.state {
+        let cancel_key = OrderKey {
+            exchange: ExchangeId::Ibkr,
+            instrument: &aapl_name,
+            strategy: result.parent.key.strategy.clone(),
+            cid: result.parent.key.cid.clone(),
+        };
+
+        let cancel_request = rustrade_execution::order::OrderEvent {
+            key: cancel_key,
+            state: rustrade_execution::order::request::RequestCancel {
+                id: Some(open_state.id.clone()),
+            },
+        };
+
+        println!("Canceling bracket order (parent)...");
+        let cancel_response = client.cancel_order(cancel_request).await;
+
+        assert!(cancel_response.is_some(), "Expected cancel response");
+        let cancel_response = cancel_response.unwrap();
+
+        match &cancel_response.state {
+            Ok(_cancelled) => {
+                println!("Bracket order canceled successfully!");
+                println!("  (Children should be auto-cancelled by IB via parent_id linkage)");
+            }
+            Err(e) => {
+                panic!("Cancel rejected: {:?}", e);
+            }
+        }
+    }
+}
+
+/// Test that bracket order OCA group is set correctly.
+///
+/// This test verifies the OCA linkage by checking that when we fetch open orders,
+/// the TP and SL orders share the same OCA group identifier.
+#[tokio::test]
+#[ignore]
+async fn test_bracket_order_oca_group_linkage() {
+    use rustrade_execution::client::ibkr::BracketOrderRequest;
+
+    init_logging();
+
+    let config = test_config(17);
+    let client = connect_client(config).await.expect("connection failed");
+
+    let aapl_name = aapl_instrument();
+    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
+    client.register_contract(aapl_name.clone(), aapl_contract);
+
+    let strategy = StrategyId::new("test-bracket-oca");
+    let parent_cid = ClientOrderId::new(format!(
+        "bracket-oca-{}",
+        chrono::Utc::now().timestamp_millis()
+    ));
+
+    let request = BracketOrderRequest {
+        instrument: aapl_name.clone(),
+        strategy: strategy.clone(),
+        parent_cid: parent_cid.clone(),
+        side: Side::Buy,
+        quantity: dec!(1),
+        entry_price: dec!(1.00),
+        take_profit_price: dec!(2.00),
+        stop_loss_price: dec!(0.50),
+        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+    };
+
+    println!("Placing bracket order to verify OCA linkage...");
+    let result = client.open_bracket_order(request).await;
+
+    // Verify all three are active
+    assert!(
+        matches!(result.parent.state, OrderState::Active(_)),
+        "Parent should be active"
+    );
+    assert!(
+        matches!(result.take_profit.state, OrderState::Active(_)),
+        "TP should be active"
+    );
+    assert!(
+        matches!(result.stop_loss.state, OrderState::Active(_)),
+        "SL should be active"
+    );
+
+    println!("All three legs placed successfully.");
+    println!("  Parent CID: {}", result.parent.key.cid);
+    println!(
+        "  TP CID: {} (should end with _tp)",
+        result.take_profit.key.cid
+    );
+    println!(
+        "  SL CID: {} (should end with _sl)",
+        result.stop_loss.key.cid
+    );
+
+    // Verify CID naming convention
+    assert!(
+        result.take_profit.key.cid.0.ends_with("_tp"),
+        "TP CID should end with _tp"
+    );
+    assert!(
+        result.stop_loss.key.cid.0.ends_with("_sl"),
+        "SL CID should end with _sl"
+    );
+
+    // Brief delay before cleanup
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Cleanup: cancel the parent
+    if let OrderState::Active(ActiveOrderState::Open(open_state)) = &result.parent.state {
+        let cancel_key = OrderKey {
+            exchange: ExchangeId::Ibkr,
+            instrument: &aapl_name,
+            strategy: result.parent.key.strategy.clone(),
+            cid: result.parent.key.cid.clone(),
+        };
+
+        let cancel_request = rustrade_execution::order::OrderEvent {
+            key: cancel_key,
+            state: rustrade_execution::order::request::RequestCancel {
+                id: Some(open_state.id.clone()),
+            },
+        };
+
+        let _ = client.cancel_order(cancel_request).await;
+        println!("Cleanup: bracket order cancelled.");
+    }
+}

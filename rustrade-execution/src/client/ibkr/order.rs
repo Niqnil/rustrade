@@ -1,10 +1,77 @@
-use crate::order::{OrderKind, TimeInForce, TrailingOffsetType, id::ClientOrderId};
+use crate::order::{
+    Order as RustradeOrder, OrderKind, TimeInForce, TrailingOffsetType,
+    id::{ClientOrderId, StrategyId},
+    state::UnindexedOrderState,
+};
 use fnv::FnvHashMap;
-use ibapi::orders::{Action, Order, TimeInForce as IbTimeInForce, order_builder};
+use ibapi::orders::{Action, OcaType, Order, TimeInForce as IbTimeInForce, order_builder};
 use parking_lot::{Mutex, RwLock};
 use rust_decimal::Decimal;
-use rustrade_instrument::{Side, instrument::name::InstrumentNameExchange};
+use rustrade_instrument::{Side, exchange::ExchangeId, instrument::name::InstrumentNameExchange};
 use std::{sync::Arc, time::Instant};
+
+// ============================================================================
+// Bracket Order Types
+// ============================================================================
+
+/// Request to place a bracket order (entry + take-profit + stop-loss).
+///
+/// A bracket order consists of three linked orders:
+/// 1. **Entry**: Limit order to enter the position
+/// 2. **Take Profit**: Limit order to exit at profit target
+/// 3. **Stop Loss**: Stop order to exit at loss limit
+///
+/// The entry order is submitted with `transmit=false`, holding all orders until
+/// the stop-loss (with `transmit=true`) triggers atomic submission of all three.
+///
+/// Take-profit and stop-loss are linked via OCA (One-Cancels-All) group, so when
+/// one fills, IB automatically cancels the other.
+#[derive(Debug, Clone)]
+pub struct BracketOrderRequest {
+    /// Instrument to trade.
+    pub instrument: InstrumentNameExchange,
+    /// Strategy identifier for order correlation.
+    pub strategy: StrategyId,
+    /// Client order ID for the parent (entry) order.
+    /// Child orders will have IDs derived from this (parent_cid + "_tp", parent_cid + "_sl").
+    pub parent_cid: ClientOrderId,
+    /// Buy or Sell for the entry order (exits use opposite side).
+    pub side: Side,
+    /// Number of shares/contracts.
+    pub quantity: Decimal,
+    /// Entry limit price.
+    pub entry_price: Decimal,
+    /// Take profit limit price.
+    pub take_profit_price: Decimal,
+    /// Stop loss trigger price.
+    pub stop_loss_price: Decimal,
+    /// Time-in-force for all three orders.
+    pub time_in_force: TimeInForce,
+}
+
+/// Result of placing a bracket order.
+///
+/// Contains the three orders with their states. Use the `ClientOrderId` from each
+/// order's key to cancel individual legs or correlate stream events.
+///
+/// # Invariant
+///
+/// Either all three orders are `Active(Open)` or all three are `Inactive`.
+/// Partial success (some active, some inactive) is prevented by the all-or-nothing
+/// error handling in `open_bracket_order`.
+#[derive(Debug, Clone)]
+pub struct BracketOrderResult {
+    /// Parent (entry) order.
+    pub parent: RustradeOrder<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
+    /// Take profit order (opposite side, limit).
+    pub take_profit: RustradeOrder<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
+    /// Stop loss order (opposite side, stop).
+    pub stop_loss: RustradeOrder<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
+}
+
+// ============================================================================
+// Order Context
+// ============================================================================
 
 /// Order context stored when placing orders.
 ///
@@ -225,7 +292,7 @@ impl Default for PendingCancels {
 }
 
 /// Convert rustrade Side to IB Action.
-pub fn side_to_action(side: rustrade_instrument::Side) -> Action {
+pub(crate) fn side_to_action(side: rustrade_instrument::Side) -> Action {
     match side {
         rustrade_instrument::Side::Buy => Action::Buy,
         rustrade_instrument::Side::Sell => Action::Sell,
@@ -405,6 +472,76 @@ pub fn build_ib_order(
     order.tif = tif_ib;
 
     Ok(order)
+}
+
+/// Build a bracket order with proper OCA linking.
+///
+/// ibapi's `order_builder::bracket_order()` sets `parent_id` on child orders (TP/SL
+/// wait for entry fill) but does NOT set `oca_group` or `oca_type`. Without OCA
+/// linking, if take-profit fills, stop-loss stays open — dangerous position exposure.
+///
+/// This function wraps `bracket_order()` and adds OCA group linking so that when
+/// either child order fills, the other is automatically cancelled by IB.
+///
+/// # Arguments
+///
+/// * `parent_order_id` - The IB order ID for the parent (entry) order
+/// * `action` - Buy or Sell for the entry order (children use opposite action)
+/// * `quantity` - Number of shares/contracts
+/// * `limit_price` - Entry limit price
+/// * `take_profit_price` - Take profit limit price (above entry for Buy, below for Sell)
+/// * `stop_loss_price` - Stop loss trigger price (below entry for Buy, above for Sell)
+///
+/// # Returns
+///
+/// Vec of 3 orders: `[parent, take_profit, stop_loss]` with:
+/// - `parent_id` set on children (IB's bracket linkage)
+/// - `oca_group` set on children (OCA linkage between TP and SL)
+/// - `oca_type = CancelWithBlock` (safest: one at a time, cancel remaining)
+/// - `transmit` flags: parent=false, TP=false, SL=true (atomic submission)
+///
+/// # Order ID Convention
+///
+/// ibapi's `bracket_order()` assigns consecutive IDs: parent=N, TP=N+1, SL=N+2.
+/// Caller must ensure these IDs are reserved atomically via `allocate_order_id_range(3)`.
+pub fn build_ib_bracket_with_oca(
+    parent_order_id: i32,
+    action: Action,
+    quantity: f64,
+    limit_price: f64,
+    take_profit_price: f64,
+    stop_loss_price: f64,
+    tif: IbTimeInForce,
+) -> Vec<Order> {
+    let mut orders = order_builder::bracket_order(
+        parent_order_id,
+        action,
+        quantity,
+        limit_price,
+        take_profit_price,
+        stop_loss_price,
+    );
+    assert_eq!(
+        orders.len(),
+        3,
+        "ibapi bracket_order must return exactly 3 orders (parent, TP, SL)"
+    );
+
+    // ibapi's bracket_order() defaults all legs to TimeInForce::Day; override
+    // with the caller-specified TIF so it actually reaches the wire.
+    orders[0].tif = tif.clone();
+    orders[1].tif = tif.clone();
+    orders[2].tif = tif;
+
+    // Link TP and SL via OCA group so one cancels the other.
+    // CancelWithBlock provides overfill protection by routing only one child at a time.
+    let oca_group = format!("bracket_{}", parent_order_id);
+    orders[1].oca_group = oca_group.clone();
+    orders[1].oca_type = OcaType::CancelWithBlock;
+    orders[2].oca_group = oca_group;
+    orders[2].oca_type = OcaType::CancelWithBlock;
+
+    orders
 }
 
 #[cfg(test)]
@@ -824,5 +961,166 @@ mod tests {
                 TrailingOffsetType::BasisPoints
             ))
         ));
+    }
+
+    // =========================================================================
+    // Bracket Order Tests (Phase 3)
+    // =========================================================================
+
+    #[test]
+    fn test_build_ib_bracket_with_oca_sets_oca_fields() {
+        let orders = build_ib_bracket_with_oca(
+            1000,
+            Action::Buy,
+            10.0,
+            150.0,
+            160.0,
+            140.0,
+            IbTimeInForce::Day,
+        );
+
+        assert_eq!(orders.len(), 3);
+
+        // OCA group must be non-empty on both child orders
+        assert!(!orders[1].oca_group.is_empty());
+        assert_eq!(orders[1].oca_group, orders[2].oca_group);
+
+        // Both children must use CancelWithBlock
+        assert_eq!(orders[1].oca_type, OcaType::CancelWithBlock);
+        assert_eq!(orders[2].oca_type, OcaType::CancelWithBlock);
+
+        // Parent must NOT be in OCA group (only children are linked)
+        assert!(orders[0].oca_group.is_empty());
+        assert_eq!(orders[0].oca_type, OcaType::None);
+    }
+
+    #[test]
+    fn test_build_ib_bracket_with_oca_parent_id_linkage() {
+        let orders = build_ib_bracket_with_oca(
+            1000,
+            Action::Buy,
+            10.0,
+            150.0,
+            160.0,
+            140.0,
+            IbTimeInForce::Day,
+        );
+
+        // Children must reference parent via parent_id
+        assert_eq!(orders[1].parent_id, 1000); // TP waits for parent fill
+        assert_eq!(orders[2].parent_id, 1000); // SL waits for parent fill
+
+        // Parent has no parent
+        assert_eq!(orders[0].parent_id, 0);
+    }
+
+    #[test]
+    fn test_build_ib_bracket_with_oca_transmit_flags() {
+        let orders = build_ib_bracket_with_oca(
+            1000,
+            Action::Buy,
+            10.0,
+            150.0,
+            160.0,
+            140.0,
+            IbTimeInForce::Day,
+        );
+
+        // Only the last order triggers transmission of all three
+        assert!(!orders[0].transmit); // Parent: don't transmit yet
+        assert!(!orders[1].transmit); // TP: don't transmit yet
+        assert!(orders[2].transmit); // SL: transmit all
+    }
+
+    #[test]
+    fn test_build_ib_bracket_with_oca_order_ids_are_consecutive() {
+        let orders = build_ib_bracket_with_oca(
+            500,
+            Action::Sell,
+            5.0,
+            100.0,
+            90.0,
+            110.0,
+            IbTimeInForce::Day,
+        );
+
+        assert_eq!(orders[0].order_id, 500); // Parent
+        assert_eq!(orders[1].order_id, 501); // Take profit
+        assert_eq!(orders[2].order_id, 502); // Stop loss
+    }
+
+    #[test]
+    fn test_build_ib_bracket_with_oca_group_name_contains_parent_id() {
+        let orders =
+            build_ib_bracket_with_oca(42, Action::Buy, 1.0, 10.0, 12.0, 8.0, IbTimeInForce::Day);
+
+        assert!(orders[1].oca_group.contains("42"));
+        assert!(orders[2].oca_group.contains("42"));
+    }
+
+    #[test]
+    fn test_build_ib_bracket_with_oca_order_types() {
+        let orders = build_ib_bracket_with_oca(
+            1000,
+            Action::Buy,
+            100.0,
+            150.0,
+            160.0,
+            140.0,
+            IbTimeInForce::Day,
+        );
+
+        // Parent is limit order
+        assert_eq!(orders[0].order_type, "LMT");
+        assert_eq!(orders[0].limit_price, Some(150.0));
+
+        // Take profit is limit order
+        assert_eq!(orders[1].order_type, "LMT");
+        assert_eq!(orders[1].limit_price, Some(160.0));
+
+        // Stop loss is stop order
+        assert_eq!(orders[2].order_type, "STP");
+        assert_eq!(orders[2].aux_price, Some(140.0));
+    }
+
+    #[test]
+    fn test_build_ib_bracket_with_oca_actions_reversed_for_children() {
+        // Buy bracket: entry=Buy, exits=Sell
+        let buy_orders =
+            build_ib_bracket_with_oca(100, Action::Buy, 10.0, 50.0, 55.0, 45.0, IbTimeInForce::Day);
+        assert_eq!(buy_orders[0].action, Action::Buy);
+        assert_eq!(buy_orders[1].action, Action::Sell);
+        assert_eq!(buy_orders[2].action, Action::Sell);
+
+        // Sell bracket: entry=Sell, exits=Buy
+        let sell_orders = build_ib_bracket_with_oca(
+            200,
+            Action::Sell,
+            10.0,
+            50.0,
+            45.0,
+            55.0,
+            IbTimeInForce::Day,
+        );
+        assert_eq!(sell_orders[0].action, Action::Sell);
+        assert_eq!(sell_orders[1].action, Action::Buy);
+        assert_eq!(sell_orders[2].action, Action::Buy);
+    }
+
+    #[test]
+    fn test_build_ib_bracket_with_oca_applies_tif_to_all_legs() {
+        let orders = build_ib_bracket_with_oca(
+            1000,
+            Action::Buy,
+            10.0,
+            150.0,
+            160.0,
+            140.0,
+            IbTimeInForce::GoodTilCanceled,
+        );
+
+        assert_eq!(orders[0].tif, IbTimeInForce::GoodTilCanceled);
+        assert_eq!(orders[1].tif, IbTimeInForce::GoodTilCanceled);
+        assert_eq!(orders[2].tif, IbTimeInForce::GoodTilCanceled);
     }
 }
