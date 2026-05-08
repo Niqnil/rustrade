@@ -100,6 +100,10 @@
 // Silence unused_crate_dependencies for dev-dependencies used only in tests
 #[cfg(test)]
 use tracing_subscriber as _;
+// serial_test is only referenced by integration tests under the `massive` feature
+// (tests/massive_integration.rs), which compile as separate units.
+#[cfg(test)]
+use serial_test as _;
 
 use crate::{
     error::DataError,

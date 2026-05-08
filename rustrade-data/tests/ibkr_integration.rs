@@ -31,7 +31,7 @@ use rustrade_data::{
     event::DataKind,
     exchange::ibkr::{
         IbkrMarketStream, IbkrStreamConfig,
-        historical::{HistoricalRequest, IbkrHistoricalData, ToDuration},
+        historical::{HistoricalRequest, HistoricalTickRequest, IbkrHistoricalData, ToDuration},
         subscription::{IbkrSubscription, IbkrSubscriptionKind},
     },
 };
@@ -348,6 +348,165 @@ async fn test_historical_from_shared_client() {
         "Expected at least one candle from shared client"
     );
     println!("Received {} candles from shared client", candles.len());
+}
+
+// ============================================================================
+// Historical Tick Data Tests (Task 13.4)
+// ============================================================================
+
+#[tokio::test]
+#[ignore]
+async fn test_historical_ticks_trade() {
+    init_logging();
+
+    let url = format!("127.0.0.1:{}", test_port());
+    let client_id = test_client_id_base() + 6;
+
+    let client = connect_historical(&url, client_id)
+        .await
+        .expect("connection failed");
+
+    let contract = aapl_contract();
+    let request = HistoricalTickRequest::recent(contract, 100);
+
+    println!("Fetching recent 100 AAPL trade ticks...");
+
+    let result = client.fetch_historical_ticks(request).await;
+
+    assert!(
+        result.is_ok(),
+        "fetch_historical_ticks failed: {:?}",
+        result.err()
+    );
+
+    let trades = result.unwrap();
+    println!("Received {} trade ticks", trades.len());
+
+    // May be empty outside market hours
+    if !trades.is_empty() {
+        for trade in trades.iter().take(5) {
+            println!(
+                "  Trade: id={} price={:.2} amount={} side={:?}",
+                trade.id, trade.price, trade.amount, trade.side
+            );
+        }
+
+        let first = &trades[0];
+        assert!(
+            !first.price.is_zero(),
+            "Trade price should be non-zero: {}",
+            first.price
+        );
+        assert!(
+            first.side.is_none(),
+            "IB historical ticks have no side info"
+        );
+    } else {
+        println!("No ticks available (normal outside market hours)");
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_historical_ticks_bid_ask() {
+    init_logging();
+
+    let url = format!("127.0.0.1:{}", test_port());
+    let client_id = test_client_id_base() + 7;
+
+    let client = connect_historical(&url, client_id)
+        .await
+        .expect("connection failed");
+
+    let contract = aapl_contract();
+    let request = HistoricalTickRequest::recent(contract, 100);
+
+    println!("Fetching recent 100 AAPL bid/ask ticks...");
+
+    let result = client.fetch_historical_bid_ask(request, false).await;
+
+    assert!(
+        result.is_ok(),
+        "fetch_historical_bid_ask failed: {:?}",
+        result.err()
+    );
+
+    let quotes = result.unwrap();
+    println!("Received {} bid/ask ticks", quotes.len());
+
+    // May be empty outside market hours
+    if !quotes.is_empty() {
+        for l1 in quotes.iter().take(5) {
+            let bid = l1.best_bid.as_ref().map(|b| format!("{:.2}", b.price));
+            let ask = l1.best_ask.as_ref().map(|a| format!("{:.2}", a.price));
+            println!(
+                "  L1: time={} bid={:?} ask={:?}",
+                l1.last_update_time.format("%H:%M:%S"),
+                bid,
+                ask
+            );
+        }
+
+        let first = &quotes[0];
+        assert!(
+            first.best_bid.is_some() && first.best_ask.is_some(),
+            "Expected both bid and ask to be present"
+        );
+
+        let bid = first.best_bid.as_ref().unwrap();
+        let ask = first.best_ask.as_ref().unwrap();
+        assert!(
+            bid.price < ask.price,
+            "Bid {:.4} should be less than ask {:.4}",
+            bid.price,
+            ask.price
+        );
+    } else {
+        println!("No ticks available (normal outside market hours)");
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_historical_ticks_with_time_range() {
+    use time::macros::datetime;
+
+    init_logging();
+
+    let url = format!("127.0.0.1:{}", test_port());
+    let client_id = test_client_id_base() + 8;
+
+    let client = connect_historical(&url, client_id)
+        .await
+        .expect("connection failed");
+
+    let contract = aapl_contract();
+
+    // Request ticks from a specific time (adjust date as needed for testing)
+    let request = HistoricalTickRequest {
+        contract,
+        start: Some(datetime!(2024-01-15 14:30 UTC)),
+        end: None,
+        number_of_ticks: 50,
+        regular_trading_hours_only: true,
+    };
+
+    println!("Fetching 50 AAPL trade ticks starting from 2024-01-15 14:30 UTC...");
+
+    let result = client.fetch_historical_ticks(request).await;
+
+    // This may fail if the date is too old or no data available
+    match result {
+        Ok(trades) => {
+            println!("Received {} trade ticks", trades.len());
+            for trade in trades.iter().take(3) {
+                println!("  Trade: price={:.2} amount={}", trade.price, trade.amount);
+            }
+        }
+        Err(e) => {
+            println!("Request failed (expected if date too old): {}", e);
+        }
+    }
 }
 
 // ============================================================================
