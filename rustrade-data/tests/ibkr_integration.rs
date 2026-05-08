@@ -24,7 +24,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Integration tests: panics are the correct failure mode
 
 use ibapi::{
-    contracts::Contract,
+    contracts::{Contract, SecurityType},
     market_data::historical::{BarSize, WhatToShow},
 };
 use rustrade_data::{
@@ -814,4 +814,233 @@ async fn test_contract_resolution() {
             .get_name_by_con_id(first.contract.contract_id)
             .is_some()
     );
+}
+
+// ============================================================================
+// Option Greeks Calculator Tests (Phase 5A)
+// ============================================================================
+
+/// Create an AAPL call option contract for testing.
+///
+/// Uses a near-the-money strike with an expiration ~30 days out.
+/// Adjust expiration date to a valid future date when running tests.
+fn aapl_call_option() -> Contract {
+    // Note: Update expiration date to a valid future date before running
+    Contract::call("AAPL")
+        .strike(200.0)
+        .expires_on(2027, 6, 18) // Third Friday of June 2027
+        .build()
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_calculate_theoretical_greeks() {
+    init_logging();
+
+    let url = format!("127.0.0.1:{}", test_port());
+    let client_id = test_client_id_base() + 30;
+
+    let client = IbkrHistoricalData::connect(&url, client_id).expect("connection failed");
+
+    let option = aapl_call_option();
+
+    println!("Calculating theoretical Greeks for AAPL call option...");
+    println!("  Strike: {}", option.strike);
+    println!("  Using volatility: 25% (0.25)");
+    println!("  Using underlying price: $200.00");
+
+    let greeks = client
+        .calculate_theoretical_greeks(&option, 0.25, 200.0)
+        .await;
+
+    match greeks {
+        Ok(g) => {
+            println!("Theoretical Greeks:");
+            if let Some(delta) = g.delta {
+                println!("  Delta: {:.4}", delta);
+            }
+            if let Some(gamma) = g.gamma {
+                println!("  Gamma: {:.4}", gamma);
+            }
+            if let Some(theta) = g.theta {
+                println!("  Theta: {:.4}", theta);
+            }
+            if let Some(vega) = g.vega {
+                println!("  Vega: {:.4}", vega);
+            }
+            if let Some(price) = g.theoretical_price {
+                println!("  Theoretical Price: ${:.2}", price);
+            }
+
+            // For an ATM call with reasonable inputs, delta should be around 0.5
+            assert!(
+                g.has_any_greek(),
+                "Expected at least some Greeks to be computed"
+            );
+        }
+        Err(e) => panic!("calculate_theoretical_greeks failed: {e}"),
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_calculate_implied_volatility() {
+    init_logging();
+
+    let url = format!("127.0.0.1:{}", test_port());
+    let client_id = test_client_id_base() + 31;
+
+    let client = IbkrHistoricalData::connect(&url, client_id).expect("connection failed");
+
+    let option = aapl_call_option();
+
+    println!("Calculating implied volatility for AAPL call option...");
+    println!("  Strike: {}", option.strike);
+    println!("  Using option price: $10.00");
+    println!("  Using underlying price: $200.00");
+
+    let greeks = client
+        .calculate_implied_volatility(&option, 10.0, 200.0)
+        .await;
+
+    match greeks {
+        Ok(g) => {
+            println!("Implied Volatility Result:");
+            if let Some(iv) = g.implied_volatility {
+                println!("  IV: {:.2}%", iv * 100.0);
+            }
+            if let Some(delta) = g.delta {
+                println!("  Delta: {:.4}", delta);
+            }
+
+            assert!(g.implied_volatility.is_some(), "Expected IV to be computed");
+        }
+        Err(e) => panic!("calculate_implied_volatility failed: {e}"),
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_fetch_option_chain() {
+    init_logging();
+
+    let url = format!("127.0.0.1:{}", test_port());
+    let client_id = test_client_id_base() + 32;
+
+    let client = IbkrHistoricalData::connect(&url, client_id).expect("connection failed");
+
+    println!("Fetching option chain for AAPL...");
+
+    let chains = client
+        .fetch_option_chain("AAPL", "SMART", SecurityType::Stock, 0)
+        .await;
+
+    match chains {
+        Ok(entries) => {
+            println!("Received {} option chain entries:", entries.len());
+            for (i, entry) in entries.iter().take(3).enumerate() {
+                println!("Entry {}:", i + 1);
+                println!("  Exchange: {}", entry.exchange);
+                println!("  Trading Class: {}", entry.trading_class);
+                println!("  Multiplier: {}", entry.multiplier);
+                println!("  Expirations: {} available", entry.expirations.len());
+                if !entry.expirations.is_empty() {
+                    println!(
+                        "    First few: {:?}",
+                        &entry.expirations[..3.min(entry.expirations.len())]
+                    );
+                }
+                println!("  Strikes: {} available", entry.strikes.len());
+                if !entry.strikes.is_empty() {
+                    println!(
+                        "    First few: {:?}",
+                        &entry.strikes[..3.min(entry.strikes.len())]
+                    );
+                }
+            }
+
+            assert!(
+                !entries.is_empty(),
+                "Expected at least one option chain entry"
+            );
+        }
+        Err(e) => {
+            println!("Fetch failed: {}", e);
+            // Option chain data should be available for AAPL without special subscriptions
+            panic!("Option chain fetch failed: {}", e);
+        }
+    }
+}
+
+// ============================================================================
+// Real-Time Option Greeks Streaming Tests (Phase 5B)
+// ============================================================================
+
+#[tokio::test]
+#[ignore]
+async fn test_option_greeks_stream() {
+    init_logging();
+
+    let config = IbkrStreamConfig {
+        host: "127.0.0.1".to_string(),
+        port: test_port(),
+        client_id: test_client_id_base() + 33,
+    };
+
+    let option = aapl_call_option();
+
+    let registry = ContractRegistry::new();
+    registry.register("AAPL_CALL".into(), option);
+    let registry = Arc::new(registry);
+
+    let subscriptions = vec![IbkrSubscription {
+        instrument: "AAPL_CALL".into(),
+        key: "AAPL_CALL".to_string(),
+        kind: IbkrSubscriptionKind::OptionGreeks,
+    }];
+
+    let result = IbkrMarketStream::init(config, registry, subscriptions);
+
+    match result {
+        Ok(mut stream) => {
+            println!("Option Greeks stream initialized");
+            println!("Waiting for Greeks updates (10 second timeout)...");
+            println!("Note: Requires OPRA subscription for live Greeks");
+
+            let timeout_result = tokio::time::timeout(Duration::from_secs(10), async {
+                let mut greeks_count = 0;
+                while let Some(result) = stream.next().await {
+                    match result {
+                        Ok(event) => {
+                            if let DataKind::OptionGreeks(g) = &event.kind {
+                                println!("Greeks update:");
+                                if let Some(delta) = g.delta {
+                                    println!("  Delta: {:.4}", delta);
+                                }
+                                if let Some(iv) = g.implied_volatility {
+                                    println!("  IV: {:.2}%", iv * 100.0);
+                                }
+                                greeks_count += 1;
+                                if greeks_count >= 3 {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            println!("Stream error: {:?}", e);
+                            break;
+                        }
+                    }
+                }
+                greeks_count
+            })
+            .await;
+
+            match timeout_result {
+                Ok(count) => println!("Received {} Greeks updates", count),
+                Err(_) => println!("Timeout (requires OPRA subscription for live Greeks)"),
+            }
+        }
+        Err(e) => panic!("Stream init failed: {e}"),
+    }
 }

@@ -55,6 +55,7 @@
 //!
 //! [`IbkrMarketStream`]: super::IbkrMarketStream
 
+use super::options::{OptionChainEntry, OptionGreeks};
 use crate::{
     books::Level,
     error::DataError,
@@ -63,7 +64,7 @@ use crate::{
 use chrono::{DateTime, Utc};
 use ibapi::{
     client::blocking::Client,
-    contracts::Contract,
+    contracts::{Contract, SecurityType},
     market_data::{
         TradingHours,
         historical::{BarSize, Duration, TickBidAsk, TickLast, WhatToShow},
@@ -380,6 +381,236 @@ impl IbkrHistoricalData {
         debug!(symbol = %symbol, count = quotes.len(), "Received historical bid/ask ticks");
 
         Ok(quotes)
+    }
+
+    // ========================================================================
+    // Option Greeks Calculators (Phase 5A)
+    // ========================================================================
+
+    /// Calculate theoretical option Greeks given volatility and underlying price.
+    ///
+    /// This is a **calculator** — you provide the volatility and underlying price,
+    /// and IB computes the theoretical Greeks. This does NOT fetch market data.
+    ///
+    /// For real-time Greeks based on live market prices, use the streaming API
+    /// (Phase 5B) with `TickTypes::OptionComputation`.
+    ///
+    /// # Arguments
+    ///
+    /// * `contract` - Option contract (must be SecurityType::Option)
+    /// * `volatility` - Implied volatility to use (e.g., 0.25 for 25%)
+    /// * `underlying_price` - Underlying price to use for calculation
+    ///
+    /// # Returns
+    ///
+    /// [`OptionGreeks`] containing computed delta, gamma, theta, vega, and
+    /// theoretical option price.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DataError::Socket` if IB rejects the request (invalid contract,
+    /// missing subscription, etc.).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let client = IbkrHistoricalData::connect("127.0.0.1:4002", 102)?;
+    /// let option = Contract::call("AAPL").strike(150.0).expires_on(2024, 12, 20).build();
+    ///
+    /// let greeks = client.calculate_theoretical_greeks(&option, 0.25, 148.0).await?;
+    /// if let Some(delta) = greeks.delta {
+    ///     println!("Delta: {:.3}", delta);
+    /// }
+    /// ```
+    pub async fn calculate_theoretical_greeks(
+        &self,
+        contract: &Contract,
+        volatility: f64,
+        underlying_price: f64,
+    ) -> Result<OptionGreeks, DataError> {
+        let client = self.client.clone();
+        let contract = contract.clone();
+        let symbol = contract.symbol.to_string();
+
+        debug!(
+            symbol = %symbol,
+            volatility,
+            underlying_price,
+            "Calculating theoretical option Greeks"
+        );
+
+        let greeks = tokio::task::spawn_blocking(move || {
+            let computation = client
+                .calculate_option_price(&contract, volatility, underlying_price)
+                .map_err(|e| DataError::Socket(format!("calculate_option_price: {e}")))?;
+
+            Ok::<_, DataError>(OptionGreeks::from_ib(&computation))
+        })
+        .await
+        .map_err(|e| {
+            if e.is_panic() {
+                DataError::Socket(format!("calculate_option_price task panicked: {e}"))
+            } else {
+                DataError::Socket(format!("calculate_option_price task cancelled: {e}"))
+            }
+        })??;
+
+        debug!(
+            symbol = %symbol,
+            delta = ?greeks.delta,
+            gamma = ?greeks.gamma,
+            "Calculated option Greeks"
+        );
+
+        Ok(greeks)
+    }
+
+    /// Calculate implied volatility from option price and underlying price.
+    ///
+    /// This is a **calculator** — you provide the option and underlying prices,
+    /// and IB computes the implied volatility using its options model.
+    ///
+    /// # Arguments
+    ///
+    /// * `contract` - Option contract (must be SecurityType::Option)
+    /// * `option_price` - Current or hypothetical option price
+    /// * `underlying_price` - Current or hypothetical underlying price
+    ///
+    /// # Returns
+    ///
+    /// Implied volatility as a decimal (e.g., 0.25 for 25% IV).
+    /// Also returns other Greeks computed at this IV level.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DataError::Socket` if IB rejects the request or if IV cannot
+    /// be computed (e.g., option price is below intrinsic value).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let client = IbkrHistoricalData::connect("127.0.0.1:4002", 102)?;
+    /// let option = Contract::call("AAPL").strike(150.0).expires_on(2024, 12, 20).build();
+    ///
+    /// let greeks = client.calculate_implied_volatility(&option, 7.50, 155.0).await?;
+    /// if let Some(iv) = greeks.implied_volatility {
+    ///     println!("Implied Volatility: {:.1}%", iv * 100.0);
+    /// }
+    /// ```
+    pub async fn calculate_implied_volatility(
+        &self,
+        contract: &Contract,
+        option_price: f64,
+        underlying_price: f64,
+    ) -> Result<OptionGreeks, DataError> {
+        let client = self.client.clone();
+        let contract = contract.clone();
+        let symbol = contract.symbol.to_string();
+
+        debug!(
+            symbol = %symbol,
+            option_price,
+            underlying_price,
+            "Calculating implied volatility"
+        );
+
+        let greeks = tokio::task::spawn_blocking(move || {
+            let computation = client
+                .calculate_implied_volatility(&contract, option_price, underlying_price)
+                .map_err(|e| DataError::Socket(format!("calculate_implied_volatility: {e}")))?;
+
+            Ok::<_, DataError>(OptionGreeks::from_ib(&computation))
+        })
+        .await
+        .map_err(|e| {
+            if e.is_panic() {
+                DataError::Socket(format!("calculate_implied_volatility task panicked: {e}"))
+            } else {
+                DataError::Socket(format!("calculate_implied_volatility task cancelled: {e}"))
+            }
+        })??;
+
+        debug!(
+            symbol = %symbol,
+            iv = ?greeks.implied_volatility,
+            "Calculated implied volatility"
+        );
+
+        Ok(greeks)
+    }
+
+    /// Fetch option chain metadata for an underlying security.
+    ///
+    /// Returns available expiration dates and strike prices for options on
+    /// the specified underlying. Does NOT return Greeks or prices — use
+    /// market data subscriptions for that.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - Underlying symbol (e.g., "AAPL")
+    /// * `exchange` - Exchange to query (e.g., "SMART", "CBOE")
+    /// * `security_type` - Type of underlying (typically `SecurityType::Stock`)
+    /// * `contract_id` - IB contract ID of the underlying (0 to search by symbol)
+    ///
+    /// # Returns
+    ///
+    /// Vector of [`OptionChainEntry`] for each exchange/trading class combination.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DataError::Socket` if IB rejects the request.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let client = IbkrHistoricalData::connect("127.0.0.1:4002", 102)?;
+    ///
+    /// let chains = client.fetch_option_chain("AAPL", "SMART", SecurityType::Stock, 0).await?;
+    /// for chain in chains {
+    ///     println!("Exchange: {}, Expirations: {:?}", chain.exchange, chain.expirations);
+    /// }
+    /// ```
+    pub async fn fetch_option_chain(
+        &self,
+        symbol: &str,
+        exchange: &str,
+        security_type: SecurityType,
+        contract_id: i32,
+    ) -> Result<Vec<OptionChainEntry>, DataError> {
+        let client = self.client.clone();
+        let symbol = symbol.to_string();
+        let exchange = exchange.to_string();
+
+        debug!(
+            symbol = %symbol,
+            exchange = %exchange,
+            "Fetching option chain"
+        );
+
+        let chains = tokio::task::spawn_blocking(move || {
+            let subscription = client
+                .option_chain(&symbol, &exchange, security_type, contract_id)
+                .map_err(|e| DataError::Socket(format!("option_chain: {e}")))?;
+
+            let mut entries = Vec::with_capacity(16);
+            for chain in subscription {
+                entries.push(OptionChainEntry::from_ib(&chain));
+            }
+
+            debug!(symbol = %symbol, count = entries.len(), "Received option chain entries");
+
+            Ok::<_, DataError>(entries)
+        })
+        .await
+        .map_err(|e| {
+            if e.is_panic() {
+                DataError::Socket(format!("option_chain task panicked: {e}"))
+            } else {
+                DataError::Socket(format!("option_chain task cancelled: {e}"))
+            }
+        })??;
+
+        Ok(chains)
     }
 }
 
