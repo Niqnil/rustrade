@@ -2,6 +2,12 @@
 //!
 //! These tests require IB Gateway or TWS running on localhost:4002 (paper account).
 //!
+//! # Safety
+//!
+//! **All tests use paper trading accounts only.** The `IBKR_PAPER_ACCOUNT` env var is required
+//! and tests connect to port 4002 (Gateway paper) or 7497 (TWS paper). Never configure these
+//! tests to use a live trading account.
+//!
 //! # Prerequisites
 //!
 //! 1. IB Gateway or TWS running with API enabled
@@ -19,6 +25,38 @@
 //! ```
 //!
 //! Tests are marked `#[ignore]` to avoid CI failures without IB connectivity.
+//!
+//! # Subscription Tiers
+//!
+//! Tests are organized by the market data subscriptions required to run them.
+//!
+//! ## Tier 0: Paper Account Only (FREE)
+//!
+//! No market data subscriptions needed — just a paper trading account.
+//!
+//! | Test | Description |
+//! |------|-------------|
+//! | `test_connection` | Connect to IB Gateway |
+//! | `test_contract_registration` | Register contracts in local registry |
+//! | `test_fetch_balances` | Fetch account balances |
+//! | `test_account_snapshot` | Fetch full account snapshot |
+//! | `test_fetch_open_orders` | Fetch currently open orders |
+//! | `test_account_stream` | Stream account events |
+//! | `test_fetch_trades` | Fetch historical trades |
+//! | `test_order_id_mapping_cleanup` | Test stale order cleanup |
+//! | `test_place_and_cancel_limit_order` | Place and cancel limit order |
+//! | `test_order_without_registered_contract` | Verify rejection for unknown contract |
+//! | `test_cancel_nonexistent_order` | Verify rejection for unknown order |
+//! | `test_cancel_produces_cancelled_not_expired` | Verify Cancelled vs Expired state |
+//! | `test_place_and_cancel_stop_order` | Stop order lifecycle |
+//! | `test_place_and_cancel_stop_limit_order` | Stop-limit order lifecycle |
+//! | `test_place_and_cancel_trailing_stop_percentage` | Trailing stop (%) lifecycle |
+//! | `test_place_and_cancel_trailing_stop_limit_absolute` | Trailing stop-limit ($) lifecycle |
+//! | `test_place_and_cancel_bracket_order` | Bracket order with OCA |
+//! | `test_bracket_order_oca_group_linkage` | Verify OCA group linkage |
+//! | `test_place_and_cancel_gtd_order` | Good-Till-Date order |
+//! | `test_place_moo_order_premarket` | Market-on-Open (timing-sensitive) |
+//! | `test_place_loo_order_premarket` | Limit-on-Open (timing-sensitive) |
 
 #![cfg(feature = "ibkr")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Integration tests: panics are the correct failure mode
@@ -87,7 +125,7 @@ async fn connect_client(config: IbkrConfig) -> Result<IbkrClient, String> {
 }
 
 // ============================================================================
-// Connection Tests
+// Connection Tests — Tier 0: Paper Account Only (FREE)
 // ============================================================================
 
 #[tokio::test]
@@ -128,7 +166,7 @@ async fn test_contract_registration() {
 }
 
 // ============================================================================
-// Account Snapshot Tests
+// Account Snapshot Tests — Tier 0: Paper Account Only (FREE)
 // ============================================================================
 
 #[tokio::test]
@@ -180,7 +218,7 @@ async fn test_account_snapshot() {
 }
 
 // ============================================================================
-// Open Orders Tests
+// Open Orders Tests — Tier 0: Paper Account Only (FREE)
 // ============================================================================
 
 #[tokio::test]
@@ -215,7 +253,7 @@ async fn test_fetch_open_orders() {
 }
 
 // ============================================================================
-// Order Lifecycle Tests
+// Order Lifecycle Tests — Tier 0: Paper Account Only (FREE)
 // ============================================================================
 
 #[tokio::test]
@@ -314,7 +352,7 @@ async fn test_place_and_cancel_limit_order() {
 }
 
 // ============================================================================
-// Account Stream Tests
+// Account Stream Tests — Tier 0: Paper Account Only (FREE)
 // ============================================================================
 
 #[tokio::test]
@@ -360,7 +398,7 @@ async fn test_account_stream() {
 }
 
 // ============================================================================
-// Historical Trades Tests
+// Historical Trades Tests — Tier 0: Paper Account Only (FREE)
 // ============================================================================
 
 #[tokio::test]
@@ -397,7 +435,7 @@ async fn test_fetch_trades() {
 }
 
 // ============================================================================
-// Order ID Mapping Tests
+// Order ID Mapping Tests — Tier 0: Paper Account Only (FREE)
 // ============================================================================
 
 #[tokio::test]
@@ -418,7 +456,7 @@ async fn test_order_id_mapping_cleanup() {
 }
 
 // ============================================================================
-// Edge Case Tests
+// Edge Case Tests — Tier 0: Paper Account Only (FREE)
 // ============================================================================
 
 #[tokio::test]
@@ -504,7 +542,7 @@ async fn test_cancel_nonexistent_order() {
 }
 
 // ============================================================================
-// Cancelled vs Expired Differentiation Tests
+// Cancelled vs Expired Differentiation Tests — Tier 0: Paper Account Only (FREE)
 // ============================================================================
 
 /// Verifies that user-initiated cancel produces `Cancelled` state, not `Expired`.
@@ -641,7 +679,7 @@ async fn test_cancel_produces_cancelled_not_expired() {
 }
 
 // ============================================================================
-// Stop and Trailing Stop Order Tests (TG13 Phase 1 & 2)
+// Stop and Trailing Stop Order Tests (TG13 Phase 1 & 2) — Tier 0: Paper Account Only (FREE)
 // ============================================================================
 
 /// Test placing and cancelling a Stop order.
@@ -1053,7 +1091,7 @@ async fn test_place_and_cancel_trailing_stop_limit_absolute() {
 }
 
 // ============================================================================
-// Bracket Order Tests (TG13 Phase 3)
+// Bracket Order Tests (TG13 Phase 3) — Tier 0: Paper Account Only (FREE)
 // ============================================================================
 
 /// Test placing and cancelling a bracket order with OCA linkage.
@@ -1280,7 +1318,7 @@ async fn test_bracket_order_oca_group_linkage() {
 }
 
 // ============================================================================
-// Extended Time-in-Force Tests (TG13 Phase 6)
+// Extended Time-in-Force Tests (TG13 Phase 6) — Tier 0: Paper Account Only (FREE)
 // ============================================================================
 
 /// Test placing and cancelling a Good-Till-Date (GTD) order.

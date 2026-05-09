@@ -2,10 +2,15 @@
 //!
 //! These tests require IB Gateway or TWS running on localhost:4002 (paper account).
 //!
+//! # Safety
+//!
+//! **All tests use paper trading accounts only.** Tests connect to port 4002 (Gateway paper)
+//! or 7497 (TWS paper). Never configure these tests to use a live trading account.
+//!
 //! # Prerequisites
 //!
 //! 1. IB Gateway or TWS running with API enabled
-//! 2. Market data subscriptions for test instruments (AAPL)
+//! 2. Market data subscriptions for test instruments (see tiers below)
 //! 3. Port 4002 (Gateway paper) or 7497 (TWS paper)
 //!
 //! # Running
@@ -19,6 +24,57 @@
 //! ```
 //!
 //! Tests are marked `#[ignore]` to avoid CI failures without IB connectivity.
+//!
+//! # Subscription Tiers
+//!
+//! Tests are organized by the market data subscriptions required to run them.
+//!
+//! ## Tier 0: Connection Only (FREE)
+//!
+//! No market data subscriptions needed.
+//!
+//! | Test | Description |
+//! |------|-------------|
+//! | `test_historical_connection` | Connect to IB for historical data |
+//! | `test_historical_from_shared_client` | Use shared ibapi client |
+//! | `test_market_stream_connection` | Initialize market stream |
+//! | `test_market_stream_unregistered_contract` | Verify rejection for unknown contract |
+//! | `test_contract_resolution` | Resolve contract details |
+//!
+//! ## Tier 1: US Real-Time Non-Consolidated (FREE with IBKR Pro)
+//!
+//! Included with IBKR Pro accounts. Provides IEX/Cboe data (not consolidated NBBO).
+//!
+//! | Test | Description |
+//! |------|-------------|
+//! | `test_historical_daily_bars` | Fetch daily OHLCV bars |
+//! | `test_historical_hourly_bars` | Fetch hourly bars |
+//! | `test_historical_minute_bars` | Fetch 1-minute bars |
+//! | `test_historical_midpoint_data` | Fetch midpoint bars |
+//! | `test_historical_ticks_trade` | Fetch historical trade ticks |
+//! | `test_historical_ticks_bid_ask` | Fetch historical bid/ask ticks |
+//! | `test_historical_ticks_with_time_range` | Fetch ticks with specific time range |
+//! | `test_market_stream_quotes` | Stream L1 quotes |
+//! | `test_market_stream_multiple_subscriptions` | Stream multiple symbols |
+//! | `test_calculate_theoretical_greeks` | Calculate option Greeks (calculator, no data) |
+//! | `test_calculate_implied_volatility` | Calculate IV (calculator, no data) |
+//! | `test_fetch_option_chain` | Fetch option chain structure |
+//!
+//! ## Tier 2: L2 Market Depth (PAID — varies by exchange)
+//!
+//! Requires exchange-specific L2 subscription.
+//!
+//! | Test | Description |
+//! |------|-------------|
+//! | `test_market_stream_depth` | Stream L2 order book depth |
+//!
+//! ## Tier 3: OPRA US Options ($1.50/mo)
+//!
+//! Required for real-time options quotes and Greeks.
+//!
+//! | Test | Description |
+//! |------|-------------|
+//! | `test_option_greeks_stream` | Stream real-time option Greeks |
 
 #![cfg(feature = "ibkr")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Integration tests: panics are the correct failure mode
@@ -92,7 +148,7 @@ async fn connect_raw_client(
 }
 
 // ============================================================================
-// Historical Data Tests (Task 3.3.5)
+// Historical Data Tests (Task 3.3.5) — Tier 0/1: Connection + US Real-Time (FREE)
 // ============================================================================
 
 #[tokio::test]
@@ -351,7 +407,7 @@ async fn test_historical_from_shared_client() {
 }
 
 // ============================================================================
-// Historical Tick Data Tests (Task 13.4)
+// Historical Tick Data Tests (Task 13.4) — Tier 1: US Real-Time (FREE)
 // ============================================================================
 
 #[tokio::test]
@@ -510,9 +566,10 @@ async fn test_historical_ticks_with_time_range() {
 }
 
 // ============================================================================
-// Market Data Stream Tests (Task 3.2.7)
+// Market Data Stream Tests (Task 3.2.7) — Tier 0/1/2: Varies by test
 // ============================================================================
 
+/// Tier 0: Connection Only (FREE)
 #[tokio::test]
 #[ignore]
 async fn test_market_stream_connection() {
@@ -545,6 +602,7 @@ async fn test_market_stream_connection() {
     println!("Market stream initialized successfully");
 }
 
+/// Tier 1: US Real-Time Non-Consolidated (FREE with IBKR Pro)
 #[tokio::test]
 #[ignore]
 async fn test_market_stream_quotes() {
@@ -609,6 +667,7 @@ async fn test_market_stream_quotes() {
     }
 }
 
+/// Tier 2: L2 Market Depth (PAID — varies by exchange)
 #[tokio::test]
 #[ignore]
 async fn test_market_stream_depth() {
@@ -666,6 +725,7 @@ async fn test_market_stream_depth() {
     }
 }
 
+/// Tier 0: Connection Only (FREE)
 #[tokio::test]
 #[ignore]
 async fn test_market_stream_unregistered_contract() {
@@ -697,6 +757,7 @@ async fn test_market_stream_unregistered_contract() {
     );
 }
 
+/// Tier 1: US Real-Time Non-Consolidated (FREE with IBKR Pro)
 #[tokio::test]
 #[ignore]
 async fn test_market_stream_multiple_subscriptions() {
@@ -764,7 +825,7 @@ async fn test_market_stream_multiple_subscriptions() {
 }
 
 // ============================================================================
-// Contract Registry Integration
+// Contract Registry Integration — Tier 0: Connection Only (FREE)
 // ============================================================================
 
 #[tokio::test]
@@ -817,8 +878,10 @@ async fn test_contract_resolution() {
 }
 
 // ============================================================================
-// Option Greeks Calculator Tests (Phase 5A)
+// Option Greeks Calculator Tests (Phase 5A) — Tier 1: US Real-Time (FREE)
 // ============================================================================
+// Note: These are calculator functions, not data fetches. They don't require
+// OPRA subscription — they compute Greeks from user-provided inputs.
 
 /// Create an AAPL call option contract for testing.
 ///
@@ -973,7 +1036,7 @@ async fn test_fetch_option_chain() {
 }
 
 // ============================================================================
-// Real-Time Option Greeks Streaming Tests (Phase 5B)
+// Real-Time Option Greeks Streaming Tests (Phase 5B) — Tier 3: OPRA ($1.50/mo)
 // ============================================================================
 
 #[tokio::test]
