@@ -3,6 +3,7 @@ use crate::order::{
     request::{OrderRequestCancel, OrderRequestOpen, RequestCancel, RequestOpen},
     state::UnindexedOrderState,
 };
+use chrono::{DateTime, Utc};
 use derive_more::{Constructor, Display};
 use id::ClientOrderId;
 use rust_decimal::Decimal;
@@ -206,10 +207,21 @@ pub enum OrderKind {
     Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Display,
 )]
 pub enum TimeInForce {
-    GoodUntilCancelled { post_only: bool },
+    GoodUntilCancelled {
+        post_only: bool,
+    },
     GoodUntilEndOfDay,
     FillOrKill,
     ImmediateOrCancel,
+    /// Good until a specific date/time. Order expires if not filled by the specified time.
+    #[display("GoodTillDate({expiry})")]
+    GoodTillDate {
+        expiry: DateTime<Utc>,
+    },
+    /// Execute at market open (OPG). Valid for various order types.
+    AtOpen,
+    /// Execute at market close. Only valid with Market (→ MOC) or Limit (→ LOC) orders.
+    AtClose,
 }
 
 impl<ExchangeKey, InstrumentKey> From<&OrderRequestOpen<ExchangeKey, InstrumentKey>>

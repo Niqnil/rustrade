@@ -307,6 +307,13 @@ pub enum OrderMappingError {
     InvalidPrice(String),
     /// Trailing offset type not supported by IBKR.
     UnsupportedOffsetType(TrailingOffsetType),
+    /// AtClose TIF only valid with Market or Limit orders (becomes MOC/LOC).
+    /// Stop orders cannot be combined with at-close execution.
+    UnsupportedOrderKindForAtClose(OrderKind),
+    /// AtClose TIF reached `time_in_force_to_ib` directly. AtClose changes the
+    /// order TYPE (MOC/LOC), not just the TIF; callers must route through
+    /// `build_ib_order` which handles the type promotion.
+    AtCloseRequiresOrderTypeChange,
 }
 
 impl std::fmt::Display for OrderMappingError {
@@ -317,6 +324,17 @@ impl std::fmt::Display for OrderMappingError {
             Self::UnsupportedOffsetType(t) => {
                 write!(f, "trailing offset type {t:?} not supported by IBKR")
             }
+            Self::UnsupportedOrderKindForAtClose(k) => {
+                write!(
+                    f,
+                    "AtClose TIF only valid with Market or Limit orders, got {k:?}"
+                )
+            }
+            Self::AtCloseRequiresOrderTypeChange => write!(
+                f,
+                "AtClose TIF must be routed through build_ib_order, which promotes \
+                 the order to MOC/LOC; time_in_force_to_ib cannot map it directly"
+            ),
         }
     }
 }
@@ -324,6 +342,12 @@ impl std::fmt::Display for OrderMappingError {
 impl std::error::Error for OrderMappingError {}
 
 /// Convert rustrade TimeInForce to IB TimeInForce.
+///
+/// Returns [`OrderMappingError::AtCloseRequiresOrderTypeChange`] for
+/// [`TimeInForce::AtClose`]: AtClose changes the order TYPE (MOC/LOC), not
+/// just the TIF, and is handled by [`build_ib_order`] which promotes the
+/// order type. Callers needing AtClose support should route through
+/// [`build_ib_order`] rather than this helper.
 pub fn time_in_force_to_ib(tif: &TimeInForce) -> Result<IbTimeInForce, OrderMappingError> {
     match tif {
         TimeInForce::GoodUntilCancelled { post_only } => {
@@ -336,6 +360,12 @@ pub fn time_in_force_to_ib(tif: &TimeInForce) -> Result<IbTimeInForce, OrderMapp
         TimeInForce::GoodUntilEndOfDay => Ok(IbTimeInForce::Day),
         TimeInForce::FillOrKill => Ok(IbTimeInForce::FillOrKill),
         TimeInForce::ImmediateOrCancel => Ok(IbTimeInForce::ImmediateOrCancel),
+        TimeInForce::GoodTillDate { .. } => Ok(IbTimeInForce::GoodTilDate),
+        TimeInForce::AtOpen => Ok(IbTimeInForce::OnOpen),
+        // AtClose changes the order TYPE to MOC/LOC, not just the TIF.
+        // `build_ib_order` intercepts AtClose; surfacing Err here lets other
+        // callers (e.g. the bracket-order path) reject gracefully.
+        TimeInForce::AtClose => Err(OrderMappingError::AtCloseRequiresOrderTypeChange),
     }
 }
 
@@ -362,6 +392,13 @@ fn decimal_to_f64(value: rust_decimal::Decimal) -> Result<f64, OrderMappingError
 /// - `TrailingStopLimit` (Absolute) → IB "TRAIL LIMIT" with `aux_price`, `limit_price_offset`
 /// - `TrailingStopLimit` (Percentage) → IB "TRAIL LIMIT" with `trailing_percent`, `limit_price_offset`
 /// - `BasisPoints` offset type → Error (not supported by IBKR)
+///
+/// # Time-in-Force Special Cases
+///
+/// - `AtClose` + `Market` → IB "MOC" (Market-on-Close)
+/// - `AtClose` + `Limit` → IB "LOC" (Limit-on-Close)
+/// - `AtClose` + Stop/Trailing → Error (not supported by IBKR)
+/// - `GoodTillDate` → Sets both TIF and `good_till_date` field
 pub fn build_ib_order(
     side: rustrade_instrument::Side,
     quantity: f64,
@@ -370,6 +407,12 @@ pub fn build_ib_order(
     tif: &TimeInForce,
 ) -> Result<Order, OrderMappingError> {
     let action = side_to_action(side);
+
+    // Handle AtClose specially - it changes the order TYPE, not just TIF
+    if matches!(tif, TimeInForce::AtClose) {
+        return build_at_close_order(action, quantity, kind, price);
+    }
+
     let tif_ib = time_in_force_to_ib(tif)?;
 
     let mut order = match kind {
@@ -471,7 +514,41 @@ pub fn build_ib_order(
 
     order.tif = tif_ib;
 
+    // Handle GoodTillDate: set the good_till_date string field
+    if let TimeInForce::GoodTillDate { expiry } = tif {
+        order.good_till_date = format_gtd_datetime(expiry);
+    }
+
     Ok(order)
+}
+
+/// Format a DateTime<Utc> for IB's good_till_date field.
+///
+/// IB accepts format: "yyyyMMdd HH:mm:ss" with optional timezone suffix.
+/// We use UTC format "yyyyMMdd-HH:mm:ss" which IB interprets as UTC.
+fn format_gtd_datetime(dt: &chrono::DateTime<chrono::Utc>) -> String {
+    dt.format("%Y%m%d-%H:%M:%S").to_string()
+}
+
+/// Build an at-close order (MOC or LOC).
+///
+/// Only Market and Limit orders can be combined with at-close execution.
+/// Stop orders cannot execute at close due to IBKR's order model constraints.
+fn build_at_close_order(
+    action: Action,
+    quantity: f64,
+    kind: &OrderKind,
+    price: rust_decimal::Decimal,
+) -> Result<Order, OrderMappingError> {
+    match kind {
+        OrderKind::Market => Ok(order_builder::market_on_close(action, quantity)),
+        OrderKind::Limit => {
+            let price_f64 = decimal_to_f64(price)?;
+            Ok(order_builder::limit_on_close(action, quantity, price_f64))
+        }
+        // Stop orders cannot be combined with at-close execution
+        _ => Err(OrderMappingError::UnsupportedOrderKindForAtClose(*kind)),
+    }
 }
 
 /// Build a bracket order with proper OCA linking.
@@ -630,6 +707,36 @@ mod tests {
         assert_eq!(
             time_in_force_to_ib(&TimeInForce::ImmediateOrCancel),
             Ok(IbTimeInForce::ImmediateOrCancel)
+        );
+    }
+
+    #[test]
+    fn test_time_in_force_conversion_good_till_date() {
+        use chrono::{TimeZone, Utc};
+
+        let expiry = Utc.with_ymd_and_hms(2025, 6, 30, 23, 59, 59).unwrap();
+        assert_eq!(
+            time_in_force_to_ib(&TimeInForce::GoodTillDate { expiry }),
+            Ok(IbTimeInForce::GoodTilDate)
+        );
+    }
+
+    #[test]
+    fn test_time_in_force_conversion_at_open() {
+        assert_eq!(
+            time_in_force_to_ib(&TimeInForce::AtOpen),
+            Ok(IbTimeInForce::OnOpen)
+        );
+    }
+
+    #[test]
+    fn test_time_in_force_conversion_at_close_returns_err() {
+        // AtClose changes the order TYPE (MOC/LOC), so callers must route
+        // through build_ib_order. Other callers (e.g. bracket orders) get a
+        // graceful Err that they can surface as an order rejection.
+        assert_eq!(
+            time_in_force_to_ib(&TimeInForce::AtClose),
+            Err(OrderMappingError::AtCloseRequiresOrderTypeChange)
         );
     }
 
@@ -961,6 +1068,212 @@ mod tests {
                 TrailingOffsetType::BasisPoints
             ))
         ));
+    }
+
+    // =========================================================================
+    // Extended Time-in-Force Tests (Phase 6)
+    // =========================================================================
+
+    #[test]
+    fn test_build_market_order_at_open() {
+        let order = build_ib_order(
+            rustrade_instrument::Side::Buy,
+            100.0,
+            &OrderKind::Market,
+            Decimal::ZERO,
+            &TimeInForce::AtOpen,
+        )
+        .unwrap();
+
+        assert_eq!(order.action, Action::Buy);
+        assert_eq!(order.total_quantity, 100.0);
+        assert_eq!(order.order_type, "MKT");
+        assert_eq!(order.tif, IbTimeInForce::OnOpen);
+    }
+
+    #[test]
+    fn test_build_limit_order_at_open() {
+        let order = build_ib_order(
+            rustrade_instrument::Side::Sell,
+            50.0,
+            &OrderKind::Limit,
+            Decimal::from(150),
+            &TimeInForce::AtOpen,
+        )
+        .unwrap();
+
+        assert_eq!(order.action, Action::Sell);
+        assert_eq!(order.total_quantity, 50.0);
+        assert_eq!(order.order_type, "LMT");
+        assert_eq!(order.limit_price, Some(150.0));
+        assert_eq!(order.tif, IbTimeInForce::OnOpen);
+    }
+
+    #[test]
+    fn test_build_stop_order_at_open() {
+        // Stop orders can use AtOpen TIF
+        let order = build_ib_order(
+            rustrade_instrument::Side::Sell,
+            100.0,
+            &OrderKind::Stop {
+                trigger_price: Decimal::from(45),
+            },
+            Decimal::ZERO,
+            &TimeInForce::AtOpen,
+        )
+        .unwrap();
+
+        assert_eq!(order.order_type, "STP");
+        assert_eq!(order.aux_price, Some(45.0));
+        assert_eq!(order.tif, IbTimeInForce::OnOpen);
+    }
+
+    #[test]
+    fn test_build_market_on_close() {
+        let order = build_ib_order(
+            rustrade_instrument::Side::Buy,
+            100.0,
+            &OrderKind::Market,
+            Decimal::ZERO,
+            &TimeInForce::AtClose,
+        )
+        .unwrap();
+
+        assert_eq!(order.action, Action::Buy);
+        assert_eq!(order.total_quantity, 100.0);
+        assert_eq!(order.order_type, "MOC");
+    }
+
+    #[test]
+    fn test_build_limit_on_close() {
+        let order = build_ib_order(
+            rustrade_instrument::Side::Sell,
+            50.0,
+            &OrderKind::Limit,
+            Decimal::from(150),
+            &TimeInForce::AtClose,
+        )
+        .unwrap();
+
+        assert_eq!(order.action, Action::Sell);
+        assert_eq!(order.total_quantity, 50.0);
+        assert_eq!(order.order_type, "LOC");
+        assert_eq!(order.limit_price, Some(150.0));
+    }
+
+    #[test]
+    fn test_build_stop_at_close_unsupported() {
+        let result = build_ib_order(
+            rustrade_instrument::Side::Sell,
+            100.0,
+            &OrderKind::Stop {
+                trigger_price: Decimal::from(45),
+            },
+            Decimal::ZERO,
+            &TimeInForce::AtClose,
+        );
+
+        assert!(matches!(
+            result,
+            Err(OrderMappingError::UnsupportedOrderKindForAtClose(
+                OrderKind::Stop { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_build_stop_limit_at_close_unsupported() {
+        let result = build_ib_order(
+            rustrade_instrument::Side::Sell,
+            100.0,
+            &OrderKind::StopLimit {
+                trigger_price: Decimal::from(44),
+            },
+            Decimal::from(45),
+            &TimeInForce::AtClose,
+        );
+
+        assert!(matches!(
+            result,
+            Err(OrderMappingError::UnsupportedOrderKindForAtClose(
+                OrderKind::StopLimit { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_build_trailing_stop_at_close_unsupported() {
+        let result = build_ib_order(
+            rustrade_instrument::Side::Sell,
+            100.0,
+            &OrderKind::TrailingStop {
+                offset: Decimal::from(5),
+                offset_type: TrailingOffsetType::Percentage,
+            },
+            Decimal::ZERO,
+            &TimeInForce::AtClose,
+        );
+
+        assert!(matches!(
+            result,
+            Err(OrderMappingError::UnsupportedOrderKindForAtClose(
+                OrderKind::TrailingStop { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_build_trailing_stop_limit_at_close_unsupported() {
+        let result = build_ib_order(
+            rustrade_instrument::Side::Sell,
+            100.0,
+            &OrderKind::TrailingStopLimit {
+                offset: Decimal::from(5),
+                offset_type: TrailingOffsetType::Absolute,
+                limit_offset: Decimal::from(1),
+            },
+            Decimal::ZERO,
+            &TimeInForce::AtClose,
+        );
+
+        assert!(matches!(
+            result,
+            Err(OrderMappingError::UnsupportedOrderKindForAtClose(
+                OrderKind::TrailingStopLimit { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_build_good_till_date_order() {
+        use chrono::{TimeZone, Utc};
+
+        let expiry = Utc.with_ymd_and_hms(2025, 6, 30, 23, 59, 59).unwrap();
+        let order = build_ib_order(
+            rustrade_instrument::Side::Buy,
+            100.0,
+            &OrderKind::Limit,
+            Decimal::from(150),
+            &TimeInForce::GoodTillDate { expiry },
+        )
+        .unwrap();
+
+        assert_eq!(order.action, Action::Buy);
+        assert_eq!(order.total_quantity, 100.0);
+        assert_eq!(order.order_type, "LMT");
+        assert_eq!(order.tif, IbTimeInForce::GoodTilDate);
+        assert_eq!(order.good_till_date, "20250630-23:59:59");
+    }
+
+    #[test]
+    fn test_format_gtd_datetime() {
+        use chrono::{TimeZone, Utc};
+
+        let dt = Utc.with_ymd_and_hms(2024, 12, 25, 14, 30, 0).unwrap();
+        assert_eq!(format_gtd_datetime(&dt), "20241225-14:30:00");
+
+        let dt2 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        assert_eq!(format_gtd_datetime(&dt2), "20250101-00:00:00");
     }
 
     // =========================================================================

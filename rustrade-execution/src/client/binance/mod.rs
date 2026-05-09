@@ -2558,32 +2558,42 @@ fn convert_order_kind_tif(
 ) -> Option<(OrderPlaceTypeEnum, Option<OrderPlaceTimeInForceEnum>)> {
     match kind {
         OrderKind::Market => Some((OrderPlaceTypeEnum::Market, None)),
-        OrderKind::Limit => Some(match tif {
-            TimeInForce::GoodUntilCancelled { post_only: false } => (
+        OrderKind::Limit => match tif {
+            TimeInForce::GoodUntilCancelled { post_only: false } => Some((
                 OrderPlaceTypeEnum::Limit,
                 Some(OrderPlaceTimeInForceEnum::Gtc),
-            ),
+            )),
             TimeInForce::GoodUntilCancelled { post_only: true } => {
                 // LIMIT_MAKER is Binance's post-only order type (rejects if
                 // it would immediately match as taker)
-                (OrderPlaceTypeEnum::LimitMaker, None)
+                Some((OrderPlaceTypeEnum::LimitMaker, None))
             }
-            TimeInForce::FillOrKill => (
+            TimeInForce::FillOrKill => Some((
                 OrderPlaceTypeEnum::Limit,
                 Some(OrderPlaceTimeInForceEnum::Fok),
-            ),
-            TimeInForce::ImmediateOrCancel => (
+            )),
+            TimeInForce::ImmediateOrCancel => Some((
                 OrderPlaceTypeEnum::Limit,
                 Some(OrderPlaceTimeInForceEnum::Ioc),
-            ),
+            )),
             TimeInForce::GoodUntilEndOfDay => {
                 warn!("Binance Spot does not support GTD; coercing to GTC");
-                (
+                Some((
                     OrderPlaceTypeEnum::Limit,
                     Some(OrderPlaceTimeInForceEnum::Gtc),
-                )
+                ))
             }
-        }),
+            // Binance Spot does not support GTD/MOO/MOC. Surface as unsupported
+            // rather than silently coercing — these have venue-specific semantics
+            // that should not be lost.
+            TimeInForce::GoodTillDate { .. } | TimeInForce::AtOpen | TimeInForce::AtClose => {
+                warn!(
+                    time_in_force = ?tif,
+                    "Binance Spot does not support this TimeInForce"
+                );
+                None
+            }
+        },
         // TODO(TG13): Binance supports STOP_LOSS, STOP_LOSS_LIMIT, TAKE_PROFIT,
         // TAKE_PROFIT_LIMIT, and TRAILING_STOP_MARKET. Add mapping in a future PR.
         OrderKind::Stop { .. }

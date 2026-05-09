@@ -1278,3 +1278,298 @@ async fn test_bracket_order_oca_group_linkage() {
         println!("Cleanup: bracket order cancelled.");
     }
 }
+
+// ============================================================================
+// Extended Time-in-Force Tests (TG13 Phase 6)
+// ============================================================================
+
+/// Test placing and cancelling a Good-Till-Date (GTD) order.
+///
+/// Uses a limit order with expiry set to tomorrow. The order won't fill at $1
+/// and will be cancelled before expiry.
+#[tokio::test]
+#[ignore]
+async fn test_place_and_cancel_gtd_order() {
+    init_logging();
+
+    let config = test_config(18);
+    let client = connect_client(config).await.expect("connection failed");
+
+    let aapl_name = aapl_instrument();
+    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
+    client.register_contract(aapl_name.clone(), aapl_contract);
+
+    let strategy = StrategyId::new("test-gtd-order");
+    let order_cid = ClientOrderId::new(format!(
+        "gtd-order-{}",
+        chrono::Utc::now().timestamp_millis()
+    ));
+
+    let order_key = OrderKey {
+        exchange: ExchangeId::Ibkr,
+        instrument: &aapl_name,
+        strategy: strategy.clone(),
+        cid: order_cid.clone(),
+    };
+
+    // GTD order expiring tomorrow at 23:59:59 UTC
+    let expiry = chrono::Utc::now() + chrono::Duration::days(1);
+    let request_open = RequestOpen {
+        side: Side::Buy,
+        price: dec!(1.00),
+        quantity: dec!(1),
+        kind: OrderKind::Limit,
+        time_in_force: TimeInForce::GoodTillDate { expiry },
+        position_id: None,
+        reduce_only: false,
+    };
+
+    let open_request = rustrade_execution::order::OrderEvent {
+        key: order_key.clone(),
+        state: request_open,
+    };
+
+    println!(
+        "Placing GTD limit order: BUY 1 AAPL @ $1.00, expires {}",
+        expiry.format("%Y-%m-%d %H:%M:%S UTC")
+    );
+
+    let response = client.open_order(open_request).await;
+
+    assert!(response.is_some(), "Expected order response");
+    let response = response.unwrap();
+
+    match &response.state {
+        OrderState::Active(ActiveOrderState::Open(open_state)) => {
+            println!("GTD order placed successfully!");
+            println!("  Client Order ID: {}", response.key.cid);
+            println!("  Exchange Order ID: {:?}", open_state.id);
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let cancel_key = OrderKey {
+                exchange: ExchangeId::Ibkr,
+                instrument: &aapl_name,
+                strategy: response.key.strategy.clone(),
+                cid: response.key.cid.clone(),
+            };
+
+            let cancel_request = rustrade_execution::order::OrderEvent {
+                key: cancel_key,
+                state: rustrade_execution::order::request::RequestCancel {
+                    id: Some(open_state.id.clone()),
+                },
+            };
+
+            println!("Canceling GTD order...");
+            let cancel_response = client.cancel_order(cancel_request).await;
+
+            assert!(cancel_response.is_some(), "Expected cancel response");
+            let cancel_response = cancel_response.unwrap();
+
+            match &cancel_response.state {
+                Ok(_cancelled) => {
+                    println!("GTD order canceled successfully!");
+                }
+                Err(e) => {
+                    panic!("Cancel rejected: {:?}", e);
+                }
+            }
+        }
+        OrderState::Inactive(e) => {
+            panic!("GTD order rejected: {:?}", e);
+        }
+        other => {
+            panic!("Unexpected order state: {:?}", other);
+        }
+    }
+}
+
+/// Test placing a Market-on-Open (MOO) order during pre-market.
+///
+/// Note: This test is timing-sensitive - it should be run during pre-market hours
+/// (before 9:30 AM ET) for the order to be accepted. Running during regular hours
+/// will result in rejection.
+#[tokio::test]
+#[ignore]
+async fn test_place_moo_order_premarket() {
+    init_logging();
+
+    let config = test_config(19);
+    let client = connect_client(config).await.expect("connection failed");
+
+    let aapl_name = aapl_instrument();
+    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
+    client.register_contract(aapl_name.clone(), aapl_contract);
+
+    let strategy = StrategyId::new("test-moo-order");
+    let order_cid = ClientOrderId::new(format!(
+        "moo-order-{}",
+        chrono::Utc::now().timestamp_millis()
+    ));
+
+    let order_key = OrderKey {
+        exchange: ExchangeId::Ibkr,
+        instrument: &aapl_name,
+        strategy: strategy.clone(),
+        cid: order_cid.clone(),
+    };
+
+    // Market-on-Open order - only valid during pre-market
+    let request_open = RequestOpen {
+        side: Side::Buy,
+        price: dec!(0.00), // Not used for market orders
+        quantity: dec!(1),
+        kind: OrderKind::Market,
+        time_in_force: TimeInForce::AtOpen,
+        position_id: None,
+        reduce_only: false,
+    };
+
+    let open_request = rustrade_execution::order::OrderEvent {
+        key: order_key.clone(),
+        state: request_open,
+    };
+
+    println!("Placing MOO order: BUY 1 AAPL at market open");
+    println!("Note: This test should be run during pre-market hours");
+
+    let response = client.open_order(open_request).await;
+
+    assert!(response.is_some(), "Expected order response");
+    let response = response.unwrap();
+
+    match &response.state {
+        OrderState::Active(ActiveOrderState::Open(open_state)) => {
+            println!("MOO order placed successfully (pre-market)!");
+            println!("  Client Order ID: {}", response.key.cid);
+            println!("  Exchange Order ID: {:?}", open_state.id);
+
+            // Cancel immediately to avoid execution at open
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let cancel_key = OrderKey {
+                exchange: ExchangeId::Ibkr,
+                instrument: &aapl_name,
+                strategy: response.key.strategy.clone(),
+                cid: response.key.cid.clone(),
+            };
+
+            let cancel_request = rustrade_execution::order::OrderEvent {
+                key: cancel_key,
+                state: rustrade_execution::order::request::RequestCancel {
+                    id: Some(open_state.id.clone()),
+                },
+            };
+
+            println!("Canceling MOO order...");
+            let cancel_response = client.cancel_order(cancel_request).await;
+
+            assert!(cancel_response.is_some(), "Expected cancel response");
+            match &cancel_response.unwrap().state {
+                Ok(_) => println!("MOO order canceled successfully!"),
+                Err(e) => panic!("Cancel rejected: {:?}", e),
+            }
+        }
+        OrderState::Inactive(e) => {
+            // This is expected if running outside pre-market hours
+            println!("MOO order rejected (expected if not pre-market): {:?}", e);
+            println!("Test is timing-sensitive - run during pre-market for success");
+        }
+        other => {
+            panic!("Unexpected order state: {:?}", other);
+        }
+    }
+}
+
+/// Test placing a Limit-on-Open (LOO) order during pre-market.
+///
+/// Similar to MOO but with a limit price. The order will only fill if the
+/// opening price is at or below the limit.
+#[tokio::test]
+#[ignore]
+async fn test_place_loo_order_premarket() {
+    init_logging();
+
+    let config = test_config(20);
+    let client = connect_client(config).await.expect("connection failed");
+
+    let aapl_name = aapl_instrument();
+    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
+    client.register_contract(aapl_name.clone(), aapl_contract);
+
+    let strategy = StrategyId::new("test-loo-order");
+    let order_cid = ClientOrderId::new(format!(
+        "loo-order-{}",
+        chrono::Utc::now().timestamp_millis()
+    ));
+
+    let order_key = OrderKey {
+        exchange: ExchangeId::Ibkr,
+        instrument: &aapl_name,
+        strategy: strategy.clone(),
+        cid: order_cid.clone(),
+    };
+
+    // Limit-on-Open at $1 - won't fill
+    let request_open = RequestOpen {
+        side: Side::Buy,
+        price: dec!(1.00),
+        quantity: dec!(1),
+        kind: OrderKind::Limit,
+        time_in_force: TimeInForce::AtOpen,
+        position_id: None,
+        reduce_only: false,
+    };
+
+    let open_request = rustrade_execution::order::OrderEvent {
+        key: order_key.clone(),
+        state: request_open,
+    };
+
+    println!("Placing LOO order: BUY 1 AAPL @ $1.00 at market open");
+
+    let response = client.open_order(open_request).await;
+
+    assert!(response.is_some(), "Expected order response");
+    let response = response.unwrap();
+
+    match &response.state {
+        OrderState::Active(ActiveOrderState::Open(open_state)) => {
+            println!("LOO order placed successfully!");
+            println!("  Client Order ID: {}", response.key.cid);
+            println!("  Exchange Order ID: {:?}", open_state.id);
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let cancel_key = OrderKey {
+                exchange: ExchangeId::Ibkr,
+                instrument: &aapl_name,
+                strategy: response.key.strategy.clone(),
+                cid: response.key.cid.clone(),
+            };
+
+            let cancel_request = rustrade_execution::order::OrderEvent {
+                key: cancel_key,
+                state: rustrade_execution::order::request::RequestCancel {
+                    id: Some(open_state.id.clone()),
+                },
+            };
+
+            println!("Canceling LOO order...");
+            let cancel_response = client.cancel_order(cancel_request).await;
+
+            assert!(cancel_response.is_some(), "Expected cancel response");
+            match &cancel_response.unwrap().state {
+                Ok(_) => println!("LOO order canceled successfully!"),
+                Err(e) => panic!("Cancel rejected: {:?}", e),
+            }
+        }
+        OrderState::Inactive(e) => {
+            println!("LOO order rejected (may be timing-related): {:?}", e);
+        }
+        other => {
+            panic!("Unexpected order state: {:?}", other);
+        }
+    }
+}

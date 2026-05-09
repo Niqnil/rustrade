@@ -2679,6 +2679,14 @@ fn map_time_in_force(tif: TimeInForce) -> Result<&'static str, &'static str> {
         TimeInForce::GoodUntilEndOfDay => Ok("day"),
         TimeInForce::FillOrKill => Ok("fok"),
         TimeInForce::ImmediateOrCancel => Ok("ioc"),
+        TimeInForce::AtOpen => Ok("opg"),
+        TimeInForce::AtClose => Ok("cls"),
+        // Alpaca's `gtd` requires an `expired_at` timestamp on the order request,
+        // which this client does not currently surface. Reject to avoid silently
+        // dropping the expiry semantics.
+        TimeInForce::GoodTillDate { .. } => {
+            Err("Alpaca GoodTillDate is not yet wired through this client")
+        }
     }
 }
 
