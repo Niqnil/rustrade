@@ -1249,11 +1249,29 @@ impl AlpacaClient {
             }
         };
 
+        // Validate order kind — reject unsupported types early.
+        let order_type_str = match map_order_kind(kind) {
+            Some(s) => s,
+            None => {
+                return Some(Order {
+                    key: order_key,
+                    side,
+                    price,
+                    quantity,
+                    kind,
+                    time_in_force,
+                    state: OrderState::inactive(OrderError::UnsupportedOrderType(format!(
+                        "Alpaca connector does not yet support OrderKind::{kind:?}"
+                    ))),
+                });
+            }
+        };
+
         let body = AlpacaOrderRequest {
             symbol: instrument.name().as_str(),
             qty: quantity.to_string(),
             side: map_side(side),
-            order_type: map_order_kind(kind),
+            order_type: order_type_str,
             time_in_force: tif_str,
             limit_price: if matches!(kind, OrderKind::Limit) {
                 Some(price.to_string())
@@ -2629,10 +2647,16 @@ fn map_side(side: Side) -> &'static str {
     }
 }
 
-fn map_order_kind(kind: OrderKind) -> &'static str {
+fn map_order_kind(kind: OrderKind) -> Option<&'static str> {
     match kind {
-        OrderKind::Market => "market",
-        OrderKind::Limit => "limit",
+        OrderKind::Market => Some("market"),
+        OrderKind::Limit => Some("limit"),
+        // Alpaca supports stop, stop_limit, trailing_stop natively, but rustrade's
+        // Alpaca connector doesn't expose them yet. Return None to reject at open_order.
+        OrderKind::Stop { .. }
+        | OrderKind::StopLimit { .. }
+        | OrderKind::TrailingStop { .. }
+        | OrderKind::TrailingStopLimit { .. } => None,
     }
 }
 
@@ -2655,6 +2679,14 @@ fn map_time_in_force(tif: TimeInForce) -> Result<&'static str, &'static str> {
         TimeInForce::GoodUntilEndOfDay => Ok("day"),
         TimeInForce::FillOrKill => Ok("fok"),
         TimeInForce::ImmediateOrCancel => Ok("ioc"),
+        TimeInForce::AtOpen => Ok("opg"),
+        TimeInForce::AtClose => Ok("cls"),
+        // Alpaca's `gtd` requires an `expired_at` timestamp on the order request,
+        // which this client does not currently surface. Reject to avoid silently
+        // dropping the expiry semantics.
+        TimeInForce::GoodTillDate { .. } => {
+            Err("Alpaca GoodTillDate is not yet wired through this client")
+        }
     }
 }
 

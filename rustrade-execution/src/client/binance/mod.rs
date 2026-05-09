@@ -1154,7 +1154,22 @@ impl ExecutionClient for BinanceSpot {
             Side::Sell => OrderPlaceSideEnum::Sell,
         };
 
-        let (binance_type, binance_tif) = convert_order_kind_tif(kind, time_in_force);
+        let (binance_type, binance_tif) = match convert_order_kind_tif(kind, time_in_force) {
+            Some(converted) => converted,
+            None => {
+                return Some(Order {
+                    key: order_key,
+                    side,
+                    price,
+                    quantity,
+                    kind,
+                    time_in_force,
+                    state: OrderState::inactive(OrderError::UnsupportedOrderType(format!(
+                        "Binance Spot does not yet support OrderKind::{kind:?}"
+                    ))),
+                });
+            }
+        };
 
         // market BUY sends base quantity, not quoteOrderQty. Callers must
         // specify how much of the base asset they want, not how much quote to spend.
@@ -2366,9 +2381,23 @@ fn convert_new_order(
             warn!(%symbol, "BinanceSpot NEW market order missing price field (p), defaulting to 0");
             Decimal::ZERO
         }
-        (None, OrderKind::Limit) => {
-            warn!(%symbol, "BinanceSpot NEW limit order missing price (p), dropping");
+        (
+            None,
+            OrderKind::Limit | OrderKind::StopLimit { .. } | OrderKind::TrailingStopLimit { .. },
+        ) => {
+            warn!(%symbol, "BinanceSpot NEW limit-type order missing price (p), dropping");
             return None;
+        }
+        (
+            None,
+            OrderKind::Stop { trigger_price }
+            | OrderKind::TrailingStop {
+                offset: trigger_price,
+                ..
+            },
+        ) => {
+            // Stop orders without explicit price use trigger price as display price.
+            trigger_price
         }
     };
     let quantity = match report.q.as_deref() {
@@ -2526,35 +2555,57 @@ fn parse_time_in_force(tif: &str) -> TimeInForce {
 fn convert_order_kind_tif(
     kind: OrderKind,
     tif: TimeInForce,
-) -> (OrderPlaceTypeEnum, Option<OrderPlaceTimeInForceEnum>) {
+) -> Option<(OrderPlaceTypeEnum, Option<OrderPlaceTimeInForceEnum>)> {
     match kind {
-        OrderKind::Market => (OrderPlaceTypeEnum::Market, None),
+        OrderKind::Market => Some((OrderPlaceTypeEnum::Market, None)),
         OrderKind::Limit => match tif {
-            TimeInForce::GoodUntilCancelled { post_only: false } => (
+            TimeInForce::GoodUntilCancelled { post_only: false } => Some((
                 OrderPlaceTypeEnum::Limit,
                 Some(OrderPlaceTimeInForceEnum::Gtc),
-            ),
+            )),
             TimeInForce::GoodUntilCancelled { post_only: true } => {
                 // LIMIT_MAKER is Binance's post-only order type (rejects if
                 // it would immediately match as taker)
-                (OrderPlaceTypeEnum::LimitMaker, None)
+                Some((OrderPlaceTypeEnum::LimitMaker, None))
             }
-            TimeInForce::FillOrKill => (
+            TimeInForce::FillOrKill => Some((
                 OrderPlaceTypeEnum::Limit,
                 Some(OrderPlaceTimeInForceEnum::Fok),
-            ),
-            TimeInForce::ImmediateOrCancel => (
+            )),
+            TimeInForce::ImmediateOrCancel => Some((
                 OrderPlaceTypeEnum::Limit,
                 Some(OrderPlaceTimeInForceEnum::Ioc),
-            ),
+            )),
             TimeInForce::GoodUntilEndOfDay => {
                 warn!("Binance Spot does not support GTD; coercing to GTC");
-                (
+                Some((
                     OrderPlaceTypeEnum::Limit,
                     Some(OrderPlaceTimeInForceEnum::Gtc),
-                )
+                ))
+            }
+            // Binance Spot does not support GTD/MOO/MOC. Surface as unsupported
+            // rather than silently coercing — these have venue-specific semantics
+            // that should not be lost.
+            TimeInForce::GoodTillDate { .. } | TimeInForce::AtOpen | TimeInForce::AtClose => {
+                warn!(
+                    time_in_force = ?tif,
+                    "Binance Spot does not support this TimeInForce"
+                );
+                None
             }
         },
+        // TODO(TG13): Binance supports STOP_LOSS, STOP_LOSS_LIMIT, TAKE_PROFIT,
+        // TAKE_PROFIT_LIMIT, and TRAILING_STOP_MARKET. Add mapping in a future PR.
+        OrderKind::Stop { .. }
+        | OrderKind::StopLimit { .. }
+        | OrderKind::TrailingStop { .. }
+        | OrderKind::TrailingStopLimit { .. } => {
+            warn!(
+                "Binance connector does not yet support OrderKind::{:?}",
+                kind
+            );
+            None
+        }
     }
 }
 
@@ -2680,6 +2731,7 @@ fn connectivity_error(e: anyhow::Error) -> UnindexedClientError {
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use crate::order::TrailingOffsetType;
 
     #[test]
     fn test_parse_side() {
@@ -2726,50 +2778,74 @@ mod tests {
 
     #[test]
     fn test_convert_order_kind_tif() {
+        use rust_decimal::Decimal;
+
         // binance-sdk enums don't derive PartialEq, so use matches!
         assert!(matches!(
             convert_order_kind_tif(OrderKind::Market, TimeInForce::ImmediateOrCancel),
-            (OrderPlaceTypeEnum::Market, None)
+            Some((OrderPlaceTypeEnum::Market, None))
         ));
         assert!(matches!(
             convert_order_kind_tif(
                 OrderKind::Limit,
                 TimeInForce::GoodUntilCancelled { post_only: false }
             ),
-            (
+            Some((
                 OrderPlaceTypeEnum::Limit,
                 Some(OrderPlaceTimeInForceEnum::Gtc)
-            )
+            ))
         ));
         assert!(matches!(
             convert_order_kind_tif(
                 OrderKind::Limit,
                 TimeInForce::GoodUntilCancelled { post_only: true }
             ),
-            (OrderPlaceTypeEnum::LimitMaker, None)
+            Some((OrderPlaceTypeEnum::LimitMaker, None))
         ));
         assert!(matches!(
             convert_order_kind_tif(OrderKind::Limit, TimeInForce::FillOrKill),
-            (
+            Some((
                 OrderPlaceTypeEnum::Limit,
                 Some(OrderPlaceTimeInForceEnum::Fok)
-            )
+            ))
         ));
         assert!(matches!(
             convert_order_kind_tif(OrderKind::Limit, TimeInForce::ImmediateOrCancel),
-            (
+            Some((
                 OrderPlaceTypeEnum::Limit,
                 Some(OrderPlaceTimeInForceEnum::Ioc)
-            )
+            ))
         ));
         // GoodUntilEndOfDay coerces to GTC on Binance Spot
         assert!(matches!(
             convert_order_kind_tif(OrderKind::Limit, TimeInForce::GoodUntilEndOfDay),
-            (
+            Some((
                 OrderPlaceTypeEnum::Limit,
                 Some(OrderPlaceTimeInForceEnum::Gtc)
-            )
+            ))
         ));
+
+        // Stop/Trailing order types return None (not yet supported)
+        assert!(
+            convert_order_kind_tif(
+                OrderKind::Stop {
+                    trigger_price: Decimal::from(100)
+                },
+                TimeInForce::GoodUntilCancelled { post_only: false }
+            )
+            .is_none()
+        );
+
+        assert!(
+            convert_order_kind_tif(
+                OrderKind::TrailingStop {
+                    offset: Decimal::from(5),
+                    offset_type: TrailingOffsetType::Percentage,
+                },
+                TimeInForce::GoodUntilCancelled { post_only: false }
+            )
+            .is_none()
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@ use crate::{
     subscription::{
         book::{OrderBookEvent, OrderBookL1},
         candle::Candle,
+        greeks::OptionGreeks,
         liquidation::Liquidation,
         trade::PublicTrade,
     },
@@ -98,6 +99,13 @@ impl<InstrumentKey> MarketEvent<InstrumentKey, DataKind> {
         }
     }
 
+    pub fn as_option_greeks(&self) -> Option<MarketEvent<&InstrumentKey, &OptionGreeks>> {
+        match &self.kind {
+            DataKind::OptionGreeks(greeks) => Some(self.as_event(greeks)),
+            _ => None,
+        }
+    }
+
     fn as_event<'a, K>(&'a self, kind: &'a K) -> MarketEvent<&'a InstrumentKey, &'a K> {
         MarketEvent {
             time_exchange: self.time_exchange,
@@ -127,6 +135,7 @@ pub enum DataKind {
     OrderBook(OrderBookEvent),
     Candle(Candle),
     Liquidation(Liquidation),
+    OptionGreeks(OptionGreeks),
 }
 
 impl DataKind {
@@ -137,7 +146,24 @@ impl DataKind {
             DataKind::OrderBook(_) => "l2",
             DataKind::Candle(_) => "candle",
             DataKind::Liquidation(_) => "liquidation",
+            DataKind::OptionGreeks(_) => "option_greeks",
         }
+    }
+}
+
+impl<InstrumentKey> From<MarketEvent<InstrumentKey, OptionGreeks>>
+    for MarketEvent<InstrumentKey, DataKind>
+{
+    fn from(value: MarketEvent<InstrumentKey, OptionGreeks>) -> Self {
+        value.map_kind(OptionGreeks::into)
+    }
+}
+
+impl<InstrumentKey> From<MarketStreamResult<InstrumentKey, OptionGreeks>>
+    for MarketStreamResult<InstrumentKey, DataKind>
+{
+    fn from(value: MarketStreamResult<InstrumentKey, OptionGreeks>) -> Self {
+        value.map_ok(MarketEvent::from)
     }
 }
 

@@ -45,7 +45,9 @@
 //! [`Candle`]: crate::subscription::candle::Candle
 
 pub mod depth;
+pub mod greeks;
 pub mod historical;
+pub mod options;
 pub mod quotes;
 pub mod subscription;
 pub mod trades;
@@ -56,7 +58,8 @@ use crate::{
 };
 use chrono::Utc;
 use depth::DepthAggregator;
-use ibapi::client::blocking::Client;
+use greeks::GreeksAggregator;
+use ibapi::{client::blocking::Client, contracts::SecurityType};
 use quotes::QuoteAggregator;
 use rust_decimal::Decimal;
 use rustrade_instrument::{exchange::ExchangeId, ibkr::ContractRegistry};
@@ -196,6 +199,12 @@ where
                     tx.clone(),
                 ),
                 IbkrSubscriptionKind::Trades => Self::run_trades_subscription(
+                    client.clone(),
+                    contract,
+                    sub.key.clone(),
+                    tx.clone(),
+                ),
+                IbkrSubscriptionKind::OptionGreeks => Self::run_option_greeks_subscription(
                     client.clone(),
                     contract,
                     sub.key.clone(),
@@ -429,6 +438,81 @@ where
                 }
             })
             .map_err(|e| DataError::Socket(format!("Failed to spawn trades thread: {e}")))?;
+        Ok(())
+    }
+
+    fn run_option_greeks_subscription(
+        client: Arc<Client>,
+        contract: ibapi::contracts::Contract,
+        key: K,
+        tx: mpsc::UnboundedSender<Result<MarketEvent<K, DataKind>, DataError>>,
+    ) -> Result<(), DataError> {
+        if contract.security_type != SecurityType::Option {
+            return Err(DataError::Socket(format!(
+                "option Greeks subscription requires SecurityType::Option, got {:?} for {}",
+                contract.security_type, contract.symbol
+            )));
+        }
+
+        let symbol = contract.symbol.to_string();
+        let symbol_clone = symbol.clone();
+        let tx_panic = tx.clone();
+
+        std::thread::Builder::new()
+            .name(format!("ibkr-greeks-{symbol}"))
+            .spawn(move || {
+                // Panic safety: parking_lot mutexes do not poison on panic, so shared state
+                // (ContractRegistry, etc.) remains usable. On panic the thread exits,
+                // tx is dropped, and the stream closes — caller observes EOF.
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    debug!(symbol = %symbol, "Starting option Greeks subscription");
+
+                    let sub = match client.market_data(&contract).subscribe() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!(symbol = %symbol, error = %e, "Failed to subscribe to option Greeks");
+                            let _ = tx.send(Err(DataError::Socket(format!(
+                                "option Greeks subscription {symbol}: {e}"
+                            ))));
+                            return;
+                        }
+                    };
+
+                    let aggregator = GreeksAggregator::new();
+
+                    for tick in sub {
+                        if let Some(greeks) = aggregator.update(&tick) {
+                            let now = Utc::now();
+                            let event = MarketEvent {
+                                time_exchange: now,
+                                time_received: now,
+                                exchange: ExchangeId::Ibkr,
+                                instrument: key.clone(),
+                                kind: DataKind::OptionGreeks(greeks),
+                            };
+
+                            if tx.send(Ok(event)).is_err() {
+                                break;
+                            }
+                        }
+                    }
+
+                    debug!(symbol = %symbol, "Option Greeks subscription ended");
+                }));
+
+                if let Err(panic_info) = result {
+                    let msg = panic_info
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic_info.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_string());
+                    error!(symbol = %symbol_clone, "Option Greeks worker panicked: {msg}");
+                    let _ = tx_panic.send(Err(DataError::Socket(format!(
+                        "option Greeks subscription {symbol_clone} panicked: {msg}"
+                    ))));
+                }
+            })
+            .map_err(|e| DataError::Socket(format!("Failed to spawn option Greeks thread: {e}")))?;
         Ok(())
     }
 }

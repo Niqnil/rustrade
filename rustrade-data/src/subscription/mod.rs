@@ -20,6 +20,9 @@ pub mod book;
 /// Candle [`SubscriptionKind`] and the associated Barter output data model.
 pub mod candle;
 
+/// Option Greeks data model for options analytics.
+pub mod greeks;
+
 /// Liquidation [`SubscriptionKind`] and the associated Barter output data model.
 pub mod liquidation;
 

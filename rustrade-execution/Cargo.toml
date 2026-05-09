@@ -111,3 +111,18 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 rust_decimal_macros = { workspace = true }
 # Serde round-trip tests (L2)
 serde_json = { workspace = true }
+
+# Examples that depend on optional features. Without `required-features`,
+# `cargo check --all-targets` (default features) fails to compile them.
+
+[[example]]
+name = "hyperliquid_execution"
+required-features = ["hyperliquid"]
+
+[[example]]
+name = "hyperliquid_spot_execution"
+required-features = ["hyperliquid"]
+
+[[example]]
+name = "ibkr_execution"
+required-features = ["ibkr"]

@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Option Greeks support** (Phase 5): Real-time and computed Greeks for IBKR options
+  - `DataKind::OptionGreeks(OptionGreeks)` variant for the unified market data stream
+  - `IbkrSubscriptionKind::OptionGreeks` for live streaming via `market_data()` subscription
+  - `OptionGreeks` struct (`subscription::greeks`): `delta`, `gamma`, `theta`, `vega`, `implied_volatility`,
+    `theoretical_price`, `underlying_price` (all `Option<f64>`); marked `#[non_exhaustive]`
+  - `OptionGreeks::has_any_greek()` returns true when at least one first-order Greek is present
+    (excludes `theoretical_price` / `underlying_price`)
+  - `IbkrHistoricalData::calculate_theoretical_greeks(contract, volatility, underlying_price)`:
+    IB-side Greeks calculator from user-supplied IV and underlying
+  - `IbkrHistoricalData::calculate_implied_volatility(contract, option_price, underlying_price)`:
+    IB-side IV calculator from user-supplied option/underlying prices
+  - `IbkrHistoricalData::fetch_option_chain(symbol, exchange, security_type, contract_id)` returning
+    `Vec<OptionChainEntry>` with available expirations, strikes, trading classes, and exchanges
+  - `OptionChainEntry` struct (`exchange::ibkr::options`): marked `#[non_exhaustive]`; `strikes` is
+    `Vec<rust_decimal::Decimal>` (financial values must use `Decimal` per project standard)
+  - `IbkrMarketStream` rejects non-`SecurityType::Option` contracts on `OptionGreeks` subscription
+    with `DataError::Socket` (fail-fast over silent zero events)
+- **Historical tick data APIs** for IBKR: `fetch_historical_ticks`, `fetch_historical_bid_ask`
+- Cargo `required-features` declarations for feature-gated examples
+  (`download_databento_fixtures`, `hyperliquid_*`, `ibkr_*`); `cargo check --all-targets`
+  no longer fails on default features
+- **Stop and Trailing Stop order types** (TG13 Phase 1+2):
+  - `OrderKind::Stop { trigger_price }`: Stop market orders
+  - `OrderKind::StopLimit { trigger_price }`: Stop-limit orders
+  - `OrderKind::TrailingStop { offset, offset_type }`: Trailing stop orders
+  - `OrderKind::TrailingStopLimit { offset, offset_type, limit_offset }`: Trailing stop-limit orders
+  - `TrailingOffsetType` enum: `Absolute`, `Percentage`, `BasisPoints`
+  - IBKR connector: Full support for all stop/trailing order types
+  - Binance/Alpaca connectors: Return `UnsupportedOrderType` error (support planned)
+- `OrderError::UnsupportedOrderType`: New error variant for connectors that don't support certain order types
 - **Massive market data connector**: Historical, live, and reference data via `massive` feature
   - `MassiveRestClient`: Historical aggregates, trades, quotes with streaming pagination
   - `MassiveLive`: Real-time WebSocket streaming for trades, quotes, and aggregates
@@ -41,6 +71,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Migration: Match on `Some(side)` to handle the `None` case explicitly, or use
     `.is_some_and(|s| s == Side::Buy)` for boolean checks. (`Side` does not implement
     `Default`, so `unwrap_or_default()` will not compile.)
+- **BREAKING**: `OptionChainEntry::expirations` changed from `Vec<String>` to `Vec<NaiveDate>`.
+  - Removes IBKR wire format leakage (YYYYMMDD strings) from caller code
+  - Invalid expiration strings are now filtered during `from_ib()` conversion
+  - Migration: Replace string parsing with direct `NaiveDate` usage
 - **BREAKING**: `PublicTrade`, `Quote`, `Candle`, and `Liquidation` price/amount fields
   changed from `f64` to `rust_decimal::Decimal` for financial precision.
   - `PublicTrade`: `price`, `amount` now `Decimal`
