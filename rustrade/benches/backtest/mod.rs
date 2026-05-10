@@ -321,7 +321,7 @@ impl AlgoStrategy for LoseMoneyStrategy {
                     },
                     state: RequestOpen {
                         side: Side::Buy,
-                        price: trade_not_sent_as_order_open.price,
+                        price: None, // Market orders don't have a limit price
                         quantity: trade_not_sent_as_order_open.amount,
                         kind: OrderKind::Market,
                         time_in_force: TimeInForce::ImmediateOrCancel,

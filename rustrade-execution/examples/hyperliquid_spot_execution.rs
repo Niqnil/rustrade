@@ -124,7 +124,7 @@ async fn main() {
             for inst in &snapshot.instruments {
                 for order in &inst.orders {
                     info!(
-                        "  {} {:?} {} @ {}",
+                        "  {} {:?} {} @ {:?}",
                         inst.instrument, order.side, order.quantity, order.price
                     );
                 }
@@ -158,7 +158,7 @@ async fn main() {
     // Quantity 0.001 BTC @ $50k = $50 notional (above $10 minimum)
     let request_open = RequestOpen {
         side: Side::Buy,
-        price: dec!(50000.0),
+        price: Some(dec!(50000.0)),
         quantity: dec!(0.001),
         kind: OrderKind::Limit,
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },

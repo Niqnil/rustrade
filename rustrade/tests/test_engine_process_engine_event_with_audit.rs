@@ -166,7 +166,7 @@ fn test_engine_process_engine_event_with_audit() {
             side: Side::Buy,
             kind: OrderKind::Market,
             time_in_force: TimeInForce::ImmediateOrCancel,
-            price: dec!(10_000),
+            price: None,
             quantity: dec!(1),
             position_id: None,
             reduce_only: false,
@@ -183,7 +183,7 @@ fn test_engine_process_engine_event_with_audit() {
             side: Side::Buy,
             kind: OrderKind::Market,
             time_in_force: TimeInForce::ImmediateOrCancel,
-            price: dec!(0.1),
+            price: None,
             quantity: dec!(1),
             position_id: None,
             reduce_only: false,
@@ -232,7 +232,7 @@ fn test_engine_process_engine_event_with_audit() {
     );
 
     // Simulate OpenOrder response for Sequence(3) btc_usdt_buy_order
-    let event = account_event_order_response(0, 2, Side::Buy, 10_000.0, 1.0, 1.0);
+    let event = account_event_order_response(0, 2, Side::Buy, 1.0, 1.0);
     let audit = process_with_audit(&mut engine, event.clone());
     assert_eq!(audit.context.sequence, Sequence(5));
     assert_eq!(audit.event, EngineAudit::process(event));
@@ -288,7 +288,7 @@ fn test_engine_process_engine_event_with_audit() {
     );
 
     // Simulate OpenOrder response for Sequence(3) eth_btc_buy_order
-    let event = account_event_order_response(1, 2, Side::Buy, 0.1, 1.0, 1.0);
+    let event = account_event_order_response(1, 2, Side::Buy, 1.0, 1.0);
     let audit = process_with_audit(&mut engine, event.clone());
     assert_eq!(audit.context.sequence, Sequence(9));
     assert_eq!(audit.event, EngineAudit::process(event));
@@ -373,7 +373,7 @@ fn test_engine_process_engine_event_with_audit() {
             side: Side::Sell,
             kind: OrderKind::Market,
             time_in_force: TimeInForce::ImmediateOrCancel,
-            price: dec!(20_000),
+            price: None,
             quantity: dec!(1),
             position_id: Some(PositionId::NETTING),
             reduce_only: true, // closing position
@@ -411,7 +411,7 @@ fn test_engine_process_engine_event_with_audit() {
                 cid: ClientOrderId::new("netting"),
             },
             side: Side::Sell,
-            price: dec!(20_000),
+            price: None,
             quantity: dec!(1),
             kind: OrderKind::Market,
             time_in_force: TimeInForce::ImmediateOrCancel,
@@ -533,7 +533,7 @@ fn test_engine_process_engine_event_with_audit() {
             side: Side::Sell,
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: true },
-            price: dec!(0.05),
+            price: Some(dec!(0.05)),
             quantity: dec!(1),
             position_id: None,
             reduce_only: true, // closing position
@@ -562,7 +562,7 @@ fn test_engine_process_engine_event_with_audit() {
     );
 
     // Simulate LIMIT OpenOrder response for Sequence(21) eth_btc_sell_order (0/1 quantity filled)
-    let event = account_event_order_response(1, 4, Side::Sell, 0.05, 1.0, 0.0);
+    let event = account_event_order_response(1, 4, Side::Sell, 1.0, 0.0);
     let audit = process_with_audit(&mut engine, event.clone());
     assert_eq!(audit.context.sequence, Sequence(22));
     assert_eq!(audit.event, EngineAudit::process(event));
@@ -593,7 +593,7 @@ fn test_engine_process_engine_event_with_audit() {
                 cid: gen_cid(1),
             },
             side: Side::Sell,
-            price: dec!(0.05),
+            price: Some(dec!(0.05)),
             quantity: dec!(1),
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: true },
@@ -634,7 +634,7 @@ fn test_engine_process_engine_event_with_audit() {
                 cid: gen_cid(1),
             },
             side: Side::Sell,
-            price: dec!(0.05),
+            price: Some(dec!(0.05)),
             quantity: dec!(1),
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: true },
@@ -772,7 +772,7 @@ impl AlgoStrategy for TestBuyAndHoldStrategy {
                 }
 
                 // Don't open if there is no instrument market price available
-                let price = state.data.price()?;
+                state.data.price()?;
 
                 // Generate Market order to buy the minimum allowed quantity
                 Some(OrderRequestOpen {
@@ -786,7 +786,7 @@ impl AlgoStrategy for TestBuyAndHoldStrategy {
                         side: Side::Buy,
                         kind: OrderKind::Market,
                         time_in_force: TimeInForce::ImmediateOrCancel,
-                        price,
+                        price: None, // Market orders don't have a limit price
                         quantity: dec!(1),
                         position_id: None,
                         reduce_only: false,
@@ -988,7 +988,6 @@ fn account_event_order_response(
     instrument: usize,
     time_plus: u64,
     side: Side,
-    price: f64,
     quantity: f64,
     filled: f64,
 ) -> EngineEvent<DataKind> {
@@ -1002,7 +1001,7 @@ fn account_event_order_response(
                 cid: gen_cid(instrument),
             },
             side,
-            price: Decimal::try_from(price).unwrap(),
+            price: None, // Market orders don't have a limit price
             quantity: Decimal::try_from(quantity).unwrap(),
             kind: OrderKind::Market,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: true },
@@ -1672,7 +1671,7 @@ fn send_open_order_with_position_id(
             side,
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-            price,
+            price: Some(price),
             quantity: dec!(1),
             position_id: Some(position_id),
             reduce_only,
@@ -1700,7 +1699,7 @@ fn send_order_ack(
                 cid,
             },
             side,
-            price: dec!(1_000),
+            price: Some(dec!(1_000)),
             quantity: dec!(1),
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
@@ -1757,7 +1756,7 @@ fn send_fully_filled_snapshot(engine: &mut HedgingTestEngine, cid: ClientOrderId
                 cid,
             },
             side: Side::Buy, // side is unused by the terminal-state transition
-            price: dec!(0),
+            price: Some(dec!(0)),
             quantity: dec!(1),
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },

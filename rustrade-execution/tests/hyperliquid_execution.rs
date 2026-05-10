@@ -271,7 +271,7 @@ async fn test_fetch_open_orders() {
     println!("Open orders: {}", orders.len());
     for order in &orders {
         println!(
-            "  {:?} {} {} @ {}",
+            "  {:?} {} {} @ {:?}",
             order.side, order.quantity, order.key.instrument, order.price
         );
     }
@@ -344,7 +344,7 @@ async fn test_place_and_cancel_limit_order() {
     // BTC ~$95k as of 2026, so $50k is ~47% below - within Hyperliquid's 80% limit
     let request_open = RequestOpen {
         side: Side::Buy,
-        price: dec!(50000.0),
+        price: Some(dec!(50000.0)),
         quantity: dec!(0.001), // Minimum size
         kind: OrderKind::Limit,
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
@@ -508,7 +508,7 @@ async fn test_account_stream_with_order() {
     // ETH ~$3500 as of 2026, so $2000 is ~43% below - within 80% limit
     let request_open = RequestOpen {
         side: Side::Buy,
-        price: dec!(2000.0),
+        price: Some(dec!(2000.0)),
         quantity: dec!(0.01),
         kind: OrderKind::Limit,
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },

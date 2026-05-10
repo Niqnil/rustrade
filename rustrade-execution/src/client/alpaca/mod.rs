@@ -1274,7 +1274,7 @@ impl AlpacaClient {
             order_type: order_type_str,
             time_in_force: tif_str,
             limit_price: if matches!(kind, OrderKind::Limit) {
-                Some(price.to_string())
+                price.map(|p| p.to_string())
             } else {
                 None
             },
@@ -2344,8 +2344,7 @@ fn convert_open_order(
     let price = o
         .limit_price
         .as_deref()
-        .and_then(|s| Decimal::from_str(s).ok())
-        .unwrap_or(Decimal::ZERO);
+        .and_then(|s| Decimal::from_str(s).ok());
     let filled_qty = Decimal::from_str(&o.filled_qty).unwrap_or(Decimal::ZERO);
     let kind = parse_order_kind(&o.order_type)?;
     let time_in_force = parse_time_in_force(&o.time_in_force);
@@ -2503,10 +2502,7 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
                 trace!(order_id = %order.id, "Alpaca WS: skipping notional order snapshot (qty=None)");
                 return None;
             }
-            let price = order
-                .limit_price
-                .and_then(|s| Decimal::from_str(s).ok())
-                .unwrap_or(Decimal::ZERO);
+            let price = order.limit_price.and_then(|s| Decimal::from_str(s).ok());
             let filled_qty =
                 Decimal::from_str(order.filled_qty.unwrap_or("0")).unwrap_or(Decimal::ZERO);
             let kind = parse_order_kind(&order.order_type)?;
@@ -3915,7 +3911,7 @@ mod tests {
                 },
                 state: RequestOpen {
                     side: Side::Sell,
-                    price: Decimal::ZERO,
+                    price: None,
                     quantity: Decimal::new(10, 0),
                     kind: OrderKind::Market,
                     time_in_force: TimeInForce::ImmediateOrCancel,
@@ -4013,7 +4009,7 @@ mod tests {
                 },
                 state: RequestOpen {
                     side: Side::Buy,
-                    price: Decimal::ZERO,
+                    price: None,
                     quantity: Decimal::new(10, 0),
                     kind: OrderKind::Market,
                     time_in_force: TimeInForce::ImmediateOrCancel,

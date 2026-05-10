@@ -283,7 +283,7 @@ async fn test_place_and_cancel_limit_order() {
 
     let request_open = RequestOpen {
         side: Side::Buy,
-        price: dec!(1.00),
+        price: Some(dec!(1.00)),
         quantity: dec!(1),
         kind: OrderKind::Limit,
         time_in_force: TimeInForce::GoodUntilEndOfDay,
@@ -480,7 +480,7 @@ async fn test_order_without_registered_contract() {
 
     let request_open = RequestOpen {
         side: Side::Buy,
-        price: dec!(100.00),
+        price: Some(dec!(100.00)),
         quantity: dec!(1),
         kind: OrderKind::Limit,
         time_in_force: TimeInForce::GoodUntilEndOfDay,
@@ -587,7 +587,7 @@ async fn test_cancel_produces_cancelled_not_expired() {
 
     let request_open = RequestOpen {
         side: Side::Buy,
-        price: dec!(1.00),
+        price: Some(dec!(1.00)),
         quantity: dec!(1),
         kind: OrderKind::Limit,
         time_in_force: TimeInForce::GoodUntilEndOfDay, // DAY order - would be Expired if not cancelled
@@ -714,7 +714,7 @@ async fn test_place_and_cancel_stop_order() {
     // Sell Stop at $0.01 trigger - won't trigger since AAPL >> $0.01
     let request_open = RequestOpen {
         side: Side::Sell,
-        price: dec!(0.00), // Not used for Stop (market) orders
+        price: None, // Stop orders have no limit price
         quantity: dec!(1),
         kind: OrderKind::Stop {
             trigger_price: dec!(0.01),
@@ -814,7 +814,7 @@ async fn test_place_and_cancel_stop_limit_order() {
     // Sell StopLimit: trigger at $0.01, limit at $0.01 - won't trigger
     let request_open = RequestOpen {
         side: Side::Sell,
-        price: dec!(0.01), // Limit price (used when stop triggers)
+        price: Some(dec!(0.01)), // Limit price (used when stop triggers)
         quantity: dec!(1),
         kind: OrderKind::StopLimit {
             trigger_price: dec!(0.01),
@@ -915,7 +915,7 @@ async fn test_place_and_cancel_trailing_stop_percentage() {
     // Sell TrailingStop with 50% percentage offset - won't trigger
     let request_open = RequestOpen {
         side: Side::Sell,
-        price: dec!(0.00), // Not used for trailing stop (market) orders
+        price: None, // Trailing stop orders have no limit price
         quantity: dec!(1),
         kind: OrderKind::TrailingStop {
             offset: dec!(50), // 50% trailing offset
@@ -1018,7 +1018,7 @@ async fn test_place_and_cancel_trailing_stop_limit_absolute() {
     // Sell TrailingStopLimit: $500 absolute trail, $1 limit offset from stop
     let request_open = RequestOpen {
         side: Side::Sell,
-        price: dec!(0.00), // Not used directly; limit_offset determines limit price
+        price: None, // Trailing stop limit uses limit_offset, not a fixed price
         quantity: dec!(1),
         kind: OrderKind::TrailingStopLimit {
             offset: dec!(500), // $500 trailing amount
@@ -1354,7 +1354,7 @@ async fn test_place_and_cancel_gtd_order() {
     let expiry = chrono::Utc::now() + chrono::Duration::days(1);
     let request_open = RequestOpen {
         side: Side::Buy,
-        price: dec!(1.00),
+        price: Some(dec!(1.00)),
         quantity: dec!(1),
         kind: OrderKind::Limit,
         time_in_force: TimeInForce::GoodTillDate { expiry },
@@ -1456,7 +1456,7 @@ async fn test_place_moo_order_premarket() {
     // Market-on-Open order - only valid during pre-market
     let request_open = RequestOpen {
         side: Side::Buy,
-        price: dec!(0.00), // Not used for market orders
+        price: None, // Market orders have no limit price
         quantity: dec!(1),
         kind: OrderKind::Market,
         time_in_force: TimeInForce::AtOpen,
@@ -1552,7 +1552,7 @@ async fn test_place_loo_order_premarket() {
     // Limit-on-Open at $1 - won't fill
     let request_open = RequestOpen {
         side: Side::Buy,
-        price: dec!(1.00),
+        price: Some(dec!(1.00)),
         quantity: dec!(1),
         kind: OrderKind::Limit,
         time_in_force: TimeInForce::AtOpen,

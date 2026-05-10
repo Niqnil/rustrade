@@ -87,7 +87,8 @@ pub struct BracketOrderResult {
 pub struct OrderContext {
     pub instrument: InstrumentNameExchange,
     pub side: Side,
-    pub price: Decimal,
+    /// Limit price. `None` for Market/Stop/TrailingStop orders.
+    pub price: Option<Decimal>,
     pub quantity: Decimal,
     pub kind: OrderKind,
     pub time_in_force: TimeInForce,
@@ -305,6 +306,8 @@ pub enum OrderMappingError {
     PostOnlyNotSupported,
     /// Price conversion to f64 failed (overflow or invalid decimal).
     InvalidPrice(String),
+    /// Limit price required for this order type but was None.
+    MissingLimitPrice(OrderKind),
     /// Trailing offset type not supported by IBKR.
     UnsupportedOffsetType(TrailingOffsetType),
     /// AtClose TIF only valid with Market or Limit orders (becomes MOC/LOC).
@@ -321,13 +324,16 @@ impl std::fmt::Display for OrderMappingError {
         match self {
             Self::PostOnlyNotSupported => write!(f, "post_only not supported by IB"),
             Self::InvalidPrice(p) => write!(f, "invalid price for f64 conversion: {p}"),
+            Self::MissingLimitPrice(k) => {
+                write!(f, "limit price required for {k} but was None")
+            }
             Self::UnsupportedOffsetType(t) => {
                 write!(f, "trailing offset type {t:?} not supported by IBKR")
             }
             Self::UnsupportedOrderKindForAtClose(k) => {
                 write!(
                     f,
-                    "AtClose TIF only valid with Market or Limit orders, got {k:?}"
+                    "AtClose TIF only valid with Market or Limit orders, got {k}"
                 )
             }
             Self::AtCloseRequiresOrderTypeChange => write!(
@@ -379,6 +385,17 @@ fn decimal_to_f64(value: rust_decimal::Decimal) -> Result<f64, OrderMappingError
     })
 }
 
+/// Extract required limit price from Option, returning error if None.
+fn require_limit_price(
+    price: Option<rust_decimal::Decimal>,
+    kind: OrderKind,
+) -> Result<f64, OrderMappingError> {
+    match price {
+        Some(p) => decimal_to_f64(p),
+        None => Err(OrderMappingError::MissingLimitPrice(kind)),
+    }
+}
+
 /// Build an IB Order from rustrade order parameters.
 ///
 /// # Order Type Mapping
@@ -393,6 +410,11 @@ fn decimal_to_f64(value: rust_decimal::Decimal) -> Result<f64, OrderMappingError
 /// - `TrailingStopLimit` (Percentage) → IB "TRAIL LIMIT" with `trailing_percent`, `limit_price_offset`
 /// - `BasisPoints` offset type → Error (not supported by IBKR)
 ///
+/// # Price Requirements
+///
+/// - `Market`, `Stop`, `TrailingStop`: `price` should be `None` (ignored if provided)
+/// - `Limit`, `StopLimit`, `TrailingStopLimit`: `price` must be `Some(limit_price)`
+///
 /// # Time-in-Force Special Cases
 ///
 /// - `AtClose` + `Market` → IB "MOC" (Market-on-Close)
@@ -403,7 +425,7 @@ pub fn build_ib_order(
     side: rustrade_instrument::Side,
     quantity: f64,
     kind: &OrderKind,
-    price: rust_decimal::Decimal,
+    price: Option<rust_decimal::Decimal>,
     tif: &TimeInForce,
 ) -> Result<Order, OrderMappingError> {
     let action = side_to_action(side);
@@ -419,7 +441,7 @@ pub fn build_ib_order(
         OrderKind::Market => order_builder::market_order(action, quantity),
 
         OrderKind::Limit => {
-            let price_f64 = decimal_to_f64(price)?;
+            let price_f64 = require_limit_price(price, *kind)?;
             order_builder::limit_order(action, quantity, price_f64)
         }
 
@@ -429,7 +451,7 @@ pub fn build_ib_order(
         }
 
         OrderKind::StopLimit { trigger_price } => {
-            let limit_f64 = decimal_to_f64(price)?;
+            let limit_f64 = require_limit_price(price, *kind)?;
             let trigger_f64 = decimal_to_f64(*trigger_price)?;
             order_builder::stop_limit(action, quantity, limit_f64, trigger_f64)
         }
@@ -538,12 +560,12 @@ fn build_at_close_order(
     action: Action,
     quantity: f64,
     kind: &OrderKind,
-    price: rust_decimal::Decimal,
+    price: Option<rust_decimal::Decimal>,
 ) -> Result<Order, OrderMappingError> {
     match kind {
         OrderKind::Market => Ok(order_builder::market_on_close(action, quantity)),
         OrderKind::Limit => {
-            let price_f64 = decimal_to_f64(price)?;
+            let price_f64 = require_limit_price(price, *kind)?;
             Ok(order_builder::limit_on_close(action, quantity, price_f64))
         }
         // Stop orders cannot be combined with at-close execution
@@ -631,7 +653,7 @@ mod tests {
         OrderContext {
             instrument: rustrade_instrument::instrument::name::InstrumentNameExchange::from("AAPL"),
             side: Side::Buy,
-            price: Decimal::from(150),
+            price: Some(Decimal::from(150)),
             quantity: Decimal::from(100),
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
@@ -653,7 +675,7 @@ mod tests {
         let (retrieved_cid, retrieved_ctx) = map.get_client_id_and_context(42).unwrap();
         assert_eq!(retrieved_cid, cid);
         assert_eq!(retrieved_ctx.side, Side::Buy);
-        assert_eq!(retrieved_ctx.price, Decimal::from(150));
+        assert_eq!(retrieved_ctx.price, Some(Decimal::from(150)));
     }
 
     #[test]
@@ -746,7 +768,7 @@ mod tests {
             rustrade_instrument::Side::Buy,
             100.0,
             &OrderKind::Market,
-            rust_decimal::Decimal::ZERO,
+            None, // Market orders have no limit price
             &TimeInForce::GoodUntilEndOfDay,
         )
         .unwrap();
@@ -762,7 +784,7 @@ mod tests {
             rustrade_instrument::Side::Sell,
             50.0,
             &OrderKind::Limit,
-            Decimal::try_from(150.5).unwrap(),
+            Some(Decimal::try_from(150.5).unwrap()),
             &TimeInForce::GoodUntilCancelled { post_only: false },
         )
         .unwrap();
@@ -905,7 +927,7 @@ mod tests {
             &OrderKind::Stop {
                 trigger_price: Decimal::from(45),
             },
-            Decimal::ZERO,
+            None, // Stop orders have no limit price
             &TimeInForce::GoodUntilCancelled { post_only: false },
         )
         .unwrap();
@@ -925,7 +947,7 @@ mod tests {
             &OrderKind::StopLimit {
                 trigger_price: Decimal::from(44),
             },
-            Decimal::from(45), // limit price
+            Some(Decimal::from(45)), // limit price
             &TimeInForce::GoodUntilCancelled { post_only: false },
         )
         .unwrap();
@@ -946,7 +968,7 @@ mod tests {
                 offset: Decimal::from(5),
                 offset_type: TrailingOffsetType::Percentage,
             },
-            Decimal::ZERO,
+            None, // Trailing stop orders have no limit price
             &TimeInForce::GoodUntilCancelled { post_only: false },
         )
         .unwrap();
@@ -968,7 +990,7 @@ mod tests {
                 offset: Decimal::from(2),
                 offset_type: TrailingOffsetType::Absolute,
             },
-            Decimal::ZERO,
+            None, // Trailing stop orders have no limit price
             &TimeInForce::GoodUntilCancelled { post_only: false },
         )
         .unwrap();
@@ -991,7 +1013,7 @@ mod tests {
                 offset_type: TrailingOffsetType::Absolute,
                 limit_offset: Decimal::try_from(0.5).unwrap(),
             },
-            Decimal::ZERO,
+            None, // Trailing stop limit uses limit_offset, not a fixed price
             &TimeInForce::GoodUntilCancelled { post_only: false },
         )
         .unwrap();
@@ -1014,7 +1036,7 @@ mod tests {
                 offset_type: TrailingOffsetType::Percentage,
                 limit_offset: Decimal::try_from(0.5).unwrap(),
             },
-            Decimal::ZERO,
+            None, // Trailing stop limit uses limit_offset, not a fixed price
             &TimeInForce::GoodUntilCancelled { post_only: false },
         )
         .unwrap();
@@ -1036,7 +1058,7 @@ mod tests {
                 offset: Decimal::from(50), // 50 basis points
                 offset_type: TrailingOffsetType::BasisPoints,
             },
-            Decimal::ZERO,
+            None, // Trailing stop orders have no limit price
             &TimeInForce::GoodUntilCancelled { post_only: false },
         );
 
@@ -1058,7 +1080,7 @@ mod tests {
                 offset_type: TrailingOffsetType::BasisPoints,
                 limit_offset: Decimal::try_from(0.5).unwrap(),
             },
-            Decimal::ZERO,
+            None, // Trailing stop limit uses limit_offset, not a fixed price
             &TimeInForce::GoodUntilCancelled { post_only: false },
         );
 
@@ -1080,7 +1102,7 @@ mod tests {
             rustrade_instrument::Side::Buy,
             100.0,
             &OrderKind::Market,
-            Decimal::ZERO,
+            None, // Market orders have no limit price
             &TimeInForce::AtOpen,
         )
         .unwrap();
@@ -1097,7 +1119,7 @@ mod tests {
             rustrade_instrument::Side::Sell,
             50.0,
             &OrderKind::Limit,
-            Decimal::from(150),
+            Some(Decimal::from(150)),
             &TimeInForce::AtOpen,
         )
         .unwrap();
@@ -1118,7 +1140,7 @@ mod tests {
             &OrderKind::Stop {
                 trigger_price: Decimal::from(45),
             },
-            Decimal::ZERO,
+            None, // Stop orders have no limit price
             &TimeInForce::AtOpen,
         )
         .unwrap();
@@ -1134,7 +1156,7 @@ mod tests {
             rustrade_instrument::Side::Buy,
             100.0,
             &OrderKind::Market,
-            Decimal::ZERO,
+            None, // Market orders have no limit price
             &TimeInForce::AtClose,
         )
         .unwrap();
@@ -1150,7 +1172,7 @@ mod tests {
             rustrade_instrument::Side::Sell,
             50.0,
             &OrderKind::Limit,
-            Decimal::from(150),
+            Some(Decimal::from(150)),
             &TimeInForce::AtClose,
         )
         .unwrap();
@@ -1169,7 +1191,7 @@ mod tests {
             &OrderKind::Stop {
                 trigger_price: Decimal::from(45),
             },
-            Decimal::ZERO,
+            None, // Stop orders have no limit price
             &TimeInForce::AtClose,
         );
 
@@ -1189,7 +1211,7 @@ mod tests {
             &OrderKind::StopLimit {
                 trigger_price: Decimal::from(44),
             },
-            Decimal::from(45),
+            Some(Decimal::from(45)),
             &TimeInForce::AtClose,
         );
 
@@ -1210,7 +1232,7 @@ mod tests {
                 offset: Decimal::from(5),
                 offset_type: TrailingOffsetType::Percentage,
             },
-            Decimal::ZERO,
+            None, // Trailing stop orders have no limit price
             &TimeInForce::AtClose,
         );
 
@@ -1232,7 +1254,7 @@ mod tests {
                 offset_type: TrailingOffsetType::Absolute,
                 limit_offset: Decimal::from(1),
             },
-            Decimal::ZERO,
+            None, // Trailing stop limit uses limit_offset, not a fixed price
             &TimeInForce::AtClose,
         );
 
@@ -1253,7 +1275,7 @@ mod tests {
             rustrade_instrument::Side::Buy,
             100.0,
             &OrderKind::Limit,
-            Decimal::from(150),
+            Some(Decimal::from(150)),
             &TimeInForce::GoodTillDate { expiry },
         )
         .unwrap();

@@ -479,7 +479,7 @@ impl IbkrClient {
         let parent_ctx = OrderContext {
             instrument: instrument.clone(),
             side: request.side,
-            price: request.entry_price,
+            price: Some(request.entry_price),
             quantity: request.quantity,
             kind: OrderKind::Limit,
             time_in_force: request.time_in_force,
@@ -487,7 +487,7 @@ impl IbkrClient {
         let tp_ctx = OrderContext {
             instrument: instrument.clone(),
             side: exit_side,
-            price: request.take_profit_price,
+            price: Some(request.take_profit_price),
             quantity: request.quantity,
             kind: OrderKind::Limit,
             time_in_force: request.time_in_force,
@@ -495,7 +495,7 @@ impl IbkrClient {
         let sl_ctx = OrderContext {
             instrument: instrument.clone(),
             side: exit_side,
-            price: request.stop_loss_price,
+            price: None, // Stop orders don't have a limit price
             quantity: request.quantity,
             kind: OrderKind::Stop {
                 trigger_price: request.stop_loss_price,
@@ -643,7 +643,7 @@ impl IbkrClient {
                             cid: parent_cid,
                         },
                         side: request.side,
-                        price: request.entry_price,
+                        price: Some(request.entry_price),
                         quantity: request.quantity,
                         kind: OrderKind::Limit,
                         time_in_force: request.time_in_force,
@@ -661,7 +661,7 @@ impl IbkrClient {
                             cid: tp_cid,
                         },
                         side: exit_side,
-                        price: request.take_profit_price,
+                        price: Some(request.take_profit_price),
                         quantity: request.quantity,
                         kind: OrderKind::Limit,
                         time_in_force: request.time_in_force,
@@ -679,7 +679,7 @@ impl IbkrClient {
                             cid: sl_cid,
                         },
                         side: exit_side,
-                        price: request.stop_loss_price,
+                        price: None, // Stop orders don't have a limit price
                         quantity: request.quantity,
                         kind: OrderKind::Stop {
                             trigger_price: request.stop_loss_price,
@@ -754,7 +754,7 @@ fn make_all_inactive_bracket(
                 cid: parent_cid,
             },
             side: request.side,
-            price: request.entry_price,
+            price: Some(request.entry_price),
             quantity: request.quantity,
             kind: OrderKind::Limit,
             time_in_force: request.time_in_force,
@@ -768,7 +768,7 @@ fn make_all_inactive_bracket(
                 cid: tp_cid,
             },
             side: exit_side,
-            price: request.take_profit_price,
+            price: Some(request.take_profit_price),
             quantity: request.quantity,
             kind: OrderKind::Limit,
             time_in_force: request.time_in_force,
@@ -782,7 +782,7 @@ fn make_all_inactive_bracket(
                 cid: sl_cid,
             },
             side: exit_side,
-            price: request.stop_loss_price,
+            price: None, // Stop orders don't have a limit price
             quantity: request.quantity,
             kind: OrderKind::Stop {
                 trigger_price: request.stop_loss_price,
@@ -1479,8 +1479,7 @@ impl ExecutionClient for IbkrClient {
                 let price = order_data
                     .order
                     .limit_price
-                    .map(|p| parse_decimal_or_warn(p, "limit_price"))
-                    .unwrap_or_default();
+                    .map(|p| parse_decimal_or_warn(p, "limit_price"));
                 let kind = if order_data.order.order_type == "LMT" {
                     OrderKind::Limit
                 } else {

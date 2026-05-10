@@ -76,7 +76,8 @@ pub struct OrderKey<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex
 pub struct Order<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex, State = OrderState> {
     pub key: OrderKey<ExchangeKey, InstrumentKey>,
     pub side: Side,
-    pub price: Decimal,
+    /// Limit price for the order. `None` for Market/Stop/TrailingStop orders.
+    pub price: Option<Decimal>,
     pub quantity: Decimal,
     pub kind: OrderKind,
     pub time_in_force: TimeInForce,

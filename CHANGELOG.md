@@ -84,6 +84,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Migration: Use `dec!()` macro for literals, `> Decimal::ZERO` for positivity checks.
     For string-typed JSON fields, use `de_str` deserializer or `.parse::<Decimal>()`.
     Use `Decimal::try_from(f64)` only when the source is already `f64` (e.g., IBKR API).
+- **BREAKING**: `RequestOpen.price` and `Order.price` changed from `Decimal` to `Option<Decimal>`.
+  - Market, Stop, and TrailingStop orders: `price: None` (no limit price)
+  - Limit, StopLimit, and TrailingStopLimit orders: `price: Some(limit_price)`
+  - Removes the `dec!(0)` sentinel convention: Market/Stop orders now carry an explicit `None`
+    rather than a placeholder zero, so callers can no longer plumb a meaningless price through
+    them. (Note: `Some(price)` for a Market order still compiles — this is a clarity win, not a
+    compiler-enforced invariant.)
+  - Migration: For `Limit`, `StopLimit`, and `TrailingStopLimit` orders, wrap the
+    limit price in `Some()`. For `Market`, `Stop`, and `TrailingStop` orders, use `None`.
 
 ### Deprecated
 
