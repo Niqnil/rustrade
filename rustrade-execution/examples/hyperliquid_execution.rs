@@ -133,7 +133,7 @@ async fn main() {
             for inst in &snapshot.instruments {
                 for order in &inst.orders {
                     info!(
-                        "  {} {:?} {} @ {}",
+                        "  {} {:?} {} @ {:?}",
                         inst.instrument, order.side, order.quantity, order.price
                     );
                 }
@@ -164,7 +164,7 @@ async fn main() {
     // BTC ~$95k, so $50k is ~47% below - safe limit
     let request_open = RequestOpen {
         side: Side::Buy,
-        price: dec!(50000.0),
+        price: Some(dec!(50000.0)),
         quantity: dec!(0.001), // Minimum BTC size
         kind: OrderKind::Limit,
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },

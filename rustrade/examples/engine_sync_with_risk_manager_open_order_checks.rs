@@ -36,10 +36,7 @@ use rustrade_data::{
     streams::builder::dynamic::indexed::init_indexed_multi_exchange_market_stream,
     subscription::SubKind,
 };
-use rustrade_execution::order::{
-    OrderKind,
-    request::{OrderRequestCancel, OrderRequestOpen},
-};
+use rustrade_execution::order::request::{OrderRequestCancel, OrderRequestOpen};
 use rustrade_instrument::{index::IndexedInstruments, instrument::kind::InstrumentKind};
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, fs::File, io::BufReader, marker::PhantomData, time::Duration};
@@ -115,9 +112,23 @@ impl RiskManager
                 }
 
                 // Calculate notional value in instrument quote currency
+                // Use order price for limit orders, or current market price for market orders
+                let Some(price) = request_open.state.price
+                    .or_else(|| instrument_state.data.price()) else {
+                    warn!(
+                        instrument = %instrument_state.instrument.name_internal,
+                        ?request_open,
+                        "RiskManager filtered order: notional check failed: no price available from order or market data"
+                    );
+                    refused.push(RiskRefused::new(
+                        request_open,
+                        "RiskManager notional check failed: no price available"
+                    ));
+                    return (approved, refused);
+                };
                 let notional = calculate_quote_notional(
                     request_open.state.quantity,
-                    request_open.state.price,
+                    price,
                     instrument_state.instrument.kind.contract_size(),
                 ).expect("notional calculation overflowed");
 
@@ -136,47 +147,45 @@ impl RiskManager
                     return (approved, refused);
                 }
 
-                // Only need to make additional checks if OrderKind::Market, so can approve otherwise
-                if OrderKind::Market != request_open.state.kind {
-                    approved.push(RiskApproved::new(request_open));
-                    return (approved, refused);
+                // For limit orders with a price, check price deviation from market
+                if let Some(order_price) = request_open.state.price {
+                    // Check there is an instrument market data price available
+                    let Some(market_price) = instrument_state.data.price() else {
+                        warn!(
+                            instrument = %instrument_state.instrument.name_internal,
+                            ?request_open,
+                            market_data = ?instrument_state.data,
+                            "RiskManager filtered order: max_market_order_price_percent_from_market failed: no available instrument market price"
+                        );
+                        refused.push(RiskRefused::new(
+                            request_open,
+                            "RiskManager max_market_order_price_percent_from_market failed"
+                        ));
+                        return (approved, refused);
+                    };
+
+                    // Calculate percentage difference from the latest market price
+                    let price_diff_pct = calculate_abs_percent_difference(
+                        order_price,
+                        market_price,
+                    ).expect("price abs percent difference calculation overflowed");
+
+                    // Filter orders with price_diff_pct deviation from the latest market data price
+                    if let Err(error) = self.max_market_order_price_percent_from_market.check(&price_diff_pct) {
+                        warn!(
+                            instrument = %instrument_state.instrument.name_internal,
+                            ?request_open,
+                            ?error,
+                            "RiskManager filtered order: max_market_order_price_percent_from_market failed"
+                        );
+                        refused.push(RiskRefused::new(
+                            request_open,
+                            "RiskManager max_market_order_price_percent_from_market failed",
+                        ));
+                        return (approved, refused);
+                    }
                 }
-
-                // Check there is an instrument market data price available
-                let Some(market_price) = instrument_state.data.price() else {
-                    warn!(
-                        instrument = %instrument_state.instrument.name_internal,
-                        ?request_open,
-                        market_data = ?instrument_state.data,
-                        "RiskManager filtered order: max_market_order_price_percent_from_market failed: no available instrument market price"
-                    );
-                    refused.push(RiskRefused::new(
-                        request_open,
-                        "RiskManager max_market_order_price_percent_from_market failed"
-                    ));
-                    return (approved, refused);
-                };
-
-                // Calculate percentage difference from the latest market price
-                let price_diff_pct = calculate_abs_percent_difference(
-                    request_open.state.price,
-                    market_price,
-                ).expect("price abs percent difference calculation overflowed");
-
-                // Filter orders with price_diff_pct deviation from the latest market data price
-                if let Err(error) = self.max_market_order_price_percent_from_market.check(&price_diff_pct) {
-                    warn!(
-                        instrument = %instrument_state.instrument.name_internal,
-                        ?request_open,
-                        ?error,
-                        "RiskManager filtered order: max_market_order_price_percent_from_market failed"
-                    );
-                    refused.push(RiskRefused::new(
-                        request_open,
-                        "RiskManager max_market_order_price_percent_from_market failed",
-                    ));
-                    return (approved, refused);
-                }
+                // Market orders (price: None) skip price deviation check
 
                 // All checks passed, approve order
                 approved.push(RiskApproved::new(request_open));

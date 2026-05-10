@@ -3,7 +3,6 @@ use crate::engine::state::{
     instrument::{InstrumentState, data::InstrumentDataState, filter::InstrumentFilter},
     position::Position,
 };
-use rust_decimal::Decimal;
 use rustrade_execution::order::{
     OrderKey, OrderKind, TimeInForce,
     id::{ClientOrderId, PositionId, StrategyId},
@@ -82,9 +81,11 @@ where
     let open_requests = state
         .instruments
         .instruments(filter)
-        // Filter to instruments with market data, extracting price to avoid re-lookup.
-        .filter_map(|state| state.data.price().map(|price| (state, price)))
-        .flat_map(move |(state, price)| {
+        // Require a live price feed before generating a closing market order: an instrument
+        // with no recent price is treated as stale, and the price itself is intentionally not
+        // forwarded — market orders fill at exchange best price, not a caller-supplied limit.
+        .filter(|state| state.data.price().is_some())
+        .flat_map(move |state| {
             // Generate one closing order per open position.
             // In Netting mode there is at most one position; in Hedging mode there may be N.
             // Each order carries the PositionId so hedging-mode fills route to the right slot.
@@ -97,7 +98,6 @@ where
                         state.instrument.exchange,
                         position,
                         strategy_id.clone(),
-                        price,
                         || gen_cid(state, pos_id),
                     );
                     req.state.position_id = Some(pos_id.clone());
@@ -116,7 +116,6 @@ pub fn build_ioc_market_order_to_close_position<ExchangeKey, AssetKey, Instrumen
     exchange: ExchangeKey,
     position: &Position<AssetKey, InstrumentKey>,
     strategy_id: StrategyId,
-    price: Decimal,
     gen_cid: impl Fn() -> ClientOrderId,
 ) -> OrderRequestOpen<ExchangeKey, InstrumentKey>
 where
@@ -135,7 +134,7 @@ where
                 Side::Buy => Side::Sell,
                 Side::Sell => Side::Buy,
             },
-            price,
+            price: None,
             quantity: position.quantity_abs,
             kind: OrderKind::Market,
             time_in_force: TimeInForce::ImmediateOrCancel,

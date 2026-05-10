@@ -246,7 +246,7 @@ async fn test_place_and_cancel_limit_order() {
 
     let request_open = RequestOpen {
         side: Side::Buy,
-        price: dec!(1.00),
+        price: Some(dec!(1.00)),
         quantity: dec!(1),
         kind: OrderKind::Limit,
         time_in_force: TimeInForce::GoodUntilEndOfDay,
@@ -273,7 +273,7 @@ async fn test_place_and_cancel_limit_order() {
             println!("  Exchange Order ID: {:?}", open_state.id);
             println!("  Side: {:?}", response.side);
             println!("  Quantity: {}", response.quantity);
-            println!("  Price: {}", response.price);
+            println!("  Price: {:?}", response.price);
 
             tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -343,7 +343,7 @@ async fn test_place_crypto_limit_order() {
 
     let request_open = RequestOpen {
         side: Side::Buy,
-        price: dec!(1000.00),
+        price: Some(dec!(1000.00)),
         quantity: dec!(0.01),
         kind: OrderKind::Limit,
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
@@ -495,7 +495,7 @@ async fn test_account_stream_with_order() {
 
     let request_open = RequestOpen {
         side: Side::Buy,
-        price: dec!(1.00),
+        price: Some(dec!(1.00)),
         quantity: dec!(1),
         kind: OrderKind::Limit,
         time_in_force: TimeInForce::GoodUntilEndOfDay,

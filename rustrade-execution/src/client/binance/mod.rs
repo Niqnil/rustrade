@@ -1955,13 +1955,7 @@ fn convert_open_order(
             return None;
         }
     };
-    let price = match o.price.as_deref().and_then(|s| Decimal::from_str(s).ok()) {
-        Some(v) => v,
-        None => {
-            warn!(%instrument, order_id = %order_id_raw, "BinanceSpot open order missing/unparseable price");
-            return None;
-        }
-    };
+    let price = o.price.as_deref().and_then(|s| Decimal::from_str(s).ok());
     let quantity = match o
         .orig_qty
         .as_deref()
@@ -2369,17 +2363,31 @@ fn convert_new_order(
         }
     };
     let kind = parse_order_kind(report.o.as_deref().unwrap_or("LIMIT"))?;
-    let price = match (report.p.as_deref(), kind) {
+    let price: Option<Decimal> = match (report.p.as_deref(), &kind) {
         (Some(p), _) => match Decimal::from_str(p) {
-            Ok(v) => v,
+            Ok(v) if !v.is_zero() => Some(v),
+            Ok(_) => {
+                // Binance sends "0" / "0.00" as the price field for Market/Stop/TrailingStop
+                // orders. Trace only when a zero arrives on an order kind that should carry
+                // a limit price, so the surprising case is observable.
+                if matches!(
+                    kind,
+                    OrderKind::Limit
+                        | OrderKind::StopLimit { .. }
+                        | OrderKind::TrailingStopLimit { .. }
+                ) {
+                    trace!(%symbol, %kind, "BinanceSpot NEW event has zero price (p) on limit-type order, treating as no limit price");
+                }
+                None
+            }
             Err(e) => {
                 warn!(%symbol, price = p, error = %e, "BinanceSpot NEW event unparseable price (p), dropping");
                 return None;
             }
         },
-        (None, OrderKind::Market) => {
-            warn!(%symbol, "BinanceSpot NEW market order missing price field (p), defaulting to 0");
-            Decimal::ZERO
+        (None, OrderKind::Market | OrderKind::Stop { .. } | OrderKind::TrailingStop { .. }) => {
+            // Market and Stop orders don't have a limit price
+            None
         }
         (
             None,
@@ -2387,17 +2395,6 @@ fn convert_new_order(
         ) => {
             warn!(%symbol, "BinanceSpot NEW limit-type order missing price (p), dropping");
             return None;
-        }
-        (
-            None,
-            OrderKind::Stop { trigger_price }
-            | OrderKind::TrailingStop {
-                offset: trigger_price,
-                ..
-            },
-        ) => {
-            // Stop orders without explicit price use trigger price as display price.
-            trigger_price
         }
     };
     let quantity = match report.q.as_deref() {
@@ -3363,7 +3360,7 @@ mod tests {
                 let order = &snap.0;
                 assert_eq!(order.side, Side::Buy);
                 assert_eq!(order.kind, OrderKind::Limit);
-                assert_eq!(order.price, Decimal::from_str("50000.00").unwrap());
+                assert_eq!(order.price, Some(Decimal::from_str("50000.00").unwrap()));
                 assert_eq!(order.quantity, Decimal::from_str("0.01").unwrap());
                 assert_eq!(order.key.cid.0.as_str(), "client-1");
                 assert_eq!(order.key.instrument.name().as_str(), "BTCUSDT");
@@ -3800,7 +3797,7 @@ mod tests {
         assert_eq!(order.key.instrument, instrument);
         assert_eq!(order.side, Side::Buy);
         assert_eq!(order.kind, OrderKind::Limit);
-        assert_eq!(order.price, Decimal::from_str("50000.00").unwrap());
+        assert_eq!(order.price, Some(Decimal::from_str("50000.00").unwrap()));
         assert_eq!(order.quantity, Decimal::from_str("0.01").unwrap());
         assert_eq!(order.state.filled_quantity, Decimal::ZERO);
     }
@@ -3900,7 +3897,7 @@ mod tests {
             AccountEventKind::OrderSnapshot(Snapshot(Order::new(
                 key.clone(),
                 Side::Buy,
-                Decimal::ZERO,
+                None, // Market orders have no limit price
                 Decimal::ZERO,
                 OrderKind::Market,
                 TimeInForce::ImmediateOrCancel,
@@ -3920,7 +3917,7 @@ mod tests {
             AccountEventKind::OrderSnapshot(Snapshot(Order::new(
                 key.clone(),
                 Side::Buy,
-                Decimal::ZERO,
+                None, // Market orders have no limit price
                 Decimal::ZERO,
                 OrderKind::Market,
                 TimeInForce::ImmediateOrCancel,
@@ -3940,7 +3937,7 @@ mod tests {
             AccountEventKind::OrderSnapshot(Snapshot(Order::new(
                 key,
                 Side::Buy,
-                Decimal::ONE,
+                None, // Market orders have no limit price
                 Decimal::ONE,
                 OrderKind::Market,
                 TimeInForce::ImmediateOrCancel,
