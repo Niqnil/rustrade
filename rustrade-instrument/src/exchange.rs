@@ -34,11 +34,6 @@ pub enum ExchangeId {
     Other,
     Simulated,
     Mock,
-    #[deprecated(
-        since = "0.2.0",
-        note = "Use AlpacaIex, AlpacaSip, or AlpacaCrypto instead"
-    )]
-    Alpaca,
     BinanceFuturesCoin,
     BinanceFuturesUsd,
     BinanceOptions,
@@ -110,12 +105,10 @@ pub enum ExchangeId {
 impl ExchangeId {
     /// Return the &str representation of this [`ExchangeId`]
     pub fn as_str(&self) -> &'static str {
-        #[allow(deprecated)] // Alpaca variant retained for serialization until removal
         match self {
             ExchangeId::Other => "other",
             ExchangeId::Simulated => "simulated",
             ExchangeId::Mock => "mock",
-            ExchangeId::Alpaca => "alpaca",
             ExchangeId::AlpacaBroker => "alpaca_broker",
             ExchangeId::AlpacaCrypto => "alpaca_crypto",
             ExchangeId::AlpacaIex => "alpaca_iex",

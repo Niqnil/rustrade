@@ -93,12 +93,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     compiler-enforced invariant.)
   - Migration: For `Limit`, `StopLimit`, and `TrailingStopLimit` orders, wrap the
     limit price in `Some()`. For `Market`, `Stop`, and `TrailingStop` orders, use `None`.
-
-### Deprecated
-
-- `ExchangeId::Alpaca`: Use `AlpacaIex`, `AlpacaSip`, or `AlpacaCrypto` instead.
-  The bare `Alpaca` variant will be removed in the next major version.
-  Migration: Replace `ExchangeId::Alpaca` with `ExchangeId::AlpacaIex` for US equities.
+- **BREAKING**: Removed `ExchangeId::Alpaca`.
+  - Use `AlpacaIex`, `AlpacaSip`, or `AlpacaCrypto` for market data feeds
+  - Use `AlpacaBroker` for execution
+  - Migration: Replace `ExchangeId::Alpaca` with the appropriate specific variant
 
 ## [0.1.0] - 2026-05-01
 
