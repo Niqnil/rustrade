@@ -111,6 +111,8 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 rust_decimal_macros = { workspace = true }
 # Serde round-trip tests (L2)
 serde_json = { workspace = true }
+# Serial test execution for integration tests that share exchange state
+serial_test = { workspace = true }
 
 # Examples that depend on optional features. Without `required-features`,
 # `cargo check --all-targets` (default features) fails to compile them.
