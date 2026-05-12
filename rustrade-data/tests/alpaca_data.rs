@@ -40,7 +40,7 @@
 use futures_util::StreamExt;
 use rust_decimal::Decimal;
 use rustrade_data::{
-    exchange::alpaca::{AlpacaCrypto, AlpacaIex},
+    exchange::alpaca::{AlpacaCrypto, AlpacaIex, AlpacaSip},
     streams::{
         Streams,
         reconnect::{Event, stream::ReconnectingStream},
@@ -453,6 +453,170 @@ async fn test_iex_quote_stream_receives_data() {
 }
 
 // ============================================================================
+// SIP Equity Stream Tests (requires SIP subscription)
+// ============================================================================
+
+/// Test SIP trade stream connection.
+///
+/// NOTE: Requires SIP subscription. Will fail with auth error without subscription.
+#[tokio::test]
+#[ignore]
+async fn test_sip_trade_stream_connection() {
+    init_logging();
+
+    let streams = Streams::<PublicTrades>::builder()
+        .subscribe([(
+            AlpacaSip::default(),
+            "spy",
+            "usd",
+            MarketDataInstrumentKind::Spot,
+            PublicTrades,
+        )])
+        .init()
+        .await;
+
+    assert!(
+        streams.is_ok(),
+        "Failed to connect to SIP trade stream: {:?}",
+        streams.err()
+    );
+    tracing::info!("SIP trade stream connected and subscribed");
+}
+
+/// Test SIP quote stream connection.
+///
+/// NOTE: Requires SIP subscription.
+#[tokio::test]
+#[ignore]
+async fn test_sip_quote_stream_connection() {
+    init_logging();
+
+    let streams = Streams::<Quotes>::builder()
+        .subscribe([(
+            AlpacaSip::default(),
+            "aapl",
+            "usd",
+            MarketDataInstrumentKind::Spot,
+            Quotes,
+        )])
+        .init()
+        .await;
+
+    assert!(
+        streams.is_ok(),
+        "Failed to connect to SIP quote stream: {:?}",
+        streams.err()
+    );
+    tracing::info!("SIP quote stream connected and subscribed");
+}
+
+/// Test receiving trade data from SIP (consolidated tape).
+///
+/// NOTE: Requires SIP subscription. May timeout outside US market hours.
+#[tokio::test]
+#[ignore]
+async fn test_sip_trade_stream_receives_data() {
+    init_logging();
+
+    let streams = Streams::<PublicTrades>::builder()
+        .subscribe([(
+            AlpacaSip::default(),
+            "spy",
+            "usd",
+            MarketDataInstrumentKind::Spot,
+            PublicTrades,
+        )])
+        .init()
+        .await
+        .expect("Failed to init SIP stream");
+
+    let mut stream = streams
+        .select_all()
+        .with_error_handler(|e| tracing::warn!(?e, "Stream error"));
+
+    tracing::info!("Waiting for SIP trade data (consolidated tape)...");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+
+    while tokio::time::Instant::now() < deadline {
+        let timeout = tokio::time::timeout(Duration::from_secs(30), stream.next()).await;
+
+        match timeout {
+            Ok(Some(Event::Item(trade))) => {
+                tracing::info!(?trade, "Received SIP trade");
+                assert!(trade.kind.price > Decimal::ZERO, "Invalid trade price");
+                assert!(trade.kind.amount > Decimal::ZERO, "Invalid trade amount");
+                return;
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("Stream ended unexpectedly"),
+            Err(_) => {
+                tracing::warn!("Timeout waiting for SIP data - may be outside market hours");
+                continue;
+            }
+        }
+    }
+
+    panic!(
+        "No SIP trade events received within timeout. \
+         If outside US market hours (9:30 AM - 4:00 PM ET), this is expected."
+    );
+}
+
+/// Test receiving quote data from SIP (consolidated NBBO).
+///
+/// NOTE: Requires SIP subscription. May timeout outside US market hours.
+#[tokio::test]
+#[ignore]
+async fn test_sip_quote_stream_receives_data() {
+    init_logging();
+
+    let streams = Streams::<Quotes>::builder()
+        .subscribe([(
+            AlpacaSip::default(),
+            "spy",
+            "usd",
+            MarketDataInstrumentKind::Spot,
+            Quotes,
+        )])
+        .init()
+        .await
+        .expect("Failed to init SIP quote stream");
+
+    let mut stream = streams
+        .select_all()
+        .with_error_handler(|e| tracing::warn!(?e, "Stream error"));
+
+    tracing::info!("Waiting for SIP quote data (consolidated NBBO)...");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+
+    while tokio::time::Instant::now() < deadline {
+        let timeout = tokio::time::timeout(Duration::from_secs(30), stream.next()).await;
+
+        match timeout {
+            Ok(Some(Event::Item(quote))) => {
+                tracing::info!(?quote, "Received SIP quote (NBBO)");
+                assert!(quote.kind.bid_price > Decimal::ZERO, "Invalid bid price");
+                assert!(quote.kind.ask_price > Decimal::ZERO, "Invalid ask price");
+                return;
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("Stream ended unexpectedly"),
+            Err(_) => {
+                tracing::warn!("Timeout waiting for SIP quote - may be outside market hours");
+                continue;
+            }
+        }
+    }
+
+    panic!(
+        "No SIP quote events received within timeout. \
+         If outside US market hours (9:30 AM - 4:00 PM ET), this is expected."
+    );
+}
+
+// ============================================================================
 // Options Market Data Tests (REST API - available 24/7)
 // ============================================================================
 
@@ -668,4 +832,98 @@ async fn test_fetch_chain_snapshots_convenience() {
 
     // SPY has many options, we should get a substantial number
     assert!(!snapshots.is_empty(), "No SPY chain snapshots received");
+}
+
+// ============================================================================
+// OPRA Options Tests (requires OPRA subscription)
+// ============================================================================
+
+/// Test fetching option snapshots with real-time OPRA feed.
+///
+/// NOTE: Requires OPRA subscription. Will return empty or error without subscription.
+#[tokio::test]
+#[ignore]
+async fn test_fetch_opra_snapshots() {
+    init_logging();
+
+    let client = AlpacaOptionsClient::from_env().expect("Failed to create options client");
+
+    // Get some AAPL contracts
+    let today = Utc::now().date_naive();
+    let thirty_days = today + chrono::Duration::days(30);
+
+    let query = AlpacaOptionContractQuery::new(vec!["AAPL".into()])
+        .expiration_gte(today)
+        .expiration_lte(thirty_days)
+        .limit(10);
+
+    let contracts = client
+        .fetch_contracts(&query)
+        .await
+        .expect("Failed to fetch contracts");
+
+    assert!(!contracts.is_empty(), "No contracts to fetch snapshots for");
+
+    let symbols: Vec<String> = contracts.iter().map(|c| c.symbol.clone()).collect();
+
+    // Fetch with OPRA (real-time) feed
+    let snapshots = client
+        .fetch_snapshots(&symbols, AlpacaOptionFeed::Opra)
+        .await
+        .expect("Failed to fetch OPRA snapshots");
+
+    tracing::info!(
+        requested = symbols.len(),
+        received = snapshots.len(),
+        "Fetched OPRA option snapshots"
+    );
+
+    assert!(!snapshots.is_empty(), "No OPRA snapshots received");
+
+    // Verify we got real-time data with Greeks
+    let mut greeks_count = 0;
+    for snapshot in &snapshots {
+        if snapshot.has_greeks() {
+            greeks_count += 1;
+            let greeks = snapshot.greeks();
+            tracing::info!(
+                symbol = %snapshot.symbol,
+                delta = ?greeks.delta,
+                gamma = ?greeks.gamma,
+                theta = ?greeks.theta,
+                vega = ?greeks.vega,
+                iv = ?greeks.implied_volatility,
+                "OPRA snapshot with Greeks"
+            );
+        }
+    }
+
+    tracing::info!(
+        total = snapshots.len(),
+        with_greeks = greeks_count,
+        "OPRA snapshot summary"
+    );
+}
+
+/// Test fetching entire chain with OPRA feed.
+///
+/// NOTE: Requires OPRA subscription.
+#[tokio::test]
+#[ignore]
+async fn test_fetch_opra_chain_snapshots() {
+    init_logging();
+
+    let client = AlpacaOptionsClient::from_env().expect("Failed to create options client");
+
+    let snapshots = client
+        .fetch_chain_snapshots("AAPL", AlpacaOptionFeed::Opra)
+        .await
+        .expect("Failed to fetch OPRA chain snapshots");
+
+    tracing::info!(count = snapshots.len(), "Fetched AAPL OPRA chain snapshots");
+
+    assert!(
+        !snapshots.is_empty(),
+        "No AAPL OPRA chain snapshots received"
+    );
 }
