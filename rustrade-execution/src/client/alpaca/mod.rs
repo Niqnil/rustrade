@@ -716,6 +716,8 @@ pub struct AlpacaClient {
     /// default headers — every request carries auth automatically.
     http: reqwest::Client,
     rate_limiter: Arc<RateLimitTracker>,
+    /// Pre-allocated `/v2/orders` endpoint URL to avoid allocation per request.
+    orders_url: String,
 }
 
 impl std::fmt::Debug for AlpacaClient {
@@ -965,10 +967,12 @@ impl ExecutionClient for AlpacaClient {
     /// HTTP header value.
     fn new(config: Self::Config) -> Self {
         let http = Self::build_http(&config);
+        let orders_url = format!("{}/v2/orders", config.rest_base_url());
         Self {
             config: Arc::new(config),
             http,
             rate_limiter: Arc::new(RateLimitTracker::new()),
+            orders_url,
         }
     }
 
@@ -1509,13 +1513,11 @@ impl AlpacaClient {
             }),
         };
 
-        let base = self.base_url();
         let http = self.http.clone();
         let rl = &self.rate_limiter;
-        let orders_url = format!("{base}/v2/orders");
 
         let result: Result<AlpacaOrderResponse, UnindexedClientError> =
-            rest_with_retry(rl, || http.post(&orders_url).json(&body)).await;
+            rest_with_retry(rl, || http.post(&self.orders_url).json(&body)).await;
 
         match result {
             Ok(resp) => {
@@ -1713,14 +1715,11 @@ impl AlpacaClient {
             stop_loss: None,
         };
 
-        let base = self.base_url();
         let http = self.http.clone();
         let rl = &self.rate_limiter;
-        // Pre-allocate URL to avoid re-allocation on each retry attempt.
-        let orders_url = format!("{base}/v2/orders");
 
         let result: Result<AlpacaOrderResponse, UnindexedClientError> =
-            rest_with_retry(rl, || http.post(&orders_url).json(&body)).await;
+            rest_with_retry(rl, || http.post(&self.orders_url).json(&body)).await;
 
         match result {
             Ok(resp) => {
