@@ -73,6 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **perf(alpaca)**: Pre-allocate `/v2/orders` endpoint URL at `AlpacaClient` construction,
+  eliminating 2 heap allocations per order placement (`open_order_inner`, `open_bracket_order`).
 - **BREAKING**: `PublicTrade::side` changed from `Side` to `Option<Side>`.
   - Crypto connectors (Binance, Hyperliquid, Alpaca Crypto, etc.): `Some(side)`
   - Equities connectors (Alpaca IEX/SIP, IBKR): `None` — taker side not available
