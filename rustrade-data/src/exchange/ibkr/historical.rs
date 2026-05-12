@@ -138,6 +138,23 @@ impl IbkrHistoricalData {
         Self { client }
     }
 
+    /// Disconnect from IB Gateway.
+    ///
+    /// Signals the ibapi client to shut down and releases the client ID for reuse.
+    /// When constructed via [`Self::connect`], `Drop` already calls this automatically
+    /// once this is the sole owner of the `Arc<Client>` — explicit calls are typically
+    /// unnecessary.
+    ///
+    /// When constructed via [`Self::from_client`] with a shared `Arc<Client>`, calling
+    /// `disconnect()` **terminates the connection for all owners** (other
+    /// [`IbkrHistoricalData`] instances or external holders of the same `Arc`).
+    ///
+    /// This is idempotent — calling it multiple times is safe.
+    pub fn disconnect(&self) {
+        debug!("Disconnecting IbkrHistoricalData");
+        self.client.disconnect();
+    }
+
     /// Fetch historical candles for the given request.
     ///
     /// # Arguments
@@ -611,6 +628,23 @@ impl IbkrHistoricalData {
         })??;
 
         Ok(chains)
+    }
+}
+
+impl Drop for IbkrHistoricalData {
+    fn drop(&mut self) {
+        // Only disconnect when we are the sole owner of the Arc<Client>.
+        // `from_client(Arc<Client>)` lets callers share the client; disconnecting
+        // here would terminate the connection for other owners too.
+        //
+        // `Arc::strong_count` is approximate under concurrent clone/drop on other
+        // threads. A spurious skip is harmless (ibapi's own `Client::Drop` will
+        // eventually run when the last Arc drops); a spurious disconnect is also
+        // benign because `disconnect()` is idempotent.
+        if Arc::strong_count(&self.client) == 1 {
+            debug!("Dropping IbkrHistoricalData (sole owner), disconnecting client");
+            self.client.disconnect();
+        }
     }
 }
 

@@ -92,6 +92,7 @@ use rustrade_data::{
     },
 };
 use rustrade_instrument::ibkr::ContractRegistry;
+use serial_test::serial;
 use std::{sync::Arc, time::Duration};
 use tokio_stream::StreamExt;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -151,6 +152,7 @@ async fn connect_raw_client(
 // Historical Data Tests (Task 3.3.5) — Tier 0/1: Connection + US Real-Time (FREE)
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 #[ignore]
 async fn test_historical_connection() {
@@ -159,12 +161,13 @@ async fn test_historical_connection() {
     let url = format!("127.0.0.1:{}", test_port());
     let client_id = test_client_id_base();
 
-    let result = connect_historical(&url, client_id).await;
+    let client = connect_historical(&url, client_id).await;
 
-    assert!(result.is_ok(), "Failed to connect: {:?}", result.err());
+    assert!(client.is_ok(), "Failed to connect: {:?}", client.err());
     println!("Connected to IB for historical data");
 }
 
+#[serial]
 #[tokio::test]
 #[ignore]
 async fn test_historical_daily_bars() {
@@ -243,6 +246,7 @@ async fn test_historical_daily_bars() {
     );
 }
 
+#[serial]
 #[tokio::test]
 #[ignore]
 async fn test_historical_hourly_bars() {
@@ -292,6 +296,7 @@ async fn test_historical_hourly_bars() {
     }
 }
 
+#[serial]
 #[tokio::test]
 #[ignore]
 async fn test_historical_minute_bars() {
@@ -326,6 +331,7 @@ async fn test_historical_minute_bars() {
     assert!(!candles.is_empty(), "Expected at least one 1-minute candle");
 }
 
+#[serial]
 #[tokio::test]
 #[ignore]
 async fn test_historical_midpoint_data() {
@@ -372,6 +378,7 @@ async fn test_historical_midpoint_data() {
     }
 }
 
+#[serial]
 #[tokio::test]
 #[ignore]
 async fn test_historical_from_shared_client() {
@@ -410,6 +417,7 @@ async fn test_historical_from_shared_client() {
 // Historical Tick Data Tests (Task 13.4) — Tier 1: US Real-Time (FREE)
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 #[ignore]
 async fn test_historical_ticks_trade() {
@@ -462,6 +470,7 @@ async fn test_historical_ticks_trade() {
     }
 }
 
+#[serial]
 #[tokio::test]
 #[ignore]
 async fn test_historical_ticks_bid_ask() {
@@ -522,6 +531,7 @@ async fn test_historical_ticks_bid_ask() {
     }
 }
 
+#[serial]
 #[tokio::test]
 #[ignore]
 async fn test_historical_ticks_with_time_range() {
@@ -570,6 +580,7 @@ async fn test_historical_ticks_with_time_range() {
 // ============================================================================
 
 /// Tier 0: Connection Only (FREE)
+#[serial]
 #[tokio::test]
 #[ignore]
 async fn test_market_stream_connection() {
@@ -603,6 +614,7 @@ async fn test_market_stream_connection() {
 }
 
 /// Tier 1: US Real-Time Non-Consolidated (FREE with IBKR Pro)
+#[serial]
 #[tokio::test]
 #[ignore]
 async fn test_market_stream_quotes() {
@@ -668,6 +680,7 @@ async fn test_market_stream_quotes() {
 }
 
 /// Tier 2: L2 Market Depth (PAID — varies by exchange)
+#[serial]
 #[tokio::test]
 #[ignore]
 async fn test_market_stream_depth() {
@@ -726,6 +739,7 @@ async fn test_market_stream_depth() {
 }
 
 /// Tier 0: Connection Only (FREE)
+#[serial]
 #[tokio::test]
 #[ignore]
 async fn test_market_stream_unregistered_contract() {
@@ -758,6 +772,7 @@ async fn test_market_stream_unregistered_contract() {
 }
 
 /// Tier 1: US Real-Time Non-Consolidated (FREE with IBKR Pro)
+#[serial]
 #[tokio::test]
 #[ignore]
 async fn test_market_stream_multiple_subscriptions() {
@@ -828,6 +843,7 @@ async fn test_market_stream_multiple_subscriptions() {
 // Contract Registry Integration — Tier 0: Connection Only (FREE)
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 #[ignore]
 async fn test_contract_resolution() {
@@ -895,6 +911,7 @@ fn aapl_call_option() -> Contract {
         .build()
 }
 
+#[serial]
 #[tokio::test]
 #[ignore]
 async fn test_calculate_theoretical_greeks() {
@@ -945,6 +962,7 @@ async fn test_calculate_theoretical_greeks() {
     }
 }
 
+#[serial]
 #[tokio::test]
 #[ignore]
 async fn test_calculate_implied_volatility() {
@@ -982,6 +1000,7 @@ async fn test_calculate_implied_volatility() {
     }
 }
 
+#[serial]
 #[tokio::test]
 #[ignore]
 async fn test_fetch_option_chain() {
@@ -1039,6 +1058,7 @@ async fn test_fetch_option_chain() {
 // Real-Time Option Greeks Streaming Tests (Phase 5B) — Tier 3: OPRA ($1.50/mo)
 // ============================================================================
 
+#[serial]
 #[tokio::test]
 #[ignore]
 async fn test_option_greeks_stream() {

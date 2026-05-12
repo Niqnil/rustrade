@@ -324,6 +324,24 @@ impl IbkrClient {
         self.pending_cancels.clear_stale(max_age)
     }
 
+    /// Disconnect from IB Gateway.
+    ///
+    /// Signals the ibapi client to shut down and releases the client ID for reuse.
+    ///
+    /// [`IbkrClient`] implements [`Clone`] and has no `Drop` impl: the underlying
+    /// connection is released automatically when the last `Arc<Client>` reference
+    /// is dropped. Calling `disconnect()` explicitly terminates the connection
+    /// **immediately for all clones** sharing this client.
+    ///
+    /// Any active `account_stream()` iterators will receive errors on their
+    /// next iteration attempt.
+    ///
+    /// This is idempotent — calling it multiple times is safe.
+    pub fn disconnect(&self) {
+        debug!("Disconnecting IbkrClient");
+        self.client.disconnect();
+    }
+
     /// Place a bracket order (entry + take-profit + stop-loss) with OCA linking.
     ///
     /// A bracket order consists of three linked orders:

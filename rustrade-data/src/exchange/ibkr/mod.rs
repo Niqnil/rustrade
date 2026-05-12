@@ -128,6 +128,7 @@ impl Default for IbkrStreamConfig {
 #[derive(Debug)]
 pub struct IbkrMarketStream<K> {
     rx: mpsc::UnboundedReceiver<Result<MarketEvent<K, DataKind>, DataError>>,
+    client: Arc<Client>,
 }
 
 impl<K> futures::Stream for IbkrMarketStream<K> {
@@ -226,7 +227,21 @@ where
             ));
         }
 
-        Ok(Self { rx })
+        Ok(Self { rx, client })
+    }
+
+    /// Disconnect from IB Gateway.
+    ///
+    /// Signals the client to shut down, which will cause worker threads to exit
+    /// when they next attempt an IB operation. This releases the client ID for reuse.
+    ///
+    /// Call this before dropping to ensure IB Gateway releases the connection promptly.
+    /// Worker threads will terminate when they observe the disconnected state.
+    ///
+    /// This is idempotent — calling it multiple times is safe.
+    pub fn disconnect(&self) {
+        debug!("Disconnecting IbkrMarketStream");
+        self.client.disconnect();
     }
 
     fn run_quotes_subscription(
@@ -514,6 +529,13 @@ where
             })
             .map_err(|e| DataError::Socket(format!("Failed to spawn option Greeks thread: {e}")))?;
         Ok(())
+    }
+}
+
+impl<K> Drop for IbkrMarketStream<K> {
+    fn drop(&mut self) {
+        debug!("Dropping IbkrMarketStream, disconnecting client");
+        self.client.disconnect();
     }
 }
 
