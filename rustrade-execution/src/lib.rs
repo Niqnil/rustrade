@@ -30,6 +30,8 @@
 
 // Silence unused_crate_dependencies for dev-dependencies used only in tests
 #[cfg(test)]
+use serial_test as _;
+#[cfg(test)]
 use tracing_subscriber as _;
 #[cfg(test)]
 use wiremock as _;

@@ -92,6 +92,7 @@ use rustrade_data::{
     },
 };
 use rustrade_instrument::ibkr::ContractRegistry;
+use serial_test::serial;
 use std::{sync::Arc, time::Duration};
 use tokio_stream::StreamExt;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -153,20 +154,22 @@ async fn connect_raw_client(
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_historical_connection() {
     init_logging();
 
     let url = format!("127.0.0.1:{}", test_port());
     let client_id = test_client_id_base();
 
-    let result = connect_historical(&url, client_id).await;
+    let client = connect_historical(&url, client_id).await;
 
-    assert!(result.is_ok(), "Failed to connect: {:?}", result.err());
+    assert!(client.is_ok(), "Failed to connect: {:?}", client.err());
     println!("Connected to IB for historical data");
 }
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_historical_daily_bars() {
     init_logging();
 
@@ -245,6 +248,7 @@ async fn test_historical_daily_bars() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_historical_hourly_bars() {
     init_logging();
 
@@ -294,6 +298,7 @@ async fn test_historical_hourly_bars() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_historical_minute_bars() {
     init_logging();
 
@@ -328,6 +333,7 @@ async fn test_historical_minute_bars() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_historical_midpoint_data() {
     init_logging();
 
@@ -374,6 +380,7 @@ async fn test_historical_midpoint_data() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_historical_from_shared_client() {
     init_logging();
 
@@ -412,6 +419,7 @@ async fn test_historical_from_shared_client() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_historical_ticks_trade() {
     init_logging();
 
@@ -464,6 +472,7 @@ async fn test_historical_ticks_trade() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_historical_ticks_bid_ask() {
     init_logging();
 
@@ -524,6 +533,7 @@ async fn test_historical_ticks_bid_ask() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_historical_ticks_with_time_range() {
     use time::macros::datetime;
 
@@ -572,6 +582,7 @@ async fn test_historical_ticks_with_time_range() {
 /// Tier 0: Connection Only (FREE)
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_market_stream_connection() {
     init_logging();
 
@@ -605,6 +616,7 @@ async fn test_market_stream_connection() {
 /// Tier 1: US Real-Time Non-Consolidated (FREE with IBKR Pro)
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_market_stream_quotes() {
     init_logging();
 
@@ -670,6 +682,7 @@ async fn test_market_stream_quotes() {
 /// Tier 2: L2 Market Depth (PAID — varies by exchange)
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_market_stream_depth() {
     init_logging();
 
@@ -728,6 +741,7 @@ async fn test_market_stream_depth() {
 /// Tier 0: Connection Only (FREE)
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_market_stream_unregistered_contract() {
     init_logging();
 
@@ -760,6 +774,7 @@ async fn test_market_stream_unregistered_contract() {
 /// Tier 1: US Real-Time Non-Consolidated (FREE with IBKR Pro)
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_market_stream_multiple_subscriptions() {
     init_logging();
 
@@ -830,6 +845,7 @@ async fn test_market_stream_multiple_subscriptions() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_contract_resolution() {
     init_logging();
 
@@ -897,6 +913,7 @@ fn aapl_call_option() -> Contract {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_calculate_theoretical_greeks() {
     init_logging();
 
@@ -947,6 +964,7 @@ async fn test_calculate_theoretical_greeks() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_calculate_implied_volatility() {
     init_logging();
 
@@ -984,6 +1002,7 @@ async fn test_calculate_implied_volatility() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_fetch_option_chain() {
     init_logging();
 
@@ -1041,6 +1060,7 @@ async fn test_fetch_option_chain() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_option_greeks_stream() {
     init_logging();
 

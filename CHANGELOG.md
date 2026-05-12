@@ -109,6 +109,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Use `AlpacaBroker` for execution
   - Migration: Replace `ExchangeId::Alpaca` with the appropriate specific variant
 
+### Fixed
+
+- **IBKR integration tests no longer leave zombie connections** ([#63](https://github.com/Niqnil/rustrade/issues/63)):
+  - Added `disconnect()` method to `IbkrHistoricalData`, `IbkrMarketStream`, and `IbkrClient`
+    for explicit connection cleanup
+  - Added `Drop` implementations that call `disconnect()` to ensure IB Gateway releases
+    client IDs even when tests panic or exit abruptly
+  - Added `#[serial]` attribute to all IBKR integration tests to prevent parallel execution
+    conflicts when sharing IB Gateway connections
+  - Previously, repeated test runs would fail with "client id already in use" until IB Gateway
+    was restarted
+
 ## [0.1.0] - 2026-05-01
 
 Initial release of rustrade, a fork of [barter-rs](https://github.com/barter-rs/barter-rs).

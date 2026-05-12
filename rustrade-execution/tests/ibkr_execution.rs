@@ -79,6 +79,7 @@ use rustrade_instrument::{
     Side, asset::name::AssetNameExchange, exchange::ExchangeId,
     instrument::name::InstrumentNameExchange,
 };
+use serial_test::serial;
 use std::time::Duration;
 use tokio_stream::StreamExt;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -130,6 +131,7 @@ async fn connect_client(config: IbkrConfig) -> Result<IbkrClient, String> {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_connection() {
     init_logging();
 
@@ -145,6 +147,7 @@ async fn test_connection() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_contract_registration() {
     init_logging();
 
@@ -171,6 +174,7 @@ async fn test_contract_registration() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_fetch_balances() {
     init_logging();
 
@@ -194,6 +198,7 @@ async fn test_fetch_balances() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_account_snapshot() {
     init_logging();
 
@@ -223,6 +228,7 @@ async fn test_account_snapshot() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_fetch_open_orders() {
     init_logging();
 
@@ -258,6 +264,7 @@ async fn test_fetch_open_orders() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_place_and_cancel_limit_order() {
     init_logging();
 
@@ -357,6 +364,7 @@ async fn test_place_and_cancel_limit_order() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_account_stream() {
     init_logging();
 
@@ -403,6 +411,7 @@ async fn test_account_stream() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_fetch_trades() {
     init_logging();
 
@@ -440,6 +449,7 @@ async fn test_fetch_trades() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_order_id_mapping_cleanup() {
     init_logging();
 
@@ -461,6 +471,7 @@ async fn test_order_id_mapping_cleanup() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_order_without_registered_contract() {
     init_logging();
 
@@ -507,6 +518,7 @@ async fn test_order_without_registered_contract() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_cancel_nonexistent_order() {
     init_logging();
 
@@ -552,6 +564,7 @@ async fn test_cancel_nonexistent_order() {
 /// - DAY orders expired at market close → Expired (not in pending_cancels)
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_cancel_produces_cancelled_not_expired() {
     init_logging();
 
@@ -688,6 +701,7 @@ async fn test_cancel_produces_cancelled_not_expired() {
 /// the stop will never trigger and the order remains open for cancellation.
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_place_and_cancel_stop_order() {
     init_logging();
 
@@ -788,6 +802,7 @@ async fn test_place_and_cancel_stop_order() {
 /// since AAPL trades far above this, the stop will never trigger.
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_place_and_cancel_stop_limit_order() {
     init_logging();
 
@@ -889,6 +904,7 @@ async fn test_place_and_cancel_stop_limit_order() {
 /// won't trigger and remains open for cancellation.
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_place_and_cancel_trailing_stop_percentage() {
     init_logging();
 
@@ -992,6 +1008,7 @@ async fn test_place_and_cancel_trailing_stop_percentage() {
 /// trigger and the order remains open for cancellation.
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_place_and_cancel_trailing_stop_limit_absolute() {
     init_logging();
 
@@ -1105,6 +1122,7 @@ async fn test_place_and_cancel_trailing_stop_limit_absolute() {
 /// should cascade to cancel the children.
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_place_and_cancel_bracket_order() {
     use rustrade_execution::client::ibkr::BracketOrderRequest;
 
@@ -1225,6 +1243,7 @@ async fn test_place_and_cancel_bracket_order() {
 /// the TP and SL orders share the same OCA group identifier.
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_bracket_order_oca_group_linkage() {
     use rustrade_execution::client::ibkr::BracketOrderRequest;
 
@@ -1327,6 +1346,7 @@ async fn test_bracket_order_oca_group_linkage() {
 /// and will be cancelled before expiry.
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_place_and_cancel_gtd_order() {
     init_logging();
 
@@ -1430,6 +1450,7 @@ async fn test_place_and_cancel_gtd_order() {
 /// will result in rejection.
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_place_moo_order_premarket() {
     init_logging();
 
@@ -1526,6 +1547,7 @@ async fn test_place_moo_order_premarket() {
 /// opening price is at or below the limit.
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_place_loo_order_premarket() {
     init_logging();
 
