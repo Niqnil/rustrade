@@ -50,6 +50,7 @@ use url::Url;
 
 pub mod channel;
 pub mod market;
+pub mod options;
 pub mod quote;
 pub mod subscription;
 pub mod trade;
