@@ -58,6 +58,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `AlpacaIex`: Free IEX feed for US equities
   - `AlpacaSip`: Paid consolidated SIP feed for US equities
   - `AlpacaCrypto`: Crypto market data
+- **Alpaca options market data**: REST-based option discovery and Greeks snapshots
+  - `AlpacaOptionsClient`: Options market data client with rate limiting and pagination
+  - `AlpacaOptionContractQuery`: Builder for filtering contracts by underlying, expiration, strike, type, style
+  - `fetch_contracts(query)`: Discover option contracts via `GET /v2/options/contracts`
+  - `AlpacaOptionSnapshot`: Option snapshot with quote and Greeks data
+  - `fetch_snapshots(symbols, feed)`: Fetch snapshots with Greeks via `GET /v1beta1/options/snapshots`
+  - `fetch_chain_snapshots(underlying, feed)`: Convenience method for entire option chains
+  - `AlpacaOptionFeed`: `Opra` (real-time, paid) or `Indicative` (15-min delayed, free)
+  - **Note**: Greeks streaming is NOT available — Alpaca only provides REST snapshots for Greeks data
 - **Quotes subscription kind**: Generic top-of-book quotes (`SubKind::Quotes`)
 - `ExchangeId::AlpacaBroker`: Dedicated variant for Alpaca execution client
   (distinct from market data feed identifiers)

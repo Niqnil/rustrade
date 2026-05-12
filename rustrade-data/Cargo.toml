@@ -75,7 +75,7 @@ hyperliquid_rust_sdk = { version = "0.6", optional = true }
 
 # Databento (optional, behind "databento" feature)
 # Note: databento re-exports dbn, so we don't need a separate dbn dependency
-databento = { version = "0.49", optional = true }
+databento = { version = "0.50", optional = true }
 
 # Massive (optional, behind "massive" feature)
 tokio-tungstenite = { version = "0.29", optional = true, features = ["native-tls"] }

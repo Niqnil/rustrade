@@ -80,7 +80,7 @@ derive_more = { workspace = true, features = [
 reqwest = { workspace = true, optional = true } # HTTP client for Alpaca REST API
 
 # Binance (optional, behind "binance" feature)
-binance-sdk = { version = "=46.0.0", features = ["spot"], optional = true }
+binance-sdk = { version = "=48.0.1", features = ["spot"], optional = true }
 anyhow = { workspace = true, optional = true }                              # Required: binance-sdk's public API returns anyhow::Result
 
 # Shared between "alpaca" and "binance" features
@@ -111,6 +111,8 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 rust_decimal_macros = { workspace = true }
 # Serde round-trip tests (L2)
 serde_json = { workspace = true }
+# Serial test execution for integration tests that share exchange state
+serial_test = { workspace = true }
 
 # Examples that depend on optional features. Without `required-features`,
 # `cargo check --all-targets` (default features) fails to compile them.

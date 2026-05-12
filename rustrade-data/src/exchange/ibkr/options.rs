@@ -30,6 +30,7 @@
 use chrono::NaiveDate;
 use ibapi::contracts::{OptionChain, OptionComputation};
 use rust_decimal::Decimal;
+use rustrade_instrument::{exchange::ExchangeId, instrument::market_data::OptionChainDescriptor};
 use serde::{Deserialize, Serialize};
 
 pub use crate::subscription::greeks::OptionGreeks;
@@ -95,10 +96,34 @@ impl OptionChainEntry {
                 .collect(),
         }
     }
+
+    /// Convert to unified [`OptionChainDescriptor`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`rust_decimal::Error`] if the multiplier string cannot be parsed
+    /// as a decimal. Surfacing the parse error lets callers log the offending
+    /// value instead of silently dropping the entry.
+    ///
+    /// # Notes
+    ///
+    /// - `exercise` is `None` because IBKR does not return exercise style in chain data
+    /// - `exchange` is always `ExchangeId::Ibkr` (the IBKR-specific exchange string is not mapped)
+    pub fn to_descriptor(&self) -> Result<OptionChainDescriptor, rust_decimal::Error> {
+        let multiplier = self.multiplier.parse::<Decimal>()?;
+
+        Ok(OptionChainDescriptor::new(
+            ExchangeId::Ibkr,
+            multiplier,
+            self.expirations.clone(),
+            self.strikes.clone(),
+            None,
+        ))
+    }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
 
@@ -184,5 +209,44 @@ mod tests {
         let entry = OptionChainEntry::from_ib(&chain);
 
         assert_eq!(entry.expirations.len(), 2);
+    }
+
+    #[test]
+    fn option_chain_entry_to_descriptor() {
+        use rust_decimal_macros::dec;
+
+        let entry = OptionChainEntry {
+            underlying_contract_id: 265598,
+            trading_class: "AAPL".to_string(),
+            multiplier: "100".to_string(),
+            exchange: "SMART".to_string(),
+            expirations: vec![
+                NaiveDate::from_ymd_opt(2024, 1, 19).unwrap(),
+                NaiveDate::from_ymd_opt(2024, 2, 16).unwrap(),
+            ],
+            strikes: vec![dec!(145), dec!(150), dec!(155)],
+        };
+
+        let descriptor = entry.to_descriptor().unwrap();
+
+        assert_eq!(descriptor.exchange, ExchangeId::Ibkr);
+        assert_eq!(descriptor.multiplier, dec!(100));
+        assert_eq!(descriptor.expirations.len(), 2);
+        assert_eq!(descriptor.strikes.len(), 3);
+        assert!(descriptor.exercise.is_none());
+    }
+
+    #[test]
+    fn option_chain_entry_to_descriptor_invalid_multiplier() {
+        let entry = OptionChainEntry {
+            underlying_contract_id: 265598,
+            trading_class: "AAPL".to_string(),
+            multiplier: "not_a_number".to_string(),
+            exchange: "SMART".to_string(),
+            expirations: vec![],
+            strikes: vec![],
+        };
+
+        assert!(entry.to_descriptor().is_err());
     }
 }
