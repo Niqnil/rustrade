@@ -44,7 +44,7 @@ use rustrade_execution::{
         alpaca::{AlpacaClient, AlpacaConfig},
     },
     order::{
-        OrderKey, OrderKind, TimeInForce,
+        OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
         id::{ClientOrderId, StrategyId},
         request::RequestOpen,
         state::{ActiveOrderState, InactiveOrderState, OrderState},
@@ -54,6 +54,7 @@ use rustrade_instrument::{
     Side, asset::name::AssetNameExchange, exchange::ExchangeId,
     instrument::name::InstrumentNameExchange,
 };
+use serial_test::serial;
 use std::time::Duration;
 use tokio_stream::StreamExt;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -224,6 +225,7 @@ async fn test_fetch_open_orders() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_place_and_cancel_limit_order() {
     init_logging();
 
@@ -321,6 +323,7 @@ async fn test_place_and_cancel_limit_order() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_place_crypto_limit_order() {
     init_logging();
 
@@ -408,6 +411,7 @@ async fn test_place_crypto_limit_order() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_account_stream() {
     init_logging();
 
@@ -459,6 +463,7 @@ async fn test_account_stream() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_account_stream_with_order() {
     init_logging();
 
@@ -579,5 +584,404 @@ async fn test_account_stream_with_order() {
             })
             .await;
         println!("Cleanup complete");
+    }
+}
+
+// ============================================================================
+// Stop Order Tests
+// ============================================================================
+
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_place_and_cancel_stop_order() {
+    init_logging();
+
+    let config = test_config();
+    let client = AlpacaClient::new(config);
+
+    let instrument = spy_instrument();
+    let strategy = StrategyId::new("test-strategy");
+    let order_cid = ClientOrderId::new(format!(
+        "test-stop-{}",
+        chrono::Utc::now().timestamp_millis()
+    ));
+
+    let order_key = OrderKey {
+        exchange: ExchangeId::AlpacaBroker,
+        instrument: &instrument,
+        strategy: strategy.clone(),
+        cid: order_cid.clone(),
+    };
+
+    // Stop order: triggers a market order when SPY drops to $1.00
+    // This price is unrealistically low so the order will never trigger
+    let request_open = RequestOpen {
+        side: Side::Sell,
+        price: None,
+        quantity: dec!(1),
+        kind: OrderKind::Stop {
+            trigger_price: dec!(1.00),
+        },
+        time_in_force: TimeInForce::GoodUntilEndOfDay,
+        position_id: None,
+        reduce_only: false,
+    };
+
+    let open_request = rustrade_execution::order::OrderEvent {
+        key: order_key.clone(),
+        state: request_open,
+    };
+
+    println!("Placing stop order: SELL 1 SPY @ stop $1.00 (won't trigger - price too low)");
+
+    let response = client.open_order(open_request).await;
+
+    assert!(response.is_some(), "Expected order response");
+    let response = response.unwrap();
+
+    match &response.state {
+        OrderState::Active(ActiveOrderState::Open(open_state)) => {
+            println!("Stop order placed successfully!");
+            println!("  Client Order ID: {}", response.key.cid);
+            println!("  Exchange Order ID: {:?}", open_state.id);
+            println!("  Kind: {:?}", response.kind);
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            let cancel_key = OrderKey {
+                exchange: ExchangeId::AlpacaBroker,
+                instrument: &instrument,
+                strategy: response.key.strategy.clone(),
+                cid: response.key.cid.clone(),
+            };
+
+            let cancel_request = rustrade_execution::order::OrderEvent {
+                key: cancel_key,
+                state: rustrade_execution::order::request::RequestCancel {
+                    id: Some(open_state.id.clone()),
+                },
+            };
+
+            println!("Canceling stop order...");
+            let cancel_response = client.cancel_order(cancel_request).await;
+
+            assert!(cancel_response.is_some(), "Expected cancel response");
+            let cancel_response = cancel_response.unwrap();
+
+            match &cancel_response.state {
+                Ok(cancelled) => {
+                    println!("Stop order canceled successfully!");
+                    println!("  Exchange Order ID: {:?}", cancelled.id);
+                }
+                Err(e) => {
+                    panic!("Cancel rejected: {:?}", e);
+                }
+            }
+        }
+        OrderState::Inactive(e) => {
+            panic!("Stop order rejected: {:?}", e);
+        }
+        OrderState::Active(other) => {
+            panic!("Unexpected active state: {:?}", other);
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_place_and_cancel_trailing_stop_order() {
+    init_logging();
+
+    let config = test_config();
+    let client = AlpacaClient::new(config);
+
+    let instrument = spy_instrument();
+    let strategy = StrategyId::new("test-strategy");
+    let order_cid = ClientOrderId::new(format!(
+        "test-trail-{}",
+        chrono::Utc::now().timestamp_millis()
+    ));
+
+    let order_key = OrderKey {
+        exchange: ExchangeId::AlpacaBroker,
+        instrument: &instrument,
+        strategy: strategy.clone(),
+        cid: order_cid.clone(),
+    };
+
+    // Trailing stop order with 5% trail distance
+    let request_open = RequestOpen {
+        side: Side::Sell,
+        price: None,
+        quantity: dec!(1),
+        kind: OrderKind::TrailingStop {
+            offset: dec!(5.0),
+            offset_type: TrailingOffsetType::Percentage,
+        },
+        time_in_force: TimeInForce::GoodUntilEndOfDay,
+        position_id: None,
+        reduce_only: false,
+    };
+
+    let open_request = rustrade_execution::order::OrderEvent {
+        key: order_key.clone(),
+        state: request_open,
+    };
+
+    println!("Placing trailing stop order: SELL 1 SPY with 5% trail");
+
+    let response = client.open_order(open_request).await;
+
+    assert!(response.is_some(), "Expected order response");
+    let response = response.unwrap();
+
+    match &response.state {
+        OrderState::Active(ActiveOrderState::Open(open_state)) => {
+            println!("Trailing stop order placed successfully!");
+            println!("  Client Order ID: {}", response.key.cid);
+            println!("  Exchange Order ID: {:?}", open_state.id);
+            println!("  Kind: {:?}", response.kind);
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            let cancel_key = OrderKey {
+                exchange: ExchangeId::AlpacaBroker,
+                instrument: &instrument,
+                strategy: response.key.strategy.clone(),
+                cid: response.key.cid.clone(),
+            };
+
+            let cancel_request = rustrade_execution::order::OrderEvent {
+                key: cancel_key,
+                state: rustrade_execution::order::request::RequestCancel {
+                    id: Some(open_state.id.clone()),
+                },
+            };
+
+            println!("Canceling trailing stop order...");
+            let cancel_response = client.cancel_order(cancel_request).await;
+
+            assert!(cancel_response.is_some(), "Expected cancel response");
+            let cancel_response = cancel_response.unwrap();
+
+            match &cancel_response.state {
+                Ok(cancelled) => {
+                    println!("Trailing stop order canceled successfully!");
+                    println!("  Exchange Order ID: {:?}", cancelled.id);
+                }
+                Err(e) => {
+                    panic!("Cancel rejected: {:?}", e);
+                }
+            }
+        }
+        OrderState::Inactive(e) => {
+            panic!("Trailing stop order rejected: {:?}", e);
+        }
+        OrderState::Active(other) => {
+            panic!("Unexpected active state: {:?}", other);
+        }
+    }
+}
+
+// ============================================================================
+// Bracket Order Tests
+// ============================================================================
+
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_place_and_cancel_bracket_order_with_stop() {
+    use rustrade_execution::client::alpaca::{AlpacaBracketOrderRequest, AlpacaBracketOrderResult};
+
+    init_logging();
+
+    let config = test_config();
+    let client = AlpacaClient::new(config);
+
+    let instrument = spy_instrument();
+    let strategy = StrategyId::new("test-bracket");
+    let order_cid = ClientOrderId::new(format!(
+        "test-bracket-{}",
+        chrono::Utc::now().timestamp_millis()
+    ));
+
+    // Bracket order with stop-loss as a simple stop order
+    // Entry at $100 (way below market ~$580+, won't fill), TP at $120, SL at $90
+    let request = AlpacaBracketOrderRequest {
+        instrument: instrument.clone(),
+        strategy: strategy.clone(),
+        cid: order_cid.clone(),
+        side: Side::Buy,
+        quantity: dec!(1),
+        entry_price: dec!(100.00),
+        take_profit_price: dec!(120.00),
+        stop_loss_price: dec!(90.00),
+        stop_loss_limit_price: None, // Simple stop order
+        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+    };
+
+    println!("Placing bracket order: BUY 1 SPY @ $100 entry, $120 TP, $90 SL (stop)");
+
+    let result: AlpacaBracketOrderResult = client.open_bracket_order(request).await;
+
+    match &result.parent.state {
+        OrderState::Active(ActiveOrderState::Open(open_state)) => {
+            println!("Bracket order placed successfully!");
+            println!("  Client Order ID: {}", result.parent.key.cid);
+            println!("  Exchange Order ID: {:?}", open_state.id);
+            println!("  Entry Price: {:?}", result.parent.price);
+
+            // Verify the order is on the book
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            // Fetch open orders to see all legs
+            let instruments: Vec<InstrumentNameExchange> = vec![instrument.clone()];
+            let open_orders = client.fetch_open_orders(&instruments).await;
+            match open_orders {
+                Ok(orders) => {
+                    println!("Open orders after bracket placement: {}", orders.len());
+                    for order in &orders {
+                        println!(
+                            "  {:?} {} {} @ {:?} (kind: {:?})",
+                            order.side,
+                            order.quantity,
+                            order.key.instrument,
+                            order.price,
+                            order.kind
+                        );
+                    }
+                    // Bracket order should create 3 legs (entry, TP, SL)
+                    // but we only assert >= 1 since entry might be the only one visible before fill
+                    assert!(
+                        !orders.is_empty(),
+                        "Expected at least the entry order to be visible"
+                    );
+                }
+                Err(e) => {
+                    println!("Warning: fetch_open_orders failed: {:?}", e);
+                }
+            }
+
+            // Cancel the bracket order (canceling parent cancels all legs)
+            let cancel_key = OrderKey {
+                exchange: ExchangeId::AlpacaBroker,
+                instrument: &instrument,
+                strategy: result.parent.key.strategy.clone(),
+                cid: result.parent.key.cid.clone(),
+            };
+
+            let cancel_request = rustrade_execution::order::OrderEvent {
+                key: cancel_key,
+                state: rustrade_execution::order::request::RequestCancel {
+                    id: Some(open_state.id.clone()),
+                },
+            };
+
+            println!("Canceling bracket order...");
+            let cancel_response = client.cancel_order(cancel_request).await;
+
+            assert!(cancel_response.is_some(), "Expected cancel response");
+            match &cancel_response.unwrap().state {
+                Ok(cancelled) => {
+                    println!("Bracket order canceled successfully!");
+                    println!("  Exchange Order ID: {:?}", cancelled.id);
+                }
+                Err(e) => {
+                    panic!("Cancel rejected: {:?}", e);
+                }
+            }
+        }
+        OrderState::Inactive(e) => {
+            panic!("Bracket order rejected: {:?}", e);
+        }
+        OrderState::Active(other) => {
+            panic!("Unexpected active state: {:?}", other);
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_place_and_cancel_bracket_order_with_stop_limit() {
+    use rustrade_execution::client::alpaca::{AlpacaBracketOrderRequest, AlpacaBracketOrderResult};
+
+    init_logging();
+
+    let config = test_config();
+    let client = AlpacaClient::new(config);
+
+    let instrument = spy_instrument();
+    let strategy = StrategyId::new("test-bracket-sl");
+    let order_cid = ClientOrderId::new(format!(
+        "test-bracket-sl-{}",
+        chrono::Utc::now().timestamp_millis()
+    ));
+
+    // Bracket order with stop-loss as a stop-limit order
+    // Entry at $100 (way below market, won't fill), TP at $120, SL triggers at $90, limit at $88
+    let request = AlpacaBracketOrderRequest {
+        instrument: instrument.clone(),
+        strategy: strategy.clone(),
+        cid: order_cid.clone(),
+        side: Side::Buy,
+        quantity: dec!(1),
+        entry_price: dec!(100.00),
+        take_profit_price: dec!(120.00),
+        stop_loss_price: dec!(90.00),
+        stop_loss_limit_price: Some(dec!(88.00)), // Stop-limit order
+        time_in_force: TimeInForce::GoodUntilEndOfDay,
+    };
+
+    println!("Placing bracket order: BUY 1 SPY @ $100 entry, $120 TP, $90/$88 SL (stop-limit)");
+
+    let result: AlpacaBracketOrderResult = client.open_bracket_order(request).await;
+
+    match &result.parent.state {
+        OrderState::Active(ActiveOrderState::Open(open_state)) => {
+            println!("Bracket order (stop-limit SL) placed successfully!");
+            println!("  Client Order ID: {}", result.parent.key.cid);
+            println!("  Exchange Order ID: {:?}", open_state.id);
+            println!("  Entry Price: {:?}", result.parent.price);
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            // Cancel the bracket order
+            let cancel_key = OrderKey {
+                exchange: ExchangeId::AlpacaBroker,
+                instrument: &instrument,
+                strategy: result.parent.key.strategy.clone(),
+                cid: result.parent.key.cid.clone(),
+            };
+
+            let cancel_request = rustrade_execution::order::OrderEvent {
+                key: cancel_key,
+                state: rustrade_execution::order::request::RequestCancel {
+                    id: Some(open_state.id.clone()),
+                },
+            };
+
+            println!("Canceling bracket order (stop-limit)...");
+            let cancel_response = client.cancel_order(cancel_request).await;
+
+            assert!(cancel_response.is_some(), "Expected cancel response");
+            match &cancel_response.unwrap().state {
+                Ok(cancelled) => {
+                    println!("Bracket order (stop-limit) canceled successfully!");
+                    println!("  Exchange Order ID: {:?}", cancelled.id);
+                }
+                Err(e) => {
+                    panic!("Cancel rejected: {:?}", e);
+                }
+            }
+        }
+        OrderState::Inactive(e) => {
+            panic!("Bracket order (stop-limit) rejected: {:?}", e);
+        }
+        OrderState::Active(other) => {
+            panic!("Unexpected active state: {:?}", other);
+        }
     }
 }
