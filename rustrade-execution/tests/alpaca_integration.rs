@@ -817,18 +817,17 @@ async fn test_place_and_cancel_bracket_order_with_stop() {
 
     // Bracket order with stop-loss as a simple stop order
     // Entry at $100 (way below market ~$580+, won't fill), TP at $120, SL at $90
-    let request = AlpacaBracketOrderRequest {
-        instrument: instrument.clone(),
-        strategy: strategy.clone(),
-        cid: order_cid.clone(),
-        side: Side::Buy,
-        quantity: dec!(1),
-        entry_price: dec!(100.00),
-        take_profit_price: dec!(120.00),
-        stop_loss_price: dec!(90.00),
-        stop_loss_limit_price: None, // Simple stop order
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-    };
+    let request = AlpacaBracketOrderRequest::new(
+        instrument.clone(),
+        strategy.clone(),
+        order_cid.clone(),
+        Side::Buy,
+        dec!(1),
+        dec!(100.00),
+        dec!(120.00),
+        dec!(90.00),
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
 
     println!("Placing bracket order: BUY 1 SPY @ $100 entry, $120 TP, $90 SL (stop)");
 
@@ -930,18 +929,18 @@ async fn test_place_and_cancel_bracket_order_with_stop_limit() {
 
     // Bracket order with stop-loss as a stop-limit order
     // Entry at $100 (way below market, won't fill), TP at $120, SL triggers at $90, limit at $88
-    let request = AlpacaBracketOrderRequest {
-        instrument: instrument.clone(),
-        strategy: strategy.clone(),
-        cid: order_cid.clone(),
-        side: Side::Buy,
-        quantity: dec!(1),
-        entry_price: dec!(100.00),
-        take_profit_price: dec!(120.00),
-        stop_loss_price: dec!(90.00),
-        stop_loss_limit_price: Some(dec!(88.00)), // Stop-limit order
-        time_in_force: TimeInForce::GoodUntilEndOfDay,
-    };
+    let request = AlpacaBracketOrderRequest::new(
+        instrument.clone(),
+        strategy.clone(),
+        order_cid.clone(),
+        Side::Buy,
+        dec!(1),
+        dec!(100.00),
+        dec!(120.00),
+        dec!(90.00),
+        TimeInForce::GoodUntilEndOfDay,
+    )
+    .with_stop_loss_limit_price(dec!(88.00));
 
     println!("Placing bracket order: BUY 1 SPY @ $100 entry, $120 TP, $90/$88 SL (stop-limit)");
 

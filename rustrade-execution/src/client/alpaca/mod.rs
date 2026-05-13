@@ -529,20 +529,21 @@ struct StopLossParams {
 /// # Example
 ///
 /// ```ignore
-/// let request = AlpacaBracketOrderRequest {
-///     instrument: "AAPL".into(),
-///     strategy: StrategyId::new("momentum"),
-///     cid: ClientOrderId::new("bracket-001"),
-///     side: Side::Buy,
-///     quantity: dec!(10),
-///     entry_price: dec!(150.00),
-///     take_profit_price: dec!(160.00),
-///     stop_loss_price: dec!(145.00),
-///     stop_loss_limit_price: None,  // Simple stop, or Some(dec!(144.00)) for stop-limit
-///     time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-/// };
+/// let request = AlpacaBracketOrderRequest::new(
+///     "AAPL".into(),
+///     StrategyId::new("momentum"),
+///     ClientOrderId::new("bracket-001"),
+///     Side::Buy,
+///     dec!(10),
+///     dec!(150.00),  // entry
+///     dec!(160.00),  // take profit
+///     dec!(145.00),  // stop loss
+///     TimeInForce::GoodUntilCancelled { post_only: false },
+/// );
+/// // For stop-limit SL: .with_stop_loss_limit_price(dec!(144.00))
 /// let result = client.open_bracket_order(request).await;
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct AlpacaBracketOrderRequest {
     /// Instrument to trade.
@@ -567,6 +568,44 @@ pub struct AlpacaBracketOrderRequest {
     pub time_in_force: TimeInForce,
 }
 
+impl AlpacaBracketOrderRequest {
+    /// Create a new bracket order request.
+    ///
+    /// For a stop-limit stop-loss leg, chain `.with_stop_loss_limit_price()`.
+    #[allow(clippy::too_many_arguments)] // Bracket orders inherently need many params
+    pub fn new(
+        instrument: InstrumentNameExchange,
+        strategy: StrategyId,
+        cid: ClientOrderId,
+        side: Side,
+        quantity: Decimal,
+        entry_price: Decimal,
+        take_profit_price: Decimal,
+        stop_loss_price: Decimal,
+        time_in_force: TimeInForce,
+    ) -> Self {
+        Self {
+            instrument,
+            strategy,
+            cid,
+            side,
+            quantity,
+            entry_price,
+            take_profit_price,
+            stop_loss_price,
+            stop_loss_limit_price: None,
+            time_in_force,
+        }
+    }
+
+    /// Set the stop-loss limit price, converting the SL leg to a stop-limit order.
+    #[must_use]
+    pub fn with_stop_loss_limit_price(mut self, price: Decimal) -> Self {
+        self.stop_loss_limit_price = Some(price);
+        self
+    }
+}
+
 /// Result of placing an Alpaca bracket order.
 ///
 /// Contains the parent order with its state. The take-profit and stop-loss legs
@@ -577,6 +616,7 @@ pub struct AlpacaBracketOrderRequest {
 /// Unlike IBKR which returns three separate orders, Alpaca's bracket API returns
 /// a single parent order. The child legs (TP/SL) are implicitly created and linked
 /// by Alpaca. Use `fetch_open_orders` to retrieve all legs after placement.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct AlpacaBracketOrderResult {
     /// Parent (entry) order with its current state.
@@ -1354,18 +1394,17 @@ impl AlpacaClient {
     /// # Example
     ///
     /// ```ignore
-    /// let request = AlpacaBracketOrderRequest {
-    ///     instrument: "AAPL".into(),
-    ///     strategy: StrategyId::new("momentum"),
-    ///     cid: ClientOrderId::new("bracket-001"),
-    ///     side: Side::Buy,
-    ///     quantity: dec!(10),
-    ///     entry_price: dec!(150.00),
-    ///     take_profit_price: dec!(160.00),
-    ///     stop_loss_price: dec!(145.00),
-    ///     stop_loss_limit_price: None,
-    ///     time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-    /// };
+    /// let request = AlpacaBracketOrderRequest::new(
+    ///     "AAPL".into(),
+    ///     StrategyId::new("momentum"),
+    ///     ClientOrderId::new("bracket-001"),
+    ///     Side::Buy,
+    ///     dec!(10),
+    ///     dec!(150.00),  // entry
+    ///     dec!(160.00),  // take profit
+    ///     dec!(145.00),  // stop loss
+    ///     TimeInForce::GoodUntilCancelled { post_only: false },
+    /// );
     /// let result = client.open_bracket_order(request).await;
     /// ```
     pub async fn open_bracket_order(
@@ -3475,18 +3514,17 @@ mod tests {
         let config = AlpacaConfig::new("dummy_key".into(), "dummy_secret".into(), true);
         let client = AlpacaClient::new(config);
 
-        let request = AlpacaBracketOrderRequest {
-            instrument: InstrumentNameExchange::new("SPY"),
-            strategy: crate::order::id::StrategyId::new("test"),
-            cid: crate::order::id::ClientOrderId::new("test-tif"),
-            side: Side::Buy,
-            quantity: dec!(1),
-            entry_price: dec!(100.00),
-            take_profit_price: dec!(120.00),
-            stop_loss_price: dec!(90.00),
-            stop_loss_limit_price: None,
-            time_in_force: TimeInForce::ImmediateOrCancel, // Invalid for brackets
-        };
+        let request = AlpacaBracketOrderRequest::new(
+            InstrumentNameExchange::new("SPY"),
+            crate::order::id::StrategyId::new("test"),
+            crate::order::id::ClientOrderId::new("test-tif"),
+            Side::Buy,
+            dec!(1),
+            dec!(100.00),
+            dec!(120.00),
+            dec!(90.00),
+            TimeInForce::ImmediateOrCancel, // Invalid for brackets
+        );
 
         let result = client.open_bracket_order(request).await;
 
@@ -3505,18 +3543,17 @@ mod tests {
         let client = AlpacaClient::new(config);
 
         // Buy bracket with SL > entry (invalid)
-        let request = AlpacaBracketOrderRequest {
-            instrument: InstrumentNameExchange::new("SPY"),
-            strategy: crate::order::id::StrategyId::new("test"),
-            cid: crate::order::id::ClientOrderId::new("test-price"),
-            side: Side::Buy,
-            quantity: dec!(1),
-            entry_price: dec!(100.00),
-            take_profit_price: dec!(120.00),
-            stop_loss_price: dec!(105.00), // Invalid: SL > entry for buy
-            stop_loss_limit_price: None,
-            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        };
+        let request = AlpacaBracketOrderRequest::new(
+            InstrumentNameExchange::new("SPY"),
+            crate::order::id::StrategyId::new("test"),
+            crate::order::id::ClientOrderId::new("test-price"),
+            Side::Buy,
+            dec!(1),
+            dec!(100.00),
+            dec!(120.00),
+            dec!(105.00), // Invalid: SL > entry for buy
+            TimeInForce::GoodUntilCancelled { post_only: false },
+        );
 
         let result = client.open_bracket_order(request).await;
 
@@ -3535,18 +3572,18 @@ mod tests {
         let client = AlpacaClient::new(config);
 
         // Buy bracket with SL limit > SL trigger (invalid for sell stop-limit)
-        let request = AlpacaBracketOrderRequest {
-            instrument: InstrumentNameExchange::new("SPY"),
-            strategy: crate::order::id::StrategyId::new("test"),
-            cid: crate::order::id::ClientOrderId::new("test-sl-limit"),
-            side: Side::Buy,
-            quantity: dec!(1),
-            entry_price: dec!(100.00),
-            take_profit_price: dec!(120.00),
-            stop_loss_price: dec!(90.00),
-            stop_loss_limit_price: Some(dec!(95.00)), // Invalid: limit > trigger for sell SL
-            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        };
+        let request = AlpacaBracketOrderRequest::new(
+            InstrumentNameExchange::new("SPY"),
+            crate::order::id::StrategyId::new("test"),
+            crate::order::id::ClientOrderId::new("test-sl-limit"),
+            Side::Buy,
+            dec!(1),
+            dec!(100.00),
+            dec!(120.00),
+            dec!(90.00),
+            TimeInForce::GoodUntilCancelled { post_only: false },
+        )
+        .with_stop_loss_limit_price(dec!(95.00)); // Invalid: limit > trigger for sell SL
 
         let result = client.open_bracket_order(request).await;
 
