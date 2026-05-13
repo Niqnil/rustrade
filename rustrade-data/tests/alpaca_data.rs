@@ -2,9 +2,20 @@
 //!
 //! These tests verify connectivity and data reception from Alpaca market data streams.
 //!
+//! # Status
+//!
+//! **Tested locally, CI planned (paper trading allowed by Alpaca):**
+//! - Crypto streaming: trades and quotes (24/7, free)
+//! - IEX equity streaming: trades and quotes (market hours, free)
+//!
+//! **NOT tested (requires Algo Trader Plus subscription):**
+//! - SIP equity streaming (`test_sip_*`) — implemented but unverified
+//!
+//! Tests are marked `#[ignore]` to avoid CI failures without credentials.
+//!
 //! # Prerequisites
 //!
-//! 1. Alpaca account (https://app.alpaca.markets)
+//! 1. Alpaca paper trading account (https://app.alpaca.markets)
 //! 2. Environment variables set (see .env.template):
 //!    - ALPACA_API_KEY: API key
 //!    - ALPACA_SECRET_KEY: Secret key
@@ -21,8 +32,6 @@
 //! # Run specific test
 //! cargo test --test alpaca_data --features alpaca test_crypto_trade_stream -- --ignored
 //! ```
-//!
-//! Tests are marked `#[ignore]` to avoid CI failures without credentials.
 //!
 //! # Market Hours Note
 //!

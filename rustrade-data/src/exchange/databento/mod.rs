@@ -22,15 +22,16 @@
 //! Requires `DATABENTO_API_KEY` environment variable from an active Databento
 //! subscription.
 //!
-//! # Testing
+//! # Testing Status
 //!
-//! **Live data integration is NOT TESTED** — Databento does not offer development/sandbox
-//! keys and we do not have a subscription.
+//! **NOT tested in CI** — no permission to use credentials for CI.
 //!
-//! - **Offline tests** (`databento_transformer.rs`): Verify DBN-to-rustrade
-//!   transformation using fixture files. Runs in CI.
-//! - **Integration tests** (`databento_integration.rs`): Written but not run.
-//!   Network calls (auth, API, WebSocket) are unverified.
+//! **Tested locally:**
+//! - Offline fixture tests (`databento_transformer.rs`): DBN-to-rustrade transformation
+//!
+//! **NOT tested locally (no subscription, no sandbox keys):**
+//! - Historical API (`databento_integration.rs`): authentication, queries
+//! - Live streaming (`databento_integration.rs`): WebSocket connection, data reception
 //!
 //! # Datasets
 //!

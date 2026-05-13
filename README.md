@@ -5,6 +5,8 @@ A Rust ecosystem for building high-performance algorithmic trading systems.
 [![MIT licensed][mit-badge]][mit-url]
 [![Crates.io][crates-badge]][crates-url]
 [![docs.rs][docs-badge]][docs-url]
+[![Alpaca Integration][alpaca-badge]][alpaca-url]
+[![Alpaca Weekly][alpaca-weekly-badge]][alpaca-weekly-url]
 
 [mit-badge]: https://img.shields.io/badge/license-MIT-blue.svg
 [mit-url]: https://github.com/Niqnil/rustrade/blob/main/LICENSE
@@ -12,6 +14,10 @@ A Rust ecosystem for building high-performance algorithmic trading systems.
 [crates-url]: https://crates.io/crates/rustrade
 [docs-badge]: https://img.shields.io/docsrs/rustrade
 [docs-url]: https://docs.rs/rustrade
+[alpaca-badge]: https://github.com/Niqnil/rustrade/actions/workflows/alpaca-integration.yml/badge.svg
+[alpaca-url]: https://github.com/Niqnil/rustrade/actions/workflows/alpaca-integration.yml
+[alpaca-weekly-badge]: https://github.com/Niqnil/rustrade/actions/workflows/alpaca-weekly.yml/badge.svg
+[alpaca-weekly-url]: https://github.com/Niqnil/rustrade/actions/workflows/alpaca-weekly.yml
 
 ## Overview
 

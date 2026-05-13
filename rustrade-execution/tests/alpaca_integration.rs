@@ -2,6 +2,16 @@
 //!
 //! These tests require Alpaca paper trading API credentials.
 //!
+//! # Status
+//!
+//! **Tested locally, CI planned (paper trading allowed by Alpaca):**
+//! - All order types: market, limit, stop, stop-limit, trailing stop
+//! - Bracket orders with TP/SL legs
+//! - Account snapshots, balances, positions
+//! - Account event streaming via WebSocket
+//!
+//! Tests are marked `#[ignore]` to avoid CI failures without credentials.
+//!
 //! # Prerequisites
 //!
 //! 1. Alpaca paper trading account (https://app.alpaca.markets)
@@ -22,8 +32,6 @@
 //! # Run specific test
 //! cargo test --test alpaca_integration --features alpaca test_account_snapshot -- --ignored
 //! ```
-//!
-//! Tests are marked `#[ignore]` to avoid CI failures without credentials.
 //!
 //! # Market Hours Note
 //!

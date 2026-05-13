@@ -3,6 +3,14 @@
 //! Uses the `ibapi` crate for IB TWS/Gateway connectivity. Supports equities,
 //! futures, options, and forex.
 //!
+//! # Testing Status
+//!
+//! **NOT TESTED in CI.** IBKR has not confirmed permission to use credentials
+//! for CI, and requires IB Gateway/TWS running locally.
+//!
+//! **Tested locally:** All execution tests (connection, orders, account streaming)
+//! run on paper trading accounts — no market data subscriptions required.
+//!
 //! # Connection
 //!
 //! Requires TWS or IB Gateway running locally with API enabled:

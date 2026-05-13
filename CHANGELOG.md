@@ -52,12 +52,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `DatabentoLive<K>`: Real-time WebSocket streaming with `PitSymbolMap` symbol resolution
   - `ExchangeId` variants: `DatabentoGlbx`, `DatabentoXnas`, `DatabentoXnys`, `DatabentoDbeq`, `DatabentoOpra`
   - Nanosecond-precision timestamps and lossless Decimal price conversion
-  - **Note**: Live data integration is NOT TESTED — Databento does not offer development/sandbox keys and we do not have a subscription.
-    Offline fixture tests verify transformation logic; network integration is unverified.
+  - **Testing**: NOT TESTED in CI; offline fixture tests verified locally; live integration untested (requires paid subscription)
 - **Alpaca market data connector**: Real-time trades and quotes via WebSocket
   - `AlpacaIex`: Free IEX feed for US equities
   - `AlpacaSip`: Paid consolidated SIP feed for US equities
   - `AlpacaCrypto`: Crypto market data
+  - **Testing**: IEX and crypto feeds are tested with paper credentials; SIP requires Algo Trader Plus (paid subscription) and is NOT TESTED
 - **Alpaca options market data**: REST-based option discovery and Greeks snapshots
   - `AlpacaOptionsClient`: Options market data client with rate limiting and pagination
   - `AlpacaOptionContractQuery`: Builder for filtering contracts by underlying, expiration, strike, type, style
@@ -66,6 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `fetch_snapshots(symbols, feed)`: Fetch snapshots with Greeks via `GET /v1beta1/options/snapshots`
   - `fetch_chain_snapshots(underlying, feed)`: Convenience method for entire option chains
   - `AlpacaOptionFeed`: `Opra` (real-time, paid) or `Indicative` (15-min delayed, free)
+  - **Testing**: Indicative feed is tested; OPRA requires Algo Trader Plus (paid subscription) and is NOT TESTED
   - **Note**: Greeks streaming is NOT available — Alpaca only provides REST snapshots for Greeks data
 - **Quotes subscription kind**: Generic top-of-book quotes (`SubKind::Quotes`)
 - `ExchangeId::AlpacaBroker`: Dedicated variant for Alpaca execution client

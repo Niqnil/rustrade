@@ -2,6 +2,14 @@
 //!
 //! These tests require IB Gateway or TWS running on localhost:4002 (paper account).
 //!
+//! # Status
+//!
+//! **NOT TESTED in CI.** IBKR has not confirmed permission to use credentials
+//! for CI, and requires IB Gateway/TWS running locally.
+//!
+//! **Tested locally:** All execution tests (Tier 0) run on paper trading accounts
+//! — no market data subscriptions needed.
+//!
 //! # Safety
 //!
 //! **All tests use paper trading accounts only.** The `IBKR_PAPER_ACCOUNT` env var is required
@@ -23,8 +31,6 @@
 //! # Run specific test
 //! IBKR_PAPER_ACCOUNT=<account_id> cargo test --test ibkr_execution --features ibkr test_connection -- --ignored
 //! ```
-//!
-//! Tests are marked `#[ignore]` to avoid CI failures without IB connectivity.
 //!
 //! # Subscription Tiers
 //!

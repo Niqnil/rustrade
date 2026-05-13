@@ -67,7 +67,7 @@ impl<K> IbkrSubscription<K> {
     ///
     /// # Subscription Requirements
     ///
-    /// Requires OPRA subscription ($1.50/mo) for US options.
+    /// Requires OPRA subscription (paid) for US options.
     pub fn option_greeks(key: K, instrument: InstrumentNameExchange) -> Self {
         Self {
             key,
