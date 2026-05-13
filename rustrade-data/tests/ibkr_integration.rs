@@ -2,6 +2,14 @@
 //!
 //! These tests require IB Gateway or TWS running on localhost:4002 (paper account).
 //!
+//! # Status
+//!
+//! **NOT TESTED in CI.** IBKR has not confirmed permission to use credentials
+//! for CI, and requires IB Gateway/TWS running locally.
+//!
+//! **Tested locally:** Tier 0 (connection) and Tier 1 (free IBKR Pro subscriptions).
+//! **NOT tested locally:** Tier 2 (L2 depth) and Tier 3 (OPRA) — paid subscriptions.
+//!
 //! # Safety
 //!
 //! **All tests use paper trading accounts only.** Tests connect to port 4002 (Gateway paper)
@@ -22,8 +30,6 @@
 //! # Run specific test
 //! cargo test --test ibkr_integration --features ibkr test_historical_daily_bars -- --ignored
 //! ```
-//!
-//! Tests are marked `#[ignore]` to avoid CI failures without IB connectivity.
 //!
 //! # Subscription Tiers
 //!
@@ -68,7 +74,7 @@
 //! |------|-------------|
 //! | `test_market_stream_depth` | Stream L2 order book depth |
 //!
-//! ## Tier 3: OPRA US Options ($1.50/mo)
+//! ## Tier 3: OPRA US Options (PAID)
 //!
 //! Required for real-time options quotes and Greeks.
 //!
@@ -1055,7 +1061,7 @@ async fn test_fetch_option_chain() {
 }
 
 // ============================================================================
-// Real-Time Option Greeks Streaming Tests (Phase 5B) — Tier 3: OPRA ($1.50/mo)
+// Real-Time Option Greeks Streaming Tests (Phase 5B) — Tier 3: OPRA (PAID)
 // ============================================================================
 
 #[serial]

@@ -5,6 +5,15 @@
 //! - SIP: `wss://stream.data.alpaca.markets/v2/sip` (paid, consolidated tape)
 //! - Crypto: `wss://stream.data.alpaca.markets/v1beta3/crypto/us`
 //!
+//! # Testing Status
+//!
+//! **Tested locally, CI planned (free tier — paper trading allowed):**
+//! - Crypto streaming: trades and quotes (24/7)
+//! - IEX equity streaming: trades and quotes (market hours only)
+//!
+//! **NOT tested (requires Algo Trader Plus subscription):**
+//! - SIP equity streaming — implemented but unverified against real endpoints
+//!
 //! # Authentication
 //!
 //! Requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` environment variables.

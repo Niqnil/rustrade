@@ -21,7 +21,7 @@
 //!
 //! # Subscription Requirements
 //!
-//! Option Greeks require OPRA subscription ($1.50/mo) for US options.
+//! Option Greeks require OPRA subscription (paid) for US options.
 //!
 //! [`subscription::greeks`]: crate::subscription::greeks
 //! [`IbkrHistoricalData::calculate_theoretical_greeks`]: super::historical::IbkrHistoricalData::calculate_theoretical_greeks

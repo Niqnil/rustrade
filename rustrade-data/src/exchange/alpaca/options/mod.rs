@@ -38,6 +38,15 @@
 //! let snapshots = client.fetch_snapshots(&symbols, AlpacaOptionFeed::Indicative).await?;
 //! ```
 //!
+//! # Testing Status
+//!
+//! **Tested locally, CI planned (free tier — paper trading allowed):**
+//! - Contract discovery via `fetch_contracts()`
+//! - Indicative feed (15-min delayed) via `fetch_snapshots()`
+//!
+//! **NOT tested (requires OPRA subscription via Algo Trader Plus):**
+//! - OPRA real-time feed — implemented but unverified against real endpoints
+//!
 //! # Limitations
 //!
 //! - **REST only**: Greeks streaming is NOT available via WebSocket. Use snapshots for

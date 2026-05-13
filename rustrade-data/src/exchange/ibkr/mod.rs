@@ -2,6 +2,21 @@
 //!
 //! Provides streaming market data from IB TWS/Gateway via the `ibapi` crate.
 //!
+//! # Testing Status
+//!
+//! **NOT TESTED in CI.** IBKR has not confirmed permission to use credentials
+//! for CI, and requires IB Gateway/TWS running locally.
+//!
+//! **Tested locally (free subscriptions via IBKR Pro):**
+//! - Tier 0: Connection, contract resolution
+//! - Tier 1: Historical bars/ticks, L1 quotes, Greeks calculator, option chains
+//!
+//! **NOT tested locally (paid subscriptions):**
+//! - Tier 2: L2 Market Depth — exchange-specific fees
+//! - Tier 3: OPRA US Options — paid subscription
+//!
+//! Tests are organized by subscription tier (see `ibkr_integration.rs`).
+//!
 //! # Connection
 //!
 //! Requires TWS or IB Gateway running locally with API enabled:

@@ -4,11 +4,13 @@
 //!
 //! # Status
 //!
-//! **Live data integration is NOT TESTED.** Databento does not offer sandbox or
-//! development API keys, and we do not have a subscription. The transformation
-//! logic (DBN → rustrade events) is tested via fixtures in
-//! `databento_transformer.rs`, but the network integration (authentication,
-//! API calls, WebSocket streaming) has not been verified against real endpoints.
+//! **NOT tested in CI** — no permission to use credentials for CI.
+//!
+//! **NOT tested locally (no subscription, no sandbox keys):**
+//! - All tests in this file — network integration (authentication, API calls,
+//!   WebSocket streaming) has not been verified against real endpoints
+//!
+//! Offline fixture tests (`databento_transformer.rs`) verify transformation logic locally.
 //!
 //! # Prerequisites
 //!
