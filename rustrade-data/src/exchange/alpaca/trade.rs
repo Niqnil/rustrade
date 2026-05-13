@@ -72,7 +72,11 @@ impl AlpacaTrade {
         match self.taker_side.as_deref() {
             Some("B") => Some(Side::Buy),
             Some("S") => Some(Side::Sell),
-            _ => None,
+            None => None,
+            Some(other) => {
+                tracing::warn!(tks = other, "AlpacaTrade: unexpected taker_side value");
+                None
+            }
         }
     }
 }
@@ -238,5 +242,13 @@ mod tests {
         let input = r#"{"T":"t","S":"AAPL","i":123,"p":150.25,"s":100,"t":"2026-05-02T14:00:00Z"}"#;
         let trade: AlpacaTrade = serde_json::from_str(input).unwrap();
         assert_eq!(trade.subscription_id.as_ref(), "trades|AAPL");
+    }
+
+    #[test]
+    fn test_unexpected_taker_side_returns_none() {
+        let input = r#"{"T":"t","S":"BTC/USD","i":456,"p":60000.50,"s":0.5,"tks":"X","t":"2026-05-02T14:00:00Z"}"#;
+        let trade: AlpacaTrade = serde_json::from_str(input).unwrap();
+        assert_eq!(trade.taker_side, Some(SmolStr::new("X")));
+        assert!(trade.side().is_none());
     }
 }
