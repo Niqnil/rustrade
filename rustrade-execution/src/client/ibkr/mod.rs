@@ -50,10 +50,14 @@ use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, Snapshot, UnindexedAccountEvent,
     UnindexedAccountSnapshot,
     balance::AssetBalance,
-    client::ExecutionClient,
+    client::{BracketOrderClient, ExecutionClient},
     error::{ApiError, ConnectivityError, OrderError, UnindexedClientError},
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
+        bracket::{
+            BracketOrderRequest as UnifiedBracketOrderRequest,
+            BracketOrderResult as UnifiedBracketOrderResult,
+        },
         id::{ClientOrderId, OrderId, StrategyId},
         request::{
             OrderRequestCancel, OrderRequestOpen, OrderResponseCancel, UnindexedOrderResponseCancel,
@@ -1736,3 +1740,30 @@ fn make_order_from_status(
 }
 
 pub use execution::parse_ib_timestamp;
+
+impl BracketOrderClient for IbkrClient {
+    async fn open_bracket_order(
+        &self,
+        request: UnifiedBracketOrderRequest<ExchangeId, &InstrumentNameExchange>,
+    ) -> UnifiedBracketOrderResult {
+        let ibkr_request = BracketOrderRequest {
+            instrument: request.key.instrument.clone(),
+            strategy: request.key.strategy.clone(),
+            parent_cid: request.key.cid.clone(),
+            side: request.state.side,
+            quantity: request.state.quantity,
+            entry_price: request.state.entry_price,
+            take_profit_price: request.state.take_profit_price,
+            stop_loss_price: request.state.stop_loss_price,
+            time_in_force: request.state.time_in_force,
+        };
+
+        let result = self.open_bracket_order(ibkr_request).await;
+
+        UnifiedBracketOrderResult::with_all_legs(
+            result.parent,
+            result.take_profit,
+            result.stop_loss,
+        )
+    }
+}

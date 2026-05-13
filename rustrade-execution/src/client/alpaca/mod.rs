@@ -35,10 +35,14 @@ use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
     UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance},
-    client::ExecutionClient,
+    client::{BracketOrderClient, ExecutionClient},
     error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
     order::{
         Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
+        bracket::{
+            BracketOrderRequest as UnifiedBracketOrderRequest,
+            BracketOrderResult as UnifiedBracketOrderResult,
+        },
         id::{ClientOrderId, OrderId, StrategyId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
@@ -3252,6 +3256,34 @@ fn parse_order_error(status: reqwest::StatusCode, message: &str) -> UnindexedOrd
 
 fn connectivity_err(msg: impl Into<String>) -> UnindexedClientError {
     UnindexedClientError::Connectivity(ConnectivityError::Socket(msg.into()))
+}
+
+// ---------------------------------------------------------------------------
+// BracketOrderClient implementation
+// ---------------------------------------------------------------------------
+
+impl BracketOrderClient for AlpacaClient {
+    async fn open_bracket_order(
+        &self,
+        request: UnifiedBracketOrderRequest<ExchangeId, &InstrumentNameExchange>,
+    ) -> UnifiedBracketOrderResult {
+        let alpaca_request = AlpacaBracketOrderRequest {
+            instrument: request.key.instrument.clone(),
+            strategy: request.key.strategy.clone(),
+            cid: request.key.cid.clone(),
+            side: request.state.side,
+            quantity: request.state.quantity,
+            entry_price: request.state.entry_price,
+            take_profit_price: request.state.take_profit_price,
+            stop_loss_price: request.state.stop_loss_price,
+            stop_loss_limit_price: request.state.stop_loss_limit_price,
+            time_in_force: request.state.time_in_force,
+        };
+
+        let result = self.open_bracket_order(alpaca_request).await;
+
+        UnifiedBracketOrderResult::parent_only(result.parent)
+    }
 }
 
 // ---------------------------------------------------------------------------
