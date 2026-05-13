@@ -112,6 +112,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Use `AlpacaIex`, `AlpacaSip`, or `AlpacaCrypto` for market data feeds
   - Use `AlpacaBroker` for execution
   - Migration: Replace `ExchangeId::Alpaca` with the appropriate specific variant
+- **BREAKING**: `AlpacaBracketOrderRequest` and `AlpacaBracketOrderResult` marked `#[non_exhaustive]`
+  ([#69](https://github.com/Niqnil/rustrade/issues/69)).
+  - Allows future field additions without breaking downstream code
+  - Struct literal construction no longer works; use `AlpacaBracketOrderRequest::new()` constructor
+  - Optional stop-loss limit price: chain `.with_stop_loss_limit_price(price)` after construction
 
 ### Fixed
 
