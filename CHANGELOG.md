@@ -9,7 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Option Greeks support** (Phase 5): Real-time and computed Greeks for IBKR options
+- **BracketOrderClient supertrait**: Unified trait for bracket orders
+  - `BracketOrderClient` trait extending `ExecutionClient` for exchanges supporting native bracket orders
+  - `RequestOpenBracket` struct: Common request parameters (side, quantity, prices, TIF)
+  - `BracketOrderRequest<ExchangeKey, InstrumentKey>` type alias using `OrderEvent`
+  - `BracketOrderResult` with `Option<Order>` for child legs (documents API divergence)
+  - `BracketOrderRequestBuilder` for fluent request construction
+  - Implemented for `IbkrClient` (returns all 3 legs) and `AlpacaClient` (returns parent only)
+  - Enables generic code: `T: ExecutionClient + BracketOrderClient`
+- **Option Greeks support**: Real-time and computed Greeks for IBKR options
   - `DataKind::OptionGreeks(OptionGreeks)` variant for the unified market data stream
   - `IbkrSubscriptionKind::OptionGreeks` for live streaming via `market_data()` subscription
   - `OptionGreeks` struct (`subscription::greeks`): `delta`, `gamma`, `theta`, `vega`, `implied_volatility`,
@@ -30,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cargo `required-features` declarations for feature-gated examples
   (`download_databento_fixtures`, `hyperliquid_*`, `ibkr_*`); `cargo check --all-targets`
   no longer fails on default features
-- **Stop and Trailing Stop order types** (TG13 Phase 1+2):
+- **Stop and Trailing Stop order types**:
   - `OrderKind::Stop { trigger_price }`: Stop market orders
   - `OrderKind::StopLimit { trigger_price }`: Stop-limit orders
   - `OrderKind::TrailingStop { offset, offset_type }`: Trailing stop orders

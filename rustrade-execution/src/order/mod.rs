@@ -29,6 +29,9 @@ pub mod state;
 /// ie/ `OrderRequestOpen` & `OrderRequestCancel`.
 pub mod request;
 
+/// Bracket order types for the [`BracketOrderClient`](crate::client::BracketOrderClient) trait.
+pub mod bracket;
+
 /// Convenient type alias for an [`Order`] keyed with [`ExchangeId`] and [`InstrumentNameExchange`].
 pub type UnindexedOrder = Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>;
 
