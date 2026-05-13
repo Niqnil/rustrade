@@ -1,0 +1,60 @@
+name: "Alpaca Integration"
+
+on:
+  push:
+    paths-ignore:
+      - "**.md"
+    branches: ["main", "develop"]
+  pull_request:
+    paths-ignore:
+      - "**.md"
+    branches: ["main", "develop"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MOLD_VERSION: "2.35.1"
+  ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+  ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+  ALPACA_PAPER: "true"
+
+jobs:
+  alpaca-tests:
+    name: Alpaca integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Only run on same-repo PRs and pushes (prevents secret exfiltration from forks)
+    if: |
+      github.event_name == 'push' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install mold linker
+        uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444  # v1
+        with:
+          mold-version: ${{ env.MOLD_VERSION }}
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          shared-key: "rustrade-ci-test"
+
+      - name: Execution tests
+        id: exec-tests
+        continue-on-error: true
+        run: cargo test -p rustrade-execution --test alpaca_integration -- --ignored
+
+      - name: Market data tests (skip IEX, SIP, OPRA)
+        id: data-tests
+        continue-on-error: true
+        run: cargo test -p rustrade-data --test alpaca_data -- --ignored --skip iex --skip sip --skip opra
+
+      - name: Check test results
+        if: steps.exec-tests.outcome == 'failure' || steps.data-tests.outcome == 'failure'
+        run: exit 1
