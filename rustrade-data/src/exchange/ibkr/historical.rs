@@ -255,6 +255,11 @@ impl IbkrHistoricalData {
     /// - Maximum 1000 ticks per request (IB limit)
     /// - Trade side is not available from IB historical data
     /// - For larger ranges, paginate using last tick's timestamp as new `start`
+    /// - Tick IDs are unique within a single returned batch. Across separate
+    ///   calls (e.g. pagination), IDs are not guaranteed unique — ticks with
+    ///   identical `(timestamp, price, size)` may collide across batches.
+    ///   IB timestamps have only 1-second resolution and IB provides no
+    ///   native unique identifier.
     pub async fn fetch_historical_ticks(
         &self,
         request: HistoricalTickRequest,
@@ -293,8 +298,8 @@ impl IbkrHistoricalData {
 
             let mut trades =
                 Vec::with_capacity(usize::try_from(request.number_of_ticks).unwrap_or(0));
-            for tick in subscription {
-                if let Some(trade) = tick_last_to_public_trade(&tick) {
+            for (seq, tick) in subscription.into_iter().enumerate() {
+                if let Some(trade) = tick_last_to_public_trade(&tick, seq) {
                     trades.push(trade);
                 }
             }
@@ -752,6 +757,11 @@ impl HistoricalTickRequest {
 
 /// Convert an ibapi `TickLast` (historical trade) to a rustrade `PublicTrade`.
 ///
+/// # Arguments
+///
+/// * `tick` - The IB tick data
+/// * `seq` - Sequence index within the batch (for unique ID generation)
+///
 /// # Side Field
 ///
 /// IB historical tick data does not include trade side (buyer/seller initiated).
@@ -760,7 +770,7 @@ impl HistoricalTickRequest {
 /// # Returns
 ///
 /// Returns `None` if price is non-finite (invalid data from IB).
-fn tick_last_to_public_trade(tick: &TickLast) -> Option<PublicTrade> {
+fn tick_last_to_public_trade(tick: &TickLast, seq: usize) -> Option<PublicTrade> {
     if !tick.price.is_finite() {
         warn!(
             price = tick.price,
@@ -773,7 +783,7 @@ fn tick_last_to_public_trade(tick: &TickLast) -> Option<PublicTrade> {
     let amount = Decimal::from(tick.size);
 
     Some(PublicTrade {
-        id: generate_tick_id(tick.timestamp, tick.price, tick.size),
+        id: generate_tick_id(tick.timestamp, tick.price, tick.size, seq),
         price,
         amount,
         side: None,
@@ -800,12 +810,21 @@ fn parse_tick_timestamp(timestamp: OffsetDateTime) -> Option<DateTime<Utc>> {
 /// Generate a unique ID for a historical tick.
 ///
 /// IB doesn't provide tick IDs, so we generate one from a hash of
-/// time + price + size.
-fn generate_tick_id(timestamp: OffsetDateTime, price: f64, size: i32) -> smol_str::SmolStr {
+/// time + price + size + sequence index. The sequence index ensures
+/// uniqueness within a batch when multiple trades have identical
+/// (timestamp, price, size) — common since IB timestamps have only
+/// 1-second resolution.
+fn generate_tick_id(
+    timestamp: OffsetDateTime,
+    price: f64,
+    size: i32,
+    seq: usize,
+) -> smol_str::SmolStr {
     let mut hasher = fnv::FnvHasher::default();
     timestamp.unix_timestamp_nanos().hash(&mut hasher);
     price.to_bits().hash(&mut hasher);
     size.hash(&mut hasher);
+    seq.hash(&mut hasher);
     format_smolstr!("{:016x}", hasher.finish())
 }
 
@@ -1014,7 +1033,7 @@ mod tests {
         use rust_decimal_macros::dec;
 
         let tick = make_tick_last(1700000000, 150.25, 100);
-        let trade = tick_last_to_public_trade(&tick).unwrap();
+        let trade = tick_last_to_public_trade(&tick, 0).unwrap();
 
         assert_eq!(trade.price, dec!(150.25));
         assert_eq!(trade.amount, dec!(100));
@@ -1025,10 +1044,10 @@ mod tests {
     #[test]
     fn tick_last_rejects_non_finite_price() {
         let tick = make_tick_last(1700000000, f64::NAN, 100);
-        assert!(tick_last_to_public_trade(&tick).is_none());
+        assert!(tick_last_to_public_trade(&tick, 0).is_none());
 
         let tick = make_tick_last(1700000000, f64::INFINITY, 100);
-        assert!(tick_last_to_public_trade(&tick).is_none());
+        assert!(tick_last_to_public_trade(&tick, 0).is_none());
     }
 
     #[test]
@@ -1037,9 +1056,9 @@ mod tests {
         let tick2 = make_tick_last(1700000001, 150.25, 100);
         let tick3 = make_tick_last(1700000000, 150.26, 100);
 
-        let id1 = generate_tick_id(tick1.timestamp, tick1.price, tick1.size);
-        let id2 = generate_tick_id(tick2.timestamp, tick2.price, tick2.size);
-        let id3 = generate_tick_id(tick3.timestamp, tick3.price, tick3.size);
+        let id1 = generate_tick_id(tick1.timestamp, tick1.price, tick1.size, 0);
+        let id2 = generate_tick_id(tick2.timestamp, tick2.price, tick2.size, 0);
+        let id3 = generate_tick_id(tick3.timestamp, tick3.price, tick3.size, 0);
 
         assert_ne!(id1, id2);
         assert_ne!(id1, id3);
@@ -1047,14 +1066,25 @@ mod tests {
     }
 
     #[test]
-    fn tick_last_same_data_same_id() {
+    fn tick_last_same_data_same_seq_same_id() {
         let tick1 = make_tick_last(1700000000, 150.25, 100);
         let tick2 = make_tick_last(1700000000, 150.25, 100);
 
-        let id1 = generate_tick_id(tick1.timestamp, tick1.price, tick1.size);
-        let id2 = generate_tick_id(tick2.timestamp, tick2.price, tick2.size);
+        let id1 = generate_tick_id(tick1.timestamp, tick1.price, tick1.size, 0);
+        let id2 = generate_tick_id(tick2.timestamp, tick2.price, tick2.size, 0);
 
         assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn tick_last_same_data_different_seq_different_id() {
+        let tick1 = make_tick_last(1700000000, 150.25, 100);
+        let tick2 = make_tick_last(1700000000, 150.25, 100);
+
+        let id1 = generate_tick_id(tick1.timestamp, tick1.price, tick1.size, 0);
+        let id2 = generate_tick_id(tick2.timestamp, tick2.price, tick2.size, 1);
+
+        assert_ne!(id1, id2);
     }
 
     #[test]
