@@ -48,5 +48,6 @@ pub mod historical;
 pub mod live;
 pub(crate) mod transformer;
 
+pub use error::DatabentoErrorKind;
 pub use historical::{DatabentoHistorical, load_quotes_from_dbn, load_trades_from_dbn};
 pub use live::DatabentoLive;

@@ -21,7 +21,7 @@
 //! let trades = client.fetch_trades(&params, ExchangeId::DatabentoGlbx, "ES").await?;
 //! ```
 
-use super::error::DatabentoResultExt;
+use super::error::{DatabentoResultExt, decode_error};
 use super::transformer::{dbn_mbp1_to_quote, dbn_trade_to_public_trade};
 use crate::error::DataError;
 use crate::event::MarketEvent;
@@ -32,6 +32,7 @@ use databento::dbn::decode::DynDecoder;
 use databento::dbn::enums::VersionUpgradePolicy;
 use databento::dbn::{self, decode::DecodeRecord};
 use databento::historical::timeseries::GetRangeParams;
+use futures::Stream;
 use rustrade_instrument::exchange::ExchangeId;
 use std::path::Path;
 use tracing::{debug, info};
@@ -81,11 +82,25 @@ impl DatabentoHistorical {
 
     /// Fetch historical trades for the given parameters.
     ///
+    /// Collects all records into memory before returning. For large queries
+    /// (millions of records), consider [`fetch_trades_stream`](Self::fetch_trades_stream)
+    /// to process records incrementally.
+    ///
     /// # Arguments
     ///
     /// * `params` - Query parameters (dataset, symbols, time range)
     /// * `exchange` - ExchangeId to tag events with (should match dataset)
     /// * `instrument` - Instrument key to tag events with
+    ///
+    /// # Performance
+    ///
+    /// The instrument key is cloned for each record. For high-frequency data,
+    /// use [`Arc<K>`](std::sync::Arc) to avoid per-record heap allocations:
+    ///
+    /// ```ignore
+    /// let instrument = Arc::new("ES".to_string());
+    /// let trades = client.fetch_trades(&params, exchange, instrument).await?;
+    /// ```
     ///
     /// # Returns
     ///
@@ -135,13 +150,20 @@ impl DatabentoHistorical {
 
     /// Fetch historical quotes (top-of-book) for the given parameters.
     ///
-    /// Uses MBP-1 (Market By Price level 1) schema.
+    /// Uses MBP-1 (Market By Price level 1) schema. Collects all records into
+    /// memory before returning. For large queries, consider
+    /// [`fetch_quotes_stream`](Self::fetch_quotes_stream).
     ///
     /// # Arguments
     ///
     /// * `params` - Query parameters (dataset, symbols, time range). Schema should be Mbp1.
     /// * `exchange` - ExchangeId to tag events with
     /// * `instrument` - Instrument key to tag events with
+    ///
+    /// # Performance
+    ///
+    /// The instrument key is cloned for each record. For high-frequency data,
+    /// use [`Arc<K>`](std::sync::Arc) to avoid per-record heap allocations.
     ///
     /// Each event's `time_received` is stamped at decode time on the local machine.
     pub async fn fetch_quotes<K: Clone>(
@@ -186,6 +208,152 @@ impl DatabentoHistorical {
         Ok(quotes)
     }
 
+    /// Stream historical trades without collecting into memory.
+    ///
+    /// Unlike [`fetch_trades`](Self::fetch_trades), this returns a stream that
+    /// yields records as they're decoded, avoiding memory spikes for large queries.
+    ///
+    /// # Arguments
+    ///
+    /// * `params` - Query parameters (dataset, symbols, time range)
+    /// * `exchange` - ExchangeId to tag events with
+    /// * `instrument` - Instrument key to tag events with (use `Arc<K>` for efficiency)
+    ///
+    /// # Errors
+    ///
+    /// The outer `Result` returns [`DataError::Databento`] if the initial
+    /// `get_range` request fails (e.g. authentication, network, or invalid
+    /// params).
+    ///
+    /// Per-item errors are yielded as `Err` items on the stream and indicate
+    /// a DBN decode failure. After a decode error the underlying decoder is
+    /// in an unspecified state; callers should drop the stream rather than
+    /// continue polling for more records. Records that successfully decode
+    /// but fail conversion to [`PublicTrade`] are logged at `debug` and
+    /// skipped silently.
+    pub async fn fetch_trades_stream<K: Clone + Send + 'static>(
+        &mut self,
+        params: &GetRangeParams,
+        exchange: ExchangeId,
+        instrument: K,
+    ) -> Result<impl Stream<Item = Result<MarketEvent<K, PublicTrade>, DataError>>, DataError> {
+        debug!(?params, "Streaming historical trades from Databento");
+
+        let decoder = self
+            .client
+            .timeseries()
+            .get_range(params)
+            .await
+            .with_context("fetching trades")?;
+
+        Ok(futures::stream::unfold(
+            TradeStreamState {
+                decoder,
+                exchange,
+                instrument,
+            },
+            |mut state| async move {
+                loop {
+                    match state.decoder.decode_record::<dbn::TradeMsg>().await {
+                        Ok(Some(record)) => match dbn_trade_to_public_trade(record) {
+                            Ok((time_exchange, trade)) => {
+                                let event = MarketEvent {
+                                    time_exchange,
+                                    time_received: Utc::now(),
+                                    exchange: state.exchange,
+                                    instrument: state.instrument.clone(),
+                                    kind: trade,
+                                };
+                                return Some((Ok(event), state));
+                            }
+                            Err(e) => {
+                                debug!(error = %e, "Skipping invalid trade record");
+                                continue;
+                            }
+                        },
+                        Ok(None) => return None,
+                        Err(e) => {
+                            return Some((Err(decode_error(e.to_string())), state));
+                        }
+                    }
+                }
+            },
+        ))
+    }
+
+    /// Stream historical quotes without collecting into memory.
+    ///
+    /// Unlike [`fetch_quotes`](Self::fetch_quotes), this returns a stream that
+    /// yields records as they're decoded, avoiding memory spikes for large queries.
+    ///
+    /// # Arguments
+    ///
+    /// * `params` - Query parameters (dataset, symbols, time range). Schema should be Mbp1.
+    /// * `exchange` - ExchangeId to tag events with
+    /// * `instrument` - Instrument key to tag events with (use `Arc<K>` for efficiency)
+    ///
+    /// # Errors
+    ///
+    /// The outer `Result` returns [`DataError::Databento`] if the initial
+    /// `get_range` request fails (e.g. authentication, network, or invalid
+    /// params).
+    ///
+    /// Per-item errors are yielded as `Err` items on the stream and indicate
+    /// a DBN decode failure. After a decode error the underlying decoder is
+    /// in an unspecified state; callers should drop the stream rather than
+    /// continue polling for more records. Records that successfully decode
+    /// but fail conversion to [`Quote`] are logged at `debug` and skipped
+    /// silently.
+    pub async fn fetch_quotes_stream<K: Clone + Send + 'static>(
+        &mut self,
+        params: &GetRangeParams,
+        exchange: ExchangeId,
+        instrument: K,
+    ) -> Result<impl Stream<Item = Result<MarketEvent<K, Quote>, DataError>>, DataError> {
+        debug!(?params, "Streaming historical quotes from Databento");
+
+        let decoder = self
+            .client
+            .timeseries()
+            .get_range(params)
+            .await
+            .with_context("fetching quotes")?;
+
+        Ok(futures::stream::unfold(
+            QuoteStreamState {
+                decoder,
+                exchange,
+                instrument,
+            },
+            |mut state| async move {
+                loop {
+                    match state.decoder.decode_record::<dbn::Mbp1Msg>().await {
+                        Ok(Some(record)) => match dbn_mbp1_to_quote(record) {
+                            Ok((time_exchange, quote)) => {
+                                let event = MarketEvent {
+                                    time_exchange,
+                                    time_received: Utc::now(),
+                                    exchange: state.exchange,
+                                    instrument: state.instrument.clone(),
+                                    kind: quote,
+                                };
+                                return Some((Ok(event), state));
+                            }
+                            Err(e) => {
+                                debug!(error = %e, "Skipping invalid quote record");
+                                continue;
+                            }
+                        },
+                        Ok(None) => return None,
+                        Err(e) => {
+                            return Some((Err(decode_error(e.to_string())), state));
+                        }
+                    }
+                }
+            },
+        ))
+    }
+
     /// Returns the underlying client for advanced use cases.
     pub fn client(&self) -> &HistoricalClient {
         &self.client
@@ -206,19 +374,19 @@ impl DatabentoHistorical {
 ///
 /// * `path` - Path to `.dbn` or `.dbn.zst` file
 /// * `exchange` - ExchangeId to tag events with
-/// * `instrument` - Instrument key to tag events with
+/// * `instrument` - Instrument key to tag events with (use `Arc<K>` for efficiency)
 ///
 /// # Errors
 ///
-/// Returns [`DataError::Socket`] if the file cannot be opened or the DBN
+/// Returns [`DataError::Databento`] if the file cannot be opened or the DBN
 /// header is invalid.
 pub fn load_trades_from_dbn<K: Clone>(
     path: &Path,
     exchange: ExchangeId,
     instrument: K,
 ) -> Result<impl Iterator<Item = Result<MarketEvent<K, PublicTrade>, DataError>>, DataError> {
-    let decoder = DynDecoder::from_file(path, VersionUpgradePolicy::AsIs)
-        .map_err(|e| DataError::Socket(format!("opening DBN file: {e}")))?;
+    let decoder =
+        DynDecoder::from_file(path, VersionUpgradePolicy::AsIs).with_context("opening DBN file")?;
 
     Ok(DbnTradeIterator {
         decoder,
@@ -229,23 +397,42 @@ pub fn load_trades_from_dbn<K: Clone>(
 
 /// Load quotes from a pre-downloaded DBN file.
 ///
+/// # Arguments
+///
+/// * `path` - Path to `.dbn` or `.dbn.zst` file
+/// * `exchange` - ExchangeId to tag events with
+/// * `instrument` - Instrument key to tag events with (use `Arc<K>` for efficiency)
+///
 /// # Errors
 ///
-/// Returns [`DataError::Socket`] if the file cannot be opened or the DBN
+/// Returns [`DataError::Databento`] if the file cannot be opened or the DBN
 /// header is invalid.
 pub fn load_quotes_from_dbn<K: Clone>(
     path: &Path,
     exchange: ExchangeId,
     instrument: K,
 ) -> Result<impl Iterator<Item = Result<MarketEvent<K, Quote>, DataError>>, DataError> {
-    let decoder = DynDecoder::from_file(path, VersionUpgradePolicy::AsIs)
-        .map_err(|e| DataError::Socket(format!("opening DBN file: {e}")))?;
+    let decoder =
+        DynDecoder::from_file(path, VersionUpgradePolicy::AsIs).with_context("opening DBN file")?;
 
     Ok(DbnQuoteIterator {
         decoder,
         exchange,
         instrument,
     })
+}
+
+// Stream state types for async streaming
+struct TradeStreamState<K, D> {
+    decoder: D,
+    exchange: ExchangeId,
+    instrument: K,
+}
+
+struct QuoteStreamState<K, D> {
+    decoder: D,
+    exchange: ExchangeId,
+    instrument: K,
 }
 
 struct DbnTradeIterator<K> {
@@ -277,7 +464,7 @@ impl<K: Clone> Iterator for DbnTradeIterator<K> {
                 },
                 Ok(None) => return None,
                 Err(e) => {
-                    return Some(Err(DataError::Socket(format!("decoding DBN record: {e}"))));
+                    return Some(Err(decode_error(e.to_string())));
                 }
             }
         }
@@ -313,7 +500,7 @@ impl<K: Clone> Iterator for DbnQuoteIterator<K> {
                 },
                 Ok(None) => return None,
                 Err(e) => {
-                    return Some(Err(DataError::Socket(format!("decoding DBN record: {e}"))));
+                    return Some(Err(decode_error(e.to_string())));
                 }
             }
         }

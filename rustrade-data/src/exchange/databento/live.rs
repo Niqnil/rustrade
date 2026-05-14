@@ -46,7 +46,7 @@
 //! }
 //! ```
 
-use super::error::DatabentoResultExt;
+use super::error::{DatabentoErrorKind, DatabentoResultExt};
 use super::transformer::{dbn_mbp1_to_orderbook_l1, dbn_trade_to_public_trade};
 use crate::error::DataError;
 use crate::event::{DataKind, MarketEvent};
@@ -71,6 +71,19 @@ use tracing::{debug, trace, warn};
 ///
 /// Consolidate symbol subscriptions within one `DatabentoLive` instance per dataset
 /// rather than creating multiple instances for the same dataset.
+///
+/// # Performance
+///
+/// The instrument key is cloned for each record. For high-frequency data, use
+/// [`Arc<K>`](std::sync::Arc) to avoid per-record heap allocations:
+///
+/// ```ignore
+/// use std::sync::Arc;
+///
+/// let instruments: HashMap<String, Arc<String>> = [
+///     ("ESM5".to_string(), Arc::new("ES-front".to_string())),
+/// ].into_iter().collect();
+/// ```
 #[derive(Debug)]
 pub struct DatabentoLive<K> {
     client: LiveClient,
@@ -225,7 +238,11 @@ impl<K: Clone + Send + 'static> DatabentoLive<K> {
                             return None;
                         }
                         Err(e) => {
-                            let err = DataError::Socket(format!("receiving record: {e}"));
+                            let err = DataError::Databento {
+                                kind: DatabentoErrorKind::Network,
+                                context: "receiving record".to_string(),
+                                message: e.to_string(),
+                            };
                             return Some((Err(err), state));
                         }
                     };
