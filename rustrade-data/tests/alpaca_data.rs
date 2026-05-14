@@ -49,7 +49,7 @@
 use futures_util::StreamExt;
 use rust_decimal::Decimal;
 use rustrade_data::{
-    exchange::alpaca::{AlpacaCrypto, AlpacaIex, AlpacaSip},
+    exchange::alpaca::{AlpacaCrypto, AlpacaIex, AlpacaSip, AlpacaSubscriber},
     streams::{
         Streams,
         reconnect::{Event, stream::ReconnectingStream},
@@ -80,13 +80,16 @@ async fn test_crypto_trade_stream_connection() {
     init_logging();
 
     let streams = Streams::<PublicTrades>::builder()
-        .subscribe([(
-            AlpacaCrypto::default(),
-            "btc",
-            "usd",
-            MarketDataInstrumentKind::Spot,
-            PublicTrades,
-        )])
+        .subscribe(
+            AlpacaSubscriber::from_env().unwrap(),
+            [(
+                AlpacaCrypto::default(),
+                "btc",
+                "usd",
+                MarketDataInstrumentKind::Spot,
+                PublicTrades,
+            )],
+        )
         .init()
         .await;
 
@@ -104,13 +107,16 @@ async fn test_crypto_trade_stream_receives_data() {
     init_logging();
 
     let streams = Streams::<PublicTrades>::builder()
-        .subscribe([(
-            AlpacaCrypto::default(),
-            "btc",
-            "usd",
-            MarketDataInstrumentKind::Spot,
-            PublicTrades,
-        )])
+        .subscribe(
+            AlpacaSubscriber::from_env().unwrap(),
+            [(
+                AlpacaCrypto::default(),
+                "btc",
+                "usd",
+                MarketDataInstrumentKind::Spot,
+                PublicTrades,
+            )],
+        )
         .init()
         .await
         .expect("Failed to init crypto stream");
@@ -145,13 +151,16 @@ async fn test_crypto_quote_stream_connection() {
     init_logging();
 
     let streams = Streams::<Quotes>::builder()
-        .subscribe([(
-            AlpacaCrypto::default(),
-            "btc",
-            "usd",
-            MarketDataInstrumentKind::Spot,
-            Quotes,
-        )])
+        .subscribe(
+            AlpacaSubscriber::from_env().unwrap(),
+            [(
+                AlpacaCrypto::default(),
+                "btc",
+                "usd",
+                MarketDataInstrumentKind::Spot,
+                Quotes,
+            )],
+        )
         .init()
         .await;
 
@@ -169,13 +178,16 @@ async fn test_crypto_quote_stream_receives_data() {
     init_logging();
 
     let streams = Streams::<Quotes>::builder()
-        .subscribe([(
-            AlpacaCrypto::default(),
-            "btc",
-            "usd",
-            MarketDataInstrumentKind::Spot,
-            Quotes,
-        )])
+        .subscribe(
+            AlpacaSubscriber::from_env().unwrap(),
+            [(
+                AlpacaCrypto::default(),
+                "btc",
+                "usd",
+                MarketDataInstrumentKind::Spot,
+                Quotes,
+            )],
+        )
         .init()
         .await
         .expect("Failed to init crypto quote stream");
@@ -214,22 +226,25 @@ async fn test_crypto_multiple_symbols() {
     init_logging();
 
     let streams = Streams::<PublicTrades>::builder()
-        .subscribe([
-            (
-                AlpacaCrypto::default(),
-                "btc",
-                "usd",
-                MarketDataInstrumentKind::Spot,
-                PublicTrades,
-            ),
-            (
-                AlpacaCrypto::default(),
-                "eth",
-                "usd",
-                MarketDataInstrumentKind::Spot,
-                PublicTrades,
-            ),
-        ])
+        .subscribe(
+            AlpacaSubscriber::from_env().unwrap(),
+            [
+                (
+                    AlpacaCrypto::default(),
+                    "btc",
+                    "usd",
+                    MarketDataInstrumentKind::Spot,
+                    PublicTrades,
+                ),
+                (
+                    AlpacaCrypto::default(),
+                    "eth",
+                    "usd",
+                    MarketDataInstrumentKind::Spot,
+                    PublicTrades,
+                ),
+            ],
+        )
         .init()
         .await;
 
@@ -279,13 +294,16 @@ async fn test_iex_trade_stream_connection() {
     init_logging();
 
     let streams = Streams::<PublicTrades>::builder()
-        .subscribe([(
-            AlpacaIex::default(),
-            "spy",
-            "usd",
-            MarketDataInstrumentKind::Spot,
-            PublicTrades,
-        )])
+        .subscribe(
+            AlpacaSubscriber::from_env().unwrap(),
+            [(
+                AlpacaIex::default(),
+                "spy",
+                "usd",
+                MarketDataInstrumentKind::Spot,
+                PublicTrades,
+            )],
+        )
         .init()
         .await;
 
@@ -303,13 +321,16 @@ async fn test_iex_quote_stream_connection() {
     init_logging();
 
     let streams = Streams::<Quotes>::builder()
-        .subscribe([(
-            AlpacaIex::default(),
-            "aapl",
-            "usd",
-            MarketDataInstrumentKind::Spot,
-            Quotes,
-        )])
+        .subscribe(
+            AlpacaSubscriber::from_env().unwrap(),
+            [(
+                AlpacaIex::default(),
+                "aapl",
+                "usd",
+                MarketDataInstrumentKind::Spot,
+                Quotes,
+            )],
+        )
         .init()
         .await;
 
@@ -327,22 +348,25 @@ async fn test_iex_multiple_symbols_subscription() {
     init_logging();
 
     let streams = Streams::<PublicTrades>::builder()
-        .subscribe([
-            (
-                AlpacaIex::default(),
-                "spy",
-                "usd",
-                MarketDataInstrumentKind::Spot,
-                PublicTrades,
-            ),
-            (
-                AlpacaIex::default(),
-                "aapl",
-                "usd",
-                MarketDataInstrumentKind::Spot,
-                PublicTrades,
-            ),
-        ])
+        .subscribe(
+            AlpacaSubscriber::from_env().unwrap(),
+            [
+                (
+                    AlpacaIex::default(),
+                    "spy",
+                    "usd",
+                    MarketDataInstrumentKind::Spot,
+                    PublicTrades,
+                ),
+                (
+                    AlpacaIex::default(),
+                    "aapl",
+                    "usd",
+                    MarketDataInstrumentKind::Spot,
+                    PublicTrades,
+                ),
+            ],
+        )
         .init()
         .await;
 
@@ -364,13 +388,16 @@ async fn test_iex_trade_stream_receives_data() {
     init_logging();
 
     let streams = Streams::<PublicTrades>::builder()
-        .subscribe([(
-            AlpacaIex::default(),
-            "spy",
-            "usd",
-            MarketDataInstrumentKind::Spot,
-            PublicTrades,
-        )])
+        .subscribe(
+            AlpacaSubscriber::from_env().unwrap(),
+            [(
+                AlpacaIex::default(),
+                "spy",
+                "usd",
+                MarketDataInstrumentKind::Spot,
+                PublicTrades,
+            )],
+        )
         .init()
         .await
         .expect("Failed to init IEX stream");
@@ -417,13 +444,16 @@ async fn test_iex_quote_stream_receives_data() {
     init_logging();
 
     let streams = Streams::<Quotes>::builder()
-        .subscribe([(
-            AlpacaIex::default(),
-            "spy",
-            "usd",
-            MarketDataInstrumentKind::Spot,
-            Quotes,
-        )])
+        .subscribe(
+            AlpacaSubscriber::from_env().unwrap(),
+            [(
+                AlpacaIex::default(),
+                "spy",
+                "usd",
+                MarketDataInstrumentKind::Spot,
+                Quotes,
+            )],
+        )
         .init()
         .await
         .expect("Failed to init IEX quote stream");
@@ -474,13 +504,16 @@ async fn test_sip_trade_stream_connection() {
     init_logging();
 
     let streams = Streams::<PublicTrades>::builder()
-        .subscribe([(
-            AlpacaSip::default(),
-            "spy",
-            "usd",
-            MarketDataInstrumentKind::Spot,
-            PublicTrades,
-        )])
+        .subscribe(
+            AlpacaSubscriber::from_env().unwrap(),
+            [(
+                AlpacaSip::default(),
+                "spy",
+                "usd",
+                MarketDataInstrumentKind::Spot,
+                PublicTrades,
+            )],
+        )
         .init()
         .await;
 
@@ -501,13 +534,16 @@ async fn test_sip_quote_stream_connection() {
     init_logging();
 
     let streams = Streams::<Quotes>::builder()
-        .subscribe([(
-            AlpacaSip::default(),
-            "aapl",
-            "usd",
-            MarketDataInstrumentKind::Spot,
-            Quotes,
-        )])
+        .subscribe(
+            AlpacaSubscriber::from_env().unwrap(),
+            [(
+                AlpacaSip::default(),
+                "aapl",
+                "usd",
+                MarketDataInstrumentKind::Spot,
+                Quotes,
+            )],
+        )
         .init()
         .await;
 
@@ -528,13 +564,16 @@ async fn test_sip_trade_stream_receives_data() {
     init_logging();
 
     let streams = Streams::<PublicTrades>::builder()
-        .subscribe([(
-            AlpacaSip::default(),
-            "spy",
-            "usd",
-            MarketDataInstrumentKind::Spot,
-            PublicTrades,
-        )])
+        .subscribe(
+            AlpacaSubscriber::from_env().unwrap(),
+            [(
+                AlpacaSip::default(),
+                "spy",
+                "usd",
+                MarketDataInstrumentKind::Spot,
+                PublicTrades,
+            )],
+        )
         .init()
         .await
         .expect("Failed to init SIP stream");
@@ -581,13 +620,16 @@ async fn test_sip_quote_stream_receives_data() {
     init_logging();
 
     let streams = Streams::<Quotes>::builder()
-        .subscribe([(
-            AlpacaSip::default(),
-            "spy",
-            "usd",
-            MarketDataInstrumentKind::Spot,
-            Quotes,
-        )])
+        .subscribe(
+            AlpacaSubscriber::from_env().unwrap(),
+            [(
+                AlpacaSip::default(),
+                "spy",
+                "usd",
+                MarketDataInstrumentKind::Spot,
+                Quotes,
+            )],
+        )
         .init()
         .await
         .expect("Failed to init SIP quote stream");

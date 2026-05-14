@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: Stateful `Subscriber` trait for credential injection** ([#43](https://github.com/Niqnil/rustrade/issues/43))
+  - `Subscriber::subscribe` now takes `&self` instead of being a static method
+  - `Subscriber` trait requires `Clone + Send + Sync` bounds
+  - `StreamBuilder::subscribe()` now requires a subscriber instance as first argument:
+    - Unauthenticated: `.subscribe(WebSocketSubscriber, [...])`
+    - Authenticated (Alpaca): `.subscribe(AlpacaSubscriber::from_env()?, [...])`
+  - `init_market_stream()` now takes subscriber as second argument
+  - `AlpacaSubscriber` is now stateful with `AlpacaCredentials`:
+    - `AlpacaSubscriber::new(credentials)`: Create with explicit credentials
+    - `AlpacaSubscriber::from_env()`: Load from `ALPACA_API_KEY`/`ALPACA_SECRET_KEY`
+    - `AlpacaCredentials::new(key, secret)`: Create credentials explicitly
+    - `AlpacaCredentials::from_env()`: Load from environment
+  - Auth errors now fail at construction time (fast fail) instead of first reconnect
+  - Credentials are cloned into reconnect closure, available on every reconnect
+
 ### Added
 
 - **BracketOrderClient supertrait**: Unified trait for bracket orders

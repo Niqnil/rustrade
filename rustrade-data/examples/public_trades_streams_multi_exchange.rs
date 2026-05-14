@@ -15,6 +15,7 @@ use rustrade_data::{
         okx::Okx,
     },
     streams::{Streams, reconnect::stream::ReconnectingStream},
+    subscriber::WebSocketSubscriber,
     subscription::trade::PublicTrades,
 };
 use rustrade_instrument::instrument::{
@@ -34,49 +35,49 @@ async fn main() {
     // Initialise PublicTrades Streams for various exchanges
     // '--> each call to StreamBuilder::subscribe() creates a separate WebSocket connection
     let streams = Streams::<PublicTrades>::builder()
-        .subscribe([
+        .subscribe(WebSocketSubscriber, [
             (BinanceSpot::default(), "btc", "usdt", MarketDataInstrumentKind::Spot, PublicTrades),
             (BinanceSpot::default(), "eth", "usdt", MarketDataInstrumentKind::Spot, PublicTrades),
         ])
 
-        .subscribe([
+        .subscribe(WebSocketSubscriber, [
             (BinanceFuturesUsd::default(), "btc", "usdt", MarketDataInstrumentKind::Perpetual, PublicTrades),
             (BinanceFuturesUsd::default(), "eth", "usdt", MarketDataInstrumentKind::Perpetual, PublicTrades),
         ])
 
-        .subscribe([
+        .subscribe(WebSocketSubscriber, [
             (GateioSpot::default(), "btc", "usdt", MarketDataInstrumentKind::Spot, PublicTrades),
         ])
 
-        .subscribe([
+        .subscribe(WebSocketSubscriber, [
             (GateioPerpetualsUsd::default(), "btc", "usdt", MarketDataInstrumentKind::Perpetual, PublicTrades),
         ])
 
-        .subscribe([
+        .subscribe(WebSocketSubscriber, [
             (GateioPerpetualsBtc::default(), "btc", "usd", MarketDataInstrumentKind::Perpetual, PublicTrades),
         ])
 
-        .subscribe([
+        .subscribe(WebSocketSubscriber, [
             (GateioOptions::default(), "btc", "usdt", MarketDataInstrumentKind::Option(put_contract()), PublicTrades),
         ])
 
-        .subscribe([
+        .subscribe(WebSocketSubscriber, [
             (Okx, "btc", "usdt", MarketDataInstrumentKind::Spot, PublicTrades),
             (Okx, "btc", "usdt", MarketDataInstrumentKind::Perpetual, PublicTrades),
             (Okx, "btc", "usd", MarketDataInstrumentKind::Future(future_contract_expiry()), PublicTrades),
             (Okx, "btc", "usd", MarketDataInstrumentKind::Option(call_contract()), PublicTrades),
         ])
 
-        .subscribe([
+        .subscribe(WebSocketSubscriber, [
             (BybitSpot::default(), "btc", "usdt", MarketDataInstrumentKind::Spot, PublicTrades),
             (BybitSpot::default(), "eth", "usdt", MarketDataInstrumentKind::Spot, PublicTrades),
         ])
 
-        .subscribe([
+        .subscribe(WebSocketSubscriber, [
             (BybitPerpetualsUsd::default(), "btc", "usdt", MarketDataInstrumentKind::Perpetual, PublicTrades),
         ])
 
-        .subscribe([
+        .subscribe(WebSocketSubscriber, [
             (Bitmex, "xbt", "usd", MarketDataInstrumentKind::Perpetual, PublicTrades)
         ])
 

@@ -4,6 +4,7 @@ use futures_util::StreamExt;
 use rustrade_data::{
     exchange::binance::futures::BinanceFuturesUsd,
     streams::{Streams, reconnect::stream::ReconnectingStream},
+    subscriber::WebSocketSubscriber,
     subscription::trade::PublicTrades,
 };
 use rustrade_instrument::instrument::market_data::kind::MarketDataInstrumentKind;
@@ -20,17 +21,17 @@ async fn main() {
     let streams = Streams::<PublicTrades>::builder()
 
         // Separate WebSocket connection for BTC_USDT stream since it's very high volume
-        .subscribe([
+        .subscribe(WebSocketSubscriber, [
             (BinanceFuturesUsd::default(), "btc", "usdt", MarketDataInstrumentKind::Perpetual, PublicTrades),
         ])
 
         // Separate WebSocket connection for ETH_USDT stream since it's very high volume
-        .subscribe([
+        .subscribe(WebSocketSubscriber, [
             (BinanceFuturesUsd::default(), "eth", "usdt", MarketDataInstrumentKind::Perpetual, PublicTrades),
         ])
 
         // Lower volume Instruments can share a WebSocket connection
-        .subscribe([
+        .subscribe(WebSocketSubscriber, [
             (BinanceFuturesUsd::default(), "xrp", "usdt", MarketDataInstrumentKind::Perpetual, PublicTrades),
             (BinanceFuturesUsd::default(), "sol", "usdt", MarketDataInstrumentKind::Perpetual, PublicTrades),
             (BinanceFuturesUsd::default(), "avax", "usdt", MarketDataInstrumentKind::Perpetual, PublicTrades),

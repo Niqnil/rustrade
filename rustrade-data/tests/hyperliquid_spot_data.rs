@@ -34,6 +34,7 @@ use rustrade_data::{
         Streams,
         reconnect::{Event, stream::ReconnectingStream},
     },
+    subscriber::WebSocketSubscriber,
     subscription::{book::OrderBooksL2, trade::PublicTrades},
 };
 use rustrade_instrument::instrument::market_data::kind::MarketDataInstrumentKind;
@@ -60,13 +61,16 @@ async fn test_spot_trade_stream_connection() {
     init_logging();
 
     let streams = Streams::<PublicTrades>::builder()
-        .subscribe([(
-            HyperliquidSpot,
-            "@107",
-            "usdc",
-            MarketDataInstrumentKind::Spot,
-            PublicTrades,
-        )])
+        .subscribe(
+            WebSocketSubscriber,
+            [(
+                HyperliquidSpot,
+                "@107",
+                "usdc",
+                MarketDataInstrumentKind::Spot,
+                PublicTrades,
+            )],
+        )
         .init()
         .await;
 
@@ -84,13 +88,16 @@ async fn test_spot_trade_stream_receives_data() {
     init_logging();
 
     let streams = Streams::<PublicTrades>::builder()
-        .subscribe([(
-            HyperliquidSpot,
-            "@107",
-            "usdc",
-            MarketDataInstrumentKind::Spot,
-            PublicTrades,
-        )])
+        .subscribe(
+            WebSocketSubscriber,
+            [(
+                HyperliquidSpot,
+                "@107",
+                "usdc",
+                MarketDataInstrumentKind::Spot,
+                PublicTrades,
+            )],
+        )
         .init()
         .await
         .expect("Failed to init stream");
@@ -139,13 +146,16 @@ async fn test_spot_l2_book_stream_connection() {
     init_logging();
 
     let streams = Streams::<OrderBooksL2>::builder()
-        .subscribe([(
-            HyperliquidSpot,
-            "@107",
-            "usdc",
-            MarketDataInstrumentKind::Spot,
-            OrderBooksL2,
-        )])
+        .subscribe(
+            WebSocketSubscriber,
+            [(
+                HyperliquidSpot,
+                "@107",
+                "usdc",
+                MarketDataInstrumentKind::Spot,
+                OrderBooksL2,
+            )],
+        )
         .init()
         .await;
 
@@ -163,13 +173,16 @@ async fn test_spot_l2_book_stream_receives_data() {
     init_logging();
 
     let streams = Streams::<OrderBooksL2>::builder()
-        .subscribe([(
-            HyperliquidSpot,
-            "@107",
-            "usdc",
-            MarketDataInstrumentKind::Spot,
-            OrderBooksL2,
-        )])
+        .subscribe(
+            WebSocketSubscriber,
+            [(
+                HyperliquidSpot,
+                "@107",
+                "usdc",
+                MarketDataInstrumentKind::Spot,
+                OrderBooksL2,
+            )],
+        )
         .init()
         .await
         .expect("Failed to init stream");
@@ -196,25 +209,31 @@ async fn test_spot_combined_streams() {
 
     // Subscribe to both trades and books for BTC/USDC spot
     let trades = Streams::<PublicTrades>::builder()
-        .subscribe([(
-            HyperliquidSpot,
-            "@107",
-            "usdc",
-            MarketDataInstrumentKind::Spot,
-            PublicTrades,
-        )])
+        .subscribe(
+            WebSocketSubscriber,
+            [(
+                HyperliquidSpot,
+                "@107",
+                "usdc",
+                MarketDataInstrumentKind::Spot,
+                PublicTrades,
+            )],
+        )
         .init()
         .await
         .expect("Failed to init trade stream");
 
     let books = Streams::<OrderBooksL2>::builder()
-        .subscribe([(
-            HyperliquidSpot,
-            "@107",
-            "usdc",
-            MarketDataInstrumentKind::Spot,
-            OrderBooksL2,
-        )])
+        .subscribe(
+            WebSocketSubscriber,
+            [(
+                HyperliquidSpot,
+                "@107",
+                "usdc",
+                MarketDataInstrumentKind::Spot,
+                OrderBooksL2,
+            )],
+        )
         .init()
         .await
         .expect("Failed to init book stream");
@@ -265,13 +284,16 @@ async fn test_spot_invalid_pair_handling() {
 
     // Try to subscribe to a non-existent spot pair
     let result = Streams::<PublicTrades>::builder()
-        .subscribe([(
-            HyperliquidSpot,
-            "invalidcoin",
-            "usdc",
-            MarketDataInstrumentKind::Spot,
-            PublicTrades,
-        )])
+        .subscribe(
+            WebSocketSubscriber,
+            [(
+                HyperliquidSpot,
+                "invalidcoin",
+                "usdc",
+                MarketDataInstrumentKind::Spot,
+                PublicTrades,
+            )],
+        )
         .init()
         .await;
 

@@ -72,9 +72,17 @@ where
     /// Add a collection of [`Subscription`]s to the [`StreamBuilder`] that will be actioned on
     /// a distinct [`WebSocket`](rustrade_integration::protocol::websocket::WebSocket) connection.
     ///
+    /// The `subscriber` handles the WebSocket connection and authentication.
+    /// For unauthenticated exchanges, use [`WebSocketSubscriber`](crate::subscriber::WebSocketSubscriber).
+    /// For authenticated exchanges like Alpaca, use the exchange-specific subscriber with credentials.
+    ///
     /// Note that [`Subscription`]s are not actioned until the
     /// [`init()`](StreamBuilder::init()) method is invoked.
-    pub fn subscribe<SubIter, Sub, Exchange, Instrument>(mut self, subscriptions: SubIter) -> Self
+    pub fn subscribe<SubIter, Sub, Exchange, Instrument>(
+        mut self,
+        subscriber: Exchange::Subscriber,
+        subscriptions: SubIter,
+    ) -> Self
     where
         SubIter: IntoIterator<Item = Sub>,
         Sub: Into<Subscription<Exchange, Instrument, Kind>>,
@@ -106,7 +114,8 @@ where
             subscriptions.dedup();
 
             // Initialise a MarketEvent `ReconnectingStream`
-            let stream = init_market_stream(STREAM_RECONNECTION_POLICY, subscriptions).await?;
+            let stream =
+                init_market_stream(STREAM_RECONNECTION_POLICY, subscriber, subscriptions).await?;
 
             // Forward MarketEvents to ExchangeTx
             tokio::spawn(stream.forward_to(exchange_tx));

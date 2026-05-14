@@ -12,6 +12,7 @@ use futures_util::StreamExt;
 use rustrade_data::{
     exchange::hyperliquid::Hyperliquid,
     streams::{Streams, reconnect::stream::ReconnectingStream},
+    subscriber::WebSocketSubscriber,
     subscription::{book::OrderBooksL2, trade::PublicTrades},
 };
 use rustrade_instrument::instrument::market_data::kind::MarketDataInstrumentKind;
@@ -25,42 +26,51 @@ async fn main() {
 
     // Subscribe to BTC and ETH trades on separate connections (high volume)
     let trades = Streams::<PublicTrades>::builder()
-        .subscribe([(
-            Hyperliquid,
-            "btc",
-            "usdc",
-            MarketDataInstrumentKind::Perpetual,
-            PublicTrades,
-        )])
-        .subscribe([(
-            Hyperliquid,
-            "eth",
-            "usdc",
-            MarketDataInstrumentKind::Perpetual,
-            PublicTrades,
-        )])
+        .subscribe(
+            WebSocketSubscriber,
+            [(
+                Hyperliquid,
+                "btc",
+                "usdc",
+                MarketDataInstrumentKind::Perpetual,
+                PublicTrades,
+            )],
+        )
+        .subscribe(
+            WebSocketSubscriber,
+            [(
+                Hyperliquid,
+                "eth",
+                "usdc",
+                MarketDataInstrumentKind::Perpetual,
+                PublicTrades,
+            )],
+        )
         .init()
         .await
         .unwrap();
 
     // Subscribe to L2 order book snapshots
     let books = Streams::<OrderBooksL2>::builder()
-        .subscribe([
-            (
-                Hyperliquid,
-                "btc",
-                "usdc",
-                MarketDataInstrumentKind::Perpetual,
-                OrderBooksL2,
-            ),
-            (
-                Hyperliquid,
-                "eth",
-                "usdc",
-                MarketDataInstrumentKind::Perpetual,
-                OrderBooksL2,
-            ),
-        ])
+        .subscribe(
+            WebSocketSubscriber,
+            [
+                (
+                    Hyperliquid,
+                    "btc",
+                    "usdc",
+                    MarketDataInstrumentKind::Perpetual,
+                    OrderBooksL2,
+                ),
+                (
+                    Hyperliquid,
+                    "eth",
+                    "usdc",
+                    MarketDataInstrumentKind::Perpetual,
+                    OrderBooksL2,
+                ),
+            ],
+        )
         .init()
         .await
         .unwrap();

@@ -47,6 +47,7 @@
 //!         okx::Okx,
 //!     },
 //!     streams::{Streams, reconnect::stream::ReconnectingStream},
+//!     subscriber::WebSocketSubscriber,
 //!     subscription::trade::PublicTrades,
 //! };
 //! use rustrade_instrument::instrument::market_data::kind::MarketDataInstrumentKind;
@@ -59,23 +60,23 @@
 //!     // '--> each call to StreamBuilder::subscribe() initialises a separate WebSocket connection
 //!
 //!     let streams = Streams::<PublicTrades>::builder()
-//!         .subscribe([
+//!         .subscribe(WebSocketSubscriber, [
 //!             (BinanceSpot::default(), "btc", "usdt", MarketDataInstrumentKind::Spot, PublicTrades),
 //!             (BinanceSpot::default(), "eth", "usdt", MarketDataInstrumentKind::Spot, PublicTrades),
 //!         ])
-//!         .subscribe([
+//!         .subscribe(WebSocketSubscriber, [
 //!             (BinanceFuturesUsd::default(), "btc", "usdt", MarketDataInstrumentKind::Perpetual, PublicTrades),
 //!             (BinanceFuturesUsd::default(), "eth", "usdt", MarketDataInstrumentKind::Perpetual, PublicTrades),
 //!         ])
-//!         .subscribe([
+//!         .subscribe(WebSocketSubscriber, [
 //!             (Coinbase, "btc", "usd", MarketDataInstrumentKind::Spot, PublicTrades),
 //!             (Coinbase, "eth", "usd", MarketDataInstrumentKind::Spot, PublicTrades),
 //!         ])
-//!         .subscribe([
+//!         .subscribe(WebSocketSubscriber, [
 //!             (GateioSpot::default(), "btc", "usdt", MarketDataInstrumentKind::Spot, PublicTrades),
 //!             (GateioSpot::default(), "eth", "usdt", MarketDataInstrumentKind::Spot, PublicTrades),
 //!         ])
-//!         .subscribe([
+//!         .subscribe(WebSocketSubscriber, [
 //!             (Okx, "btc", "usdt", MarketDataInstrumentKind::Spot, PublicTrades),
 //!             (Okx, "eth", "usdt", MarketDataInstrumentKind::Spot, PublicTrades),
 //!             (Okx, "btc", "usdt", MarketDataInstrumentKind::Perpetual, PublicTrades),
@@ -200,6 +201,7 @@ where
     Kind: SubscriptionKind,
 {
     async fn init<SnapFetcher>(
+        subscriber: &Exchange::Subscriber,
         subscriptions: &[Subscription<Exchange, Instrument, Kind>],
     ) -> Result<Self, DataError>
     where
@@ -239,6 +241,7 @@ where
     Parser: StreamParser<Transformer::Input, Message = WsMessage, Error = WsError> + Send,
 {
     async fn init<SnapFetcher>(
+        subscriber: &Exchange::Subscriber,
         subscriptions: &[Subscription<Exchange, Instrument, Kind>],
     ) -> Result<Self, DataError>
     where
@@ -251,7 +254,7 @@ where
             websocket,
             map: instrument_map,
             buffered_websocket_events,
-        } = Exchange::Subscriber::subscribe(subscriptions).await?;
+        } = subscriber.subscribe(subscriptions).await?;
 
         // Fetch any required initial MarketEvent snapshots
         let initial_snapshots = SnapFetcher::fetch_snapshots(subscriptions).await?;

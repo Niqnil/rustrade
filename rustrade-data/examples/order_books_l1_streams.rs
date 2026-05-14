@@ -3,6 +3,7 @@
 use rustrade_data::{
     exchange::binance::spot::BinanceSpot,
     streams::{Streams, reconnect::stream::ReconnectingStream},
+    subscriber::WebSocketSubscriber,
     subscription::book::OrderBooksL1,
 };
 use rustrade_instrument::{
@@ -22,17 +23,17 @@ async fn main() {
     let mut streams = Streams::<OrderBooksL1>::builder()
 
         // Separate WebSocket connection for BTC_USDT stream since it's very high volume
-        .subscribe([
+        .subscribe(WebSocketSubscriber, [
             (BinanceSpot::default(), "btc", "usdt", MarketDataInstrumentKind::Spot, OrderBooksL1),
         ])
 
         // Separate WebSocket connection for ETH_USDT stream since it's very high volume
-        .subscribe([
+        .subscribe(WebSocketSubscriber, [
             (BinanceSpot::default(), "eth", "usdt", MarketDataInstrumentKind::Spot, OrderBooksL1),
         ])
 
         // Lower volume Instruments can share a WebSocket connection
-        .subscribe([
+        .subscribe(WebSocketSubscriber, [
             (BinanceSpot::default(), "xrp", "usdt", MarketDataInstrumentKind::Spot, OrderBooksL1),
             (BinanceSpot::default(), "sol", "usdt", MarketDataInstrumentKind::Spot, OrderBooksL1),
             (BinanceSpot::default(), "avax", "usdt", MarketDataInstrumentKind::Spot, OrderBooksL1),

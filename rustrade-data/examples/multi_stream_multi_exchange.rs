@@ -7,6 +7,7 @@ use rustrade_data::{
         okx::Okx,
     },
     streams::{Streams, consumer::MarketStreamResult, reconnect::stream::ReconnectingStream},
+    subscriber::WebSocketSubscriber,
     subscription::{
         book::{OrderBooksL1, OrderBooksL2},
         trade::PublicTrades,
@@ -34,13 +35,13 @@ async fn main() {
 
         // Add PublicTrades Streams for various exchanges
         .add(Streams::<PublicTrades>::builder()
-            .subscribe([
+            .subscribe(WebSocketSubscriber, [
                 (BinanceSpot::default(), "btc", "usdt", MarketDataInstrumentKind::Spot, PublicTrades),
             ])
-            .subscribe([
+            .subscribe(WebSocketSubscriber, [
                 (BinanceFuturesUsd::default(), "btc", "usdt", MarketDataInstrumentKind::Perpetual, PublicTrades),
             ])
-            .subscribe([
+            .subscribe(WebSocketSubscriber, [
                 (Okx, "btc", "usdt", MarketDataInstrumentKind::Spot, PublicTrades),
                 (Okx, "btc", "usdt", MarketDataInstrumentKind::Perpetual, PublicTrades),
             ])
@@ -48,20 +49,20 @@ async fn main() {
 
         // Add OrderBooksL1 Stream for various exchanges
         .add(Streams::<OrderBooksL1>::builder()
-            .subscribe([
+            .subscribe(WebSocketSubscriber, [
                 (BinanceSpot::default(), "btc", "usdt", MarketDataInstrumentKind::Spot, OrderBooksL1),
             ])
-            .subscribe([
+            .subscribe(WebSocketSubscriber, [
                 (BinanceFuturesUsd::default(), "btc", "usdt", MarketDataInstrumentKind::Perpetual, OrderBooksL1),
             ])
         )
 
         // Add OrderBooksL2 Stream for various exchanges
         .add(Streams::<OrderBooksL2>::builder()
-            .subscribe([
+            .subscribe(WebSocketSubscriber, [
                 (BinanceSpot::default(), "btc", "usdt", MarketDataInstrumentKind::Spot, OrderBooksL2),
             ])
-            .subscribe([
+            .subscribe(WebSocketSubscriber, [
                 (BinanceFuturesUsd::default(), "btc", "usdt", MarketDataInstrumentKind::Perpetual, OrderBooksL2),
             ])
         )
