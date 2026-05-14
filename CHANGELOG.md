@@ -7,7 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Databento streaming variants** ([#46](https://github.com/Niqnil/rustrade/issues/46))
+  - `DatabentoHistorical::fetch_trades_stream()`: Stream trades without collecting into memory
+  - `DatabentoHistorical::fetch_quotes_stream()`: Stream quotes without collecting into memory
+  - Avoids memory spikes for large historical queries (millions of records)
+
 ### Changed
+
+- **Databento structured error types** ([#47](https://github.com/Niqnil/rustrade/issues/47))
+  - New `DatabentoErrorKind` enum: `Authentication`, `RateLimit`, `Network`, `Decode`, `Api`
+  - New `DataError::Databento { kind, context, message }` variant for programmatic error handling
+  - Enables proper retry logic: don't retry auth errors, backoff on rate limits, retry network errors
+  - All Databento errors now use structured types instead of `DataError::Socket(String)`
+
+- **Databento `Arc<K>` performance documentation** ([#45](https://github.com/Niqnil/rustrade/issues/45))
+  - Documented that instrument keys are cloned per record
+  - Recommended `Arc<K>` for high-frequency scenarios to avoid per-record heap allocations
+  - Added examples in rustdoc for `fetch_trades`, `fetch_quotes`, and `DatabentoLive`
 
 - **BREAKING: Stateful `Subscriber` trait for credential injection** ([#43](https://github.com/Niqnil/rustrade/issues/43))
   - `Subscriber::subscribe` now takes `&self` instead of being a static method

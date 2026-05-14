@@ -1,3 +1,5 @@
+#[cfg(feature = "databento")]
+use crate::exchange::databento::DatabentoErrorKind;
 use crate::subscription::SubKind;
 use rustrade_instrument::{exchange::ExchangeId, index::error::IndexError};
 use rustrade_integration::{error::SocketError, subscription::SubscriptionId};
@@ -24,6 +26,15 @@ pub enum DataError {
 
     #[error("SocketError: {0}")]
     Socket(String),
+
+    /// Databento-specific error with categorized kind for programmatic handling.
+    #[cfg(feature = "databento")]
+    #[error("Databento {kind} error ({context}): {message}")]
+    Databento {
+        kind: DatabentoErrorKind,
+        context: String,
+        message: String,
+    },
 
     #[error("unsupported dynamic Subscription for exchange: {exchange}, kind: {sub_kind}")]
     Unsupported {
