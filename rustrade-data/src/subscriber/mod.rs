@@ -27,11 +27,16 @@ pub mod mapper;
 pub mod validator;
 
 /// Defines how to connect to a socket and subscribe to market data streams.
+///
+/// Subscribers may carry state such as authentication credentials.
+/// The trait requires `Clone` to support reconnection (subscribers are cloned
+/// into the reconnect closure).
 #[async_trait]
-pub trait Subscriber {
+pub trait Subscriber: Clone + Send + Sync {
     type SubMapper: SubscriptionMapper;
 
     async fn subscribe<Exchange, Instrument, Kind>(
+        &self,
         subscriptions: &[Subscription<Exchange, Instrument, Kind>],
     ) -> Result<Subscribed<Instrument::Key>, SocketError>
     where
@@ -50,7 +55,11 @@ pub struct Subscribed<InstrumentKey> {
 }
 
 /// Standard [`Subscriber`] for [`WebSocket`]s suitable for most exchanges.
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Deserialize, Serialize)]
+///
+/// This is a stateless subscriber for unauthenticated market data streams.
+#[derive(
+    Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default, Deserialize, Serialize,
+)]
 pub struct WebSocketSubscriber;
 
 #[async_trait]
@@ -58,6 +67,7 @@ impl Subscriber for WebSocketSubscriber {
     type SubMapper = WebSocketSubMapper;
 
     async fn subscribe<Exchange, Instrument, Kind>(
+        &self,
         subscriptions: &[Subscription<Exchange, Instrument, Kind>],
     ) -> Result<Subscribed<Instrument::Key>, SocketError>
     where

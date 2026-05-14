@@ -30,6 +30,7 @@ use rustrade_data::{
         Streams,
         reconnect::{Event, stream::ReconnectingStream},
     },
+    subscriber::WebSocketSubscriber,
     subscription::{book::OrderBooksL2, trade::PublicTrades},
 };
 use rustrade_instrument::instrument::market_data::kind::MarketDataInstrumentKind;
@@ -165,13 +166,16 @@ async fn test_trade_stream_connection() {
     init_logging();
 
     let streams = Streams::<PublicTrades>::builder()
-        .subscribe([(
-            Hyperliquid,
-            "btc",
-            "usdc",
-            MarketDataInstrumentKind::Perpetual,
-            PublicTrades,
-        )])
+        .subscribe(
+            WebSocketSubscriber,
+            [(
+                Hyperliquid,
+                "btc",
+                "usdc",
+                MarketDataInstrumentKind::Perpetual,
+                PublicTrades,
+            )],
+        )
         .init()
         .await;
 
@@ -189,13 +193,16 @@ async fn test_trade_stream_receives_data() {
     init_logging();
 
     let streams = Streams::<PublicTrades>::builder()
-        .subscribe([(
-            Hyperliquid,
-            "btc",
-            "usdc",
-            MarketDataInstrumentKind::Perpetual,
-            PublicTrades,
-        )])
+        .subscribe(
+            WebSocketSubscriber,
+            [(
+                Hyperliquid,
+                "btc",
+                "usdc",
+                MarketDataInstrumentKind::Perpetual,
+                PublicTrades,
+            )],
+        )
         .init()
         .await
         .expect("Failed to init stream");
@@ -230,13 +237,16 @@ async fn test_l2_book_stream_connection() {
     init_logging();
 
     let streams = Streams::<OrderBooksL2>::builder()
-        .subscribe([(
-            Hyperliquid,
-            "btc",
-            "usdc",
-            MarketDataInstrumentKind::Perpetual,
-            OrderBooksL2,
-        )])
+        .subscribe(
+            WebSocketSubscriber,
+            [(
+                Hyperliquid,
+                "btc",
+                "usdc",
+                MarketDataInstrumentKind::Perpetual,
+                OrderBooksL2,
+            )],
+        )
         .init()
         .await;
 
@@ -254,13 +264,16 @@ async fn test_l2_book_stream_receives_data() {
     init_logging();
 
     let streams = Streams::<OrderBooksL2>::builder()
-        .subscribe([(
-            Hyperliquid,
-            "btc",
-            "usdc",
-            MarketDataInstrumentKind::Perpetual,
-            OrderBooksL2,
-        )])
+        .subscribe(
+            WebSocketSubscriber,
+            [(
+                Hyperliquid,
+                "btc",
+                "usdc",
+                MarketDataInstrumentKind::Perpetual,
+                OrderBooksL2,
+            )],
+        )
         .init()
         .await
         .expect("Failed to init stream");
@@ -285,22 +298,25 @@ async fn test_multiple_symbols_stream() {
     init_logging();
 
     let streams = Streams::<PublicTrades>::builder()
-        .subscribe([
-            (
-                Hyperliquid,
-                "btc",
-                "usdc",
-                MarketDataInstrumentKind::Perpetual,
-                PublicTrades,
-            ),
-            (
-                Hyperliquid,
-                "eth",
-                "usdc",
-                MarketDataInstrumentKind::Perpetual,
-                PublicTrades,
-            ),
-        ])
+        .subscribe(
+            WebSocketSubscriber,
+            [
+                (
+                    Hyperliquid,
+                    "btc",
+                    "usdc",
+                    MarketDataInstrumentKind::Perpetual,
+                    PublicTrades,
+                ),
+                (
+                    Hyperliquid,
+                    "eth",
+                    "usdc",
+                    MarketDataInstrumentKind::Perpetual,
+                    PublicTrades,
+                ),
+            ],
+        )
         .init()
         .await;
 

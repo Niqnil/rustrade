@@ -16,8 +16,27 @@
 //!
 //! # Authentication
 //!
-//! Requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` environment variables.
+//! Alpaca requires authentication via [`AlpacaCredentials`]. Credentials can be:
+//! - Loaded from environment variables via [`AlpacaCredentials::from_env()`]
+//! - Provided explicitly via [`AlpacaCredentials::new()`]
+//!
 //! Auth message is sent immediately after WebSocket connection, before subscriptions.
+//!
+//! # Example
+//!
+//! ```ignore
+//! use rustrade_data::exchange::alpaca::{AlpacaCredentials, AlpacaSubscriber, AlpacaIex};
+//! use rustrade_data::streams::Streams;
+//! use rustrade_data::subscription::trade::PublicTrades;
+//!
+//! // Load credentials at construction time (fails fast if env vars missing)
+//! let subscriber = AlpacaSubscriber::from_env()?;
+//!
+//! let streams = Streams::<PublicTrades>::builder()
+//!     .subscribe(subscriber, [(AlpacaIex::default(), "AAPL", "USD", PublicTrades)])
+//!     .init()
+//!     .await?;
+//! ```
 //!
 //! # Connectors
 //!
@@ -53,7 +72,7 @@ use rustrade_integration::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{env, fmt::Debug, marker::PhantomData, time::Duration};
+use std::{env, fmt, fmt::Debug, marker::PhantomData, time::Duration};
 use tracing::debug;
 use url::Url;
 
@@ -222,17 +241,95 @@ where
     }
 }
 
+/// Credentials for authenticating to Alpaca market data WebSocket.
+///
+/// `Debug` is implemented manually to redact `api_secret`, preventing accidental
+/// exposure of the secret in tracing or panic output.
+#[derive(Clone)]
+pub struct AlpacaCredentials {
+    api_key: String,
+    api_secret: String,
+}
+
+impl fmt::Debug for AlpacaCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AlpacaCredentials")
+            .field("api_key", &self.api_key)
+            .field("api_secret", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl AlpacaCredentials {
+    /// Create credentials from explicit values.
+    pub fn new(api_key: impl Into<String>, api_secret: impl Into<String>) -> Self {
+        Self {
+            api_key: api_key.into(),
+            api_secret: api_secret.into(),
+        }
+    }
+
+    /// Load credentials from environment variables.
+    ///
+    /// Reads `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` from environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if either environment variable is not set.
+    pub fn from_env() -> Result<Self, SocketError> {
+        let api_key = env::var("ALPACA_API_KEY")
+            .map_err(|e| SocketError::Subscribe(format!("ALPACA_API_KEY: {e}")))?;
+        let api_secret = env::var("ALPACA_SECRET_KEY")
+            .map_err(|e| SocketError::Subscribe(format!("ALPACA_SECRET_KEY: {e}")))?;
+        Ok(Self {
+            api_key,
+            api_secret,
+        })
+    }
+}
+
 /// Alpaca WebSocket subscriber with authentication.
 ///
 /// Handles the auth → subscribe flow required by Alpaca market data streams.
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Deserialize, Serialize)]
-pub struct AlpacaSubscriber;
+///
+/// # Example
+///
+/// ```ignore
+/// use rustrade_data::exchange::alpaca::{AlpacaCredentials, AlpacaSubscriber};
+///
+/// // Load credentials at construction time (fails fast if env vars missing)
+/// let credentials = AlpacaCredentials::from_env()?;
+/// let subscriber = AlpacaSubscriber::new(credentials);
+///
+/// // Or with explicit credentials
+/// let subscriber = AlpacaSubscriber::new(AlpacaCredentials::new("key", "secret"));
+/// ```
+#[derive(Clone, Debug)]
+pub struct AlpacaSubscriber {
+    credentials: AlpacaCredentials,
+}
+
+impl AlpacaSubscriber {
+    /// Create a new subscriber with the provided credentials.
+    pub fn new(credentials: AlpacaCredentials) -> Self {
+        Self { credentials }
+    }
+
+    /// Create a new subscriber using credentials from environment variables.
+    ///
+    /// Equivalent to `AlpacaSubscriber::new(AlpacaCredentials::from_env()?)`.
+    /// See [`AlpacaCredentials::from_env`] for the variables read and error conditions.
+    pub fn from_env() -> Result<Self, SocketError> {
+        Ok(Self::new(AlpacaCredentials::from_env()?))
+    }
+}
 
 #[async_trait]
 impl crate::subscriber::Subscriber for AlpacaSubscriber {
     type SubMapper = crate::subscriber::mapper::WebSocketSubMapper;
 
     async fn subscribe<Exchange, Instrument, Kind>(
+        &self,
         subscriptions: &[crate::subscription::Subscription<Exchange, Instrument, Kind>],
     ) -> Result<crate::subscriber::Subscribed<Instrument::Key>, SocketError>
     where
@@ -249,7 +346,7 @@ impl crate::subscriber::Subscriber for AlpacaSubscriber {
         let mut websocket = connect(url).await?;
         debug!(%exchange, "connected to Alpaca WebSocket, sending auth");
 
-        alpaca_authenticate(&mut websocket).await?;
+        alpaca_authenticate(&mut websocket, &self.credentials).await?;
         debug!(%exchange, "Alpaca auth successful");
 
         let crate::subscription::SubscriptionMeta {
@@ -281,24 +378,15 @@ impl crate::subscriber::Subscriber for AlpacaSubscriber {
     }
 }
 
-/// Authenticate to Alpaca WebSocket using env credentials.
-///
-/// # Note
-/// Reads `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` from environment.
-/// This is a Phase 2 expedient — other market data connectors use unauthenticated
-/// public streams. A proper credential-injection mechanism should be designed
-/// when another authenticated market data connector is added.
-// FIXME: Design credential-injection mechanism for Subscriber trait instead of env::var
-async fn alpaca_authenticate(ws: &mut WebSocket) -> Result<(), SocketError> {
-    let api_key = env::var("ALPACA_API_KEY")
-        .map_err(|e| SocketError::Subscribe(format!("ALPACA_API_KEY: {e}")))?;
-    let api_secret = env::var("ALPACA_SECRET_KEY")
-        .map_err(|e| SocketError::Subscribe(format!("ALPACA_SECRET_KEY: {e}")))?;
-
+/// Authenticate to Alpaca WebSocket using the provided credentials.
+async fn alpaca_authenticate(
+    ws: &mut WebSocket,
+    credentials: &AlpacaCredentials,
+) -> Result<(), SocketError> {
     let auth_msg = json!({
         "action": "auth",
-        "key": api_key,
-        "secret": api_secret,
+        "key": credentials.api_key,
+        "secret": credentials.api_secret,
     })
     .to_string();
 

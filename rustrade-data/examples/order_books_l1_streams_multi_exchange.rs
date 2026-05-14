@@ -4,6 +4,7 @@ use futures::StreamExt;
 use rustrade_data::{
     exchange::binance::{futures::BinanceFuturesUsd, spot::BinanceSpot},
     streams::{Streams, reconnect::stream::ReconnectingStream},
+    subscriber::WebSocketSubscriber,
     subscription::book::OrderBooksL1,
 };
 use rustrade_instrument::instrument::market_data::kind::MarketDataInstrumentKind;
@@ -18,11 +19,11 @@ async fn main() {
     // Initialise OrderBooksL1 Streams for various exchanges
     // '--> each call to StreamBuilder::subscribe() initialises a separate WebSocket connection
     let streams = Streams::<OrderBooksL1>::builder()
-        .subscribe([
+        .subscribe(WebSocketSubscriber, [
             (BinanceSpot::default(), "btc", "usdt", MarketDataInstrumentKind::Spot, OrderBooksL1),
             (BinanceSpot::default(), "eth", "usd", MarketDataInstrumentKind::Spot, OrderBooksL1),
         ])
-        .subscribe([
+        .subscribe(WebSocketSubscriber, [
             (BinanceFuturesUsd::default(), "btc", "usdt", MarketDataInstrumentKind::Perpetual, OrderBooksL1),
             (BinanceFuturesUsd::default(), "eth", "usd", MarketDataInstrumentKind::Perpetual, OrderBooksL1),
         ])
