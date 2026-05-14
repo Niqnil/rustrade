@@ -2,7 +2,6 @@ use crate::{
     exchange::Connector,
     subscription::{Map, SubscriptionKind},
 };
-use async_trait::async_trait;
 use futures::StreamExt;
 use rustrade_integration::{
     Validator,
@@ -13,18 +12,18 @@ use rustrade_integration::{
     },
 };
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 use tracing::debug;
 
 /// Defines how to validate that actioned market data
 /// [`Subscription`](crate::subscription::Subscription)s were accepted by the exchange.
-#[async_trait]
 pub trait SubscriptionValidator {
     type Parser;
 
-    async fn validate<Exchange, InstrumentKey, Kind>(
+    fn validate<Exchange, InstrumentKey, Kind>(
         instrument_map: Map<InstrumentKey>,
         websocket: &mut WebSocket,
-    ) -> Result<(Map<InstrumentKey>, Vec<WsMessage>), SocketError>
+    ) -> impl Future<Output = Result<(Map<InstrumentKey>, Vec<WsMessage>), SocketError>> + Send
     where
         Exchange: Connector + Send,
         InstrumentKey: Send,
@@ -35,7 +34,6 @@ pub trait SubscriptionValidator {
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Deserialize, Serialize)]
 pub struct WebSocketSubValidator;
 
-#[async_trait]
 impl SubscriptionValidator for WebSocketSubValidator {
     type Parser = WebSocketSerdeParser;
 

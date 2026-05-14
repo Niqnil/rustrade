@@ -7,7 +7,6 @@ use crate::{
     subscription::{Map, quote::Quote},
     transformer::ExchangeTransformer,
 };
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rustrade_instrument::exchange::ExchangeId;
@@ -111,13 +110,12 @@ pub struct AlpacaQuoteTransformer<Exchange, InstrumentKey> {
     phantom: PhantomData<Exchange>,
 }
 
-#[async_trait]
 impl<Exchange, InstrumentKey>
     ExchangeTransformer<Exchange, InstrumentKey, crate::subscription::quote::Quotes>
     for AlpacaQuoteTransformer<Exchange, InstrumentKey>
 where
     Exchange: crate::exchange::Connector + Send,
-    InstrumentKey: Clone + Send,
+    InstrumentKey: Clone + Send + Sync,
 {
     async fn init(
         instrument_map: Map<InstrumentKey>,

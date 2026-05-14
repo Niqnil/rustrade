@@ -14,7 +14,6 @@ use crate::{
     },
     transformer::ExchangeTransformer,
 };
-use async_trait::async_trait;
 use derive_more::Constructor;
 use rustrade_integration::{Transformer, protocol::websocket::WsMessage};
 use tokio::sync::mpsc::UnboundedSender;
@@ -33,11 +32,11 @@ pub struct BybitOrderBooksL2Transformer<InstrumentKey> {
     instrument_map: Map<BybitOrderBookL2Meta<InstrumentKey, BybitOrderBookL2Sequencer>>,
 }
 
-#[async_trait]
 impl<InstrumentKey, Server> ExchangeTransformer<Bybit<Server>, InstrumentKey, OrderBooksL2>
     for BybitOrderBooksL2Transformer<InstrumentKey>
 where
     InstrumentKey: Clone + PartialEq + Send + Sync,
+    Server: Send,
 {
     async fn init(
         instrument_map: Map<InstrumentKey>,

@@ -8,14 +8,13 @@ use crate::{
     instrument::InstrumentData,
     subscription::{Map, Subscription, SubscriptionKind, SubscriptionMeta},
 };
-use async_trait::async_trait;
 use futures::SinkExt;
 use rustrade_integration::{
     error::SocketError,
     protocol::websocket::{WebSocket, WsMessage, connect},
 };
 use serde::{Deserialize, Serialize};
-use std::fmt::Debug;
+use std::{fmt::Debug, future::Future};
 use tracing::debug;
 
 /// [`SubscriptionMapper`] implementations defining how to map a
@@ -31,14 +30,13 @@ pub mod validator;
 /// Subscribers may carry state such as authentication credentials.
 /// The trait requires `Clone` to support reconnection (subscribers are cloned
 /// into the reconnect closure).
-#[async_trait]
 pub trait Subscriber: Clone + Send + Sync {
     type SubMapper: SubscriptionMapper;
 
-    async fn subscribe<Exchange, Instrument, Kind>(
+    fn subscribe<Exchange, Instrument, Kind>(
         &self,
         subscriptions: &[Subscription<Exchange, Instrument, Kind>],
-    ) -> Result<Subscribed<Instrument::Key>, SocketError>
+    ) -> impl Future<Output = Result<Subscribed<Instrument::Key>, SocketError>> + Send
     where
         Exchange: Connector + Send + Sync,
         Kind: SubscriptionKind + Send + Sync,
@@ -62,7 +60,6 @@ pub struct Subscribed<InstrumentKey> {
 )]
 pub struct WebSocketSubscriber;
 
-#[async_trait]
 impl Subscriber for WebSocketSubscriber {
     type SubMapper = WebSocketSubMapper;
 

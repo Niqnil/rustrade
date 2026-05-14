@@ -115,7 +115,6 @@ use crate::{
     subscription::{Subscription, SubscriptionKind},
     transformer::ExchangeTransformer,
 };
-use async_trait::async_trait;
 use futures::{SinkExt, Stream, StreamExt};
 use rustrade_instrument::exchange::ExchangeId;
 use rustrade_integration::{
@@ -189,7 +188,6 @@ pub trait Identifier<T> {
 
 /// [`Stream`] that yields [`Market<Kind>`](MarketEvent) events. The type of [`Market<Kind>`](MarketEvent)
 /// depends on the provided [`SubscriptionKind`] of the passed [`Subscription`]s.
-#[async_trait]
 pub trait MarketStream<Exchange, Instrument, Kind>
 where
     Self: Stream<Item = Result<MarketEvent<Instrument::Key, Kind::Event>, DataError>>
@@ -200,10 +198,10 @@ where
     Instrument: InstrumentData,
     Kind: SubscriptionKind,
 {
-    async fn init<SnapFetcher>(
+    fn init<SnapFetcher>(
         subscriber: &Exchange::Subscriber,
         subscriptions: &[Subscription<Exchange, Instrument, Kind>],
-    ) -> Result<Self, DataError>
+    ) -> impl Future<Output = Result<Self, DataError>> + Send
     where
         SnapFetcher: SnapshotFetcher<Exchange, Kind>,
         Subscription<Exchange, Instrument, Kind>:
@@ -229,7 +227,6 @@ pub trait SnapshotFetcher<Exchange, Kind> {
         Subscription<Exchange, Instrument, Kind>: Identifier<Exchange::Market>;
 }
 
-#[async_trait]
 impl<Exchange, Instrument, Kind, Transformer, Parser> MarketStream<Exchange, Instrument, Kind>
     for ExchangeWsStream<Parser, Transformer>
 where
@@ -237,7 +234,7 @@ where
     Instrument: InstrumentData,
     Kind: SubscriptionKind + Send + Sync,
     Transformer: ExchangeTransformer<Exchange, Instrument::Key, Kind> + Send,
-    Kind::Event: Send,
+    Kind::Event: Send + Sync,
     Parser: StreamParser<Transformer::Input, Message = WsMessage, Error = WsError> + Send,
 {
     async fn init<SnapFetcher>(
@@ -344,8 +341,8 @@ where
 /// the [`WsSink`].
 ///
 /// **Note:**
-/// ExchangeTransformer is operating in a synchronous trait context so we use this separate task
-/// to avoid adding `#[\async_trait\]` to the transformer - this avoids allocations.
+/// [`Transformer`] is a synchronous trait, so we use this separate task to handle
+/// async WebSocket writes without requiring the transformer to be async.
 pub async fn distribute_messages_to_exchange(
     exchange: ExchangeId,
     mut ws_sink: WsSink,

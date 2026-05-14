@@ -19,7 +19,6 @@ use crate::{
     },
     transformer::ExchangeTransformer,
 };
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::future::try_join_all;
 use rustrade_instrument::exchange::ExchangeId;
@@ -81,7 +80,6 @@ pub struct BinanceSpotOrderBooksL2Transformer<InstrumentKey> {
     instrument_map: Map<BinanceOrderBookL2Meta<InstrumentKey, BinanceSpotOrderBookL2Sequencer>>,
 }
 
-#[async_trait]
 impl<InstrumentKey> ExchangeTransformer<BinanceSpot, InstrumentKey, OrderBooksL2>
     for BinanceSpotOrderBooksL2Transformer<InstrumentKey>
 where

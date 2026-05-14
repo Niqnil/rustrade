@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING: Migrate from `async_trait` to native AFIT** ([#85](https://github.com/Niqnil/rustrade/issues/85))
+  - `Subscriber`, `SubscriptionValidator`, `ExchangeTransformer`, and `MarketStream` traits now use native async fn in trait (Rust 1.75+)
+  - Removed `async-trait` crate dependency
+  - Additional `Sync` bounds added to some generic parameters where required
+  - Return type changed from `Pin<Box<dyn Future + Send>>` to opaque `impl Future + Send`
+  - No code changes required for most downstream users unless explicitly naming future types
+
 - **Databento structured error types** ([#47](https://github.com/Niqnil/rustrade/issues/47))
   - New `DatabentoErrorKind` enum: `Authentication`, `RateLimit`, `Network`, `Decode`, `Api`
   - New `DataError::Databento { kind, context, message }` variant for programmatic error handling

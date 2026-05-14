@@ -7,7 +7,6 @@ use crate::{
     subscription::{Map, trade::PublicTrade},
     transformer::ExchangeTransformer,
 };
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rustrade_instrument::{Side, exchange::ExchangeId};
@@ -127,13 +126,12 @@ pub struct AlpacaTradeTransformer<Exchange, InstrumentKey> {
     phantom: PhantomData<Exchange>,
 }
 
-#[async_trait]
 impl<Exchange, InstrumentKey>
     ExchangeTransformer<Exchange, InstrumentKey, crate::subscription::trade::PublicTrades>
     for AlpacaTradeTransformer<Exchange, InstrumentKey>
 where
     Exchange: crate::exchange::Connector + Send,
-    InstrumentKey: Clone + Send,
+    InstrumentKey: Clone + Send + Sync,
 {
     async fn init(
         instrument_map: Map<InstrumentKey>,
