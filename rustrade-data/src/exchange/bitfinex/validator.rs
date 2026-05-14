@@ -5,7 +5,6 @@ use crate::{
     subscriber::validator::SubscriptionValidator,
     subscription::{Map, SubscriptionKind},
 };
-use async_trait::async_trait;
 use futures::StreamExt;
 use rustrade_integration::{
     Validator,
@@ -34,7 +33,6 @@ use tracing::debug;
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Deserialize, Serialize)]
 pub struct BitfinexWebSocketSubValidator;
 
-#[async_trait]
 impl SubscriptionValidator for BitfinexWebSocketSubValidator {
     type Parser = WebSocketSerdeParser;
 

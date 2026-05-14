@@ -6,7 +6,6 @@ use crate::{
     exchange::Connector,
     subscription::{Map, SubscriptionKind},
 };
-use async_trait::async_trait;
 use rustrade_instrument::exchange::ExchangeId;
 use rustrade_integration::{
     Transformer, protocol::websocket::WsMessage, subscription::SubscriptionId,
@@ -25,13 +24,13 @@ pub struct StatelessTransformer<Exchange, InstrumentKey, Kind, Input> {
     phantom: PhantomData<(Exchange, Kind, Input)>,
 }
 
-#[async_trait]
 impl<Exchange, InstrumentKey, Kind, Input> ExchangeTransformer<Exchange, InstrumentKey, Kind>
     for StatelessTransformer<Exchange, InstrumentKey, Kind, Input>
 where
     Exchange: Connector + Send,
-    InstrumentKey: Clone + Send,
+    InstrumentKey: Clone + Send + Sync,
     Kind: SubscriptionKind + Send,
+    Kind::Event: Sync,
     Input: Identifier<Option<SubscriptionId>> + for<'de> Deserialize<'de>,
     MarketIter<InstrumentKey, Kind::Event>: From<(ExchangeId, InstrumentKey, Input)>,
 {

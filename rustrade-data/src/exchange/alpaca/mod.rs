@@ -63,7 +63,6 @@ use crate::{
     },
     subscription::{quote::Quotes, trade::PublicTrades},
 };
-use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use rustrade_instrument::exchange::ExchangeId;
 use rustrade_integration::{
@@ -324,7 +323,6 @@ impl AlpacaSubscriber {
     }
 }
 
-#[async_trait]
 impl crate::subscriber::Subscriber for AlpacaSubscriber {
     type SubMapper = crate::subscriber::mapper::WebSocketSubMapper;
 
