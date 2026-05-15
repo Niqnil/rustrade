@@ -33,6 +33,7 @@ impl FeeModel for ZeroFeeModel {
 /// not per underlying share.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub struct PerContractFeeModel {
+    #[serde(with = "rust_decimal::serde::str")]
     pub commission_per_contract: Decimal,
 }
 
@@ -55,6 +56,7 @@ pub struct PercentageFeeModel {
     ///
     /// No validation is performed; values outside `[0, 1]` are accepted
     /// but produce unusual fee amounts.
+    #[serde(with = "rust_decimal::serde::str")]
     pub rate: Decimal,
 }
 

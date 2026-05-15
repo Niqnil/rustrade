@@ -262,7 +262,7 @@ impl ExecutionClient for HyperliquidSpotClient {
                     cid: ClientOrderId::new(order_id.clone()),
                 },
                 side,
-                price,
+                price: Some(price),
                 quantity,
                 kind: OrderKind::Limit,
                 time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
@@ -605,11 +605,36 @@ impl ExecutionClient for HyperliquidSpotClient {
         };
         let is_buy = request.state.side == Side::Buy;
 
-        let limit_px = round_to_5_sig_figs(request.state.price);
+        // Hyperliquid only supports Limit orders, so price is required
+        let price = match request.state.price {
+            Some(p) => p,
+            None => {
+                return Some(Order {
+                    key: OrderKey {
+                        exchange: ExchangeId::HyperliquidSpot,
+                        instrument: request.key.instrument.clone(),
+                        strategy: request.key.strategy.clone(),
+                        cid: request.key.cid.clone(),
+                    },
+                    side: request.state.side,
+                    price: None,
+                    quantity: request.state.quantity,
+                    kind: request.state.kind,
+                    time_in_force: request.state.time_in_force,
+                    state: OrderState::inactive(OrderError::Rejected(
+                        crate::error::ApiError::OrderRejected(
+                            "Hyperliquid requires limit price for all orders".to_owned(),
+                        ),
+                    )),
+                });
+            }
+        };
+
+        let limit_px = round_to_5_sig_figs(price);
         let sz = round_to_5_sig_figs(request.state.quantity);
 
         // Hyperliquid spot requires minimum $10 notional value
-        let notional = request.state.price * request.state.quantity;
+        let notional = price * request.state.quantity;
         if notional < Decimal::TEN {
             warn!(
                 instrument = %request.key.instrument,
@@ -832,7 +857,7 @@ impl ExecutionClient for HyperliquidSpotClient {
                     cid: ClientOrderId::new(order_id.clone()),
                 },
                 side,
-                price,
+                price: Some(price),
                 quantity,
                 kind: OrderKind::Limit,
                 time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
@@ -1067,7 +1092,7 @@ fn order_update_to_account_event(
             cid,
         },
         side,
-        price,
+        price: Some(price),
         quantity: orig_sz,
         kind: OrderKind::Limit,
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
@@ -1149,7 +1174,7 @@ mod tests {
             AccountEventKind::OrderSnapshot(Snapshot(order)) => {
                 assert_eq!(order.key.instrument.as_ref(), "HYPE-USDC-SPOT");
                 assert_eq!(order.side, Side::Sell);
-                assert_eq!(order.price, dec!(25.5));
+                assert_eq!(order.price, Some(dec!(25.5)));
                 assert_eq!(order.quantity, dec!(10));
                 assert!(matches!(
                     order.state,

@@ -3,6 +3,14 @@
 //! Uses the `ibapi` crate for IB TWS/Gateway connectivity. Supports equities,
 //! futures, options, and forex.
 //!
+//! # Testing Status
+//!
+//! **NOT TESTED in CI.** IBKR has not confirmed permission to use credentials
+//! for CI, and requires IB Gateway/TWS running locally.
+//!
+//! **Tested locally:** All execution tests (connection, orders, account streaming)
+//! run on paper trading accounts — no market data subscriptions required.
+//!
 //! # Connection
 //!
 //! Requires TWS or IB Gateway running locally with API enabled:
@@ -23,9 +31,28 @@
 //!
 //! # Limitations
 //!
-//! - **Order types**: Only Market and Limit supported (no Stop, Trailing, Algo)
+//! - **Order types**: Market, Limit, Stop, StopLimit, TrailingStop, TrailingStopLimit,
+//!   and Bracket (entry + take-profit + stop-loss) supported. No Algo orders.
 //! - **TimeInForce**: No `post_only` (IB has no maker-only orders)
 //! - **No auto-reconnect**: Caller responsibility per library philosophy
+//!
+//! # Caller Responsibilities (Reconnection & Recovery)
+//!
+//! Unlike WebSocket-based connectors (Binance, Alpaca), this client does **not**
+//! auto-reconnect. The caller must handle:
+//!
+//! 1. **Disconnect detection**: Monitor [`ExecutionClient::account_stream`] for EOF or errors
+//! 2. **Reconnection**: Call [`IbkrClient::connect_sync`] with a new client ID
+//! 3. **Fill recovery**: After reconnect, call [`ExecutionClient::fetch_trades`] to
+//!    query executions since disconnect, then deduplicate against known fills
+//! 4. **Order reconciliation**: Call [`ExecutionClient::fetch_open_orders`] to
+//!    reconcile open-order state (order lifecycle events during disconnect are lost)
+//! 5. **Stale state cleanup**: Periodically call [`IbkrClient::clear_stale_executions`],
+//!    [`IbkrClient::clear_stale_order_ids`], and [`IbkrClient::clear_stale_pending_cancels`]
+//!
+//! **Rationale**: IBKR uses TCP to local TWS/Gateway, not cloud WebSocket. Reconnection
+//! requires IB Gateway availability and client ID coordination — decisions that belong
+//! in the caller's wrapper, not the library.
 //!
 //! # See Also
 //!
@@ -41,10 +68,14 @@ use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, Snapshot, UnindexedAccountEvent,
     UnindexedAccountSnapshot,
     balance::AssetBalance,
-    client::ExecutionClient,
+    client::{BracketOrderClient, ExecutionClient},
     error::{ApiError, ConnectivityError, OrderError, UnindexedClientError},
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
+        bracket::{
+            BracketOrderRequest as UnifiedBracketOrderRequest,
+            BracketOrderResult as UnifiedBracketOrderResult,
+        },
         id::{ClientOrderId, OrderId, StrategyId},
         request::{
             OrderRequestCancel, OrderRequestOpen, OrderResponseCancel, UnindexedOrderResponseCancel,
@@ -61,7 +92,11 @@ use ibapi::{
     accounts::{AccountSummaryResult, types::AccountGroup},
     client::blocking::Client,
 };
-use order::{OrderContext, OrderIdMap, PendingCancels, build_ib_order};
+pub use order::{BracketOrderRequest, BracketOrderResult};
+use order::{
+    OrderContext, OrderIdMap, PendingCancels, build_ib_bracket_with_oca, build_ib_order,
+    side_to_action, time_in_force_to_ib,
+};
 use parking_lot::Mutex;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
@@ -230,14 +265,30 @@ impl IbkrClient {
     }
 
     /// Get the next order ID and increment the counter.
-    #[allow(clippy::expect_used)] // Panic is correct: i32::MAX orders means system is broken
     fn allocate_order_id(&self) -> i32 {
+        self.allocate_order_id_range(1)
+    }
+
+    /// Allocate a contiguous range of order IDs atomically.
+    ///
+    /// Returns the first ID in the range. Caller uses `base`, `base+1`, ..., `base+(count-1)`.
+    ///
+    /// This is essential for bracket orders which require consecutive IDs (parent=N,
+    /// take_profit=N+1, stop_loss=N+2). A single lock acquisition ensures no other
+    /// concurrent `open_order` call can grab an ID in the middle of the range.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `count` exceeds `i32::MAX`, or if the resulting range would overflow `i32::MAX`.
+    #[allow(clippy::expect_used)] // Panic is correct: i32::MAX orders means system is broken
+    fn allocate_order_id_range(&self, count: u32) -> i32 {
+        let count_i32: i32 = count.try_into().expect("count exceeds i32::MAX");
         let mut id = self.next_order_id.lock();
-        let current = *id;
+        let base = *id;
         *id = id
-            .checked_add(1)
+            .checked_add(count_i32)
             .expect("order ID overflow: i32::MAX exceeded");
-        current
+        base
     }
 
     /// Register a contract for an instrument.
@@ -301,6 +352,492 @@ impl IbkrClient {
     /// remain indefinitely. Call this alongside other stale cleanup methods.
     pub fn clear_stale_pending_cancels(&self, max_age: std::time::Duration) -> usize {
         self.pending_cancels.clear_stale(max_age)
+    }
+
+    /// Disconnect from IB Gateway.
+    ///
+    /// Signals the ibapi client to shut down and releases the client ID for reuse.
+    ///
+    /// [`IbkrClient`] implements [`Clone`] and has no `Drop` impl: the underlying
+    /// connection is released automatically when the last `Arc<Client>` reference
+    /// is dropped. Calling `disconnect()` explicitly terminates the connection
+    /// **immediately for all clones** sharing this client.
+    ///
+    /// Any active `account_stream()` iterators will receive errors on their
+    /// next iteration attempt.
+    ///
+    /// This is idempotent — calling it multiple times is safe.
+    pub fn disconnect(&self) {
+        debug!("Disconnecting IbkrClient");
+        self.client.disconnect();
+    }
+
+    /// Place a bracket order (entry + take-profit + stop-loss) with OCA linking.
+    ///
+    /// A bracket order consists of three linked orders:
+    /// 1. **Entry**: Limit order to enter the position
+    /// 2. **Take Profit**: Limit order to exit at profit target (OCA-linked to SL)
+    /// 3. **Stop Loss**: Stop order to exit at loss limit (OCA-linked to TP)
+    ///
+    /// # OCA (One-Cancels-All) Behavior
+    ///
+    /// When either exit order fills, IB automatically cancels the other. This
+    /// prevents the dangerous scenario where take-profit fills but stop-loss
+    /// remains open, potentially opening an unintended opposing position.
+    ///
+    /// # All-or-Nothing Semantics
+    ///
+    /// If any leg is rejected by IB (e.g., insufficient margin, invalid price),
+    /// this method cancels all other legs and returns all three as `Inactive`.
+    /// You will never receive a mix of active and inactive legs.
+    ///
+    /// # Cancellation Safety
+    ///
+    /// This future registers order ID mappings before submitting to IB. If
+    /// cancelled mid-flight, orders may still be submitted and mappings will
+    /// leak. Avoid cancelling this future; use IB's native order timeout via
+    /// `TimeInForce` if timeout behavior is needed.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let request = BracketOrderRequest {
+    ///     instrument: "AAPL".into(),
+    ///     strategy: StrategyId::new("my-strategy"),
+    ///     parent_cid: ClientOrderId::new("bracket-001"),
+    ///     side: Side::Buy,
+    ///     quantity: dec!(100),
+    ///     entry_price: dec!(150.00),
+    ///     take_profit_price: dec!(160.00),  // +$10 profit target
+    ///     stop_loss_price: dec!(145.00),    // -$5 stop loss
+    ///     time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+    /// };
+    /// let result = client.open_bracket_order(request).await;
+    /// ```
+    pub async fn open_bracket_order(&self, request: BracketOrderRequest) -> BracketOrderResult {
+        let instrument = request.instrument.clone();
+
+        // Look up contract
+        let contract = match self.contracts.get_contract(&instrument) {
+            Some(c) => c,
+            None => {
+                return make_all_inactive_bracket(
+                    &request,
+                    OrderError::Rejected(ApiError::InstrumentInvalid(
+                        instrument,
+                        "contract not registered".to_string(),
+                    )),
+                );
+            }
+        };
+
+        // Convert quantity to f64
+        let quantity: f64 = match request.quantity.try_into() {
+            Ok(q) => q,
+            Err(_) => {
+                return make_all_inactive_bracket(
+                    &request,
+                    OrderError::Rejected(ApiError::OrderRejected(format!(
+                        "quantity {} exceeds f64 range",
+                        request.quantity
+                    ))),
+                );
+            }
+        };
+
+        // Convert prices to f64
+        let entry_price: f64 = match request.entry_price.try_into() {
+            Ok(p) => p,
+            Err(_) => {
+                return make_all_inactive_bracket(
+                    &request,
+                    OrderError::Rejected(ApiError::OrderRejected(format!(
+                        "entry_price {} exceeds f64 range",
+                        request.entry_price
+                    ))),
+                );
+            }
+        };
+        let tp_price: f64 = match request.take_profit_price.try_into() {
+            Ok(p) => p,
+            Err(_) => {
+                return make_all_inactive_bracket(
+                    &request,
+                    OrderError::Rejected(ApiError::OrderRejected(format!(
+                        "take_profit_price {} exceeds f64 range",
+                        request.take_profit_price
+                    ))),
+                );
+            }
+        };
+        let sl_price: f64 = match request.stop_loss_price.try_into() {
+            Ok(p) => p,
+            Err(_) => {
+                return make_all_inactive_bracket(
+                    &request,
+                    OrderError::Rejected(ApiError::OrderRejected(format!(
+                        "stop_loss_price {} exceeds f64 range",
+                        request.stop_loss_price
+                    ))),
+                );
+            }
+        };
+
+        // Validate time_in_force and convert to IB wire format
+        let ib_tif = match time_in_force_to_ib(&request.time_in_force) {
+            Ok(tif) => tif,
+            Err(e) => {
+                return make_all_inactive_bracket(
+                    &request,
+                    OrderError::Rejected(ApiError::OrderRejected(format!(
+                        "TIF not supported by IB: {e}"
+                    ))),
+                );
+            }
+        };
+
+        // Allocate 3 consecutive order IDs atomically
+        let parent_ib_id = self.allocate_order_id_range(3);
+        let tp_ib_id = parent_ib_id + 1;
+        let sl_ib_id = parent_ib_id + 2;
+
+        // Build bracket orders with OCA linking
+        let action = side_to_action(request.side);
+        let ib_orders = build_ib_bracket_with_oca(
+            parent_ib_id,
+            action,
+            quantity,
+            entry_price,
+            tp_price,
+            sl_price,
+            ib_tif,
+        );
+
+        // Generate client order IDs for children
+        let parent_cid = request.parent_cid.clone();
+        let (tp_cid, sl_cid) = derive_child_cids(&parent_cid);
+
+        // Determine opposite side for exit orders
+        let exit_side = match request.side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        };
+
+        // Register order contexts for all three legs
+        let parent_ctx = OrderContext {
+            instrument: instrument.clone(),
+            side: request.side,
+            price: Some(request.entry_price),
+            quantity: request.quantity,
+            kind: OrderKind::Limit,
+            time_in_force: request.time_in_force,
+        };
+        let tp_ctx = OrderContext {
+            instrument: instrument.clone(),
+            side: exit_side,
+            price: Some(request.take_profit_price),
+            quantity: request.quantity,
+            kind: OrderKind::Limit,
+            time_in_force: request.time_in_force,
+        };
+        let sl_ctx = OrderContext {
+            instrument: instrument.clone(),
+            side: exit_side,
+            price: None, // Stop orders don't have a limit price
+            quantity: request.quantity,
+            kind: OrderKind::Stop {
+                trigger_price: request.stop_loss_price,
+            },
+            time_in_force: request.time_in_force,
+        };
+
+        self.order_ids
+            .register(parent_cid.clone(), parent_ib_id, parent_ctx);
+        self.order_ids.register(tp_cid.clone(), tp_ib_id, tp_ctx);
+        self.order_ids.register(sl_cid.clone(), sl_ib_id, sl_ctx);
+
+        // Place all three orders in spawn_blocking
+        let client = self.client.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            use ibapi::orders::PlaceOrder;
+
+            // Place parent (transmit=false, held until SL is sent)
+            let parent_sub = match client.place_order(parent_ib_id, &contract, &ib_orders[0]) {
+                Ok(s) => s,
+                Err(e) => return Err(format!("parent order failed: {e}")),
+            };
+
+            // Place take-profit (transmit=false)
+            let tp_sub = match client.place_order(tp_ib_id, &contract, &ib_orders[1]) {
+                Ok(s) => s,
+                Err(e) => {
+                    // Cancel parent before returning
+                    let _ = client.cancel_order(parent_ib_id, "");
+                    return Err(format!("take_profit order failed: {e}"));
+                }
+            };
+
+            // Place stop-loss (transmit=true, triggers all)
+            let sl_sub = match client.place_order(sl_ib_id, &contract, &ib_orders[2]) {
+                Ok(s) => s,
+                Err(e) => {
+                    // Cancel parent and TP before returning
+                    let _ = client.cancel_order(parent_ib_id, "");
+                    let _ = client.cancel_order(tp_ib_id, "");
+                    return Err(format!("stop_loss order failed: {e}"));
+                }
+            };
+
+            // Wait for first status from each subscription
+            let mut parent_status = None;
+            let mut tp_status = None;
+            let mut sl_status = None;
+
+            // Poll parent subscription
+            for event in parent_sub {
+                if let PlaceOrder::OrderStatus(status) = event {
+                    match status.status.as_str() {
+                        "Submitted" | "PreSubmitted" | "PendingSubmit" => {
+                            parent_status = Some(Ok(status.filled));
+                            break;
+                        }
+                        "Cancelled" | "Inactive" => {
+                            parent_status = Some(Err(status.status));
+                            break;
+                        }
+                        // Any other terminal status (e.g. "Filled", "ApiCancelled",
+                        // "PendingCancel") is treated as a rejection rather than
+                        // silently ignored — preserves observable failure semantics.
+                        other => {
+                            parent_status = Some(Err(format!("unexpected parent status: {other}")));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Poll TP subscription
+            for event in tp_sub {
+                if let PlaceOrder::OrderStatus(status) = event {
+                    match status.status.as_str() {
+                        "Submitted" | "PreSubmitted" | "PendingSubmit" => {
+                            tp_status = Some(Ok(status.filled));
+                            break;
+                        }
+                        "Cancelled" | "Inactive" => {
+                            tp_status = Some(Err(status.status));
+                            break;
+                        }
+                        other => {
+                            tp_status =
+                                Some(Err(format!("unexpected take_profit status: {other}")));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Poll SL subscription
+            for event in sl_sub {
+                if let PlaceOrder::OrderStatus(status) = event {
+                    match status.status.as_str() {
+                        "Submitted" | "PreSubmitted" | "PendingSubmit" => {
+                            sl_status = Some(Ok(status.filled));
+                            break;
+                        }
+                        "Cancelled" | "Inactive" => {
+                            sl_status = Some(Err(status.status));
+                            break;
+                        }
+                        other => {
+                            sl_status = Some(Err(format!("unexpected stop_loss status: {other}")));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Verify all three legs reported a successful status. A `None` here
+            // means the subscription closed without producing a recognised event
+            // — surface that as an error rather than silently treating it as
+            // success. Any error or missing status cancels all legs.
+            match (parent_status, tp_status, sl_status) {
+                (Some(Ok(parent)), Some(Ok(tp)), Some(Ok(sl))) => Ok((parent, tp, sl)),
+                (parent, tp, sl) => {
+                    let _ = client.cancel_order(parent_ib_id, "");
+                    let _ = client.cancel_order(tp_ib_id, "");
+                    let _ = client.cancel_order(sl_ib_id, "");
+                    Err(format!(
+                        "bracket order rejected: parent={parent:?}, tp={tp:?}, sl={sl:?}"
+                    ))
+                }
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok((parent_filled, tp_filled, sl_filled))) => {
+                let now = Utc::now();
+                let parent_filled_dec = parse_decimal_or_warn(parent_filled, "parent.filled");
+                let tp_filled_dec = parse_decimal_or_warn(tp_filled, "tp.filled");
+                let sl_filled_dec = parse_decimal_or_warn(sl_filled, "sl.filled");
+
+                BracketOrderResult {
+                    parent: Order {
+                        key: OrderKey {
+                            exchange: ExchangeId::Ibkr,
+                            instrument: instrument.clone(),
+                            strategy: request.strategy.clone(),
+                            cid: parent_cid,
+                        },
+                        side: request.side,
+                        price: Some(request.entry_price),
+                        quantity: request.quantity,
+                        kind: OrderKind::Limit,
+                        time_in_force: request.time_in_force,
+                        state: OrderState::active(Open::new(
+                            OrderId::new(format_smolstr!("{}", parent_ib_id)),
+                            now,
+                            parent_filled_dec,
+                        )),
+                    },
+                    take_profit: Order {
+                        key: OrderKey {
+                            exchange: ExchangeId::Ibkr,
+                            instrument: instrument.clone(),
+                            strategy: request.strategy.clone(),
+                            cid: tp_cid,
+                        },
+                        side: exit_side,
+                        price: Some(request.take_profit_price),
+                        quantity: request.quantity,
+                        kind: OrderKind::Limit,
+                        time_in_force: request.time_in_force,
+                        state: OrderState::active(Open::new(
+                            OrderId::new(format_smolstr!("{}", tp_ib_id)),
+                            now,
+                            tp_filled_dec,
+                        )),
+                    },
+                    stop_loss: Order {
+                        key: OrderKey {
+                            exchange: ExchangeId::Ibkr,
+                            instrument: instrument.clone(),
+                            strategy: request.strategy.clone(),
+                            cid: sl_cid,
+                        },
+                        side: exit_side,
+                        price: None, // Stop orders don't have a limit price
+                        quantity: request.quantity,
+                        kind: OrderKind::Stop {
+                            trigger_price: request.stop_loss_price,
+                        },
+                        time_in_force: request.time_in_force,
+                        state: OrderState::active(Open::new(
+                            OrderId::new(format_smolstr!("{}", sl_ib_id)),
+                            now,
+                            sl_filled_dec,
+                        )),
+                    },
+                }
+            }
+            Ok(Err(err_msg)) => {
+                // Clean up order ID mappings
+                self.order_ids.remove_by_ib_id(parent_ib_id);
+                self.order_ids.remove_by_ib_id(tp_ib_id);
+                self.order_ids.remove_by_ib_id(sl_ib_id);
+
+                make_all_inactive_bracket(
+                    &request,
+                    OrderError::Rejected(ApiError::OrderRejected(err_msg)),
+                )
+            }
+            Err(join_err) => {
+                // Clean up order ID mappings
+                self.order_ids.remove_by_ib_id(parent_ib_id);
+                self.order_ids.remove_by_ib_id(tp_ib_id);
+                self.order_ids.remove_by_ib_id(sl_ib_id);
+
+                make_all_inactive_bracket(
+                    &request,
+                    OrderError::Rejected(ApiError::OrderRejected(format!(
+                        "task join error: {join_err}"
+                    ))),
+                )
+            }
+        }
+    }
+}
+
+/// Derive bracket child CIDs from the parent CID.
+///
+/// Convention: `{parent}_tp` for take-profit, `{parent}_sl` for stop-loss.
+/// All bracket call sites must use this helper to keep the naming consistent.
+fn derive_child_cids(parent_cid: &ClientOrderId) -> (ClientOrderId, ClientOrderId) {
+    (
+        ClientOrderId::new(format_smolstr!("{}_tp", parent_cid.0)),
+        ClientOrderId::new(format_smolstr!("{}_sl", parent_cid.0)),
+    )
+}
+
+/// Helper to create a BracketOrderResult with all legs inactive (same error).
+fn make_all_inactive_bracket(
+    request: &BracketOrderRequest,
+    error: OrderError<AssetNameExchange, InstrumentNameExchange>,
+) -> BracketOrderResult {
+    let exit_side = match request.side {
+        Side::Buy => Side::Sell,
+        Side::Sell => Side::Buy,
+    };
+
+    let parent_cid = request.parent_cid.clone();
+    let (tp_cid, sl_cid) = derive_child_cids(&parent_cid);
+
+    BracketOrderResult {
+        parent: Order {
+            key: OrderKey {
+                exchange: ExchangeId::Ibkr,
+                instrument: request.instrument.clone(),
+                strategy: request.strategy.clone(),
+                cid: parent_cid,
+            },
+            side: request.side,
+            price: Some(request.entry_price),
+            quantity: request.quantity,
+            kind: OrderKind::Limit,
+            time_in_force: request.time_in_force,
+            state: OrderState::inactive(error.clone()),
+        },
+        take_profit: Order {
+            key: OrderKey {
+                exchange: ExchangeId::Ibkr,
+                instrument: request.instrument.clone(),
+                strategy: request.strategy.clone(),
+                cid: tp_cid,
+            },
+            side: exit_side,
+            price: Some(request.take_profit_price),
+            quantity: request.quantity,
+            kind: OrderKind::Limit,
+            time_in_force: request.time_in_force,
+            state: OrderState::inactive(error.clone()),
+        },
+        stop_loss: Order {
+            key: OrderKey {
+                exchange: ExchangeId::Ibkr,
+                instrument: request.instrument.clone(),
+                strategy: request.strategy.clone(),
+                cid: sl_cid,
+            },
+            side: exit_side,
+            price: None, // Stop orders don't have a limit price
+            quantity: request.quantity,
+            kind: OrderKind::Stop {
+                trigger_price: request.stop_loss_price,
+            },
+            time_in_force: request.time_in_force,
+            state: OrderState::inactive(error),
+        },
     }
 }
 
@@ -990,8 +1527,7 @@ impl ExecutionClient for IbkrClient {
                 let price = order_data
                     .order
                     .limit_price
-                    .map(|p| parse_decimal_or_warn(p, "limit_price"))
-                    .unwrap_or_default();
+                    .map(|p| parse_decimal_or_warn(p, "limit_price"));
                 let kind = if order_data.order.order_type == "LMT" {
                     OrderKind::Limit
                 } else {
@@ -1222,3 +1758,30 @@ fn make_order_from_status(
 }
 
 pub use execution::parse_ib_timestamp;
+
+impl BracketOrderClient for IbkrClient {
+    async fn open_bracket_order(
+        &self,
+        request: UnifiedBracketOrderRequest<ExchangeId, &InstrumentNameExchange>,
+    ) -> UnifiedBracketOrderResult {
+        let ibkr_request = BracketOrderRequest {
+            instrument: request.key.instrument.clone(),
+            strategy: request.key.strategy.clone(),
+            parent_cid: request.key.cid.clone(),
+            side: request.state.side,
+            quantity: request.state.quantity,
+            entry_price: request.state.entry_price,
+            take_profit_price: request.state.take_profit_price,
+            stop_loss_price: request.state.stop_loss_price,
+            time_in_force: request.state.time_in_force,
+        };
+
+        let result = self.open_bracket_order(ibkr_request).await;
+
+        UnifiedBracketOrderResult::with_all_legs(
+            result.parent,
+            result.take_profit,
+            result.stop_loss,
+        )
+    }
+}

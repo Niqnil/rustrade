@@ -35,10 +35,14 @@ use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
     UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance},
-    client::ExecutionClient,
+    client::{BracketOrderClient, ExecutionClient},
     error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
     order::{
-        Order, OrderKey, OrderKind, TimeInForce,
+        Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
+        bracket::{
+            BracketOrderRequest as UnifiedBracketOrderRequest,
+            BracketOrderResult as UnifiedBracketOrderResult,
+        },
         id::{ClientOrderId, OrderId, StrategyId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
@@ -444,6 +448,9 @@ struct AlpacaOrderResponse {
     order_type: String,
     time_in_force: String,
     limit_price: Option<String>,
+    stop_price: Option<String>,
+    trail_percent: Option<String>,
+    trail_price: Option<String>,
     created_at: String,
 }
 
@@ -484,6 +491,143 @@ pub enum AlpacaPositionIntent {
 }
 
 // ---------------------------------------------------------------------------
+// Bracket order types
+// ---------------------------------------------------------------------------
+
+/// Take-profit parameters for Alpaca bracket orders.
+///
+/// The take-profit leg is always a limit order at the specified price.
+#[derive(Debug, Serialize)]
+struct TakeProfitParams {
+    limit_price: String,
+}
+
+/// Stop-loss parameters for Alpaca bracket orders.
+///
+/// When `limit_price` is `None`, the stop-loss is a stop (market) order.
+/// When `limit_price` is `Some`, the stop-loss becomes a stop-limit order.
+#[derive(Debug, Serialize)]
+struct StopLossParams {
+    stop_price: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit_price: Option<String>,
+}
+
+/// Request to place a bracket order (entry + take-profit + stop-loss).
+///
+/// A bracket order consists of three linked orders submitted in a single request:
+/// 1. **Entry**: Limit order to enter the position
+/// 2. **Take Profit**: Limit order to exit at profit target
+/// 3. **Stop Loss**: Stop or stop-limit order to exit at loss limit
+///
+/// When either the take-profit or stop-loss fills, Alpaca automatically cancels
+/// the other leg.
+///
+/// # Constraints
+///
+/// - `time_in_force` must be `Day` or `GoodUntilCancelled` (no extended hours)
+/// - Entry order type is always `Limit`
+/// - Take-profit is always a `Limit` order
+/// - Stop-loss is a `Stop` order (or `StopLimit` if `stop_loss_limit_price` is set)
+///
+/// # Example
+///
+/// ```ignore
+/// let request = AlpacaBracketOrderRequest::new(
+///     "AAPL".into(),
+///     StrategyId::new("momentum"),
+///     ClientOrderId::new("bracket-001"),
+///     Side::Buy,
+///     dec!(10),
+///     dec!(150.00),  // entry
+///     dec!(160.00),  // take profit
+///     dec!(145.00),  // stop loss
+///     TimeInForce::GoodUntilCancelled { post_only: false },
+/// );
+/// // For stop-limit SL: .with_stop_loss_limit_price(dec!(144.00))
+/// let result = client.open_bracket_order(request).await;
+/// ```
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct AlpacaBracketOrderRequest {
+    /// Instrument to trade.
+    pub instrument: InstrumentNameExchange,
+    /// Strategy identifier for order correlation.
+    pub strategy: StrategyId,
+    /// Client order ID for the parent (entry) order.
+    pub cid: ClientOrderId,
+    /// Buy or Sell for the entry order (exits use opposite side).
+    pub side: Side,
+    /// Number of shares/contracts.
+    pub quantity: Decimal,
+    /// Entry limit price.
+    pub entry_price: Decimal,
+    /// Take-profit limit price.
+    pub take_profit_price: Decimal,
+    /// Stop-loss trigger price.
+    pub stop_loss_price: Decimal,
+    /// Optional stop-loss limit price. When set, makes the stop-loss a stop-limit order.
+    pub stop_loss_limit_price: Option<Decimal>,
+    /// Time-in-force for all legs. Must be `Day` or `GoodUntilCancelled`.
+    pub time_in_force: TimeInForce,
+}
+
+impl AlpacaBracketOrderRequest {
+    /// Create a new bracket order request.
+    ///
+    /// For a stop-limit stop-loss leg, chain `.with_stop_loss_limit_price()`.
+    #[allow(clippy::too_many_arguments)] // Bracket orders inherently need many params
+    pub fn new(
+        instrument: InstrumentNameExchange,
+        strategy: StrategyId,
+        cid: ClientOrderId,
+        side: Side,
+        quantity: Decimal,
+        entry_price: Decimal,
+        take_profit_price: Decimal,
+        stop_loss_price: Decimal,
+        time_in_force: TimeInForce,
+    ) -> Self {
+        Self {
+            instrument,
+            strategy,
+            cid,
+            side,
+            quantity,
+            entry_price,
+            take_profit_price,
+            stop_loss_price,
+            stop_loss_limit_price: None,
+            time_in_force,
+        }
+    }
+
+    /// Set the stop-loss limit price, converting the SL leg to a stop-limit order.
+    #[must_use]
+    pub fn with_stop_loss_limit_price(mut self, price: Decimal) -> Self {
+        self.stop_loss_limit_price = Some(price);
+        self
+    }
+}
+
+/// Result of placing an Alpaca bracket order.
+///
+/// Contains the parent order with its state. The take-profit and stop-loss legs
+/// are managed by Alpaca and their status can be queried via `fetch_open_orders`.
+///
+/// # Note
+///
+/// Unlike IBKR which returns three separate orders, Alpaca's bracket API returns
+/// a single parent order. The child legs (TP/SL) are implicitly created and linked
+/// by Alpaca. Use `fetch_open_orders` to retrieve all legs after placement.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct AlpacaBracketOrderResult {
+    /// Parent (entry) order with its current state.
+    pub parent: Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
+}
+
+// ---------------------------------------------------------------------------
 // REST order request body
 // ---------------------------------------------------------------------------
 
@@ -498,12 +642,26 @@ struct AlpacaOrderRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     limit_price: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    stop_price: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trail_percent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trail_price: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     client_order_id: Option<&'a str>,
     // position_intent: heuristic mapping (buy→buy_to_open, sell→sell_to_close).
     // Correct for directional long-only strategies. Omit for exchanges/asset
     // classes that don't require it (stocks/crypto ignore this field).
     #[serde(skip_serializing_if = "Option::is_none")]
     position_intent: Option<AlpacaPositionIntent>,
+    // Bracket order fields (order_class, take_profit, stop_loss).
+    // Set order_class to "bracket" and populate TP/SL for bracket orders.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    order_class: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    take_profit: Option<TakeProfitParams>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_loss: Option<StopLossParams>,
 }
 
 // ---------------------------------------------------------------------------
@@ -571,6 +729,12 @@ struct AlpacaOrderWs<'a> {
     time_in_force: SmolStr,
     #[serde(borrow)]
     limit_price: Option<&'a str>,
+    #[serde(borrow)]
+    stop_price: Option<&'a str>,
+    #[serde(borrow)]
+    trail_percent: Option<&'a str>,
+    #[serde(borrow)]
+    trail_price: Option<&'a str>,
     status: SmolStr,
 }
 
@@ -596,6 +760,8 @@ pub struct AlpacaClient {
     /// default headers — every request carries auth automatically.
     http: reqwest::Client,
     rate_limiter: Arc<RateLimitTracker>,
+    /// Pre-allocated `/v2/orders` endpoint URL to avoid allocation per request.
+    orders_url: String,
 }
 
 impl std::fmt::Debug for AlpacaClient {
@@ -835,7 +1001,7 @@ async fn rest_delete_with_retry(
 // ---------------------------------------------------------------------------
 
 impl ExecutionClient for AlpacaClient {
-    const EXCHANGE: ExchangeId = ExchangeId::Alpaca;
+    const EXCHANGE: ExchangeId = ExchangeId::AlpacaBroker;
     type Config = AlpacaConfig;
     type AccountStream = BoxStream<'static, UnindexedAccountEvent>;
 
@@ -845,10 +1011,12 @@ impl ExecutionClient for AlpacaClient {
     /// HTTP header value.
     fn new(config: Self::Config) -> Self {
         let http = Self::build_http(&config);
+        let orders_url = format!("{}/v2/orders", config.rest_base_url());
         Self {
             config: Arc::new(config),
             http,
             rate_limiter: Arc::new(RateLimitTracker::new()),
+            orders_url,
         }
     }
 
@@ -909,7 +1077,7 @@ impl ExecutionClient for AlpacaClient {
         let instrument_snapshots = build_instrument_snapshots(open_orders, instruments);
 
         Ok(AccountSnapshot::new(
-            ExchangeId::Alpaca,
+            ExchangeId::AlpacaBroker,
             balances,
             instrument_snapshots,
         ))
@@ -1211,6 +1379,244 @@ impl AlpacaClient {
         self.open_order_inner(request, intent).await
     }
 
+    /// Place a bracket order (entry + take-profit + stop-loss) in a single request.
+    ///
+    /// A bracket order consists of three linked orders:
+    /// 1. **Entry**: Limit order to enter the position
+    /// 2. **Take Profit**: Limit order to exit at profit target
+    /// 3. **Stop Loss**: Stop (or stop-limit) order to exit at loss limit
+    ///
+    /// When the entry order fills, Alpaca activates both exit legs. When either
+    /// exit leg fills, Alpaca automatically cancels the other.
+    ///
+    /// # Constraints
+    ///
+    /// - `time_in_force` must be `Day` or `GoodUntilCancelled` (Alpaca rejects others)
+    /// - No extended hours trading with bracket orders
+    /// - Entry is always a limit order
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let request = AlpacaBracketOrderRequest::new(
+    ///     "AAPL".into(),
+    ///     StrategyId::new("momentum"),
+    ///     ClientOrderId::new("bracket-001"),
+    ///     Side::Buy,
+    ///     dec!(10),
+    ///     dec!(150.00),  // entry
+    ///     dec!(160.00),  // take profit
+    ///     dec!(145.00),  // stop loss
+    ///     TimeInForce::GoodUntilCancelled { post_only: false },
+    /// );
+    /// let result = client.open_bracket_order(request).await;
+    /// ```
+    pub async fn open_bracket_order(
+        &self,
+        request: AlpacaBracketOrderRequest,
+    ) -> AlpacaBracketOrderResult {
+        let order_key = crate::order::OrderKey::new(
+            ExchangeId::AlpacaBroker,
+            request.instrument.clone(),
+            request.strategy.clone(),
+            request.cid.clone(),
+        );
+
+        // Validate time_in_force: bracket orders only support day or gtc
+        let tif_str = match request.time_in_force {
+            TimeInForce::GoodUntilEndOfDay => "day",
+            TimeInForce::GoodUntilCancelled { post_only } => {
+                if post_only {
+                    return AlpacaBracketOrderResult {
+                        parent: Order {
+                            key: order_key,
+                            side: request.side,
+                            price: Some(request.entry_price),
+                            quantity: request.quantity,
+                            kind: OrderKind::Limit,
+                            time_in_force: request.time_in_force,
+                            state: OrderState::inactive(OrderError::Rejected(
+                                ApiError::OrderRejected(
+                                    "Alpaca does not support post_only for bracket orders"
+                                        .to_string(),
+                                ),
+                            )),
+                        },
+                    };
+                }
+                "gtc"
+            }
+            other => {
+                return AlpacaBracketOrderResult {
+                    parent: Order {
+                        key: order_key,
+                        side: request.side,
+                        price: Some(request.entry_price),
+                        quantity: request.quantity,
+                        kind: OrderKind::Limit,
+                        time_in_force: request.time_in_force,
+                        state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
+                            format!(
+                                "Alpaca bracket orders only support Day or GTC time_in_force, got {:?}",
+                                other
+                            ),
+                        ))),
+                    },
+                };
+            }
+        };
+
+        // Validate price ordering. Alpaca rejects mis-ordered brackets with a
+        // generic 422; surface a structured local error before round-trip.
+        let price_ordering_ok = match request.side {
+            Side::Buy => {
+                request.stop_loss_price < request.entry_price
+                    && request.entry_price < request.take_profit_price
+            }
+            Side::Sell => {
+                request.take_profit_price < request.entry_price
+                    && request.entry_price < request.stop_loss_price
+            }
+        };
+        if !price_ordering_ok {
+            return AlpacaBracketOrderResult {
+                parent: Order {
+                    key: order_key,
+                    side: request.side,
+                    price: Some(request.entry_price),
+                    quantity: request.quantity,
+                    kind: OrderKind::Limit,
+                    time_in_force: request.time_in_force,
+                    state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
+                        format!(
+                            "Invalid bracket price ordering for {:?} side: entry={}, take_profit={}, stop_loss={}",
+                            request.side,
+                            request.entry_price,
+                            request.take_profit_price,
+                            request.stop_loss_price,
+                        ),
+                    ))),
+                },
+            };
+        }
+
+        // Validate stop-loss limit price if provided. For a Buy bracket, the SL
+        // is a sell stop(-limit); the limit must be at or below the trigger so
+        // the order can fill if price gaps down. Reverse for Sell brackets.
+        if let Some(sl_limit) = request.stop_loss_limit_price {
+            let sl_limit_ok = match request.side {
+                Side::Buy => sl_limit <= request.stop_loss_price,
+                Side::Sell => sl_limit >= request.stop_loss_price,
+            };
+            if !sl_limit_ok {
+                return AlpacaBracketOrderResult {
+                    parent: Order {
+                        key: order_key,
+                        side: request.side,
+                        price: Some(request.entry_price),
+                        quantity: request.quantity,
+                        kind: OrderKind::Limit,
+                        time_in_force: request.time_in_force,
+                        state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
+                            format!(
+                                "Invalid stop-loss limit price for {:?} bracket: \
+                                 stop_loss_price={}, stop_loss_limit_price={}",
+                                request.side, request.stop_loss_price, sl_limit,
+                            ),
+                        ))),
+                    },
+                };
+            }
+        }
+
+        // Build the bracket order request
+        let body = AlpacaOrderRequest {
+            symbol: request.instrument.name().as_str(),
+            qty: request.quantity.to_string(),
+            side: map_side(request.side),
+            order_type: "limit",
+            time_in_force: tif_str,
+            limit_price: Some(request.entry_price.to_string()),
+            stop_price: None,
+            trail_percent: None,
+            trail_price: None,
+            client_order_id: Some(request.cid.0.as_str()),
+            position_intent: if is_options_or_equity_symbol(request.instrument.name().as_str()) {
+                Some(map_position_intent(request.side, false))
+            } else {
+                None
+            },
+            order_class: Some("bracket"),
+            take_profit: Some(TakeProfitParams {
+                limit_price: request.take_profit_price.to_string(),
+            }),
+            stop_loss: Some(StopLossParams {
+                stop_price: request.stop_loss_price.to_string(),
+                limit_price: request.stop_loss_limit_price.map(|p| p.to_string()),
+            }),
+        };
+
+        let http = self.http.clone();
+        let rl = &self.rate_limiter;
+
+        let result: Result<AlpacaOrderResponse, UnindexedClientError> =
+            rest_with_retry(rl, || http.post(&self.orders_url).json(&body)).await;
+
+        match result {
+            Ok(resp) => {
+                let exchange_order_id = OrderId(SmolStr::new(&resp.id));
+                let time_exchange = parse_timestamp(&resp.created_at).unwrap_or_else(Utc::now);
+                let filled_qty = Decimal::from_str(&resp.filled_qty).unwrap_or(Decimal::ZERO);
+
+                let state = if filled_qty >= request.quantity {
+                    OrderState::fully_filled(Filled::new(
+                        exchange_order_id,
+                        time_exchange,
+                        filled_qty,
+                        None,
+                    ))
+                } else {
+                    OrderState::active(Open::new(exchange_order_id, time_exchange, filled_qty))
+                };
+
+                AlpacaBracketOrderResult {
+                    parent: Order {
+                        key: order_key,
+                        side: request.side,
+                        price: Some(request.entry_price),
+                        quantity: request.quantity,
+                        kind: OrderKind::Limit,
+                        time_in_force: request.time_in_force,
+                        state,
+                    },
+                }
+            }
+            Err(e) => {
+                let order_err = match e {
+                    UnindexedClientError::Connectivity(ce) => OrderError::Connectivity(ce),
+                    UnindexedClientError::Api(ae) => OrderError::Rejected(ae),
+                    UnindexedClientError::TaskFailed(_)
+                    | UnindexedClientError::Internal(_)
+                    | UnindexedClientError::Truncated { .. }
+                    | UnindexedClientError::TruncatedSnapshot { .. } => {
+                        unreachable!("rest_with_retry (order path) does not produce these variants")
+                    }
+                };
+                AlpacaBracketOrderResult {
+                    parent: Order {
+                        key: order_key,
+                        side: request.side,
+                        price: Some(request.entry_price),
+                        quantity: request.quantity,
+                        kind: OrderKind::Limit,
+                        time_in_force: request.time_in_force,
+                        state: OrderState::inactive(order_err),
+                    },
+                }
+            }
+        }
+    }
+
     async fn open_order_inner(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
@@ -1225,7 +1631,7 @@ impl AlpacaClient {
         let cid = request.key.cid.clone();
 
         let order_key = crate::order::OrderKey::new(
-            ExchangeId::Alpaca,
+            ExchangeId::AlpacaBroker,
             instrument.clone(),
             request.key.strategy.clone(),
             cid.clone(),
@@ -1249,17 +1655,92 @@ impl AlpacaClient {
             }
         };
 
+        // Validate order kind — reject unsupported types early.
+        let order_type_str = match map_order_kind(kind) {
+            Some(s) => s,
+            None => {
+                return Some(Order {
+                    key: order_key,
+                    side,
+                    price,
+                    quantity,
+                    kind,
+                    time_in_force,
+                    state: OrderState::inactive(OrderError::UnsupportedOrderType(format!(
+                        "Alpaca connector does not yet support OrderKind::{kind:?}"
+                    ))),
+                });
+            }
+        };
+
+        // Validate trailing stop offset type — Alpaca only supports percent and absolute.
+        if let OrderKind::TrailingStop {
+            offset_type: TrailingOffsetType::BasisPoints,
+            ..
+        } = kind
+        {
+            return Some(Order {
+                key: order_key,
+                side,
+                price,
+                quantity,
+                kind,
+                time_in_force,
+                state: OrderState::inactive(OrderError::UnsupportedOrderType(
+                    "Alpaca does not support TrailingOffsetType::BasisPoints; \
+                     use Percentage or Absolute"
+                        .to_string(),
+                )),
+            });
+        }
+
+        // StopLimit requires Order.price (the limit price applied once trigger fires).
+        // Guard locally to avoid a wire round-trip producing a generic 422.
+        if matches!(kind, OrderKind::StopLimit { .. }) && price.is_none() {
+            return Some(Order {
+                key: order_key,
+                side,
+                price,
+                quantity,
+                kind,
+                time_in_force,
+                state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
+                    "StopLimit order requires Order.price (the limit price) to be set".to_string(),
+                ))),
+            });
+        }
+
+        // Extract stop/trailing parameters based on order kind.
+        let (stop_price, trail_percent, trail_price) = match kind {
+            OrderKind::Stop { trigger_price } | OrderKind::StopLimit { trigger_price } => {
+                (Some(trigger_price.to_string()), None, None)
+            }
+            OrderKind::TrailingStop {
+                offset,
+                offset_type,
+            } => match offset_type {
+                TrailingOffsetType::Percentage => (None, Some(offset.to_string()), None),
+                TrailingOffsetType::Absolute => (None, None, Some(offset.to_string())),
+                TrailingOffsetType::BasisPoints => unreachable!("validated above"),
+            },
+            OrderKind::Market | OrderKind::Limit | OrderKind::TrailingStopLimit { .. } => {
+                (None, None, None)
+            }
+        };
+
         let body = AlpacaOrderRequest {
             symbol: instrument.name().as_str(),
             qty: quantity.to_string(),
             side: map_side(side),
-            order_type: map_order_kind(kind),
+            order_type: order_type_str,
             time_in_force: tif_str,
-            limit_price: if matches!(kind, OrderKind::Limit) {
-                Some(price.to_string())
-            } else {
-                None
+            limit_price: match kind {
+                OrderKind::Limit | OrderKind::StopLimit { .. } => price.map(|p| p.to_string()),
+                _ => None,
             },
+            stop_price,
+            trail_percent,
+            trail_price,
             client_order_id: Some(cid.0.as_str()),
             // position_intent is required for options orders and valid (but optional)
             // for equities. It is NOT a valid field for crypto orders and must be
@@ -1271,16 +1752,17 @@ impl AlpacaClient {
             } else {
                 None
             },
+            // Non-bracket order: no bracket fields
+            order_class: None,
+            take_profit: None,
+            stop_loss: None,
         };
 
-        let base = self.base_url();
         let http = self.http.clone();
         let rl = &self.rate_limiter;
-        // Pre-allocate URL to avoid re-allocation on each retry attempt.
-        let orders_url = format!("{base}/v2/orders");
 
         let result: Result<AlpacaOrderResponse, UnindexedClientError> =
-            rest_with_retry(rl, || http.post(&orders_url).json(&body)).await;
+            rest_with_retry(rl, || http.post(&self.orders_url).json(&body)).await;
 
         match result {
             Ok(resp) => {
@@ -2134,7 +2616,8 @@ async fn recover_fills(
             cumulative.normalize()
         ));
 
-        let event = UnindexedAccountEvent::new(ExchangeId::Alpaca, AccountEventKind::Trade(trade));
+        let event =
+            UnindexedAccountEvent::new(ExchangeId::AlpacaBroker, AccountEventKind::Trade(trade));
 
         // Re-use fill_dedup_key_from_event so the key logic is in one place.
         if fill_dedup_key_from_event(&event).is_some_and(|k| is_duplicate(dedup, k)) {
@@ -2325,16 +2808,20 @@ fn convert_open_order(
     let price = o
         .limit_price
         .as_deref()
-        .and_then(|s| Decimal::from_str(s).ok())
-        .unwrap_or(Decimal::ZERO);
+        .and_then(|s| Decimal::from_str(s).ok());
     let filled_qty = Decimal::from_str(&o.filled_qty).unwrap_or(Decimal::ZERO);
-    let kind = parse_order_kind(&o.order_type)?;
+    let kind = parse_order_kind(
+        &o.order_type,
+        o.stop_price.as_deref(),
+        o.trail_percent.as_deref(),
+        o.trail_price.as_deref(),
+    )?;
     let time_in_force = parse_time_in_force(&o.time_in_force);
     let time_exchange = parse_timestamp(&o.created_at).unwrap_or_else(Utc::now);
 
     Some(Order {
         key: OrderKey::new(
-            ExchangeId::Alpaca,
+            ExchangeId::AlpacaBroker,
             instrument,
             // Alpaca doesn't carry strategy IDs in any response field.
             StrategyId::unknown(),
@@ -2468,7 +2955,7 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
                 ),
             );
             Some(UnindexedAccountEvent::new(
-                ExchangeId::Alpaca,
+                ExchangeId::AlpacaBroker,
                 AccountEventKind::Trade(trade),
             ))
         }
@@ -2484,13 +2971,15 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
                 trace!(order_id = %order.id, "Alpaca WS: skipping notional order snapshot (qty=None)");
                 return None;
             }
-            let price = order
-                .limit_price
-                .and_then(|s| Decimal::from_str(s).ok())
-                .unwrap_or(Decimal::ZERO);
+            let price = order.limit_price.and_then(|s| Decimal::from_str(s).ok());
             let filled_qty =
                 Decimal::from_str(order.filled_qty.unwrap_or("0")).unwrap_or(Decimal::ZERO);
-            let kind = parse_order_kind(&order.order_type)?;
+            let kind = parse_order_kind(
+                &order.order_type,
+                order.stop_price,
+                order.trail_percent,
+                order.trail_price,
+            )?;
             let time_in_force = parse_time_in_force(&order.time_in_force);
             let time_exchange = update
                 .timestamp
@@ -2499,7 +2988,12 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
 
             let open_state = Open::new(order_id, time_exchange, filled_qty);
             let order_snapshot = crate::order::Order {
-                key: OrderKey::new(ExchangeId::Alpaca, instrument, StrategyId::unknown(), cid),
+                key: OrderKey::new(
+                    ExchangeId::AlpacaBroker,
+                    instrument,
+                    StrategyId::unknown(),
+                    cid,
+                ),
                 side,
                 price,
                 quantity,
@@ -2508,7 +3002,7 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
                 state: OrderState::active(open_state),
             };
             Some(UnindexedAccountEvent::new(
-                ExchangeId::Alpaca,
+                ExchangeId::AlpacaBroker,
                 AccountEventKind::OrderSnapshot(
                     rustrade_integration::collection::snapshot::Snapshot(order_snapshot),
                 ),
@@ -2531,24 +3025,34 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
                 Decimal::from_str(order.filled_qty.unwrap_or("0")).unwrap_or(Decimal::ZERO);
             let cancelled = Cancelled::new(order_id, time_exchange, filled_qty);
             let response = crate::order::request::OrderResponseCancel {
-                key: OrderKey::new(ExchangeId::Alpaca, instrument, StrategyId::unknown(), cid),
+                key: OrderKey::new(
+                    ExchangeId::AlpacaBroker,
+                    instrument,
+                    StrategyId::unknown(),
+                    cid,
+                ),
                 state: Ok(cancelled),
             };
             Some(UnindexedAccountEvent::new(
-                ExchangeId::Alpaca,
+                ExchangeId::AlpacaBroker,
                 AccountEventKind::OrderCancelled(response),
             ))
         }
 
         "rejected" => {
             let response = crate::order::request::OrderResponseCancel {
-                key: OrderKey::new(ExchangeId::Alpaca, instrument, StrategyId::unknown(), cid),
+                key: OrderKey::new(
+                    ExchangeId::AlpacaBroker,
+                    instrument,
+                    StrategyId::unknown(),
+                    cid,
+                ),
                 state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
                     format!("order rejected: status={}", order.status),
                 ))),
             };
             Some(UnindexedAccountEvent::new(
-                ExchangeId::Alpaca,
+                ExchangeId::AlpacaBroker,
                 AccountEventKind::OrderCancelled(response),
             ))
         }
@@ -2574,13 +3078,41 @@ fn parse_side(s: &str) -> Option<Side> {
     }
 }
 
-fn parse_order_kind(s: &str) -> Option<OrderKind> {
-    match s {
+fn parse_order_kind(
+    order_type: &str,
+    stop_price: Option<&str>,
+    trail_percent: Option<&str>,
+    trail_price: Option<&str>,
+) -> Option<OrderKind> {
+    match order_type {
         "market" | "Market" => Some(OrderKind::Market),
         "limit" | "Limit" => Some(OrderKind::Limit),
+        "stop" | "Stop" => {
+            let trigger_price = stop_price.and_then(|s| Decimal::from_str(s).ok())?;
+            Some(OrderKind::Stop { trigger_price })
+        }
+        "stop_limit" | "Stop_limit" => {
+            let trigger_price = stop_price.and_then(|s| Decimal::from_str(s).ok())?;
+            Some(OrderKind::StopLimit { trigger_price })
+        }
+        "trailing_stop" | "Trailing_stop" => {
+            // Alpaca returns either trail_percent or trail_price, not both.
+            if let Some(pct) = trail_percent.and_then(|s| Decimal::from_str(s).ok()) {
+                Some(OrderKind::TrailingStop {
+                    offset: pct,
+                    offset_type: TrailingOffsetType::Percentage,
+                })
+            } else if let Some(price) = trail_price.and_then(|s| Decimal::from_str(s).ok()) {
+                Some(OrderKind::TrailingStop {
+                    offset: price,
+                    offset_type: TrailingOffsetType::Absolute,
+                })
+            } else {
+                trace!("Alpaca: trailing_stop missing trail_percent and trail_price");
+                None
+            }
+        }
         other => {
-            // stop, stop_limit, trailing_stop — not in rustrade's OrderKind enum.
-            // Return None to skip the order; the consumer never placed these via rustrade.
             trace!(%other, "Alpaca: unsupported order type, skipping");
             None
         }
@@ -2613,10 +3145,15 @@ fn map_side(side: Side) -> &'static str {
     }
 }
 
-fn map_order_kind(kind: OrderKind) -> &'static str {
+fn map_order_kind(kind: OrderKind) -> Option<&'static str> {
     match kind {
-        OrderKind::Market => "market",
-        OrderKind::Limit => "limit",
+        OrderKind::Market => Some("market"),
+        OrderKind::Limit => Some("limit"),
+        OrderKind::Stop { .. } => Some("stop"),
+        OrderKind::StopLimit { .. } => Some("stop_limit"),
+        OrderKind::TrailingStop { .. } => Some("trailing_stop"),
+        // Alpaca does not support trailing stop-limit orders.
+        OrderKind::TrailingStopLimit { .. } => None,
     }
 }
 
@@ -2639,6 +3176,14 @@ fn map_time_in_force(tif: TimeInForce) -> Result<&'static str, &'static str> {
         TimeInForce::GoodUntilEndOfDay => Ok("day"),
         TimeInForce::FillOrKill => Ok("fok"),
         TimeInForce::ImmediateOrCancel => Ok("ioc"),
+        TimeInForce::AtOpen => Ok("opg"),
+        TimeInForce::AtClose => Ok("cls"),
+        // Alpaca's `gtd` requires an `expired_at` timestamp on the order request,
+        // which this client does not currently surface. Reject to avoid silently
+        // dropping the expiry semantics.
+        TimeInForce::GoodTillDate { .. } => {
+            Err("Alpaca GoodTillDate is not yet wired through this client")
+        }
     }
 }
 
@@ -2714,6 +3259,34 @@ fn connectivity_err(msg: impl Into<String>) -> UnindexedClientError {
 }
 
 // ---------------------------------------------------------------------------
+// BracketOrderClient implementation
+// ---------------------------------------------------------------------------
+
+impl BracketOrderClient for AlpacaClient {
+    async fn open_bracket_order(
+        &self,
+        request: UnifiedBracketOrderRequest<ExchangeId, &InstrumentNameExchange>,
+    ) -> UnifiedBracketOrderResult {
+        let alpaca_request = AlpacaBracketOrderRequest {
+            instrument: request.key.instrument.clone(),
+            strategy: request.key.strategy.clone(),
+            cid: request.key.cid.clone(),
+            side: request.state.side,
+            quantity: request.state.quantity,
+            entry_price: request.state.entry_price,
+            take_profit_price: request.state.take_profit_price,
+            stop_loss_price: request.state.stop_loss_price,
+            stop_loss_limit_price: request.state.stop_loss_limit_price,
+            time_in_force: request.state.time_in_force,
+        };
+
+        let result = self.open_bracket_order(alpaca_request).await;
+
+        UnifiedBracketOrderResult::parent_only(result.parent)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2756,9 +3329,97 @@ mod tests {
 
     #[test]
     fn test_parse_order_kind() {
-        assert_eq!(parse_order_kind("market"), Some(OrderKind::Market));
-        assert_eq!(parse_order_kind("limit"), Some(OrderKind::Limit));
-        assert_eq!(parse_order_kind("stop"), None);
+        // Market and Limit don't need extra params
+        assert_eq!(
+            parse_order_kind("market", None, None, None),
+            Some(OrderKind::Market)
+        );
+        assert_eq!(
+            parse_order_kind("limit", None, None, None),
+            Some(OrderKind::Limit)
+        );
+
+        // Stop requires stop_price
+        assert_eq!(
+            parse_order_kind("stop", Some("150.00"), None, None),
+            Some(OrderKind::Stop {
+                trigger_price: Decimal::from_str("150.00").unwrap()
+            })
+        );
+        assert_eq!(parse_order_kind("stop", None, None, None), None);
+
+        // StopLimit requires stop_price
+        assert_eq!(
+            parse_order_kind("stop_limit", Some("145.00"), None, None),
+            Some(OrderKind::StopLimit {
+                trigger_price: Decimal::from_str("145.00").unwrap()
+            })
+        );
+
+        // TrailingStop with percentage
+        assert_eq!(
+            parse_order_kind("trailing_stop", None, Some("5.0"), None),
+            Some(OrderKind::TrailingStop {
+                offset: Decimal::from_str("5.0").unwrap(),
+                offset_type: TrailingOffsetType::Percentage,
+            })
+        );
+
+        // TrailingStop with absolute price
+        assert_eq!(
+            parse_order_kind("trailing_stop", None, None, Some("2.50")),
+            Some(OrderKind::TrailingStop {
+                offset: Decimal::from_str("2.50").unwrap(),
+                offset_type: TrailingOffsetType::Absolute,
+            })
+        );
+
+        // TrailingStop without either offset returns None
+        assert_eq!(parse_order_kind("trailing_stop", None, None, None), None);
+
+        // Unknown type returns None
+        assert_eq!(parse_order_kind("unknown", None, None, None), None);
+    }
+
+    #[test]
+    fn test_map_order_kind() {
+        assert_eq!(map_order_kind(OrderKind::Market), Some("market"));
+        assert_eq!(map_order_kind(OrderKind::Limit), Some("limit"));
+        assert_eq!(
+            map_order_kind(OrderKind::Stop {
+                trigger_price: Decimal::from_str("150.00").unwrap()
+            }),
+            Some("stop")
+        );
+        assert_eq!(
+            map_order_kind(OrderKind::StopLimit {
+                trigger_price: Decimal::from_str("145.00").unwrap()
+            }),
+            Some("stop_limit")
+        );
+        assert_eq!(
+            map_order_kind(OrderKind::TrailingStop {
+                offset: Decimal::from_str("5.0").unwrap(),
+                offset_type: TrailingOffsetType::Percentage,
+            }),
+            Some("trailing_stop")
+        );
+        assert_eq!(
+            map_order_kind(OrderKind::TrailingStop {
+                offset: Decimal::from_str("2.50").unwrap(),
+                offset_type: TrailingOffsetType::Absolute,
+            }),
+            Some("trailing_stop")
+        );
+        // TrailingStopLimit is not supported by Alpaca
+        assert_eq!(
+            map_order_kind(OrderKind::TrailingStopLimit {
+                offset: Decimal::from_str("5.0").unwrap(),
+                offset_type: TrailingOffsetType::Percentage,
+                limit_offset: Decimal::from_str("1.0").unwrap(),
+            }),
+            None
+        );
     }
 
     #[test]
@@ -2777,6 +3438,228 @@ mod tests {
         let result = map_time_in_force(TimeInForce::GoodUntilCancelled { post_only: true });
         assert!(result.is_err(), "post_only must be rejected");
         assert!(result.unwrap_err().contains("post_only"));
+    }
+
+    // =========================================================================
+    // Bracket Order Serialization Tests
+    // =========================================================================
+
+    #[test]
+    fn test_bracket_order_serializes_with_stop_loss_stop_order() {
+        // Bracket order with stop-loss as a simple stop order (no limit_price)
+        let body = AlpacaOrderRequest {
+            symbol: "AAPL",
+            qty: "10".to_string(),
+            side: "buy",
+            order_type: "limit",
+            time_in_force: "gtc",
+            limit_price: Some("150.00".to_string()),
+            stop_price: None,
+            trail_percent: None,
+            trail_price: None,
+            client_order_id: Some("bracket-001"),
+            position_intent: Some(AlpacaPositionIntent::BuyToOpen),
+            order_class: Some("bracket"),
+            take_profit: Some(TakeProfitParams {
+                limit_price: "160.00".to_string(),
+            }),
+            stop_loss: Some(StopLossParams {
+                stop_price: "145.00".to_string(),
+                limit_price: None,
+            }),
+        };
+
+        let json = serde_json::to_value(&body).unwrap();
+
+        assert_eq!(json["symbol"], "AAPL");
+        assert_eq!(json["qty"], "10");
+        assert_eq!(json["side"], "buy");
+        assert_eq!(json["type"], "limit");
+        assert_eq!(json["time_in_force"], "gtc");
+        assert_eq!(json["limit_price"], "150.00");
+        assert_eq!(json["order_class"], "bracket");
+
+        // Take profit should have limit_price
+        assert_eq!(json["take_profit"]["limit_price"], "160.00");
+
+        // Stop loss should have stop_price but NO limit_price
+        assert_eq!(json["stop_loss"]["stop_price"], "145.00");
+        assert!(
+            json["stop_loss"].get("limit_price").is_none(),
+            "stop_loss.limit_price should be omitted when None"
+        );
+    }
+
+    #[test]
+    fn test_bracket_order_serializes_with_stop_loss_stop_limit_order() {
+        // Bracket order with stop-loss as a stop-limit order (has limit_price)
+        let body = AlpacaOrderRequest {
+            symbol: "SPY",
+            qty: "5".to_string(),
+            side: "sell",
+            order_type: "limit",
+            time_in_force: "day",
+            limit_price: Some("450.00".to_string()),
+            stop_price: None,
+            trail_percent: None,
+            trail_price: None,
+            client_order_id: Some("bracket-002"),
+            position_intent: Some(AlpacaPositionIntent::SellToClose),
+            order_class: Some("bracket"),
+            take_profit: Some(TakeProfitParams {
+                limit_price: "440.00".to_string(),
+            }),
+            stop_loss: Some(StopLossParams {
+                stop_price: "455.00".to_string(),
+                limit_price: Some("456.00".to_string()),
+            }),
+        };
+
+        let json = serde_json::to_value(&body).unwrap();
+
+        assert_eq!(json["symbol"], "SPY");
+        assert_eq!(json["side"], "sell");
+        assert_eq!(json["time_in_force"], "day");
+        assert_eq!(json["order_class"], "bracket");
+
+        // Take profit
+        assert_eq!(json["take_profit"]["limit_price"], "440.00");
+
+        // Stop loss with limit_price (stop-limit order)
+        assert_eq!(json["stop_loss"]["stop_price"], "455.00");
+        assert_eq!(
+            json["stop_loss"]["limit_price"], "456.00",
+            "stop_loss.limit_price should be present for stop-limit orders"
+        );
+    }
+
+    // =========================================================================
+    // Bracket Order Validation Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_open_bracket_order_rejects_invalid_tif() {
+        use rust_decimal_macros::dec;
+        use rustrade_instrument::instrument::name::InstrumentNameExchange;
+
+        // Create a minimal client with dummy credentials (no network call will be made)
+        let config = AlpacaConfig::new("dummy_key".into(), "dummy_secret".into(), true);
+        let client = AlpacaClient::new(config);
+
+        let request = AlpacaBracketOrderRequest::new(
+            InstrumentNameExchange::new("SPY"),
+            crate::order::id::StrategyId::new("test"),
+            crate::order::id::ClientOrderId::new("test-tif"),
+            Side::Buy,
+            dec!(1),
+            dec!(100.00),
+            dec!(120.00),
+            dec!(90.00),
+            TimeInForce::ImmediateOrCancel, // Invalid for brackets
+        );
+
+        let result = client.open_bracket_order(request).await;
+
+        assert!(
+            result.parent.state.is_failed(),
+            "Bracket order with IOC TIF should be rejected locally"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_open_bracket_order_rejects_invalid_price_ordering() {
+        use rust_decimal_macros::dec;
+        use rustrade_instrument::instrument::name::InstrumentNameExchange;
+
+        let config = AlpacaConfig::new("dummy_key".into(), "dummy_secret".into(), true);
+        let client = AlpacaClient::new(config);
+
+        // Buy bracket with SL > entry (invalid)
+        let request = AlpacaBracketOrderRequest::new(
+            InstrumentNameExchange::new("SPY"),
+            crate::order::id::StrategyId::new("test"),
+            crate::order::id::ClientOrderId::new("test-price"),
+            Side::Buy,
+            dec!(1),
+            dec!(100.00),
+            dec!(120.00),
+            dec!(105.00), // Invalid: SL > entry for buy
+            TimeInForce::GoodUntilCancelled { post_only: false },
+        );
+
+        let result = client.open_bracket_order(request).await;
+
+        assert!(
+            result.parent.state.is_failed(),
+            "Bracket order with invalid price ordering should be rejected locally"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_open_bracket_order_rejects_invalid_sl_limit_price() {
+        use rust_decimal_macros::dec;
+        use rustrade_instrument::instrument::name::InstrumentNameExchange;
+
+        let config = AlpacaConfig::new("dummy_key".into(), "dummy_secret".into(), true);
+        let client = AlpacaClient::new(config);
+
+        // Buy bracket with SL limit > SL trigger (invalid for sell stop-limit)
+        let request = AlpacaBracketOrderRequest::new(
+            InstrumentNameExchange::new("SPY"),
+            crate::order::id::StrategyId::new("test"),
+            crate::order::id::ClientOrderId::new("test-sl-limit"),
+            Side::Buy,
+            dec!(1),
+            dec!(100.00),
+            dec!(120.00),
+            dec!(90.00),
+            TimeInForce::GoodUntilCancelled { post_only: false },
+        )
+        .with_stop_loss_limit_price(dec!(95.00)); // Invalid: limit > trigger for sell SL
+
+        let result = client.open_bracket_order(request).await;
+
+        assert!(
+            result.parent.state.is_failed(),
+            "Bracket order with invalid SL limit price should be rejected locally"
+        );
+    }
+
+    #[test]
+    fn test_non_bracket_order_omits_bracket_fields() {
+        // Regular limit order should not have bracket fields
+        let body = AlpacaOrderRequest {
+            symbol: "AAPL",
+            qty: "1".to_string(),
+            side: "buy",
+            order_type: "limit",
+            time_in_force: "gtc",
+            limit_price: Some("150.00".to_string()),
+            stop_price: None,
+            trail_percent: None,
+            trail_price: None,
+            client_order_id: Some("regular-001"),
+            position_intent: Some(AlpacaPositionIntent::BuyToOpen),
+            order_class: None,
+            take_profit: None,
+            stop_loss: None,
+        };
+
+        let json = serde_json::to_value(&body).unwrap();
+
+        assert_eq!(json["symbol"], "AAPL");
+        assert!(
+            json.get("order_class").is_none(),
+            "order_class should be omitted for non-bracket orders"
+        );
+        assert!(
+            json.get("take_profit").is_none(),
+            "take_profit should be omitted for non-bracket orders"
+        );
+        assert!(
+            json.get("stop_loss").is_none(),
+            "stop_loss should be omitted for non-bracket orders"
+        );
     }
 
     #[test]
@@ -2958,6 +3841,9 @@ mod tests {
             order_type: SmolStr::new("limit"),
             time_in_force: SmolStr::new("day"),
             limit_price: Some("100.00"),
+            stop_price: None,
+            trail_percent: None,
+            trail_price: None,
             status: SmolStr::new("partially_filled"),
         }
     }
@@ -3008,6 +3894,9 @@ mod tests {
                 order_type: SmolStr::new("limit"),
                 time_in_force: SmolStr::new("day"),
                 limit_price: Some("150.00"),
+                stop_price: None,
+                trail_percent: None,
+                trail_price: None,
                 status: SmolStr::new("new"),
             },
             price: None,
@@ -3064,6 +3953,9 @@ mod tests {
             order_type: "market".to_string(),
             time_in_force: "day".to_string(),
             limit_price: None,
+            stop_price: None,
+            trail_percent: None,
+            trail_price: None,
             created_at: "2025-04-18T14:30:00Z".to_string(),
         };
         assert!(convert_open_order(&order).is_none());
@@ -3136,6 +4028,9 @@ mod tests {
             order_type: "limit".to_string(),
             time_in_force: "day".to_string(),
             limit_price: Some("100.00".to_string()),
+            stop_price: None,
+            trail_percent: None,
+            trail_price: None,
             created_at: "2025-04-18T14:30:00Z".to_string(),
         }
     }
@@ -3283,6 +4178,9 @@ mod tests {
                 order_type: SmolStr::new("market"),
                 time_in_force: SmolStr::new("day"),
                 limit_price: None,
+                stop_price: None,
+                trail_percent: None,
+                trail_price: None,
                 status: SmolStr::new("filled"),
             },
             price: Some("100.00"),
@@ -3304,6 +4202,9 @@ mod tests {
                 order_type: SmolStr::new("market"),
                 time_in_force: SmolStr::new("day"),
                 limit_price: None,
+                stop_price: None,
+                trail_percent: None,
+                trail_price: None,
                 status: SmolStr::new("filled"),
             },
             price: Some("100.00"),
@@ -3325,6 +4226,9 @@ mod tests {
                 order_type: SmolStr::new("market"),
                 time_in_force: SmolStr::new("day"),
                 limit_price: None,
+                stop_price: None,
+                trail_percent: None,
+                trail_price: None,
                 status: SmolStr::new("filled"),
             },
             price: Some("100.00"),
@@ -3860,14 +4764,14 @@ mod tests {
             // Create a Sell order with reduce_only=true (should map to SellToClose)
             let request = OrderRequestOpen {
                 key: OrderKey {
-                    exchange: ExchangeId::Alpaca,
+                    exchange: ExchangeId::AlpacaBroker,
                     instrument: InstrumentNameExchange::new("AAPL"),
                     strategy: StrategyId::new("test-strategy"),
                     cid: ClientOrderId::new("test-cid"),
                 },
                 state: RequestOpen {
                     side: Side::Sell,
-                    price: Decimal::ZERO,
+                    price: None,
                     quantity: Decimal::new(10, 0),
                     kind: OrderKind::Market,
                     time_in_force: TimeInForce::ImmediateOrCancel,
@@ -3958,14 +4862,14 @@ mod tests {
             let instrument = InstrumentNameExchange::new("AAPL");
             let request = OrderRequestOpen {
                 key: OrderKey {
-                    exchange: ExchangeId::Alpaca,
+                    exchange: ExchangeId::AlpacaBroker,
                     instrument: &instrument,
                     strategy: StrategyId::new("test-strategy"),
                     cid: ClientOrderId::new("test-cid"),
                 },
                 state: RequestOpen {
                     side: Side::Buy,
-                    price: Decimal::ZERO,
+                    price: None,
                     quantity: Decimal::new(10, 0),
                     kind: OrderKind::Market,
                     time_in_force: TimeInForce::ImmediateOrCancel,

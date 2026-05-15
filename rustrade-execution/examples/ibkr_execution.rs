@@ -133,7 +133,7 @@ async fn main() {
 
     let request_open = RequestOpen {
         side: Side::Buy,
-        price: dec!(1.00), // Very low price - won't fill
+        price: Some(dec!(1.00)), // Very low price - won't fill
         quantity: dec!(1),
         kind: OrderKind::Limit,
         time_in_force: TimeInForce::GoodUntilEndOfDay,

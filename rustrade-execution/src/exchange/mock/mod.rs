@@ -291,6 +291,7 @@ impl MockExchange {
         unimplemented!()
     }
 
+    #[allow(clippy::expect_used)] // Mock exchange: panic if test data is incomplete
     pub fn open_order(
         &mut self,
         request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
@@ -325,17 +326,25 @@ impl MockExchange {
                 request.state.side,
                 match request.state.kind {
                     // unreachable: validate_order_kind_supported (called above) already
-                    // rejects Limit orders with Err, so this arm is never reached.
-                    // Kept for exhaustiveness; passes the limit price so fill models that
-                    // gain Limit support in future behave correctly without a separate change.
-                    OrderKind::Limit => Some(request.state.price),
+                    // rejects non-Market orders with Err, so these arms are never reached.
+                    // Kept for exhaustiveness; passes the limit/trigger price so fill models
+                    // that gain support in future behave correctly without a separate change.
                     OrderKind::Market => None,
+                    OrderKind::Limit
+                    | OrderKind::StopLimit { .. }
+                    | OrderKind::TrailingStopLimit { .. } => request.state.price,
+                    OrderKind::Stop { trigger_price }
+                    | OrderKind::TrailingStop {
+                        offset: trigger_price,
+                        ..
+                    } => Some(trigger_price),
                 },
                 market_prices.best_bid,
                 market_prices.best_ask,
-                market_prices.last_price.or(Some(request.state.price)),
+                market_prices.last_price.or(request.state.price),
             )
-            .unwrap_or(request.state.price);
+            .or(request.state.price)
+            .expect("fill_price must be available from market data or request price");
 
         let time_exchange = self.time_exchange();
 
@@ -450,7 +459,7 @@ impl MockExchange {
         let order_response = Order {
             key: request.key.clone(),
             side: request.state.side,
-            price: fill_price,
+            price: request.state.price,
             quantity: request.state.quantity,
             kind: request.state.kind,
             time_in_force: request.state.time_in_force,
@@ -488,7 +497,7 @@ impl MockExchange {
             Ok(())
         } else {
             Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
-                format!("MockExchange does not supported OrderKind: {order_kind}"),
+                format!("MockExchange does not support OrderKind::{order_kind:?}"),
             )))
         }
     }
@@ -658,11 +667,8 @@ mod tests {
         MockExchange::new(config, request_rx, event_tx, instruments)
     }
 
-    fn buy_request(
-        quantity: &str,
-        price: &str,
-    ) -> OrderRequestOpen<ExchangeId, InstrumentNameExchange> {
-        let (quantity, price) = (d(quantity), d(price));
+    fn buy_request(quantity: &str) -> OrderRequestOpen<ExchangeId, InstrumentNameExchange> {
+        let quantity = d(quantity);
         OrderEvent {
             key: OrderKey {
                 exchange: EXCHANGE,
@@ -672,7 +678,7 @@ mod tests {
             },
             state: RequestOpen {
                 side: Side::Buy,
-                price,
+                price: None, // Market orders don't have a limit price
                 quantity,
                 kind: OrderKind::Market,
                 time_in_force: TimeInForce::ImmediateOrCancel,
@@ -682,11 +688,8 @@ mod tests {
         }
     }
 
-    fn sell_request(
-        quantity: &str,
-        price: &str,
-    ) -> OrderRequestOpen<ExchangeId, InstrumentNameExchange> {
-        let (quantity, price) = (d(quantity), d(price));
+    fn sell_request(quantity: &str) -> OrderRequestOpen<ExchangeId, InstrumentNameExchange> {
+        let quantity = d(quantity);
         OrderEvent {
             key: OrderKey {
                 exchange: EXCHANGE,
@@ -696,7 +699,7 @@ mod tests {
             },
             state: RequestOpen {
                 side: Side::Sell,
-                price,
+                price: None, // Market orders don't have a limit price
                 quantity,
                 kind: OrderKind::Market,
                 time_in_force: TimeInForce::ImmediateOrCancel,
@@ -706,13 +709,22 @@ mod tests {
         }
     }
 
+    fn market_prices(price: &str) -> MarketPrices {
+        let p = Some(d(price));
+        MarketPrices {
+            best_bid: p,
+            best_ask: p,
+            last_price: p,
+        }
+    }
+
     #[test]
     fn sell_order_decrements_base_balance_not_quote() {
         let mut exchange = make_exchange("1.0", "10000");
         let initial_usdt = d("10000");
 
         let (response, notifications) =
-            exchange.open_order(sell_request("0.5", "50000"), MarketPrices::default());
+            exchange.open_order(sell_request("0.5"), market_prices("50000"));
 
         assert!(
             response.state.is_accepted(),
@@ -748,8 +760,8 @@ mod tests {
         let mut exchange = make_exchange("0.1", "10000");
 
         let (response, notifications) = exchange.open_order(
-            sell_request("1.0", "50000"), // selling 1 BTC but only 0.1 available
-            MarketPrices::default(),
+            sell_request("1.0"), // selling 1 BTC but only 0.1 available
+            market_prices("50000"),
         );
 
         assert!(
@@ -783,7 +795,7 @@ mod tests {
 
         // Market buy of 1 BTC; reference price 100 is only used as a fallback
         // when fill_model returns None — BidAsk returns best_ask so it is not used.
-        let (response, notifications) = exchange.open_order(buy_request("1", "100"), market_prices);
+        let (response, notifications) = exchange.open_order(buy_request("1"), market_prices);
 
         assert!(
             response.state.is_accepted(),
@@ -819,7 +831,7 @@ mod tests {
         // Fee = 1000 * 0.001 = 1 USDT
         // Total deducted = 1000 + 1 = 1001 USDT
         let (response, notifications) =
-            exchange.open_order(buy_request("10", "100"), MarketPrices::default());
+            exchange.open_order(buy_request("10"), market_prices("100"));
 
         assert!(
             response.state.is_accepted(),
@@ -852,7 +864,7 @@ mod tests {
         // Fee (base) = 0.1 / 100 = 0.001 BTC
         // Total base deducted = 1 + 0.001 = 1.001 BTC
         let (response, notifications) =
-            exchange.open_order(sell_request("1", "100"), MarketPrices::default());
+            exchange.open_order(sell_request("1"), market_prices("100"));
 
         assert!(
             response.state.is_accepted(),
@@ -886,8 +898,7 @@ mod tests {
         // Sell 1 BTC at price 0 (degenerate case)
         // Fee (quote) = 0 * 0.001 * 1 = 0
         // Fee (base) = guarded by is_zero() check, returns 0
-        let (response, notifications) =
-            exchange.open_order(sell_request("1", "0"), MarketPrices::default());
+        let (response, notifications) = exchange.open_order(sell_request("1"), market_prices("0"));
 
         assert!(
             response.state.is_accepted(),

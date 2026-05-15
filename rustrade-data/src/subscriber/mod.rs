@@ -8,14 +8,13 @@ use crate::{
     instrument::InstrumentData,
     subscription::{Map, Subscription, SubscriptionKind, SubscriptionMeta},
 };
-use async_trait::async_trait;
 use futures::SinkExt;
 use rustrade_integration::{
     error::SocketError,
     protocol::websocket::{WebSocket, WsMessage, connect},
 };
 use serde::{Deserialize, Serialize};
-use std::fmt::Debug;
+use std::{fmt::Debug, future::Future};
 use tracing::debug;
 
 /// [`SubscriptionMapper`] implementations defining how to map a
@@ -27,13 +26,17 @@ pub mod mapper;
 pub mod validator;
 
 /// Defines how to connect to a socket and subscribe to market data streams.
-#[async_trait]
-pub trait Subscriber {
+///
+/// Subscribers may carry state such as authentication credentials.
+/// The trait requires `Clone` to support reconnection (subscribers are cloned
+/// into the reconnect closure).
+pub trait Subscriber: Clone + Send + Sync {
     type SubMapper: SubscriptionMapper;
 
-    async fn subscribe<Exchange, Instrument, Kind>(
+    fn subscribe<Exchange, Instrument, Kind>(
+        &self,
         subscriptions: &[Subscription<Exchange, Instrument, Kind>],
-    ) -> Result<Subscribed<Instrument::Key>, SocketError>
+    ) -> impl Future<Output = Result<Subscribed<Instrument::Key>, SocketError>> + Send
     where
         Exchange: Connector + Send + Sync,
         Kind: SubscriptionKind + Send + Sync,
@@ -50,14 +53,18 @@ pub struct Subscribed<InstrumentKey> {
 }
 
 /// Standard [`Subscriber`] for [`WebSocket`]s suitable for most exchanges.
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Deserialize, Serialize)]
+///
+/// This is a stateless subscriber for unauthenticated market data streams.
+#[derive(
+    Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default, Deserialize, Serialize,
+)]
 pub struct WebSocketSubscriber;
 
-#[async_trait]
 impl Subscriber for WebSocketSubscriber {
     type SubMapper = WebSocketSubMapper;
 
     async fn subscribe<Exchange, Instrument, Kind>(
+        &self,
         subscriptions: &[Subscription<Exchange, Instrument, Kind>],
     ) -> Result<Subscribed<Instrument::Key>, SocketError>
     where

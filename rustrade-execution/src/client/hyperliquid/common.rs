@@ -130,6 +130,13 @@ pub fn map_tif(tif: &TimeInForce) -> &'static str {
         TimeInForce::ImmediateOrCancel => "Ioc",
         TimeInForce::FillOrKill => "Ioc", // Hyperliquid doesn't have FOK, use IOC
         TimeInForce::GoodUntilEndOfDay => "Gtc", // No EOD on Hyperliquid
+        // Hyperliquid is a perpetuals DEX with no auction sessions and no native
+        // GTD. Coerce to GTC and surface the loss of semantics so downstream
+        // wrappers can decide whether to reject upstream.
+        TimeInForce::GoodTillDate { .. } | TimeInForce::AtOpen | TimeInForce::AtClose => {
+            warn!(time_in_force = ?tif, "Hyperliquid does not support this TimeInForce; coercing to Gtc");
+            "Gtc"
+        }
     }
 }
 

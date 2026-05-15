@@ -59,6 +59,22 @@ impl<K> IbkrSubscription<K> {
             kind: IbkrSubscriptionKind::Trades,
         }
     }
+
+    /// Create an option Greeks subscription.
+    ///
+    /// Use for option contracts to receive real-time Greeks (delta, gamma, theta,
+    /// vega, implied volatility) computed from live market prices.
+    ///
+    /// # Subscription Requirements
+    ///
+    /// Requires OPRA subscription (paid) for US options.
+    pub fn option_greeks(key: K, instrument: InstrumentNameExchange) -> Self {
+        Self {
+            key,
+            instrument,
+            kind: IbkrSubscriptionKind::OptionGreeks,
+        }
+    }
 }
 
 /// Type of IBKR market data subscription.
@@ -73,6 +89,12 @@ pub enum IbkrSubscriptionKind {
     },
     /// Tick-by-tick trades via tick_by_tick()
     Trades,
+    /// Real-time option Greeks via market_data() with OptionComputation ticks.
+    ///
+    /// Use this for option contracts to receive live Greeks (delta, gamma, theta,
+    /// vega, IV) computed from market prices. Requires OPRA subscription for US
+    /// options.
+    OptionGreeks,
 }
 
 #[cfg(test)]

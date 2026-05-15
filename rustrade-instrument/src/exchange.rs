@@ -34,7 +34,6 @@ pub enum ExchangeId {
     Other,
     Simulated,
     Mock,
-    Alpaca,
     BinanceFuturesCoin,
     BinanceFuturesUsd,
     BinanceOptions,
@@ -58,6 +57,16 @@ pub enum ExchangeId {
     Coinbase,
     CoinbaseInternational,
     Cryptocom,
+    /// Databento DBEQ.MAX — Composite US equities (all venues)
+    DatabentoDbeq,
+    /// Databento GLBX.MDP3 — CME Globex futures
+    DatabentoGlbx,
+    /// Databento OPRA.PILLAR — US options consolidated
+    DatabentoOpra,
+    /// Databento XNAS.ITCH — Nasdaq equities
+    DatabentoXnas,
+    /// Databento XNYS.PILLAR — NYSE equities
+    DatabentoXnys,
     Deribit,
     GateioFuturesBtc,
     GateioFuturesUsd,
@@ -73,11 +82,21 @@ pub enum ExchangeId {
     HyperliquidPerp,
     /// Hyperliquid spot trading (decentralized, EVM-based)
     HyperliquidSpot,
+    /// Alpaca Broker API (execution for equities, options, and crypto)
+    AlpacaBroker,
+    /// Alpaca crypto market data (wss://stream.data.alpaca.markets/v1beta3/crypto/us)
+    AlpacaCrypto,
+    /// Alpaca IEX equities market data (free feed)
+    AlpacaIex,
+    /// Alpaca SIP equities market data (paid consolidated feed)
+    AlpacaSip,
     /// Interactive Brokers — equities, futures, options, forex
     Ibkr,
     Kraken,
     Kucoin,
     Liquid,
+    /// Massive (formerly Polygon.io) — consolidated market data across all asset classes
+    Massive,
     Mexc,
     Okx,
     Poloniex,
@@ -90,7 +109,10 @@ impl ExchangeId {
             ExchangeId::Other => "other",
             ExchangeId::Simulated => "simulated",
             ExchangeId::Mock => "mock",
-            ExchangeId::Alpaca => "alpaca",
+            ExchangeId::AlpacaBroker => "alpaca_broker",
+            ExchangeId::AlpacaCrypto => "alpaca_crypto",
+            ExchangeId::AlpacaIex => "alpaca_iex",
+            ExchangeId::AlpacaSip => "alpaca_sip",
             ExchangeId::BinanceFuturesCoin => "binance_futures_coin",
             ExchangeId::BinanceFuturesUsd => "binance_futures_usd",
             ExchangeId::BinanceOptions => "binance_options",
@@ -114,6 +136,11 @@ impl ExchangeId {
             ExchangeId::Coinbase => "coinbase",
             ExchangeId::CoinbaseInternational => "coinbase_international",
             ExchangeId::Cryptocom => "cryptocom",
+            ExchangeId::DatabentoDbeq => "databento_dbeq",
+            ExchangeId::DatabentoGlbx => "databento_glbx",
+            ExchangeId::DatabentoOpra => "databento_opra",
+            ExchangeId::DatabentoXnas => "databento_xnas",
+            ExchangeId::DatabentoXnys => "databento_xnys",
             ExchangeId::Deribit => "deribit",
             ExchangeId::GateioFuturesBtc => "gateio_futures_btc",
             ExchangeId::GateioFuturesUsd => "gateio_futures_usd",
@@ -130,6 +157,7 @@ impl ExchangeId {
             ExchangeId::Kraken => "kraken",
             ExchangeId::Kucoin => "kucoin",
             ExchangeId::Liquid => "liquid",
+            ExchangeId::Massive => "massive",
             ExchangeId::Mexc => "mexc",
             ExchangeId::Okx => "okx",
             ExchangeId::Poloniex => "poloniex",

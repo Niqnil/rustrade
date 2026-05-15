@@ -140,10 +140,10 @@ impl ClosePositionsStrategy for MultiStrategy {
             .instruments
             .instruments(filter)
             .flat_map(move |state| {
-                // Only generate orders if we have a market price
-                let Some(price) = state.data.price() else {
+                // Only generate orders if we have a market price (sanity check for the instrument).
+                if state.data.price().is_none() {
                     return itertools::Either::Left(std::iter::empty());
-                };
+                }
 
                 // Generate a MARKET order to close StrategyA position
                 let close_position_a_request = state
@@ -157,7 +157,6 @@ impl ClosePositionsStrategy for MultiStrategy {
                             state.instrument.exchange,
                             position_a,
                             StrategyA::ID,
-                            price,
                             ClientOrderId::random,
                         )
                     });
@@ -174,7 +173,6 @@ impl ClosePositionsStrategy for MultiStrategy {
                             state.instrument.exchange,
                             position_b,
                             StrategyB::ID,
-                            price,
                             ClientOrderId::random,
                         )
                     });

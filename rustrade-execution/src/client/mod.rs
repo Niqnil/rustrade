@@ -1,9 +1,39 @@
+//! Execution client implementations for various exchanges.
+//!
+//! # Connector Comparison
+//!
+//! | Connector | Reconnect | Dedup | Fill Recovery | Heartbeat |
+//! |-----------|-----------|-------|---------------|-----------|
+//! | [`binance`] | Auto (1s→30s backoff) | 10k LRU | REST after reconnect | 30s |
+//! | [`alpaca`] | Auto (1s→30s backoff) | 2k LRU | REST after reconnect | 35s |
+//! | [`ibkr`] | Caller responsibility | N/A | Caller responsibility | N/A |
+//! | [`hyperliquid`] | SDK-managed | SDK-managed | N/A | SDK-managed |
+//!
+//! # Resilience Philosophy
+//!
+//! **WebSocket-based connectors** (Binance, Alpaca) implement auto-reconnection with
+//! fill recovery and deduplication. After reconnect, they query REST APIs for missed
+//! fills and deduplicate against the LRU cache to prevent duplicate processing.
+//!
+//! **IBKR** uses TCP to local TWS/Gateway. Reconnection requires IB Gateway availability
+//! and client ID coordination — decisions that belong in the caller's wrapper. See
+//! [`ibkr`] module docs for caller responsibilities.
+//!
+//! **Hyperliquid** delegates to the official SDK's `with_reconnect()` mechanism.
+//!
+//! # Known Limitations
+//!
+//! All connectors have a gap between reconnection and fill recovery: **order lifecycle
+//! events** (NEW, CANCELED, EXPIRED) during disconnect are NOT recovered. Callers must
+//! call [`ExecutionClient::fetch_open_orders`] after reconnect to reconcile state.
+
 use crate::{
     UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::AssetBalance,
     error::UnindexedClientError,
     order::{
         Order,
+        bracket::{BracketOrderRequest, BracketOrderResult},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Open, UnindexedOrderState},
     },
@@ -165,4 +195,91 @@ where
             UnindexedClientError,
         >,
     > + Send;
+}
+
+/// Extension trait for exchanges that support native bracket orders.
+///
+/// A bracket order consists of three linked orders:
+/// 1. **Entry**: Limit order to enter the position
+/// 2. **Take Profit**: Limit order to exit at profit target
+/// 3. **Stop Loss**: Stop (or stop-limit) order to exit at loss limit
+///
+/// When either exit leg fills, the exchange automatically cancels the other.
+///
+/// # Type-Level Capability
+///
+/// This is a supertrait of [`ExecutionClient`], enabling compile-time capability checks:
+/// - `impl ExecutionClient` — basic order operations
+/// - `impl ExecutionClient + BracketOrderClient` — includes bracket orders
+///
+/// This follows Rust idioms like `Read + Seek` or `Iterator + ExactSizeIterator`.
+///
+/// # Why Supertrait Over Alternatives
+///
+/// **vs. associated types on `ExecutionClient`**: Callers can't construct
+/// `Self::BracketRequest` without knowing the concrete type — adds trait surface
+/// without enabling generic use.
+///
+/// **vs. default impl returning `Unsupported`**: Puts a "dead method" on every
+/// client (MockClient, BinanceClient, HyperliquidClient). Compile-time capability
+/// via trait bounds is better than runtime errors.
+///
+/// # Result Types
+///
+/// [`BracketOrderResult`] uses `Option<Order>` for child legs to document API divergence:
+///
+/// | Exchange | `take_profit` | `stop_loss` | Reason |
+/// |----------|---------------|-------------|--------|
+/// | IBKR     | `Some(...)` | `Some(...)` | Returns all three orders immediately |
+/// | Alpaca   | `None` | `None` | Child legs created server-side |
+///
+/// # Example
+///
+/// ```ignore
+/// use rustrade_execution::client::{ExecutionClient, BracketOrderClient};
+/// use rustrade_execution::order::bracket::{BracketOrderRequest, RequestOpenBracket};
+///
+/// async fn place_bracket<C: ExecutionClient + BracketOrderClient>(
+///     client: &C,
+///     request: BracketOrderRequest<ExchangeId, &InstrumentNameExchange>,
+/// ) -> BracketOrderResult {
+///     client.open_bracket_order(request).await
+/// }
+/// ```
+pub trait BracketOrderClient: ExecutionClient {
+    /// Place a bracket order (entry + take-profit + stop-loss).
+    ///
+    /// # Request
+    ///
+    /// The [`BracketOrderRequest`] contains:
+    /// - `key`: Order key (exchange, instrument, strategy, client order ID)
+    /// - `state`: [`RequestOpenBracket`](crate::order::bracket::RequestOpenBracket) with
+    ///   side, quantity, prices, and optional stop-loss limit price
+    ///
+    /// # Constraints
+    ///
+    /// - `time_in_force` must be `Day` or `GoodUntilCancelled` on most exchanges
+    /// - Entry order type is always `Limit`
+    /// - Price ordering must be valid for the side (see [`RequestOpenBracket`](crate::order::bracket::RequestOpenBracket))
+    ///
+    /// # Exchange-Specific Field Handling
+    ///
+    /// `RequestOpenBracket::stop_loss_limit_price` is **not honored uniformly**:
+    /// - **Alpaca**: When `Some`, the stop-loss leg becomes a stop-limit order at that price.
+    /// - **IBKR**: Silently ignored — the stop-loss leg is always a stop (market) order.
+    ///
+    /// Generic callers `T: BracketOrderClient` must treat this field as advisory.
+    ///
+    /// # Return Value
+    ///
+    /// Returns [`BracketOrderResult`] with:
+    /// - `parent`: Always present (entry order)
+    /// - `take_profit`: `Some` if exchange returns legs immediately (IBKR), `None` otherwise (Alpaca)
+    /// - `stop_loss`: `Some` if exchange returns legs immediately (IBKR), `None` otherwise (Alpaca)
+    ///
+    /// Either all orders are `Active(Open)` or all are `Inactive` (placement failed).
+    fn open_bracket_order(
+        &self,
+        request: BracketOrderRequest<ExchangeId, &InstrumentNameExchange>,
+    ) -> impl Future<Output = BracketOrderResult> + Send;
 }

@@ -22,6 +22,7 @@ use crate::{
         consumer::{MarketStreamResult, STREAM_RECONNECTION_POLICY, init_market_stream},
         reconnect::stream::ReconnectingStream,
     },
+    subscriber::WebSocketSubscriber,
     subscription::{
         SubKind, Subscription,
         book::{OrderBookEvent, OrderBookL1, OrderBooksL1, OrderBooksL2},
@@ -81,7 +82,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
         SubIter: IntoIterator<Item = Sub>,
         Sub: Into<Subscription<ExchangeId, Instrument, SubKind>>,
         Instrument: InstrumentData<Key = InstrumentKey> + Ord + Display + 'static,
-        InstrumentKey: Debug + Clone + Send + 'static,
+        InstrumentKey: Debug + Clone + PartialEq + Send + Sync + 'static,
         Subscription<BinanceSpot, Instrument, PublicTrades>: Identifier<BinanceMarket>,
         Subscription<BinanceSpot, Instrument, OrderBooksL1>: Identifier<BinanceMarket>,
         Subscription<BinanceSpot, Instrument, OrderBooksL2>: Identifier<BinanceMarket>,
@@ -131,6 +132,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     (ExchangeId::BinanceSpot, SubKind::PublicTrades) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::new(
@@ -151,6 +153,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     (ExchangeId::BinanceSpot, SubKind::OrderBooksL1) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::new(
@@ -171,6 +174,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     (ExchangeId::BinanceSpot, SubKind::OrderBooksL2) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::new(
@@ -191,6 +195,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     (ExchangeId::BinanceFuturesUsd, SubKind::PublicTrades) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::new(
@@ -211,6 +216,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     (ExchangeId::BinanceFuturesUsd, SubKind::OrderBooksL1) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::<_, Instrument, _>::new(
@@ -231,6 +237,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     (ExchangeId::BinanceFuturesUsd, SubKind::OrderBooksL2) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::<_, Instrument, _>::new(
@@ -251,6 +258,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     (ExchangeId::BinanceFuturesUsd, SubKind::Liquidations) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::<_, Instrument, _>::new(
@@ -271,6 +279,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     (ExchangeId::Bitfinex, SubKind::PublicTrades) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::new(
@@ -291,6 +300,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     (ExchangeId::Bitmex, SubKind::PublicTrades) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::new(
@@ -311,6 +321,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     (ExchangeId::BybitSpot, SubKind::PublicTrades) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::new(
@@ -331,6 +342,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     (ExchangeId::BybitSpot, SubKind::OrderBooksL1) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::new(
@@ -351,6 +363,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     (ExchangeId::BybitSpot, SubKind::OrderBooksL2) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::new(
@@ -371,6 +384,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     (ExchangeId::BybitPerpetualsUsd, SubKind::PublicTrades) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::new(
@@ -391,6 +405,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     (ExchangeId::BybitPerpetualsUsd, SubKind::OrderBooksL1) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::new(
@@ -411,6 +426,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     (ExchangeId::BybitPerpetualsUsd, SubKind::OrderBooksL2) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::new(
@@ -431,6 +447,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     (ExchangeId::Coinbase, SubKind::PublicTrades) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::new(
@@ -451,6 +468,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     (ExchangeId::GateioSpot, SubKind::PublicTrades) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::new(
@@ -471,6 +489,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     (ExchangeId::GateioFuturesUsd, SubKind::PublicTrades) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::new(
@@ -491,6 +510,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     (ExchangeId::GateioFuturesBtc, SubKind::PublicTrades) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::new(
@@ -511,6 +531,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     (ExchangeId::GateioPerpetualsUsd, SubKind::PublicTrades) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::new(
@@ -531,6 +552,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     (ExchangeId::GateioPerpetualsBtc, SubKind::PublicTrades) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::new(
@@ -551,6 +573,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     (ExchangeId::GateioOptions, SubKind::PublicTrades) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::new(
@@ -571,6 +594,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     (ExchangeId::Kraken, SubKind::PublicTrades) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::new(
@@ -591,6 +615,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     (ExchangeId::Kraken, SubKind::OrderBooksL1) => {
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::new(
@@ -610,6 +635,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                     }
                                     (ExchangeId::Okx, SubKind::PublicTrades) => init_market_stream(
                                         STREAM_RECONNECTION_POLICY,
+                                        WebSocketSubscriber,
                                         subs.into_iter()
                                             .map(|sub| {
                                                 Subscription::new(Okx, sub.instrument, PublicTrades)

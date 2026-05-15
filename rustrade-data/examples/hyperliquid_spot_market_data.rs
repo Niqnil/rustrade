@@ -21,6 +21,7 @@ use futures_util::StreamExt;
 use rustrade_data::{
     exchange::hyperliquid::{HyperliquidSpot, resolve_spot_pair},
     streams::{Streams, reconnect::stream::ReconnectingStream},
+    subscriber::WebSocketSubscriber,
     subscription::{book::OrderBooksL2, trade::PublicTrades},
 };
 use rustrade_instrument::instrument::market_data::kind::MarketDataInstrumentKind;
@@ -42,26 +43,32 @@ async fn main() {
 
     // Subscribe to HYPE/USDC spot trades
     let trades = Streams::<PublicTrades>::builder()
-        .subscribe([(
-            HyperliquidSpot,
-            hype_usdc.as_str(),
-            "usdc",
-            MarketDataInstrumentKind::Spot,
-            PublicTrades,
-        )])
+        .subscribe(
+            WebSocketSubscriber,
+            [(
+                HyperliquidSpot,
+                hype_usdc.as_str(),
+                "usdc",
+                MarketDataInstrumentKind::Spot,
+                PublicTrades,
+            )],
+        )
         .init()
         .await
         .unwrap();
 
     // Subscribe to HYPE/USDC spot L2 order book
     let books = Streams::<OrderBooksL2>::builder()
-        .subscribe([(
-            HyperliquidSpot,
-            hype_usdc.as_str(),
-            "usdc",
-            MarketDataInstrumentKind::Spot,
-            OrderBooksL2,
-        )])
+        .subscribe(
+            WebSocketSubscriber,
+            [(
+                HyperliquidSpot,
+                hype_usdc.as_str(),
+                "usdc",
+                MarketDataInstrumentKind::Spot,
+                OrderBooksL2,
+            )],
+        )
         .init()
         .await
         .unwrap();

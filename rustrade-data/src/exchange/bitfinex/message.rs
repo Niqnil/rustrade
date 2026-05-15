@@ -132,6 +132,7 @@ impl<'de> serde::Deserialize<'de> for BitfinexMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
     use rustrade_instrument::Side;
     use rustrade_integration::{error::SocketError, serde::de::datetime_utc_from_epoch_duration};
     use std::time::Duration;
@@ -159,8 +160,8 @@ mod tests {
                             1665452200022,
                         )),
                         side: Side::Sell,
-                        price: 19027.02807752,
-                        amount: 0.08980641,
+                        price: dec!(19027.02807752),
+                        amount: dec!(0.08980641),
                     }),
                 }),
             },
@@ -175,8 +176,8 @@ mod tests {
                             1665452200022,
                         )),
                         side: Side::Buy,
-                        price: 19027.02807752,
-                        amount: 0.08980641,
+                        price: dec!(19027.02807752),
+                        amount: dec!(0.08980641),
                     }),
                 }),
             },

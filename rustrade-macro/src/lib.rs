@@ -84,7 +84,7 @@ pub fn de_sub_kind_derive(input: TokenStream) -> TokenStream {
     let expected_sub_kind = sub_kind
         .to_string()
         .from_case(Case::Pascal)
-        .without_boundaries(&Boundary::letter_digit())
+        .remove_boundaries(&Boundary::letter_digit())
         .to_case(Case::Snake);
 
     let generated = quote! {

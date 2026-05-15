@@ -139,14 +139,14 @@ fn test_engine_process_engine_event_with_audit() {
     assert_eq!(engine.state.connectivity.global, Health::Reconnecting);
 
     // Process 1st MarketEvent for btc_usdt
-    let event = market_event_trade(1, 0, 10_000.0);
+    let event = market_event_trade(1, 0, dec!(10_000));
     let audit = process_with_audit(&mut engine, event.clone());
     assert_eq!(audit.context.sequence, Sequence(1));
     assert_eq!(audit.event, EngineAudit::process(event));
     assert_eq!(engine.state.connectivity.global, Health::Healthy);
 
     // Process 1st MarketEvent for eth_btc
-    let event = market_event_trade(1, 1, 0.1);
+    let event = market_event_trade(1, 1, dec!(0.1));
     let audit = process_with_audit(&mut engine, event.clone());
     assert_eq!(audit.context.sequence, Sequence(2));
     assert_eq!(audit.event, EngineAudit::process(event));
@@ -166,7 +166,7 @@ fn test_engine_process_engine_event_with_audit() {
             side: Side::Buy,
             kind: OrderKind::Market,
             time_in_force: TimeInForce::ImmediateOrCancel,
-            price: dec!(10_000),
+            price: None,
             quantity: dec!(1),
             position_id: None,
             reduce_only: false,
@@ -183,7 +183,7 @@ fn test_engine_process_engine_event_with_audit() {
             side: Side::Buy,
             kind: OrderKind::Market,
             time_in_force: TimeInForce::ImmediateOrCancel,
-            price: dec!(0.1),
+            price: None,
             quantity: dec!(1),
             position_id: None,
             reduce_only: false,
@@ -232,7 +232,7 @@ fn test_engine_process_engine_event_with_audit() {
     );
 
     // Simulate OpenOrder response for Sequence(3) btc_usdt_buy_order
-    let event = account_event_order_response(0, 2, Side::Buy, 10_000.0, 1.0, 1.0);
+    let event = account_event_order_response(0, 2, Side::Buy, 1.0, 1.0);
     let audit = process_with_audit(&mut engine, event.clone());
     assert_eq!(audit.context.sequence, Sequence(5));
     assert_eq!(audit.event, EngineAudit::process(event));
@@ -288,7 +288,7 @@ fn test_engine_process_engine_event_with_audit() {
     );
 
     // Simulate OpenOrder response for Sequence(3) eth_btc_buy_order
-    let event = account_event_order_response(1, 2, Side::Buy, 0.1, 1.0, 1.0);
+    let event = account_event_order_response(1, 2, Side::Buy, 1.0, 1.0);
     let audit = process_with_audit(&mut engine, event.clone());
     assert_eq!(audit.context.sequence, Sequence(9));
     assert_eq!(audit.event, EngineAudit::process(event));
@@ -345,13 +345,13 @@ fn test_engine_process_engine_event_with_audit() {
     );
 
     // Process 2nd MarketEvent for btc_usdt
-    let event = market_event_trade(2, 0, 20_000.0);
+    let event = market_event_trade(2, 0, dec!(20_000));
     let audit = process_with_audit(&mut engine, event.clone());
     assert_eq!(audit.context.sequence, Sequence(13));
     assert_eq!(audit.event, EngineAudit::process(event));
 
     // Process 2nd MarketEvent for eth_btc
-    let event = market_event_trade(2, 1, 0.05);
+    let event = market_event_trade(2, 1, dec!(0.05));
     let audit = process_with_audit(&mut engine, event.clone());
     assert_eq!(audit.context.sequence, Sequence(14));
     assert_eq!(audit.event, EngineAudit::process(event));
@@ -373,7 +373,7 @@ fn test_engine_process_engine_event_with_audit() {
             side: Side::Sell,
             kind: OrderKind::Market,
             time_in_force: TimeInForce::ImmediateOrCancel,
-            price: dec!(20_000),
+            price: None,
             quantity: dec!(1),
             position_id: Some(PositionId::NETTING),
             reduce_only: true, // closing position
@@ -411,7 +411,7 @@ fn test_engine_process_engine_event_with_audit() {
                 cid: ClientOrderId::new("netting"),
             },
             side: Side::Sell,
-            price: dec!(20_000),
+            price: None,
             quantity: dec!(1),
             kind: OrderKind::Market,
             time_in_force: TimeInForce::ImmediateOrCancel,
@@ -533,7 +533,7 @@ fn test_engine_process_engine_event_with_audit() {
             side: Side::Sell,
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: true },
-            price: dec!(0.05),
+            price: Some(dec!(0.05)),
             quantity: dec!(1),
             position_id: None,
             reduce_only: true, // closing position
@@ -562,7 +562,7 @@ fn test_engine_process_engine_event_with_audit() {
     );
 
     // Simulate LIMIT OpenOrder response for Sequence(21) eth_btc_sell_order (0/1 quantity filled)
-    let event = account_event_order_response(1, 4, Side::Sell, 0.05, 1.0, 0.0);
+    let event = account_event_order_response(1, 4, Side::Sell, 1.0, 0.0);
     let audit = process_with_audit(&mut engine, event.clone());
     assert_eq!(audit.context.sequence, Sequence(22));
     assert_eq!(audit.event, EngineAudit::process(event));
@@ -593,7 +593,7 @@ fn test_engine_process_engine_event_with_audit() {
                 cid: gen_cid(1),
             },
             side: Side::Sell,
-            price: dec!(0.05),
+            price: Some(dec!(0.05)),
             quantity: dec!(1),
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: true },
@@ -634,7 +634,7 @@ fn test_engine_process_engine_event_with_audit() {
                 cid: gen_cid(1),
             },
             side: Side::Sell,
-            price: dec!(0.05),
+            price: Some(dec!(0.05)),
             quantity: dec!(1),
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: true },
@@ -772,7 +772,7 @@ impl AlgoStrategy for TestBuyAndHoldStrategy {
                 }
 
                 // Don't open if there is no instrument market price available
-                let price = state.data.price()?;
+                state.data.price()?;
 
                 // Generate Market order to buy the minimum allowed quantity
                 Some(OrderRequestOpen {
@@ -786,7 +786,7 @@ impl AlgoStrategy for TestBuyAndHoldStrategy {
                         side: Side::Buy,
                         kind: OrderKind::Market,
                         time_in_force: TimeInForce::ImmediateOrCancel,
-                        price,
+                        price: None, // Market orders don't have a limit price
                         quantity: dec!(1),
                         position_id: None,
                         reduce_only: false,
@@ -969,7 +969,7 @@ fn account_event_snapshot(assets: &AssetStates) -> EngineEvent<DataKind> {
     }))
 }
 
-fn market_event_trade(time_plus: u64, instrument: usize, price: f64) -> EngineEvent<DataKind> {
+fn market_event_trade(time_plus: u64, instrument: usize, price: Decimal) -> EngineEvent<DataKind> {
     EngineEvent::Market(MarketStreamEvent::Item(MarketEvent {
         time_exchange: time_plus_days(STARTING_TIMESTAMP, time_plus),
         time_received: time_plus_days(STARTING_TIMESTAMP, time_plus),
@@ -978,8 +978,8 @@ fn market_event_trade(time_plus: u64, instrument: usize, price: f64) -> EngineEv
         kind: DataKind::Trade(PublicTrade {
             id: time_plus.to_string().into(),
             price,
-            amount: 1.0,
-            side: Side::Buy,
+            amount: Decimal::ONE,
+            side: Some(Side::Buy),
         }),
     }))
 }
@@ -988,7 +988,6 @@ fn account_event_order_response(
     instrument: usize,
     time_plus: u64,
     side: Side,
-    price: f64,
     quantity: f64,
     filled: f64,
 ) -> EngineEvent<DataKind> {
@@ -1002,7 +1001,7 @@ fn account_event_order_response(
                 cid: gen_cid(instrument),
             },
             side,
-            price: Decimal::try_from(price).unwrap(),
+            price: None, // Market orders don't have a limit price
             quantity: Decimal::try_from(quantity).unwrap(),
             kind: OrderKind::Market,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: true },
@@ -1139,13 +1138,13 @@ fn build_option_engine(
 }
 
 /// Send a market trade event to set the spot price for instrument at index `instrument`.
-fn send_spot_price(engine: &mut TestEngine, instrument: usize, price: f64) {
+fn send_spot_price(engine: &mut TestEngine, instrument: usize, price: Decimal) {
     let event = market_event_trade(1, instrument, price);
     engine.process(event);
 }
 
 /// Open a long position in the option instrument (index 0) by sending a buy trade.
-fn open_option_position(engine: &mut TestEngine, quantity: f64, price: f64) {
+fn open_option_position(engine: &mut TestEngine, quantity: Decimal, price: Decimal) {
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
         kind: AccountEventKind::Trade(Trade {
@@ -1155,8 +1154,8 @@ fn open_option_position(engine: &mut TestEngine, quantity: f64, price: f64) {
             strategy: strategy_id(),
             time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
             side: Side::Buy,
-            price: Decimal::try_from(price).unwrap(),
-            quantity: Decimal::try_from(quantity).unwrap(),
+            price,
+            quantity,
             // Option instrument quote is USD = AssetIndex(1) in option engine
             fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
         }),
@@ -1170,10 +1169,10 @@ fn test_contract_expiry_otm_call() {
     let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
 
     // Set underlying spot price BELOW strike (50_000) → OTM (spot is at index 1)
-    send_spot_price(&mut engine, 1, 45_000.0);
+    send_spot_price(&mut engine, 1, dec!(45_000));
 
     // Open a long call position with 2 contracts at premium 1_000
-    open_option_position(&mut engine, 2.0, 1_000.0);
+    open_option_position(&mut engine, dec!(2), dec!(1_000));
 
     // Verify position exists before expiry (option is at index 0)
     assert!(
@@ -1221,10 +1220,10 @@ fn test_contract_expiry_itm_call() {
 
     // Set underlying spot price ABOVE strike (50_000) → ITM (spot is at index 1)
     // Intrinsic value = spot - strike = 55_000 - 50_000 = 5_000
-    send_spot_price(&mut engine, 1, 55_000.0);
+    send_spot_price(&mut engine, 1, dec!(55_000));
 
     // Open a long call position with 1 contract at premium 2_000
-    open_option_position(&mut engine, 1.0, 2_000.0);
+    open_option_position(&mut engine, dec!(1), dec!(2_000));
 
     let exited = engine.process_contract_expiry(&InstrumentIndex(0));
 
@@ -1258,8 +1257,8 @@ fn test_contract_expiry_idempotent() {
     let (execution_tx, _execution_rx) = mpsc_unbounded();
     let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
 
-    send_spot_price(&mut engine, 1, 45_000.0);
-    open_option_position(&mut engine, 1.0, 1_000.0);
+    send_spot_price(&mut engine, 1, dec!(45_000));
+    open_option_position(&mut engine, dec!(1), dec!(1_000));
 
     // First expiry processes the position
     let exited_first = engine.process_contract_expiry(&InstrumentIndex(0));
@@ -1282,7 +1281,7 @@ fn test_contract_expiry_no_position() {
     let (execution_tx, _execution_rx) = mpsc_unbounded();
     let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
 
-    send_spot_price(&mut engine, 1, 45_000.0);
+    send_spot_price(&mut engine, 1, dec!(45_000));
 
     // No position open — expiry should still mark as processed
     let exited = engine.process_contract_expiry(&InstrumentIndex(0));
@@ -1304,7 +1303,7 @@ fn test_contract_expiry_missing_spot_price() {
     // Do NOT send any market data for the spot instrument
 
     // Open a position so expiry has something to settle
-    open_option_position(&mut engine, 1.0, 1_000.0);
+    open_option_position(&mut engine, dec!(1), dec!(1_000));
 
     // Without spot price, expiry cannot compute settlement — returns empty
     let exited = engine.process_contract_expiry(&InstrumentIndex(0));
@@ -1331,8 +1330,8 @@ fn test_contract_expiry_replica_state_cleared() {
     let (execution_tx, _execution_rx) = mpsc_unbounded();
     let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
 
-    send_spot_price(&mut engine, 1, 45_000.0);
-    open_option_position(&mut engine, 1.0, 1_000.0);
+    send_spot_price(&mut engine, 1, dec!(45_000));
+    open_option_position(&mut engine, dec!(1), dec!(1_000));
 
     // Process ContractExpiry on the live engine to get the real audit outputs.
     let expiry_event = EngineEvent::ContractExpiry(InstrumentIndex(0));
@@ -1341,8 +1340,8 @@ fn test_contract_expiry_replica_state_cleared() {
     // Build a separate replica state that mirrors the pre-expiry state.
     let (execution_tx2, _) = mpsc_unbounded();
     let mut replica_engine = build_option_engine(TradingState::Disabled, execution_tx2);
-    send_spot_price(&mut replica_engine, 1, 45_000.0);
-    open_option_position(&mut replica_engine, 1.0, 1_000.0);
+    send_spot_price(&mut replica_engine, 1, dec!(45_000));
+    open_option_position(&mut replica_engine, dec!(1), dec!(1_000));
 
     let seed_context = EngineContext {
         time: STARTING_TIMESTAMP,
@@ -1468,7 +1467,12 @@ fn build_put_option_engine(
 }
 
 /// Open a long or short option position at instrument index 0.
-fn open_option_position_side(engine: &mut TestEngine, side: Side, quantity: f64, price: f64) {
+fn open_option_position_side(
+    engine: &mut TestEngine,
+    side: Side,
+    quantity: Decimal,
+    price: Decimal,
+) {
     let trade_id = match side {
         Side::Buy => TradeId::new("opt-trade-open-buy"),
         Side::Sell => TradeId::new("opt-trade-open-sell"),
@@ -1482,8 +1486,8 @@ fn open_option_position_side(engine: &mut TestEngine, side: Side, quantity: f64,
             strategy: strategy_id(),
             time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
             side,
-            price: Decimal::try_from(price).unwrap(),
-            quantity: Decimal::try_from(quantity).unwrap(),
+            price,
+            quantity,
             // Put option instrument quote is USD = AssetIndex(1)
             fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
         }),
@@ -1498,8 +1502,8 @@ fn test_contract_expiry_itm_put() {
 
     // Spot BELOW strike (50_000) → ITM for put.
     // Intrinsic value = strike - spot = 50_000 - 45_000 = 5_000
-    send_spot_price(&mut engine, 1, 45_000.0);
-    open_option_position(&mut engine, 1.0, 2_000.0); // bought at 2_000 premium
+    send_spot_price(&mut engine, 1, dec!(45_000));
+    open_option_position(&mut engine, dec!(1), dec!(2_000)); // bought at 2_000 premium
 
     let exited = engine.process_contract_expiry(&InstrumentIndex(0));
 
@@ -1531,8 +1535,8 @@ fn test_contract_expiry_otm_put() {
     let mut engine = build_put_option_engine(TradingState::Disabled, execution_tx);
 
     // Spot ABOVE strike → OTM for put → settlement = 0
-    send_spot_price(&mut engine, 1, 55_000.0);
-    open_option_position(&mut engine, 1.0, 2_000.0);
+    send_spot_price(&mut engine, 1, dec!(55_000));
+    open_option_position(&mut engine, dec!(1), dec!(2_000));
 
     let exited = engine.process_contract_expiry(&InstrumentIndex(0));
 
@@ -1553,8 +1557,8 @@ fn test_contract_expiry_short_call_itm() {
     // Spot ABOVE strike (50_000) → ITM for call.
     // Intrinsic = 55_000 - 50_000 = 5_000
     // Short writer must "pay" intrinsic at settlement: pnl = premium_received - intrinsic
-    send_spot_price(&mut engine, 1, 55_000.0);
-    open_option_position_side(&mut engine, Side::Sell, 1.0, 2_000.0); // sold at 2_000 premium
+    send_spot_price(&mut engine, 1, dec!(55_000));
+    open_option_position_side(&mut engine, Side::Sell, dec!(1), dec!(2_000)); // sold at 2_000 premium
 
     let exited = engine.process_contract_expiry(&InstrumentIndex(0));
 
@@ -1571,8 +1575,8 @@ fn test_contract_expiry_short_call_otm() {
     let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
 
     // Spot BELOW strike → OTM → settlement = 0 → short writer keeps full premium
-    send_spot_price(&mut engine, 1, 45_000.0);
-    open_option_position_side(&mut engine, Side::Sell, 1.0, 2_000.0);
+    send_spot_price(&mut engine, 1, dec!(45_000));
+    open_option_position_side(&mut engine, Side::Sell, dec!(1), dec!(2_000));
 
     let exited = engine.process_contract_expiry(&InstrumentIndex(0));
 
@@ -1667,7 +1671,7 @@ fn send_open_order_with_position_id(
             side,
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-            price,
+            price: Some(price),
             quantity: dec!(1),
             position_id: Some(position_id),
             reduce_only,
@@ -1695,7 +1699,7 @@ fn send_order_ack(
                 cid,
             },
             side,
-            price: dec!(1_000),
+            price: Some(dec!(1_000)),
             quantity: dec!(1),
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
@@ -1752,7 +1756,7 @@ fn send_fully_filled_snapshot(engine: &mut HedgingTestEngine, cid: ClientOrderId
                 cid,
             },
             side: Side::Buy, // side is unused by the terminal-state transition
-            price: dec!(0),
+            price: Some(dec!(0)),
             quantity: dec!(1),
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
@@ -1911,7 +1915,7 @@ fn test_contract_expiry_hedging_multi_position() {
     let mut engine = build_hedging_option_engine(TradingState::Disabled, execution_tx);
 
     // Set spot price above strike → ITM, intrinsic = 5_000
-    send_spot_price(&mut engine, 1, 55_000.0);
+    send_spot_price(&mut engine, 1, dec!(55_000));
 
     // Open two independent long positions (leg-a and leg-b).
     let cid_a = ClientOrderId::new("cid-a");
@@ -2040,7 +2044,7 @@ fn test_fee_model_zero_no_fees_on_trade() {
     let (execution_tx, _) = mpsc_unbounded();
     let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
     // Default fee model is Zero — exchange-reported zero fees stay zero.
-    open_option_position(&mut engine, 1.0, 1_000.0);
+    open_option_position(&mut engine, dec!(1), dec!(1_000));
 
     let instr = engine
         .state
@@ -2214,7 +2218,7 @@ fn test_contract_expiry_clears_pending_fills() {
     assert_eq!(instr.pending_fills.len(), 1, "setup: pending fill exists");
 
     // Set spot price for ITM settlement and trigger expiry.
-    send_spot_price(&mut engine, 1, 55_000.0); // ITM for strike 50_000
+    send_spot_price(&mut engine, 1, dec!(55_000)); // ITM for strike 50_000
 
     let expiry_event = EngineEvent::ContractExpiry(InstrumentIndex(0));
     engine.process(expiry_event);

@@ -26,6 +26,7 @@
 use crate::{error::DataError, subscription::candle::Candle};
 use chrono::{DateTime, TimeZone, Utc};
 use hyperliquid_rust_sdk::{BaseUrl, InfoClient};
+use rust_decimal::Decimal;
 use tracing::debug;
 
 /// Historical data fetcher for Hyperliquid.
@@ -230,23 +231,23 @@ fn sdk_candle_to_candle(
 
     let open = sdk
         .open
-        .parse::<f64>()
+        .parse::<Decimal>()
         .map_err(|e| DataError::Socket(format!("parse open: {e}")))?;
     let high = sdk
         .high
-        .parse::<f64>()
+        .parse::<Decimal>()
         .map_err(|e| DataError::Socket(format!("parse high: {e}")))?;
     let low = sdk
         .low
-        .parse::<f64>()
+        .parse::<Decimal>()
         .map_err(|e| DataError::Socket(format!("parse low: {e}")))?;
     let close = sdk
         .close
-        .parse::<f64>()
+        .parse::<Decimal>()
         .map_err(|e| DataError::Socket(format!("parse close: {e}")))?;
     let volume = sdk
         .vlm
-        .parse::<f64>()
+        .parse::<Decimal>()
         .map_err(|e| DataError::Socket(format!("parse volume: {e}")))?;
 
     Ok(Candle {
@@ -290,6 +291,8 @@ mod tests {
 
     #[test]
     fn test_sdk_candle_to_candle() {
+        use rust_decimal_macros::dec;
+
         let sdk_candle = hyperliquid_rust_sdk::CandlesSnapshotResponse {
             time_open: 1704067200000,
             time_close: 1704070800000,
@@ -305,11 +308,11 @@ mod tests {
 
         let candle = sdk_candle_to_candle(&sdk_candle).unwrap();
 
-        assert_eq!(candle.open, 45000.5);
-        assert_eq!(candle.high, 45500.0);
-        assert_eq!(candle.low, 44800.0);
-        assert_eq!(candle.close, 45250.0);
-        assert_eq!(candle.volume, 1234.56);
+        assert_eq!(candle.open, dec!(45000.5));
+        assert_eq!(candle.high, dec!(45500.0));
+        assert_eq!(candle.low, dec!(44800.0));
+        assert_eq!(candle.close, dec!(45250.0));
+        assert_eq!(candle.volume, dec!(1234.56));
         assert_eq!(candle.trade_count, 5000);
     }
 }

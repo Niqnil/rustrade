@@ -41,8 +41,12 @@ pub type MarketStreamEvent<InstrumentKey, Kind> =
 ///
 /// The provided [`ReconnectionBackoffPolicy`] dictates how the exponential backoff scales
 /// between reconnections.
+///
+/// The `subscriber` is cloned into the reconnect closure, so authenticated subscribers
+/// will have their credentials available on reconnection.
 pub async fn init_market_stream<Exchange, Instrument, Kind>(
     policy: ReconnectionBackoffPolicy,
+    subscriber: Exchange::Subscriber,
     subscriptions: Vec<Subscription<Exchange, Instrument, Kind>>,
 ) -> Result<impl Stream<Item = MarketStreamResult<Instrument::Key, Kind::Event>>, DataError>
 where
@@ -69,14 +73,19 @@ where
         "MarketStream with auto reconnect initialising"
     );
 
-    Ok(init_reconnecting_stream(move || {
-        let subscriptions = subscriptions.clone();
-        async move { Exchange::Stream::init::<Exchange::SnapFetcher>(&subscriptions).await }
-    })
-    .await?
-    .with_reconnect_backoff(policy, stream_key)
-    .with_termination_on_error(|error| error.is_terminal(), stream_key)
-    .with_reconnection_events(exchange))
+    Ok(
+        init_reconnecting_stream(move || {
+            let subscriber = subscriber.clone();
+            let subscriptions = subscriptions.clone();
+            async move {
+                Exchange::Stream::init::<Exchange::SnapFetcher>(&subscriber, &subscriptions).await
+            }
+        })
+        .await?
+        .with_reconnect_backoff(policy, stream_key)
+        .with_termination_on_error(|error| error.is_terminal(), stream_key)
+        .with_reconnection_events(exchange),
+    )
 }
 
 #[derive(

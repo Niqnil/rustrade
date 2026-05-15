@@ -198,7 +198,7 @@ async fn test_spot_fetch_open_orders() {
     println!("Open spot orders: {}", orders.len());
     for order in &orders {
         println!(
-            "  {:?} {} {} @ {}",
+            "  {:?} {} {} @ {:?}",
             order.side, order.quantity, order.key.instrument, order.price
         );
     }
@@ -275,7 +275,7 @@ async fn test_spot_place_and_cancel_limit_order() {
     // 1 HYPE @ $60 = $60 notional (above $10 minimum)
     let request_open = RequestOpen {
         side: Side::Buy,
-        price: dec!(60.0),
+        price: Some(dec!(60.0)),
         quantity: dec!(1.0),
         kind: OrderKind::Limit,
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
@@ -368,7 +368,7 @@ async fn test_spot_minimum_notional_validation() {
     // Order below $10 minimum: 0.1 HYPE @ $60 = $6 notional
     let request_open = RequestOpen {
         side: Side::Buy,
-        price: dec!(60.0),
+        price: Some(dec!(60.0)),
         quantity: dec!(0.1),
         kind: OrderKind::Limit,
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
@@ -496,7 +496,7 @@ async fn test_spot_account_stream_with_order() {
     // 1 HYPE @ $60 = $60 notional (above minimum, within 80% of testnet market ~$90)
     let request_open = RequestOpen {
         side: Side::Buy,
-        price: dec!(60.0),
+        price: Some(dec!(60.0)),
         quantity: dec!(1.0),
         kind: OrderKind::Limit,
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },

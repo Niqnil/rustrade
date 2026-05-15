@@ -8,6 +8,7 @@ use crate::{
     exchange::StreamSelector,
     instrument::InstrumentData,
     streams::{Streams, consumer::MarketStreamEvent, reconnect::stream::ReconnectingStream},
+    subscriber::WebSocketSubscriber,
     subscription::{
         Subscription,
         book::{OrderBookEvent, OrderBooksL2},
@@ -82,7 +83,12 @@ where
     SubBatchIter: IntoIterator<Item = SubIter>,
     SubIter: IntoIterator<Item = Sub>,
     Sub: Into<Subscription<Exchange, Instrument, OrderBooksL2>>,
-    Exchange: StreamSelector<Instrument, OrderBooksL2> + Ord + Display + Send + Sync + 'static,
+    Exchange: StreamSelector<Instrument, OrderBooksL2, Subscriber = WebSocketSubscriber>
+        + Ord
+        + Display
+        + Send
+        + Sync
+        + 'static,
     Instrument: InstrumentData + Ord + Display + 'static,
     Instrument::Key: Eq + Hash + Send + 'static,
     Subscription<Exchange, Instrument, OrderBooksL2>:
@@ -102,7 +108,7 @@ where
                 subscription
             });
 
-            let builder = builder.subscribe(batch);
+            let builder = builder.subscribe(WebSocketSubscriber, batch);
             (builder, books)
         },
     );

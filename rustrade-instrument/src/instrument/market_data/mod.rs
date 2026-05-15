@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 
 pub mod kind;
+pub mod option_chain;
+
+pub use option_chain::{OptionChainDescriptor, OptionChainError};
 
 /// Barter representation of an `MarketDataInstrument`. Used to uniquely identify a `base_quote`
 /// pair, and it's associated instrument type.

@@ -44,6 +44,18 @@ pub mod hyperliquid;
 #[cfg(feature = "ibkr")]
 pub mod ibkr;
 
+/// `Alpaca` market data stream (behind `alpaca` feature).
+#[cfg(feature = "alpaca")]
+pub mod alpaca;
+
+/// `Databento` historical and live market data (behind `databento` feature).
+#[cfg(feature = "databento")]
+pub mod databento;
+
+/// `Massive` (formerly Polygon.io) market data (behind `massive` feature).
+#[cfg(feature = "massive")]
+pub mod massive;
+
 /// Defines the generic [`ExchangeSub`] containing a market and channel combination used by an
 /// exchange [`Connector`] to build [`WsMessage`] subscription payloads.
 pub mod subscription;

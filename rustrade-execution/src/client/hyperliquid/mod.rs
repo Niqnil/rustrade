@@ -19,10 +19,24 @@
 //! - REST (`ExchangeClient`): open_order, cancel_order
 //! - WebSocket (`InfoClient` with `with_reconnect`): account_stream via UserFills + OrderUpdates subscriptions
 //!
+//! # SDK Delegation Model
+//!
+//! This client delegates connection management to the official `hyperliquid_rust_sdk`:
+//!
+//! | Responsibility | Implementation |
+//! |----------------|----------------|
+//! | **Reconnection** | `InfoClient::with_reconnect()` handles WebSocket reconnection automatically |
+//! | **Heartbeat** | SDK manages WebSocket ping/pong internally |
+//! | **Deduplication** | SDK-managed; no custom dedup cache needed |
+//! | **Fill recovery** | Not implemented — use [`ExecutionClient::fetch_trades`] after reconnect if needed |
+//!
+//! **Caller responsibilities**:
+//! - If fill recovery is critical, monitor for reconnection events and call `fetch_trades()`
+//! - REST clients (`InfoClient::new()`, `ExchangeClient::new()`) do NOT auto-reconnect;
+//!   only WebSocket streams via `with_reconnect()` do
+//!
 //! # Limitations
 //!
-//! - **SDK-managed reconnect**: WebSocket streams use `InfoClient::with_reconnect()` for automatic
-//!   reconnection. REST clients (`InfoClient::new()`, `ExchangeClient::new()`) do not auto-reconnect.
 //! - **Price precision**: Hyperliquid requires 5 significant figures for prices
 
 pub mod common;
@@ -283,7 +297,7 @@ impl ExecutionClient for HyperliquidClient {
                     cid: ClientOrderId::new(order_id.clone()),
                 },
                 side,
-                price,
+                price: Some(price),
                 quantity,
                 kind: OrderKind::Limit,
                 time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
@@ -630,8 +644,33 @@ impl ExecutionClient for HyperliquidClient {
         let coin = instrument_to_perp_coin(request.key.instrument);
         let is_buy = request.state.side == Side::Buy;
 
+        // Hyperliquid only supports Limit orders, so price is required
+        let price = match request.state.price {
+            Some(p) => p,
+            None => {
+                return Some(Order {
+                    key: OrderKey {
+                        exchange: ExchangeId::HyperliquidPerp,
+                        instrument: request.key.instrument.clone(),
+                        strategy: request.key.strategy.clone(),
+                        cid: request.key.cid.clone(),
+                    },
+                    side: request.state.side,
+                    price: None,
+                    quantity: request.state.quantity,
+                    kind: request.state.kind,
+                    time_in_force: request.state.time_in_force,
+                    state: OrderState::inactive(OrderError::Rejected(
+                        crate::error::ApiError::OrderRejected(
+                            "Hyperliquid requires limit price for all orders".to_owned(),
+                        ),
+                    )),
+                });
+            }
+        };
+
         // Round price and quantity to 5 significant figures
-        let limit_px = round_to_5_sig_figs(request.state.price);
+        let limit_px = round_to_5_sig_figs(price);
         let sz = round_to_5_sig_figs(request.state.quantity);
 
         // Map time-in-force (warn if FOK is substituted with IOC)
@@ -850,7 +889,7 @@ impl ExecutionClient for HyperliquidClient {
                     cid: ClientOrderId::new(order_id.clone()),
                 },
                 side,
-                price,
+                price: Some(price),
                 quantity,
                 kind: OrderKind::Limit,
                 time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
@@ -1036,7 +1075,7 @@ fn order_update_to_account_event(
             cid,
         },
         side,
-        price,
+        price: Some(price),
         quantity: orig_sz,
         kind: OrderKind::Limit,
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
@@ -1151,7 +1190,7 @@ mod tests {
             AccountEventKind::OrderSnapshot(Snapshot(order)) => {
                 assert_eq!(order.key.instrument.as_ref(), "BTC-USD-PERP");
                 assert_eq!(order.side, Side::Buy);
-                assert_eq!(order.price, dec!(64000));
+                assert_eq!(order.price, Some(dec!(64000)));
                 assert_eq!(order.quantity, dec!(0.5));
                 assert!(matches!(
                     order.state,
