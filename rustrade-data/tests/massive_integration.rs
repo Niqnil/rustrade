@@ -21,6 +21,8 @@
 //! | WebSocket (stocks) | ❌ | Requires stocks subscription |
 //! | Reference data | ✅ | Free tier |
 //! | Corporate actions (dividends, splits) | ✅ | Free tier |
+//! | Options contracts (reference) | ✅ | Free tier |
+//! | Options snapshots (Greeks) | ❌ | Requires Options Starter subscription |
 //!
 //! Transformation logic is tested via unit tests in `transformer.rs`. Network
 //! integration for untested endpoints has not been verified against real data.
@@ -73,10 +75,13 @@
 use chrono::{Duration, Utc};
 use futures_util::StreamExt;
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use rustrade_data::exchange::massive::{
-    ChannelType, DividendQuery, Market, MassiveLive, MassiveRestClient, SplitQuery, TickerQuery,
+    ChannelType, DividendQuery, Market, MassiveLive, MassiveRestClient, OptionContractQuery,
+    OptionSnapshotQuery, SplitQuery, TickerQuery,
 };
 use rustrade_instrument::exchange::ExchangeId;
+use rustrade_instrument::instrument::kind::option::OptionKind;
 use serial_test::serial;
 use std::collections::HashMap;
 use std::pin::pin;
@@ -913,4 +918,175 @@ async fn test_corporate_actions_splits_specific_ticker() {
     }
 
     tracing::info!(count = splits.len(), "Fetched NVDA splits");
+}
+
+// ============================================================================
+// Options Reference Data Tests
+// ============================================================================
+
+#[tokio::test]
+#[ignore]
+async fn test_options_contracts() {
+    init_logging();
+
+    let client = MassiveRestClient::from_env().expect("Failed to create client");
+
+    // Query AAPL call options
+    let query = OptionContractQuery::new()
+        .underlying_ticker("AAPL")
+        .limit(10);
+
+    tracing::info!("Fetching AAPL option contracts");
+
+    let contracts = client
+        .fetch_option_contracts(&query)
+        .await
+        .expect("Failed to fetch contracts");
+
+    assert!(!contracts.is_empty(), "Should have received contracts");
+
+    for contract in &contracts {
+        assert_eq!(contract.underlying_ticker, "AAPL");
+        assert!(
+            contract.strike_price > Decimal::ZERO,
+            "Strike should be positive"
+        );
+
+        tracing::info!(
+            ticker = %contract.ticker,
+            underlying = %contract.underlying_ticker,
+            contract_type = %contract.contract_type,
+            expiration = %contract.expiration_date,
+            strike = %contract.strike_price,
+            exercise = %contract.exercise_style,
+            "Option contract"
+        );
+    }
+
+    tracing::info!(count = contracts.len(), "Fetched option contracts");
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_options_contracts_filtered() {
+    init_logging();
+
+    let client = MassiveRestClient::from_env().expect("Failed to create client");
+
+    // Query AAPL call options with strike range
+    let query = OptionContractQuery::new()
+        .underlying_ticker("AAPL")
+        .contract_type(OptionKind::Call)
+        .strike_price_gte(dec!(150))
+        .strike_price_lte(dec!(200))
+        .limit(20);
+
+    tracing::info!("Fetching filtered AAPL call options (strike 150-200)");
+
+    let contracts = client
+        .fetch_option_contracts(&query)
+        .await
+        .expect("Failed to fetch contracts");
+
+    for contract in &contracts {
+        assert_eq!(contract.underlying_ticker, "AAPL");
+        assert!(
+            contract.strike_price >= dec!(150),
+            "Strike should be >= 150"
+        );
+        assert!(
+            contract.strike_price <= dec!(200),
+            "Strike should be <= 200"
+        );
+
+        tracing::info!(
+            ticker = %contract.ticker,
+            strike = %contract.strike_price,
+            expiration = %contract.expiration_date,
+            "Filtered option contract"
+        );
+    }
+
+    tracing::info!(count = contracts.len(), "Fetched filtered option contracts");
+}
+
+/// Options chain snapshot test - requires Options Starter subscription
+#[tokio::test]
+#[ignore]
+async fn test_options_chain_snapshot() {
+    init_logging();
+
+    let client = MassiveRestClient::from_env().expect("Failed to create client");
+
+    let query = OptionSnapshotQuery::new().limit(5);
+
+    tracing::info!("Fetching AAPL option chain snapshot");
+
+    let snapshots = client
+        .fetch_option_chain_snapshot("AAPL", &query)
+        .await
+        .expect("Failed to fetch chain snapshot");
+
+    for snapshot in &snapshots {
+        tracing::info!(
+            ticker = %snapshot.contract.ticker,
+            strike = %snapshot.contract.strike_price,
+            iv = ?snapshot.implied_volatility,
+            delta = ?snapshot.greeks.as_ref().and_then(|g| g.delta),
+            gamma = ?snapshot.greeks.as_ref().and_then(|g| g.gamma),
+            theta = ?snapshot.greeks.as_ref().and_then(|g| g.theta),
+            vega = ?snapshot.greeks.as_ref().and_then(|g| g.vega),
+            "Option snapshot"
+        );
+    }
+
+    tracing::info!(count = snapshots.len(), "Fetched option chain snapshot");
+}
+
+/// Single option snapshot test - requires Options Starter subscription
+#[tokio::test]
+#[ignore]
+async fn test_option_single_snapshot() {
+    init_logging();
+
+    let client = MassiveRestClient::from_env().expect("Failed to create client");
+
+    // First, find a valid contract ticker
+    let query = OptionContractQuery::new()
+        .underlying_ticker("AAPL")
+        .limit(1);
+
+    let contracts = match client.fetch_option_contracts(&query).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to fetch contract ticker");
+            return;
+        }
+    };
+
+    if contracts.is_empty() {
+        tracing::warn!("No AAPL options found, skipping test");
+        return;
+    }
+
+    let contract_ticker = &contracts[0].ticker;
+
+    tracing::info!(%contract_ticker, "Fetching single option snapshot");
+
+    match client.fetch_option_snapshot("AAPL", contract_ticker).await {
+        Ok(snapshot) => {
+            tracing::info!(
+                ticker = %snapshot.contract.ticker,
+                strike = %snapshot.contract.strike_price,
+                iv = ?snapshot.implied_volatility,
+                open_interest = ?snapshot.open_interest,
+                break_even = ?snapshot.break_even_price,
+                delta = ?snapshot.greeks.as_ref().and_then(|g| g.delta),
+                "Single option snapshot"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to fetch option snapshot (may require subscription)");
+        }
+    }
 }

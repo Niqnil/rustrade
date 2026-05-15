@@ -14,13 +14,15 @@
 //! - ✅ WebSocket streaming (crypto)
 //! - ✅ Reference data (tickers, exchanges, market status, holidays)
 //! - ✅ Corporate actions (dividends, splits)
+//! - ✅ Options contracts reference data (free tier)
+//! - ❌ Options snapshots with Greeks — requires Options Starter subscription
 //! - ❌ REST aggregates (indices) — requires indices subscription
 //! - ❌ REST tick trades (stocks) — requires stocks subscription
 //! - ❌ REST quotes (stocks) — requires stocks subscription
 //! - ❌ WebSocket (stocks) — requires stocks subscription
 //!
-//! Unit tests for JSON transformation live inline in `reference.rs` and `transformer.rs`.
-//! Live API integration tests are in `tests/massive_integration.rs`.
+//! Unit tests for JSON transformation live inline in `reference.rs`, `options.rs`,
+//! and `transformer.rs`. Live API integration tests are in `tests/massive_integration.rs`.
 //!
 //! # Architecture
 //!
@@ -76,12 +78,17 @@
 
 mod error;
 pub(crate) mod live;
+pub(crate) mod options;
 pub(crate) mod reference;
 pub(crate) mod rest;
 pub(crate) mod transformer;
 
 pub use error::MassiveError;
 pub use live::{ChannelType, Market, MassiveLive};
+pub use options::{
+    MassiveOptionContract, MassiveOptionSnapshot, OptionContractQuery, OptionDayBar, OptionQuote,
+    OptionSnapshotQuery, OptionTrade, UnderlyingAsset,
+};
 pub use reference::{
     Address, CurrencyStatus, Dividend, DividendFrequency, DividendQuery, Exchange, MarketHoliday,
     MarketStatus, SortOrder, SplitQuery, StockSplit, Ticker, TickerDetails, TickerQuery,

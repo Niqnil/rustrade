@@ -33,6 +33,12 @@ impl SortOrder {
     }
 }
 
+impl std::fmt::Display for SortOrder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Filter parameters for the `/v3/reference/tickers` endpoint.
 ///
 /// All fields are optional. Construct with [`TickerQuery::new`] and chain
