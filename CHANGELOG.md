@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0]
+
 ### Added
 
 - **Databento streaming variants** ([#46](https://github.com/Niqnil/rustrade/issues/46))
@@ -180,7 +182,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Previously, repeated test runs would fail with "client id already in use" until IB Gateway
     was restarted
 
-## [0.1.0] - 2026-05-01
+## [0.1.0]
 
 Initial release of rustrade, a fork of [barter-rs](https://github.com/barter-rs/barter-rs).
 
