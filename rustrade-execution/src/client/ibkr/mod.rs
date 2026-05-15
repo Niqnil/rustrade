@@ -36,6 +36,24 @@
 //! - **TimeInForce**: No `post_only` (IB has no maker-only orders)
 //! - **No auto-reconnect**: Caller responsibility per library philosophy
 //!
+//! # Caller Responsibilities (Reconnection & Recovery)
+//!
+//! Unlike WebSocket-based connectors (Binance, Alpaca), this client does **not**
+//! auto-reconnect. The caller must handle:
+//!
+//! 1. **Disconnect detection**: Monitor [`ExecutionClient::account_stream`] for EOF or errors
+//! 2. **Reconnection**: Call [`IbkrClient::connect_sync`] with a new client ID
+//! 3. **Fill recovery**: After reconnect, call [`ExecutionClient::fetch_trades`] to
+//!    query executions since disconnect, then deduplicate against known fills
+//! 4. **Order reconciliation**: Call [`ExecutionClient::fetch_open_orders`] to
+//!    reconcile open-order state (order lifecycle events during disconnect are lost)
+//! 5. **Stale state cleanup**: Periodically call [`IbkrClient::clear_stale_executions`],
+//!    [`IbkrClient::clear_stale_order_ids`], and [`IbkrClient::clear_stale_pending_cancels`]
+//!
+//! **Rationale**: IBKR uses TCP to local TWS/Gateway, not cloud WebSocket. Reconnection
+//! requires IB Gateway availability and client ID coordination — decisions that belong
+//! in the caller's wrapper, not the library.
+//!
 //! # See Also
 //!
 //! - [IB API Documentation](https://www.interactivebrokers.com/campus/ibkr-api-page/trader-workstation-api/)

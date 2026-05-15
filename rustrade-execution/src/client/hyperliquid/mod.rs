@@ -19,10 +19,24 @@
 //! - REST (`ExchangeClient`): open_order, cancel_order
 //! - WebSocket (`InfoClient` with `with_reconnect`): account_stream via UserFills + OrderUpdates subscriptions
 //!
+//! # SDK Delegation Model
+//!
+//! This client delegates connection management to the official `hyperliquid_rust_sdk`:
+//!
+//! | Responsibility | Implementation |
+//! |----------------|----------------|
+//! | **Reconnection** | `InfoClient::with_reconnect()` handles WebSocket reconnection automatically |
+//! | **Heartbeat** | SDK manages WebSocket ping/pong internally |
+//! | **Deduplication** | SDK-managed; no custom dedup cache needed |
+//! | **Fill recovery** | Not implemented — use [`ExecutionClient::fetch_trades`] after reconnect if needed |
+//!
+//! **Caller responsibilities**:
+//! - If fill recovery is critical, monitor for reconnection events and call `fetch_trades()`
+//! - REST clients (`InfoClient::new()`, `ExchangeClient::new()`) do NOT auto-reconnect;
+//!   only WebSocket streams via `with_reconnect()` do
+//!
 //! # Limitations
 //!
-//! - **SDK-managed reconnect**: WebSocket streams use `InfoClient::with_reconnect()` for automatic
-//!   reconnection. REST clients (`InfoClient::new()`, `ExchangeClient::new()`) do not auto-reconnect.
 //! - **Price precision**: Hyperliquid requires 5 significant figures for prices
 
 pub mod common;

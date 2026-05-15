@@ -1,3 +1,32 @@
+//! Execution client implementations for various exchanges.
+//!
+//! # Connector Comparison
+//!
+//! | Connector | Reconnect | Dedup | Fill Recovery | Heartbeat |
+//! |-----------|-----------|-------|---------------|-----------|
+//! | [`binance`] | Auto (1s→30s backoff) | 10k LRU | REST after reconnect | 30s |
+//! | [`alpaca`] | Auto (1s→30s backoff) | 2k LRU | REST after reconnect | 35s |
+//! | [`ibkr`] | Caller responsibility | N/A | Caller responsibility | N/A |
+//! | [`hyperliquid`] | SDK-managed | SDK-managed | N/A | SDK-managed |
+//!
+//! # Resilience Philosophy
+//!
+//! **WebSocket-based connectors** (Binance, Alpaca) implement auto-reconnection with
+//! fill recovery and deduplication. After reconnect, they query REST APIs for missed
+//! fills and deduplicate against the LRU cache to prevent duplicate processing.
+//!
+//! **IBKR** uses TCP to local TWS/Gateway. Reconnection requires IB Gateway availability
+//! and client ID coordination — decisions that belong in the caller's wrapper. See
+//! [`ibkr`] module docs for caller responsibilities.
+//!
+//! **Hyperliquid** delegates to the official SDK's `with_reconnect()` mechanism.
+//!
+//! # Known Limitations
+//!
+//! All connectors have a gap between reconnection and fill recovery: **order lifecycle
+//! events** (NEW, CANCELED, EXPIRED) during disconnect are NOT recovered. Callers must
+//! call [`ExecutionClient::fetch_open_orders`] after reconnect to reconcile state.
+
 use crate::{
     UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::AssetBalance,
