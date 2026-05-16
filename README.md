@@ -49,9 +49,16 @@ rustrade is a collection of Rust libraries for live-trading, paper-trading, and 
 | Exchange | Market Data | Execution | Notes |
 |----------|-------------|-----------|-------|
 | **Binance** | ✅ Spot | ✅ Spot | WebSocket + REST |
-| **Alpaca** | ✅ Equities (IEX/SIP), Crypto | ✅ Equities, Options, Crypto | WebSocket + REST |
+| **Alpaca** | ✅ Equities (IEX/SIP), Crypto, Options | ✅ Equities, Options, Crypto | WebSocket + REST |
 | **Hyperliquid** | ✅ Perps, Spot | ✅ Perps, Spot | WebSocket + REST |
 | **Interactive Brokers** | ✅ All asset classes | ✅ All asset classes | TWS/Gateway API |
+
+### Data Providers
+
+| Provider | Asset Classes | Notes |
+|----------|---------------|-------|
+| **Massive** | Stocks, Crypto, Forex, Options, Futures | Historical + live streaming |
+| **Databento** | Equities, Futures, Options | Nanosecond precision, DBN format |
 
 ## Quick Start
 
@@ -59,9 +66,9 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rustrade = "0.1"
-rustrade-data = { version = "0.1", features = ["hyperliquid"] }
-rustrade-execution = { version = "0.1", features = ["binance"] }
+rustrade = "0.2"
+rustrade-data = { version = "0.2", features = ["hyperliquid"] }
+rustrade-execution = { version = "0.2", features = ["binance"] }
 ```
 
 See the [examples](https://github.com/Niqnil/rustrade/tree/main/rustrade/examples) for complete working code.
