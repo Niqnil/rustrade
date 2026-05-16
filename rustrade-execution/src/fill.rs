@@ -13,6 +13,14 @@ use serde::{Deserialize, Serialize};
 /// Live execution clients receive real fill prices from the venue — they do
 /// not use `FillModel`.
 ///
+/// # Extensibility
+///
+/// Implement this trait to model slippage, market impact, or other execution
+/// dynamics. The built-in models ([`LastPriceFillModel`], [`BidAskFillModel`],
+/// [`MidpointFillModel`]) provide baseline behavior; custom implementations
+/// can add fixed or random slippage, volume-based price impact, or other
+/// realistic execution simulation.
+///
 /// # Arguments
 ///
 /// * `side` — order side (Buy or Sell).
@@ -39,9 +47,8 @@ pub trait FillModel {
 ///
 /// Fallback chain: `order_price` → `last_price` → `best_ask` (Buy) / `best_bid` (Sell).
 ///
-/// This is the simplest fill model and is well-suited for RL training where
-/// speed matters more than realism: it eliminates spread noise and keeps
-/// episode reward signals clean.
+/// The simplest fill model — ignores spread entirely. Useful when spread
+/// modeling is handled elsewhere or when deterministic fills are preferred.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Deserialize, Serialize,
 )]
