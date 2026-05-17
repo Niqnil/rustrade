@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Binance conditional order support** ([#93](https://github.com/Niqnil/rustrade/issues/93))
+  - `Stop` → Binance `STOP_LOSS` (market order triggered at stop price)
+  - `StopLimit` → Binance `STOP_LOSS_LIMIT` (limit order triggered at stop price)
+  - `TakeProfit` → Binance `TAKE_PROFIT` (market order triggered at take-profit price)
+  - `TakeProfitLimit` → Binance `TAKE_PROFIT_LIMIT` (limit order triggered at take-profit price)
+  - `TrailingStop` with `BasisPoints` or `Percentage` offset → Binance `STOP_LOSS` with `trailingDelta`
+    - `BasisPoints`: value passed directly as `trailingDelta` (1 bp = 0.01%)
+    - `Percentage`: value multiplied by 100 before sending (e.g., 2% → 200 trailingDelta)
+  - Note: `TrailingStop` with `Absolute` offset returns `UnsupportedOrderType` (manual conversion required: `(absolute / price) * 10000`)
+  - Note: `TrailingStopLimit` returns `UnsupportedOrderType` (Binance doesn't support)
+
 ## [0.2.0]
 
 ### Added
