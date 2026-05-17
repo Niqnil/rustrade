@@ -2374,6 +2374,7 @@ fn convert_new_order(
                     kind,
                     OrderKind::Limit
                         | OrderKind::StopLimit { .. }
+                        | OrderKind::TakeProfitLimit { .. }
                         | OrderKind::TrailingStopLimit { .. }
                 ) {
                     trace!(%symbol, %kind, "BinanceSpot NEW event has zero price (p) on limit-type order, treating as no limit price");
@@ -2385,13 +2386,22 @@ fn convert_new_order(
                 return None;
             }
         },
-        (None, OrderKind::Market | OrderKind::Stop { .. } | OrderKind::TrailingStop { .. }) => {
-            // Market and Stop orders don't have a limit price
+        (
+            None,
+            OrderKind::Market
+            | OrderKind::Stop { .. }
+            | OrderKind::TakeProfit { .. }
+            | OrderKind::TrailingStop { .. },
+        ) => {
+            // Market, Stop, and TakeProfit orders don't have a limit price
             None
         }
         (
             None,
-            OrderKind::Limit | OrderKind::StopLimit { .. } | OrderKind::TrailingStopLimit { .. },
+            OrderKind::Limit
+            | OrderKind::StopLimit { .. }
+            | OrderKind::TakeProfitLimit { .. }
+            | OrderKind::TrailingStopLimit { .. },
         ) => {
             warn!(%symbol, "BinanceSpot NEW limit-type order missing price (p), dropping");
             return None;
@@ -2591,10 +2601,12 @@ fn convert_order_kind_tif(
                 None
             }
         },
-        // TODO(TG13): Binance supports STOP_LOSS, STOP_LOSS_LIMIT, TAKE_PROFIT,
-        // TAKE_PROFIT_LIMIT, and TRAILING_STOP_MARKET. Add mapping in a future PR.
+        // TODO(TG16): Binance supports STOP_LOSS, STOP_LOSS_LIMIT, TAKE_PROFIT,
+        // TAKE_PROFIT_LIMIT, and TRAILING_STOP_MARKET. Implement in Phase 2.
         OrderKind::Stop { .. }
         | OrderKind::StopLimit { .. }
+        | OrderKind::TakeProfit { .. }
+        | OrderKind::TakeProfitLimit { .. }
         | OrderKind::TrailingStop { .. }
         | OrderKind::TrailingStopLimit { .. } => {
             warn!(
