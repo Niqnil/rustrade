@@ -34,7 +34,7 @@ use crate::{
     client::ExecutionClient,
     error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
     order::{
-        Order, OrderKey, OrderKind, TimeInForce,
+        Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
         id::{ClientOrderId, OrderId, StrategyId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
@@ -1182,9 +1182,88 @@ impl ExecutionClient for BinanceSpot {
                 .quantity(quantity)
                 .new_client_order_id(cid.0.to_string());
 
-        // Set price for limit orders
-        if matches!(kind, OrderKind::Limit) {
-            params_builder = params_builder.price(price);
+        // Set price, stop_price, and trailing_delta in a single exhaustive match
+        // so that adding a new OrderKind variant fails to compile until handled here.
+        match kind {
+            OrderKind::Limit => {
+                params_builder = params_builder.price(price);
+            }
+            OrderKind::Stop { trigger_price } | OrderKind::TakeProfit { trigger_price } => {
+                params_builder = params_builder.stop_price(trigger_price);
+            }
+            OrderKind::StopLimit { trigger_price }
+            | OrderKind::TakeProfitLimit { trigger_price } => {
+                params_builder = params_builder.price(price).stop_price(trigger_price);
+            }
+            OrderKind::TrailingStop {
+                offset,
+                offset_type,
+            } => {
+                // Convert to basis points (i32). Binance trailingDelta is in basis points.
+                let basis_points: i32 = match offset_type {
+                    TrailingOffsetType::BasisPoints => {
+                        let Ok(bp) = i32::try_from(offset) else {
+                            return Some(Order {
+                                key: order_key,
+                                side,
+                                price,
+                                quantity,
+                                kind,
+                                time_in_force,
+                                state: OrderState::inactive(OrderError::UnsupportedOrderType(
+                                    format!(
+                                        "TrailingStop basis-point offset {offset} overflows i32 \
+                                         (Binance trailingDelta filter typically caps at 2000)"
+                                    ),
+                                )),
+                            });
+                        };
+                        bp
+                    }
+                    TrailingOffsetType::Percentage => {
+                        let Ok(bp) = i32::try_from(offset * Decimal::from(100)) else {
+                            return Some(Order {
+                                key: order_key,
+                                side,
+                                price,
+                                quantity,
+                                kind,
+                                time_in_force,
+                                state: OrderState::inactive(OrderError::UnsupportedOrderType(
+                                    format!(
+                                        "TrailingStop percentage offset {offset} overflows i32 \
+                                         after scaling to basis points"
+                                    ),
+                                )),
+                            });
+                        };
+                        bp
+                    }
+                    TrailingOffsetType::Absolute => {
+                        // convert_order_kind_tif already rejects Absolute; surface a clean
+                        // error here too rather than panic, so a future refactor that
+                        // changes that contract still fails observably.
+                        return Some(Order {
+                            key: order_key,
+                            side,
+                            price,
+                            quantity,
+                            kind,
+                            time_in_force,
+                            state: OrderState::inactive(OrderError::UnsupportedOrderType(
+                                "TrailingStop with Absolute offset is not supported by Binance; \
+                                 convert to basis points: (absolute / price) * 10000"
+                                    .into(),
+                            )),
+                        });
+                    }
+                };
+                params_builder = params_builder.trailing_delta(basis_points);
+            }
+            // Market and TrailingStopLimit need no price/stop_price/trailing_delta here.
+            // (TrailingStopLimit is already rejected by convert_order_kind_tif above.)
+            // Wildcard catches them and any future variants added before this match is updated.
+            _ => {}
         }
 
         if let Some(tif) = binance_tif {
@@ -2374,6 +2453,7 @@ fn convert_new_order(
                     kind,
                     OrderKind::Limit
                         | OrderKind::StopLimit { .. }
+                        | OrderKind::TakeProfitLimit { .. }
                         | OrderKind::TrailingStopLimit { .. }
                 ) {
                     trace!(%symbol, %kind, "BinanceSpot NEW event has zero price (p) on limit-type order, treating as no limit price");
@@ -2385,13 +2465,22 @@ fn convert_new_order(
                 return None;
             }
         },
-        (None, OrderKind::Market | OrderKind::Stop { .. } | OrderKind::TrailingStop { .. }) => {
-            // Market and Stop orders don't have a limit price
+        (
+            None,
+            OrderKind::Market
+            | OrderKind::Stop { .. }
+            | OrderKind::TakeProfit { .. }
+            | OrderKind::TrailingStop { .. },
+        ) => {
+            // Market, Stop, and TakeProfit orders don't have a limit price
             None
         }
         (
             None,
-            OrderKind::Limit | OrderKind::StopLimit { .. } | OrderKind::TrailingStopLimit { .. },
+            OrderKind::Limit
+            | OrderKind::StopLimit { .. }
+            | OrderKind::TakeProfitLimit { .. }
+            | OrderKind::TrailingStopLimit { .. },
         ) => {
             warn!(%symbol, "BinanceSpot NEW limit-type order missing price (p), dropping");
             return None;
@@ -2549,6 +2638,32 @@ fn parse_time_in_force(tif: &str) -> TimeInForce {
     }
 }
 
+/// Convert rustrade OrderKind + TimeInForce to Binance SDK order type and TIF.
+///
+/// Returns `None` for unsupported combinations, which `open_order` converts to
+/// `UnsupportedOrderType` rejection.
+///
+/// # Conditional Orders
+///
+/// - `Stop` → `STOP_LOSS` (market order triggered at stop price)
+/// - `StopLimit` → `STOP_LOSS_LIMIT` (limit order triggered at stop price)
+/// - `TakeProfit` → `TAKE_PROFIT` (market order triggered at take-profit price)
+/// - `TakeProfitLimit` → `TAKE_PROFIT_LIMIT` (limit order triggered at take-profit price)
+///
+/// # Trailing Stop Orders
+///
+/// Binance implements trailing stops via `STOP_LOSS` with `trailingDelta` parameter.
+///
+/// **Supported offset types:**
+/// - `BasisPoints`: used directly (1 basis point = 0.01%)
+/// - `Percentage`: converted to basis points (multiplied by 100)
+///
+/// **Unsupported:**
+/// - `Absolute`: returns `None` → `UnsupportedOrderType`. The caller (`open_order`)
+///   must surface this so end users can convert absolute offsets to basis points
+///   themselves: `basis_points = (absolute / price) * 10000`
+/// - `TrailingStopLimit`: Binance does not support limit orders with trailing stops
+///
 fn convert_order_kind_tif(
     kind: OrderKind,
     tif: TimeInForce,
@@ -2591,16 +2706,75 @@ fn convert_order_kind_tif(
                 None
             }
         },
-        // TODO(TG13): Binance supports STOP_LOSS, STOP_LOSS_LIMIT, TAKE_PROFIT,
-        // TAKE_PROFIT_LIMIT, and TRAILING_STOP_MARKET. Add mapping in a future PR.
-        OrderKind::Stop { .. }
-        | OrderKind::StopLimit { .. }
-        | OrderKind::TrailingStop { .. }
-        | OrderKind::TrailingStopLimit { .. } => {
-            warn!(
-                "Binance connector does not yet support OrderKind::{:?}",
-                kind
-            );
+        // Conditional orders: stop_price/trailing_delta set separately in open_order
+        OrderKind::Stop { .. } => Some((OrderPlaceTypeEnum::StopLoss, None)),
+        OrderKind::StopLimit { .. } => {
+            // StopLimit requires TIF like regular Limit orders
+            match tif {
+                TimeInForce::GoodUntilCancelled { post_only: false } => Some((
+                    OrderPlaceTypeEnum::StopLossLimit,
+                    Some(OrderPlaceTimeInForceEnum::Gtc),
+                )),
+                TimeInForce::FillOrKill => Some((
+                    OrderPlaceTypeEnum::StopLossLimit,
+                    Some(OrderPlaceTimeInForceEnum::Fok),
+                )),
+                TimeInForce::ImmediateOrCancel => Some((
+                    OrderPlaceTypeEnum::StopLossLimit,
+                    Some(OrderPlaceTimeInForceEnum::Ioc),
+                )),
+                _ => {
+                    warn!(
+                        time_in_force = ?tif,
+                        "Binance StopLimit does not support this TimeInForce"
+                    );
+                    None
+                }
+            }
+        }
+        OrderKind::TakeProfit { .. } => Some((OrderPlaceTypeEnum::TakeProfit, None)),
+        OrderKind::TakeProfitLimit { .. } => {
+            // TakeProfitLimit requires TIF like regular Limit orders
+            match tif {
+                TimeInForce::GoodUntilCancelled { post_only: false } => Some((
+                    OrderPlaceTypeEnum::TakeProfitLimit,
+                    Some(OrderPlaceTimeInForceEnum::Gtc),
+                )),
+                TimeInForce::FillOrKill => Some((
+                    OrderPlaceTypeEnum::TakeProfitLimit,
+                    Some(OrderPlaceTimeInForceEnum::Fok),
+                )),
+                TimeInForce::ImmediateOrCancel => Some((
+                    OrderPlaceTypeEnum::TakeProfitLimit,
+                    Some(OrderPlaceTimeInForceEnum::Ioc),
+                )),
+                _ => {
+                    warn!(
+                        time_in_force = ?tif,
+                        "Binance TakeProfitLimit does not support this TimeInForce"
+                    );
+                    None
+                }
+            }
+        }
+        // TrailingStop: Binance uses STOP_LOSS with trailingDelta parameter.
+        // Only BasisPoints and Percentage are supported; Absolute requires manual
+        // conversion by the caller: basis_points = (absolute / price) * 10000
+        OrderKind::TrailingStop { offset_type, .. } => match offset_type {
+            TrailingOffsetType::BasisPoints | TrailingOffsetType::Percentage => {
+                Some((OrderPlaceTypeEnum::StopLoss, None))
+            }
+            TrailingOffsetType::Absolute => {
+                warn!(
+                    "Binance TrailingStop does not support Absolute offset; \
+                     convert to basis points: (absolute / price) * 10000"
+                );
+                None
+            }
+        },
+        // Binance does not support TrailingStopLimit
+        OrderKind::TrailingStopLimit { .. } => {
+            warn!("Binance does not support TrailingStopLimit orders");
             None
         }
     }
@@ -2822,22 +2996,91 @@ mod tests {
             ))
         ));
 
-        // Stop/Trailing order types return None (not yet supported)
-        assert!(
+        // Conditional orders
+        assert!(matches!(
             convert_order_kind_tif(
                 OrderKind::Stop {
                     trigger_price: Decimal::from(100)
+                },
+                TimeInForce::GoodUntilCancelled { post_only: false }
+            ),
+            Some((OrderPlaceTypeEnum::StopLoss, None))
+        ));
+        assert!(matches!(
+            convert_order_kind_tif(
+                OrderKind::StopLimit {
+                    trigger_price: Decimal::from(100)
+                },
+                TimeInForce::GoodUntilCancelled { post_only: false }
+            ),
+            Some((
+                OrderPlaceTypeEnum::StopLossLimit,
+                Some(OrderPlaceTimeInForceEnum::Gtc)
+            ))
+        ));
+        assert!(matches!(
+            convert_order_kind_tif(
+                OrderKind::TakeProfit {
+                    trigger_price: Decimal::from(150)
+                },
+                TimeInForce::ImmediateOrCancel
+            ),
+            Some((OrderPlaceTypeEnum::TakeProfit, None))
+        ));
+        assert!(matches!(
+            convert_order_kind_tif(
+                OrderKind::TakeProfitLimit {
+                    trigger_price: Decimal::from(150)
+                },
+                TimeInForce::FillOrKill
+            ),
+            Some((
+                OrderPlaceTypeEnum::TakeProfitLimit,
+                Some(OrderPlaceTimeInForceEnum::Fok)
+            ))
+        ));
+
+        // TrailingStop with BasisPoints/Percentage → StopLoss (trailingDelta set separately)
+        assert!(matches!(
+            convert_order_kind_tif(
+                OrderKind::TrailingStop {
+                    offset: Decimal::from(100),
+                    offset_type: TrailingOffsetType::BasisPoints,
+                },
+                TimeInForce::GoodUntilCancelled { post_only: false }
+            ),
+            Some((OrderPlaceTypeEnum::StopLoss, None))
+        ));
+        assert!(matches!(
+            convert_order_kind_tif(
+                OrderKind::TrailingStop {
+                    offset: Decimal::from(5),
+                    offset_type: TrailingOffsetType::Percentage,
+                },
+                TimeInForce::GoodUntilCancelled { post_only: false }
+            ),
+            Some((OrderPlaceTypeEnum::StopLoss, None))
+        ));
+
+        // TrailingStop with Absolute → unsupported (returns None)
+        assert!(
+            convert_order_kind_tif(
+                OrderKind::TrailingStop {
+                    offset: Decimal::from(10),
+                    offset_type: TrailingOffsetType::Absolute,
                 },
                 TimeInForce::GoodUntilCancelled { post_only: false }
             )
             .is_none()
         );
 
+        // TrailingStopLimit → unsupported (Binance doesn't support)
         assert!(
             convert_order_kind_tif(
-                OrderKind::TrailingStop {
-                    offset: Decimal::from(5),
-                    offset_type: TrailingOffsetType::Percentage,
+                OrderKind::TrailingStopLimit {
+                    offset: Decimal::from(100),
+                    offset_type: TrailingOffsetType::BasisPoints,
+                    limit_offset: Decimal::from(10),
                 },
                 TimeInForce::GoodUntilCancelled { post_only: false }
             )

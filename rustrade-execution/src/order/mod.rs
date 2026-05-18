@@ -178,6 +178,7 @@ pub enum TrailingOffsetType {
 #[derive(
     Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Display,
 )]
+#[non_exhaustive]
 pub enum OrderKind {
     Market,
     Limit,
@@ -189,6 +190,17 @@ pub enum OrderKind {
     /// Stop-limit order - triggers a limit order at Order.price when trigger_price is reached.
     #[display("StopLimit({trigger_price})")]
     StopLimit {
+        trigger_price: Decimal,
+    },
+    /// Take-profit (market) order - triggers a market order when trigger_price is reached.
+    /// Opposite of Stop: triggers when price moves favorably (above for longs, below for shorts).
+    #[display("TakeProfit({trigger_price})")]
+    TakeProfit {
+        trigger_price: Decimal,
+    },
+    /// Take-profit limit order - triggers a limit order at Order.price when trigger_price is reached.
+    #[display("TakeProfitLimit({trigger_price})")]
+    TakeProfitLimit {
         trigger_price: Decimal,
     },
     /// Trailing stop order - stop price trails the market by a specified offset.
@@ -336,5 +348,48 @@ impl<ExchangeKey, AssetKey, InstrumentKey> From<Order<ExchangeKey, InstrumentKey
             time_in_force,
             state: OrderState::Inactive(InactiveOrderState::Cancelled(state)),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn order_kind_display_take_profit() {
+        let tp = OrderKind::TakeProfit {
+            trigger_price: dec!(100.50),
+        };
+        assert_eq!(tp.to_string(), "TakeProfit(100.50)");
+    }
+
+    #[test]
+    fn order_kind_display_take_profit_limit() {
+        let tpl = OrderKind::TakeProfitLimit {
+            trigger_price: dec!(200.25),
+        };
+        assert_eq!(tpl.to_string(), "TakeProfitLimit(200.25)");
+    }
+
+    #[test]
+    fn order_kind_serde_roundtrip_take_profit() {
+        let original = OrderKind::TakeProfit {
+            trigger_price: dec!(150.00),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: OrderKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, deserialized);
+    }
+
+    #[test]
+    fn order_kind_serde_roundtrip_take_profit_limit() {
+        let original = OrderKind::TakeProfitLimit {
+            trigger_price: dec!(250.75),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: OrderKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, deserialized);
     }
 }

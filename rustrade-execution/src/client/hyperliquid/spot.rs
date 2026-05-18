@@ -27,6 +27,14 @@
 //!
 //! If a user has both perp and spot clients for the same wallet, events will be
 //! duplicated. Consumers should use one client type per account, or deduplicate externally.
+//!
+//! # Conditional Orders (Stop, TakeProfit)
+//!
+//! See [`super`] module documentation for conditional order support details.
+//! The same constraints apply to spot:
+//! - Supported: `Stop`, `StopLimit`, `TakeProfit`, `TakeProfitLimit`
+//! - Unsupported: `TrailingStop`, `TrailingStopLimit`, `Market`
+//! - UUID requirement: Trigger orders MUST use [`crate::order::id::ClientOrderId::uuid()`]
 
 use super::common::{
     CancelOnDropStream, cid_to_cloid, instrument_to_spot_coin, is_spot_coin, map_tif,
@@ -449,7 +457,10 @@ impl ExecutionClient for HyperliquidSpotClient {
         request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
     ) -> Option<UnindexedOrderResponseCancel> {
         use crate::order::{request::OrderResponseCancel, state::Cancelled};
-        use hyperliquid_rust_sdk::ClientCancelRequest;
+        use hyperliquid_rust_sdk::{
+            ClientCancelRequest, ClientCancelRequestCloid, ExchangeResponseStatus,
+        };
+        use uuid::Uuid;
 
         let coin = match instrument_to_spot_coin(request.key.instrument) {
             Some(c) => c,
@@ -493,29 +504,53 @@ impl ExecutionClient for HyperliquidSpotClient {
             }
         };
 
-        let oid: u64 = match order_id.0.parse() {
-            Ok(id) => id,
-            Err(e) => {
-                warn!(?order_id, %e, "Failed to parse order ID as u64");
-                return Some(OrderResponseCancel {
-                    key: OrderKey {
-                        exchange: ExchangeId::HyperliquidSpot,
-                        instrument: request.key.instrument.clone(),
-                        strategy: request.key.strategy.clone(),
-                        cid: request.key.cid.clone(),
-                    },
-                    state: Err(UnindexedOrderError::Rejected(
-                        crate::error::ApiError::OrderRejected(format!("Invalid order ID: {e}")),
-                    )),
-                });
+        // Try to determine cancel method:
+        // 1. If order_id parses as u64, use cancel() with OID (regular limit orders)
+        // 2. If order_id parses as UUID, use cancel_by_cloid() (trigger orders)
+        // 3. Otherwise, reject with clear error
+        enum CancelMethod {
+            ByOid(u64),
+            ByCloid(Uuid),
+        }
+
+        let cancel_method = if let Ok(oid) = order_id.0.parse::<u64>() {
+            CancelMethod::ByOid(oid)
+        } else if let Ok(uuid) = Uuid::parse_str(&order_id.0) {
+            CancelMethod::ByCloid(uuid)
+        } else {
+            warn!(?order_id, "Order ID is neither u64 (OID) nor UUID (cloid)");
+            return Some(OrderResponseCancel {
+                key: OrderKey {
+                    exchange: ExchangeId::HyperliquidSpot,
+                    instrument: request.key.instrument.clone(),
+                    strategy: request.key.strategy.clone(),
+                    cid: request.key.cid.clone(),
+                },
+                state: Err(UnindexedOrderError::Rejected(
+                    crate::error::ApiError::OrderRejected(
+                        "Invalid order ID: must be numeric OID or UUID (for trigger orders)"
+                            .to_string(),
+                    ),
+                )),
+            });
+        };
+
+        let response = match cancel_method {
+            CancelMethod::ByOid(oid) => {
+                debug!(oid, "Cancelling spot order by OID");
+                let cancel_request = ClientCancelRequest { asset: coin, oid };
+                self.exchange_client.cancel(cancel_request, None).await
+            }
+            CancelMethod::ByCloid(cloid) => {
+                debug!(%cloid, "Cancelling spot order by cloid (trigger order)");
+                let cancel_request = ClientCancelRequestCloid { asset: coin, cloid };
+                self.exchange_client
+                    .cancel_by_cloid(cancel_request, None)
+                    .await
             }
         };
 
-        let cancel_request = ClientCancelRequest { asset: coin, oid };
-
-        use hyperliquid_rust_sdk::ExchangeResponseStatus;
-
-        let response = match self.exchange_client.cancel(cancel_request, None).await {
+        let response = match response {
             Ok(r) => r,
             Err(e) => {
                 warn!(%e, "Spot cancel order failed (transport)");
@@ -571,18 +606,13 @@ impl ExecutionClient for HyperliquidSpotClient {
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
     ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
         use hyperliquid_rust_sdk::{
-            ClientLimit, ClientOrder, ClientOrderRequest, ExchangeDataStatus,
+            ClientLimit, ClientOrder, ClientOrderRequest, ClientTrigger, ExchangeDataStatus,
             ExchangeResponseStatus,
         };
 
-        let coin = match instrument_to_spot_coin(request.key.instrument) {
-            Some(c) => c,
-            None => {
-                warn!(
-                    instrument = %request.key.instrument,
-                    "Invalid spot instrument format (expected BASE-QUOTE-SPOT)"
-                );
-                return Some(Order {
+        let make_rejected =
+            |msg: String| -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
+                Order {
                     key: OrderKey {
                         exchange: ExchangeId::HyperliquidSpot,
                         instrument: request.key.instrument.clone(),
@@ -595,21 +625,14 @@ impl ExecutionClient for HyperliquidSpotClient {
                     kind: request.state.kind,
                     time_in_force: request.state.time_in_force,
                     state: OrderState::inactive(OrderError::Rejected(
-                        crate::error::ApiError::OrderRejected(format!(
-                            "Invalid instrument format: {}",
-                            request.key.instrument
-                        )),
+                        crate::error::ApiError::OrderRejected(msg),
                     )),
-                });
-            }
-        };
-        let is_buy = request.state.side == Side::Buy;
+                }
+            };
 
-        // Hyperliquid only supports Limit orders, so price is required
-        let price = match request.state.price {
-            Some(p) => p,
-            None => {
-                return Some(Order {
+        let make_unsupported =
+            |msg: String| -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
+                Order {
                     key: OrderKey {
                         exchange: ExchangeId::HyperliquidSpot,
                         instrument: request.key.instrument.clone(),
@@ -617,48 +640,101 @@ impl ExecutionClient for HyperliquidSpotClient {
                         cid: request.key.cid.clone(),
                     },
                     side: request.state.side,
-                    price: None,
+                    price: request.state.price,
                     quantity: request.state.quantity,
                     kind: request.state.kind,
                     time_in_force: request.state.time_in_force,
-                    state: OrderState::inactive(OrderError::Rejected(
-                        crate::error::ApiError::OrderRejected(
-                            "Hyperliquid requires limit price for all orders".to_owned(),
-                        ),
-                    )),
-                });
+                    state: OrderState::inactive(OrderError::UnsupportedOrderType(msg)),
+                }
+            };
+
+        let coin = match instrument_to_spot_coin(request.key.instrument) {
+            Some(c) => c,
+            None => {
+                warn!(
+                    instrument = %request.key.instrument,
+                    "Invalid spot instrument format (expected BASE-QUOTE-SPOT)"
+                );
+                return Some(make_rejected(format!(
+                    "Invalid instrument format: {}",
+                    request.key.instrument
+                )));
             }
         };
+        let is_buy = request.state.side == Side::Buy;
 
-        let limit_px = round_to_5_sig_figs(price);
+        match request.state.kind {
+            OrderKind::Market => {
+                return Some(make_unsupported(
+                    "Hyperliquid does not support market orders; use Limit with IOC time-in-force"
+                        .to_string(),
+                ));
+            }
+            OrderKind::TrailingStop { .. } | OrderKind::TrailingStopLimit { .. } => {
+                return Some(make_unsupported(
+                    "Hyperliquid does not support trailing stop orders".to_string(),
+                ));
+            }
+            OrderKind::Limit
+            | OrderKind::Stop { .. }
+            | OrderKind::StopLimit { .. }
+            | OrderKind::TakeProfit { .. }
+            | OrderKind::TakeProfitLimit { .. } => {}
+        }
+
+        let cloid = cid_to_cloid(&request.key.cid);
+        let cloid_is_some = cloid.is_some();
+        let is_trigger_order = matches!(
+            request.state.kind,
+            OrderKind::Stop { .. }
+                | OrderKind::StopLimit { .. }
+                | OrderKind::TakeProfit { .. }
+                | OrderKind::TakeProfitLimit { .. }
+        );
+        if is_trigger_order && cloid.is_none() {
+            return Some(make_rejected(
+                "Trigger orders require UUID-format client order ID (use ClientOrderId::uuid()). \
+                 Non-UUID IDs cannot be cancelled via cancel_by_cloid()."
+                    .to_string(),
+            ));
+        }
+
+        let limit_px = match request.state.kind {
+            // Market triggers: SDK uses trigger_px as limit_px
+            OrderKind::Stop { trigger_price } | OrderKind::TakeProfit { trigger_price } => {
+                round_to_5_sig_figs(trigger_price)
+            }
+            _ => match request.state.price {
+                Some(p) => round_to_5_sig_figs(p),
+                None => {
+                    return Some(make_rejected(
+                        "Hyperliquid requires limit price for Limit/StopLimit/TakeProfitLimit orders"
+                            .to_string(),
+                    ));
+                }
+            },
+        };
+
         let sz = round_to_5_sig_figs(request.state.quantity);
 
         // Hyperliquid spot requires minimum $10 notional value
-        let notional = price * request.state.quantity;
+        // For market triggers, use trigger_price for notional calculation
+        let notional_price = match request.state.kind {
+            OrderKind::Stop { trigger_price } | OrderKind::TakeProfit { trigger_price } => {
+                trigger_price
+            }
+            _ => request.state.price.unwrap_or(Decimal::ZERO),
+        };
+        let notional = notional_price * request.state.quantity;
         if notional < Decimal::TEN {
             warn!(
                 instrument = %request.key.instrument,
                 %notional,
                 "Spot order below $10 minimum notional value"
             );
-            return Some(Order {
-                key: OrderKey {
-                    exchange: ExchangeId::HyperliquidSpot,
-                    instrument: request.key.instrument.clone(),
-                    strategy: request.key.strategy.clone(),
-                    cid: request.key.cid.clone(),
-                },
-                side: request.state.side,
-                price: request.state.price,
-                quantity: request.state.quantity,
-                kind: request.state.kind,
-                time_in_force: request.state.time_in_force,
-                state: OrderState::inactive(OrderError::Rejected(
-                    crate::error::ApiError::OrderRejected(format!(
-                        "Spot order notional ${notional} below $10 minimum"
-                    )),
-                )),
-            });
+            return Some(make_rejected(format!(
+                "Spot order notional ${notional} below $10 minimum"
+            )));
         }
 
         if matches!(request.state.time_in_force, TimeInForce::FillOrKill) {
@@ -669,7 +745,37 @@ impl ExecutionClient for HyperliquidSpotClient {
         }
         let tif = map_tif(&request.state.time_in_force).to_string();
 
-        let cloid = cid_to_cloid(&request.key.cid);
+        // Build order_type based on OrderKind
+        let order_type = match request.state.kind {
+            OrderKind::Limit => ClientOrder::Limit(ClientLimit { tif }),
+            OrderKind::Stop { trigger_price } => ClientOrder::Trigger(ClientTrigger {
+                is_market: true,
+                trigger_px: round_to_5_sig_figs(trigger_price),
+                tpsl: "sl".to_string(),
+            }),
+            OrderKind::StopLimit { trigger_price } => ClientOrder::Trigger(ClientTrigger {
+                is_market: false,
+                trigger_px: round_to_5_sig_figs(trigger_price),
+                tpsl: "sl".to_string(),
+            }),
+            OrderKind::TakeProfit { trigger_price } => ClientOrder::Trigger(ClientTrigger {
+                is_market: true,
+                trigger_px: round_to_5_sig_figs(trigger_price),
+                tpsl: "tp".to_string(),
+            }),
+            OrderKind::TakeProfitLimit { trigger_price } => ClientOrder::Trigger(ClientTrigger {
+                is_market: false,
+                trigger_px: round_to_5_sig_figs(trigger_price),
+                tpsl: "tp".to_string(),
+            }),
+            // Already rejected above
+            OrderKind::Market
+            | OrderKind::TrailingStop { .. }
+            | OrderKind::TrailingStopLimit { .. } => {
+                unreachable!("unsupported order kinds rejected earlier")
+            }
+        };
+
         let order_request = ClientOrderRequest {
             asset: coin,
             is_buy,
@@ -677,7 +783,7 @@ impl ExecutionClient for HyperliquidSpotClient {
             limit_px,
             sz,
             cloid,
-            order_type: ClientOrder::Limit(ClientLimit { tif }),
+            order_type,
         };
 
         let response = match self.exchange_client.order(order_request, None).await {
@@ -735,14 +841,30 @@ impl ExecutionClient for HyperliquidSpotClient {
                             crate::error::ApiError::OrderRejected(msg),
                         ))
                     }
-                    Some(ExchangeDataStatus::WaitingForFill)
-                    | Some(ExchangeDataStatus::WaitingForTrigger) => {
-                        warn!("Trigger/conditional orders not supported");
-                        OrderState::inactive(OrderError::Rejected(
-                            crate::error::ApiError::OrderRejected(
-                                "trigger/conditional orders not supported".to_string(),
-                            ),
-                        ))
+                    Some(
+                        ExchangeDataStatus::WaitingForFill | ExchangeDataStatus::WaitingForTrigger,
+                    ) => {
+                        // Use cid as OrderId only if it's a valid UUID (required for
+                        // cancel_by_cloid). Trigger orders pass the UUID guard above;
+                        // limit IOC/FOK orders may have non-UUID cids — those become
+                        // untrackable, so reject with an observable failure rather than
+                        // returning an OrderId that cancel cannot parse.
+                        if cloid_is_some {
+                            debug!(cloid = %request.key.cid.0, "Spot order waiting (cloid trackable)");
+                            OrderState::active(Open {
+                                id: OrderId(request.key.cid.0.clone()),
+                                time_exchange: Utc::now(),
+                                filled_quantity: Decimal::ZERO,
+                            })
+                        } else {
+                            warn!("Spot order accepted but cid is not UUID — untrackable");
+                            OrderState::inactive(OrderError::Rejected(
+                                crate::error::ApiError::OrderRejected(
+                                    "order accepted but cid is not UUID; cannot track for cancel"
+                                        .to_string(),
+                                ),
+                            ))
+                        }
                     }
                     Some(ExchangeDataStatus::Success) | None => {
                         warn!("Spot order accepted but no order ID returned");

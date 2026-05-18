@@ -16,6 +16,19 @@ impl ClientOrderId<SmolStr> {
         Self(id.into())
     }
 
+    /// Construct a `ClientOrderId` containing a UUID v4 string.
+    ///
+    /// Produces lowercase hyphenated format (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`, 36 chars),
+    /// the format required by Hyperliquid's `cancel_by_cloid()` endpoint.
+    ///
+    /// Required for Hyperliquid trigger orders (Stop, TakeProfit, etc.), which must use
+    /// UUID-format client order IDs for `cancel_by_cloid()` to work. Regular orders can
+    /// use [`Self::random`] for better performance (stack-allocated, no heap).
+    #[cfg(feature = "hyperliquid")]
+    pub fn uuid() -> Self {
+        Self(SmolStr::new(uuid::Uuid::new_v4().to_string()))
+    }
+
     /// Construct a stack-allocated `ClientOrderId` backed by a 23 byte [`SmolStr`].
     pub fn random() -> Self {
         const LEN_URL_SAFE_SYMBOLS: usize = 64;
@@ -116,5 +129,27 @@ impl Default for PositionId {
 impl std::fmt::Display for PositionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)] // Test code: panics on bad input are acceptable
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_order_id_random_is_23_bytes() {
+        let cid = ClientOrderId::random();
+        assert_eq!(cid.0.len(), 23);
+    }
+
+    #[test]
+    #[cfg(feature = "hyperliquid")]
+    fn client_order_id_uuid_is_valid_uuid() {
+        let cid = ClientOrderId::uuid();
+        // UUID v4 string is 36 chars (8-4-4-4-12 with hyphens)
+        assert_eq!(cid.0.len(), 36);
+        // Verify it parses as a valid UUID
+        uuid::Uuid::parse_str(&cid.0).expect("should be valid UUID");
     }
 }
