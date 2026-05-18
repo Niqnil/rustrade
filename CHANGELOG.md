@@ -20,6 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Note: `TrailingStop` with `Absolute` offset returns `UnsupportedOrderType` (manual conversion required: `(absolute / price) * 10000`)
   - Note: `TrailingStopLimit` returns `UnsupportedOrderType` (Binance doesn't support)
 
+- **Hyperliquid conditional order support** ([#94](https://github.com/Niqnil/rustrade/issues/94))
+  - `Stop` → Hyperliquid trigger order (`tpsl: "sl"`, `is_market: true`)
+  - `StopLimit` → Hyperliquid trigger order (`tpsl: "sl"`, `is_market: false`)
+  - `TakeProfit` → Hyperliquid trigger order (`tpsl: "tp"`, `is_market: true`)
+  - `TakeProfitLimit` → Hyperliquid trigger order (`tpsl: "tp"`, `is_market: false`)
+  - Trigger orders require UUID-format client order ID (`ClientOrderId::uuid()`) for cancellation support
+  - Cancellation via `cancel_by_cloid()` for trigger orders (uses UUID), `cancel()` for regular orders (uses OID)
+  - Note: `TrailingStop`, `TrailingStopLimit`, and `Market` return `UnsupportedOrderType`
+  - Note: SDK limitation — `fetch_open_orders` and `account_stream` cannot distinguish trigger orders from limit orders (SDK structs lack trigger fields). Track `OrderKind` from placement response.
+
 ## [0.2.0]
 
 ### Added

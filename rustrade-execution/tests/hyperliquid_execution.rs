@@ -414,6 +414,335 @@ async fn test_place_and_cancel_limit_order() {
 }
 
 // ============================================================================
+// Conditional Order Tests
+// ============================================================================
+
+/// Test that Stop orders require UUID-format client order ID.
+#[tokio::test]
+#[ignore]
+async fn test_stop_order_requires_uuid_cid() {
+    init_logging();
+
+    let config = test_config();
+    assert!(config.testnet, "This test MUST run on testnet only!");
+
+    let client = HyperliquidClient::connect(config)
+        .await
+        .expect("Failed to connect");
+
+    let instrument = btc_instrument();
+    let strategy = StrategyId::new("test-strategy");
+
+    // Use a non-UUID cid - should be rejected
+    let non_uuid_cid =
+        ClientOrderId::new(format!("test-{}", chrono::Utc::now().timestamp_millis()));
+
+    let order_key = OrderKey {
+        exchange: ExchangeId::HyperliquidPerp,
+        instrument: &instrument,
+        strategy: strategy.clone(),
+        cid: non_uuid_cid.clone(),
+    };
+
+    // Place a Stop order with non-UUID cid
+    let request_open = RequestOpen {
+        side: Side::Sell,
+        price: None, // Market trigger - no limit price
+        quantity: dec!(0.001),
+        kind: OrderKind::Stop {
+            trigger_price: dec!(80000.0), // Stop below current price
+        },
+        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+        position_id: None,
+        reduce_only: false,
+    };
+
+    let open_request = rustrade_execution::order::OrderEvent {
+        key: order_key,
+        state: request_open,
+    };
+
+    println!("Placing Stop order with non-UUID cid (should be rejected)...");
+
+    let response = client.open_order(open_request).await;
+    assert!(response.is_some(), "Expected order response");
+    let response = response.unwrap();
+
+    match &response.state {
+        OrderState::Inactive(rustrade_execution::order::state::InactiveOrderState::OpenFailed(
+            rustrade_execution::error::OrderError::Rejected(err),
+        )) => {
+            println!("Stop order correctly rejected: {:?}", err);
+            assert!(
+                err.to_string().contains("UUID"),
+                "Error message should mention UUID requirement"
+            );
+        }
+        other => {
+            panic!("Expected rejection for non-UUID cid, got: {:?}", other);
+        }
+    }
+}
+
+/// Test placing and canceling a Stop order with proper UUID cid.
+#[tokio::test]
+#[ignore]
+async fn test_place_and_cancel_stop_order() {
+    init_logging();
+
+    let config = test_config();
+    assert!(config.testnet, "This test MUST run on testnet only!");
+
+    let client = HyperliquidClient::connect(config)
+        .await
+        .expect("Failed to connect");
+
+    let instrument = btc_instrument();
+    let strategy = StrategyId::new("test-strategy");
+
+    // Use UUID cid as required for trigger orders
+    let uuid_cid = ClientOrderId::uuid();
+    println!("Using UUID cid: {}", uuid_cid);
+
+    let order_key = OrderKey {
+        exchange: ExchangeId::HyperliquidPerp,
+        instrument: &instrument,
+        strategy: strategy.clone(),
+        cid: uuid_cid.clone(),
+    };
+
+    // Place a Stop order (sell stop below market to avoid triggering)
+    // BTC ~$95k, so $50k stop is well below market
+    let request_open = RequestOpen {
+        side: Side::Sell,
+        price: None, // Market trigger
+        quantity: dec!(0.001),
+        kind: OrderKind::Stop {
+            trigger_price: dec!(50000.0),
+        },
+        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+        position_id: None,
+        reduce_only: false,
+    };
+
+    let open_request = rustrade_execution::order::OrderEvent {
+        key: order_key.clone(),
+        state: request_open,
+    };
+
+    println!("Placing Stop order: SELL 0.001 BTC-USD-PERP @ stop $50,000");
+
+    let response = client.open_order(open_request).await;
+    assert!(response.is_some(), "Expected order response");
+    let response = response.unwrap();
+
+    match &response.state {
+        OrderState::Active(ActiveOrderState::Open(open_state)) => {
+            println!("Stop order placed successfully!");
+            println!("  Client Order ID (UUID): {}", response.key.cid);
+            println!("  Order ID: {}", open_state.id);
+
+            // Note: Exchange may return numeric OID (Resting) or UUID (WaitingForTrigger)
+            // depending on the trigger order type. Both should work for cancellation.
+            let is_uuid_format = open_state.id.0.contains('-');
+            println!(
+                "  Order ID format: {}",
+                if is_uuid_format {
+                    "UUID (cloid)"
+                } else {
+                    "numeric (OID)"
+                }
+            );
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            // Cancel using the order ID (works for both OID and cloid)
+            let cancel_key = OrderKey {
+                exchange: ExchangeId::HyperliquidPerp,
+                instrument: &instrument,
+                strategy: response.key.strategy.clone(),
+                cid: response.key.cid.clone(),
+            };
+
+            let cancel_request = rustrade_execution::order::OrderEvent {
+                key: cancel_key,
+                state: rustrade_execution::order::request::RequestCancel {
+                    id: Some(open_state.id.clone()),
+                },
+            };
+
+            println!("Canceling Stop order...");
+            let cancel_response = client.cancel_order(cancel_request).await;
+
+            assert!(cancel_response.is_some(), "Expected cancel response");
+            let cancel_response = cancel_response.unwrap();
+
+            match &cancel_response.state {
+                Ok(cancelled) => {
+                    println!("Stop order canceled successfully!");
+                    println!("  Cancelled at: {}", cancelled.time_exchange);
+                }
+                Err(e) => {
+                    panic!("Cancel rejected: {:?}", e);
+                }
+            }
+        }
+        OrderState::Inactive(e) => {
+            panic!("Stop order rejected: {:?}", e);
+        }
+        other => {
+            panic!("Unexpected order state: {:?}", other);
+        }
+    }
+}
+
+/// Test placing and canceling a TakeProfit order.
+#[tokio::test]
+#[ignore]
+async fn test_place_and_cancel_take_profit_order() {
+    init_logging();
+
+    let config = test_config();
+    assert!(config.testnet, "This test MUST run on testnet only!");
+
+    let client = HyperliquidClient::connect(config)
+        .await
+        .expect("Failed to connect");
+
+    let instrument = btc_instrument();
+    let strategy = StrategyId::new("test-strategy");
+    let uuid_cid = ClientOrderId::uuid();
+
+    let order_key = OrderKey {
+        exchange: ExchangeId::HyperliquidPerp,
+        instrument: &instrument,
+        strategy: strategy.clone(),
+        cid: uuid_cid.clone(),
+    };
+
+    // Place a TakeProfit order (sell TP above market to avoid triggering)
+    // BTC ~$95k, so $150k TP is well above market
+    let request_open = RequestOpen {
+        side: Side::Sell,
+        price: None, // Market trigger
+        quantity: dec!(0.001),
+        kind: OrderKind::TakeProfit {
+            trigger_price: dec!(150000.0),
+        },
+        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+        position_id: None,
+        reduce_only: false,
+    };
+
+    let open_request = rustrade_execution::order::OrderEvent {
+        key: order_key,
+        state: request_open,
+    };
+
+    println!("Placing TakeProfit order: SELL 0.001 BTC-USD-PERP @ TP $150,000");
+
+    let response = client.open_order(open_request).await;
+    assert!(response.is_some(), "Expected order response");
+    let response = response.unwrap();
+
+    match &response.state {
+        OrderState::Active(ActiveOrderState::Open(open_state)) => {
+            println!("TakeProfit order placed successfully!");
+            println!("  Order ID (cloid): {}", open_state.id);
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            // Cancel
+            let cancel_key = OrderKey {
+                exchange: ExchangeId::HyperliquidPerp,
+                instrument: &response.key.instrument,
+                strategy: response.key.strategy.clone(),
+                cid: response.key.cid.clone(),
+            };
+
+            let cancel_request = rustrade_execution::order::OrderEvent {
+                key: cancel_key,
+                state: rustrade_execution::order::request::RequestCancel {
+                    id: Some(open_state.id.clone()),
+                },
+            };
+
+            println!("Canceling TakeProfit order...");
+            let cancel_response = client.cancel_order(cancel_request).await;
+            assert!(cancel_response.is_some());
+
+            match &cancel_response.unwrap().state {
+                Ok(_) => println!("TakeProfit order canceled successfully!"),
+                Err(e) => panic!("Cancel rejected: {:?}", e),
+            }
+        }
+        OrderState::Inactive(e) => {
+            panic!("TakeProfit order rejected: {:?}", e);
+        }
+        other => {
+            panic!("Unexpected order state: {:?}", other);
+        }
+    }
+}
+
+/// Test that TrailingStop orders are rejected (unsupported).
+#[tokio::test]
+#[ignore]
+async fn test_trailing_stop_unsupported() {
+    init_logging();
+
+    let config = test_config();
+    assert!(config.testnet, "This test MUST run on testnet only!");
+
+    let client = HyperliquidClient::connect(config)
+        .await
+        .expect("Failed to connect");
+
+    let instrument = btc_instrument();
+    let order_key = OrderKey {
+        exchange: ExchangeId::HyperliquidPerp,
+        instrument: &instrument,
+        strategy: StrategyId::new("test"),
+        cid: ClientOrderId::uuid(),
+    };
+
+    let request_open = RequestOpen {
+        side: Side::Sell,
+        price: None,
+        quantity: dec!(0.001),
+        kind: OrderKind::TrailingStop {
+            offset: dec!(100.0),
+            offset_type: rustrade_execution::order::TrailingOffsetType::Absolute,
+        },
+        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+        position_id: None,
+        reduce_only: false,
+    };
+
+    let open_request = rustrade_execution::order::OrderEvent {
+        key: order_key,
+        state: request_open,
+    };
+
+    println!("Placing TrailingStop order (should be rejected as unsupported)...");
+
+    let response = client.open_order(open_request).await;
+    assert!(response.is_some());
+
+    match &response.unwrap().state {
+        OrderState::Inactive(rustrade_execution::order::state::InactiveOrderState::OpenFailed(
+            rustrade_execution::error::OrderError::UnsupportedOrderType(msg),
+        )) => {
+            println!("TrailingStop correctly rejected: {}", msg);
+            assert!(msg.to_lowercase().contains("trailing"));
+        }
+        other => {
+            panic!("Expected UnsupportedOrderType, got: {:?}", other);
+        }
+    }
+}
+
+// ============================================================================
 // Account Stream Tests
 // ============================================================================
 

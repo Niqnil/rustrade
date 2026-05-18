@@ -35,6 +35,29 @@
 //! - REST clients (`InfoClient::new()`, `ExchangeClient::new()`) do NOT auto-reconnect;
 //!   only WebSocket streams via `with_reconnect()` do
 //!
+//! # Conditional Orders (Stop, TakeProfit)
+//!
+//! Hyperliquid supports conditional (trigger) orders via the `ClientOrder::Trigger` variant.
+//!
+//! **Supported order kinds**:
+//! - `Stop` → market order triggered at stop price (`tpsl: "sl"`, `is_market: true`)
+//! - `StopLimit` → limit order triggered at stop price (`tpsl: "sl"`, `is_market: false`)
+//! - `TakeProfit` → market order triggered at take-profit price (`tpsl: "tp"`, `is_market: true`)
+//! - `TakeProfitLimit` → limit order triggered at take-profit price (`tpsl: "tp"`, `is_market: false`)
+//!
+//! **Unsupported**: `TrailingStop`, `TrailingStopLimit` (Hyperliquid does not support trailing stops)
+//!
+//! **UUID requirement**: Trigger orders MUST use [`ClientOrderId::uuid()`] for the client order ID.
+//! The SDK's `cancel_by_cloid()` requires a valid UUID. Non-UUID client IDs will be rejected
+//! at order placement with a clear error message.
+//!
+//! **SDK limitations** (hyperliquid_rust_sdk 0.6.x):
+//! - `fetch_open_orders`: Returns `OpenOrdersResponse` which lacks trigger fields (`is_trigger`,
+//!   `trigger_px`). All orders appear as `OrderKind::Limit`.
+//! - `account_stream` (WebSocket): `OrderUpdate` uses `BasicOrder` which also lacks trigger fields.
+//!   Downstream consumers should correlate orders by `cloid` and track `OrderKind` from the
+//!   placement response.
+//!
 //! # Limitations
 //!
 //! - **Price precision**: Hyperliquid requires 5 significant figures for prices
@@ -535,7 +558,10 @@ impl ExecutionClient for HyperliquidClient {
         request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
     ) -> Option<UnindexedOrderResponseCancel> {
         use crate::order::{request::OrderResponseCancel, state::Cancelled};
-        use hyperliquid_rust_sdk::ClientCancelRequest;
+        use hyperliquid_rust_sdk::{
+            ClientCancelRequest, ClientCancelRequestCloid, ExchangeResponseStatus,
+        };
+        use uuid::Uuid;
 
         let coin = instrument_to_perp_coin(request.key.instrument);
 
@@ -558,30 +584,53 @@ impl ExecutionClient for HyperliquidClient {
             }
         };
 
-        // Parse order ID to u64
-        let oid: u64 = match order_id.0.parse() {
-            Ok(id) => id,
-            Err(e) => {
-                warn!(?order_id, %e, "Failed to parse order ID as u64");
-                return Some(OrderResponseCancel {
-                    key: OrderKey {
-                        exchange: ExchangeId::HyperliquidPerp,
-                        instrument: request.key.instrument.clone(),
-                        strategy: request.key.strategy.clone(),
-                        cid: request.key.cid.clone(),
-                    },
-                    state: Err(UnindexedOrderError::Rejected(
-                        crate::error::ApiError::OrderRejected(format!("Invalid order ID: {e}")),
-                    )),
-                });
+        // Try to determine cancel method:
+        // 1. If order_id parses as u64, use cancel() with OID (regular limit orders)
+        // 2. If order_id parses as UUID, use cancel_by_cloid() (trigger orders)
+        // 3. Otherwise, reject with clear error
+        enum CancelMethod {
+            ByOid(u64),
+            ByCloid(Uuid),
+        }
+
+        let cancel_method = if let Ok(oid) = order_id.0.parse::<u64>() {
+            CancelMethod::ByOid(oid)
+        } else if let Ok(uuid) = Uuid::parse_str(&order_id.0) {
+            CancelMethod::ByCloid(uuid)
+        } else {
+            warn!(?order_id, "Order ID is neither u64 (OID) nor UUID (cloid)");
+            return Some(OrderResponseCancel {
+                key: OrderKey {
+                    exchange: ExchangeId::HyperliquidPerp,
+                    instrument: request.key.instrument.clone(),
+                    strategy: request.key.strategy.clone(),
+                    cid: request.key.cid.clone(),
+                },
+                state: Err(UnindexedOrderError::Rejected(
+                    crate::error::ApiError::OrderRejected(
+                        "Invalid order ID: must be numeric OID or UUID (for trigger orders)"
+                            .to_string(),
+                    ),
+                )),
+            });
+        };
+
+        let response = match cancel_method {
+            CancelMethod::ByOid(oid) => {
+                debug!(oid, "Cancelling by OID");
+                let cancel_request = ClientCancelRequest { asset: coin, oid };
+                self.exchange_client.cancel(cancel_request, None).await
+            }
+            CancelMethod::ByCloid(cloid) => {
+                debug!(%cloid, "Cancelling by cloid (trigger order)");
+                let cancel_request = ClientCancelRequestCloid { asset: coin, cloid };
+                self.exchange_client
+                    .cancel_by_cloid(cancel_request, None)
+                    .await
             }
         };
 
-        let cancel_request = ClientCancelRequest { asset: coin, oid };
-
-        use hyperliquid_rust_sdk::ExchangeResponseStatus;
-
-        let response = match self.exchange_client.cancel(cancel_request, None).await {
+        let response = match response {
             Ok(r) => r,
             Err(e) => {
                 warn!(%e, "Cancel order failed (transport)");
@@ -637,18 +686,13 @@ impl ExecutionClient for HyperliquidClient {
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
     ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
         use hyperliquid_rust_sdk::{
-            ClientLimit, ClientOrder, ClientOrderRequest, ExchangeDataStatus,
+            ClientLimit, ClientOrder, ClientOrderRequest, ClientTrigger, ExchangeDataStatus,
             ExchangeResponseStatus,
         };
 
-        let coin = instrument_to_perp_coin(request.key.instrument);
-        let is_buy = request.state.side == Side::Buy;
-
-        // Hyperliquid only supports Limit orders, so price is required
-        let price = match request.state.price {
-            Some(p) => p,
-            None => {
-                return Some(Order {
+        let make_rejected =
+            |msg: String| -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
+                Order {
                     key: OrderKey {
                         exchange: ExchangeId::HyperliquidPerp,
                         instrument: request.key.instrument.clone(),
@@ -656,21 +700,89 @@ impl ExecutionClient for HyperliquidClient {
                         cid: request.key.cid.clone(),
                     },
                     side: request.state.side,
-                    price: None,
+                    price: request.state.price,
                     quantity: request.state.quantity,
                     kind: request.state.kind,
                     time_in_force: request.state.time_in_force,
                     state: OrderState::inactive(OrderError::Rejected(
-                        crate::error::ApiError::OrderRejected(
-                            "Hyperliquid requires limit price for all orders".to_owned(),
-                        ),
+                        crate::error::ApiError::OrderRejected(msg),
                     )),
-                });
+                }
+            };
+
+        let make_unsupported =
+            |msg: String| -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
+                Order {
+                    key: OrderKey {
+                        exchange: ExchangeId::HyperliquidPerp,
+                        instrument: request.key.instrument.clone(),
+                        strategy: request.key.strategy.clone(),
+                        cid: request.key.cid.clone(),
+                    },
+                    side: request.state.side,
+                    price: request.state.price,
+                    quantity: request.state.quantity,
+                    kind: request.state.kind,
+                    time_in_force: request.state.time_in_force,
+                    state: OrderState::inactive(OrderError::UnsupportedOrderType(msg)),
+                }
+            };
+
+        let coin = instrument_to_perp_coin(request.key.instrument);
+        let is_buy = request.state.side == Side::Buy;
+
+        match request.state.kind {
+            OrderKind::Market => {
+                return Some(make_unsupported(
+                    "Hyperliquid does not support market orders; use Limit with IOC time-in-force"
+                        .to_string(),
+                ));
             }
+            OrderKind::TrailingStop { .. } | OrderKind::TrailingStopLimit { .. } => {
+                return Some(make_unsupported(
+                    "Hyperliquid does not support trailing stop orders".to_string(),
+                ));
+            }
+            OrderKind::Limit
+            | OrderKind::Stop { .. }
+            | OrderKind::StopLimit { .. }
+            | OrderKind::TakeProfit { .. }
+            | OrderKind::TakeProfitLimit { .. } => {}
+        }
+
+        let cloid = cid_to_cloid(&request.key.cid);
+        let cloid_is_some = cloid.is_some();
+        let is_trigger_order = matches!(
+            request.state.kind,
+            OrderKind::Stop { .. }
+                | OrderKind::StopLimit { .. }
+                | OrderKind::TakeProfit { .. }
+                | OrderKind::TakeProfitLimit { .. }
+        );
+        if is_trigger_order && cloid.is_none() {
+            return Some(make_rejected(
+                "Trigger orders require UUID-format client order ID (use ClientOrderId::uuid()). \
+                 Non-UUID IDs cannot be cancelled via cancel_by_cloid()."
+                    .to_string(),
+            ));
+        }
+
+        let limit_px = match request.state.kind {
+            // Market triggers: SDK uses trigger_px as limit_px
+            OrderKind::Stop { trigger_price } | OrderKind::TakeProfit { trigger_price } => {
+                round_to_5_sig_figs(trigger_price)
+            }
+            _ => match request.state.price {
+                Some(p) => round_to_5_sig_figs(p),
+                None => {
+                    return Some(make_rejected(
+                        "Hyperliquid requires limit price for Limit/StopLimit/TakeProfitLimit orders"
+                            .to_string(),
+                    ));
+                }
+            },
         };
 
-        // Round price and quantity to 5 significant figures
-        let limit_px = round_to_5_sig_figs(price);
         let sz = round_to_5_sig_figs(request.state.quantity);
 
         // Map time-in-force (warn if FOK is substituted with IOC)
@@ -682,9 +794,37 @@ impl ExecutionClient for HyperliquidClient {
         }
         let tif = map_tif(&request.state.time_in_force).to_string();
 
-        // Build order request
-        // Pass cloid if cid is a valid UUID (enables order correlation via client ID)
-        let cloid = cid_to_cloid(&request.key.cid);
+        // Build order_type based on OrderKind
+        let order_type = match request.state.kind {
+            OrderKind::Limit => ClientOrder::Limit(ClientLimit { tif }),
+            OrderKind::Stop { trigger_price } => ClientOrder::Trigger(ClientTrigger {
+                is_market: true,
+                trigger_px: round_to_5_sig_figs(trigger_price),
+                tpsl: "sl".to_string(),
+            }),
+            OrderKind::StopLimit { trigger_price } => ClientOrder::Trigger(ClientTrigger {
+                is_market: false,
+                trigger_px: round_to_5_sig_figs(trigger_price),
+                tpsl: "sl".to_string(),
+            }),
+            OrderKind::TakeProfit { trigger_price } => ClientOrder::Trigger(ClientTrigger {
+                is_market: true,
+                trigger_px: round_to_5_sig_figs(trigger_price),
+                tpsl: "tp".to_string(),
+            }),
+            OrderKind::TakeProfitLimit { trigger_price } => ClientOrder::Trigger(ClientTrigger {
+                is_market: false,
+                trigger_px: round_to_5_sig_figs(trigger_price),
+                tpsl: "tp".to_string(),
+            }),
+            // Already rejected above
+            OrderKind::Market
+            | OrderKind::TrailingStop { .. }
+            | OrderKind::TrailingStopLimit { .. } => {
+                unreachable!("unsupported order kinds rejected earlier")
+            }
+        };
+
         let order_request = ClientOrderRequest {
             asset: coin,
             is_buy,
@@ -692,7 +832,7 @@ impl ExecutionClient for HyperliquidClient {
             limit_px,
             sz,
             cloid,
-            order_type: ClientOrder::Limit(ClientLimit { tif }),
+            order_type,
         };
 
         let response = match self.exchange_client.order(order_request, None).await {
@@ -751,16 +891,30 @@ impl ExecutionClient for HyperliquidClient {
                             crate::error::ApiError::OrderRejected(msg),
                         ))
                     }
-                    Some(ExchangeDataStatus::WaitingForFill)
-                    | Some(ExchangeDataStatus::WaitingForTrigger) => {
-                        // Trigger/conditional orders return no usable order ID.
-                        // Reject since we can't track or cancel these orders.
-                        warn!("Trigger/conditional orders not supported");
-                        OrderState::inactive(OrderError::Rejected(
-                            crate::error::ApiError::OrderRejected(
-                                "trigger/conditional orders not supported".to_string(),
-                            ),
-                        ))
+                    Some(
+                        ExchangeDataStatus::WaitingForFill | ExchangeDataStatus::WaitingForTrigger,
+                    ) => {
+                        // Use cid as OrderId only if it's a valid UUID (required for
+                        // cancel_by_cloid). Trigger orders pass the UUID guard above;
+                        // limit IOC/FOK orders may have non-UUID cids — those become
+                        // untrackable, so reject with an observable failure rather than
+                        // returning an OrderId that cancel cannot parse.
+                        if cloid_is_some {
+                            debug!(cloid = %request.key.cid.0, "Order waiting (cloid trackable)");
+                            OrderState::active(Open {
+                                id: OrderId(request.key.cid.0.clone()),
+                                time_exchange: Utc::now(),
+                                filled_quantity: Decimal::ZERO,
+                            })
+                        } else {
+                            warn!("Order accepted but cid is not UUID — untrackable");
+                            OrderState::inactive(OrderError::Rejected(
+                                crate::error::ApiError::OrderRejected(
+                                    "order accepted but cid is not UUID; cannot track for cancel"
+                                        .to_string(),
+                                ),
+                            ))
+                        }
                     }
                     Some(ExchangeDataStatus::Success) | None => {
                         // Generic success without order ID — SDK didn't return structured data.
