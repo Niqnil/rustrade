@@ -1723,9 +1723,12 @@ impl AlpacaClient {
                 TrailingOffsetType::Absolute => (None, None, Some(offset.to_string())),
                 TrailingOffsetType::BasisPoints => unreachable!("validated above"),
             },
-            OrderKind::Market | OrderKind::Limit | OrderKind::TrailingStopLimit { .. } => {
-                (None, None, None)
-            }
+            // TakeProfit/TakeProfitLimit rejected by map_order_kind → unreachable here
+            OrderKind::Market
+            | OrderKind::Limit
+            | OrderKind::TakeProfit { .. }
+            | OrderKind::TakeProfitLimit { .. }
+            | OrderKind::TrailingStopLimit { .. } => (None, None, None),
         };
 
         let body = AlpacaOrderRequest {
@@ -3152,8 +3155,10 @@ fn map_order_kind(kind: OrderKind) -> Option<&'static str> {
         OrderKind::Stop { .. } => Some("stop"),
         OrderKind::StopLimit { .. } => Some("stop_limit"),
         OrderKind::TrailingStop { .. } => Some("trailing_stop"),
-        // Alpaca does not support trailing stop-limit orders.
-        OrderKind::TrailingStopLimit { .. } => None,
+        // Alpaca does not support take-profit or trailing stop-limit orders.
+        OrderKind::TakeProfit { .. }
+        | OrderKind::TakeProfitLimit { .. }
+        | OrderKind::TrailingStopLimit { .. } => None,
     }
 }
 
@@ -3417,6 +3422,19 @@ mod tests {
                 offset: Decimal::from_str("5.0").unwrap(),
                 offset_type: TrailingOffsetType::Percentage,
                 limit_offset: Decimal::from_str("1.0").unwrap(),
+            }),
+            None
+        );
+        // TakeProfit/TakeProfitLimit are not supported by Alpaca
+        assert_eq!(
+            map_order_kind(OrderKind::TakeProfit {
+                trigger_price: Decimal::from_str("160.00").unwrap()
+            }),
+            None
+        );
+        assert_eq!(
+            map_order_kind(OrderKind::TakeProfitLimit {
+                trigger_price: Decimal::from_str("160.00").unwrap()
             }),
             None
         );

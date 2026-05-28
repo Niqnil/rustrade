@@ -1,6 +1,6 @@
 [package]
 name = "rustrade-data"
-version = "0.2.0"
+version = "0.2.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -74,7 +74,7 @@ hyperliquid_rust_sdk = { version = "0.6", optional = true }
 
 # Databento (optional, behind "databento" feature)
 # Note: databento re-exports dbn, so we don't need a separate dbn dependency
-databento = { version = "0.50", optional = true }
+databento = { version = "0.51", optional = true }
 
 # Massive (optional, behind "massive" feature)
 tokio-tungstenite = { version = "0.29", optional = true, features = ["native-tls"] }

@@ -332,8 +332,10 @@ impl MockExchange {
                     OrderKind::Market => None,
                     OrderKind::Limit
                     | OrderKind::StopLimit { .. }
+                    | OrderKind::TakeProfitLimit { .. }
                     | OrderKind::TrailingStopLimit { .. } => request.state.price,
                     OrderKind::Stop { trigger_price }
+                    | OrderKind::TakeProfit { trigger_price }
                     | OrderKind::TrailingStop {
                         offset: trigger_price,
                         ..

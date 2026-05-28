@@ -310,6 +310,8 @@ pub enum OrderMappingError {
     MissingLimitPrice(OrderKind),
     /// Trailing offset type not supported by IBKR.
     UnsupportedOffsetType(TrailingOffsetType),
+    /// Order kind not supported by IBKR (e.g., TakeProfit).
+    UnsupportedOrderKind(OrderKind),
     /// AtClose TIF only valid with Market or Limit orders (becomes MOC/LOC).
     /// Stop orders cannot be combined with at-close execution.
     UnsupportedOrderKindForAtClose(OrderKind),
@@ -329,6 +331,9 @@ impl std::fmt::Display for OrderMappingError {
             }
             Self::UnsupportedOffsetType(t) => {
                 write!(f, "trailing offset type {t:?} not supported by IBKR")
+            }
+            Self::UnsupportedOrderKind(k) => {
+                write!(f, "order kind {k} not supported by IBKR")
             }
             Self::UnsupportedOrderKindForAtClose(k) => {
                 write!(
@@ -408,6 +413,8 @@ fn require_limit_price(
 /// - `TrailingStop` (Absolute) → IB "TRAIL" with `aux_price`
 /// - `TrailingStopLimit` (Absolute) → IB "TRAIL LIMIT" with `aux_price`, `limit_price_offset`
 /// - `TrailingStopLimit` (Percentage) → IB "TRAIL LIMIT" with `trailing_percent`, `limit_price_offset`
+/// - `TakeProfit` → `Err(UnsupportedOrderKind)` (IBKR has no native TP; use bracket orders)
+/// - `TakeProfitLimit` → `Err(UnsupportedOrderKind)` (IBKR has no native TP; use bracket orders)
 /// - `BasisPoints` offset type → Error (not supported by IBKR)
 ///
 /// # Price Requirements
@@ -531,6 +538,12 @@ pub fn build_ib_order(
                     ));
                 }
             }
+        }
+
+        // IBKR does not have native take-profit order types. Callers should use
+        // bracket orders or manage TP logic at the strategy level.
+        OrderKind::TakeProfit { .. } | OrderKind::TakeProfitLimit { .. } => {
+            return Err(OrderMappingError::UnsupportedOrderKind(*kind));
         }
     };
 
@@ -1088,6 +1101,46 @@ mod tests {
             result,
             Err(OrderMappingError::UnsupportedOffsetType(
                 TrailingOffsetType::BasisPoints
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_build_take_profit_unsupported() {
+        let result = build_ib_order(
+            rustrade_instrument::Side::Sell,
+            100.0,
+            &OrderKind::TakeProfit {
+                trigger_price: Decimal::from(150),
+            },
+            None,
+            &TimeInForce::GoodUntilCancelled { post_only: false },
+        );
+
+        assert!(matches!(
+            result,
+            Err(OrderMappingError::UnsupportedOrderKind(
+                OrderKind::TakeProfit { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_build_take_profit_limit_unsupported() {
+        let result = build_ib_order(
+            rustrade_instrument::Side::Sell,
+            100.0,
+            &OrderKind::TakeProfitLimit {
+                trigger_price: Decimal::from(150),
+            },
+            None,
+            &TimeInForce::GoodUntilCancelled { post_only: false },
+        );
+
+        assert!(matches!(
+            result,
+            Err(OrderMappingError::UnsupportedOrderKind(
+                OrderKind::TakeProfitLimit { .. }
             ))
         ));
     }
