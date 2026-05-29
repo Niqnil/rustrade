@@ -14,13 +14,22 @@ Execution client library for streaming private account data and executing orders
 
 ## Order Types
 
-All connectors support Market and Limit orders. Additional order types:
+All connectors support Limit orders. Market orders are supported everywhere except
+Hyperliquid (use a Limit order with `ImmediateOrCancel` time-in-force instead).
+Additional order types:
 
 | Order Type | IBKR | Alpaca | Binance | Hyperliquid |
 |:----------:|:----:|:------:|:-------:|:-----------:|
-| Stop | ✅ | ✅ | ❌ | ❌ |
-| StopLimit | ✅ | ✅ | ❌ | ❌ |
-| TrailingStop | ✅ | ✅ | ❌ | ❌ |
+| Stop | ✅ | ✅ | ✅ | ✅ |
+| StopLimit | ✅ | ✅ | ✅ | ✅ |
+| TakeProfit | ❌ | ❌ | ✅ | ✅ |
+| TakeProfitLimit | ❌ | ❌ | ✅ | ✅ |
+| TrailingStop | ✅ | ✅ | ⚠️ | ❌ |
 | TrailingStopLimit | ✅ | ❌ | ❌ | ❌ |
+
+⚠️ Binance `TrailingStop` supports `BasisPoints` and `Percentage` offsets only;
+`Absolute` offsets are rejected as unsupported. Hyperliquid trigger orders (Stop,
+StopLimit, TakeProfit, TakeProfitLimit) require a UUID-format client order ID
+(`ClientOrderId::uuid()`).
 
 See the [workspace README](../README.md) for documentation, examples, and contributing guidelines.
