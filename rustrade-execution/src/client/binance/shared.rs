@@ -200,7 +200,7 @@ pub(crate) fn dedup_key_from_event(event: &UnindexedAccountEvent) -> Option<Dedu
             }),
             Err(_) => None, // error responses don't need dedup
         },
-        _ => None, // BalanceSnapshot, Snapshot — no dedup needed
+        _ => None, // BalanceSnapshot, BalanceStreamUpdate, Snapshot, StreamError — no dedup needed
     }
 }
 

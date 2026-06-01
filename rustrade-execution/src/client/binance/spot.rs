@@ -37,7 +37,7 @@ use super::shared::{
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
     UnindexedAccountSnapshot,
-    balance::{AssetBalance, Balance},
+    balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate},
     client::ExecutionClient,
     error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
     order::{
@@ -2173,10 +2173,10 @@ fn convert_new_order(
     ))
 }
 
-/// Convert a Binance outboundAccountPosition to balance snapshot events.
+/// Convert a Binance outboundAccountPosition to balance stream-update events.
 ///
-/// Emits one BalanceSnapshot event per asset since `Snapshot<AssetBalance>` wraps
-/// a single balance. Pushes into the provided buffer to avoid per-message allocation.
+/// Emits one `BalanceStreamUpdate` event per asset (the WS message is a `free`/`locked` partial,
+/// not a full snapshot). Pushes into the provided buffer to avoid per-message allocation.
 fn convert_account_position(
     position: binance_sdk::spot::websocket_api::OutboundAccountPosition,
     buf: &mut Vec<UnindexedAccountEvent>,
@@ -2210,11 +2210,16 @@ fn convert_account_position(
                 continue;
             }
         };
-        let balance = AssetBalance::new(asset, Balance::new(free + locked, free), time_exchange);
+        // WS `outboundAccountPosition` is a free/locked partial (no debt), so emit a
+        // `BalanceStreamUpdate` rather than a full `BalanceSnapshot`. Spot carries no margin debt,
+        // so nothing is preserved here — but routing it through the update path keeps one
+        // consistent model (REST → snapshot, WS → update) and protects margin debt downstream.
+        let update =
+            AssetBalanceUpdate::new(asset, BalanceUpdate::new(free, locked), time_exchange);
         buf.push(UnindexedAccountEvent::new(
             ExchangeId::BinanceSpot,
-            AccountEventKind::BalanceSnapshot(
-                rustrade_integration::collection::snapshot::Snapshot::new(balance),
+            AccountEventKind::BalanceStreamUpdate(
+                rustrade_integration::collection::snapshot::Snapshot::new(update),
             ),
         ));
     }
@@ -2900,16 +2905,17 @@ mod tests {
 
         assert_eq!(buf.len(), 1);
         match &buf[0].kind {
-            AccountEventKind::BalanceSnapshot(snap) => {
-                let balance = &snap.0;
-                assert_eq!(balance.asset.as_ref(), "BTC");
-                // total = free + locked = 1.5 + 0.5 = 2.0; free = 1.5
-                let expected_total = Decimal::from_str("2.0").unwrap();
+            AccountEventKind::BalanceStreamUpdate(snap) => {
+                let update = &snap.0;
+                assert_eq!(update.asset.as_ref(), "BTC");
+                // free = 1.5, locked = 0.5; total = free + locked = 2.0
                 let expected_free = Decimal::from_str("1.5").unwrap();
-                assert_eq!(balance.balance.total, expected_total);
-                assert_eq!(balance.balance.free, expected_free);
+                let expected_locked = Decimal::from_str("0.5").unwrap();
+                assert_eq!(update.update.free, expected_free);
+                assert_eq!(update.update.locked, expected_locked);
+                assert_eq!(update.update.total(), Decimal::from_str("2.0").unwrap());
             }
-            other => panic!("expected BalanceSnapshot, got {:?}", other),
+            other => panic!("expected BalanceStreamUpdate, got {:?}", other),
         }
     }
 
@@ -2945,10 +2951,10 @@ mod tests {
         // The entry with missing asset name is skipped; USDT entry is kept
         assert_eq!(buf.len(), 1);
         match &buf[0].kind {
-            AccountEventKind::BalanceSnapshot(snap) => {
+            AccountEventKind::BalanceStreamUpdate(snap) => {
                 assert_eq!(snap.0.asset.as_ref(), "USDT");
             }
-            other => panic!("expected BalanceSnapshot, got {:?}", other),
+            other => panic!("expected BalanceStreamUpdate, got {:?}", other),
         }
     }
 
@@ -2971,10 +2977,10 @@ mod tests {
         // BTC skipped due to unparseable free; ETH kept
         assert_eq!(buf.len(), 1);
         match &buf[0].kind {
-            AccountEventKind::BalanceSnapshot(snap) => {
+            AccountEventKind::BalanceStreamUpdate(snap) => {
                 assert_eq!(snap.0.asset.as_ref(), "ETH");
             }
-            other => panic!("expected BalanceSnapshot, got {:?}", other),
+            other => panic!("expected BalanceStreamUpdate, got {:?}", other),
         }
     }
 

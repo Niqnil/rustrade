@@ -37,7 +37,7 @@ use tracing_subscriber as _;
 use wiremock as _;
 
 use crate::{
-    balance::AssetBalance,
+    balance::{AssetBalance, AssetBalanceUpdate},
     order::{Order, OrderSnapshot, request::OrderResponseCancel},
     position::Position,
     trade::Trade,
@@ -106,7 +106,18 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
     Snapshot(AccountSnapshot<ExchangeKey, AssetKey, InstrumentKey>),
 
     /// Single [`AssetBalance`] snapshot - replaces existing balance state.
+    ///
+    /// Sourced from a REST account snapshot: carries the **full** balance including any per-asset
+    /// margin debt (`borrowed`/`interest`). This is the authoritative source for debt totals.
     BalanceSnapshot(Snapshot<AssetBalance<AssetKey>>),
+
+    /// Single [`AssetBalanceUpdate`] - applies a WS partial (`free`/`locked` only).
+    ///
+    /// Sourced from an exchange WS user-data stream (e.g. Binance `outboundAccountPosition`). It
+    /// carries **no** margin debt, so applying it updates `free`/`locked` while **preserving** any
+    /// existing [`MarginDetails`](balance::MarginDetails) — debt cannot be silently clobbered by a
+    /// stream update. Debt totals remain as fresh as the last [`BalanceSnapshot`].
+    BalanceStreamUpdate(Snapshot<AssetBalanceUpdate<AssetKey>>),
 
     /// Single [`Order`] snapshot - used to upsert existing order state if it's more recent.
     ///

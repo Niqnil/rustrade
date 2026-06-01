@@ -1,7 +1,7 @@
 use crate::{
     AccountEvent, AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot,
     UnindexedAccountEvent, UnindexedAccountSnapshot,
-    balance::AssetBalance,
+    balance::{AssetBalance, AssetBalanceUpdate},
     error::{
         ApiError, ClientError, KeyError, OrderError, UnindexedApiError, UnindexedClientError,
         UnindexedOrderError,
@@ -55,6 +55,11 @@ impl AccountEventIndexer {
             }
             AccountEventKind::BalanceSnapshot(snapshot) => {
                 AccountEventKind::BalanceSnapshot(self.asset_balance(snapshot.0).map(Snapshot)?)
+            }
+            AccountEventKind::BalanceStreamUpdate(snapshot) => {
+                AccountEventKind::BalanceStreamUpdate(
+                    self.asset_balance_update(snapshot.0).map(Snapshot)?,
+                )
             }
             AccountEventKind::OrderSnapshot(snapshot) => {
                 AccountEventKind::OrderSnapshot(self.order_snapshot(snapshot.0).map(Snapshot)?)
@@ -131,6 +136,24 @@ impl AccountEventIndexer {
         Ok(AssetBalance {
             asset,
             balance,
+            time_exchange,
+        })
+    }
+
+    pub fn asset_balance_update(
+        &self,
+        update: AssetBalanceUpdate<AssetNameExchange>,
+    ) -> Result<AssetBalanceUpdate<AssetIndex>, IndexError> {
+        let AssetBalanceUpdate {
+            asset,
+            update,
+            time_exchange,
+        } = update;
+        let asset = self.map.find_asset_index(&asset)?;
+
+        Ok(AssetBalanceUpdate {
+            asset,
+            update,
             time_exchange,
         })
     }
