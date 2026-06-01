@@ -50,7 +50,7 @@ use std::future::Future;
 #[cfg(feature = "alpaca")]
 pub mod alpaca;
 
-// BinanceSpot ExecutionClient implementation
+// Binance ExecutionClient implementations: Spot (live) and Cross Margin (identity/config scaffolding)
 #[cfg(feature = "binance")]
 pub mod binance;
 

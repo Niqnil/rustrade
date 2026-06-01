@@ -36,6 +36,7 @@ pub enum ExchangeId {
     Mock,
     BinanceFuturesCoin,
     BinanceFuturesUsd,
+    BinanceMargin,
     BinanceOptions,
     BinancePortfolioMargin,
     BinanceSpot,
@@ -115,6 +116,7 @@ impl ExchangeId {
             ExchangeId::AlpacaSip => "alpaca_sip",
             ExchangeId::BinanceFuturesCoin => "binance_futures_coin",
             ExchangeId::BinanceFuturesUsd => "binance_futures_usd",
+            ExchangeId::BinanceMargin => "binance_margin",
             ExchangeId::BinanceOptions => "binance_options",
             ExchangeId::BinancePortfolioMargin => "binance_portfolio_margin",
             ExchangeId::BinanceSpot => "binance_spot",
@@ -179,6 +181,19 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ExchangeId>(r#""huobi""#).unwrap(),
             ExchangeId::Htx
+        );
+    }
+
+    #[test]
+    fn test_serde_binance_margin() {
+        assert_eq!(ExchangeId::BinanceMargin.as_str(), "binance_margin");
+        assert_eq!(
+            serde_json::to_string(&ExchangeId::BinanceMargin).unwrap(),
+            r#""binance_margin""#
+        );
+        assert_eq!(
+            serde_json::from_str::<ExchangeId>(r#""binance_margin""#).unwrap(),
+            ExchangeId::BinanceMargin
         );
     }
 }
