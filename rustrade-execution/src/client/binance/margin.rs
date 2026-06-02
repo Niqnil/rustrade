@@ -6,10 +6,13 @@
 //! trait so callers do not branch on spot-vs-margin transport.
 //!
 //! ## Scope
-//! This module currently provides the client's *identity and configuration* only: the
-//! [`BinanceMargin`] struct, its [`BinanceMarginConfig`], and the [`MarginSideEffect`] borrow
-//! policy. Order submission, account snapshots, and the live user-data stream are added in
-//! follow-up work; until then `BinanceMargin` is not yet a usable `ExecutionClient`.
+//! This module provides the client's identity and configuration ([`BinanceMargin`],
+//! [`BinanceMarginConfig`], [`MarginSideEffect`]) plus the REST surface: order submission/cancel
+//! and the account snapshot / balance / open-order / trade queries — all currently exposed as
+//! inherent methods. The live `userListenToken` user-data stream (`account_stream`) is added in
+//! follow-up work; until it lands and the inherent methods are folded into the trait,
+//! `BinanceMargin` is not yet a usable `ExecutionClient`. Cross margin only (`isIsolated = "FALSE"`);
+//! isolated margin is a separate follow-up.
 //!
 //! ## Borrow/repay
 //! Margin orders carry a `sideEffectType` controlling whether the venue borrows on entry and
@@ -23,17 +26,21 @@
 //! rather than silent. See [`BinanceMarginConfig::testnet`].
 
 use super::shared::{
-    BinanceOrderType, BinanceTimeInForce, RateLimitTracker, classify_order_kind_tif,
-    classify_rest_order_error, rest_call_with_retry,
+    BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce, RateLimitTracker,
+    classify_order_kind_tif, classify_rest_order_error, connectivity_error, parse_order_kind,
+    parse_side, parse_time_in_force, rest_call_with_retry,
 };
 use crate::{
-    error::{ApiError, OrderError},
+    AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountSnapshot,
+    balance::{AssetBalance, Balance},
+    error::{ApiError, OrderError, UnindexedClientError},
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
-        id::OrderId,
+        id::{ClientOrderId, OrderId, StrategyId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
     },
+    trade::{AssetFees, Trade, TradeId},
 };
 use binance_sdk::{
     common::config::{ConfigurationRestApi, ConfigurationWebsocketApi},
@@ -42,17 +49,23 @@ use binance_sdk::{
         rest_api::{
             MarginAccountCancelOrderParams, MarginAccountNewOrderNewOrderRespTypeEnum,
             MarginAccountNewOrderParams, MarginAccountNewOrderSideEnum,
-            MarginAccountNewOrderTimeInForceEnum, RestApi,
+            MarginAccountNewOrderTimeInForceEnum, QueryCrossMarginAccountDetailsParams,
+            QueryCrossMarginAccountDetailsResponseUserAssetsInner,
+            QueryMarginAccountsOpenOrdersParams, QueryMarginAccountsOpenOrdersResponseInner,
+            QueryMarginAccountsTradeListParams, QueryMarginAccountsTradeListResponseInner, RestApi,
         },
     },
 };
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use rust_decimal::Decimal;
-use rustrade_instrument::{Side, exchange::ExchangeId, instrument::name::InstrumentNameExchange};
+use rustrade_instrument::{
+    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
+    instrument::name::InstrumentNameExchange,
+};
 use serde::{Deserialize, Serialize};
 use smol_str::{SmolStr, format_smolstr};
 use std::{str::FromStr, sync::Arc};
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 // ---------------------------------------------------------------------------
 // Margin sideEffectType
@@ -570,6 +583,623 @@ impl BinanceMargin {
             state: Ok(Cancelled::new(exchange_order_id, time_exchange, filled_qty)),
         })
     }
+
+    /// Fetch a full cross-margin account snapshot: per-asset balances (incl. debt) plus open
+    /// orders for each requested instrument.
+    ///
+    /// Balances come from `query_cross_margin_account_details` (account-wide `userAssets`,
+    /// carrying `borrowed`/`interest` → [`Balance::new_margin`]); open orders are fetched
+    /// per-instrument, mirroring [`BinanceSpot::account_snapshot`](super::spot::BinanceSpot).
+    /// Cross only (`isIsolated = "FALSE"`).
+    ///
+    /// Inherent for now; becomes the `ExecutionClient::account_snapshot` body once the
+    /// account stream lands and the trait is implemented in full (see [`open_order`](Self::open_order)).
+    pub async fn account_snapshot(
+        &self,
+        assets: &[AssetNameExchange],
+        instruments: &[InstrumentNameExchange],
+    ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
+        let response = rest_call_with_retry(&self.rest, &self.rate_limiter, |rest| {
+            Box::pin(async move {
+                let params = QueryCrossMarginAccountDetailsParams::builder().build()?;
+                rest.query_cross_margin_account_details(params).await
+            })
+        })
+        .await
+        .map_err(connectivity_error)?;
+
+        let account = response
+            .data()
+            .await
+            .map_err(|e| connectivity_error(e.into()))?;
+
+        let balances =
+            filter_and_convert_margin_balances(account.user_assets.unwrap_or_default(), assets);
+
+        // Fetch open orders for all instruments concurrently (with retry), limiting concurrency
+        // to avoid bursting Binance's request weight limits. account_snapshot wraps Open orders
+        // in OrderState::active(); fetch_open_orders returns them without the wrapper — both use
+        // fetch_margin_open_orders_for_instrument.
+        use futures::{StreamExt as _, TryStreamExt as _};
+        let instrument_snapshots: Vec<_> =
+            futures::stream::iter(instruments.iter().cloned().map(|instrument| {
+                fetch_margin_open_orders_for_instrument(
+                    self.rest.clone(),
+                    self.rate_limiter.clone(),
+                    instrument,
+                )
+            }))
+            .buffer_unordered(8)
+            .map(|result| {
+                let (inst, orders) = result?;
+                let wrapped = orders
+                    .into_iter()
+                    .map(|o| Order {
+                        key: o.key,
+                        side: o.side,
+                        price: o.price,
+                        quantity: o.quantity,
+                        kind: o.kind,
+                        time_in_force: o.time_in_force,
+                        state: OrderState::active(o.state),
+                    })
+                    .collect();
+                Ok::<_, UnindexedClientError>(InstrumentAccountSnapshot::new(inst, wrapped, None))
+            })
+            .try_collect()
+            .await?;
+
+        Ok(AccountSnapshot::new(
+            ExchangeId::BinanceMargin,
+            balances,
+            instrument_snapshots,
+        ))
+    }
+
+    /// Fetch current cross-margin balances (incl. `borrowed`/`interest` debt) for the requested
+    /// assets. An empty `assets` slice is the "return all" sentinel.
+    ///
+    /// Inherent for now; becomes the `ExecutionClient::fetch_balances` body in a follow-up.
+    pub async fn fetch_balances(
+        &self,
+        assets: &[AssetNameExchange],
+    ) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError> {
+        let response = rest_call_with_retry(&self.rest, &self.rate_limiter, |rest| {
+            Box::pin(async move {
+                let params = QueryCrossMarginAccountDetailsParams::builder().build()?;
+                rest.query_cross_margin_account_details(params).await
+            })
+        })
+        .await
+        .map_err(connectivity_error)?;
+
+        let account = response
+            .data()
+            .await
+            .map_err(|e| connectivity_error(e.into()))?;
+
+        Ok(filter_and_convert_margin_balances(
+            account.user_assets.unwrap_or_default(),
+            assets,
+        ))
+    }
+
+    /// Fetch currently open cross-margin orders, optionally filtered by instrument.
+    ///
+    /// Honours the `ExecutionClient::fetch_open_orders` contract: an empty `instruments` slice is
+    /// the "return all" sentinel, served by a single no-symbol `query_margin_accounts_open_orders`
+    /// call returning open orders across every cross-margin instrument (each order's instrument is
+    /// taken from its own `symbol` field). A non-empty slice fetches the listed instruments
+    /// concurrently, per-symbol. Cross only (`isIsolated = "FALSE"`).
+    ///
+    /// Inherent for now; becomes the `ExecutionClient::fetch_open_orders` body in a follow-up.
+    pub async fn fetch_open_orders(
+        &self,
+        instruments: &[InstrumentNameExchange],
+    ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError> {
+        // Empty slice = "return all" sentinel: a single no-symbol query is both correct (the
+        // contract requires all instruments) and far cheaper than enumerating every symbol.
+        if instruments.is_empty() {
+            return fetch_margin_all_open_orders(self.rest.clone(), self.rate_limiter.clone())
+                .await;
+        }
+        use futures::{StreamExt as _, TryStreamExt as _};
+        futures::stream::iter(instruments.iter().cloned().map(|instrument| {
+            fetch_margin_open_orders_for_instrument(
+                self.rest.clone(),
+                self.rate_limiter.clone(),
+                instrument,
+            )
+        }))
+        .buffer_unordered(8)
+        .try_fold(
+            Vec::with_capacity(instruments.len()),
+            |mut acc: Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, (_, orders)| async move {
+                acc.extend(orders);
+                Ok(acc)
+            },
+        )
+        .await
+    }
+
+    /// Fetch cross-margin trades (fills) since `time_since`, optionally filtered by instrument.
+    ///
+    /// **Documented deviation from the `ExecutionClient::fetch_trades` "return all" contract:**
+    /// Binance's margin trade-list endpoint (`myTrades`) requires a symbol — there is no no-symbol
+    /// "all trades" query (unlike open orders). An empty `instruments` slice therefore has nothing
+    /// to query and returns an empty `Vec`; callers wanting all trades must enumerate instruments
+    /// explicitly. (Open orders *do* honour the sentinel — see [`fetch_open_orders`](Self::fetch_open_orders).)
+    ///
+    /// Inherent for now; becomes the `ExecutionClient::fetch_trades` body in a follow-up.
+    // `.iter().cloned()` is required: Rust async closures cannot satisfy the HRTB needed by the
+    // iterator machinery, even when the clone is moved inside the closure body (mirrors spot).
+    #[allow(clippy::redundant_iter_cloned)]
+    pub async fn fetch_trades(
+        &self,
+        time_since: DateTime<Utc>,
+        instruments: &[InstrumentNameExchange],
+    ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError> {
+        use futures::StreamExt as _;
+
+        if instruments.is_empty() {
+            debug!(
+                "BinanceMargin fetch_trades called with empty instruments slice — returning empty result"
+            );
+            return Ok(Vec::new());
+        }
+        let start_time_ms = time_since.timestamp_millis();
+        let mut all_trades = Vec::new();
+
+        // Binance requires per-symbol queries for trade history. Limit concurrency to avoid
+        // bursting Binance's request weight limits.
+        let mut stream = futures::stream::iter(instruments.iter().cloned().map(|inst| {
+            let rest = self.rest.clone();
+            let rate_limiter = self.rate_limiter.clone();
+            async move {
+                let pages =
+                    paginate_margin_my_trades(&rest, &rate_limiter, &inst, start_time_ms).await?;
+                Ok::<_, UnindexedClientError>((inst, pages))
+            }
+        }))
+        .buffer_unordered(8);
+        while let Some(result) = stream.next().await {
+            let (instrument, trades_data) = result?;
+            for t in trades_data {
+                if let Some(trade) = convert_margin_trade(&t, &instrument) {
+                    all_trades.push(trade);
+                }
+            }
+        }
+
+        Ok(all_trades)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Account query helpers (margin-specific)
+// ---------------------------------------------------------------------------
+
+/// Fetch open orders for a single instrument via `query_margin_accounts_open_orders`
+/// (cross, `isIsolated = "FALSE"`). Mirrors `BinanceSpot::fetch_open_orders_for_instrument`.
+async fn fetch_margin_open_orders_for_instrument(
+    rest: Arc<RestApi>,
+    rate_limiter: Arc<RateLimitTracker>,
+    instrument: InstrumentNameExchange,
+) -> Result<
+    (
+        InstrumentNameExchange,
+        Vec<Order<ExchangeId, InstrumentNameExchange, Open>>,
+    ),
+    UnindexedClientError,
+> {
+    // Convert once before the retry closure to avoid a String allocation on every retry.
+    let symbol_str = instrument.name().to_string();
+    let response = rest_call_with_retry(&rest, &rate_limiter, |rest| {
+        let sym = symbol_str.clone();
+        Box::pin(async move {
+            let params = QueryMarginAccountsOpenOrdersParams::builder()
+                .symbol(sym)
+                .is_isolated("FALSE".to_string())
+                .build()?;
+            rest.query_margin_accounts_open_orders(params).await
+        })
+    })
+    .await
+    .map_err(connectivity_error)?;
+
+    let orders_data = response
+        .data()
+        .await
+        .map_err(|e| connectivity_error(e.into()))?;
+
+    let orders = orders_data
+        .into_iter()
+        .filter_map(|o| convert_margin_open_order(&o, &instrument))
+        .collect();
+
+    Ok((instrument, orders))
+}
+
+/// Fetch *all* open cross-margin orders in a single no-symbol `query_margin_accounts_open_orders`
+/// call (cross, `isIsolated = "FALSE"`). Backs the [`fetch_open_orders`](BinanceMargin::fetch_open_orders)
+/// "return all" sentinel: with no symbol the venue returns orders across every instrument, so each
+/// order's instrument is recovered from its own `symbol` field (orders missing it are dropped).
+async fn fetch_margin_all_open_orders(
+    rest: Arc<RestApi>,
+    rate_limiter: Arc<RateLimitTracker>,
+) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError> {
+    let response = rest_call_with_retry(&rest, &rate_limiter, |rest| {
+        Box::pin(async move {
+            let params = QueryMarginAccountsOpenOrdersParams::builder()
+                .is_isolated("FALSE".to_string())
+                .build()?;
+            rest.query_margin_accounts_open_orders(params).await
+        })
+    })
+    .await
+    .map_err(connectivity_error)?;
+
+    let orders_data = response
+        .data()
+        .await
+        .map_err(|e| connectivity_error(e.into()))?;
+
+    let orders = orders_data
+        .into_iter()
+        .filter_map(|o| convert_margin_open_order_owned_symbol(&o))
+        .collect();
+
+    Ok(orders)
+}
+
+/// Paginate the margin trade list for a single instrument since `start_time_ms`
+/// (cross, `isIsolated = "FALSE"`). Mirrors `BinanceSpot::paginate_my_trades`: cursor-based,
+/// first page by `start_time`, subsequent pages by `from_id = last_id + 1` (Binance ignores
+/// `start_time` once `from_id` is set), producing a gapless result.
+async fn paginate_margin_my_trades(
+    rest: &Arc<RestApi>,
+    rate_limiter: &Arc<RateLimitTracker>,
+    instrument: &InstrumentNameExchange,
+    start_time_ms: i64,
+) -> Result<Vec<QueryMarginAccountsTradeListResponseInner>, UnindexedClientError> {
+    // Convert once before the retry closure to avoid a String allocation on every retry.
+    let symbol_str = instrument.name().to_string();
+    // The const_assert! in shared bounds BINANCE_MAX_TRADES <= i32::MAX, which trivially fits in
+    // i64, so this cast is always lossless. clippy::cast_possible_wrap fires only because usize is
+    // the same width as i64 on 64-bit targets (a hypothetical >64-bit usize could wrap); the bound
+    // rules that out.
+    #[allow(clippy::cast_possible_wrap)]
+    let limit = BINANCE_MAX_TRADES as i64;
+    let mut all_pages = Vec::new();
+    let mut cursor: Option<i64> = None;
+    loop {
+        let fid = cursor; // Option<i64> is Copy
+        let response = rest_call_with_retry(rest, rate_limiter, |rest| {
+            let sym = symbol_str.clone();
+            let stm = start_time_ms;
+            Box::pin(async move {
+                let builder = QueryMarginAccountsTradeListParams::builder(sym)
+                    .is_isolated("FALSE".to_string())
+                    .limit(limit);
+                let params = if let Some(id) = fid {
+                    builder.from_id(id).build()?
+                } else {
+                    builder.start_time(stm).build()?
+                };
+                rest.query_margin_accounts_trade_list(params).await
+            })
+        })
+        .await
+        .map_err(connectivity_error)?;
+
+        let page = response
+            .data()
+            .await
+            .map_err(|e| connectivity_error(e.into()))?;
+
+        let page_len = page.len();
+        let last_id = page.last().and_then(|t| t.id);
+        all_pages.extend(page);
+
+        if page_len < BINANCE_MAX_TRADES {
+            break;
+        }
+        match last_id {
+            Some(id) => {
+                debug!(%instrument, "BinanceMargin paginate_my_trades: fetching next page ({page_len} results)");
+                match id.checked_add(1) {
+                    Some(next) => cursor = Some(next),
+                    None => break, // saturated at i64::MAX; no further pages possible
+                }
+            }
+            None => {
+                warn!(%instrument, "BinanceMargin paginate_my_trades: trade missing ID, stopping pagination");
+                break;
+            }
+        }
+    }
+    Ok(all_pages)
+}
+
+// ---------------------------------------------------------------------------
+// Account conversion helpers (margin-specific)
+// ---------------------------------------------------------------------------
+
+/// Convert one cross-margin `userAsset` into a margin [`AssetBalance`], carrying the per-asset
+/// `borrowed`/`interest` debt via [`Balance::new_margin`]. `total = free + locked`.
+///
+/// Distinct from spot's `convert_balance_entry`: spot has no debt fields and calls
+/// [`Balance::new`]. Returns `None` (with a warning) if a required field is missing/unparseable.
+fn convert_margin_balance_entry(
+    b: QueryCrossMarginAccountDetailsResponseUserAssetsInner,
+    now: DateTime<Utc>,
+) -> Option<AssetBalance<AssetNameExchange>> {
+    let asset_name = AssetNameExchange::new(b.asset.as_deref()?);
+    let free = match b.free.as_deref().and_then(|s| Decimal::from_str(s).ok()) {
+        Some(v) => v,
+        None => {
+            warn!(%asset_name, "BinanceMargin balance missing/unparseable 'free' field");
+            return None;
+        }
+    };
+    let locked = match b.locked.as_deref().and_then(|s| Decimal::from_str(s).ok()) {
+        Some(v) => v,
+        None => {
+            warn!(%asset_name, "BinanceMargin balance missing/unparseable 'locked' field");
+            return None;
+        }
+    };
+    // Debt fields default to zero when missing/unparseable: a userAsset row always represents a
+    // real margin position, so absent debt means "no debt", not corrupt data — emit a margin
+    // Balance (carrying zero debt) rather than dropping the asset. This preserves the
+    // Design-decision-#4 invariant that a REST snapshot always populates `margin`.
+    let borrowed = b
+        .borrowed
+        .as_deref()
+        .and_then(|s| Decimal::from_str(s).ok())
+        .unwrap_or(Decimal::ZERO);
+    let interest = b
+        .interest
+        .as_deref()
+        .and_then(|s| Decimal::from_str(s).ok())
+        .unwrap_or(Decimal::ZERO);
+    Some(AssetBalance::new(
+        asset_name,
+        Balance::new_margin(free + locked, free, borrowed, interest),
+        now,
+    ))
+}
+
+/// Filter cross-margin `userAssets` to the requested assets and convert to [`AssetBalance`]s.
+/// An empty `assets` slice returns all. Mirrors spot's `filter_and_convert_balances`.
+fn filter_and_convert_margin_balances(
+    user_assets: Vec<QueryCrossMarginAccountDetailsResponseUserAssetsInner>,
+    assets: &[AssetNameExchange],
+) -> Vec<AssetBalance<AssetNameExchange>> {
+    let now = Utc::now();
+    // Empty assets slice means "return all" — skip building the set entirely.
+    if assets.is_empty() {
+        return user_assets
+            .into_iter()
+            .filter_map(|b| convert_margin_balance_entry(b, now))
+            .collect();
+    }
+    // For small slices (≤16 assets), linear scan avoids allocation and hashing overhead.
+    if assets.len() <= 16 {
+        return user_assets
+            .into_iter()
+            .filter_map(|b| {
+                let asset_name_str = b.asset.as_deref()?;
+                if !assets.iter().any(|a| a.name().as_str() == asset_name_str) {
+                    return None;
+                }
+                convert_margin_balance_entry(b, now)
+            })
+            .collect();
+    }
+    use std::collections::HashSet;
+    let asset_set: HashSet<&str> = assets.iter().map(|a| a.name().as_str()).collect();
+    user_assets
+        .into_iter()
+        .filter_map(|b| {
+            let asset_name_str = b.asset.as_deref()?;
+            if !asset_set.contains(asset_name_str) {
+                return None;
+            }
+            convert_margin_balance_entry(b, now)
+        })
+        .collect()
+}
+
+/// Convert a margin open-order response into rustrade's `Open` state order.
+///
+/// Field-for-field identical to spot's `convert_open_order` but typed to the margin SDK response
+/// and stamped with [`ExchangeId::BinanceMargin`]. Reuses the shared wire-string parsers
+/// (`parse_side`/`parse_order_kind`/`parse_time_in_force`); see the duplication rationale in the
+/// module's design notes (two clients is below the abstraction threshold).
+fn convert_margin_open_order(
+    o: &QueryMarginAccountsOpenOrdersResponseInner,
+    instrument: &InstrumentNameExchange,
+) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
+    let order_id_raw = match o.order_id {
+        Some(id) => id,
+        None => {
+            warn!(%instrument, "BinanceMargin open order missing orderId");
+            return None;
+        }
+    };
+    let order_id = OrderId(format_smolstr!("{order_id_raw}"));
+    if o.client_order_id.is_none() {
+        warn!(%instrument, order_id = %order_id_raw, "BinanceMargin open order missing clientOrderId, using orderId as fallback — order may not reconcile with engine state");
+    }
+    let cid = ClientOrderId::new(
+        o.client_order_id
+            .as_deref()
+            .unwrap_or(&format_smolstr!("{order_id_raw}")),
+    );
+    let side = match o.side.as_deref() {
+        // parse_side already logs a warning on unknown values
+        Some(s) => parse_side(s)?,
+        None => {
+            warn!(%instrument, order_id = %order_id_raw, "BinanceMargin open order missing side");
+            return None;
+        }
+    };
+    let price = o.price.as_deref().and_then(|s| Decimal::from_str(s).ok());
+    let quantity = match o
+        .orig_qty
+        .as_deref()
+        .and_then(|s| Decimal::from_str(s).ok())
+    {
+        Some(v) => v,
+        None => {
+            warn!(%instrument, order_id = %order_id_raw, "BinanceMargin open order missing/unparseable origQty");
+            return None;
+        }
+    };
+    let filled_qty = match o.executed_qty.as_deref() {
+        Some(s) => match Decimal::from_str(s) {
+            Ok(v) => v,
+            Err(_) => {
+                warn!(%instrument, order_id = %order_id_raw, executed_qty = s, "BinanceMargin open order unparseable executedQty, defaulting to 0");
+                Decimal::ZERO
+            }
+        },
+        None => Decimal::ZERO,
+    };
+    let kind = match o.r#type.as_deref() {
+        // parse_order_kind already logs a warning on unknown values
+        Some(t) => parse_order_kind(t)?,
+        None => {
+            warn!(%instrument, order_id = %order_id_raw, "BinanceMargin open order missing type");
+            return None;
+        }
+    };
+    let time_in_force = parse_time_in_force(o.time_in_force.as_deref().unwrap_or("GTC"));
+    let time_exchange = match o.time.and_then(|ms| Utc.timestamp_millis_opt(ms).single()) {
+        Some(ts) => ts,
+        None => {
+            warn!(%instrument, order_id = %order_id_raw, "BinanceMargin open order missing/unparseable time, using now");
+            Utc::now()
+        }
+    };
+
+    Some(Order {
+        key: OrderKey::new(
+            ExchangeId::BinanceMargin,
+            instrument.clone(),
+            // Binance doesn't carry strategy IDs in any response field.
+            // Callers must reconcile orders by ClientOrderId or OrderId — never StrategyId.
+            StrategyId::unknown(),
+            cid,
+        ),
+        side,
+        price,
+        quantity,
+        kind,
+        time_in_force,
+        state: Open::new(order_id, time_exchange, filled_qty),
+    })
+}
+
+/// Convert a margin open-order response whose instrument is recovered from its own `symbol` field,
+/// rather than supplied by the caller. Used by the no-symbol "return all" path
+/// ([`fetch_margin_all_open_orders`]), where each order may belong to a different instrument.
+/// Drops (with a warning) any order missing `symbol`; otherwise delegates to
+/// [`convert_margin_open_order`].
+fn convert_margin_open_order_owned_symbol(
+    o: &QueryMarginAccountsOpenOrdersResponseInner,
+) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
+    let instrument = match o.symbol.as_deref() {
+        Some(s) => InstrumentNameExchange::new(s),
+        None => {
+            warn!("BinanceMargin open order missing symbol in return-all query, dropping order");
+            return None;
+        }
+    };
+    convert_margin_open_order(o, &instrument)
+}
+
+/// Convert a margin trade-list response into a rustrade [`Trade`].
+///
+/// Field-for-field identical to spot's `convert_my_trade` but typed to the margin SDK response and
+/// stamped with [`ExchangeId::BinanceMargin`]. Fee asset is taken verbatim from `commissionAsset`
+/// (may be base, quote, or third-party e.g. BNB); `fees_quote` is left `None` for the indexer to
+/// resolve.
+fn convert_margin_trade(
+    t: &QueryMarginAccountsTradeListResponseInner,
+    instrument: &InstrumentNameExchange,
+) -> Option<Trade<AssetNameExchange, InstrumentNameExchange>> {
+    let trade_id_raw = match t.id {
+        Some(id) => id,
+        None => {
+            warn!(%instrument, "BinanceMargin trade missing id");
+            return None;
+        }
+    };
+    let trade_id = TradeId(format_smolstr!("{trade_id_raw}"));
+    let order_id = match t.order_id {
+        Some(id) => OrderId(format_smolstr!("{id}")),
+        None => {
+            warn!(%instrument, trade_id = %trade_id_raw, "BinanceMargin trade missing orderId");
+            return None;
+        }
+    };
+    let side = match t.is_buyer {
+        Some(true) => Side::Buy,
+        Some(false) => Side::Sell,
+        None => {
+            warn!(%instrument, trade_id = %trade_id_raw, "BinanceMargin trade missing isBuyer");
+            return None;
+        }
+    };
+    let price = match t.price.as_deref().and_then(|s| Decimal::from_str(s).ok()) {
+        Some(v) => v,
+        None => {
+            warn!(%instrument, trade_id = %trade_id_raw, "BinanceMargin trade missing/unparseable price");
+            return None;
+        }
+    };
+    let quantity = match t.qty.as_deref().and_then(|s| Decimal::from_str(s).ok()) {
+        Some(v) => v,
+        None => {
+            warn!(%instrument, trade_id = %trade_id_raw, "BinanceMargin trade missing/unparseable qty");
+            return None;
+        }
+    };
+    let commission = t
+        .commission
+        .as_deref()
+        .and_then(|s| Decimal::from_str(s).ok())
+        .unwrap_or(Decimal::ZERO);
+    let time_exchange = match t.time.and_then(|ms| Utc.timestamp_millis_opt(ms).single()) {
+        Some(ts) => ts,
+        None => {
+            warn!(%instrument, trade_id = %trade_id_raw, "BinanceMargin trade missing/unparseable time, using now");
+            Utc::now()
+        }
+    };
+
+    // Use actual commission asset from Binance (e.g., BNB, USDT, BTC). fees_quote is None here;
+    // the indexer computes it when the fee is in quote or base asset. "UNKNOWN" fallback (rare:
+    // API omits commissionAsset) will fail indexing rather than silently misattribute the fee.
+    let fee_asset = t
+        .commission_asset
+        .as_deref()
+        .map(AssetNameExchange::from)
+        .unwrap_or_else(|| AssetNameExchange::from("UNKNOWN"));
+
+    Some(Trade::new(
+        trade_id,
+        order_id,
+        instrument.clone(),
+        StrategyId::unknown(), // Binance doesn't carry strategy IDs
+        time_exchange,
+        side,
+        price,
+        quantity,
+        AssetFees::new(fee_asset, commission, None),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1054,5 +1684,206 @@ mod tests {
             margin_avg_price(Some("not-a-number"), Decimal::from(4)),
             None
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Account query converters (17.5.x)
+    // -----------------------------------------------------------------------
+
+    fn user_asset(
+        asset: &str,
+        free: &str,
+        locked: &str,
+        borrowed: &str,
+        interest: &str,
+    ) -> QueryCrossMarginAccountDetailsResponseUserAssetsInner {
+        let mut a = QueryCrossMarginAccountDetailsResponseUserAssetsInner::new();
+        a.asset = Some(asset.to_string());
+        a.free = Some(free.to_string());
+        a.locked = Some(locked.to_string());
+        a.borrowed = Some(borrowed.to_string());
+        a.interest = Some(interest.to_string());
+        a
+    }
+
+    #[test]
+    fn margin_balance_entry_maps_debt() {
+        // free=10, locked=2 → total=12; borrowed=3, interest=0.5 → net_asset = total - borrowed = 9.
+        let ab =
+            convert_margin_balance_entry(user_asset("USDT", "10", "2", "3", "0.5"), Utc::now())
+                .expect("convert");
+        assert_eq!(ab.asset.name().as_str(), "USDT");
+        assert_eq!(ab.balance.total, Decimal::from(12));
+        assert_eq!(ab.balance.free, Decimal::from(10));
+        assert!(
+            ab.balance.margin.is_some(),
+            "REST snapshot must populate margin"
+        );
+        // net_asset deducts borrowed principal (interest is tracked separately, not deducted here).
+        assert_eq!(ab.balance.net_asset(), Decimal::from(9));
+    }
+
+    #[test]
+    fn margin_balance_short_is_negative_net() {
+        // A short borrows more base than it holds: total=1, borrowed=5 → net_asset = -4.
+        let ab = convert_margin_balance_entry(user_asset("BTC", "1", "0", "5", "0"), Utc::now())
+            .expect("convert");
+        assert_eq!(ab.balance.net_asset(), Decimal::from(-4));
+    }
+
+    #[test]
+    fn margin_balance_missing_debt_defaults_to_zero() {
+        // A userAsset with no borrowed/interest is a real no-debt position, not corrupt data:
+        // still emit a margin Balance (carrying zero debt) so the REST snapshot always sets margin.
+        let mut a = QueryCrossMarginAccountDetailsResponseUserAssetsInner::new();
+        a.asset = Some("ETH".to_string());
+        a.free = Some("4".to_string());
+        a.locked = Some("0".to_string());
+        let ab = convert_margin_balance_entry(a, Utc::now()).expect("convert");
+        assert!(ab.balance.margin.is_some());
+        assert_eq!(ab.balance.net_asset(), Decimal::from(4));
+    }
+
+    #[test]
+    fn margin_balance_missing_free_is_dropped() {
+        // Missing free/locked is corrupt (not no-debt) → drop the asset rather than guess.
+        let mut a = QueryCrossMarginAccountDetailsResponseUserAssetsInner::new();
+        a.asset = Some("USDT".to_string());
+        a.locked = Some("0".to_string());
+        assert!(convert_margin_balance_entry(a, Utc::now()).is_none());
+    }
+
+    #[test]
+    fn margin_balance_filtering() {
+        let assets = vec![
+            user_asset("USDT", "10", "0", "0", "0"),
+            user_asset("BTC", "1", "0", "0", "0"),
+            user_asset("ETH", "5", "0", "0", "0"),
+        ];
+        // Empty filter → all assets.
+        assert_eq!(
+            filter_and_convert_margin_balances(assets.clone(), &[]).len(),
+            3
+        );
+        // Subset filter → only requested assets.
+        let filtered = filter_and_convert_margin_balances(
+            assets,
+            &[AssetNameExchange::new("BTC"), AssetNameExchange::new("ETH")],
+        );
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|b| b.asset.name().as_str() != "USDT"));
+    }
+
+    #[test]
+    fn margin_balance_filtering_large_slice_uses_hashset_branch() {
+        // >16 requested assets takes the HashSet path (vs the ≤16 linear scan) — exercise it.
+        let assets = vec![
+            user_asset("BTC", "1", "0", "0", "0"),
+            user_asset("ETH", "5", "0", "0", "0"),
+            user_asset("DOGE", "9", "0", "0", "0"), // present in account, not requested → dropped
+        ];
+        // 17 requested assets (A00..A16) forces the HashSet branch; BTC and ETH also requested.
+        let mut requested: Vec<AssetNameExchange> = (0..17)
+            .map(|i| AssetNameExchange::new(format!("A{i:02}")))
+            .collect();
+        requested.push(AssetNameExchange::new("BTC"));
+        requested.push(AssetNameExchange::new("ETH"));
+        assert!(
+            requested.len() > 16,
+            "must exceed the linear-scan threshold"
+        );
+
+        let filtered = filter_and_convert_margin_balances(assets, &requested);
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|b| b.asset.name().as_str() != "DOGE"));
+    }
+
+    fn open_order(order_id: Option<i64>, side: &str) -> QueryMarginAccountsOpenOrdersResponseInner {
+        let mut o = QueryMarginAccountsOpenOrdersResponseInner::new();
+        o.order_id = order_id;
+        o.client_order_id = Some("cid-9".to_string());
+        o.side = Some(side.to_string());
+        o.price = Some("50000".to_string());
+        o.orig_qty = Some("2".to_string());
+        o.executed_qty = Some("0.5".to_string());
+        o.r#type = Some("LIMIT".to_string());
+        o.time_in_force = Some("GTC".to_string());
+        o.time = Some(1_700_000_000_000);
+        o
+    }
+
+    #[test]
+    fn margin_open_order_converts() {
+        let inst = InstrumentNameExchange::new("BTCUSDT");
+        let order =
+            convert_margin_open_order(&open_order(Some(42), "BUY"), &inst).expect("convert");
+        assert_eq!(order.key.exchange, ExchangeId::BinanceMargin);
+        assert_eq!(order.state.id.0.as_str(), "42");
+        assert_eq!(order.key.cid.0.as_str(), "cid-9");
+        assert_eq!(order.side, Side::Buy);
+        assert_eq!(order.price, Some(Decimal::from(50_000)));
+        assert_eq!(order.quantity, Decimal::from(2));
+        assert_eq!(order.state.filled_quantity, Decimal::new(5, 1));
+        assert_eq!(order.kind, OrderKind::Limit);
+    }
+
+    #[test]
+    fn margin_open_order_missing_order_id_is_dropped() {
+        let inst = InstrumentNameExchange::new("BTCUSDT");
+        assert!(convert_margin_open_order(&open_order(None, "BUY"), &inst).is_none());
+    }
+
+    #[test]
+    fn margin_open_order_owned_symbol_recovers_instrument() {
+        // The no-symbol "return all" path derives the instrument from each order's own `symbol`.
+        let mut o = open_order(Some(42), "SELL");
+        o.symbol = Some("ETHUSDT".to_string());
+        let order = convert_margin_open_order_owned_symbol(&o).expect("convert");
+        assert_eq!(order.key.instrument.name().as_str(), "ETHUSDT");
+        assert_eq!(order.key.exchange, ExchangeId::BinanceMargin);
+        assert_eq!(order.side, Side::Sell);
+    }
+
+    #[test]
+    fn margin_open_order_owned_symbol_missing_symbol_is_dropped() {
+        // open_order() leaves `symbol` unset — the return-all path must drop it rather than guess.
+        let o = open_order(Some(42), "BUY");
+        assert!(o.symbol.is_none());
+        assert!(convert_margin_open_order_owned_symbol(&o).is_none());
+    }
+
+    fn trade(id: Option<i64>, is_buyer: Option<bool>) -> QueryMarginAccountsTradeListResponseInner {
+        let mut t = QueryMarginAccountsTradeListResponseInner::new();
+        t.id = id;
+        t.order_id = Some(7);
+        t.is_buyer = is_buyer;
+        t.price = Some("48000".to_string());
+        t.qty = Some("0.25".to_string());
+        t.commission = Some("0.001".to_string());
+        t.commission_asset = Some("BNB".to_string());
+        t.time = Some(1_700_000_000_000);
+        t
+    }
+
+    #[test]
+    fn margin_trade_converts() {
+        let inst = InstrumentNameExchange::new("BTCUSDT");
+        let tr = convert_margin_trade(&trade(Some(11), Some(false)), &inst).expect("convert");
+        assert_eq!(tr.id.0.as_str(), "11");
+        assert_eq!(tr.order_id.0.as_str(), "7");
+        assert_eq!(tr.side, Side::Sell);
+        assert_eq!(tr.price, Decimal::from(48_000));
+        assert_eq!(tr.quantity, Decimal::new(25, 2));
+        // Third-party fee asset (BNB) preserved verbatim; fees_quote left for the indexer.
+        assert_eq!(tr.fees.asset.name().as_str(), "BNB");
+        assert_eq!(tr.fees.fees, Decimal::new(1, 3));
+    }
+
+    #[test]
+    fn margin_trade_missing_fields_are_dropped() {
+        let inst = InstrumentNameExchange::new("BTCUSDT");
+        // Missing id and missing isBuyer both drop the trade rather than guess.
+        assert!(convert_margin_trade(&trade(None, Some(true)), &inst).is_none());
+        assert!(convert_margin_trade(&trade(Some(11), None), &inst).is_none());
     }
 }

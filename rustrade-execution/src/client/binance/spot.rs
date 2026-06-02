@@ -296,6 +296,36 @@ async fn fetch_open_orders_for_instrument(
     Ok((instrument, orders))
 }
 
+/// Fetch *all* open orders in a single no-symbol `GET /api/v3/openOrders` call. Backs the
+/// [`fetch_open_orders`](BinanceSpot::fetch_open_orders) "return all" sentinel: with no symbol the
+/// venue returns orders across every instrument, so each order's instrument is recovered from its
+/// own `symbol` field (orders missing it are dropped).
+async fn fetch_all_open_orders(
+    rest: Arc<RestApi>,
+    rate_limiter: Arc<RateLimitTracker>,
+) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError> {
+    let response = rest_call_with_retry(&rest, &rate_limiter, |rest| {
+        Box::pin(async move {
+            let params = GetOpenOrdersParams::builder().build()?;
+            rest.get_open_orders(params).await
+        })
+    })
+    .await
+    .map_err(connectivity_error)?;
+
+    let orders_data = response
+        .data()
+        .await
+        .map_err(|e| connectivity_error(e.into()))?;
+
+    let orders = orders_data
+        .into_iter()
+        .filter_map(|o| convert_open_order_owned_symbol(&o))
+        .collect();
+
+    Ok(orders)
+}
+
 /// Paginate `GET /api/v3/myTrades` for a single instrument since `start_time_ms`.
 ///
 /// Uses cursor-based pagination: first page queries by `start_time`; subsequent pages
@@ -1040,10 +1070,19 @@ impl ExecutionClient for BinanceSpot {
         ))
     }
 
+    /// An empty `instruments` slice is the [`ExecutionClient`] "return all" sentinel: a single
+    /// no-symbol `GET /api/v3/openOrders` call returns open orders across every instrument (each
+    /// order's instrument is recovered from its own `symbol` field). A non-empty slice fetches the
+    /// listed instruments concurrently, per-symbol.
     async fn fetch_open_orders(
         &self,
         instruments: &[InstrumentNameExchange],
     ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError> {
+        // Empty slice = "return all" sentinel: a single no-symbol query is both correct (the
+        // contract requires all instruments) and far cheaper than enumerating every symbol.
+        if instruments.is_empty() {
+            return fetch_all_open_orders(self.rest.clone(), self.rate_limiter.clone()).await;
+        }
         // limit concurrency to avoid bursting Binance's request weight limits
         // (each GET /api/v3/openOrders costs 3 weight; 8 concurrent = 24 weight).
         // try_fold into a flat Vec avoids the intermediate Vec<Vec<_>> that
@@ -1064,6 +1103,10 @@ impl ExecutionClient for BinanceSpot {
             .await
     }
 
+    /// **Documented deviation from the `ExecutionClient::fetch_trades` "return all" contract:**
+    /// Binance's `myTrades` endpoint requires a symbol — there is no no-symbol "all trades" query
+    /// (unlike open orders). An empty `instruments` slice therefore has nothing to query and
+    /// returns an empty `Vec`; callers wanting all trades must enumerate instruments explicitly.
     // `.iter().cloned()` is required: Rust async closures cannot satisfy the HRTB
     // `for<'a> FnMut(&'a InstrumentNameExchange) -> impl Future + 'static` needed by
     // the iterator machinery, even when the clone is moved inside the closure body.
@@ -1690,6 +1733,23 @@ fn convert_open_order(
         time_in_force,
         state: Open::new(order_id, time_exchange, filled_qty),
     })
+}
+
+/// Convert an open-order response whose instrument is recovered from its own `symbol` field,
+/// rather than supplied by the caller. Used by the no-symbol "return all" path
+/// ([`fetch_all_open_orders`]), where each order may belong to a different instrument. Drops
+/// (with a warning) any order missing `symbol`; otherwise delegates to [`convert_open_order`].
+fn convert_open_order_owned_symbol(
+    o: &binance_sdk::spot::rest_api::AllOrdersResponseInner,
+) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
+    let instrument = match o.symbol.as_deref() {
+        Some(s) => InstrumentNameExchange::new(s),
+        None => {
+            warn!("BinanceSpot open order missing symbol in return-all query, dropping order");
+            return None;
+        }
+    };
+    convert_open_order(o, &instrument)
 }
 
 /// Convert a Binance myTrades REST response into a rustrade Trade.
@@ -3379,6 +3439,26 @@ mod tests {
         assert_eq!(order.price, Some(Decimal::from_str("50000.00").unwrap()));
         assert_eq!(order.quantity, Decimal::from_str("0.01").unwrap());
         assert_eq!(order.state.filled_quantity, Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_convert_open_order_owned_symbol_recovers_instrument() {
+        // The no-symbol "return all" path derives the instrument from each order's own `symbol`.
+        let o = binance_sdk::spot::rest_api::AllOrdersResponseInner {
+            symbol: Some("ETHUSDT".to_string()),
+            ..make_base_open_order()
+        };
+        let order = convert_open_order_owned_symbol(&o).expect("valid order should convert");
+        assert_eq!(order.key.instrument.name().as_str(), "ETHUSDT");
+        assert_eq!(order.side, Side::Buy);
+    }
+
+    #[test]
+    fn test_convert_open_order_owned_symbol_missing_symbol_returns_none() {
+        // make_base_open_order() leaves `symbol` unset — drop rather than guess the instrument.
+        let o = make_base_open_order();
+        assert!(o.symbol.is_none());
+        assert!(convert_open_order_owned_symbol(&o).is_none());
     }
 
     #[test]
