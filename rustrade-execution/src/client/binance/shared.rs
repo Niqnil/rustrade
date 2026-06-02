@@ -13,10 +13,10 @@
 
 use crate::{
     AccountEventKind, UnindexedAccountEvent,
-    error::{ApiError, ConnectivityError, UnindexedClientError},
-    order::{OrderKind, TimeInForce, state::OrderState},
+    error::{ApiError, ConnectivityError, OrderError, UnindexedClientError},
+    order::{OrderKind, TimeInForce, TrailingOffsetType, state::OrderState},
 };
-use binance_sdk::common::errors::WebsocketError;
+use binance_sdk::common::errors::{ConnectorError, WebsocketError};
 use lru::LruCache;
 use rustrade_instrument::{
     Side, asset::name::AssetNameExchange, instrument::name::InstrumentNameExchange,
@@ -571,4 +571,396 @@ pub(crate) fn connectivity_error(e: anyhow::Error) -> UnindexedClientError {
     }
 
     UnindexedClientError::Connectivity(ConnectivityError::Socket(msg))
+}
+
+// ---------------------------------------------------------------------------
+// REST call retry wrapper
+// ---------------------------------------------------------------------------
+
+/// Execute a REST call with rate-limit awareness and retry.
+///
+/// Generic over the SDK `RestApi` type (`R`) so it serves both the spot
+/// (`binance_sdk::spot::rest_api::RestApi`) and margin
+/// (`binance_sdk::margin_trading::rest_api::RestApi`) clients — the helper never touches
+/// `R` itself, it only hands an `Arc<R>` clone to the per-attempt closure. Also usable
+/// from concurrent per-instrument futures that hold only `Arc<R>` + `Arc<RateLimitTracker>`.
+pub(crate) async fn rest_call_with_retry<R, T>(
+    rest: &Arc<R>,
+    rate_limiter: &RateLimitTracker,
+    mut make_call: impl FnMut(
+        Arc<R>,
+    )
+        -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<T>> + Send>>,
+) -> anyhow::Result<T>
+where
+    // `Arc<R>` is moved into the `+ Send` future, which requires `R: Send + Sync`. Both SDK
+    // RestApi types satisfy this; stating it here surfaces the constraint at the definition
+    // rather than as a confusing error at the call sites' `Box::pin(async move ...)`.
+    R: Send + Sync,
+{
+    // on the last iteration (attempt == MAX_RATE_LIMIT_RETRIES) the rate-limit
+    // guard `attempt < MAX_RATE_LIMIT_RETRIES` is false, so a rate-limit error falls
+    // through to the catch-all `Err(e) => return Err(e)` arm. All three match arms
+    // return on the last iteration, so the post-loop unreachable!() is a runtime
+    // safety net — the loop body always returns before exhaustion.
+    for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
+        rate_limiter.wait_if_blocked().await;
+        match make_call(Arc::clone(rest)).await {
+            Ok(v) => return Ok(v),
+            Err(e) if is_rate_limit_error(&e) && attempt < MAX_RATE_LIMIT_RETRIES => {
+                // exponential delay starting at 1s (not DEFAULT_RATE_LIMIT_DELAY_SECS=10s).
+                // The retry loop uses an aggressive initial delay to recover quickly from
+                // transient bursts. DEFAULT_RATE_LIMIT_DELAY_SECS is for the externally-set
+                // "blocked" state (e.g. Retry-After header), not for per-call retries.
+                let delay = Duration::from_secs(2u64.saturating_pow(attempt).min(30));
+                warn!(
+                    attempt = attempt.saturating_add(1),
+                    max = MAX_RATE_LIMIT_RETRIES,
+                    delay_secs = delay.as_secs(),
+                    "Binance REST rate-limited, retrying"
+                );
+                rate_limiter.on_rate_limited(Some(delay));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("Binance REST retries exhausted: loop invariant violated")
+}
+
+// ---------------------------------------------------------------------------
+// Order-kind / TIF classification (rustrade enums → Binance semantics)
+// ---------------------------------------------------------------------------
+
+/// Venue-neutral Binance order type — the single source of truth for mapping a rustrade
+/// [`OrderKind`] to Binance order semantics, shared by the spot and margin clients.
+///
+/// Spot maps this to the WS-API `OrderPlaceTypeEnum`; margin maps it to the REST `r#type`
+/// **string** (the margin SDK types the field as a plain `String`, not an enum) via
+/// [`as_binance_str`](Self::as_binance_str). Keeping the decision logic here (in
+/// [`classify_order_kind_tif`]) avoids duplicating the match arms across the two clients,
+/// which differ only in their SDK output types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BinanceOrderType {
+    Market,
+    Limit,
+    LimitMaker,
+    StopLoss,
+    StopLossLimit,
+    TakeProfit,
+    TakeProfitLimit,
+}
+
+impl BinanceOrderType {
+    /// The Binance API order-type wire string (e.g. `"STOP_LOSS_LIMIT"`).
+    pub(crate) fn as_binance_str(self) -> &'static str {
+        match self {
+            BinanceOrderType::Market => "MARKET",
+            BinanceOrderType::Limit => "LIMIT",
+            BinanceOrderType::LimitMaker => "LIMIT_MAKER",
+            BinanceOrderType::StopLoss => "STOP_LOSS",
+            BinanceOrderType::StopLossLimit => "STOP_LOSS_LIMIT",
+            BinanceOrderType::TakeProfit => "TAKE_PROFIT",
+            BinanceOrderType::TakeProfitLimit => "TAKE_PROFIT_LIMIT",
+        }
+    }
+}
+
+/// Venue-neutral Binance time-in-force. Both spot and margin expose exactly `GTC`/`IOC`/`FOK`
+/// on their order endpoints; post-only is modelled as [`BinanceOrderType::LimitMaker`] (no TIF),
+/// matching Binance's own API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BinanceTimeInForce {
+    Gtc,
+    Ioc,
+    Fok,
+}
+
+/// Map a rustrade [`OrderKind`] + [`TimeInForce`] to Binance order semantics.
+///
+/// Returns `None` for combinations Binance does not support (so callers surface
+/// `UnsupportedOrderType`). `TrailingStop`/`TrailingStopLimit` classify to
+/// [`BinanceOrderType::StopLoss`]/`None` here (valid for spot, which sets `trailingDelta`);
+/// the **margin** adapter rejects trailing kinds *before* calling this, since the margin SDK
+/// has no `trailingDelta` binding.
+pub(crate) fn classify_order_kind_tif(
+    kind: OrderKind,
+    tif: TimeInForce,
+) -> Option<(BinanceOrderType, Option<BinanceTimeInForce>)> {
+    match kind {
+        OrderKind::Market => Some((BinanceOrderType::Market, None)),
+        OrderKind::Limit => match tif {
+            TimeInForce::GoodUntilCancelled { post_only: false } => {
+                Some((BinanceOrderType::Limit, Some(BinanceTimeInForce::Gtc)))
+            }
+            TimeInForce::GoodUntilCancelled { post_only: true } => {
+                // LIMIT_MAKER is Binance's post-only order type (rejects if
+                // it would immediately match as taker)
+                Some((BinanceOrderType::LimitMaker, None))
+            }
+            TimeInForce::FillOrKill => {
+                Some((BinanceOrderType::Limit, Some(BinanceTimeInForce::Fok)))
+            }
+            TimeInForce::ImmediateOrCancel => {
+                Some((BinanceOrderType::Limit, Some(BinanceTimeInForce::Ioc)))
+            }
+            // Binance does not support GTD (good-til-end-of-day), GTC-until-date, MOO, or MOC.
+            // Surface as unsupported rather than silently coercing — these have venue-specific
+            // semantics (e.g. an end-of-day auto-cancel) that a GTC coercion would silently drop,
+            // risking an unintended resting/overnight order.
+            TimeInForce::GoodUntilEndOfDay
+            | TimeInForce::GoodTillDate { .. }
+            | TimeInForce::AtOpen
+            | TimeInForce::AtClose => {
+                warn!(time_in_force = ?tif, "Binance does not support this TimeInForce");
+                None
+            }
+        },
+        // Conditional orders: stop_price/trailing_delta set separately by the caller.
+        OrderKind::Stop { .. } => Some((BinanceOrderType::StopLoss, None)),
+        OrderKind::StopLimit { .. } => match tif {
+            // StopLimit requires TIF like regular Limit orders.
+            TimeInForce::GoodUntilCancelled { post_only: false } => Some((
+                BinanceOrderType::StopLossLimit,
+                Some(BinanceTimeInForce::Gtc),
+            )),
+            TimeInForce::FillOrKill => Some((
+                BinanceOrderType::StopLossLimit,
+                Some(BinanceTimeInForce::Fok),
+            )),
+            TimeInForce::ImmediateOrCancel => Some((
+                BinanceOrderType::StopLossLimit,
+                Some(BinanceTimeInForce::Ioc),
+            )),
+            _ => {
+                warn!(time_in_force = ?tif, "Binance StopLimit does not support this TimeInForce");
+                None
+            }
+        },
+        OrderKind::TakeProfit { .. } => Some((BinanceOrderType::TakeProfit, None)),
+        OrderKind::TakeProfitLimit { .. } => match tif {
+            // TakeProfitLimit requires TIF like regular Limit orders.
+            TimeInForce::GoodUntilCancelled { post_only: false } => Some((
+                BinanceOrderType::TakeProfitLimit,
+                Some(BinanceTimeInForce::Gtc),
+            )),
+            TimeInForce::FillOrKill => Some((
+                BinanceOrderType::TakeProfitLimit,
+                Some(BinanceTimeInForce::Fok),
+            )),
+            TimeInForce::ImmediateOrCancel => Some((
+                BinanceOrderType::TakeProfitLimit,
+                Some(BinanceTimeInForce::Ioc),
+            )),
+            _ => {
+                warn!(time_in_force = ?tif, "Binance TakeProfitLimit does not support this TimeInForce");
+                None
+            }
+        },
+        // TrailingStop: Binance uses STOP_LOSS with a trailingDelta parameter. Only
+        // BasisPoints and Percentage are supported; Absolute requires manual conversion by
+        // the caller: basis_points = (absolute / price) * 10000.
+        OrderKind::TrailingStop { offset_type, .. } => match offset_type {
+            TrailingOffsetType::BasisPoints | TrailingOffsetType::Percentage => {
+                Some((BinanceOrderType::StopLoss, None))
+            }
+            TrailingOffsetType::Absolute => {
+                warn!(
+                    "Binance TrailingStop does not support Absolute offset; \
+                     convert to basis points: (absolute / price) * 10000"
+                );
+                None
+            }
+        },
+        // Binance does not support TrailingStopLimit.
+        OrderKind::TrailingStopLimit { .. } => {
+            warn!("Binance does not support TrailingStopLimit orders");
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REST order-error classification
+// ---------------------------------------------------------------------------
+
+/// Classify an `anyhow::Error` from a REST order/cancel call into an [`OrderError`].
+///
+/// REST errors differ from the WS-API path: binance-sdk surfaces them as
+/// [`ConnectorError`], whose `Display` **omits** the Binance numeric code (it lives in a
+/// separate `code` field). So the WS classifier [`is_api_rejection_error`] (which downcasts
+/// to `WebsocketError`) does not apply here — we downcast to `ConnectorError` instead, splice
+/// the code back into the message, and reuse [`parse_binance_api_error`] for precise mapping.
+///
+/// - 401/403 → [`ApiError::Unauthenticated`]; 429/418 → [`ApiError::RateLimit`].
+/// - 400/404 / other client errors that carry a Binance code → mapped by code/text.
+/// - Network/server failures (and the SDK's codeless transport/decode wrappers — failed HTTP
+///   request, response-byte read, gzip, or UTF-8 decode) → [`OrderError::Connectivity`]: the
+///   order may or may not have reached the matching engine.
+pub(crate) fn classify_rest_order_error(
+    e: &anyhow::Error,
+    instrument: &InstrumentNameExchange,
+) -> OrderError<AssetNameExchange, InstrumentNameExchange> {
+    let Some(ce) = e.downcast_ref::<ConnectorError>() else {
+        // Not an SDK ConnectorError — treat as opaque transport failure.
+        return OrderError::Connectivity(ConnectivityError::Socket(format!("{e:#}")));
+    };
+
+    match ce {
+        ConnectorError::TooManyRequestsError { .. } | ConnectorError::RateLimitBanError { .. } => {
+            OrderError::Rejected(ApiError::RateLimit)
+        }
+        ConnectorError::UnauthorizedError { msg, .. }
+        | ConnectorError::ForbiddenError { msg, .. } => {
+            OrderError::Rejected(ApiError::Unauthenticated(msg.clone()))
+        }
+        ConnectorError::ServerError { msg, .. } | ConnectorError::NetworkError(msg) => {
+            OrderError::Connectivity(ConnectivityError::Socket(msg.clone()))
+        }
+        ConnectorError::BadRequestError { msg, code }
+        | ConnectorError::NotFoundError { msg, code }
+        | ConnectorError::ConnectorClientError { msg, code } => {
+            // A codeless `ConnectorClientError` from the SDK's `http_request` is a transport or
+            // response-decode failure, not a matching-engine decision (genuine Binance rejections
+            // carry a numeric code). These prefixes are the SDK's codeless transport/decode sites:
+            // the request never completed, or a 2xx body could not be read/decompressed/decoded.
+            // Route them to Connectivity — the order's venue status is unknown — rather than
+            // misreporting a definitive rejection. Match by prefix (not a blanket `code.is_none()`)
+            // so an unusual HTTP error *status* with no Binance code still maps to a rejection.
+            // (Body-deserialization failures surface via `.data()`, a separate path handled at
+            // that call site.)
+            //
+            // These prefixes mirror the codeless error sites in the binance-sdk `http_request`
+            // helper (binance-sdk `src/common`). They are not a stable public contract — re-verify
+            // this list (and the test below that pins it) whenever the binance-sdk pin is bumped.
+            const TRANSPORT_PREFIXES: [&str; 4] = [
+                "HTTP request failed",
+                "Failed to get response bytes",
+                "Failed to decompress gzip response",
+                "Failed to convert response to UTF-8",
+            ];
+            if code.is_none() && TRANSPORT_PREFIXES.iter().any(|p| msg.starts_with(p)) {
+                return OrderError::Connectivity(ConnectivityError::Socket(msg.clone()));
+            }
+            // Splice the code (Display omits it) back in so the shared code-first parser maps
+            // -2010/-1121/-2011/… precisely; falls back to text heuristics when code is absent.
+            let msg_with_code = code.map_or_else(|| msg.clone(), |c| format!("{c} {msg}"));
+            OrderError::Rejected(parse_binance_api_error(msg_with_code, instrument))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn classify(
+        msg: &str,
+        code: Option<i64>,
+    ) -> OrderError<AssetNameExchange, InstrumentNameExchange> {
+        let err = anyhow::Error::new(ConnectorError::ConnectorClientError {
+            msg: msg.to_string(),
+            code,
+        });
+        classify_rest_order_error(&err, &InstrumentNameExchange::new("BTCUSDT"))
+    }
+
+    #[test]
+    fn codeless_transport_failures_map_to_connectivity() {
+        // The SDK's codeless transport/decode wrappers (http_request error arm) must classify as
+        // Connectivity — venue status unknown — never as a definitive rejection. Misreporting one
+        // of these as Rejected risks a phantom position when the order actually reached the engine.
+        // This test also pins the brittle prefix list against silent SDK message-format drift.
+        for msg in [
+            "HTTP request failed: connection reset",
+            "Failed to get response bytes: error reading body",
+            "Failed to decompress gzip response",
+            "Failed to convert response to UTF-8: invalid utf-8 sequence",
+        ] {
+            assert!(
+                matches!(classify(msg, None), OrderError::Connectivity(_)),
+                "expected Connectivity for {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn coded_error_maps_to_rejection() {
+        // A genuine matching-engine rejection carries a Binance numeric code.
+        assert!(matches!(
+            classify("Account has insufficient balance.", Some(-2010)),
+            OrderError::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn codeless_non_transport_status_error_maps_to_rejection() {
+        // An unusual HTTP error *status* with no Binance code (SDK's catch-all `_` arm) did reach
+        // the venue, so it must remain a rejection — not be swallowed as connectivity by an
+        // over-broad `code.is_none()` guard. This is the distinction the prefix match preserves.
+        assert!(matches!(
+            classify("Conflict", None),
+            OrderError::Rejected(_)
+        ));
+    }
+
+    fn classify_err(ce: ConnectorError) -> OrderError<AssetNameExchange, InstrumentNameExchange> {
+        classify_rest_order_error(
+            &anyhow::Error::new(ce),
+            &InstrumentNameExchange::new("BTCUSDT"),
+        )
+    }
+
+    #[test]
+    fn rate_limit_variants_map_to_rejection_ratelimit() {
+        // 429/418 surface as RateLimit so callers can back off; venue did respond.
+        for ce in [
+            ConnectorError::TooManyRequestsError {
+                msg: "Too many requests.".to_string(),
+                code: Some(-1003),
+            },
+            ConnectorError::RateLimitBanError {
+                msg: "IP banned.".to_string(),
+                code: Some(-1003),
+            },
+        ] {
+            assert!(matches!(
+                classify_err(ce),
+                OrderError::Rejected(ApiError::RateLimit)
+            ));
+        }
+    }
+
+    #[test]
+    fn auth_variants_map_to_unauthenticated() {
+        // 401/403 are definitive auth rejections, not connectivity.
+        for ce in [
+            ConnectorError::UnauthorizedError {
+                msg: "bad key".to_string(),
+                code: Some(-2014),
+            },
+            ConnectorError::ForbiddenError {
+                msg: "forbidden".to_string(),
+                code: None,
+            },
+        ] {
+            assert!(matches!(
+                classify_err(ce),
+                OrderError::Rejected(ApiError::Unauthenticated(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn server_and_network_variants_map_to_connectivity() {
+        // 5xx / transport failures leave the order's venue status unknown → Connectivity.
+        for ce in [
+            ConnectorError::ServerError {
+                msg: "internal error".to_string(),
+                status_code: Some(503),
+            },
+            ConnectorError::NetworkError("connection reset".to_string()),
+        ] {
+            assert!(matches!(classify_err(ce), OrderError::Connectivity(_)));
+        }
+    }
 }

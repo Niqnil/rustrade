@@ -28,11 +28,12 @@
 //   reconcile balances after external transfers.
 
 use super::shared::{
-    AbortOnDropStream, BINANCE_MAX_TRADES, CONNECT_TIMEOUT_SECS, ExponentialBackoff,
-    FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS, MAX_RATE_LIMIT_RETRIES, RateLimitTracker,
-    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, connectivity_error, dedup_key_from_event,
-    is_api_rejection_error, is_duplicate, is_rate_limit_error, new_dedup_cache,
-    parse_binance_api_error, parse_order_kind, parse_side, parse_time_in_force,
+    AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
+    CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
+    RateLimitTracker, SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, classify_order_kind_tif,
+    connectivity_error, dedup_key_from_event, is_api_rejection_error, is_duplicate,
+    is_rate_limit_error, new_dedup_cache, parse_binance_api_error, parse_order_kind, parse_side,
+    parse_time_in_force, rest_call_with_retry,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
@@ -251,48 +252,6 @@ impl BinanceSpot {
             }
         }
     }
-}
-
-/// Execute a REST call with rate-limit awareness and retry.
-///
-/// Free function so it can be used both from `BinanceSpot` methods and from
-/// concurrent per-instrument futures that only have `Arc<RestApi>` + `Arc<RateLimitTracker>`.
-async fn rest_call_with_retry<T>(
-    rest: &Arc<RestApi>,
-    rate_limiter: &RateLimitTracker,
-    mut make_call: impl FnMut(
-        Arc<RestApi>,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = anyhow::Result<T>> + Send>,
-    >,
-) -> anyhow::Result<T> {
-    // on the last iteration (attempt == MAX_RATE_LIMIT_RETRIES) the rate-limit
-    // guard `attempt < MAX_RATE_LIMIT_RETRIES` is false, so a rate-limit error falls
-    // through to the catch-all `Err(e) => return Err(e)` arm. All three match arms
-    // return on the last iteration, so the post-loop unreachable!() is a runtime
-    // safety net — the loop body always returns before exhaustion.
-    for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
-        rate_limiter.wait_if_blocked().await;
-        match make_call(Arc::clone(rest)).await {
-            Ok(v) => return Ok(v),
-            Err(e) if is_rate_limit_error(&e) && attempt < MAX_RATE_LIMIT_RETRIES => {
-                // exponential delay starting at 1s (not DEFAULT_RATE_LIMIT_DELAY_SECS=10s).
-                // The retry loop uses an aggressive initial delay to recover quickly from
-                // transient bursts. DEFAULT_RATE_LIMIT_DELAY_SECS is for the externally-set
-                // "blocked" state (e.g. Retry-After header), not for per-call retries.
-                let delay = Duration::from_secs(2u64.saturating_pow(attempt).min(30));
-                warn!(
-                    attempt = attempt + 1,
-                    max = MAX_RATE_LIMIT_RETRIES,
-                    delay_secs = delay.as_secs(),
-                    "BinanceSpot REST rate-limited, retrying"
-                );
-                rate_limiter.on_rate_limited(Some(delay));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    unreachable!("BinanceSpot REST retries exhausted: loop invariant violated")
 }
 
 /// Fetch open orders for a single instrument with rate-limit retry.
@@ -2255,116 +2214,25 @@ fn convert_order_kind_tif(
     kind: OrderKind,
     tif: TimeInForce,
 ) -> Option<(OrderPlaceTypeEnum, Option<OrderPlaceTimeInForceEnum>)> {
-    match kind {
-        OrderKind::Market => Some((OrderPlaceTypeEnum::Market, None)),
-        OrderKind::Limit => match tif {
-            TimeInForce::GoodUntilCancelled { post_only: false } => Some((
-                OrderPlaceTypeEnum::Limit,
-                Some(OrderPlaceTimeInForceEnum::Gtc),
-            )),
-            TimeInForce::GoodUntilCancelled { post_only: true } => {
-                // LIMIT_MAKER is Binance's post-only order type (rejects if
-                // it would immediately match as taker)
-                Some((OrderPlaceTypeEnum::LimitMaker, None))
-            }
-            TimeInForce::FillOrKill => Some((
-                OrderPlaceTypeEnum::Limit,
-                Some(OrderPlaceTimeInForceEnum::Fok),
-            )),
-            TimeInForce::ImmediateOrCancel => Some((
-                OrderPlaceTypeEnum::Limit,
-                Some(OrderPlaceTimeInForceEnum::Ioc),
-            )),
-            TimeInForce::GoodUntilEndOfDay => {
-                warn!("Binance Spot does not support GTD; coercing to GTC");
-                Some((
-                    OrderPlaceTypeEnum::Limit,
-                    Some(OrderPlaceTimeInForceEnum::Gtc),
-                ))
-            }
-            // Binance Spot does not support GTD/MOO/MOC. Surface as unsupported
-            // rather than silently coercing — these have venue-specific semantics
-            // that should not be lost.
-            TimeInForce::GoodTillDate { .. } | TimeInForce::AtOpen | TimeInForce::AtClose => {
-                warn!(
-                    time_in_force = ?tif,
-                    "Binance Spot does not support this TimeInForce"
-                );
-                None
-            }
-        },
-        // Conditional orders: stop_price/trailing_delta set separately in open_order
-        OrderKind::Stop { .. } => Some((OrderPlaceTypeEnum::StopLoss, None)),
-        OrderKind::StopLimit { .. } => {
-            // StopLimit requires TIF like regular Limit orders
-            match tif {
-                TimeInForce::GoodUntilCancelled { post_only: false } => Some((
-                    OrderPlaceTypeEnum::StopLossLimit,
-                    Some(OrderPlaceTimeInForceEnum::Gtc),
-                )),
-                TimeInForce::FillOrKill => Some((
-                    OrderPlaceTypeEnum::StopLossLimit,
-                    Some(OrderPlaceTimeInForceEnum::Fok),
-                )),
-                TimeInForce::ImmediateOrCancel => Some((
-                    OrderPlaceTypeEnum::StopLossLimit,
-                    Some(OrderPlaceTimeInForceEnum::Ioc),
-                )),
-                _ => {
-                    warn!(
-                        time_in_force = ?tif,
-                        "Binance StopLimit does not support this TimeInForce"
-                    );
-                    None
-                }
-            }
-        }
-        OrderKind::TakeProfit { .. } => Some((OrderPlaceTypeEnum::TakeProfit, None)),
-        OrderKind::TakeProfitLimit { .. } => {
-            // TakeProfitLimit requires TIF like regular Limit orders
-            match tif {
-                TimeInForce::GoodUntilCancelled { post_only: false } => Some((
-                    OrderPlaceTypeEnum::TakeProfitLimit,
-                    Some(OrderPlaceTimeInForceEnum::Gtc),
-                )),
-                TimeInForce::FillOrKill => Some((
-                    OrderPlaceTypeEnum::TakeProfitLimit,
-                    Some(OrderPlaceTimeInForceEnum::Fok),
-                )),
-                TimeInForce::ImmediateOrCancel => Some((
-                    OrderPlaceTypeEnum::TakeProfitLimit,
-                    Some(OrderPlaceTimeInForceEnum::Ioc),
-                )),
-                _ => {
-                    warn!(
-                        time_in_force = ?tif,
-                        "Binance TakeProfitLimit does not support this TimeInForce"
-                    );
-                    None
-                }
-            }
-        }
-        // TrailingStop: Binance uses STOP_LOSS with trailingDelta parameter.
-        // Only BasisPoints and Percentage are supported; Absolute requires manual
-        // conversion by the caller: basis_points = (absolute / price) * 10000
-        OrderKind::TrailingStop { offset_type, .. } => match offset_type {
-            TrailingOffsetType::BasisPoints | TrailingOffsetType::Percentage => {
-                Some((OrderPlaceTypeEnum::StopLoss, None))
-            }
-            TrailingOffsetType::Absolute => {
-                warn!(
-                    "Binance TrailingStop does not support Absolute offset; \
-                     convert to basis points: (absolute / price) * 10000"
-                );
-                None
-            }
-        },
-        // Binance does not support TrailingStopLimit
-        OrderKind::TrailingStopLimit { .. } => {
-            warn!("Binance does not support TrailingStopLimit orders");
-            None
-        }
-    }
+    // The decision logic (which kind/TIF combinations Binance supports, GTD coercion,
+    // trailing-offset handling) lives in the shared classifier so spot and margin share it;
+    // this adapter only maps the venue-neutral result onto spot's WS-API enum types.
+    let (binance_type, binance_tif) = classify_order_kind_tif(kind, tif)?;
+    let type_enum = match binance_type {
+        BinanceOrderType::Market => OrderPlaceTypeEnum::Market,
+        BinanceOrderType::Limit => OrderPlaceTypeEnum::Limit,
+        BinanceOrderType::LimitMaker => OrderPlaceTypeEnum::LimitMaker,
+        BinanceOrderType::StopLoss => OrderPlaceTypeEnum::StopLoss,
+        BinanceOrderType::StopLossLimit => OrderPlaceTypeEnum::StopLossLimit,
+        BinanceOrderType::TakeProfit => OrderPlaceTypeEnum::TakeProfit,
+        BinanceOrderType::TakeProfitLimit => OrderPlaceTypeEnum::TakeProfitLimit,
+    };
+    let tif_enum = binance_tif.map(|t| match t {
+        BinanceTimeInForce::Gtc => OrderPlaceTimeInForceEnum::Gtc,
+        BinanceTimeInForce::Ioc => OrderPlaceTimeInForceEnum::Ioc,
+        BinanceTimeInForce::Fok => OrderPlaceTimeInForceEnum::Fok,
+    });
+    Some((type_enum, tif_enum))
 }
 
 #[cfg(test)]
@@ -2459,14 +2327,9 @@ mod tests {
                 Some(OrderPlaceTimeInForceEnum::Ioc)
             ))
         ));
-        // GoodUntilEndOfDay coerces to GTC on Binance Spot
-        assert!(matches!(
-            convert_order_kind_tif(OrderKind::Limit, TimeInForce::GoodUntilEndOfDay),
-            Some((
-                OrderPlaceTypeEnum::Limit,
-                Some(OrderPlaceTimeInForceEnum::Gtc)
-            ))
-        ));
+        // GoodUntilEndOfDay is unsupported on Binance (no native EOD order) — surfaced as
+        // unsupported rather than silently coerced to GTC, which would drop the EOD semantics.
+        assert!(convert_order_kind_tif(OrderKind::Limit, TimeInForce::GoodUntilEndOfDay).is_none());
 
         // Conditional orders
         assert!(matches!(

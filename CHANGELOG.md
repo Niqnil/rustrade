@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Binance `GoodUntilEndOfDay` (GTD) time-in-force is now rejected as `UnsupportedOrderType`** instead of being silently coerced to `GoodTillCancelled` (GTC). Binance has no native end-of-day order, and coercing to GTC dropped the EOD auto-cancel semantics — risking an unintended resting order. This affects both the spot and margin clients.
+
 ### Fixed
 
 - Corrected the order-type support matrix in `rustrade-execution/README.md` to reflect Binance and Hyperliquid conditional order support (Stop, StopLimit, TakeProfit, TakeProfitLimit), Binance trailing-stop offset limitations, and Hyperliquid's lack of native market orders.
