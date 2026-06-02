@@ -11,6 +11,12 @@ documentation = "https://docs.rs/rustrade-execution/"
 readme = "README.md"
 description = "Stream private account data from financial venues, and execute (live or mock) orders."
 
+# Every connector module (alpaca/binance/ibkr/hyperliquid) is feature-gated and `default = []`, so a
+# default-feature docs.rs build would publish a crate documenting zero connectors and break the
+# connector-comparison intra-doc links in `client/mod.rs`. Build the full surface for published docs.
+[package.metadata.docs.rs]
+all-features = true
+
 
 [features]
 default = []

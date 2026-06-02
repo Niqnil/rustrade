@@ -13,3 +13,8 @@
 # The auto-merge workflow reads this file and applies 'tier-2' label.
 
 ibapi=2.11.0  # 2026-04-18 | Financial protocol, community-maintained, no official SDK
+binance-sdk=50.0.0  # 2026-06-02 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
+#   1. common::websocket::WebsocketApi::send_message      — signature + WebsocketMessageSendOptions signing fields (margin WS subscribe send)
+#   2. ws.common.events.subscribe (WebsocketEventEmitter) — receive/event-callback path (margin WS event delivery)
+#   3. common::utils::send_request                        — signature + HMAC signing + X-MBX-APIKEY header (hand-rolled `userListenToken` POST; SDK binds no endpoint for it)
+# Background: legacy margin listen-key user-data API retired 2026-02-20; SDK binds only the dead endpoint, so the live `userListenToken` flow is hand-rolled atop these internals.

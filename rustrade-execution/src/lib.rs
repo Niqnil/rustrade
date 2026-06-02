@@ -116,7 +116,7 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
     /// Sourced from an exchange WS user-data stream (e.g. Binance `outboundAccountPosition`). It
     /// carries **no** margin debt, so applying it updates `free`/`locked` while **preserving** any
     /// existing [`MarginDetails`](balance::MarginDetails) — debt cannot be silently clobbered by a
-    /// stream update. Debt totals remain as fresh as the last [`BalanceSnapshot`].
+    /// stream update. Debt totals remain as fresh as the last [`BalanceSnapshot`](Self::BalanceSnapshot).
     BalanceStreamUpdate(Snapshot<AssetBalanceUpdate<AssetKey>>),
 
     /// Single [`Order`] snapshot - used to upsert existing order state if it's more recent.

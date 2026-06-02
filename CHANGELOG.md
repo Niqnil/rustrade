@@ -7,14 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Binance Cross Margin execution client** (`BinanceMargin`, `binance` feature)
+  - Implements the full `ExecutionClient` trait, so callers do not branch on spot-vs-margin
+    transport: order submission/cancel and account snapshot / balance / open-order / trade queries
+    over the margin REST API, plus a live account event stream.
+  - `BinanceMarginConfig` with `MarginSideEffect` borrow/repay policy (`AutoBorrowRepay` default /
+    `NoBorrow`), set once per client (`sideEffectType`). `BinanceMarginConfig::cross_margin(api_key, secret_key)`
+    convenience constructor.
+  - Live user-data stream is hand-rolled over the `userListenToken` model (the legacy margin
+    listen-key API was retired by Binance on 2026-02-20): token acquisition, renew-before-expiry,
+    auto-reconnect, exponential backoff, heartbeat monitoring, fill recovery, and dedup —
+    spot-equivalent resilience.
+  - Scope: **cross** margin only (account-wide). Isolated (per-pair) margin is a planned follow-up.
+  - Limitations: `TrailingStop`/`TrailingStopLimit` return `UnsupportedOrderType` (the SDK margin
+    binding omits `trailingDelta`); Binance margin/SAPI has no testnet (a `testnet: true` config is
+    inert and resolves to production, logged at construction).
+- **Margin-aware universal `Balance`**
+  - `MarginDetails { borrowed, interest }` and `Balance.margin: Option<MarginDetails>`; the per-asset
+    debt model generalises across CEX per-asset-margin venues (cash/no-debt venues leave `margin: None`).
+  - `Balance::net_asset()` returns `total` when there is no margin and `total - borrowed` when present
+    (a short is negative net asset in the base). Reflects debt only as fresh as the last
+    `BalanceSnapshot` for that asset.
+  - `Balance::new_margin(total, free, borrowed, interest)` constructor alongside `Balance::new`.
+- **REST/WS balance event split** to prevent silently clobbering debt
+  - `BalanceUpdate { free, locked }` / `AssetBalanceUpdate` model the WS partial (free/locked only),
+    and a new `AccountEventKind::BalanceStreamUpdate(Snapshot<AssetBalanceUpdate>)` carries it.
+  - REST snapshots remain the full `BalanceSnapshot(Snapshot<AssetBalance>)` (replace); WS updates
+    apply free/locked while **preserving** existing `margin`, so a partial update structurally cannot
+    overwrite known debt.
+
 ### Changed
 
+- **BREAKING: `Balance` gained a public `margin: Option<MarginDetails>` field.** Direct struct-literal
+  construction (`Balance { total, free }`) no longer compiles. Migration: use `Balance::new(total, free)`
+  for cash balances or `Balance::new_margin(..)` for margin balances. `const` sites that cannot use
+  `..Default::default()` need an explicit `margin: None`.
+- **Binance spot WS balance events now emit `BalanceStreamUpdate` instead of `BalanceSnapshot`.**
+  Spot's `outboundAccountPosition` was always a free/locked partial; it now uses the same
+  REST→snapshot / WS→update model as margin. Engine balance state is updated via
+  `AssetState::apply_balance_update` (sets `free`, recomputes `total = free + locked`, preserves
+  `margin`). No behavioural change for spot (which carries no debt) beyond the event variant.
 - **Binance `GoodUntilEndOfDay` (GTD) time-in-force is now rejected as `UnsupportedOrderType`** instead of being silently coerced to `GoodTillCancelled` (GTC). Binance has no native end-of-day order, and coercing to GTC dropped the EOD auto-cancel semantics — risking an unintended resting order. This affects both the spot and margin clients.
 
 ### Fixed
 
 - **Binance `fetch_open_orders` now honours the `ExecutionClient` "return all" contract** for an empty `instruments` slice. Both the spot and margin clients previously iterated the (empty) slice and returned an empty `Vec`, silently violating the trait contract that an empty slice must return open orders across all instruments. They now issue a single no-symbol query (`GET /api/v3/openOrders`, `GET /sapi/v1/margin/openOrders`), recovering each order's instrument from its own `symbol` field. The `fetch_trades` per-symbol limitation (Binance `myTrades` requires a symbol, so an empty slice returns empty) is now an explicitly documented deviation on both clients.
 - Corrected the order-type support matrix in `rustrade-execution/README.md` to reflect Binance and Hyperliquid conditional order support (Stop, StopLimit, TakeProfit, TakeProfitLimit), Binance trailing-stop offset limitations, and Hyperliquid's lack of native market orders.
+- **`rustrade-execution` docs.rs builds now use `all-features`.** Every connector module is feature-gated behind `default = []`, so docs.rs previously published a crate documenting no connectors and the connector-comparison intra-doc links broke. The full client surface is now documented and those links resolve.
 
 ## [0.2.1] - 2026-05-28
 

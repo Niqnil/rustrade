@@ -238,7 +238,42 @@ impl BinanceMarginConfig {
 /// (`margin_trading::rest_api`), and streams live account events via a hand-rolled
 /// `userListenToken` flow over the WS API, not the SDK's retired listen-key path.
 ///
-/// See the [module docs](self) for scope, borrow/repay behaviour, and the no-testnet caveat.
+/// See [`BinanceMarginConfig::testnet`] for the no-testnet caveat. The behaviour a caller most needs to know
+/// is summarised below, with links to the authoritative detail.
+///
+/// # Borrow/repay (`sideEffectType`)
+/// Fixed once per client via [`BinanceMarginConfig::side_effect`] / [`MarginSideEffect`]. The
+/// default [`MarginSideEffect::AutoBorrowRepay`] makes shorting work out of the box but lets a
+/// **mis-sized order silently borrow** — use [`MarginSideEffect::NoBorrow`] to opt out. Per-order
+/// borrow intent is intentionally not modelled (it would require position tracking); see
+/// [`MarginSideEffect`] for the rationale and upgrade path.
+///
+/// # Scope: cross margin only
+/// This client is **cross** margin (`isIsolated = "FALSE"`, account-wide collateral). Isolated
+/// (per-pair) margin is a separate follow-up and is **not** honoured by this client regardless of
+/// [`BinanceMarginConfig::is_isolated`] (the constructor warns if it is set).
+///
+/// # Trailing stops unsupported
+/// `TrailingStop` / `TrailingStopLimit` return [`OrderError::UnsupportedOrderType`]: the binance-sdk
+/// margin new-order binding omits `trailingDelta`. See [`open_order`](Self::open_order).
+///
+/// # User-data stream (`userListenToken`)
+/// [`account_stream`](Self::account_stream) is hand-rolled over the `userListenToken` model — the
+/// legacy margin listen-key user-data API was retired by Binance on 2026-02-20 and the SDK binds
+/// only the dead endpoint. There is **no keepalive ping** (the retired listen-key `PUT` mechanism):
+/// instead the token (~24h validity) is re-acquired and re-subscribed before its `expirationTime`,
+/// transparently across reconnects.
+///
+/// # Margin balances & debt-freshness
+/// Balances carry per-asset margin debt: [`Balance::net_asset`](crate::balance::Balance::net_asset)
+/// returns `total - borrowed`, with `borrowed`/`interest` exposed via
+/// [`MarginDetails`](crate::balance::MarginDetails). Authoritative debt totals come from the REST
+/// [`account_snapshot`](Self::account_snapshot) (`BalanceSnapshot`); the WS stream keeps
+/// `free`/`locked` live via `BalanceStreamUpdate` but **never** clobbers or re-establishes debt, and
+/// `userLiabilityChange` is surfaced as an observable log only, never accumulated into state.
+/// Consequently `net_asset` reflects debt only as fresh as the last `account_snapshot` for that
+/// asset — call it at startup and refresh on demand (see [`account_stream`](Self::account_stream)'s
+/// cold-start note).
 #[derive(Clone)]
 pub struct BinanceMargin {
     config: Arc<BinanceMarginConfig>,
