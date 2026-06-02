@@ -80,7 +80,7 @@ derive_more = { workspace = true, features = [
 reqwest = { workspace = true, optional = true } # HTTP client for Alpaca REST API
 
 # Binance (optional, behind "binance" feature)
-binance-sdk = { version = "=50.0.0", features = ["spot"], optional = true }
+binance-sdk = { version = "=52.0.0", features = ["spot"], optional = true }
 anyhow = { workspace = true, optional = true }                              # Required: binance-sdk's public API returns anyhow::Result
 
 # Shared between "alpaca" and "binance" features
