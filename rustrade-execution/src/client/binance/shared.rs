@@ -86,12 +86,24 @@ pub(crate) const MAX_BACKOFF_MS: u64 = 30_000;
 pub(crate) const MAX_RECONNECT_ATTEMPTS: u32 = 10;
 /// If no WS activity (messages, ping, pong) for this duration, force reconnect.
 pub(crate) const HEARTBEAT_TIMEOUT_SECS: u64 = 30;
+// Compile-time guard: reconnect sites cast this to i64 (`chrono::Duration::seconds`); ensure it
+// never overflows.
+const _: () = assert!(
+    HEARTBEAT_TIMEOUT_SECS <= i64::MAX as u64,
+    "HEARTBEAT_TIMEOUT_SECS overflows i64"
+);
 /// Timeout for fill recovery REST queries after reconnect.
 pub(crate) const FILL_RECOVERY_TIMEOUT_SECS: u64 = 30;
 /// Timeout for the initial WebSocket API TCP+TLS handshake.
 /// Without this, a network partition holds the write lock for up to 75–127 s
 /// (OS TCP timeout), stalling all concurrent open_order/cancel_order callers.
 pub(crate) const CONNECT_TIMEOUT_SECS: u64 = 15;
+// Compile-time guard: fill-recovery sites cast this to i64 (`chrono::Duration::seconds`); ensure it
+// never overflows.
+const _: () = assert!(
+    CONNECT_TIMEOUT_SECS <= i64::MAX as u64,
+    "CONNECT_TIMEOUT_SECS overflows i64"
+);
 /// Extra lookback subtracted from Signal disconnect timestamps to cover Tokio scheduling
 /// jitter between the actual WS close and when the monitor task records Utc::now().
 /// The dedup cache absorbs any resulting duplicate fills.
