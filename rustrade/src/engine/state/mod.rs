@@ -135,6 +135,12 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                     .update_from_balance(balance.as_ref());
                 None
             }
+            AccountEventKind::BalanceStreamUpdate(update) => {
+                self.assets
+                    .asset_index_mut(&update.0.asset)
+                    .apply_balance_update(update.as_ref());
+                None
+            }
             AccountEventKind::OrderSnapshot(order) => {
                 let instrument_state = self
                     .instruments

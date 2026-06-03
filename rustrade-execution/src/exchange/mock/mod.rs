@@ -620,18 +620,12 @@ mod tests {
             balances: vec![
                 AssetBalance {
                     asset: base(),
-                    balance: Balance {
-                        total: btc,
-                        free: btc,
-                    },
+                    balance: Balance::new(btc, btc),
                     time_exchange: Utc::now(),
                 },
                 AssetBalance {
                     asset: quote(),
-                    balance: Balance {
-                        total: usdt,
-                        free: usdt,
-                    },
+                    balance: Balance::new(usdt, usdt),
                     time_exchange: Utc::now(),
                 },
             ],

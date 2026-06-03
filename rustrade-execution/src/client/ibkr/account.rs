@@ -61,7 +61,7 @@ impl BalanceAggregator {
 
                 Some(AssetBalance {
                     asset: AssetNameExchange::from(currency.as_str()),
-                    balance: Balance { total, free },
+                    balance: Balance::new(total, free),
                     time_exchange: now,
                 })
             })
