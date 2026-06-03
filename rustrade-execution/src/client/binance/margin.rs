@@ -1809,7 +1809,9 @@ async fn margin_connection_manager(
                     }
                     () = tokio::time::sleep(Duration::from_secs(HEARTBEAT_TIMEOUT_SECS)) => {
                         if heartbeat_flag.swap(false, Ordering::AcqRel) {
-                            backoff.reset();
+                            // Backoff is already cleared post-subscribe (see backoff.reset() above);
+                            // the monitor loop is only entered on a live connection, so a heartbeat
+                            // tick never sees a non-zero count. Just consume the flag and keep waiting.
                             continue;
                         }
                         warn!("BinanceMargin heartbeat timeout ({}s), will attempt reconnect", HEARTBEAT_TIMEOUT_SECS);

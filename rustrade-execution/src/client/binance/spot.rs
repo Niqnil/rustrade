@@ -22,7 +22,7 @@
 // - Fill recovery: on reconnect, fetches missed trades via REST since disconnect
 //   timestamp, sends through dedup cache to avoid duplicates
 //
-// Known limitations (Phase 1 scope decisions):
+// Known limitations:
 // - balanceUpdate events (deposits/withdrawals) are silently ignored. The crypto
 //   repo wrapper should call fetch_balances or account_snapshot periodically to
 //   reconcile balances after external transfers.
@@ -705,7 +705,7 @@ impl ExecutionClient for BinanceSpot {
                 }
             },
             Err(e) => {
-                // binance-sdk =44.0.1 routes both transport failures and API-level
+                // binance-sdk =50.0.0 routes both transport failures and API-level
                 // rejections (status >= 400) through this outer Err path as ResponseError.
                 // Distinguish them so API rejections (-2010, -1121, etc.) don't tear down
                 // a healthy WS session and don't surface as ConnectivityError to the engine.
@@ -992,7 +992,7 @@ impl ExecutionClient for BinanceSpot {
                 }
             },
             Err(e) => {
-                // binance-sdk =44.0.1 routes both transport failures and API-level
+                // binance-sdk =50.0.0 routes both transport failures and API-level
                 // rejections (status >= 400) through this outer Err path as ResponseError.
                 // Distinguish them so API rejections (-2010, -1121, etc.) don't tear down
                 // a healthy WS session and don't surface as ConnectivityError to the engine.
@@ -1277,7 +1277,7 @@ async fn connection_manager(
         // subscription; that task processes events sequentially from an internal channel,
         // so FnMut callbacks are never invoked concurrently per subscription. If the SDK
         // changes to concurrent callbacks, these `Option::take()` calls would need a Mutex.
-        // verified against binance-sdk =44.0.1. Re-verify on SDK upgrade.
+        // verified against binance-sdk =50.0.0. Re-verify on SDK upgrade.
         let subscription = ws.subscribe_on_ws_events(move |event| {
             let Some(ref sender) = event_tx else { return };
             match event {
@@ -1440,7 +1440,7 @@ async fn connection_manager(
         // --- Cleanup current connection ---
         // must explicitly unsubscribe — Subscription::drop only detaches the
         // internal JoinHandle, it doesn't abort it.
-        // assumption (verified against binance-sdk =44.0.1): unsubscribe() stops
+        // assumption (verified against binance-sdk =50.0.0): unsubscribe() stops
         // the callback task before returning, so no further invocations of the FnMut
         // callback occur after this point. The old `heartbeat_flag` Arc is therefore
         // safe to drop here. Re-verify on SDK upgrade if the callback invocation model changes.
@@ -1648,7 +1648,7 @@ fn filter_and_convert_balances(
 
 /// Convert a Binance open order into rustrade's Open state order.
 // `AllOrdersResponseInner` is the response type for both `GET /api/v3/allOrders`
-// and `GET /api/v3/openOrders` in binance-sdk =44.0.1 — they share the same struct.
+// and `GET /api/v3/openOrders` in binance-sdk =50.0.0 — they share the same struct.
 // Verified against the SDK source. Re-verify on SDK upgrade if open-orders parsing breaks.
 fn convert_open_order(
     o: &binance_sdk::spot::rest_api::AllOrdersResponseInner,

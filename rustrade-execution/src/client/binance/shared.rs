@@ -821,9 +821,13 @@ pub(crate) fn classify_rest_order_error(
         ConnectorError::TooManyRequestsError { .. } | ConnectorError::RateLimitBanError { .. } => {
             OrderError::Rejected(ApiError::RateLimit)
         }
-        ConnectorError::UnauthorizedError { msg, .. }
-        | ConnectorError::ForbiddenError { msg, .. } => {
-            OrderError::Rejected(ApiError::Unauthenticated(msg.clone()))
+        ConnectorError::UnauthorizedError { msg, code }
+        | ConnectorError::ForbiddenError { msg, code } => {
+            // Splice the code (Display omits it) into the message so downstream callers can tell
+            // auth-failure subtypes apart (e.g. -2014 invalid key vs -2015 IP/permission), matching
+            // the BadRequest arm below and this function's documented contract.
+            let msg_with_code = code.map_or_else(|| msg.clone(), |c| format!("{c} {msg}"));
+            OrderError::Rejected(ApiError::Unauthenticated(msg_with_code))
         }
         ConnectorError::ServerError { msg, .. } | ConnectorError::NetworkError(msg) => {
             OrderError::Connectivity(ConnectivityError::Socket(msg.clone()))
