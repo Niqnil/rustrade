@@ -113,6 +113,9 @@ impl Balance {
     /// asset is simply the gross holding) and `total - borrowed` when `Some`. The result can be
     /// **negative** — a short position is a negative net holding in the borrowed (base) asset.
     ///
+    /// Accrued [`MarginDetails::interest`] is intentionally **excluded**: it is tracked separately
+    /// and does not reduce net holdings until the venue actually deducts it.
+    ///
     /// # Freshness
     /// The returned value reflects debt only as fresh as the last
     /// [`BalanceSnapshot`](crate::AccountEventKind::BalanceSnapshot) for this asset. WS partial

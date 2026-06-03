@@ -31,6 +31,7 @@ alpaca = [
 binance = [
     "dep:binance-sdk",
     "dep:serde_json",
+    "serde_json/raw_value", # RawValue borrow for zero-copy WS user-data frame parsing
     "dep:anyhow",
     "dep:lru",
     "dep:parking_lot",

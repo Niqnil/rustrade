@@ -943,22 +943,31 @@ struct UserListenTokenResponse {
 /// The endpoint is unbound in the SDK, so this reuses `common::utils::send_request` (signing,
 /// timestamp, `X-MBX-APIKEY`, and the SDK's reqwest client) against the production REST config.
 /// Cross margin sends no params (`isIsolated`/`symbol` omitted).
+///
+/// Routed through [`rest_call_with_retry`] so a transient rate-limit during a *planned* token
+/// renewal retries in place rather than collapsing the stream into the full reconnect+backoff
+/// path. `ConfigurationRestApi` stands in as the retry helper's `R` (it only ever hands back an
+/// `Arc` clone to the per-attempt closure).
 async fn acquire_user_listen_token(
-    rest_config: &ConfigurationRestApi,
+    rest_config: &Arc<ConfigurationRestApi>,
     rate_limiter: &RateLimitTracker,
 ) -> Result<UserListenToken, UnindexedClientError> {
-    rate_limiter.wait_if_blocked().await;
-    let response = binance_sdk::common::utils::send_request::<UserListenTokenResponse>(
-        rest_config,
-        "/sapi/v1/userListenToken",
-        reqwest::Method::POST,
-        // `send_request` takes owned query + body maps; cross margin sends no params, so both are
-        // empty. The empty-map allocations are SDK-signature-forced and happen once per acquisition.
-        BTreeMap::new(),
-        BTreeMap::new(),
-        None,
-        true, // is_signed — token is auth-bearing; HMAC/timestamp/api-key applied by send_request
-    )
+    let response = rest_call_with_retry(rest_config, rate_limiter, |cfg| {
+        Box::pin(async move {
+            binance_sdk::common::utils::send_request::<UserListenTokenResponse>(
+                &cfg,
+                "/sapi/v1/userListenToken",
+                reqwest::Method::POST,
+                // `send_request` takes owned query + body maps; cross margin sends no params, so
+                // both are empty. The allocations are SDK-signature-forced and run once per attempt.
+                BTreeMap::new(),
+                BTreeMap::new(),
+                None,
+                true, // is_signed — token is auth-bearing; HMAC/timestamp/api-key by send_request
+            )
+            .await
+        })
+    })
     .await
     .map_err(connectivity_error)?;
 
@@ -977,7 +986,8 @@ async fn acquire_user_listen_token(
 fn token_renew_after(expiration_time_ms: i64) -> Duration {
     let now_ms = Utc::now().timestamp_millis();
     // Saturating arithmetic so a malformed/huge `expirationTime` can't overflow i64 (debug panic /
-    // release wrap). try_from then maps any negative (already-expired/odd) result to 0.
+    // release wrap); the `/ 1_000` is a truncating ms→s conversion. try_from then maps any negative
+    // (already-expired/odd) result to 0.
     let remaining_secs = expiration_time_ms
         .saturating_sub(now_ms)
         .saturating_div(1_000)
@@ -999,12 +1009,22 @@ fn token_renew_after(expiration_time_ms: i64) -> Duration {
 ///
 /// The SDK's spot ws-api wrapper can't be reused for margin (private base, no generic
 /// send/receive surface), so margin drives `common::websocket::WebsocketApi` directly. An empty
-/// pool is auto-populated by the SDK; `connect()` establishes the socket (10s internal timeout).
+/// pool is auto-populated by the SDK. The handshake is bounded by `CONNECT_TIMEOUT_SECS` explicitly
+/// rather than relying on the SDK's internal timeout (an unstable, version-pinned detail).
 async fn connect_margin_ws(
     ws_config: &ConfigurationWebsocketApi,
 ) -> anyhow::Result<Arc<WsApiBase>> {
     let ws = WsApiBase::new(ws_config.clone(), vec![]);
-    ws.clone().connect().await?;
+    // Mirrors BinanceSpot's reconnect path: a stalled connect must not block the connection
+    // manager for an OS-length TCP timeout if the SDK's internal bound ever changes.
+    tokio::time::timeout(
+        Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        ws.clone().connect(),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("BinanceMargin WS connect timed out after {CONNECT_TIMEOUT_SECS}s")
+    })??;
     Ok(ws)
 }
 
@@ -1039,28 +1059,53 @@ async fn subscribe_listen_token(ws: &Arc<WsApiBase>, token: &str) -> anyhow::Res
 /// Returns `true` if the exchange signalled stream termination (a reconnect trigger). Unknown frames
 /// are ignored. Deserialization of a known event type is defensive: a mismatch is logged and the
 /// event dropped (observable), never silently mis-parsed.
-fn convert_margin_user_data_events(
-    value: &serde_json::Value,
-    buf: &mut Vec<UnindexedAccountEvent>,
-) -> bool {
+fn convert_margin_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -> bool {
+    use serde_json::value::RawValue;
+
+    // Borrowed envelope — avoids building a full `serde_json::Value` DOM for every inbound frame
+    // (hot path). RPC responses (subscribe ack, errors) carry a top-level `id`; pushed user-data
+    // events are wrapped as `{ subscriptionId, event: { e, .. } }`. The inner `event` is kept as an
+    // un-parsed raw slice so only the matched branch below pays for a single typed pass.
+    #[derive(Deserialize)]
+    struct Envelope<'a> {
+        #[serde(borrow, default)]
+        id: Option<&'a RawValue>,
+        #[serde(borrow, default)]
+        event: Option<&'a RawValue>,
+    }
+    // Discriminator-only view of the inner event: reads `e` without materialising the payload.
+    #[derive(Deserialize)]
+    struct EventTag<'a> {
+        #[serde(borrow, default)]
+        e: Option<&'a str>,
+    }
+
+    let envelope = match serde_json::from_str::<Envelope<'_>>(frame) {
+        Ok(env) => env,
+        Err(e) => {
+            trace!(error = %e, "BinanceMargin WS: skipped unparseable frame");
+            return false;
+        }
+    };
     // RPC responses (subscribe ack, errors) carry a top-level "id"; not a user-data event.
-    if value.get("id").is_some() {
+    if envelope.id.is_some() {
         return false;
     }
     // Pushed user-data events are wrapped: { subscriptionId, event: { e: "...", ... } }.
-    let Some(event) = value.get("event") else {
+    let Some(event) = envelope.event else {
         trace!("BinanceMargin WS: ignoring frame without `event` or `id`");
         return false;
     };
-    let event_type = event
-        .get("e")
-        .and_then(serde_json::Value::as_str)
+    let event_raw = event.get();
+    let event_type = serde_json::from_str::<EventTag<'_>>(event_raw)
+        .ok()
+        .and_then(|tag| tag.e)
         .unwrap_or_default();
     match event_type {
         "executionReport" => {
-            // Borrow `event` directly via `&Value`'s Deserializer impl — avoids a deep clone of
-            // the JSON subtree on every WS frame (hot path). Only the matched branch deserializes.
-            match Executionreport::deserialize(event) {
+            // Single typed pass straight from the raw inner slice — no intermediate DOM, and only
+            // the matched branch deserializes its payload.
+            match serde_json::from_str::<Executionreport>(event_raw) {
                 Ok(report) => {
                     if let Some(ev) = convert_margin_execution_report(report) {
                         buf.push(ev);
@@ -1073,7 +1118,7 @@ fn convert_margin_user_data_events(
             false
         }
         "outboundAccountPosition" => {
-            match Outboundaccountposition::deserialize(event) {
+            match serde_json::from_str::<Outboundaccountposition>(event_raw) {
                 Ok(position) => convert_margin_account_position(position, buf),
                 Err(e) => {
                     warn!(error = %e, "BinanceMargin: undeserializable outboundAccountPosition, dropping")
@@ -1084,32 +1129,52 @@ fn convert_margin_user_data_events(
         "balanceUpdate" => {
             // Deposit/withdrawal delta; outboundAccountPosition covers trade-driven balance changes.
             // Mirrors spot — not forwarded. Consumers reconcile transfers via account_snapshot.
-            debug!("BinanceMargin ignoring balanceUpdate event");
+            // No log here: this is the per-frame receive hot path (fires on every balance change).
             false
         }
         "userLiabilityChange" => {
             // Observable, NOT accumulated into balance state (Design decision #4): borrow/repay is a
             // delta, and folding it in would be the position tracking the library refuses. Surfaced
-            // via logs; consumers needing exact live debt refresh via account_snapshot.
-            if let Ok(c) = UserLiabilityChange::deserialize(event) {
-                info!(
-                    asset = c.a.as_deref().unwrap_or("?"),
-                    kind = c.t.as_deref().unwrap_or("?"),
-                    principal = c.p.as_deref().unwrap_or("?"),
-                    interest = c.i.as_deref().unwrap_or("?"),
-                    "BinanceMargin userLiabilityChange (observable; not applied to balance state)"
-                );
+            // via logs; consumers needing exact live debt refresh via account_snapshot. Always
+            // deserialized (rare borrow/repay path, not per-frame) so a parse failure — exchange
+            // schema drift — is surfaced at WARN rather than silently dropped, even when INFO is
+            // filtered out (observable failures over silent ones). The success log itself is INFO-gated.
+            match serde_json::from_str::<UserLiabilityChange>(event_raw) {
+                Ok(c) => {
+                    if tracing::enabled!(tracing::Level::INFO) {
+                        info!(
+                            asset = c.a.as_deref().unwrap_or("?"),
+                            kind = c.t.as_deref().unwrap_or("?"),
+                            principal = c.p.as_deref().unwrap_or("?"),
+                            interest = c.i.as_deref().unwrap_or("?"),
+                            "BinanceMargin userLiabilityChange (observable; not applied to balance state)"
+                        );
+                    }
+                }
+                Err(e) => warn!(
+                    error = %e,
+                    "BinanceMargin: undeserializable userLiabilityChange, dropping"
+                ),
             }
             false
         }
         "marginLevelStatusChange" => {
             // Liquidation-risk signal — observable, no policy (the library takes no defensive action).
-            if let Ok(c) = MarginLevelStatusChange::deserialize(event) {
-                warn!(
-                    margin_level = c.l.as_deref().unwrap_or("?"),
-                    status = c.s.as_deref().unwrap_or("?"),
-                    "BinanceMargin marginLevelStatusChange (liquidation risk; observable, no policy)"
-                );
+            // The level guard skips the deserialize allocation when WARN is filtered out, mirroring
+            // userLiabilityChange above. A parse failure on a liquidation-risk frame is surfaced
+            // rather than dropped silently (observable failures over silent ones).
+            if tracing::enabled!(tracing::Level::WARN) {
+                match serde_json::from_str::<MarginLevelStatusChange>(event_raw) {
+                    Ok(c) => warn!(
+                        margin_level = c.l.as_deref().unwrap_or("?"),
+                        status = c.s.as_deref().unwrap_or("?"),
+                        "BinanceMargin marginLevelStatusChange (liquidation risk; observable, no policy)"
+                    ),
+                    Err(e) => warn!(
+                        error = %e,
+                        "BinanceMargin: undeserializable marginLevelStatusChange, dropping"
+                    ),
+                }
             }
             false
         }
@@ -1631,35 +1696,31 @@ async fn margin_connection_manager(
             match event {
                 WebsocketEvent::Message(json_str) => {
                     hb_callback.store(true, Ordering::Release);
-                    match serde_json::from_str::<serde_json::Value>(&json_str) {
-                        Ok(value) => {
-                            let terminated =
-                                convert_margin_user_data_events(&value, &mut event_buf);
-                            for ev in event_buf.drain(..) {
-                                if let Some(key) = dedup_key_from_event(&ev)
-                                    && is_duplicate(&dedup_callback, key)
-                                {
-                                    trace!("BinanceMargin dedup: skipping duplicate event");
-                                    continue;
-                                }
-                                if sender.send(ev).is_err() {
-                                    warn!("BinanceMargin account_stream receiver dropped, suppressing sends");
-                                    event_tx.take();
-                                    if let Some(s) = signal_tx_opt.take() {
-                                        let _ = s.send(());
-                                    }
-                                    return;
-                                }
-                            }
-                            if terminated {
-                                event_tx.take();
-                                if let Some(s) = signal_tx_opt.take() {
-                                    let _ = s.send(());
-                                }
-                            }
+                    // Frame parsing (including skipping non-JSON frames) happens inside the
+                    // converter, which parses borrowed slices rather than a full DOM (hot path).
+                    let terminated = convert_margin_user_data_events(&json_str, &mut event_buf);
+                    for ev in event_buf.drain(..) {
+                        if let Some(key) = dedup_key_from_event(&ev)
+                            && is_duplicate(&dedup_callback, key)
+                        {
+                            trace!("BinanceMargin dedup: skipping duplicate event");
+                            continue;
                         }
-                        Err(e) => {
-                            trace!(error = %e, "BinanceMargin WS: skipped non-JSON message")
+                        if sender.send(ev).is_err() {
+                            warn!(
+                                "BinanceMargin account_stream receiver dropped, suppressing sends"
+                            );
+                            event_tx.take();
+                            if let Some(s) = signal_tx_opt.take() {
+                                let _ = s.send(());
+                            }
+                            return;
+                        }
+                    }
+                    if terminated {
+                        event_tx.take();
+                        if let Some(s) = signal_tx_opt.take() {
+                            let _ = s.send(());
                         }
                     }
                 }
@@ -1731,6 +1792,9 @@ async fn margin_connection_manager(
             let mut signal_rx = signal_rx;
             loop {
                 tokio::select! {
+                    // Biased: a consumer drop is terminal and must win over a simultaneously-ready
+                    // disconnect signal, which would otherwise enqueue one pointless reconnect.
+                    biased;
                     _ = tx.closed() => {
                         debug!("BinanceMargin account_stream consumer dropped, terminating");
                         break DisconnectReason::ConsumerDropped;
@@ -2933,15 +2997,16 @@ mod tests {
 
     // -- User-data stream: frame discrimination + event conversion -----------------------------
 
-    /// Wrap an inner user-data `event` object in the WS-API push envelope (Phase 0 shape).
-    fn push(event: serde_json::Value) -> serde_json::Value {
-        serde_json::json!({ "subscriptionId": 1, "event": event })
+    /// Wrap an inner user-data `event` object in the WS-API push envelope (Phase 0 shape),
+    /// serialized to the on-wire JSON string the converter parses.
+    fn push(event: serde_json::Value) -> String {
+        serde_json::json!({ "subscriptionId": 1, "event": event }).to_string()
     }
 
     #[test]
     fn margin_ws_rpc_ack_yields_no_events() {
         // An RPC response (e.g. the subscribe ack) carries a top-level `id` and is not user data.
-        let frame = serde_json::json!({ "id": "abc", "status": 200, "result": {} });
+        let frame = serde_json::json!({ "id": "abc", "status": 200, "result": {} }).to_string();
         let mut buf = Vec::new();
         assert!(!convert_margin_user_data_events(&frame, &mut buf));
         assert!(buf.is_empty());

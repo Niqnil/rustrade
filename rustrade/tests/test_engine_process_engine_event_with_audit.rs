@@ -1103,10 +1103,10 @@ fn account_event_balance_update(
         exchange: ExchangeIndex(0),
         kind: AccountEventKind::BalanceStreamUpdate(Snapshot(AssetBalanceUpdate {
             asset: AssetIndex(asset),
-            update: BalanceUpdate {
-                free: Decimal::try_from(free).unwrap(),
-                locked: Decimal::try_from(locked).unwrap(),
-            },
+            update: BalanceUpdate::new(
+                Decimal::try_from(free).unwrap(),
+                Decimal::try_from(locked).unwrap(),
+            ),
             time_exchange: time_plus_days(STARTING_TIMESTAMP, time_plus),
         })),
     }))
