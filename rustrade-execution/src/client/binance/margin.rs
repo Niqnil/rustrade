@@ -154,16 +154,26 @@ pub struct BinanceMarginConfig {
     /// as production. Retained to mirror the spot config shape; [`BinanceMargin::new`] warns if it
     /// is set to `true`.
     pub testnet: bool,
-    /// Isolated margin when `true`; cross margin (account-wide) when `false`.
+    /// Isolated margin (per-pair sub-accounts) when `true`; cross margin (account-wide) when
+    /// `false`.
     ///
-    /// Defaults to `false` (cross). Isolated support is a follow-up; cross is the primary mode.
-    ///
-    /// # Warning
-    /// Setting this to `true` is **not yet honoured**: the client currently operates as cross
-    /// margin regardless, logging a warning at construction (see [`BinanceMargin::new`]) rather
-    /// than failing silently. Isolated execution is a separate follow-up.
+    /// Defaults to `false` (cross). When `true`, [`isolated_symbols`](Self::isolated_symbols) must
+    /// be non-empty — it declares the pairs to snapshot/stream; [`BinanceMargin::new`] panics
+    /// otherwise.
     #[serde(default)]
     pub is_isolated: bool,
+    /// The isolated-margin pairs this client snapshots and streams when
+    /// [`is_isolated`](Self::is_isolated) is `true`.
+    ///
+    /// This is the authoritative symbol universe for the isolated per-symbol `userListenToken`
+    /// token/subscription fan-out: tokens are per-symbol and must be known at stream start, so the
+    /// set is fixed for the stream's lifetime. A pair activated *after* `account_stream` is called
+    /// is **not** auto-subscribed — reconfigure and restart the stream to pick it up.
+    ///
+    /// Ignored for cross margin (`is_isolated = false`). Empty by default; a `true` +
+    /// empty-set combination is a misconfiguration that panics in [`BinanceMargin::new`].
+    #[serde(default)]
+    pub isolated_symbols: Vec<InstrumentNameExchange>,
     /// Borrow/repay policy applied to every order placed by this client.
     ///
     /// Defaults to [`MarginSideEffect::AutoBorrowRepay`] — see its `# Warning` on silent borrowing.
@@ -179,6 +189,7 @@ impl std::fmt::Debug for BinanceMarginConfig {
             .field("secret_key", &"***")
             .field("testnet", &self.testnet)
             .field("is_isolated", &self.is_isolated)
+            .field("isolated_symbols", &self.isolated_symbols)
             .field("side_effect", &self.side_effect)
             .finish()
     }
@@ -187,15 +198,19 @@ impl std::fmt::Debug for BinanceMarginConfig {
 impl BinanceMarginConfig {
     /// Construct a [`BinanceMarginConfig`] with explicit control over every field.
     ///
-    /// Prefer [`BinanceMarginConfig::cross_margin`] for the common case, or deserialize from a
-    /// config file to keep credentials out of source. The required positional args are the
-    /// credentials plus any non-defaultable knobs; defaultable knobs (`is_isolated`, `side_effect`)
-    /// are exposed here for full control and via `#[serde(default)]` for the file path.
+    /// Prefer [`BinanceMarginConfig::cross_margin`] / [`BinanceMarginConfig::isolated`] for the
+    /// common cases, or deserialize from a config file to keep credentials out of source. The
+    /// positional args expose every field for full control; defaultable knobs (`is_isolated`,
+    /// `isolated_symbols`, `side_effect`) also default via `#[serde(default)]` on the file path.
+    ///
+    /// Note: this does not itself validate `is_isolated` against `isolated_symbols`; that gate
+    /// lives in [`BinanceMargin::new`] (it must also cover the `Deserialize`-only path).
     pub fn new(
         api_key: String,
         secret_key: String,
         testnet: bool,
         is_isolated: bool,
+        isolated_symbols: Vec<InstrumentNameExchange>,
         side_effect: MarginSideEffect,
     ) -> Self {
         Self {
@@ -203,6 +218,7 @@ impl BinanceMarginConfig {
             secret_key,
             testnet,
             is_isolated,
+            isolated_symbols,
             side_effect,
         }
     }
@@ -210,14 +226,38 @@ impl BinanceMarginConfig {
     /// Convenience constructor for the common case: cross margin, production endpoints, and the
     /// default [`MarginSideEffect::AutoBorrowRepay`] borrow/repay policy.
     ///
-    /// Equivalent to [`new`](Self::new) with `testnet = false`, `is_isolated = false`, and the
-    /// default `side_effect`. Use [`new`](Self::new) when any of those need to differ.
+    /// Equivalent to [`new`](Self::new) with `testnet = false`, `is_isolated = false`, no
+    /// `isolated_symbols`, and the default `side_effect`. Use [`new`](Self::new) when any of those
+    /// need to differ.
     pub fn cross_margin(api_key: String, secret_key: String) -> Self {
         Self::new(
             api_key,
             secret_key,
             false,
             false,
+            Vec::new(),
+            MarginSideEffect::default(),
+        )
+    }
+
+    /// Convenience constructor for isolated margin: production endpoints, the default
+    /// [`MarginSideEffect::AutoBorrowRepay`] borrow/repay policy, and the given per-pair symbol
+    /// universe (see [`isolated_symbols`](Self::isolated_symbols)).
+    ///
+    /// `symbols` should be non-empty: an isolated client with no symbols has nothing to
+    /// snapshot or stream and [`BinanceMargin::new`] panics on it. Use [`new`](Self::new) to
+    /// override `side_effect`.
+    pub fn isolated(
+        api_key: String,
+        secret_key: String,
+        symbols: Vec<InstrumentNameExchange>,
+    ) -> Self {
+        Self::new(
+            api_key,
+            secret_key,
+            false,
+            true,
+            symbols,
             MarginSideEffect::default(),
         )
     }
@@ -350,8 +390,15 @@ impl ExecutionClient for BinanceMargin {
     /// Construct a `BinanceMargin` client from its configuration.
     ///
     /// # Panics
-    /// Panics if the binance-sdk configuration builder fails (e.g. empty or malformed
-    /// API key/secret), matching [`BinanceSpot`](super::spot::BinanceSpot)'s startup contract.
+    /// Panics if:
+    /// - the binance-sdk configuration builder fails (e.g. empty or malformed API key/secret),
+    ///   matching [`BinanceSpot`](super::spot::BinanceSpot)'s startup contract; or
+    /// - `is_isolated = true` but [`isolated_symbols`](BinanceMarginConfig::isolated_symbols) is
+    ///   empty — an isolated client with no configured pairs has nothing to snapshot or stream.
+    ///   This gate lives here (not only in [`BinanceMarginConfig::isolated`]) because the config is
+    ///   `Deserialize`-only and a deserialized config bypasses the named constructor. The
+    ///   `ExecutionClient::new` signature returns `Self`, not `Result`, so an unusable config is a
+    ///   fail-fast panic (consistent with the credential `expect`s above), not a recoverable error.
     fn new(config: Self::Config) -> Self {
         if config.testnet {
             warn!(
@@ -359,12 +406,10 @@ impl ExecutionClient for BinanceMargin {
                  using production endpoints"
             );
         }
-        if config.is_isolated {
-            warn!(
-                "BinanceMarginConfig.is_isolated = true is not yet supported: isolated margin is a \
-                 follow-up; operating as cross margin"
-            );
-        }
+        assert!(
+            !(config.is_isolated && config.isolated_symbols.is_empty()),
+            "BinanceMarginConfig: is_isolated = true requires a non-empty isolated_symbols"
+        );
         // Built once and shared: one clone is consumed by the SDK `RestApi`, the original is retained
         // for the hand-rolled `userListenToken` POST via `send_request`. `ConfigurationRestApi: Clone`
         // and is cheap to copy (its `reqwest::Client` is `Arc`-backed), avoiding redundant credential
@@ -390,7 +435,7 @@ impl ExecutionClient for BinanceMargin {
     ///
     /// Margin specifics:
     /// - `sideEffectType` is the client-level [`MarginSideEffect`] (borrow/repay policy).
-    /// - `isIsolated` is always `"FALSE"` (cross) in this version — isolated margin is a follow-up.
+    /// - `isIsolated` is config-driven (`"TRUE"` for isolated, `"FALSE"` for cross).
     /// - `autoRepayAtCancel` is set only under [`MarginSideEffect::AutoBorrowRepay`]: a `NoBorrow`
     ///   client takes no loan, so requesting repay-on-cancel would be incoherent.
     /// - Trailing-stop kinds return [`OrderError::UnsupportedOrderType`] (the SDK omits
@@ -437,6 +482,7 @@ impl ExecutionClient for BinanceMargin {
             time_in_force,
             cid.0.to_string(),
             self.config.side_effect,
+            self.config.is_isolated,
         ) {
             Ok(params) => params,
             Err(BuildOrderError::Unsupported) => {
@@ -542,7 +588,7 @@ impl ExecutionClient for BinanceMargin {
     /// Cancel a resting margin order via `DELETE /sapi/v1/margin/order`.
     ///
     /// Cancels by exchange `orderId` when present and parseable, otherwise by the originating
-    /// client order id. Cross only (`isIsolated = "FALSE"`). Mirrors
+    /// client order id. `isIsolated` is config-driven. Mirrors
     /// [`BinanceSpot::cancel_order`](super::spot::BinanceSpot): every failure is folded into the
     /// returned response's `state` as an `Err`.
     ///
@@ -560,31 +606,18 @@ impl ExecutionClient for BinanceMargin {
             cid: request.key.cid.clone(),
         };
 
-        let mut builder = MarginAccountCancelOrderParams::builder(instrument.name().to_string())
-            .is_isolated("FALSE".to_string());
-
-        if let Some(ref order_id) = request.state.id {
-            if let Ok(id) = order_id.0.parse::<i64>() {
-                builder = builder.order_id(id);
-            } else {
-                // exchange order id exists but isn't a valid i64 — fall back to the cid.
-                error!(
-                    order_id = %order_id.0,
-                    "BinanceMargin cancel: exchange orderId not parseable as i64, falling back to clientOrderId"
-                );
-                builder = builder.orig_client_order_id(request.key.cid.0.to_string());
-            }
-        } else {
-            builder = builder.orig_client_order_id(request.key.cid.0.to_string());
-        }
-
-        let params = match builder.build() {
+        let params = match build_cancel_order_params(
+            instrument.name().to_string(),
+            request.state.id.as_ref(),
+            &request.key.cid,
+            self.config.is_isolated,
+        ) {
             Ok(p) => p,
             Err(e) => {
                 error!(%e, "BinanceMargin failed to build cancel order params");
                 return Some(UnindexedOrderResponseCancel {
                     key,
-                    state: Err(OrderError::Rejected(ApiError::OrderRejected(e.to_string()))),
+                    state: Err(OrderError::Rejected(ApiError::OrderRejected(e))),
                 });
             }
         };
@@ -699,6 +732,7 @@ impl ExecutionClient for BinanceMargin {
                     self.rest.clone(),
                     self.rate_limiter.clone(),
                     instrument,
+                    self.config.is_isolated,
                 )
             }))
             .buffer_unordered(8)
@@ -768,8 +802,12 @@ impl ExecutionClient for BinanceMargin {
         // Empty slice = "return all" sentinel: a single no-symbol query is both correct (the
         // contract requires all instruments) and far cheaper than enumerating every symbol.
         if instruments.is_empty() {
-            return fetch_margin_all_open_orders(self.rest.clone(), self.rate_limiter.clone())
-                .await;
+            return fetch_margin_all_open_orders(
+                self.rest.clone(),
+                self.rate_limiter.clone(),
+                self.config.is_isolated,
+            )
+            .await;
         }
         use futures::{StreamExt as _, TryStreamExt as _};
         futures::stream::iter(instruments.iter().cloned().map(|instrument| {
@@ -777,6 +815,7 @@ impl ExecutionClient for BinanceMargin {
                 self.rest.clone(),
                 self.rate_limiter.clone(),
                 instrument,
+                self.config.is_isolated,
             )
         }))
         .buffer_unordered(8)
@@ -814,6 +853,7 @@ impl ExecutionClient for BinanceMargin {
             return Ok(Vec::new());
         }
         let start_time_ms = time_since.timestamp_millis();
+        let is_isolated = self.config.is_isolated;
         let mut all_trades = Vec::new();
 
         // Binance requires per-symbol queries for trade history. Limit concurrency to avoid
@@ -822,8 +862,14 @@ impl ExecutionClient for BinanceMargin {
             let rest = self.rest.clone();
             let rate_limiter = self.rate_limiter.clone();
             async move {
-                let pages =
-                    paginate_margin_my_trades(&rest, &rate_limiter, &inst, start_time_ms).await?;
+                let pages = paginate_margin_my_trades(
+                    &rest,
+                    &rate_limiter,
+                    &inst,
+                    start_time_ms,
+                    is_isolated,
+                )
+                .await?;
                 Ok::<_, UnindexedClientError>((inst, pages))
             }
         }))
@@ -1530,6 +1576,7 @@ async fn recover_margin_fills(
     disconnect_time: DateTime<Utc>,
     tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
     dedup: &SharedDedupCache,
+    is_isolated: bool,
 ) {
     use futures::StreamExt as _;
 
@@ -1552,7 +1599,7 @@ async fn recover_margin_fills(
         let rest = rest.clone();
         let rl = rate_limiter.clone();
         async move {
-            match paginate_margin_my_trades(&rest, &rl, &inst, start_time_ms).await {
+            match paginate_margin_my_trades(&rest, &rl, &inst, start_time_ms, is_isolated).await {
                 Ok(pages) => Some(
                     pages
                         .iter()
@@ -1776,7 +1823,9 @@ async fn margin_connection_manager(
         if let Some(dt) = disconnect_time.take()
             && tokio::time::timeout(
                 Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS),
-                recover_margin_fills(&rest, &rate_limiter, &instruments, dt, &tx, &dedup),
+                // This is the cross manager (account-wide); fill recovery is always cross-scoped.
+                // The isolated manager (a separate path) passes `true`.
+                recover_margin_fills(&rest, &rate_limiter, &instruments, dt, &tx, &dedup, false),
             )
             .await
             .is_err()
@@ -1867,11 +1916,12 @@ async fn margin_connection_manager(
 // ---------------------------------------------------------------------------
 
 /// Fetch open orders for a single instrument via `query_margin_accounts_open_orders`
-/// (cross, `isIsolated = "FALSE"`). Mirrors `BinanceSpot::fetch_open_orders_for_instrument`.
+/// (`isIsolated` config-driven). Mirrors `BinanceSpot::fetch_open_orders_for_instrument`.
 async fn fetch_margin_open_orders_for_instrument(
     rest: Arc<RestApi>,
     rate_limiter: Arc<RateLimitTracker>,
     instrument: InstrumentNameExchange,
+    is_isolated: bool,
 ) -> Result<
     (
         InstrumentNameExchange,
@@ -1881,12 +1931,14 @@ async fn fetch_margin_open_orders_for_instrument(
 > {
     // Convert once before the retry closure to avoid a String allocation on every retry.
     let symbol_str = instrument.name().to_string();
+    let isolated = isolated_str(is_isolated);
     let response = rest_call_with_retry(&rest, &rate_limiter, |rest| {
         let sym = symbol_str.clone();
+        let isolated = isolated.clone();
         Box::pin(async move {
             let params = QueryMarginAccountsOpenOrdersParams::builder()
                 .symbol(sym)
-                .is_isolated("FALSE".to_string())
+                .is_isolated(isolated)
                 .build()?;
             rest.query_margin_accounts_open_orders(params).await
         })
@@ -1907,18 +1959,23 @@ async fn fetch_margin_open_orders_for_instrument(
     Ok((instrument, orders))
 }
 
-/// Fetch *all* open cross-margin orders in a single no-symbol `query_margin_accounts_open_orders`
-/// call (cross, `isIsolated = "FALSE"`). Backs the [`fetch_open_orders`](BinanceMargin::fetch_open_orders)
-/// "return all" sentinel: with no symbol the venue returns orders across every instrument, so each
-/// order's instrument is recovered from its own `symbol` field (orders missing it are dropped).
+/// Fetch *all* open margin orders in a single no-symbol `query_margin_accounts_open_orders`
+/// call. Backs the [`fetch_open_orders`](BinanceMargin::fetch_open_orders) "return all" sentinel for
+/// **cross** (the no-symbol affordance is cross-only): with no symbol the venue returns orders
+/// across every instrument, so each order's instrument is recovered from its own `symbol` field
+/// (orders missing it are dropped). `isIsolated` is config-driven, but under isolated the caller
+/// iterates the configured symbol set per-symbol rather than using this no-symbol path.
 async fn fetch_margin_all_open_orders(
     rest: Arc<RestApi>,
     rate_limiter: Arc<RateLimitTracker>,
+    is_isolated: bool,
 ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError> {
+    let isolated = isolated_str(is_isolated);
     let response = rest_call_with_retry(&rest, &rate_limiter, |rest| {
+        let isolated = isolated.clone();
         Box::pin(async move {
             let params = QueryMarginAccountsOpenOrdersParams::builder()
-                .is_isolated("FALSE".to_string())
+                .is_isolated(isolated)
                 .build()?;
             rest.query_margin_accounts_open_orders(params).await
         })
@@ -1940,17 +1997,23 @@ async fn fetch_margin_all_open_orders(
 }
 
 /// Paginate the margin trade list for a single instrument since `start_time_ms`
-/// (cross, `isIsolated = "FALSE"`). Mirrors `BinanceSpot::paginate_my_trades`: cursor-based,
+/// (`isIsolated` config-driven). Mirrors `BinanceSpot::paginate_my_trades`: cursor-based,
 /// first page by `start_time`, subsequent pages by `from_id = last_id + 1` (Binance ignores
 /// `start_time` once `from_id` is set), producing a gapless result.
+///
+/// **Isolated correctness:** this also backs reconnect fill-recovery (`recover_margin_fills`), so a
+/// missed `isIsolated` flip would silently query *cross* trades on an isolated client — hence the
+/// value is threaded from config rather than hardcoded.
 async fn paginate_margin_my_trades(
     rest: &Arc<RestApi>,
     rate_limiter: &Arc<RateLimitTracker>,
     instrument: &InstrumentNameExchange,
     start_time_ms: i64,
+    is_isolated: bool,
 ) -> Result<Vec<QueryMarginAccountsTradeListResponseInner>, UnindexedClientError> {
     // Convert once before the retry closure to avoid a String allocation on every retry.
     let symbol_str = instrument.name().to_string();
+    let isolated = isolated_str(is_isolated);
     // The const_assert! in shared bounds BINANCE_MAX_TRADES <= i32::MAX, which trivially fits in
     // i64, so this cast is always lossless. clippy::cast_possible_wrap fires only because usize is
     // the same width as i64 on 64-bit targets (a hypothetical >64-bit usize could wrap); the bound
@@ -1963,10 +2026,11 @@ async fn paginate_margin_my_trades(
         let fid = cursor; // Option<i64> is Copy
         let response = rest_call_with_retry(rest, rate_limiter, |rest| {
             let sym = symbol_str.clone();
+            let isolated = isolated.clone();
             let stm = start_time_ms;
             Box::pin(async move {
                 let builder = QueryMarginAccountsTradeListParams::builder(sym)
-                    .is_isolated("FALSE".to_string())
+                    .is_isolated(isolated)
                     .limit(limit);
                 let params = if let Some(id) = fid {
                     builder.from_id(id).build()?
@@ -2302,12 +2366,55 @@ enum BuildOrderError {
     Build(String),
 }
 
+/// The Binance `isIsolated` query/param wire string for the configured margin mode.
+///
+/// `true` → `"TRUE"` (isolated, per-pair sub-accounts); `false` → `"FALSE"` (cross, account-wide).
+/// Threaded through every margin order/cancel/query call so the mode is config-driven from a single
+/// source rather than hardcoded per-call.
+fn isolated_str(is_isolated: bool) -> String {
+    if is_isolated { "TRUE" } else { "FALSE" }.to_string()
+}
+
+/// Build the margin cancel-order params (pure; no I/O).
+///
+/// Cancels by exchange `orderId` when present and parseable as `i64`, otherwise falls back to the
+/// originating client order id (`origClientOrderId`). `isIsolated` is config-driven. Factored out of
+/// [`BinanceMargin::cancel_order`] so the id-vs-cid fallback branch and the `isIsolated` value are
+/// unit-testable without a live REST call. Returns the builder's error message (stringified) on the
+/// rare build failure (e.g. a malformed symbol).
+fn build_cancel_order_params(
+    symbol: String,
+    id: Option<&OrderId>,
+    cid: &ClientOrderId,
+    is_isolated: bool,
+) -> Result<MarginAccountCancelOrderParams, String> {
+    let mut builder =
+        MarginAccountCancelOrderParams::builder(symbol).is_isolated(isolated_str(is_isolated));
+
+    match id {
+        Some(order_id) => match order_id.0.parse::<i64>() {
+            Ok(id) => builder = builder.order_id(id),
+            Err(_) => {
+                // exchange order id exists but isn't a valid i64 — fall back to the cid.
+                error!(
+                    order_id = %order_id.0,
+                    "BinanceMargin cancel: exchange orderId not parseable as i64, falling back to clientOrderId"
+                );
+                builder = builder.orig_client_order_id(cid.0.to_string());
+            }
+        },
+        None => builder = builder.orig_client_order_id(cid.0.to_string()),
+    }
+
+    builder.build().map_err(|e| e.to_string())
+}
+
 /// Build the margin new-order params from a rustrade order request (pure; no I/O).
 ///
 /// Factored out of [`BinanceMargin::open_order`] so the rustrade→Binance mapping (sideEffectType,
-/// cross `isIsolated`, conditional `stopPrice`, `autoRepayAtCancel` gating, trailing rejection) is
-/// unit-testable without a live REST call. `isIsolated` is always `"FALSE"` (cross) in this
-/// version.
+/// `isIsolated`, conditional `stopPrice`, `autoRepayAtCancel` gating, trailing rejection) is
+/// unit-testable without a live REST call. `isIsolated` is config-driven via `is_isolated`
+/// (`true` = isolated, `false` = cross).
 #[allow(clippy::too_many_arguments)] // mirrors the flat request fields; grouping them into a
 // struct would just shuffle the same data and obscure the 1:1 mapping to SDK params.
 fn build_new_order_params(
@@ -2319,6 +2426,7 @@ fn build_new_order_params(
     time_in_force: TimeInForce,
     new_client_order_id: String,
     side_effect: MarginSideEffect,
+    is_isolated: bool,
 ) -> Result<MarginAccountNewOrderParams, BuildOrderError> {
     let binance_side = match side {
         Side::Buy => MarginAccountNewOrderSideEnum::Buy,
@@ -2328,14 +2436,14 @@ fn build_new_order_params(
     let (binance_type, binance_tif) =
         convert_order_kind_tif_margin(kind, time_in_force).ok_or(BuildOrderError::Unsupported)?;
 
-    // isIsolated is always "FALSE" (cross) in this version — isolated margin is a follow-up.
+    // isIsolated is config-driven: "TRUE" for isolated, "FALSE" for cross.
     let mut builder = MarginAccountNewOrderParams::builder(
         symbol,
         binance_side,
         binance_type.as_binance_str().to_string(),
     )
     .quantity(quantity)
-    .is_isolated("FALSE".to_string())
+    .is_isolated(isolated_str(is_isolated))
     .side_effect_type(side_effect.as_binance_str().to_string())
     .new_client_order_id(new_client_order_id)
     .new_order_resp_type(MarginAccountNewOrderNewOrderRespTypeEnum::Full);
@@ -2487,6 +2595,7 @@ mod tests {
             "my_secret_key".to_string(),
             false,
             false,
+            Vec::new(),
             MarginSideEffect::default(),
         );
         let debug = format!("{config:?}");
@@ -2524,13 +2633,129 @@ mod tests {
         assert_eq!(config.side_effect, MarginSideEffect::NoBorrow);
     }
 
+    #[test]
+    fn isolated_ctor_sets_symbols_and_flag() {
+        let symbols = vec![
+            InstrumentNameExchange::new("BTCUSDT"),
+            InstrumentNameExchange::new("ETHUSDT"),
+        ];
+        let config =
+            BinanceMarginConfig::isolated("k".to_string(), "s".to_string(), symbols.clone());
+        assert!(config.is_isolated);
+        assert_eq!(config.isolated_symbols, symbols);
+        assert_eq!(config.side_effect, MarginSideEffect::AutoBorrowRepay);
+    }
+
+    #[test]
+    fn isolated_config_with_symbols_constructs() {
+        // The construction gate only rejects isolated + *empty* symbols; a populated set is fine.
+        let config = BinanceMarginConfig::isolated(
+            "k".to_string(),
+            "s".to_string(),
+            vec![InstrumentNameExchange::new("BTCUSDT")],
+        );
+        let _client = BinanceMargin::new(config); // must not panic
+    }
+
+    #[test]
+    #[should_panic(expected = "non-empty isolated_symbols")]
+    fn isolated_empty_symbols_panics_at_new() {
+        // is_isolated = true with no isolated_symbols is an unusable config → fail-fast panic.
+        let config = BinanceMarginConfig::new(
+            "k".to_string(),
+            "s".to_string(),
+            false,
+            true,
+            Vec::new(),
+            MarginSideEffect::default(),
+        );
+        let _ = BinanceMargin::new(config);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-empty isolated_symbols")]
+    fn isolated_empty_symbols_panics_via_deserialize_path() {
+        // The gate must also cover the Deserialize-only path (a config file with is_isolated = true
+        // and no isolated_symbols bypasses the named constructor).
+        let config: BinanceMarginConfig = serde_json::from_str(
+            r#"{"api_key":"k","secret_key":"s","testnet":false,"is_isolated":true}"#,
+        )
+        .expect("deserialize");
+        assert!(config.isolated_symbols.is_empty());
+        let _ = BinanceMargin::new(config);
+    }
+
+    #[test]
+    fn isolated_str_maps_mode() {
+        assert_eq!(isolated_str(false), "FALSE");
+        assert_eq!(isolated_str(true), "TRUE");
+    }
+
+    // -----------------------------------------------------------------------
+    // Cancel param mapping (orderId-vs-cid fallback + config-driven isIsolated)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cancel_params_cross_with_parseable_order_id() {
+        let p = build_cancel_order_params(
+            "BTCUSDT".to_string(),
+            Some(&OrderId::new("12345")),
+            &ClientOrderId::new("cid-1"),
+            false,
+        )
+        .expect("build");
+        assert_eq!(p.symbol, "BTCUSDT");
+        assert_eq!(p.is_isolated.as_deref(), Some("FALSE"));
+        assert_eq!(p.order_id, Some(12345));
+        assert_eq!(p.orig_client_order_id, None);
+    }
+
+    #[test]
+    fn cancel_params_isolated_is_config_driven() {
+        let p = build_cancel_order_params(
+            "BTCUSDT".to_string(),
+            Some(&OrderId::new("12345")),
+            &ClientOrderId::new("cid-1"),
+            true,
+        )
+        .expect("build");
+        assert_eq!(p.is_isolated.as_deref(), Some("TRUE"));
+        assert_eq!(p.order_id, Some(12345));
+    }
+
+    #[test]
+    fn cancel_params_non_i64_order_id_falls_back_to_cid() {
+        let p = build_cancel_order_params(
+            "BTCUSDT".to_string(),
+            Some(&OrderId::new("not-an-i64")),
+            &ClientOrderId::new("cid-1"),
+            false,
+        )
+        .expect("build");
+        assert_eq!(p.order_id, None);
+        assert_eq!(p.orig_client_order_id.as_deref(), Some("cid-1"));
+    }
+
+    #[test]
+    fn cancel_params_absent_order_id_uses_cid() {
+        let p = build_cancel_order_params(
+            "BTCUSDT".to_string(),
+            None,
+            &ClientOrderId::new("cid-1"),
+            false,
+        )
+        .expect("build");
+        assert_eq!(p.order_id, None);
+        assert_eq!(p.orig_client_order_id.as_deref(), Some("cid-1"));
+    }
+
     // -----------------------------------------------------------------------
     // Order param mapping (17.4.x)
     // -----------------------------------------------------------------------
 
     use crate::order::TrailingOffsetType;
 
-    /// Build params for the common case, overriding only what a test cares about.
+    /// Build params for the common case (cross), overriding only what a test cares about.
     fn params(
         side: Side,
         price: Option<Decimal>,
@@ -2547,6 +2772,7 @@ mod tests {
             tif,
             "cid-1".to_string(),
             side_effect,
+            false, // cross
         )
     }
 
@@ -2581,18 +2807,37 @@ mod tests {
     }
 
     #[test]
-    fn new_order_is_always_cross() {
-        // TG17 is cross-only: isIsolated must be "FALSE" regardless of config.is_isolated.
-        let p = params(
+    fn new_order_is_isolated_is_config_driven() {
+        // Cross (is_isolated = false) → "FALSE".
+        let cross = build_new_order_params(
+            "BTCUSDT".to_string(),
             Side::Sell,
             Some(Decimal::from(10)),
+            Decimal::from(2),
             OrderKind::Limit,
             gtc(),
+            "cid-1".to_string(),
             MarginSideEffect::AutoBorrowRepay,
+            false,
         )
         .expect("build");
-        assert_eq!(p.is_isolated.as_deref(), Some("FALSE"));
-        assert_eq!(p.side.as_str(), "SELL");
+        assert_eq!(cross.is_isolated.as_deref(), Some("FALSE"));
+        assert_eq!(cross.side.as_str(), "SELL");
+
+        // Isolated (is_isolated = true) → "TRUE".
+        let isolated = build_new_order_params(
+            "BTCUSDT".to_string(),
+            Side::Sell,
+            Some(Decimal::from(10)),
+            Decimal::from(2),
+            OrderKind::Limit,
+            gtc(),
+            "cid-1".to_string(),
+            MarginSideEffect::AutoBorrowRepay,
+            true,
+        )
+        .expect("build");
+        assert_eq!(isolated.is_isolated.as_deref(), Some("TRUE"));
     }
 
     #[test]
