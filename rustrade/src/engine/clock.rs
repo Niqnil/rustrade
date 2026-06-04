@@ -152,6 +152,11 @@ impl<MarketEventKind: Debug> TimeExchange for EngineEvent<MarketEventKind> {
                 AccountEventKind::Snapshot(snapshot) => snapshot.time_most_recent(),
                 AccountEventKind::BalanceSnapshot(balance) => Some(balance.0.time_exchange),
                 AccountEventKind::BalanceStreamUpdate(update) => Some(update.0.time_exchange),
+                AccountEventKind::InstrumentBalanceUpdate(update) => {
+                    // Per-pair isolated balance update — advance on its event time, consistent with
+                    // its asset-keyed sibling `BalanceStreamUpdate` (base/quote share the frame's time).
+                    Some(update.base.time_exchange)
+                }
                 AccountEventKind::OrderSnapshot(order) => order.0.state.time_exchange(),
                 AccountEventKind::OrderCancelled(response) => response
                     .state

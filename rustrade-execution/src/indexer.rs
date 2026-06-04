@@ -1,6 +1,7 @@
 use crate::{
     AccountEvent, AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot,
-    UnindexedAccountEvent, UnindexedAccountSnapshot,
+    InstrumentBalanceUpdate, IsolatedInstrumentState, UnindexedAccountEvent,
+    UnindexedAccountSnapshot,
     balance::{AssetBalance, AssetBalanceUpdate},
     error::{
         ApiError, ClientError, KeyError, OrderError, UnindexedApiError, UnindexedClientError,
@@ -61,6 +62,9 @@ impl AccountEventIndexer {
                     self.asset_balance_update(snapshot.0).map(Snapshot)?,
                 )
             }
+            AccountEventKind::InstrumentBalanceUpdate(update) => {
+                AccountEventKind::InstrumentBalanceUpdate(self.instrument_balance_update(update)?)
+            }
             AccountEventKind::OrderSnapshot(snapshot) => {
                 AccountEventKind::OrderSnapshot(self.order_snapshot(snapshot.0).map(Snapshot)?)
             }
@@ -98,6 +102,7 @@ impl AccountEventIndexer {
                     instrument,
                     orders,
                     position,
+                    isolated,
                 } = snapshot;
 
                 let instrument = self.map.find_instrument_index(&instrument)?;
@@ -107,10 +112,18 @@ impl AccountEventIndexer {
                     .map(|order| self.order_snapshot(order))
                     .collect::<Result<Vec<_>, _>>()?;
 
+                // Per-pair isolated balances are generic over `AssetKey`, so (unlike `position`)
+                // their base/quote asset names must be mapped to indices. A pair whose asset is
+                // unregistered fails the snapshot index, matching top-level-balance behaviour.
+                let isolated = isolated
+                    .map(|state| self.isolated_instrument_state(state))
+                    .transpose()?;
+
                 Ok(InstrumentAccountSnapshot {
                     instrument,
                     orders,
                     position,
+                    isolated,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -155,6 +168,45 @@ impl AccountEventIndexer {
             asset,
             update,
             time_exchange,
+        })
+    }
+
+    /// Index the per-pair isolated state's `base`/`quote` asset names to indices.
+    ///
+    /// # Errors
+    /// Returns `IndexError` if either the base or quote asset is not registered in the map —
+    /// matching the fail-fast behaviour of top-level [`Self::asset_balance`].
+    pub fn isolated_instrument_state(
+        &self,
+        state: IsolatedInstrumentState<AssetNameExchange>,
+    ) -> Result<IsolatedInstrumentState<AssetIndex>, IndexError> {
+        let IsolatedInstrumentState { base, quote, risk } = state;
+
+        Ok(IsolatedInstrumentState {
+            base: self.asset_balance(base)?,
+            quote: self.asset_balance(quote)?,
+            risk,
+        })
+    }
+
+    /// Index an [`InstrumentBalanceUpdate`]'s instrument and `base`/`quote` asset keys.
+    ///
+    /// # Errors
+    /// Returns `IndexError` if the instrument or either asset is not registered in the map.
+    pub fn instrument_balance_update(
+        &self,
+        update: InstrumentBalanceUpdate<AssetNameExchange, InstrumentNameExchange>,
+    ) -> Result<InstrumentBalanceUpdate, IndexError> {
+        let InstrumentBalanceUpdate {
+            instrument,
+            base,
+            quote,
+        } = update;
+
+        Ok(InstrumentBalanceUpdate {
+            instrument: self.map.find_instrument_index(&instrument)?,
+            base: self.asset_balance_update(base)?,
+            quote: self.asset_balance_update(quote)?,
         })
     }
 

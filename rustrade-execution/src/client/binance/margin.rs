@@ -32,8 +32,8 @@ use super::shared::{
     new_dedup_cache, parse_order_kind, parse_side, parse_time_in_force, rest_call_with_retry,
 };
 use crate::{
-    AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
-    UnindexedAccountSnapshot,
+    AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, IsolatedInstrumentState,
+    IsolatedMarginRisk, UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate},
     client::ExecutionClient,
     error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
@@ -59,8 +59,10 @@ use binance_sdk::{
             MarginAccountNewOrderParams, MarginAccountNewOrderSideEnum,
             MarginAccountNewOrderTimeInForceEnum, QueryCrossMarginAccountDetailsParams,
             QueryCrossMarginAccountDetailsResponseUserAssetsInner,
-            QueryMarginAccountsOpenOrdersParams, QueryMarginAccountsOpenOrdersResponseInner,
-            QueryMarginAccountsTradeListParams, QueryMarginAccountsTradeListResponseInner, RestApi,
+            QueryIsolatedMarginAccountInfoParams,
+            QueryIsolatedMarginAccountInfoResponseAssetsInner, QueryMarginAccountsOpenOrdersParams,
+            QueryMarginAccountsOpenOrdersResponseInner, QueryMarginAccountsTradeListParams,
+            QueryMarginAccountsTradeListResponseInner, RestApi,
         },
         websocket_streams::{
             Executionreport, MarginLevelStatusChange, Outboundaccountposition, UserLiabilityChange,
@@ -77,7 +79,7 @@ use rustrade_instrument::{
 use serde::{Deserialize, Serialize};
 use smol_str::{SmolStr, format_smolstr};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     str::FromStr,
     sync::{
         Arc,
@@ -288,10 +290,15 @@ impl BinanceMarginConfig {
 /// borrow intent is intentionally not modelled (it would require position tracking); see
 /// [`MarginSideEffect`] for the rationale and upgrade path.
 ///
-/// # Scope: cross margin only
-/// This client is **cross** margin (`isIsolated = "FALSE"`, account-wide collateral). Isolated
-/// (per-pair) margin is a separate follow-up and is **not** honoured by this client regardless of
-/// [`BinanceMarginConfig::is_isolated`] (the constructor warns if it is set).
+/// # Cross vs. isolated margin
+/// The mode is fixed per client via [`BinanceMarginConfig::is_isolated`]:
+/// - **Cross** (`is_isolated = false`, `isIsolated = "FALSE"`, account-wide collateral): per-asset
+///   balances (incl. debt) are surfaced account-wide in the top-level `balances`.
+/// - **Isolated** (`is_isolated = true`): per-pair sub-accounts. Balances + risk are attached
+///   **per-instrument** via [`InstrumentAccountSnapshot::isolated`] (the asset-keyed top-level
+///   `balances` is left empty, since `(pair, asset)` slots would collide), and per-symbol queries
+///   are scoped to the configured [`BinanceMarginConfig::isolated_symbols`]. See
+///   [`account_snapshot`](Self::account_snapshot) for the full per-method semantics.
 ///
 /// # Trailing stops unsupported
 /// `TrailingStop` / `TrailingStopLimit` return [`OrderError::UnsupportedOrderType`]: the binance-sdk
@@ -379,6 +386,112 @@ impl BinanceMargin {
             .ws_url(SPOT_WS_API_PROD_URL)
             .build()
             .expect("failed to build Binance margin WebSocket configuration")
+    }
+
+    /// Resolve the per-call effective isolated symbol set (isolated mode only).
+    ///
+    /// Isolated margin queries are per-symbol on the venue (there is no account-wide "no symbol =
+    /// all" affordance), so every isolated snapshot/query iterates an explicit symbol set:
+    /// - empty `instruments` (the "return all" sentinel) → the full configured
+    ///   [`isolated_symbols`](BinanceMarginConfig::isolated_symbols);
+    /// - non-empty → `instruments ∩ isolated_symbols`; any requested instrument NOT in
+    ///   `isolated_symbols` is skipped with a `warn!` (there is no configured isolated
+    ///   token/stream/snapshot for it — returning it would be a silent mismatch).
+    ///
+    /// Shared by `account_snapshot`, `fetch_open_orders`, and `fetch_trades` so their instrument,
+    /// open-order, and trade sets cannot drift apart.
+    fn effective_isolated_set(
+        &self,
+        instruments: &[InstrumentNameExchange],
+    ) -> Vec<InstrumentNameExchange> {
+        if instruments.is_empty() {
+            return self.config.isolated_symbols.clone();
+        }
+        instruments
+            .iter()
+            .filter(|inst| {
+                let in_set = self.config.isolated_symbols.contains(*inst);
+                if !in_set {
+                    warn!(
+                        instrument = %inst.name(),
+                        "BinanceMargin isolated: requested instrument not in configured isolated_symbols — skipping"
+                    );
+                }
+                in_set
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Isolated-margin `account_snapshot`: per-pair balances + risk attached per-instrument, with
+    /// the asset-keyed top-level `balances` left empty (Design decision #2). Open orders and
+    /// isolated balances cover the same effective isolated set so they cannot diverge.
+    async fn isolated_account_snapshot(
+        &self,
+        instruments: &[InstrumentNameExchange],
+    ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
+        use futures::{StreamExt as _, TryStreamExt as _};
+
+        let effective = self.effective_isolated_set(instruments);
+        if effective.is_empty() {
+            // No configured isolated pair matched: a no-symbol isolated call is invalid, so there is
+            // nothing to query — return an empty snapshot rather than an account-wide one.
+            return Ok(AccountSnapshot::new(
+                ExchangeId::BinanceMargin,
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+
+        // Per-pair isolated balances + risk (chunked ≤5 symbols/request), keyed by instrument.
+        let mut balances_by_symbol = convert_isolated_margin_assets(
+            fetch_isolated_margin_account_info(
+                self.rest.clone(),
+                self.rate_limiter.clone(),
+                effective.clone(),
+            )
+            .await?,
+        );
+
+        // Open orders per instrument over the same effective set, concurrently (bounded to avoid
+        // bursting request-weight limits).
+        let instrument_snapshots: Vec<_> =
+            futures::stream::iter(effective.into_iter().map(|instrument| {
+                fetch_margin_open_orders_for_instrument(
+                    self.rest.clone(),
+                    self.rate_limiter.clone(),
+                    instrument,
+                    true,
+                )
+            }))
+            .buffer_unordered(8)
+            .map(|result| {
+                let (inst, orders) = result?;
+                let wrapped = orders.into_iter().map(active_order_snapshot).collect();
+                let isolated = balances_by_symbol.remove(&inst);
+                if isolated.is_none() {
+                    // The same effective set drives both balances and open orders, so a miss here
+                    // means the venue's isolated-account response omitted (or mis-keyed) a requested
+                    // pair. Surface it rather than silently emitting `isolated: None`.
+                    warn!(
+                        instrument = %inst.name(),
+                        "BinanceMargin isolated: no isolated balance entry returned for instrument — snapshot will carry isolated: None"
+                    );
+                }
+                Ok::<_, UnindexedClientError>(InstrumentAccountSnapshot::new(
+                    inst, wrapped, None, isolated,
+                ))
+            })
+            .try_collect()
+            .await?;
+
+        // Isolated balances live on the instrument snapshots; the asset-keyed top-level vec stays
+        // empty so the engine's `update_from_account` never writes colliding per-asset slots.
+        Ok(AccountSnapshot::new(
+            ExchangeId::BinanceMargin,
+            Vec::new(),
+            instrument_snapshots,
+        ))
     }
 }
 
@@ -692,18 +805,28 @@ impl ExecutionClient for BinanceMargin {
         })
     }
 
-    /// Fetch a full cross-margin account snapshot: per-asset balances (incl. debt) plus open
-    /// orders for each requested instrument.
+    /// Fetch a full margin account snapshot: balances plus open orders per instrument.
     ///
-    /// Balances come from `query_cross_margin_account_details` (account-wide `userAssets`,
-    /// carrying `borrowed`/`interest` → [`Balance::new_margin`]); open orders are fetched
-    /// per-instrument, mirroring [`BinanceSpot::account_snapshot`](super::spot::BinanceSpot).
-    /// Cross only (`isIsolated = "FALSE"`).
+    /// **Cross** (`is_isolated = false`): account-wide per-asset balances from
+    /// `query_cross_margin_account_details` (carrying `borrowed`/`interest` → [`Balance::new_margin`])
+    /// in the top-level `balances`, plus open orders per requested instrument — mirroring
+    /// [`BinanceSpot::account_snapshot`](super::spot::BinanceSpot).
+    ///
+    /// **Isolated** (`is_isolated = true`): per-pair balances + risk from
+    /// `query_isolated_margin_account_info` (chunked ≤5 symbols/request), attached **per-instrument**
+    /// via [`InstrumentAccountSnapshot::isolated`] rather than folded into the asset-keyed
+    /// top-level `balances` (which is left **empty**) — isolated sub-accounts are per-`(pair, asset)`
+    /// and would collide in the asset-keyed model. The instrument set is the effective isolated set
+    /// (see [`effective_isolated_set`](Self::effective_isolated_set)); each instrument's open orders
+    /// and isolated balances are fetched over that same set.
     async fn account_snapshot(
         &self,
         assets: &[AssetNameExchange],
         instruments: &[InstrumentNameExchange],
     ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
+        if self.config.is_isolated {
+            return self.isolated_account_snapshot(instruments).await;
+        }
         let response = rest_call_with_retry(&self.rest, &self.rate_limiter, |rest| {
             Box::pin(async move {
                 let params = QueryCrossMarginAccountDetailsParams::builder().build()?;
@@ -732,25 +855,17 @@ impl ExecutionClient for BinanceMargin {
                     self.rest.clone(),
                     self.rate_limiter.clone(),
                     instrument,
-                    self.config.is_isolated,
+                    // Cross path only: isolated returns early via `isolated_account_snapshot`.
+                    false,
                 )
             }))
             .buffer_unordered(8)
             .map(|result| {
                 let (inst, orders) = result?;
-                let wrapped = orders
-                    .into_iter()
-                    .map(|o| Order {
-                        key: o.key,
-                        side: o.side,
-                        price: o.price,
-                        quantity: o.quantity,
-                        kind: o.kind,
-                        time_in_force: o.time_in_force,
-                        state: OrderState::active(o.state),
-                    })
-                    .collect();
-                Ok::<_, UnindexedClientError>(InstrumentAccountSnapshot::new(inst, wrapped, None))
+                let wrapped = orders.into_iter().map(active_order_snapshot).collect();
+                Ok::<_, UnindexedClientError>(InstrumentAccountSnapshot::new(
+                    inst, wrapped, None, None,
+                ))
             })
             .try_collect()
             .await?;
@@ -762,12 +877,22 @@ impl ExecutionClient for BinanceMargin {
         ))
     }
 
-    /// Fetch current cross-margin balances (incl. `borrowed`/`interest` debt) for the requested
-    /// assets. An empty `assets` slice is the "return all" sentinel.
+    /// Fetch current margin balances (incl. `borrowed`/`interest` debt) for the requested assets.
+    ///
+    /// **Cross**: account-wide per-asset balances; an empty `assets` slice is the "return all"
+    /// sentinel.
+    ///
+    /// **Isolated**: returns an empty `Vec`. Isolated balances are per-`(pair, asset)` and the
+    /// asset-keyed return type cannot carry them without collision — they are surfaced per-instrument
+    /// via [`account_snapshot`](Self::account_snapshot)'s [`InstrumentAccountSnapshot::isolated`]
+    /// instead (Design decision #2).
     async fn fetch_balances(
         &self,
         assets: &[AssetNameExchange],
     ) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError> {
+        if self.config.is_isolated {
+            return Ok(Vec::new());
+        }
         let response = rest_call_with_retry(&self.rest, &self.rate_limiter, |rest| {
             Box::pin(async move {
                 let params = QueryCrossMarginAccountDetailsParams::builder().build()?;
@@ -788,34 +913,64 @@ impl ExecutionClient for BinanceMargin {
         ))
     }
 
-    /// Fetch currently open cross-margin orders, optionally filtered by instrument.
+    /// Fetch currently open margin orders, optionally filtered by instrument.
     ///
-    /// Honours the `ExecutionClient::fetch_open_orders` contract: an empty `instruments` slice is
-    /// the "return all" sentinel, served by a single no-symbol `query_margin_accounts_open_orders`
-    /// call returning open orders across every cross-margin instrument (each order's instrument is
-    /// taken from its own `symbol` field). A non-empty slice fetches the listed instruments
-    /// concurrently, per-symbol. Cross only (`isIsolated = "FALSE"`).
+    /// **Cross**: honours the `ExecutionClient::fetch_open_orders` "return all" sentinel — an empty
+    /// `instruments` slice is served by a single no-symbol `query_margin_accounts_open_orders` call
+    /// (each order's instrument taken from its own `symbol`); a non-empty slice fetches the listed
+    /// instruments concurrently, per-symbol.
+    ///
+    /// **Isolated**: per-symbol on the venue — always iterates the effective isolated set (empty
+    /// `instruments` → configured `isolated_symbols`; out-of-set instruments skipped with a warning);
+    /// never issues a no-symbol isolated call (Design decision #4).
     async fn fetch_open_orders(
         &self,
         instruments: &[InstrumentNameExchange],
     ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError> {
-        // Empty slice = "return all" sentinel: a single no-symbol query is both correct (the
-        // contract requires all instruments) and far cheaper than enumerating every symbol.
+        use futures::{StreamExt as _, TryStreamExt as _};
+
+        // Isolated: per-symbol on the venue — always iterate the effective set (never a no-symbol
+        // isolated call, which would error). The empty-`instruments` sentinel resolves to the
+        // configured isolated_symbols (Design decision #4).
+        if self.config.is_isolated {
+            let effective = self.effective_isolated_set(instruments);
+            let capacity = effective.len();
+            return futures::stream::iter(effective.into_iter().map(|instrument| {
+                fetch_margin_open_orders_for_instrument(
+                    self.rest.clone(),
+                    self.rate_limiter.clone(),
+                    instrument,
+                    true,
+                )
+            }))
+            .buffer_unordered(8)
+            .try_fold(
+                Vec::with_capacity(capacity),
+                |mut acc: Vec<Order<ExchangeId, InstrumentNameExchange, Open>>,
+                 (_, orders)| async move {
+                    acc.extend(orders);
+                    Ok(acc)
+                },
+            )
+            .await;
+        }
+
+        // Cross: empty slice = "return all" sentinel — a single no-symbol query is both correct
+        // (the contract requires all instruments) and far cheaper than enumerating every symbol.
         if instruments.is_empty() {
             return fetch_margin_all_open_orders(
                 self.rest.clone(),
                 self.rate_limiter.clone(),
-                self.config.is_isolated,
+                false,
             )
             .await;
         }
-        use futures::{StreamExt as _, TryStreamExt as _};
         futures::stream::iter(instruments.iter().cloned().map(|instrument| {
             fetch_margin_open_orders_for_instrument(
                 self.rest.clone(),
                 self.rate_limiter.clone(),
                 instrument,
-                self.config.is_isolated,
+                false,
             )
         }))
         .buffer_unordered(8)
@@ -829,16 +984,18 @@ impl ExecutionClient for BinanceMargin {
         .await
     }
 
-    /// Fetch cross-margin trades (fills) since `time_since`, optionally filtered by instrument.
+    /// Fetch margin trades (fills) since `time_since`, optionally filtered by instrument.
     ///
     /// **Documented deviation from the `ExecutionClient::fetch_trades` "return all" contract:**
     /// Binance's margin trade-list endpoint (`myTrades`) requires a symbol — there is no no-symbol
-    /// "all trades" query (unlike open orders). An empty `instruments` slice therefore has nothing
-    /// to query and returns an empty `Vec`; callers wanting all trades must enumerate instruments
-    /// explicitly. (Open orders *do* honour the sentinel — see [`fetch_open_orders`](Self::fetch_open_orders).)
-    // `.iter().cloned()` is required: Rust async closures cannot satisfy the HRTB needed by the
-    // iterator machinery, even when the clone is moved inside the closure body (mirrors spot).
-    #[allow(clippy::redundant_iter_cloned)]
+    /// "all trades" query (unlike open orders).
+    ///
+    /// **Cross**: an empty `instruments` slice has nothing to query and returns an empty `Vec`;
+    /// callers wanting all trades must enumerate instruments explicitly.
+    ///
+    /// **Isolated**: the empty sentinel resolves to the configured `isolated_symbols` (the effective
+    /// isolated set; out-of-set instruments skipped with a warning), iterated per-symbol (Design
+    /// decision #4).
     async fn fetch_trades(
         &self,
         time_since: DateTime<Utc>,
@@ -846,9 +1003,19 @@ impl ExecutionClient for BinanceMargin {
     ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError> {
         use futures::StreamExt as _;
 
-        if instruments.is_empty() {
+        // Resolve the effective instrument set. Isolated resolves the empty sentinel to the
+        // configured isolated_symbols; cross keeps the slice verbatim (no no-symbol "all" form).
+        let effective: Vec<InstrumentNameExchange> = if self.config.is_isolated {
+            self.effective_isolated_set(instruments)
+        } else {
+            instruments.to_vec()
+        };
+        if effective.is_empty() {
+            // Distinguish the two empty causes: cross with an empty `instruments` slice (the
+            // documented no-op sentinel) vs. isolated with no configured `isolated_symbols` matched.
             debug!(
-                "BinanceMargin fetch_trades called with empty instruments slice — returning empty result"
+                is_isolated = self.config.is_isolated,
+                "BinanceMargin fetch_trades: empty effective instrument set — returning empty result"
             );
             return Ok(Vec::new());
         }
@@ -858,7 +1025,7 @@ impl ExecutionClient for BinanceMargin {
 
         // Binance requires per-symbol queries for trade history. Limit concurrency to avoid
         // bursting Binance's request weight limits.
-        let mut stream = futures::stream::iter(instruments.iter().cloned().map(|inst| {
+        let mut stream = futures::stream::iter(effective.into_iter().map(|inst| {
             let rest = self.rest.clone();
             let rate_limiter = self.rate_limiter.clone();
             async move {
@@ -2162,6 +2329,211 @@ fn filter_and_convert_margin_balances(
         .collect()
 }
 
+/// Wrap a fetched `Open` order as an `OrderState::active` snapshot for `account_snapshot`.
+///
+/// `account_snapshot` reports open orders wrapped in `OrderState::active(..)`, whereas
+/// `fetch_open_orders` returns the bare `Open` — both share
+/// [`fetch_margin_open_orders_for_instrument`], so this is the single wrap used by the cross and
+/// isolated snapshot paths.
+fn active_order_snapshot(
+    o: Order<ExchangeId, InstrumentNameExchange, Open>,
+) -> Order<ExchangeId, InstrumentNameExchange, OrderState<AssetNameExchange, InstrumentNameExchange>>
+{
+    Order {
+        key: o.key,
+        side: o.side,
+        price: o.price,
+        quantity: o.quantity,
+        kind: o.kind,
+        time_in_force: o.time_in_force,
+        state: OrderState::active(o.state),
+    }
+}
+
+/// Convert one side (base or quote) of an isolated `assets[]` entry into a margin [`AssetBalance`].
+///
+/// Mirrors [`convert_margin_balance_entry`]'s field handling: `free`/`locked` are required (missing
+/// → `None`, drop), while `borrowed`/`interest` default to zero when absent — a real isolated
+/// sub-account row with absent debt means "no debt", not corrupt data, upholding the
+/// Design-decision-#4 invariant that a REST snapshot always populates `margin`. `total = free + locked`.
+///
+/// Takes the fields rather than the SDK side type because the base and quote sides are distinct
+/// nominal types (`...BaseAsset` / `...QuoteAsset`) with identical fields.
+fn convert_isolated_asset_balance(
+    asset: Option<&str>,
+    free: Option<&str>,
+    locked: Option<&str>,
+    borrowed: Option<&str>,
+    interest: Option<&str>,
+    now: DateTime<Utc>,
+) -> Option<AssetBalance<AssetNameExchange>> {
+    let asset_name = AssetNameExchange::new(asset?);
+    let free = match free.and_then(|s| Decimal::from_str(s).ok()) {
+        Some(v) => v,
+        None => {
+            warn!(%asset_name, "BinanceMargin isolated balance missing/unparseable 'free' field");
+            return None;
+        }
+    };
+    let locked = match locked.and_then(|s| Decimal::from_str(s).ok()) {
+        Some(v) => v,
+        None => {
+            warn!(%asset_name, "BinanceMargin isolated balance missing/unparseable 'locked' field");
+            return None;
+        }
+    };
+    let borrowed = borrowed
+        .and_then(|s| Decimal::from_str(s).ok())
+        .unwrap_or(Decimal::ZERO);
+    let interest = interest
+        .and_then(|s| Decimal::from_str(s).ok())
+        .unwrap_or(Decimal::ZERO);
+    Some(AssetBalance::new(
+        asset_name,
+        Balance::new_margin(free + locked, free, borrowed, interest),
+        now,
+    ))
+}
+
+/// Map isolated `query_isolated_margin_account_info` `assets[]` entries to per-instrument
+/// [`IsolatedInstrumentState`], keyed by instrument (pair symbol).
+///
+/// An entry must carry a `symbol` plus a `baseAsset` and `quoteAsset` with parseable `free`/`locked`;
+/// an entry missing any of these is dropped with a `warn!` (observable, never silently mis-mapped).
+/// Per-pair risk metrics (`marginLevel`/`marginRatio`/`liquidatePrice`) are best-effort `Option`s — a
+/// missing/unparseable risk field becomes `None` and does NOT drop the entry.
+fn convert_isolated_margin_assets(
+    assets: Vec<QueryIsolatedMarginAccountInfoResponseAssetsInner>,
+) -> HashMap<InstrumentNameExchange, IsolatedInstrumentState<AssetNameExchange>> {
+    // Single timestamp for the whole batch: every entry came from the same REST response, so this
+    // is the response's freshness (mirrors the cross-margin `convert_margin_balance_entry` `now`).
+    let now = Utc::now();
+    let mut map = HashMap::with_capacity(assets.len());
+    for entry in assets {
+        let Some(symbol) = entry.symbol.as_deref() else {
+            warn!("BinanceMargin isolated asset entry missing 'symbol' — skipping");
+            continue;
+        };
+        let instrument = InstrumentNameExchange::new(symbol);
+
+        let Some(base_raw) = entry.base_asset.as_deref() else {
+            warn!(%instrument, "BinanceMargin isolated entry missing baseAsset — skipping");
+            continue;
+        };
+        let Some(quote_raw) = entry.quote_asset.as_deref() else {
+            warn!(%instrument, "BinanceMargin isolated entry missing quoteAsset — skipping");
+            continue;
+        };
+
+        let Some(base) = convert_isolated_asset_balance(
+            base_raw.asset.as_deref(),
+            base_raw.free.as_deref(),
+            base_raw.locked.as_deref(),
+            base_raw.borrowed.as_deref(),
+            base_raw.interest.as_deref(),
+            now,
+        ) else {
+            warn!(%instrument, "BinanceMargin isolated baseAsset missing required field — skipping");
+            continue;
+        };
+        let Some(quote) = convert_isolated_asset_balance(
+            quote_raw.asset.as_deref(),
+            quote_raw.free.as_deref(),
+            quote_raw.locked.as_deref(),
+            quote_raw.borrowed.as_deref(),
+            quote_raw.interest.as_deref(),
+            now,
+        ) else {
+            warn!(%instrument, "BinanceMargin isolated quoteAsset missing required field — skipping");
+            continue;
+        };
+
+        let risk = IsolatedMarginRisk {
+            margin_level: entry
+                .margin_level
+                .as_deref()
+                .and_then(|s| Decimal::from_str(s).ok()),
+            margin_ratio: entry
+                .margin_ratio
+                .as_deref()
+                .and_then(|s| Decimal::from_str(s).ok()),
+            liquidation_price: entry
+                .liquidate_price
+                .as_deref()
+                .and_then(|s| Decimal::from_str(s).ok()),
+        };
+
+        map.insert(instrument, IsolatedInstrumentState { base, quote, risk });
+    }
+    map
+}
+
+/// Group symbols into comma-separated request strings, ≤5 symbols each (the venue's per-request
+/// cap on `query_isolated_margin_account_info`'s `symbols`). An empty input yields no chunks.
+fn chunk_symbols(symbols: &[InstrumentNameExchange]) -> Vec<String> {
+    symbols
+        .chunks(5)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .map(|s| s.name().as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .collect()
+}
+
+/// Fetch isolated-margin account info for `symbols`, chunked at the venue's max-5-symbols/request
+/// cap and flattened to the `assets[]` entries across all chunks.
+///
+/// `symbols` must be non-empty (a no-symbol isolated call is invalid). Chunks are fetched
+/// concurrently (bounded to 8) through the shared rate-limit/backoff machinery.
+async fn fetch_isolated_margin_account_info(
+    rest: Arc<RestApi>,
+    rate_limiter: Arc<RateLimitTracker>,
+    symbols: Vec<InstrumentNameExchange>,
+) -> Result<Vec<QueryIsolatedMarginAccountInfoResponseAssetsInner>, UnindexedClientError> {
+    use futures::{StreamExt as _, TryStreamExt as _};
+
+    let chunks = chunk_symbols(&symbols);
+
+    // One `assets[]` entry per requested symbol, so pre-size the flat accumulator to `symbols.len()`
+    // and `try_fold` the per-chunk results straight into it — avoiding the intermediate
+    // `Vec<Vec<_>>` + re-copying `flatten().collect()` (mirrors the `try_fold` in `fetch_open_orders`).
+    futures::stream::iter(chunks.into_iter().map(|symbols_param| {
+        let rest = rest.clone();
+        let rate_limiter = rate_limiter.clone();
+        async move {
+            let response = rest_call_with_retry(&rest, &rate_limiter, |rest| {
+                let symbols_param = symbols_param.clone();
+                Box::pin(async move {
+                    let params = QueryIsolatedMarginAccountInfoParams::builder()
+                        .symbols(symbols_param)
+                        .build()?;
+                    rest.query_isolated_margin_account_info(params).await
+                })
+            })
+            .await
+            .map_err(connectivity_error)?;
+
+            let info = response
+                .data()
+                .await
+                .map_err(|e| connectivity_error(e.into()))?;
+            Ok::<_, UnindexedClientError>(info.assets.unwrap_or_default())
+        }
+    }))
+    .buffer_unordered(8)
+    .try_fold(
+        Vec::with_capacity(symbols.len()),
+        |mut acc, assets| async move {
+            acc.extend(assets);
+            Ok(acc)
+        },
+    )
+    .await
+}
+
 /// Convert a margin open-order response into rustrade's `Open` state order.
 ///
 /// Field-for-field identical to spot's `convert_open_order` but typed to the margin SDK response
@@ -3128,6 +3500,257 @@ mod tests {
         let filtered = filter_and_convert_margin_balances(assets, &requested);
         assert_eq!(filtered.len(), 2);
         assert!(filtered.iter().all(|b| b.asset.name().as_str() != "DOGE"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Isolated account snapshot converters + query scoping
+    // -----------------------------------------------------------------------
+
+    use binance_sdk::margin_trading::rest_api::{
+        QueryIsolatedMarginAccountInfoResponseAssetsInnerBaseAsset as IsoBase,
+        QueryIsolatedMarginAccountInfoResponseAssetsInnerQuoteAsset as IsoQuote,
+    };
+
+    fn d(s: &str) -> Decimal {
+        Decimal::from_str(s).unwrap()
+    }
+
+    fn iso_base(asset: &str, free: &str, locked: &str, borrowed: &str, interest: &str) -> IsoBase {
+        let mut b = IsoBase::new();
+        b.asset = Some(asset.to_string());
+        b.free = Some(free.to_string());
+        b.locked = Some(locked.to_string());
+        b.borrowed = Some(borrowed.to_string());
+        b.interest = Some(interest.to_string());
+        b
+    }
+
+    fn iso_quote(
+        asset: &str,
+        free: &str,
+        locked: &str,
+        borrowed: &str,
+        interest: &str,
+    ) -> IsoQuote {
+        let mut q = IsoQuote::new();
+        q.asset = Some(asset.to_string());
+        q.free = Some(free.to_string());
+        q.locked = Some(locked.to_string());
+        q.borrowed = Some(borrowed.to_string());
+        q.interest = Some(interest.to_string());
+        q
+    }
+
+    fn iso_entry(
+        symbol: &str,
+        base: IsoBase,
+        quote: IsoQuote,
+        margin_level: Option<&str>,
+        margin_ratio: Option<&str>,
+        liquidate_price: Option<&str>,
+    ) -> QueryIsolatedMarginAccountInfoResponseAssetsInner {
+        let mut e = QueryIsolatedMarginAccountInfoResponseAssetsInner::new();
+        e.symbol = Some(symbol.to_string());
+        e.base_asset = Some(Box::new(base));
+        e.quote_asset = Some(Box::new(quote));
+        e.margin_level = margin_level.map(str::to_string);
+        e.margin_ratio = margin_ratio.map(str::to_string);
+        e.liquidate_price = liquidate_price.map(str::to_string);
+        e
+    }
+
+    fn isolated_client(symbols: &[&str]) -> BinanceMargin {
+        let config = BinanceMarginConfig::isolated(
+            "k".to_string(),
+            "s".to_string(),
+            symbols
+                .iter()
+                .map(|s| InstrumentNameExchange::new(*s))
+                .collect(),
+        );
+        BinanceMargin::new(config)
+    }
+
+    #[test]
+    fn isolated_assets_map_base_quote_and_risk() {
+        // base: free 0.5 + locked 0.1 = total 0.6, borrowed 0.2 → net 0.4.
+        // quote: free 1000 + locked 50 = total 1050, borrowed 300 → net 750.
+        let entry = iso_entry(
+            "BTCUSDT",
+            iso_base("BTC", "0.5", "0.1", "0.2", "0.001"),
+            iso_quote("USDT", "1000", "50", "300", "1.5"),
+            Some("3.5"),
+            Some("0.12"),
+            Some("48000"),
+        );
+        let map = convert_isolated_margin_assets(vec![entry]);
+        let state = map
+            .get(&InstrumentNameExchange::new("BTCUSDT"))
+            .expect("entry present");
+
+        assert_eq!(state.base.asset.name().as_str(), "BTC");
+        assert_eq!(state.base.balance.total, d("0.6"));
+        assert_eq!(state.base.balance.free, d("0.5"));
+        assert_eq!(state.base.balance.net_asset(), d("0.4"));
+
+        assert_eq!(state.quote.asset.name().as_str(), "USDT");
+        assert_eq!(state.quote.balance.total, d("1050"));
+        assert_eq!(state.quote.balance.net_asset(), d("750"));
+
+        assert_eq!(state.risk.margin_level, Some(d("3.5")));
+        assert_eq!(state.risk.margin_ratio, Some(d("0.12")));
+        assert_eq!(state.risk.liquidation_price, Some(d("48000")));
+    }
+
+    #[test]
+    fn isolated_base_short_is_negative_net() {
+        // A short on the base side: total 0, borrowed 1.5 → net_asset = -1.5.
+        let entry = iso_entry(
+            "BTCUSDT",
+            iso_base("BTC", "0", "0", "1.5", "0.001"),
+            iso_quote("USDT", "100", "0", "0", "0"),
+            None,
+            None,
+            None,
+        );
+        let map = convert_isolated_margin_assets(vec![entry]);
+        let state = map.get(&InstrumentNameExchange::new("BTCUSDT")).unwrap();
+        assert_eq!(state.base.balance.net_asset(), d("-1.5"));
+    }
+
+    #[test]
+    fn isolated_missing_debt_defaults_zero_and_risk_optional() {
+        // No borrowed/interest = real no-debt position → margin still populated (zero debt), not
+        // dropped. Absent risk fields → None, but the snapshot is still produced.
+        let mut base = IsoBase::new();
+        base.asset = Some("BTC".to_string());
+        base.free = Some("0.5".to_string());
+        base.locked = Some("0".to_string());
+        let mut quote = IsoQuote::new();
+        quote.asset = Some("USDT".to_string());
+        quote.free = Some("100".to_string());
+        quote.locked = Some("0".to_string());
+
+        let map = convert_isolated_margin_assets(vec![iso_entry(
+            "BTCUSDT", base, quote, None, None, None,
+        )]);
+        let state = map.get(&InstrumentNameExchange::new("BTCUSDT")).unwrap();
+        assert!(state.base.balance.margin.is_some());
+        assert_eq!(state.base.balance.net_asset(), d("0.5"));
+        assert_eq!(state.risk.margin_level, None);
+        assert_eq!(state.risk.liquidation_price, None);
+    }
+
+    #[test]
+    fn isolated_unparseable_risk_is_none_but_entry_kept() {
+        let entry = iso_entry(
+            "BTCUSDT",
+            iso_base("BTC", "1", "0", "0", "0"),
+            iso_quote("USDT", "1", "0", "0", "0"),
+            Some("not_a_number"),
+            None,
+            None,
+        );
+        let map = convert_isolated_margin_assets(vec![entry]);
+        let state = map.get(&InstrumentNameExchange::new("BTCUSDT")).unwrap();
+        assert_eq!(state.risk.margin_level, None);
+    }
+
+    #[test]
+    fn isolated_missing_base_free_drops_entry() {
+        // Missing free/locked is corrupt (not no-debt) → drop the whole pair entry.
+        let mut base = IsoBase::new();
+        base.asset = Some("BTC".to_string());
+        base.locked = Some("0".to_string()); // no free
+        let entry = iso_entry(
+            "BTCUSDT",
+            base,
+            iso_quote("USDT", "100", "0", "0", "0"),
+            None,
+            None,
+            None,
+        );
+        assert!(convert_isolated_margin_assets(vec![entry]).is_empty());
+    }
+
+    #[test]
+    fn isolated_missing_symbol_drops_entry() {
+        let mut e = QueryIsolatedMarginAccountInfoResponseAssetsInner::new();
+        e.base_asset = Some(Box::new(iso_base("BTC", "1", "0", "0", "0")));
+        e.quote_asset = Some(Box::new(iso_quote("USDT", "1", "0", "0", "0")));
+        // no symbol set
+        assert!(convert_isolated_margin_assets(vec![e]).is_empty());
+    }
+
+    #[test]
+    fn chunk_symbols_batches_by_five() {
+        let syms: Vec<InstrumentNameExchange> = (0..12)
+            .map(|i| InstrumentNameExchange::new(format!("S{i:02}")))
+            .collect();
+        let chunks = chunk_symbols(&syms);
+        assert_eq!(chunks.len(), 3, "12 symbols → 5 + 5 + 2");
+        assert_eq!(chunks[0].split(',').count(), 5);
+        assert_eq!(chunks[1].split(',').count(), 5);
+        assert_eq!(chunks[2].split(',').count(), 2);
+
+        // ≤5 → a single chunk.
+        let three: Vec<_> = (0..3)
+            .map(|i| InstrumentNameExchange::new(format!("S{i}")))
+            .collect();
+        assert_eq!(chunk_symbols(&three).len(), 1);
+
+        // exactly 5 → a single chunk of 5.
+        let five: Vec<_> = (0..5)
+            .map(|i| InstrumentNameExchange::new(format!("S{i}")))
+            .collect();
+        let c = chunk_symbols(&five);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].split(',').count(), 5);
+
+        // empty → no chunks (never a no-symbol call).
+        assert!(chunk_symbols(&[]).is_empty());
+    }
+
+    #[test]
+    fn effective_isolated_set_empty_returns_all_configured() {
+        let client = isolated_client(&["BTCUSDT", "ETHUSDT"]);
+        assert_eq!(
+            client.effective_isolated_set(&[]),
+            vec![
+                InstrumentNameExchange::new("BTCUSDT"),
+                InstrumentNameExchange::new("ETHUSDT"),
+            ]
+        );
+    }
+
+    #[test]
+    fn effective_isolated_set_intersects_requested() {
+        let client = isolated_client(&["BTCUSDT", "ETHUSDT"]);
+        assert_eq!(
+            client.effective_isolated_set(&[InstrumentNameExchange::new("ETHUSDT")]),
+            vec![InstrumentNameExchange::new("ETHUSDT")]
+        );
+    }
+
+    #[test]
+    fn effective_isolated_set_skips_out_of_set() {
+        let client = isolated_client(&["BTCUSDT", "ETHUSDT"]);
+        // DOGEUSDT is not configured → skipped (warn), only BTCUSDT survives.
+        assert_eq!(
+            client.effective_isolated_set(&[
+                InstrumentNameExchange::new("BTCUSDT"),
+                InstrumentNameExchange::new("DOGEUSDT"),
+            ]),
+            vec![InstrumentNameExchange::new("BTCUSDT")]
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_balances_isolated_returns_empty() {
+        // Isolated balances are per-pair (on account_snapshot); the asset-keyed fetch returns empty
+        // without a network call.
+        let client = isolated_client(&["BTCUSDT"]);
+        assert!(client.fetch_balances(&[]).await.expect("ok").is_empty());
     }
 
     fn open_order(order_id: Option<i64>, side: &str) -> QueryMarginAccountsOpenOrdersResponseInner {

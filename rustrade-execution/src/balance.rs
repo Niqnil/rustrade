@@ -129,6 +129,25 @@ impl Balance {
             None => self.total,
         }
     }
+
+    /// Merge a WS partial [`BalanceUpdate`] onto an optional prior [`Balance`], preserving debt.
+    ///
+    /// Applies the stream's live `free`/`locked` (recomputing `total = free + locked`) while
+    /// carrying forward any [`MarginDetails`] from `prior` — a partial update never carries debt, so
+    /// this is the single-sourced "debt fresh as of last snapshot, `free`/`locked` live over the
+    /// stream" merge. On a cold start (`prior = None`) the result has `margin: None`.
+    ///
+    /// This is the same no-clobber merge the engine applies internally for asset-keyed balances. It
+    /// is exposed so consumers applying per-instrument
+    /// [`InstrumentBalanceUpdate`](crate::InstrumentBalanceUpdate) frames — which the engine does
+    /// not store — can reuse it rather than re-implement the contract.
+    pub fn apply_stream_update(prior: Option<Balance>, update: &BalanceUpdate) -> Balance {
+        Balance {
+            total: update.total(),
+            free: update.free,
+            margin: prior.and_then(|b| b.margin),
+        }
+    }
 }
 
 /// Partial balance update carrying only `free`/`locked` — the shape delivered by exchange WS

@@ -200,6 +200,7 @@ impl MockExchange {
                 instrument,
                 orders: orders.into_iter().collect(),
                 position: None,
+                isolated: None,
             })
             .collect();
 

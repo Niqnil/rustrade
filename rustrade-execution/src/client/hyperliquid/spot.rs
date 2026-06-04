@@ -294,6 +294,7 @@ impl ExecutionClient for HyperliquidSpotClient {
                 instrument,
                 orders,
                 position: None, // Spot has no positions
+                isolated: None,
             })
             .collect();
 
