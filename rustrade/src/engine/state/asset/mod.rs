@@ -190,14 +190,10 @@ impl AssetState {
             return;
         }
 
-        // Preserve existing margin debt — a WS partial never carries it.
-        let prior_margin = self.balance.as_ref().and_then(|b| b.value.margin);
-
-        let merged = Balance {
-            total: update.update.total(),
-            free: update.update.free,
-            margin: prior_margin,
-        };
+        // Preserve existing margin debt — a WS partial never carries it. Single-sourced through
+        // the public `Balance::apply_stream_update` no-clobber merge.
+        let prior = self.balance.as_ref().map(|b| b.value);
+        let merged = Balance::apply_stream_update(prior, &update.update);
         self.balance = Some(Timed::new(merged, update.time_exchange));
 
         // Drawdown statistics track `total`, which the update changes — feed it through the same

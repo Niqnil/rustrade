@@ -9,21 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Binance Cross Margin execution client** (`BinanceMargin`, `binance` feature)
+- **Binance Margin execution client** (`BinanceMargin`, `binance` feature) — **cross and isolated**
   - Implements the full `ExecutionClient` trait, so callers do not branch on spot-vs-margin
     transport: order submission/cancel and account snapshot / balance / open-order / trade queries
     over the margin REST API, plus a live account event stream.
   - `BinanceMarginConfig` with `MarginSideEffect` borrow/repay policy (`AutoBorrowRepay` default /
-    `NoBorrow`), set once per client (`sideEffectType`). `BinanceMarginConfig::cross_margin(api_key, secret_key)`
-    convenience constructor.
+    `NoBorrow`), set once per client (`sideEffectType`). Mode is selected by `is_isolated`, with
+    `BinanceMarginConfig::cross_margin(api_key, secret_key)` and
+    `BinanceMarginConfig::isolated(api_key, secret_key, symbols)` convenience constructors.
   - Live user-data stream is hand-rolled over the `userListenToken` model (the legacy margin
     listen-key API was retired by Binance on 2026-02-20): token acquisition, renew-before-expiry,
     auto-reconnect, exponential backoff, heartbeat monitoring, fill recovery, and dedup —
     spot-equivalent resilience.
-  - Scope: **cross** margin only (account-wide). Isolated (per-pair) margin is a planned follow-up.
   - Limitations: `TrailingStop`/`TrailingStopLimit` return `UnsupportedOrderType` (the SDK margin
     binding omits `trailingDelta`); Binance margin/SAPI has no testnet (a `testnet: true` config is
     inert and resolves to production, logged at construction).
+- **Binance Isolated Margin support** (per-pair sub-accounts; `is_isolated = true` + `isolated_symbols`)
+  - `BinanceMarginConfig::isolated_symbols: Vec<InstrumentNameExchange>` declares the per-pair
+    universe (the authoritative symbol set for the isolated tokens/stream, fixed for the stream's
+    lifetime — pairs added later require a restart). `BinanceMargin::new` **panics** if
+    `is_isolated = true` with an empty `isolated_symbols`.
+  - Per-pair balances and risk are surfaced **per-instrument** on
+    `InstrumentAccountSnapshot.isolated` — a single `Option<IsolatedInstrumentState>` field carrying
+    base/quote `AssetBalance` plus `risk` — rather than folded into the asset-keyed `AccountSnapshot.balances`
+    (which would collide on shared assets). New public types `IsolatedInstrumentState` and
+    `IsolatedMarginRisk` (`margin_level` / `margin_ratio` / `liquidation_price`, snapshot-fresh, no
+    live stream twin). Under isolated, `fetch_balances` returns an empty `Vec` (per-pair balances are
+    per-instrument, not asset-keyed); snapshot/open-order/trade queries cover one identical effective
+    set (`isolated_symbols`, or `instruments ∩ isolated_symbols` with out-of-set instruments skipped
+    with a warning).
+  - Live per-pair `free`/`locked` arrives over the isolated stream as the new
+    `AccountEventKind::InstrumentBalanceUpdate` (base + quote per pair). The engine deliberately does
+    **not** store it (mirroring the snapshot's `isolated` field): consumers read it off the raw
+    account-event stream, not via `EngineState` / a `StateReplicaManager` replica. The public
+    `Balance::apply_stream_update` utility single-sources the no-clobber merge (apply WS `free`/`locked`,
+    preserve REST-snapshot debt).
+  - Transport: per-symbol `userListenToken`s are **multiplexed onto a single WS-API socket**; all
+    tokens are acquired, connected, and subscribed before `account_stream` returns (any failure →
+    `Err`, nothing spawned), with planned-reconnect token renewal. The cross stream is a separate,
+    untouched manager.
+  - Known limitation: all events are stamped `ExchangeId::BinanceMargin`, so a single engine should
+    run at most one `BinanceMargin` client (cross + isolated concurrently need separate engines).
 - **Margin-aware universal `Balance`**
   - `MarginDetails { borrowed, interest }` and `Balance.margin: Option<MarginDetails>`; the per-asset
     debt model generalises across CEX per-asset-margin venues (cash/no-debt venues leave `margin: None`).
@@ -51,6 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `margin`). No behavioural change for spot (which carries no debt) beyond the event variant.
 - **Binance `GoodUntilEndOfDay` (GTD) time-in-force is now rejected as `UnsupportedOrderType`** instead of being silently coerced to `GoodTillCancelled` (GTC). Binance has no native end-of-day order, and coercing to GTC dropped the EOD auto-cancel semantics — risking an unintended resting order. This affects both the spot and margin clients.
 - **Binance margin user-data frames are parsed without a full JSON DOM.** The WS receive path now deserializes a borrowed envelope (`serde_json::value::RawValue` for the inner `event`) and reads the event discriminator from a raw slice, so only the matched event type pays for a single typed pass — no intermediate `serde_json::Value` tree is built per frame on this hot path. Internal only; no public API change (the `binance` feature now enables `serde_json/raw_value`).
+- **`InstrumentAccountSnapshot` gained a public `isolated: Option<IsolatedInstrumentState>` field**, and **`AccountEventKind` gained an `InstrumentBalanceUpdate` variant** (both for isolated margin). Both are additive on the wire (`Option` + `#[serde(default)]` / `#[non_exhaustive]` enum), but `InstrumentAccountSnapshot::new()`'s arity went 3→4 (struct-literal / `::new()` call sites must pass the new field) and the library's `indexer.rs` gained one match arm — a minor breaking change for code that directly constructs `InstrumentAccountSnapshot`. The new field sorts/hashes last (`None` before `Some`), so it acts only as a tie-breaker; the cross stream/snapshot paths are unchanged.
 
 ### Fixed
 
