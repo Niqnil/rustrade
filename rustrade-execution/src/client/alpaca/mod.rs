@@ -2771,7 +2771,7 @@ fn build_instrument_snapshots(
         by_symbol
             .into_iter()
             .map(|(sym, orders)| {
-                InstrumentAccountSnapshot::new(InstrumentNameExchange::new(sym), orders, None)
+                InstrumentAccountSnapshot::new(InstrumentNameExchange::new(sym), orders, None, None)
             })
             .collect()
     } else {
@@ -2783,7 +2783,7 @@ fn build_instrument_snapshots(
                 let orders = by_symbol
                     .swap_remove(inst.name().as_str())
                     .unwrap_or_default();
-                InstrumentAccountSnapshot::new(inst.clone(), orders, None)
+                InstrumentAccountSnapshot::new(inst.clone(), orders, None, None)
             })
             .collect()
     }

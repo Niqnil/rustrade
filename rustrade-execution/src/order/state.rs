@@ -155,6 +155,12 @@ pub enum InactiveOrderState<AssetKey, InstrumentKey> {
 )]
 pub struct Cancelled {
     pub id: OrderId,
+    /// Cancellation timestamp.
+    ///
+    /// Normally the venue-reported cancel time. Some venues omit a timestamp on their cancel
+    /// response (e.g. Binance margin cancels carry no `transactTime`); for those the client falls
+    /// back to the local receive time, which can differ from the true venue cancel time by network
+    /// latency. Consumers building fill ledgers or P&L should not assume sub-second venue accuracy.
     pub time_exchange: DateTime<Utc>,
     /// Quantity filled before the order was cancelled.
     ///

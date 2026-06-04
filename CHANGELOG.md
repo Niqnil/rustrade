@@ -7,9 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Binance Margin execution client** (`BinanceMargin`, `binance` feature) — **cross and isolated**
+  - Implements the full `ExecutionClient` trait, so callers do not branch on spot-vs-margin
+    transport: order submission/cancel and account snapshot / balance / open-order / trade queries
+    over the margin REST API, plus a live account event stream.
+  - `BinanceMarginConfig` with `MarginSideEffect` borrow/repay policy (`AutoBorrowRepay` default /
+    `NoBorrow`), set once per client (`sideEffectType`). Mode is selected by `is_isolated`, with
+    `BinanceMarginConfig::cross_margin(api_key, secret_key)` and
+    `BinanceMarginConfig::isolated(api_key, secret_key, symbols)` convenience constructors.
+  - Live user-data stream is hand-rolled over the `userListenToken` model (the legacy margin
+    listen-key API was retired by Binance on 2026-02-20): token acquisition, renew-before-expiry,
+    auto-reconnect, exponential backoff, heartbeat monitoring, fill recovery, and dedup —
+    spot-equivalent resilience.
+  - Limitations: `TrailingStop`/`TrailingStopLimit` return `UnsupportedOrderType` (the SDK margin
+    binding omits `trailingDelta`); Binance margin/SAPI has no testnet (a `testnet: true` config is
+    inert and resolves to production, logged at construction).
+- **Binance Isolated Margin support** (per-pair sub-accounts; `is_isolated = true` + `isolated_symbols`)
+  - `BinanceMarginConfig::isolated_symbols: Vec<InstrumentNameExchange>` declares the per-pair
+    universe (the authoritative symbol set for the isolated tokens/stream, fixed for the stream's
+    lifetime — pairs added later require a restart). `BinanceMargin::new` **panics** if
+    `is_isolated = true` with an empty `isolated_symbols`.
+  - Per-pair balances and risk are surfaced **per-instrument** on
+    `InstrumentAccountSnapshot.isolated` — a single `Option<IsolatedInstrumentState>` field carrying
+    base/quote `AssetBalance` plus `risk` — rather than folded into the asset-keyed `AccountSnapshot.balances`
+    (which would collide on shared assets). New public types `IsolatedInstrumentState` and
+    `IsolatedMarginRisk` (`margin_level` / `margin_ratio` / `liquidation_price`, snapshot-fresh, no
+    live stream twin). Under isolated, `fetch_balances` returns an empty `Vec` (per-pair balances are
+    per-instrument, not asset-keyed); snapshot/open-order/trade queries cover one identical effective
+    set (`isolated_symbols`, or `instruments ∩ isolated_symbols` with out-of-set instruments skipped
+    with a warning).
+  - Live per-pair `free`/`locked` arrives over the isolated stream as the new
+    `AccountEventKind::InstrumentBalanceUpdate` (base + quote per pair). The engine deliberately does
+    **not** store it (mirroring the snapshot's `isolated` field): consumers read it off the raw
+    account-event stream, not via `EngineState` / a `StateReplicaManager` replica. The public
+    `Balance::apply_stream_update` utility single-sources the no-clobber merge (apply WS `free`/`locked`,
+    preserve REST-snapshot debt).
+  - Transport: per-symbol `userListenToken`s are **multiplexed onto a single WS-API socket**; all
+    tokens are acquired, connected, and subscribed before `account_stream` returns (any failure →
+    `Err`, nothing spawned), with planned-reconnect token renewal. The cross stream is a separate,
+    untouched manager.
+  - Known limitation: all events are stamped `ExchangeId::BinanceMargin`, so a single engine should
+    run at most one `BinanceMargin` client (cross + isolated concurrently need separate engines).
+- **Margin-aware universal `Balance`**
+  - `MarginDetails { borrowed, interest }` and `Balance.margin: Option<MarginDetails>`; the per-asset
+    debt model generalises across CEX per-asset-margin venues (cash/no-debt venues leave `margin: None`).
+  - `Balance::net_asset()` returns `total` when there is no margin and `total - borrowed` when present
+    (a short is negative net asset in the base). Reflects debt only as fresh as the last
+    `BalanceSnapshot` for that asset.
+  - `Balance::new_margin(total, free, borrowed, interest)` constructor alongside `Balance::new`.
+- **REST/WS balance event split** to prevent silently clobbering debt
+  - `BalanceUpdate { free, locked }` / `AssetBalanceUpdate` model the WS partial (free/locked only),
+    and a new `AccountEventKind::BalanceStreamUpdate(Snapshot<AssetBalanceUpdate>)` carries it.
+  - REST snapshots remain the full `BalanceSnapshot(Snapshot<AssetBalance>)` (replace); WS updates
+    apply free/locked while **preserving** existing `margin`, so a partial update structurally cannot
+    overwrite known debt.
+
+### Changed
+
+- **BREAKING: `Balance` gained a public `margin: Option<MarginDetails>` field.** Direct struct-literal
+  construction (`Balance { total, free }`) no longer compiles. Migration: use `Balance::new(total, free)`
+  for cash balances or `Balance::new_margin(..)` for margin balances. `const` sites that cannot use
+  `..Default::default()` need an explicit `margin: None`.
+- **Binance spot WS balance events now emit `BalanceStreamUpdate` instead of `BalanceSnapshot`.**
+  Spot's `outboundAccountPosition` was always a free/locked partial; it now uses the same
+  REST→snapshot / WS→update model as margin. Engine balance state is updated via
+  `AssetState::apply_balance_update` (sets `free`, recomputes `total = free + locked`, preserves
+  `margin`). No behavioural change for spot (which carries no debt) beyond the event variant.
+- **Binance `GoodUntilEndOfDay` (GTD) time-in-force is now rejected as `UnsupportedOrderType`** instead of being silently coerced to `GoodTillCancelled` (GTC). Binance has no native end-of-day order, and coercing to GTC dropped the EOD auto-cancel semantics — risking an unintended resting order. This affects both the spot and margin clients.
+- **Binance margin user-data frames are parsed without a full JSON DOM.** The WS receive path now deserializes a borrowed envelope (`serde_json::value::RawValue` for the inner `event`) and reads the event discriminator from a raw slice, so only the matched event type pays for a single typed pass — no intermediate `serde_json::Value` tree is built per frame on this hot path. Internal only; no public API change (the `binance` feature now enables `serde_json/raw_value`).
+- **`InstrumentAccountSnapshot` gained a public `isolated: Option<IsolatedInstrumentState>` field**, and **`AccountEventKind` gained an `InstrumentBalanceUpdate` variant** (both for isolated margin). Both are additive on the wire (`Option` + `#[serde(default)]` / `#[non_exhaustive]` enum), but `InstrumentAccountSnapshot::new()`'s arity went 3→4 (struct-literal / `::new()` call sites must pass the new field) and the library's `indexer.rs` gained one match arm — a minor breaking change for code that directly constructs `InstrumentAccountSnapshot`. The new field sorts/hashes last (`None` before `Some`), so it acts only as a tie-breaker; the cross stream/snapshot paths are unchanged.
+
 ### Fixed
 
+- **Binance `fetch_open_orders` now honours the `ExecutionClient` "return all" contract** for an empty `instruments` slice. Both the spot and margin clients previously iterated the (empty) slice and returned an empty `Vec`, silently violating the trait contract that an empty slice must return open orders across all instruments. They now issue a single no-symbol query (`GET /api/v3/openOrders`, `GET /sapi/v1/margin/openOrders`), recovering each order's instrument from its own `symbol` field. The `fetch_trades` per-symbol limitation (Binance `myTrades` requires a symbol, so an empty slice returns empty) is now an explicitly documented deviation on both clients.
 - Corrected the order-type support matrix in `rustrade-execution/README.md` to reflect Binance and Hyperliquid conditional order support (Stop, StopLimit, TakeProfit, TakeProfitLimit), Binance trailing-stop offset limitations, and Hyperliquid's lack of native market orders.
+- **`rustrade-execution` docs.rs builds now use `all-features`.** Every connector module is feature-gated behind `default = []`, so docs.rs previously published a crate documenting no connectors and the connector-comparison intra-doc links broke. The full client surface is now documented and those links resolve.
+- **Binance REST auth-failure errors now carry the numeric Binance code.** `401`/`403` (`UnauthorizedError`/`ForbiddenError`) rejections splice the code into the `ApiError::Unauthenticated` message, so callers can distinguish auth subtypes (e.g. `-2014` invalid key vs `-2015` IP/permission), matching the existing behaviour for client-error rejections.
 
 ## [0.2.1] - 2026-05-28
 
