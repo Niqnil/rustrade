@@ -953,6 +953,7 @@ impl ExecutionClient for IbkrClient {
                     instrument,
                     orders: Vec::new(),
                     position: None,
+                    isolated: None,
                 });
             }
             Ok::<_, UnindexedClientError>(snapshots)

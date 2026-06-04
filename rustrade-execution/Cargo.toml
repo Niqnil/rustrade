@@ -11,6 +11,12 @@ documentation = "https://docs.rs/rustrade-execution/"
 readme = "README.md"
 description = "Stream private account data from financial venues, and execute (live or mock) orders."
 
+# Every connector module (alpaca/binance/ibkr/hyperliquid) is feature-gated and `default = []`, so a
+# default-feature docs.rs build would publish a crate documenting zero connectors and break the
+# connector-comparison intra-doc links in `client/mod.rs`. Build the full surface for published docs.
+[package.metadata.docs.rs]
+all-features = true
+
 
 [features]
 default = []
@@ -25,9 +31,14 @@ alpaca = [
 binance = [
     "dep:binance-sdk",
     "dep:serde_json",
+    "serde_json/raw_value", # RawValue borrow for zero-copy WS user-data frame parsing
     "dep:anyhow",
     "dep:lru",
     "dep:parking_lot",
+    # Only to name `reqwest::Method` for the hand-rolled userListenToken POST, which reuses the
+    # SDK's `common::utils::send_request` (and its own reqwest client). No new crate enters the
+    # graph — reqwest is already a workspace dep and a binance-sdk transitive dep.
+    "dep:reqwest",
 ]
 ibkr = ["dep:ibapi", "dep:parking_lot", "dep:chrono-tz", "rustrade-instrument/ibkr"]
 hyperliquid = [
@@ -80,7 +91,10 @@ derive_more = { workspace = true, features = [
 reqwest = { workspace = true, optional = true } # HTTP client for Alpaca REST API
 
 # Binance (optional, behind "binance" feature)
-binance-sdk = { version = "=52.0.0", features = ["spot"], optional = true }
+# `margin_trading` is bundled with `spot` under the single `binance` feature (one feature per
+# exchange, matching alpaca/ibkr/hyperliquid). It ships ahead of the BinanceMargin client being
+# fully wired so spot + margin compile together; spot-only users pay the margin module's build cost.
+binance-sdk = { version = "=52.0.0", features = ["spot", "margin_trading"], optional = true }
 anyhow = { workspace = true, optional = true }                              # Required: binance-sdk's public API returns anyhow::Result
 
 # Shared between "alpaca" and "binance" features

@@ -6,6 +6,7 @@ use crate::{
         mean::{MeanDrawdown, MeanDrawdownGenerator},
     },
 };
+use chrono::{DateTime, Utc};
 use rustrade_execution::balance::{AssetBalance, Balance};
 use rustrade_integration::collection::snapshot::Snapshot;
 use serde::{Deserialize, Serialize};
@@ -41,12 +42,30 @@ impl TearSheetAssetGenerator {
 
     /// Update the [`TearSheetAssetGenerator`] from the next [`Snapshot`] [`AssetBalance`].
     pub fn update_from_balance<AssetKey>(&mut self, balance: Snapshot<&AssetBalance<AssetKey>>) {
-        self.balance_now = Some(balance.value().balance);
+        self.update_from_balance_parts(balance.value().balance, balance.value().time_exchange);
+    }
 
-        if let Some(next_drawdown) = self.drawdown.update(Timed::new(
-            balance.value().balance.total,
-            balance.value().time_exchange,
-        )) {
+    /// Update the [`TearSheetAssetGenerator`] from a [`Balance`] and its exchange timestamp.
+    ///
+    /// The asset-key-free core of [`Self::update_from_balance`]; the generator tracks only `total`
+    /// drawdown and so never needs the asset identity. Lets callers that hold a balance without an
+    /// owned asset key (e.g. WS partial updates) avoid constructing a throwaway [`AssetBalance`].
+    ///
+    /// `time_exchange` is expected to be non-decreasing across calls; the underlying
+    /// [`DrawdownGenerator`] tracks peak state and does not itself guard against out-of-order
+    /// timestamps (the engine applies a staleness gate before calling this). `pub(crate)`: an
+    /// internal helper for [`Self::update_from_balance`] and the engine's balance-apply path.
+    pub(crate) fn update_from_balance_parts(
+        &mut self,
+        balance: Balance,
+        time_exchange: DateTime<Utc>,
+    ) {
+        self.balance_now = Some(balance);
+
+        if let Some(next_drawdown) = self
+            .drawdown
+            .update(Timed::new(balance.total, time_exchange))
+        {
             self.drawdown_mean.update(&next_drawdown);
             self.drawdown_max.update(&next_drawdown);
         }

@@ -5,7 +5,7 @@ use crate::{
 use chrono::Utc;
 use derive_more::Constructor;
 use itertools::Either;
-use rustrade_execution::balance::{AssetBalance, Balance};
+use rustrade_execution::balance::{AssetBalance, AssetBalanceUpdate, Balance};
 use rustrade_instrument::{
     asset::{
         Asset, AssetIndex, ExchangeAsset,
@@ -167,6 +167,41 @@ impl AssetState {
             self.statistics.update_from_balance(snapshot);
         }
     }
+
+    /// Applies a WS partial [`AssetBalanceUpdate`] (`free`/`locked` only), if more recent.
+    ///
+    /// Updates `free` and recomputes `total = free + locked`, while **preserving** any existing
+    /// [`MarginDetails`](rustrade_execution::balance::MarginDetails) — a stream update carries no
+    /// debt, so this path structurally cannot clobber known `borrowed`/`interest`. On a cold start
+    /// (no prior balance) the merged balance has `margin: None`, consistent with the debt-freshness
+    /// contract (debt becomes known only via a [`BalanceSnapshot`](rustrade_execution::AccountEventKind::BalanceSnapshot)).
+    ///
+    /// Like [`Self::update_from_balance`], stale updates (older than the current state) are ignored.
+    pub fn apply_balance_update<AssetKey>(
+        &mut self,
+        snapshot: Snapshot<&AssetBalanceUpdate<AssetKey>>,
+    ) {
+        let update = snapshot.value();
+
+        // Timestamp-gate: ignore updates older than the current state.
+        if let Some(balance) = &self.balance
+            && balance.time > update.time_exchange
+        {
+            return;
+        }
+
+        // Preserve existing margin debt — a WS partial never carries it. Single-sourced through
+        // the public `Balance::apply_stream_update` no-clobber merge.
+        let prior = self.balance.as_ref().map(|b| b.value);
+        let merged = Balance::apply_stream_update(prior, &update.update);
+        self.balance = Some(Timed::new(merged, update.time_exchange));
+
+        // Drawdown statistics track `total`, which the update changes — feed it through the same
+        // path as a full snapshot. The generator needs only `balance`/`time_exchange`, so the
+        // asset key (and a throwaway `AssetBalance`) is unnecessary here.
+        self.statistics
+            .update_from_balance_parts(merged, update.time_exchange);
+    }
 }
 
 impl From<&AssetState> for AssetBalance<AssetNameExchange> {
@@ -221,7 +256,9 @@ mod tests {
     use super::*;
     use crate::test_utils::asset_state;
     use chrono::{DateTime, TimeZone, Utc};
+    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
+    use rustrade_execution::balance::{BalanceUpdate, MarginDetails};
     use rustrade_instrument::{asset::name::AssetNameExchange, exchange::ExchangeId};
 
     #[test]
@@ -240,10 +277,7 @@ mod tests {
                 name_internal: AssetNameInternal::new("btc"),
                 name_exchange: AssetNameExchange::new("btc"),
             },
-            balance: Balance {
-                total: dec!(1100.0),
-                free: dec!(1100.0),
-            },
+            balance: Balance::new(dec!(1100.0), dec!(1100.0)),
             time_exchange: DateTime::<Utc>::MIN_UTC,
         });
 
@@ -263,10 +297,7 @@ mod tests {
                 name_internal: AssetNameInternal::new("btc"),
                 name_exchange: AssetNameExchange::new("xbt"),
             },
-            balance: Balance {
-                total: dec!(1100.0),
-                free: dec!(1100.0),
-            },
+            balance: Balance::new(dec!(1100.0), dec!(1100.0)),
             time_exchange: DateTime::<Utc>::MAX_UTC,
         });
 
@@ -289,10 +320,7 @@ mod tests {
                 name_internal: AssetNameInternal::new("btc"),
                 name_exchange: AssetNameExchange::new("xbt"),
             },
-            balance: Balance {
-                total: dec!(1000.0),
-                free: dec!(800.0),
-            },
+            balance: Balance::new(dec!(1000.0), dec!(800.0)),
             time_exchange: time,
         });
 
@@ -347,10 +375,7 @@ mod tests {
                 name_internal: AssetNameInternal::new("btc"),
                 name_exchange: AssetNameExchange::new("xbt"),
             },
-            balance: Balance {
-                total: dec!(1000.0),
-                free: dec!(800.0),
-            },
+            balance: Balance::new(dec!(1000.0), dec!(800.0)),
             time_exchange: DateTime::<Utc>::MIN_UTC,
         });
 
@@ -359,5 +384,101 @@ mod tests {
         let expected = asset_state("btc", 1000.0, 900.0, DateTime::<Utc>::MAX_UTC);
 
         assert_eq!(state, expected)
+    }
+
+    fn btc_balance_update(
+        free: f64,
+        locked: f64,
+        time: DateTime<Utc>,
+    ) -> AssetBalanceUpdate<AssetNameExchange> {
+        AssetBalanceUpdate {
+            asset: AssetNameExchange::new("btc"),
+            update: BalanceUpdate::new(
+                Decimal::try_from(free).unwrap(),
+                Decimal::try_from(locked).unwrap(),
+            ),
+            time_exchange: time,
+        }
+    }
+
+    #[test]
+    fn test_apply_balance_update_preserves_margin_debt() {
+        // Seed a margin balance carrying debt via a full snapshot...
+        let time = Utc.timestamp_opt(1000, 0).unwrap();
+        let mut state = asset_state("btc", 0.0, 0.0, time);
+        let seed = Snapshot(AssetBalance {
+            asset: Asset {
+                name_internal: AssetNameInternal::new("btc"),
+                name_exchange: AssetNameExchange::new("btc"),
+            },
+            balance: Balance::new_margin(dec!(2.0), dec!(2.0), dec!(1.5), dec!(0.01)),
+            time_exchange: time,
+        });
+        state.update_from_balance(seed.as_ref());
+
+        // ...then apply a WS partial (free/locked only) that must NOT clobber the debt.
+        let later = Utc.timestamp_opt(2000, 0).unwrap();
+        let update = btc_balance_update(1.0, 0.5, later);
+        state.apply_balance_update(Snapshot(&update));
+
+        let balance = state.balance.unwrap().value;
+        assert_eq!(balance.free, dec!(1.0));
+        assert_eq!(balance.total, dec!(1.5)); // free + locked
+        // Debt preserved from the snapshot — net_asset still deducts it.
+        assert_eq!(
+            balance.margin,
+            Some(MarginDetails::new(dec!(1.5), dec!(0.01)))
+        );
+        assert_eq!(balance.net_asset(), dec!(0.0)); // 1.5 total - 1.5 borrowed
+    }
+
+    #[test]
+    fn test_apply_balance_update_cold_start_has_no_margin() {
+        // First-ever event is a WS partial → margin is None (debt unknown until a snapshot).
+        let time = Utc.timestamp_opt(1000, 0).unwrap();
+        let mut state = AssetState {
+            asset: Asset {
+                name_internal: AssetNameInternal::new("btc"),
+                name_exchange: AssetNameExchange::new("btc"),
+            },
+            statistics: Default::default(),
+            balance: None,
+        };
+        let update = btc_balance_update(3.0, 1.0, time);
+        state.apply_balance_update(Snapshot(&update));
+
+        let balance = state.balance.unwrap().value;
+        assert_eq!(balance.total, dec!(4.0));
+        assert_eq!(balance.free, dec!(3.0));
+        assert_eq!(balance.margin, None);
+        assert_eq!(balance.net_asset(), dec!(4.0));
+    }
+
+    #[test]
+    fn test_apply_balance_update_equal_timestamp_is_applied() {
+        // Mirrors update_from_balance: an update with a timestamp equal to the current state is
+        // applied (the gate only rejects strictly-older updates).
+        let time = Utc.timestamp_opt(1000, 0).unwrap();
+        let mut state = asset_state("btc", 1000.0, 900.0, time);
+
+        let update = btc_balance_update(1.5, 0.5, time);
+        state.apply_balance_update(Snapshot(&update));
+
+        assert_eq!(state.balance.unwrap().value.free, dec!(1.5));
+        assert_eq!(state.balance.unwrap().value.total, dec!(2.0)); // free + locked
+        assert_eq!(state.balance.unwrap().time, time);
+    }
+
+    #[test]
+    fn test_apply_balance_update_ignores_stale() {
+        let time = Utc.timestamp_opt(2000, 0).unwrap();
+        let mut state = asset_state("btc", 1000.0, 900.0, time);
+
+        let stale = btc_balance_update(1.0, 0.0, Utc.timestamp_opt(1000, 0).unwrap());
+        state.apply_balance_update(Snapshot(&stale));
+
+        // Unchanged: stale update older than current state is ignored.
+        assert_eq!(state.balance.unwrap().value.total, dec!(1000.0));
+        assert_eq!(state.balance.unwrap().value.free, dec!(900.0));
     }
 }
