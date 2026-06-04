@@ -1,17 +1,27 @@
-//! Binance Cross Margin execution client.
+//! Binance Margin execution client (cross and isolated).
 //!
 //! [`BinanceMargin`] is a margin counterpart to [`super::spot::BinanceSpot`]. It shares the
 //! exchange-agnostic infrastructure in [`super::shared`] (rate-limit tracking, reconnect/backoff,
-//! event deduplication, error parsing) and is intended to implement the same `ExecutionClient`
-//! trait so callers do not branch on spot-vs-margin transport.
+//! event deduplication, error parsing) and implements the same `ExecutionClient` trait so callers
+//! do not branch on spot-vs-margin transport.
 //!
 //! ## Scope
 //! This module provides the client's identity and configuration ([`BinanceMargin`],
 //! [`BinanceMarginConfig`], [`MarginSideEffect`]) and a full [`ExecutionClient`] implementation:
 //! order submission/cancel and account snapshot / balance / open-order / trade queries over REST,
 //! plus a live account event stream ([`ExecutionClient::account_stream`]) over the hand-rolled
-//! `userListenToken` user-data WebSocket (the SDK's retired listen-key path is not used). Cross
-//! margin only (`isIsolated = "FALSE"`); isolated margin is a separate follow-up.
+//! `userListenToken` user-data WebSocket (the SDK's retired listen-key path is not used). Both
+//! **cross** (`isIsolated = "FALSE"`, account-wide collateral) and **isolated** (`isIsolated =
+//! "TRUE"`, per-pair sub-accounts) margin are supported, selected by
+//! [`BinanceMarginConfig::is_isolated`].
+//!
+//! ## Cross vs. isolated
+//! Cross is account-wide: a single `userListenToken`, one WS-API subscription, and per-asset
+//! balances surfaced in the top-level `balances`. Isolated is per-pair: the caller declares the
+//! [`BinanceMarginConfig::isolated_symbols`] universe, each symbol gets its own `userListenToken`,
+//! and all N tokens are **multiplexed onto one WS-API socket**. Isolated per-pair balances and risk
+//! are attached per-instrument (never folded into the asset-keyed model, which cannot represent
+//! `(pair, asset)` pools). See [`BinanceMargin`] for the per-method contract.
 //!
 //! ## Borrow/repay
 //! Margin orders carry a `sideEffectType` controlling whether the venue borrows on entry and
@@ -324,6 +334,13 @@ impl BinanceMarginConfig {
 /// Consequently `net_asset` reflects debt only as fresh as the last `account_snapshot` for that
 /// asset — call it at startup and refresh on demand (see [`account_stream`](Self::account_stream)'s
 /// cold-start note).
+///
+/// # One client per engine (`ExchangeId`)
+/// All emitted events — cross and isolated alike — are stamped [`ExchangeId::BinanceMargin`], and
+/// the engine routes `AssetStates` / `ConnectivityStates` by `ExchangeId`. Running **two**
+/// `BinanceMargin` clients in a single engine (e.g. one cross, one isolated) therefore collides
+/// their exchange identity. A single engine should run **at most one** `BinanceMargin` client; a
+/// consumer needing cross and isolated concurrently runs them in separate engines.
 #[derive(Clone)]
 pub struct BinanceMargin {
     config: Arc<BinanceMarginConfig>,
@@ -820,8 +837,8 @@ impl ExecutionClient for BinanceMargin {
     /// via [`InstrumentAccountSnapshot::isolated`] rather than folded into the asset-keyed
     /// top-level `balances` (which is left **empty**) — isolated sub-accounts are per-`(pair, asset)`
     /// and would collide in the asset-keyed model. The instrument set is the effective isolated set
-    /// (see [`effective_isolated_set`](Self::effective_isolated_set)); each instrument's open orders
-    /// and isolated balances are fetched over that same set.
+    /// (`isolated_symbols`, or `instruments ∩ isolated_symbols` with out-of-set instruments skipped);
+    /// each instrument's open orders and isolated balances are fetched over that same set.
     async fn account_snapshot(
         &self,
         assets: &[AssetNameExchange],
@@ -1079,6 +1096,43 @@ impl ExecutionClient for BinanceMargin {
     /// a ~1s lookback after this returns. Callers must also call
     /// [`ExecutionClient::fetch_open_orders`] after each reconnect to reconcile order state — only
     /// TRADE fills are recovered, not order-lifecycle events.
+    ///
+    /// # Isolated mode (multiplexed `userListenToken`)
+    /// Under `is_isolated = true` a **separate** manager drives the stream (the cross path above is
+    /// left untouched). It acquires one per-symbol `userListenToken` for each
+    /// [`BinanceMarginConfig::isolated_symbols`] entry and multiplexes **all N subscriptions onto a
+    /// single WS-API socket**. Every token is acquired, the socket connected, and all subscriptions
+    /// confirmed **before this method returns** — if the connect or **any** subscribe fails, it
+    /// returns `Err` with nothing spawned (preserving the "can't-start vs started-then-dropped"
+    /// distinction). The `instruments` argument does **not** drive the isolated token set: the stream
+    /// always covers exactly `isolated_symbols`.
+    ///
+    /// ## Live per-pair balances — [`InstrumentBalanceUpdate`](crate::AccountEventKind::InstrumentBalanceUpdate)
+    /// The isolated stream delivers live fills and order updates (routed by the inner `symbol`) **and**
+    /// live per-pair `free`/`locked` balances, emitted as
+    /// [`AccountEventKind::InstrumentBalanceUpdate`](crate::AccountEventKind::InstrumentBalanceUpdate)
+    /// (base + quote per pair). Debt totals (`borrowed`/`interest`) stay REST-`BalanceSnapshot`-fresh
+    /// per the debt-freshness contract; the stream keeps only `free`/`locked` live.
+    ///
+    /// **Consumption contract (important):** the engine deliberately does **not** store
+    /// `InstrumentBalanceUpdate` — it falls through `update_from_account`'s `_ => None` wildcard,
+    /// mirroring the snapshot's
+    /// [`InstrumentAccountSnapshot::isolated`](crate::InstrumentAccountSnapshot::isolated). It is
+    /// therefore **never in `EngineState`**, and a `StateReplicaManager` replica replays the same
+    /// wildcard so it is **not** in replica state either. A consumer obtains live per-pair balances
+    /// **only** by inspecting the raw account event off the stream (`AccountStreamEvent::Item(..)` /
+    /// `audit_tick.event`) and matching the variant itself — a consumer reading solely replica
+    /// `EngineState` will see nothing and wrongly conclude the feature is broken. A wrapper wanting
+    /// engine-queryable per-instrument balances uses the `InstrumentData` extension point instead.
+    ///
+    /// ## First-prod-run check — `subscriptionId → symbol` routing
+    /// `outboundAccountPosition` frames carry no symbol inline; on the multiplexed socket their pair
+    /// is recovered via a `subscriptionId → symbol` map. This correlation is the one assumption no
+    /// offline source could validate — **verify it on the first production run**. Fills and order
+    /// updates are unaffected (they self-identify by `symbol`); if the correlation does not hold,
+    /// per-pair balance frames are dropped with a `warn!` (never mis-applied) and balances degrade to
+    /// snapshot-polling. The documented fallback is one socket per isolated symbol (symbol implied by
+    /// the connection).
     async fn account_stream(
         &self,
         // _assets is intentionally ignored — Binance pushes outboundAccountPosition for all account
