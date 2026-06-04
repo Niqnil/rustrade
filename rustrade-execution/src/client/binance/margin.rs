@@ -32,8 +32,8 @@ use super::shared::{
     new_dedup_cache, parse_order_kind, parse_side, parse_time_in_force, rest_call_with_retry,
 };
 use crate::{
-    AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, IsolatedInstrumentState,
-    IsolatedMarginRisk, UnindexedAccountEvent, UnindexedAccountSnapshot,
+    AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, InstrumentBalanceUpdate,
+    IsolatedInstrumentState, IsolatedMarginRisk, UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate},
     client::ExecutionClient,
     error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
@@ -50,7 +50,10 @@ use binance_sdk::{
         config::{ConfigurationRestApi, ConfigurationWebsocketApi},
         constants::{MARGIN_TRADING_REST_API_PROD_URL, SPOT_WS_API_PROD_URL},
         models::WebsocketEvent,
-        websocket::{WebsocketApi as WsApiBase, WebsocketMessageSendOptions},
+        websocket::{
+            SendWebsocketMessageResult, Subscription, WebsocketApi as WsApiBase,
+            WebsocketMessageSendOptions,
+        },
     },
     margin_trading::{
         MarginTradingRestApi,
@@ -82,7 +85,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     str::FromStr,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -1089,36 +1092,99 @@ impl ExecutionClient for BinanceMargin {
         let rest_config = self.rest_config.clone();
         let ws_config = self.ws_config.clone();
         let rate_limiter = self.rate_limiter.clone();
-        let instruments = instruments.to_vec();
-        // All current Binance margin symbols are ≤22 bytes (within SmolStr's 23-byte inline limit),
-        // making clone() a stack memcpy with no heap allocation. Guard this implicit invariant so
-        // future symbols that exceed the limit are caught early.
-        debug_assert!(
-            instruments.iter().all(|i| i.name().len() <= 23),
-            "instrument name exceeds SmolStr inline capacity: {:?}",
-            instruments.iter().find(|i| i.name().len() > 23)
-        );
 
-        // Validate credentials + connectivity before returning the stream so the caller can
-        // distinguish "can't start at all" from "started then disconnected" (auto-reconnect handles
-        // the latter). The token POST is a signed REST round-trip; the WS connect proves the socket.
-        // Subscription happens inside the manager (after the event listener attaches), so early
-        // pushed events are not missed.
-        let initial_token = acquire_user_listen_token(&rest_config, &rate_limiter).await?;
-        let initial_ws = connect_margin_ws(&ws_config).await.map_err(|e| {
-            UnindexedClientError::Connectivity(ConnectivityError::Socket(e.to_string()))
-        })?;
+        let cm_handle = if self.config.is_isolated {
+            // --- Isolated: separate multiplexed manager over the configured isolated_symbols ---
+            // The stream covers exactly `isolated_symbols` (the per-symbol token universe — Design
+            // decision #1); the trait's `instruments` argument does NOT drive the isolated token set.
+            let symbols = self.config.isolated_symbols.clone();
+            // All current Binance margin symbols are ≤22 bytes (within SmolStr's 23-byte inline
+            // limit); guard the implicit invariant so an over-long symbol is caught early.
+            debug_assert!(
+                symbols.iter().all(|i| i.name().len() <= 23),
+                "instrument name exceeds SmolStr inline capacity: {:?}",
+                symbols.iter().find(|i| i.name().len() > 23)
+            );
 
-        let cm_handle = tokio::spawn(margin_connection_manager(
-            tx,
-            dedup,
-            ws_config,
-            rest_config,
-            rest,
-            rate_limiter,
-            instruments,
-            Some((initial_ws, initial_token)),
-        ));
+            // (0) Build the invariant `instrument → (base, quote)` map from the isolated account
+            // info. Authoritative base/quote split for routing the symbol-less
+            // `outboundAccountPosition` frames (Design decision #5); built once, reused across
+            // reconnects (a pair's base/quote never change). A REST failure here is a hard Err
+            // before anything spawns.
+            let assets = fetch_isolated_margin_account_info(
+                rest.clone(),
+                rate_limiter.clone(),
+                symbols.clone(),
+            )
+            .await?;
+            let base_quote = Arc::new(build_base_quote_map(&assets));
+            for sym in &symbols {
+                if !base_quote.contains_key(sym) {
+                    warn!(
+                        symbol = %sym.name(),
+                        "BinanceMargin isolated: account info returned no base/quote for configured \
+                         symbol — its live per-pair balance frames will be dropped (fills/orders \
+                         unaffected; balances available via account_snapshot)"
+                    );
+                }
+            }
+
+            // (1) Acquire all N per-symbol tokens, (2) connect one socket, (3) subscribe all N —
+            // all before returning so connect-or-any-subscribe failure → Err (nothing spawned),
+            // preserving cross's "can't-start vs started-then-dropped" distinction.
+            let tokens = acquire_all_isolated_tokens(&rest_config, &rate_limiter, &symbols).await?;
+            let live =
+                isolated_connect_and_subscribe(&ws_config, &tx, &dedup, &base_quote, &tokens)
+                    .await
+                    .map_err(|e| {
+                        UnindexedClientError::Connectivity(ConnectivityError::Socket(e.to_string()))
+                    })?;
+
+            tokio::spawn(isolated_connection_manager(
+                tx,
+                dedup,
+                ws_config,
+                rest_config,
+                rest,
+                rate_limiter,
+                symbols,
+                base_quote,
+                Some(live),
+            ))
+        } else {
+            // --- Cross: the live-validated account-wide manager (TG17, unchanged) ---
+            let instruments = instruments.to_vec();
+            // All current Binance margin symbols are ≤22 bytes (within SmolStr's 23-byte inline
+            // limit), making clone() a stack memcpy with no heap allocation. Guard this implicit
+            // invariant so future symbols that exceed the limit are caught early.
+            debug_assert!(
+                instruments.iter().all(|i| i.name().len() <= 23),
+                "instrument name exceeds SmolStr inline capacity: {:?}",
+                instruments.iter().find(|i| i.name().len() > 23)
+            );
+
+            // Validate credentials + connectivity before returning the stream so the caller can
+            // distinguish "can't start at all" from "started then disconnected" (auto-reconnect
+            // handles the latter). The token POST is a signed REST round-trip; the WS connect proves
+            // the socket. Subscription happens inside the manager (after the event listener
+            // attaches), so early pushed events are not missed.
+            let initial_token =
+                acquire_user_listen_token(&rest_config, &rate_limiter, None).await?;
+            let initial_ws = connect_margin_ws(&ws_config).await.map_err(|e| {
+                UnindexedClientError::Connectivity(ConnectivityError::Socket(e.to_string()))
+            })?;
+
+            tokio::spawn(margin_connection_manager(
+                tx,
+                dedup,
+                ws_config,
+                rest_config,
+                rest,
+                rate_limiter,
+                instruments,
+                Some((initial_ws, initial_token)),
+            ))
+        };
 
         let rx_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
         let guarded_stream = AbortOnDropStream::new(rx_stream, cm_handle);
@@ -1141,6 +1207,26 @@ struct UserListenToken {
     expiration_time_ms: i64,
 }
 
+/// Build the query params for the `userListenToken` POST: empty for **cross**, or
+/// `isIsolated=TRUE&symbol=SYM` for **isolated** (a per-symbol token). Factored out so the
+/// cross-vs-isolated param shape is unit-testable without a network round-trip.
+fn build_listen_token_query(
+    symbol: Option<&InstrumentNameExchange>,
+) -> BTreeMap<String, serde_json::Value> {
+    let mut query = BTreeMap::new();
+    if let Some(sym) = symbol {
+        query.insert(
+            "isIsolated".to_string(),
+            serde_json::Value::String("TRUE".to_string()),
+        );
+        query.insert(
+            "symbol".to_string(),
+            serde_json::Value::String(sym.name().to_string()),
+        );
+    }
+    query
+}
+
 /// Wire shape of the `POST /sapi/v1/userListenToken` response.
 #[derive(Deserialize)]
 struct UserListenTokenResponse {
@@ -1151,11 +1237,14 @@ struct UserListenTokenResponse {
     expiration_time: i64,
 }
 
-/// Acquire a cross-margin `userListenToken` via the SDK's generic signed sender.
+/// Acquire a `userListenToken` via the SDK's generic signed sender.
 ///
 /// The endpoint is unbound in the SDK, so this reuses `common::utils::send_request` (signing,
 /// timestamp, `X-MBX-APIKEY`, and the SDK's reqwest client) against the production REST config.
-/// Cross margin sends no params (`isIsolated`/`symbol` omitted).
+/// `symbol` selects the scope:
+/// - `None` → **cross** margin (account-wide), no `isIsolated`/`symbol` params;
+/// - `Some(sym)` → **isolated** margin, scoped to that pair (`isIsolated=TRUE&symbol=SYM`). Each
+///   isolated symbol gets its own per-symbol token (the isolated stream multiplexes N of them).
 ///
 /// Routed through [`rest_call_with_retry`] so a transient rate-limit during a *planned* token
 /// renewal retries in place rather than collapsing the stream into the full reconnect+backoff
@@ -1164,16 +1253,21 @@ struct UserListenTokenResponse {
 async fn acquire_user_listen_token(
     rest_config: &Arc<ConfigurationRestApi>,
     rate_limiter: &RateLimitTracker,
+    symbol: Option<&InstrumentNameExchange>,
 ) -> Result<UserListenToken, UnindexedClientError> {
+    // Cross sends no params; isolated scopes the token to one symbol. Built once and cloned per
+    // retry attempt (the closure runs per attempt; mirrors `fetch_isolated_margin_account_info`).
+    let query = build_listen_token_query(symbol);
     let response = rest_call_with_retry(rest_config, rate_limiter, |cfg| {
+        let query = query.clone();
         Box::pin(async move {
             binance_sdk::common::utils::send_request::<UserListenTokenResponse>(
                 &cfg,
                 "/sapi/v1/userListenToken",
                 reqwest::Method::POST,
-                // `send_request` takes owned query + body maps; cross margin sends no params, so
-                // both are empty. The allocations are SDK-signature-forced and run once per attempt.
-                BTreeMap::new(),
+                // `send_request` takes owned query + body maps; params (if any) ride the query
+                // string the signature is computed over, the body stays empty.
+                query,
                 BTreeMap::new(),
                 None,
                 true, // is_signed — token is auth-bearing; HMAC/timestamp/api-key by send_request
@@ -1265,6 +1359,75 @@ async fn subscribe_listen_token(ws: &Arc<WsApiBase>, token: &str) -> anyhow::Res
     Ok(())
 }
 
+/// Subscribe over an existing WS-API connection and return the ack's `subscriptionId` (isolated).
+///
+/// Identical wire frame to [`subscribe_listen_token`] (unsigned, token-as-auth) but deserializes the
+/// ack's `result.subscriptionId` so the isolated manager can build the `subscriptionId → symbol`
+/// routing map (the symbol-less `outboundAccountPosition` frames carry only this id — Design
+/// decision #5). Returns:
+/// - `Ok(Some(id))` — subscribed; the id correlates this symbol's pushed balance frames;
+/// - `Ok(None)` — subscribed, but the ack carried no `subscriptionId` (per-instrument balance
+///   routing for this pair is then unavailable: its `outboundAccountPosition` frames drop with a
+///   `warn!` and the consumer falls back to snapshot-polled balances — fills/orders are unaffected,
+///   they self-identify by inner `s`). This is the documented first-prod-run degradation path.
+/// - `Err(..)` — the subscribe itself failed (a startup/reconnect error, surfaced by the caller).
+async fn subscribe_listen_token_capture(
+    ws: &Arc<WsApiBase>,
+    token: &str,
+) -> anyhow::Result<Option<i64>> {
+    /// Ack `result` shape — `subscriptionId` is read defensively as an `Option` (its presence on the
+    /// `.listenToken` ack is the one assumption no offline source closes; absent → `Ok(None)`).
+    #[derive(Deserialize)]
+    struct SubscribeAck {
+        #[serde(rename = "subscriptionId", default)]
+        subscription_id: Option<i64>,
+    }
+
+    let mut payload = BTreeMap::new();
+    payload.insert(
+        "listenToken".to_string(),
+        serde_json::Value::String(token.to_string()),
+    );
+    let result = ws
+        .send_message::<SubscribeAck>(
+            "userDataStream.subscribe.listenToken",
+            payload,
+            WebsocketMessageSendOptions::new(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("userDataStream.subscribe.listenToken failed: {e}"))?;
+    let ack = match result {
+        SendWebsocketMessageResult::Single(resp) => resp.data()?,
+        // The subscribe is a single request; defensively take the first if the SDK ever batches.
+        SendWebsocketMessageResult::Multiple(responses) => responses
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("empty subscribe ack"))?
+            .data()?,
+    };
+    Ok(ack.subscription_id)
+}
+
+/// Cross-margin balance-arm handler: convert an `outboundAccountPosition` into asset-keyed
+/// `BalanceStreamUpdate`s (the `subscriptionId` is unused — cross is account-wide). This is the
+/// `handle_position` passed to [`convert_margin_user_data_events_with`] / the cross manager.
+fn cross_account_position_handler(
+    position: Outboundaccountposition,
+    _subscription_id: Option<i64>,
+    buf: &mut Vec<UnindexedAccountEvent>,
+) {
+    convert_margin_account_position(position, buf);
+}
+
+/// Cross-margin convenience wrapper over [`convert_margin_user_data_events_with`] using
+/// [`cross_account_position_handler`] (account-wide `BalanceStreamUpdate`s). Test-only: the cross
+/// manager calls the listener helper with the handler directly, but the converter unit tests exercise
+/// frame discrimination through this two-arg form (they do not route balances per-instrument).
+#[cfg(test)]
+fn convert_margin_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -> bool {
+    convert_margin_user_data_events_with(frame, buf, &mut cross_account_position_handler)
+}
+
 /// Frame discrimination for the WS-API user-data delivery (Phase 0 finding).
 ///
 /// Each text frame is either an RPC response (`{ "id", "status", "result", … }` — e.g. the
@@ -1272,19 +1435,36 @@ async fn subscribe_listen_token(ws: &Arc<WsApiBase>, token: &str) -> anyhow::Res
 /// Returns `true` if the exchange signalled stream termination (a reconnect trigger). Unknown frames
 /// are ignored. Deserialization of a known event type is defensive: a mismatch is logged and the
 /// event dropped (observable), never silently mis-parsed.
-fn convert_margin_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -> bool {
+///
+/// The `outboundAccountPosition` (balance) arm is delegated to `handle_position` — the **only** arm
+/// that differs between cross (account-wide `BalanceStreamUpdate`) and isolated (per-instrument
+/// `InstrumentBalanceUpdate`, routed via the frame's `subscriptionId`). Everything else
+/// (`executionReport` routing by inner `s`, the observable-only margin events, termination
+/// signalling) is single-sourced here.
+fn convert_margin_user_data_events_with(
+    frame: &str,
+    buf: &mut Vec<UnindexedAccountEvent>,
+    handle_position: &mut impl FnMut(
+        Outboundaccountposition,
+        Option<i64>,
+        &mut Vec<UnindexedAccountEvent>,
+    ),
+) -> bool {
     use serde_json::value::RawValue;
 
     // Borrowed envelope — avoids building a full `serde_json::Value` DOM for every inbound frame
     // (hot path). RPC responses (subscribe ack, errors) carry a top-level `id`; pushed user-data
     // events are wrapped as `{ subscriptionId, event: { e, .. } }`. The inner `event` is kept as an
-    // un-parsed raw slice so only the matched branch below pays for a single typed pass.
+    // un-parsed raw slice so only the matched branch below pays for a single typed pass. The
+    // `subscriptionId` (present on pushed frames) is recovered as a plain int for isolated routing.
     #[derive(Deserialize)]
     struct Envelope<'a> {
         #[serde(borrow, default)]
         id: Option<&'a RawValue>,
         #[serde(borrow, default)]
         event: Option<&'a RawValue>,
+        #[serde(rename = "subscriptionId", default)]
+        subscription_id: Option<i64>,
     }
     // Discriminator-only view of the inner event: reads `e` without materialising the payload.
     #[derive(Deserialize)]
@@ -1309,6 +1489,7 @@ fn convert_margin_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEv
         trace!("BinanceMargin WS: ignoring frame without `event` or `id`");
         return false;
     };
+    let subscription_id = envelope.subscription_id;
     let event_raw = event.get();
     let event_type = serde_json::from_str::<EventTag<'_>>(event_raw)
         .ok()
@@ -1332,7 +1513,8 @@ fn convert_margin_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEv
         }
         "outboundAccountPosition" => {
             match serde_json::from_str::<Outboundaccountposition>(event_raw) {
-                Ok(position) => convert_margin_account_position(position, buf),
+                // Balance arm is the one cross/isolated divergence — delegate to the handler.
+                Ok(position) => handle_position(position, subscription_id, buf),
                 Err(e) => {
                     warn!(error = %e, "BinanceMargin: undeserializable outboundAccountPosition, dropping")
                 }
@@ -1732,6 +1914,197 @@ fn convert_margin_account_position(
     }
 }
 
+/// Route an isolated `outboundAccountPosition` frame to an [`InstrumentBalanceUpdate`] (Tier B).
+///
+/// The frame carries no symbol inline, so the pair is recovered from `subscription_id` via
+/// `sub_map` (populated from the per-symbol subscribe acks). The flat `b[]` asset list is then
+/// split into `base`/`quote` by **asset-name equality** against the pair's known `(base, quote)`
+/// from `base_quote` (the authoritative startup map — never string-matched against the symbol).
+/// Emits one `InstrumentBalanceUpdate` carrying both sides' free/locked. Dropped with a `warn!`
+/// (observable, never mis-applied) when: the `subscriptionId` is missing/unmapped; the pair's
+/// base/quote is unknown; or either side is absent/unparseable in the frame. The engine does not
+/// store this variant (`_ => None` wildcard); the wrapper consumes it off the account-event feed.
+fn route_isolated_account_position(
+    position: Outboundaccountposition,
+    subscription_id: Option<i64>,
+    sub_map: &Mutex<HashMap<i64, InstrumentNameExchange>>,
+    base_quote: &HashMap<InstrumentNameExchange, (AssetNameExchange, AssetNameExchange)>,
+    buf: &mut Vec<UnindexedAccountEvent>,
+) {
+    let Some(sub_id) = subscription_id else {
+        warn!(
+            "BinanceMargin isolated: outboundAccountPosition without subscriptionId — dropping \
+             (per-instrument balance routing requires it)"
+        );
+        return;
+    };
+    let instrument = {
+        // Brief lock: the map is read-only after startup and only written by the subscribe loop on
+        // (re)connect. Recover from poisoning rather than killing balance routing.
+        let map = sub_map.lock().unwrap_or_else(|p| p.into_inner());
+        match map.get(&sub_id) {
+            Some(inst) => inst.clone(),
+            None => {
+                warn!(
+                    subscription_id = sub_id,
+                    "BinanceMargin isolated: outboundAccountPosition for unmapped subscriptionId — dropping"
+                );
+                return;
+            }
+        }
+    };
+    let Some((base_asset, quote_asset)) = base_quote.get(&instrument) else {
+        warn!(
+            instrument = %instrument.name(),
+            "BinanceMargin isolated: no base/quote known for instrument — dropping balance frame"
+        );
+        return;
+    };
+
+    let time_exchange = position
+        .u
+        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+        .unwrap_or_else(Utc::now);
+
+    let mut base_update: Option<AssetBalanceUpdate<AssetNameExchange>> = None;
+    let mut quote_update: Option<AssetBalanceUpdate<AssetNameExchange>> = None;
+    for b in position.b_uppercase.unwrap_or_default() {
+        let Some(asset) = b.a.as_deref() else {
+            warn!(instrument = %instrument.name(), "BinanceMargin isolated account position entry missing asset name");
+            continue;
+        };
+        // Only the pair's own base/quote are relevant; ignore any stray asset on the frame.
+        let side = if asset == base_asset.name().as_str() {
+            &mut base_update
+        } else if asset == quote_asset.name().as_str() {
+            &mut quote_update
+        } else {
+            continue;
+        };
+        let (Some(free), Some(locked)) = (
+            b.f.as_deref().and_then(|s| Decimal::from_str(s).ok()),
+            b.l.as_deref().and_then(|s| Decimal::from_str(s).ok()),
+        ) else {
+            warn!(%asset, instrument = %instrument.name(), "BinanceMargin isolated account position missing/unparseable free/locked");
+            continue;
+        };
+        *side = Some(AssetBalanceUpdate::new(
+            AssetNameExchange::new(asset),
+            BalanceUpdate::new(free, locked),
+            time_exchange,
+        ));
+    }
+
+    // InstrumentBalanceUpdate carries BOTH sides; a frame missing either is dropped rather than
+    // fabricating a zero side (which would silently report a wrong free/locked). A trade-driven
+    // outboundAccountPosition changes both base and quote together, so both are normally present.
+    let (Some(base), Some(quote)) = (base_update, quote_update) else {
+        warn!(
+            instrument = %instrument.name(),
+            "BinanceMargin isolated: outboundAccountPosition missing base or quote side — dropping (no partial InstrumentBalanceUpdate)"
+        );
+        return;
+    };
+    buf.push(UnindexedAccountEvent::new(
+        ExchangeId::BinanceMargin,
+        AccountEventKind::InstrumentBalanceUpdate(InstrumentBalanceUpdate::new(
+            instrument, base, quote,
+        )),
+    ));
+}
+
+/// Register the WS-API event-dispatch callback shared by both margin managers.
+///
+/// Single-sources the demux/dedup/dispatch + heartbeat + terminal-signal logic the cross and
+/// isolated managers both need; only the `outboundAccountPosition` (balance) arm differs and is
+/// supplied as `handle_position` (cross → account-wide `BalanceStreamUpdate` via
+/// [`cross_account_position_handler`]; isolated → per-instrument `InstrumentBalanceUpdate` via
+/// [`route_isolated_account_position`]). Returns the [`Subscription`] handle; the caller must
+/// `unsubscribe()` it on disconnect. `heartbeat_flag` is shared with the caller's monitor loop
+/// (set on every inbound frame/ping); `signal_tx` fires once on a terminal condition
+/// (consumer-drop, socket error/close, or exchange `eventStreamTerminated`).
+fn register_user_data_listener(
+    ws: &Arc<WsApiBase>,
+    tx: mpsc::UnboundedSender<UnindexedAccountEvent>,
+    dedup: SharedDedupCache,
+    heartbeat_flag: Arc<AtomicBool>,
+    signal_tx: oneshot::Sender<()>,
+    mut handle_position: impl FnMut(
+        Outboundaccountposition,
+        Option<i64>,
+        &mut Vec<UnindexedAccountEvent>,
+    ) + Send
+    + 'static,
+) -> Subscription {
+    let mut signal_tx_opt = Some(signal_tx);
+    let mut event_tx = Some(tx);
+    // 32 comfortably covers a typical account's outboundAccountPosition (one entry per asset) plus
+    // the execution events in a single message; an account with >32 assets reallocates once, after
+    // which the buffer is reused across messages via drain(..).
+    let mut event_buf = Vec::with_capacity(32);
+
+    // Safety — non-atomic Option::take() in the callback is safe: binance-sdk drives one spawned
+    // task per subscription, invoking the FnMut sequentially (verified =50.0.0; re-verify on SDK
+    // upgrade). Same contract spot relies on.
+    ws.common.events.subscribe(move |event| {
+        let Some(ref sender) = event_tx else { return };
+        match event {
+            WebsocketEvent::Message(json_str) => {
+                heartbeat_flag.store(true, Ordering::Release);
+                // Frame parsing (including skipping non-JSON frames) happens inside the converter,
+                // which parses borrowed slices rather than a full DOM (hot path).
+                let terminated = convert_margin_user_data_events_with(
+                    &json_str,
+                    &mut event_buf,
+                    &mut handle_position,
+                );
+                for ev in event_buf.drain(..) {
+                    if let Some(key) = dedup_key_from_event(&ev)
+                        && is_duplicate(&dedup, key)
+                    {
+                        trace!("BinanceMargin dedup: skipping duplicate event");
+                        continue;
+                    }
+                    if sender.send(ev).is_err() {
+                        warn!("BinanceMargin account_stream receiver dropped, suppressing sends");
+                        event_tx.take();
+                        if let Some(s) = signal_tx_opt.take() {
+                            let _ = s.send(());
+                        }
+                        return;
+                    }
+                }
+                if terminated {
+                    event_tx.take();
+                    if let Some(s) = signal_tx_opt.take() {
+                        let _ = s.send(());
+                    }
+                }
+            }
+            WebsocketEvent::Ping | WebsocketEvent::Pong => {
+                heartbeat_flag.store(true, Ordering::Release);
+            }
+            WebsocketEvent::Error(e) => {
+                warn!(%e, "BinanceMargin WebSocket error, will attempt reconnect");
+                event_tx.take();
+                if let Some(s) = signal_tx_opt.take() {
+                    let _ = s.send(());
+                }
+            }
+            WebsocketEvent::Close(code, reason) => {
+                warn!(code, %reason, "BinanceMargin WebSocket closed");
+                event_tx.take();
+                if let Some(s) = signal_tx_opt.take() {
+                    let _ = s.send(());
+                }
+            }
+            _ => {
+                trace!("BinanceMargin ignoring unhandled WebsocketEvent variant");
+            }
+        }
+    })
+}
+
 /// Recover fills missed during a disconnect via REST `myTrades`, routed through the dedup cache.
 ///
 /// Only TRADE fills are recovered — order-lifecycle events (NEW/CANCELED) require a
@@ -1829,9 +2202,11 @@ async fn recover_margin_fills(
 /// disconnect/heartbeat-timeout/token-expiry → backoff → fill recovery → reconnect. The `tx`
 /// channel persists across reconnections so the consumer sees a seamless stream. Terminates when
 /// the consumer drops the stream or max reconnect attempts are exhausted.
-// inherent reconnect-loop complexity (token + connect + subscribe + callback + recovery + monitor
-// + cleanup + backoff); mirrors spot's `connection_manager`, not worth splitting further.
-#[allow(clippy::cognitive_complexity)]
+#[allow(
+    clippy::cognitive_complexity,
+    reason = "inherent reconnect-loop complexity (token + connect + subscribe + callback + recovery \
+              + monitor + cleanup + backoff); mirrors spot's `connection_manager`, not worth splitting further"
+)]
 async fn margin_connection_manager(
     tx: mpsc::UnboundedSender<UnindexedAccountEvent>,
     dedup: SharedDedupCache,
@@ -1860,7 +2235,7 @@ async fn margin_connection_manager(
         // --- Token: reuse the verified/previous token, else acquire a fresh one ---
         let token = match current_token.take() {
             Some(t) => t,
-            None => match acquire_user_listen_token(&rest_config, &rate_limiter).await {
+            None => match acquire_user_listen_token(&rest_config, &rate_limiter, None).await {
                 Ok(t) => t,
                 Err(e) => {
                     error!(%e, "BinanceMargin userListenToken acquisition failed");
@@ -1891,75 +2266,18 @@ async fn margin_connection_manager(
 
         // --- Register the event listener BEFORE subscribing so no pushed event is missed ---
         let (signal_tx, signal_rx) = oneshot::channel::<()>();
-        let mut signal_tx_opt = Some(signal_tx);
         // start true — grant one full heartbeat window before requiring activity.
         let heartbeat_flag = Arc::new(AtomicBool::new(true));
-        let hb_callback = heartbeat_flag.clone();
-        let dedup_callback = dedup.clone();
-        let mut event_tx = Some(tx.clone());
-        // 32 comfortably covers a typical margin account's outboundAccountPosition (one entry per
-        // asset) plus the execution events in a single message; an account with >32 assets reallocates
-        // once, after which the buffer is reused across messages via drain(..).
-        let mut event_buf = Vec::with_capacity(32);
-
-        // Safety — non-atomic Option::take() in the callback is safe: binance-sdk drives one
-        // spawned task per subscription, invoking the FnMut sequentially (verified =50.0.0;
-        // re-verify on SDK upgrade). Same contract spot relies on.
-        let subscription = ws.common.events.subscribe(move |event| {
-            let Some(ref sender) = event_tx else { return };
-            match event {
-                WebsocketEvent::Message(json_str) => {
-                    hb_callback.store(true, Ordering::Release);
-                    // Frame parsing (including skipping non-JSON frames) happens inside the
-                    // converter, which parses borrowed slices rather than a full DOM (hot path).
-                    let terminated = convert_margin_user_data_events(&json_str, &mut event_buf);
-                    for ev in event_buf.drain(..) {
-                        if let Some(key) = dedup_key_from_event(&ev)
-                            && is_duplicate(&dedup_callback, key)
-                        {
-                            trace!("BinanceMargin dedup: skipping duplicate event");
-                            continue;
-                        }
-                        if sender.send(ev).is_err() {
-                            warn!(
-                                "BinanceMargin account_stream receiver dropped, suppressing sends"
-                            );
-                            event_tx.take();
-                            if let Some(s) = signal_tx_opt.take() {
-                                let _ = s.send(());
-                            }
-                            return;
-                        }
-                    }
-                    if terminated {
-                        event_tx.take();
-                        if let Some(s) = signal_tx_opt.take() {
-                            let _ = s.send(());
-                        }
-                    }
-                }
-                WebsocketEvent::Ping | WebsocketEvent::Pong => {
-                    hb_callback.store(true, Ordering::Release);
-                }
-                WebsocketEvent::Error(e) => {
-                    warn!(%e, "BinanceMargin WebSocket error, will attempt reconnect");
-                    event_tx.take();
-                    if let Some(s) = signal_tx_opt.take() {
-                        let _ = s.send(());
-                    }
-                }
-                WebsocketEvent::Close(code, reason) => {
-                    warn!(code, %reason, "BinanceMargin WebSocket closed");
-                    event_tx.take();
-                    if let Some(s) = signal_tx_opt.take() {
-                        let _ = s.send(());
-                    }
-                }
-                _ => {
-                    trace!("BinanceMargin ignoring unhandled WebsocketEvent variant");
-                }
-            }
-        });
+        // Cross is account-wide: balance frames become asset-keyed BalanceStreamUpdates (no
+        // per-instrument routing). The shared dispatch/dedup/heartbeat logic lives in the helper.
+        let subscription = register_user_data_listener(
+            &ws,
+            tx.clone(),
+            dedup.clone(),
+            heartbeat_flag.clone(),
+            signal_tx,
+            cross_account_position_handler,
+        );
 
         // --- Subscribe (token is the sole auth) ---
         if let Err(e) = subscribe_listen_token(&ws, &token.token).await {
@@ -2073,6 +2391,362 @@ async fn margin_connection_manager(
         // `current_token` and `current_ws` are already None, forcing a fresh token + connection.
         if !matches!(reason, DisconnectReason::TokenRefresh) && !backoff.wait().await {
             error!("BinanceMargin max reconnect attempts exhausted, stream terminating");
+            break;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Isolated user-data stream (separate multiplexed manager; cross untouched)
+// ---------------------------------------------------------------------------
+
+/// Extract the invariant `instrument → (base_asset, quote_asset)` map from an isolated
+/// account-info response.
+///
+/// The authoritative base/quote split for routing symbol-less `outboundAccountPosition` frames
+/// (Design decision #5 / [`route_isolated_account_position`]) — base/quote never change for a pair,
+/// so this is built once at stream start and reused across reconnects. Entries missing a symbol or
+/// either asset name are skipped (their balance frames then drop with a `warn!` at routing time).
+fn build_base_quote_map(
+    assets: &[QueryIsolatedMarginAccountInfoResponseAssetsInner],
+) -> HashMap<InstrumentNameExchange, (AssetNameExchange, AssetNameExchange)> {
+    let mut map = HashMap::with_capacity(assets.len());
+    for entry in assets {
+        let (Some(symbol), Some(base), Some(quote)) = (
+            entry.symbol.as_deref(),
+            entry.base_asset.as_deref().and_then(|b| b.asset.as_deref()),
+            entry
+                .quote_asset
+                .as_deref()
+                .and_then(|q| q.asset.as_deref()),
+        ) else {
+            warn!(
+                "BinanceMargin isolated: account-info entry missing symbol/base/quote asset — \
+                 skipping base/quote map entry"
+            );
+            continue;
+        };
+        map.insert(
+            InstrumentNameExchange::new(symbol),
+            (AssetNameExchange::new(base), AssetNameExchange::new(quote)),
+        );
+    }
+    map
+}
+
+/// Acquire one per-symbol isolated `userListenToken` for every configured symbol, bounded-concurrent.
+///
+/// Fans out at 8-wide (mirroring `recover_margin_fills`) through the shared rate-limit/backoff
+/// machinery — ~1s at the v1 N≤100 ceiling vs ~5–10s sequential (Design decision #5). Each token is
+/// a weight-1 signed POST; the bound stays well inside SAPI weight limits. Errors if any acquisition
+/// fails (the caller treats a partial set as a startup/reconnect failure).
+///
+/// Takes `&Arc<_>` rather than the file-wide `&RateLimitTracker` convention because each per-symbol
+/// `async move` future needs an owned `Arc` clone to share the tracker without borrowing from this
+/// frame across the concurrent `buffer_unordered` fan-out. Cloning the `Arc` (a refcount bump) is
+/// correct; cloning `RateLimitTracker` itself would be semantically wrong — each clone would get its
+/// own `blocked_until`, splitting the shared rate-limit state the fan-out is meant to respect.
+async fn acquire_all_isolated_tokens(
+    rest_config: &Arc<ConfigurationRestApi>,
+    rate_limiter: &Arc<RateLimitTracker>,
+    symbols: &[InstrumentNameExchange],
+) -> Result<Vec<(InstrumentNameExchange, UserListenToken)>, UnindexedClientError> {
+    use futures::{StreamExt as _, TryStreamExt as _};
+
+    futures::stream::iter(symbols.iter().cloned().map(|sym| {
+        let rest_config = rest_config.clone();
+        let rate_limiter = rate_limiter.clone();
+        async move {
+            let token = acquire_user_listen_token(&rest_config, &rate_limiter, Some(&sym)).await?;
+            Ok::<_, UnindexedClientError>((sym, token))
+        }
+    }))
+    .buffer_unordered(8)
+    .try_collect()
+    .await
+}
+
+/// Earliest `expirationTime` (epoch ms) across the per-symbol tokens — drives the planned-renewal
+/// deadline. The N tokens are acquired in a tight startup loop so their 24h expiries cluster;
+/// renewing on the earliest refreshes the whole set in one reconnect. Empty → `i64::MAX` (no token
+/// to expire; never happens for isolated, which always has ≥1 configured symbol).
+fn earliest_token_expiry_ms(tokens: &[(InstrumentNameExchange, UserListenToken)]) -> i64 {
+    tokens
+        .iter()
+        .map(|(_, t)| t.expiration_time_ms)
+        .min()
+        .unwrap_or(i64::MAX)
+}
+
+/// A live, subscribed isolated connection: the single multiplexed socket plus the per-connection
+/// lifecycle handles the manager's monitor loop needs.
+struct IsolatedLiveConn {
+    ws: Arc<WsApiBase>,
+    subscription: Subscription,
+    signal_rx: oneshot::Receiver<()>,
+    heartbeat_flag: Arc<AtomicBool>,
+    /// Earliest `expirationTime` across the N tokens — drives the planned-renewal deadline (the
+    /// tokens cluster, so renewing on the earliest refreshes the whole set in one reconnect).
+    earliest_expiry_ms: i64,
+}
+
+/// Connect one WS-API socket and subscribe all N per-symbol `userListenToken`s on it (multiplex).
+///
+/// Registers the shared dispatch listener (with the isolated per-instrument balance handler) BEFORE
+/// the first subscribe so no pushed event between the N acks is missed, then issues all N subscribes,
+/// capturing each ack's `subscriptionId` into the shared `subscriptionId → symbol` routing map. If
+/// **any** subscribe fails, the partially-subscribed socket is cleaned up and the error returned
+/// (startup → `Err` with nothing spawned; reconnect → retry with backoff). Reused by both the
+/// initial `account_stream` startup and the manager's reconnect path so connect+subscribe is
+/// single-sourced.
+async fn isolated_connect_and_subscribe(
+    ws_config: &ConfigurationWebsocketApi,
+    tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
+    dedup: &SharedDedupCache,
+    base_quote: &Arc<HashMap<InstrumentNameExchange, (AssetNameExchange, AssetNameExchange)>>,
+    tokens: &[(InstrumentNameExchange, UserListenToken)],
+) -> anyhow::Result<IsolatedLiveConn> {
+    let ws = connect_margin_ws(ws_config).await?;
+    // subscriptionId → symbol routing map: written here as each subscribe ack resolves, read by the
+    // dispatch callback on every `outboundAccountPosition`. Shared (Mutex) because the two run on
+    // different tasks (manager vs the SDK's per-subscription callback task); contention is negligible
+    // (writes only at (re)connect, reads only on balance frames).
+    // Sized to the token count up front — exactly one entry is inserted per subscribe ack below.
+    let sub_map = Arc::new(Mutex::new(
+        HashMap::<i64, InstrumentNameExchange>::with_capacity(tokens.len()),
+    ));
+    let (signal_tx, signal_rx) = oneshot::channel::<()>();
+    // start true — grant one full heartbeat window before requiring activity.
+    let heartbeat_flag = Arc::new(AtomicBool::new(true));
+
+    let handle_position = {
+        let sub_map = sub_map.clone();
+        let base_quote = base_quote.clone();
+        move |position, subscription_id, buf: &mut Vec<UnindexedAccountEvent>| {
+            route_isolated_account_position(position, subscription_id, &sub_map, &base_quote, buf);
+        }
+    };
+    // Register BEFORE subscribing so a pushed event arriving mid-fan-out is not missed.
+    let subscription = register_user_data_listener(
+        &ws,
+        tx.clone(),
+        dedup.clone(),
+        heartbeat_flag.clone(),
+        signal_tx,
+        handle_position,
+    );
+
+    let earliest_expiry_ms = earliest_token_expiry_ms(tokens);
+    for (sym, token) in tokens {
+        match subscribe_listen_token_capture(&ws, &token.token).await {
+            Ok(Some(id)) => {
+                sub_map
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(id, sym.clone());
+            }
+            Ok(None) => warn!(
+                symbol = %sym.name(),
+                "BinanceMargin isolated: subscribe ack carried no subscriptionId — live per-pair \
+                 balances unavailable for this symbol (fills/orders unaffected; balances via snapshot)"
+            ),
+            Err(e) => {
+                // Any subscribe failing voids the whole stream — clean up the partially-subscribed
+                // socket rather than leaking it, and surface the error to the caller.
+                warn!(%e, symbol = %sym.name(), "BinanceMargin isolated subscribe failed");
+                subscription.unsubscribe();
+                if let Err(de) = ws.disconnect().await {
+                    warn!(%de, "BinanceMargin isolated: disconnect after subscribe failure failed");
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(IsolatedLiveConn {
+        ws,
+        subscription,
+        signal_rx,
+        heartbeat_flag,
+        earliest_expiry_ms,
+    })
+}
+
+/// Long-running task driving the isolated `account_stream` lifecycle over one multiplexed socket.
+///
+/// Mirrors [`margin_connection_manager`] (the cross manager, left untouched) but for the N-symbol
+/// multiplex: reconnect re-acquires all N tokens + re-subscribes all N from the configured symbol
+/// set; renewal is a planned reconnect on the earliest token deadline (`DisconnectReason::TokenRefresh`,
+/// reusing cross's `token_renew_after`/`sleep_until` discipline — no make-before-break). One socket
+/// ⇒ one heartbeat, one reconnect loop, one backoff. The `base_quote` map is invariant and reused
+/// across reconnects (never rebuilt).
+#[allow(
+    clippy::cognitive_complexity,
+    reason = "inherent reconnect-loop complexity (tokens + connect + subscribe + monitor + cleanup \
+              + backoff); mirrors the cross manager, not worth splitting further"
+)]
+async fn isolated_connection_manager(
+    tx: mpsc::UnboundedSender<UnindexedAccountEvent>,
+    dedup: SharedDedupCache,
+    ws_config: ConfigurationWebsocketApi,
+    rest_config: Arc<ConfigurationRestApi>,
+    rest: Arc<RestApi>,
+    rate_limiter: Arc<RateLimitTracker>,
+    symbols: Vec<InstrumentNameExchange>,
+    base_quote: Arc<HashMap<InstrumentNameExchange, (AssetNameExchange, AssetNameExchange)>>,
+    initial: Option<IsolatedLiveConn>,
+) {
+    enum DisconnectReason {
+        Signal,
+        HeartbeatTimeout,
+        TokenRefresh,
+        ConsumerDropped,
+    }
+
+    let mut backoff = ExponentialBackoff::new();
+    let mut disconnect_time: Option<DateTime<Utc>> = None;
+    let mut current = initial;
+
+    loop {
+        // --- (Re)establish the live, subscribed connection ---
+        let IsolatedLiveConn {
+            ws,
+            subscription,
+            signal_rx,
+            heartbeat_flag,
+            earliest_expiry_ms,
+        } = match current.take() {
+            // Verified initial connection from account_stream — used as-is on the first pass.
+            Some(live) => live,
+            None => {
+                // Reconnect: re-acquire all N tokens (they cluster; a planned refresh re-acquires the
+                // whole set) then connect a fresh socket and re-subscribe all N.
+                let tokens = match acquire_all_isolated_tokens(
+                    &rest_config,
+                    &rate_limiter,
+                    &symbols,
+                )
+                .await
+                {
+                    Ok(t) => t,
+                    Err(e) => {
+                        error!(%e, "BinanceMargin isolated userListenToken acquisition failed");
+                        if !backoff.wait().await {
+                            error!("BinanceMargin isolated max reconnect attempts exhausted");
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                match isolated_connect_and_subscribe(&ws_config, &tx, &dedup, &base_quote, &tokens)
+                    .await
+                {
+                    Ok(live) => live,
+                    Err(e) => {
+                        error!(%e, "BinanceMargin isolated connect/subscribe failed");
+                        if !backoff.wait().await {
+                            error!("BinanceMargin isolated max reconnect attempts exhausted");
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            }
+        };
+
+        info!(
+            symbols = symbols.len(),
+            "BinanceMargin isolated account_stream connected and subscribed"
+        );
+        // Reaching a live, subscribed connection clears any prior failure count (see the cross
+        // manager) so only *consecutive* failures exhaust the reconnect budget.
+        backoff.reset();
+
+        // Absolute deadline (not a per-iteration relative sleep) so heartbeat ticks that `continue`
+        // the monitor loop don't keep restarting the renewal timer. Earliest token expiry drives it.
+        let token_deadline = tokio::time::Instant::now() + token_renew_after(earliest_expiry_ms);
+
+        // --- Fill recovery after a reconnect (isolated-scoped over the full symbol set) ---
+        if let Some(dt) = disconnect_time.take()
+            && tokio::time::timeout(
+                Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS),
+                // is_isolated = true: paginate_margin_my_trades must query isolated trades.
+                recover_margin_fills(&rest, &rate_limiter, &symbols, dt, &tx, &dedup, true),
+            )
+            .await
+            .is_err()
+        {
+            warn!(
+                timeout_secs = FILL_RECOVERY_TIMEOUT_SECS,
+                "BinanceMargin isolated fill recovery timed out — remaining instruments not queried"
+            );
+        }
+
+        // --- Monitor: disconnect signal, heartbeat timeout, token refresh, or consumer drop ---
+        // One socket regardless of N, so the conditions are identical to cross.
+        let reason = {
+            let mut signal_rx = signal_rx;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = tx.closed() => {
+                        debug!("BinanceMargin isolated consumer dropped, terminating");
+                        break DisconnectReason::ConsumerDropped;
+                    }
+                    _ = &mut signal_rx => {
+                        warn!("BinanceMargin isolated WS disconnected, will attempt reconnect");
+                        break DisconnectReason::Signal;
+                    }
+                    () = tokio::time::sleep_until(token_deadline) => {
+                        info!("BinanceMargin isolated userListenToken nearing expiry, renewing all");
+                        break DisconnectReason::TokenRefresh;
+                    }
+                    () = tokio::time::sleep(Duration::from_secs(HEARTBEAT_TIMEOUT_SECS)) => {
+                        if heartbeat_flag.swap(false, Ordering::AcqRel) {
+                            continue;
+                        }
+                        warn!("BinanceMargin isolated heartbeat timeout ({}s), will attempt reconnect", HEARTBEAT_TIMEOUT_SECS);
+                        break DisconnectReason::HeartbeatTimeout;
+                    }
+                }
+            }
+        };
+        let should_reconnect = !matches!(reason, DisconnectReason::ConsumerDropped);
+
+        if should_reconnect {
+            disconnect_time = Some(match reason {
+                DisconnectReason::HeartbeatTimeout => {
+                    Utc::now()
+                        - chrono::Duration::seconds(HEARTBEAT_TIMEOUT_SECS as i64)
+                        - chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS)
+                }
+                DisconnectReason::TokenRefresh => {
+                    // A rotation fully disconnects + reconnects (re-acquire N tokens + reconnect +
+                    // re-subscribe N). Look back far enough to bound that whole window so a fill
+                    // landing during the sub-second gap isn't missed; dedup absorbs the overlap.
+                    Utc::now()
+                        - chrono::Duration::seconds(CONNECT_TIMEOUT_SECS as i64)
+                        - chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS)
+                }
+                _ => Utc::now() - chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS),
+            });
+        }
+
+        // --- Cleanup ---
+        subscription.unsubscribe();
+        if let Err(e) = ws.disconnect().await {
+            warn!(%e, "BinanceMargin isolated failed to disconnect WebSocket");
+        }
+
+        if !should_reconnect || tx.is_closed() {
+            debug!("BinanceMargin isolated connection manager exiting");
+            break;
+        }
+
+        // A planned token refresh is not a failure — reconnect immediately (no backoff); `current`
+        // is already None, forcing fresh tokens + a fresh connection next iteration.
+        if !matches!(reason, DisconnectReason::TokenRefresh) && !backoff.wait().await {
+            error!("BinanceMargin isolated max reconnect attempts exhausted, stream terminating");
             break;
         }
     }
@@ -4028,5 +4702,232 @@ mod tests {
             is_duplicate(&cache, second),
             "second sighting is a duplicate"
         );
+    }
+
+    // -- Isolated user-data stream: token params, base/quote map, balance routing ---------------
+
+    /// Wrap an inner `event` in the WS-API push envelope with an explicit `subscriptionId` (the
+    /// isolated routing key for symbol-less `outboundAccountPosition` frames).
+    fn push_with_sub(subscription_id: i64, event: serde_json::Value) -> String {
+        serde_json::json!({ "subscriptionId": subscription_id, "event": event }).to_string()
+    }
+
+    /// Build the isolated balance handler (closes over the routing maps) for driving
+    /// `convert_margin_user_data_events_with` in tests.
+    fn isolated_handler(
+        sub_map: Arc<Mutex<HashMap<i64, InstrumentNameExchange>>>,
+        base_quote: Arc<HashMap<InstrumentNameExchange, (AssetNameExchange, AssetNameExchange)>>,
+    ) -> impl FnMut(Outboundaccountposition, Option<i64>, &mut Vec<UnindexedAccountEvent>) {
+        move |position, subscription_id, buf| {
+            route_isolated_account_position(position, subscription_id, &sub_map, &base_quote, buf);
+        }
+    }
+
+    fn btcusdt() -> InstrumentNameExchange {
+        InstrumentNameExchange::new("BTCUSDT")
+    }
+
+    fn token(expiration_time_ms: i64) -> UserListenToken {
+        UserListenToken {
+            token: "t".to_string(),
+            expiration_time_ms,
+        }
+    }
+
+    #[test]
+    fn listen_token_query_cross_vs_isolated() {
+        // Cross → no params (the signed POST sends an empty query, exactly as TG17).
+        assert!(build_listen_token_query(None).is_empty());
+
+        // Isolated → isIsolated=TRUE & symbol=<sym> (the per-symbol scoping).
+        let q = build_listen_token_query(Some(&btcusdt()));
+        assert_eq!(q.get("isIsolated").and_then(|v| v.as_str()), Some("TRUE"));
+        assert_eq!(q.get("symbol").and_then(|v| v.as_str()), Some("BTCUSDT"));
+        assert_eq!(q.len(), 2);
+    }
+
+    #[test]
+    fn earliest_token_expiry_picks_min() {
+        let tokens = vec![
+            (btcusdt(), token(3_000)),
+            (InstrumentNameExchange::new("ETHUSDT"), token(1_000)),
+            (InstrumentNameExchange::new("BNBUSDT"), token(2_000)),
+        ];
+        assert_eq!(earliest_token_expiry_ms(&tokens), 1_000);
+        // Empty set → sentinel (never happens for isolated, which always has ≥1 symbol).
+        assert_eq!(earliest_token_expiry_ms(&[]), i64::MAX);
+    }
+
+    #[test]
+    fn base_quote_map_extracts_base_and_quote() {
+        let entries = vec![
+            iso_entry(
+                "BTCUSDT",
+                iso_base("BTC", "0", "0", "0", "0"),
+                iso_quote("USDT", "0", "0", "0", "0"),
+                None,
+                None,
+                None,
+            ),
+            iso_entry(
+                "ETHBTC",
+                iso_base("ETH", "0", "0", "0", "0"),
+                iso_quote("BTC", "0", "0", "0", "0"),
+                None,
+                None,
+                None,
+            ),
+        ];
+        let map = build_base_quote_map(&entries);
+        assert_eq!(
+            map.get(&btcusdt())
+                .map(|(b, q)| (b.name().as_str(), q.name().as_str())),
+            Some(("BTC", "USDT"))
+        );
+        // ETHBTC: prefix/suffix string-matching would be ambiguous (BTC is the quote here, base
+        // elsewhere) — the authoritative map resolves it unambiguously to base=ETH, quote=BTC.
+        assert_eq!(
+            map.get(&InstrumentNameExchange::new("ETHBTC"))
+                .map(|(b, q)| (b.name().as_str(), q.name().as_str())),
+            Some(("ETH", "BTC"))
+        );
+    }
+
+    #[test]
+    fn isolated_outbound_position_routes_to_instrument_balance_update() {
+        let sub_map = Arc::new(Mutex::new(HashMap::from([(7_i64, btcusdt())])));
+        let base_quote = Arc::new(HashMap::from([(
+            btcusdt(),
+            (
+                AssetNameExchange::new("BTC"),
+                AssetNameExchange::new("USDT"),
+            ),
+        )]));
+        let mut handler = isolated_handler(sub_map, base_quote);
+
+        // Quote listed before base in `B` → assignment is by asset-name equality, not position.
+        let frame = push_with_sub(
+            7,
+            serde_json::json!({
+                "e": "outboundAccountPosition", "u": 1_700_000_000_000_i64,
+                "B": [
+                    { "a": "USDT", "f": "1000.0", "l": "50.0" },
+                    { "a": "BTC", "f": "0.5", "l": "0.1" },
+                ],
+            }),
+        );
+        let mut buf = Vec::new();
+        assert!(!convert_margin_user_data_events_with(
+            &frame,
+            &mut buf,
+            &mut handler
+        ));
+        assert_eq!(buf.len(), 1, "one InstrumentBalanceUpdate for the pair");
+        match &buf[0].kind {
+            AccountEventKind::InstrumentBalanceUpdate(ibu) => {
+                assert_eq!(ibu.instrument.name().as_str(), "BTCUSDT");
+                assert_eq!(ibu.base.asset.name().as_str(), "BTC");
+                assert_eq!(ibu.base.update.free, Decimal::new(5, 1));
+                assert_eq!(ibu.base.update.locked, Decimal::new(1, 1));
+                assert_eq!(ibu.quote.asset.name().as_str(), "USDT");
+                assert_eq!(ibu.quote.update.free, Decimal::from(1000));
+                assert_eq!(ibu.quote.update.locked, Decimal::from(50));
+            }
+            other => panic!("expected InstrumentBalanceUpdate, got {other:?}"),
+        }
+        // Crucially NOT the asset-keyed BalanceStreamUpdate (which would corrupt AssetStates).
+        assert!(!matches!(
+            buf[0].kind,
+            AccountEventKind::BalanceStreamUpdate(_)
+        ));
+    }
+
+    #[test]
+    fn isolated_outbound_position_unknown_subscription_dropped() {
+        // subscriptionId 99 is not in the map → dropped (observable warn), nothing emitted.
+        let sub_map = Arc::new(Mutex::new(HashMap::from([(7_i64, btcusdt())])));
+        let base_quote = Arc::new(HashMap::from([(
+            btcusdt(),
+            (
+                AssetNameExchange::new("BTC"),
+                AssetNameExchange::new("USDT"),
+            ),
+        )]));
+        let mut handler = isolated_handler(sub_map, base_quote);
+
+        let frame = push_with_sub(
+            99,
+            serde_json::json!({
+                "e": "outboundAccountPosition", "u": 1_700_000_000_000_i64,
+                "B": [{ "a": "BTC", "f": "1", "l": "0" }, { "a": "USDT", "f": "1", "l": "0" }],
+            }),
+        );
+        let mut buf = Vec::new();
+        assert!(!convert_margin_user_data_events_with(
+            &frame,
+            &mut buf,
+            &mut handler
+        ));
+        assert!(buf.is_empty(), "unmapped subscriptionId frame is dropped");
+    }
+
+    #[test]
+    fn isolated_outbound_position_missing_side_dropped() {
+        // Only the base side present → no partial InstrumentBalanceUpdate (would fabricate a zero
+        // quote, silently mis-reporting free/locked). Dropped with a warn instead.
+        let sub_map = Arc::new(Mutex::new(HashMap::from([(7_i64, btcusdt())])));
+        let base_quote = Arc::new(HashMap::from([(
+            btcusdt(),
+            (
+                AssetNameExchange::new("BTC"),
+                AssetNameExchange::new("USDT"),
+            ),
+        )]));
+        let mut handler = isolated_handler(sub_map, base_quote);
+
+        let frame = push_with_sub(
+            7,
+            serde_json::json!({
+                "e": "outboundAccountPosition", "u": 1_700_000_000_000_i64,
+                "B": [{ "a": "BTC", "f": "0.5", "l": "0" }],
+            }),
+        );
+        let mut buf = Vec::new();
+        assert!(!convert_margin_user_data_events_with(
+            &frame,
+            &mut buf,
+            &mut handler
+        ));
+        assert!(buf.is_empty(), "missing quote side → frame dropped");
+    }
+
+    #[test]
+    fn isolated_execution_report_routes_by_inner_symbol_independent_of_map() {
+        // Fills self-identify via inner `s` and route regardless of the subscriptionId map (which
+        // is empty here) — only balance frames need the map. Confirms fills are unaffected if the
+        // subscriptionId→symbol routing ever fails live.
+        let sub_map = Arc::new(Mutex::new(HashMap::<i64, InstrumentNameExchange>::new()));
+        let base_quote = Arc::new(HashMap::new());
+        let mut handler = isolated_handler(sub_map, base_quote);
+
+        let frame = push_with_sub(
+            42,
+            serde_json::json!({
+                "e": "executionReport", "s": "BTCUSDT", "S": "BUY", "o": "LIMIT",
+                "x": "TRADE", "X": "FILLED", "i": 1_i64, "c": "cid", "t": 5_i64,
+                "l": "1", "L": "100", "z": "1", "n": "0", "N": "USDT", "T": 1_700_000_000_000_i64,
+            }),
+        );
+        let mut buf = Vec::new();
+        assert!(!convert_margin_user_data_events_with(
+            &frame,
+            &mut buf,
+            &mut handler
+        ));
+        assert_eq!(buf.len(), 1);
+        match &buf[0].kind {
+            AccountEventKind::Trade(t) => assert_eq!(t.instrument.name().as_str(), "BTCUSDT"),
+            other => panic!("expected Trade, got {other:?}"),
+        }
     }
 }
