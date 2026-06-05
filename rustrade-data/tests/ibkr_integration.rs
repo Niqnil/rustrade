@@ -905,15 +905,67 @@ async fn test_contract_resolution() {
 // Note: These are calculator functions, not data fetches. They don't require
 // OPRA subscription — they compute Greeks from user-provided inputs.
 
-/// Create an AAPL call option contract for testing.
+/// AAPL underlying contract ID on IBKR.
 ///
-/// Uses a near-the-money strike with an expiration ~30 days out.
-/// Adjust expiration date to a valid future date when running tests.
-fn aapl_call_option() -> Contract {
-    // Note: Update expiration date to a valid future date before running
+/// This is a stable identifier — the same value is used as the canonical AAPL
+/// conId throughout `exchange::ibkr::options`. `reqSecDefOptParams` (option
+/// chain) and contract qualification require a real underlying conId; passing
+/// `0` is rejected by IBKR with `[321] Invalid contract id`.
+const AAPL_UNDERLYING_CONID: i32 = 265598;
+
+/// Resolve a currently-listed, near-the-money AAPL call option from the live
+/// option chain.
+///
+/// The previous helper hardcoded an expiration date that had to be hand-edited
+/// before every run; once it lapsed, IBKR rejected the contract with
+/// `[200] No security definition has been found`. Deriving the expiration and
+/// strike from the live chain keeps the option-calculator tests valid over time
+/// with no manual upkeep, and only uses values IBKR itself reports as listed.
+async fn resolve_aapl_call_option(client: &IbkrHistoricalData) -> Contract {
+    use chrono::{Datelike, Duration as ChronoDuration, Utc};
+    use rust_decimal::prelude::ToPrimitive;
+
+    // `fut_fop_exchange` must be empty to get every exchange's parameters; a
+    // routing exchange like "SMART" filters the result to zero rows.
+    let chains = client
+        .fetch_option_chain("AAPL", "", SecurityType::Stock, AAPL_UNDERLYING_CONID)
+        .await
+        .expect("fetch AAPL option chain to resolve a valid option contract");
+
+    // Prefer the standard SMART "AAPL" trading class (densest, most reliable
+    // strike/expiration coverage); fall back to any returned chain.
+    let chain = chains
+        .iter()
+        .find(|c| c.exchange == "SMART" && c.trading_class == "AAPL")
+        .or_else(|| chains.first())
+        .expect("at least one AAPL option chain entry");
+
+    // Earliest expiration at least ~2 weeks out: avoids about-to-expire
+    // contracts while staying on a standard, well-populated series.
+    let cutoff = Utc::now().date_naive() + ChronoDuration::days(14);
+    let expiration = chain
+        .expirations
+        .iter()
+        .filter(|d| **d > cutoff)
+        .min()
+        .copied()
+        .expect("a future AAPL option expiration in the chain");
+
+    // Median strike ≈ at-the-money and is guaranteed to be a listed strike for
+    // this series, so the (expiration, strike) pair resolves to a real contract.
+    let mut strikes = chain.strikes.clone();
+    strikes.sort();
+    let strike = strikes[strikes.len() / 2]
+        .to_f64()
+        .expect("strike Decimal converts to f64");
+
     Contract::call("AAPL")
-        .strike(200.0)
-        .expires_on(2027, 6, 18) // Third Friday of June 2027
+        .strike(strike)
+        .expires_on(
+            expiration.year() as u16,
+            expiration.month() as u8,
+            expiration.day() as u8,
+        )
         .build()
 }
 
@@ -928,15 +980,18 @@ async fn test_calculate_theoretical_greeks() {
 
     let client = IbkrHistoricalData::connect(&url, client_id).expect("connection failed");
 
-    let option = aapl_call_option();
+    let option = resolve_aapl_call_option(&client).await;
+    // Price the option at-the-money (underlying == strike) so the inputs are
+    // internally consistent regardless of where AAPL is trading at run time.
+    let underlying_price = option.strike;
 
     println!("Calculating theoretical Greeks for AAPL call option...");
     println!("  Strike: {}", option.strike);
     println!("  Using volatility: 25% (0.25)");
-    println!("  Using underlying price: $200.00");
+    println!("  Using underlying price: ${underlying_price:.2}");
 
     let greeks = client
-        .calculate_theoretical_greeks(&option, 0.25, 200.0)
+        .calculate_theoretical_greeks(&option, 0.25, underlying_price)
         .await;
 
     match greeks {
@@ -979,15 +1034,20 @@ async fn test_calculate_implied_volatility() {
 
     let client = IbkrHistoricalData::connect(&url, client_id).expect("connection failed");
 
-    let option = aapl_call_option();
+    let option = resolve_aapl_call_option(&client).await;
+    // At-the-money (underlying == strike): intrinsic value is zero, so any
+    // positive option price yields a well-defined implied volatility. ~5% of
+    // the strike is a realistic ATM premium for a near-term option.
+    let underlying_price = option.strike;
+    let option_price = option.strike * 0.05;
 
     println!("Calculating implied volatility for AAPL call option...");
     println!("  Strike: {}", option.strike);
-    println!("  Using option price: $10.00");
-    println!("  Using underlying price: $200.00");
+    println!("  Using option price: ${option_price:.2}");
+    println!("  Using underlying price: ${underlying_price:.2}");
 
     let greeks = client
-        .calculate_implied_volatility(&option, 10.0, 200.0)
+        .calculate_implied_volatility(&option, option_price, underlying_price)
         .await;
 
     match greeks {
@@ -1019,8 +1079,12 @@ async fn test_fetch_option_chain() {
 
     println!("Fetching option chain for AAPL...");
 
+    // IBKR's `reqSecDefOptParams` requires a real underlying conId (`0` is
+    // rejected with `[321] Invalid contract id`) and an empty `fut_fop_exchange`
+    // to return every exchange's parameters (a routing exchange like "SMART"
+    // filters the result to zero rows).
     let chains = client
-        .fetch_option_chain("AAPL", "SMART", SecurityType::Stock, 0)
+        .fetch_option_chain("AAPL", "", SecurityType::Stock, AAPL_UNDERLYING_CONID)
         .await;
 
     match chains {
@@ -1076,7 +1140,13 @@ async fn test_option_greeks_stream() {
         client_id: test_client_id_base() + 33,
     };
 
-    let option = aapl_call_option();
+    // Resolve a currently-listed option via a short-lived historical client
+    // (distinct client_id) before opening the streaming connection.
+    let url = format!("127.0.0.1:{}", test_port());
+    let resolver =
+        IbkrHistoricalData::connect(&url, test_client_id_base() + 34).expect("connection failed");
+    let option = resolve_aapl_call_option(&resolver).await;
+    resolver.disconnect();
 
     let registry = ContractRegistry::new();
     registry.register("AAPL_CALL".into(), option);

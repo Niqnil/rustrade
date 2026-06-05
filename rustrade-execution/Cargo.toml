@@ -103,7 +103,7 @@ lru = { workspace = true, optional = true }         # Event deduplication cache 
 parking_lot = { workspace = true, optional = true } # Lighter mutex for dedup cache (no poisoning, no OS thread park)
 
 # IBKR (optional, behind "ibkr" feature)
-ibapi = { version = "=2.12.0", optional = true, default-features = false, features = [
+ibapi = { version = "=3.0.1", optional = true, default-features = false, features = [
     "sync",
 ] }
 chrono-tz = { workspace = true, optional = true }

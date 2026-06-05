@@ -66,7 +66,7 @@ use ibapi::{
     client::blocking::Client,
     contracts::{Contract, SecurityType},
     market_data::{
-        TradingHours,
+        IgnoreSize, TradingHours,
         historical::{BarSize, Duration, TickBidAsk, TickLast, WhatToShow},
     },
 };
@@ -180,6 +180,10 @@ impl IbkrHistoricalData {
     /// - IB rate-limits historical data requests (pacing violations)
     /// - Some data requires paid market data subscriptions
     /// - Volume and trade count are only available for `WhatToShow::Trades`
+    /// - For daily/weekly/monthly bar sizes, IB returns a calendar date with no
+    ///   time component, so each candle's `close_time` is anchored to `00:00:00`
+    ///   UTC of that date — it does **not** represent the exchange session close.
+    ///   Intraday bar sizes carry a full timestamp and are unaffected.
     pub async fn fetch_candles(
         &self,
         request: HistoricalRequest,
@@ -201,15 +205,19 @@ impl IbkrHistoricalData {
                 TradingHours::Extended
             };
 
-            let historical_data = client
-                .historical_data(
-                    &request.contract,
-                    request.end_date,
-                    request.duration,
-                    request.bar_size,
-                    request.what_to_show,
-                    trading_hours,
-                )
+            // ibapi 3.x: historical bars are requested via a builder. `ending` is
+            // optional — omitting it anchors the window at the current time, matching
+            // the previous `end_date: None` behavior.
+            let mut builder = client
+                .historical_data(&request.contract, request.bar_size)
+                .what_to_show(request.what_to_show)
+                .duration(request.duration)
+                .trading_hours(trading_hours);
+            if let Some(end_date) = request.end_date {
+                builder = builder.ending(end_date);
+            }
+            let historical_data = builder
+                .fetch()
                 .map_err(|e| DataError::Socket(format!("historical data: {e}")))?;
 
             let mut candles = Vec::with_capacity(historical_data.bars.len());
@@ -260,6 +268,11 @@ impl IbkrHistoricalData {
     ///   identical `(timestamp, price, size)` may collide across batches.
     ///   IB timestamps have only 1-second resolution and IB provides no
     ///   native unique identifier.
+    /// - A mid-stream IB API error ends iteration silently: ibapi 3.0.1's
+    ///   `TickSubscription` stores the error internally but exposes no public
+    ///   accessor, so a shorter-than-requested result may indicate truncation
+    ///   rather than genuine end-of-data. Callers needing completeness
+    ///   guarantees should validate the returned count against expectations.
     pub async fn fetch_historical_ticks(
         &self,
         request: HistoricalTickRequest,
@@ -286,18 +299,27 @@ impl IbkrHistoricalData {
                 TradingHours::Extended
             };
 
-            let subscription = client
-                .historical_ticks_trade(
-                    &request.contract,
-                    request.start,
-                    request.end,
-                    request.number_of_ticks,
-                    trading_hours,
-                )
+            // ibapi 3.x: historical ticks use a builder; the tick type is selected
+            // by the terminal method (`.trade()` here). At least one of
+            // `starting`/`ending` is required (validated above).
+            let mut builder = client
+                .historical_ticks(&request.contract, request.number_of_ticks)
+                .trading_hours(trading_hours);
+            if let Some(start) = request.start {
+                builder = builder.starting(start);
+            }
+            if let Some(end) = request.end {
+                builder = builder.ending(end);
+            }
+            let subscription = builder
+                .trade()
                 .map_err(|e| DataError::Socket(format!("historical_ticks_trade: {e}")))?;
 
             let mut trades =
                 Vec::with_capacity(usize::try_from(request.number_of_ticks).unwrap_or(0));
+            // `TickSubscription` yields `T` directly and stops silently on a
+            // mid-stream error (no public error accessor in ibapi 3.0.1), so a
+            // short result may be truncation rather than end-of-data.
             for (seq, tick) in subscription.into_iter().enumerate() {
                 if let Some(trade) = tick_last_to_public_trade(&tick, seq) {
                     trades.push(trade);
@@ -342,6 +364,11 @@ impl IbkrHistoricalData {
     ///
     /// - Maximum 1000 ticks per request (IB limit)
     /// - For larger ranges, paginate using last tick's timestamp as new `start`
+    /// - A mid-stream IB API error ends iteration silently: ibapi 3.0.1's
+    ///   `TickSubscription` stores the error internally but exposes no public
+    ///   accessor, so a shorter-than-requested result may indicate truncation
+    ///   rather than genuine end-of-data. Callers needing completeness
+    ///   guarantees should validate the returned count against expectations.
     pub async fn fetch_historical_bid_ask(
         &self,
         request: HistoricalTickRequest,
@@ -370,19 +397,31 @@ impl IbkrHistoricalData {
                 TradingHours::Extended
             };
 
-            let subscription = client
-                .historical_ticks_bid_ask(
-                    &request.contract,
-                    request.start,
-                    request.end,
-                    request.number_of_ticks,
-                    trading_hours,
-                    ignore_size,
-                )
+            // ibapi 3.x: same builder as trades, with `.bid_ask(IgnoreSize)` as the
+            // terminal. At least one of `starting`/`ending` is required (validated above).
+            let mut builder = client
+                .historical_ticks(&request.contract, request.number_of_ticks)
+                .trading_hours(trading_hours);
+            if let Some(start) = request.start {
+                builder = builder.starting(start);
+            }
+            if let Some(end) = request.end {
+                builder = builder.ending(end);
+            }
+            let ignore_size = if ignore_size {
+                IgnoreSize::Yes
+            } else {
+                IgnoreSize::No
+            };
+            let subscription = builder
+                .bid_ask(ignore_size)
                 .map_err(|e| DataError::Socket(format!("historical_ticks_bid_ask: {e}")))?;
 
             let mut quotes =
                 Vec::with_capacity(usize::try_from(request.number_of_ticks).unwrap_or(0));
+            // `TickSubscription` yields `T` directly and stops silently on a
+            // mid-stream error (no public error accessor in ibapi 3.0.1), so a
+            // short result may be truncation rather than end-of-data.
             for tick in subscription {
                 if let Some(l1) = tick_bid_ask_to_order_book_l1(&tick) {
                     quotes.push(l1);
@@ -570,9 +609,13 @@ impl IbkrHistoricalData {
     /// # Arguments
     ///
     /// * `symbol` - Underlying symbol (e.g., "AAPL")
-    /// * `exchange` - Exchange to query (e.g., "SMART", "CBOE")
+    /// * `exchange` - `fut_fop_exchange` filter. Pass `""` for all exchanges
+    ///   (recommended); a routing exchange like "SMART" filters the result to
+    ///   zero rows.
     /// * `security_type` - Type of underlying (typically `SecurityType::Stock`)
-    /// * `contract_id` - IB contract ID of the underlying (0 to search by symbol)
+    /// * `contract_id` - IB contract ID of the underlying. Must be a valid
+    ///   conId; IBKR's `reqSecDefOptParams` rejects `0` with
+    ///   `[321] Invalid contract id`. Resolve it first via contract details.
     ///
     /// # Returns
     ///
@@ -587,7 +630,9 @@ impl IbkrHistoricalData {
     /// ```ignore
     /// let client = IbkrHistoricalData::connect("127.0.0.1:4002", 102)?;
     ///
-    /// let chains = client.fetch_option_chain("AAPL", "SMART", SecurityType::Stock, 0).await?;
+    /// // 265598 is AAPL's underlying conId; resolve via contract details for other symbols.
+    /// // Empty exchange returns every exchange's option parameters.
+    /// let chains = client.fetch_option_chain("AAPL", "", SecurityType::Stock, 265598).await?;
     /// for chain in chains {
     ///     println!("Exchange: {}, Expirations: {:?}", chain.exchange, chain.expirations);
     /// }
@@ -614,8 +659,11 @@ impl IbkrHistoricalData {
                 .option_chain(&symbol, &exchange, security_type, contract_id)
                 .map_err(|e| DataError::Socket(format!("option_chain: {e}")))?;
 
+            // ibapi 3.x: `iter_data()` yields `Result<OptionChain, Error>`, filtering
+            // subscription-level notices. Surface the first error to the caller.
             let mut entries = Vec::with_capacity(16);
-            for chain in subscription {
+            for chain in subscription.iter_data() {
+                let chain = chain.map_err(|e| DataError::Socket(format!("option_chain: {e}")))?;
                 entries.push(OptionChainEntry::from_ib(&chain));
             }
 
@@ -863,13 +911,21 @@ fn tick_bid_ask_to_order_book_l1(tick: &TickBidAsk) -> Option<OrderBookL1> {
 /// Returns `Err(DataError::Socket(...))` if any price/volume value cannot be
 /// converted to Decimal (e.g., NaN, Infinity from the IB API).
 fn bar_to_candle(bar: &ibapi::market_data::historical::Bar) -> Result<Candle, DataError> {
-    let close_time = DateTime::from_timestamp(bar.date.unix_timestamp(), bar.date.nanosecond())
-        .ok_or_else(|| {
-            DataError::Socket(format!(
-                "IB timestamp {} out of DateTime<Utc> range",
-                bar.date.unix_timestamp()
-            ))
-        })?;
+    use ibapi::market_data::historical::BarTimestamp;
+
+    // ibapi 3.0 models `Bar.date` as a `BarTimestamp` enum: daily/weekly/monthly
+    // bars carry a calendar `Date` (anchored here to midnight UTC), intraday bars
+    // a full `OffsetDateTime`. NOTE: for date-only bars `close_time` is therefore
+    // 00:00:00 UTC of the bar's date, NOT the exchange session close — consumers
+    // must not treat it as a session-close timestamp and should compare daily
+    // bars by date, not by the full timestamp.
+    let (secs, nanos) = match bar.date {
+        BarTimestamp::DateTime(dt) => (dt.unix_timestamp(), dt.nanosecond()),
+        BarTimestamp::Date(d) => (d.midnight().assume_utc().unix_timestamp(), 0),
+    };
+    let close_time = DateTime::from_timestamp(secs, nanos).ok_or_else(|| {
+        DataError::Socket(format!("IB timestamp {secs} out of DateTime<Utc> range"))
+    })?;
 
     let open =
         Decimal::try_from(bar.open).map_err(|e| DataError::Socket(format!("parse open: {e}")))?;
@@ -906,8 +962,9 @@ mod tests {
     fn bar_to_candle_converts_all_fields() {
         use rust_decimal_macros::dec;
 
+        let date = datetime!(2024-01-15 16:00 UTC);
         let bar = ibapi::market_data::historical::Bar {
-            date: datetime!(2024-01-15 16:00 UTC),
+            date: date.into(),
             open: 150.0,
             high: 155.0,
             low: 149.0,
@@ -930,13 +987,13 @@ mod tests {
         assert_eq!(candle.close_time.year(), 2024);
         assert_eq!(candle.close_time.month(), 1); // January = 1
         assert_eq!(candle.close_time.day(), 15);
-        assert_eq!(candle.close_time.timestamp(), bar.date.unix_timestamp());
+        assert_eq!(candle.close_time.timestamp(), date.unix_timestamp());
     }
 
     #[test]
     fn bar_to_candle_handles_negative_count() {
         let bar = ibapi::market_data::historical::Bar {
-            date: datetime!(2024-01-15 16:00 UTC),
+            date: datetime!(2024-01-15 16:00 UTC).into(),
             open: 100.0,
             high: 100.0,
             low: 100.0,

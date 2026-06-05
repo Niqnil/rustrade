@@ -6,7 +6,8 @@
 
 use crate::{books::Level, subscription::book::OrderBookL1};
 use chrono::{DateTime, Utc};
-use ibapi::market_data::realtime::{TickPrice, TickSize, TickType, TickTypes};
+use ibapi::contracts::tick_types::TickType;
+use ibapi::market_data::realtime::{TickPrice, TickSize, TickTypes};
 use rust_decimal::Decimal;
 
 use super::decimal_from_f64;

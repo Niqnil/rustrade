@@ -86,7 +86,7 @@ use crate::{
 };
 use account::BalanceAggregator;
 use chrono::{DateTime, Utc};
-use execution::{ExecutionBuffer, parse_decimal_or_warn, parse_ib_side};
+use execution::{ExecutionBuffer, parse_decimal_or_warn};
 use futures::stream::BoxStream;
 use ibapi::{
     accounts::{AccountSummaryResult, types::AccountGroup},
@@ -150,8 +150,8 @@ pub struct ContractConfig {
 }
 
 impl ContractConfig {
-    fn to_contract(&self) -> ibapi::contracts::Contract {
-        match self.security_type.as_str() {
+    fn to_contract(&self) -> Result<ibapi::contracts::Contract, contract::InvalidOptionRight> {
+        Ok(match self.security_type.as_str() {
             "STK" => contract::stock_contract(&self.symbol, &self.exchange, &self.currency),
             "FUT" => contract::futures_contract(
                 &self.symbol,
@@ -166,13 +166,13 @@ impl ContractConfig {
                 self.right.as_deref().unwrap_or("C"),
                 &self.exchange,
                 &self.currency,
-            ),
+            )?,
             "CASH" => contract::forex_contract(&self.symbol, &self.currency),
             other => {
                 warn!(security_type = %other, symbol = %self.symbol, "Unknown security_type, defaulting to STK");
                 contract::stock_contract(&self.symbol, &self.exchange, &self.currency)
             }
-        }
+        })
     }
 }
 
@@ -183,6 +183,149 @@ static ACCOUNT_GROUP_ALL: std::sync::LazyLock<AccountGroup> =
 /// Timeout for position stream iteration.
 /// Workaround for ibapi bug where `PositionEnd` isn't routed to subscription.
 const POSITION_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Maximum time to await an initial `OrderStatus` on an order-placement
+/// subscription before giving up. Bounds the placement loops so a silent TWS
+/// (e.g. a half-open socket) cannot hang them indefinitely. A timeout yields
+/// [`PlacementOutcome::NoStatus`]; the order may still have been submitted, so
+/// callers resolve the final state via the order-update/account stream.
+const PLACEMENT_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// IBKR "Order Message" codes that are informational rather than rejections.
+///
+/// ibapi classifies the whole `200..=399` range as order rejections
+/// (`ORDER_REJECTION_CODE_RANGE`), but IBKR uses code 399 as a generic order
+/// message — e.g. *"Your order will not be placed at the exchange until
+/// 09:30:00 US/Eastern"* — for an order that is in fact **accepted and held**
+/// (it proceeds to `PreSubmitted`). ibapi surfaces such codes as
+/// `Err(Error::Notice)` and terminates the subscription, so the eventual
+/// `OrderStatus(PreSubmitted)` is observable only via the order-update/account
+/// stream, never on the placement subscription itself. We therefore report the
+/// order as live-but-pending ([`PlacementOutcome::HeldPending`]) rather than
+/// rejected when one of these codes arrives.
+///
+/// This list documents the known gap between ibapi's range heuristic and IBKR's
+/// actual protocol semantics. If IBKR adds further informational codes in the
+/// 200-399 range, an out-of-RTH placement test will surface them and they can be
+/// added here.
+const INFORMATIONAL_ORDER_CODES: &[i32] = &[399];
+
+/// Outcome of awaiting the initial status on an order-placement subscription.
+///
+/// The authoritative acceptance/rejection signal in the IBKR protocol is the
+/// `OrderStatus` event, not an error notice — see [`await_order_placement`].
+///
+/// Every variant carries a distinct order-placement outcome that callers must
+/// dispatch on; dropping a value would silently discard the order's status.
+#[must_use]
+enum PlacementOutcome {
+    /// The order was acknowledged by IB and its order-id mapping must be
+    /// retained so the account stream can resolve its terminal/fill state. This
+    /// covers the working statuses (`Submitted`/`PreSubmitted`/`PendingSubmit`),
+    /// an immediate `Filled`, and the transitional cancel states
+    /// (`ApiCancelled`/`PendingCancel`) that precede a confirmed terminal status.
+    /// Carries the filled quantity reported with the status.
+    Accepted { filled: f64 },
+    /// A terminal rejection: a `Cancelled`/`Inactive` `OrderStatus`, a genuine
+    /// non-informational TWS notice, or a transport error. Carries the
+    /// human-readable reason.
+    Rejected(String),
+    /// An informational notice (see [`INFORMATIONAL_ORDER_CODES`]) closed the
+    /// subscription. The order is live/held; its authoritative status will
+    /// arrive via the order-update/account stream. Carries the notice text.
+    HeldPending(String),
+    /// The subscription ended — or [`PLACEMENT_STATUS_TIMEOUT`] elapsed —
+    /// without any terminal status or informational notice. The order may or
+    /// may not have been accepted; resolve via the order-update/account stream.
+    NoStatus,
+}
+
+/// Drive an order-placement subscription to its initial [`PlacementOutcome`].
+///
+/// Shared by the single-order and bracket-leg placement paths. Consumes events
+/// from a `place_order` subscription (typically `sub.timeout_iter_data(..)`)
+/// until a decisive outcome is reached.
+///
+/// # Why notices are not blanket rejections
+///
+/// ibapi 3.x delivers any TWS error frame outside the warning range
+/// (`2100..=2169`) as `Err(Error::Notice)` and then closes the subscription. IB
+/// emits informational order messages (e.g. code 399, order held until RTH) the
+/// same way, so treating every `Err` as a rejection would falsely reject orders
+/// that are actually live. We instead key off the notice code: known
+/// informational codes yield [`PlacementOutcome::HeldPending`]; all other
+/// notices and transport errors yield [`PlacementOutcome::Rejected`]. The
+/// `OrderStatus` event — when one is delivered before the closing notice —
+/// remains authoritative.
+fn await_order_placement<I>(events: I) -> PlacementOutcome
+where
+    I: IntoIterator<Item = Result<ibapi::orders::PlaceOrder, ibapi::Error>>,
+{
+    use ibapi::orders::PlaceOrder;
+
+    for event in events {
+        let event = match event {
+            Ok(event) => event,
+            // Informational order message (e.g. 399 held-until-RTH): the order
+            // is accepted; ibapi has closed the subscription, so stop here and
+            // let the update stream carry the real status.
+            Err(ibapi::Error::Notice(n)) if INFORMATIONAL_ORDER_CODES.contains(&n.code) => {
+                return PlacementOutcome::HeldPending(format!("[{}] {}", n.code, n.message));
+            }
+            // Genuine notice (e.g. 201 reject) or transport error.
+            Err(e) => return PlacementOutcome::Rejected(e.to_string()),
+        };
+
+        if let PlaceOrder::OrderStatus(status) = event {
+            use ibapi::orders::OrderStatusKind;
+            match status.status {
+                OrderStatusKind::Submitted
+                | OrderStatusKind::PreSubmitted
+                | OrderStatusKind::PendingSubmit
+                // A marketable order can fill before any working status is
+                // delivered on the placement subscription — ibapi 3.x sends
+                // `OrderStatus(Filled)` directly in that case. The order is
+                // live, not rejected; its authoritative terminal/fill state
+                // arrives via the account stream. Report it accepted so the
+                // order-id mapping is retained and the stream's
+                // executions/commissions are captured (treating it as a
+                // rejection would remove the mapping and drop those events).
+                | OrderStatusKind::Filled => {
+                    return PlacementOutcome::Accepted {
+                        filled: status.filled,
+                    };
+                }
+                OrderStatusKind::Cancelled | OrderStatusKind::Inactive => {
+                    return PlacementOutcome::Rejected(status.status.to_string());
+                }
+                // Transitional cancel states: a cancellation was already requested
+                // (e.g. a fast cancel racing the placement ack), but the order was
+                // submitted — we have a placement subscription — and is still live.
+                // `ApiCancelled` always precedes a confirmed `Cancelled`; both it
+                // and `PendingCancel` resolve to a terminal status on the account
+                // stream, which is authoritative. Report accepted so the order-id
+                // mapping is retained and the stream's terminal/execution/commission
+                // events are captured (treating these as a rejection would remove
+                // the mapping and drop those events).
+                OrderStatusKind::ApiCancelled | OrderStatusKind::PendingCancel => {
+                    return PlacementOutcome::Accepted {
+                        filled: status.filled,
+                    };
+                }
+                // Pre-transmission state: ibapi has not yet sent the order to IB
+                // (e.g. awaiting a security-definition lookup). This is not a
+                // placement decision — keep waiting for a definitive status. The
+                // `PLACEMENT_STATUS_TIMEOUT` backstop yields `NoStatus` if none
+                // arrives.
+                OrderStatusKind::ApiPending => {}
+            }
+        }
+        // Non-status events (OpenOrder, ExecutionData, CommissionReport): keep
+        // waiting for the OrderStatus.
+    }
+
+    PlacementOutcome::NoStatus
+}
 
 /// Interactive Brokers execution client.
 ///
@@ -231,7 +374,13 @@ impl IbkrClient {
         let contracts = ContractRegistry::new();
 
         for contract_config in &config.contracts {
-            let contract = contract_config.to_contract();
+            let contract = match contract_config.to_contract() {
+                Ok(contract) => contract,
+                Err(e) => {
+                    warn!(name = %contract_config.name, error = %e, "Invalid contract config, skipping");
+                    continue;
+                }
+            };
             let name = InstrumentNameExchange::from(contract_config.name.as_str());
 
             match client.contract_details(&contract) {
@@ -390,6 +539,14 @@ impl IbkrClient {
     /// If any leg is rejected by IB (e.g., insufficient margin, invalid price),
     /// this method cancels all other legs and returns all three as `Inactive`.
     /// You will never receive a mix of active and inactive legs.
+    ///
+    /// The same all-legs cancellation applies if any leg fails to report a
+    /// terminal status within the placement timeout (an unknown/no-status
+    /// outcome): leaving part of a bracket working while the rest is in an
+    /// unknown state is unsafe, so all three legs are cancelled and an error is
+    /// returned. This is intentionally stricter than single-order placement
+    /// (`open_order`), where a no-status outcome retains the order and defers
+    /// resolution to the account stream.
     ///
     /// # Cancellation Safety
     ///
@@ -559,8 +716,6 @@ impl IbkrClient {
         // Place all three orders in spawn_blocking
         let client = self.client.clone();
         let result = tokio::task::spawn_blocking(move || {
-            use ibapi::orders::PlaceOrder;
-
             // Place parent (transmit=false, held until SL is sent)
             let parent_sub = match client.place_order(parent_ib_id, &contract, &ib_orders[0]) {
                 Ok(s) => s,
@@ -588,74 +743,32 @@ impl IbkrClient {
                 }
             };
 
-            // Wait for first status from each subscription
-            let mut parent_status = None;
-            let mut tp_status = None;
-            let mut sl_status = None;
-
-            // Poll parent subscription
-            for event in parent_sub {
-                if let PlaceOrder::OrderStatus(status) = event {
-                    match status.status.as_str() {
-                        "Submitted" | "PreSubmitted" | "PendingSubmit" => {
-                            parent_status = Some(Ok(status.filled));
-                            break;
-                        }
-                        "Cancelled" | "Inactive" => {
-                            parent_status = Some(Err(status.status));
-                            break;
-                        }
-                        // Any other terminal status (e.g. "Filled", "ApiCancelled",
-                        // "PendingCancel") is treated as a rejection rather than
-                        // silently ignored — preserves observable failure semantics.
-                        other => {
-                            parent_status = Some(Err(format!("unexpected parent status: {other}")));
-                            break;
-                        }
-                    }
+            // Await the first status from each subscription. A leg held until
+            // RTH (informational notice, e.g. 399) is treated as live with an
+            // unknown fill (0.0) — the order is working, not rejected. `None`
+            // means the subscription closed/timed out without a terminal status.
+            let leg_status = |outcome: PlacementOutcome, leg: &str| match outcome {
+                PlacementOutcome::Accepted { filled } => Some(Ok(filled)),
+                PlacementOutcome::HeldPending(notice) => {
+                    warn!(leg, %notice, "bracket leg held/pending; tracking via stream");
+                    Some(Ok(0.0))
                 }
-            }
+                PlacementOutcome::Rejected(reason) => Some(Err(reason)),
+                PlacementOutcome::NoStatus => None,
+            };
 
-            // Poll TP subscription
-            for event in tp_sub {
-                if let PlaceOrder::OrderStatus(status) = event {
-                    match status.status.as_str() {
-                        "Submitted" | "PreSubmitted" | "PendingSubmit" => {
-                            tp_status = Some(Ok(status.filled));
-                            break;
-                        }
-                        "Cancelled" | "Inactive" => {
-                            tp_status = Some(Err(status.status));
-                            break;
-                        }
-                        other => {
-                            tp_status =
-                                Some(Err(format!("unexpected take_profit status: {other}")));
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Poll SL subscription
-            for event in sl_sub {
-                if let PlaceOrder::OrderStatus(status) = event {
-                    match status.status.as_str() {
-                        "Submitted" | "PreSubmitted" | "PendingSubmit" => {
-                            sl_status = Some(Ok(status.filled));
-                            break;
-                        }
-                        "Cancelled" | "Inactive" => {
-                            sl_status = Some(Err(status.status));
-                            break;
-                        }
-                        other => {
-                            sl_status = Some(Err(format!("unexpected stop_loss status: {other}")));
-                            break;
-                        }
-                    }
-                }
-            }
+            let parent_status = leg_status(
+                await_order_placement(parent_sub.timeout_iter_data(PLACEMENT_STATUS_TIMEOUT)),
+                "parent",
+            );
+            let tp_status = leg_status(
+                await_order_placement(tp_sub.timeout_iter_data(PLACEMENT_STATUS_TIMEOUT)),
+                "take_profit",
+            );
+            let sl_status = leg_status(
+                await_order_placement(sl_sub.timeout_iter_data(PLACEMENT_STATUS_TIMEOUT)),
+                "stop_loss",
+            );
 
             // Verify all three legs reported a successful status. A `None` here
             // means the subscription closed without producing a recognised event
@@ -923,10 +1036,21 @@ impl ExecutionClient for IbkrClient {
             let mut snapshots = Vec::new();
             let mut seen = HashSet::new();
 
-            // Use next_timeout() instead of blocking iterator to avoid hang.
-            // ibapi bug: PositionEnd has no request_id so it's not routed to the
-            // subscription, causing the iterator to block forever.
-            while let Some(pos_update) = positions_sub.next_timeout(POSITION_STREAM_TIMEOUT) {
+            // Use the timeout-bounded data iterator instead of the plain blocking
+            // iterator to avoid hang. ibapi bug: PositionEnd has no request_id so it
+            // is not routed to the subscription, causing iteration to block forever;
+            // the per-item timeout yields `None` to end the loop instead.
+            for pos_update in positions_sub.timeout_iter_data(POSITION_STREAM_TIMEOUT) {
+                // Surface subscription errors rather than returning partial positions
+                // (a truncated snapshot could be misread as positions having closed).
+                let pos_update = match pos_update {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return Err(UnindexedClientError::Internal(format!(
+                            "positions subscription: {e}"
+                        )));
+                    }
+                };
                 let PositionUpdate::Position(pos) = pos_update else {
                     trace!(?pos_update, "Ignoring non-Position variant");
                     continue;
@@ -1029,15 +1153,32 @@ impl ExecutionClient for IbkrClient {
                 // (ContractRegistry, OrderIdMap, etc.) remains usable. On panic the
                 // thread exits, tx is dropped, and the stream closes — caller observes EOF.
                 let result = catch_unwind(AssertUnwindSafe(|| {
-                    use ibapi::orders::OrderUpdate;
+                    use ibapi::orders::{OrderStatusKind, OrderUpdate};
 
-                    for update in order_sub {
+                    for update in order_sub.iter_data() {
+                        let update = match update {
+                            Ok(u) => u,
+                            Err(e) => {
+                                // Channel carries UnindexedAccountEvent, not Result —
+                                // cannot forward the error. Log and close the stream so
+                                // the caller observes EOF (consistent with the panic path).
+                                error!(error = %e, "Order stream subscription error");
+                                break;
+                            }
+                        };
                         let event = match update {
                             OrderUpdate::OrderStatus(status) => {
                                 let ib_id = status.order_id;
-                                // Use single-lock method for terminal status to avoid read+write
-                                let is_terminal =
-                                    matches!(status.status.as_str(), "Cancelled" | "Inactive");
+                                // Use single-lock method for terminal status to avoid read+write.
+                                // Only `Cancelled`/`Inactive` remove the mapping here: a `Filled`
+                                // order's mapping is intentionally retained so late-arriving
+                                // ExecutionData/CommissionReport events still resolve it (reaped
+                                // later by `OrderIdMap::clear_stale`), so this is deliberately
+                                // narrower than `OrderStatusKind::is_terminal()`.
+                                let is_terminal = matches!(
+                                    status.status,
+                                    OrderStatusKind::Cancelled | OrderStatusKind::Inactive
+                                );
 
                                 let lookup_result = if is_terminal {
                                     order_ids_clone.remove_and_get_context(ib_id)
@@ -1310,35 +1451,33 @@ impl ExecutionClient for IbkrClient {
         // Move both place_order AND subscription iteration into spawn_blocking
         // to avoid blocking Tokio worker threads on IB's synchronous iterator.
         let result = tokio::task::spawn_blocking(move || {
-            use ibapi::orders::PlaceOrder;
-
             let sub = match client.place_order(ib_order_id, &contract, &ib_order) {
                 Ok(s) => s,
                 Err(e) => return Err(e.to_string()),
             };
 
-            for event in sub {
-                if let PlaceOrder::OrderStatus(status) = event {
-                    match status.status.as_str() {
-                        "Submitted" | "PreSubmitted" | "PendingSubmit" => {
-                            let filled = parse_decimal_or_warn(status.filled, "status.filled");
-                            return Ok(Some((ib_order_id, filled)));
-                        }
-                        "Cancelled" | "Inactive" => {
-                            // Don't remove here - let outer match at line 726 handle cleanup
-                            // to centralize all error-path removals in one place
-                            return Err(status.status);
-                        }
-                        _ => continue,
-                    }
+            match await_order_placement(sub.timeout_iter_data(PLACEMENT_STATUS_TIMEOUT)) {
+                PlacementOutcome::Accepted { filled } => {
+                    let filled = parse_decimal_or_warn(filled, "status.filled");
+                    Ok(Some((ib_order_id, filled)))
                 }
+                // Cancelled/Inactive/unexpected status or a genuine notice/error.
+                // Don't remove the mapping here — the outer match centralizes all
+                // error-path removals.
+                PlacementOutcome::Rejected(reason) => Err(reason),
+                // Held until RTH (informational notice): the order is live; its
+                // authoritative status arrives via account_stream. Surface as
+                // "no terminal status yet" (Open with zero fill), same as below.
+                PlacementOutcome::HeldPending(notice) => {
+                    warn!(ib_order_id, %notice, "order held/pending; tracking via stream");
+                    Ok(None)
+                }
+                // Subscription exhausted/timed out without a terminal status.
+                // Do NOT remove the mapping — ExecutionData/CommissionReport may
+                // still arrive via account_stream; clear_stale_order_ids() handles
+                // stale mappings.
+                PlacementOutcome::NoStatus => Ok(None),
             }
-
-            // Subscription exhausted without terminal status.
-            // Do NOT remove mapping here - ExecutionData/CommissionReport may still
-            // arrive via account_stream. Time-based cleanup via clear_stale_order_ids()
-            // handles stale mappings.
-            Ok(None)
         })
         .await;
 
@@ -1441,7 +1580,10 @@ impl ExecutionClient for IbkrClient {
                 .map_err(|e| UnindexedClientError::Internal(format!("account_summary: {e}")))?;
 
             let mut aggregator = BalanceAggregator::new();
-            for summary in sub {
+            for summary in sub.iter_data() {
+                // Surface errors rather than returning a partial balance set.
+                let summary = summary
+                    .map_err(|e| UnindexedClientError::Internal(format!("account_summary: {e}")))?;
                 match summary {
                     AccountSummaryResult::Summary(s) => aggregator.process(&s),
                     AccountSummaryResult::End => break,
@@ -1493,7 +1635,11 @@ impl ExecutionClient for IbkrClient {
                 .map_err(|e| UnindexedClientError::Internal(format!("open_orders: {e}")))?;
 
             let mut orders = Vec::new();
-            for order_item in sub {
+            for order_item in sub.iter_data() {
+                // Surface errors rather than returning a partial open-order set,
+                // which the caller could misread during order reconciliation.
+                let order_item = order_item
+                    .map_err(|e| UnindexedClientError::Internal(format!("open_orders: {e}")))?;
                 let order_data = match order_item {
                     Orders::OrderData(data) => data,
                     _ => continue,
@@ -1592,7 +1738,7 @@ impl ExecutionClient for IbkrClient {
         };
 
         tokio::task::spawn_blocking(move || {
-            use ibapi::orders::Executions;
+            use ibapi::orders::{ExecutionSide, Executions};
 
             let exec_filter = ibapi::orders::ExecutionFilter::default();
             // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
@@ -1601,7 +1747,11 @@ impl ExecutionClient for IbkrClient {
                 .map_err(|e| UnindexedClientError::Internal(format!("executions: {e}")))?;
 
             let mut trades = Vec::new();
-            for exec_item in sub {
+            for exec_item in sub.iter_data() {
+                // Surface errors rather than returning a partial fill set, which the
+                // caller could misread during fill recovery.
+                let exec_item = exec_item
+                    .map_err(|e| UnindexedClientError::Internal(format!("executions: {e}")))?;
                 let exec_data = match exec_item {
                     Executions::ExecutionData(data) => data,
                     _ => continue,
@@ -1637,16 +1787,11 @@ impl ExecutionClient for IbkrClient {
                     continue;
                 }
 
-                let side = match parse_ib_side(&exec.side) {
-                    Some(s) => s,
-                    None => {
-                        warn!(
-                            side = %exec.side,
-                            exec_id = %exec.execution_id,
-                            "Unknown IB side string, skipping trade"
-                        );
-                        continue;
-                    }
+                // `ExecutionSide` is a closed two-variant enum in ibapi 3.x
+                // (the decoder rejects unknown wire values), so this is total.
+                let side = match exec.side {
+                    ExecutionSide::Bought => Side::Buy,
+                    ExecutionSide::Sold => Side::Sell,
                 };
 
                 let client_id = order_ids
@@ -1679,12 +1824,16 @@ impl ExecutionClient for IbkrClient {
 ///
 /// # IBKR Status Mapping
 ///
-/// | IB Status    | → OrderState          | Rationale                                    |
-/// |--------------|-----------------------|----------------------------------------------|
-/// | "Inactive"   | OpenFailed(Rejected)  | Order blocked by validation/margin/exchange  |
-/// | "Cancelled"  | Cancelled or Expired  | See differentiation logic below              |
-/// | "Filled"     | FullyFilled           | Order fully executed                         |
-/// | Other        | Active(Open)          | Order working on exchange                    |
+/// | `OrderStatusKind`                           | → OrderState         | Rationale                                   |
+/// |---------------------------------------------|----------------------|---------------------------------------------|
+/// | `Inactive`                                  | OpenFailed(Rejected) | Order blocked by validation/margin/exchange |
+/// | `Cancelled`                                 | Cancelled or Expired | See differentiation logic below             |
+/// | `Filled`                                    | FullyFilled          | Order fully executed                        |
+/// | `Submitted`/`PreSubmitted`/`PendingSubmit`  | Active(Open)         | Order working on exchange                   |
+/// | `ApiPending`/`PendingCancel`/`ApiCancelled` | Active(Open)         | Transitional; await a confirmed terminal    |
+///
+/// The match is exhaustive over `OrderStatusKind` (no wildcard), so a new ibapi
+/// status variant becomes a compile error rather than a silent `Active(Open)`.
 ///
 /// # Cancelled vs Expired Differentiation
 ///
@@ -1707,12 +1856,14 @@ fn make_order_from_status(
     pending_cancels: &PendingCancels,
 ) -> Order<ExchangeId, InstrumentNameExchange, OrderState<AssetNameExchange, InstrumentNameExchange>>
 {
+    use ibapi::orders::OrderStatusKind;
+
     let ib_id = status.order_id;
     let order_id = OrderId::new(format_smolstr!("{}", ib_id));
 
     let filled_qty = parse_decimal_or_warn(status.filled, "status.filled");
-    let state = match status.status.as_str() {
-        "Inactive" => {
+    let state = match status.status {
+        OrderStatusKind::Inactive => {
             // "Inactive" means the order was accepted by IB but is not working:
             // validation failure, margin issue, exchange closed, share location hold.
             // This is a placement failure, not a cancellation.
@@ -1720,7 +1871,7 @@ fn make_order_from_status(
                 "IB status: Inactive (order blocked by validation/margin/exchange)".into(),
             )))
         }
-        "Cancelled" => {
+        OrderStatusKind::Cancelled => {
             // Differentiate user-cancel from time-expiration
             let was_user_cancel = pending_cancels.remove(ib_id);
 
@@ -1735,9 +1886,23 @@ fn make_order_from_status(
                 OrderState::inactive(Cancelled::new(order_id, Utc::now(), filled_qty))
             }
         }
-        "Filled" => OrderState::fully_filled(Filled::new(order_id, Utc::now(), filled_qty, None)),
-        _ => {
-            // "Submitted", "PreSubmitted", "PendingSubmit", "PendingCancel", etc.
+        OrderStatusKind::Filled => {
+            OrderState::fully_filled(Filled::new(order_id, Utc::now(), filled_qty, None))
+        }
+        // Working states (Submitted/PreSubmitted/PendingSubmit) and the
+        // transitional ones (ApiPending/PendingCancel/ApiCancelled) are reported
+        // as active/Open until a confirmed Cancelled/Inactive/Filled arrives.
+        // ApiCancelled is deliberately NOT treated as terminal here: it precedes
+        // a confirmed Cancelled, whose event reaps the order-id mapping (or
+        // clear_stale does), mirroring the account_stream `is_terminal` guard.
+        // Enumerated explicitly so a future ibapi variant fails to compile rather
+        // than silently defaulting to Open.
+        OrderStatusKind::Submitted
+        | OrderStatusKind::PreSubmitted
+        | OrderStatusKind::PendingSubmit
+        | OrderStatusKind::ApiPending
+        | OrderStatusKind::PendingCancel
+        | OrderStatusKind::ApiCancelled => {
             OrderState::active(Open::new(order_id, Utc::now(), filled_qty))
         }
     };

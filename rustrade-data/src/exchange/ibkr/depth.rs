@@ -36,8 +36,12 @@ impl DepthAggregator {
     /// Process a depth update and emit an OrderBookEvent.
     ///
     /// Returns `Some(OrderBookEvent)` for actual depth updates, `None` for
-    /// notices or MarketDepthL2 updates (which include market maker attribution
-    /// that we don't track — we aggregate into a simple anonymous book).
+    /// MarketDepthL2 updates (which include market maker attribution that we
+    /// don't track — we aggregate into a simple anonymous book).
+    ///
+    /// Note: as of ibapi 3.x, server notices are delivered through the
+    /// subscription's `SubscriptionItem::Notice` arm rather than as a variant of
+    /// [`MarketDepths`], so they never reach this method.
     pub fn update(&mut self, depth: &MarketDepths) -> Option<OrderBookEvent> {
         match depth {
             MarketDepths::MarketDepth(d) => self.process_depth(d),
@@ -47,7 +51,6 @@ impl DepthAggregator {
                 tracing::trace!("Discarding MarketDepthL2 event (market maker data not tracked)");
                 None
             }
-            MarketDepths::Notice(_) => None,
         }
     }
 
@@ -234,19 +237,6 @@ mod tests {
             }
             _ => panic!("Expected Snapshot"),
         }
-    }
-
-    #[test]
-    fn notice_ignored() {
-        let mut agg = DepthAggregator::new();
-
-        let notice = MarketDepths::Notice(ibapi::messages::Notice {
-            code: 2100,
-            message: "test notice".to_string(),
-            error_time: None,
-        });
-        let result = agg.update(&notice);
-        assert!(result.is_none());
     }
 
     #[test]
