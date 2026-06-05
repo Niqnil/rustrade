@@ -66,6 +66,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Bumped `ibapi` from `2.12.0` to `3.0.1`** (`ibkr` feature). ibapi 3.0 is a major release with
+  breaking API changes; the IBKR market-data (`rustrade-data`) and execution (`rustrade-execution`)
+  connectors were migrated to the new surface. Notable upstream changes absorbed: `Subscription<T>`
+  iteration now yields `Result<SubscriptionItem<T>, Error>` (most data loops use `iter_data()`,
+  surfacing subscription errors instead of silently ending — the exception is `TickSubscription`,
+  which yields `T` directly and has no error accessor; see the `fetch_historical_ticks` /
+  `fetch_historical_bid_ask` doc comments for that silent-truncation caveat); builder-style
+  market-data requests
+  (`historical_data`/`historical_ticks`/`market_depth`/`tick_by_tick`); `Contract.right` is now
+  `Option<OptionRight>`; `OrderStatus.status` is now the `OrderStatusKind` enum; and `Execution.side`
+  is now the `ExecutionSide` enum. Two small `ibkr`-feature public API changes accompany this
+  migration (see the BREAKING sub-entries below). (Downstream code that constructs the re-exported
+  `ibapi::contracts::Contract` via struct literals directly must also update `right` from `String`
+  to `Option<OptionRight>`; callers using the `rustrade-execution` contract builders are unaffected.)
+  - **Operational requirement:** ibapi 3.x speaks only the protobuf transport and refuses to
+    connect to a TWS/IB Gateway older than **server version 213** (it errors with
+    *"server version 213 required … please upgrade"*). Operators of the `ibkr` connector must
+    run a recent ("latest"-channel) TWS/Gateway build; older Gateways that worked with ibapi 2.x
+    will no longer connect.
+  - **Order placement no longer misreports IB informational order messages as rejections.**
+    Under ibapi 3.x, any TWS message outside the warning range (`2100..=2169`) — including IB's
+    informational "Order Message" code 399 (e.g. *"your order will not be placed at the exchange
+    until 09:30 US/Eastern"* for an order accepted and **held** until regular trading hours) — is
+    delivered as a stream-terminating `Err` on the placement subscription. The order-placement
+    paths now classify these: known informational codes are reported as live-but-pending (the
+    order's authoritative status is resolved via the order-update/account stream) rather than as a
+    hard rejection, while genuine rejections and transport errors still fail observably. Placement
+    loops also gained a bounded wait so a silent Gateway cannot hang them indefinitely.
+  - **Immediately-filled orders are no longer misreported as rejections.** A marketable order can
+    fill before any working status is delivered, in which case ibapi 3.x sends `OrderStatus(Filled)`
+    directly on the placement subscription. Placement now classifies `Filled` as accepted (the order
+    is live; its authoritative fill is resolved via the order-update/account stream) and retains the
+    order-id mapping, rather than returning a hard rejection and dropping the order's later
+    execution/commission events.
+  - **BREAKING (`ibkr`): `client::ibkr::contract::option_contract` now returns
+    `Result<Contract, InvalidOptionRight>`** instead of `Contract`. An unrecognized or empty option
+    `right` is now an observable error at construction (new public error type
+    `client::ibkr::contract::InvalidOptionRight`) rather than a silently right-less `Contract` that
+    IBKR only rejects later at submission. Migration: handle the `Result` (e.g. `?` or `match`) at
+    call sites; the other builders (`stock_contract`/`futures_contract`/`forex_contract`) are
+    unchanged.
+  - **BREAKING (`ibkr`): removed `client::ibkr::execution::parse_ib_side`.** `Execution.side` is now
+    the typed `ExecutionSide` enum upstream, so the string parser is obsolete — map the enum directly
+    (`ExecutionSide::Bought` → `Side::Buy`, `ExecutionSide::Sold` → `Side::Sell`).
 - **BREAKING: `Balance` gained a public `margin: Option<MarginDetails>` field.** Direct struct-literal
   construction (`Balance { total, free }`) no longer compiles. Migration: use `Balance::new(total, free)`
   for cash balances or `Balance::new_margin(..)` for margin balances. `const` sites that cannot use

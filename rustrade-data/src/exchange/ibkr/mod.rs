@@ -291,7 +291,20 @@ where
 
                     let mut aggregator = QuoteAggregator::new();
 
-                    for tick in sub {
+                    // ibapi 3.x: `iter_data()` yields `Result<TickTypes, Error>`,
+                    // filtering subscription-level notices. Surface errors as a
+                    // terminal event (observable failures over silent ones).
+                    for tick in sub.iter_data() {
+                        let tick = match tick {
+                            Ok(t) => t,
+                            Err(e) => {
+                                error!(symbol = %symbol, error = %e, "Quotes subscription error");
+                                let _ = tx.send(Err(DataError::Socket(format!(
+                                    "quotes subscription {symbol}: {e}"
+                                ))));
+                                break;
+                            }
+                        };
                         let now = Utc::now();
                         if let Some(l1) = aggregator.update(&tick, now) {
                             let event = MarketEvent {
@@ -347,9 +360,9 @@ where
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     debug!(symbol = %symbol, rows, "Starting depth subscription");
 
-                    // smart_depth=false: We aggregate into a simple anonymous book without
-                    // tracking market maker attribution from MarketDepthL2 events.
-                    let sub = match client.market_depth(&contract, rows, false) {
+                    // Default SmartDepth::No: we aggregate into a simple anonymous book
+                    // without tracking market maker attribution from MarketDepthL2 events.
+                    let sub = match client.market_depth(&contract, rows).subscribe() {
                         Ok(s) => s,
                         Err(e) => {
                             error!(symbol = %symbol, error = %e, "Failed to subscribe to depth");
@@ -362,7 +375,17 @@ where
 
                     let mut aggregator = DepthAggregator::new();
 
-                    for depth in sub {
+                    for depth in sub.iter_data() {
+                        let depth = match depth {
+                            Ok(d) => d,
+                            Err(e) => {
+                                error!(symbol = %symbol, error = %e, "Depth subscription error");
+                                let _ = tx.send(Err(DataError::Socket(format!(
+                                    "depth subscription {symbol}: {e}"
+                                ))));
+                                break;
+                            }
+                        };
                         if let Some(book_event) = aggregator.update(&depth) {
                             // IB's MarketDepth events have no timestamp. We use time_received
                             // for both fields. Consumers should NOT interpret time_exchange
@@ -420,7 +443,7 @@ where
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     debug!(symbol = %symbol, "Starting trades subscription");
 
-                    let sub = match client.tick_by_tick_all_last(&contract, 0, false) {
+                    let sub = match client.tick_by_tick(&contract, 0).all_last() {
                         Ok(s) => s,
                         Err(e) => {
                             error!(symbol = %symbol, error = %e, "Failed to subscribe to trades");
@@ -431,7 +454,17 @@ where
                         }
                     };
 
-                    for trade in sub {
+                    for trade in sub.iter_data() {
+                        let trade = match trade {
+                            Ok(t) => t,
+                            Err(e) => {
+                                error!(symbol = %symbol, error = %e, "Trades subscription error");
+                                let _ = tx.send(Err(DataError::Socket(format!(
+                                    "trades subscription {symbol}: {e}"
+                                ))));
+                                break;
+                            }
+                        };
                         let now = Utc::now();
                         let public_trade = match trades::from_ib_trade(&trade) {
                             Some(t) => t,
@@ -510,7 +543,17 @@ where
 
                     let aggregator = GreeksAggregator::new();
 
-                    for tick in sub {
+                    for tick in sub.iter_data() {
+                        let tick = match tick {
+                            Ok(t) => t,
+                            Err(e) => {
+                                error!(symbol = %symbol, error = %e, "Option Greeks subscription error");
+                                let _ = tx.send(Err(DataError::Socket(format!(
+                                    "option Greeks subscription {symbol}: {e}"
+                                ))));
+                                break;
+                            }
+                        };
                         if let Some(greeks) = aggregator.update(&tick) {
                             let now = Utc::now();
                             let event = MarketEvent {
