@@ -63,6 +63,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - REST snapshots remain the full `BalanceSnapshot(Snapshot<AssetBalance>)` (replace); WS updates
     apply free/locked while **preserving** existing `margin`, so a partial update structurally cannot
     overwrite known debt.
+- **Shared `Candle` time-boundary helpers** (`rustrade-data`, `subscription::candle`) — the single
+  source of truth every range-computing candle producer routes through (the Massive WS path is the
+  exception: it trusts the venue-supplied boundary directly), so the `close_time` contract is computed
+  in exactly one place:
+  - `IntervalStep { Fixed(chrono::Duration), Months(u32) }` — a primitive step type (`Months` covers
+    calendar `month`/`quarter`/`year`).
+  - `close_time_from_open(open, step) -> Option<DateTime<Utc>>` — computes a candle's exclusive
+    end-of-period boundary (`open + interval`); calendar months use leap-year-correct
+    `checked_add_months`. Returns `None` on overflow (callers surface it as their error type, never a
+    silent fallback).
+  - `open_time_from_close(close, step) -> Option<DateTime<Utc>>` — the inverse (`close − interval`),
+    used by range-bounded fetches to widen the venue request window. It round-trips exactly for the
+    closes this library produces (monthly boundaries always land on a calendar 1st); it is not a
+    universal identity, since `Months` day-clamping is asymmetric for non-1st anchors.
 
 ### Changed
 
@@ -122,6 +136,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Binance `GoodUntilEndOfDay` (GTD) time-in-force is now rejected as `UnsupportedOrderType`** instead of being silently coerced to `GoodTillCancelled` (GTC). Binance has no native end-of-day order, and coercing to GTC dropped the EOD auto-cancel semantics — risking an unintended resting order. This affects both the spot and margin clients.
 - **Binance margin user-data frames are parsed without a full JSON DOM.** The WS receive path now deserializes a borrowed envelope (`serde_json::value::RawValue` for the inner `event`) and reads the event discriminator from a raw slice, so only the matched event type pays for a single typed pass — no intermediate `serde_json::Value` tree is built per frame on this hot path. Internal only; no public API change (the `binance` feature now enables `serde_json/raw_value`).
 - **`InstrumentAccountSnapshot` gained a public `isolated: Option<IsolatedInstrumentState>` field**, and **`AccountEventKind` gained an `InstrumentBalanceUpdate` variant** (both for isolated margin). Both are additive on the wire (`Option` + `#[serde(default)]` / `#[non_exhaustive]` enum), but `InstrumentAccountSnapshot::new()`'s arity went 3→4 (struct-literal / `::new()` call sites must pass the new field) and the library's `indexer.rs` gained one match arm — a minor breaking change for code that directly constructs `InstrumentAccountSnapshot`. The new field sorts/hashes last (`None` before `Some`), so it acts only as a tie-breaker; the cross stream/snapshot paths are unchanged.
+- **Documented the `Candle.close_time` contract** (`rustrade-data`): `close_time` is the **exclusive
+  end-of-period boundary** (`close_time == open_time + interval`); a candle aggregates the half-open
+  window `[close_time − interval, close_time)`, so `close_time` equals the next candle's open instant.
+  The boundary is the UTC period grid, **not** the exchange session close (the library has no session
+  calendar); `month`/`quarter`/`year` use nominal calendar arithmetic. `Candle` carries neither
+  `open_time` nor `interval` — recover them from the originating fetch/subscription.
+- **BREAKING (`ibkr`): IBKR candle `close_time` is now the end-of-period boundary, not the bar start.**
+  `bar_to_candle` previously stuffed the bar's own start timestamp into `close_time` (off by one full
+  interval); it now computes `close_time = bar_open + interval` via the shared helper. **Call out:** an
+  IBKR **daily** bar's `close_time` is now the **next** day's `00:00 UTC` (e.g. a Jan 15 daily bar →
+  `Jan 16 00:00 UTC`), so `close_time.date()` shifts forward by one day — any `group_by(close_time.date())`
+  must subtract one interval (the bar's own date `= close_time − interval`). Monthly bars use calendar
+  arithmetic (`Jan → Feb 1 00:00 UTC`).
+- **BREAKING: standardized the historical-fetch range contract on `close_time`.** `fetch_candles`
+  (Hyperliquid) and `fetch_aggregates` (Massive) now return exactly the candles whose `close_time`
+  falls within the requested `[start, end]` (inclusive) — matched on `close_time`, the field consumers
+  receive — by widening the venue request one interval and trimming the result. Previously both matched
+  the venue-native **open-time** (Hyperliquid by open-time bucket, Massive/Polygon by the bar's
+  open-time), so the candle set near the range boundaries changes. IBKR is unaffected: its venue API is
+  duration-based (`end_date` + `duration`), documented as the exception (its candles still carry the
+  corrected `close_time`).
+- **BREAKING (`massive`): `AggregateBar` candle conversion is now fallible and keyed on `IntervalStep`.**
+  `into_candle_with_duration(Duration) -> Candle` was renamed to `into_candle_with_step(IntervalStep) ->
+  Result<Candle, MassiveError>`, and `into_candle(multiplier, timespan)` likewise now returns
+  `Result<Candle, MassiveError>` (a computed `close_time` overflow is surfaced rather than silently
+  wrapped). Migration: pass an `IntervalStep` (via `timespan_to_step`) instead of a `Duration`, and
+  handle the `Result`. The free function `timespan_to_duration` was correspondingly replaced by
+  `timespan_to_step`.
 
 ### Fixed
 
@@ -129,6 +171,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Corrected the order-type support matrix in `rustrade-execution/README.md` to reflect Binance and Hyperliquid conditional order support (Stop, StopLimit, TakeProfit, TakeProfitLimit), Binance trailing-stop offset limitations, and Hyperliquid's lack of native market orders.
 - **`rustrade-execution` docs.rs builds now use `all-features`.** Every connector module is feature-gated behind `default = []`, so docs.rs previously published a crate documenting no connectors and the connector-comparison intra-doc links broke. The full client surface is now documented and those links resolve.
 - **Binance REST auth-failure errors now carry the numeric Binance code.** `401`/`403` (`UnauthorizedError`/`ForbiddenError`) rejections splice the code into the `ApiError::Unauthenticated` message, so callers can distinguish auth subtypes (e.g. `-2014` invalid key vs `-2015` IP/permission), matching the existing behaviour for client-error rejections.
+- **BREAKING: Massive monthly/quarterly/yearly candle `close_time` now uses calendar arithmetic**
+  (`rustrade-data`). `month`/`quarter`/`year` aggregates previously approximated the boundary as a
+  fixed `+30/91/365 days`, so a January monthly bar's `close_time` was `Jan 31`, not `Feb 1` — it did
+  not equal the next candle's open and did not align with Binance `1M` / IBKR monthly boundaries. They
+  now use leap-year-correct `Months` arithmetic (a January monthly bar → `Feb 1 00:00 UTC`). Fixed
+  intervals (`second`…`week`) are unchanged. Breaking for consumers comparing Massive coarse-interval
+  timestamps.
+- **BREAKING: Hyperliquid candle `close_time` is now computed library-side as `time_open + interval`**
+  (`rustrade-data`), instead of the venue's raw `time_close`. Hyperliquid reports `time_close` as
+  `period-end − 1ms` (the inclusive-last-ms convention, verified against the live API), which does not
+  satisfy the `close_time == open + interval` contract; the boundary is now computed via the shared
+  helper so Hyperliquid aligns with the other producers. Breaking by `+1ms` for consumers comparing
+  Hyperliquid candle timestamps against the raw venue value.
 
 ## [0.2.1] - 2026-05-28
 

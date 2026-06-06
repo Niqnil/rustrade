@@ -3,7 +3,11 @@
 use super::error::MassiveError;
 use crate::{
     books::Level,
-    subscription::{book::OrderBookL1, candle::Candle, trade::PublicTrade},
+    subscription::{
+        book::OrderBookL1,
+        candle::{Candle, IntervalStep, close_time_from_open},
+        trade::PublicTrade,
+    },
 };
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use rust_decimal::Decimal;
@@ -114,20 +118,36 @@ pub struct AggregateBar {
 }
 
 impl AggregateBar {
-    /// Convert to rustrade Candle type.
+    /// Convert to rustrade [`Candle`], mapping `(multiplier, timespan)` to the
+    /// shared [`IntervalStep`].
     ///
-    /// The `close_time` is calculated as `timestamp + (multiplier * timespan_duration)`.
-    #[allow(dead_code)] // Public API; internal code uses into_candle_with_duration
-    pub fn into_candle(self, multiplier: u32, timespan: &str) -> Candle {
-        let duration = timespan_to_duration(multiplier, timespan);
-        self.into_candle_with_duration(duration)
+    /// `close_time` is the exclusive end-of-period boundary `open + interval`,
+    /// computed per-bar via [`close_time_from_open`] — calendar intervals
+    /// (`month`/`quarter`/`year`) therefore use leap-year-correct month
+    /// arithmetic, not an approximate fixed `Duration`.
+    // Public convenience API; the internal REST stream uses `into_candle_with_step`
+    // (pre-computes the step once per stream), so this is unused in-crate.
+    #[allow(dead_code)]
+    pub fn into_candle(self, multiplier: u32, timespan: &str) -> Result<Candle, MassiveError> {
+        self.into_candle_with_step(timespan_to_step(multiplier, timespan))
     }
 
-    /// Convert to rustrade Candle type with a pre-computed duration.
+    /// Convert to rustrade [`Candle`] with a pre-computed [`IntervalStep`].
     ///
-    /// Use this variant when processing multiple bars with the same timespan
-    /// to avoid recomputing the duration for each bar.
-    pub fn into_candle_with_duration(self, duration: Duration) -> Candle {
+    /// Use this variant when processing multiple bars with the same timespan to
+    /// avoid recomputing the step for each bar. The step is still applied
+    /// **per-bar** (`close_time_from_open(open, step)`) because calendar months
+    /// are variable-length — a single pre-computed `Duration` for the whole
+    /// stream would be wrong for `month`/`quarter`/`year`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MassiveError::InvalidInput`] if the computed `close_time`
+    /// overflows the representable [`DateTime<Utc>`] range. An un-parseable
+    /// *input* `timestamp` is, by contrast, tolerated with a warning and
+    /// `UNIX_EPOCH` (preserving prior behaviour) — only a computed *boundary*
+    /// overflow is a hard error.
+    pub fn into_candle_with_step(self, step: IntervalStep) -> Result<Candle, MassiveError> {
         let start_time = Utc
             .timestamp_millis_opt(self.timestamp)
             .single()
@@ -138,9 +158,12 @@ impl AggregateBar {
                 );
                 DateTime::<Utc>::UNIX_EPOCH
             });
-        let close_time = start_time + duration;
+        let close_time =
+            close_time_from_open(start_time, step).ok_or_else(|| MassiveError::InvalidInput {
+                message: format!("candle close_time overflow: open={start_time}, step={step:?}"),
+            })?;
 
-        Candle {
+        Ok(Candle {
             close_time,
             open: self.open,
             high: self.high,
@@ -148,7 +171,7 @@ impl AggregateBar {
             close: self.close,
             volume: self.volume,
             trade_count: self.trade_count.unwrap_or(0),
-        }
+        })
     }
 }
 
@@ -160,21 +183,26 @@ pub fn parse_aggregates_response(body: &str) -> Result<AggregatesResponse, Massi
     })
 }
 
-/// Convert timespan string to chrono Duration.
-pub fn timespan_to_duration(multiplier: u32, timespan: &str) -> Duration {
-    let mult = multiplier as i64;
+/// Map a Massive `(multiplier, timespan)` to the shared [`IntervalStep`].
+///
+/// Fixed-length units (`second`…`week`) become [`IntervalStep::Fixed`], exact in
+/// UTC. Calendar units (`month`/`quarter`/`year`) become [`IntervalStep::Months`]
+/// (1 / 3 / 12 months per multiplier) so the boundary uses leap-year-correct
+/// calendar arithmetic instead of the previous approximate `+30/91/365 days`.
+pub fn timespan_to_step(multiplier: u32, timespan: &str) -> IntervalStep {
+    let mult = i64::from(multiplier);
     match timespan {
-        "second" => Duration::seconds(mult),
-        "minute" => Duration::minutes(mult),
-        "hour" => Duration::hours(mult),
-        "day" => Duration::days(mult),
-        "week" => Duration::weeks(mult),
-        "month" => Duration::days(mult * 30),   // Approximate
-        "quarter" => Duration::days(mult * 91), // Approximate
-        "year" => Duration::days(mult * 365),   // Approximate
+        "second" => IntervalStep::Fixed(Duration::seconds(mult)),
+        "minute" => IntervalStep::Fixed(Duration::minutes(mult)),
+        "hour" => IntervalStep::Fixed(Duration::hours(mult)),
+        "day" => IntervalStep::Fixed(Duration::days(mult)),
+        "week" => IntervalStep::Fixed(Duration::weeks(mult)),
+        "month" => IntervalStep::Months(multiplier),
+        "quarter" => IntervalStep::Months(multiplier.saturating_mul(3)),
+        "year" => IntervalStep::Months(multiplier.saturating_mul(12)),
         _ => {
             tracing::warn!(timespan = %timespan, "unknown timespan, defaulting to minutes");
-            Duration::minutes(mult)
+            IntervalStep::Fixed(Duration::minutes(mult))
         }
     }
 }
@@ -629,7 +657,19 @@ pub(crate) struct WsAggregateMsg {
 }
 
 impl WsAggregateMsg {
-    /// Convert to Candle with exchange timestamp.
+    /// Convert to [`Candle`] with exchange timestamp.
+    ///
+    /// `close_time` is taken directly from the wire `end_timestamp` (`e`), which
+    /// the venue already supplies as the **exclusive end-of-period boundary**
+    /// (`e == start (s) + interval`) — for the second/minute aggregates this path
+    /// emits, `e` equals `s + 1s`/`s + 60s` exactly. It therefore satisfies the
+    /// [`Candle::close_time`] contract **without** re-normalising through
+    /// [`close_time_from_open`](crate::subscription::candle::close_time_from_open):
+    /// re-deriving a boundary the venue already provides correctly would add no
+    /// value. A regression test pins `e == s + interval` so a future wire change
+    /// can't silently drift this off the contract. (If a Massive WS aggregate ever
+    /// carried a coarser-than-minute interval, this trust assumption must be
+    /// revisited.)
     pub fn into_candle(self) -> (DateTime<Utc>, Candle) {
         let time = millis_to_datetime(self.end_timestamp);
 
@@ -812,7 +852,7 @@ mod tests {
             trade_count: Some(150),
         };
 
-        let candle = bar.into_candle(1, "minute");
+        let candle = bar.into_candle(1, "minute").unwrap();
 
         assert_eq!(candle.open, dec!(65000.0));
         assert_eq!(candle.close, dec!(65100.0));
@@ -822,6 +862,51 @@ mod tests {
         let expected_close =
             Utc.timestamp_millis_opt(1704067200000).single().unwrap() + Duration::minutes(1);
         assert_eq!(candle.close_time, expected_close);
+    }
+
+    #[test]
+    fn test_aggregate_bar_monthly_calendar_boundary() {
+        // A January monthly bar must close at Feb 1 00:00 UTC via calendar
+        // arithmetic, NOT open + 30 days (= Jan 31, the previous approximate bug).
+        // `AggregateBar` is not `Clone`, so build a fresh bar per assertion.
+        let bar_at = || AggregateBar {
+            open: dec!(65000.0),
+            high: dec!(65200.0),
+            low: dec!(64900.0),
+            close: dec!(65100.0),
+            volume: dec!(234.5678),
+            vwap: None,
+            timestamp: 1_704_067_200_000, // 2024-01-01 00:00:00 UTC
+            trade_count: Some(150),
+        };
+
+        // Month: Jan 1 -> Feb 1 (not 1704067200000 + 30d = 2024-01-31).
+        assert_eq!(
+            bar_at()
+                .into_candle(1, "month")
+                .unwrap()
+                .close_time
+                .timestamp_millis(),
+            1_706_745_600_000 // 2024-02-01 00:00:00 UTC
+        );
+        // Quarter: Jan 1 -> Apr 1.
+        assert_eq!(
+            bar_at()
+                .into_candle(1, "quarter")
+                .unwrap()
+                .close_time
+                .timestamp_millis(),
+            1_711_929_600_000 // 2024-04-01 00:00:00 UTC
+        );
+        // Year: Jan 1 -> next Jan 1.
+        assert_eq!(
+            bar_at()
+                .into_candle(1, "year")
+                .unwrap()
+                .close_time
+                .timestamp_millis(),
+            1_735_689_600_000 // 2025-01-01 00:00:00 UTC
+        );
     }
 
     #[test]
@@ -854,12 +939,31 @@ mod tests {
     }
 
     #[test]
-    fn test_timespan_to_duration() {
-        assert_eq!(timespan_to_duration(1, "second"), Duration::seconds(1));
-        assert_eq!(timespan_to_duration(5, "minute"), Duration::minutes(5));
-        assert_eq!(timespan_to_duration(1, "hour"), Duration::hours(1));
-        assert_eq!(timespan_to_duration(1, "day"), Duration::days(1));
-        assert_eq!(timespan_to_duration(1, "week"), Duration::weeks(1));
+    fn test_timespan_to_step() {
+        assert_eq!(
+            timespan_to_step(1, "second"),
+            IntervalStep::Fixed(Duration::seconds(1))
+        );
+        assert_eq!(
+            timespan_to_step(5, "minute"),
+            IntervalStep::Fixed(Duration::minutes(5))
+        );
+        assert_eq!(
+            timespan_to_step(1, "hour"),
+            IntervalStep::Fixed(Duration::hours(1))
+        );
+        assert_eq!(
+            timespan_to_step(1, "day"),
+            IntervalStep::Fixed(Duration::days(1))
+        );
+        assert_eq!(
+            timespan_to_step(1, "week"),
+            IntervalStep::Fixed(Duration::weeks(1))
+        );
+        // Calendar units map to month counts (multiplier-scaled), not Durations.
+        assert_eq!(timespan_to_step(1, "month"), IntervalStep::Months(1));
+        assert_eq!(timespan_to_step(2, "quarter"), IntervalStep::Months(6));
+        assert_eq!(timespan_to_step(1, "year"), IntervalStep::Months(12));
     }
 
     #[test]
@@ -1157,6 +1261,7 @@ mod tests {
             trade_count: Some(150),
         };
 
+        let start_ms = agg.start_timestamp;
         let (time, candle) = agg.into_candle();
 
         assert_eq!(candle.open, dec!(45200.0));
@@ -1168,6 +1273,16 @@ mod tests {
         assert_eq!(
             time,
             Utc.timestamp_millis_opt(1704067260000).single().unwrap()
+        );
+
+        // Contract lock (TG20): the venue-supplied `e` is the exclusive boundary
+        // and equals `s + interval` (here a 1-minute aggregate: s + 60_000 ms).
+        // If a future wire change drifts `e` off `s + interval`, this fails.
+        assert_eq!(candle.close_time, time);
+        assert_eq!(
+            candle.close_time.timestamp_millis(),
+            start_ms + 60_000,
+            "WS aggregate close_time must equal start (s) + 1 minute"
         );
     }
 
