@@ -386,11 +386,13 @@ where
                                 break;
                             }
                         };
-                        if let Some(book_event) = aggregator.update(&depth) {
-                            // IB's MarketDepth events have no timestamp. We use time_received
-                            // for both fields. Consumers should NOT interpret time_exchange
-                            // as actual exchange timestamp for depth events.
-                            let now = Utc::now();
+                        // IB's MarketDepth events have no timestamp. Stamp `now`
+                        // BEFORE aggregating so the book's `time_received` (threaded
+                        // into the OrderBook) matches the MarketEvent envelope's.
+                        // Consumers should NOT interpret the MarketEvent's
+                        // time_exchange as a real venue timestamp for depth events.
+                        let now = Utc::now();
+                        if let Some(book_event) = aggregator.update(&depth, now) {
                             let event = MarketEvent {
                                 time_exchange: now,
                                 time_received: now,

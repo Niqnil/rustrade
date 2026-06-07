@@ -1,7 +1,7 @@
 use super::HyperliquidChannel;
 use crate::{
     Identifier,
-    books::{Level, OrderBook},
+    books::{Level, OrderBook, OrderBookTimes},
     error::DataError,
     event::{MarketEvent, MarketIter},
     exchange::ExchangeSub,
@@ -139,13 +139,26 @@ where
             (vec![], vec![])
         };
 
+        let time_received = Utc::now();
+
         // Hyperliquid L2 book messages carry no sequence number; use the message
         // timestamp (millis) as a monotonic proxy for snapshot ordering.
-        let order_book = OrderBook::new(data.time, Some(time_exchange), bids, asks);
+        let order_book = OrderBook::new(
+            data.time,
+            // `time` is Hyperliquid's broadcast time → `time_exchange` only.
+            // Hyperliquid sends no matching-engine time, so `time_engine` is `None`.
+            OrderBookTimes {
+                time_engine: None,
+                time_exchange: Some(time_exchange),
+                time_received,
+            },
+            bids,
+            asks,
+        );
 
         Self(vec![Ok(MarketEvent {
             time_exchange,
-            time_received: Utc::now(),
+            time_received,
             exchange: exchange_id,
             instrument,
             kind: OrderBookEvent::Snapshot(order_book),
