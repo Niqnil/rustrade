@@ -1,6 +1,6 @@
 //! Option Greeks subscription type.
 //!
-//! This module defines the [`OptionGreeks`] data type for option analytics
+//! This module defines the [`OptionGreeks`](crate::subscription::greeks::OptionGreeks) data type for option analytics
 //! (delta, gamma, theta, vega, implied volatility).
 //!
 //! Unlike other subscription types in this module, Greeks are typically

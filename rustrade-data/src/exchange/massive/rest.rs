@@ -5,9 +5,13 @@
 use super::error::MassiveError;
 use super::transformer::{
     AggregatesResponse, QuotesResponse, TradesResponse, parse_aggregates_response,
-    parse_quotes_response, parse_trades_response, timespan_to_duration,
+    parse_quotes_response, parse_trades_response, timespan_to_step,
 };
-use crate::subscription::{book::OrderBookL1, candle::Candle, trade::PublicTrade};
+use crate::subscription::{
+    book::OrderBookL1,
+    candle::{Candle, open_time_from_close},
+    trade::PublicTrade,
+};
 use async_stream::try_stream;
 use futures::Stream;
 use reqwest::{Client, StatusCode, header};
@@ -181,6 +185,22 @@ impl MassiveRestClient {
     /// Returns a stream that handles pagination automatically. Does not collect
     /// results into memory — processes each page as it arrives.
     ///
+    /// Each [`Candle`]'s `close_time` is the exclusive end-of-period boundary
+    /// `bar_open + interval` (see [`Candle::close_time`](crate::subscription::candle::Candle)).
+    /// Fixed units (`second`…`week`) are exact in UTC; **calendar units
+    /// (`month`/`quarter`/`year`) use leap-year-correct calendar arithmetic** —
+    /// e.g. a January monthly bar closes at `Feb 1 00:00 UTC`, aligning with
+    /// Binance `1M` / IBKR monthly boundaries (previously an approximate
+    /// `+30/91/365 days`).
+    ///
+    /// # Range contract
+    ///
+    /// Yields exactly the candles whose `close_time ∈ [from, to]` (both inclusive),
+    /// matched on `close_time` — the field consumers receive. Massive's endpoint
+    /// natively filters by the bar's open-time, so this method widens the request
+    /// by one interval and trims by `close_time`, consistent with the library's
+    /// other historical fetches.
+    ///
     /// # Arguments
     ///
     /// * `ticker` - Symbol with asset class prefix (e.g., `X:BTCUSD`, `C:EURUSD`, `AAPL`)
@@ -205,7 +225,21 @@ impl MassiveRestClient {
         try_stream! {
             Self::validate_ticker(ticker)?;
 
-            let from_ms = from.timestamp_millis();
+            // Map the interval to a step once; the boundary is still computed
+            // per-bar (calendar months are variable-length, so a single Duration
+            // for the whole stream would be wrong for month/quarter/year).
+            let bar_step = timespan_to_step(multiplier, timespan);
+
+            // Range contract: yield candles whose `close_time ∈ [from, to]`. The
+            // Massive (Polygon) endpoint filters by the bar's open-time, so widen
+            // the lower bound by one interval to capture the candle whose
+            // `close_time == from` (open == from − interval), then trim by
+            // `close_time` below — consistent with the library's other fetches.
+            // `None` (underflow near DateTime::MIN_UTC) is not an error: the boundary
+            // candle would have an unrepresentable open and so cannot exist, making
+            // the un-widened bound already correct. See `open_time_from_close`.
+            let request_from = open_time_from_close(from, bar_step).unwrap_or(from);
+            let from_ms = request_from.timestamp_millis();
             let to_ms = to.timestamp_millis();
 
             let initial_url = format!(
@@ -214,9 +248,6 @@ impl MassiveRestClient {
             );
 
             let mut next_url: Option<String> = Some(initial_url);
-
-            // Pre-compute duration once for all bars in this stream
-            let bar_duration = timespan_to_duration(multiplier, timespan);
 
             while let Some(url) = next_url.take() {
                 debug!(url = %url, "Fetching aggregates page");
@@ -231,7 +262,10 @@ impl MassiveRestClient {
 
                 if let Some(results) = parsed.results {
                     for bar in results {
-                        yield bar.into_candle_with_duration(bar_duration);
+                        let candle = bar.into_candle_with_step(bar_step)?;
+                        if candle.close_time >= from && candle.close_time <= to {
+                            yield candle;
+                        }
                     }
                 }
 

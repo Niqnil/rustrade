@@ -31,7 +31,7 @@
 //! # Architecture
 //!
 //! Unlike WebSocket-based exchanges, IB uses TCP sockets with a blocking API.
-//! This module implements [`Stream`] directly rather than using the [`Connector`]
+//! This module implements [`Stream`](futures::Stream) directly rather than using the [`Connector`]
 //! trait designed for WebSocket exchanges.
 //!
 //! # Supported Data Types
