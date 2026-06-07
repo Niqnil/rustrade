@@ -77,6 +77,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     used by range-bounded fetches to widen the venue request window. It round-trips exactly for the
     closes this library produces (monthly boundaries always land on a calendar 1st); it is not a
     universal identity, since `Months` day-clamping is asymmetric for non-1st anchors.
+- **`OrderBook` liveness timestamps** (`rustrade-data`): new accessors give a maintained L2
+  `OrderBook` a usable liveness signal on every venue (previously `time_engine()` was the only
+  timestamp and was `None` for a Binance-spot book's entire life).
+  - `OrderBook::time_exchange() -> Option<DateTime<Utc>>` — the venue's latest event/broadcast time
+    (`"E"` on Binance, `ts` on Bybit). Feed-lag-aware staleness where present (`now - time_exchange`
+    catches data that is old despite being just received). `None` when the venue supplies no
+    broadcast timestamp (IBKR; Binance spot REST seed before the first diff) — a capability signal,
+    not a defect. Note the asymmetry with `MarketEvent::time_exchange` (non-`Option`, with a local
+    fallback): on `OrderBook`, `None` means "the venue gave nothing".
+  - `OrderBook::time_received() -> DateTime<Utc>` — the local ingestion wall-clock, **always
+    present** once a revision is applied, on **every** venue (including IBKR, where it is the only
+    liveness signal). The universal liveness floor; skew-immune (`now - time_received` is a
+    same-clock comparison). Prefer it as the fallback when `time_exchange()` is `None`. A
+    default/pre-population book reports the epoch (1970), so it reads as stale until the first
+    revision — the intended fail-closed behaviour.
+  - `OrderBook::times() -> OrderBookTimes` — convenience accessor returning all three revision
+    timestamps as a single `Copy` value, for forwarding the whole set in one move.
 
 ### Changed
 
@@ -175,6 +192,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrapped). Migration: pass an `IntervalStep` (via `timespan_to_step`) instead of a `Duration`, and
   handle the `Result`. The free function `timespan_to_duration` was correspondingly replaced by
   `timespan_to_step`.
+- **BREAKING (`rustrade-data`): `OrderBook` now stores a nested `OrderBookTimes` instead of a bare
+  `time_engine`.** The new public `OrderBookTimes` struct groups the three revision timestamps
+  (`time_engine` + `time_exchange` + `time_received`) and serves double duty as both the constructor
+  argument and the stored field (its named fields prevent transposing the two same-typed `Option`
+  times).
+  - `OrderBook::new` and `OrderBook::from_sides` now take an `OrderBookTimes` in place of the former
+    `time_engine: Option<DateTime<Utc>>` argument. Callers constructing `OrderBook`s directly must
+    migrate (e.g. `OrderBookTimes { time_engine, time_exchange, time_received }`, or
+    `OrderBookTimes::default()`).
+  - The serialized shape changes: the timestamps are now nested under a `times` object rather than a
+    flat `time_engine` field. (Cross-version reads of serialized `OrderBook`s are out of scope, so
+    there is no wire back-compat path.)
+  - `time_engine()`'s signature and "matching-engine time" contract are unchanged, **but its value
+    on Bybit and Hyperliquid changes from `Some(broadcast_time)` to `None`.** Those venues only
+    broadcast an event time, which previously leaked into `time_engine()` (conflating broadcast with
+    matching-engine time); it now lives solely in the new `time_exchange()`. Read `time_exchange()`
+    for that value instead.
+  - `OrderBook` equality (`PartialEq`/`Eq`) is still derived over all fields, so it now also reflects
+    `time_exchange`/`time_received`. Two content-identical books observed at different instants
+    compare **unequal** — compare via the accessors (`sequence()`/`bids()`/`asks()`) for content
+    equality.
+  - `DepthAggregator::update` (IBKR, `ibkr` feature) now takes a second argument
+    `time_received: DateTime<Utc>`, the local ingestion wall-clock stamped into the produced
+    `OrderBook`'s `time_received`. Callers must pass the same timestamp used for the wrapping
+    `MarketEvent`.
 
 ### Fixed
 

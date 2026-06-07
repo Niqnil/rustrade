@@ -5,9 +5,10 @@
 //! [`OrderBookEvent`] updates.
 
 use crate::{
-    books::{Asks, Bids, Level, OrderBook, OrderBookSide},
+    books::{Asks, Bids, Level, OrderBook, OrderBookSide, OrderBookTimes},
     subscription::book::OrderBookEvent,
 };
+use chrono::{DateTime, Utc};
 use ibapi::market_data::realtime::{MarketDepth, MarketDepths};
 use rust_decimal::Decimal;
 
@@ -42,9 +43,18 @@ impl DepthAggregator {
     /// Note: as of ibapi 3.x, server notices are delivered through the
     /// subscription's `SubscriptionItem::Notice` arm rather than as a variant of
     /// [`MarketDepths`], so they never reach this method.
-    pub fn update(&mut self, depth: &MarketDepths) -> Option<OrderBookEvent> {
+    ///
+    /// `time_received` is the local ingestion wall-clock; it is threaded in from
+    /// the caller so the emitted book's `time_received` matches the
+    /// `MarketEvent`'s. IB market-depth carries no venue timestamp, so it is the
+    /// only liveness signal on IBKR (`time_engine`/`time_exchange` are `None`).
+    pub fn update(
+        &mut self,
+        depth: &MarketDepths,
+        time_received: DateTime<Utc>,
+    ) -> Option<OrderBookEvent> {
         match depth {
-            MarketDepths::MarketDepth(d) => self.process_depth(d),
+            MarketDepths::MarketDepth(d) => self.process_depth(d, time_received),
             MarketDepths::MarketDepthL2(_) => {
                 // MarketDepthL2 includes market maker attribution - we aggregate
                 // into a simple book without tracking individual market makers
@@ -54,7 +64,11 @@ impl DepthAggregator {
         }
     }
 
-    fn process_depth(&mut self, depth: &MarketDepth) -> Option<OrderBookEvent> {
+    fn process_depth(
+        &mut self,
+        depth: &MarketDepth,
+        time_received: DateTime<Utc>,
+    ) -> Option<OrderBookEvent> {
         // Skip levels with invalid price (e.g., NaN, Inf, DBL_MAX sentinel)
         // Note: depth.position (IB's position-based addressing) is ignored;
         // we use price-keyed book maintenance instead.
@@ -85,7 +99,7 @@ impl DepthAggregator {
         }
 
         self.sequence += 1;
-        Some(OrderBookEvent::Snapshot(self.to_order_book()))
+        Some(OrderBookEvent::Snapshot(self.to_order_book(time_received)))
     }
 
     fn update_bids(&mut self, price: Decimal, size: Decimal) {
@@ -108,8 +122,19 @@ impl DepthAggregator {
             .upsert_single(level, |existing| existing.price.cmp(&level.price));
     }
 
-    fn to_order_book(&self) -> OrderBook {
-        OrderBook::from_sides(self.sequence, None, self.bids.clone(), self.asks.clone())
+    fn to_order_book(&self, time_received: DateTime<Utc>) -> OrderBook {
+        OrderBook::from_sides(
+            self.sequence,
+            // IB market-depth carries no venue timestamp: engine/exchange times are
+            // `None`; `time_received` is the only liveness signal on IBKR.
+            OrderBookTimes {
+                time_engine: None,
+                time_exchange: None,
+                time_received,
+            },
+            self.bids.clone(),
+            self.asks.clone(),
+        )
     }
 
     /// Clear all book state.
@@ -140,11 +165,34 @@ mod tests {
         })
     }
 
+    /// Fixed local-ingestion time for deterministic assertions.
+    fn tr() -> DateTime<Utc> {
+        DateTime::from_timestamp_millis(1_700_000_000_000).unwrap()
+    }
+
+    #[test]
+    fn order_book_has_only_time_received() {
+        // IB market-depth carries no venue timestamp: engine/exchange times must be
+        // `None`, and `time_received` is the (threaded) local ingestion wall-clock —
+        // the only liveness signal on IBKR.
+        let mut agg = DepthAggregator::new();
+
+        let event = agg.update(&depth(1, 0, 100.0, 10.0), tr()).unwrap();
+        match event {
+            OrderBookEvent::Snapshot(book) => {
+                assert_eq!(book.time_engine(), None);
+                assert_eq!(book.time_exchange(), None);
+                assert_eq!(book.time_received(), tr());
+            }
+            _ => panic!("Expected Snapshot"),
+        }
+    }
+
     #[test]
     fn insert_bid() {
         let mut agg = DepthAggregator::new();
 
-        let event = agg.update(&depth(1, 0, 100.0, 10.0)).unwrap();
+        let event = agg.update(&depth(1, 0, 100.0, 10.0), tr()).unwrap();
 
         match event {
             OrderBookEvent::Snapshot(book) => {
@@ -161,7 +209,7 @@ mod tests {
     fn insert_ask() {
         let mut agg = DepthAggregator::new();
 
-        let event = agg.update(&depth(0, 0, 101.0, 5.0)).unwrap();
+        let event = agg.update(&depth(0, 0, 101.0, 5.0), tr()).unwrap();
 
         match event {
             OrderBookEvent::Snapshot(book) => {
@@ -178,8 +226,8 @@ mod tests {
     fn update_level() {
         let mut agg = DepthAggregator::new();
 
-        agg.update(&depth(1, 0, 100.0, 10.0));
-        let event = agg.update(&depth(1, 1, 100.0, 15.0)).unwrap();
+        agg.update(&depth(1, 0, 100.0, 10.0), tr());
+        let event = agg.update(&depth(1, 1, 100.0, 15.0), tr()).unwrap();
 
         match event {
             OrderBookEvent::Snapshot(book) => {
@@ -194,9 +242,9 @@ mod tests {
     fn delete_level() {
         let mut agg = DepthAggregator::new();
 
-        agg.update(&depth(1, 0, 100.0, 10.0));
-        agg.update(&depth(1, 0, 99.0, 5.0));
-        let event = agg.update(&depth(1, 2, 100.0, 0.0)).unwrap();
+        agg.update(&depth(1, 0, 100.0, 10.0), tr());
+        agg.update(&depth(1, 0, 99.0, 5.0), tr());
+        let event = agg.update(&depth(1, 2, 100.0, 0.0), tr()).unwrap();
 
         match event {
             OrderBookEvent::Snapshot(book) => {
@@ -211,10 +259,10 @@ mod tests {
     fn multiple_levels() {
         let mut agg = DepthAggregator::new();
 
-        agg.update(&depth(1, 0, 100.0, 10.0));
-        agg.update(&depth(1, 0, 99.0, 20.0));
-        agg.update(&depth(0, 0, 101.0, 5.0));
-        let event = agg.update(&depth(0, 0, 102.0, 3.0)).unwrap();
+        agg.update(&depth(1, 0, 100.0, 10.0), tr());
+        agg.update(&depth(1, 0, 99.0, 20.0), tr());
+        agg.update(&depth(0, 0, 101.0, 5.0), tr());
+        let event = agg.update(&depth(0, 0, 102.0, 3.0), tr()).unwrap();
 
         match event {
             OrderBookEvent::Snapshot(book) => {
@@ -244,15 +292,15 @@ mod tests {
         let mut agg = DepthAggregator::new();
 
         // NaN price should be skipped
-        let result = agg.update(&depth(1, 0, f64::NAN, 10.0));
+        let result = agg.update(&depth(1, 0, f64::NAN, 10.0), tr());
         assert!(result.is_none());
 
         // Infinity should be skipped
-        let result = agg.update(&depth(1, 0, f64::INFINITY, 10.0));
+        let result = agg.update(&depth(1, 0, f64::INFINITY, 10.0), tr());
         assert!(result.is_none());
 
         // Valid price should work
-        let result = agg.update(&depth(1, 0, 100.0, 10.0));
+        let result = agg.update(&depth(1, 0, 100.0, 10.0), tr());
         assert!(result.is_some());
     }
 
@@ -261,10 +309,10 @@ mod tests {
         let mut agg = DepthAggregator::new();
 
         // Insert a bid level
-        agg.update(&depth(1, 0, 100.0, 10.0));
+        agg.update(&depth(1, 0, 100.0, 10.0), tr());
 
         // Delete with NaN size should still remove the level (size irrelevant for deletes)
-        let event = agg.update(&depth(1, 2, 100.0, f64::NAN)).unwrap();
+        let event = agg.update(&depth(1, 2, 100.0, f64::NAN), tr()).unwrap();
 
         match event {
             OrderBookEvent::Snapshot(book) => {
@@ -282,9 +330,9 @@ mod tests {
         let mut agg = DepthAggregator::new();
 
         // Build up some book state
-        agg.update(&depth(1, 0, 100.0, 10.0));
-        agg.update(&depth(1, 0, 99.0, 5.0));
-        agg.update(&depth(0, 0, 101.0, 8.0));
+        agg.update(&depth(1, 0, 100.0, 10.0), tr());
+        agg.update(&depth(1, 0, 99.0, 5.0), tr());
+        agg.update(&depth(0, 0, 101.0, 8.0), tr());
         assert_eq!(agg.sequence, 3);
 
         // Clear should reset everything
@@ -295,7 +343,7 @@ mod tests {
         assert!(agg.asks.levels().is_empty(), "asks should be empty");
 
         // Next update should work normally with sequence 1
-        let event = agg.update(&depth(1, 0, 50.0, 1.0)).unwrap();
+        let event = agg.update(&depth(1, 0, 50.0, 1.0), tr()).unwrap();
         match event {
             OrderBookEvent::Snapshot(book) => {
                 assert_eq!(book.sequence(), 1);

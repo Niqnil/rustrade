@@ -1,5 +1,5 @@
 use crate::{
-    books::{Level, OrderBook},
+    books::{Level, OrderBook, OrderBookTimes},
     event::{MarketEvent, MarketIter},
     subscription::book::OrderBookEvent,
 };
@@ -40,9 +40,20 @@ impl<InstrumentKey> From<(ExchangeId, InstrumentKey, BybitOrderBookMessage)>
     fn from(
         (exchange, instrument, message): (ExchangeId, InstrumentKey, BybitOrderBookMessage),
     ) -> Self {
+        let time_received = Utc::now();
+        // Bybit's `ts` broadcast time feeds both the book's `time_exchange` and the
+        // `MarketEvent` envelope's `time_exchange` below — bind once so the shared
+        // source is explicit.
+        let time_exchange = message.time;
         let orderbook = OrderBook::new(
             message.data.sequence,
-            Some(message.time),
+            // `time_exchange` is Bybit's `ts` broadcast time → `time_exchange` only.
+            // Bybit sends no matching-engine time, so `time_engine` is `None`.
+            OrderBookTimes {
+                time_engine: None,
+                time_exchange: Some(time_exchange),
+                time_received,
+            },
             message.data.bids,
             message.data.asks,
         );
@@ -53,8 +64,8 @@ impl<InstrumentKey> From<(ExchangeId, InstrumentKey, BybitOrderBookMessage)>
         };
 
         Self(vec![Ok(MarketEvent {
-            time_exchange: message.time,
-            time_received: Utc::now(),
+            time_exchange,
+            time_received,
             exchange,
             instrument,
             kind,

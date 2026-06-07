@@ -13,11 +13,46 @@ pub mod manager;
 /// Provides an abstract collection of cheaply cloneable shared-state [`OrderBook`].
 pub mod map;
 
+/// Venue + local timestamps for an [`OrderBook`] revision.
+///
+/// Serves double duty as both the constructor argument
+/// ([`OrderBook::new`]/[`OrderBook::from_sides`]) and the stored field, so
+/// `update`/`snapshot` are one-line copies. The named fields prevent
+/// transposition of the two same-typed `Option<DateTime<Utc>>` times.
+///
+/// Each timestamp carries exactly one honest meaning; staleness *policy* is left
+/// to the consumer (compose over the accessors).
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Deserialize, Serialize)]
+pub struct OrderBookTimes {
+    /// Matching-engine time (`"T"` on Binance futures). `None` when the venue
+    /// doesn't supply it (Binance spot, IBKR, ...). Latency/engine audit — not a
+    /// liveness signal.
+    pub time_engine: Option<DateTime<Utc>>,
+    /// Venue event/broadcast time (`"E"` on Binance, `ts` on Bybit). `None` when
+    /// the venue supplies none (IBKR; Binance spot REST seed). Feed-lag-aware
+    /// liveness where present.
+    pub time_exchange: Option<DateTime<Utc>>,
+    /// Local ingestion wall-clock — ALWAYS present once a revision is applied.
+    /// Universal liveness floor; use when `time_exchange` is `None` (e.g. IBKR).
+    ///
+    /// NOTE: a default/pre-population book ([`OrderBook::default`], used as the
+    /// manager placeholder before the first event) carries the epoch (1970) here
+    /// — desirable for a liveness floor (reads as stale → consumer fail-closes
+    /// until the first revision), but it is NOT a real ingestion time.
+    pub time_received: DateTime<Utc>,
+}
+
 /// Normalised Barter [`OrderBook`] snapshot.
+///
+/// ### Equality
+/// `PartialEq`/`Eq` is derived over **all** fields, including the [`OrderBookTimes`]
+/// timestamps. Because `time_received` is stamped per construction, two
+/// content-identical books observed at different instants compare **unequal**. For
+/// content comparison use the accessors (`sequence()`/`bids()`/`asks()`).
 #[derive(Clone, PartialEq, Eq, Debug, Default, Deserialize, Serialize)]
 pub struct OrderBook {
     sequence: u64,
-    time_engine: Option<DateTime<Utc>>,
+    times: OrderBookTimes,
     bids: OrderBookSide<Bids>,
     asks: OrderBookSide<Asks>,
 }
@@ -28,7 +63,7 @@ impl OrderBook {
     /// Note that the passed bid and asks levels do not need to be pre-sorted.
     pub fn new<IterBids, IterAsks, L>(
         sequence: u64,
-        time_engine: Option<DateTime<Utc>>,
+        times: OrderBookTimes,
         bids: IterBids,
         asks: IterAsks,
     ) -> Self
@@ -39,7 +74,7 @@ impl OrderBook {
     {
         Self {
             sequence,
-            time_engine,
+            times,
             bids: OrderBookSide::bids(bids),
             asks: OrderBookSide::asks(asks),
         }
@@ -51,7 +86,7 @@ impl OrderBook {
     /// Caller must ensure sides are correctly sorted (bids descending, asks ascending).
     pub fn from_sides(
         sequence: u64,
-        time_engine: Option<DateTime<Utc>>,
+        times: OrderBookTimes,
         bids: OrderBookSide<Bids>,
         asks: OrderBookSide<Asks>,
     ) -> Self {
@@ -65,7 +100,7 @@ impl OrderBook {
         );
         Self {
             sequence,
-            time_engine,
+            times,
             bids,
             asks,
         }
@@ -76,22 +111,73 @@ impl OrderBook {
         self.sequence
     }
 
-    /// Current engine time associated with the [`OrderBook`].
+    /// Matching-engine time associated with the [`OrderBook`] (`"T"` on Binance
+    /// futures).
+    ///
+    /// `None` when the venue doesn't supply matching-engine time (Binance spot,
+    /// IBKR, ...). This is for latency / engine audit — **not** a liveness signal;
+    /// use [`OrderBook::time_exchange`]/[`OrderBook::time_received`] for staleness.
     pub fn time_engine(&self) -> Option<DateTime<Utc>> {
-        self.time_engine
+        self.times.time_engine
+    }
+
+    /// Venue event/broadcast time associated with the [`OrderBook`] (`"E"` on
+    /// Binance, `ts` on Bybit).
+    ///
+    /// Feed-lag-aware liveness where present: `now - time_exchange` catches data
+    /// that is old despite being just received. `None` when the venue supplies no
+    /// broadcast timestamp (IBKR; Binance spot REST seed before the first diff).
+    /// `None` is a capability signal, not a defect — fall back to
+    /// [`OrderBook::time_received`].
+    ///
+    /// Note the asymmetry with `MarketEvent::time_exchange` (non-`Option`, with a
+    /// local fallback): here `None` means "the venue gave nothing".
+    pub fn time_exchange(&self) -> Option<DateTime<Utc>> {
+        self.times.time_exchange
+    }
+
+    /// Local ingestion wall-clock associated with the [`OrderBook`].
+    ///
+    /// The **universal liveness floor** — always present once a revision is
+    /// applied, on every venue (including IBKR, where it is the only liveness
+    /// signal). Skew-immune: `now - time_received` is a same-clock comparison.
+    /// Prefer it as the fallback when [`OrderBook::time_exchange`] is `None`.
+    ///
+    /// A default/pre-population book ([`OrderBook::default`]) reports the epoch
+    /// (1970) here, so it reads as stale until the first revision — the intended
+    /// liveness-floor behaviour.
+    pub fn time_received(&self) -> DateTime<Utc> {
+        self.times.time_received
+    }
+
+    /// All revision timestamps for this [`OrderBook`] as a single
+    /// [`OrderBookTimes`].
+    ///
+    /// Convenience over the individual `time_engine`/`time_exchange`/
+    /// `time_received` accessors for forwarding the whole set in one (`Copy`) move
+    /// — e.g. reconstructing a book that shares this revision's times.
+    pub fn times(&self) -> OrderBookTimes {
+        self.times
     }
 
     /// Generate a sorted [`OrderBook`] snapshot with a maximum depth.
+    ///
+    /// The returned snapshot carries the same [`OrderBookTimes`] as the source
+    /// book (timestamps are not reset).
     pub fn snapshot(&self, depth: usize) -> Self {
         Self {
             sequence: self.sequence,
-            time_engine: self.time_engine,
+            times: self.times,
             bids: OrderBookSide::bids(self.bids.levels.iter().take(depth).copied()),
             asks: OrderBookSide::asks(self.asks.levels.iter().take(depth).copied()),
         }
     }
 
     /// Update the local [`OrderBook`] from a new [`OrderBookEvent`].
+    ///
+    /// `Update` advances the book's [`OrderBookTimes`] wholesale (alongside
+    /// upserting the changed levels); `Snapshot` replaces the book in its
+    /// entirety, including its times.
     pub fn update(&mut self, event: &OrderBookEvent) {
         match event {
             OrderBookEvent::Snapshot(snapshot) => {
@@ -99,7 +185,7 @@ impl OrderBook {
             }
             OrderBookEvent::Update(update) => {
                 self.sequence = update.sequence;
-                self.time_engine = update.time_engine;
+                self.times = update.times;
                 self.upsert_bids(&update.bids);
                 self.upsert_asks(&update.asks);
             }
@@ -342,6 +428,7 @@ pub fn volume_weighted_mid_price(best_bid: Level, best_ask: Level) -> Decimal {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
 
@@ -478,6 +565,67 @@ mod tests {
     mod order_book {
         use super::*;
         use rust_decimal_macros::dec;
+
+        fn times(received_ms: i64) -> OrderBookTimes {
+            OrderBookTimes {
+                time_engine: Some(DateTime::from_timestamp_millis(1).unwrap()),
+                time_exchange: Some(DateTime::from_timestamp_millis(2).unwrap()),
+                time_received: DateTime::from_timestamp_millis(received_ms).unwrap(),
+            }
+        }
+
+        #[test]
+        fn test_update_replaces_times_wholesale() {
+            let mut book = OrderBook::new(1, times(100), vec![Level::new(50, 1)], vec![]);
+
+            let newer = OrderBookTimes {
+                time_engine: None,
+                time_exchange: Some(DateTime::from_timestamp_millis(999).unwrap()),
+                time_received: DateTime::from_timestamp_millis(1000).unwrap(),
+            };
+            let update = OrderBook::new(2, newer, vec![Level::new(50, 1)], vec![]);
+            book.update(&OrderBookEvent::Update(update));
+
+            assert_eq!(book.time_engine(), newer.time_engine);
+            assert_eq!(book.time_exchange(), newer.time_exchange);
+            assert_eq!(book.time_received(), newer.time_received);
+        }
+
+        #[test]
+        fn test_update_snapshot_propagates_times_wholesale() {
+            // The `Snapshot` arm replaces the live book via `*self = snapshot.clone()`,
+            // so it must carry the snapshot's `times` (not retain the old ones).
+            let mut book = OrderBook::new(1, times(100), vec![Level::new(50, 1)], vec![]);
+
+            let newer = OrderBookTimes {
+                time_engine: None,
+                time_exchange: Some(DateTime::from_timestamp_millis(999).unwrap()),
+                time_received: DateTime::from_timestamp_millis(1000).unwrap(),
+            };
+            let snapshot = OrderBook::new(2, newer, vec![Level::new(60, 1)], vec![]);
+            book.update(&OrderBookEvent::Snapshot(snapshot));
+
+            assert_eq!(book.time_engine(), newer.time_engine);
+            assert_eq!(book.time_exchange(), newer.time_exchange);
+            assert_eq!(book.time_received(), newer.time_received);
+        }
+
+        #[test]
+        fn test_snapshot_copies_times() {
+            let book = OrderBook::new(1, times(100), vec![Level::new(50, 1)], vec![]);
+            let snap = book.snapshot(10);
+            assert_eq!(snap.time_engine(), book.time_engine());
+            assert_eq!(snap.time_exchange(), book.time_exchange());
+            assert_eq!(snap.time_received(), book.time_received());
+        }
+
+        #[test]
+        fn test_equality_reflects_timestamps() {
+            // Two content-identical books with different `time_received` are unequal.
+            let a = OrderBook::new(1, times(100), vec![Level::new(50, 1)], vec![]);
+            let b = OrderBook::new(1, times(200), vec![Level::new(50, 1)], vec![]);
+            assert_ne!(a, b);
+        }
 
         #[test]
         fn test_mid_price() {
