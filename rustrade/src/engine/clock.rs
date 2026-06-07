@@ -11,6 +11,11 @@ use tracing::{debug, error, warn};
 /// Generally an `Engine` will use a:
 /// * [`LiveClock`] for live-trading.
 /// * [`HistoricalClock`] for back-testing.
+///
+/// A [`HistoricalClock`] derives "current time" — and the engine replays events in
+/// that order — from each event's `time_exchange`. For aggregated payloads such as
+/// candles, `time_exchange` must be the period **end** (`close_time`) to avoid
+/// lookahead; see [`rustrade_data::event::MarketEvent::time_exchange`].
 pub trait EngineClock {
     fn time(&self) -> DateTime<Utc>;
 }
@@ -18,6 +23,9 @@ pub trait EngineClock {
 /// Defines how to extract an "exchange timestamp" from an event.
 ///
 /// Used by a [`HistoricalClock`] to assist deriving the "current" `Engine` time.
+/// The returned instant is the event's position on the engine timeline — for
+/// candles and other windowed data it is the period **end** (`close_time`); see
+/// [`rustrade_data::event::MarketEvent::time_exchange`] for the full contract.
 pub trait TimeExchange {
     fn time_exchange(&self) -> Option<DateTime<Utc>>;
 }

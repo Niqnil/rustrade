@@ -1,6 +1,6 @@
 //! WebSocket live streaming client for Massive real-time market data.
 //!
-//! Provides real-time market data streaming via [`MassiveLive`].
+//! Provides real-time market data streaming via [`MassiveLive`](crate::exchange::massive::MassiveLive).
 //!
 //! # Architecture
 //!

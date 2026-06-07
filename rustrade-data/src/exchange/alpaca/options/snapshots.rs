@@ -139,7 +139,7 @@ pub struct AlpacaOptionSnapshot {
 impl AlpacaOptionSnapshot {
     /// Get option Greeks in the standard format.
     ///
-    /// Returns [`OptionGreeks`] with delta, gamma, theta, vega populated from the
+    /// Returns [`OptionGreeks`](crate::subscription::greeks::OptionGreeks) with delta, gamma, theta, vega populated from the
     /// Alpaca response. Implied volatility is stored separately in [`Self::implied_volatility`].
     pub fn greeks(&self) -> OptionGreeks {
         let mut greeks: OptionGreeks = self.greeks.unwrap_or_default().into();

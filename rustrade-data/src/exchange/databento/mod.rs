@@ -8,8 +8,8 @@
 //! Unlike WebSocket-based connectors (Binance, Alpaca), Databento uses high-level
 //! client wrappers that handle connection management internally:
 //!
-//! - [`DatabentoHistorical`]: One-shot queries for data older than 24 hours
-//! - [`DatabentoLive`]: Real-time streaming for live and intraday replay data
+//! - [`DatabentoHistorical`](crate::exchange::databento::DatabentoHistorical): One-shot queries for data older than 24 hours
+//! - [`DatabentoLive`](crate::exchange::databento::DatabentoLive): Real-time streaming for live and intraday replay data
 //!
 //! # Connection Model
 //!

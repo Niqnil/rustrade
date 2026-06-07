@@ -193,6 +193,15 @@ mod tests {
 /// exactly one place (the Massive WS path uses the venue-supplied boundary
 /// directly — see [`close_time_from_open`] for the full producer list).
 ///
+/// # Using a `Candle` with the engine
+///
+/// When wrapping a `Candle` into a [`MarketEvent`](crate::event::MarketEvent) for
+/// a consuming engine (live or backtest), set
+/// [`time_exchange`](crate::event::MarketEvent::time_exchange) to this
+/// `close_time` — it is the period-END instant, the only choice that avoids
+/// lookahead (see that field's contract). The library's own candle producers
+/// already do this.
+///
 /// [`Months`]: chrono::Months
 /// [`Duration`]: chrono::Duration
 #[derive(Copy, Clone, PartialEq, PartialOrd, Debug, Deserialize, Serialize)]

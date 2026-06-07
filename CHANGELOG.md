@@ -142,6 +142,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The boundary is the UTC period grid, **not** the exchange session close (the library has no session
   calendar); `month`/`quarter`/`year` use nominal calendar arithmetic. `Candle` carries neither
   `open_time` nor `interval` — recover them from the originating fetch/subscription.
+- **Documented the `MarketEvent.time_exchange` contract** (`rustrade-data`): `time_exchange` is the
+  event's position on the consuming engine's timeline (the historical/backtest clock derives "current
+  time" and replays events in `time_exchange` order). For point-in-time payloads it is the venue event
+  time; for **aggregated/windowed payloads (candles/OHLCV) it must be the period END (`close_time`)**,
+  never the period start — stamping the open makes a completed bar enter the timeline before it could
+  exist (silent lookahead). Applies to any windowed payload, including a custom event type fed to the
+  engine without this crate's producers. Cross-referenced from the engine `EngineClock`/`TimeExchange`
+  traits and the `Candle.close_time` docs. Documentation only — no behaviour change. A new
+  `engine_backtest_with_candle_market_data` example demonstrates wrapping candles into `MarketEvent`s
+  (stamping `time_exchange = close_time`) and the custom `InstrumentDataState` needed to consume them
+  (the default instrument state tracks only trades + L1).
 - **BREAKING (`ibkr`): IBKR candle `close_time` is now the end-of-period boundary, not the bar start.**
   `bar_to_candle` previously stuffed the bar's own start timestamp into `close_time` (off by one full
   interval); it now computes `close_time = bar_open + interval` via the shared helper. **Call out:** an
@@ -170,6 +181,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Binance `fetch_open_orders` now honours the `ExecutionClient` "return all" contract** for an empty `instruments` slice. Both the spot and margin clients previously iterated the (empty) slice and returned an empty `Vec`, silently violating the trait contract that an empty slice must return open orders across all instruments. They now issue a single no-symbol query (`GET /api/v3/openOrders`, `GET /sapi/v1/margin/openOrders`), recovering each order's instrument from its own `symbol` field. The `fetch_trades` per-symbol limitation (Binance `myTrades` requires a symbol, so an empty slice returns empty) is now an explicitly documented deviation on both clients.
 - Corrected the order-type support matrix in `rustrade-execution/README.md` to reflect Binance and Hyperliquid conditional order support (Stop, StopLimit, TakeProfit, TakeProfitLimit), Binance trailing-stop offset limitations, and Hyperliquid's lack of native market orders.
 - **`rustrade-execution` docs.rs builds now use `all-features`.** Every connector module is feature-gated behind `default = []`, so docs.rs previously published a crate documenting no connectors and the connector-comparison intra-doc links broke. The full client surface is now documented and those links resolve.
+- **Resolved broken intra-doc links in `rustrade-data`** surfaced under `--all-features` (`OptionGreeks`, `Stream`, `AlpacaCredentials`/`AlpacaIex`/`AlpacaSip`/`AlpacaCrypto`, `DatabentoHistorical`/`DatabentoLive`, `MassiveRestClient`/`MassiveLive`): module/header docs referenced these types by short name where they were not in scope. They now use explicit paths, so the published docs link correctly.
 - **Binance REST auth-failure errors now carry the numeric Binance code.** `401`/`403` (`UnauthorizedError`/`ForbiddenError`) rejections splice the code into the `ApiError::Unauthenticated` message, so callers can distinguish auth subtypes (e.g. `-2014` invalid key vs `-2015` IP/permission), matching the existing behaviour for client-error rejections.
 - **BREAKING: Massive monthly/quarterly/yearly candle `close_time` now uses calendar arithmetic**
   (`rustrade-data`). `month`/`quarter`/`year` aggregates previously approximated the boundary as a
