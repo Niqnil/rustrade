@@ -192,6 +192,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrapped). Migration: pass an `IntervalStep` (via `timespan_to_step`) instead of a `Duration`, and
   handle the `Result`. The free function `timespan_to_duration` was correspondingly replaced by
   `timespan_to_step`.
+- **BREAKING (`rustrade-data`): the `Candles` subscription kind gained a mandatory
+  `interval: CandleInterval` field and no longer implements `Default`.** The unit struct `Candles`
+  is now `Candles { pub interval: CandleInterval }`; the interval is intrinsic to a candle
+  subscription, so a phantom `Default` (silently `1m`) was removed as a footgun. A new shared
+  `CandleInterval` enum (`subscription::candle`) is the venue-agnostic union of candle resolutions
+  (`as_str`/`Display`/`FromStr`/`Serialize`/`Deserialize` all single-sourced; strings match
+  Binance's kline `interval`). Migration: replace `Candles` / `Candles::default()` with
+  `Candles { interval: CandleInterval::Min1 }` (or the desired resolution). Note: the serialized
+  representation also changes (e.g. JSON `null`/`"candles"` → `{"interval":"1h"}`), so persisted or
+  transmitted `Candles` values from older versions are not deserialization-compatible and must be
+  re-serialized.
 - **BREAKING (`rustrade-data`): `OrderBook` now stores a nested `OrderBookTimes` instead of a bare
   `time_engine`.** The new public `OrderBookTimes` struct groups the three revision timestamps
   (`time_engine` + `time_exchange` + `time_received`) and serves double duty as both the constructor
