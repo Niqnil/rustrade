@@ -203,6 +203,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   representation also changes (e.g. JSON `null`/`"candles"` → `{"interval":"1h"}`), so persisted or
   transmitted `Candles` values from older versions are not deserialization-compatible and must be
   re-serialized.
+- **BREAKING (`rustrade-data`): the `SubKind::Candles` enum variant gained a mandatory
+  `interval: CandleInterval` field.** Mirroring the marker `Candles` kind above, the dynamic-subscription
+  `SubKind` enum's unit variant `Candles` is now `Candles { interval: CandleInterval }`. Exhaustive
+  matches on `SubKind` and any persisted/transmitted serde form change (the `Display` tag stays the fixed
+  `"candles"`, interval-independent). Migration: replace `SubKind::Candles` with
+  `SubKind::Candles { interval: CandleInterval::Min1 }` (or the desired resolution). The
+  `DynamicStreams` stream builder now collects per-exchange candle streams symmetrically with the other
+  data kinds (new public field `candles` and accessors `select_candles` / `select_all_candles`, and a new
+  `MarketStreamResult<_, Candle>: Into<Output>` bound on `select_all`); a `SubKind::Candles` subscription
+  is currently rejected during dynamic-path subscription validation (`exchange_supports_instrument_kind_sub_kind`
+  returns `false`) until a venue candle producer is wired, so these accessors are empty for now.
 - **BREAKING (`rustrade-data`): `OrderBook` now stores a nested `OrderBookTimes` instead of a bare
   `time_engine`.** The new public `OrderBookTimes` struct groups the three revision timestamps
   (`time_engine` + `time_exchange` + `time_received`) and serves double duty as both the constructor

@@ -1,4 +1,6 @@
-use crate::{exchange::Connector, instrument::InstrumentData};
+use crate::{
+    exchange::Connector, instrument::InstrumentData, subscription::candle::CandleInterval,
+};
 use derive_more::Display;
 use fnv::FnvHashMap;
 use rustrade_instrument::{
@@ -92,7 +94,17 @@ pub enum SubKind {
     OrderBooksL2,
     OrderBooksL3,
     Liquidations,
-    Candles,
+    /// Candle (kline) subscription at a specific [`CandleInterval`] resolution.
+    ///
+    /// Unlike the other [`SubKind`]s, a candle subscription is **not** fully specified
+    /// without a resolution — there is no venue-agnostic "default" candle stream — so the
+    /// [`interval`](CandleInterval) is carried in the variant. The `derive_more::Display`
+    /// tag is the fixed `"candles"` (independent of the interval), matching the typed
+    /// [`Candles`](candle::Candles) kind tag.
+    #[display("candles")]
+    Candles {
+        interval: CandleInterval,
+    },
     /// Real-time top-of-book quotes (best bid/ask). Generic subscription kind
     /// that may be supported by multiple exchanges providing quote data.
     Quotes,
@@ -562,6 +574,58 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    mod sub_kind {
+        use super::*;
+
+        #[test]
+        fn candles_variant_serde_round_trips() {
+            let kind = SubKind::Candles {
+                interval: CandleInterval::Min1,
+            };
+
+            let json = serde_json::to_string(&kind).unwrap();
+            let back = serde_json::from_str::<SubKind>(&json).unwrap();
+
+            assert_eq!(kind, back, "SubKind::Candles must serde round-trip");
+        }
+
+        #[test]
+        fn candles_display_tag_is_interval_independent() {
+            // The `derive_more::Display` tag is the fixed kind name, never the interval.
+            assert_eq!(
+                SubKind::Candles {
+                    interval: CandleInterval::Sec1
+                }
+                .to_string(),
+                "candles"
+            );
+            assert_eq!(
+                SubKind::Candles {
+                    interval: CandleInterval::Month1
+                }
+                .to_string(),
+                "candles"
+            );
+        }
+
+        #[test]
+        fn candles_not_yet_supported_on_dynamic_path() {
+            // The dynamic-path support matrix gains `Candles` only once the Binance candle
+            // `StreamSelector` exists to serve it. Until then the matrix must reject it so
+            // validation and stream init stay consistent (never validate-true-but-init-fails).
+            assert!(
+                !exchange_supports_instrument_kind_sub_kind(
+                    &ExchangeId::BinanceSpot,
+                    &MarketDataInstrumentKind::Spot,
+                    SubKind::Candles {
+                        interval: CandleInterval::Min1,
+                    },
+                ),
+                "Candles is not yet wired on the dynamic SubKind path"
+            );
         }
     }
 
