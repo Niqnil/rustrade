@@ -81,13 +81,8 @@ fn test_config() -> AlpacaConfig {
     let api_key = std::env::var("ALPACA_API_KEY").expect("ALPACA_API_KEY env var required");
     let secret_key =
         std::env::var("ALPACA_SECRET_KEY").expect("ALPACA_SECRET_KEY env var required");
-    let paper = std::env::var("ALPACA_PAPER")
-        .map(|v| v.to_lowercase() != "false")
-        .unwrap_or(true);
 
-    assert!(paper, "Integration tests must run on paper trading account");
-
-    AlpacaConfig::new(api_key, secret_key, paper)
+    AlpacaConfig::paper(api_key, secret_key)
 }
 
 #[allow(dead_code)] // Reserved for future AAPL equity tests; SPY currently used as the equity fixture

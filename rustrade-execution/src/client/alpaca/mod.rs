@@ -336,11 +336,17 @@ pub struct AlpacaConfig {
     // Private fields prevent accidental credential exposure via struct access.
     api_key: String,
     secret_key: String,
+
     /// Use paper trading endpoints instead of production.
+    #[serde(default = "default_paper")]
     pub paper: bool,
     /// Test-only: override the REST base URL (e.g., to point at a wiremock server).
     #[cfg(test)]
     pub base_url_override: Option<String>,
+}
+
+fn default_paper() -> bool {
+    true
 }
 
 // Custom Debug to avoid leaking credentials in logs.
@@ -355,13 +361,50 @@ impl std::fmt::Debug for AlpacaConfig {
 }
 
 impl AlpacaConfig {
-    pub fn new(api_key: String, secret_key: String, paper: bool) -> Self {
+    /// Create a new Alpaca config using paper trading by default.
+    pub fn new(api_key: String, secret_key: String) -> Self {
+        Self::paper(api_key, secret_key)
+    }
+
+    pub fn paper(api_key: String, secret_key: String) -> Self {
         Self {
             api_key,
             secret_key,
-            paper,
+            paper: true,
             #[cfg(test)]
             base_url_override: None,
+        }
+    }
+
+    pub fn production(api_key: String, secret_key: String) -> Self {
+        Self {
+            api_key,
+            secret_key,
+            paper: false,
+            #[cfg(test)]
+            base_url_override: None,
+        }
+    }
+
+    pub fn from_env() -> Result<Self, AlpacaConfigError> {
+        let api_key =
+            std::env::var("ALPACA_API_KEY").map_err(|_| AlpacaConfigError::MissingApiKey)?;
+        let secret_key =
+            std::env::var("ALPACA_SECRET_KEY").map_err(|_| AlpacaConfigError::MissingSecretKey)?;
+
+        let paper = std::env::var("ALPACA_PAPER")
+            .ok()
+            .and_then(|v| match v.to_ascii_lowercase().as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            })
+            .unwrap_or(true);
+
+        if paper {
+            Ok(Self::paper(api_key, secret_key))
+        } else {
+            Ok(Self::production(api_key, secret_key))
         }
     }
 
@@ -403,6 +446,15 @@ impl AlpacaConfig {
             "wss://api.alpaca.markets/stream"
         }
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AlpacaConfigError {
+    #[error("ALPACA_API_KEY environment variable not set")]
+    MissingApiKey,
+
+    #[error("ALPACA_SECRET_KEY environment variable not set")]
+    MissingSecretKey,
 }
 
 // ---------------------------------------------------------------------------
@@ -3301,8 +3353,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_alpaca_config_new_uses_paper_trading_by_default() {
+        let cfg = AlpacaConfig::new("my_key".into(), "my_secret".into());
+        assert!(cfg.paper);
+    }
+
+    #[test]
     fn test_alpaca_config_debug_redacts_credentials() {
-        let cfg = AlpacaConfig::new("my_key".into(), "my_secret".into(), true);
+        let cfg = AlpacaConfig::new("my_key".into(), "my_secret".into());
         let debug = format!("{cfg:?}");
         assert!(!debug.contains("my_key"), "api_key should be redacted");
         assert!(
@@ -3313,12 +3371,56 @@ mod tests {
     }
 
     #[test]
+    fn test_alpaca_config_deserialize_omitted_paper_defaults_to_paper() {
+        let cfg: AlpacaConfig = serde_json::from_str(
+            r#"{
+        "api_key": "my_key",
+        "secret_key": "my_secret"
+    }"#,
+        )
+        .unwrap();
+
+        assert!(cfg.paper);
+        assert_eq!(cfg.rest_base_url(), "https://paper-api.alpaca.markets");
+    }
+
+    #[test]
+    fn test_alpaca_config_deserialize_paper_true() {
+        let cfg: AlpacaConfig = serde_json::from_str(
+            r#"{
+        "api_key": "my_key",
+        "secret_key": "my_secret",
+        "paper": true
+    }"#,
+        )
+        .unwrap();
+
+        assert!(cfg.paper);
+        assert_eq!(cfg.rest_base_url(), "https://paper-api.alpaca.markets");
+    }
+
+    #[test]
+    fn test_alpaca_config_deserialize_paper_false() {
+        let cfg: AlpacaConfig = serde_json::from_str(
+            r#"{
+        "api_key": "my_key",
+        "secret_key": "my_secret",
+        "paper": false
+    }"#,
+        )
+        .unwrap();
+
+        assert!(!cfg.paper);
+        assert_eq!(cfg.rest_base_url(), "https://api.alpaca.markets");
+    }
+
+    #[test]
     fn test_alpaca_config_urls() {
-        let paper = AlpacaConfig::new("k".into(), "s".into(), true);
+        let paper = AlpacaConfig::paper("k".into(), "s".into());
         assert!(paper.rest_base_url().contains("paper-api"));
         assert!(paper.ws_url().contains("paper-api"));
 
-        let live = AlpacaConfig::new("k".into(), "s".into(), false);
+        let live = AlpacaConfig::production("k".into(), "s".into());
         assert!(!live.rest_base_url().contains("paper-api"));
         assert!(!live.ws_url().contains("paper-api"));
     }
@@ -3561,7 +3663,7 @@ mod tests {
         use rustrade_instrument::instrument::name::InstrumentNameExchange;
 
         // Create a minimal client with dummy credentials (no network call will be made)
-        let config = AlpacaConfig::new("dummy_key".into(), "dummy_secret".into(), true);
+        let config = AlpacaConfig::new("dummy_key".into(), "dummy_secret".into());
         let client = AlpacaClient::new(config);
 
         let request = AlpacaBracketOrderRequest::new(
@@ -3589,7 +3691,7 @@ mod tests {
         use rust_decimal_macros::dec;
         use rustrade_instrument::instrument::name::InstrumentNameExchange;
 
-        let config = AlpacaConfig::new("dummy_key".into(), "dummy_secret".into(), true);
+        let config = AlpacaConfig::new("dummy_key".into(), "dummy_secret".into());
         let client = AlpacaClient::new(config);
 
         // Buy bracket with SL > entry (invalid)
@@ -3618,7 +3720,7 @@ mod tests {
         use rust_decimal_macros::dec;
         use rustrade_instrument::instrument::name::InstrumentNameExchange;
 
-        let config = AlpacaConfig::new("dummy_key".into(), "dummy_secret".into(), true);
+        let config = AlpacaConfig::new("dummy_key".into(), "dummy_secret".into());
         let client = AlpacaClient::new(config);
 
         // Buy bracket with SL limit > SL trigger (invalid for sell stop-limit)
