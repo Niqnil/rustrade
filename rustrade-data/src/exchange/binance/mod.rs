@@ -23,6 +23,16 @@ pub mod book;
 /// into an exchange [`Connector`] specific channel used for generating [`Connector::requests`].
 pub mod channel;
 
+/// Dedicated error type for the Binance historical klines REST client.
+mod error;
+pub use error::BinanceDataError;
+
+/// Historical klines (OHLCV candles) via Binance's public, unauthenticated REST
+/// endpoints — spot (`/api/v3/klines`) and futures continuous
+/// (`/fapi/v1/continuousKlines`).
+pub mod historical;
+pub use historical::BinanceHistoricalClient;
+
 /// [`ExchangeServer`] and [`StreamSelector`] implementations for
 /// [`BinanceFuturesUsd`](futures::BinanceFuturesUsd).
 pub mod futures;
