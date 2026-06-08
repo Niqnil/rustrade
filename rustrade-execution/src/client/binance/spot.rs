@@ -96,8 +96,14 @@ pub struct BinanceSpotConfig {
     // Use BinanceSpotConfig::new() to construct, or deserialize from config file.
     api_key: String,
     secret_key: String,
+
     /// Use testnet endpoints instead of production.
+    #[serde(default = "default_testnet")]
     pub testnet: bool,
+}
+
+fn default_testnet() -> bool {
+    true
 }
 
 // custom Debug to avoid leaking credentials in logs
@@ -112,11 +118,44 @@ impl std::fmt::Debug for BinanceSpotConfig {
 }
 
 impl BinanceSpotConfig {
-    pub fn new(api_key: String, secret_key: String, testnet: bool) -> Self {
+    pub fn new(api_key: String, secret_key: String) -> Self {
+        Self::testnet(api_key, secret_key)
+    }
+
+    pub fn testnet(api_key: String, secret_key: String) -> Self {
         Self {
             api_key,
             secret_key,
-            testnet,
+            testnet: true,
+        }
+    }
+
+    pub fn production(api_key: String, secret_key: String) -> Self {
+        Self {
+            api_key,
+            secret_key,
+            testnet: false,
+        }
+    }
+
+    pub fn from_env() -> Result<Self, BinanceSpotConfigError> {
+        let api_key =
+            std::env::var("BINANCE_API_KEY").map_err(|_| BinanceSpotConfigError::MissingApiKey)?;
+        let secret_key = std::env::var("BINANCE_SECRET_KEY")
+            .map_err(|_| BinanceSpotConfigError::MissingSecretKey)?;
+        let testnet = std::env::var("BINANCE_TESTNET")
+            .ok()
+            .and_then(|v| match v.to_ascii_lowercase().as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            })
+            .unwrap_or(true);
+
+        if testnet {
+            Ok(Self::testnet(api_key, secret_key))
+        } else {
+            Ok(Self::production(api_key, secret_key))
         }
     }
 
@@ -124,6 +163,15 @@ impl BinanceSpotConfig {
     pub fn api_key(&self) -> &str {
         &self.api_key
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BinanceSpotConfigError {
+    #[error("BINANCE_API_KEY environment variable not set")]
+    MissingApiKey,
+
+    #[error("BINANCE_SECRET_KEY environment variable not set")]
+    MissingSecretKey,
 }
 
 // ---------------------------------------------------------------------------
@@ -2305,6 +2353,74 @@ mod tests {
     use crate::order::TrailingOffsetType;
     use binance_sdk::common::errors::WebsocketError;
     use smol_str::SmolStr;
+
+    #[test]
+    fn test_binance_spot_config_new_uses_testnet_by_default() {
+        let cfg = BinanceSpotConfig::new("my_key".into(), "my_secret".into());
+        assert!(cfg.testnet);
+        assert_eq!(cfg.api_key(), "my_key");
+    }
+
+    #[test]
+    fn test_binance_spot_config_production_is_explicit() {
+        let cfg = BinanceSpotConfig::production("my_key".into(), "my_secret".into());
+        assert!(!cfg.testnet);
+    }
+
+    #[test]
+    fn test_binance_spot_config_debug_redacts_credentials() {
+        let cfg = BinanceSpotConfig::new("my_key".into(), "my_secret".into());
+        let debug = format!("{cfg:?}");
+
+        assert!(!debug.contains("my_key"), "api_key should be redacted");
+        assert!(
+            !debug.contains("my_secret"),
+            "secret_key should be redacted"
+        );
+        assert!(debug.contains("testnet: true"));
+    }
+
+    #[test]
+    fn test_binance_spot_config_deserialize_omitted_testnet_defaults_to_testnet() {
+        let cfg: BinanceSpotConfig = serde_json::from_str(
+            r#"{
+        "api_key": "my_key",
+        "secret_key": "my_secret"
+    }"#,
+        )
+        .unwrap();
+
+        assert!(cfg.testnet);
+        assert_eq!(cfg.api_key(), "my_key");
+    }
+
+    #[test]
+    fn test_binance_spot_config_deserialize_testnet_true() {
+        let cfg: BinanceSpotConfig = serde_json::from_str(
+            r#"{
+        "api_key": "my_key",
+        "secret_key": "my_secret",
+        "testnet": true
+    }"#,
+        )
+        .unwrap();
+
+        assert!(cfg.testnet);
+    }
+
+    #[test]
+    fn test_binance_spot_config_deserialize_testnet_false() {
+        let cfg: BinanceSpotConfig = serde_json::from_str(
+            r#"{
+        "api_key": "my_key",
+        "secret_key": "my_secret",
+        "testnet": false
+    }"#,
+        )
+        .unwrap();
+
+        assert!(!cfg.testnet);
+    }
 
     #[test]
     fn test_parse_side() {
