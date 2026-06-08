@@ -412,7 +412,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::new(
-                                                        BybitSpot::default(),
+                                                        BybitPerpetualsUsd::default(),
                                                         sub.instrument,
                                                         OrderBooksL1,
                                                     )
@@ -433,7 +433,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::new(
-                                                        BybitSpot::default(),
+                                                        BybitPerpetualsUsd::default(),
                                                         sub.instrument,
                                                         OrderBooksL2,
                                                     )
