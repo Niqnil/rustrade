@@ -1,0 +1,83 @@
+name: "Binance WS tier canary"
+
+# Re-verifies Binance's live WebSocket stream→tier routing weekly, so a silent Binance routing
+# change (which presents as HTTP 101 + zero frames — no error) fails loudly within a week instead
+# of becoming a silent dead stream in production. See
+# rustrade-data/tests/binance_ws_tier_canary.rs for the tier map and skip-vs-fail contract.
+
+on:
+  schedule:
+    # Weekly, Monday 06:00 UTC. NOTE: `schedule:` only fires from the workflow file as it exists
+    # on the default branch (main) — it will not run from develop or a feature branch.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+  # TEMPORARY (validation-only — REMOVE before merge): run on push to the feature branch so we can
+  # empirically check whether a GitHub-hosted (Azure/US) runner can actually reach Binance.
+  # Binance geoblocks many US IPs with 451; if this run skips-neutral every time, the canary must
+  # move to a self-hosted / non-US runner to be effective.
+  push:
+    branches: ["feature/binance-klines"]
+    paths:
+      - ".github/workflows/binance-ws-canary.yml"
+      - "rustrade-data/tests/binance_ws_tier_canary.rs"
+
+env:
+  MOLD_VERSION: "2.35.1"
+
+jobs:
+  binance-ws-canary:
+    name: Binance WS tier-routing canary
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      # Preflight: is Binance even reachable from this runner? Binance geoblocks some cloud / US
+      # IPs (451/403). A connectivity failure is NOT a tier change — surface it as a neutral
+      # notice and skip the test rather than going red on an infra artifact.
+      # NOTE: this gates the WHOLE run on both probes (spot api + futures fapi). A partial geoblock
+      # (e.g. only fapi blocked) therefore also skips the spot canary, even though spot is
+      # reachable. Intentional: skip-neutral is the safe outcome for a canary — losing coverage for
+      # one run beats a false red. Split per-stream only if partial geoblocks become common.
+      - name: Preflight Binance reachability
+        id: reachable
+        run: |
+          ok=true
+          for url in \
+            "https://api.binance.com/api/v3/ping" \
+            "https://fapi.binance.com/fapi/v1/ping"; do
+            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 15 "$url" || echo "000")
+            echo "$url -> HTTP $code"
+            if [ "$code" != "200" ]; then ok=false; fi
+          done
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+          if [ "$ok" != "true" ]; then
+            echo "::notice title=Binance unreachable::Skipping WS tier canary — Binance is not reachable from this runner (likely geoblock/451). This is a connectivity artifact, NOT a tier change. Consider a self-hosted / non-US runner."
+          fi
+
+      - name: Install mold linker
+        if: steps.reachable.outputs.ok == 'true'
+        uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444  # v1
+        with:
+          mold-version: ${{ env.MOLD_VERSION }}
+
+      - name: Install stable toolchain
+        if: steps.reachable.outputs.ok == 'true'
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        if: steps.reachable.outputs.ok == 'true'
+        with:
+          shared-key: "rustrade-ci-test"
+
+      # Binance reachable: any failure here is a REAL signal (connected + ACKed but the expected
+      # stream is silent ⇒ tier routing changed). The test itself still classifies a per-stream
+      # handshake failure as a logged SKIP (defense in depth for partial geoblocks).
+      - name: Run WS tier canary
+        if: steps.reachable.outputs.ok == 'true'
+        # Force INFO so the test's CANARY_SKIP / CANARY_OK lines (its primary diagnostic) always
+        # reach the CI log, regardless of any inherited RUST_LOG.
+        env:
+          RUST_LOG: info
+        run: cargo test -p rustrade-data --test binance_ws_tier_canary -- --ignored --nocapture
