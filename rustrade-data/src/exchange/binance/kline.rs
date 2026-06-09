@@ -1,3 +1,31 @@
+//! Live Binance kline (candle) WebSocket payloads and their normalisation to
+//! [`Candle`](crate::subscription::candle::Candle).
+//!
+//! Covers both the [`BinanceSpot`](crate::exchange::binance::spot::BinanceSpot) `@kline_<interval>`
+//! stream and the
+//! [`BinanceFuturesUsdMarket`](crate::exchange::binance::futures::BinanceFuturesUsdMarket)
+//! `@continuousKline_<interval>` stream (perpetual-only). Endpoints are public/unauthenticated.
+//!
+//! # Closed candles only (no repaint)
+//!
+//! rustrade emits **closed candles only** — an in-progress kline (`k.x == false`) yields an empty
+//! [`MarketIter`](crate::event::MarketIter), so consumers never see a repainting/lookahead value.
+//! The exclusive `close_time` boundary is recomputed library-side as `open + interval` (see
+//! [`close_time_from_open`](crate::subscription::candle::close_time_from_open)), **not** taken from
+//! Binance's wire `T` (its `period-end − 1ms` convention) — consumers comparing against the raw `T`
+//! will see a 1ms difference by design.
+//!
+//! # Reconnection: no replay, no dedup (consumer policy)
+//!
+//! Across a reconnect the underlying [`Connector`](crate::exchange::Connector) /
+//! `ReconnectingStream` re-subscribes but does **not** replay or de-duplicate: a closed candle
+//! straddling the disconnect may be **re-delivered or skipped**. De-duplication and gap-back-fill
+//! are **consumer policy, not library policy** (consistent with rustrade's "no consumer-specific
+//! policy in the library" rule). A consumer wanting a gapless series should reconcile the live
+//! candle stream against a
+//! [`fetch_candles`](crate::exchange::binance::historical::BinanceHistoricalClient::fetch_candles)
+//! backfill keyed on `close_time` (the field both paths agree on, since `open ≡ close − interval`).
+
 use super::BinanceChannel;
 use crate::{
     Identifier,

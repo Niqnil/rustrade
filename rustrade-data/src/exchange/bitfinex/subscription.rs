@@ -195,7 +195,7 @@ impl<'de> Deserialize<'de> for Status {
 ///
 /// 0 => [`Status::Maintenance`](Status), <br>
 /// 1 => [`Status::Operative`](Status), <br>
-/// other => [`de::Error`]
+/// other => [`de::Error`](serde::de::Error)
 fn de_status_from_integer<'de, D>(deserializer: D) -> Result<Status, D::Error>
 where
     D: serde::de::Deserializer<'de>,

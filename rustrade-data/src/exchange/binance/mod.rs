@@ -16,8 +16,8 @@ use rustrade_integration::protocol::websocket::{WebSocketSerdeParser, WsMessage}
 use std::{fmt::Debug, marker::PhantomData};
 use url::Url;
 
-/// OrderBook types common to both [`BinanceSpot`](spot::BinanceSpot) and
-/// [`BinanceFuturesUsd`](futures::BinanceFuturesUsd).
+/// OrderBook types common to both [`BinanceSpot`] and
+/// [`BinanceFuturesUsd`].
 pub mod book;
 
 /// Defines the type that translates a Barter [`Subscription`](crate::subscription::Subscription)
@@ -35,11 +35,11 @@ pub mod historical;
 pub use historical::BinanceHistoricalClient;
 
 /// [`ExchangeServer`] and [`StreamSelector`] implementations for
-/// [`BinanceFuturesUsd`](futures::BinanceFuturesUsd).
+/// [`BinanceFuturesUsd`].
 pub mod futures;
 
-/// Live kline (candle) wire models common to [`BinanceSpot`](spot::BinanceSpot) (`@kline_`)
-/// and [`BinanceFuturesUsd`](futures::BinanceFuturesUsd) (`@continuousKline_`).
+/// Live kline (candle) wire models common to [`BinanceSpot`] (`@kline_`)
+/// and [`BinanceFuturesUsd`] (`@continuousKline_`).
 pub mod kline;
 
 /// Defines the type that translates a Barter [`Subscription`](crate::subscription::Subscription)
@@ -47,16 +47,16 @@ pub mod kline;
 pub mod market;
 
 /// [`ExchangeServer`] and [`StreamSelector`] implementations for
-/// [`BinanceSpot`](spot::BinanceSpot).
+/// [`BinanceSpot`].
 pub mod spot;
 
 /// [`Subscription`](crate::subscription::Subscription) response type and response
-/// [`Validator`](rustrade_integration::Validator) common to both [`BinanceSpot`](spot::BinanceSpot)
-/// and [`BinanceFuturesUsd`](futures::BinanceFuturesUsd).
+/// [`Validator`](rustrade_integration::Validator) common to both [`BinanceSpot`]
+/// and [`BinanceFuturesUsd`].
 pub mod subscription;
 
-/// Public trade types common to both [`BinanceSpot`](spot::BinanceSpot) and
-/// [`BinanceFuturesUsd`](futures::BinanceFuturesUsd).
+/// Public trade types common to both [`BinanceSpot`] and
+/// [`BinanceFuturesUsd`].
 pub mod trade;
 
 /// Convenient type alias for a Binance [`ExchangeWsStream`] using [`WebSocketSerdeParser`].
@@ -66,7 +66,7 @@ pub type BinanceWsStream<Transformer> = ExchangeWsStream<WebSocketSerdeParser, T
 ///
 /// ### Notes
 /// A `Server` [`ExchangeServer`] implementations exists for
-/// [`BinanceSpot`](spot::BinanceSpot) and [`BinanceFuturesUsd`](futures::BinanceFuturesUsd).
+/// [`BinanceSpot`] and [`BinanceFuturesUsd`].
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
 pub struct Binance<Server> {
     server: PhantomData<Server>,

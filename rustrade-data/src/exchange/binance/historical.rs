@@ -2,8 +2,8 @@
 //! REST endpoints.
 //!
 //! Gives consumers free historical candle data for research/backtest on both
-//! [`BinanceSpot`](super::spot::BinanceSpot) and
-//! [`BinanceFuturesUsd`](super::futures::BinanceFuturesUsd) — no API key, no paid
+//! [`BinanceSpot`](crate::exchange::binance::spot::BinanceSpot) and
+//! [`BinanceFuturesUsd`](crate::exchange::binance::futures::BinanceFuturesUsd) — no API key, no paid
 //! data subscription. Construct a client for the surface you want and call
 //! [`fetch_candles`](BinanceHistoricalClient::fetch_candles):
 //!
@@ -26,7 +26,7 @@
 //! # Two surfaces, one mapping
 //!
 //! Spot and futures return the **same** array-of-arrays row shape and share one
-//! row→[`Candle`] mapping. They differ only on host, page cap, and URL params:
+//! row→[`Candle`](crate::subscription::candle::Candle) mapping. They differ only on host, page cap, and URL params:
 //!
 //! | Surface | Endpoint | Host | Page cap | Market param |
 //! |---|---|---|---|---|
@@ -36,7 +36,7 @@
 //! The futures path uses the **continuous-contract** surface (`contractType=PERPETUAL`)
 //! rather than `/fapi/v1/klines`. For a perpetual this is the same data as the
 //! symbol klines **plus** sub-minute resolutions: `/fapi/v1/klines` returns
-//! `400 Invalid interval` for [`Sec1`](CandleInterval::Sec1), whereas the
+//! `400 Invalid interval` for [`Sec1`](crate::subscription::candle::CandleInterval::Sec1), whereas the
 //! continuous surface serves genuine 1-second candles.
 //!
 //! # Rate limits & resumable backfill

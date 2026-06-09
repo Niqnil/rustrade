@@ -21,6 +21,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `Candles` is wired through `DynamicStreams`, so `ExchangeId`-keyed dynamic subscriptions can mix
     candle intervals alongside trades / order books.
 
+- **Binance historical klines (candles) over public REST** (`rustrade-data`,
+  `BinanceHistoricalClient`) — free historical OHLCV for research/backtest, no API key.
+  - Spot via `/api/v3/klines` (`BinanceHistoricalClient::spot()`) and USD-M perpetual futures via
+    `/fapi/v1/continuousKlines` (`BinanceHistoricalClient::futures()`); the continuous-contract
+    surface unlocks **`1s`** candles on futures (the symbol surface `/fapi/v1/klines` returns
+    `400 Invalid interval` for sub-minute). Both surfaces share one row→`Candle` mapping.
+  - Returns a paginated `Stream<Item = Result<Candle, BinanceDataError>>` (+ a `collect`-to-`Vec`
+    convenience); `close_time` is recomputed library-side as `open + interval`, and OHLCV is parsed
+    JSON-string → `Decimal` (never via `f64`). Server-side gap-filled zero-trade candles (`V = 0`)
+    are **delivered, not filtered** (filtering would be consumer policy).
+  - New dedicated `BinanceDataError` (`RateLimited { retry_after }` / `Api { status, message }`):
+    on `429`/`418` the stream **yields `RateLimited` and ends** — it does not sleep, retry, run a
+    global limiter, or emit metrics. The consumer owns retry/backoff and **resumes** by re-calling
+    `fetch_candles` with `start` advanced to the last received `close_time` (lossless; pagination
+    keys off `open_time`).
+  - A bounded, `tracing`-observable, caller-overridable **proactive inter-page pace** is on by
+    default (`BinanceHistoricalClient::with_pace(Duration)`), sized per surface to keep a single
+    backfill within Binance's weight budget (spot flat weight 2/req; futures `continuousKlines`
+    weight 10/req at the 1500/page max against a lower IP budget). It never inspects a 429 — purely
+    good-client courtesy, orthogonal to the surface-and-end rate-limit contract above.
+
 - **Binance Margin execution client** (`BinanceMargin`, `binance` feature) — **cross and isolated**
   - Implements the full `ExecutionClient` trait, so callers do not branch on spot-vs-margin
     transport: order submission/cancel and account snapshot / balance / open-order / trade queries
@@ -119,6 +140,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     subscribing to futures liquidations via `BinanceFuturesUsd` must switch to
     `BinanceFuturesUsdMarket`. The `DynamicStreams` / `ExchangeId` path is unaffected. Spot is
     unaffected.
+  - The blanket `StreamSelector<_, PublicTrades>` / `StreamSelector<_, OrderBooksL1>` impls on
+    `Binance<Server>` are now **explicit per-server** impls (`BinanceSpot` + `BinanceFuturesUsd`
+    only — never `BinanceFuturesUsdMarket`), so a `/market`-tier trade / L1 subscription is a
+    compile error instead of a silent dead stream, mirroring the already-per-server `OrderBooksL2`.
+    Breaking only for downstream users who implemented their own `Binance<CustomServer>` and relied
+    on the blanket impls — they must now add explicit `StreamSelector` impls for the kinds their
+    server supports.
 - **Bumped `ibapi` from `2.12.0` to `3.0.1`** (`ibkr` feature). ibapi 3.0 is a major release with
   breaking API changes; the IBKR market-data (`rustrade-data`) and execution (`rustrade-execution`)
   connectors were migrated to the new surface. Notable upstream changes absorbed: `Subscription<T>`
@@ -263,6 +291,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `MarketEvent`.
 
 ### Fixed
+
+- **Binance USD-M futures liquidation stream (`@forceOrder`) delivers again** (`rustrade-data`).
+  Binance routed `@forceOrder` to its `/market` WebSocket tier and decommissioned `/market`
+  delivery on the unrouted legacy `/ws` on 2026-04-23, leaving the existing futures `Liquidations`
+  stream (which connected to `/ws`) **silently dead in production** — a `101` handshake followed by
+  zero frames, no error. It now connects via the new `BinanceFuturesUsdMarket` server type on
+  `fstream.binance.com/market/ws`. No auth/listenKey is required (per-symbol `<sym>@forceOrder` was
+  confirmed live on a public `/market` socket).
 
 - **`BybitPerpetualsUsd` L1/L2 order books in `DynamicStreams` now use the perpetuals connector.**
   The `(BybitPerpetualsUsd, OrderBooksL1)` and `(BybitPerpetualsUsd, OrderBooksL2)` arms of the

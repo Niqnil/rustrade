@@ -25,7 +25,7 @@ impl BinanceChannel {
     /// See docs: <https://binance-docs.github.io/apidocs/spot/en/#trade-streams>
     ///
     /// Note:
-    /// For [`BinanceFuturesUsd`] this real-time
+    /// For [`BinanceFuturesUsd`](super::futures::BinanceFuturesUsd) this real-time
     /// stream is undocumented.
     ///
     /// See discord: <https://discord.com/channels/910237311332151317/923160222711812126/975712874582388757>
@@ -46,7 +46,7 @@ impl BinanceChannel {
     /// [`BinanceFuturesUsd`](super::futures::BinanceFuturesUsd) liquidation orders channel name.
     ///
     /// Routed on Binance's `/market` WS tier (see
-    /// [`BinanceFuturesUsdMarket`](super::futures::BinanceFuturesUsdMarket)).
+    /// [`BinanceFuturesUsdMarket`]).
     ///
     /// See docs: <https://binance-docs.github.io/apidocs/futures/en/#liquidation-order-streams>
     pub const LIQUIDATIONS: Self = Self("@forceOrder");
@@ -85,7 +85,7 @@ impl BinanceChannel {
     /// `_perpetual@continuousKline_1m`.
     ///
     /// Routed on Binance's `/market` WS tier (see
-    /// [`BinanceFuturesUsdMarket`](super::futures::BinanceFuturesUsdMarket)). The
+    /// [`BinanceFuturesUsdMarket`]). The
     /// `contractType` is fixed `PERPETUAL` because [`BinanceFuturesUsd`](super::futures::BinanceFuturesUsd)
     /// is perpetual-only. The interval suffix is exactly [`CandleInterval::as_str`] —
     /// pinned by the `futures_candle_channel_suffix_matches_interval` drift-guard test.

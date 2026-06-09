@@ -1,12 +1,13 @@
 //! Error type for the Binance historical klines REST client.
 //!
-//! Modelled on [`MassiveError`](crate::exchange::massive::MassiveError): the
+//! Modelled on `MassiveError` (the `massive` feature's REST error): the
 //! library surfaces these errors **without** automatic retry, reconnection, or
 //! adaptive backoff. The consumer decides how to handle rate limits and API
 //! failures (see [`BinanceDataError::RateLimited`] for the resume contract).
 //!
 //! It is deliberately a **dedicated** type rather than a new variant on the
-//! shared [`DataError`] — that shared enum derives `Eq`/`Ord`/`Hash`/`Serialize`,
+//! shared [`DataError`](crate::error::DataError) — that shared enum derives
+//! `Eq`/`Ord`/`Hash`/`Serialize`,
 //! and a `retry_after: Duration` payload would not fit cleanly. Keeping the
 //! Binance REST error local mirrors the Massive client exactly.
 
@@ -16,7 +17,7 @@ use std::time::Duration;
 /// Errors returned by the Binance historical klines REST client.
 ///
 /// The kline endpoints are public and unauthenticated, so there is no auth or
-/// environment-variable variant (contrast [`MassiveError`](crate::exchange::massive::MassiveError),
+/// environment-variable variant (contrast the `massive` feature's `MassiveError`,
 /// which carries both). WebSocket disconnects are handled by the live path's
 /// `Connector`, not here.
 #[derive(Debug, Clone, PartialEq)]

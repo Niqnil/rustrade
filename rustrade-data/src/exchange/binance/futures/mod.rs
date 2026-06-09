@@ -30,7 +30,9 @@ pub mod liquidation;
 ///
 /// Binance routes `fstream.binance.com` into mutually-exclusive path tiers; the legacy unrouted
 /// `/ws` was deprecated and stopped delivering `/market`-tier streams (e.g. `@forceOrder`) on
-/// 2026-04-23. Public-tier streams (`@trade`/`@bookTicker`/`@depth`) live here on `/public/ws`.
+/// 2026-04-23. Tier map: `@trade`/`@bookTicker`/`@depth` are `/public`-tier (here, on `/public/ws`);
+/// `@forceOrder`/`@aggTrade`/`@continuousKline`/`@markPrice` are `/market`-tier (see
+/// [`BinanceFuturesUsdMarket`]).
 ///
 /// See docs: <https://binance-docs.github.io/apidocs/futures/en/#websocket-market-streams>
 pub const WEBSOCKET_BASE_URL_BINANCE_FUTURES_USD: &str = "wss://fstream.binance.com/public/ws";
@@ -44,6 +46,18 @@ pub const WEBSOCKET_BASE_URL_BINANCE_FUTURES_USD_MARKET: &str =
     "wss://fstream.binance.com/market/ws";
 
 /// [`Binance`] perpetual usd exchange (`/public` WS tier: trade/bookTicker/depth).
+///
+/// # WebSocket connection limits
+///
+/// Existing Binance constraints a multi-symbol consumer must respect (not new — already handled by
+/// `ReconnectingStream` + tungstenite's automatic pong, but worth stating); they apply equally to
+/// the `/market`-tier [`BinanceFuturesUsdMarket`] socket:
+/// - **1024 streams per connection.**
+/// - **Incoming-message cap: 10 messages/second** (counts ping/pong + control frames) — space out
+///   bulk `SUBSCRIBE`s.
+/// - **Forced disconnect at 24h** (transparently re-established by `ReconnectingStream`).
+/// - **Keepalive:** the server pings every **3 minutes** with a **10-minute** pong deadline
+///   (tungstenite auto-pongs, so no action) — note this is far looser than spot's 20s/1-min cadence.
 pub type BinanceFuturesUsd = Binance<BinanceServerFuturesUsd>;
 
 /// [`Binance`] perpetual usd exchange on the `/market` WS tier (klines + liquidations).
