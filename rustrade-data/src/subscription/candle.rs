@@ -281,7 +281,12 @@ mod tests {
 /// - **Variable-length calendar arithmetic** (month/quarter/year only): these
 ///   are nominal boundaries computed with calendar months (chrono [`Months`]),
 ///   not fixed [`Duration`]s. Daily and weekly are exact fixed durations in UTC
-///   (no DST), exact to the millisecond.
+///   (no DST), exact to the millisecond. The `open_time + N months` equality
+///   holds only when `open_time` is calendar-grid-aligned (e.g. a `1M` candle
+///   opens on the 1st at 00:00 UTC); a non-aligned open day-clamps
+///   (Jan 31 + 1 month → Feb 28/29). Venue-supplied open times are always
+///   aligned, so clamping never arises in practice, but it is part of the
+///   contract for callers computing boundaries from arbitrary instants.
 ///
 /// `Candle` deliberately carries **neither `open_time` nor `interval`** — recover
 /// them from the originating fetch request / subscription resolution

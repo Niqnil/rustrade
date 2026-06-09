@@ -839,6 +839,18 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
     /// Remove an exchange [`Candle`] `Stream` from the [`DynamicStreams`] collection.
     ///
     /// Note that calling this method will permanently remove this `Stream` from [`Self`].
+    ///
+    /// # Mixed intervals
+    ///
+    /// `DynamicStreams` keys candle streams by [`ExchangeId`] only, so subscribing to
+    /// multiple intervals on one exchange (e.g. `Candles { Min1 }` + `Candles { Hour1 }`
+    /// on `BinanceSpot`) merges them into this single per-exchange stream. Each distinct
+    /// interval is a separate upstream WebSocket subscription (mind venue per-connection
+    /// stream limits at high symbol × interval fan-out). Because [`Candle`] carries no
+    /// `interval` field, a consumer mixing intervals must recover it from `close_time`
+    /// spacing or the originating subscription; if per-interval routing matters, use the
+    /// typed [`Streams`](crate::streams::Streams) builder with one
+    /// [`StreamSelector`](crate::exchange::StreamSelector) per interval.
     pub fn select_candles(
         &mut self,
         exchange: ExchangeId,
@@ -848,6 +860,9 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
 
     /// Select and merge every exchange [`Candle`] `Stream` using
     /// [`SelectAll`](futures_util::stream::select_all::select_all).
+    ///
+    /// See [`select_candles`](Self::select_candles) for how multiple intervals on one
+    /// exchange are merged — the merged `Candle`s carry no `interval` to disambiguate them.
     pub fn select_all_candles(
         &mut self,
     ) -> SelectAll<UnboundedReceiverStream<MarketStreamResult<InstrumentKey, Candle>>> {

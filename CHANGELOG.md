@@ -146,9 +146,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `Binance<Server>` are now **explicit per-server** impls (`BinanceSpot` + `BinanceFuturesUsd`
     only — never `BinanceFuturesUsdMarket`), so a `/market`-tier trade / L1 subscription is a
     compile error instead of a silent dead stream, mirroring the already-per-server `OrderBooksL2`.
-    Breaking only for downstream users who implemented their own `Binance<CustomServer>` and relied
-    on the blanket impls — they must now add explicit `StreamSelector` impls for the kinds their
-    server supports.
+    Breaking for any downstream user with their own `Binance<CustomServer>`: code that previously
+    compiled by resolving `PublicTrades` / `OrderBooksL1` through the blanket impl now fails to
+    compile. Migration is mechanical — add an explicit `impl StreamSelector<_, PublicTrades> for
+    Binance<CustomServer>` (and likewise `OrderBooksL1`) for each kind that server actually
+    supports.
 - **Bumped `ibapi` from `2.12.0` to `3.0.1`** (`ibkr` feature). ibapi 3.0 is a major release with
   breaking API changes; the IBKR market-data (`rustrade-data`) and execution (`rustrade-execution`)
   connectors were migrated to the new surface. Notable upstream changes absorbed: `Subscription<T>`
