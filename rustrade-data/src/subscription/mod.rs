@@ -279,11 +279,11 @@ pub fn exchange_supports_instrument_kind_sub_kind(
     use SubKind::*;
 
     match (exchange_id, instrument_kind, sub_kind) {
-        (BinanceSpot, Spot, PublicTrades | OrderBooksL1 | OrderBooksL2) => true,
+        (BinanceSpot, Spot, PublicTrades | OrderBooksL1 | OrderBooksL2 | Candles { .. }) => true,
         (
             BinanceFuturesUsd,
             Perpetual,
-            PublicTrades | OrderBooksL1 | OrderBooksL2 | Liquidations,
+            PublicTrades | OrderBooksL1 | OrderBooksL2 | Liquidations | Candles { .. },
         ) => true,
         (Bitfinex, Spot, PublicTrades) => true,
         (Bitmex, Perpetual, PublicTrades) => true,
@@ -612,19 +612,41 @@ mod tests {
         }
 
         #[test]
-        fn candles_not_yet_supported_on_dynamic_path() {
-            // The dynamic-path support matrix gains `Candles` only once the Binance candle
-            // `StreamSelector` exists to serve it. Until then the matrix must reject it so
-            // validation and stream init stay consistent (never validate-true-but-init-fails).
+        fn candles_supported_on_both_binance_venues_for_every_interval() {
+            // Both Binance venues serve the full interval set on the dynamic path; no interval
+            // is rejected (the Hyperliquid interval guard lives only in its typed historical path).
+            for interval in CandleInterval::ALL {
+                assert!(
+                    exchange_supports_instrument_kind_sub_kind(
+                        &ExchangeId::BinanceSpot,
+                        &MarketDataInstrumentKind::Spot,
+                        SubKind::Candles { interval },
+                    ),
+                    "BinanceSpot/Spot must support Candles {interval:?}"
+                );
+                assert!(
+                    exchange_supports_instrument_kind_sub_kind(
+                        &ExchangeId::BinanceFuturesUsd,
+                        &MarketDataInstrumentKind::Perpetual,
+                        SubKind::Candles { interval },
+                    ),
+                    "BinanceFuturesUsd/Perpetual must support Candles {interval:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn candles_rejected_for_unsupported_venue_kind_pairing() {
+            // A supported venue with the wrong instrument kind is still rejected.
             assert!(
                 !exchange_supports_instrument_kind_sub_kind(
                     &ExchangeId::BinanceSpot,
-                    &MarketDataInstrumentKind::Spot,
+                    &MarketDataInstrumentKind::Perpetual,
                     SubKind::Candles {
                         interval: CandleInterval::Min1,
                     },
                 ),
-                "Candles is not yet wired on the dynamic SubKind path"
+                "BinanceSpot does not serve Perpetual candles"
             );
         }
     }

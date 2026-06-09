@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Live Binance klines (candles) over WebSocket** (`rustrade-data`, `SubKind::Candles { interval }`)
+  - Spot via `@kline_<interval>` on `BinanceSpot`; USD-M perpetual futures via
+    `@continuousKline_<interval>` on a new `BinanceFuturesUsdMarket` exchange-server type routed to
+    the `/market` WebSocket tier (the only tier that delivers `@continuousKline_` frames).
+  - Closed-candles-only delivery (no repaint/lookahead): in-progress klines (`x == false`) yield no
+    event; the exclusive `close_time` boundary is recomputed library-side as `open + interval`
+    rather than taken from Binance's `period-end − 1ms` wire `T`.
+  - OHLCV parsed JSON-string → `Decimal` (never through an `f64` intermediate), preserving exchange
+    precision. New public wire models `BinanceKline`, `BinanceContinuousKline`, `BinanceKlineData`.
+  - `Candles` is wired through `DynamicStreams`, so `ExchangeId`-keyed dynamic subscriptions can mix
+    candle intervals alongside trades / order books.
+
 - **Binance Margin execution client** (`BinanceMargin`, `binance` feature) — **cross and isolated**
   - Implements the full `ExecutionClient` trait, so callers do not branch on spot-vs-margin
     transport: order submission/cancel and account snapshot / balance / open-order / trade queries
@@ -97,6 +109,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Binance USD-M futures WebSocket tier routing** (`rustrade-data`). Binance split the futures
+  WebSocket into mutually-exclusive routed tiers; subscribing on the wrong tier silently connects
+  (`101`) then delivers zero frames. To make the tier a compile-time property:
+  - Existing futures streams (trades, L1/L2 order books) migrated from `/ws` to `/public/ws`.
+  - `Liquidations` (`@forceOrder`) and the new `Candles` (`@continuousKline_`) `StreamSelector`
+    implementations now live on the new `/market`-tier `BinanceFuturesUsdMarket` server type, **not**
+    on `BinanceFuturesUsd`. This is a breaking change for the typed `Streams` path: callers
+    subscribing to futures liquidations via `BinanceFuturesUsd` must switch to
+    `BinanceFuturesUsdMarket`. The `DynamicStreams` / `ExchangeId` path is unaffected. Spot is
+    unaffected.
 - **Bumped `ibapi` from `2.12.0` to `3.0.1`** (`ibkr` feature). ibapi 3.0 is a major release with
   breaking API changes; the IBKR market-data (`rustrade-data`) and execution (`rustrade-execution`)
   connectors were migrated to the new surface. Notable upstream changes absorbed: `Subscription<T>`

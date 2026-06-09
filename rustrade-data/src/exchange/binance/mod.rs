@@ -1,5 +1,6 @@
 use self::{
-    book::l1::BinanceOrderBookL1, channel::BinanceChannel, market::BinanceMarket,
+    book::l1::BinanceOrderBookL1, channel::BinanceChannel, futures::BinanceFuturesUsd,
+    kline::BinanceKline, market::BinanceMarket, spot::BinanceSpot,
     subscription::BinanceSubResponse, trade::BinanceTrade,
 };
 use crate::{
@@ -7,7 +8,7 @@ use crate::{
     exchange::{Connector, ExchangeServer, ExchangeSub, StreamSelector},
     instrument::InstrumentData,
     subscriber::{WebSocketSubscriber, validator::WebSocketSubValidator},
-    subscription::{Map, book::OrderBooksL1, trade::PublicTrades},
+    subscription::{Map, book::OrderBooksL1, candle::Candles, trade::PublicTrades},
     transformer::stateless::StatelessTransformer,
 };
 use rustrade_instrument::exchange::ExchangeId;
@@ -36,6 +37,10 @@ pub use historical::BinanceHistoricalClient;
 /// [`ExchangeServer`] and [`StreamSelector`] implementations for
 /// [`BinanceFuturesUsd`](futures::BinanceFuturesUsd).
 pub mod futures;
+
+/// Live kline (candle) wire models common to [`BinanceSpot`](spot::BinanceSpot) (`@kline_`)
+/// and [`BinanceFuturesUsd`](futures::BinanceFuturesUsd) (`@continuousKline_`).
+pub mod kline;
 
 /// Defines the type that translates a Barter [`Subscription`](crate::subscription::Subscription)
 /// into an exchange [`Connector`] specific market used for generating [`Connector::requests`].
@@ -112,25 +117,58 @@ where
     }
 }
 
-impl<Instrument, Server> StreamSelector<Instrument, PublicTrades> for Binance<Server>
+// `PublicTrades` and `OrderBooksL1` are implemented per-server (NOT blanket over
+// `Binance<Server>`) so they ride only the `/public`-tier server types — `BinanceSpot` (`/ws`)
+// and `BinanceFuturesUsd` (`/public/ws`). The market-tier `BinanceFuturesUsdMarket` (`/market/ws`)
+// deliberately has no such impl, making a trade/L1 subscription on that tier — which Binance
+// would silently dead-stream — a compile error instead. This mirrors `OrderBooksL2`, which is
+// already per-server.
+impl<Instrument> StreamSelector<Instrument, PublicTrades> for BinanceSpot
 where
     Instrument: InstrumentData,
-    Server: ExchangeServer + Debug + Send + Sync,
 {
     type SnapFetcher = NoInitialSnapshots;
     type Stream =
         BinanceWsStream<StatelessTransformer<Self, Instrument::Key, PublicTrades, BinanceTrade>>;
 }
 
-impl<Instrument, Server> StreamSelector<Instrument, OrderBooksL1> for Binance<Server>
+impl<Instrument> StreamSelector<Instrument, PublicTrades> for BinanceFuturesUsd
 where
     Instrument: InstrumentData,
-    Server: ExchangeServer + Debug + Send + Sync,
+{
+    type SnapFetcher = NoInitialSnapshots;
+    type Stream =
+        BinanceWsStream<StatelessTransformer<Self, Instrument::Key, PublicTrades, BinanceTrade>>;
+}
+
+impl<Instrument> StreamSelector<Instrument, OrderBooksL1> for BinanceSpot
+where
+    Instrument: InstrumentData,
 {
     type SnapFetcher = NoInitialSnapshots;
     type Stream = BinanceWsStream<
         StatelessTransformer<Self, Instrument::Key, OrderBooksL1, BinanceOrderBookL1>,
     >;
+}
+
+impl<Instrument> StreamSelector<Instrument, OrderBooksL1> for BinanceFuturesUsd
+where
+    Instrument: InstrumentData,
+{
+    type SnapFetcher = NoInitialSnapshots;
+    type Stream = BinanceWsStream<
+        StatelessTransformer<Self, Instrument::Key, OrderBooksL1, BinanceOrderBookL1>,
+    >;
+}
+
+// Live spot klines: `@kline_<interval>` on `BinanceSpot`'s `/ws` tier.
+impl<Instrument> StreamSelector<Instrument, Candles> for BinanceSpot
+where
+    Instrument: InstrumentData,
+{
+    type SnapFetcher = NoInitialSnapshots;
+    type Stream =
+        BinanceWsStream<StatelessTransformer<Self, Instrument::Key, Candles, BinanceKline>>;
 }
 
 impl<'de, Server> serde::Deserialize<'de> for Binance<Server>

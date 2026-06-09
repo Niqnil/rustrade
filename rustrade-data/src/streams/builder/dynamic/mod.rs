@@ -2,7 +2,11 @@ use crate::{
     Identifier,
     error::DataError,
     exchange::{
-        binance::{futures::BinanceFuturesUsd, market::BinanceMarket, spot::BinanceSpot},
+        binance::{
+            futures::{BinanceFuturesUsd, BinanceFuturesUsdMarket},
+            market::BinanceMarket,
+            spot::BinanceSpot,
+        },
         bitfinex::{Bitfinex, market::BitfinexMarket},
         bitmex::{Bitmex, market::BitmexMarket},
         bybit::{futures::BybitPerpetualsUsd, market::BybitMarket, spot::BybitSpot},
@@ -26,7 +30,7 @@ use crate::{
     subscription::{
         SubKind, Subscription,
         book::{OrderBookEvent, OrderBookL1, OrderBooksL1, OrderBooksL2},
-        candle::Candle,
+        candle::{Candle, Candles},
         liquidation::{Liquidation, Liquidations},
         trade::{PublicTrade, PublicTrades},
     },
@@ -92,7 +96,9 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
         Subscription<BinanceFuturesUsd, Instrument, PublicTrades>: Identifier<BinanceMarket>,
         Subscription<BinanceFuturesUsd, Instrument, OrderBooksL1>: Identifier<BinanceMarket>,
         Subscription<BinanceFuturesUsd, Instrument, OrderBooksL2>: Identifier<BinanceMarket>,
-        Subscription<BinanceFuturesUsd, Instrument, Liquidations>: Identifier<BinanceMarket>,
+        Subscription<BinanceFuturesUsdMarket, Instrument, Liquidations>: Identifier<BinanceMarket>,
+        Subscription<BinanceSpot, Instrument, Candles>: Identifier<BinanceMarket>,
+        Subscription<BinanceFuturesUsdMarket, Instrument, Candles>: Identifier<BinanceMarket>,
         Subscription<Bitfinex, Instrument, PublicTrades>: Identifier<BitfinexMarket>,
         Subscription<Bitmex, Instrument, PublicTrades>: Identifier<BitmexMarket>,
         Subscription<BybitSpot, Instrument, PublicTrades>: Identifier<BybitMarket>,
@@ -259,13 +265,17 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                         })
                                     }
                                     (ExchangeId::BinanceFuturesUsd, SubKind::Liquidations) => {
+                                        // `@forceOrder` is a `/market`-tier stream — construct the
+                                        // market-tier server type so the `/market/ws` URL is used.
+                                        // Output still forwards to the BinanceFuturesUsd liquidation
+                                        // tx (both server types share that ExchangeId).
                                         init_market_stream(
                                             STREAM_RECONNECTION_POLICY,
                                             WebSocketSubscriber,
                                             subs.into_iter()
                                                 .map(|sub| {
                                                     Subscription::<_, Instrument, _>::new(
-                                                        BinanceFuturesUsd::default(),
+                                                        BinanceFuturesUsdMarket::default(),
                                                         sub.instrument,
                                                         Liquidations,
                                                     )
@@ -276,6 +286,59 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
                                         .map(|stream| {
                                             tokio::spawn(stream.forward_to(
                                                 txs.liquidations.get(&exchange).unwrap().clone(),
+                                            ))
+                                        })
+                                    }
+                                    (ExchangeId::BinanceSpot, SubKind::Candles { interval }) => {
+                                        // Every sub in this group shares one interval (the
+                                        // `chunk_by` key is `(exchange, sub.kind)`), so the
+                                        // group-key `interval` equals each `sub.kind.interval`.
+                                        init_market_stream(
+                                            STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
+                                            subs.into_iter()
+                                                .map(|sub| {
+                                                    Subscription::new(
+                                                        BinanceSpot::default(),
+                                                        sub.instrument,
+                                                        Candles { interval },
+                                                    )
+                                                })
+                                                .collect(),
+                                        )
+                                        .await
+                                        .map(|stream| {
+                                            tokio::spawn(stream.forward_to(
+                                                txs.candles.get(&exchange).unwrap().clone(),
+                                            ))
+                                        })
+                                    }
+                                    (
+                                        ExchangeId::BinanceFuturesUsd,
+                                        SubKind::Candles { interval },
+                                    ) => {
+                                        // Futures klines are a `/market`-tier stream — construct the
+                                        // market-tier server type (`/market/ws`). Output forwards to
+                                        // the BinanceFuturesUsd candles tx (shared ExchangeId).
+                                        // Group is homogeneous by `(exchange, sub.kind)`, so the
+                                        // group-key `interval` equals every `sub.kind.interval`.
+                                        init_market_stream(
+                                            STREAM_RECONNECTION_POLICY,
+                                            WebSocketSubscriber,
+                                            subs.into_iter()
+                                                .map(|sub| {
+                                                    Subscription::<_, Instrument, _>::new(
+                                                        BinanceFuturesUsdMarket::default(),
+                                                        sub.instrument,
+                                                        Candles { interval },
+                                                    )
+                                                })
+                                                .collect(),
+                                        )
+                                        .await
+                                        .map(|stream| {
+                                            tokio::spawn(stream.forward_to(
+                                                txs.candles.get(&exchange).unwrap().clone(),
                                             ))
                                         })
                                     }
@@ -935,6 +998,16 @@ where
                         rxs.liquidations.insert(sub.exchange, rx);
                     }
                 }
+                SubKind::Candles { .. } => {
+                    if let (None, None) = (
+                        txs.candles.get(&sub.exchange),
+                        rxs.candles.get(&sub.exchange),
+                    ) {
+                        let (tx, rx) = mpsc_unbounded();
+                        txs.candles.insert(sub.exchange, tx);
+                        rxs.candles.insert(sub.exchange, rx);
+                    }
+                }
                 unsupported => return Err(DataError::UnsupportedSubKind(unsupported)),
             }
         }
@@ -952,10 +1025,6 @@ struct Txs<InstrumentKey> {
     l2s: FnvHashMap<ExchangeId, UnboundedTx<MarketStreamResult<InstrumentKey, OrderBookEvent>>>,
     liquidations:
         FnvHashMap<ExchangeId, UnboundedTx<MarketStreamResult<InstrumentKey, Liquidation>>>,
-    // The candle tx end is held for channel symmetry but has no producer yet: nothing
-    // forwards to it until the Binance candle `StreamSelector` and its `Channels::try_from`
-    // arm are wired. `dead_code` is allowed only for this transitional, never-read field.
-    #[allow(dead_code)]
     candles: FnvHashMap<ExchangeId, UnboundedTx<MarketStreamResult<InstrumentKey, Candle>>>,
 }
 
