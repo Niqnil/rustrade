@@ -34,8 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - New dedicated `BinanceDataError` (`RateLimited { retry_after }` / `Api { status, message }`):
     on `429`/`418` the stream **yields `RateLimited` and ends** — it does not sleep, retry, run a
     global limiter, or emit metrics. The consumer owns retry/backoff and **resumes** by re-calling
-    `fetch_candles` with `start` advanced to the last received `close_time` (lossless; pagination
-    keys off `open_time`).
+    `fetch_candles` with `start` advanced to `last_close_time + 1ms` — the next candle's open. The
+    `[start, end]` range is `close_time`-inclusive, so resuming exactly at the last `close_time`
+    would re-yield that candle; the `+1ms` step is lossless and duplicate-free (pagination keys off
+    `open_time`).
   - A bounded, `tracing`-observable, caller-overridable **proactive inter-page pace** is on by
     default (`BinanceHistoricalClient::with_pace(Duration)`), sized per surface to keep a single
     backfill within Binance's weight budget (spot flat weight 2/req; futures `continuousKlines`
@@ -255,15 +257,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-serialized.
 - **BREAKING (`rustrade-data`): the `SubKind::Candles` enum variant gained a mandatory
   `interval: CandleInterval` field.** Mirroring the marker `Candles` kind above, the dynamic-subscription
-  `SubKind` enum's unit variant `Candles` is now `Candles { interval: CandleInterval }`. Exhaustive
-  matches on `SubKind` and any persisted/transmitted serde form change (the `Display` tag stays the fixed
-  `"candles"`, interval-independent). Migration: replace `SubKind::Candles` with
+  `SubKind` enum's unit variant `Candles` is now `Candles { interval: CandleInterval }`, so exhaustive
+  matches on `SubKind` must bind the field. The serde form also changes: `SubKind` is an
+  externally-tagged enum, so the representation goes from `"Candles"` to `{"Candles":{"interval":"1m"}}`
+  (the `derive_more::Display` tag stays the fixed `"candles"`, interval-independent).
+  Migration: replace `SubKind::Candles` with
   `SubKind::Candles { interval: CandleInterval::Min1 }` (or the desired resolution). The
   `DynamicStreams` stream builder now collects per-exchange candle streams symmetrically with the other
   data kinds (new public field `candles` and accessors `select_candles` / `select_all_candles`, and a new
-  `MarketStreamResult<_, Candle>: Into<Output>` bound on `select_all`); a `SubKind::Candles` subscription
-  is currently rejected during dynamic-path subscription validation (`exchange_supports_instrument_kind_sub_kind`
-  returns `false`) until a venue candle producer is wired, so these accessors are empty for now.
+  `MarketStreamResult<_, Candle>: Into<Output>` bound on `select_all`). Binance spot and USD-M perpetual
+  futures candles are wired through the dynamic path (`exchange_supports_instrument_kind_sub_kind` accepts
+  them), so `select_candles` / `select_all_candles` yield live candle streams; venues without a candle
+  producer remain rejected.
 - **BREAKING (`rustrade-data`): `OrderBook` now stores a nested `OrderBookTimes` instead of a bare
   `time_engine`.** The new public `OrderBookTimes` struct groups the three revision timestamps
   (`time_engine` + `time_exchange` + `time_received`) and serves double duty as both the constructor

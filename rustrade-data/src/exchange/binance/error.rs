@@ -11,7 +11,6 @@
 //! and a `retry_after: Duration` payload would not fit cleanly. Keeping the
 //! Binance REST error local mirrors the Massive client exactly.
 
-use crate::error::DataError;
 use std::time::Duration;
 
 /// Errors returned by the Binance historical klines REST client.
@@ -31,8 +30,11 @@ pub enum BinanceDataError {
     /// The historical `Stream` **yields this error and ends** — it does **not**
     /// wait, retry, or run a process-global limiter. The consumer owns
     /// retry/backoff and **resumes** losslessly by re-invoking `fetch_candles`
-    /// with `start` advanced to the last `close_time` already received
-    /// (pagination keys off `open_time`, and `open ≡ close − interval`).
+    /// with `start` advanced to `last_close_time + 1ms` (the next candle's open).
+    /// The `[start, end]` range is `close_time`-inclusive, so resuming exactly at
+    /// the last `close_time` would re-yield that final candle; the `+1ms` step
+    /// skips it without leaving a gap (pagination keys off `open_time`, and
+    /// `open ≡ close − interval`).
     RateLimited { retry_after: Option<Duration> },
 
     /// API returned a non-success, non-rate-limit response (e.g. `400 Invalid
@@ -85,12 +87,6 @@ impl std::fmt::Display for BinanceDataError {
 }
 
 impl std::error::Error for BinanceDataError {}
-
-impl From<BinanceDataError> for DataError {
-    fn from(err: BinanceDataError) -> Self {
-        DataError::Socket(err.to_string())
-    }
-}
 
 impl From<reqwest::Error> for BinanceDataError {
     fn from(err: reqwest::Error) -> Self {

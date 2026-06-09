@@ -593,6 +593,19 @@ mod tests {
         }
 
         #[test]
+        fn candles_variant_serde_shape_is_externally_tagged() {
+            // `SubKind` is an externally-tagged enum (no `#[serde(tag = ...)]`), so the struct
+            // variant serialises as `{"Candles":{"interval":"1m"}}` — NOT an internally-tagged
+            // `{"type":"candles",...}` form. Pin the wire shape so a future tag/rename change is
+            // caught here rather than silently shipped to config-driven consumers.
+            let json = serde_json::to_string(&SubKind::Candles {
+                interval: CandleInterval::Min1,
+            })
+            .unwrap();
+            assert_eq!(json, r#"{"Candles":{"interval":"1m"}}"#);
+        }
+
+        #[test]
         fn candles_display_tag_is_interval_independent() {
             // The `derive_more::Display` tag is the fixed kind name, never the interval.
             assert_eq!(

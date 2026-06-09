@@ -278,6 +278,19 @@ mod tests {
         }
     }"#;
 
+    /// Futures `continuousKline_1m` frame for a **closed** candle (note: no `k.s`; the symbol
+    /// source is the top-level `ps` pair).
+    const FUTURES_CLOSED: &str = r#"
+    {
+        "e": "continuous_kline", "E": 1607443079999, "ps": "BTCUSDT", "ct": "PERPETUAL",
+        "k": {
+            "t": 1607443020000, "T": 1607443079999, "i": "1m",
+            "f": 116467658886, "L": 116468012423, "o": "18787.00", "c": "18804.04",
+            "h": "18810.00", "l": "18786.54", "v": "197.664", "n": 543, "x": true,
+            "q": "3715253.19494", "V": "184.769", "Q": "3472925.84746", "B": "0"
+        }
+    }"#;
+
     #[test]
     fn spot_kline_deserialises_and_builds_map_key() {
         let kline = serde_json::from_str::<BinanceKline>(SPOT_CLOSED).unwrap();
@@ -340,6 +353,33 @@ mod tests {
         let MarketIter(events) =
             MarketIter::<u64, Candle>::from((ExchangeId::BinanceFuturesUsd, 1u64, kline));
         assert!(events.is_empty(), "in-progress klines must not emit events");
+    }
+
+    #[test]
+    fn closed_continuous_kline_maps_with_boundary_close_time_via_ps_pair() {
+        // Symmetric to `closed_candle_maps_to_candle_with_boundary_close_time`, but for the
+        // futures continuous frame: the symbol comes from `ps` (no `k.s`) and the OHLCV must
+        // map through unchanged.
+        let kline = serde_json::from_str::<BinanceContinuousKline>(FUTURES_CLOSED).unwrap();
+        let MarketIter(events) =
+            MarketIter::<u64, Candle>::from((ExchangeId::BinanceFuturesUsd, 7u64, kline));
+        assert_eq!(
+            events.len(),
+            1,
+            "a closed continuous kline must emit exactly one candle"
+        );
+        let event = events.into_iter().next().unwrap().unwrap();
+        // close_time = open (1607443020000ms) + 1m = 1607443080000ms — the exclusive boundary,
+        // NOT the wire `T` (1607443079999ms).
+        let expected = Utc.timestamp_millis_opt(1607443080000).unwrap();
+        assert_eq!(event.kind.close_time, expected);
+        assert_eq!(event.time_exchange, expected);
+        assert_eq!(event.kind.open, dec!(18787.00));
+        assert_eq!(event.kind.high, dec!(18810.00));
+        assert_eq!(event.kind.low, dec!(18786.54));
+        assert_eq!(event.kind.close, dec!(18804.04));
+        assert_eq!(event.kind.volume, dec!(197.664));
+        assert_eq!(event.kind.trade_count, 543);
     }
 
     #[test]

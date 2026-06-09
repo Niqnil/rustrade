@@ -45,9 +45,12 @@
 //! [`BinanceDataError::RateLimited`] and **ends** — it never waits, retries, or
 //! runs a process-global limiter (the consumer owns retry/backoff). The stream is
 //! **resumable**: on a `RateLimited` error, wait `retry_after`, then re-invoke
-//! `fetch_candles` with `start` advanced to the **last `close_time` already
-//! received**. No progress is lost — pagination keys off `open_time`, and
-//! `open ≡ close − interval`.
+//! `fetch_candles` with `start` advanced to **1ms past the last `close_time`
+//! already received** (`last_close_time + 1ms`, i.e. the next candle's open). The
+//! `[start, end]` range is `close_time`-inclusive, so resuming exactly at
+//! `last_close_time` would re-yield that final candle; the `+1ms` step skips it
+//! without leaving a gap. No progress is lost — pagination keys off `open_time`,
+//! and `open ≡ close − interval`.
 //!
 //! A long unattended backfill (a 90-day `1s` series is ≈ 7.8M candles over
 //! thousands of requests) will **not** "just work" without that resume loop on
@@ -241,7 +244,9 @@ impl BinanceHistoricalClient {
     ///
     /// Each yielded item is a `Result`. On HTTP `429`/`418` the stream yields
     /// [`BinanceDataError::RateLimited`] and ends (resume by re-calling with
-    /// `start` = last received `close_time`). Other failures surface as
+    /// `start` = last received `close_time` **+ 1ms**, the next candle's open —
+    /// resuming exactly at the last `close_time` re-yields that candle, as the
+    /// range is `close_time`-inclusive). Other failures surface as
     /// [`BinanceDataError::Api`] / [`Http`](BinanceDataError::Http) /
     /// [`Deserialize`](BinanceDataError::Deserialize) /
     /// [`InvalidInput`](BinanceDataError::InvalidInput).
@@ -592,7 +597,8 @@ fn parse_decimal<E: serde::de::Error>(raw: &str) -> Result<Decimal, E> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+// Test code: panics on bad input are acceptable (expect carries a diagnostic message).
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
@@ -717,5 +723,242 @@ mod tests {
             matches!(err, BinanceDataError::InvalidInput { .. }),
             "expected InvalidInput, got {err:?}"
         );
+    }
+
+    // --- Mock-server pagination / rate-limit tests -------------------------------------------
+    //
+    // A throwaway in-process HTTP/1.1 server (std-only, no extra dependency) serves canned
+    // responses to the real `reqwest` client via `with_base_url`, exercising the multi-page
+    // loop, the `close_time` trim, the resume contract, and the `RateLimited`-then-ends path.
+
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// One canned HTTP response for the mock server.
+    struct MockResponse {
+        status: u16,
+        retry_after_secs: Option<u64>,
+        body: String,
+    }
+
+    fn ok(body: String) -> MockResponse {
+        MockResponse {
+            status: 200,
+            retry_after_secs: None,
+            body,
+        }
+    }
+
+    /// Spawn a single-shot HTTP/1.1 server that serves `responses` in order, one per accepted
+    /// connection (`Connection: close` makes `reqwest` open a fresh connection per page). Returns
+    /// `(base_url, join_handle)`. The caller must:
+    ///
+    /// 1. Pass the base URL to [`with_base_url`](BinanceHistoricalClient::with_base_url).
+    /// 2. Drive **exactly** `responses.len()` page requests (fewer leaves the server thread
+    ///    parked in `accept()` with responses unserved, so the test silently covers fewer pages
+    ///    than intended).
+    /// 3. Call `handle.join().expect("mock server panicked")` after all awaits complete so that
+    ///    any server-side panic surfaces as a test failure rather than being swallowed.
+    fn spawn_mock(responses: Vec<MockResponse>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            for resp in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                // A GET carries no body; one read of the request line + headers is enough on
+                // loopback (the request is far smaller than the buffer — we only need to let the
+                // client finish writing before we reply; the bytes themselves are discarded).
+                let _ = stream.read(&mut [0u8; 4096]);
+                let retry = resp
+                    .retry_after_secs
+                    .map(|s| format!("Retry-After: {s}\r\n"))
+                    .unwrap_or_default();
+                let http = format!(
+                    "HTTP/1.1 {} X\r\nContent-Type: application/json\r\n{retry}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp.status,
+                    resp.body.len(),
+                    resp.body,
+                );
+                stream.write_all(http.as_bytes()).unwrap();
+            }
+        });
+        (base, handle)
+    }
+
+    /// A minimal valid spot kline row (9 elements) opening at `open_ms`. The wire `closeTime`
+    /// (index 6) is `open + 59_999ms`, so the recomputed exclusive boundary (`open + 60_000ms`)
+    /// is provably not the wire value.
+    fn row(open_ms: i64) -> String {
+        format!(
+            r#"[{open_ms},"1","2","0.5","1.5","10",{},"0",1]"#,
+            open_ms + 59_999
+        )
+    }
+
+    /// Build a JSON array page from the given row open-times.
+    fn page(opens: impl IntoIterator<Item = i64>) -> String {
+        let rows: Vec<String> = opens.into_iter().map(row).collect();
+        format!("[{}]", rows.join(","))
+    }
+
+    fn ms(millis: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp_millis(millis).unwrap()
+    }
+
+    const MIN_MS: i64 = 60_000;
+    const BASE_MS: i64 = 1_700_000_000_000;
+
+    #[tokio::test]
+    async fn paginates_across_pages_without_gap_or_duplicate() {
+        // Page 1 fills the spot page cap (1000) so the loop continues; page 2 is a short page
+        // that terminates it. The cursor advance keys off open-time, so the page seam must be
+        // seamless: candle[1000] follows candle[999] by exactly one interval.
+        let page1 = page((0..1000).map(|i| BASE_MS + i * MIN_MS));
+        let page2 = page([BASE_MS + 1000 * MIN_MS, BASE_MS + 1001 * MIN_MS]);
+        let (url, server) = spawn_mock(vec![ok(page1), ok(page2)]);
+
+        let candles = BinanceHistoricalClient::spot()
+            .with_base_url(url)
+            .with_pace(Duration::ZERO)
+            .collect_candles(
+                "BTCUSDT",
+                CandleInterval::Min1,
+                ms(BASE_MS + MIN_MS),        // close of row 0
+                ms(BASE_MS + 1002 * MIN_MS), // close of the last row
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            candles.len(),
+            1002,
+            "every row across both pages is delivered once"
+        );
+        for w in candles.windows(2) {
+            assert_eq!(
+                w[1].close_time - w[0].close_time,
+                chrono::Duration::milliseconds(MIN_MS),
+                "close_time must advance by exactly one interval — no gap, no duplicate at the seam",
+            );
+        }
+        server.join().expect("mock server panicked");
+    }
+
+    #[tokio::test]
+    async fn close_time_trim_excludes_out_of_range_candles() {
+        // A page of three candles (close_times base+1m, base+2m, base+3m); the window admits
+        // only the middle one, proving both trim bounds are exact and applied per row.
+        let (url, server) = spawn_mock(vec![ok(page([
+            BASE_MS,
+            BASE_MS + MIN_MS,
+            BASE_MS + 2 * MIN_MS,
+        ]))]);
+
+        let candles = BinanceHistoricalClient::spot()
+            .with_base_url(url)
+            .with_pace(Duration::ZERO)
+            .collect_candles(
+                "BTCUSDT",
+                CandleInterval::Min1,
+                ms(BASE_MS + 2 * MIN_MS), // == close of the middle candle
+                ms(BASE_MS + 2 * MIN_MS),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(candles.len(), 1);
+        assert_eq!(candles[0].close_time, ms(BASE_MS + 2 * MIN_MS));
+        server.join().expect("mock server panicked");
+    }
+
+    #[tokio::test]
+    async fn resume_at_last_close_plus_1ms_skips_the_boundary_duplicate() {
+        // The candle already received before the 429 has close_time `last_close`. Binance widens
+        // the lower bound by one interval, so a resume page leads with that boundary candle
+        // (open = last_close − interval) followed by the next candle (open = last_close). The mock
+        // serves this page verbatim regardless of the query params, so the exclusion asserted
+        // below is driven by the library's `close_time >= start` trim, not Binance-side
+        // `startTime` filtering — which is exactly the layer the resume contract relies on.
+        let last_close = BASE_MS + MIN_MS;
+        let resume_page = page([last_close - MIN_MS, last_close]);
+
+        // Resuming exactly at `last_close` re-yields the boundary candle (the `[start, end]`
+        // lower bound is inclusive) → duplicate. This is the trap the resume contract warns of.
+        let (dup_url, dup_server) = spawn_mock(vec![ok(resume_page.clone())]);
+        let dup = BinanceHistoricalClient::spot()
+            .with_base_url(dup_url)
+            .with_pace(Duration::ZERO)
+            .collect_candles(
+                "BTCUSDT",
+                CandleInterval::Min1,
+                ms(last_close),
+                ms(last_close + MIN_MS),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            dup.len(),
+            2,
+            "resuming at last close_time re-delivers it (documents the duplicate)"
+        );
+        dup_server.join().expect("mock server panicked");
+
+        // Resuming at `last_close + 1ms` (the documented contract) skips the boundary candle and
+        // delivers only the next one — lossless and duplicate-free.
+        let (resumed_url, resumed_server) = spawn_mock(vec![ok(resume_page)]);
+        let resumed = BinanceHistoricalClient::spot()
+            .with_base_url(resumed_url)
+            .with_pace(Duration::ZERO)
+            .collect_candles(
+                "BTCUSDT",
+                CandleInterval::Min1,
+                ms(last_close + 1),
+                ms(last_close + MIN_MS),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed.len(),
+            1,
+            "last_close + 1ms resume skips the duplicate"
+        );
+        assert_eq!(resumed[0].close_time, ms(last_close + MIN_MS));
+        resumed_server.join().expect("mock server panicked");
+    }
+
+    #[tokio::test]
+    async fn rate_limited_yields_once_then_ends() {
+        let (url, server) = spawn_mock(vec![MockResponse {
+            status: 429,
+            retry_after_secs: Some(30),
+            body: "{}".to_owned(),
+        }]);
+
+        let client = BinanceHistoricalClient::spot()
+            .with_base_url(url)
+            .with_pace(Duration::ZERO);
+        let mut stream = std::pin::pin!(client.fetch_candles(
+            "BTCUSDT",
+            CandleInterval::Min1,
+            ms(0),
+            ms(MIN_MS)
+        ));
+
+        let first = stream
+            .next()
+            .await
+            .expect("the stream must yield the rate-limit error");
+        assert!(
+            matches!(
+                first,
+                Err(BinanceDataError::RateLimited { retry_after: Some(d) }) if d == Duration::from_secs(30)
+            ),
+            "429 must yield RateLimited carrying the parsed Retry-After, got {first:?}",
+        );
+        assert!(
+            stream.next().await.is_none(),
+            "the stream must end after RateLimited"
+        );
+        server.join().expect("mock server panicked");
     }
 }
