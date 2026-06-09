@@ -1,4 +1,4 @@
-//! Binance WebSocket tier-routing canary (network-gated, scheduled).
+//! Binance WebSocket tier-routing canary (network-gated, on-demand diagnostic).
 //!
 //! # Why this exists
 //!
@@ -9,9 +9,21 @@
 //! `PublicTrades` additionally rides the *undocumented* `@trade` stream. A tier change would
 //! therefore produce a silent dead stream in production with no compile-time or runtime error.
 //!
-//! This canary re-verifies the live tier map weekly and fails loudly within a week of any
-//! Binance change. It exercises rustrade's **typed `Streams` API** (not raw sockets) so it also
-//! catches a wrong `websocket_url()` / channel-string regression on *our* side.
+//! This canary re-verifies the live tier map and fails loudly if a stream Binance should be
+//! serving has gone dark. It exercises rustrade's **typed `Streams` API** (not raw sockets) so it
+//! also catches a wrong `websocket_url()` / channel-string regression on *our* side.
+//!
+//! # When to run it
+//!
+//! This is an **on-demand diagnostic**, not a scheduled job — there is no weekly CI workflow.
+//! Continuous protection in production is the **consumer's** job: a staleness watchdog on the live
+//! stream catches a tier change in seconds, on a non-geoblocked IP, on the data that actually
+//! matters (see the caller-obligation rustdoc on [`BinanceFuturesUsd`]). GitHub-hosted runners are
+//! Azure/US and geoblocked by Binance (`451`), so an automated canary there only ever skips-neutral
+//! and adds no signal. Run this by hand (from a Binance-reachable host) to confirm the tier map
+//! when a prod staleness alert fires, or when validating a Binance routing change.
+//!
+//! [`BinanceFuturesUsd`]: rustrade_data::exchange::binance::futures::BinanceFuturesUsd
 //!
 //! # Tier map under test (see decision 8 in the design notes)
 //!
@@ -34,8 +46,9 @@
 //! - `init()` returns `Err` (e.g. `DataError::Socket`)  → **SKIP** (logged, test passes).
 //! - `init()` succeeds but no frame within the timeout  → **FAIL** (the real tier-change signal).
 //!
-//! The accompanying `.github/workflows/binance-ws-canary.yml` adds a preflight reachability probe
-//! so an all-skipped run surfaces as a CI *notice* rather than a false green.
+//! Because this is run by hand from a Binance-reachable host, an all-SKIP run means *you* are
+//! geoblocked (check the logged `CANARY_SKIP` lines) — rerun from a non-geoblocked network rather
+//! than reading SKIP as a pass.
 //!
 //! Known limitation: a malformed-but-routable `websocket_url()` that returned a non-`101` status
 //! would also be classified SKIP here rather than FAIL. That failure mode is covered by the

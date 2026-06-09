@@ -47,6 +47,24 @@ pub const WEBSOCKET_BASE_URL_BINANCE_FUTURES_USD_MARKET: &str =
 
 /// [`Binance`] perpetual usd exchange (`/public` WS tier: trade/bookTicker/depth).
 ///
+/// # Caller obligation: detect a silently dead stream
+///
+/// Binance has *demonstrated* that it re-routes which WS stream is served on which path tier (the
+/// `/public` vs `/market` split — see [`BinanceFuturesUsdMarket`]), and futures `PublicTrades` here
+/// rides the **undocumented** `@trade` stream. A tier change does **not** surface as an error: the
+/// handshake still returns HTTP `101` and the socket then delivers **zero frames**, silently —
+/// there is no `Err`, no disconnect, no reconnect trigger. The library cannot distinguish "the
+/// market is quiet" from "this stream is dead" without policy that belongs in the consumer.
+///
+/// Per this library's separation-of-concerns contract, staleness detection is the **caller's**
+/// responsibility: consumers (especially trading systems acting on this data) **must** run a
+/// staleness watchdog — assert that an expected-dense stream (e.g. `btcusdt` `PublicTrades`)
+/// delivers at least one event within a sane window (seconds for a liquid symbol), and treat
+/// prolonged silence on a connected socket as a fault to alert/halt on. Do not assume a healthy
+/// socket implies live data. If `@trade` ever goes dark, the known fix on rustrade's side is
+/// migrating futures `PublicTrades` to `@aggTrade` on [`BinanceFuturesUsdMarket`] (`/market`); the
+/// `#[ignore]`d `binance_ws_tier_canary` integration test re-verifies the live tier map on demand.
+///
 /// # WebSocket connection limits
 ///
 /// Existing Binance constraints a multi-symbol consumer must respect (not new — already handled by
