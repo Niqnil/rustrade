@@ -24,13 +24,14 @@ use rust_decimal::Decimal;
 use rustrade_data::{
     exchange::hyperliquid::{
         Hyperliquid,
-        historical::{CandleInterval, HistoricalRequest, HyperliquidHistoricalData},
+        historical::{HistoricalRequest, HyperliquidHistoricalData},
     },
     streams::{
         Streams,
         reconnect::{Event, stream::ReconnectingStream},
     },
     subscriber::WebSocketSubscriber,
+    subscription::candle::CandleInterval,
     subscription::{book::OrderBooksL2, trade::PublicTrades},
 };
 use rustrade_instrument::instrument::market_data::kind::MarketDataInstrumentKind;

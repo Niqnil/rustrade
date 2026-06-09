@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Live Binance klines (candles) over WebSocket** (`rustrade-data`, `SubKind::Candles { interval }`)
+  - Spot via `@kline_<interval>` on `BinanceSpot`; USD-M perpetual futures via
+    `@continuousKline_<interval>` on a new `BinanceFuturesUsdMarket` exchange-server type routed to
+    the `/market` WebSocket tier (the only tier that delivers `@continuousKline_` frames).
+  - Closed-candles-only delivery (no repaint/lookahead): in-progress klines (`x == false`) yield no
+    event; the exclusive `close_time` boundary is recomputed library-side as `open + interval`
+    rather than taken from Binance's `period-end − 1ms` wire `T`.
+  - OHLCV parsed JSON-string → `Decimal` (never through an `f64` intermediate), preserving exchange
+    precision. New public wire models `BinanceKline`, `BinanceContinuousKline`, `BinanceKlineData`.
+  - `Candles` is wired through `DynamicStreams`, so `ExchangeId`-keyed dynamic subscriptions can mix
+    candle intervals alongside trades / order books.
+
+- **Binance historical klines (candles) over public REST** (`rustrade-data`,
+  `BinanceHistoricalClient`) — free historical OHLCV for research/backtest, no API key.
+  - Spot via `/api/v3/klines` (`BinanceHistoricalClient::spot()`) and USD-M perpetual futures via
+    `/fapi/v1/continuousKlines` (`BinanceHistoricalClient::futures()`); the continuous-contract
+    surface unlocks **`1s`** candles on futures (the symbol surface `/fapi/v1/klines` returns
+    `400 Invalid interval` for sub-minute). Both surfaces share one row→`Candle` mapping.
+  - Returns a paginated `Stream<Item = Result<Candle, BinanceDataError>>` (+ a `collect`-to-`Vec`
+    convenience); `close_time` is recomputed library-side as `open + interval`, and OHLCV is parsed
+    JSON-string → `Decimal` (never via `f64`). Server-side gap-filled zero-trade candles (`V = 0`)
+    are **delivered, not filtered** (filtering would be consumer policy).
+  - New dedicated `BinanceDataError` (`RateLimited { retry_after }` / `Api { status, message }`):
+    on `429`/`418` the stream **yields `RateLimited` and ends** — it does not sleep, retry, run a
+    global limiter, or emit metrics. The consumer owns retry/backoff and **resumes** by re-calling
+    `fetch_candles` with `start` advanced to `last_close_time + 1ms` — the next candle's open. The
+    `[start, end]` range is `close_time`-inclusive, so resuming exactly at the last `close_time`
+    would re-yield that candle; the `+1ms` step is lossless and duplicate-free (pagination keys off
+    `open_time`).
+  - A bounded, `tracing`-observable, caller-overridable **proactive inter-page pace** is on by
+    default (`BinanceHistoricalClient::with_pace(Duration)`), sized per surface to keep a single
+    backfill within Binance's weight budget (spot flat weight 2/req; futures `continuousKlines`
+    weight 10/req at the 1500/page max against a lower IP budget). It never inspects a 429 — purely
+    good-client courtesy, orthogonal to the surface-and-end rate-limit contract above.
+
 - **Binance Margin execution client** (`BinanceMargin`, `binance` feature) — **cross and isolated**
   - Implements the full `ExecutionClient` trait, so callers do not branch on spot-vs-margin
     transport: order submission/cancel and account snapshot / balance / open-order / trade queries
@@ -97,6 +132,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Binance USD-M futures WebSocket tier routing** (`rustrade-data`). Binance split the futures
+  WebSocket into mutually-exclusive routed tiers; subscribing on the wrong tier silently connects
+  (`101`) then delivers zero frames. To make the tier a compile-time property:
+  - Existing futures streams (trades, L1/L2 order books) migrated from `/ws` to `/public/ws`.
+  - `Liquidations` (`@forceOrder`) and the new `Candles` (`@continuousKline_`) `StreamSelector`
+    implementations now live on the new `/market`-tier `BinanceFuturesUsdMarket` server type, **not**
+    on `BinanceFuturesUsd`. This is a breaking change for the typed `Streams` path: callers
+    subscribing to futures liquidations via `BinanceFuturesUsd` must switch to
+    `BinanceFuturesUsdMarket`. The `DynamicStreams` / `ExchangeId` path is unaffected. Spot is
+    unaffected.
+  - The blanket `StreamSelector<_, PublicTrades>` / `StreamSelector<_, OrderBooksL1>` impls on
+    `Binance<Server>` are now **explicit per-server** impls (`BinanceSpot` + `BinanceFuturesUsd`
+    only — never `BinanceFuturesUsdMarket`), so a `/market`-tier trade / L1 subscription is a
+    compile error instead of a silent dead stream, mirroring the already-per-server `OrderBooksL2`.
+    Breaking for any downstream user with their own `Binance<CustomServer>`: code that previously
+    compiled by resolving `PublicTrades` / `OrderBooksL1` through the blanket impl now fails to
+    compile. Migration is mechanical — add an explicit `impl StreamSelector<_, PublicTrades> for
+    Binance<CustomServer>` (and likewise `OrderBooksL1`) for each kind that server actually
+    supports.
 - **Bumped `ibapi` from `2.12.0` to `3.0.1`** (`ibkr` feature). ibapi 3.0 is a major release with
   breaking API changes; the IBKR market-data (`rustrade-data`) and execution (`rustrade-execution`)
   connectors were migrated to the new surface. Notable upstream changes absorbed: `Subscription<T>`
@@ -192,6 +246,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrapped). Migration: pass an `IntervalStep` (via `timespan_to_step`) instead of a `Duration`, and
   handle the `Result`. The free function `timespan_to_duration` was correspondingly replaced by
   `timespan_to_step`.
+- **BREAKING (`rustrade-data`): the `Candles` subscription kind gained a mandatory
+  `interval: CandleInterval` field and no longer implements `Default`.** The unit struct `Candles`
+  is now `Candles { pub interval: CandleInterval }`; the interval is intrinsic to a candle
+  subscription, so a phantom `Default` (silently `1m`) was removed as a footgun. A new shared
+  `CandleInterval` enum (`subscription::candle`) is the venue-agnostic union of candle resolutions
+  (`as_str`/`Display`/`FromStr`/`Serialize`/`Deserialize` all single-sourced; strings match
+  Binance's kline `interval`). Migration: replace `Candles` / `Candles::default()` with
+  `Candles { interval: CandleInterval::Min1 }` (or the desired resolution). Note: the serialized
+  representation also changes (e.g. JSON `null`/`"candles"` → `{"interval":"1h"}`), so persisted or
+  transmitted `Candles` values from older versions are not deserialization-compatible and must be
+  re-serialized.
+- **BREAKING (`rustrade-data`): the `SubKind::Candles` enum variant gained a mandatory
+  `interval: CandleInterval` field.** Mirroring the marker `Candles` kind above, the dynamic-subscription
+  `SubKind` enum's unit variant `Candles` is now `Candles { interval: CandleInterval }`, so exhaustive
+  matches on `SubKind` must bind the field. The serde form also changes: `SubKind` is an
+  externally-tagged enum, so the representation goes from `"Candles"` to `{"Candles":{"interval":"1m"}}`
+  (the `derive_more::Display` tag stays the fixed `"candles"`, interval-independent).
+  Migration: replace `SubKind::Candles` with
+  `SubKind::Candles { interval: CandleInterval::Min1 }` (or the desired resolution). The
+  `DynamicStreams` stream builder now collects per-exchange candle streams symmetrically with the other
+  data kinds (new public field `candles` and accessors `select_candles` / `select_all_candles`, and a new
+  `MarketStreamResult<_, Candle>: Into<Output>` bound on `select_all`). Binance spot and USD-M perpetual
+  futures candles are wired through the dynamic path (`exchange_supports_instrument_kind_sub_kind` accepts
+  them), so `select_candles` / `select_all_candles` yield live candle streams; venues without a candle
+  producer remain rejected.
 - **BREAKING (`rustrade-data`): `OrderBook` now stores a nested `OrderBookTimes` instead of a bare
   `time_engine`.** The new public `OrderBookTimes` struct groups the three revision timestamps
   (`time_engine` + `time_exchange` + `time_received`) and serves double duty as both the constructor
@@ -220,6 +299,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Binance USD-M futures liquidation stream (`@forceOrder`) delivers again** (`rustrade-data`).
+  Binance routed `@forceOrder` to its `/market` WebSocket tier and decommissioned `/market`
+  delivery on the unrouted legacy `/ws` on 2026-04-23, leaving the existing futures `Liquidations`
+  stream (which connected to `/ws`) **silently dead in production** — a `101` handshake followed by
+  zero frames, no error. It now connects via the new `BinanceFuturesUsdMarket` server type on
+  `fstream.binance.com/market/ws`. No auth/listenKey is required (per-symbol `<sym>@forceOrder` was
+  confirmed live on a public `/market` socket).
+
+- **`BybitPerpetualsUsd` L1/L2 order books in `DynamicStreams` now use the perpetuals connector.**
+  The `(BybitPerpetualsUsd, OrderBooksL1)` and `(BybitPerpetualsUsd, OrderBooksL2)` arms of the
+  dynamic stream builder constructed their `Subscription` with `BybitSpot::default()`, so a caller
+  subscribing to perpetuals order books was wired to the Bybit **spot** WebSocket endpoint and
+  payload format. Both arms now use `BybitPerpetualsUsd::default()`, matching the perpetuals
+  `PublicTrades` arm.
 - **Binance `fetch_open_orders` now honours the `ExecutionClient` "return all" contract** for an empty `instruments` slice. Both the spot and margin clients previously iterated the (empty) slice and returned an empty `Vec`, silently violating the trait contract that an empty slice must return open orders across all instruments. They now issue a single no-symbol query (`GET /api/v3/openOrders`, `GET /sapi/v1/margin/openOrders`), recovering each order's instrument from its own `symbol` field. The `fetch_trades` per-symbol limitation (Binance `myTrades` requires a symbol, so an empty slice returns empty) is now an explicitly documented deviation on both clients.
 - Corrected the order-type support matrix in `rustrade-execution/README.md` to reflect Binance and Hyperliquid conditional order support (Stop, StopLimit, TakeProfit, TakeProfitLimit), Binance trailing-stop offset limitations, and Hyperliquid's lack of native market orders.
 - **`rustrade-execution` docs.rs builds now use `all-features`.** Every connector module is feature-gated behind `default = []`, so docs.rs previously published a crate documenting no connectors and the connector-comparison intra-doc links broke. The full client surface is now documented and those links resolve.

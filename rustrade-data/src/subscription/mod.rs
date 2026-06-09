@@ -1,4 +1,6 @@
-use crate::{exchange::Connector, instrument::InstrumentData};
+use crate::{
+    exchange::Connector, instrument::InstrumentData, subscription::candle::CandleInterval,
+};
 use derive_more::Display;
 use fnv::FnvHashMap;
 use rustrade_instrument::{
@@ -92,7 +94,17 @@ pub enum SubKind {
     OrderBooksL2,
     OrderBooksL3,
     Liquidations,
-    Candles,
+    /// Candle (kline) subscription at a specific [`CandleInterval`] resolution.
+    ///
+    /// Unlike the other [`SubKind`]s, a candle subscription is **not** fully specified
+    /// without a resolution — there is no venue-agnostic "default" candle stream — so the
+    /// [`interval`](CandleInterval) is carried in the variant. The `derive_more::Display`
+    /// tag is the fixed `"candles"` (independent of the interval), matching the typed
+    /// [`Candles`](candle::Candles) kind tag.
+    #[display("candles")]
+    Candles {
+        interval: CandleInterval,
+    },
     /// Real-time top-of-book quotes (best bid/ask). Generic subscription kind
     /// that may be supported by multiple exchanges providing quote data.
     Quotes,
@@ -267,11 +279,11 @@ pub fn exchange_supports_instrument_kind_sub_kind(
     use SubKind::*;
 
     match (exchange_id, instrument_kind, sub_kind) {
-        (BinanceSpot, Spot, PublicTrades | OrderBooksL1 | OrderBooksL2) => true,
+        (BinanceSpot, Spot, PublicTrades | OrderBooksL1 | OrderBooksL2 | Candles { .. }) => true,
         (
             BinanceFuturesUsd,
             Perpetual,
-            PublicTrades | OrderBooksL1 | OrderBooksL2 | Liquidations,
+            PublicTrades | OrderBooksL1 | OrderBooksL2 | Liquidations | Candles { .. },
         ) => true,
         (Bitfinex, Spot, PublicTrades) => true,
         (Bitmex, Perpetual, PublicTrades) => true,
@@ -562,6 +574,93 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    mod sub_kind {
+        use super::*;
+
+        #[test]
+        fn candles_variant_serde_round_trips() {
+            let kind = SubKind::Candles {
+                interval: CandleInterval::Min1,
+            };
+
+            let json = serde_json::to_string(&kind).unwrap();
+            let back = serde_json::from_str::<SubKind>(&json).unwrap();
+
+            assert_eq!(kind, back, "SubKind::Candles must serde round-trip");
+        }
+
+        #[test]
+        fn candles_variant_serde_shape_is_externally_tagged() {
+            // `SubKind` is an externally-tagged enum (no `#[serde(tag = ...)]`), so the struct
+            // variant serialises as `{"Candles":{"interval":"1m"}}` — NOT an internally-tagged
+            // `{"type":"candles",...}` form. Pin the wire shape so a future tag/rename change is
+            // caught here rather than silently shipped to config-driven consumers.
+            let json = serde_json::to_string(&SubKind::Candles {
+                interval: CandleInterval::Min1,
+            })
+            .unwrap();
+            assert_eq!(json, r#"{"Candles":{"interval":"1m"}}"#);
+        }
+
+        #[test]
+        fn candles_display_tag_is_interval_independent() {
+            // The `derive_more::Display` tag is the fixed kind name, never the interval.
+            assert_eq!(
+                SubKind::Candles {
+                    interval: CandleInterval::Sec1
+                }
+                .to_string(),
+                "candles"
+            );
+            assert_eq!(
+                SubKind::Candles {
+                    interval: CandleInterval::Month1
+                }
+                .to_string(),
+                "candles"
+            );
+        }
+
+        #[test]
+        fn candles_supported_on_both_binance_venues_for_every_interval() {
+            // Both Binance venues serve the full interval set on the dynamic path; no interval
+            // is rejected (the Hyperliquid interval guard lives only in its typed historical path).
+            for interval in CandleInterval::ALL {
+                assert!(
+                    exchange_supports_instrument_kind_sub_kind(
+                        &ExchangeId::BinanceSpot,
+                        &MarketDataInstrumentKind::Spot,
+                        SubKind::Candles { interval },
+                    ),
+                    "BinanceSpot/Spot must support Candles {interval:?}"
+                );
+                assert!(
+                    exchange_supports_instrument_kind_sub_kind(
+                        &ExchangeId::BinanceFuturesUsd,
+                        &MarketDataInstrumentKind::Perpetual,
+                        SubKind::Candles { interval },
+                    ),
+                    "BinanceFuturesUsd/Perpetual must support Candles {interval:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn candles_rejected_for_unsupported_venue_kind_pairing() {
+            // A supported venue with the wrong instrument kind is still rejected.
+            assert!(
+                !exchange_supports_instrument_kind_sub_kind(
+                    &ExchangeId::BinanceSpot,
+                    &MarketDataInstrumentKind::Perpetual,
+                    SubKind::Candles {
+                        interval: CandleInterval::Min1,
+                    },
+                ),
+                "BinanceSpot does not serve Perpetual candles"
+            );
         }
     }
 

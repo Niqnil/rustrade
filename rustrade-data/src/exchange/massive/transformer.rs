@@ -305,14 +305,14 @@ impl TradeRecord {
         }
     }
 
-    /// Get the exchange timestamp as DateTime<Utc>.
+    /// Get the exchange timestamp as `DateTime<Utc>`.
     #[allow(dead_code)] // Public API for consumers accessing raw TradeRecord
     pub fn timestamp(&self) -> DateTime<Utc> {
         nanos_to_datetime(self.participant_timestamp)
     }
 }
 
-/// Convert nanosecond timestamp to DateTime<Utc>.
+/// Convert nanosecond timestamp to `DateTime<Utc>`.
 ///
 /// Returns [`DateTime::<Utc>::UNIX_EPOCH`] for out-of-range timestamps.
 /// Negative values (pre-epoch) are handled correctly using Euclidean division.
@@ -418,7 +418,7 @@ impl QuoteRecord {
         }
     }
 
-    /// Get the exchange timestamp as DateTime<Utc>.
+    /// Get the exchange timestamp as `DateTime<Utc>`.
     pub fn timestamp(&self) -> DateTime<Utc> {
         nanos_to_datetime(self.participant_timestamp)
     }
@@ -664,7 +664,7 @@ impl WsAggregateMsg {
     /// (`e == start (s) + interval`) — for the second/minute aggregates this path
     /// emits, `e` equals `s + 1s`/`s + 60s` exactly. It therefore satisfies the
     /// [`Candle::close_time`] contract **without** re-normalising through
-    /// [`close_time_from_open`](crate::subscription::candle::close_time_from_open):
+    /// [`close_time_from_open`]:
     /// re-deriving a boundary the venue already provides correctly would add no
     /// value. A regression test pins `e == s + interval` so a future wire change
     /// can't silently drift this off the contract. (If a Massive WS aggregate ever
@@ -702,7 +702,7 @@ pub(crate) struct WsStatusMsg {
     pub message: Option<String>,
 }
 
-/// Convert millisecond timestamp to DateTime<Utc>.
+/// Convert millisecond timestamp to `DateTime<Utc>`.
 fn millis_to_datetime(millis: i64) -> DateTime<Utc> {
     Utc.timestamp_millis_opt(millis)
         .single()
