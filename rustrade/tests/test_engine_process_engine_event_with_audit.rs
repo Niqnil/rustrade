@@ -49,7 +49,7 @@ use rustrade_data::{
 };
 use rustrade_execution::{
     AccountEvent, AccountEventKind, AccountSnapshot, FeeModelConfig, PerContractFeeModel,
-    balance::{AssetBalance, Balance},
+    balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate},
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, OrderId, PositionId, StrategyId},
@@ -82,18 +82,9 @@ use rustrade_integration::{
 
 const STARTING_TIMESTAMP: DateTime<Utc> = DateTime::<Utc>::MIN_UTC;
 const RISK_FREE_RETURN: Decimal = dec!(0.05);
-const STARTING_BALANCE_USDT: Balance = Balance {
-    total: dec!(40_000.0),
-    free: dec!(40_000.0),
-};
-const STARTING_BALANCE_BTC: Balance = Balance {
-    total: dec!(1.0),
-    free: dec!(1.0),
-};
-const STARTING_BALANCE_ETH: Balance = Balance {
-    total: dec!(10.0),
-    free: dec!(10.0),
-};
+const STARTING_BALANCE_USDT: Balance = Balance::new(dec!(40_000.0), dec!(40_000.0));
+const STARTING_BALANCE_BTC: Balance = Balance::new(dec!(1.0), dec!(1.0));
+const STARTING_BALANCE_ETH: Balance = Balance::new(dec!(10.0), dec!(10.0));
 const QUOTE_FEES_PERCENT: f64 = 0.1; // 10%
 
 // Asset indices after alphabetical sorting: btc(0), eth(1), usdt(2)
@@ -743,6 +734,71 @@ fn test_engine_process_engine_event_with_audit() {
     assert_eq!(eth_btc_sheet.pnl, dec!(-0.065));
 }
 
+/// Routes a `BalanceStreamUpdate` (the WS-sourced partial) end-to-end through
+/// `EngineState::update_from_account` → `AssetState::apply_balance_update`, asserting both the
+/// resulting balance state and the audit trail.
+///
+/// Complements 17.3.6's isolated unit tests by exercising the full dispatch path
+/// (`indexer` → `EngineState` → `AssetState::apply_balance_update`). The second scenario validates
+/// the Design-decision-#4 no-clobber contract end-to-end: a REST `BalanceSnapshot` seeds margin
+/// debt, then a WS `BalanceStreamUpdate` keeps `free`/`locked` live without erasing `margin`.
+#[test]
+fn test_engine_process_balance_stream_update_with_audit() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx);
+
+    // --- Scenario 1: cash stream update applies free/locked, recomputes total, no margin ---
+    // usdt = AssetIndex(2); free=9_000 + locked=1_000 → total=10_000.
+    let event = account_event_balance_update(2, 1, 9_000.0, 1_000.0);
+    let audit = process_with_audit(&mut engine, event.clone());
+    // Balance stream updates produce no engine output, like a BalanceSnapshot.
+    assert_eq!(audit.event, EngineAudit::process(event));
+
+    let usdt = engine
+        .state
+        .assets
+        .asset_index(&AssetIndex(2))
+        .balance
+        .unwrap();
+    assert_eq!(
+        usdt,
+        Timed::new(
+            Balance::new(dec!(10_000.0), dec!(9_000.0)),
+            time_plus_days(STARTING_TIMESTAMP, 1)
+        )
+    );
+    // Cash context: no debt was ever reported, so margin stays absent.
+    assert_eq!(usdt.value.margin, None);
+
+    // --- Scenario 2: snapshot seeds debt, stream update preserves margin (no-clobber) ---
+    // btc = AssetIndex(0); REST snapshot: total=2, free=2, borrowed=1, interest=0.01.
+    let event = account_event_balance_margin(0, 2, 2.0, 2.0, 1.0, 0.01);
+    let audit = process_with_audit(&mut engine, event.clone());
+    assert_eq!(audit.event, EngineAudit::process(event));
+
+    // WS partial: free=1.5 + locked=0.5 → total=2.0. Carries no debt.
+    let event = account_event_balance_update(0, 3, 1.5, 0.5);
+    let audit = process_with_audit(&mut engine, event.clone());
+    assert_eq!(audit.event, EngineAudit::process(event));
+
+    let btc = engine
+        .state
+        .assets
+        .asset_index(&AssetIndex(0))
+        .balance
+        .unwrap();
+    // free/locked are live from the WS update; borrowed/interest survive from the snapshot.
+    assert_eq!(
+        btc,
+        Timed::new(
+            Balance::new_margin(dec!(2.0), dec!(1.5), dec!(1.0), dec!(0.01)),
+            time_plus_days(STARTING_TIMESTAMP, 3)
+        )
+    );
+    // net_asset reflects the preserved debt: total - borrowed = 2 - 1.
+    assert_eq!(btc.value.net_asset(), dec!(1.0));
+}
+
 struct TestBuyAndHoldStrategy {
     id: StrategyId,
 }
@@ -1027,6 +1083,55 @@ fn account_event_balance(
             balance: Balance::new(
                 Decimal::try_from(total).unwrap(),
                 Decimal::try_from(free).unwrap(),
+            ),
+            time_exchange: time_plus_days(STARTING_TIMESTAMP, time_plus),
+        })),
+    }))
+}
+
+/// WS partial balance update (`free`/`locked` only) — sibling to [`account_event_balance`],
+/// which emits a full REST [`AccountEventKind::BalanceSnapshot`]. This emits the WS-sourced
+/// [`AccountEventKind::BalanceStreamUpdate`] that the engine applies via
+/// `AssetState::apply_balance_update` (free/locked live, existing `margin` preserved).
+fn account_event_balance_update(
+    asset: usize,
+    time_plus: u64,
+    free: f64,
+    locked: f64,
+) -> EngineEvent<DataKind> {
+    EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+        exchange: ExchangeIndex(0),
+        kind: AccountEventKind::BalanceStreamUpdate(Snapshot(AssetBalanceUpdate {
+            asset: AssetIndex(asset),
+            update: BalanceUpdate::new(
+                Decimal::try_from(free).unwrap(),
+                Decimal::try_from(locked).unwrap(),
+            ),
+            time_exchange: time_plus_days(STARTING_TIMESTAMP, time_plus),
+        })),
+    }))
+}
+
+/// Full REST [`AccountEventKind::BalanceSnapshot`] carrying margin debt (`borrowed`/`interest`).
+/// Used to seed debt before a [`account_event_balance_update`] to verify the WS partial does
+/// not clobber it (Design decision #4 no-clobber contract).
+fn account_event_balance_margin(
+    asset: usize,
+    time_plus: u64,
+    total: f64,
+    free: f64,
+    borrowed: f64,
+    interest: f64,
+) -> EngineEvent<DataKind> {
+    EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+        exchange: ExchangeIndex(0),
+        kind: AccountEventKind::BalanceSnapshot(Snapshot(AssetBalance {
+            asset: AssetIndex(asset),
+            balance: Balance::new_margin(
+                Decimal::try_from(total).unwrap(),
+                Decimal::try_from(free).unwrap(),
+                Decimal::try_from(borrowed).unwrap(),
+                Decimal::try_from(interest).unwrap(),
             ),
             time_exchange: time_plus_days(STARTING_TIMESTAMP, time_plus),
         })),

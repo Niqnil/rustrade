@@ -28,18 +28,9 @@ use smol_str::SmolStr;
 // Risk-free rate of 5% (configure as needed)
 const RISK_FREE_RETURN: Decimal = dec!(0.05);
 const EXCHANGE: ExchangeId = ExchangeId::BinanceSpot;
-const STARTING_BALANCE_USDT: Balance = Balance {
-    total: dec!(10_000.0),
-    free: dec!(10_000.0),
-};
-const STARTING_BALANCE_BTC: Balance = Balance {
-    total: dec!(0.1),
-    free: dec!(0.1),
-};
-const STARTING_BALANCE_ETH: Balance = Balance {
-    total: dec!(1.0),
-    free: dec!(1.0),
-};
+const STARTING_BALANCE_USDT: Balance = Balance::new(dec!(10_000.0), dec!(10_000.0));
+const STARTING_BALANCE_BTC: Balance = Balance::new(dec!(0.1), dec!(0.1));
+const STARTING_BALANCE_ETH: Balance = Balance::new(dec!(1.0), dec!(1.0));
 
 pub enum ContrivedEvents {
     Balance(Snapshot<AssetBalance<AssetIndex>>),

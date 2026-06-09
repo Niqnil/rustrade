@@ -1,7 +1,7 @@
 use super::super::book::BinanceLevel;
 use crate::{
     Identifier, SnapshotFetcher,
-    books::OrderBook,
+    books::{OrderBook, OrderBookTimes},
     error::DataError,
     event::{MarketEvent, MarketIter},
     exchange::{
@@ -329,14 +329,20 @@ impl<InstrumentKey> From<(ExchangeId, InstrumentKey, BinanceSpotOrderBookL2Updat
             BinanceSpotOrderBookL2Update,
         ),
     ) -> Self {
+        let time_received = Utc::now();
         Self(vec![Ok(MarketEvent {
             time_exchange: update.time_exchange,
-            time_received: Utc::now(),
+            time_received,
             exchange: exchange_id,
             instrument,
             kind: OrderBookEvent::Update(OrderBook::new(
                 update.last_update_id,
-                None,
+                // Spot diffs carry "E" (broadcast) but no "T" (matching-engine) time.
+                OrderBookTimes {
+                    time_engine: None,
+                    time_exchange: Some(update.time_exchange),
+                    time_received,
+                },
                 update.bids,
                 update.asks,
             )),
@@ -350,6 +356,54 @@ mod tests {
     use super::*;
     use crate::books::Level;
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn test_spot_order_book_times() {
+        // Spot diffs carry "E" (broadcast) but no "T" (matching-engine) time, so a
+        // converted book exposes `time_exchange == "E"`, `time_engine == None`, and a
+        // populated `time_received`. Applying a later diff advances `time_exchange`
+        // (never resets it to `None`).
+        let e0 = DateTime::from_timestamp_millis(1671656397761).unwrap();
+        let e1 = DateTime::from_timestamp_millis(1671656397800).unwrap();
+
+        let update = |last_update_id, time_exchange| BinanceSpotOrderBookL2Update {
+            subscription_id: SubscriptionId::from("@depth@100ms|ETHUSDT"),
+            time_exchange,
+            first_update_id: last_update_id,
+            last_update_id,
+            bids: vec![BinanceLevel {
+                price: dec!(100),
+                amount: dec!(1),
+            }],
+            asks: vec![],
+        };
+
+        let MarketIter(mut events) = MarketIter::<&str, OrderBookEvent>::from((
+            ExchangeId::BinanceSpot,
+            "inst",
+            update(1, e0),
+        ));
+        let event = events.remove(0).unwrap();
+        let envelope_time_received = event.time_received;
+        let OrderBookEvent::Update(mut book) = event.kind else {
+            panic!("expected Update");
+        };
+        assert_eq!(book.time_exchange(), Some(e0));
+        assert_eq!(book.time_engine(), None);
+        // The book's local ingestion time shares the envelope's `time_received`.
+        assert_eq!(book.time_received(), envelope_time_received);
+
+        // A later diff advances `time_exchange` and keeps `time_engine` None.
+        let MarketIter(mut next) = MarketIter::<&str, OrderBookEvent>::from((
+            ExchangeId::BinanceSpot,
+            "inst",
+            update(2, e1),
+        ));
+        let event = next.remove(0).unwrap().kind;
+        book.update(&event);
+        assert_eq!(book.time_exchange(), Some(e1));
+        assert_eq!(book.time_engine(), None);
+    }
 
     #[test]
     fn test_de_binance_spot_order_book_l2_update() {
@@ -615,7 +669,12 @@ mod tests {
                     last_update_id: 100,
                     prev_last_update_id: 0,
                 },
-                book: OrderBook::new(100, None, vec![Level::new(50, 1)], vec![Level::new(100, 1)]),
+                book: OrderBook::new(
+                    100,
+                    OrderBookTimes::default(),
+                    vec![Level::new(50, 1)],
+                    vec![Level::new(100, 1)],
+                ),
                 input_update: BinanceSpotOrderBookL2Update {
                     subscription_id: SubscriptionId::from("subscription_id"),
                     time_exchange: Default::default(),
@@ -626,7 +685,7 @@ mod tests {
                 },
                 expected: OrderBook::new(
                     100,
-                    None,
+                    OrderBookTimes::default(),
                     vec![Level::new(50, 1)],
                     vec![Level::new(100, 1)],
                 ),
@@ -640,7 +699,7 @@ mod tests {
                 },
                 book: OrderBook::new(
                     100,
-                    None,
+                    OrderBookTimes::default(),
                     vec![Level::new(80, 1), Level::new(100, 1), Level::new(90, 1)],
                     vec![Level::new(150, 1), Level::new(110, 1), Level::new(120, 1)],
                 ),
@@ -676,7 +735,7 @@ mod tests {
                 },
                 expected: OrderBook::new(
                     110,
-                    None,
+                    OrderBookTimes::default(),
                     vec![Level::new(100, 1), Level::new(90, 10)],
                     vec![
                         Level::new(110, 1),
@@ -693,7 +752,7 @@ mod tests {
             {
                 let rustrade_update = OrderBookEvent::Update(OrderBook::new(
                     valid_update.last_update_id,
-                    None,
+                    OrderBookTimes::default(),
                     valid_update.bids,
                     valid_update.asks,
                 ));

@@ -77,7 +77,7 @@ fn gateio_market(instrument: &MarketDataInstrument) -> GateioMarket {
     )
 }
 
-/// Format the expiry DateTime<Utc> to be Gateio API compatible.
+/// Format the expiry `DateTime<Utc>` to be Gateio API compatible.
 ///
 /// eg/ "20241231" (31st of December 2024)
 ///

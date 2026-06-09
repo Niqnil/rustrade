@@ -383,6 +383,7 @@ impl ExecutionClient for HyperliquidClient {
                 instrument,
                 orders,
                 position,
+                isolated: None,
             });
         }
 
@@ -392,6 +393,7 @@ impl ExecutionClient for HyperliquidClient {
                 instrument,
                 orders,
                 position: None,
+                isolated: None,
             });
         }
 

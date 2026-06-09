@@ -41,7 +41,31 @@ impl<InstrumentKey, T> FromIterator<Result<MarketEvent<InstrumentKey, T>, DataEr
 /// - [`MarketEvent<DataKind>`](DataKind)
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Deserialize, Serialize)]
 pub struct MarketEvent<InstrumentKey = MarketDataInstrument, T = DataKind> {
+    /// Exchange timestamp of the event — its position on the **engine timeline**.
+    ///
+    /// A consuming engine treats this as *the* time the event occurred: the
+    /// historical/backtest clock derives "current time" from it and replays
+    /// events in `time_exchange` order (see `rustrade`'s `EngineClock` /
+    /// `TimeExchange`).
+    ///
+    /// # Contract for aggregated / windowed payloads (candles, OHLCV bars)
+    ///
+    /// For a point-in-time payload (e.g. [`PublicTrade`], [`OrderBookL1`]) this is
+    /// simply the venue event time. For a payload that aggregates a **time window**
+    /// (a [`Candle`]), `time_exchange` **must be the period END**, i.e. the
+    /// candle's [`close_time`](crate::subscription::candle::Candle::close_time) —
+    /// **never the period start**.
+    ///
+    /// Stamping the open instant makes a *completed* bar enter the engine timeline
+    /// at the moment its period *began*, so a strategy would act on a fully-formed
+    /// bar before it could possibly exist — silent lookahead / repaint bias. This
+    /// applies to **any** windowed payload, including a custom `T` supplied by a
+    /// consumer driving the engine without this crate's producers. The library's
+    /// own candle producers already stamp `close_time` here; when wrapping a
+    /// [`Candle`] into a `MarketEvent` yourself, use its `close_time`.
     pub time_exchange: DateTime<Utc>,
+    /// Local timestamp at which this event was received/decoded. Diagnostic only —
+    /// the engine clock and replay ordering use [`time_exchange`](Self::time_exchange).
     pub time_received: DateTime<Utc>,
     pub exchange: ExchangeId,
     pub instrument: InstrumentKey,

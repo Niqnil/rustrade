@@ -16,9 +16,9 @@
 //!
 //! # Authentication
 //!
-//! Alpaca requires authentication via [`AlpacaCredentials`]. Credentials can be:
-//! - Loaded from environment variables via [`AlpacaCredentials::from_env()`]
-//! - Provided explicitly via [`AlpacaCredentials::new()`]
+//! Alpaca requires authentication via [`AlpacaCredentials`](crate::exchange::alpaca::AlpacaCredentials). Credentials can be:
+//! - Loaded from environment variables via [`AlpacaCredentials::from_env()`](crate::exchange::alpaca::AlpacaCredentials::from_env)
+//! - Provided explicitly via [`AlpacaCredentials::new()`](crate::exchange::alpaca::AlpacaCredentials::new)
 //!
 //! Auth message is sent immediately after WebSocket connection, before subscriptions.
 //!
@@ -40,9 +40,9 @@
 //!
 //! # Connectors
 //!
-//! - [`AlpacaIex`]: Free IEX feed for US equities
-//! - [`AlpacaSip`]: Paid consolidated SIP feed (untested — requires subscription)
-//! - [`AlpacaCrypto`]: Crypto market data
+//! - [`AlpacaIex`](crate::exchange::alpaca::AlpacaIex): Free IEX feed for US equities
+//! - [`AlpacaSip`](crate::exchange::alpaca::AlpacaSip): Paid consolidated SIP feed (untested — requires subscription)
+//! - [`AlpacaCrypto`](crate::exchange::alpaca::AlpacaCrypto): Crypto market data
 //!
 //! # Supported Streams
 //!
@@ -317,7 +317,7 @@ impl AlpacaSubscriber {
     /// Create a new subscriber using credentials from environment variables.
     ///
     /// Equivalent to `AlpacaSubscriber::new(AlpacaCredentials::from_env()?)`.
-    /// See [`AlpacaCredentials::from_env`] for the variables read and error conditions.
+    /// See [`AlpacaCredentials::from_env`](crate::exchange::alpaca::AlpacaCredentials::from_env) for the variables read and error conditions.
     pub fn from_env() -> Result<Self, SocketError> {
         Ok(Self::new(AlpacaCredentials::from_env()?))
     }

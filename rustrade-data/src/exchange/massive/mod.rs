@@ -26,8 +26,8 @@
 //!
 //! # Architecture
 //!
-//! - [`MassiveRestClient`]: Historical and intraday data via REST API
-//! - [`MassiveLive`]: Real-time streaming via WebSocket
+//! - [`MassiveRestClient`](crate::exchange::massive::MassiveRestClient): Historical and intraday data via REST API
+//! - [`MassiveLive`](crate::exchange::massive::MassiveLive): Real-time streaming via WebSocket
 //!
 //! # Authentication
 //!

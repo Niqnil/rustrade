@@ -5,7 +5,7 @@ use crate::{
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use fnv::FnvHashMap;
-use ibapi::orders::{CommissionReport, ExecutionData};
+use ibapi::orders::{CommissionReport, ExecutionData, ExecutionSide};
 use parking_lot::Mutex;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
@@ -95,7 +95,7 @@ impl ExecutionBuffer {
             inner.pending.remove(&report.execution_id)?
         };
 
-        build_trade(pending, report)
+        Some(build_trade(pending, report))
     }
 
     /// Get number of pending executions (for diagnostics).
@@ -139,24 +139,17 @@ impl Default for ExecutionBuffer {
 }
 
 /// Build a rustrade Trade from IB execution + commission data.
-///
-/// Returns `None` if the side string is unrecognized (logged as warning).
 fn build_trade(
     pending: PendingExecution,
     commission: &CommissionReport,
-) -> Option<Trade<AssetNameExchange, InstrumentNameExchange>> {
+) -> Trade<AssetNameExchange, InstrumentNameExchange> {
     let exec = &pending.execution.execution;
 
-    let side = match parse_ib_side(&exec.side) {
-        Some(s) => s,
-        None => {
-            warn!(
-                side = %exec.side,
-                exec_id = %exec.execution_id,
-                "Unknown IB side string, dropping trade"
-            );
-            return None;
-        }
+    // `ExecutionSide` is a closed two-variant enum in ibapi 3.x (the decoder
+    // rejects unknown wire values upstream), so the mapping is total.
+    let side = match exec.side {
+        ExecutionSide::Bought => Side::Buy,
+        ExecutionSide::Sold => Side::Sell,
     };
 
     let price = parse_decimal_or_warn(exec.price, "exec.price");
@@ -165,7 +158,7 @@ fn build_trade(
 
     let time_exchange = parse_ib_timestamp(&exec.time).unwrap_or_else(Utc::now);
 
-    Some(Trade {
+    Trade {
         id: TradeId::new(&exec.execution_id),
         order_id: crate::order::id::OrderId::new(&pending.client_order_id.0),
         instrument: pending.instrument,
@@ -179,20 +172,6 @@ fn build_trade(
             fees: commission_amount,
             fees_quote: None, // Indexer computes based on fee asset vs instrument quote
         },
-    })
-}
-
-/// Parse IB side string to rustrade Side.
-///
-/// IB sends uppercase: "BOT" (bought), "SLD" (sold), "BUY", "SELL",
-/// "SSHORT" (short sell), "SLONG" (sell long).
-///
-/// Returns `None` for unrecognized values to avoid silent data corruption.
-pub fn parse_ib_side(s: &str) -> Option<Side> {
-    match s {
-        "BOT" | "BUY" => Some(Side::Buy),
-        "SLD" | "SELL" | "SSHORT" | "SLONG" => Some(Side::Sell),
-        _ => None,
     }
 }
 
@@ -295,17 +274,5 @@ mod tests {
     fn test_parse_ib_timestamp_invalid() {
         assert!(parse_ib_timestamp("invalid").is_none());
         assert!(parse_ib_timestamp("").is_none());
-    }
-
-    #[test]
-    fn test_parse_ib_side() {
-        assert_eq!(parse_ib_side("BOT"), Some(Side::Buy));
-        assert_eq!(parse_ib_side("BUY"), Some(Side::Buy));
-        assert_eq!(parse_ib_side("SLD"), Some(Side::Sell));
-        assert_eq!(parse_ib_side("SELL"), Some(Side::Sell));
-        assert_eq!(parse_ib_side("SSHORT"), Some(Side::Sell));
-        assert_eq!(parse_ib_side("SLONG"), Some(Side::Sell));
-        // Unknown returns None
-        assert_eq!(parse_ib_side("UNKNOWN"), None);
     }
 }

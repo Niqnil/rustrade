@@ -59,14 +59,18 @@ use super::options::{OptionChainEntry, OptionGreeks};
 use crate::{
     books::Level,
     error::DataError,
-    subscription::{book::OrderBookL1, candle::Candle, trade::PublicTrade},
+    subscription::{
+        book::OrderBookL1,
+        candle::{Candle, IntervalStep, close_time_from_open},
+        trade::PublicTrade,
+    },
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use ibapi::{
     client::blocking::Client,
     contracts::{Contract, SecurityType},
     market_data::{
-        TradingHours,
+        IgnoreSize, TradingHours,
         historical::{BarSize, Duration, TickBidAsk, TickLast, WhatToShow},
     },
 };
@@ -180,6 +184,15 @@ impl IbkrHistoricalData {
     /// - IB rate-limits historical data requests (pacing violations)
     /// - Some data requires paid market data subscriptions
     /// - Volume and trade count are only available for `WhatToShow::Trades`
+    /// - Each candle's `close_time` is the exclusive end-of-period boundary
+    ///   `bar_open + interval`, **not** the bar's own start (IB returns the start)
+    ///   and **not** the exchange session close (the library has no session
+    ///   calendar). For daily/weekly/monthly bars this is the **next** UTC period
+    ///   start: a Jan 15 daily bar → `close_time = Jan 16 00:00 UTC`; a January
+    ///   monthly bar → `Feb 1 00:00 UTC` (calendar arithmetic). The bar's own date
+    ///   is `close_time − interval`, so do **not** compare daily bars by
+    ///   `close_time.date()` — it shifts forward by one interval. See
+    ///   [`Candle::close_time`](crate::subscription::candle::Candle).
     pub async fn fetch_candles(
         &self,
         request: HistoricalRequest,
@@ -201,20 +214,24 @@ impl IbkrHistoricalData {
                 TradingHours::Extended
             };
 
-            let historical_data = client
-                .historical_data(
-                    &request.contract,
-                    request.end_date,
-                    request.duration,
-                    request.bar_size,
-                    request.what_to_show,
-                    trading_hours,
-                )
+            // ibapi 3.x: historical bars are requested via a builder. `ending` is
+            // optional — omitting it anchors the window at the current time, matching
+            // the previous `end_date: None` behavior.
+            let mut builder = client
+                .historical_data(&request.contract, request.bar_size)
+                .what_to_show(request.what_to_show)
+                .duration(request.duration)
+                .trading_hours(trading_hours);
+            if let Some(end_date) = request.end_date {
+                builder = builder.ending(end_date);
+            }
+            let historical_data = builder
+                .fetch()
                 .map_err(|e| DataError::Socket(format!("historical data: {e}")))?;
 
             let mut candles = Vec::with_capacity(historical_data.bars.len());
             for bar in &historical_data.bars {
-                candles.push(bar_to_candle(bar)?);
+                candles.push(bar_to_candle(bar, request.bar_size)?);
             }
 
             Ok::<_, DataError>(candles)
@@ -260,6 +277,11 @@ impl IbkrHistoricalData {
     ///   identical `(timestamp, price, size)` may collide across batches.
     ///   IB timestamps have only 1-second resolution and IB provides no
     ///   native unique identifier.
+    /// - A mid-stream IB API error ends iteration silently: ibapi 3.0.1's
+    ///   `TickSubscription` stores the error internally but exposes no public
+    ///   accessor, so a shorter-than-requested result may indicate truncation
+    ///   rather than genuine end-of-data. Callers needing completeness
+    ///   guarantees should validate the returned count against expectations.
     pub async fn fetch_historical_ticks(
         &self,
         request: HistoricalTickRequest,
@@ -286,18 +308,27 @@ impl IbkrHistoricalData {
                 TradingHours::Extended
             };
 
-            let subscription = client
-                .historical_ticks_trade(
-                    &request.contract,
-                    request.start,
-                    request.end,
-                    request.number_of_ticks,
-                    trading_hours,
-                )
+            // ibapi 3.x: historical ticks use a builder; the tick type is selected
+            // by the terminal method (`.trade()` here). At least one of
+            // `starting`/`ending` is required (validated above).
+            let mut builder = client
+                .historical_ticks(&request.contract, request.number_of_ticks)
+                .trading_hours(trading_hours);
+            if let Some(start) = request.start {
+                builder = builder.starting(start);
+            }
+            if let Some(end) = request.end {
+                builder = builder.ending(end);
+            }
+            let subscription = builder
+                .trade()
                 .map_err(|e| DataError::Socket(format!("historical_ticks_trade: {e}")))?;
 
             let mut trades =
                 Vec::with_capacity(usize::try_from(request.number_of_ticks).unwrap_or(0));
+            // `TickSubscription` yields `T` directly and stops silently on a
+            // mid-stream error (no public error accessor in ibapi 3.0.1), so a
+            // short result may be truncation rather than end-of-data.
             for (seq, tick) in subscription.into_iter().enumerate() {
                 if let Some(trade) = tick_last_to_public_trade(&tick, seq) {
                     trades.push(trade);
@@ -342,6 +373,11 @@ impl IbkrHistoricalData {
     ///
     /// - Maximum 1000 ticks per request (IB limit)
     /// - For larger ranges, paginate using last tick's timestamp as new `start`
+    /// - A mid-stream IB API error ends iteration silently: ibapi 3.0.1's
+    ///   `TickSubscription` stores the error internally but exposes no public
+    ///   accessor, so a shorter-than-requested result may indicate truncation
+    ///   rather than genuine end-of-data. Callers needing completeness
+    ///   guarantees should validate the returned count against expectations.
     pub async fn fetch_historical_bid_ask(
         &self,
         request: HistoricalTickRequest,
@@ -370,19 +406,31 @@ impl IbkrHistoricalData {
                 TradingHours::Extended
             };
 
-            let subscription = client
-                .historical_ticks_bid_ask(
-                    &request.contract,
-                    request.start,
-                    request.end,
-                    request.number_of_ticks,
-                    trading_hours,
-                    ignore_size,
-                )
+            // ibapi 3.x: same builder as trades, with `.bid_ask(IgnoreSize)` as the
+            // terminal. At least one of `starting`/`ending` is required (validated above).
+            let mut builder = client
+                .historical_ticks(&request.contract, request.number_of_ticks)
+                .trading_hours(trading_hours);
+            if let Some(start) = request.start {
+                builder = builder.starting(start);
+            }
+            if let Some(end) = request.end {
+                builder = builder.ending(end);
+            }
+            let ignore_size = if ignore_size {
+                IgnoreSize::Yes
+            } else {
+                IgnoreSize::No
+            };
+            let subscription = builder
+                .bid_ask(ignore_size)
                 .map_err(|e| DataError::Socket(format!("historical_ticks_bid_ask: {e}")))?;
 
             let mut quotes =
                 Vec::with_capacity(usize::try_from(request.number_of_ticks).unwrap_or(0));
+            // `TickSubscription` yields `T` directly and stops silently on a
+            // mid-stream error (no public error accessor in ibapi 3.0.1), so a
+            // short result may be truncation rather than end-of-data.
             for tick in subscription {
                 if let Some(l1) = tick_bid_ask_to_order_book_l1(&tick) {
                     quotes.push(l1);
@@ -570,9 +618,13 @@ impl IbkrHistoricalData {
     /// # Arguments
     ///
     /// * `symbol` - Underlying symbol (e.g., "AAPL")
-    /// * `exchange` - Exchange to query (e.g., "SMART", "CBOE")
+    /// * `exchange` - `fut_fop_exchange` filter. Pass `""` for all exchanges
+    ///   (recommended); a routing exchange like "SMART" filters the result to
+    ///   zero rows.
     /// * `security_type` - Type of underlying (typically `SecurityType::Stock`)
-    /// * `contract_id` - IB contract ID of the underlying (0 to search by symbol)
+    /// * `contract_id` - IB contract ID of the underlying. Must be a valid
+    ///   conId; IBKR's `reqSecDefOptParams` rejects `0` with
+    ///   `[321] Invalid contract id`. Resolve it first via contract details.
     ///
     /// # Returns
     ///
@@ -587,7 +639,9 @@ impl IbkrHistoricalData {
     /// ```ignore
     /// let client = IbkrHistoricalData::connect("127.0.0.1:4002", 102)?;
     ///
-    /// let chains = client.fetch_option_chain("AAPL", "SMART", SecurityType::Stock, 0).await?;
+    /// // 265598 is AAPL's underlying conId; resolve via contract details for other symbols.
+    /// // Empty exchange returns every exchange's option parameters.
+    /// let chains = client.fetch_option_chain("AAPL", "", SecurityType::Stock, 265598).await?;
     /// for chain in chains {
     ///     println!("Exchange: {}, Expirations: {:?}", chain.exchange, chain.expirations);
     /// }
@@ -614,8 +668,11 @@ impl IbkrHistoricalData {
                 .option_chain(&symbol, &exchange, security_type, contract_id)
                 .map_err(|e| DataError::Socket(format!("option_chain: {e}")))?;
 
+            // ibapi 3.x: `iter_data()` yields `Result<OptionChain, Error>`, filtering
+            // subscription-level notices. Surface the first error to the caller.
             let mut entries = Vec::with_capacity(16);
-            for chain in subscription {
+            for chain in subscription.iter_data() {
+                let chain = chain.map_err(|e| DataError::Socket(format!("option_chain: {e}")))?;
                 entries.push(OptionChainEntry::from_ib(&chain));
             }
 
@@ -855,19 +912,86 @@ fn tick_bid_ask_to_order_book_l1(tick: &TickBidAsk) -> Option<OrderBookL1> {
     })
 }
 
-/// Convert an ibapi `Bar` to a rustrade `Candle`.
+/// Map an ibapi [`BarSize`] to the shared [`IntervalStep`] used to compute a
+/// candle's exclusive `close_time` boundary.
 ///
-/// Note: `Bar::wap` (volume-weighted average price) is not mapped to `Candle`
-/// as rustrade's `Candle` type does not include VWAP.
+/// Every bar size is a fixed-length step except `Month`, which is a calendar
+/// month (variable length) and must use [`IntervalStep::Months`]. A `Day`/`Week`
+/// step is fixed but can still cross a month boundary (e.g. a Jan 31 daily bar →
+/// `Feb 1 00:00 UTC`).
+fn bar_size_to_step(bar_size: BarSize) -> IntervalStep {
+    match bar_size {
+        BarSize::Sec => IntervalStep::Fixed(ChronoDuration::seconds(1)),
+        BarSize::Sec5 => IntervalStep::Fixed(ChronoDuration::seconds(5)),
+        BarSize::Sec10 => IntervalStep::Fixed(ChronoDuration::seconds(10)),
+        BarSize::Sec15 => IntervalStep::Fixed(ChronoDuration::seconds(15)),
+        BarSize::Sec30 => IntervalStep::Fixed(ChronoDuration::seconds(30)),
+        BarSize::Min => IntervalStep::Fixed(ChronoDuration::minutes(1)),
+        BarSize::Min2 => IntervalStep::Fixed(ChronoDuration::minutes(2)),
+        BarSize::Min3 => IntervalStep::Fixed(ChronoDuration::minutes(3)),
+        BarSize::Min5 => IntervalStep::Fixed(ChronoDuration::minutes(5)),
+        BarSize::Min10 => IntervalStep::Fixed(ChronoDuration::minutes(10)),
+        BarSize::Min15 => IntervalStep::Fixed(ChronoDuration::minutes(15)),
+        BarSize::Min20 => IntervalStep::Fixed(ChronoDuration::minutes(20)),
+        BarSize::Min30 => IntervalStep::Fixed(ChronoDuration::minutes(30)),
+        BarSize::Hour => IntervalStep::Fixed(ChronoDuration::hours(1)),
+        BarSize::Hour2 => IntervalStep::Fixed(ChronoDuration::hours(2)),
+        BarSize::Hour3 => IntervalStep::Fixed(ChronoDuration::hours(3)),
+        BarSize::Hour4 => IntervalStep::Fixed(ChronoDuration::hours(4)),
+        BarSize::Hour8 => IntervalStep::Fixed(ChronoDuration::hours(8)),
+        BarSize::Day => IntervalStep::Fixed(ChronoDuration::days(1)),
+        BarSize::Week => IntervalStep::Fixed(ChronoDuration::weeks(1)),
+        BarSize::Month => IntervalStep::Months(1),
+    }
+}
+
+/// Convert an ibapi `Bar` to a rustrade [`Candle`].
 ///
-/// Returns `Err(DataError::Socket(...))` if any price/volume value cannot be
-/// converted to Decimal (e.g., NaN, Infinity from the IB API).
-fn bar_to_candle(bar: &ibapi::market_data::historical::Bar) -> Result<Candle, DataError> {
-    let close_time = DateTime::from_timestamp(bar.date.unix_timestamp(), bar.date.nanosecond())
-        .ok_or_else(|| {
+/// `Bar.date` is the bar's **open** instant; the returned [`Candle::close_time`]
+/// is the exclusive end-of-period boundary `open + interval`, computed via the
+/// shared [`close_time_from_open`] helper from the requested `bar_size`.
+///
+/// Consequences of the boundary contract for IBKR consumers:
+/// - **Daily/weekly/monthly** bars carry a calendar `Date` (anchored to midnight
+///   UTC). The boundary is the **next** UTC period start, **not** the exchange
+///   session close — e.g. a Jan 15 daily bar → `close_time = Jan 16 00:00 UTC`,
+///   and a monthly Jan bar → `Feb 1 00:00 UTC` (calendar arithmetic, not
+///   `+ Duration`). The bar's own date is therefore `close_time − interval`;
+///   `close_time.date()` no longer equals the bar's date, so any
+///   `group_by(close_time.date())` shifts by one interval. Do **not** compare
+///   daily bars by `close_time.date()`.
+/// - **Intraday** bars carry a full `OffsetDateTime`; the boundary is `open + interval`.
+///
+/// Note: `Bar::wap` (volume-weighted average price) is not mapped — rustrade's
+/// `Candle` has no VWAP field.
+///
+/// # Errors
+///
+/// Returns `Err(DataError::Socket(...))` if the open timestamp or the computed
+/// `close_time` falls outside the representable [`DateTime<Utc>`] range, or if any
+/// price/volume value cannot be converted to `Decimal` (e.g. NaN/Infinity).
+fn bar_to_candle(
+    bar: &ibapi::market_data::historical::Bar,
+    bar_size: BarSize,
+) -> Result<Candle, DataError> {
+    use ibapi::market_data::historical::BarTimestamp;
+
+    // `Bar.date` is the bar's OPEN instant: daily/weekly/monthly bars carry a
+    // calendar `Date` (anchored here to midnight UTC), intraday bars a full
+    // `OffsetDateTime`.
+    let (secs, nanos) = match bar.date {
+        BarTimestamp::DateTime(dt) => (dt.unix_timestamp(), dt.nanosecond()),
+        BarTimestamp::Date(d) => (d.midnight().assume_utc().unix_timestamp(), 0),
+    };
+    let open_time = DateTime::from_timestamp(secs, nanos).ok_or_else(|| {
+        DataError::Socket(format!("IB timestamp {secs} out of DateTime<Utc> range"))
+    })?;
+
+    // close_time is the exclusive end-of-period boundary (open + interval).
+    let close_time =
+        close_time_from_open(open_time, bar_size_to_step(bar_size)).ok_or_else(|| {
             DataError::Socket(format!(
-                "IB timestamp {} out of DateTime<Utc> range",
-                bar.date.unix_timestamp()
+                "IB candle close_time overflow: open={open_time}, bar_size={bar_size:?}"
             ))
         })?;
 
@@ -899,15 +1023,15 @@ fn bar_to_candle(bar: &ibapi::market_data::historical::Bar) -> Result<Candle, Da
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use chrono::Datelike;
+    use chrono::{Datelike, Timelike};
     use time::macros::datetime;
 
-    #[test]
-    fn bar_to_candle_converts_all_fields() {
-        use rust_decimal_macros::dec;
-
-        let bar = ibapi::market_data::historical::Bar {
-            date: datetime!(2024-01-15 16:00 UTC),
+    /// Build an ibapi `Bar` at the given `BarTimestamp` with placeholder OHLCV.
+    fn bar_at(
+        date: ibapi::market_data::historical::BarTimestamp,
+    ) -> ibapi::market_data::historical::Bar {
+        ibapi::market_data::historical::Bar {
+            date,
             open: 150.0,
             high: 155.0,
             low: 149.0,
@@ -915,9 +1039,18 @@ mod tests {
             volume: 1_000_000.0,
             wap: 152.0,
             count: 50_000,
-        };
+        }
+    }
 
-        let candle = bar_to_candle(&bar).unwrap();
+    #[test]
+    fn bar_to_candle_converts_all_fields() {
+        use rust_decimal_macros::dec;
+
+        // Intraday hourly bar opening at 16:00 → close_time = open + 1h = 17:00.
+        let open = datetime!(2024-01-15 16:00 UTC);
+        let bar = bar_at(open.into());
+
+        let candle = bar_to_candle(&bar, BarSize::Hour).unwrap();
 
         assert_eq!(candle.open, dec!(150));
         assert_eq!(candle.high, dec!(155));
@@ -926,30 +1059,70 @@ mod tests {
         assert_eq!(candle.volume, dec!(1_000_000));
         assert_eq!(candle.trade_count, 50_000);
 
-        // Check timestamp conversion
-        assert_eq!(candle.close_time.year(), 2024);
-        assert_eq!(candle.close_time.month(), 1); // January = 1
-        assert_eq!(candle.close_time.day(), 15);
-        assert_eq!(candle.close_time.timestamp(), bar.date.unix_timestamp());
+        // close_time is the exclusive boundary: open + 1 hour.
+        assert_eq!(
+            candle.close_time,
+            DateTime::from_timestamp(open.unix_timestamp(), 0).unwrap() + ChronoDuration::hours(1)
+        );
+        assert_eq!(candle.close_time.hour(), 17);
     }
 
     #[test]
     fn bar_to_candle_handles_negative_count() {
-        let bar = ibapi::market_data::historical::Bar {
-            date: datetime!(2024-01-15 16:00 UTC),
-            open: 100.0,
-            high: 100.0,
-            low: 100.0,
-            close: 100.0,
-            volume: 0.0,
-            wap: 0.0,
-            count: -1, // IB sometimes returns -1 for "not available"
-        };
+        let mut bar = bar_at(datetime!(2024-01-15 16:00 UTC).into());
+        bar.count = -1; // IB sometimes returns -1 for "not available"
 
-        let candle = bar_to_candle(&bar).unwrap();
+        let candle = bar_to_candle(&bar, BarSize::Hour).unwrap();
 
         // Negative count should clamp to 0
         assert_eq!(candle.trade_count, 0);
+    }
+
+    #[test]
+    fn bar_to_candle_daily_boundary_is_next_day() {
+        use ibapi::market_data::historical::BarTimestamp;
+        use time::macros::date;
+
+        // A Jan 15 daily bar (date-only, midnight UTC) → close_time = Jan 16 00:00 UTC.
+        let bar = bar_at(BarTimestamp::Date(date!(2024 - 01 - 15)));
+        let candle = bar_to_candle(&bar, BarSize::Day).unwrap();
+
+        assert_eq!(candle.close_time.year(), 2024);
+        assert_eq!(candle.close_time.month(), 1);
+        assert_eq!(candle.close_time.day(), 16);
+        assert_eq!(candle.close_time.hour(), 0);
+        // close_time.date() no longer equals the bar's own date (it shifted +1 day).
+        assert_ne!(candle.close_time.day(), 15);
+    }
+
+    #[test]
+    fn bar_to_candle_daily_boundary_crosses_month() {
+        use ibapi::market_data::historical::BarTimestamp;
+        use time::macros::date;
+
+        // A Jan 31 daily bar → Feb 1 00:00 UTC via Fixed(1 day).
+        let bar = bar_at(BarTimestamp::Date(date!(2024 - 01 - 31)));
+        let candle = bar_to_candle(&bar, BarSize::Day).unwrap();
+
+        assert_eq!(candle.close_time.month(), 2);
+        assert_eq!(candle.close_time.day(), 1);
+    }
+
+    #[test]
+    fn bar_to_candle_monthly_boundary_is_calendar_month() {
+        use ibapi::market_data::historical::BarTimestamp;
+        use time::macros::date;
+
+        // A January monthly bar → Feb 1 00:00 UTC via Months(1), NOT +30 days.
+        let bar = bar_at(BarTimestamp::Date(date!(2024 - 01 - 01)));
+        let candle = bar_to_candle(&bar, BarSize::Month).unwrap();
+
+        assert_eq!(candle.close_time.year(), 2024);
+        assert_eq!(candle.close_time.month(), 2);
+        assert_eq!(candle.close_time.day(), 1);
+        // Overflow / out-of-range boundary is surfaced as DataError, never a
+        // silent fallback — covered directly by the helper's unit tests
+        // (`close_time_from_open` returns None → DataError here).
     }
 
     #[test]

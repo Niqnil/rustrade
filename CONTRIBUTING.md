@@ -88,12 +88,25 @@ This is a library crate — avoid breaking downstream users unnecessarily.
 - Document migration paths in CHANGELOG.md under `Deprecated`
 - Only remove in the next major version (or minor version pre-1.0)
 
+**Pre-release checklist (maintainers):**
+Before cutting a release, verify documentation is current:
+- [ ] **CHANGELOG.md** — `[Unreleased]` captures all notable changes since the last release
+- [ ] **README.md files** — all are up to date with any API, feature, or behavior changes. Check every crate:
+  - `README.md` (workspace root)
+  - `rustrade/README.md`
+  - `rustrade-data/README.md`
+  - `rustrade-execution/README.md`
+  - `rustrade-instrument/README.md`
+  - `rustrade-integration/README.md`
+- [ ] Version numbers are consistent across all `Cargo.toml` files
+
 **Release process (maintainers):**
-1. Create release prep PR: bump versions in all Cargo.toml files
-2. Rename `[Unreleased]` → `[x.y.z] - YYYY-MM-DD`, add new empty `[Unreleased]`
-3. Merge to main
-4. Tag: `git tag v0.1.0 && git push origin v0.1.0`
-5. Publish workflow runs automatically
+1. Complete the pre-release checklist above
+2. Create release prep PR: bump versions in all Cargo.toml files
+3. Rename `[Unreleased]` → `[x.y.z] - YYYY-MM-DD`, add new empty `[Unreleased]`
+4. Merge to main
+5. Tag: `git tag v0.1.0 && git push origin v0.1.0`
+6. Publish workflow runs automatically
 
 ## What NOT to Contribute
 

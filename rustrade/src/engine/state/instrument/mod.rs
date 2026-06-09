@@ -839,6 +839,7 @@ where
             })
             .collect(),
         position: None,
+        isolated: None,
     }
 }
 
