@@ -125,6 +125,8 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 rust_decimal_macros = { workspace = true }
 # Serde round-trip tests (L2)
 serde_json = { workspace = true }
+# Scoped environment mutation for config tests
+temp-env = { workspace = true }
 # Serial test execution for integration tests that share exchange state
 serial_test = { workspace = true }
 
