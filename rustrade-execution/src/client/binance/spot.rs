@@ -31,16 +31,20 @@ use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
     RateLimitTracker, SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, classify_order_kind_tif,
-    connectivity_error, dedup_key_from_event, emit_reconnect_exhausted, is_api_rejection_error,
-    is_duplicate, is_rate_limit_error, new_dedup_cache, parse_binance_api_error, parse_order_kind,
-    parse_side, parse_time_in_force, rest_call_with_retry,
+    connectivity_error, dedup_key_from_event, is_api_rejection_error, is_duplicate,
+    is_rate_limit_error, new_dedup_cache, parse_binance_api_error, parse_order_kind, parse_side,
+    parse_time_in_force, rest_call_with_retry,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
     UnindexedAccountSnapshot,
     balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate},
     client::ExecutionClient,
-    error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
+    emit_stream_terminated,
+    error::{
+        ApiError, ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
+        UnindexedOrderError,
+    },
     order::{
         Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
         id::{ClientOrderId, OrderId, StrategyId},
@@ -1245,11 +1249,13 @@ async fn connection_manager(
                     if !backoff.wait().await {
                         error!("BinanceSpot max reconnect attempts exhausted");
                         // Signal terminal stream death in-band before tx drops.
-                        emit_reconnect_exhausted(
+                        emit_stream_terminated(
                             &tx,
                             ExchangeId::BinanceSpot,
-                            backoff.attempts(),
-                            e.to_string(),
+                            StreamTerminationReason::ReconnectBudgetExhausted {
+                                attempts: backoff.attempts(),
+                                last_error: e.to_string(),
+                            },
                         );
                         break;
                     }
@@ -1462,7 +1468,7 @@ async fn connection_manager(
 
         if !should_reconnect || tx.is_closed() {
             // Consumer dropped the receiver — no StreamTerminated emit (the channel is already
-            // closed, so it would be a no-op; see emit_reconnect_exhausted docs).
+            // closed, so it would be a no-op; see emit_stream_terminated docs).
             debug!("BinanceSpot connection manager exiting");
             break;
         }
@@ -1476,7 +1482,14 @@ async fn connection_manager(
                 }
                 _ => "WebSocket disconnected (server close/error)".to_string(),
             };
-            emit_reconnect_exhausted(&tx, ExchangeId::BinanceSpot, backoff.attempts(), last_error);
+            emit_stream_terminated(
+                &tx,
+                ExchangeId::BinanceSpot,
+                StreamTerminationReason::ReconnectBudgetExhausted {
+                    attempts: backoff.attempts(),
+                    last_error,
+                },
+            );
             break;
         }
     }

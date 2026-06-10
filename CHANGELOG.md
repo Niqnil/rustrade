@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in-band (a consumer-initiated drop is excluded — the channel is already closed by the time it is
   observed, so the signal would be undeliverable). This change adds the type plumbing; emitting the
   variant at each venue's terminal stream site is a follow-up.
+- **`StreamTerminated` is now emitted at every venue's terminal stream death** (`rustrade-execution`).
+  Each integration client emits the variant in-band on the account feed when its event stream truly
+  dies: `ReconnectBudgetExhausted { attempts, last_error }` after a venue's library-managed
+  reconnection gives up (Binance spot/margin, Alpaca), and `Error(String)` for unrecoverable closes
+  with no retry (IBKR, Hyperliquid perp/spot, Mock). A consumer-initiated drop emits nothing — the
+  channel is already closed by the time it is observed. All venues funnel through one feature-agnostic
+  `emit_stream_terminated` helper, so silent-EOF is now a programmatic signal at every venue. Closes #123.
 
 ### Changed
 

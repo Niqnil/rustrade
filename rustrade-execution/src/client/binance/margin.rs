@@ -38,16 +38,19 @@ use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
     RateLimitTracker, SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, classify_order_kind_tif,
-    classify_rest_order_error, connectivity_error, dedup_key_from_event, emit_reconnect_exhausted,
-    is_duplicate, new_dedup_cache, parse_order_kind, parse_side, parse_time_in_force,
-    rest_call_with_retry,
+    classify_rest_order_error, connectivity_error, dedup_key_from_event, is_duplicate,
+    new_dedup_cache, parse_order_kind, parse_side, parse_time_in_force, rest_call_with_retry,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, InstrumentBalanceUpdate,
     IsolatedInstrumentState, IsolatedMarginRisk, UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate},
     client::ExecutionClient,
-    error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
+    emit_stream_terminated,
+    error::{
+        ApiError, ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
+        UnindexedOrderError,
+    },
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, OrderId, StrategyId},
@@ -2296,11 +2299,13 @@ async fn margin_connection_manager(
                     error!(%e, "BinanceMargin userListenToken acquisition failed");
                     if !backoff.wait().await {
                         error!("BinanceMargin max reconnect attempts exhausted");
-                        emit_reconnect_exhausted(
+                        emit_stream_terminated(
                             &tx,
                             ExchangeId::BinanceMargin,
-                            backoff.attempts(),
-                            e.to_string(),
+                            StreamTerminationReason::ReconnectBudgetExhausted {
+                                attempts: backoff.attempts(),
+                                last_error: e.to_string(),
+                            },
                         );
                         break;
                     }
@@ -2318,11 +2323,13 @@ async fn margin_connection_manager(
                     error!(%e, "BinanceMargin WS connect failed");
                     if !backoff.wait().await {
                         error!("BinanceMargin max reconnect attempts exhausted");
-                        emit_reconnect_exhausted(
+                        emit_stream_terminated(
                             &tx,
                             ExchangeId::BinanceMargin,
-                            backoff.attempts(),
-                            e.to_string(),
+                            StreamTerminationReason::ReconnectBudgetExhausted {
+                                attempts: backoff.attempts(),
+                                last_error: e.to_string(),
+                            },
                         );
                         break;
                     }
@@ -2356,11 +2363,13 @@ async fn margin_connection_manager(
             // token left consumed → next iteration acquires a fresh one (auth/expiry-safe).
             if !backoff.wait().await {
                 error!("BinanceMargin max reconnect attempts exhausted");
-                emit_reconnect_exhausted(
+                emit_stream_terminated(
                     &tx,
                     ExchangeId::BinanceMargin,
-                    backoff.attempts(),
-                    e.to_string(),
+                    StreamTerminationReason::ReconnectBudgetExhausted {
+                        attempts: backoff.attempts(),
+                        last_error: e.to_string(),
+                    },
                 );
                 break;
             }
@@ -2473,11 +2482,13 @@ async fn margin_connection_manager(
                 }
                 _ => "WebSocket disconnected (server close/error)".to_string(),
             };
-            emit_reconnect_exhausted(
+            emit_stream_terminated(
                 &tx,
                 ExchangeId::BinanceMargin,
-                backoff.attempts(),
-                last_error,
+                StreamTerminationReason::ReconnectBudgetExhausted {
+                    attempts: backoff.attempts(),
+                    last_error,
+                },
             );
             break;
         }
@@ -2721,11 +2732,13 @@ async fn isolated_connection_manager(
                         error!(%e, "BinanceMargin isolated userListenToken acquisition failed");
                         if !backoff.wait().await {
                             error!("BinanceMargin isolated max reconnect attempts exhausted");
-                            emit_reconnect_exhausted(
+                            emit_stream_terminated(
                                 &tx,
                                 ExchangeId::BinanceMargin,
-                                backoff.attempts(),
-                                e.to_string(),
+                                StreamTerminationReason::ReconnectBudgetExhausted {
+                                    attempts: backoff.attempts(),
+                                    last_error: e.to_string(),
+                                },
                             );
                             break;
                         }
@@ -2740,11 +2753,13 @@ async fn isolated_connection_manager(
                         error!(%e, "BinanceMargin isolated connect/subscribe failed");
                         if !backoff.wait().await {
                             error!("BinanceMargin isolated max reconnect attempts exhausted");
-                            emit_reconnect_exhausted(
+                            emit_stream_terminated(
                                 &tx,
                                 ExchangeId::BinanceMargin,
-                                backoff.attempts(),
-                                e.to_string(),
+                                StreamTerminationReason::ReconnectBudgetExhausted {
+                                    attempts: backoff.attempts(),
+                                    last_error: e.to_string(),
+                                },
                             );
                             break;
                         }
@@ -2856,11 +2871,13 @@ async fn isolated_connection_manager(
                 }
                 _ => "WebSocket disconnected (server close/error)".to_string(),
             };
-            emit_reconnect_exhausted(
+            emit_stream_terminated(
                 &tx,
                 ExchangeId::BinanceMargin,
-                backoff.attempts(),
-                last_error,
+                StreamTerminationReason::ReconnectBudgetExhausted {
+                    attempts: backoff.attempts(),
+                    last_error,
+                },
             );
             break;
         }

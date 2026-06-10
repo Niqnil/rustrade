@@ -36,7 +36,11 @@ use crate::{
     UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance},
     client::{BracketOrderClient, ExecutionClient},
-    error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
+    emit_stream_terminated,
+    error::{
+        ApiError, ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
+        UnindexedOrderError,
+    },
     order::{
         Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
         bracket::{
@@ -254,6 +258,15 @@ impl ExponentialBackoff {
 
     fn reset(&mut self) {
         self.attempt = 0;
+    }
+
+    /// Number of reconnect attempts consumed so far.
+    ///
+    /// After [`wait`](Self::wait) has returned `false` this equals `max_attempts` — the number of
+    /// attempts made before the budget was exhausted. Used to populate
+    /// [`StreamTerminationReason::ReconnectBudgetExhausted`].
+    fn attempts(&self) -> u32 {
+        self.attempt
     }
 
     /// Waits for the current backoff duration. Returns `false` if max attempts exhausted.
@@ -2022,6 +2035,15 @@ async fn connection_manager(
                     error!(%e, "Alpaca WS connect/subscribe failed");
                     if !backoff.wait().await {
                         error!("Alpaca max reconnect attempts exhausted");
+                        // Signal terminal stream death in-band before tx drops.
+                        emit_stream_terminated(
+                            &tx,
+                            ExchangeId::AlpacaBroker,
+                            StreamTerminationReason::ReconnectBudgetExhausted {
+                                attempts: backoff.attempts(),
+                                last_error: e.to_string(),
+                            },
+                        );
                         break;
                     }
                     continue;
@@ -2098,7 +2120,15 @@ async fn connection_manager(
                 last_message_time = Utc::now();
             };
         }
-        loop {
+        // Distinguishes why the inner stream loop exited so the terminal emit below can report a
+        // meaningful `last_error`. The consumer-drop arm uses `break 'outer` and never yields one.
+        enum DisconnectReason {
+            ServerClose,
+            Error,
+            StreamEnded,
+            HeartbeatTimeout,
+        }
+        let reason = loop {
             tokio::select! {
                 msg = ws.next() => {
                     match msg {
@@ -2126,16 +2156,16 @@ async fn connection_manager(
                         }
                         Some(Ok(WsMessage::Close(frame))) => {
                             warn!(frame = ?frame, "Alpaca WS closed by server");
-                            break;
+                            break DisconnectReason::ServerClose;
                         }
                         Some(Ok(_)) => {} // Pong, Frame — ignore
                         Some(Err(e)) => {
                             warn!(%e, "Alpaca WS error, reconnecting");
-                            break;
+                            break DisconnectReason::Error;
                         }
                         None => {
                             warn!("Alpaca WS stream ended, reconnecting");
-                            break;
+                            break DisconnectReason::StreamEnded;
                         }
                     }
                 }
@@ -2146,7 +2176,7 @@ async fn connection_manager(
                     );
                     // Heartbeat timeout is a failure — do NOT reset backoff here.
                     // Backoff resets on successful event receipt in process_ws_text.
-                    break;
+                    break DisconnectReason::HeartbeatTimeout;
                 }
                 _ = tx.closed() => {
                     debug!("Alpaca account_stream consumer dropped, terminating");
@@ -2154,10 +2184,12 @@ async fn connection_manager(
                         Duration::from_secs(WS_CLOSE_TIMEOUT_SECS),
                         ws.close(None),
                     ).await;
+                    // Consumer dropped the receiver — no StreamTerminated emit (channel already
+                    // closed, so it would be a no-op; see emit_stream_terminated docs).
                     break 'outer;
                 }
             }
-        }
+        };
 
         // --- Record disconnect time for fill recovery ---
         // Anchor to last_message_time, not Utc::now(). For heartbeat-triggered
@@ -2171,10 +2203,30 @@ async fn connection_manager(
             tokio::time::timeout(Duration::from_secs(WS_CLOSE_TIMEOUT_SECS), ws.close(None)).await;
 
         if tx.is_closed() {
+            // Consumer dropped the receiver — no StreamTerminated emit (channel already closed,
+            // so it would be a no-op; see emit_stream_terminated docs).
             break;
         }
         if !backoff.wait().await {
             error!("Alpaca max reconnect attempts exhausted, stream terminating");
+            // Surrender after repeated reconnects: report the failure that triggered this round
+            // (consumer-drop already broke out via `break 'outer`).
+            let last_error = match reason {
+                DisconnectReason::HeartbeatTimeout => {
+                    format!("heartbeat timeout ({HEARTBEAT_TIMEOUT_SECS}s)")
+                }
+                DisconnectReason::ServerClose => "WebSocket closed by server".to_string(),
+                DisconnectReason::Error => "WebSocket error".to_string(),
+                DisconnectReason::StreamEnded => "WebSocket stream ended".to_string(),
+            };
+            emit_stream_terminated(
+                &tx,
+                ExchangeId::AlpacaBroker,
+                StreamTerminationReason::ReconnectBudgetExhausted {
+                    attempts: backoff.attempts(),
+                    last_error,
+                },
+            );
             break;
         }
     }

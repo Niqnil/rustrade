@@ -69,6 +69,7 @@ use crate::{
     UnindexedAccountSnapshot,
     balance::AssetBalance,
     client::{BracketOrderClient, ExecutionClient},
+    emit_stream_terminated,
     error::{
         ApiError, ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
     },
@@ -1190,12 +1191,11 @@ impl ExecutionClient for IbkrClient {
                                 // programmatic signal rather than inferring EOF. (best-effort
                                 // send — if the consumer already dropped rx it is a no-op.)
                                 error!(error = %e, "Order stream subscription error");
-                                let _ = tx.send(UnindexedAccountEvent {
-                                    exchange: ExchangeId::Ibkr,
-                                    kind: AccountEventKind::StreamTerminated(
-                                        StreamTerminationReason::Error(e.to_string()),
-                                    ),
-                                });
+                                emit_stream_terminated(
+                                    &tx,
+                                    ExchangeId::Ibkr,
+                                    StreamTerminationReason::Error(e.to_string()),
+                                );
                                 return;
                             }
                         };
@@ -1281,12 +1281,13 @@ impl ExecutionClient for IbkrClient {
                     // The subscription iterator ended without an error (e.g. clean
                     // disconnect/unsubscribe). Still a terminal stream death — surface it
                     // in-band so the consumer doesn't have to infer it from channel EOF.
-                    let _ = tx.send(UnindexedAccountEvent {
-                        exchange: ExchangeId::Ibkr,
-                        kind: AccountEventKind::StreamTerminated(StreamTerminationReason::Error(
+                    emit_stream_terminated(
+                        &tx,
+                        ExchangeId::Ibkr,
+                        StreamTerminationReason::Error(
                             "IBKR order-update stream ended".to_string(),
-                        )),
-                    });
+                        ),
+                    );
                 }));
 
                 if let Err(panic_info) = result {
