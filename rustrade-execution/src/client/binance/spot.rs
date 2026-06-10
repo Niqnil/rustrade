@@ -31,9 +31,9 @@ use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
     RateLimitTracker, SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, classify_order_kind_tif,
-    connectivity_error, dedup_key_from_event, is_api_rejection_error, is_duplicate,
-    is_rate_limit_error, new_dedup_cache, parse_binance_api_error, parse_order_kind, parse_side,
-    parse_time_in_force, rest_call_with_retry,
+    connectivity_error, dedup_key_from_event, emit_reconnect_exhausted, is_api_rejection_error,
+    is_duplicate, is_rate_limit_error, new_dedup_cache, parse_binance_api_error, parse_order_kind,
+    parse_side, parse_time_in_force, rest_call_with_retry,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
@@ -1244,6 +1244,13 @@ async fn connection_manager(
                     error!(%e, "BinanceSpot WS connect/subscribe failed");
                     if !backoff.wait().await {
                         error!("BinanceSpot max reconnect attempts exhausted");
+                        // Signal terminal stream death in-band before tx drops.
+                        emit_reconnect_exhausted(
+                            &tx,
+                            ExchangeId::BinanceSpot,
+                            backoff.attempts(),
+                            e.to_string(),
+                        );
                         break;
                     }
                     continue;
@@ -1383,6 +1390,9 @@ async fn connection_manager(
         }
 
         // --- Monitor: wait for disconnect, heartbeat timeout, or consumer drop ---
+        // Copy so `reason` survives the `match` that derives `disconnect_time` below and is
+        // still readable at the terminal-break emit.
+        #[derive(Clone, Copy)]
         enum DisconnectReason {
             Signal,
             HeartbeatTimeout,
@@ -1454,11 +1464,22 @@ async fn connection_manager(
         }
 
         if !should_reconnect || tx.is_closed() {
+            // Consumer dropped the receiver — no StreamTerminated emit (the channel is already
+            // closed, so it would be a no-op; see emit_reconnect_exhausted docs).
             debug!("BinanceSpot connection manager exiting");
             break;
         }
         if !backoff.wait().await {
             error!("BinanceSpot max reconnect attempts exhausted, stream terminating");
+            // Surrender after repeated reconnects: the most recent failure is the disconnect
+            // that triggered this round (ConsumerDropped already broke out above).
+            let last_error = match reason {
+                DisconnectReason::HeartbeatTimeout => {
+                    format!("heartbeat timeout ({HEARTBEAT_TIMEOUT_SECS}s)")
+                }
+                _ => "WebSocket disconnected (server close/error)".to_string(),
+            };
+            emit_reconnect_exhausted(&tx, ExchangeId::BinanceSpot, backoff.attempts(), last_error);
             break;
         }
     }

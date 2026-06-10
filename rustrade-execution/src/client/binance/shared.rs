@@ -12,14 +12,17 @@
 //! params) deliberately stay in their respective modules.
 
 use crate::{
-    AccountEventKind, UnindexedAccountEvent,
-    error::{ApiError, ConnectivityError, OrderError, UnindexedClientError},
+    AccountEvent, AccountEventKind, UnindexedAccountEvent,
+    error::{
+        ApiError, ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
+    },
     order::{OrderKind, TimeInForce, TrailingOffsetType, state::OrderState},
 };
 use binance_sdk::common::errors::{ConnectorError, WebsocketError};
 use lru::LruCache;
 use rustrade_instrument::{
-    Side, asset::name::AssetNameExchange, instrument::name::InstrumentNameExchange,
+    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
+    instrument::name::InstrumentNameExchange,
 };
 use smol_str::SmolStr;
 use std::{
@@ -29,6 +32,7 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
+use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 // ---------------------------------------------------------------------------
@@ -382,6 +386,15 @@ impl ExponentialBackoff {
         self.attempt = 0;
     }
 
+    /// Number of reconnect attempts consumed so far.
+    ///
+    /// After [`wait`](Self::wait) has returned `false` this equals `max_attempts` — i.e. the
+    /// number of attempts made before the budget was exhausted. Used to populate
+    /// [`StreamTerminationReason::ReconnectBudgetExhausted`].
+    pub(crate) fn attempts(&self) -> u32 {
+        self.attempt
+    }
+
     /// Wait for the current backoff duration. Returns `false` if max attempts exhausted.
     pub(crate) async fn wait(&mut self) -> bool {
         if self.attempt >= self.max_attempts {
@@ -401,6 +414,30 @@ impl ExponentialBackoff {
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         true
     }
+}
+
+/// Best-effort in-band emit of a terminal
+/// [`StreamTerminated`](AccountEventKind::StreamTerminated) carrying
+/// [`ReconnectBudgetExhausted`](StreamTerminationReason::ReconnectBudgetExhausted), sent on the
+/// account-event channel just before a connection manager exits.
+///
+/// Shared by the venues whose connection managers reconnect internally (Binance spot/margin,
+/// Alpaca) so stream death is delivered in-band rather than inferred from channel EOF. The send is
+/// best-effort: if the consumer already dropped the receiver it is a silent no-op — which is the
+/// consumer-initiated-drop case, deliberately *not* signalled (there is no one left to deliver to).
+pub(crate) fn emit_reconnect_exhausted(
+    tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
+    exchange: ExchangeId,
+    attempts: u32,
+    last_error: String,
+) {
+    let _ = tx.send(AccountEvent::new(
+        exchange,
+        AccountEventKind::StreamTerminated(StreamTerminationReason::ReconnectBudgetExhausted {
+            attempts,
+            last_error,
+        }),
+    ));
 }
 
 // ---------------------------------------------------------------------------
