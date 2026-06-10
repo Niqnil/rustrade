@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **IBKR contract config now rejects incomplete/unsupported configs instead of silently
+  fabricating a wrong contract** (`rustrade-execution`, `ibkr` feature). `ContractConfig::to_contract`
+  previously filled missing fields with silent defaults that produced a *different* contract than
+  intended; each is now a hard error (the startup registration loop already warns-and-skips on a bad
+  config, so a rejected contract is logged and omitted rather than mis-registered):
+  - a missing option `right` on an `OPT` contract no longer defaults to **Call** (`"C"`);
+  - a missing `strike` on an `OPT` no longer defaults to `0.0`;
+  - a missing `last_trade_date` on a `FUT`/`OPT` no longer defaults to `""`;
+  - an unrecognized `security_type` no longer silently falls back to a **stock** (`STK`).
+- **Breaking (`rustrade-execution`, `ibkr` feature):** the `contract::InvalidOptionRight` error type
+  is replaced by a `#[non_exhaustive]` `contract::ContractConfigError` enum
+  (`MissingOptionRight` / `UnrecognizedOptionRight { right }` / `MissingStrike` /
+  `MissingLastTradeDate` / `UnrecognizedSecurityType { security_type }`). `option_contract` now
+  returns `Result<Contract, ContractConfigError>`.
+
 ## [0.3.0] - 2026-06-09
 
 ### Added
