@@ -69,7 +69,9 @@ use crate::{
     UnindexedAccountSnapshot,
     balance::AssetBalance,
     client::{BracketOrderClient, ExecutionClient},
-    error::{ApiError, ConnectivityError, OrderError, UnindexedClientError},
+    error::{
+        ApiError, ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
+    },
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
         bracket::{
@@ -1182,11 +1184,19 @@ impl ExecutionClient for IbkrClient {
                         let update = match update {
                             Ok(u) => u,
                             Err(e) => {
-                                // Channel carries UnindexedAccountEvent, not Result —
-                                // cannot forward the error. Log and close the stream so
-                                // the caller observes EOF (consistent with the panic path).
+                                // IBKR has no library-managed reconnection: a subscription
+                                // error ends the stream. Surface it in-band as a terminal
+                                // StreamTerminated(Error) before tx drops so the caller gets a
+                                // programmatic signal rather than inferring EOF. (best-effort
+                                // send — if the consumer already dropped rx it is a no-op.)
                                 error!(error = %e, "Order stream subscription error");
-                                break;
+                                let _ = tx.send(UnindexedAccountEvent {
+                                    exchange: ExchangeId::Ibkr,
+                                    kind: AccountEventKind::StreamTerminated(
+                                        StreamTerminationReason::Error(e.to_string()),
+                                    ),
+                                });
+                                return;
                             }
                         };
                         let event = match update {
@@ -1262,9 +1272,21 @@ impl ExecutionClient for IbkrClient {
                         if let Some(e) = event
                             && tx.send(e).is_err()
                         {
-                            break;
+                            // Consumer dropped rx: no point emitting StreamTerminated
+                            // (the channel is already closed — it would be a no-op).
+                            return;
                         }
                     }
+
+                    // The subscription iterator ended without an error (e.g. clean
+                    // disconnect/unsubscribe). Still a terminal stream death — surface it
+                    // in-band so the consumer doesn't have to infer it from channel EOF.
+                    let _ = tx.send(UnindexedAccountEvent {
+                        exchange: ExchangeId::Ibkr,
+                        kind: AccountEventKind::StreamTerminated(StreamTerminationReason::Error(
+                            "IBKR order-update stream ended".to_string(),
+                        )),
+                    });
                 }));
 
                 if let Err(panic_info) = result {
