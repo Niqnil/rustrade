@@ -38,8 +38,9 @@ use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
     RateLimitTracker, SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, classify_order_kind_tif,
-    classify_rest_order_error, connectivity_error, dedup_key_from_event, is_duplicate,
-    new_dedup_cache, parse_order_kind, parse_side, parse_time_in_force, rest_call_with_retry,
+    classify_rest_order_error, connectivity_error, dedup_key_from_event, emit_reconnect_exhausted,
+    is_duplicate, new_dedup_cache, parse_order_kind, parse_side, parse_time_in_force,
+    rest_call_with_retry,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, InstrumentBalanceUpdate,
@@ -2295,6 +2296,12 @@ async fn margin_connection_manager(
                     error!(%e, "BinanceMargin userListenToken acquisition failed");
                     if !backoff.wait().await {
                         error!("BinanceMargin max reconnect attempts exhausted");
+                        emit_reconnect_exhausted(
+                            &tx,
+                            ExchangeId::BinanceMargin,
+                            backoff.attempts(),
+                            e.to_string(),
+                        );
                         break;
                     }
                     continue;
@@ -2311,6 +2318,12 @@ async fn margin_connection_manager(
                     error!(%e, "BinanceMargin WS connect failed");
                     if !backoff.wait().await {
                         error!("BinanceMargin max reconnect attempts exhausted");
+                        emit_reconnect_exhausted(
+                            &tx,
+                            ExchangeId::BinanceMargin,
+                            backoff.attempts(),
+                            e.to_string(),
+                        );
                         break;
                     }
                     continue;
@@ -2343,6 +2356,12 @@ async fn margin_connection_manager(
             // token left consumed → next iteration acquires a fresh one (auth/expiry-safe).
             if !backoff.wait().await {
                 error!("BinanceMargin max reconnect attempts exhausted");
+                emit_reconnect_exhausted(
+                    &tx,
+                    ExchangeId::BinanceMargin,
+                    backoff.attempts(),
+                    e.to_string(),
+                );
                 break;
             }
             continue;
@@ -2437,6 +2456,7 @@ async fn margin_connection_manager(
         }
 
         if !should_reconnect || tx.is_closed() {
+            // Consumer dropped the receiver — no StreamTerminated emit (channel already closed).
             debug!("BinanceMargin connection manager exiting");
             break;
         }
@@ -2445,6 +2465,20 @@ async fn margin_connection_manager(
         // `current_token` and `current_ws` are already None, forcing a fresh token + connection.
         if !matches!(reason, DisconnectReason::TokenRefresh) && !backoff.wait().await {
             error!("BinanceMargin max reconnect attempts exhausted, stream terminating");
+            // reason here is Signal or HeartbeatTimeout (TokenRefresh is guarded above,
+            // ConsumerDropped already broke out earlier).
+            let last_error = match reason {
+                DisconnectReason::HeartbeatTimeout => {
+                    format!("heartbeat timeout ({HEARTBEAT_TIMEOUT_SECS}s)")
+                }
+                _ => "WebSocket disconnected (server close/error)".to_string(),
+            };
+            emit_reconnect_exhausted(
+                &tx,
+                ExchangeId::BinanceMargin,
+                backoff.attempts(),
+                last_error,
+            );
             break;
         }
     }
@@ -2687,6 +2721,12 @@ async fn isolated_connection_manager(
                         error!(%e, "BinanceMargin isolated userListenToken acquisition failed");
                         if !backoff.wait().await {
                             error!("BinanceMargin isolated max reconnect attempts exhausted");
+                            emit_reconnect_exhausted(
+                                &tx,
+                                ExchangeId::BinanceMargin,
+                                backoff.attempts(),
+                                e.to_string(),
+                            );
                             break;
                         }
                         continue;
@@ -2700,6 +2740,12 @@ async fn isolated_connection_manager(
                         error!(%e, "BinanceMargin isolated connect/subscribe failed");
                         if !backoff.wait().await {
                             error!("BinanceMargin isolated max reconnect attempts exhausted");
+                            emit_reconnect_exhausted(
+                                &tx,
+                                ExchangeId::BinanceMargin,
+                                backoff.attempts(),
+                                e.to_string(),
+                            );
                             break;
                         }
                         continue;
@@ -2793,6 +2839,7 @@ async fn isolated_connection_manager(
         }
 
         if !should_reconnect || tx.is_closed() {
+            // Consumer dropped the receiver — no StreamTerminated emit (channel already closed).
             debug!("BinanceMargin isolated connection manager exiting");
             break;
         }
@@ -2801,6 +2848,20 @@ async fn isolated_connection_manager(
         // is already None, forcing fresh tokens + a fresh connection next iteration.
         if !matches!(reason, DisconnectReason::TokenRefresh) && !backoff.wait().await {
             error!("BinanceMargin isolated max reconnect attempts exhausted, stream terminating");
+            // reason here is Signal or HeartbeatTimeout (TokenRefresh guarded above,
+            // ConsumerDropped already broke out earlier).
+            let last_error = match reason {
+                DisconnectReason::HeartbeatTimeout => {
+                    format!("heartbeat timeout ({HEARTBEAT_TIMEOUT_SECS}s)")
+                }
+                _ => "WebSocket disconnected (server close/error)".to_string(),
+            };
+            emit_reconnect_exhausted(
+                &tx,
+                ExchangeId::BinanceMargin,
+                backoff.attempts(),
+                last_error,
+            );
             break;
         }
     }
