@@ -392,14 +392,11 @@ impl AlpacaConfig {
         let secret_key =
             std::env::var("ALPACA_SECRET_KEY").map_err(|_| AlpacaConfigError::MissingSecretKey)?;
 
-        let paper = std::env::var("ALPACA_PAPER")
-            .ok()
-            .and_then(|v| match v.to_ascii_lowercase().as_str() {
-                "true" => Some(true),
-                "false" => Some(false),
-                _ => None,
-            })
-            .unwrap_or(true);
+        let paper = match std::env::var("ALPACA_PAPER") {
+            Ok(value) => parse_env_bool(&value).ok_or(AlpacaConfigError::InvalidPaper(value))?,
+            Err(std::env::VarError::NotPresent) => true,
+            Err(_) => return Err(AlpacaConfigError::InvalidPaper("<non-unicode>".into())),
+        };
 
         if paper {
             Ok(Self::paper(api_key, secret_key))
@@ -448,6 +445,14 @@ impl AlpacaConfig {
     }
 }
 
+fn parse_env_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AlpacaConfigError {
     #[error("ALPACA_API_KEY environment variable not set")]
@@ -455,6 +460,9 @@ pub enum AlpacaConfigError {
 
     #[error("ALPACA_SECRET_KEY environment variable not set")]
     MissingSecretKey,
+
+    #[error("ALPACA_PAPER must be true or false, got {0}")]
+    InvalidPaper(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -3423,6 +3431,72 @@ mod tests {
         let live = AlpacaConfig::production("k".into(), "s".into());
         assert!(!live.rest_base_url().contains("paper-api"));
         assert!(!live.ws_url().contains("paper-api"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_alpaca_config_from_env_defaults_to_paper_trading() {
+        temp_env::with_vars(
+            [
+                ("ALPACA_API_KEY", Some("my_key")),
+                ("ALPACA_SECRET_KEY", Some("my_secret")),
+                ("ALPACA_PAPER", None),
+            ],
+            || {
+                let cfg = AlpacaConfig::from_env().unwrap();
+                assert!(cfg.paper);
+                assert_eq!(cfg.rest_base_url(), "https://paper-api.alpaca.markets");
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_alpaca_config_from_env_accepts_explicit_production() {
+        temp_env::with_vars(
+            [
+                ("ALPACA_API_KEY", Some("my_key")),
+                ("ALPACA_SECRET_KEY", Some("my_secret")),
+                ("ALPACA_PAPER", Some("false")),
+            ],
+            || {
+                let cfg = AlpacaConfig::from_env().unwrap();
+                assert!(!cfg.paper);
+                assert_eq!(cfg.rest_base_url(), "https://api.alpaca.markets");
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_alpaca_config_from_env_rejects_invalid_paper() {
+        temp_env::with_vars(
+            [
+                ("ALPACA_API_KEY", Some("my_key")),
+                ("ALPACA_SECRET_KEY", Some("my_secret")),
+                ("ALPACA_PAPER", Some("maybe")),
+            ],
+            || {
+                let err = AlpacaConfig::from_env().unwrap_err();
+                assert!(matches!(err, AlpacaConfigError::InvalidPaper(value) if value == "maybe"));
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_alpaca_config_from_env_requires_credentials() {
+        temp_env::with_vars(
+            [
+                ("ALPACA_API_KEY", None),
+                ("ALPACA_SECRET_KEY", Some("my_secret")),
+                ("ALPACA_PAPER", None),
+            ],
+            || {
+                let err = AlpacaConfig::from_env().unwrap_err();
+                assert!(matches!(err, AlpacaConfigError::MissingApiKey));
+            },
+        );
     }
 
     #[test]

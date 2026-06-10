@@ -32,6 +32,8 @@
 #[cfg(test)]
 use serial_test as _;
 #[cfg(test)]
+use temp_env as _;
+#[cfg(test)]
 use tracing_subscriber as _;
 #[cfg(test)]
 use wiremock as _;

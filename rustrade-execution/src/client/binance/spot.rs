@@ -143,14 +143,17 @@ impl BinanceSpotConfig {
             std::env::var("BINANCE_API_KEY").map_err(|_| BinanceSpotConfigError::MissingApiKey)?;
         let secret_key = std::env::var("BINANCE_SECRET_KEY")
             .map_err(|_| BinanceSpotConfigError::MissingSecretKey)?;
-        let testnet = std::env::var("BINANCE_TESTNET")
-            .ok()
-            .and_then(|v| match v.to_ascii_lowercase().as_str() {
-                "true" => Some(true),
-                "false" => Some(false),
-                _ => None,
-            })
-            .unwrap_or(true);
+        let testnet = match std::env::var("BINANCE_TESTNET") {
+            Ok(value) => {
+                parse_env_bool(&value).ok_or(BinanceSpotConfigError::InvalidTestnet(value))?
+            }
+            Err(std::env::VarError::NotPresent) => true,
+            Err(_) => {
+                return Err(BinanceSpotConfigError::InvalidTestnet(
+                    "<non-unicode>".into(),
+                ));
+            }
+        };
 
         if testnet {
             Ok(Self::testnet(api_key, secret_key))
@@ -165,6 +168,14 @@ impl BinanceSpotConfig {
     }
 }
 
+fn parse_env_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum BinanceSpotConfigError {
     #[error("BINANCE_API_KEY environment variable not set")]
@@ -172,6 +183,9 @@ pub enum BinanceSpotConfigError {
 
     #[error("BINANCE_SECRET_KEY environment variable not set")]
     MissingSecretKey,
+
+    #[error("BINANCE_TESTNET must be true or false, got {0}")]
+    InvalidTestnet(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -2420,6 +2434,73 @@ mod tests {
         .unwrap();
 
         assert!(!cfg.testnet);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_binance_spot_config_from_env_defaults_to_testnet() {
+        temp_env::with_vars(
+            [
+                ("BINANCE_API_KEY", Some("my_key")),
+                ("BINANCE_SECRET_KEY", Some("my_secret")),
+                ("BINANCE_TESTNET", None),
+            ],
+            || {
+                let cfg = BinanceSpotConfig::from_env().unwrap();
+                assert!(cfg.testnet);
+                assert_eq!(cfg.api_key(), "my_key");
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_binance_spot_config_from_env_accepts_explicit_production() {
+        temp_env::with_vars(
+            [
+                ("BINANCE_API_KEY", Some("my_key")),
+                ("BINANCE_SECRET_KEY", Some("my_secret")),
+                ("BINANCE_TESTNET", Some("false")),
+            ],
+            || {
+                let cfg = BinanceSpotConfig::from_env().unwrap();
+                assert!(!cfg.testnet);
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_binance_spot_config_from_env_rejects_invalid_testnet() {
+        temp_env::with_vars(
+            [
+                ("BINANCE_API_KEY", Some("my_key")),
+                ("BINANCE_SECRET_KEY", Some("my_secret")),
+                ("BINANCE_TESTNET", Some("maybe")),
+            ],
+            || {
+                let err = BinanceSpotConfig::from_env().unwrap_err();
+                assert!(
+                    matches!(err, BinanceSpotConfigError::InvalidTestnet(value) if value == "maybe")
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_binance_spot_config_from_env_requires_credentials() {
+        temp_env::with_vars(
+            [
+                ("BINANCE_API_KEY", None),
+                ("BINANCE_SECRET_KEY", Some("my_secret")),
+                ("BINANCE_TESTNET", None),
+            ],
+            || {
+                let err = BinanceSpotConfig::from_env().unwrap_err();
+                assert!(matches!(err, BinanceSpotConfigError::MissingApiKey));
+            },
+        );
     }
 
     #[test]

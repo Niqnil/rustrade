@@ -112,7 +112,7 @@ async fn test_mainnet_authentication() {
     let private_key =
         std::env::var("HYPERLIQUID_PRIVATE_KEY").expect("HYPERLIQUID_PRIVATE_KEY env var required");
     let config =
-        HyperliquidConfig::from_private_key_mainnet(&private_key).expect("Invalid private key");
+        HyperliquidConfig::from_private_key(&private_key, false).expect("Invalid private key");
 
     assert!(!config.testnet, "This test must run on mainnet");
     println!("Mainnet wallet address: {}", config.wallet_address_hex());

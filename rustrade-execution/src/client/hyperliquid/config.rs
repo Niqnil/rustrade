@@ -22,23 +22,9 @@ pub struct HyperliquidConfig {
 }
 
 impl HyperliquidConfig {
-    /// Create a new config with the given wallet, defaulting to mainnet.
-    pub fn new(wallet: LocalWallet) -> Self {
-        Self::mainnet(wallet)
-    }
-
-    pub fn testnet(wallet: LocalWallet) -> Self {
-        Self {
-            wallet,
-            testnet: true,
-        }
-    }
-
-    pub fn mainnet(wallet: LocalWallet) -> Self {
-        Self {
-            wallet,
-            testnet: false,
-        }
+    /// Create a new config with the given wallet and network selection.
+    pub fn new(wallet: LocalWallet, testnet: bool) -> Self {
+        Self { wallet, testnet }
     }
 
     /// Create a config from environment variables.
@@ -58,36 +44,20 @@ impl HyperliquidConfig {
             .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
             .unwrap_or(false);
 
-        if testnet {
-            Self::from_private_key_testnet(&private_key)
-        } else {
-            Self::from_private_key_mainnet(&private_key)
-        }
+        Self::from_private_key(&private_key, testnet)
     }
 
     /// Create a config from a hex-encoded private key string.
     ///
     /// The private key can have an optional "0x" prefix.
-    pub fn from_private_key(private_key: &str) -> Result<Self, ConfigError> {
-        let wallet = Self::wallet_from_private_key(private_key)?;
-
-        Ok(Self::mainnet(wallet))
-    }
-
-    pub fn from_private_key_testnet(private_key: &str) -> Result<Self, ConfigError> {
-        let wallet = Self::wallet_from_private_key(private_key)?;
-        Ok(Self::testnet(wallet))
-    }
-
-    pub fn from_private_key_mainnet(private_key: &str) -> Result<Self, ConfigError> {
-        let wallet = Self::wallet_from_private_key(private_key)?;
-        Ok(Self::mainnet(wallet))
-    }
-
-    fn wallet_from_private_key(private_key: &str) -> Result<LocalWallet, ConfigError> {
+    pub fn from_private_key(private_key: &str, testnet: bool) -> Result<Self, ConfigError> {
         let key = private_key.strip_prefix("0x").unwrap_or(private_key);
-        key.parse::<LocalWallet>()
-            .map_err(|e| ConfigError::InvalidPrivateKey(format!("{e}")))
+
+        let wallet: LocalWallet = key
+            .parse()
+            .map_err(|e| ConfigError::InvalidPrivateKey(format!("{e}")))?;
+
+        Ok(Self { wallet, testnet })
     }
 
     /// Returns the wallet address as a hex string (0x-prefixed).
@@ -125,7 +95,7 @@ mod tests {
     #[test]
     fn test_from_private_key_with_prefix() {
         let key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-        let config = HyperliquidConfig::from_private_key_mainnet(key).unwrap();
+        let config = HyperliquidConfig::from_private_key(key, false).unwrap();
         assert!(!config.testnet);
         assert!(config.wallet_address_hex().starts_with("0x"));
     }
@@ -133,13 +103,13 @@ mod tests {
     #[test]
     fn test_from_private_key_without_prefix() {
         let key = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-        let config = HyperliquidConfig::from_private_key(key).unwrap();
-        assert!(!config.testnet);
+        let config = HyperliquidConfig::from_private_key(key, true).unwrap();
+        assert!(config.testnet);
     }
 
     #[test]
     fn test_invalid_private_key() {
-        let result = HyperliquidConfig::from_private_key_mainnet("invalid");
+        let result = HyperliquidConfig::from_private_key("invalid", false);
         assert!(result.is_err());
     }
 }

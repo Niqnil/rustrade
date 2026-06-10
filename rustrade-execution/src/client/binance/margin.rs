@@ -196,15 +196,6 @@ pub struct BinanceMarginConfig {
     pub side_effect: MarginSideEffect,
 }
 
-/// Errors that can occur when creating a BinanceMarginConfig.
-#[derive(Debug, thiserror::Error)]
-pub enum ConfigError {
-    #[error("BINANCE_MARGIN_API_KEY environment variable not set")]
-    MissingApiKey,
-    #[error("BINANCE_MARGIN_SECRET_KEY environment variable not set")]
-    MissingSecretKey,
-}
-
 // custom Debug to avoid leaking credentials in logs
 impl std::fmt::Debug for BinanceMarginConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -229,8 +220,22 @@ impl BinanceMarginConfig {
     ///
     /// Note: this does not itself validate `is_isolated` against `isolated_symbols`; that gate
     /// lives in [`BinanceMargin::new`] (it must also cover the `Deserialize`-only path).
-    pub fn new(api_key: String, secret_key: String) -> Self {
-        Self::cross_margin(api_key, secret_key)
+    pub fn new(
+        api_key: String,
+        secret_key: String,
+        testnet: bool,
+        is_isolated: bool,
+        isolated_symbols: Vec<InstrumentNameExchange>,
+        side_effect: MarginSideEffect,
+    ) -> Self {
+        Self {
+            api_key,
+            secret_key,
+            testnet,
+            is_isolated,
+            isolated_symbols,
+            side_effect,
+        }
     }
 
     /// Convenience constructor for the common case: cross margin, production endpoints, and the
@@ -240,14 +245,14 @@ impl BinanceMarginConfig {
     /// `isolated_symbols`, and the default `side_effect`. Use [`new`](Self::new) when any of those
     /// need to differ.
     pub fn cross_margin(api_key: String, secret_key: String) -> Self {
-        Self {
+        Self::new(
             api_key,
             secret_key,
-            testnet: false,
-            is_isolated: false,
-            isolated_symbols: Vec::new(),
-            side_effect: MarginSideEffect::default(),
-        }
+            false,
+            false,
+            Vec::new(),
+            MarginSideEffect::default(),
+        )
     }
 
     /// Convenience constructor for isolated margin: production endpoints, the default
@@ -262,86 +267,19 @@ impl BinanceMarginConfig {
         secret_key: String,
         symbols: Vec<InstrumentNameExchange>,
     ) -> Self {
-        Self {
+        Self::new(
             api_key,
             secret_key,
-            testnet: false,
-            is_isolated: true,
-            isolated_symbols: symbols,
-            side_effect: MarginSideEffect::default(),
-        }
-    }
-
-    pub fn with_side_effect(mut self, side_effect: MarginSideEffect) -> Self {
-        self.side_effect = side_effect;
-        self
+            false,
+            true,
+            symbols,
+            MarginSideEffect::default(),
+        )
     }
 
     /// Read-only access to the API key (e.g. for logging or header construction).
     pub fn api_key(&self) -> &str {
         &self.api_key
-    }
-
-    /// Create a config from environment variables.
-    ///
-    /// Reads:
-    /// - `BINANCE_MARGIN_API_KEY`: Private key
-    /// - `BINANCE_MARGIN_SECRET_KEY`: Secret key
-    /// - `BINANCE_MARGIN_TESTNET`: Optional and ignored. Warns when set because Binance margin/SAPI has no testnet.
-    /// - `BINANCE_MARGIN_IS_ISOLATED`: Optional. Set to `true` for isolated margin.
-    /// - `BINANCE_MARGIN_ISOLATED_SYMBOLS`: Optional comma-separated isolated-margin pairs.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if required credentials are not set.
-    pub fn from_env() -> Result<Self, ConfigError> {
-        let api_key =
-            std::env::var("BINANCE_MARGIN_API_KEY").map_err(|_| ConfigError::MissingApiKey)?;
-        let secret_key = std::env::var("BINANCE_MARGIN_SECRET_KEY")
-            .map_err(|_| ConfigError::MissingSecretKey)?;
-        if std::env::var_os("BINANCE_MARGIN_TESTNET").is_some() {
-            warn!(
-                "BINANCE_MARGIN_TESTNET is set but ignored: Binance margin has no testnet; \
-                 using production endpoints"
-            );
-        }
-        let testnet = false;
-        let mut is_isolated = std::env::var("BINANCE_MARGIN_IS_ISOLATED")
-            .ok()
-            .and_then(|v| parse_env_bool(&v))
-            .unwrap_or(false);
-        let isolated_symbols = std::env::var("BINANCE_MARGIN_ISOLATED_SYMBOLS")
-            .ok()
-            .map(|symbols| {
-                symbols
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|symbol| !symbol.is_empty())
-                    .map(InstrumentNameExchange::new)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        if !isolated_symbols.is_empty() {
-            is_isolated = true;
-        }
-
-        Ok(Self {
-            api_key,
-            secret_key,
-            testnet,
-            is_isolated,
-            isolated_symbols,
-            side_effect: MarginSideEffect::default(),
-        })
-    }
-}
-
-fn parse_env_bool(value: &str) -> Option<bool> {
-    match value.to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" => Some(true),
-        "false" | "0" | "no" => Some(false),
-        _ => None,
     }
 }
 
@@ -3752,8 +3690,14 @@ mod tests {
 
     #[test]
     fn config_debug_redacts_secrets() {
-        let config =
-            BinanceMarginConfig::new("my_api_key".to_string(), "my_secret_key".to_string());
+        let config = BinanceMarginConfig::new(
+            "my_api_key".to_string(),
+            "my_secret_key".to_string(),
+            false,
+            false,
+            Vec::new(),
+            MarginSideEffect::default(),
+        );
         let debug = format!("{config:?}");
         assert!(!debug.contains("my_api_key"));
         assert!(!debug.contains("my_secret_key"));
@@ -3803,68 +3747,6 @@ mod tests {
     }
 
     #[test]
-    fn from_env_uses_cross_margin_defaults() {
-        temp_env::with_vars(
-            [
-                ("BINANCE_MARGIN_API_KEY", Some("k")),
-                ("BINANCE_MARGIN_SECRET_KEY", Some("s")),
-                ("BINANCE_MARGIN_TESTNET", None),
-                ("BINANCE_MARGIN_IS_ISOLATED", None),
-                ("BINANCE_MARGIN_ISOLATED_SYMBOLS", None),
-            ],
-            || {
-                let config = BinanceMarginConfig::from_env().expect("config");
-                assert!(!config.testnet);
-                assert!(!config.is_isolated);
-                assert!(config.isolated_symbols.is_empty());
-                assert_eq!(config.side_effect, MarginSideEffect::AutoBorrowRepay);
-            },
-        );
-    }
-
-    #[test]
-    fn from_env_warns_on_testnet_env_but_ignores_it() {
-        temp_env::with_vars(
-            [
-                ("BINANCE_MARGIN_API_KEY", Some("k")),
-                ("BINANCE_MARGIN_SECRET_KEY", Some("s")),
-                ("BINANCE_MARGIN_TESTNET", Some("true")),
-                ("BINANCE_MARGIN_IS_ISOLATED", None),
-                ("BINANCE_MARGIN_ISOLATED_SYMBOLS", None),
-            ],
-            || {
-                let config = BinanceMarginConfig::from_env().expect("config");
-                assert!(!config.testnet);
-                assert!(!config.is_isolated);
-            },
-        );
-    }
-
-    #[test]
-    fn from_env_isolated_symbols_force_isolated_margin() {
-        temp_env::with_vars(
-            [
-                ("BINANCE_MARGIN_API_KEY", Some("k")),
-                ("BINANCE_MARGIN_SECRET_KEY", Some("s")),
-                ("BINANCE_MARGIN_TESTNET", None),
-                ("BINANCE_MARGIN_IS_ISOLATED", Some("false")),
-                ("BINANCE_MARGIN_ISOLATED_SYMBOLS", Some("BTCUSDT, ETHUSDT")),
-            ],
-            || {
-                let config = BinanceMarginConfig::from_env().expect("config");
-                assert!(config.is_isolated);
-                assert_eq!(
-                    config.isolated_symbols,
-                    vec![
-                        InstrumentNameExchange::new("BTCUSDT"),
-                        InstrumentNameExchange::new("ETHUSDT")
-                    ]
-                );
-            },
-        );
-    }
-
-    #[test]
     fn isolated_config_with_symbols_constructs() {
         // The construction gate only rejects isolated + *empty* symbols; a populated set is fine.
         let config = BinanceMarginConfig::isolated(
@@ -3879,7 +3761,14 @@ mod tests {
     #[should_panic(expected = "non-empty isolated_symbols")]
     fn isolated_empty_symbols_panics_at_new() {
         // is_isolated = true with no isolated_symbols is an unusable config → fail-fast panic.
-        let config = BinanceMarginConfig::isolated("k".to_string(), "s".to_string(), Vec::new());
+        let config = BinanceMarginConfig::new(
+            "k".to_string(),
+            "s".to_string(),
+            false,
+            true,
+            Vec::new(),
+            MarginSideEffect::default(),
+        );
         let _ = BinanceMargin::new(config);
     }
 
