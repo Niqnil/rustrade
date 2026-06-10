@@ -150,27 +150,50 @@ pub struct ContractConfig {
 }
 
 impl ContractConfig {
-    fn to_contract(&self) -> Result<ibapi::contracts::Contract, contract::InvalidOptionRight> {
+    /// Convert this config into an [`ibapi::contracts::Contract`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ContractConfigError`](contract::ContractConfigError) instead of
+    /// silently fabricating a wrong contract when the config is incomplete or
+    /// unsupported:
+    /// - [`UnrecognizedSecurityType`](contract::ContractConfigError::UnrecognizedSecurityType)
+    ///   — `security_type` is not one of `STK`/`FUT`/`OPT`/`CASH`.
+    /// - [`MissingLastTradeDate`](contract::ContractConfigError::MissingLastTradeDate)
+    ///   — `last_trade_date` is absent on a `FUT` or `OPT` contract.
+    /// - [`MissingStrike`](contract::ContractConfigError::MissingStrike) — `strike`
+    ///   is absent on an `OPT` contract.
+    /// - [`MissingOptionRight`](contract::ContractConfigError::MissingOptionRight) —
+    ///   `right` is absent on an `OPT` contract.
+    /// - [`UnrecognizedOptionRight`](contract::ContractConfigError::UnrecognizedOptionRight)
+    ///   — `right` is present but not one of `C`/`CALL`/`P`/`PUT` (case-insensitive).
+    fn to_contract(&self) -> Result<ibapi::contracts::Contract, contract::ContractConfigError> {
+        use contract::ContractConfigError as E;
         Ok(match self.security_type.as_str() {
             "STK" => contract::stock_contract(&self.symbol, &self.exchange, &self.currency),
             "FUT" => contract::futures_contract(
                 &self.symbol,
-                self.last_trade_date.as_deref().unwrap_or(""),
+                self.last_trade_date
+                    .as_deref()
+                    .ok_or(E::MissingLastTradeDate)?,
                 &self.exchange,
                 &self.currency,
             ),
             "OPT" => contract::option_contract(
                 &self.symbol,
-                self.last_trade_date.as_deref().unwrap_or(""),
-                self.strike.unwrap_or(0.0),
-                self.right.as_deref().unwrap_or("C"),
+                self.last_trade_date
+                    .as_deref()
+                    .ok_or(E::MissingLastTradeDate)?,
+                self.strike.ok_or(E::MissingStrike)?,
+                self.right.as_deref().ok_or(E::MissingOptionRight)?,
                 &self.exchange,
                 &self.currency,
             )?,
             "CASH" => contract::forex_contract(&self.symbol, &self.currency),
             other => {
-                warn!(security_type = %other, symbol = %self.symbol, "Unknown security_type, defaulting to STK");
-                contract::stock_contract(&self.symbol, &self.exchange, &self.currency)
+                return Err(E::UnrecognizedSecurityType {
+                    security_type: other.to_string(),
+                });
             }
         })
     }
@@ -1949,5 +1972,97 @@ impl BracketOrderClient for IbkrClient {
             result.take_profit,
             result.stop_loss,
         )
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+mod contract_config_tests {
+    use super::*;
+    use contract::ContractConfigError as E;
+
+    /// A `ContractConfig` with every optional field present, so individual tests
+    /// can null out exactly the field under test.
+    fn full_config(security_type: &str) -> ContractConfig {
+        ContractConfig {
+            name: "TEST".to_string(),
+            symbol: "AAPL".to_string(),
+            security_type: security_type.to_string(),
+            exchange: "SMART".to_string(),
+            currency: "USD".to_string(),
+            last_trade_date: Some("20260116".to_string()),
+            strike: Some(150.0),
+            right: Some("C".to_string()),
+        }
+    }
+
+    #[test]
+    fn stk_and_cash_ignore_option_fields() {
+        // STK/CASH never read last_trade_date/strike/right, so absence is fine.
+        let mut stk = full_config("STK");
+        stk.last_trade_date = None;
+        stk.strike = None;
+        stk.right = None;
+        assert!(stk.to_contract().is_ok());
+
+        let mut cash = full_config("CASH");
+        cash.last_trade_date = None;
+        cash.strike = None;
+        cash.right = None;
+        assert!(cash.to_contract().is_ok());
+    }
+
+    #[test]
+    fn valid_fut_and_opt_build() {
+        assert!(full_config("FUT").to_contract().is_ok());
+        assert!(full_config("OPT").to_contract().is_ok());
+    }
+
+    #[test]
+    fn opt_missing_right_is_error_not_silent_call() {
+        let mut cfg = full_config("OPT");
+        cfg.right = None;
+        assert_eq!(cfg.to_contract().unwrap_err(), E::MissingOptionRight);
+    }
+
+    #[test]
+    fn opt_unrecognized_right_is_error() {
+        let mut cfg = full_config("OPT");
+        cfg.right = Some("X".to_string());
+        assert_eq!(
+            cfg.to_contract().unwrap_err(),
+            E::UnrecognizedOptionRight {
+                right: "X".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn opt_missing_strike_is_error() {
+        let mut cfg = full_config("OPT");
+        cfg.strike = None;
+        assert_eq!(cfg.to_contract().unwrap_err(), E::MissingStrike);
+    }
+
+    #[test]
+    fn fut_and_opt_missing_last_trade_date_is_error() {
+        let mut fut = full_config("FUT");
+        fut.last_trade_date = None;
+        assert_eq!(fut.to_contract().unwrap_err(), E::MissingLastTradeDate);
+
+        let mut opt = full_config("OPT");
+        opt.last_trade_date = None;
+        assert_eq!(opt.to_contract().unwrap_err(), E::MissingLastTradeDate);
+    }
+
+    #[test]
+    fn unknown_security_type_is_error_not_silent_stk() {
+        let cfg = full_config("BOND");
+        assert_eq!(
+            cfg.to_contract().unwrap_err(),
+            E::UnrecognizedSecurityType {
+                security_type: "BOND".to_string()
+            }
+        );
     }
 }

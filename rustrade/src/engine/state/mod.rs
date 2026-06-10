@@ -28,6 +28,7 @@ use rustrade_instrument::{
 use rustrade_integration::collection::{one_or_many::OneOrMany, snapshot::Snapshot};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
+use tracing::warn;
 
 /// Asset-centric state and associated state management logic.
 pub mod asset;
@@ -168,6 +169,17 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
 
                 instrument_state.data.process(event);
                 instrument_state.update_from_trade(trade)
+            }
+            AccountEventKind::StreamTerminated(reason) => {
+                // Observe stream death rather than silently dropping it. The engine does not own
+                // recovery policy (reconnect/re-sync/halt is consumer-specific), but a terminated
+                // account feed means subsequent state may go stale — surface it loudly.
+                warn!(
+                    exchange = ?event.exchange,
+                    %reason,
+                    "account event stream terminated — no further account events will arrive on it",
+                );
+                None
             }
             _ => None,
         };

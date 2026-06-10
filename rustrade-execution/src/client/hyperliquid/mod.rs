@@ -487,11 +487,9 @@ impl ExecutionClient for HyperliquidClient {
                                 warn!("UserFills WebSocket disconnected");
                             }
                             Message::HyperliquidError(e) => {
+                                // Transient, non-terminal: the loop continues. Log only — no
+                                // in-band event (consumers took no action on the old StreamError).
                                 error!(%e, "UserFills WebSocket error");
-                                let _ = fills_event_tx.send(AccountEvent::new(
-                                    ExchangeId::HyperliquidPerp,
-                                    AccountEventKind::StreamError(e),
-                                ));
                             }
                             _ => {}
                         }
@@ -536,11 +534,9 @@ impl ExecutionClient for HyperliquidClient {
                                 warn!("OrderUpdates WebSocket disconnected");
                             }
                             Message::HyperliquidError(e) => {
+                                // Transient, non-terminal: the loop continues. Log only — no
+                                // in-band event (consumers took no action on the old StreamError).
                                 error!(%e, "OrderUpdates WebSocket error");
-                                let _ = orders_event_tx.send(AccountEvent::new(
-                                    ExchangeId::HyperliquidPerp,
-                                    AccountEventKind::StreamError(e),
-                                ));
                             }
                             _ => {}
                         }
