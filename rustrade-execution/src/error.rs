@@ -324,8 +324,16 @@ impl<AssetKey, InstrumentKey> OrderError<AssetKey, InstrumentKey> {
 /// consumer can react (re-sync via REST, re-establish the stream, halt trading) according to its
 /// own policy — the library reports *why* the stream ended without prescribing the response.
 ///
+/// # Only in-band-deliverable terminations are represented
+///
+/// Every variant here is a termination the library can actually deliver to a consumer that is
+/// still listening. A consumer-initiated drop is deliberately **not** a variant: by the time a
+/// stream task observes the drop, the receiving half of the channel is already gone, so a
+/// `StreamTerminated` send would be a guaranteed no-op. `StreamTerminated` therefore always means
+/// "the stream died while you were still listening".
+///
 /// `#[non_exhaustive]` so venues may distinguish further termination causes in future without a
-/// breaking change.
+/// breaking change (e.g. a venue able to signal a graceful shutdown over a still-open channel).
 #[non_exhaustive]
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]
 pub enum StreamTerminationReason {
@@ -345,21 +353,12 @@ pub enum StreamTerminationReason {
 
     /// The stream ended on an unrecoverable error with no automatic recovery.
     ///
-    /// Emitted by venues without built-in reconnection (e.g. IBKR): the underlying stream errored
-    /// and the client does not retry. The consumer is responsible for any re-establishment.
+    /// Emitted by venues without library-managed reconnection — e.g. IBKR (the underlying
+    /// subscription errored and the client does not retry), Hyperliquid (the SDK's internal
+    /// reconnection gave up and closed the channel), or the mock exchange (its broadcast stream
+    /// lagged past the buffer). The consumer is responsible for any re-establishment.
     #[error("unrecoverable stream error: {0}")]
     Error(String),
-
-    /// The consumer dropped the receiving half of the account event channel.
-    ///
-    /// The stream task observed that sends now fail and exited. Not an error condition — it
-    /// indicates intentional teardown on the consumer side.
-    #[error("consumer dropped the stream receiver")]
-    ConsumerDropped,
-
-    /// The venue closed the stream as part of a graceful shutdown.
-    #[error("graceful shutdown by venue")]
-    GracefulShutdown,
 }
 
 /// Represents errors related to exchange, asset and instrument identifier key lookups.
