@@ -72,7 +72,6 @@ impl AccountEventIndexer {
                 AccountEventKind::OrderCancelled(self.order_response_cancel(response)?)
             }
             AccountEventKind::Trade(trade) => AccountEventKind::Trade(self.trade(trade)?),
-            AccountEventKind::StreamError(msg) => AccountEventKind::StreamError(msg),
             // Termination reason carries no exchange/asset/instrument keys — pass through verbatim.
             AccountEventKind::StreamTerminated(reason) => {
                 AccountEventKind::StreamTerminated(reason)

@@ -150,13 +150,6 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
     /// when available.
     Trade(Trade<AssetKey, InstrumentKey>),
 
-    /// WebSocket-level error from exchange. Connection may have dropped.
-    ///
-    /// Implementations send this when the underlying stream encounters an error.
-    /// Consumers should treat this as a signal that events may have been missed
-    /// and consider re-syncing via REST (e.g., `fetch_trades`, `account_snapshot`).
-    StreamError(String),
-
     /// The account event stream has ended; no further events will arrive on it.
     ///
     /// This is the in-band, programmatic signal that a stream died — delivered on the **same**
