@@ -1390,9 +1390,6 @@ async fn connection_manager(
         }
 
         // --- Monitor: wait for disconnect, heartbeat timeout, or consumer drop ---
-        // Copy so `reason` survives the `match` that derives `disconnect_time` below and is
-        // still readable at the terminal-break emit.
-        #[derive(Clone, Copy)]
         enum DisconnectReason {
             Signal,
             HeartbeatTimeout,
