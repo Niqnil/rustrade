@@ -382,6 +382,15 @@ impl ExponentialBackoff {
         self.attempt = 0;
     }
 
+    /// Number of reconnect attempts consumed so far.
+    ///
+    /// After [`wait`](Self::wait) has returned `false` this equals `max_attempts` — i.e. the
+    /// number of attempts made before the budget was exhausted. Used to populate
+    /// [`crate::error::StreamTerminationReason::ReconnectBudgetExhausted`].
+    pub(crate) fn attempts(&self) -> u32 {
+        self.attempt
+    }
+
     /// Wait for the current backoff duration. Returns `false` if max attempts exhausted.
     pub(crate) async fn wait(&mut self) -> bool {
         if self.attempt >= self.max_attempts {

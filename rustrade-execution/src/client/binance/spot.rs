@@ -40,7 +40,11 @@ use crate::{
     UnindexedAccountSnapshot,
     balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate},
     client::ExecutionClient,
-    error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
+    emit_stream_terminated,
+    error::{
+        ApiError, ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
+        UnindexedOrderError,
+    },
     order::{
         Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
         id::{ClientOrderId, OrderId, StrategyId},
@@ -1244,6 +1248,15 @@ async fn connection_manager(
                     error!(%e, "BinanceSpot WS connect/subscribe failed");
                     if !backoff.wait().await {
                         error!("BinanceSpot max reconnect attempts exhausted");
+                        // Signal terminal stream death in-band before tx drops.
+                        emit_stream_terminated(
+                            &tx,
+                            ExchangeId::BinanceSpot,
+                            StreamTerminationReason::ReconnectBudgetExhausted {
+                                attempts: backoff.attempts(),
+                                last_error: e.to_string(),
+                            },
+                        );
                         break;
                     }
                     continue;
@@ -1454,11 +1467,29 @@ async fn connection_manager(
         }
 
         if !should_reconnect || tx.is_closed() {
+            // Consumer dropped the receiver — no StreamTerminated emit (the channel is already
+            // closed, so it would be a no-op; see emit_stream_terminated docs).
             debug!("BinanceSpot connection manager exiting");
             break;
         }
         if !backoff.wait().await {
             error!("BinanceSpot max reconnect attempts exhausted, stream terminating");
+            // Surrender after repeated reconnects: the most recent failure is the disconnect
+            // that triggered this round (ConsumerDropped already broke out above).
+            let last_error = match reason {
+                DisconnectReason::HeartbeatTimeout => {
+                    format!("heartbeat timeout ({HEARTBEAT_TIMEOUT_SECS}s)")
+                }
+                _ => "WebSocket disconnected (server close/error)".to_string(),
+            };
+            emit_stream_terminated(
+                &tx,
+                ExchangeId::BinanceSpot,
+                StreamTerminationReason::ReconnectBudgetExhausted {
+                    attempts: backoff.attempts(),
+                    last_error,
+                },
+            );
             break;
         }
     }
