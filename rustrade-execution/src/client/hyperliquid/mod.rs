@@ -72,7 +72,11 @@ use crate::{
     UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance},
     client::ExecutionClient,
-    error::{ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
+    emit_stream_terminated,
+    error::{
+        ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
+        UnindexedOrderError,
+    },
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, OrderId, StrategyId},
@@ -99,7 +103,13 @@ use rustrade_instrument::{
 };
 use rustrade_integration::collection::snapshot::Snapshot;
 use smol_str::{SmolStr, format_smolstr};
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -456,9 +466,16 @@ impl ExecutionClient for HyperliquidClient {
         // CancellationToken ensures tasks exit when stream is dropped
         let cancel_token = CancellationToken::new();
 
+        // Both tasks share `event_tx` and both observe `recv() -> None` when the SDK gives up on the
+        // socket, so guard the terminal emit with a shared flag — only the first non-cancellation
+        // terminal sends `StreamTerminated`, avoiding a double-emit. Relaxed ordering suffices: the
+        // flag has no associated payload to synchronise; the channel send is the synchronisation point.
+        let terminated = Arc::new(AtomicBool::new(false));
+
         // Spawn task to process fills
         let fills_event_tx = event_tx.clone();
         let fills_cancel = cancel_token.clone();
+        let fills_terminated = terminated.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -470,6 +487,20 @@ impl ExecutionClient for HyperliquidClient {
                     msg = fills_rx.recv() => {
                         let Some(msg) = msg else {
                             debug!("Fills receiver closed");
+                            // SDK gave up on the stream (channel closed). Emit a single terminal
+                            // StreamTerminated across both tasks (guarded by the shared flag).
+                            if fills_terminated
+                                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                                .is_ok()
+                            {
+                                emit_stream_terminated(
+                                    &fills_event_tx,
+                                    ExchangeId::HyperliquidPerp,
+                                    StreamTerminationReason::Error(
+                                        "hyperliquid account stream closed".to_string(),
+                                    ),
+                                );
+                            }
                             return;
                         };
                         match msg {
@@ -504,6 +535,7 @@ impl ExecutionClient for HyperliquidClient {
         // which causes fills_rx to also close.
         let orders_event_tx = event_tx;
         let orders_cancel = cancel_token.clone();
+        let orders_terminated = terminated;
         tokio::spawn(async move {
             let _ws_client = ws_client;
 
@@ -517,6 +549,20 @@ impl ExecutionClient for HyperliquidClient {
                     msg = orders_rx.recv() => {
                         let Some(msg) = msg else {
                             debug!("Orders receiver closed");
+                            // SDK gave up on the stream (channel closed). Emit a single terminal
+                            // StreamTerminated across both tasks (guarded by the shared flag).
+                            if orders_terminated
+                                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                                .is_ok()
+                            {
+                                emit_stream_terminated(
+                                    &orders_event_tx,
+                                    ExchangeId::HyperliquidPerp,
+                                    StreamTerminationReason::Error(
+                                        "hyperliquid account stream closed".to_string(),
+                                    ),
+                                );
+                            }
                             return;
                         };
                         match msg {

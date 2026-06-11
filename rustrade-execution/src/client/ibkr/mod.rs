@@ -69,7 +69,10 @@ use crate::{
     UnindexedAccountSnapshot,
     balance::AssetBalance,
     client::{BracketOrderClient, ExecutionClient},
-    error::{ApiError, ConnectivityError, OrderError, UnindexedClientError},
+    emit_stream_terminated,
+    error::{
+        ApiError, ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
+    },
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
         bracket::{
@@ -1173,8 +1176,10 @@ impl ExecutionClient for IbkrClient {
             .name("ibkr-order-stream".to_string())
             .spawn(move || {
                 // Panic safety: parking_lot mutexes do not poison on panic, so shared state
-                // (ContractRegistry, OrderIdMap, etc.) remains usable. On panic the
-                // thread exits, tx is dropped, and the stream closes — caller observes EOF.
+                // (ContractRegistry, OrderIdMap, etc.) remains usable. catch_unwind unwinds only
+                // the inner closure — `tx` lives in this outer thread closure and is still open
+                // afterward, so the panic handler below emits a terminal StreamTerminated before
+                // `tx` drops (a panic is a terminal stream death like any other).
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     use ibapi::orders::{OrderStatusKind, OrderUpdate};
 
@@ -1182,11 +1187,18 @@ impl ExecutionClient for IbkrClient {
                         let update = match update {
                             Ok(u) => u,
                             Err(e) => {
-                                // Channel carries UnindexedAccountEvent, not Result —
-                                // cannot forward the error. Log and close the stream so
-                                // the caller observes EOF (consistent with the panic path).
+                                // IBKR has no library-managed reconnection: a subscription
+                                // error ends the stream. Surface it in-band as a terminal
+                                // StreamTerminated(Error) before tx drops so the caller gets a
+                                // programmatic signal rather than inferring EOF. (best-effort
+                                // send — if the consumer already dropped rx it is a no-op.)
                                 error!(error = %e, "Order stream subscription error");
-                                break;
+                                emit_stream_terminated(
+                                    &tx,
+                                    ExchangeId::Ibkr,
+                                    StreamTerminationReason::Error(e.to_string()),
+                                );
+                                return;
                             }
                         };
                         let event = match update {
@@ -1262,9 +1274,22 @@ impl ExecutionClient for IbkrClient {
                         if let Some(e) = event
                             && tx.send(e).is_err()
                         {
-                            break;
+                            // Consumer dropped rx: no point emitting StreamTerminated
+                            // (the channel is already closed — it would be a no-op).
+                            return;
                         }
                     }
+
+                    // The subscription iterator ended without an error (e.g. clean
+                    // disconnect/unsubscribe). Still a terminal stream death — surface it
+                    // in-band so the consumer doesn't have to infer it from channel EOF.
+                    emit_stream_terminated(
+                        &tx,
+                        ExchangeId::Ibkr,
+                        StreamTerminationReason::Error(
+                            "IBKR order-update stream ended".to_string(),
+                        ),
+                    );
                 }));
 
                 if let Err(panic_info) = result {
@@ -1274,8 +1299,16 @@ impl ExecutionClient for IbkrClient {
                         .or_else(|| panic_info.downcast_ref::<String>().cloned())
                         .unwrap_or_else(|| "unknown panic".to_string());
                     error!("Order stream worker panicked: {msg}");
-                    // Channel type is UnindexedAccountEvent, not Result — cannot send error.
-                    // Caller observes stream close; they can check logs for panic message.
+                    // A panic is a terminal stream death — surface it in-band before tx drops so
+                    // the consumer gets a programmatic signal rather than inferring EOF.
+                    // Best-effort: a no-op if the consumer already dropped rx.
+                    emit_stream_terminated(
+                        &tx,
+                        ExchangeId::Ibkr,
+                        StreamTerminationReason::Error(format!(
+                            "IBKR order-update worker panicked: {msg}"
+                        )),
+                    );
                 }
             })
             .map_err(|e| UnindexedClientError::TaskFailed(format!("thread spawn: {e}")))?;

@@ -2,7 +2,10 @@ use crate::{
     UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::AssetBalance,
     client::ExecutionClient,
-    error::{ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
+    error::{
+        ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
+        UnindexedOrderError,
+    },
     exchange::mock::request::{MarketPrices, MockExchangeRequest},
     fee::FeeModelConfig,
     fill::SimFillConfig,
@@ -15,13 +18,13 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use derive_more::Constructor;
-use futures::stream::BoxStream;
+use futures::{StreamExt, stream::BoxStream};
 use rustrade_instrument::{
     asset::name::AssetNameExchange, exchange::ExchangeId, instrument::name::InstrumentNameExchange,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tokio_stream::{StreamExt, wrappers::BroadcastStream};
+use tokio_stream::wrappers::BroadcastStream;
 use tracing::error;
 
 #[derive(
@@ -148,18 +151,37 @@ where
         _: &[AssetNameExchange],
         _: &[InstrumentNameExchange],
     ) -> Result<Self::AccountStream, UnindexedClientError> {
-        Ok(futures::StreamExt::boxed(
-            BroadcastStream::new(self.event_rx.resubscribe()).map_while(|result| match result {
-                Ok(event) => Some(event),
-                Err(error) => {
-                    error!(
-                        ?error,
-                        "MockExchange Broadcast AccountStream lagged - terminating"
-                    );
+        // `scan` (not `map_while`) so the broadcast-lag terminal is delivered in-band: on lag we
+        // yield one StreamTerminated event, set `done`, and the next poll ends the stream — whereas
+        // `map_while` would end on lag with a silent EOF and no terminal event.
+        let exchange = self.mocked_exchange;
+        Ok(BroadcastStream::new(self.event_rx.resubscribe())
+            .scan(false, move |done, result| {
+                // `futures::StreamExt::scan` ends the stream when the closure resolves to None.
+                let item = if *done {
+                    // Terminal already emitted on the prior poll — end the stream now.
                     None
-                }
-            }),
-        ))
+                } else {
+                    match result {
+                        Ok(event) => Some(event),
+                        Err(error) => {
+                            error!(
+                                ?error,
+                                "MockExchange Broadcast AccountStream lagged - terminating"
+                            );
+                            *done = true;
+                            Some(UnindexedAccountEvent::stream_terminated(
+                                exchange,
+                                StreamTerminationReason::Error(
+                                    "mock broadcast stream lagged".to_string(),
+                                ),
+                            ))
+                        }
+                    }
+                };
+                futures::future::ready(item)
+            })
+            .boxed())
     }
 
     async fn cancel_order(
@@ -350,5 +372,64 @@ fn into_owned_request<Kind>(
             cid,
         },
         state,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
+mod tests {
+    use super::*;
+    use crate::{AccountEventKind, balance::Balance};
+    use rust_decimal::Decimal;
+    use rustrade_integration::collection::snapshot::Snapshot;
+
+    fn filler_event() -> UnindexedAccountEvent {
+        // Content is irrelevant — these events are overwritten by the lag before they can be
+        // delivered; they exist only to overflow the broadcast buffer.
+        UnindexedAccountEvent::new(
+            ExchangeId::Mock,
+            AccountEventKind::BalanceSnapshot(Snapshot::new(AssetBalance {
+                asset: AssetNameExchange::new("btc"),
+                balance: Balance::new(Decimal::ONE, Decimal::ONE),
+                time_exchange: Utc::now(),
+            })),
+        )
+    }
+
+    /// Broadcast lag is a terminal stream death: the account stream must deliver an in-band
+    /// `StreamTerminated(Error)` (not a silent EOF) and then end.
+    #[tokio::test]
+    async fn account_stream_emits_stream_terminated_on_broadcast_lag() {
+        // Capacity 1 so a burst of sends with no reader immediately overflows → lag.
+        let (event_tx, event_rx) = broadcast::channel::<UnindexedAccountEvent>(1);
+        let (request_tx, _request_rx) = mpsc::unbounded_channel();
+        // `MockExecution` derives `Constructor`, so its inherent `new` takes the four fields
+        // directly (the `ExecutionClient::new(config)` trait method is shadowed here).
+        let client = MockExecution::new(ExchangeId::Mock, Utc::now, request_tx, event_rx);
+
+        let mut stream = client.account_stream(&[], &[]).await.unwrap();
+
+        // Overflow the buffer before the stream's receiver reads anything → force a lag.
+        for _ in 0..3 {
+            event_tx.send(filler_event()).unwrap();
+        }
+
+        // The lag is surfaced in-band as the terminal event...
+        let event = stream.next().await.expect("expected a terminal event");
+        assert!(
+            matches!(
+                event.kind,
+                AccountEventKind::StreamTerminated(StreamTerminationReason::Error(_))
+            ),
+            "expected StreamTerminated(Error) on broadcast lag, got {:?}",
+            event.kind
+        );
+        assert_eq!(event.exchange, ExchangeId::Mock);
+
+        // ...after which the stream ends.
+        assert!(
+            stream.next().await.is_none(),
+            "stream must end after the terminal event"
+        );
     }
 }

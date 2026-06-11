@@ -196,10 +196,12 @@ where
         }
         table.add_row(header_row);
 
-        // Add metric rows
-        self.add_asset_metric_row(&mut table, "Balance", |ts| {
+        // Add metric rows. The "Balance" row reflects the session's BalanceBasis in both its label
+        // and its value, so a net-asset summary is never mistaken for a gross one.
+        let basis = self.basis;
+        self.add_asset_metric_row(&mut table, &format!("Balance ({basis})"), move |ts| {
             if let Some(balance) = ts.balance_end {
-                format!("{:.8}", balance.total)
+                format!("{:.8}", basis.value(balance))
             } else {
                 "N/A".to_string()
             }
@@ -255,5 +257,68 @@ fn format_percentage(value: Decimal, precision: usize) -> String {
     match value.checked_mul(Decimal::ONE_HUNDRED) {
         Some(pct) => format!("{pct:.precision$}%"),
         None => "∞%".to_string(),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+mod tests {
+    use super::*;
+    use crate::statistic::{summary::asset::BalanceBasis, time::Annual365};
+    use chrono::{DateTime, Utc};
+    use rust_decimal_macros::dec;
+    use rustrade_execution::balance::Balance;
+    use rustrade_instrument::{
+        asset::{ExchangeAsset, name::AssetNameInternal},
+        exchange::ExchangeId,
+    };
+    use rustrade_integration::collection::FnvIndexMap;
+
+    fn summary_with_basis(basis: BalanceBasis, balance_end: Balance) -> TradingSummary<Annual365> {
+        let mut assets = FnvIndexMap::default();
+        assets.insert(
+            ExchangeAsset::new(ExchangeId::BinanceSpot, AssetNameInternal::new("btc")),
+            TearSheetAsset {
+                balance_end: Some(balance_end),
+                drawdown: None,
+                drawdown_mean: None,
+                drawdown_max: None,
+            },
+        );
+
+        TradingSummary {
+            time_engine_start: DateTime::<Utc>::MIN_UTC,
+            time_engine_end: DateTime::<Utc>::MIN_UTC,
+            instruments: FnvIndexMap::default(),
+            assets,
+            basis,
+        }
+    }
+
+    /// The asset-table "Balance" row labels itself with the session basis and formats the value
+    /// through that basis, so a net-asset summary (net 30, gross 180) is never read as gross.
+    #[test]
+    fn asset_table_balance_row_reflects_net_asset_basis() {
+        // total 180, net asset 30 (borrowed 150).
+        let margin = Balance::new_margin(dec!(180.0), dec!(30.0), dec!(150.0), dec!(0.0));
+        let rendered = summary_with_basis(BalanceBasis::NetAsset, margin)
+            .asset_table()
+            .to_string();
+
+        assert!(rendered.contains("Balance (net asset)"));
+        assert!(rendered.contains("30.00000000")); // net asset, not gross total
+        assert!(!rendered.contains("Balance (gross)"));
+    }
+
+    /// Under the default Gross basis the row labels itself "Balance (gross)" and shows the raw total.
+    #[test]
+    fn asset_table_balance_row_reflects_gross_basis() {
+        let margin = Balance::new_margin(dec!(180.0), dec!(30.0), dec!(150.0), dec!(0.0));
+        let rendered = summary_with_basis(BalanceBasis::Gross, margin)
+            .asset_table()
+            .to_string();
+
+        assert!(rendered.contains("Balance (gross)"));
+        assert!(rendered.contains("180.00000000")); // gross total
     }
 }

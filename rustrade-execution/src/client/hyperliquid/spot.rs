@@ -47,7 +47,11 @@ use crate::{
     UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance},
     client::ExecutionClient,
-    error::{ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
+    emit_stream_terminated,
+    error::{
+        ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
+        UnindexedOrderError,
+    },
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, OrderId, StrategyId},
@@ -67,7 +71,13 @@ use rustrade_instrument::{
 };
 use rustrade_integration::collection::snapshot::Snapshot;
 use smol_str::{SmolStr, format_smolstr};
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -347,9 +357,15 @@ impl ExecutionClient for HyperliquidSpotClient {
         let (event_tx, event_rx) = mpsc::unbounded_channel::<UnindexedAccountEvent>();
         let cancel_token = CancellationToken::new();
 
+        // Both tasks share `event_tx` and both observe `recv() -> None` when the SDK gives up on the
+        // socket, so guard the terminal emit with a shared flag — only the first non-cancellation
+        // terminal sends `StreamTerminated`, avoiding a double-emit.
+        let terminated = Arc::new(AtomicBool::new(false));
+
         // Spawn task to process fills (filtered to spot only)
         let fills_event_tx = event_tx.clone();
         let fills_cancel = cancel_token.clone();
+        let fills_terminated = terminated.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -361,6 +377,20 @@ impl ExecutionClient for HyperliquidSpotClient {
                     msg = fills_rx.recv() => {
                         let Some(msg) = msg else {
                             debug!("Spot fills receiver closed");
+                            // SDK gave up on the stream (channel closed). Emit a single terminal
+                            // StreamTerminated across both tasks (guarded by the shared flag).
+                            if fills_terminated
+                                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                                .is_ok()
+                            {
+                                emit_stream_terminated(
+                                    &fills_event_tx,
+                                    ExchangeId::HyperliquidSpot,
+                                    StreamTerminationReason::Error(
+                                        "hyperliquid spot account stream closed".to_string(),
+                                    ),
+                                );
+                            }
                             return;
                         };
                         match msg {
@@ -399,6 +429,7 @@ impl ExecutionClient for HyperliquidSpotClient {
         // which causes fills_rx to also close.
         let orders_event_tx = event_tx;
         let orders_cancel = cancel_token.clone();
+        let orders_terminated = terminated;
         tokio::spawn(async move {
             let _ws_client = ws_client;
 
@@ -412,6 +443,20 @@ impl ExecutionClient for HyperliquidSpotClient {
                     msg = orders_rx.recv() => {
                         let Some(msg) = msg else {
                             debug!("Spot orders receiver closed");
+                            // SDK gave up on the stream (channel closed). Emit a single terminal
+                            // StreamTerminated across both tasks (guarded by the shared flag).
+                            if orders_terminated
+                                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                                .is_ok()
+                            {
+                                emit_stream_terminated(
+                                    &orders_event_tx,
+                                    ExchangeId::HyperliquidSpot,
+                                    StreamTerminationReason::Error(
+                                        "hyperliquid spot account stream closed".to_string(),
+                                    ),
+                                );
+                            }
                             return;
                         };
                         match msg {

@@ -13,13 +13,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`rustrade-execution`, `alpaca` / `binance` features). Added `AlpacaConfig::from_env()` and
   `BinanceSpotConfig::from_env()` plus typed config errors (`AlpacaConfigError`,
   `BinanceSpotConfigError`) for missing credentials and invalid boolean env values.
+- **Caller-selectable `BalanceBasis` for asset statistics** (`rustrade`). Asset drawdown and the
+  end-of-session balance row can now be computed from either gross holdings (`Balance::total`, the
+  default) or net asset value (`Balance::net_asset()`, i.e. `total - borrowed`). Select it once via
+  the new `EngineStateBuilder::balance_basis(BalanceBasis)` builder method (mirrors `oms_mode`); the
+  basis flows to every asset's tear-sheet generator and is reported on the `TradingSummary` (its
+  asset-table "Balance" row labels itself "Balance (gross)" / "Balance (net asset)"). **Default is
+  `Gross`, so existing and cash-only users see no change.** `NetAsset` is only well-defined while net
+  asset stays strictly positive — a zero or negative net peak makes the drawdown ratio undefined and
+  the sample is silently dropped; see the `BalanceBasis::NetAsset` docs for this precondition and the
+  snapshot-freshness caveat.
 - **In-band stream-termination signal** (`rustrade-execution`). New
   `AccountEventKind::StreamTerminated(StreamTerminationReason)` variant delivers *why* an account
-  event stream ended — `ReconnectBudgetExhausted { attempts, last_error }` / `Error(String)` /
-  `ConsumerDropped` / `GracefulShutdown` — on the existing account feed, so stream death is a
-  programmatic signal rather than something inferred from channel EOF or read from logs. The engine
-  surfaces it via `warn!` instead of dropping it. This change adds the type plumbing; emitting the
+  event stream ended — `ReconnectBudgetExhausted { attempts, last_error }` (venues with
+  library-managed reconnection) or `Error(String)` (unrecoverable, no retry) — on the existing
+  account feed, so stream death is a programmatic signal rather than something inferred from channel
+  EOF or read from logs. The engine surfaces it via `warn!` instead of dropping it. The
+  `#[non_exhaustive]` `StreamTerminationReason` carries only terminations the library can deliver
+  in-band (a consumer-initiated drop is excluded — the channel is already closed by the time it is
+  observed, so the signal would be undeliverable). This change adds the type plumbing; emitting the
   variant at each venue's terminal stream site is a follow-up.
+- **`StreamTerminated` is now emitted at every venue's terminal stream death** (`rustrade-execution`).
+  Each integration client emits the variant in-band on the account feed when its event stream truly
+  dies: `ReconnectBudgetExhausted { attempts, last_error }` after a venue's library-managed
+  reconnection gives up (Binance spot/margin, Alpaca), and `Error(String)` for unrecoverable closes
+  with no retry (IBKR, Hyperliquid perp/spot, Mock). A consumer-initiated drop emits nothing — the
+  channel is already closed by the time it is observed. All venues funnel through one feature-agnostic
+  `emit_stream_terminated` helper, so silent-EOF is now a programmatic signal at every venue. Closes #123.
 
 ### Changed
 
@@ -28,6 +48,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constructors: `AlpacaConfig::paper` / `AlpacaConfig::production` and
   `BinanceSpotConfig::testnet` / `BinanceSpotConfig::production`. The credentials-only constructors
   default to paper trading for Alpaca and testnet for Binance Spot.
+- **Breaking (`rustrade`):** the `BalanceBasis` work changes two signatures. `generate_empty_indexed_asset_states`
+  gains a `basis: BalanceBasis` parameter (the `EngineStateBuilder` is the intended construction path
+  and threads it for you). The `TradingSummary` output struct gains a `basis` field
+  (`#[serde(default)]`, so summaries serialised before this change still deserialize as `Gross`);
+  the `TearSheetAssetGenerator` likewise gains a `#[serde(default)] basis` field. No behavior change
+  under the default `Gross` basis.
+- **Dynamic-streams `SubKind` rejection is now exhaustive** (`rustrade-data`, internal). The
+  `Channels::try_from` match that allocates per-`SubKind` channels no longer uses a catch-all
+  wildcard for unsupported kinds; it lists the rejected kinds explicitly, so a future `SubKind`
+  variant is a compile error here rather than a silent runtime fall-through. Unsupported dynamic
+  subscriptions now return `DataError::Unsupported { exchange, sub_kind }` (matching the sibling
+  stream-init path), so the error names the exchange as well as the kind. No behavior change for
+  supported kinds.
 - **IBKR historical tick fetches now warn on suspiciously short reads** (`rustrade-data`, `ibkr`
   feature). `fetch_historical_ticks` / `fetch_historical_bid_ask` emit a `warn!` when fewer ticks
   are returned than requested — a best-effort flag for possible silent truncation. A short read can
@@ -51,6 +84,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`MissingOptionRight` / `UnrecognizedOptionRight { right }` / `MissingStrike` /
   `MissingLastTradeDate` / `UnrecognizedSecurityType { security_type }`). `option_contract` now
   returns `Result<Contract, ContractConfigError>`.
+- **BinanceSpot user-data WS deserialization is now single-pass** (`rustrade-execution`, `binance`
+  feature, internal). The per-frame account-stream path no longer builds a full `serde_json::Value`
+  DOM and re-parses the matched variant out of it; it reads the `e` discriminator from a borrowed
+  view of the frame, then deserializes only the matched event type from the same slice (mirroring
+  the BinanceMargin path). No behavior or API change — variant coverage and the harmless
+  fall-through for unhandled/unknown event types are preserved.
 
 ## [0.3.0] - 2026-06-09
 
