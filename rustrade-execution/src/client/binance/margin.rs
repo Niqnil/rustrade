@@ -1549,6 +1549,13 @@ fn convert_margin_user_data_events_with(
     };
     let subscription_id = envelope.subscription_id;
     let event_raw = event.get();
+    // INTENTIONAL two-pass discriminator (do NOT "optimize" away): this cheap pass reads only the
+    // `e` tag (Binance places it in the ~30B prefix) so the expensive typed deserialization below
+    // runs once, on the matched branch only. The two passes touch the same borrowed slice — no DOM,
+    // no extra allocation — and the prefix scan is ~5 orders of magnitude cheaper than the 1–50ms
+    // network round-trip per frame. The tempting single-pass alternatives are both worse: a manual
+    // byte-scan for `"e"` is fragile (whitespace/escaping/key-order), and mirror structs that parse
+    // tag + payload together drift against the SDK types. Keep the typed two-pass.
     let event_type = serde_json::from_str::<EventTag<'_>>(event_raw)
         .ok()
         .and_then(|tag| tag.e)
