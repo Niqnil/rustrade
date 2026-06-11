@@ -63,8 +63,8 @@ use binance_sdk::{
         rest_api::{GetAccountParams, GetOpenOrdersParams, MyTradesParams, RestApi},
         websocket_api::{
             OrderCancelParams, OrderPlaceParams, OrderPlaceSideEnum, OrderPlaceTimeInForceEnum,
-            OrderPlaceTypeEnum, UserDataStreamEventsResponse,
-            UserDataStreamSubscribeSignatureParams, WebsocketApi, WebsocketApiHandle,
+            OrderPlaceTypeEnum, UserDataStreamSubscribeSignatureParams, WebsocketApi,
+            WebsocketApiHandle,
         },
     },
 };
@@ -1300,43 +1300,33 @@ async fn connection_manager(
                     // Release: pairs with Acquire swap in monitor task so the stored
                     // `true` is visible before the monitor swaps in `false`.
                     hb_callback.store(true, Ordering::Release);
-                    match serde_json::from_str::<UserDataStreamEventsResponse>(&json_str) {
-                        Ok(user_event) => {
-                            let stream_terminated = convert_user_data_events(user_event, &mut event_buf);
-                            for ev in event_buf.drain(..) {
-                                // Dedup check
-                                if let Some(key) = dedup_key_from_event(&ev)
-                                    && is_duplicate(&dedup_callback, key)
-                                {
-                                    trace!("BinanceSpot dedup: skipping duplicate event");
-                                    continue;
-                                }
-                                if sender.send(ev).is_err() {
-                                    warn!("BinanceSpot account_stream receiver dropped, suppressing further sends");
-                                    event_tx.take();
-                                    if let Some(s) = signal_tx_opt.take() {
-                                        let _ = s.send(());
-                                    }
-                                    return;
-                                }
-                            }
-                            // EventStreamTerminated arrives as a JSON message,
-                            // not a WS close frame — signal reconnect explicitly.
-                            if stream_terminated {
-                                event_tx.take();
-                                if let Some(s) = signal_tx_opt.take() {
-                                    let _ = s.send(());
-                                }
-                            }
+                    // Borrowed discriminator + matched-variant parse (no full Value DOM).
+                    // Unparseable / non-user-data frames (subscribe acks, WS-API metadata)
+                    // are ignored inside the converter.
+                    let stream_terminated = convert_user_data_events(&json_str, &mut event_buf);
+                    for ev in event_buf.drain(..) {
+                        // Dedup check
+                        if let Some(key) = dedup_key_from_event(&ev)
+                            && is_duplicate(&dedup_callback, key)
+                        {
+                            trace!("BinanceSpot dedup: skipping duplicate event");
+                            continue;
                         }
-                        Err(e) => {
-                            // Could be a subscription response, WS API metadata, or a real
-                            // user-data event that failed to deserialize (SDK version skew)
-                            trace!(
-                                error = %e,
-                                raw = %json_str.get(..200).unwrap_or(json_str.as_str()),
-                                "BinanceSpot WS: skipped non-UserDataStream message"
-                            );
+                        if sender.send(ev).is_err() {
+                            warn!("BinanceSpot account_stream receiver dropped, suppressing further sends");
+                            event_tx.take();
+                            if let Some(s) = signal_tx_opt.take() {
+                                let _ = s.send(());
+                            }
+                            return;
+                        }
+                    }
+                    // eventStreamTerminated arrives as a JSON message,
+                    // not a WS close frame — signal reconnect explicitly.
+                    if stream_terminated {
+                        event_tx.take();
+                        if let Some(s) = signal_tx_opt.take() {
+                            let _ = s.send(());
                         }
                     }
                 }
@@ -1868,46 +1858,84 @@ fn convert_my_trade(
     ))
 }
 
-/// Convert binance-sdk UserDataStreamEventsResponse to rustrade AccountEvents.
+/// Convert a raw BinanceSpot user-data WS frame to rustrade AccountEvents.
 ///
 /// Pushes into the provided buffer to avoid per-message heap allocation.
 /// A single Binance event (e.g., outboundAccountPosition) may map to multiple
 /// rustrade events (one per asset balance).
 ///
 /// Returns `true` if the stream should be considered terminated (requires reconnect).
-fn convert_user_data_events(
-    event: UserDataStreamEventsResponse,
-    buf: &mut Vec<UnindexedAccountEvent>,
-) -> bool {
-    match event {
-        UserDataStreamEventsResponse::ExecutionReport(report) => {
-            if let Some(ev) = convert_execution_report(*report) {
-                buf.push(ev);
+///
+/// # Hot path
+///
+/// Reads the `e` discriminator from a borrowed view of the frame, then deserializes **only**
+/// the matched variant straight from the same slice — avoiding the full `serde_json::Value`
+/// DOM that `UserDataStreamEventsResponse`'s `#[serde(try_from = "Value")]` would build for
+/// every inbound frame (it parses the whole payload into a `Value`, then re-parses the matched
+/// variant out of it). Mirrors `convert_margin_user_data_events`. Unrecognized or unparseable
+/// frames (subscribe acks, WS-API metadata, future event types) are ignored, never mis-parsed.
+fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -> bool {
+    // Discriminator-only view: reads the `e` event-type tag without materialising the payload.
+    // The BinanceSpot user-data frame is the bare event (`{ "e": "...", ... }`) — no envelope,
+    // unlike the margin WS-API path. Tag values match `UserDataStreamEventsResponse`'s
+    // `try_from = "Value"` arms (binance-sdk).
+    #[derive(Deserialize)]
+    struct EventTag<'a> {
+        #[serde(borrow, default)]
+        e: Option<&'a str>,
+    }
+
+    let event_type = serde_json::from_str::<EventTag<'_>>(frame)
+        .ok()
+        .and_then(|tag| tag.e)
+        .unwrap_or_default();
+    match event_type {
+        "executionReport" => {
+            // Single typed pass straight from the raw frame — no intermediate DOM, and only the
+            // matched branch deserializes its payload. The SDK struct ignores the unknown `e` tag.
+            match serde_json::from_str::<binance_sdk::spot::websocket_api::ExecutionReport>(frame) {
+                Ok(report) => {
+                    if let Some(ev) = convert_execution_report(report) {
+                        buf.push(ev);
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "BinanceSpot: undeserializable executionReport, dropping")
+                }
             }
             false
         }
-        UserDataStreamEventsResponse::OutboundAccountPosition(position) => {
-            convert_account_position(*position, buf);
+        "outboundAccountPosition" => {
+            match serde_json::from_str::<binance_sdk::spot::websocket_api::OutboundAccountPosition>(
+                frame,
+            ) {
+                Ok(position) => convert_account_position(position, buf),
+                Err(e) => {
+                    warn!(error = %e, "BinanceSpot: undeserializable outboundAccountPosition, dropping")
+                }
+            }
             false
         }
-        UserDataStreamEventsResponse::BalanceUpdate(_update) => {
+        "balanceUpdate" => {
             // balanceUpdate events are for deposits/withdrawals;
             // outboundAccountPosition covers balance changes from trades.
             // deposit/withdrawal balance changes are not forwarded to the consumer.
             // The crypto repo wrapper should call fetch_balances or account_snapshot
             // periodically to reconcile balances after external transfers.
-            debug!("BinanceSpot ignoring BalanceUpdate event");
+            // No log here: this is the per-frame receive hot path.
             false
         }
-        UserDataStreamEventsResponse::EventStreamTerminated(_) => {
-            // Binance sends EventStreamTerminated as a JSON message, not a WS
+        "eventStreamTerminated" => {
+            // Binance sends eventStreamTerminated as a JSON message, not a WS
             // close frame. Without signalling reconnect here, the stream silently dies
             // while heartbeat ping/pong keeps the connection alive.
             warn!("BinanceSpot user data stream terminated by exchange, signalling reconnect");
             true
         }
+        // listStatus, externalLockUpdate, and any future/unknown event types: harmless
+        // fall-through (observable at trace, never tears down the stream).
         _ => {
-            trace!("BinanceSpot ignoring unhandled user data event");
+            trace!(event_type, "BinanceSpot ignoring unhandled user data event");
             false
         }
     }
@@ -3673,6 +3701,23 @@ mod tests {
     // convert_user_data_events tests
     // ---------------------------------------------------------------------------
 
+    /// Build a raw user-data wire frame from an SDK event struct.
+    ///
+    /// The SDK event structs carry only the `E` (event time) field, not the lowercase `e`
+    /// discriminator, so the tag must be injected to reproduce the on-the-wire shape
+    /// (`{ "e": "<type>", .. }`) that `convert_user_data_events` reads.
+    fn user_data_frame<T: serde::Serialize>(event_type: &str, event: &T) -> String {
+        let mut value = serde_json::to_value(event).expect("event serializes to Value");
+        value
+            .as_object_mut()
+            .expect("event serializes to a JSON object")
+            .insert(
+                "e".to_string(),
+                serde_json::Value::String(event_type.to_string()),
+            );
+        serde_json::to_string(&value).expect("frame serializes")
+    }
+
     #[test]
     fn test_convert_user_data_events_execution_report_pushes_to_buf() {
         let report = binance_sdk::spot::websocket_api::ExecutionReport {
@@ -3685,11 +3730,9 @@ mod tests {
             z: Some("0".to_string()),
             ..make_base_report()
         };
+        let frame = user_data_frame("executionReport", &report);
         let mut buf = Vec::new();
-        let terminated = convert_user_data_events(
-            UserDataStreamEventsResponse::ExecutionReport(Box::new(report)),
-            &mut buf,
-        );
+        let terminated = convert_user_data_events(&frame, &mut buf);
         assert!(
             !terminated,
             "ExecutionReport should not signal stream termination"
@@ -3705,11 +3748,9 @@ mod tests {
             b_uppercase: Some(vec![make_balance_inner("BTC", "1.0", "0.0")]),
             ..Default::default()
         };
+        let frame = user_data_frame("outboundAccountPosition", &position);
         let mut buf = Vec::new();
-        let terminated = convert_user_data_events(
-            UserDataStreamEventsResponse::OutboundAccountPosition(Box::new(position)),
-            &mut buf,
-        );
+        let terminated = convert_user_data_events(&frame, &mut buf);
         assert!(
             !terminated,
             "OutboundAccountPosition should not signal stream termination"
@@ -3726,11 +3767,9 @@ mod tests {
         let update = binance_sdk::spot::websocket_api::BalanceUpdate {
             ..Default::default()
         };
+        let frame = user_data_frame("balanceUpdate", &update);
         let mut buf = Vec::new();
-        let terminated = convert_user_data_events(
-            UserDataStreamEventsResponse::BalanceUpdate(Box::new(update)),
-            &mut buf,
-        );
+        let terminated = convert_user_data_events(&frame, &mut buf);
         assert!(
             !terminated,
             "BalanceUpdate should not signal stream termination"
@@ -3740,19 +3779,42 @@ mod tests {
 
     #[test]
     fn test_convert_user_data_events_stream_terminated_signals_reconnect() {
+        // No payload struct — the terminal frame is just the bare discriminator.
+        let frame = r#"{"e":"eventStreamTerminated","E":1700000000000}"#;
         let mut buf = Vec::new();
-        let terminated = convert_user_data_events(
-            UserDataStreamEventsResponse::EventStreamTerminated(Default::default()),
-            &mut buf,
-        );
+        let terminated = convert_user_data_events(frame, &mut buf);
         assert!(
             terminated,
-            "EventStreamTerminated must signal stream termination"
+            "eventStreamTerminated must signal stream termination"
         );
         assert!(
             buf.is_empty(),
-            "EventStreamTerminated should push no events"
+            "eventStreamTerminated should push no events"
         );
+    }
+
+    #[test]
+    fn test_convert_user_data_events_unknown_event_ignored() {
+        // listStatus / externalLockUpdate / future event types: harmless fall-through —
+        // ignored, no events pushed, stream not terminated.
+        let frame = r#"{"e":"listStatus","E":1700000000000,"s":"BTCUSDT"}"#;
+        let mut buf = Vec::new();
+        let terminated = convert_user_data_events(frame, &mut buf);
+        assert!(!terminated, "unknown event must not signal termination");
+        assert!(buf.is_empty(), "unknown event should push no events");
+    }
+
+    #[test]
+    fn test_convert_user_data_events_non_user_data_frame_ignored() {
+        // Subscribe acks / WS-API metadata carry no `e` tag — ignored, not mis-parsed.
+        let frame = r#"{"id":"abc","status":200,"result":[]}"#;
+        let mut buf = Vec::new();
+        let terminated = convert_user_data_events(frame, &mut buf);
+        assert!(
+            !terminated,
+            "non-user-data frame must not signal termination"
+        );
+        assert!(buf.is_empty(), "non-user-data frame should push no events");
     }
 
     // ---------------------------------------------------------------------------

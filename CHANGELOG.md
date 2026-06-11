@@ -52,6 +52,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`MissingOptionRight` / `UnrecognizedOptionRight { right }` / `MissingStrike` /
   `MissingLastTradeDate` / `UnrecognizedSecurityType { security_type }`). `option_contract` now
   returns `Result<Contract, ContractConfigError>`.
+- **BinanceSpot user-data WS deserialization is now single-pass** (`rustrade-execution`, `binance`
+  feature, internal). The per-frame account-stream path no longer builds a full `serde_json::Value`
+  DOM and re-parses the matched variant out of it; it reads the `e` discriminator from a borrowed
+  view of the frame, then deserializes only the matched event type from the same slice (mirroring
+  the BinanceMargin path). No behavior or API change — variant coverage and the harmless
+  fall-through for unhandled/unknown event types are preserved.
 
 ## [0.3.0] - 2026-06-09
 
