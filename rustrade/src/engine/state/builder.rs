@@ -1,11 +1,14 @@
-use crate::engine::state::{
-    EngineState,
-    asset::generate_empty_indexed_asset_states,
-    connectivity::generate_empty_indexed_connectivity_states,
-    instrument::generate_indexed_instrument_states,
-    order::Orders,
-    position::{OmsMode, PositionManager},
-    trading::TradingState,
+use crate::{
+    engine::state::{
+        EngineState,
+        asset::generate_empty_indexed_asset_states,
+        connectivity::generate_empty_indexed_connectivity_states,
+        instrument::generate_indexed_instrument_states,
+        order::Orders,
+        position::{OmsMode, PositionManager},
+        trading::TradingState,
+    },
+    statistic::summary::asset::BalanceBasis,
 };
 use chrono::{DateTime, Utc};
 use fnv::FnvHashMap;
@@ -34,6 +37,12 @@ pub struct EngineStateBuilder<'a, GlobalData, FnInstrumentData> {
     /// Defaults to [`OmsMode::Netting`]. Use [`OmsMode::Hedging`] for strategies that hold
     /// simultaneous long and short positions on the same instrument (e.g. options writing).
     oms_mode: OmsMode,
+    /// [`BalanceBasis`] applied to every asset's `TearSheetAssetGenerator` at construction.
+    ///
+    /// Defaults to [`BalanceBasis::Gross`] (no change for existing/cash users). Use
+    /// [`BalanceBasis::NetAsset`] to compute drawdown and end-of-session balance from net asset
+    /// value on margin accounts — see its docs for the net-must-stay-positive precondition.
+    balance_basis: BalanceBasis,
 }
 
 impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInstrumentData> {
@@ -57,6 +66,7 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
             balances: FnvHashMap::default(),
             instrument_data_init,
             oms_mode: OmsMode::Netting,
+            balance_basis: BalanceBasis::default(),
         }
     }
 
@@ -103,6 +113,23 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
         }
     }
 
+    /// Optionally set the [`BalanceBasis`] for all asset `TearSheetAssetGenerator`s.
+    ///
+    /// Defaults to [`BalanceBasis::Gross`] (drawdown and end-of-session balance computed from gross
+    /// `Balance::total`), which is unchanged behaviour for existing and cash users. Set to
+    /// [`BalanceBasis::NetAsset`] to compute them from net asset value (`total - borrowed`) on
+    /// margin accounts.
+    ///
+    /// # Precondition (`NetAsset`)
+    /// Net-asset drawdown is only well-defined while net asset stays **strictly positive**; see
+    /// [`BalanceBasis::NetAsset`] for the silent-failure modes when it is not.
+    pub fn balance_basis(self, basis: BalanceBasis) -> Self {
+        Self {
+            balance_basis: basis,
+            ..self
+        }
+    }
+
     /// Optionally provide initial exchange asset `Balance`s.
     ///
     /// Useful for back-test scenarios where seeding EngineState with initial `Balance`s is
@@ -140,6 +167,7 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
             balances,
             instrument_data_init,
             oms_mode,
+            balance_basis,
         } = self;
 
         // Default if not provided
@@ -153,7 +181,7 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
         let connectivity = generate_empty_indexed_connectivity_states(instruments);
 
         // Update empty AssetStates from provided exchange asset Balances
-        let mut assets = generate_empty_indexed_asset_states(instruments);
+        let mut assets = generate_empty_indexed_asset_states(instruments, balance_basis);
         for (key, balance) in balances {
             assets
                 .asset_mut(&key)
@@ -180,5 +208,49 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
             assets,
             instruments,
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+mod tests {
+    use super::*;
+    use crate::{
+        engine::state::EngineState,
+        statistic::{summary::TradingSummaryGenerator, time::Annual365},
+    };
+    use rust_decimal::Decimal;
+    use rustrade_instrument::{Underlying, instrument::Instrument};
+
+    /// End-to-end seam: `EngineStateBuilder::balance_basis(NetAsset)` rides the asset generators
+    /// into the on-demand `TradingSummaryGenerator` (which clones `AssetState.statistics`) and is
+    /// stamped onto the output `TradingSummary.basis`.
+    #[test]
+    fn balance_basis_reaches_output_trading_summary() {
+        let instruments = IndexedInstruments::builder()
+            .add_instrument(Instrument::spot(
+                ExchangeId::BinanceSpot,
+                "binance_spot_btc_usdt",
+                "BTCUSDT",
+                Underlying::new("btc", "usdt"),
+                None,
+            ))
+            .build();
+
+        let state: EngineState<(), ()> = EngineState::builder(&instruments, (), |_| ())
+            .balance_basis(BalanceBasis::NetAsset)
+            .build();
+
+        // Summary generator is built on-demand by cloning the per-asset generators, so the basis
+        // selected on the builder must surface on the generated summary.
+        let mut generator = TradingSummaryGenerator::init(
+            Decimal::ZERO,
+            DateTime::<Utc>::MIN_UTC,
+            DateTime::<Utc>::MIN_UTC,
+            &state.instruments,
+            &state.assets,
+        );
+
+        assert_eq!(generator.generate(Annual365).basis, BalanceBasis::NetAsset);
     }
 }

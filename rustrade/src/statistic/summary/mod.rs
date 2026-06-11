@@ -2,7 +2,7 @@ use crate::{
     engine::state::{asset::AssetStates, instrument::InstrumentStates, position::PositionExited},
     statistic::{
         summary::{
-            asset::{TearSheetAsset, TearSheetAssetGenerator},
+            asset::{BalanceBasis, TearSheetAsset, TearSheetAssetGenerator},
             instrument::{TearSheet, TearSheetGenerator},
         },
         time::TimeInterval,
@@ -41,6 +41,13 @@ pub struct TradingSummary<Interval> {
 
     /// [`ExchangeAsset`] [`TearSheet`]s.
     pub assets: FnvIndexMap<ExchangeAsset<AssetNameInternal>, TearSheetAsset>,
+
+    /// [`BalanceBasis`] the asset drawdown and end-of-session balance figures were computed from.
+    ///
+    /// Reported once at the summary level (a session uses one basis for all assets). `#[serde(default)]`
+    /// so summaries serialised before this field existed load as [`BalanceBasis::Gross`].
+    #[serde(default)]
+    pub basis: BalanceBasis,
 }
 
 impl<Interval> TradingSummary<Interval> {
@@ -166,11 +173,22 @@ impl TradingSummaryGenerator {
             .map(|(asset, tear_sheet)| (asset.clone(), tear_sheet.generate()))
             .collect();
 
+        // Single source of truth: the per-asset generators all carry the session basis (set once at
+        // engine-state construction), so derive the report-level basis from them rather than storing
+        // a redundant field. Empty (no assets) defaults to Gross — there are no rows to label.
+        let basis = self
+            .assets
+            .values()
+            .next()
+            .map(|generator| generator.basis)
+            .unwrap_or_default();
+
         TradingSummary {
             time_engine_start: self.time_engine_start,
             time_engine_end: self.time_engine_now,
             instruments,
             assets,
+            basis,
         }
     }
 }
@@ -245,5 +263,51 @@ impl AssetTearSheetManager<ExchangeAsset<AssetNameInternal>> for TradingSummaryG
         self.assets
             .get_mut(key)
             .unwrap_or_else(|| panic!("TradingSummaryGenerator does not contain: {key:?}"))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+mod tests {
+    use super::*;
+    use crate::statistic::{summary::asset::BalanceBasis, time::Annual365};
+    use rust_decimal_macros::dec;
+    use rustrade_instrument::exchange::ExchangeId;
+
+    fn generator_with_assets(
+        assets: FnvIndexMap<ExchangeAsset<AssetNameInternal>, TearSheetAssetGenerator>,
+    ) -> TradingSummaryGenerator {
+        TradingSummaryGenerator::new(
+            dec!(0),
+            DateTime::<Utc>::MIN_UTC,
+            DateTime::<Utc>::MIN_UTC,
+            FnvIndexMap::default(),
+            assets,
+        )
+    }
+
+    /// The report-level basis on the generated `TradingSummary` is derived from the per-asset
+    /// generators (which all carry the session basis), so a net-asset session is reported as such.
+    #[test]
+    fn generate_stamps_basis_from_asset_generators() {
+        let mut assets = FnvIndexMap::default();
+        assets.insert(
+            ExchangeAsset::new(ExchangeId::BinanceSpot, AssetNameInternal::new("btc")),
+            TearSheetAssetGenerator {
+                basis: BalanceBasis::NetAsset,
+                ..Default::default()
+            },
+        );
+
+        let mut generator = generator_with_assets(assets);
+        assert_eq!(generator.generate(Annual365).basis, BalanceBasis::NetAsset);
+    }
+
+    /// With no assets there is nothing to derive a basis from (and no rows to label), so the report
+    /// defaults to Gross.
+    #[test]
+    fn generate_with_no_assets_defaults_basis_to_gross() {
+        let mut generator = generator_with_assets(FnvIndexMap::default());
+        assert_eq!(generator.generate(Annual365).basis, BalanceBasis::Gross);
     }
 }

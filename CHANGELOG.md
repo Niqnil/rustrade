@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Caller-selectable `BalanceBasis` for asset statistics** (`rustrade`). Asset drawdown and the
+  end-of-session balance row can now be computed from either gross holdings (`Balance::total`, the
+  default) or net asset value (`Balance::net_asset()`, i.e. `total - borrowed`). Select it once via
+  the new `EngineStateBuilder::balance_basis(BalanceBasis)` builder method (mirrors `oms_mode`); the
+  basis flows to every asset's tear-sheet generator and is reported on the `TradingSummary` (its
+  asset-table "Balance" row labels itself "Balance (gross)" / "Balance (net asset)"). **Default is
+  `Gross`, so existing and cash-only users see no change.** `NetAsset` is only well-defined while net
+  asset stays strictly positive — a zero or negative net peak makes the drawdown ratio undefined and
+  the sample is silently dropped; see the `BalanceBasis::NetAsset` docs for this precondition and the
+  snapshot-freshness caveat.
 - **In-band stream-termination signal** (`rustrade-execution`). New
   `AccountEventKind::StreamTerminated(StreamTerminationReason)` variant delivers *why* an account
   event stream ended — `ReconnectBudgetExhausted { attempts, last_error }` (venues with
@@ -29,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (`rustrade`):** the `BalanceBasis` work changes two signatures. `generate_empty_indexed_asset_states`
+  gains a `basis: BalanceBasis` parameter (the `EngineStateBuilder` is the intended construction path
+  and threads it for you). The `TradingSummary` output struct gains a `basis` field
+  (`#[serde(default)]`, so summaries serialised before this change still deserialize as `Gross`);
+  the `TearSheetAssetGenerator` likewise gains a `#[serde(default)] basis` field. No behavior change
+  under the default `Gross` basis.
 - **Dynamic-streams `SubKind` rejection is now exhaustive** (`rustrade-data`, internal). The
   `Channels::try_from` match that allocates per-`SubKind` channels no longer uses a catch-all
   wildcard for unsupported kinds; it lists the rejected kinds explicitly, so a future `SubKind`
