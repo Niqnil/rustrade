@@ -72,7 +72,10 @@ impl AccountEventIndexer {
                 AccountEventKind::OrderCancelled(self.order_response_cancel(response)?)
             }
             AccountEventKind::Trade(trade) => AccountEventKind::Trade(self.trade(trade)?),
-            AccountEventKind::StreamError(msg) => AccountEventKind::StreamError(msg),
+            // Termination reason carries no exchange/asset/instrument keys — pass through verbatim.
+            AccountEventKind::StreamTerminated(reason) => {
+                AccountEventKind::StreamTerminated(reason)
+            }
         };
 
         Ok(AccountEvent { exchange, kind })
@@ -429,5 +432,47 @@ impl AccountEventIndexer {
                 fees_quote,
             },
         })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+mod tests {
+    use super::*;
+    use crate::{error::StreamTerminationReason, map::generate_execution_instrument_map};
+    use rustrade_instrument::{index::IndexedInstruments, test_utils};
+
+    fn binance_indexer() -> AccountEventIndexer {
+        let instruments = IndexedInstruments::new(vec![test_utils::instrument(
+            ExchangeId::BinanceSpot,
+            "BTC",
+            "USDT",
+        )]);
+        let map = generate_execution_instrument_map(&instruments, ExchangeId::BinanceSpot).unwrap();
+        AccountEventIndexer::new(Arc::new(map))
+    }
+
+    /// `StreamTerminated` carries no asset/instrument keys, so it must index by mapping only the
+    /// exchange and passing the reason through verbatim.
+    #[test]
+    fn account_event_passes_stream_terminated_through_verbatim() {
+        let indexer = binance_indexer();
+        let reason = StreamTerminationReason::ReconnectBudgetExhausted {
+            attempts: 3,
+            last_error: "socket reset".to_string(),
+        };
+
+        let indexed = indexer
+            .account_event(UnindexedAccountEvent::new(
+                ExchangeId::BinanceSpot,
+                AccountEventKind::StreamTerminated(reason.clone()),
+            ))
+            .unwrap();
+
+        assert_eq!(indexed.exchange, indexer.map.exchange.key);
+        assert!(
+            matches!(indexed.kind, AccountEventKind::StreamTerminated(r) if r == reason),
+            "expected StreamTerminated to pass through unchanged",
+        );
     }
 }

@@ -6,8 +6,9 @@ Integration library for streaming public market data from exchanges and data pro
 
 | Exchange | Constructor | InstrumentKinds | SubscriptionKinds |
 |:--------:|:-----------:|:---------------:|:-----------------:|
-| **BinanceSpot** | `BinanceSpot::default()` | Spot | PublicTrades, Quotes, OrderBooksL1, OrderBooksL2 |
-| **BinanceFuturesUsd** | `BinanceFuturesUsd::default()` | Perpetual | PublicTrades, Quotes, OrderBooksL1, OrderBooksL2, Liquidations |
+| **BinanceSpot** | `BinanceSpot::default()` | Spot | PublicTrades, Quotes, OrderBooksL1, OrderBooksL2, Candles |
+| **BinanceFuturesUsd** | `BinanceFuturesUsd::default()` | Perpetual | PublicTrades, Quotes, OrderBooksL1, OrderBooksL2 |
+| **BinanceFuturesUsdMarket** | `BinanceFuturesUsdMarket::default()` | Perpetual | Liquidations, Candles |
 | **Bitfinex** | `Bitfinex` | Spot | PublicTrades |
 | **Bitmex** | `Bitmex` | Perpetual | PublicTrades |
 | **BybitSpot** | `BybitSpot::default()` | Spot | PublicTrades, OrderBooksL1, OrderBooksL2 |
@@ -28,6 +29,12 @@ Integration library for streaming public market data from exchanges and data pro
 | **AlpacaSip** | `AlpacaSip::new(credentials)` | Spot (Equities) | PublicTrades, Quotes |
 | **AlpacaCrypto** | `AlpacaCrypto::new(credentials)` | Spot (Crypto) | PublicTrades, Quotes |
 | **AlpacaOptionsClient** | `AlpacaOptionsClient::new(credentials)` | Option | Quotes, OptionGreeks (REST snapshots) |
+
+> **Binance USD-M futures WebSocket tiers:** Binance routes futures streams across mutually-exclusive
+> WebSocket tiers, so the typed `Streams` path splits them across two server types. `Liquidations`
+> (`@forceOrder`) and `Candles` (`@continuousKline_`) are served only on the `/market` tier, exposed as
+> `BinanceFuturesUsdMarket`; trades and order books stay on `BinanceFuturesUsd`. The `DynamicStreams` /
+> `ExchangeId` path handles this routing automatically.
 
 ## Data Providers
 

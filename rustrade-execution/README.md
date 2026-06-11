@@ -7,6 +7,7 @@ Execution client library for streaming private account data and executing orders
 | Exchange | Constructor | InstrumentKinds | Features |
 |:--------:|:-----------:|:---------------:|:--------:|
 | **Binance** | `BinanceClient::connect()` | Spot | Orders, Balances, Positions |
+| **BinanceMargin** | `BinanceMargin::new(config)` | Spot (cross/isolated margin) | Orders, Balances, Positions |
 | **Alpaca** | `AlpacaClient::connect()` | Spot (Equities, Crypto), Option | Orders, Balances, Positions, BracketOrders |
 | **Hyperliquid** | `HyperliquidClient::connect()` | Perpetual | Orders, Balances, Positions |
 | **HyperliquidSpot** | `HyperliquidSpotClient::connect()` | Spot | Orders, Balances, Positions |
@@ -30,6 +31,8 @@ Additional order types:
 ⚠️ Binance `TrailingStop` supports `BasisPoints` and `Percentage` offsets only;
 `Absolute` offsets are rejected as unsupported. Hyperliquid trigger orders (Stop,
 StopLimit, TakeProfit, TakeProfitLimit) require a UUID-format client order ID
-(`ClientOrderId::uuid()`).
+(`ClientOrderId::uuid()`). `BinanceMargin` matches Binance spot except that both
+`TrailingStop` and `TrailingStopLimit` are rejected as unsupported (the SDK margin
+binding omits `trailingDelta`).
 
 See the [workspace README](../README.md) for documentation, examples, and contributing guidelines.

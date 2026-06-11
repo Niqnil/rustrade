@@ -40,6 +40,7 @@ use wiremock as _;
 
 use crate::{
     balance::{AssetBalance, AssetBalanceUpdate},
+    error::StreamTerminationReason,
     order::{Order, OrderSnapshot, request::OrderResponseCancel},
     position::Position,
     trade::Trade,
@@ -151,12 +152,16 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
     /// when available.
     Trade(Trade<AssetKey, InstrumentKey>),
 
-    /// WebSocket-level error from exchange. Connection may have dropped.
+    /// The account event stream has ended; no further events will arrive on it.
     ///
-    /// Implementations send this when the underlying stream encounters an error.
-    /// Consumers should treat this as a signal that events may have been missed
-    /// and consider re-syncing via REST (e.g., `fetch_trades`, `account_snapshot`).
-    StreamError(String),
+    /// This is the in-band, programmatic signal that a stream died — delivered on the **same**
+    /// account feed as every other event rather than being inferred from channel EOF or read from
+    /// logs. The [`StreamTerminationReason`] distinguishes a venue that exhausted its reconnect
+    /// budget from an unrecoverable error, a consumer-side drop, or a graceful shutdown, so the
+    /// consumer can apply its own recovery policy (re-establish the stream, re-sync via REST, halt
+    /// trading). The library reports *that* and *why* the stream ended; it does not prescribe the
+    /// response.
+    StreamTerminated(StreamTerminationReason),
 }
 
 impl<ExchangeKey, AssetKey, InstrumentKey> AccountEvent<ExchangeKey, AssetKey, InstrumentKey>

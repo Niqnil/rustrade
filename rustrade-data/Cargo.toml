@@ -1,6 +1,6 @@
 [package]
 name = "rustrade-data"
-version = "0.2.1"
+version = "0.3.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -17,7 +17,7 @@ ibkr = ["dep:ibapi", "dep:time", "rustrade-instrument/ibkr"]
 hyperliquid = ["dep:hyperliquid_rust_sdk"]
 alpaca = []
 databento = ["dep:databento"]
-massive = ["dep:tokio-tungstenite", "dep:async-stream", "dep:urlencoding", "rust_decimal/serde-float", "serde_json/raw_value"]
+massive = ["dep:tokio-tungstenite", "dep:urlencoding", "rust_decimal/serde-float", "serde_json/raw_value"]
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
@@ -40,7 +40,9 @@ tokio = { workspace = true, features = ["sync", "macros", "rt-multi-thread"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 futures = { workspace = true }
 futures-util = { workspace = true }
-async-stream = { workspace = true, optional = true }
+# Used by the always-on Binance historical klines REST client (and the optional
+# Massive client). Plain dep — not feature-gated. Note for tier-2 review.
+async-stream = { workspace = true }
 
 # Protocol
 url = { workspace = true }

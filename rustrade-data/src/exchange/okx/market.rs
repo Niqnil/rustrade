@@ -70,7 +70,7 @@ fn okx_market(instrument: &MarketDataInstrument) -> OkxMarket {
     })
 }
 
-/// Format the expiry DateTime<Utc> to be Okx API compatible.
+/// Format the expiry `DateTime<Utc>` to be Okx API compatible.
 ///
 /// eg/ "230526" (26th of May 2023)
 ///

@@ -9,8 +9,9 @@
 
 use chrono::{Duration, Utc};
 use rustrade_data::exchange::hyperliquid::historical::{
-    CandleInterval, HistoricalRequest, HyperliquidHistoricalData,
+    HistoricalRequest, HyperliquidHistoricalData,
 };
+use rustrade_data::subscription::candle::CandleInterval;
 use tracing::info;
 
 #[tokio::main]

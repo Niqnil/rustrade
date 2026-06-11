@@ -1,6 +1,6 @@
 #[cfg(feature = "databento")]
 use crate::exchange::databento::DatabentoErrorKind;
-use crate::subscription::SubKind;
+use crate::subscription::{SubKind, candle::CandleInterval};
 use rustrade_instrument::{exchange::ExchangeId, index::error::IndexError};
 use rustrade_integration::{error::SocketError, subscription::SubscriptionId};
 use serde::{Deserialize, Serialize};
@@ -42,6 +42,12 @@ pub enum DataError {
         sub_kind: SubKind,
     },
 
+    #[error("exchange {exchange} does not support candle interval: {interval}")]
+    UnsupportedInterval {
+        exchange: ExchangeId,
+        interval: CandleInterval,
+    },
+
     #[error(
         "\
         InvalidSequence: first_update_id {first_update_id} does not follow on from the \
@@ -56,6 +62,8 @@ pub enum DataError {
 
 impl DataError {
     /// Determine if an error requires a [`MarketStream`](super::MarketStream) to re-initialise.
+    // Explicit `match` (not `matches!`) is kept so additional terminal variants can be classified
+    // arm-by-arm as they are added; the lint would otherwise push this to a single `matches!`.
     #[allow(clippy::match_like_matches_macro)]
     pub fn is_terminal(&self) -> bool {
         match self {
@@ -94,6 +102,15 @@ mod tests {
             TestCase {
                 // TC1: is not terminal w/ DataError::Socket
                 input: DataError::from(SocketError::Sink),
+                expected: false,
+            },
+            TestCase {
+                // TC2: not terminal w/ DataError::UnsupportedInterval — a caller
+                // configuration error, not a stream condition warranting re-init.
+                input: DataError::UnsupportedInterval {
+                    exchange: ExchangeId::HyperliquidPerp,
+                    interval: CandleInterval::Sec1,
+                },
                 expected: false,
             },
         ];
