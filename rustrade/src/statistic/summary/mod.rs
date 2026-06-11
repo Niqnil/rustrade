@@ -174,8 +174,9 @@ impl TradingSummaryGenerator {
             .collect();
 
         // Single source of truth: the per-asset generators all carry the session basis (set once at
-        // engine-state construction), so derive the report-level basis from them rather than storing
-        // a redundant field. Empty (no assets) defaults to Gross — there are no rows to label.
+        // engine-state construction; the field is crate-private and never mutated after, so this
+        // uniformity is an enforced invariant), so derive the report-level basis from them rather
+        // than storing a redundant field. Empty (no assets) defaults to Gross — no rows to label.
         let basis = self
             .assets
             .values()

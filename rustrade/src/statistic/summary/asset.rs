@@ -85,10 +85,17 @@ pub struct TearSheetAsset {
 pub struct TearSheetAssetGenerator {
     /// Which [`Balance`] figure drawdown and end-of-session balance are computed from.
     ///
+    /// `pub(crate)`: set once at construction (via `init`/`init_with_basis`, ultimately the
+    /// [`EngineStateBuilder`](crate::engine::state::builder::EngineStateBuilder)) and never mutated
+    /// afterwards. Keeping it crate-private makes the session-wide uniformity that
+    /// [`TradingSummaryGenerator::generate`](crate::statistic::summary::TradingSummaryGenerator::generate)
+    /// relies on to report a single basis an actual invariant, not a convention an external caller
+    /// could break.
+    ///
     /// See [`BalanceBasis::NetAsset`] for the net-asset precondition. `#[serde(default)]` so state
     /// serialised before this field existed loads as [`BalanceBasis::Gross`].
     #[serde(default)]
-    pub basis: BalanceBasis,
+    pub(crate) basis: BalanceBasis,
     pub balance_now: Option<Balance>,
     pub drawdown: DrawdownGenerator,
     pub drawdown_mean: MeanDrawdownGenerator,
@@ -497,8 +504,11 @@ mod tests {
         gross.update_from_balance_parts(next, time_plus_days(base_time, 1));
         net.update_from_balance_parts(next, time_plus_days(base_time, 1));
 
-        assert_eq!(gross.generate().drawdown, net.generate().drawdown);
-        assert_eq!(gross.generate().drawdown.unwrap().value, dec!(0.2));
+        // `generate` is `&mut self` (it folds the in-progress drawdown into the mean/max sub-
+        // generators), so bind each result once rather than calling it repeatedly.
+        let (gross_sheet, net_sheet) = (gross.generate(), net.generate());
+        assert_eq!(gross_sheet.drawdown, net_sheet.drawdown);
+        assert_eq!(gross_sheet.drawdown.unwrap().value, dec!(0.2));
     }
 
     /// Margin balance: Gross tracks `total` (200 -> 180 = 10% drawdown), while `balance_now.total`
@@ -557,9 +567,10 @@ mod tests {
         let next = Balance::new_margin(dec!(100.0), dec!(0.0), dec!(120.0), dec!(0.0));
         generator.update_from_balance_parts(next, time_plus_days(base_time, 1));
 
-        // Silent: no drawdown recorded, running max stays zero.
-        assert_eq!(generator.generate().drawdown, None);
-        assert_eq!(generator.drawdown.drawdown_max, dec!(0.0));
+        // Silent: the public tear sheet records neither a drawdown nor a max-drawdown.
+        let sheet = generator.generate();
+        assert_eq!(sheet.drawdown, None);
+        assert_eq!(sheet.drawdown_max, None);
     }
 
     /// `reset` preserves the configured basis rather than reverting to Gross.
