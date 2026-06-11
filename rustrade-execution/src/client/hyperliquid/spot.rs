@@ -380,7 +380,7 @@ impl ExecutionClient for HyperliquidSpotClient {
                             // SDK gave up on the stream (channel closed). Emit a single terminal
                             // StreamTerminated across both tasks (guarded by the shared flag).
                             if fills_terminated
-                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
                                 .is_ok()
                             {
                                 emit_stream_terminated(
@@ -446,7 +446,7 @@ impl ExecutionClient for HyperliquidSpotClient {
                             // SDK gave up on the stream (channel closed). Emit a single terminal
                             // StreamTerminated across both tasks (guarded by the shared flag).
                             if orders_terminated
-                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
                                 .is_ok()
                             {
                                 emit_stream_terminated(

@@ -1176,8 +1176,10 @@ impl ExecutionClient for IbkrClient {
             .name("ibkr-order-stream".to_string())
             .spawn(move || {
                 // Panic safety: parking_lot mutexes do not poison on panic, so shared state
-                // (ContractRegistry, OrderIdMap, etc.) remains usable. On panic the
-                // thread exits, tx is dropped, and the stream closes — caller observes EOF.
+                // (ContractRegistry, OrderIdMap, etc.) remains usable. catch_unwind unwinds only
+                // the inner closure — `tx` lives in this outer thread closure and is still open
+                // afterward, so the panic handler below emits a terminal StreamTerminated before
+                // `tx` drops (a panic is a terminal stream death like any other).
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     use ibapi::orders::{OrderStatusKind, OrderUpdate};
 
@@ -1297,8 +1299,16 @@ impl ExecutionClient for IbkrClient {
                         .or_else(|| panic_info.downcast_ref::<String>().cloned())
                         .unwrap_or_else(|| "unknown panic".to_string());
                     error!("Order stream worker panicked: {msg}");
-                    // Channel type is UnindexedAccountEvent, not Result — cannot send error.
-                    // Caller observes stream close; they can check logs for panic message.
+                    // A panic is a terminal stream death — surface it in-band before tx drops so
+                    // the consumer gets a programmatic signal rather than inferring EOF.
+                    // Best-effort: a no-op if the consumer already dropped rx.
+                    emit_stream_terminated(
+                        &tx,
+                        ExchangeId::Ibkr,
+                        StreamTerminationReason::Error(format!(
+                            "IBKR order-update worker panicked: {msg}"
+                        )),
+                    );
                 }
             })
             .map_err(|e| UnindexedClientError::TaskFailed(format!("thread spawn: {e}")))?;

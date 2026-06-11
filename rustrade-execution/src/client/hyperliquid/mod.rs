@@ -468,7 +468,8 @@ impl ExecutionClient for HyperliquidClient {
 
         // Both tasks share `event_tx` and both observe `recv() -> None` when the SDK gives up on the
         // socket, so guard the terminal emit with a shared flag — only the first non-cancellation
-        // terminal sends `StreamTerminated`, avoiding a double-emit.
+        // terminal sends `StreamTerminated`, avoiding a double-emit. Relaxed ordering suffices: the
+        // flag has no associated payload to synchronise; the channel send is the synchronisation point.
         let terminated = Arc::new(AtomicBool::new(false));
 
         // Spawn task to process fills
@@ -489,7 +490,7 @@ impl ExecutionClient for HyperliquidClient {
                             // SDK gave up on the stream (channel closed). Emit a single terminal
                             // StreamTerminated across both tasks (guarded by the shared flag).
                             if fills_terminated
-                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
                                 .is_ok()
                             {
                                 emit_stream_terminated(
@@ -551,7 +552,7 @@ impl ExecutionClient for HyperliquidClient {
                             // SDK gave up on the stream (channel closed). Emit a single terminal
                             // StreamTerminated across both tasks (guarded by the shared flag).
                             if orders_terminated
-                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
                                 .is_ok()
                             {
                                 emit_stream_terminated(

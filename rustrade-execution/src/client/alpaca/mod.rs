@@ -2124,7 +2124,7 @@ async fn connection_manager(
         // meaningful `last_error`. The consumer-drop arm uses `break 'outer` and never yields one.
         enum DisconnectReason {
             ServerClose,
-            Error,
+            Error(String),
             StreamEnded,
             HeartbeatTimeout,
         }
@@ -2161,7 +2161,7 @@ async fn connection_manager(
                         Some(Ok(_)) => {} // Pong, Frame — ignore
                         Some(Err(e)) => {
                             warn!(%e, "Alpaca WS error, reconnecting");
-                            break DisconnectReason::Error;
+                            break DisconnectReason::Error(e.to_string());
                         }
                         None => {
                             warn!("Alpaca WS stream ended, reconnecting");
@@ -2216,7 +2216,7 @@ async fn connection_manager(
                     format!("heartbeat timeout ({HEARTBEAT_TIMEOUT_SECS}s)")
                 }
                 DisconnectReason::ServerClose => "WebSocket closed by server".to_string(),
-                DisconnectReason::Error => "WebSocket error".to_string(),
+                DisconnectReason::Error(e) => e,
                 DisconnectReason::StreamEnded => "WebSocket stream ended".to_string(),
             };
             emit_stream_terminated(
