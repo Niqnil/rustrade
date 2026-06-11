@@ -1023,7 +1023,12 @@ where
                         rxs.candles.insert(sub.exchange, rx);
                     }
                 }
-                unsupported => return Err(DataError::UnsupportedSubKind(unsupported)),
+                sub_kind @ (SubKind::OrderBooksL3 | SubKind::Quotes) => {
+                    return Err(DataError::Unsupported {
+                        exchange: sub.exchange,
+                        sub_kind,
+                    });
+                }
             }
         }
 

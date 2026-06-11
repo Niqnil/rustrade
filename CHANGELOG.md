@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Dynamic-streams `SubKind` rejection is now exhaustive** (`rustrade-data`, internal). The
+  `Channels::try_from` match that allocates per-`SubKind` channels no longer uses a catch-all
+  wildcard for unsupported kinds; it lists the rejected kinds explicitly, so a future `SubKind`
+  variant is a compile error here rather than a silent runtime fall-through. Unsupported dynamic
+  subscriptions now return `DataError::Unsupported { exchange, sub_kind }` (matching the sibling
+  stream-init path), so the error names the exchange as well as the kind. No behavior change for
+  supported kinds.
 - **IBKR historical tick fetches now warn on suspiciously short reads** (`rustrade-data`, `ibkr`
   feature). `fetch_historical_ticks` / `fetch_historical_bid_ask` emit a `warn!` when fewer ticks
   are returned than requested — a best-effort flag for possible silent truncation. A short read can
