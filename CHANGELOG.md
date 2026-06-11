@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Named config constructors and env loading for Alpaca and Binance Spot**
+  (`rustrade-execution`, `alpaca` / `binance` features). Added `AlpacaConfig::from_env()` and
+  `BinanceSpotConfig::from_env()` plus typed config errors (`AlpacaConfigError`,
+  `BinanceSpotConfigError`) for missing credentials and invalid boolean env values.
 - **In-band stream-termination signal** (`rustrade-execution`). New
   `AccountEventKind::StreamTerminated(StreamTerminationReason)` variant delivers *why* an account
   event stream ended — `ReconnectBudgetExhausted { attempts, last_error }` / `Error(String)` /
@@ -19,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (`rustrade-execution`, `alpaca` / `binance` features):** `AlpacaConfig::new` and
+  `BinanceSpotConfig::new` now take credentials only. Optional live-vs-safety knobs moved to named
+  constructors: `AlpacaConfig::paper` / `AlpacaConfig::production` and
+  `BinanceSpotConfig::testnet` / `BinanceSpotConfig::production`. The credentials-only constructors
+  default to paper trading for Alpaca and testnet for Binance Spot.
 - **IBKR historical tick fetches now warn on suspiciously short reads** (`rustrade-data`, `ibkr`
   feature). `fetch_historical_ticks` / `fetch_historical_bid_ask` emit a `warn!` when fewer ticks
   are returned than requested — a best-effort flag for possible silent truncation. A short read can
