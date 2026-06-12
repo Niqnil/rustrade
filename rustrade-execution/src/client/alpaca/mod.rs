@@ -51,6 +51,7 @@ use crate::{
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
     },
+    parse_env_bool,
     trade::{AssetFees, Trade, TradeId},
 };
 use chrono::{DateTime, Utc};
@@ -358,6 +359,11 @@ pub struct AlpacaConfig {
     pub base_url_override: Option<String>,
 }
 
+/// Serde default for [`AlpacaConfig::paper`]: an absent `paper` field deserializes to the **safe**
+/// paper environment (`true`).
+///
+/// `#[serde(default = "…")]` requires a named function (it cannot take a literal), so this exists
+/// purely to supply that default to the derive.
 fn default_paper() -> bool {
     true
 }
@@ -374,11 +380,13 @@ impl std::fmt::Debug for AlpacaConfig {
 }
 
 impl AlpacaConfig {
-    /// Create a new Alpaca config using paper trading by default.
+    /// Create a new Alpaca config using the **safe** paper-trading endpoints (alias for
+    /// [`paper`](Self::paper)).
     pub fn new(api_key: String, secret_key: String) -> Self {
         Self::paper(api_key, secret_key)
     }
 
+    /// Create a config targeting Alpaca's **paper-trading** endpoints (simulated funds).
     pub fn paper(api_key: String, secret_key: String) -> Self {
         Self {
             api_key,
@@ -389,6 +397,10 @@ impl AlpacaConfig {
         }
     }
 
+    /// Create a config targeting Alpaca's **production** endpoints.
+    ///
+    /// ⚠️ Production trades execute against the live account with **real funds**. Prefer
+    /// [`paper`](Self::paper) unless you explicitly intend live execution.
     pub fn production(api_key: String, secret_key: String) -> Self {
         Self {
             api_key,
@@ -399,16 +411,49 @@ impl AlpacaConfig {
         }
     }
 
+    /// Build a config from environment variables.
+    ///
+    /// Reads:
+    /// - `ALPACA_API_KEY` (required) — API key id.
+    /// - `ALPACA_SECRET_KEY` (required) — API secret.
+    /// - `ALPACA_PAPER` (optional) — `"true"`/`"false"` (case-insensitive). **Absent ⇒ the safe
+    ///   paper environment.** Set `ALPACA_PAPER=false` to target production (real funds).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AlpacaConfigError`] (never panics):
+    /// - a required credential var is unset ([`MissingApiKey`](AlpacaConfigError::MissingApiKey) /
+    ///   [`MissingSecretKey`](AlpacaConfigError::MissingSecretKey)) or holds non-UTF-8
+    ///   ([`InvalidApiKey`](AlpacaConfigError::InvalidApiKey) /
+    ///   [`InvalidSecretKey`](AlpacaConfigError::InvalidSecretKey));
+    /// - `ALPACA_PAPER` is neither `true` nor `false`, or holds non-UTF-8
+    ///   ([`InvalidPaper`](AlpacaConfigError::InvalidPaper)).
     pub fn from_env() -> Result<Self, AlpacaConfigError> {
-        let api_key =
-            std::env::var("ALPACA_API_KEY").map_err(|_| AlpacaConfigError::MissingApiKey)?;
-        let secret_key =
-            std::env::var("ALPACA_SECRET_KEY").map_err(|_| AlpacaConfigError::MissingSecretKey)?;
+        let api_key = match std::env::var("ALPACA_API_KEY") {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => return Err(AlpacaConfigError::MissingApiKey),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(AlpacaConfigError::InvalidApiKey);
+            }
+        };
+        let secret_key = match std::env::var("ALPACA_SECRET_KEY") {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => return Err(AlpacaConfigError::MissingSecretKey),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(AlpacaConfigError::InvalidSecretKey);
+            }
+        };
 
         let paper = match std::env::var("ALPACA_PAPER") {
             Ok(value) => parse_env_bool(&value).ok_or(AlpacaConfigError::InvalidPaper(value))?,
             Err(std::env::VarError::NotPresent) => true,
-            Err(_) => return Err(AlpacaConfigError::InvalidPaper("<non-unicode>".into())),
+            // The toggle value is not secret, so echo it (lossily) like the parse-failure arm above —
+            // an actionable "got X" beats a hardcoded sentinel.
+            Err(std::env::VarError::NotUnicode(value)) => {
+                return Err(AlpacaConfigError::InvalidPaper(
+                    value.to_string_lossy().into_owned(),
+                ));
+            }
         };
 
         if paper {
@@ -458,21 +503,21 @@ impl AlpacaConfig {
     }
 }
 
-fn parse_env_bool(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, PartialEq, thiserror::Error)]
 pub enum AlpacaConfigError {
     #[error("ALPACA_API_KEY environment variable not set")]
     MissingApiKey,
 
+    // No payload: the raw value is secret-key material, so it must never be echoed into an error
+    // message or log. The variant name already identifies which credential var is non-UTF-8.
+    #[error("ALPACA_API_KEY environment variable is not valid UTF-8")]
+    InvalidApiKey,
+
     #[error("ALPACA_SECRET_KEY environment variable not set")]
     MissingSecretKey,
+
+    #[error("ALPACA_SECRET_KEY environment variable is not valid UTF-8")]
+    InvalidSecretKey,
 
     #[error("ALPACA_PAPER must be true or false, got {0}")]
     InvalidPaper(String),

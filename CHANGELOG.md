@@ -16,6 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`rustrade-execution`, `alpaca` / `binance` features). Added `AlpacaConfig::from_env()` and
   `BinanceSpotConfig::from_env()` plus typed config errors (`AlpacaConfigError`,
   `BinanceSpotConfigError`) for missing credentials and invalid boolean env values.
+- **`from_env()` now distinguishes non-UTF-8 credential vars from absent ones**
+  (`rustrade-execution`, `alpaca` / `binance` / `hyperliquid` features). New error variants —
+  `AlpacaConfigError::{InvalidApiKey, InvalidSecretKey}`,
+  `BinanceSpotConfigError::{InvalidApiKey, InvalidSecretKey}`, and
+  `HyperliquidConfigError::{InvalidPrivateKeyVar, InvalidTestnet}` — flag a non-UTF-8 environment
+  variable explicitly instead of collapsing it into "not set". The non-UTF-8 **credential** variants
+  carry no payload, so corrupt secret/key bytes are never echoed into an error message or log; the
+  non-secret network-toggle variants (`InvalidPaper` / `InvalidTestnet`) instead echo the offending
+  value (lossily for non-UTF-8) so "must be true or false, got …" stays actionable. Rustdoc added to
+  every
+  `new`/`paper`/`testnet`/`production`/`from_env` constructor spelling out caller obligations
+  (`production`/mainnet = real funds; `from_env` returns `Err`, never panics).
 - **Caller-selectable `BalanceBasis` for asset statistics** (`rustrade`). Asset drawdown and the
   end-of-session balance row can now be computed from either gross holdings (`Balance::total`, the
   default) or net asset value (`Balance::net_asset()`, i.e. `total - borrowed`). Select it once via
@@ -75,6 +87,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constructors: `AlpacaConfig::paper` / `AlpacaConfig::production` and
   `BinanceSpotConfig::testnet` / `BinanceSpotConfig::production`. The credentials-only constructors
   default to paper trading for Alpaca and testnet for Binance Spot.
+- **Breaking (`rustrade-execution`, `hyperliquid` feature):** `HyperliquidConfig::from_env()` now
+  defaults to the **safe testnet** environment when `HYPERLIQUID_TESTNET` is absent (previously
+  defaulted to **mainnet**, the dangerous foot-gun), matching Alpaca/Binance Spot. The `"1"`
+  truthy special-case is dropped — `HYPERLIQUID_TESTNET` is now `true`/`false`-only across every
+  venue. An invalid or non-UTF-8 toggle is a hard `HyperliquidConfigError::InvalidTestnet(String)`
+  rather than a silent `false` (mainnet). `HyperliquidConfigFile`'s `testnet` field likewise now
+  defaults to `true` (safe testnet) when absent from a config file. Set `HYPERLIQUID_TESTNET=false`
+  to opt into mainnet (real funds).
+- **Breaking (`rustrade-execution`, `hyperliquid` feature):** the config error type is renamed
+  `ConfigError` → `HyperliquidConfigError` and re-exported as `client::hyperliquid::HyperliquidConfigError`,
+  matching the venue-scoped naming of `AlpacaConfigError` / `BinanceSpotConfigError`.
 - **Breaking (`rustrade`):** the `BalanceBasis` work changes two signatures. `generate_empty_indexed_asset_states`
   gains a `basis: BalanceBasis` parameter (the `EngineStateBuilder` is the intended construction path
   and threads it for you). The `TradingSummary` output struct gains a `basis` field

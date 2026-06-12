@@ -91,7 +91,7 @@ use common::{
     CancelOnDropStream, cid_to_cloid, instrument_to_perp_coin, map_tif, millis_to_datetime,
     parse_decimal, parse_side, perp_coin_to_instrument, round_to_5_sig_figs,
 };
-use config::HyperliquidConfig;
+pub use config::{HyperliquidConfig, HyperliquidConfigError};
 use error::{map_order_error, map_sdk_error};
 use ethers::signers::Signer;
 use futures::{StreamExt, stream::BoxStream};

@@ -62,15 +62,11 @@ fn test_config() -> BinanceSpotConfig {
     let api_key = std::env::var("BINANCE_API_KEY").expect("BINANCE_API_KEY env var required");
     let secret_key =
         std::env::var("BINANCE_SECRET_KEY").expect("BINANCE_SECRET_KEY env var required");
-    let testnet = std::env::var("BINANCE_TESTNET")
-        .map(|v| v == "true")
-        .unwrap_or(true);
 
-    if testnet {
-        BinanceSpotConfig::testnet(api_key, secret_key)
-    } else {
-        BinanceSpotConfig::production(api_key, secret_key)
-    }
+    // These tests place live conditional orders, so they are hardcoded to testnet — there is no
+    // safe path on which `production()` is the intended target for this suite, regardless of how
+    // BINANCE_TESTNET happens to be set in the environment.
+    BinanceSpotConfig::testnet(api_key, secret_key)
 }
 
 fn test_instrument() -> InstrumentNameExchange {
