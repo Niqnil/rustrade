@@ -134,6 +134,29 @@ pub(crate) fn emit_stream_terminated(
     let _ = tx.send(UnindexedAccountEvent::stream_terminated(exchange, reason));
 }
 
+/// Parse a boolean environment-variable value using the single cross-venue policy.
+///
+/// Accepts only `"true"` / `"false"` (case-insensitive, surrounding whitespace trimmed); every other
+/// value returns `None` so the caller can surface an explicit "must be true or false" error rather
+/// than silently coercing. Deliberately does **not** accept `"1"`/`"0"` or other truthy spellings —
+/// one strict, unambiguous spelling shared by every venue's `from_env` (Alpaca `ALPACA_PAPER`,
+/// Binance `BINANCE_TESTNET`, Hyperliquid `HYPERLIQUID_TESTNET`) keeps the network-selection toggle
+/// impossible to misread.
+//
+// Gated to the venues that read env-bool toggles so the crate's default-empty feature set does not
+// warn this as unused.
+#[cfg(any(feature = "alpaca", feature = "binance", feature = "hyperliquid"))]
+pub(crate) fn parse_env_bool(value: &str) -> Option<bool> {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if trimmed.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, From)]
 #[non_exhaustive]
 pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {

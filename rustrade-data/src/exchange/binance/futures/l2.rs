@@ -25,7 +25,7 @@ use rustrade_instrument::exchange::ExchangeId;
 use rustrade_integration::{
     Transformer, error::SocketError, protocol::websocket::WsMessage, subscription::SubscriptionId,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::future::Future;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -300,7 +300,10 @@ impl BinanceFuturesUsdOrderBookL2Sequencer {
 ///     ]
 /// }
 /// ```
-#[derive(Clone, PartialEq, PartialOrd, Debug, Deserialize, Serialize)]
+// `Serialize` is intentionally not derived: the `subscription_id` field is deserialized from the
+// wire `s` symbol via `de_ob_l2_subscription_id`, so a derived `Serialize` would emit this struct's
+// own field shape and not round-trip — and nothing serializes these wire types.
+#[derive(Clone, PartialEq, PartialOrd, Debug, Deserialize)]
 pub struct BinanceFuturesOrderBookL2Update {
     #[serde(
         alias = "s",

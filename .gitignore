@@ -1,5 +1,7 @@
 # Rust
-Cargo.lock
+# Cargo.lock is committed (even though this is a library) for reproducible CI:
+# builds fail only on our own commits, never on a bad transitive upstream release.
+# Consumers are unaffected — Cargo.lock does not propagate to downstream crates.
 /target
 
 # Environment secrets (protect all .env variants except template)

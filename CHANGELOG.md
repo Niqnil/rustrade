@@ -9,10 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`impl Borrow<str> for SubscriptionId`** (`rustrade-integration`). An instrument map keyed on
+  `SubscriptionId` can now be queried with a borrowed `&str` key without allocating an owned
+  `SubscriptionId` per lookup.
 - **Named config constructors and env loading for Alpaca and Binance Spot**
   (`rustrade-execution`, `alpaca` / `binance` features). Added `AlpacaConfig::from_env()` and
   `BinanceSpotConfig::from_env()` plus typed config errors (`AlpacaConfigError`,
   `BinanceSpotConfigError`) for missing credentials and invalid boolean env values.
+- **`from_env()` now distinguishes non-UTF-8 credential vars from absent ones**
+  (`rustrade-execution`, `alpaca` / `binance` / `hyperliquid` features). New error variants —
+  `AlpacaConfigError::{InvalidApiKey, InvalidSecretKey}`,
+  `BinanceSpotConfigError::{InvalidApiKey, InvalidSecretKey}`, and
+  `HyperliquidConfigError::{InvalidPrivateKeyVar, InvalidTestnet}` — flag a non-UTF-8 environment
+  variable explicitly instead of collapsing it into "not set". The non-UTF-8 **credential** variants
+  carry no payload, so corrupt secret/key bytes are never echoed into an error message or log; the
+  non-secret network-toggle variants (`InvalidPaper` / `InvalidTestnet`) instead echo the offending
+  value (lossily for non-UTF-8) so "must be true or false, got …" stays actionable. Rustdoc added to
+  every
+  `new`/`paper`/`testnet`/`production`/`from_env` constructor spelling out caller obligations
+  (`production`/mainnet = real funds; `from_env` returns `Err`, never panics).
 - **Caller-selectable `BalanceBasis` for asset statistics** (`rustrade`). Asset drawdown and the
   end-of-session balance row can now be computed from either gross holdings (`Balance::total`, the
   default) or net asset value (`Balance::net_asset()`, i.e. `total - borrowed`). Select it once via
@@ -58,11 +73,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`Cargo.lock` is now committed and CI builds run `--locked`.** Previously the lockfile was
+  gitignored, so CI resolved fresh transitive dependencies on every run and a bad upstream release
+  could turn CI red with no change on our side (e.g. `time 0.3.48`'s coherence-breaking `From` impl,
+  [time-rs/time#783](https://github.com/time-rs/time/issues/783)). Committing the lockfile makes CI
+  reproducible; consumers are unaffected since `Cargo.lock` does not propagate to downstream crates.
+- **Breaking (`rustrade-data`):** Binance kline routing keys are now baked at deserialize.
+  `BinanceKline` and `BinanceContinuousKline` replace their public `symbol` / `pair` string fields
+  with a single `subscription_id: SubscriptionId` (the instrument-map key `{channel}|{MARKET}`),
+  built once via the same `ExchangeSub::id` used at subscribe time. This makes the subscribe-time
+  and frame-time keys a single source of truth that cannot drift and silently misroute. `Serialize`
+  is no longer derived on the Binance decode-only wire types `BinanceKline`, `BinanceContinuousKline`,
+  `BinanceKlineData`, `BinanceTrade`, `BinanceOrderBookL1`, `BinanceSpotOrderBookL2Update`, and
+  `BinanceFuturesOrderBookL2Update`: their custom field deserialization (`deserialize_with`) meant the
+  derived `Serialize` output never round-tripped, and nothing serializes these types.
 - **Breaking (`rustrade-execution`, `alpaca` / `binance` features):** `AlpacaConfig::new` and
   `BinanceSpotConfig::new` now take credentials only. Optional live-vs-safety knobs moved to named
   constructors: `AlpacaConfig::paper` / `AlpacaConfig::production` and
   `BinanceSpotConfig::testnet` / `BinanceSpotConfig::production`. The credentials-only constructors
   default to paper trading for Alpaca and testnet for Binance Spot.
+- **Breaking (`rustrade-execution`, `hyperliquid` feature):** `HyperliquidConfig::from_env()` now
+  defaults to the **safe testnet** environment when `HYPERLIQUID_TESTNET` is absent (previously
+  defaulted to **mainnet**, the dangerous foot-gun), matching Alpaca/Binance Spot. The `"1"`
+  truthy special-case is dropped — `HYPERLIQUID_TESTNET` is now `true`/`false`-only across every
+  venue. An invalid or non-UTF-8 toggle is a hard `HyperliquidConfigError::InvalidTestnet(String)`
+  rather than a silent `false` (mainnet). `HyperliquidConfigFile`'s `testnet` field likewise now
+  defaults to `true` (safe testnet) when absent from a config file. Set `HYPERLIQUID_TESTNET=false`
+  to opt into mainnet (real funds).
+- **Breaking (`rustrade-execution`, `hyperliquid` feature):** the config error type is renamed
+  `ConfigError` → `HyperliquidConfigError` and re-exported as `client::hyperliquid::HyperliquidConfigError`,
+  matching the venue-scoped naming of `AlpacaConfigError` / `BinanceSpotConfigError`.
 - **Breaking (`rustrade`):** the `BalanceBasis` work changes two signatures. `generate_empty_indexed_asset_states`
   gains a `basis: BalanceBasis` parameter (the `EngineStateBuilder` is the intended construction path
   and threads it for you). The `TradingSummary` output struct gains a `basis` field

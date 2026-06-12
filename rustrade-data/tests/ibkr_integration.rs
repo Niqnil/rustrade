@@ -969,6 +969,33 @@ async fn resolve_aapl_call_option(client: &IbkrHistoricalData) -> Contract {
         .build()
 }
 
+/// Shared AAPL call option, resolved from the live chain exactly once per run.
+static AAPL_CALL_OPTION: std::sync::OnceLock<Contract> = std::sync::OnceLock::new();
+
+/// Return the shared near-the-money AAPL call, resolving it from the live option
+/// chain on first use and caching it for the rest of the run.
+///
+/// Without this, every option test re-issued `reqSecDefOptParams` against the
+/// live gateway just to pick a valid contract — a pacing/rate-limit risk. The
+/// resolution uses a dedicated `client_id` (base+99) so the one-time chain fetch
+/// never collides with a test's own connection. Tests are `#[serial]`, so a
+/// plain `OnceLock` is race-free here — no async init primitive is needed.
+///
+/// If resolution panics, the short-lived client is dropped without an explicit
+/// `disconnect()`; the connection is reclaimed when the test process exits,
+/// which is acceptable for this `#[ignore]` live-gateway helper.
+async fn aapl_call_option() -> Contract {
+    if let Some(option) = AAPL_CALL_OPTION.get() {
+        return option.clone();
+    }
+    let url = format!("127.0.0.1:{}", test_port());
+    let client =
+        IbkrHistoricalData::connect(&url, test_client_id_base() + 99).expect("connection failed");
+    let option = resolve_aapl_call_option(&client).await;
+    client.disconnect();
+    AAPL_CALL_OPTION.get_or_init(|| option).clone()
+}
+
 #[serial]
 #[tokio::test]
 #[ignore]
@@ -980,7 +1007,7 @@ async fn test_calculate_theoretical_greeks() {
 
     let client = IbkrHistoricalData::connect(&url, client_id).expect("connection failed");
 
-    let option = resolve_aapl_call_option(&client).await;
+    let option = aapl_call_option().await;
     // Price the option at-the-money (underlying == strike) so the inputs are
     // internally consistent regardless of where AAPL is trading at run time.
     let underlying_price = option.strike;
@@ -1034,7 +1061,7 @@ async fn test_calculate_implied_volatility() {
 
     let client = IbkrHistoricalData::connect(&url, client_id).expect("connection failed");
 
-    let option = resolve_aapl_call_option(&client).await;
+    let option = aapl_call_option().await;
     // At-the-money (underlying == strike): intrinsic value is zero, so any
     // positive option price yields a well-defined implied volatility. ~5% of
     // the strike is a realistic ATM premium for a near-term option.
@@ -1079,6 +1106,9 @@ async fn test_fetch_option_chain() {
 
     println!("Fetching option chain for AAPL...");
 
+    // This test intentionally opts out of the `aapl_call_option()` cache: it is
+    // the test for `fetch_option_chain` itself, so it must exercise a real call.
+    //
     // IBKR's `reqSecDefOptParams` requires a real underlying conId (`0` is
     // rejected with `[321] Invalid contract id`) and an empty `fut_fop_exchange`
     // to return every exchange's parameters (a routing exchange like "SMART"
@@ -1140,13 +1170,9 @@ async fn test_option_greeks_stream() {
         client_id: test_client_id_base() + 33,
     };
 
-    // Resolve a currently-listed option via a short-lived historical client
-    // (distinct client_id) before opening the streaming connection.
-    let url = format!("127.0.0.1:{}", test_port());
-    let resolver =
-        IbkrHistoricalData::connect(&url, test_client_id_base() + 34).expect("connection failed");
-    let option = resolve_aapl_call_option(&resolver).await;
-    resolver.disconnect();
+    // Resolve a currently-listed option from the shared once-per-run cache
+    // before opening the streaming connection.
+    let option = aapl_call_option().await;
 
     let registry = ContractRegistry::new();
     registry.register("AAPL_CALL".into(), option);

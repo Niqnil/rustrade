@@ -51,6 +51,7 @@ use crate::{
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
     },
+    parse_env_bool,
     trade::{AssetFees, Trade, TradeId},
 };
 use binance_sdk::{
@@ -106,6 +107,11 @@ pub struct BinanceSpotConfig {
     pub testnet: bool,
 }
 
+/// Serde default for [`BinanceSpotConfig::testnet`]: an absent `testnet` field deserializes to the
+/// **safe** testnet environment (`true`).
+///
+/// `#[serde(default = "…")]` requires a named function (it cannot take a literal), so this exists
+/// purely to supply that default to the derive.
 fn default_testnet() -> bool {
     true
 }
@@ -122,10 +128,13 @@ impl std::fmt::Debug for BinanceSpotConfig {
 }
 
 impl BinanceSpotConfig {
+    /// Create a new config using the **safe** testnet endpoints (alias for
+    /// [`testnet`](Self::testnet)).
     pub fn new(api_key: String, secret_key: String) -> Self {
         Self::testnet(api_key, secret_key)
     }
 
+    /// Create a config targeting Binance Spot's **testnet** endpoints (simulated funds).
     pub fn testnet(api_key: String, secret_key: String) -> Self {
         Self {
             api_key,
@@ -134,6 +143,10 @@ impl BinanceSpotConfig {
         }
     }
 
+    /// Create a config targeting Binance Spot's **production** endpoints.
+    ///
+    /// ⚠️ Production trades execute against the live account with **real funds**. Prefer
+    /// [`testnet`](Self::testnet) unless you explicitly intend live execution.
     pub fn production(api_key: String, secret_key: String) -> Self {
         Self {
             api_key,
@@ -142,19 +155,53 @@ impl BinanceSpotConfig {
         }
     }
 
+    /// Build a config from environment variables.
+    ///
+    /// Reads:
+    /// - `BINANCE_API_KEY` (required) — API key.
+    /// - `BINANCE_SECRET_KEY` (required) — API secret.
+    /// - `BINANCE_TESTNET` (optional) — `"true"`/`"false"` (case-insensitive). **Absent ⇒ the safe
+    ///   testnet environment.** Set `BINANCE_TESTNET=false` to target production (real funds).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BinanceSpotConfigError`] (never panics):
+    /// - a required credential var is unset
+    ///   ([`MissingApiKey`](BinanceSpotConfigError::MissingApiKey) /
+    ///   [`MissingSecretKey`](BinanceSpotConfigError::MissingSecretKey)) or holds non-UTF-8
+    ///   ([`InvalidApiKey`](BinanceSpotConfigError::InvalidApiKey) /
+    ///   [`InvalidSecretKey`](BinanceSpotConfigError::InvalidSecretKey));
+    /// - `BINANCE_TESTNET` is neither `true` nor `false`, or holds non-UTF-8
+    ///   ([`InvalidTestnet`](BinanceSpotConfigError::InvalidTestnet)).
     pub fn from_env() -> Result<Self, BinanceSpotConfigError> {
-        let api_key =
-            std::env::var("BINANCE_API_KEY").map_err(|_| BinanceSpotConfigError::MissingApiKey)?;
-        let secret_key = std::env::var("BINANCE_SECRET_KEY")
-            .map_err(|_| BinanceSpotConfigError::MissingSecretKey)?;
+        let api_key = match std::env::var("BINANCE_API_KEY") {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => {
+                return Err(BinanceSpotConfigError::MissingApiKey);
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(BinanceSpotConfigError::InvalidApiKey);
+            }
+        };
+        let secret_key = match std::env::var("BINANCE_SECRET_KEY") {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => {
+                return Err(BinanceSpotConfigError::MissingSecretKey);
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(BinanceSpotConfigError::InvalidSecretKey);
+            }
+        };
         let testnet = match std::env::var("BINANCE_TESTNET") {
             Ok(value) => {
                 parse_env_bool(&value).ok_or(BinanceSpotConfigError::InvalidTestnet(value))?
             }
             Err(std::env::VarError::NotPresent) => true,
-            Err(_) => {
+            // The toggle value is not secret, so echo it (lossily) like the parse-failure arm above —
+            // an actionable "got X" beats a hardcoded sentinel.
+            Err(std::env::VarError::NotUnicode(value)) => {
                 return Err(BinanceSpotConfigError::InvalidTestnet(
-                    "<non-unicode>".into(),
+                    value.to_string_lossy().into_owned(),
                 ));
             }
         };
@@ -172,21 +219,21 @@ impl BinanceSpotConfig {
     }
 }
 
-fn parse_env_bool(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, PartialEq, thiserror::Error)]
 pub enum BinanceSpotConfigError {
     #[error("BINANCE_API_KEY environment variable not set")]
     MissingApiKey,
 
+    // No payload: the raw value is secret-key material, so it must never be echoed into an error
+    // message or log. The variant name already identifies which credential var is non-UTF-8.
+    #[error("BINANCE_API_KEY environment variable is not valid UTF-8")]
+    InvalidApiKey,
+
     #[error("BINANCE_SECRET_KEY environment variable not set")]
     MissingSecretKey,
+
+    #[error("BINANCE_SECRET_KEY environment variable is not valid UTF-8")]
+    InvalidSecretKey,
 
     #[error("BINANCE_TESTNET must be true or false, got {0}")]
     InvalidTestnet(String),
