@@ -73,6 +73,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`Cargo.lock` is now committed and CI builds run `--locked`.** Previously the lockfile was
+  gitignored, so CI resolved fresh transitive dependencies on every run and a bad upstream release
+  could turn CI red with no change on our side (e.g. `time 0.3.48`'s coherence-breaking `From` impl,
+  [time-rs/time#783](https://github.com/time-rs/time/issues/783)). Committing the lockfile makes CI
+  reproducible; consumers are unaffected since `Cargo.lock` does not propagate to downstream crates.
 - **Breaking (`rustrade-data`):** Binance kline routing keys are now baked at deserialize.
   `BinanceKline` and `BinanceContinuousKline` replace their public `symbol` / `pair` string fields
   with a single `subscription_id: SubscriptionId` (the instrument-map key `{channel}|{MARKET}`),
