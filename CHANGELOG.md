@@ -36,6 +36,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with no retry (IBKR, Hyperliquid perp/spot, Mock). A consumer-initiated drop emits nothing — the
   channel is already closed by the time it is observed. All venues funnel through one feature-agnostic
   `emit_stream_terminated` helper, so silent-EOF is now a programmatic signal at every venue. Closes #123.
+- **Databento OHLCV candles** (`rustrade-data`). The Databento integration now produces normalised
+  `Candle`s from Databento's native OHLCV schemas, both historical and live, alongside its existing
+  trades + L1. Historical: `DatabentoHistorical::fetch_candles` / `fetch_candles_stream` take a typed
+  `DatabentoOhlcvParams { dataset, symbols, time_range, interval }` (chrono types only — no
+  `databento`/`time` types or caller-supplied `Schema`); the DBN schema is derived internally from
+  the interval so the interval/schema pair cannot diverge. Live: `DatabentoLive::subscribe_candles`
+  streams `DataKind::Candle` events, deriving each bar's interval from its own record `rtype` so one
+  connection may carry multiple OHLCV intervals. Bars are stamped at the **open** instant and
+  normalised to the shared `close_time = open + interval` contract via `close_time_from_open`.
+  Databento's native intervals are `1s`/`1m`/`1h`/`1d`; the other 12 `CandleInterval` variants are
+  rejected with `DataError::UnsupportedInterval`. Live is scoped to `1s`/`1m` (the larger bars are
+  historical-only, as Databento's live gateway does not reliably stream them); `ohlcv-eod` and the
+  deprecated OHLCV rtype are out of scope and skipped observably. `OhlcvMsg` carries no trade count,
+  so `Candle::trade_count` is reported as `0` rather than fabricated. Enables Databento's `chrono`
+  feature.
 
 ### Changed
 
