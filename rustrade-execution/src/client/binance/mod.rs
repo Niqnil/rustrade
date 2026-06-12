@@ -15,4 +15,4 @@ mod shared;
 mod spot;
 
 pub use margin::{BinanceMargin, BinanceMarginConfig, MarginSideEffect};
-pub use spot::{BinanceSpot, BinanceSpotConfig};
+pub use spot::{BinanceSpot, BinanceSpotConfig, BinanceSpotConfigError};

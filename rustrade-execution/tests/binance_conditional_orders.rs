@@ -66,7 +66,11 @@ fn test_config() -> BinanceSpotConfig {
         .map(|v| v == "true")
         .unwrap_or(true);
 
-    BinanceSpotConfig::new(api_key, secret_key, testnet)
+    if testnet {
+        BinanceSpotConfig::testnet(api_key, secret_key)
+    } else {
+        BinanceSpotConfig::production(api_key, secret_key)
+    }
 }
 
 fn test_instrument() -> InstrumentNameExchange {

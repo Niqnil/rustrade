@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Named config constructors and env loading for Alpaca and Binance Spot**
+  (`rustrade-execution`, `alpaca` / `binance` features). Added `AlpacaConfig::from_env()` and
+  `BinanceSpotConfig::from_env()` plus typed config errors (`AlpacaConfigError`,
+  `BinanceSpotConfigError`) for missing credentials and invalid boolean env values.
 - **Caller-selectable `BalanceBasis` for asset statistics** (`rustrade`). Asset drawdown and the
   end-of-session balance row can now be computed from either gross holdings (`Balance::total`, the
   default) or net asset value (`Balance::net_asset()`, i.e. `total - borrowed`). Select it once via
@@ -39,6 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (`rustrade-execution`, `alpaca` / `binance` features):** `AlpacaConfig::new` and
+  `BinanceSpotConfig::new` now take credentials only. Optional live-vs-safety knobs moved to named
+  constructors: `AlpacaConfig::paper` / `AlpacaConfig::production` and
+  `BinanceSpotConfig::testnet` / `BinanceSpotConfig::production`. The credentials-only constructors
+  default to paper trading for Alpaca and testnet for Binance Spot.
 - **Breaking (`rustrade`):** the `BalanceBasis` work changes two signatures. `generate_empty_indexed_asset_states`
   gains a `basis: BalanceBasis` parameter (the `EngineStateBuilder` is the intended construction path
   and threads it for you). The `TradingSummary` output struct gains a `basis` field
