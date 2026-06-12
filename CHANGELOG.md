@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`impl Borrow<str> for SubscriptionId`** (`rustrade-integration`). An instrument map keyed on
+  `SubscriptionId` can now be queried with a borrowed `&str` key without allocating an owned
+  `SubscriptionId` per lookup.
 - **Named config constructors and env loading for Alpaca and Binance Spot**
   (`rustrade-execution`, `alpaca` / `binance` features). Added `AlpacaConfig::from_env()` and
   `BinanceSpotConfig::from_env()` plus typed config errors (`AlpacaConfigError`,
@@ -58,6 +61,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (`rustrade-data`):** Binance kline routing keys are now baked at deserialize.
+  `BinanceKline` and `BinanceContinuousKline` replace their public `symbol` / `pair` string fields
+  with a single `subscription_id: SubscriptionId` (the instrument-map key `{channel}|{MARKET}`),
+  built once via the same `ExchangeSub::id` used at subscribe time. This makes the subscribe-time
+  and frame-time keys a single source of truth that cannot drift and silently misroute. `Serialize`
+  is no longer derived on the Binance decode-only wire types `BinanceKline`, `BinanceContinuousKline`,
+  `BinanceKlineData`, `BinanceTrade`, `BinanceOrderBookL1`, `BinanceSpotOrderBookL2Update`, and
+  `BinanceFuturesOrderBookL2Update`: their custom field deserialization (`deserialize_with`) meant the
+  derived `Serialize` output never round-tripped, and nothing serializes these types.
 - **Breaking (`rustrade-execution`, `alpaca` / `binance` features):** `AlpacaConfig::new` and
   `BinanceSpotConfig::new` now take credentials only. Optional live-vs-safety knobs moved to named
   constructors: `AlpacaConfig::paper` / `AlpacaConfig::production` and

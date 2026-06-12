@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rustrade_instrument::{Side, exchange::ExchangeId};
 use rustrade_integration::subscription::SubscriptionId;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use smol_str::format_smolstr;
 
 /// Binance real-time trade message.
@@ -53,7 +53,10 @@ use smol_str::format_smolstr;
 ///     "m": true
 /// }
 /// ```
-#[derive(Clone, PartialEq, PartialOrd, Debug, Deserialize, Serialize)]
+// `Serialize` is intentionally not derived: the `subscription_id` field is deserialized from the
+// wire `s` symbol via `de_trade_subscription_id`, so a derived `Serialize` would emit this struct's
+// own field shape and not round-trip — and nothing serializes these wire types.
+#[derive(Clone, PartialEq, PartialOrd, Debug, Deserialize)]
 pub struct BinanceTrade {
     #[serde(alias = "s", deserialize_with = "de_trade_subscription_id")]
     pub subscription_id: SubscriptionId,

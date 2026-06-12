@@ -31,14 +31,15 @@ use crate::{
     Identifier,
     error::DataError,
     event::{MarketEvent, MarketIter},
+    exchange::ExchangeSub,
     subscription::candle::{Candle, CandleInterval, close_time_from_open},
 };
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rustrade_instrument::exchange::ExchangeId;
 use rustrade_integration::subscription::SubscriptionId;
-use serde::{Deserialize, Serialize};
-use smol_str::{SmolStr, format_smolstr};
+use serde::Deserialize;
+use smol_str::SmolStr;
 
 /// The inner `k` payload shared by the [`BinanceSpot`](super::spot::BinanceSpot) `@kline_`
 /// and [`BinanceFuturesUsdMarket`](super::futures::BinanceFuturesUsdMarket) `@continuousKline_` streams.
@@ -55,7 +56,10 @@ use smol_str::{SmolStr, format_smolstr};
 /// - `open_time` (`t`) is the candle's open instant; the exclusive `close_time` boundary is
 ///   recomputed library-side via [`close_time_from_open`] (`open + interval`), **not** taken
 ///   from the wire `T` (Binance's `period-end − 1ms` convention).
-#[derive(Clone, PartialEq, PartialOrd, Debug, Deserialize, Serialize)]
+// `Serialize` is intentionally not derived: the fields are decoded from Binance's wire shape via
+// `deserialize_with` (epoch-ms timestamps, string-encoded decimals), so a derived `Serialize` would
+// emit a different shape that does not round-trip — and nothing serializes this decode-only payload.
+#[derive(Clone, PartialEq, PartialOrd, Debug, Deserialize)]
 pub struct BinanceKlineData {
     #[serde(
         alias = "t",
@@ -156,25 +160,49 @@ impl BinanceKlineData {
 ///     }
 /// }
 /// ```
-#[derive(Clone, PartialEq, PartialOrd, Debug, Deserialize, Serialize)]
+// `Serialize` is intentionally not derived: the hand-written `Deserialize` reads Binance's wire
+// frame (top-level `s`, nested `k`), a different shape than this struct's own fields, so a derived
+// `Serialize` would not round-trip — and nothing serializes these wire types.
+#[derive(Clone, PartialEq, PartialOrd, Debug)]
 pub struct BinanceKline {
-    /// Top-level market symbol, UPPERCASE (e.g. `BTCUSDT`).
-    #[serde(alias = "s")]
-    pub symbol: SmolStr,
-    #[serde(alias = "k")]
+    /// Instrument-map routing key `{channel}|{MARKET}` (e.g. `@kline_1m|BTCUSDT`), baked at
+    /// deserialize from the top-level symbol (`s`) and the inner interval (`k.i`) by reusing
+    /// [`ExchangeSub::id`](crate::exchange::ExchangeSub) — the single source of truth shared with
+    /// subscribe-time key construction. Baking here (rather than re-deriving per frame in `id()`)
+    /// means the subscribe-time and frame-time keys cannot drift and silently misroute.
+    pub subscription_id: SubscriptionId,
     pub kline: BinanceKlineData,
 }
 
+impl<'de> Deserialize<'de> for BinanceKline {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        /// Private wire mirror of the spot `@kline_` frame: the symbol lives top-level (`s`) and
+        /// the interval is nested in `k.i`, so the routing key needs both fields — a single-field
+        /// `deserialize_with` cannot see across them.
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(rename = "s")]
+            symbol: SmolStr,
+            #[serde(rename = "k")]
+            kline: BinanceKlineData,
+        }
+
+        let Wire { symbol, kline } = Wire::deserialize(deserializer)?;
+        let subscription_id =
+            ExchangeSub::from((BinanceChannel::spot_candle(kline.interval), symbol.as_str())).id();
+        Ok(Self {
+            subscription_id,
+            kline,
+        })
+    }
+}
+
 impl Identifier<Option<SubscriptionId>> for BinanceKline {
-    /// Builds the instrument-map key `{channel}|{MARKET}` (e.g. `@kline_1m|BTCUSDT`) from the
-    /// payload's interval (`k.i`) and UPPERCASE symbol (`s`) — matching
-    /// [`ExchangeSub::id`](crate::exchange::ExchangeSub), **not** the lowercase stream name.
     fn id(&self) -> Option<SubscriptionId> {
-        Some(SubscriptionId(format_smolstr!(
-            "{}|{}",
-            BinanceChannel::spot_candle(self.kline.interval).0,
-            self.symbol
-        )))
+        Some(self.subscription_id.clone())
     }
 }
 
@@ -208,32 +236,57 @@ impl<InstrumentKey> From<(ExchangeId, InstrumentKey, BinanceKline)>
 ///     }
 /// }
 /// ```
-#[derive(Clone, PartialEq, PartialOrd, Debug, Deserialize, Serialize)]
+// `Serialize` is intentionally not derived: the hand-written `Deserialize` reads Binance's wire
+// frame (top-level `ps`, nested `k`), a different shape than this struct's own fields, so a derived
+// `Serialize` would not round-trip — and nothing serializes these wire types.
+#[derive(Clone, PartialEq, PartialOrd, Debug)]
 pub struct BinanceContinuousKline {
-    /// Top-level pair symbol, UPPERCASE (e.g. `BTCUSDT`). For a perpetual-only venue the pair
-    /// equals the symbol.
-    #[serde(alias = "ps")]
-    pub pair: SmolStr,
-    // The wire `ct` (contract type, e.g. `"PERPETUAL"`) is intentionally not deserialized: the
-    // `_perpetual@continuousKline_` subscription this model decodes only ever receives PERPETUAL
-    // frames, and `id()` hardcodes the perpetual channel prefix to match. A non-perpetual frame
-    // (impossible given the subscription) would build a non-matching `SubscriptionId` and be
-    // dropped at the instrument-map lookup rather than mis-attributed.
-    #[serde(alias = "k")]
+    /// Instrument-map routing key `{channel}|{MARKET}` (e.g.
+    /// `_perpetual@continuousKline_1m|BTCUSDT`), baked at deserialize from the top-level pair
+    /// (`ps`) and the inner interval (`k.i`) by reusing
+    /// [`ExchangeSub::id`](crate::exchange::ExchangeSub) — the single source of truth shared with
+    /// subscribe-time key construction. The continuous payload has no `k.s`, so the pair is the
+    /// only symbol source. The channel prefix is hardcoded perpetual (`_perpetual@`): the wire
+    /// `ct` (contract type) is intentionally not deserialized, since the
+    /// `_perpetual@continuousKline_` subscription this model decodes only ever receives PERPETUAL
+    /// frames. A non-perpetual frame (impossible given the subscription) would build a
+    /// non-matching key and be dropped at the instrument-map lookup rather than mis-attributed.
+    pub subscription_id: SubscriptionId,
     pub kline: BinanceKlineData,
 }
 
+impl<'de> Deserialize<'de> for BinanceContinuousKline {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        /// Private wire mirror of the futures `@continuousKline_` frame: the pair lives top-level
+        /// (`ps`) and the interval is nested in `k.i`, so the routing key needs both fields — a
+        /// single-field `deserialize_with` cannot see across them.
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(rename = "ps")]
+            pair: SmolStr,
+            #[serde(rename = "k")]
+            kline: BinanceKlineData,
+        }
+
+        let Wire { pair, kline } = Wire::deserialize(deserializer)?;
+        let subscription_id = ExchangeSub::from((
+            BinanceChannel::futures_candle(kline.interval),
+            pair.as_str(),
+        ))
+        .id();
+        Ok(Self {
+            subscription_id,
+            kline,
+        })
+    }
+}
+
 impl Identifier<Option<SubscriptionId>> for BinanceContinuousKline {
-    /// Builds the instrument-map key `{channel}|{MARKET}` (e.g.
-    /// `_perpetual@continuousKline_1m|BTCUSDT`) from the payload's interval (`k.i`) and
-    /// UPPERCASE pair (`ps`) — matching [`ExchangeSub::id`](crate::exchange::ExchangeSub). The
-    /// continuous payload has no `k.s`, so the pair is the only symbol source.
     fn id(&self) -> Option<SubscriptionId> {
-        Some(SubscriptionId(format_smolstr!(
-            "{}|{}",
-            BinanceChannel::futures_candle(self.kline.interval).0,
-            self.pair
-        )))
+        Some(self.subscription_id.clone())
     }
 }
 
@@ -294,7 +347,10 @@ mod tests {
     #[test]
     fn spot_kline_deserialises_and_builds_map_key() {
         let kline = serde_json::from_str::<BinanceKline>(SPOT_CLOSED).unwrap();
-        assert_eq!(kline.symbol, "BTCUSDT");
+        assert_eq!(
+            kline.subscription_id,
+            SubscriptionId::from("@kline_1m|BTCUSDT")
+        );
         assert_eq!(kline.kline.interval, CandleInterval::Min1);
         assert!(kline.kline.closed);
         assert_eq!(kline.kline.open, dec!(0.0010));
@@ -308,7 +364,10 @@ mod tests {
     #[test]
     fn futures_continuous_kline_deserialises_without_k_s() {
         let kline = serde_json::from_str::<BinanceContinuousKline>(FUTURES_OPEN).unwrap();
-        assert_eq!(kline.pair, "BTCUSDT");
+        assert_eq!(
+            kline.subscription_id,
+            SubscriptionId::from("_perpetual@continuousKline_1s|BTCUSDT")
+        );
         assert_eq!(kline.kline.interval, CandleInterval::Sec1);
         assert!(!kline.kline.closed);
         assert_eq!(
@@ -380,6 +439,52 @@ mod tests {
         assert_eq!(event.kind.close, dec!(18804.04));
         assert_eq!(event.kind.volume, dec!(197.664));
         assert_eq!(event.kind.trade_count, 543);
+    }
+
+    /// Drift guard: for **every** [`CandleInterval`] the routing key baked at deserialize must
+    /// equal the canonical instrument-map key `{channel}|{MARKET}` — the same key built at
+    /// subscribe time by [`ExchangeSub::id`] and stored in the instrument
+    /// [`Map`](crate::subscription::Map). Asserting against the literal wire format here (rather
+    /// than a second [`ExchangeSub::id`] call, which would tautologically re-derive the baked key)
+    /// also pins the channel prefix and the `{}|{}` separator, so a regression in either is caught,
+    /// not just a wrong field being read. If the baked and subscribe-time keys ever drift, frames
+    /// silently misroute/drop at `Map::find`; iterating here catches that at construction (in CI),
+    /// not in production. Covers both spot (`@kline_`) and futures (`_perpetual@continuousKline_`).
+    #[test]
+    fn baked_subscription_id_matches_exchange_sub_for_every_interval() {
+        const MARKET: &str = "BTCUSDT";
+
+        for interval in CandleInterval::ALL {
+            let wire = interval.as_str();
+
+            // Spot `@kline_<interval>`.
+            let spot_frame = format!(
+                r#"{{ "e": "kline", "E": 1, "s": "{MARKET}",
+                      "k": {{ "t": 0, "T": 1, "s": "{MARKET}", "i": "{wire}",
+                              "o": "0", "c": "0", "h": "0", "l": "0", "v": "0", "n": 0, "x": true }} }}"#
+            );
+            let spot = serde_json::from_str::<BinanceKline>(&spot_frame).unwrap();
+            assert_eq!(
+                spot.id(),
+                Some(SubscriptionId::from(format!("@kline_{wire}|{MARKET}"))),
+                "spot kline routing key drifted from the canonical `@kline_<i>|<MARKET>` form for {interval:?}"
+            );
+
+            // Futures `_perpetual@continuousKline_<interval>` (no `k.s`; symbol from `ps`).
+            let futures_frame = format!(
+                r#"{{ "e": "continuous_kline", "E": 1, "ps": "{MARKET}", "ct": "PERPETUAL",
+                      "k": {{ "t": 0, "T": 1, "i": "{wire}",
+                              "o": "0", "c": "0", "h": "0", "l": "0", "v": "0", "n": 0, "x": true }} }}"#
+            );
+            let futures = serde_json::from_str::<BinanceContinuousKline>(&futures_frame).unwrap();
+            assert_eq!(
+                futures.id(),
+                Some(SubscriptionId::from(format!(
+                    "_perpetual@continuousKline_{wire}|{MARKET}"
+                ))),
+                "futures kline routing key drifted from the canonical `_perpetual@continuousKline_<i>|<MARKET>` form for {interval:?}"
+            );
+        }
     }
 
     #[test]
