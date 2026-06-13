@@ -36,7 +36,11 @@ use crate::{
     UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance},
     client::{BracketOrderClient, ExecutionClient},
-    error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
+    emit_stream_terminated,
+    error::{
+        ApiError, ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
+        UnindexedOrderError,
+    },
     order::{
         Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
         bracket::{
@@ -47,6 +51,7 @@ use crate::{
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
     },
+    parse_env_bool,
     trade::{AssetFees, Trade, TradeId},
 };
 use chrono::{DateTime, Utc};
@@ -256,6 +261,15 @@ impl ExponentialBackoff {
         self.attempt = 0;
     }
 
+    /// Number of reconnect attempts consumed so far.
+    ///
+    /// After [`wait`](Self::wait) has returned `false` this equals `max_attempts` — the number of
+    /// attempts made before the budget was exhausted. Used to populate
+    /// [`StreamTerminationReason::ReconnectBudgetExhausted`].
+    fn attempts(&self) -> u32 {
+        self.attempt
+    }
+
     /// Waits for the current backoff duration. Returns `false` if max attempts exhausted.
     async fn wait(&mut self) -> bool {
         if self.attempt >= self.max_attempts {
@@ -336,11 +350,22 @@ pub struct AlpacaConfig {
     // Private fields prevent accidental credential exposure via struct access.
     api_key: String,
     secret_key: String,
+
     /// Use paper trading endpoints instead of production.
+    #[serde(default = "default_paper")]
     pub paper: bool,
     /// Test-only: override the REST base URL (e.g., to point at a wiremock server).
     #[cfg(test)]
     pub base_url_override: Option<String>,
+}
+
+/// Serde default for [`AlpacaConfig::paper`]: an absent `paper` field deserializes to the **safe**
+/// paper environment (`true`).
+///
+/// `#[serde(default = "…")]` requires a named function (it cannot take a literal), so this exists
+/// purely to supply that default to the derive.
+fn default_paper() -> bool {
+    true
 }
 
 // Custom Debug to avoid leaking credentials in logs.
@@ -355,13 +380,86 @@ impl std::fmt::Debug for AlpacaConfig {
 }
 
 impl AlpacaConfig {
-    pub fn new(api_key: String, secret_key: String, paper: bool) -> Self {
+    /// Create a new Alpaca config using the **safe** paper-trading endpoints (alias for
+    /// [`paper`](Self::paper)).
+    pub fn new(api_key: String, secret_key: String) -> Self {
+        Self::paper(api_key, secret_key)
+    }
+
+    /// Create a config targeting Alpaca's **paper-trading** endpoints (simulated funds).
+    pub fn paper(api_key: String, secret_key: String) -> Self {
         Self {
             api_key,
             secret_key,
-            paper,
+            paper: true,
             #[cfg(test)]
             base_url_override: None,
+        }
+    }
+
+    /// Create a config targeting Alpaca's **production** endpoints.
+    ///
+    /// ⚠️ Production trades execute against the live account with **real funds**. Prefer
+    /// [`paper`](Self::paper) unless you explicitly intend live execution.
+    pub fn production(api_key: String, secret_key: String) -> Self {
+        Self {
+            api_key,
+            secret_key,
+            paper: false,
+            #[cfg(test)]
+            base_url_override: None,
+        }
+    }
+
+    /// Build a config from environment variables.
+    ///
+    /// Reads:
+    /// - `ALPACA_API_KEY` (required) — API key id.
+    /// - `ALPACA_SECRET_KEY` (required) — API secret.
+    /// - `ALPACA_PAPER` (optional) — `"true"`/`"false"` (case-insensitive). **Absent ⇒ the safe
+    ///   paper environment.** Set `ALPACA_PAPER=false` to target production (real funds).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AlpacaConfigError`] (never panics):
+    /// - a required credential var is unset ([`MissingApiKey`](AlpacaConfigError::MissingApiKey) /
+    ///   [`MissingSecretKey`](AlpacaConfigError::MissingSecretKey)) or holds non-UTF-8
+    ///   ([`InvalidApiKey`](AlpacaConfigError::InvalidApiKey) /
+    ///   [`InvalidSecretKey`](AlpacaConfigError::InvalidSecretKey));
+    /// - `ALPACA_PAPER` is neither `true` nor `false`, or holds non-UTF-8
+    ///   ([`InvalidPaper`](AlpacaConfigError::InvalidPaper)).
+    pub fn from_env() -> Result<Self, AlpacaConfigError> {
+        let api_key = match std::env::var("ALPACA_API_KEY") {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => return Err(AlpacaConfigError::MissingApiKey),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(AlpacaConfigError::InvalidApiKey);
+            }
+        };
+        let secret_key = match std::env::var("ALPACA_SECRET_KEY") {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => return Err(AlpacaConfigError::MissingSecretKey),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(AlpacaConfigError::InvalidSecretKey);
+            }
+        };
+
+        let paper = match std::env::var("ALPACA_PAPER") {
+            Ok(value) => parse_env_bool(&value).ok_or(AlpacaConfigError::InvalidPaper(value))?,
+            Err(std::env::VarError::NotPresent) => true,
+            // The toggle value is not secret, so echo it (lossily) like the parse-failure arm above —
+            // an actionable "got X" beats a hardcoded sentinel.
+            Err(std::env::VarError::NotUnicode(value)) => {
+                return Err(AlpacaConfigError::InvalidPaper(
+                    value.to_string_lossy().into_owned(),
+                ));
+            }
+        };
+
+        if paper {
+            Ok(Self::paper(api_key, secret_key))
+        } else {
+            Ok(Self::production(api_key, secret_key))
         }
     }
 
@@ -403,6 +501,26 @@ impl AlpacaConfig {
             "wss://api.alpaca.markets/stream"
         }
     }
+}
+
+#[derive(Debug, PartialEq, thiserror::Error)]
+pub enum AlpacaConfigError {
+    #[error("ALPACA_API_KEY environment variable not set")]
+    MissingApiKey,
+
+    // No payload: the raw value is secret-key material, so it must never be echoed into an error
+    // message or log. The variant name already identifies which credential var is non-UTF-8.
+    #[error("ALPACA_API_KEY environment variable is not valid UTF-8")]
+    InvalidApiKey,
+
+    #[error("ALPACA_SECRET_KEY environment variable not set")]
+    MissingSecretKey,
+
+    #[error("ALPACA_SECRET_KEY environment variable is not valid UTF-8")]
+    InvalidSecretKey,
+
+    #[error("ALPACA_PAPER must be true or false, got {0}")]
+    InvalidPaper(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -2022,6 +2140,15 @@ async fn connection_manager(
                     error!(%e, "Alpaca WS connect/subscribe failed");
                     if !backoff.wait().await {
                         error!("Alpaca max reconnect attempts exhausted");
+                        // Signal terminal stream death in-band before tx drops.
+                        emit_stream_terminated(
+                            &tx,
+                            ExchangeId::AlpacaBroker,
+                            StreamTerminationReason::ReconnectBudgetExhausted {
+                                attempts: backoff.attempts(),
+                                last_error: e.to_string(),
+                            },
+                        );
                         break;
                     }
                     continue;
@@ -2098,7 +2225,15 @@ async fn connection_manager(
                 last_message_time = Utc::now();
             };
         }
-        loop {
+        // Distinguishes why the inner stream loop exited so the terminal emit below can report a
+        // meaningful `last_error`. The consumer-drop arm uses `break 'outer` and never yields one.
+        enum DisconnectReason {
+            ServerClose,
+            Error(String),
+            StreamEnded,
+            HeartbeatTimeout,
+        }
+        let reason = loop {
             tokio::select! {
                 msg = ws.next() => {
                     match msg {
@@ -2126,16 +2261,16 @@ async fn connection_manager(
                         }
                         Some(Ok(WsMessage::Close(frame))) => {
                             warn!(frame = ?frame, "Alpaca WS closed by server");
-                            break;
+                            break DisconnectReason::ServerClose;
                         }
                         Some(Ok(_)) => {} // Pong, Frame — ignore
                         Some(Err(e)) => {
                             warn!(%e, "Alpaca WS error, reconnecting");
-                            break;
+                            break DisconnectReason::Error(e.to_string());
                         }
                         None => {
                             warn!("Alpaca WS stream ended, reconnecting");
-                            break;
+                            break DisconnectReason::StreamEnded;
                         }
                     }
                 }
@@ -2146,7 +2281,7 @@ async fn connection_manager(
                     );
                     // Heartbeat timeout is a failure — do NOT reset backoff here.
                     // Backoff resets on successful event receipt in process_ws_text.
-                    break;
+                    break DisconnectReason::HeartbeatTimeout;
                 }
                 _ = tx.closed() => {
                     debug!("Alpaca account_stream consumer dropped, terminating");
@@ -2154,10 +2289,12 @@ async fn connection_manager(
                         Duration::from_secs(WS_CLOSE_TIMEOUT_SECS),
                         ws.close(None),
                     ).await;
+                    // Consumer dropped the receiver — no StreamTerminated emit (channel already
+                    // closed, so it would be a no-op; see emit_stream_terminated docs).
                     break 'outer;
                 }
             }
-        }
+        };
 
         // --- Record disconnect time for fill recovery ---
         // Anchor to last_message_time, not Utc::now(). For heartbeat-triggered
@@ -2171,10 +2308,30 @@ async fn connection_manager(
             tokio::time::timeout(Duration::from_secs(WS_CLOSE_TIMEOUT_SECS), ws.close(None)).await;
 
         if tx.is_closed() {
+            // Consumer dropped the receiver — no StreamTerminated emit (channel already closed,
+            // so it would be a no-op; see emit_stream_terminated docs).
             break;
         }
         if !backoff.wait().await {
             error!("Alpaca max reconnect attempts exhausted, stream terminating");
+            // Surrender after repeated reconnects: report the failure that triggered this round
+            // (consumer-drop already broke out via `break 'outer`).
+            let last_error = match reason {
+                DisconnectReason::HeartbeatTimeout => {
+                    format!("heartbeat timeout ({HEARTBEAT_TIMEOUT_SECS}s)")
+                }
+                DisconnectReason::ServerClose => "WebSocket closed by server".to_string(),
+                DisconnectReason::Error(e) => e,
+                DisconnectReason::StreamEnded => "WebSocket stream ended".to_string(),
+            };
+            emit_stream_terminated(
+                &tx,
+                ExchangeId::AlpacaBroker,
+                StreamTerminationReason::ReconnectBudgetExhausted {
+                    attempts: backoff.attempts(),
+                    last_error,
+                },
+            );
             break;
         }
     }
@@ -3301,8 +3458,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_alpaca_config_new_uses_paper_trading_by_default() {
+        let cfg = AlpacaConfig::new("my_key".into(), "my_secret".into());
+        assert!(cfg.paper);
+    }
+
+    #[test]
     fn test_alpaca_config_debug_redacts_credentials() {
-        let cfg = AlpacaConfig::new("my_key".into(), "my_secret".into(), true);
+        let cfg = AlpacaConfig::new("my_key".into(), "my_secret".into());
         let debug = format!("{cfg:?}");
         assert!(!debug.contains("my_key"), "api_key should be redacted");
         assert!(
@@ -3313,14 +3476,124 @@ mod tests {
     }
 
     #[test]
+    fn test_alpaca_config_deserialize_omitted_paper_defaults_to_paper() {
+        let cfg: AlpacaConfig = serde_json::from_str(
+            r#"{
+        "api_key": "my_key",
+        "secret_key": "my_secret"
+    }"#,
+        )
+        .unwrap();
+
+        assert!(cfg.paper);
+        assert_eq!(cfg.rest_base_url(), "https://paper-api.alpaca.markets");
+    }
+
+    #[test]
+    fn test_alpaca_config_deserialize_paper_true() {
+        let cfg: AlpacaConfig = serde_json::from_str(
+            r#"{
+        "api_key": "my_key",
+        "secret_key": "my_secret",
+        "paper": true
+    }"#,
+        )
+        .unwrap();
+
+        assert!(cfg.paper);
+        assert_eq!(cfg.rest_base_url(), "https://paper-api.alpaca.markets");
+    }
+
+    #[test]
+    fn test_alpaca_config_deserialize_paper_false() {
+        let cfg: AlpacaConfig = serde_json::from_str(
+            r#"{
+        "api_key": "my_key",
+        "secret_key": "my_secret",
+        "paper": false
+    }"#,
+        )
+        .unwrap();
+
+        assert!(!cfg.paper);
+        assert_eq!(cfg.rest_base_url(), "https://api.alpaca.markets");
+    }
+
+    #[test]
     fn test_alpaca_config_urls() {
-        let paper = AlpacaConfig::new("k".into(), "s".into(), true);
+        let paper = AlpacaConfig::paper("k".into(), "s".into());
         assert!(paper.rest_base_url().contains("paper-api"));
         assert!(paper.ws_url().contains("paper-api"));
 
-        let live = AlpacaConfig::new("k".into(), "s".into(), false);
+        let live = AlpacaConfig::production("k".into(), "s".into());
         assert!(!live.rest_base_url().contains("paper-api"));
         assert!(!live.ws_url().contains("paper-api"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_alpaca_config_from_env_defaults_to_paper_trading() {
+        temp_env::with_vars(
+            [
+                ("ALPACA_API_KEY", Some("my_key")),
+                ("ALPACA_SECRET_KEY", Some("my_secret")),
+                ("ALPACA_PAPER", None),
+            ],
+            || {
+                let cfg = AlpacaConfig::from_env().unwrap();
+                assert!(cfg.paper);
+                assert_eq!(cfg.rest_base_url(), "https://paper-api.alpaca.markets");
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_alpaca_config_from_env_accepts_explicit_production() {
+        temp_env::with_vars(
+            [
+                ("ALPACA_API_KEY", Some("my_key")),
+                ("ALPACA_SECRET_KEY", Some("my_secret")),
+                ("ALPACA_PAPER", Some("false")),
+            ],
+            || {
+                let cfg = AlpacaConfig::from_env().unwrap();
+                assert!(!cfg.paper);
+                assert_eq!(cfg.rest_base_url(), "https://api.alpaca.markets");
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_alpaca_config_from_env_rejects_invalid_paper() {
+        temp_env::with_vars(
+            [
+                ("ALPACA_API_KEY", Some("my_key")),
+                ("ALPACA_SECRET_KEY", Some("my_secret")),
+                ("ALPACA_PAPER", Some("maybe")),
+            ],
+            || {
+                let err = AlpacaConfig::from_env().unwrap_err();
+                assert!(matches!(err, AlpacaConfigError::InvalidPaper(value) if value == "maybe"));
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_alpaca_config_from_env_requires_credentials() {
+        temp_env::with_vars(
+            [
+                ("ALPACA_API_KEY", None),
+                ("ALPACA_SECRET_KEY", Some("my_secret")),
+                ("ALPACA_PAPER", None),
+            ],
+            || {
+                let err = AlpacaConfig::from_env().unwrap_err();
+                assert!(matches!(err, AlpacaConfigError::MissingApiKey));
+            },
+        );
     }
 
     #[test]
@@ -3561,7 +3834,7 @@ mod tests {
         use rustrade_instrument::instrument::name::InstrumentNameExchange;
 
         // Create a minimal client with dummy credentials (no network call will be made)
-        let config = AlpacaConfig::new("dummy_key".into(), "dummy_secret".into(), true);
+        let config = AlpacaConfig::new("dummy_key".into(), "dummy_secret".into());
         let client = AlpacaClient::new(config);
 
         let request = AlpacaBracketOrderRequest::new(
@@ -3589,7 +3862,7 @@ mod tests {
         use rust_decimal_macros::dec;
         use rustrade_instrument::instrument::name::InstrumentNameExchange;
 
-        let config = AlpacaConfig::new("dummy_key".into(), "dummy_secret".into(), true);
+        let config = AlpacaConfig::new("dummy_key".into(), "dummy_secret".into());
         let client = AlpacaClient::new(config);
 
         // Buy bracket with SL > entry (invalid)
@@ -3618,7 +3891,7 @@ mod tests {
         use rust_decimal_macros::dec;
         use rustrade_instrument::instrument::name::InstrumentNameExchange;
 
-        let config = AlpacaConfig::new("dummy_key".into(), "dummy_secret".into(), true);
+        let config = AlpacaConfig::new("dummy_key".into(), "dummy_secret".into());
         let client = AlpacaClient::new(config);
 
         // Buy bracket with SL limit > SL trigger (invalid for sell stop-limit)

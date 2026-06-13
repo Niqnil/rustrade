@@ -32,12 +32,15 @@
 #[cfg(test)]
 use serial_test as _;
 #[cfg(test)]
+use temp_env as _;
+#[cfg(test)]
 use tracing_subscriber as _;
 #[cfg(test)]
 use wiremock as _;
 
 use crate::{
     balance::{AssetBalance, AssetBalanceUpdate},
+    error::StreamTerminationReason,
     order::{Order, OrderSnapshot, request::OrderResponseCancel},
     position::Position,
     trade::Trade,
@@ -53,6 +56,7 @@ use rustrade_instrument::{
 };
 use rustrade_integration::collection::snapshot::Snapshot;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 pub mod balance;
 pub mod client;
@@ -97,6 +101,59 @@ impl<ExchangeKey, AssetKey, InstrumentKey> AccountEvent<ExchangeKey, AssetKey, I
             exchange,
             kind: kind.into(),
         }
+    }
+
+    /// Named constructor for the terminal [`StreamTerminated`](AccountEventKind::StreamTerminated)
+    /// event carrying the given [`StreamTerminationReason`].
+    pub(crate) fn stream_terminated(
+        exchange: ExchangeKey,
+        reason: StreamTerminationReason,
+    ) -> Self {
+        Self {
+            exchange,
+            kind: AccountEventKind::StreamTerminated(reason),
+        }
+    }
+}
+
+/// Best-effort in-band emit of a terminal
+/// [`StreamTerminated`](AccountEventKind::StreamTerminated) on the account-event channel, sent just
+/// before a venue's stream task exits so stream death is delivered in-band rather than inferred from
+/// channel EOF.
+///
+/// Shared by every venue connector (Binance spot/margin, Alpaca, IBKR, Hyperliquid, Mock) so the
+/// single construction/send of the terminal event lives in one place, at the abstraction level where
+/// [`AccountEvent`] is defined rather than inside any one vendor module. The send is best-effort: if
+/// the consumer already dropped the receiver it is a silent no-op — which is the
+/// consumer-initiated-drop case, deliberately *not* signalled (there is no one left to deliver to).
+pub(crate) fn emit_stream_terminated(
+    tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
+    exchange: ExchangeId,
+    reason: StreamTerminationReason,
+) {
+    let _ = tx.send(UnindexedAccountEvent::stream_terminated(exchange, reason));
+}
+
+/// Parse a boolean environment-variable value using the single cross-venue policy.
+///
+/// Accepts only `"true"` / `"false"` (case-insensitive, surrounding whitespace trimmed); every other
+/// value returns `None` so the caller can surface an explicit "must be true or false" error rather
+/// than silently coercing. Deliberately does **not** accept `"1"`/`"0"` or other truthy spellings —
+/// one strict, unambiguous spelling shared by every venue's `from_env` (Alpaca `ALPACA_PAPER`,
+/// Binance `BINANCE_TESTNET`, Hyperliquid `HYPERLIQUID_TESTNET`) keeps the network-selection toggle
+/// impossible to misread.
+//
+// Gated to the venues that read env-bool toggles so the crate's default-empty feature set does not
+// warn this as unused.
+#[cfg(any(feature = "alpaca", feature = "binance", feature = "hyperliquid"))]
+pub(crate) fn parse_env_bool(value: &str) -> Option<bool> {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if trimmed.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -149,12 +206,19 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
     /// when available.
     Trade(Trade<AssetKey, InstrumentKey>),
 
-    /// WebSocket-level error from exchange. Connection may have dropped.
+    /// The account event stream has ended; no further events will arrive on it.
     ///
-    /// Implementations send this when the underlying stream encounters an error.
-    /// Consumers should treat this as a signal that events may have been missed
-    /// and consider re-syncing via REST (e.g., `fetch_trades`, `account_snapshot`).
-    StreamError(String),
+    /// This is the in-band, programmatic signal that a stream died — delivered on the **same**
+    /// account feed as every other event rather than being inferred from channel EOF or read from
+    /// logs. The [`StreamTerminationReason`] distinguishes a venue that exhausted its reconnect
+    /// budget from an unrecoverable error, so the consumer can apply its own recovery policy
+    /// (re-establish the stream, re-sync via REST, halt trading). The library reports *that* and
+    /// *why* the stream ended; it does not prescribe the response.
+    ///
+    /// Only terminations deliverable while the consumer is still listening are signalled: a
+    /// consumer-initiated drop closes the receiver, so there is no one left to deliver to (see
+    /// [`StreamTerminationReason`] for the deliverable-only rationale).
+    StreamTerminated(StreamTerminationReason),
 }
 
 impl<ExchangeKey, AssetKey, InstrumentKey> AccountEvent<ExchangeKey, AssetKey, InstrumentKey>
@@ -310,5 +374,46 @@ impl<ExchangeKey, AssetKey, InstrumentKey> AccountSnapshot<ExchangeKey, AssetKey
 
     pub fn instruments(&self) -> impl Iterator<Item = &InstrumentKey> {
         self.instruments.iter().map(|snapshot| &snapshot.instrument)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
+mod tests {
+    use super::*;
+
+    /// The shared terminal-emit helper every venue connector funnels through must deliver an
+    /// in-band [`AccountEventKind::StreamTerminated`] carrying the given exchange and reason.
+    #[test]
+    fn emit_stream_terminated_delivers_event_in_band() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<UnindexedAccountEvent>();
+        let reason = StreamTerminationReason::ReconnectBudgetExhausted {
+            attempts: 7,
+            last_error: "socket reset".to_string(),
+        };
+
+        emit_stream_terminated(&tx, ExchangeId::BinanceSpot, reason.clone());
+
+        let event = rx.try_recv().expect("expected a terminal event");
+        assert_eq!(event.exchange, ExchangeId::BinanceSpot);
+        assert!(
+            matches!(event.kind, AccountEventKind::StreamTerminated(r) if r == reason),
+            "expected StreamTerminated carrying the supplied reason",
+        );
+    }
+
+    /// Per the D6 consumer-drop decision, emitting after the consumer dropped the receiver is a
+    /// best-effort silent no-op — it must not panic (there is no one left to deliver to).
+    #[test]
+    fn emit_stream_terminated_is_noop_when_receiver_dropped() {
+        let (tx, rx) = mpsc::unbounded_channel::<UnindexedAccountEvent>();
+        drop(rx);
+
+        // Must not panic even though the send is dropped on the floor.
+        emit_stream_terminated(
+            &tx,
+            ExchangeId::HyperliquidPerp,
+            StreamTerminationReason::Error("stream closed".to_string()),
+        );
     }
 }

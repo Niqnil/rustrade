@@ -20,11 +20,11 @@ categories = ["finance", "simulation"]
 
 [workspace.dependencies]
 # Rustrade Ecosystem
-rustrade-integration = { path = "./rustrade-integration", version = "0.3.0" }
-rustrade-instrument = { path = "./rustrade-instrument", version = "0.3.0" }
-rustrade-data = { path = "./rustrade-data", version = "0.3.0" }
-rustrade-execution = { path = "./rustrade-execution", version = "0.3.0" }
-rustrade-macro = { path = "./rustrade-macro", version = "0.3.0" }
+rustrade-integration = { path = "./rustrade-integration", version = "0.4.0" }
+rustrade-instrument = { path = "./rustrade-instrument", version = "0.4.0" }
+rustrade-data = { path = "./rustrade-data", version = "0.4.0" }
+rustrade-execution = { path = "./rustrade-execution", version = "0.4.0" }
+rustrade-macro = { path = "./rustrade-macro", version = "0.4.0" }
 
 # Logging
 tracing = { version = "0.1.41" }

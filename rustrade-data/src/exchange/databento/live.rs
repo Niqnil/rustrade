@@ -47,12 +47,16 @@
 //! ```
 
 use super::error::{DatabentoErrorKind, DatabentoResultExt};
-use super::transformer::{dbn_mbp1_to_orderbook_l1, dbn_trade_to_public_trade};
+use super::transformer::{
+    dbn_mbp1_to_orderbook_l1, dbn_ohlcv_to_candle, dbn_trade_to_public_trade,
+    ensure_databento_ohlcv_supports, rtype_to_candle_interval,
+};
 use crate::error::DataError;
 use crate::event::{DataKind, MarketEvent};
+use crate::subscription::candle::CandleInterval;
 use chrono::Utc;
 use databento::LiveClient;
-use databento::dbn::{Mbp1Msg, PitSymbolMap, RecordRef, Schema, TradeMsg};
+use databento::dbn::{Mbp1Msg, OhlcvMsg, PitSymbolMap, RecordRef, Schema, TradeMsg};
 use databento::live::Subscription;
 use futures::Stream;
 use rustrade_instrument::exchange::ExchangeId;
@@ -165,6 +169,16 @@ impl<K> DatabentoLive<K> {
     /// * `symbols` - Symbol identifiers (e.g., `["ESM5", "NQM5"]`)
     /// * `schema` - Data schema to subscribe to (e.g., `Schema::Trades`, `Schema::Mbp1`)
     ///
+    /// # OHLCV note
+    ///
+    /// This is the low-level escape hatch: it subscribes to any `Schema` as-is and
+    /// performs **no** interval validation. Subscribing to an OHLCV schema here
+    /// (e.g. `Schema::Ohlcv1H`/`Schema::Ohlcv1D`) bypasses the `Sec1`/`Min1`
+    /// live-only check in [`subscribe_candles`](Self::subscribe_candles), and any
+    /// resulting bars whose `rtype` maps to a [`CandleInterval`] will be emitted as
+    /// `DataKind::Candle`. Prefer [`subscribe_candles`](Self::subscribe_candles) for
+    /// candles unless you deliberately want that lower-level behaviour.
+    ///
     /// # Errors
     ///
     /// Returns error if subscription request fails.
@@ -182,6 +196,36 @@ impl<K> DatabentoLive<K> {
             .with_context("subscribing to live feed")?;
 
         Ok(())
+    }
+
+    /// Subscribe to OHLCV candles for `symbols` at the given interval.
+    ///
+    /// Validates the interval and maps it to the Databento OHLCV schema before
+    /// subscribing. The resulting stream emits [`DataKind::Candle`] events whose
+    /// interval is derived per-record from each bar's `rtype`, so a single
+    /// connection may safely carry multiple OHLCV intervals.
+    ///
+    /// # Live interval scope
+    ///
+    /// Only `Sec1`/`Min1` are accepted live. Databento's live gateway does not
+    /// reliably stream the larger `Hour1`/`Day1` bars, so those are
+    /// **historical-only** here — use [`DatabentoHistorical::fetch_candles`].
+    /// They are rejected at subscribe time (observable failure) rather than
+    /// yielding a silently empty stream.
+    ///
+    /// [`DatabentoHistorical::fetch_candles`]: super::historical::DatabentoHistorical::fetch_candles
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError::UnsupportedInterval`] for any interval other than
+    /// `Sec1`/`Min1`, or [`DataError::Databento`] if the subscription request fails.
+    pub async fn subscribe_candles(
+        &mut self,
+        symbols: &[&str],
+        interval: CandleInterval,
+    ) -> Result<(), DataError> {
+        let schema = ensure_databento_live_ohlcv_supports(self.exchange, interval)?;
+        self.subscribe(symbols, schema).await
     }
 
     /// Returns a reference to the underlying client for advanced use cases.
@@ -203,8 +247,8 @@ impl<K: Clone + Send + 'static> DatabentoLive<K> {
     ///
     /// # Returns
     ///
-    /// A stream of `MarketEvent<K, DataKind>` where `DataKind` is either `Trade` or
-    /// `OrderBookL1` depending on the subscribed schema.
+    /// A stream of `MarketEvent<K, DataKind>` where `DataKind` is one of `Trade`,
+    /// `OrderBookL1`, or `Candle` depending on the subscribed schema(s).
     ///
     /// Records for symbols not in the `instruments` map are skipped with a warning.
     ///
@@ -348,6 +392,100 @@ fn process_record<K: Clone>(
         }
     }
 
+    // Try OhlcvMsg for candles
+    if let Some(ohlcv) = record.get::<OhlcvMsg>() {
+        // Derive the interval from this record's own rtype: one connection may
+        // interleave multiple OHLCV schemas. `None` => an rtype with no
+        // CandleInterval (ohlcv-eod / ohlcv-deprecated); skip it observably
+        // rather than crashing the stream (a caller can subscribe ohlcv-eod).
+        let interval = match rtype_to_candle_interval(ohlcv.hd.rtype) {
+            Some(interval) => interval,
+            None => {
+                debug!(
+                    rtype = ohlcv.hd.rtype,
+                    "Skipping OHLCV record with no CandleInterval (eod/deprecated)"
+                );
+                return None;
+            }
+        };
+
+        let symbol = symbol_map.get(ohlcv.hd.instrument_id)?;
+
+        let instrument = match instruments.get(symbol) {
+            Some(key) => key.clone(),
+            None => {
+                trace!(%symbol, "Skipping candle for unknown symbol");
+                return None;
+            }
+        };
+
+        // Native OHLCV bars are always final/closed, so every record yields a
+        // candle. Conversion only fails on timestamp/close_time overflow, which
+        // the close_time contract requires be surfaced, never skipped.
+        return Some(
+            dbn_ohlcv_to_candle(ohlcv, interval).map(|(time_exchange, candle)| MarketEvent {
+                time_exchange,
+                time_received: Utc::now(),
+                exchange,
+                instrument,
+                kind: DataKind::Candle(candle),
+            }),
+        );
+    }
+
     // Other record types (InstrumentDefMsg, etc.) are silently skipped
     None
+}
+
+/// Validate and map a candle interval for the **live** feed (`Sec1`/`Min1` only).
+///
+/// First rejects the intervals Databento serves on no OHLCV path (via
+/// [`ensure_databento_ohlcv_supports`]), then additionally rejects `Hour1`/`Day1`:
+/// those are valid Databento schemas but are not reliably emitted by the live
+/// gateway, so they are historical-only here (the G21.1 hedge). Widening this is
+/// an additive change if a live key later confirms the larger bars stream.
+fn ensure_databento_live_ohlcv_supports(
+    exchange: ExchangeId,
+    interval: CandleInterval,
+) -> Result<Schema, DataError> {
+    let schema = ensure_databento_ohlcv_supports(exchange, interval)?;
+    match interval {
+        CandleInterval::Sec1 | CandleInterval::Min1 => Ok(schema),
+        _ => Err(DataError::UnsupportedInterval { exchange, interval }),
+    }
+}
+
+#[cfg(test)]
+// Test code may unwrap freely since panics indicate test failure
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_ohlcv_accepts_only_sec1_and_min1() {
+        let ex = ExchangeId::DatabentoGlbx;
+        assert_eq!(
+            ensure_databento_live_ohlcv_supports(ex, CandleInterval::Sec1).unwrap(),
+            Schema::Ohlcv1S
+        );
+        assert_eq!(
+            ensure_databento_live_ohlcv_supports(ex, CandleInterval::Min1).unwrap(),
+            Schema::Ohlcv1M
+        );
+
+        // 1h/1d are valid Databento schemas but historical-only on the live feed
+        // (G21.1 hedge): rejected observably, not silently subscribed.
+        for interval in [CandleInterval::Hour1, CandleInterval::Day1] {
+            assert!(
+                matches!(
+                    ensure_databento_live_ohlcv_supports(ex, interval),
+                    Err(DataError::UnsupportedInterval { interval: i, .. }) if i == interval
+                ),
+                "expected {interval} to be rejected live"
+            );
+        }
+
+        // A non-native interval is rejected too.
+        assert!(ensure_databento_live_ohlcv_supports(ex, CandleInterval::Min5).is_err());
+    }
 }

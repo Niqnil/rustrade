@@ -7,6 +7,154 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-13
+
+### Added
+
+- **`impl Borrow<str> for SubscriptionId`** (`rustrade-integration`). An instrument map keyed on
+  `SubscriptionId` can now be queried with a borrowed `&str` key without allocating an owned
+  `SubscriptionId` per lookup.
+- **Named config constructors and env loading for Alpaca and Binance Spot**
+  (`rustrade-execution`, `alpaca` / `binance` features). Added `AlpacaConfig::from_env()` and
+  `BinanceSpotConfig::from_env()` plus typed config errors (`AlpacaConfigError`,
+  `BinanceSpotConfigError`) for missing credentials and invalid boolean env values.
+- **`from_env()` now distinguishes non-UTF-8 credential vars from absent ones**
+  (`rustrade-execution`, `alpaca` / `binance` / `hyperliquid` features). New error variants —
+  `AlpacaConfigError::{InvalidApiKey, InvalidSecretKey}`,
+  `BinanceSpotConfigError::{InvalidApiKey, InvalidSecretKey}`, and
+  `HyperliquidConfigError::{InvalidPrivateKeyVar, InvalidTestnet}` — flag a non-UTF-8 environment
+  variable explicitly instead of collapsing it into "not set". The non-UTF-8 **credential** variants
+  carry no payload, so corrupt secret/key bytes are never echoed into an error message or log; the
+  non-secret network-toggle variants (`InvalidPaper` / `InvalidTestnet`) instead echo the offending
+  value (lossily for non-UTF-8) so "must be true or false, got …" stays actionable. Rustdoc added to
+  every
+  `new`/`paper`/`testnet`/`production`/`from_env` constructor spelling out caller obligations
+  (`production`/mainnet = real funds; `from_env` returns `Err`, never panics).
+- **Caller-selectable `BalanceBasis` for asset statistics** (`rustrade`). Asset drawdown and the
+  end-of-session balance row can now be computed from either gross holdings (`Balance::total`, the
+  default) or net asset value (`Balance::net_asset()`, i.e. `total - borrowed`). Select it once via
+  the new `EngineStateBuilder::balance_basis(BalanceBasis)` builder method (mirrors `oms_mode`); the
+  basis flows to every asset's tear-sheet generator and is reported on the `TradingSummary` (its
+  asset-table "Balance" row labels itself "Balance (gross)" / "Balance (net asset)"). **Default is
+  `Gross`, so existing and cash-only users see no change.** `NetAsset` is only well-defined while net
+  asset stays strictly positive — a zero or negative net peak makes the drawdown ratio undefined and
+  the sample is silently dropped; see the `BalanceBasis::NetAsset` docs for this precondition and the
+  snapshot-freshness caveat.
+- **In-band stream-termination signal** (`rustrade-execution`). New
+  `AccountEventKind::StreamTerminated(StreamTerminationReason)` variant delivers *why* an account
+  event stream ended — `ReconnectBudgetExhausted { attempts, last_error }` (venues with
+  library-managed reconnection) or `Error(String)` (unrecoverable, no retry) — on the existing
+  account feed, so stream death is a programmatic signal rather than something inferred from channel
+  EOF or read from logs. The engine surfaces it via `warn!` instead of dropping it. The
+  `#[non_exhaustive]` `StreamTerminationReason` carries only terminations the library can deliver
+  in-band (a consumer-initiated drop is excluded — the channel is already closed by the time it is
+  observed, so the signal would be undeliverable). This change adds the type plumbing; emitting the
+  variant at each venue's terminal stream site is a follow-up.
+- **`StreamTerminated` is now emitted at every venue's terminal stream death** (`rustrade-execution`).
+  Each integration client emits the variant in-band on the account feed when its event stream truly
+  dies: `ReconnectBudgetExhausted { attempts, last_error }` after a venue's library-managed
+  reconnection gives up (Binance spot/margin, Alpaca), and `Error(String)` for unrecoverable closes
+  with no retry (IBKR, Hyperliquid perp/spot, Mock). A consumer-initiated drop emits nothing — the
+  channel is already closed by the time it is observed. All venues funnel through one feature-agnostic
+  `emit_stream_terminated` helper, so silent-EOF is now a programmatic signal at every venue. Closes #123.
+- **Databento OHLCV candles** (`rustrade-data`). The Databento integration now produces normalised
+  `Candle`s from Databento's native OHLCV schemas, both historical and live, alongside its existing
+  trades + L1. Historical: `DatabentoHistorical::fetch_candles` / `fetch_candles_stream` take a typed
+  `DatabentoOhlcvParams { dataset, symbols, time_range, interval }` (chrono types only — no
+  `databento`/`time` types or caller-supplied `Schema`); the DBN schema is derived internally from
+  the interval so the interval/schema pair cannot diverge. Live: `DatabentoLive::subscribe_candles`
+  streams `DataKind::Candle` events, deriving each bar's interval from its own record `rtype` so one
+  connection may carry multiple OHLCV intervals. Bars are stamped at the **open** instant and
+  normalised to the shared `close_time = open + interval` contract via `close_time_from_open`.
+  Databento's native intervals are `1s`/`1m`/`1h`/`1d`; the other 12 `CandleInterval` variants are
+  rejected with `DataError::UnsupportedInterval`. Live is scoped to `1s`/`1m` (the larger bars are
+  historical-only, as Databento's live gateway does not reliably stream them); `ohlcv-eod` and the
+  deprecated OHLCV rtype are out of scope and skipped observably. `OhlcvMsg` carries no trade count,
+  so `Candle::trade_count` is reported as `0` rather than fabricated. Enables Databento's `chrono`
+  feature.
+- **CI: non-blocking early-warning build against latest dependencies.** A new weekly
+  scheduled workflow resolves the newest semver-compatible versions of every dependency
+  (ignoring the committed `Cargo.lock`) and runs `cargo check --workspace --all-targets
+  --all-features`, giving early warning when an upstream release breaks the build. It never
+  gates PRs; on failure it opens — and on recovery closes — a single deduped tracking issue.
+  Complements the committed-lockfile/`--locked` CI by exercising the versions downstream
+  consumers actually resolve, which `--locked` no longer does.
+
+### Changed
+
+- **`Cargo.lock` is now committed and CI builds run `--locked`.** Previously the lockfile was
+  gitignored, so CI resolved fresh transitive dependencies on every run and a bad upstream release
+  could turn CI red with no change on our side (e.g. `time 0.3.48`'s coherence-breaking `From` impl,
+  [time-rs/time#783](https://github.com/time-rs/time/issues/783)). Committing the lockfile makes CI
+  reproducible; consumers are unaffected since `Cargo.lock` does not propagate to downstream crates.
+- **Breaking (`rustrade-data`):** Binance kline routing keys are now baked at deserialize.
+  `BinanceKline` and `BinanceContinuousKline` replace their public `symbol` / `pair` string fields
+  with a single `subscription_id: SubscriptionId` (the instrument-map key `{channel}|{MARKET}`),
+  built once via the same `ExchangeSub::id` used at subscribe time. This makes the subscribe-time
+  and frame-time keys a single source of truth that cannot drift and silently misroute. `Serialize`
+  is no longer derived on the Binance decode-only wire types `BinanceKline`, `BinanceContinuousKline`,
+  `BinanceKlineData`, `BinanceTrade`, `BinanceOrderBookL1`, `BinanceSpotOrderBookL2Update`, and
+  `BinanceFuturesOrderBookL2Update`: their custom field deserialization (`deserialize_with`) meant the
+  derived `Serialize` output never round-tripped, and nothing serializes these types.
+- **Breaking (`rustrade-execution`, `alpaca` / `binance` features):** `AlpacaConfig::new` and
+  `BinanceSpotConfig::new` now take credentials only. Optional live-vs-safety knobs moved to named
+  constructors: `AlpacaConfig::paper` / `AlpacaConfig::production` and
+  `BinanceSpotConfig::testnet` / `BinanceSpotConfig::production`. The credentials-only constructors
+  default to paper trading for Alpaca and testnet for Binance Spot.
+- **Breaking (`rustrade-execution`, `hyperliquid` feature):** `HyperliquidConfig::from_env()` now
+  defaults to the **safe testnet** environment when `HYPERLIQUID_TESTNET` is absent (previously
+  defaulted to **mainnet**, the dangerous foot-gun), matching Alpaca/Binance Spot. The `"1"`
+  truthy special-case is dropped — `HYPERLIQUID_TESTNET` is now `true`/`false`-only across every
+  venue. An invalid or non-UTF-8 toggle is a hard `HyperliquidConfigError::InvalidTestnet(String)`
+  rather than a silent `false` (mainnet). `HyperliquidConfigFile`'s `testnet` field likewise now
+  defaults to `true` (safe testnet) when absent from a config file. Set `HYPERLIQUID_TESTNET=false`
+  to opt into mainnet (real funds).
+- **Breaking (`rustrade-execution`, `hyperliquid` feature):** the config error type is renamed
+  `ConfigError` → `HyperliquidConfigError` and re-exported as `client::hyperliquid::HyperliquidConfigError`,
+  matching the venue-scoped naming of `AlpacaConfigError` / `BinanceSpotConfigError`.
+- **Breaking (`rustrade`):** the `BalanceBasis` work changes two signatures. `generate_empty_indexed_asset_states`
+  gains a `basis: BalanceBasis` parameter (the `EngineStateBuilder` is the intended construction path
+  and threads it for you). The `TradingSummary` output struct gains a `basis` field
+  (`#[serde(default)]`, so summaries serialised before this change still deserialize as `Gross`);
+  the `TearSheetAssetGenerator` likewise gains a `#[serde(default)] basis` field. No behavior change
+  under the default `Gross` basis.
+- **Dynamic-streams `SubKind` rejection is now exhaustive** (`rustrade-data`, internal). The
+  `Channels::try_from` match that allocates per-`SubKind` channels no longer uses a catch-all
+  wildcard for unsupported kinds; it lists the rejected kinds explicitly, so a future `SubKind`
+  variant is a compile error here rather than a silent runtime fall-through. Unsupported dynamic
+  subscriptions now return `DataError::Unsupported { exchange, sub_kind }` (matching the sibling
+  stream-init path), so the error names the exchange as well as the kind. No behavior change for
+  supported kinds.
+- **IBKR historical tick fetches now warn on suspiciously short reads** (`rustrade-data`, `ibkr`
+  feature). `fetch_historical_ticks` / `fetch_historical_bid_ask` emit a `warn!` when fewer ticks
+  are returned than requested — a best-effort flag for possible silent truncation. A short read can
+  also be a legitimate end-of-data, so treat it as a prompt to investigate, not a precise error
+  signal.
+- **Breaking (`rustrade-execution`):** removed the `AccountEventKind::StreamError(String)` variant.
+  It was non-terminal (the stream continued after it), already `error!`-logged at each emit site,
+  and dropped unprocessed by the engine — no consumer reacted to it. It is superseded by the
+  terminal, structured `StreamTerminated`. Transient venue errors now remain in logs only.
+- **IBKR contract config now rejects incomplete/unsupported configs instead of silently
+  fabricating a wrong contract** (`rustrade-execution`, `ibkr` feature). `ContractConfig::to_contract`
+  previously filled missing fields with silent defaults that produced a *different* contract than
+  intended; each is now a hard error (the startup registration loop already warns-and-skips on a bad
+  config, so a rejected contract is logged and omitted rather than mis-registered):
+  - a missing option `right` on an `OPT` contract no longer defaults to **Call** (`"C"`);
+  - a missing `strike` on an `OPT` no longer defaults to `0.0`;
+  - a missing `last_trade_date` on a `FUT`/`OPT` no longer defaults to `""`;
+  - an unrecognized `security_type` no longer silently falls back to a **stock** (`STK`).
+- **Breaking (`rustrade-execution`, `ibkr` feature):** the `contract::InvalidOptionRight` error type
+  is replaced by a `#[non_exhaustive]` `contract::ContractConfigError` enum
+  (`MissingOptionRight` / `UnrecognizedOptionRight { right }` / `MissingStrike` /
+  `MissingLastTradeDate` / `UnrecognizedSecurityType { security_type }`). `option_contract` now
+  returns `Result<Contract, ContractConfigError>`.
+- **BinanceSpot user-data WS deserialization is now single-pass** (`rustrade-execution`, `binance`
+  feature, internal). The per-frame account-stream path no longer builds a full `serde_json::Value`
+  DOM and re-parses the matched variant out of it; it reads the `e` discriminator from a borrowed
+  view of the frame, then deserializes only the matched event type from the same slice (mirroring
+  the BinanceMargin path). No behavior or API change — variant coverage and the harmless
+  fall-through for unhandled/unknown event types are preserved.
+
 ## [0.3.0] - 2026-06-09
 
 ### Added

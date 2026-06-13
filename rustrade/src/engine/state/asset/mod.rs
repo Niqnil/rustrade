@@ -1,6 +1,7 @@
 use crate::{
-    Timed, engine::state::asset::filter::AssetFilter,
-    statistic::summary::asset::TearSheetAssetGenerator,
+    Timed,
+    engine::state::asset::filter::AssetFilter,
+    statistic::summary::asset::{BalanceBasis, TearSheetAssetGenerator},
 };
 use chrono::Utc;
 use derive_more::Constructor;
@@ -227,8 +228,14 @@ impl From<&AssetState> for AssetBalance<AssetNameExchange> {
 
 /// Generates an indexed [`AssetStates`] containing default asset balance data.
 ///
+/// Each asset's [`TearSheetAssetGenerator`] is seeded with `basis`, the session-wide
+/// [`BalanceBasis`] policy (gross vs net-asset) selected once at engine-state construction.
+///
 /// Note that the `time_exchange` is set to `DateTime::<Utc>::MIN_UTC`
-pub fn generate_empty_indexed_asset_states(instruments: &IndexedInstruments) -> AssetStates {
+pub fn generate_empty_indexed_asset_states(
+    instruments: &IndexedInstruments,
+    basis: BalanceBasis,
+) -> AssetStates {
     AssetStates(
         instruments
             .assets()
@@ -241,7 +248,10 @@ pub fn generate_empty_indexed_asset_states(instruments: &IndexedInstruments) -> 
                     ),
                     AssetState::new(
                         asset.value.asset.clone(),
-                        TearSheetAssetGenerator::default(),
+                        TearSheetAssetGenerator {
+                            basis,
+                            ..Default::default()
+                        },
                         None,
                     ),
                 )

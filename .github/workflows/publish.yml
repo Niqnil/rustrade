@@ -32,10 +32,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run cargo clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious -D clippy::style -W clippy::complexity -D clippy::perf
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious -D clippy::style -W clippy::complexity -D clippy::perf
 
       - name: Run cargo test
-        run: cargo test --workspace --all-features --lib --bins --tests
+        run: cargo test --locked --workspace --all-features --lib --bins --tests
 
   publish:
     name: Publish crates

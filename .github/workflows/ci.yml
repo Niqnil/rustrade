@@ -55,7 +55,7 @@ jobs:
           shared-key: "rustrade-ci-check"
 
       - name: Run cargo check
-        run: cargo check --workspace --all-targets --all-features
+        run: cargo check --locked --workspace --all-targets --all-features
 
   test:
     name: cargo test
@@ -80,7 +80,7 @@ jobs:
 
       - name: Run cargo test
         # Exclude examples to avoid mold linker hitting .debug_str section size limits
-        run: cargo test --workspace --all-features --lib --bins --tests
+        run: cargo test --locked --workspace --all-features --lib --bins --tests
 
   clippy:
     name: cargo clippy
@@ -106,7 +106,7 @@ jobs:
           shared-key: "rustrade-ci-check"
 
       - name: Run cargo clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious -D clippy::style -W clippy::complexity -D clippy::perf
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious -D clippy::style -W clippy::complexity -D clippy::perf
 
   audit:
     name: cargo audit

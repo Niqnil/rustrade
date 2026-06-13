@@ -280,8 +280,12 @@ impl IbkrHistoricalData {
     /// - A mid-stream IB API error ends iteration silently: ibapi 3.0.1's
     ///   `TickSubscription` stores the error internally but exposes no public
     ///   accessor, so a shorter-than-requested result may indicate truncation
-    ///   rather than genuine end-of-data. Callers needing completeness
-    ///   guarantees should validate the returned count against expectations.
+    ///   rather than genuine end-of-data. As a best-effort mitigation, this
+    ///   method emits a `warn!` when the number of raw ticks received is less
+    ///   than `request.number_of_ticks`. Because a short batch is also a normal
+    ///   end-of-data signal, treat the warning as a flag for investigation (or a
+    ///   prompt to paginate), **not** as proof of an error. Callers needing
+    ///   completeness guarantees should still validate the returned count.
     pub async fn fetch_historical_ticks(
         &self,
         request: HistoricalTickRequest,
@@ -328,12 +332,22 @@ impl IbkrHistoricalData {
                 Vec::with_capacity(usize::try_from(request.number_of_ticks).unwrap_or(0));
             // `TickSubscription` yields `T` directly and stops silently on a
             // mid-stream error (no public error accessor in ibapi 3.0.1), so a
-            // short result may be truncation rather than end-of-data.
+            // short result may be truncation rather than end-of-data. We count
+            // every *raw* tick received (not `trades.len()`, which also drops
+            // non-finite ticks) so the completeness check below reflects wire
+            // truncation, not data-quality filtering.
+            let mut received = 0usize;
             for (seq, tick) in subscription.into_iter().enumerate() {
+                received += 1;
                 if let Some(trade) = tick_last_to_public_trade(&tick, seq) {
                     trades.push(trade);
                 }
             }
+            warn_if_short_tick_fetch(
+                request.contract.symbol.0.as_str(),
+                received,
+                request.number_of_ticks,
+            );
 
             Ok::<_, DataError>(trades)
         })
@@ -376,8 +390,12 @@ impl IbkrHistoricalData {
     /// - A mid-stream IB API error ends iteration silently: ibapi 3.0.1's
     ///   `TickSubscription` stores the error internally but exposes no public
     ///   accessor, so a shorter-than-requested result may indicate truncation
-    ///   rather than genuine end-of-data. Callers needing completeness
-    ///   guarantees should validate the returned count against expectations.
+    ///   rather than genuine end-of-data. As a best-effort mitigation, this
+    ///   method emits a `warn!` when the number of raw ticks received is less
+    ///   than `request.number_of_ticks`. Because a short batch is also a normal
+    ///   end-of-data signal, treat the warning as a flag for investigation (or a
+    ///   prompt to paginate), **not** as proof of an error. Callers needing
+    ///   completeness guarantees should still validate the returned count.
     pub async fn fetch_historical_bid_ask(
         &self,
         request: HistoricalTickRequest,
@@ -430,12 +448,22 @@ impl IbkrHistoricalData {
                 Vec::with_capacity(usize::try_from(request.number_of_ticks).unwrap_or(0));
             // `TickSubscription` yields `T` directly and stops silently on a
             // mid-stream error (no public error accessor in ibapi 3.0.1), so a
-            // short result may be truncation rather than end-of-data.
+            // short result may be truncation rather than end-of-data. We count
+            // every *raw* tick received (not `quotes.len()`, which also drops
+            // non-finite ticks) so the completeness check below reflects wire
+            // truncation, not data-quality filtering.
+            let mut received = 0usize;
             for tick in subscription {
+                received += 1;
                 if let Some(l1) = tick_bid_ask_to_order_book_l1(&tick) {
                     quotes.push(l1);
                 }
             }
+            warn_if_short_tick_fetch(
+                request.contract.symbol.0.as_str(),
+                received,
+                request.number_of_ticks,
+            );
 
             Ok::<_, DataError>(quotes)
         })
@@ -809,6 +837,37 @@ impl HistoricalTickRequest {
             number_of_ticks: count.min(1000),
             regular_trading_hours_only: true,
         }
+    }
+}
+
+/// Warn when a historical tick fetch returned fewer raw ticks than requested.
+///
+/// ibapi 3.0.1's `TickSubscription` stops iterating silently on a mid-stream
+/// error — the error is stored in a private `Mutex` with no public accessor, so
+/// a short read is indistinguishable, through the public API, from a genuine
+/// end-of-data within the requested range.
+///
+/// This is therefore a **best-effort, flag-for-investigation** signal, **not** a
+/// precise error indicator: it fires on every legitimately short batch (e.g. the
+/// available history ends before `requested` ticks) as well as on truncation.
+/// Callers needing completeness guarantees should treat it as a prompt to retry
+/// or paginate, not as proof of an error.
+///
+/// `received` is the count of *raw* ticks pulled from the subscription, before
+/// non-finite-price filtering — so this reflects wire truncation rather than
+/// data-quality drops (which are warned per-tick elsewhere).
+fn warn_if_short_tick_fetch(symbol: &str, received: usize, requested: i32) {
+    let requested = usize::try_from(requested).unwrap_or(0);
+    if received < requested {
+        warn!(
+            symbol = %symbol,
+            received,
+            requested,
+            "Historical tick fetch returned fewer ticks than requested; this may be \
+             a legitimate end-of-data or a silent mid-stream IB error (ibapi 3.0.1 \
+             exposes no error accessor on TickSubscription). Investigate or paginate \
+             if completeness is required."
+        );
     }
 }
 
@@ -1303,5 +1362,34 @@ mod tests {
 
         assert_eq!(dt.timestamp(), 1700000000);
         assert_eq!(dt.timestamp_subsec_nanos(), 123_456_789);
+    }
+
+    // ========================================================================
+    // Short-fetch completeness mitigation (#122)
+    // ========================================================================
+    //
+    // `warn_if_short_tick_fetch` has no return value to assert on — it only
+    // emits a `tracing` warning. These tests exercise the threshold/conversion
+    // logic for panic-freedom and document the intended boundary (fires on
+    // `received < requested`, silent on `>=`, and the negative-`i32` guard).
+
+    #[test]
+    fn warn_if_short_tick_fetch_threshold_is_panic_free() {
+        // received < requested → would warn
+        warn_if_short_tick_fetch("AAPL", 500, 1000);
+        // received == requested → silent
+        warn_if_short_tick_fetch("AAPL", 1000, 1000);
+        // received > requested (defensive; IB caps at requested) → silent
+        warn_if_short_tick_fetch("AAPL", 1001, 1000);
+        // zero requested → silent (0 < 0 is false)
+        warn_if_short_tick_fetch("AAPL", 0, 0);
+    }
+
+    #[test]
+    fn warn_if_short_tick_fetch_clamps_negative_requested_to_zero() {
+        // A negative `number_of_ticks` must not panic on the i32→usize cast;
+        // it clamps to 0, so any non-negative `received` is treated as complete.
+        warn_if_short_tick_fetch("AAPL", 0, -1);
+        warn_if_short_tick_fetch("AAPL", 5, i32::MIN);
     }
 }

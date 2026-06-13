@@ -316,6 +316,51 @@ impl<AssetKey, InstrumentKey> OrderError<AssetKey, InstrumentKey> {
     }
 }
 
+/// Why an account event stream ended.
+///
+/// Delivered in-band as the payload of
+/// [`AccountEventKind::StreamTerminated`](crate::AccountEventKind::StreamTerminated) so that
+/// stream death is a programmatic signal on the account feed rather than a log-only event. A
+/// consumer can react (re-sync via REST, re-establish the stream, halt trading) according to its
+/// own policy — the library reports *why* the stream ended without prescribing the response.
+///
+/// # Only in-band-deliverable terminations are represented
+///
+/// Every variant here is a termination the library can actually deliver to a consumer that is
+/// still listening. A consumer-initiated drop is deliberately **not** a variant: by the time a
+/// stream task observes the drop, the receiving half of the channel is already gone, so a
+/// `StreamTerminated` send would be a guaranteed no-op. `StreamTerminated` therefore always means
+/// "the stream died while you were still listening".
+///
+/// `#[non_exhaustive]` so venues may distinguish further termination causes in future without a
+/// breaking change (e.g. a venue able to signal a graceful shutdown over a still-open channel).
+#[non_exhaustive]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]
+pub enum StreamTerminationReason {
+    /// A venue with built-in reconnection exhausted its retry budget and gave up.
+    ///
+    /// Emitted by venues that reconnect internally (e.g. Binance spot/margin, Alpaca) once the
+    /// final attempt fails. `last_error` is the most recent underlying failure; `attempts` is the
+    /// number of reconnects tried before surrendering. The stream will not recover on its own —
+    /// the consumer must re-establish it.
+    #[error("reconnect budget exhausted after {attempts} attempts: {last_error}")]
+    ReconnectBudgetExhausted {
+        /// Number of reconnect attempts made before giving up.
+        attempts: u32,
+        /// The most recent underlying error that triggered surrender.
+        last_error: String,
+    },
+
+    /// The stream ended on an unrecoverable error with no automatic recovery.
+    ///
+    /// Emitted by venues without library-managed reconnection — e.g. IBKR (the underlying
+    /// subscription errored and the client does not retry), Hyperliquid (the SDK's internal
+    /// reconnection gave up and closed the channel), or the mock exchange (its broadcast stream
+    /// lagged past the buffer). The consumer is responsible for any re-establishment.
+    #[error("unrecoverable stream error: {0}")]
+    Error(String),
+}
+
 /// Represents errors related to exchange, asset and instrument identifier key lookups.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]
 pub enum KeyError {

@@ -41,6 +41,6 @@ Integration library for streaming public market data from exchanges and data pro
 | Provider | Constructor | InstrumentKinds | SubscriptionKinds |
 |:--------:|:-----------:|:---------------:|:-----------------:|
 | **Massive** | `MassiveRestClient` / `MassiveLive` | Spot, Future, Option | PublicTrades, Quotes, Candles |
-| **Databento** | `DatabentoHistorical` / `DatabentoLive` | Spot, Future, Option | PublicTrades, Quotes |
+| **Databento** | `DatabentoHistorical` / `DatabentoLive` | Spot, Future, Option | PublicTrades, Quotes, Candles |
 
 See the [workspace README](../README.md) for documentation, examples, and contributing guidelines.

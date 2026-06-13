@@ -212,7 +212,7 @@ pub(crate) fn dedup_key_from_event(event: &UnindexedAccountEvent) -> Option<Dedu
             }),
             Err(_) => None, // error responses don't need dedup
         },
-        _ => None, // BalanceSnapshot, BalanceStreamUpdate, Snapshot, StreamError — no dedup needed
+        _ => None, // BalanceSnapshot, BalanceStreamUpdate, InstrumentBalanceUpdate, Snapshot, StreamTerminated — no dedup needed
     }
 }
 
@@ -380,6 +380,15 @@ impl ExponentialBackoff {
 
     pub(crate) fn reset(&mut self) {
         self.attempt = 0;
+    }
+
+    /// Number of reconnect attempts consumed so far.
+    ///
+    /// After [`wait`](Self::wait) has returned `false` this equals `max_attempts` — i.e. the
+    /// number of attempts made before the budget was exhausted. Used to populate
+    /// [`crate::error::StreamTerminationReason::ReconnectBudgetExhausted`].
+    pub(crate) fn attempts(&self) -> u32 {
+        self.attempt
     }
 
     /// Wait for the current backoff duration. Returns `false` if max attempts exhausted.

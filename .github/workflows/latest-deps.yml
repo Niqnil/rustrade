@@ -1,0 +1,119 @@
+name: "Latest Deps (early warning)"
+
+# Non-blocking early-warning build against the newest semver-compatible dependency
+# versions, ignoring the committed Cargo.lock. CI's normal jobs build `--locked` for
+# reproducibility, which means they stop exercising the versions our consumers actually
+# resolve — so an upstream release that breaks our build stays invisible until a routine
+# `cargo update`. This job closes that gap for the cases Dependabot does not cover
+# proactively (transitive-only deps, and the whole graph floated simultaneously).
+#
+# It never gates PRs: it runs only on a schedule and on manual dispatch, and reports a
+# failure by opening (or updating) a single deduped `upstream-drift` tracking issue,
+# which it closes again once the build goes green. A scheduled run's only built-in signal
+# is an easily-missed email to the workflow's last editor; the issue is the durable,
+# team-visible trigger.
+#
+# Scope: tests the newest *semver-compatible* versions (what `cargo build` gives a
+# consumer). Breakage that requires a major-version bump is out of scope.
+
+on:
+  schedule:
+    # Monday 06:00 UTC — weekly, ahead of the weekly Dependabot run.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+# Least privilege: the build needs only read; the notify steps open/close issues.
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: latest-deps
+  cancel-in-progress: true
+
+env:
+  MOLD_VERSION: "2.35.1"
+
+jobs:
+  latest-deps:
+    name: cargo check (latest deps)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install mold linker
+        uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444  # v1
+        with:
+          mold-version: ${{ env.MOLD_VERSION }}
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+
+      # Distinct cache key: this job mutates Cargo.lock, so it must not share the
+      # `--locked` jobs' caches.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          shared-key: "rustrade-latest-deps"
+
+      - name: Update to newest semver-compatible dependencies
+        id: update
+        run: cargo update
+
+      - name: Check against latest dependencies
+        id: check
+        run: cargo check --workspace --all-targets --all-features
+
+      # Open/update one deduped tracking issue, but ONLY for a dependency-resolution or
+      # compile failure — both genuine upstream drift. Gating on these two steps' outcomes
+      # (rather than a bare `failure()`) keeps transient infra failures — checkout, mold,
+      # toolchain, cache — from misfiring a false "upstream drift" issue.
+      - name: Report upstream drift
+        if: steps.update.outcome == 'failure' || steps.check.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          set -euo pipefail
+          title="Upstream dependency drift broke the latest-deps build"
+          body=$(cat <<EOF
+          The scheduled **latest-deps** build (newest semver-compatible dependencies, ignoring \`Cargo.lock\`) failed. An upstream release has likely broken our build.
+
+          - Failing run: ${RUN_URL}
+
+          This is an *early warning*, not a regression in our own code, and it does **not** block any PR. To investigate locally:
+
+          \`\`\`
+          cargo update
+          cargo check --workspace --all-targets --all-features
+          \`\`\`
+
+          Identify the offending crate, then pin or bump as appropriate. This issue is updated on each failing run and auto-closed once the build is green again.
+          EOF
+          )
+          # Idempotent label (create-or-update); issue creation requires it to exist.
+          gh label create upstream-drift \
+            --color B60205 \
+            --description "Latest-deps build broke due to an upstream release" \
+            --force
+          # Dedupe: comment on the existing open issue, else open a new one.
+          existing=$(gh issue list --label upstream-drift --state open --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --label upstream-drift --body "$body"
+          fi
+
+      # On success, close any open drift issue so the loop self-resolves.
+      - name: Resolve upstream drift
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          set -euo pipefail
+          for n in $(gh issue list --label upstream-drift --state open --json number --jq '.[].number'); do
+            gh issue comment "$n" --body "Latest-deps build is green again (run: ${RUN_URL}). Closing."
+            gh issue close "$n"
+          done

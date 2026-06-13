@@ -46,7 +46,11 @@ use crate::{
     IsolatedInstrumentState, IsolatedMarginRisk, UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate},
     client::ExecutionClient,
-    error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
+    emit_stream_terminated,
+    error::{
+        ApiError, ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
+        UnindexedOrderError,
+    },
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, OrderId, StrategyId},
@@ -1545,6 +1549,13 @@ fn convert_margin_user_data_events_with(
     };
     let subscription_id = envelope.subscription_id;
     let event_raw = event.get();
+    // INTENTIONAL two-pass discriminator (do NOT "optimize" away): this cheap pass reads only the
+    // `e` tag (Binance places it in the ~30B prefix) so the expensive typed deserialization below
+    // runs once, on the matched branch only. The two passes touch the same borrowed slice — no DOM,
+    // no extra allocation — and the prefix scan is ~5 orders of magnitude cheaper than the 1–50ms
+    // network round-trip per frame. The tempting single-pass alternatives are both worse: a manual
+    // byte-scan for `"e"` is fragile (whitespace/escaping/key-order), and mirror structs that parse
+    // tag + payload together drift against the SDK types. Keep the typed two-pass.
     let event_type = serde_json::from_str::<EventTag<'_>>(event_raw)
         .ok()
         .and_then(|tag| tag.e)
@@ -2295,6 +2306,14 @@ async fn margin_connection_manager(
                     error!(%e, "BinanceMargin userListenToken acquisition failed");
                     if !backoff.wait().await {
                         error!("BinanceMargin max reconnect attempts exhausted");
+                        emit_stream_terminated(
+                            &tx,
+                            ExchangeId::BinanceMargin,
+                            StreamTerminationReason::ReconnectBudgetExhausted {
+                                attempts: backoff.attempts(),
+                                last_error: e.to_string(),
+                            },
+                        );
                         break;
                     }
                     continue;
@@ -2311,6 +2330,14 @@ async fn margin_connection_manager(
                     error!(%e, "BinanceMargin WS connect failed");
                     if !backoff.wait().await {
                         error!("BinanceMargin max reconnect attempts exhausted");
+                        emit_stream_terminated(
+                            &tx,
+                            ExchangeId::BinanceMargin,
+                            StreamTerminationReason::ReconnectBudgetExhausted {
+                                attempts: backoff.attempts(),
+                                last_error: e.to_string(),
+                            },
+                        );
                         break;
                     }
                     continue;
@@ -2343,6 +2370,14 @@ async fn margin_connection_manager(
             // token left consumed → next iteration acquires a fresh one (auth/expiry-safe).
             if !backoff.wait().await {
                 error!("BinanceMargin max reconnect attempts exhausted");
+                emit_stream_terminated(
+                    &tx,
+                    ExchangeId::BinanceMargin,
+                    StreamTerminationReason::ReconnectBudgetExhausted {
+                        attempts: backoff.attempts(),
+                        last_error: e.to_string(),
+                    },
+                );
                 break;
             }
             continue;
@@ -2437,6 +2472,7 @@ async fn margin_connection_manager(
         }
 
         if !should_reconnect || tx.is_closed() {
+            // Consumer dropped the receiver — no StreamTerminated emit (channel already closed).
             debug!("BinanceMargin connection manager exiting");
             break;
         }
@@ -2445,6 +2481,22 @@ async fn margin_connection_manager(
         // `current_token` and `current_ws` are already None, forcing a fresh token + connection.
         if !matches!(reason, DisconnectReason::TokenRefresh) && !backoff.wait().await {
             error!("BinanceMargin max reconnect attempts exhausted, stream terminating");
+            // reason here is Signal or HeartbeatTimeout (TokenRefresh is guarded above,
+            // ConsumerDropped already broke out earlier).
+            let last_error = match reason {
+                DisconnectReason::HeartbeatTimeout => {
+                    format!("heartbeat timeout ({HEARTBEAT_TIMEOUT_SECS}s)")
+                }
+                _ => "WebSocket disconnected (server close/error)".to_string(),
+            };
+            emit_stream_terminated(
+                &tx,
+                ExchangeId::BinanceMargin,
+                StreamTerminationReason::ReconnectBudgetExhausted {
+                    attempts: backoff.attempts(),
+                    last_error,
+                },
+            );
             break;
         }
     }
@@ -2687,6 +2739,14 @@ async fn isolated_connection_manager(
                         error!(%e, "BinanceMargin isolated userListenToken acquisition failed");
                         if !backoff.wait().await {
                             error!("BinanceMargin isolated max reconnect attempts exhausted");
+                            emit_stream_terminated(
+                                &tx,
+                                ExchangeId::BinanceMargin,
+                                StreamTerminationReason::ReconnectBudgetExhausted {
+                                    attempts: backoff.attempts(),
+                                    last_error: e.to_string(),
+                                },
+                            );
                             break;
                         }
                         continue;
@@ -2700,6 +2760,14 @@ async fn isolated_connection_manager(
                         error!(%e, "BinanceMargin isolated connect/subscribe failed");
                         if !backoff.wait().await {
                             error!("BinanceMargin isolated max reconnect attempts exhausted");
+                            emit_stream_terminated(
+                                &tx,
+                                ExchangeId::BinanceMargin,
+                                StreamTerminationReason::ReconnectBudgetExhausted {
+                                    attempts: backoff.attempts(),
+                                    last_error: e.to_string(),
+                                },
+                            );
                             break;
                         }
                         continue;
@@ -2793,6 +2861,7 @@ async fn isolated_connection_manager(
         }
 
         if !should_reconnect || tx.is_closed() {
+            // Consumer dropped the receiver — no StreamTerminated emit (channel already closed).
             debug!("BinanceMargin isolated connection manager exiting");
             break;
         }
@@ -2801,6 +2870,22 @@ async fn isolated_connection_manager(
         // is already None, forcing fresh tokens + a fresh connection next iteration.
         if !matches!(reason, DisconnectReason::TokenRefresh) && !backoff.wait().await {
             error!("BinanceMargin isolated max reconnect attempts exhausted, stream terminating");
+            // reason here is Signal or HeartbeatTimeout (TokenRefresh guarded above,
+            // ConsumerDropped already broke out earlier).
+            let last_error = match reason {
+                DisconnectReason::HeartbeatTimeout => {
+                    format!("heartbeat timeout ({HEARTBEAT_TIMEOUT_SECS}s)")
+                }
+                _ => "WebSocket disconnected (server close/error)".to_string(),
+            };
+            emit_stream_terminated(
+                &tx,
+                ExchangeId::BinanceMargin,
+                StreamTerminationReason::ReconnectBudgetExhausted {
+                    attempts: backoff.attempts(),
+                    last_error,
+                },
+            );
             break;
         }
     }
