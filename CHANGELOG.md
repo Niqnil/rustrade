@@ -70,6 +70,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deprecated OHLCV rtype are out of scope and skipped observably. `OhlcvMsg` carries no trade count,
   so `Candle::trade_count` is reported as `0` rather than fabricated. Enables Databento's `chrono`
   feature.
+- **CI: non-blocking early-warning build against latest dependencies.** A new weekly
+  scheduled workflow resolves the newest semver-compatible versions of every dependency
+  (ignoring the committed `Cargo.lock`) and runs `cargo check --workspace --all-targets
+  --all-features`, giving early warning when an upstream release breaks the build. It never
+  gates PRs; on failure it opens — and on recovery closes — a single deduped tracking issue.
+  Complements the committed-lockfile/`--locked` CI by exercising the versions downstream
+  consumers actually resolve, which `--locked` no longer does.
 
 ### Changed
 
