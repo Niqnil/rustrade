@@ -9,6 +9,7 @@ Thank you for your interest in contributing to rustrade!
 | `main` | Stable release branch. |
 | `develop` | Integration and testing. All feature PRs target this branch. |
 | `feature/*` | Your feature branches. Branch off `develop`. |
+| `release/*` | Release-prep branches (version bump + changelog finalize). Branch off `develop`. |
 
 ### Workflow
 
@@ -101,12 +102,17 @@ Before cutting a release, verify documentation is current:
 - [ ] Version numbers are consistent across all `Cargo.toml` files
 
 **Release process (maintainers):**
-1. Complete the pre-release checklist above
-2. Create release prep PR: bump versions in all Cargo.toml files
-3. Rename `[Unreleased]` → `[x.y.z] - YYYY-MM-DD`, add new empty `[Unreleased]`
-4. Merge to main
-5. Tag: `git tag v0.1.0 && git push origin v0.1.0`
-6. Publish workflow runs automatically
+
+We use a **two-PR flow** so `develop` and `main` stay in sync — the version bump lands on `develop` first, so there's no post-release back-merge:
+
+1. Complete the pre-release checklist above.
+2. Create a release-prep branch off `develop` (e.g. `release/x.y.z`):
+   - Bump versions in all `Cargo.toml` files and re-sync `Cargo.lock` (CI runs `--locked`, so the lock must stay consistent).
+   - Rename `[Unreleased]` → `[x.y.z] - YYYY-MM-DD` and add a fresh empty `[Unreleased]`.
+3. Open the release-prep PR targeting **`develop`**; merge after CI is green.
+4. Open the release PR **`develop` → `main`**; merge after CI is green.
+5. Tag the release: `git tag vx.y.z && git push origin vx.y.z`.
+6. The publish workflow runs automatically on the tag.
 
 ## What NOT to Contribute
 
