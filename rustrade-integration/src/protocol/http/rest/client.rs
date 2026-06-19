@@ -71,7 +71,7 @@ where
         let mut builder = self
             .http_client
             .request(Request::method(), url)
-            .timeout(Request::timeout());
+            .timeout(request.timeout());
 
         // Add optional query parameters
         if let Some(query_params) = request.query_params() {

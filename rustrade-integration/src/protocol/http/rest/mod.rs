@@ -36,7 +36,11 @@ pub trait RestRequest {
     }
 
     /// Http request timeout [`Duration`].
-    fn timeout() -> Duration {
+    ///
+    /// Takes `&self` so an implementation may derive the timeout from per-instance/config state
+    /// (e.g. an operator-tunable timeout captured at construction). The default returns the
+    /// compile-time [`DEFAULT_HTTP_REQUEST_TIMEOUT`] and ignores `self`.
+    fn timeout(&self) -> Duration {
         DEFAULT_HTTP_REQUEST_TIMEOUT
     }
 }
