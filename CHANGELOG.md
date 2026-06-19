@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-19
+
+### Changed
+
+- **`RestRequest::timeout` is now an instance method (`&self`)** (`rustrade-integration`). Previously a
+  receiverless associated function, it could only return a compile-time constant; taking `&self` lets an
+  implementation derive the per-request timeout from instance/config state (e.g. an operator-tunable
+  timeout captured at construction). The default still returns the compile-time
+  `DEFAULT_HTTP_REQUEST_TIMEOUT`, so implementations relying on the default are unaffected. **Breaking
+  only** for impls that explicitly override `timeout()` — add `&self` to the signature.
+
 ## [0.4.0] - 2026-06-13
 
 ### Added
