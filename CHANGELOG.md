@@ -17,12 +17,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `OptionPositionsUnadjustedForSplit`, and `UnsupportedCorporateAction`. Application is idempotent
   per-instrument via a caller-assigned action `id`; a reverse split that floors a position to zero
   quantity closes it with a `PositionExit`.
+- **Backtest auxiliary-event injection seam** (`rustrade`). New `AuxEventSource` trait, `NoAuxEvents`
+  (zero-cost default), and `AuxEventsInMemory` interleave non-market `EngineEvent`s (e.g. corporate
+  actions, contract expiries) with the market stream in simulated-time order during a backtest — the
+  backtest equivalent of live trading's direct `EngineEvent` injection. The harness pre-merges the
+  two sources into one time-ordered stream before the engine feed, so an injected event lands at the
+  correct point in the timeline (aux events win ties).
 
 ### Changed
 
 - **`EngineOutput` is now `#[non_exhaustive]`** (`rustrade`). New engine-driven outputs (e.g. the
   corporate-action observables above) can be added without further breaking changes. **Breaking**
   for downstream code matching `EngineOutput` exhaustively — add a wildcard (`_`) arm.
+- **`BacktestArgsConstant` gains a required `aux_events` field** (`rustrade`). **Breaking** for
+  downstream code constructing it via a struct literal — add `aux_events: NoAuxEvents` (the new
+  generic parameter `AuxEvents` defaults to `NoAuxEvents`) or supply a custom `AuxEventSource`.
 
 ## [0.5.0] - 2026-06-19
 
