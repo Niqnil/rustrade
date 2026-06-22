@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Corporate-action stock-split processing** (`rustrade`). The engine now handles
+  `EngineEvent::CorporateAction` for stock/reverse splits, adjusting every open position on the
+  target Spot instrument via `Position::apply_split` and emitting observables — `SplitRemainder`
+  (cash-in-lieu of the fractional sliver disposed under `SplitRoundingPolicy::Floor`),
+  `OpenOrdersAtSplit` (resting orders are reported, never engine-cancelled),
+  `OptionPositionsUnadjustedForSplit`, and `UnsupportedCorporateAction`. Application is idempotent
+  per-instrument via a caller-assigned action `id`; a reverse split that floors a position to zero
+  quantity closes it with a `PositionExit`.
+
+### Changed
+
+- **`EngineOutput` is now `#[non_exhaustive]`** (`rustrade`). New engine-driven outputs (e.g. the
+  corporate-action observables above) can be added without further breaking changes. **Breaking**
+  for downstream code matching `EngineOutput` exhaustively — add a wildcard (`_`) arm.
+
 ## [0.5.0] - 2026-06-19
 
 ### Changed

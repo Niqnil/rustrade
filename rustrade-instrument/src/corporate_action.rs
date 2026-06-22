@@ -13,7 +13,12 @@ use serde::{Deserialize, Serialize};
 ///
 /// `#[non_exhaustive]`: further corporate actions (dividends, spin-offs, symbol changes, …) can
 /// be added without breaking downstream exhaustive matches.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+// `Ord`/`PartialOrd`/`Hash` are derived (over and above `Eq`) so this type can be embedded in
+// engine outputs such as `EngineOutput::UnsupportedCorporateAction`, which derive those traits.
+// `rust_decimal::Decimal` implements all three, so the derives are sound for `StockSplit`.
+// MAINTAINER NOTE: every future variant must use field types whose `Ord`/`Hash` stay consistent
+// with `Eq` (e.g. no `f32`/`f64`, which lack `Ord`); otherwise these derives must be dropped.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[non_exhaustive]
 pub enum CorporateActionKind {
     /// A forward or reverse stock split, expressed as a single multiplicative `ratio`.

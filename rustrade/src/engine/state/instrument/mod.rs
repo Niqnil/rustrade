@@ -30,8 +30,9 @@ use rustrade_instrument::{
         name::{InstrumentNameExchange, InstrumentNameInternal},
     },
 };
-use rustrade_integration::collection::{FnvIndexMap, snapshot::Snapshot};
+use rustrade_integration::collection::{FnvIndexMap, FnvIndexSet, snapshot::Snapshot};
 use serde::{Deserialize, Serialize};
+use smol_str::SmolStr;
 use std::fmt::Debug;
 use tracing::{debug, warn};
 
@@ -292,6 +293,20 @@ pub struct InstrumentState<
     /// set when appropriate.
     #[serde(default)]
     pub expiration_processed: bool,
+
+    /// Set of corporate-action `id`s already applied to this instrument (idempotency key).
+    ///
+    /// A `CorporateAction` event carries a caller-assigned unique `id`; the handler records it
+    /// here once applied and skips (with a warning) any `id` already present. Scope is
+    /// per-instrument — naturally bounded by the number of corporate actions an instrument sees,
+    /// so no global store / LRU is required. This per-instrument-set keyed on `id` alone is
+    /// intentional and sufficient for stock splits (a split event targets a single instrument);
+    /// revisit for future multi-instrument actions (e.g. spin-offs).
+    ///
+    /// Rejected actions (unsupported instrument/action kind) are deliberately **not** recorded,
+    /// so they remain retryable once support is added.
+    #[serde(default)]
+    pub corporate_actions_processed: FnvIndexSet<SmolStr>,
 
     /// Maps `ClientOrderId` → `PositionId` for hedging-mode fill routing.
     ///
@@ -799,6 +814,7 @@ where
         data: _,
         fee_model: _,
         expiration_processed: _,
+        corporate_actions_processed: _,
         position_ids: _,
         pending_fills: _,
         exchange_id_to_cid: _,
@@ -876,6 +892,7 @@ where
                         data: instrument_data_init(instrument),
                         fee_model: FeeModelConfig::default(),
                         expiration_processed: false,
+                        corporate_actions_processed: FnvIndexSet::default(),
                         position_ids: FnvHashMap::default(),
                         pending_fills: Vec::new(),
                         exchange_id_to_cid: FnvHashMap::default(),

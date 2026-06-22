@@ -3,7 +3,7 @@ use crate::{
     engine::{
         EngineMeta, EngineOutput, Processor,
         audit::{AuditTick, EngineAudit, ProcessAudit, context::EngineContext},
-        state::{EngineState, instrument::data::InstrumentDataState},
+        state::{EngineState, instrument::data::InstrumentDataState, position::PositionId},
     },
     execution::AccountStreamEvent,
 };
@@ -11,7 +11,10 @@ use rustrade_integration::collection::none_one_or_many::NoneOneOrMany;
 // (used by `update_from_event` to inspect the live engine's outputs)
 use rustrade_data::{event::MarketEvent, streams::consumer::MarketStreamEvent};
 use rustrade_execution::AccountEvent;
-use rustrade_instrument::instrument::InstrumentIndex;
+use rustrade_instrument::{
+    corporate_action::CorporateActionKind,
+    instrument::{InstrumentIndex, kind::InstrumentKind},
+};
 use rustrade_integration::Terminal;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -136,6 +139,17 @@ where
     ///   replica cannot independently determine which branch the live engine took, so it
     ///   mirrors the decision by inspecting `PositionExit` outputs.
     ///
+    /// - **`CorporateAction`**: a *hybrid*. `Position::apply_split` is deterministic, so the
+    ///   adjustment (quantity / basis / unrealised PnL) is **event-replayed** for every position
+    ///   from the payload — after re-running the same guards (idempotency / non-`Spot` /
+    ///   unsupported-kind, all of which skip without mutating). The Floor-to-zero **close** is
+    ///   **output-mirrored** (like `ContractExpiry`): the live handler stamps the closing
+    ///   `PositionExit.time_exit` with `self.time()`, which is wall-clock-derived on
+    ///   `HistoricalClock` and therefore cannot be reproduced from the payload, so the replica
+    ///   removes the slot and folds the *live* `PositionExit` into the tear sheet. Parity (incl.
+    ///   tear sheets) is asserted by the replica-parity integration test, which guards against the
+    ///   live handler and this arm drifting apart.
+    ///
     /// Adding a new event type: choose event replay (deterministic transition) or output
     /// mirroring (conditional/non-deterministic) based on whether the replica can reproduce
     /// the live engine's branching from the event alone.
@@ -229,10 +243,101 @@ where
                     instrument_state.expiration_processed = true;
                 }
             }
-            EngineEvent::CorporateAction { .. } => {
-                // TODO: event-replay the position adjustment here to keep the replica in
-                // parity once the live handler is wired. No-op until then; mirrors the
-                // live engine's current transitional no-op.
+            EngineEvent::CorporateAction {
+                id,
+                instrument,
+                kind,
+                policy,
+                effective_time: _,
+            } => {
+                // Hybrid replay (mirrors the live `process_corporate_action`):
+                //  - `apply_split` is deterministic ⇒ event-replay it for every position to
+                //    reproduce the quantity / basis / unrealised-PnL adjustment exactly.
+                //  - the Floor-to-zero close is OUTPUT-MIRRORED (like the `ContractExpiry` arm),
+                //    because the live handler stamps the closing `PositionExit.time_exit` with
+                //    `self.time()`, which is wall-clock-derived on `HistoricalClock` and cannot be
+                //    reproduced from the payload. Folding the *live* exit keeps tear-sheet parity
+                //    exact. Keep this branch structurally symmetric with the live handler — the
+                //    replica-parity test fails if they drift. Warnings are intentionally omitted
+                //    (the live engine already logged them for this event).
+
+                // Guards — each skips WITHOUT mutating or recording `id`, exactly as the live
+                // handler does, so the replica never applies an action the live engine rejected.
+                {
+                    let instrument_state = self
+                        .replica_engine_state_mut()
+                        .instruments
+                        .instrument_index_mut(&instrument);
+                    // Idempotency: already applied (the set mirrors the live engine's).
+                    if instrument_state.corporate_actions_processed.contains(&id) {
+                        return;
+                    }
+                    // Unsupported instrument kind (checked first, like the live handler): equity
+                    // splits only apply to `Spot`. `id` not recorded ⇒ retryable.
+                    if !matches!(instrument_state.instrument.kind, InstrumentKind::Spot) {
+                        return;
+                    }
+                }
+                // Unsupported action kind — the compiler-mandated arm for the `#[non_exhaustive]`
+                // `CorporateActionKind` (runtime-unreachable in this phase). `id` not recorded.
+                let CorporateActionKind::StockSplit { ratio } = kind else {
+                    return;
+                };
+
+                // Last price for the eager `pnl_unrealised` recompute — same source the live
+                // handler reads. Identical here because the replica replayed the same market data.
+                let last_price = self
+                    .replica_engine_state()
+                    .instruments
+                    .instrument_index(&instrument)
+                    .data
+                    .price();
+
+                // Event-replay `apply_split` on ALL positions (N in Hedging). Collect ids first to
+                // avoid a borrow conflict with the per-position re-borrow, like the live handler.
+                let position_ids: Vec<PositionId> = self
+                    .replica_engine_state()
+                    .instruments
+                    .instrument_index(&instrument)
+                    .position
+                    .positions
+                    .keys()
+                    .cloned()
+                    .collect();
+                for pos_id in position_ids {
+                    let instrument_state = self
+                        .replica_engine_state_mut()
+                        .instruments
+                        .instrument_index_mut(&instrument);
+                    if let Some(position) = instrument_state.position.positions.get_mut(&pos_id) {
+                        position.apply_split(ratio, policy, last_price);
+                    }
+                }
+
+                // Mirror Floor-to-zero closes from the live `PositionExit` outputs: remove the slot
+                // and fold the live exit into the tear sheet (carrying the live `time_exit`).
+                for output in outputs.iter() {
+                    if let EngineOutput::PositionExit(exit) = output
+                        && exit.instrument == instrument
+                    {
+                        let instrument_state = self
+                            .replica_engine_state_mut()
+                            .instruments
+                            .instrument_index_mut(&instrument);
+                        instrument_state
+                            .position
+                            .positions
+                            .shift_remove(&exit.position_id);
+                        instrument_state.tear_sheet.update_from_position(exit);
+                    }
+                }
+
+                // Record `id` — the action has now been applied (mirrors the live handler).
+                self.replica_engine_state_mut()
+                    .instruments
+                    .instrument_index_mut(&instrument)
+                    .corporate_actions_processed
+                    .insert(id);
             }
         }
     }

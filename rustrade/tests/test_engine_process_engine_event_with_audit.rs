@@ -27,7 +27,7 @@ use rustrade::{
                 data::{DefaultInstrumentMarketData, InstrumentDataState},
                 filter::InstrumentFilter,
             },
-            position::{OmsMode, PositionExited},
+            position::{OmsMode, PositionExited, SplitRoundingPolicy},
             trading::TradingState,
         },
     },
@@ -61,6 +61,7 @@ use rustrade_execution::{
 use rustrade_instrument::{
     Side, Underlying,
     asset::AssetIndex,
+    corporate_action::CorporateActionKind,
     exchange::{ExchangeId, ExchangeIndex},
     index::IndexedInstruments,
     instrument::{
@@ -892,7 +893,7 @@ impl ClosePositionsStrategy for TestBuyAndHoldStrategy {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct OnDisconnectOutput;
 impl
     OnDisconnectStrategy<
@@ -918,7 +919,7 @@ impl
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct OnTradingDisabledOutput;
 impl
     OnTradingDisabled<
@@ -946,6 +947,14 @@ impl
 fn build_engine(
     trading_state: TradingState,
     execution_tx: UnboundedTx<ExecutionRequest>,
+) -> TestEngine {
+    build_engine_with_oms(trading_state, execution_tx, OmsMode::Netting)
+}
+
+fn build_engine_with_oms(
+    trading_state: TradingState,
+    execution_tx: UnboundedTx<ExecutionRequest>,
+    oms_mode: OmsMode,
 ) -> TestEngine {
     let instruments = IndexedInstruments::builder()
         .add_instrument(Instrument::spot(
@@ -983,6 +992,7 @@ fn build_engine(
     })
     .time_engine_start(STARTING_TIMESTAMP)
     .trading_state(trading_state)
+    .oms_mode(oms_mode)
     .balances([
         (ExchangeId::BinanceSpot, "usdt", STARTING_BALANCE_USDT),
         (ExchangeId::BinanceSpot, "btc", STARTING_BALANCE_BTC),
@@ -1509,6 +1519,247 @@ fn test_contract_expiry_replica_state_cleared() {
     assert!(replica_instrument.orders.0.is_empty());
     // expiration_processed must be set
     assert!(replica_instrument.expiration_processed);
+}
+
+// ---------------------------------------------------------------------------
+// CorporateAction (stock split) audit-replica parity tests
+// ---------------------------------------------------------------------------
+
+/// Open a position via a bare account `Trade` with an explicit `order_id`/`trade_id` tag.
+///
+/// `tag` populates **both** the `TradeId` and the `OrderId`. In `OmsMode::Hedging` the position
+/// slot is keyed by `trade.order_id`, so distinct tags open distinct positions on the same
+/// instrument (the routing "no order match" fallback). Fees are zero to keep `pnl_realised` clean
+/// for the parity assertions.
+fn open_position_via_trade(
+    engine: &mut TestEngine,
+    instrument: usize,
+    time_plus: u64,
+    side: Side,
+    price: Decimal,
+    quantity: Decimal,
+    tag: &str,
+) {
+    let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+        exchange: ExchangeIndex(0),
+        kind: AccountEventKind::Trade(Trade {
+            id: TradeId::new(tag),
+            order_id: OrderId::new(tag),
+            instrument: InstrumentIndex(instrument),
+            strategy: strategy_id(),
+            time_exchange: time_plus_days(STARTING_TIMESTAMP, time_plus),
+            side,
+            price,
+            quantity,
+            fees: asset_fees(instrument, dec!(0)),
+        }),
+    }));
+    engine.process(event);
+}
+
+/// Live engine vs audit-replica parity for a `CorporateAction` reverse split under `Floor`,
+/// across multiple positions (Hedging) — one surviving, one floored to zero.
+///
+/// The replica arm event-replays `apply_split` from the payload (it does **not** mirror outputs),
+/// so this test guards against the live handler (`process_corporate_action`) and the replica
+/// (`StateReplicaManager::update_from_event`) drifting apart. The gold-standard assertion is full
+/// `InstrumentState` equality, which also covers tear-sheet parity for the closed position.
+#[test]
+fn test_corporate_action_replica_parity_floor_split() {
+    use rustrade::engine::audit::{
+        AuditTick, EngineAudit, context::EngineContext, state_replica::StateReplicaManager,
+    };
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine_with_oms(TradingState::Disabled, execution_tx, OmsMode::Hedging);
+
+    // Set a last price so apply_split eagerly recomputes pnl_unrealised (not the None⇒0 path).
+    engine.process(market_event_trade(1, 0, dec!(100)));
+
+    // Two long positions on the same Spot instrument (index 0). Under a 1:2 reverse split (Floor):
+    //   - "survivor" 21 → floor(10.5) = 10 (survives, with a 0.5 fractional remainder)
+    //   - "dust"      1 → floor(0.5)  = 0  (floored to zero ⇒ removed + PositionExit)
+    open_position_via_trade(
+        &mut engine,
+        0,
+        2,
+        Side::Buy,
+        dec!(100),
+        dec!(21),
+        "survivor",
+    );
+    open_position_via_trade(&mut engine, 0, 3, Side::Buy, dec!(100), dec!(1), "dust");
+
+    // Seed the replica from the exact pre-split state.
+    let pre_split_state = engine.state.clone();
+
+    // Process the split on the live engine.
+    let effective_time = time_plus_days(STARTING_TIMESTAMP, 10);
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSDT-reverse-1-2".into(),
+        instrument: InstrumentIndex(0),
+        kind: CorporateActionKind::StockSplit { ratio: dec!(0.5) },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time,
+    };
+    let audit_tick = process_with_audit(&mut engine, ca_event.clone());
+
+    // Seed the replica from the pre-split snapshot. The CorporateAction arm output-mirrors the
+    // Floor-to-zero close (folding the live PositionExit), so it does not depend on the seed time.
+    let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+        event: pre_split_state,
+        context: EngineContext {
+            time: effective_time,
+            sequence: Sequence(0),
+        },
+    };
+    // Type annotation required for StateReplicaManager::new to infer the iterator element type
+    #[allow(clippy::type_complexity)]
+    let dummy_updates: std::iter::Empty<
+        AuditTick<
+            EngineAudit<
+                EngineEvent<DataKind>,
+                EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>,
+            >,
+        >,
+    > = std::iter::empty();
+    let mut replica_manager = StateReplicaManager::new(seed_tick, dummy_updates);
+
+    // Drive the replica with the live outputs. The CorporateAction arm event-replays and ignores
+    // them, but pass them through to exercise the real run() contract faithfully.
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => audit.outputs.clone(),
+        _ => panic!("expected EngineAudit::Process"),
+    };
+    replica_manager.update_from_event(ca_event, &outputs);
+
+    let live_instrument = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    let replica_instrument = replica_manager
+        .replica_engine_state()
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+
+    // Gold-standard: full InstrumentState parity (positions, tear sheet, processed-id set, …).
+    assert_eq!(replica_instrument, live_instrument);
+
+    // Explicit checks that the LIVE handler did what we expect — so the parity assert above is
+    // not vacuously comparing two unchanged states.
+    let survivor_id = PositionId::new("survivor");
+    let dust_id = PositionId::new("dust");
+
+    // "dust" floored to zero ⇒ slot removed in both.
+    assert!(!live_instrument.position.positions.contains_key(&dust_id));
+    assert!(!replica_instrument.position.positions.contains_key(&dust_id));
+
+    // "survivor" persists, split-adjusted: qty floor(21*0.5)=10, avg 100/0.5=200, max 21*0.5=10.5
+    // (unfloored), pnl_unrealised recomputed from last price 100 = (100-200)*10 = -1000.
+    let survivor = live_instrument
+        .position
+        .positions
+        .get(&survivor_id)
+        .expect("survivor position should persist");
+    assert_eq!(survivor.quantity_abs, dec!(10));
+    assert_eq!(survivor.price_entry_average, dec!(200));
+    assert_eq!(survivor.quantity_abs_max, dec!(10.5));
+    assert_eq!(survivor.pnl_unrealised, dec!(-1000));
+
+    // Idempotency key recorded in both.
+    assert!(
+        live_instrument
+            .corporate_actions_processed
+            .contains("BTCUSDT-reverse-1-2")
+    );
+    assert!(
+        replica_instrument
+            .corporate_actions_processed
+            .contains("BTCUSDT-reverse-1-2")
+    );
+}
+
+/// Live vs replica parity for a `CorporateAction` targeting a non-`Spot` instrument: both reject
+/// (no state change, `id` not recorded), so the replica's guards must stay symmetric with the
+/// handler's. Validates the `InstrumentKindNotSupported` rejection path.
+#[test]
+fn test_corporate_action_replica_parity_unsupported_non_spot() {
+    use rustrade::engine::{
+        UnsupportedCorporateActionReason,
+        audit::{
+            AuditTick, EngineAudit, context::EngineContext, state_replica::StateReplicaManager,
+        },
+    };
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+
+    // Option position at index 0 (non-Spot). Spot underlying is index 1.
+    open_option_position(&mut engine, dec!(2), dec!(1_000));
+
+    let pre_state = engine.state.clone();
+
+    // Target the OPTION (index 0) — unsupported (equity splits apply to Spot only).
+    let effective_time = time_plus_days(STARTING_TIMESTAMP, 10);
+    let ca_event = EngineEvent::CorporateAction {
+        id: "opt-split".into(),
+        instrument: InstrumentIndex(0),
+        kind: CorporateActionKind::StockSplit { ratio: dec!(2) },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time,
+    };
+    let audit_tick = process_with_audit(&mut engine, ca_event.clone());
+
+    // Live must emit the dedicated rejection output (and NOT record the id ⇒ retryable).
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => audit.outputs.clone(),
+        _ => panic!("expected EngineAudit::Process"),
+    };
+    assert!(
+        outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::UnsupportedCorporateAction {
+                reason: UnsupportedCorporateActionReason::InstrumentKindNotSupported,
+                ..
+            }
+        )),
+        "expected UnsupportedCorporateAction(InstrumentKindNotSupported)"
+    );
+
+    let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+        event: pre_state,
+        context: EngineContext {
+            time: effective_time,
+            sequence: Sequence(0),
+        },
+    };
+    // Type annotation required for StateReplicaManager::new to infer the iterator element type
+    #[allow(clippy::type_complexity)]
+    let dummy_updates: std::iter::Empty<
+        AuditTick<
+            EngineAudit<
+                EngineEvent<DataKind>,
+                EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>,
+            >,
+        >,
+    > = std::iter::empty();
+    let mut replica_manager = StateReplicaManager::new(seed_tick, dummy_updates);
+    replica_manager.update_from_event(ca_event, &outputs);
+
+    let live_instrument = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    let replica_instrument = replica_manager
+        .replica_engine_state()
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+
+    // Rejected ⇒ unchanged and symmetric: replica == live, position intact, id NOT recorded.
+    assert_eq!(replica_instrument, live_instrument);
+    assert_eq!(live_instrument.position.positions.len(), 1);
+    assert!(live_instrument.corporate_actions_processed.is_empty());
+    assert!(replica_instrument.corporate_actions_processed.is_empty());
 }
 
 // ---------------------------------------------------------------------------

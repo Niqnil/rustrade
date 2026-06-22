@@ -16,7 +16,7 @@ use crate::{
             EngineState,
             instrument::data::InstrumentDataState,
             order::{in_flight_recorder::InFlightRequestRecorder, manager::OrderManager},
-            position::{PositionExited, PositionId},
+            position::{PositionExited, PositionId, SplitRoundingPolicy},
             trading::TradingState,
         },
     },
@@ -30,21 +30,27 @@ use crate::{
     },
 };
 use chrono::{DateTime, Utc};
+use derive_more::Constructor;
 use rust_decimal::Decimal;
 use rustrade_data::{event::MarketEvent, streams::consumer::MarketStreamEvent};
 use rustrade_execution::{
     AccountEvent,
-    order::Order,
+    order::{Order, id::ClientOrderId},
     trade::{AssetFees, Trade, TradeId},
 };
 use rustrade_instrument::{
     Side,
     asset::AssetIndex,
+    corporate_action::CorporateActionKind,
     exchange::ExchangeIndex,
-    instrument::{InstrumentIndex, kind::option::OptionKind},
+    instrument::{
+        InstrumentIndex,
+        kind::{InstrumentKind, option::OptionKind},
+    },
 };
 use rustrade_integration::channel::Tx;
 use serde::{Deserialize, Serialize};
+use smol_str::SmolStr;
 use std::fmt::Debug;
 use tracing::{info, warn};
 
@@ -190,15 +196,23 @@ where
                 // trigger algo order generation — return early before that check.
                 return EngineAudit::from(audit);
             }
-            EngineEvent::CorporateAction { .. } => {
-                // TODO: position-adjustment handler not yet wired. Surface loudly so an
-                // early-injected event is not silently dropped, and return before algo
-                // order generation (the adjustment is engine-driven, like ContractExpiry).
-                warn!(
-                    ?event,
-                    "CorporateAction received but its handler is not yet implemented; no-op"
-                );
-                return EngineAudit::process(event);
+            EngineEvent::CorporateAction {
+                id,
+                instrument,
+                kind,
+                policy,
+                effective_time: _,
+            } => {
+                let outputs = self.process_corporate_action(id, instrument, kind, *policy);
+                // Fold each observable output (SplitRemainder / OpenOrdersAtSplit /
+                // OptionPositionsUnadjustedForSplit / PositionExit / UnsupportedCorporateAction)
+                // into the audit. Like ContractExpiry, a corporate action is engine-driven and
+                // settles regardless of TradingState — return early before algo generation.
+                let mut audit = ProcessAudit::with_event(event);
+                for output in outputs {
+                    audit = audit.add_output(output);
+                }
+                return EngineAudit::from(audit);
             }
         };
 
@@ -436,7 +450,6 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
         // For options, ITM/OTM determination requires the *underlying's* price, not the
         // option's own market price (which includes premium and would give wrong results).
         // We find the underlying spot instrument by matching the option's underlying.base.
-        use rustrade_instrument::instrument::kind::InstrumentKind;
         // Capture both the underlying base key and the exchange so we can filter
         // the spot scan to the same exchange. Without the exchange filter, a
         // multi-exchange setup (e.g. BTC/USD on both Binance and Alpaca) would
@@ -625,6 +638,249 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
 
         exited
     }
+
+    /// Processes a `CorporateAction` (stock split / reverse split) for the given instrument,
+    /// adjusting **every** open position and returning the observable outputs to fold into the
+    /// audit.
+    ///
+    /// Unlike `process_contract_expiry`, this **does not** cancel resting orders (a real broker
+    /// price-adjusts them, so an engine-side cancel would diverge) and **does not** require a
+    /// market price (the split is applied regardless; see below).
+    ///
+    /// # Algorithm
+    /// 1. Idempotency guard on `id` (per-instrument `corporate_actions_processed` set). A
+    ///    duplicate `id` is skipped with a warning.
+    /// 2. **Unsupported guards (no silent no-op, `id` not recorded ⇒ retryable).** The
+    ///    instrument-kind check runs **first** so a split on an option is attributed to the
+    ///    instrument, not the (supported) kind:
+    ///    - target instrument is not `Spot` ⇒ [`UnsupportedCorporateActionReason::InstrumentKindNotSupported`];
+    ///    - action kind is not a stock split ⇒ [`UnsupportedCorporateActionReason::ActionKindNotSupported`]
+    ///      (the compiler-mandated arm for the `#[non_exhaustive]` [`CorporateActionKind`]).
+    /// 3. Snapshot resting orders into [`EngineOutput::OpenOrdersAtSplit`] (no cancellation).
+    /// 4. Apply the split to every open position via [`Position::apply_split`]; emit one
+    ///    [`EngineOutput::SplitRemainder`] per position that disposed a fractional sliver. A
+    ///    position floored to zero quantity is removed and folded as an
+    ///    [`EngineOutput::PositionExit`].
+    /// 5. Scan for option positions on the same underlying and emit
+    ///    [`EngineOutput::OptionPositionsUnadjustedForSplit`] if any (options are unadjusted in
+    ///    this phase).
+    /// 6. Record `id` in `corporate_actions_processed`.
+    ///
+    /// # Missing last price
+    /// If the instrument's last price is unavailable the split is **still applied** and the `id`
+    /// **recorded** (the quantity/basis arithmetic needs no price); `pnl_unrealised` is set to
+    /// zero with a warning and corrected on the next market tick. This is **not** retryable —
+    /// contrast `process_contract_expiry`, which bails and is retryable.
+    pub fn process_corporate_action<OnTradingDisabled, OnDisconnect>(
+        &mut self,
+        id: &SmolStr,
+        key: &InstrumentIndex,
+        kind: &CorporateActionKind,
+        policy: SplitRoundingPolicy,
+    ) -> Vec<EngineOutput<OnTradingDisabled, OnDisconnect>>
+    where
+        Clock: EngineClock,
+        InstrumentData: InstrumentDataState,
+    {
+        let mut outputs = Vec::new();
+        // Engine clock time for deterministic stamping (the clock was already advanced to the
+        // event's `effective_time` before this handler runs).
+        let engine_time = self.time();
+
+        let instrument_state = self.state.instruments.instrument_index_mut(key);
+
+        // Step 1: idempotency guard (keyed on `id` alone). Warn on suppression — a wrapper-reused
+        // `id` would otherwise silently drop a real action.
+        if instrument_state.corporate_actions_processed.contains(id) {
+            warn!(
+                %id,
+                instrument = ?key,
+                effective_time = ?engine_time,
+                "CorporateAction id already processed — skipping (idempotent). Ensure each \
+                 action (incl. same-day corrections) carries a unique id."
+            );
+            return outputs;
+        }
+
+        // Step 2a: reject non-Spot targets (checked BEFORE the action kind so a split on an
+        // option is attributed to the instrument, not the supported kind). Do NOT record `id`.
+        if !matches!(instrument_state.instrument.kind, InstrumentKind::Spot) {
+            warn!(
+                %id,
+                instrument = ?key,
+                kind = ?instrument_state.instrument.kind,
+                "CorporateAction targets a non-Spot instrument — unsupported (equity splits \
+                 only). Emitting UnsupportedCorporateAction; id NOT recorded (retryable)."
+            );
+            outputs.push(EngineOutput::UnsupportedCorporateAction {
+                instrument: *key,
+                kind: kind.clone(),
+                reason: UnsupportedCorporateActionReason::InstrumentKindNotSupported,
+            });
+            return outputs;
+        }
+
+        // Step 2b: extract the split ratio. `CorporateActionKind` is `#[non_exhaustive]` and
+        // defined in another crate, so the compiler mandates this `else` arm even though
+        // `StockSplit` is currently the only variant. It is runtime-unreachable until a second
+        // kind exists, then becomes the "action kind not supported" rejection. Do NOT record `id`.
+        let CorporateActionKind::StockSplit { ratio } = kind else {
+            warn!(
+                %id,
+                instrument = ?key,
+                kind = ?kind,
+                "CorporateAction kind not supported (stock splits only). Emitting \
+                 UnsupportedCorporateAction; id NOT recorded (retryable once supported)."
+            );
+            outputs.push(EngineOutput::UnsupportedCorporateAction {
+                instrument: *key,
+                kind: kind.clone(),
+                reason: UnsupportedCorporateActionReason::ActionKindNotSupported,
+            });
+            return outputs;
+        };
+        let ratio = *ratio;
+
+        // Step 3: snapshot resting orders as an observable — do NOT cancel (a broker price-adjusts
+        // them, so an engine-side cancel would diverge from the broker).
+        let resting_orders: Vec<OpenOrderAtSplit> = instrument_state
+            .orders
+            .orders()
+            .map(|order| OpenOrderAtSplit {
+                cid: order.key.cid.clone(),
+                price_pre_split: order.price,
+                quantity_pre_split: order.quantity,
+            })
+            .collect();
+
+        // Last price for the eager `pnl_unrealised` recompute. None ⇒ 0 (+ warn); the split is
+        // still applied and the `id` recorded (NOT retryable).
+        let last_price = instrument_state.data.price();
+        if last_price.is_none() {
+            warn!(
+                %id,
+                instrument = ?key,
+                "CorporateAction: instrument last price unavailable — pnl_unrealised set to 0, \
+                 corrected on the next market tick. The split is still applied (not retryable)."
+            );
+        }
+
+        // Step 4: apply to ALL open positions (N in Hedging mode). Collect ids first to avoid a
+        // borrow conflict with the per-position re-borrow, mirroring process_contract_expiry.
+        let position_ids: Vec<PositionId> = instrument_state
+            .position
+            .positions
+            .keys()
+            .cloned()
+            .collect();
+        // Pre-size: up to a SplitRemainder + a PositionExit per position, plus the
+        // OpenOrdersAtSplit and OptionPositionsUnadjustedForSplit observables.
+        outputs.reserve(position_ids.len() * 2 + 2);
+
+        for pos_id in position_ids {
+            let instrument_state = self.state.instruments.instrument_index_mut(key);
+            let Some(position) = instrument_state.position.positions.get_mut(&pos_id) else {
+                continue;
+            };
+
+            let side = position.side;
+            let result = position.apply_split(ratio, policy, last_price);
+            // Read the post-split basis AFTER apply_split overwrote it (Convention A): quantity
+            // and price then share the post-split era, valuing the disposed sliver with one
+            // multiply and no ratio knowledge.
+            let price_entry_average_post_split = position.price_entry_average;
+            let quantity_abs_after = position.quantity_abs;
+
+            if result.remainder > Decimal::ZERO {
+                outputs.push(EngineOutput::SplitRemainder {
+                    instrument: *key,
+                    position_id: pos_id.clone(),
+                    side,
+                    quantity_fractional_disposed: result.remainder,
+                    price_entry_average_post_split,
+                });
+            }
+
+            // Floor whole-position disposal: a reverse split under `Floor` can round the quantity
+            // to zero. Remove the slot and fold a PositionExit so no zero-qty zombie strands its
+            // pnl_realised (which would later leak into a fresh post-split buy via VWAP-from-zero).
+            if quantity_abs_after.is_zero() {
+                let instrument_state = self.state.instruments.instrument_index_mut(key);
+                if let Some(closed) = instrument_state.position.positions.shift_remove(&pos_id) {
+                    let mut exit = PositionExited::from(closed);
+                    exit.position_id = pos_id.clone();
+                    exit.time_exit = engine_time;
+                    instrument_state.tear_sheet.update_from_position(&exit);
+                    outputs.push(EngineOutput::PositionExit(exit));
+                }
+            }
+        }
+
+        // Emit the observable resting-orders snapshot if any rest.
+        if !resting_orders.is_empty() {
+            outputs.push(EngineOutput::OpenOrdersAtSplit {
+                instrument: *key,
+                orders: resting_orders,
+            });
+        }
+
+        // Step 5: options-on-underlying guard. A split targets the underlying equity; option
+        // positions on that underlying are left unadjusted in this phase. Mirror of the
+        // spot-given-option scan in process_contract_expiry: find Option instruments whose
+        // underlying matches this equity's, on the same exchange, that hold positions.
+        //
+        // Both `base` AND `quote` are matched: `Underlying` is a full pair identity, and a
+        // `CorporateAction` targets a single `InstrumentIndex` (only that instrument's positions
+        // are split). Without the quote filter, a BTC/USDT split would also flag BTC/USDC option
+        // positions that the engine itself never adjusted — false-positive noise. Mirrors the
+        // base+quote filter in process_contract_expiry's underlying-spot scan.
+        let (equity_base, equity_quote, equity_exchange) = {
+            let equity = self.state.instruments.instrument_index(key);
+            (
+                equity.instrument.underlying.base,
+                equity.instrument.underlying.quote,
+                equity.instrument.exchange,
+            )
+        };
+        let affected_options: Vec<InstrumentIndex> = self
+            .state
+            .instruments
+            .0
+            .values()
+            .filter(|state| {
+                matches!(&state.instrument.kind, InstrumentKind::Option(_))
+                    && state.instrument.underlying.base == equity_base
+                    && state.instrument.underlying.quote == equity_quote
+                    && state.instrument.exchange == equity_exchange
+                    && !state.position.positions.is_empty()
+            })
+            .map(|state| state.key)
+            .collect();
+        if !affected_options.is_empty() {
+            warn!(
+                %id,
+                instrument = ?key,
+                count = affected_options.len(),
+                "CorporateAction: option positions on the splitting underlying are left \
+                 UNADJUSTED (option corporate-action handling is deferred). Emitting \
+                 OptionPositionsUnadjustedForSplit."
+            );
+            outputs.push(EngineOutput::OptionPositionsUnadjustedForSplit {
+                split_instrument: *key,
+                ratio,
+                affected_options,
+            });
+        }
+
+        // Step 6: record the `id` — the action has now been applied.
+        self.state
+            .instruments
+            .instrument_index_mut(key)
+            .corporate_actions_processed
+            .insert(id.clone());
+
+        outputs
+    }
 }
 
 impl<Clock, State, ExecutionTxs, Strategy, Risk> Engine<Clock, State, ExecutionTxs, Strategy, Risk>
@@ -667,7 +923,11 @@ where
 }
 
 /// Output produced by [`Engine`] operations, used to construct an `Engine` [`EngineAudit`].
+///
+/// `#[non_exhaustive]`: engine-driven outputs (e.g. corporate-action observables) can be added
+/// without breaking downstream exhaustive matches. External matchers must carry a wildcard arm.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+#[non_exhaustive]
 pub enum EngineOutput<
     OnTradingDisabled,
     OnDisconnect,
@@ -680,6 +940,91 @@ pub enum EngineOutput<
     PositionExit(PositionExited<AssetIndex, InstrumentKey>),
     MarketDisconnect(OnDisconnect),
     AlgoOrders(GenerateAlgoOrdersOutput<ExchangeKey, InstrumentKey>),
+
+    /// Cash-in-lieu observable: a corporate-action split disposed a fractional share quantity
+    /// (under [`SplitRoundingPolicy::Floor`]) from one open position. Emitted **per position**
+    /// (`position_id` attributes it in hedging mode). The library writes no balances — the
+    /// wrapper reconciles this against the broker's CIL payment.
+    ///
+    /// `quantity_fractional_disposed × price_entry_average_post_split` is the cost basis of the
+    /// disposed sliver; both fields share the post-split era (Decimal arithmetic, no ratio).
+    SplitRemainder {
+        /// Instrument whose position was split.
+        instrument: InstrumentKey,
+        /// Position the remainder was disposed from.
+        position_id: PositionId,
+        /// Direction of the position (sign of the disposed sliver).
+        side: Side,
+        /// Post-split fractional shares disposed by `Floor` rounding (always `< 1`, `> 0`).
+        quantity_fractional_disposed: Decimal,
+        /// The position's split-adjusted per-share basis (`= old_avg / ratio`), read **after**
+        /// the split is applied.
+        price_entry_average_post_split: Decimal,
+    },
+
+    /// Observable snapshot of the resting orders an instrument had at the moment a split was
+    /// applied. The handler **does not** cancel or re-price them — a real broker price-adjusts
+    /// resting orders, so an engine-side cancel would diverge. The wrapper decides cancel-vs-keep
+    /// (and **must** cancel in backtest, or the mock exchange fills stale-priced orders).
+    OpenOrdersAtSplit {
+        /// Instrument whose resting orders are listed.
+        instrument: InstrumentKey,
+        /// The resting orders, captured at pre-split prices/quantities.
+        orders: Vec<OpenOrderAtSplit>,
+    },
+
+    /// Observable signal that option positions on a splitting underlying were left **unadjusted**
+    /// (option corporate-action handling is deferred). The wrapper decides what to do.
+    OptionPositionsUnadjustedForSplit {
+        /// The underlying equity instrument that was split.
+        split_instrument: InstrumentKey,
+        /// The split ratio that was applied to the underlying.
+        ratio: Decimal,
+        /// Option instruments (holding positions) on that underlying, left unadjusted.
+        affected_options: Vec<InstrumentKey>,
+    },
+
+    /// Observable signal that a [`CorporateAction`](crate::EngineEvent::CorporateAction) could
+    /// **not** be processed. The action was **not** applied and its `id` was **not** recorded, so
+    /// it remains retryable once support is added (e.g. a corrected instrument key, or a future
+    /// library version). See [`UnsupportedCorporateActionReason`].
+    UnsupportedCorporateAction {
+        /// The instrument the rejected action targeted.
+        instrument: InstrumentKey,
+        /// The action's market-fact kind (carried verbatim for the consumer).
+        kind: CorporateActionKind,
+        /// Why the action could not be processed.
+        reason: UnsupportedCorporateActionReason,
+    },
+}
+
+/// A single resting order captured in an [`EngineOutput::OpenOrdersAtSplit`] observable.
+#[derive(
+    Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
+)]
+pub struct OpenOrderAtSplit {
+    /// Client order id of the resting order.
+    pub cid: ClientOrderId,
+    /// Limit price before the split (`None` for market/stop orders).
+    pub price_pre_split: Option<Decimal>,
+    /// Order quantity before the split.
+    pub quantity_pre_split: Decimal,
+}
+
+/// Reason a [`CorporateAction`](crate::EngineEvent::CorporateAction) could not be processed,
+/// carried by [`EngineOutput::UnsupportedCorporateAction`].
+///
+/// `#[non_exhaustive]`: further rejection causes (e.g. a non-standard option split requiring a
+/// symbol-identity change) can be added without breaking downstream exhaustive matches.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+#[non_exhaustive]
+pub enum UnsupportedCorporateActionReason {
+    /// The target instrument is not a `Spot` equity (e.g. an option, perpetual, or future).
+    /// Equity-split arithmetic is invalid for these; option splits are handled separately.
+    InstrumentKindNotSupported,
+    /// The corporate-action kind is not handled by this engine version (only stock splits are
+    /// supported). Reachable once non-split kinds (dividends, spin-offs, …) are delivered.
+    ActionKindNotSupported,
 }
 
 /// Output produced by the [`Engine`] updating from an [`TradingState`], used to construct
