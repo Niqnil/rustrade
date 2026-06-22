@@ -44,6 +44,11 @@ pub mod instrument;
 /// indexing non-indexed collections.
 pub mod index;
 
+/// Corporate-action market facts (e.g. stock splits) and date-resolution helpers.
+///
+/// eg/ `CorporateActionKind`, `split_effective_instant`, etc.
+pub mod corporate_action;
+
 /// Interactive Brokers support types (behind `ibkr` feature).
 #[cfg(feature = "ibkr")]
 pub mod ibkr;

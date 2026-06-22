@@ -229,6 +229,11 @@ where
                     instrument_state.expiration_processed = true;
                 }
             }
+            EngineEvent::CorporateAction { .. } => {
+                // TODO: event-replay the position adjustment here to keep the replica in
+                // parity once the live handler is wired. No-op until then; mirrors the
+                // live engine's current transitional no-op.
+            }
         }
     }
 

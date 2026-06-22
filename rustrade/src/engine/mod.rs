@@ -190,6 +190,16 @@ where
                 // trigger algo order generation — return early before that check.
                 return EngineAudit::from(audit);
             }
+            EngineEvent::CorporateAction { .. } => {
+                // TODO: position-adjustment handler not yet wired. Surface loudly so an
+                // early-injected event is not silently dropped, and return before algo
+                // order generation (the adjustment is engine-driven, like ContractExpiry).
+                warn!(
+                    ?event,
+                    "CorporateAction received but its handler is not yet implemented; no-op"
+                );
+                return EngineAudit::process(event);
+            }
         };
 
         if let TradingState::Enabled = self.state.trading {
