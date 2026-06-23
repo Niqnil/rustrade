@@ -76,6 +76,9 @@
 //! let stream = client.start().await?;
 //! ```
 
+// Side-effect-only module: provides `impl StockSplitSource for MassiveRestClient`. It exports no
+// types, so it is private — `use` it nowhere; the impl is in scope wherever the client is.
+mod corporate_action;
 mod error;
 pub(crate) mod live;
 pub(crate) mod options;

@@ -23,6 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backtest equivalent of live trading's direct `EngineEvent` injection. The harness pre-merges the
   two sources into one time-ordered stream before the engine feed, so an injected event lands at the
   correct point in the timeline (aux events win ties).
+- **Corporate-action PULL sourcing abstraction** (`rustrade-instrument`, `rustrade-integration`,
+  `rustrade-data`). New `StockSplitSource` trait + `CorporateActionFilter` (`rustrade-integration`,
+  behind the new `corporate-action` feature, on by default) model fetching splits by symbol +
+  effective-date range; they yield the new generic `CorporateAction<K>` descriptor
+  (`rustrade-instrument`), keyed by an unresolved provider symbol (`SmolStr`) at the source boundary.
+  A shared `CorporateActionKind::stock_split(split_to, split_from)` helper computes the ratio
+  identically across providers. A reference implementation for the Massive REST client is feature-
+  gated behind `massive` in `rustrade-data`. The action *kind* is encoded in the trait name (a
+  `DividendSource` sibling is the future path) rather than a unified trait with a kind filter; push /
+  account-scoped sources (e.g. IBKR) are intentionally out of this PULL trait. A runnable example
+  (`rustrade`, `corporate_action_sourcing`, `--features massive`) shows source → resolve → inject.
 
 ### Changed
 

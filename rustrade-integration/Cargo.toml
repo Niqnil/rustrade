@@ -12,9 +12,12 @@ readme = "README.md"
 description = "Low-level framework for composing flexible web integrations, especially with financial exchanges"
 
 [features]
-default = ["collection", "error", "protocol", "serde", "subscription", "socket", "stream"]
-full = ["collection", "channel", "error", "metric", "protocol", "serde", "subscription", "socket", "stream"]
+default = ["collection", "error", "protocol", "serde", "subscription", "socket", "stream", "corporate-action"]
+full = ["collection", "channel", "error", "metric", "protocol", "serde", "subscription", "socket", "stream", "corporate-action"]
 collection = ["dep:indexmap", "dep:fnv", "dep:itertools", "dep:derive_more"]
+# PULL corporate-action sourcing trait + filter. Needs `stream` (rustrade-instrument descriptor +
+# chrono + futures) and `subscription` (smol_str symbol key); pulls no new dependencies of its own.
+corporate-action = ["stream", "subscription"]
 channel = ["dep:tokio", "dep:tokio-stream", "dep:derive_more", "dep:tracing"]
 error = ["dep:url", "dep:serde_qs", "dep:serde_urlencoded", "dep:thiserror"]
 metric = []

@@ -78,6 +78,12 @@ pub mod stream;
 #[cfg(feature = "socket")]
 pub mod socket;
 
+/// PULL-based corporate-action sourcing: the [`StockSplitSource`](corporate_action::StockSplitSource)
+/// trait + [`CorporateActionFilter`](corporate_action::CorporateActionFilter), re-exporting the
+/// `CorporateAction` descriptor from `rustrade-instrument`.
+#[cfg(feature = "corporate-action")]
+pub mod corporate_action;
+
 /// [`Validator`]s are capable of determining if their internal state is satisfactory to fulfill
 /// some use case defined by the implementor.
 pub trait Validator {
