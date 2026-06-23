@@ -168,10 +168,6 @@ pub enum EngineEvent<
     /// Signal that a corporate action (e.g. a stock split) has taken effect on an instrument and
     /// the engine's internal position(s) must be adjusted to match.
     ///
-    /// **Status**: the engine-side handler is not yet wired — receiving this event currently logs
-    /// a warning and performs no adjustment. The behaviour documented below is the intended
-    /// contract.
-    ///
     /// Positions are fill-derived: even in live trading a broker applying a split overnight does
     /// **not** fix the engine's internal `quantity`/`price_entry_average`/`pnl_unrealised`, which
     /// stay on the pre-split scale until something explicitly adjusts them. This event is that

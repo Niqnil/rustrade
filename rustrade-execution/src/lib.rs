@@ -56,6 +56,14 @@ use rustrade_instrument::{
 };
 use rustrade_integration::collection::snapshot::Snapshot;
 use serde::{Deserialize, Serialize};
+// Only `emit_stream_terminated` (and its tests) name `mpsc`, both gated to the venue features —
+// gate the import the same way so the default-empty feature set does not warn it as unused.
+#[cfg(any(
+    feature = "alpaca",
+    feature = "binance",
+    feature = "ibkr",
+    feature = "hyperliquid"
+))]
 use tokio::sync::mpsc;
 
 pub mod balance;
@@ -121,11 +129,24 @@ impl<ExchangeKey, AssetKey, InstrumentKey> AccountEvent<ExchangeKey, AssetKey, I
 /// before a venue's stream task exits so stream death is delivered in-band rather than inferred from
 /// channel EOF.
 ///
-/// Shared by every venue connector (Binance spot/margin, Alpaca, IBKR, Hyperliquid, Mock) so the
-/// single construction/send of the terminal event lives in one place, at the abstraction level where
-/// [`AccountEvent`] is defined rather than inside any one vendor module. The send is best-effort: if
-/// the consumer already dropped the receiver it is a silent no-op — which is the
-/// consumer-initiated-drop case, deliberately *not* signalled (there is no one left to deliver to).
+/// Shared by the channel-based venue connectors (Binance spot/margin, Alpaca, IBKR, Hyperliquid)
+/// so the single send of the terminal event lives in one place, at the abstraction level where
+/// [`AccountEvent`] is defined rather than inside any one vendor module. (The Mock client yields
+/// into a `Stream` rather than an mpsc channel, so it builds the terminal event via
+/// `UnindexedAccountEvent::stream_terminated` directly and does not funnel through this helper.)
+/// The send is best-effort: if the consumer already dropped the receiver it is a silent no-op —
+/// which is the consumer-initiated-drop case, deliberately *not* signalled (there is no one left
+/// to deliver to).
+//
+// Gated to the venues that send terminal events through an mpsc channel from a spawned stream task,
+// so the crate's default-empty feature set does not warn this as unused (mirrors `parse_env_bool`
+// below). The Mock client is always compiled but is excluded by design — see the note above.
+#[cfg(any(
+    feature = "alpaca",
+    feature = "binance",
+    feature = "ibkr",
+    feature = "hyperliquid"
+))]
 pub(crate) fn emit_stream_terminated(
     tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
     exchange: ExchangeId,
@@ -377,7 +398,17 @@ impl<ExchangeKey, AssetKey, InstrumentKey> AccountSnapshot<ExchangeKey, AssetKey
     }
 }
 
-#[cfg(test)]
+// Both tests exercise the feature-gated `emit_stream_terminated`, so this module compiles under the
+// same venue features — no feature → no function → no test for it.
+#[cfg(all(
+    test,
+    any(
+        feature = "alpaca",
+        feature = "binance",
+        feature = "ibkr",
+        feature = "hyperliquid"
+    )
+))]
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;

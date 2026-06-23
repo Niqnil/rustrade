@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`EngineEvent` is now `#[non_exhaustive]` and gains a `CorporateAction` variant** (`rustrade`).
+  Marking it non-exhaustive lets future engine-driven event variants be added without further
+  breaking changes. **Breaking** for downstream code matching `EngineEvent` exhaustively — add a
+  wildcard (`_`) arm. **serde/replay note:** the new variant changes the serialized form of
+  `EngineEvent`. Audit logs written by this version may contain `CorporateAction` ticks that older
+  library versions cannot deserialize (unknown variant), so wrappers that persist and replay the
+  audit stream across this version boundary must account for it.
 - **`EngineOutput` is now `#[non_exhaustive]`** (`rustrade`). New engine-driven outputs (e.g. the
   corporate-action observables above) can be added without further breaking changes. **Breaking**
   for downstream code matching `EngineOutput` exhaustively — add a wildcard (`_`) arm.

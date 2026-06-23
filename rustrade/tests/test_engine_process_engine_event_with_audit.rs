@@ -1762,6 +1762,119 @@ fn test_corporate_action_replica_parity_unsupported_non_spot() {
     assert!(replica_instrument.corporate_actions_processed.is_empty());
 }
 
+/// End-to-end: a `CorporateAction` injected **mid-stream** through the audit path — the engine-level
+/// behaviour of the backtest aux-injection seam, asserting what the `backtest()` smoke tests cannot.
+///
+/// `backtest()` hardcodes `AuditMode::Disabled`, so it produces no output/audit stream; the
+/// post-split position, the `SplitRemainder` observable, and the **exact clock stamp** (Option A:
+/// the `HistoricalClock` advances to `effective_time` on the event) are asserted here by driving a
+/// pre-merged, time-ordered event sequence through `process_with_audit`. Ordering is exercised by a
+/// market event *after* the split that must see the post-split position scale.
+#[test]
+fn test_corporate_action_injected_mid_stream_clock_and_outputs() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx); // Netting
+
+    // Pre-split market context: a trade at t+1 sets the instrument's last (mark) price to 105 — the
+    // source `apply_split` reads for the eager pnl_unrealised recompute, deliberately distinct from
+    // the position's fill basis (100 below) so the pnl assertion pins the mark-price source (not the
+    // entry price reused as the mark) — and advances the clock to t+1.
+    engine.process(market_event_trade(1, 0, dec!(105)));
+
+    // One long position of 101 @ 100 on Spot instrument 0.
+    open_position_via_trade(&mut engine, 0, 2, Side::Buy, dec!(100), dec!(101), "pos");
+
+    // The split, time-ordered after the t+1 market event and before the t+11 one below — exactly
+    // where the backtest seam's merge interleaves it. 1:2 reverse, Floor: floor(101*0.5)=50 survives
+    // with a 0.5 fractional sliver disposed.
+    let effective_time = time_plus_days(STARTING_TIMESTAMP, 10);
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSDT-reverse-1-2".into(),
+        instrument: InstrumentIndex(0),
+        kind: CorporateActionKind::StockSplit { ratio: dec!(0.5) },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time,
+    };
+    let audit_tick = process_with_audit(&mut engine, ca_event);
+
+    // Clock stamp (Option A): the `HistoricalClock` advanced to effective_time on the split. Its
+    // `time()` derives from `time_exchange_last + (now − last_event_live_time)`, so it reads
+    // effective_time plus only the sub-second test-execution delta — proving the split advanced the
+    // clock to its own instant (not the prior market event's t+1, and not beyond), the no-look-ahead
+    // guarantee. An exact `==` is impossible by construction (the wall-clock term is nondeterministic,
+    // the same drift the audit-replica parity tests output-mirror around); a tight bound is the
+    // honest assertion. `context.time` is captured the same way during `audit()`.
+    let drift = engine.time().signed_duration_since(effective_time);
+    assert!(
+        drift >= TimeDelta::zero() && drift < TimeDelta::seconds(1),
+        "clock advanced to ~effective_time (drift {drift})"
+    );
+
+    // The SplitRemainder observable is emitted with post-split-era fields (Convention A).
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+    let remainder = outputs
+        .iter()
+        .find_map(|o| match o {
+            EngineOutput::SplitRemainder {
+                instrument,
+                side,
+                quantity_fractional_disposed,
+                price_entry_average_post_split,
+                ..
+            } => Some((
+                *instrument,
+                *side,
+                *quantity_fractional_disposed,
+                *price_entry_average_post_split,
+            )),
+            _ => None,
+        })
+        .expect("a SplitRemainder output must be emitted for the floored fractional sliver");
+    assert_eq!(remainder.0, InstrumentIndex(0));
+    assert_eq!(remainder.1, Side::Buy);
+    assert_eq!(remainder.2, dec!(0.5)); // floor(50.5) disposes 0.5 (post-split units)
+    assert_eq!(remainder.3, dec!(200)); // post-split basis = old_avg / ratio = 100 / 0.5
+
+    // Post-split position: qty floored to 50, avg 200, max 50.5 (unfloored even under Floor),
+    // pnl_unrealised recomputed from the last (mark) price 105 = (105 - 200) * 50 = -4750.
+    let instrument_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    assert_eq!(instrument_state.position.positions.len(), 1);
+    let position = instrument_state.position.positions.values().next().unwrap();
+    assert_eq!(position.quantity_abs, dec!(50));
+    assert_eq!(position.price_entry_average, dec!(200));
+    assert_eq!(position.quantity_abs_max, dec!(50.5));
+    assert_eq!(position.pnl_unrealised, dec!(-4750));
+    assert!(
+        instrument_state
+            .corporate_actions_processed
+            .contains("BTCUSDT-reverse-1-2")
+    );
+
+    // The split read the last price the t+1 market event set (105) for its eager pnl recompute
+    // (-4750 above), proving that earlier market event was processed *before* the split. A market
+    // event AFTER the split (t+11) is then processed in order and updates the instrument's last
+    // price — confirming the split landed mid-stream, between the two. (Position `pnl_unrealised` is
+    // deliberately *not* re-checked here: the engine's market path updates instrument data but does
+    // not re-walk open positions each tick — the very reason `apply_split` recomputes pnl eagerly.)
+    let instrument_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    assert_eq!(instrument_state.data.price(), Some(dec!(105)));
+    engine.process(market_event_trade(11, 0, dec!(90)));
+    let instrument_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    assert_eq!(instrument_state.data.price(), Some(dec!(90)));
+}
+
 // ---------------------------------------------------------------------------
 // T1: ITM Put option expiry
 // ---------------------------------------------------------------------------
