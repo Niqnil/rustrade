@@ -1,6 +1,6 @@
 //! [`StockSplitSource`] implementation for the Massive REST client.
 //!
-//! Adapts the lower-level [`MassiveRestClient::fetch_splits`](super::rest::MassiveRestClient)
+//! Adapts the lower-level [`MassiveRestClient::fetch_splits_raw`](super::rest::MassiveRestClient)
 //! raw-split stream into the provider-agnostic
 //! [`CorporateAction`] sourcing descriptor, computing the split ratio via the shared
 //! [`CorporateActionKind::stock_split`] helper so Massive derives ratios identically to every other
@@ -42,10 +42,10 @@ impl StockSplitSource for MassiveRestClient {
 
         try_stream! {
             for query in &queries {
-                // Method-call syntax resolves to the *inherent* `MassiveRestClient::fetch_splits`
-                // (which takes `&SplitQuery`); inherent methods shadow trait methods, so this is the
-                // lower-level raw-split stream we adapt — not a recursive call into this impl.
-                let raw = self.fetch_splits(query);
+                // Calls the *inherent* `MassiveRestClient::fetch_splits_raw` (taking `&SplitQuery`),
+                // the lower-level raw-split stream this impl adapts. Its distinct name keeps the
+                // dispatch explicit — no collision with this trait's `fetch_splits`, so no recursion.
+                let raw = self.fetch_splits_raw(query);
                 futures::pin_mut!(raw);
                 while let Some(split) = raw.next().await {
                     if let Some(action) = map_split(split?) {
@@ -61,7 +61,7 @@ impl StockSplitSource for MassiveRestClient {
 /// or a single date-only query when no symbols are given).
 fn build_split_queries(filter: &CorporateActionFilter) -> Vec<SplitQuery> {
     // These queries only ever set the `execution_date_gte`/`lte` range — never the exact
-    // `execution_date` field. `SplitQuery::validate()` (run inside the inner `fetch_splits` stream)
+    // `execution_date` field. `SplitQuery::validate()` (run inside the inner `fetch_splits_raw` stream)
     // rejects only the exact+range combination, so queries built here can never trip it.
     let with_dates = |mut query: SplitQuery| {
         if let Some(start) = filter.start {

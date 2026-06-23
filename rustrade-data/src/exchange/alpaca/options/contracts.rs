@@ -300,10 +300,10 @@ impl AlpacaOptionsClient {
                 params.push(("page_token", token.clone()));
             }
 
-            let url = format!("{}/v2/options/contracts", self.broker_base);
-            let request = self.http.get(&url).query(&params);
+            let url = format!("{}/v2/options/contracts", self.rest.broker_base());
+            let request = self.rest.get(&url).query(&params);
 
-            let response: ContractsResponse = self.request_with_retry(request).await?;
+            let response: ContractsResponse = self.rest.request_with_retry(request).await?;
 
             let contracts = response.option_contracts.unwrap_or_default();
             let count = contracts.len();

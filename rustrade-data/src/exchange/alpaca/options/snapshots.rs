@@ -237,10 +237,10 @@ impl AlpacaOptionsClient {
                 params.push(("page_token", &token_string));
             }
 
-            let url = format!("{}/v1beta1/options/snapshots", self.data_base);
-            let request = self.http.get(&url).query(&params);
+            let url = format!("{}/v1beta1/options/snapshots", self.rest.data_base());
+            let request = self.rest.get(&url).query(&params);
 
-            let response: SnapshotsResponse = self.request_with_retry(request).await?;
+            let response: SnapshotsResponse = self.rest.request_with_retry(request).await?;
 
             if let Some(snapshots_map) = response.snapshots {
                 let count = snapshots_map.len();

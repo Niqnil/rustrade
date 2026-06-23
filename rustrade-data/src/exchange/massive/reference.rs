@@ -1371,12 +1371,12 @@ impl MassiveRestClient {
     ///
     /// ```ignore
     /// let query = SplitQuery::new().ticker("AAPL").limit(100);
-    /// let mut stream = client.fetch_splits(&query);
+    /// let mut stream = client.fetch_splits_raw(&query);
     /// while let Some(split) = stream.next().await {
     ///     println!("{:?}", split?);
     /// }
     /// ```
-    pub fn fetch_splits<'a>(
+    pub fn fetch_splits_raw<'a>(
         &'a self,
         query: &'a SplitQuery,
     ) -> impl Stream<Item = Result<StockSplit, MassiveError>> + 'a {

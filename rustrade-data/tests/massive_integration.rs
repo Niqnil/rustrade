@@ -857,7 +857,7 @@ async fn test_corporate_actions_splits() {
     tracing::info!(%two_years_ago, "Fetching recent stock splits");
 
     let splits: Vec<_> = client
-        .fetch_splits(&query)
+        .fetch_splits_raw(&query)
         .take(10)
         .collect::<Vec<_>>()
         .await;
@@ -899,7 +899,7 @@ async fn test_corporate_actions_splits_specific_ticker() {
     tracing::info!("Fetching NVDA stock splits");
 
     let splits: Vec<_> = client
-        .fetch_splits(&query)
+        .fetch_splits_raw(&query)
         .take(5)
         .collect::<Vec<_>>()
         .await;

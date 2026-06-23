@@ -33,7 +33,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gated behind `massive` in `rustrade-data`. The action *kind* is encoded in the trait name (a
   `DividendSource` sibling is the future path) rather than a unified trait with a kind filter; push /
   account-scoped sources (e.g. IBKR) are intentionally out of this PULL trait. A runnable example
-  (`rustrade`, `corporate_action_sourcing`, `--features massive`) shows source → resolve → inject.
+  (`rustrade`, `corporate_action_sourcing`, `--features massive`/`--features alpaca`) shows
+  source → resolve → inject.
+- **Alpaca `StockSplitSource` implementation** (`rustrade-data`, feature-gated `alpaca`). A second
+  reference source: `impl StockSplitSource for AlpacaRestClient` wraps Alpaca's
+  `GET /v1beta1/corporate-actions` endpoint (available on the free/Basic plan), with a new
+  `CorporateActionsQuery` builder, the nested `forward_splits`/`reverse_splits` response shape, a
+  normalised `AlpacaStockSplit`, and automatic `page_token` pagination. `effective_date` maps onto
+  Alpaca's `ex_date` (the market-execution / price re-basing date), deliberately **not**
+  `payable_date` — which can precede `ex_date` for forward splits and would apply the split early
+  (pinned by a provenance test). New shared `AlpacaRestClient` / `AlpacaRestError` transport (auth +
+  rate-limit retry) factored out of the options client so every Alpaca REST surface shares one
+  client; the existing `AlpacaOptionsError` is now an alias of `AlpacaRestError` (same variants, no
+  signature change).
 
 ### Changed
 

@@ -15,7 +15,9 @@ description = "High performance & normalised WebSocket intergration for leading 
 default = []
 ibkr = ["dep:ibapi", "dep:time", "rustrade-instrument/ibkr"]
 hyperliquid = ["dep:hyperliquid_rust_sdk"]
-alpaca = []
+# `serde-float` lets the corporate-actions client deserialize `new_rate`/`old_rate` JSON numbers
+# into `Decimal` (same approach as the Massive split client).
+alpaca = ["rust_decimal/serde-float"]
 databento = ["dep:databento"]
 massive = ["dep:tokio-tungstenite", "dep:urlencoding", "rust_decimal/serde-float", "serde_json/raw_value"]
 

@@ -12,21 +12,16 @@ readme = "README.md"
 description = "Framework for building high-performance live-trading, paper-trading and back-testing systems"
 
 [features]
-# Forwards the Massive market-data feature so the corporate-action *sourcing* example can drive the
-# `StockSplitSource` impl on `MassiveRestClient`. Kept off by default — the engine itself needs no
-# provider.
+# Forward provider market-data features so the corporate-action *sourcing* example can drive a real
+# `StockSplitSource` impl (Massive's `MassiveRestClient` / Alpaca's `AlpacaRestClient`). Both off by
+# default — the engine itself needs no provider; the example falls back to a canned offline source.
 massive = ["rustrade-data/massive"]
+alpaca = ["rustrade-data/alpaca"]
 
 [[bench]]
 name = "backtest"
 path = "benches/backtest/mod.rs"
 harness = false
-
-# The corporate-action sourcing example uses the Massive REST client. Without `required-features`,
-# `cargo check --all-targets` (default features) would fail to compile it.
-[[example]]
-name = "corporate_action_sourcing"
-required-features = ["massive"]
 
 [dev-dependencies]
 rust_decimal_macros = { workspace = true }

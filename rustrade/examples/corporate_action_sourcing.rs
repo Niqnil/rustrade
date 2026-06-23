@@ -18,18 +18,21 @@
 //!      executed; *when/whether* to inject stays a wrapper decision, so this is **not** an
 //!      auto-injecting driver.
 //!
-//! Run it with the real Massive source (needs `MASSIVE_API_KEY`):
+//! Run it against a real provider (each behind its own feature + credentials):
 //! ```bash
+//! # Alpaca corporate-actions endpoint (needs ALPACA_API_KEY / ALPACA_SECRET_KEY; free/paper tier):
+//! cargo run -p rustrade --features alpaca --example corporate_action_sourcing
+//! # Massive /v3/reference/splits (needs MASSIVE_API_KEY):
 //! cargo run -p rustrade --features massive --example corporate_action_sourcing
 //! ```
-//! Without the key it falls back to a small in-example [`DemoSplitSource`] so the mechanics still
-//! run offline. Both paths flow through the same trait-generic [`collect_splits`].
+//! Without any provider feature/credentials it falls back to a small in-example [`DemoSplitSource`]
+//! so the mechanics still run offline. Every path flows through the same trait-generic
+//! [`collect_splits`].
 
 use chrono::NaiveDate;
 use futures::{Stream, StreamExt};
 use rust_decimal_macros::dec;
 use rustrade::{EngineEvent, SplitRoundingPolicy};
-use rustrade_data::exchange::massive::MassiveRestClient;
 use rustrade_instrument::{
     corporate_action::{CorporateAction, CorporateActionKind, split_effective_instant},
     instrument::InstrumentIndex,
@@ -46,19 +49,9 @@ async fn main() {
         end: None,
     };
 
-    // Source the splits. With MASSIVE_API_KEY set, this drives the real `StockSplitSource` impl on
-    // `MassiveRestClient` against the live `/v3/reference/splits` endpoint; without it, a canned
-    // in-example source keeps the example runnable. Both go through the same generic `collect_splits`.
-    let actions = match MassiveRestClient::from_env() {
-        Ok(client) => {
-            println!("Sourcing splits from Massive…");
-            collect_splits(&client, &filter).await
-        }
-        Err(_) => {
-            println!("MASSIVE_API_KEY not set — using canned demo splits.");
-            collect_splits(&DemoSplitSource, &filter).await
-        }
-    };
+    // Source the splits from the first available provider (feature-gated + credentialed), falling
+    // back to a canned offline source. Every provider goes through the same generic `collect_splits`.
+    let actions = source_actions(&filter).await;
 
     // For each sourced fact, do the wrapper's job and build the injectable engine event.
     for action in &actions {
@@ -79,8 +72,35 @@ async fn main() {
     println!("Sourced {} split action(s).", actions.len());
 }
 
+/// Pick a [`StockSplitSource`] and drain it. Each real provider is feature-gated and used only when
+/// its credentials are present; otherwise the canned [`DemoSplitSource`] keeps the example runnable.
+async fn source_actions(filter: &CorporateActionFilter) -> Vec<CorporateAction<SmolStr>> {
+    #[cfg(feature = "alpaca")]
+    {
+        use rustrade_data::exchange::alpaca::AlpacaRestClient;
+        if let Ok(client) = AlpacaRestClient::from_env() {
+            println!("Sourcing splits from Alpaca…");
+            return collect_splits(&client, filter).await;
+        }
+        println!("ALPACA_API_KEY/ALPACA_SECRET_KEY not set — trying the next source.");
+    }
+
+    #[cfg(feature = "massive")]
+    {
+        use rustrade_data::exchange::massive::MassiveRestClient;
+        if let Ok(client) = MassiveRestClient::from_env() {
+            println!("Sourcing splits from Massive…");
+            return collect_splits(&client, filter).await;
+        }
+        println!("MASSIVE_API_KEY not set — trying the next source.");
+    }
+
+    println!("No provider source available — using canned demo splits.");
+    collect_splits(&DemoSplitSource, filter).await
+}
+
 /// Drain a [`StockSplitSource`] into a `Vec`, demonstrating trait-generic consumption — the same
-/// code drives the Massive client or any other implementor.
+/// code drives the Alpaca/Massive client or any other implementor.
 async fn collect_splits<S>(
     source: &S,
     filter: &CorporateActionFilter,
@@ -138,7 +158,7 @@ fn resolve_ticker(ticker: &str) -> Option<InstrumentIndex> {
     }
 }
 
-/// A canned, offline [`StockSplitSource`] so the example runs without Massive credentials.
+/// A canned, offline [`StockSplitSource`] so the example runs without provider credentials.
 struct DemoSplitSource;
 
 impl StockSplitSource for DemoSplitSource {

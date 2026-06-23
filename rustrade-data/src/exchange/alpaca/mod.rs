@@ -79,8 +79,16 @@ pub mod channel;
 pub mod market;
 pub mod options;
 pub mod quote;
+pub mod reference;
+pub mod rest;
 pub mod subscription;
 pub mod trade;
+
+// `StockSplitSource` adapter for `AlpacaRestClient` (no public items of its own — just the impl).
+mod corporate_action;
+
+pub use reference::{AlpacaStockSplit, CorporateActionsQuery};
+pub use rest::{AlpacaRestClient, AlpacaRestError};
 
 /// IEX WebSocket URL (free US equities feed).
 pub const WEBSOCKET_URL_IEX: &str = "wss://stream.data.alpaca.markets/v2/iex";
