@@ -60,12 +60,21 @@
 //! [`Candle`]: crate::subscription::candle::Candle
 
 pub mod depth;
+// `flex` is private: its public surface is re-exported flat below (matching the `massive`
+// reconciliation module), so callers use a single `ibkr::IbkrFlex*` path rather than the
+// internal submodule layout.
+mod flex;
 pub mod greeks;
 pub mod historical;
 pub mod options;
 pub mod quotes;
 pub mod subscription;
 pub mod trades;
+
+pub use flex::{
+    IbkrFlexClient, IbkrFlexConfig, IbkrFlexCorporateAction, IbkrFlexError, IbkrReorgType,
+    parse_corporate_actions,
+};
 
 use crate::{
     error::DataError,

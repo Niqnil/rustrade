@@ -13,7 +13,7 @@ description = "High performance & normalised WebSocket intergration for leading 
 
 [features]
 default = []
-ibkr = ["dep:ibapi", "dep:time", "rustrade-instrument/ibkr"]
+ibkr = ["dep:ibapi", "dep:time", "dep:quick-xml", "rustrade-instrument/ibkr"]
 hyperliquid = ["dep:hyperliquid_rust_sdk"]
 # `serde-float` lets the corporate-actions client deserialize `new_rate`/`old_rate` JSON numbers
 # into `Decimal` (same approach as the Massive split client).
@@ -72,6 +72,9 @@ fnv = { workspace = true }
 # IBKR (optional, behind "ibkr" feature)
 ibapi = { version = "=3.0.1", optional = true, default-features = false, features = ["sync"] }
 time = { version = "0.3", optional = true, features = ["macros"] }
+# XML parser for IBKR Flex Web Service statements (corporate-action reconciliation). New normal dep
+# (serde-xml-rs/xml-rs are only a build-dep of time-tz via ibapi, not reusable). Note for tier-2 review.
+quick-xml = { workspace = true, optional = true }
 
 # Hyperliquid (optional, behind "hyperliquid" feature)
 hyperliquid_rust_sdk = { version = "0.6", optional = true }
@@ -112,4 +115,8 @@ required-features = ["ibkr"]
 
 [[example]]
 name = "ibkr_market_data"
+required-features = ["ibkr"]
+
+[[example]]
+name = "ibkr_flex_corporate_actions"
 required-features = ["ibkr"]

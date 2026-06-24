@@ -18,3 +18,4 @@ binance-sdk=52.0.0  # 2026-06-04 | Exchange SDK, signing/IO. PINNED: margin user
 #   2. ws.common.events.subscribe (WebsocketEventEmitter) — receive/event-callback path (margin WS event delivery)
 #   3. common::utils::send_request                        — signature + HMAC signing + X-MBX-APIKEY header (hand-rolled `userListenToken` POST; SDK binds no endpoint for it)
 # Background: legacy margin listen-key user-data API retired 2026-02-20; SDK binds only the dead endpoint, so the live `userListenToken` flow is hand-rolled atop these internals.
+quick-xml  # 2026-06-24 | New direct dep (XML parsing of broker Flex statements). Reviewed @ 0.38.4: #![forbid(unsafe_code)] crate-wide, zero net-new transitive deps (serde+memchr only, both already in tree), no RUSTSEC advisories, de-facto-standard parser. Not pinned — any version bump still needs review.

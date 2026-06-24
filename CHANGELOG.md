@@ -46,6 +46,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rate-limit retry) factored out of the options client so every Alpaca REST surface shares one
   client; the existing `AlpacaOptionsError` is now an alias of `AlpacaRestError` (same variants, no
   signature change).
+- **IBKR Flex Web Service corporate-action reconciliation** (`rustrade-data`, feature-gated `ibkr`).
+  A new `rustrade_data::exchange::ibkr::flex` surface fetches an account's *Activity* Flex statement
+  over HTTPS (`IbkrFlexClient` / `IbkrFlexConfig`, env vars `IBKR_FLEX_TOKEN` / `IBKR_FLEX_QUERY_ID`)
+  via the 2-call SendRequest → poll → GetStatement flow, and parses the Corporate Actions section
+  into faithful raw `IbkrFlexCorporateAction` records (`IbkrReorgType` enum + a standalone
+  `parse_corporate_actions` XML parser). This is a broker-confirmed **reconciliation / audit** source
+  — account-scoped and post-hoc — **not** a `StockSplitSource`: it derives no split ratio (the raw
+  `principal_adjust_factor` is surfaced but is a TIPS field, not a ratio), leaving ratio
+  derivation/verification and reconcile policy to the caller. XML is parsed with the new `quick-xml`
+  dependency (pulled in only by the `ibkr` feature). A runnable example
+  (`ibkr_flex_corporate_actions`, `--features ibkr`) sketches the wrapper-side reconcile.
 
 ### Changed
 
