@@ -236,6 +236,13 @@ impl IbkrFlexClient {
     /// plaintext. The poll URL returned by SendRequest is required to be `https://` for the same
     /// reason — the token must never traverse an unencrypted connection.
     ///
+    /// Two IBKR hosts are involved: `ndcdyn.interactivebrokers.com` (the hard-coded `FLEX_BASE_URL`
+    /// that serves `SendRequest`) and `gdcdyn.interactivebrokers.com` (the statement-download host
+    /// that `SendRequest` returns in its poll URL). The poll host is deliberately **not** pinned to
+    /// an allowlist — only its scheme is enforced (`https://`) — so IBKR can relocate statement
+    /// serving without breaking this client, while the `https://` gate keeps the token encrypted
+    /// regardless of which host is returned.
+    ///
     /// # Errors
     ///
     /// - [`IbkrFlexError::Http`] on a transport failure.

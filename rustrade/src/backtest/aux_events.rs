@@ -22,6 +22,16 @@ use std::sync::Arc;
 /// merge with the market stream is a two-way merge that relies on both inputs already being
 /// sorted; out-of-order aux events produce an out-of-order engine feed (and, in backtest, a
 /// non-monotonic [`HistoricalClock`](crate::engine::clock::HistoricalClock)).
+///
+/// # Limitation — `ContractExpiry` does not advance the backtest clock
+/// [`EngineEvent::ContractExpiry`](crate::EngineEvent::ContractExpiry) carries no timestamp (unlike
+/// [`EngineEvent::CorporateAction`](crate::EngineEvent::CorporateAction), which carries
+/// `effective_time`). An injected expiry is therefore **ordered** correctly within the merged
+/// stream but does **not** advance the
+/// [`HistoricalClock`](crate::engine::clock::HistoricalClock): its synthetic settlement fill is
+/// stamped at the prior market tick, not the expiry instant. `CorporateAction` is unaffected (it
+/// advances the clock to its `effective_time`). If exact expiry-instant stamping matters, drive a
+/// market event at the expiry time alongside the injected `ContractExpiry`.
 pub trait AuxEventSource<
     MarketKind = DataKind,
     ExchangeKey = ExchangeIndex,

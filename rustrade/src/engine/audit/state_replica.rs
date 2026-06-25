@@ -395,6 +395,17 @@ where
                         for pos_id in opt_position_ids {
                             if let Some(position) = option_state.position.positions.get_mut(&pos_id)
                             {
+                                // Mirror the live handler's input invariant (see
+                                // `process_corporate_action`): option contract counts are whole, so a
+                                // non-integer count is corruption that must fail observably — not be
+                                // silently floored/carried. Keeps live and replica behaviour identical
+                                // (a live panic here must be a replica panic, or audit parity drifts).
+                                assert!(
+                                    position.quantity_abs.fract().is_zero(),
+                                    "replica: option position {pos_id:?} holds a non-integer contract \
+                                     count {} before a standard split — data corruption",
+                                    position.quantity_abs,
+                                );
                                 position.apply_split(ratio, policy, option_last_price);
                             }
                         }

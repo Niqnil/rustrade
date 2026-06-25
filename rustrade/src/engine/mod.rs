@@ -937,19 +937,26 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                         // record asserts the position WAS adjusted, so never emit it for a position
                         // the re-borrow could not find.
                         if let Some(position) = option_state.position.positions.get_mut(&pos_id) {
-                            // `_`-prefixed: used only by the debug_assert, which compiles out in
-                            // release. A standard split is a whole-number ratio and option contract
-                            // counts are integers, so the disposal is provably zero — assert it so a
-                            // future apply_split/contract-count regression is caught in test, not
-                            // silently dropped (no SplitRemainder is emitted on this path).
-                            let _split_result =
-                                position.apply_split(ratio, policy, option_last_price);
-                            debug_assert!(
-                                _split_result.remainder.is_zero(),
-                                "standard option split (whole-number ratio × integer contract \
-                                 count) left a non-zero remainder {} — invariant violated",
-                                _split_result.remainder,
+                            // Option contract counts are whole, and a standard split is a
+                            // whole-number ratio, so `integer × integer` stays integer with no
+                            // fractional remainder — the equity's `SplitRoundingPolicy` (a
+                            // whole-share-lot concept) does not govern option legs. Enforce that
+                            // invariant on the INPUT with a hard `assert!` (NOT `debug_assert!`,
+                            // which compiles out in release): a non-integer contract count is state
+                            // corruption that must fail observably, never be silently floored (under
+                            // `Floor`) or silently carried (under `Fractional`). Asserting the input
+                            // — rather than the post-split `remainder` — is the meaningful check:
+                            // under `Fractional` the remainder is always zero by construction, so a
+                            // remainder assert would be vacuous. With the invariant upheld the
+                            // disposal is provably zero, so no SplitRemainder/CIL or floor-to-zero
+                            // close is possible here.
+                            assert!(
+                                position.quantity_abs.fract().is_zero(),
+                                "option position {pos_id:?} holds a non-integer contract count {} \
+                                 before a standard split — data corruption",
+                                position.quantity_abs,
                             );
+                            position.apply_split(ratio, policy, option_last_price);
                             outputs.push(EngineOutput::OptionPositionAdjustedForSplit {
                                 option_instrument: opt_key,
                                 ratio,
@@ -1098,6 +1105,14 @@ pub enum EngineOutput<
     ///
     /// `quantity_fractional_disposed × price_entry_average_post_split` is the cost basis of the
     /// disposed sliver; both fields share the post-split era (Decimal arithmetic, no ratio).
+    ///
+    /// # Relationship to [`PositionExit`](Self::PositionExit)
+    /// A reverse split under `Floor` can round a position's quantity to zero. When that happens the
+    /// handler emits **both** a `SplitRemainder` **and** a [`PositionExit`](Self::PositionExit) for
+    /// the same `instrument` + `position_id` — there is no value double-count: the `PositionExit`
+    /// closes the now-zero-quantity slot and books its realised PnL, while this `SplitRemainder`
+    /// records the disposed fractional sliver as cash-in-lieu. So when both share a `position_id`,
+    /// this `SplitRemainder` is the position's **entire** remaining disposal.
     SplitRemainder {
         /// Instrument whose position was split.
         instrument: InstrumentKey,

@@ -1688,6 +1688,195 @@ fn test_corporate_action_replica_parity_floor_split() {
     );
 }
 
+/// End-to-end idempotency for `CorporateAction`: the identical event fired twice must apply the
+/// split exactly **once**. The second call hits the per-instrument `corporate_actions_processed`
+/// guard (`process_corporate_action` step 1) and must be a no-op — it re-emits no
+/// `SplitRemainder`/`PositionExit` and leaves `quantity_abs`/`price_entry_average` unchanged (a
+/// double-apply would re-scale the basis and re-dispose a remainder). Mirrors
+/// `test_contract_expiry_idempotent` for the split path, exercising the guard end-to-end through
+/// `process_with_audit`.
+#[test]
+fn test_corporate_action_idempotent() {
+    use rustrade::engine::audit::EngineAudit;
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine_with_oms(TradingState::Disabled, execution_tx, OmsMode::Hedging);
+
+    // Last price so apply_split takes the eager pnl_unrealised recompute path (not None ⇒ 0).
+    engine.process(market_event_trade(1, 0, dec!(100)));
+
+    // One long position; a 1:2 reverse split under Floor leaves a fractional remainder
+    // (21 → floor(10.5) = 10), so the FIRST application emits a SplitRemainder we can assert is
+    // NOT re-emitted by the second (idempotent) call.
+    open_position_via_trade(&mut engine, 0, 2, Side::Buy, dec!(100), dec!(21), "pos");
+
+    let effective_time = time_plus_days(STARTING_TIMESTAMP, 10);
+    let ca_event = EngineEvent::CorporateAction {
+        id: "AAPL-2026-split".into(),
+        instrument: InstrumentIndex(0),
+        kind: CorporateActionKind::StockSplit { ratio: dec!(0.5) },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time,
+    };
+
+    // First application: split applied, id recorded, SplitRemainder emitted.
+    let first = process_with_audit(&mut engine, ca_event.clone());
+    let first_outputs = match &first.event {
+        EngineAudit::Process(audit) => audit.outputs.clone(),
+        _ => panic!("expected EngineAudit::Process"),
+    };
+    assert!(
+        first_outputs
+            .iter()
+            .any(|o| matches!(o, EngineOutput::SplitRemainder { .. })),
+        "first application should emit a SplitRemainder (21 → floor(10.5) = 10, 0.5 disposed)"
+    );
+
+    // Snapshot the split-adjusted position after the first application.
+    let pos_id = PositionId::new("pos");
+    let after_first = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0))
+        .position
+        .positions
+        .get(&pos_id)
+        .expect("position should persist after the first split")
+        .clone();
+    assert_eq!(after_first.quantity_abs, dec!(10));
+    assert_eq!(after_first.price_entry_average, dec!(200));
+
+    // Second application of the IDENTICAL event: suppressed by the idempotency guard.
+    let second = process_with_audit(&mut engine, ca_event.clone());
+    let second_outputs = match &second.event {
+        EngineAudit::Process(audit) => audit.outputs.clone(),
+        _ => panic!("expected EngineAudit::Process"),
+    };
+    assert!(
+        !second_outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::SplitRemainder { .. } | EngineOutput::PositionExit(_)
+        )),
+        "second (idempotent) application must re-emit no SplitRemainder/PositionExit"
+    );
+
+    // State unchanged by the second call (no double basis-adjust / re-dispose).
+    let after_second = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0))
+        .position
+        .positions
+        .get(&pos_id)
+        .expect("position should still persist")
+        .clone();
+    assert_eq!(after_second, after_first);
+}
+
+/// Live engine vs audit-replica parity for a `CorporateAction` reverse split under `Floor` on
+/// **short** positions (`Side::Sell`), across multiple positions (Hedging) — one surviving, one
+/// floored to zero. `position.rs` unit tests cover shorts, but every other handler/replica parity
+/// test opens `Side::Buy`; this exercises the opposite `pnl_unrealised` sign branch and the
+/// floor-to-zero `PositionExit` for a short at the integration level.
+#[test]
+fn test_corporate_action_replica_parity_short_reverse_split() {
+    use rustrade::engine::audit::{
+        AuditTick, EngineAudit, context::EngineContext, state_replica::StateReplicaManager,
+    };
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine_with_oms(TradingState::Disabled, execution_tx, OmsMode::Hedging);
+
+    // Last price so apply_split eagerly recomputes pnl_unrealised (not the None ⇒ 0 path).
+    engine.process(market_event_trade(1, 0, dec!(100)));
+
+    // Two SHORT positions (Side::Sell) on the same Spot instrument (index 0). Under a 1:2 reverse
+    // split (Floor):
+    //   - "survivor" 21 → floor(10.5) = 10 (survives, with a 0.5 fractional remainder)
+    //   - "dust"      1 → floor(0.5)  = 0  (floored to zero ⇒ removed + PositionExit)
+    open_position_via_trade(
+        &mut engine,
+        0,
+        2,
+        Side::Sell,
+        dec!(100),
+        dec!(21),
+        "survivor",
+    );
+    open_position_via_trade(&mut engine, 0, 3, Side::Sell, dec!(100), dec!(1), "dust");
+
+    // Seed the replica from the exact pre-split state.
+    let pre_split_state = engine.state.clone();
+
+    let effective_time = time_plus_days(STARTING_TIMESTAMP, 10);
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSDT-reverse-1-2-short".into(),
+        instrument: InstrumentIndex(0),
+        kind: CorporateActionKind::StockSplit { ratio: dec!(0.5) },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time,
+    };
+    let audit_tick = process_with_audit(&mut engine, ca_event.clone());
+
+    let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+        event: pre_split_state,
+        context: EngineContext {
+            time: effective_time,
+            sequence: Sequence(0),
+        },
+    };
+    // Type annotation required for StateReplicaManager::new to infer the iterator element type
+    #[allow(clippy::type_complexity)]
+    let dummy_updates: std::iter::Empty<
+        AuditTick<
+            EngineAudit<
+                EngineEvent<DataKind>,
+                EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>,
+            >,
+        >,
+    > = std::iter::empty();
+    let mut replica_manager = StateReplicaManager::new(seed_tick, dummy_updates);
+
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => audit.outputs.clone(),
+        _ => panic!("expected EngineAudit::Process"),
+    };
+    replica_manager.update_from_event(ca_event, &outputs);
+
+    let live_instrument = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    let replica_instrument = replica_manager
+        .replica_engine_state()
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+
+    // Gold-standard: full InstrumentState parity (positions, tear sheet, processed-id set, …).
+    assert_eq!(replica_instrument, live_instrument);
+
+    let survivor_id = PositionId::new("survivor");
+    let dust_id = PositionId::new("dust");
+
+    // "dust" short floored to zero ⇒ slot removed in both.
+    assert!(!live_instrument.position.positions.contains_key(&dust_id));
+    assert!(!replica_instrument.position.positions.contains_key(&dust_id));
+
+    // "survivor" short persists, split-adjusted: qty floor(21*0.5)=10, avg 100/0.5=200,
+    // max 21*0.5=10.5 (unfloored). pnl_unrealised uses the SHORT branch:
+    // (entry - price) * qty = (200 - 100) * 10 = +1000 (a short gains as basis > current price).
+    let survivor = live_instrument
+        .position
+        .positions
+        .get(&survivor_id)
+        .expect("survivor short position should persist");
+    assert_eq!(survivor.side, Side::Sell);
+    assert_eq!(survivor.quantity_abs, dec!(10));
+    assert_eq!(survivor.price_entry_average, dec!(200));
+    assert_eq!(survivor.quantity_abs_max, dec!(10.5));
+    assert_eq!(survivor.pnl_unrealised, dec!(1000));
+}
+
 /// Live vs replica parity for a `CorporateAction` targeting a non-`Spot` instrument: both reject
 /// (no state change, `id` not recorded), so the replica's guards must stay symmetric with the
 /// handler's. Validates the `InstrumentKindNotSupported` rejection path.

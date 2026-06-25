@@ -186,15 +186,19 @@ pub enum EngineEvent<
     ///   underlying equity key; option positions on that underlying are **not** adjusted here and
     ///   are surfaced via a separate observable output.
     /// - `kind`: the market fact (e.g. [`CorporateActionKind::StockSplit`] carrying the ratio).
-    /// - `policy`: how to round a fractional resulting share count
-    ///   ([`SplitRoundingPolicy`]) — broker-specific, no default.
+    /// - `policy`: how to round a fractional resulting **equity** share count
+    ///   ([`SplitRoundingPolicy`]) — broker-specific, no default. Governs the **equity** leg only;
+    ///   option contract counts are whole integers and are never floored, so a standard option
+    ///   adjustment is exact regardless of this `policy`.
     /// - `effective_time`: the resolved instant the adjustment takes effect. In backtest the
     ///   [`HistoricalClock`](engine::clock::HistoricalClock) advances to this instant so the
     ///   adjustment is stamped and ordered exactly (no look-ahead); in live it is honest metadata.
     ///
     /// # Caller obligations
     /// - Assign a unique `id` per action.
-    /// - Resolve the ticker to the engine's `InstrumentKey`.
+    /// - Resolve the ticker to a **valid** engine `InstrumentKey`. The engine indexes it directly
+    ///   and **panics on an unknown key** (consistent with the rest of the `EngineEvent` API), so
+    ///   validate the key before constructing the event.
     /// - Supply the `policy` (matching the broker's rounding behaviour) and a resolved
     ///   `effective_time` (see [`split_effective_instant`](rustrade_instrument::corporate_action::split_effective_instant)).
     /// - **Inject once**, after the broker has applied the action, before processing new fills on
@@ -202,6 +206,10 @@ pub enum EngineEvent<
     /// - A same-day **correction** is expressed as two distinct events with distinct `id`s — a
     ///   reversal (`ratio = 1 / old`) followed by the corrected split — so neither is suppressed
     ///   by the idempotency guard.
+    /// - Do **not** inject a `ratio == 1` no-op "split". It is a non-event: the engine applies it as
+    ///   a no-op, yet it still classifies as non-standard and emits
+    ///   `OptionPositionsRequireIdentityChange` for any option positions on the underlying —
+    ///   misleading noise for what changed nothing.
     ///
     /// # Missing last price
     /// Unlike [`ContractExpiry`](Self::ContractExpiry) — which bails and is retryable when the
@@ -221,7 +229,8 @@ pub enum EngineEvent<
         instrument: InstrumentKey,
         /// The corporate-action market fact (e.g. a stock split ratio).
         kind: CorporateActionKind,
-        /// How to round a fractional resulting share count (broker-specific; no default).
+        /// How to round a fractional resulting **equity** share count (broker-specific; no
+        /// default). Governs the equity leg only — option contract counts are whole and never floored.
         policy: SplitRoundingPolicy,
         /// The resolved instant the adjustment takes effect (drives the backtest clock).
         effective_time: DateTime<Utc>,

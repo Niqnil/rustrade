@@ -7,7 +7,7 @@ use crate::{
     statistic::summary::instrument::TearSheetGenerator,
 };
 use chrono::{DateTime, Utc};
-use fnv::FnvHashMap;
+use fnv::{FnvHashMap, FnvHashSet};
 use itertools::Either;
 use rustrade_data::event::MarketEvent;
 use rustrade_execution::{
@@ -31,7 +31,7 @@ use rustrade_instrument::{
         name::{InstrumentNameExchange, InstrumentNameInternal},
     },
 };
-use rustrade_integration::collection::{FnvIndexMap, FnvIndexSet, snapshot::Snapshot};
+use rustrade_integration::collection::{FnvIndexMap, snapshot::Snapshot};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use std::fmt::Debug;
@@ -306,8 +306,11 @@ pub struct InstrumentState<
     ///
     /// Rejected actions (unsupported instrument/action kind) are deliberately **not** recorded,
     /// so they remain retryable once support is added.
+    ///
+    /// A hash set (insertion order is never read — only `contains`/`insert`), consistent with the
+    /// sibling `FnvHashMap` routing fields below.
     #[serde(default)]
-    pub corporate_actions_processed: FnvIndexSet<SmolStr>,
+    pub corporate_actions_processed: FnvHashSet<SmolStr>,
 
     /// Maps `ClientOrderId` → `PositionId` for hedging-mode fill routing.
     ///
@@ -917,7 +920,7 @@ where
                         data: instrument_data_init(instrument),
                         fee_model: FeeModelConfig::default(),
                         expiration_processed: false,
-                        corporate_actions_processed: FnvIndexSet::default(),
+                        corporate_actions_processed: FnvHashSet::default(),
                         position_ids: FnvHashMap::default(),
                         pending_fills: Vec::new(),
                         exchange_id_to_cid: FnvHashMap::default(),
