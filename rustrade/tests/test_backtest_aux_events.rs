@@ -23,9 +23,15 @@ use rustrade::{
         BacktestArgsConstant, BacktestArgsDynamic, aux_events::AuxEventsInMemory, backtest,
         market_data::MarketDataInMemory, run_backtests,
     },
-    engine::state::{
-        EngineState, builder::EngineStateBuilder, global::DefaultGlobalData,
-        instrument::data::DefaultInstrumentMarketData, trading::TradingState,
+    engine::{
+        command::Command,
+        state::{
+            EngineState,
+            builder::EngineStateBuilder,
+            global::DefaultGlobalData,
+            instrument::{data::DefaultInstrumentMarketData, filter::InstrumentFilter},
+            trading::TradingState,
+        },
     },
     risk::DefaultRiskManager,
     statistic::time::Daily,
@@ -41,6 +47,7 @@ use rustrade_instrument::{
     corporate_action::CorporateActionKind, exchange::ExchangeId, index::IndexedInstruments,
     instrument::InstrumentIndex,
 };
+use rustrade_integration::collection::one_or_many::OneOrMany;
 use serde::Deserialize;
 
 const CONFIG_PATH: &str = concat!(
@@ -66,14 +73,18 @@ fn ts(raw: &str) -> DateTime<Utc> {
     raw.parse().unwrap()
 }
 
-/// A single trade `MarketEvent` for BTCUSDT (instrument index 0).
-fn trade(time: &str, price: Decimal) -> MarketStreamEvent<InstrumentIndex, DataKind> {
+/// A single trade `MarketEvent` for the instrument at `instrument` index.
+fn trade_for(
+    instrument: usize,
+    time: &str,
+    price: Decimal,
+) -> MarketStreamEvent<InstrumentIndex, DataKind> {
     let time = ts(time);
     MarketStreamEvent::Item(MarketEvent {
         time_exchange: time,
         time_received: time,
         exchange: ExchangeId::BinanceSpot,
-        instrument: InstrumentIndex::new(0),
+        instrument: InstrumentIndex::new(instrument),
         kind: DataKind::Trade(PublicTrade {
             id: "trade".into(),
             price,
@@ -81,6 +92,11 @@ fn trade(time: &str, price: Decimal) -> MarketStreamEvent<InstrumentIndex, DataK
             side: None,
         }),
     })
+}
+
+/// A single trade `MarketEvent` for BTCUSDT (instrument index 0).
+fn trade(time: &str, price: Decimal) -> MarketStreamEvent<InstrumentIndex, DataKind> {
+    trade_for(0, time, price)
 }
 
 /// Four BTCUSDT trades spanning 22:00–23:00; any aux event in that window interleaves mid-stream.
@@ -98,6 +114,17 @@ fn args_constant(
 ) -> Arc<
     BacktestArgsConstant<MarketDataInMemory<DataKind>, Daily, AuxBacktestState, DefaultAuxEvents>,
 > {
+    args_constant_with_market_data(aux_events, market_events())
+}
+
+/// As [`args_constant`], but with a caller-supplied market-data series (e.g. to feed a second
+/// pre-declared instrument its own post-split prints).
+fn args_constant_with_market_data(
+    aux_events: DefaultAuxEvents,
+    events: Vec<MarketStreamEvent<InstrumentIndex, DataKind>>,
+) -> Arc<
+    BacktestArgsConstant<MarketDataInMemory<DataKind>, Daily, AuxBacktestState, DefaultAuxEvents>,
+> {
     let Config {
         system: SystemConfig {
             instruments,
@@ -106,7 +133,7 @@ fn args_constant(
     } = load_config();
 
     let instruments = IndexedInstruments::new(instruments);
-    let market_data = MarketDataInMemory::new(Arc::new(market_events()));
+    let market_data = MarketDataInMemory::new(Arc::new(events));
 
     let engine_state = EngineStateBuilder::new(&instruments, DefaultGlobalData, |_| {
         DefaultInstrumentMarketData::default()
@@ -205,4 +232,64 @@ async fn run_backtests_sweep_threads_aux_events() {
     .expect("run_backtests sweep with injected splits must complete");
 
     assert_eq!(summaries.summaries.len(), 2);
+}
+
+/// Market-data series for the two-identity non-standard-split smoke: the "old" identity (idx0,
+/// BTCUSDT) prints across the whole window; the pre-declared "new" identity (idx1, ETHUSDT) prints
+/// ONLY after the 22:30 split — the natural shape, since the new contract did not exist before.
+fn market_events_two_identity() -> Vec<MarketStreamEvent<InstrumentIndex, DataKind>> {
+    vec![
+        trade_for(0, "2025-03-24T22:00:00Z", dec!(60_000)),
+        trade_for(0, "2025-03-24T22:15:00Z", dec!(60_100)),
+        trade_for(0, "2025-03-24T22:45:00Z", dec!(60_200)),
+        trade_for(1, "2025-03-24T22:50:00Z", dec!(2_000)),
+        trade_for(1, "2025-03-24T22:55:00Z", dec!(2_010)),
+        trade_for(0, "2025-03-24T23:00:00Z", dec!(60_300)),
+    ]
+}
+
+/// A `Command::ClosePositions` for `instrument`, wrapped for injection through the aux seam.
+fn close_command_event(time: &str, instrument: usize) -> Timed<EngineEvent> {
+    Timed::new(
+        EngineEvent::Command(Command::ClosePositions(InstrumentFilter::Instruments(
+            OneOrMany::One(InstrumentIndex::new(instrument)),
+        ))),
+        ts(time),
+    )
+}
+
+/// **Structural feasibility smoke for the non-standard-split wrapper flow (plumbing only).**
+///
+/// Proves a downstream wrapper can drive the whole non-standard-split protocol through the public
+/// `backtest()` API with no library re-registration: BOTH identities are pre-declared at
+/// construction (the config registers idx0/idx1/idx2), the aux seam carries BOTH a `CorporateAction`
+/// AND a flatten `Command::ClosePositions`, the new identity receives its own post-split data, and
+/// the run completes to a `BacktestSummary`.
+///
+/// SCOPE — this asserts PLUMBING only, not economics: `backtest()` hardcodes `AuditMode::Disabled`,
+/// so the `OptionPositionsRequireIdentityChange` observable is invisible here (its content is
+/// asserted on the `process_with_audit` path in `test_engine_process_engine_event_with_audit.rs`).
+/// The close trigger is *pre-planned* (injected at the known split time), not *reactive-from-output*
+/// — the identical caveat the `OpenOrdersAtSplit` backtest pattern already carries. Kind-agnostic:
+/// the config's spot instruments stand in for the option identities (a faithful option *trading*
+/// backtest needs a custom strategy + price-bearing mock fills, deferred to a future milestone). The
+/// injected `Command` generates no order — `DefaultStrategy` opens no position — so the MockExchange
+/// price-less-market-order panic cannot fire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backtest_non_standard_split_seam_carries_corporate_action_and_close_command() {
+    let aux = AuxEventsInMemory::new(Arc::new(vec![
+        // 3:2 fractional forward ⇒ non-standard (the wrapper must migrate the option identity).
+        split_event("2025-03-24T22:30:00Z", dec!(1.5)),
+        // The wrapper flattens the old identity right after the split.
+        close_command_event("2025-03-24T22:31:00Z", 0),
+    ]));
+
+    let summary = backtest(
+        args_constant_with_market_data(aux, market_events_two_identity()),
+        args_dynamic("non-standard-identity-change"),
+    )
+    .await
+    .expect("backtest carrying a CorporateAction + a flatten Command must complete");
+
+    assert_eq!(summary.id, "non-standard-identity-change");
 }

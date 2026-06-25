@@ -14,9 +14,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   target Spot instrument via `Position::apply_split` and emitting observables — `SplitRemainder`
   (cash-in-lieu of the fractional sliver disposed under `SplitRoundingPolicy::Floor`),
   `OpenOrdersAtSplit` (resting orders are reported, never engine-cancelled),
-  `OptionPositionsUnadjustedForSplit`, and `UnsupportedCorporateAction`. Application is idempotent
+  and `UnsupportedCorporateAction`. Application is idempotent
   per-instrument via a caller-assigned action `id`; a reverse split that floors a position to zero
   quantity closes it with a `PositionExit`.
+- **Corporate-action handling for option positions on a splitting underlying** (`rustrade`,
+  `rustrade-instrument`). When a split targets an underlying equity, the engine now also handles open
+  option positions on that underlying. A **standard** split (a whole-number forward split, per the OCC
+  option-adjustment rules) adjusts each option position **in place** — strike ÷ ratio, contract count
+  × ratio, deliverable/multiplier unchanged — emitting one new `EngineOutput::OptionPositionAdjustedForSplit`
+  per adjusted position, **plus an `OpenOrdersAtSplit` for the adjusted option's own resting orders**
+  (now stale-priced; reported, never engine-cancelled, exactly as on the equity path). A **non-standard**
+  split (every reverse split, every fractional forward split) requires a new contract identity the
+  engine does not register at runtime, so it emits the new `EngineOutput::OptionPositionsRequireIdentityChange`
+  and leaves the options at their pre-split terms; the underlying equity split is still applied and its
+  `id` recorded (so, unlike `UnsupportedCorporateAction`, it is **not** retryable — the wrapper closes
+  the listed options and/or trades a pre-declared new identity). New `CorporateActionKind::split_kind`
+  method (`rustrade-instrument`) returns `Option<SplitAdjustmentKind>` (`Standard`/`NonStandard`),
+  classifying the action per the OCC rule.
 - **Backtest auxiliary-event injection seam** (`rustrade`). New `AuxEventSource` trait, `NoAuxEvents`
   (zero-cost default), and `AuxEventsInMemory` interleave non-market `EngineEvent`s (e.g. corporate
   actions, contract expiries) with the market stream in simulated-time order during a backtest — the
@@ -73,6 +87,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`BacktestArgsConstant` gains a required `aux_events` field** (`rustrade`). **Breaking** for
   downstream code constructing it via a struct literal — add `aux_events: NoAuxEvents` (the new
   generic parameter `AuxEvents` defaults to `NoAuxEvents`) or supply a custom `AuxEventSource`.
+
+### Removed
+
+- **`EngineOutput::OptionPositionsUnadjustedForSplit`** (`rustrade`). The placeholder option-split
+  signal is removed in favour of the precise pair `OptionPositionAdjustedForSplit` (standard, applied)
+  and `OptionPositionsRequireIdentityChange` (non-standard, wrapper-handled). Relevant only to code
+  tracking this unreleased development line, where both the old and new variants are pre-release.
 
 ## [0.5.0] - 2026-06-19
 

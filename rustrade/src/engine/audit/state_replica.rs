@@ -12,7 +12,7 @@ use rustrade_integration::collection::none_one_or_many::NoneOneOrMany;
 use rustrade_data::{event::MarketEvent, streams::consumer::MarketStreamEvent};
 use rustrade_execution::AccountEvent;
 use rustrade_instrument::{
-    corporate_action::CorporateActionKind,
+    corporate_action::{CorporateActionKind, SplitAdjustmentKind},
     instrument::{InstrumentIndex, kind::InstrumentKind},
 };
 use rustrade_integration::Terminal;
@@ -329,6 +329,75 @@ where
                             .positions
                             .shift_remove(&exit.position_id);
                         instrument_state.tear_sheet.update_from_position(exit);
+                    }
+                }
+
+                // Standard option adjustment (mirrors the live handler's option-handling step).
+                // For a STANDARD (whole-number forward) split, the engine adjusts each option on
+                // this underlying IN PLACE: strike ÷ ratio + apply_split per option position. This
+                // is fully deterministic (strike division + apply_split reading the option's own
+                // replayed price), so it is PURE event-replay — options never floor-to-zero on a
+                // forward split, so no output-mirror is needed (unlike the equity Floor-to-zero
+                // close above). NON-standard splits leave options untouched (the live handler only
+                // emits a signal and mutates no option state), so this whole block is skipped.
+                //
+                // Classify via a `match` (not the old `if matches!`) to stay structurally symmetric
+                // with the live handler. `SplitAdjustmentKind` is `#[non_exhaustive]` (another
+                // crate) and cannot be matched exhaustively here; only a Standard split mutates
+                // option state in the replica — NonStandard, any future variant, and the unreachable
+                // None deliberately skip (the live handler emits only a signal output for them, which
+                // the replica, mirroring state not outputs, has nothing to apply). Warnings are
+                // intentionally omitted (see the block comment above).
+                let adjust_options_in_place =
+                    matches!(kind.split_kind(), Some(SplitAdjustmentKind::Standard));
+                if adjust_options_in_place {
+                    let (equity_base, equity_quote, equity_exchange) = {
+                        let equity = self
+                            .replica_engine_state()
+                            .instruments
+                            .instrument_index(&instrument);
+                        (
+                            equity.instrument.underlying.base,
+                            equity.instrument.underlying.quote,
+                            equity.instrument.exchange,
+                        )
+                    };
+                    let affected_options: Vec<InstrumentIndex> = self
+                        .replica_engine_state()
+                        .instruments
+                        .0
+                        .values()
+                        .filter(|state| {
+                            state.is_affected_option_on_underlying(
+                                &equity_base,
+                                &equity_quote,
+                                &equity_exchange,
+                            )
+                        })
+                        .map(|state| state.key)
+                        .collect();
+                    for opt_key in affected_options {
+                        let option_state = self
+                            .replica_engine_state_mut()
+                            .instruments
+                            .instrument_index_mut(&opt_key);
+                        let option_last_price = option_state.data.price();
+                        // Mirror the live handler's `else { continue; }`: the scan only matched
+                        // Option instruments, so this is defensive (unreachable) — skip the whole
+                        // iteration rather than apply_split without adjusting the strike if it hits.
+                        let InstrumentKind::Option(ref mut contract) = option_state.instrument.kind
+                        else {
+                            continue;
+                        };
+                        contract.strike /= ratio;
+                        let opt_position_ids: Vec<PositionId> =
+                            option_state.position.positions.keys().cloned().collect();
+                        for pos_id in opt_position_ids {
+                            if let Some(position) = option_state.position.positions.get_mut(&pos_id)
+                            {
+                                position.apply_split(ratio, policy, option_last_price);
+                            }
+                        }
                     }
                 }
 

@@ -59,6 +59,61 @@ impl CorporateActionKind {
             .filter(|ratio| ratio.is_sign_positive() && !ratio.is_zero())
             .map(|ratio| Self::StockSplit { ratio })
     }
+
+    /// Classify how this action affects listed **options** on the underlying, per the OCC
+    /// option-adjustment rules (OCC By-Laws Article VI, §11):
+    /// - `Some(`[`Standard`](SplitAdjustmentKind::Standard)`)` — a whole-number forward split, which
+    ///   the engine adjusts in place;
+    /// - `Some(`[`NonStandard`](SplitAdjustmentKind::NonStandard)`)` — every reverse split, every
+    ///   *fractional* forward split, and the `ratio == 1` no-op, none of which the engine can adjust
+    ///   in place;
+    /// - `None` — this action is **not a split** and so has no split classification (a future
+    ///   dividend, spin-off, …).
+    ///
+    /// A `StockSplit`'s `ratio` is **standard** iff it is a whole number strictly greater than one
+    /// (`ratio > 1 && ratio.fract() == 0`). A non-positive `ratio` cannot occur:
+    /// [`CorporateActionKind::stock_split`] rejects it at construction and `Position::apply_split`
+    /// asserts it, so this is only ever reached with a positive `ratio`.
+    #[must_use]
+    pub fn split_kind(&self) -> Option<SplitAdjustmentKind> {
+        match self {
+            Self::StockSplit { ratio } => {
+                Some(if *ratio > Decimal::ONE && ratio.fract().is_zero() {
+                    SplitAdjustmentKind::Standard
+                } else {
+                    SplitAdjustmentKind::NonStandard
+                })
+            }
+            // No `_` catch-all: `CorporateActionKind` is `#[non_exhaustive]`, so adding a future
+            // non-split variant (dividend, spin-off, …) makes this match fail to compile, forcing an
+            // explicit `None` mapping here rather than silently classifying it as `NonStandard`. The
+            // `Option` return already expresses "not a split ⇒ no split kind".
+        }
+    }
+}
+
+/// How the OCC adjusts listed **options** on an underlying that undergoes a stock split (OCC
+/// By-Laws Article VI, §11) — the classification returned by [`CorporateActionKind::split_kind`].
+///
+/// The two cases demand opposite handling, so the engine branches on them when a split targets an
+/// underlying that has open option positions. A downstream wrapper that PULL-sources corporate
+/// actions can use the same classification to decide how to react *before* injecting the event.
+///
+/// `#[non_exhaustive]`: were the OCC rule ever to gain a further category, it can be added without
+/// breaking downstream exhaustive matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[non_exhaustive]
+pub enum SplitAdjustmentKind {
+    /// A *whole-number forward* split (2-for-1, 3-for-1, …). The option survives with the **same**
+    /// contract identity: strike is divided by `ratio`, contract count is multiplied by `ratio`,
+    /// and the deliverable/multiplier stays 100. A purely mechanical adjustment that keeps the
+    /// existing position valid, so the engine applies it in place.
+    Standard,
+    /// Every *reverse* split (always `ratio < 1`), every *fractional* forward split (e.g. 3-for-2 →
+    /// `1.5`), and the `ratio == 1` no-op. The OCC changes the deliverable and assigns a **new**
+    /// option symbol (e.g. `MSFT` → `MSFT1`), destroying the instrument identity. No mechanical
+    /// in-place adjustment keeps the position valid, so the response is a downstream policy decision.
+    NonStandard,
 }
 
 /// Resolve a **stock split**'s *effective date* (a calendar `NaiveDate` market fact) to the exact
@@ -173,6 +228,34 @@ mod tests {
             CorporateActionKind::stock_split(Decimal::from(-2), Decimal::from(1)),
             None
         );
+    }
+
+    #[test]
+    fn split_kind_classifies_per_occ_rules() {
+        use SplitAdjustmentKind::{NonStandard, Standard};
+        let split = |ratio| CorporateActionKind::StockSplit { ratio };
+
+        // Standard: whole-number forward splits.
+        assert_eq!(split(Decimal::from(2)).split_kind(), Some(Standard)); // 2-for-1
+        assert_eq!(split(Decimal::from(3)).split_kind(), Some(Standard)); // 3-for-1
+        assert_eq!(split(Decimal::from(10)).split_kind(), Some(Standard)); // 10-for-1
+
+        // Standard regardless of internal scale: a whole number carried at non-zero scale (2.0,
+        // 3.00) is still standard. Guards the `fract().is_zero()` classifier against a future
+        // `scale() == 0` regression that would misread these as non-standard.
+        assert_eq!(split(Decimal::new(20, 1)).split_kind(), Some(Standard)); // 2.0
+        assert_eq!(split(Decimal::new(300, 2)).split_kind(), Some(Standard)); // 3.00
+
+        // Non-standard: fractional forward splits.
+        assert_eq!(split(Decimal::new(15, 1)).split_kind(), Some(NonStandard)); // 3-for-2 = 1.5
+        assert_eq!(split(Decimal::new(43, 10)).split_kind(), Some(NonStandard)); // odd fractional
+
+        // Non-standard: every reverse split (ratio < 1).
+        assert_eq!(split(Decimal::new(5, 1)).split_kind(), Some(NonStandard)); // 1-for-2 = 0.5
+        assert_eq!(split(Decimal::new(1, 1)).split_kind(), Some(NonStandard)); // 1-for-10 = 0.1
+
+        // Boundary: a 1-for-1 no-op is not a standard adjustment to apply.
+        assert_eq!(split(Decimal::ONE).split_kind(), Some(NonStandard));
     }
 
     #[test]

@@ -6,14 +6,22 @@
 //! trading a broker applying a split overnight does **not** fix the engine's internal
 //! `quantity`/`price_entry_average`/`pnl_unrealised`. A wrapper detects the action and injects an
 //! `EngineEvent::CorporateAction`; the engine adjusts every open position on the target instrument
-//! and emits observables (`SplitRemainder`, `OpenOrdersAtSplit`, `OptionPositionsUnadjustedForSplit`,
-//! `UnsupportedCorporateAction`).
+//! and emits observables (`SplitRemainder`, `OpenOrdersAtSplit`, `OptionPositionAdjustedForSplit`,
+//! `OptionPositionsRequireIdentityChange`, `UnsupportedCorporateAction`).
 //!
-//! This example shows **how to construct and inject the event**, on both paths:
+//! This example shows **how to construct and inject the event**, on four paths:
 //! - **Backtest** (`main`, runnable): the split is supplied via an [`AuxEventsInMemory`] aux source,
 //!   merged with the market stream in simulated-time order, and the backtest runs to completion.
 //! - **Live** ([`live_injection_sketch`], shown but not executed — it needs a running broker
 //!   connection): the same event is sent directly through the public `System.feed_tx` channel.
+//! - **Standard option adjustment** ([`standard_option_split_sketch`]): a whole-number forward split
+//!   on the *underlying equity* also adjusts every option position on that underlying **in place**
+//!   (strike ÷ ratio, contracts × ratio, multiplier unchanged), emitting `OptionPositionAdjustedForSplit`
+//!   plus an `OpenOrdersAtSplit` for each adjusted option's own resting orders.
+//! - **Non-standard option identity change** ([`non_standard_option_split_wrapper_sketch`]): a reverse
+//!   or fractional-forward split needs a new contract identity the engine never re-registers; the
+//!   wrapper pre-declares both identities and drives close-old + trade-new through the aux seam (the
+//!   backtest pattern), the engine only signals `OptionPositionsRequireIdentityChange`.
 //!
 //! It is deliberately **not** an auto-injecting driver and does **no sourcing** (resolving tickers,
 //! fetching split ratios, deciding rounding policy, and choosing *when* to inject all remain wrapper
@@ -43,9 +51,15 @@ use rustrade::{
         BacktestArgsConstant, BacktestArgsDynamic, aux_events::AuxEventsInMemory, backtest,
         market_data::MarketDataInMemory,
     },
-    engine::state::{
-        EngineState, builder::EngineStateBuilder, global::DefaultGlobalData,
-        instrument::data::DefaultInstrumentMarketData, trading::TradingState,
+    engine::{
+        command::Command,
+        state::{
+            EngineState,
+            builder::EngineStateBuilder,
+            global::DefaultGlobalData,
+            instrument::{data::DefaultInstrumentMarketData, filter::InstrumentFilter},
+            trading::TradingState,
+        },
     },
     logging::init_logging,
     risk::DefaultRiskManager,
@@ -64,7 +78,10 @@ use rustrade_instrument::{
     index::IndexedInstruments,
     instrument::InstrumentIndex,
 };
-use rustrade_integration::channel::{Tx, UnboundedTx};
+use rustrade_integration::{
+    channel::{Tx, UnboundedTx},
+    collection::one_or_many::OneOrMany,
+};
 use serde::Deserialize;
 
 const CONFIG_PATH: &str = "rustrade/examples/config/backtest_config.json";
@@ -196,6 +213,101 @@ fn live_injection_sketch(
     feed_tx
         .send(event)
         .expect("engine feed receiver must be alive");
+}
+
+/// Standard option-adjust sketch — **not executed**; documents the *option* side of a standard split.
+///
+/// A `CorporateAction` always targets the **underlying equity** (a `Spot` instrument) — never an
+/// option key directly (a split on an option key is rejected as `UnsupportedCorporateAction`). When
+/// the ratio is **standard** — a whole-number forward split, i.e. `kind.split_kind()` is
+/// `Some(SplitAdjustmentKind::Standard)` (2-for-1, 3-for-1, …) — the engine, after splitting the
+/// equity, additionally adjusts **every open option position on that underlying in place**, with no
+/// instrument re-registration:
+///   - strike ÷ `ratio` (a 50,000 call becomes a 25,000 call on a 2:1);
+///   - contract count × `ratio` (via `Position::apply_split`);
+///   - deliverable/multiplier (`contract_size`) **unchanged** — the OCC standard rule keeps the same
+///     contract identity, so the engine's ledger stays valid.
+///
+/// For each adjusted option position it emits one `OptionPositionAdjustedForSplit`, and — exactly as
+/// for the equity — an `OpenOrdersAtSplit` listing that option's own resting orders: a real broker
+/// price-adjusts those resting orders, so the engine cancels nothing, but a backtest wrapper must
+/// cancel them itself or the mock exchange fills the now-stale-premium order against the post-split
+/// print.
+///
+/// The event is constructed **identically** to the equity-only case — only the ratio's standard-ness
+/// and the presence of option positions on the underlying change what the engine emits. (The emitted
+/// observables are only visible on the audit-stream path; see the
+/// `test_engine_process_engine_event_with_audit` integration tests.)
+// Defined for documentation; never called, so it would otherwise trip `dead_code`.
+#[allow(dead_code)]
+fn standard_option_split_sketch(equity: InstrumentIndex, effective_date: NaiveDate) -> EngineEvent {
+    EngineEvent::CorporateAction {
+        id: format!("MSFT-{effective_date}-2for1-split").into(),
+        instrument: equity,
+        // A whole-number forward split ⇒ `split_kind()` is `Some(Standard)` ⇒ options on the
+        // underlying are adjusted in place rather than flagged for an identity change.
+        kind: CorporateActionKind::StockSplit { ratio: dec!(2) },
+        policy: SplitRoundingPolicy::Fractional,
+        effective_time: split_effective_instant(effective_date),
+    }
+}
+
+/// Non-standard option-split wrapper sketch — **not executed**; documents the wrapper protocol for a
+/// non-standard split (every reverse split, every fractional forward split), **including the backtest
+/// path**, and builds the aux-event vec that drives it.
+///
+/// On a non-standard split the OCC assigns affected options a **new contract identity** (new
+/// deliverable, new symbol e.g. `MSFT` → `MSFT1`). The library **never re-registers instruments at
+/// runtime** (the instrument set is fixed at construction), so it applies the equity split, records
+/// its `id`, emits `OptionPositionsRequireIdentityChange`, and leaves the options at pre-split terms.
+/// Because the equity split *was* applied and its `id` recorded, this is **not** retryable — the
+/// signal is a directive, not a failure. **Continuing exposure through the change is a wrapper
+/// decision:** close the old option via the normal `Command` path, and (if desired) trade a
+/// **pre-declared** new-identity instrument as an ordinary instrument.
+///
+/// This is fully backtestable through the same aux-event seam used for the split itself, because a
+/// backtest replays *known* history: pre-declare **both** identities at construction (each gets its
+/// own data series — the new identity naturally has prints only post-split), then inject BOTH the
+/// `CorporateAction` and a flatten `Command::ClosePositions` for the old identity at the split
+/// boundary. This function returns exactly that vec, ready for `AuxEventsInMemory::new` (its entries
+/// are ascending by `Timed::time`, as that constructor requires).
+///
+/// **Caveat (identical to the `OpenOrdersAtSplit` backtest pattern):** in backtest the close trigger
+/// is *pre-planned* (the split date is known ahead), not *reactive-from-the-observable* — `backtest()`
+/// disables the audit stream, so `OptionPositionsRequireIdentityChange` is invisible there; the
+/// reactive decision code runs live and is unit-tested separately. The economic simulation (fills,
+/// timing, P&L) stays faithful because the aux merge respects each event's `Timed::time`.
+// Defined for documentation; never called, so it would otherwise trip `dead_code`.
+#[allow(dead_code)]
+fn non_standard_option_split_wrapper_sketch(
+    equity: InstrumentIndex,
+    old_option: InstrumentIndex,
+    effective_date: NaiveDate,
+) -> Vec<Timed<EngineEvent>> {
+    let effective_time = split_effective_instant(effective_date);
+    vec![
+        // 1: the non-standard split (a 1-for-2 reverse ⇒ `ratio = 0.5`, never standard). Targets the
+        //    *equity*; the engine applies the equity split, records the `id`, and emits
+        //    `OptionPositionsRequireIdentityChange` for the held option — it does not adjust it.
+        Timed::new(
+            EngineEvent::CorporateAction {
+                id: format!("MSFT-{effective_date}-reverse-split").into(),
+                instrument: equity,
+                kind: CorporateActionKind::StockSplit { ratio: dec!(0.5) },
+                policy: SplitRoundingPolicy::Fractional,
+                effective_time,
+            },
+            effective_time,
+        ),
+        // 2: the wrapper's reaction — flatten the old option identity. Injected just after the split
+        //    (a later `Timed::time`, so the merge orders it after the split on the engine stream).
+        Timed::new(
+            EngineEvent::Command(Command::ClosePositions(InstrumentFilter::Instruments(
+                OneOrMany::One(old_option),
+            ))),
+            effective_time + chrono::TimeDelta::seconds(60),
+        ),
+    ]
 }
 
 /// Four trades for `instrument` spanning 22:00–23:00; the midnight-UTC split sorts before all of

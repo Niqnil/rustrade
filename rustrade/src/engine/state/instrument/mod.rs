@@ -27,6 +27,7 @@ use rustrade_instrument::{
     index::IndexedInstruments,
     instrument::{
         Instrument, InstrumentIndex,
+        kind::InstrumentKind,
         name::{InstrumentNameExchange, InstrumentNameInternal},
     },
 };
@@ -355,6 +356,30 @@ pub struct InstrumentState<
 impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     InstrumentState<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
 {
+    /// `true` if this is an **option** written on the underlying `(base, quote)` traded on
+    /// `exchange` that currently holds at least one open position — i.e. exactly the options a
+    /// corporate action on the underlying spot must also adjust.
+    ///
+    /// Single-sources the affected-option scan shared by the live engine handler
+    /// (`process_corporate_action`) and the audit replica, so the predicate cannot drift between
+    /// them (the replica-parity test guards observable behaviour; this guards the predicate itself).
+    pub(crate) fn is_affected_option_on_underlying(
+        &self,
+        base: &AssetKey,
+        quote: &AssetKey,
+        exchange: &ExchangeKey,
+    ) -> bool
+    where
+        AssetKey: PartialEq,
+        ExchangeKey: PartialEq,
+    {
+        matches!(&self.instrument.kind, InstrumentKind::Option(_))
+            && self.instrument.underlying.base == *base
+            && self.instrument.underlying.quote == *quote
+            && self.instrument.exchange == *exchange
+            && !self.position.positions.is_empty()
+    }
+
     /// Updates the instrument state using an account snapshot from the exchange.
     ///
     /// This updates active orders for the instrument, using timestamps where relevant to ensure

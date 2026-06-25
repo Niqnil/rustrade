@@ -1195,6 +1195,14 @@ fn build_option_engine(
     trading_state: TradingState,
     execution_tx: UnboundedTx<ExecutionRequest>,
 ) -> TestEngine {
+    build_option_engine_with_oms(trading_state, execution_tx, OmsMode::Netting)
+}
+
+fn build_option_engine_with_oms(
+    trading_state: TradingState,
+    execution_tx: UnboundedTx<ExecutionRequest>,
+    oms_mode: OmsMode,
+) -> TestEngine {
     let expiry = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
         .unwrap()
         .with_timezone(&Utc);
@@ -1234,6 +1242,7 @@ fn build_option_engine(
     })
     .time_engine_start(STARTING_TIMESTAMP)
     .trading_state(trading_state)
+    .oms_mode(oms_mode)
     .balances([
         (ExchangeId::BinanceSpot, "usd", STARTING_BALANCE_USDT),
         (ExchangeId::BinanceSpot, "btc", STARTING_BALANCE_BTC),
@@ -1873,6 +1882,734 @@ fn test_corporate_action_injected_mid_stream_clock_and_outputs() {
         .instruments
         .instrument_index(&InstrumentIndex(0));
     assert_eq!(instrument_state.data.price(), Some(dec!(90)));
+}
+
+// ---------------------------------------------------------------------------
+// CorporateAction — option standard / non-standard split handling
+// ---------------------------------------------------------------------------
+
+/// Open a long option position (index 0) via a tagged account `Trade`, so that distinct `tag`s
+/// create distinct Hedging slots (the slot is keyed by `order_id`). Mirrors
+/// [`open_position_via_trade`] but uses the option engine's USD quote asset (`AssetIndex(1)`) for
+/// fees — `asset_fees`/`quote_asset_index` map the *spot* engine's instruments only.
+fn open_option_position_via_trade(
+    engine: &mut TestEngine,
+    time_plus: u64,
+    side: Side,
+    price: Decimal,
+    quantity: Decimal,
+    tag: &str,
+) {
+    let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+        exchange: ExchangeIndex(0),
+        kind: AccountEventKind::Trade(Trade {
+            id: TradeId::new(tag),
+            order_id: OrderId::new(tag),
+            instrument: InstrumentIndex(0),
+            strategy: strategy_id(),
+            time_exchange: time_plus_days(STARTING_TIMESTAMP, time_plus),
+            side,
+            price,
+            quantity,
+            fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
+        }),
+    }));
+    engine.process(event);
+}
+
+/// Standard (whole-number forward) split on the underlying equity adjusts an option position on
+/// that underlying **in place**: strike ÷ ratio, contracts × ratio, premium basis ÷ ratio, and
+/// `pnl_unrealised` recomputed from the **option's own** mark — `contract_size` (the multiplier)
+/// stays unchanged. One `OptionPositionAdjustedForSplit` per position, plus an `OpenOrdersAtSplit`
+/// for the option's own resting orders; no `SplitRemainder` (integer ratio × integer contracts).
+/// The equity `id` is recorded on the `Spot` target.
+#[test]
+fn test_corporate_action_option_standard_split_adjusts_in_place() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx); // Netting
+
+    // Distinct marks: the option (idx0) at 1200, the spot (idx1) at 60_000. The split must use the
+    // OPTION's mark for the pnl recompute — distinct values pin that the option's price is read,
+    // not the splitting equity's.
+    engine.process(market_event_trade(1, 0, dec!(1200)));
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+
+    // Long call: 2 contracts @ premium 1000.
+    open_option_position(&mut engine, dec!(2), dec!(1_000));
+
+    // A resting order on the OPTION (idx0) — must be surfaced via OpenOrdersAtSplit (Q1).
+    let event = account_event_order_response(0, 1, Side::Buy, 1.0, 0.0);
+    engine.process(event);
+
+    // 2:1 standard forward split, targeting the Spot underlying (idx1).
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSD-2-1-split".into(),
+        instrument: InstrumentIndex(1),
+        kind: CorporateActionKind::StockSplit { ratio: dec!(2) },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
+    };
+    let audit_tick = process_with_audit(&mut engine, ca_event);
+
+    // Option (idx0) adjusted in place: strike halved, multiplier (contract_size) untouched.
+    let option_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    let InstrumentKind::Option(contract) = &option_state.instrument.kind else {
+        panic!("instrument 0 must be an option");
+    };
+    assert_eq!(contract.strike, dec!(25_000));
+    assert_eq!(contract.contract_size, dec!(1));
+
+    // Position: contracts ×2 = 4, premium basis ÷2 = 500, pnl recomputed from the OPTION mark 1200:
+    // 4 * (1200 - 500) * contract_size(1) = 2800.
+    assert_eq!(option_state.position.positions.len(), 1);
+    let position = option_state.position.positions.values().next().unwrap();
+    assert_eq!(position.quantity_abs, dec!(4));
+    assert_eq!(position.price_entry_average, dec!(500));
+    assert_eq!(position.pnl_unrealised, dec!(2_800));
+
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+
+    // Exactly one OptionPositionAdjustedForSplit, carrying the expected per-position fields.
+    let adjusted: Vec<_> = outputs
+        .iter()
+        .filter_map(|o| match o {
+            EngineOutput::OptionPositionAdjustedForSplit {
+                option_instrument,
+                ratio,
+                strike_pre_split,
+                strike_post_split,
+                position_id,
+            } => Some((
+                *option_instrument,
+                *ratio,
+                *strike_pre_split,
+                *strike_post_split,
+                position_id.clone(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(adjusted.len(), 1);
+    assert_eq!(adjusted[0].0, InstrumentIndex(0));
+    assert_eq!(adjusted[0].1, dec!(2));
+    assert_eq!(adjusted[0].2, dec!(50_000));
+    assert_eq!(adjusted[0].3, dec!(25_000));
+    assert_eq!(adjusted[0].4, PositionId::NETTING);
+
+    // The option's resting order is surfaced (Q1) — OpenOrdersAtSplit for idx0.
+    assert!(
+        outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::OpenOrdersAtSplit { instrument, .. } if *instrument == InstrumentIndex(0)
+        )),
+        "expected OpenOrdersAtSplit for the option's resting order"
+    );
+
+    // No CIL on a standard option adjustment (integer ratio × integer contracts).
+    assert!(
+        !outputs
+            .iter()
+            .any(|o| matches!(o, EngineOutput::SplitRemainder { .. })),
+        "a standard option split must not produce a SplitRemainder"
+    );
+
+    // The equity split was applied + recorded on the Spot target (idx1).
+    let spot_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(1));
+    assert!(
+        spot_state
+            .corporate_actions_processed
+            .contains("BTCUSD-2-1-split")
+    );
+}
+
+/// Standard split on an option with **no resting orders**: the `if !option_orders.is_empty()`
+/// suppression on the option path must withhold `OpenOrdersAtSplit` for that option, while the
+/// in-place `OptionPositionAdjustedForSplit` is still emitted. Pins that the empty-orders guard
+/// gates *only* the order observable, never the position adjustment — deleting the guard, or
+/// letting it suppress the adjustment too, both fail here.
+#[test]
+fn test_corporate_action_option_standard_split_no_orders_suppresses_open_orders_at_split() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx); // Netting
+
+    // Marks for the option (idx0) and the splitting spot underlying (idx1).
+    engine.process(market_event_trade(1, 0, dec!(1200)));
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+
+    // Open a long option position but place NO resting order on it (the case the guard suppresses).
+    open_option_position(&mut engine, dec!(2), dec!(1_000));
+
+    // 2:1 standard forward split on the Spot underlying (idx1).
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSD-2-1-split".into(),
+        instrument: InstrumentIndex(1),
+        kind: CorporateActionKind::StockSplit { ratio: dec!(2) },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
+    };
+    let audit_tick = process_with_audit(&mut engine, ca_event);
+
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+
+    // No resting orders ⇒ the suppression guard withholds OpenOrdersAtSplit for the option.
+    assert!(
+        !outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::OpenOrdersAtSplit { instrument, .. } if *instrument == InstrumentIndex(0)
+        )),
+        "an option with no resting orders must not emit OpenOrdersAtSplit"
+    );
+
+    // Load-bearing: the guard gates ONLY the order observable — the in-place adjustment is still
+    // emitted for the option position even when there are no resting orders.
+    assert!(
+        outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::OptionPositionAdjustedForSplit { option_instrument, .. }
+                if *option_instrument == InstrumentIndex(0)
+        )),
+        "the option position must still be adjusted in place even with no resting orders"
+    );
+}
+
+/// Hedging: a standard split emits one `OptionPositionAdjustedForSplit` **per option position**
+/// (per-`position_id` granularity, like `SplitRemainder`), each carrying the same instrument-level
+/// strike change.
+#[test]
+fn test_corporate_action_option_standard_split_hedging_per_position() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine =
+        build_option_engine_with_oms(TradingState::Disabled, execution_tx, OmsMode::Hedging);
+
+    engine.process(market_event_trade(1, 0, dec!(1200)));
+
+    // Two independent option positions — distinct Hedging slots keyed by order_id/tag.
+    open_option_position_via_trade(&mut engine, 1, Side::Buy, dec!(1_000), dec!(2), "opt-a");
+    open_option_position_via_trade(&mut engine, 1, Side::Buy, dec!(1_000), dec!(3), "opt-b");
+
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSD-2-1-split".into(),
+        instrument: InstrumentIndex(1),
+        kind: CorporateActionKind::StockSplit { ratio: dec!(2) },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
+    };
+    let audit_tick = process_with_audit(&mut engine, ca_event);
+
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+
+    let adjusted: Vec<_> = outputs
+        .iter()
+        .filter_map(|o| match o {
+            EngineOutput::OptionPositionAdjustedForSplit {
+                option_instrument,
+                strike_pre_split,
+                strike_post_split,
+                position_id,
+                ..
+            } => Some((
+                *option_instrument,
+                *strike_pre_split,
+                *strike_post_split,
+                position_id.clone(),
+            )),
+            _ => None,
+        })
+        .collect();
+
+    // One record per position (two positions ⇒ two records), each with the same strike change.
+    assert_eq!(adjusted.len(), 2);
+    for (instrument, strike_pre, strike_post, _pos_id) in &adjusted {
+        assert_eq!(*instrument, InstrumentIndex(0));
+        assert_eq!(*strike_pre, dec!(50_000));
+        assert_eq!(*strike_post, dec!(25_000));
+    }
+    // Distinct per-position attribution (Hedging slot id == the order/trade tag).
+    let ids: Vec<_> = adjusted.iter().map(|a| a.3.clone()).collect();
+    assert!(ids.contains(&PositionId::new("opt-a")));
+    assert!(ids.contains(&PositionId::new("opt-b")));
+}
+
+/// Non-standard splits — every fractional forward (3:2) and every reverse split (1:2) — cannot
+/// adjust an option in place (the OCC assigns a new contract identity). The option is left
+/// **unchanged** and a single `OptionPositionsRequireIdentityChange` is emitted; the equity split
+/// is still applied and its `id` recorded.
+#[test]
+fn test_corporate_action_option_non_standard_requires_identity_change() {
+    for (ratio, id) in [
+        (dec!(1.5), "BTCUSD-3-2-split"),   // fractional forward (3:2)
+        (dec!(0.5), "BTCUSD-1-2-reverse"), // reverse (1:2)
+    ] {
+        let (execution_tx, _execution_rx) = mpsc_unbounded();
+        let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+
+        engine.process(market_event_trade(1, 0, dec!(1200)));
+        open_option_position(&mut engine, dec!(2), dec!(1_000));
+
+        let ca_event = EngineEvent::CorporateAction {
+            id: id.into(),
+            instrument: InstrumentIndex(1),
+            kind: CorporateActionKind::StockSplit { ratio },
+            policy: SplitRoundingPolicy::Floor,
+            effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
+        };
+        let audit_tick = process_with_audit(&mut engine, ca_event);
+
+        // Option (idx0) UNCHANGED: strike, qty, and basis all at pre-split terms.
+        let option_state = engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0));
+        let InstrumentKind::Option(contract) = &option_state.instrument.kind else {
+            panic!("instrument 0 must be an option");
+        };
+        assert_eq!(
+            contract.strike,
+            dec!(50_000),
+            "ratio {ratio}: option strike must be untouched"
+        );
+        let position = option_state.position.positions.values().next().unwrap();
+        assert_eq!(position.quantity_abs, dec!(2), "ratio {ratio}");
+        assert_eq!(position.price_entry_average, dec!(1_000), "ratio {ratio}");
+
+        let outputs = match &audit_tick.event {
+            EngineAudit::Process(audit) => &audit.outputs,
+            _ => panic!("expected EngineAudit::Process"),
+        };
+
+        // Exactly one identity-change signal listing the option.
+        let signals: Vec<_> = outputs
+            .iter()
+            .filter_map(|o| match o {
+                EngineOutput::OptionPositionsRequireIdentityChange {
+                    split_instrument,
+                    ratio: r,
+                    affected_options,
+                } => Some((*split_instrument, *r, affected_options.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(signals.len(), 1, "ratio {ratio}");
+        assert_eq!(signals[0].0, InstrumentIndex(1));
+        assert_eq!(signals[0].1, ratio);
+        assert!(
+            signals[0].2.contains(&InstrumentIndex(0)),
+            "ratio {ratio}: affected_options must list the option"
+        );
+
+        // No in-place option adjustment occurred.
+        assert!(
+            !outputs
+                .iter()
+                .any(|o| matches!(o, EngineOutput::OptionPositionAdjustedForSplit { .. })),
+            "ratio {ratio}: must not adjust the option in place"
+        );
+
+        // The equity split is still applied + recorded (the Spot target always splits).
+        let spot_state = engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(1));
+        assert!(
+            spot_state.corporate_actions_processed.contains(id),
+            "ratio {ratio}: equity id must be recorded"
+        );
+    }
+}
+
+/// Live engine vs audit-replica parity for a **standard** option adjustment: the replica
+/// event-replays the in-place strike division + per-position `apply_split` deterministically (no
+/// output-mirror). Full `InstrumentState` equality for BOTH the option (idx0) and the spot (idx1)
+/// guards against the handler and the replica drifting apart on the option path.
+#[test]
+fn test_corporate_action_option_replica_parity_standard_split() {
+    use rustrade::engine::audit::{
+        AuditTick, EngineAudit, context::EngineContext, state_replica::StateReplicaManager,
+    };
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx); // Netting
+
+    // Option mark (idx0) for the eager pnl recompute; spot mark (idx1) deliberately different.
+    engine.process(market_event_trade(1, 0, dec!(1200)));
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+    open_option_position(&mut engine, dec!(2), dec!(1_000));
+
+    // Seed the replica from the exact pre-split state.
+    let pre_split_state = engine.state.clone();
+
+    let effective_time = time_plus_days(STARTING_TIMESTAMP, 10);
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSD-2-1-split".into(),
+        instrument: InstrumentIndex(1),
+        kind: CorporateActionKind::StockSplit { ratio: dec!(2) },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time,
+    };
+    let audit_tick = process_with_audit(&mut engine, ca_event.clone());
+
+    let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+        event: pre_split_state,
+        context: EngineContext {
+            time: effective_time,
+            sequence: Sequence(0),
+        },
+    };
+    // Type annotation required for StateReplicaManager::new to infer the iterator element type
+    #[allow(clippy::type_complexity)]
+    let dummy_updates: std::iter::Empty<
+        AuditTick<
+            EngineAudit<
+                EngineEvent<DataKind>,
+                EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>,
+            >,
+        >,
+    > = std::iter::empty();
+    let mut replica_manager = StateReplicaManager::new(seed_tick, dummy_updates);
+
+    // Drive the replica with the live outputs. The standard option adjustment is pure event-replay
+    // (it ignores the outputs), but pass them through to exercise the real run() contract faithfully.
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => audit.outputs.clone(),
+        _ => panic!("expected EngineAudit::Process"),
+    };
+    replica_manager.update_from_event(ca_event, &outputs);
+
+    // Gold-standard: full InstrumentState parity for BOTH the adjusted option (idx0) and the split
+    // equity (idx1) — positions, instrument kind (strike), tear sheet, processed-id set, …
+    for idx in [InstrumentIndex(0), InstrumentIndex(1)] {
+        let live = engine.state.instruments.instrument_index(&idx);
+        let replica = replica_manager
+            .replica_engine_state()
+            .instruments
+            .instrument_index(&idx);
+        assert_eq!(replica, live, "replica/live divergence at {idx:?}");
+    }
+
+    // Explicit checks that the LIVE handler actually adjusted the option — so the parity assert
+    // above is not vacuously comparing two unchanged states.
+    let option_live = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    let InstrumentKind::Option(contract) = &option_live.instrument.kind else {
+        panic!("instrument 0 must be an option");
+    };
+    assert_eq!(contract.strike, dec!(25_000));
+    let position = option_live.position.positions.values().next().unwrap();
+    assert_eq!(position.quantity_abs, dec!(4));
+    assert_eq!(position.price_entry_average, dec!(500));
+}
+
+/// Build an engine with TWO BTC/USD call options on the same underlying plus the BTC/USD spot, for
+/// the non-standard-split wrapper-handling flow. The "old" option is the one held at split time; the
+/// "new" identity is **pre-declared at construction** (never runtime-registered) and only trades
+/// after the wrapper migrates exposure to it.
+///
+/// Indices after the alphabetical `name_internal` sort:
+///   InstrumentIndex(0) = old option   ("binance_btc_call_50k")
+///   InstrumentIndex(1) = new identity  ("binance_btc_call_50k_new")
+///   InstrumentIndex(2) = spot          ("binance_spot_btc_usd")
+fn build_two_option_engine(
+    trading_state: TradingState,
+    execution_tx: UnboundedTx<ExecutionRequest>,
+) -> TestEngine {
+    let expiry = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+
+    let instruments = IndexedInstruments::builder()
+        // index 0: old option — the identity held across the split.
+        .add_instrument(Instrument::new(
+            ExchangeId::BinanceSpot,
+            "binance_btc_call_50k",
+            "BTC-50000-C",
+            Underlying::new("btc", "usd"),
+            rustrade_instrument::instrument::quote::InstrumentQuoteAsset::UnderlyingQuote,
+            InstrumentKind::Option(OptionContract {
+                contract_size: dec!(1),
+                settlement_asset: "usd".into(),
+                kind: OptionKind::Call,
+                exercise: OptionExercise::European,
+                expiry,
+                strike: dec!(50_000),
+            }),
+            None,
+        ))
+        // index 1: pre-declared new identity (distinct OCC contract after a non-standard split).
+        .add_instrument(Instrument::new(
+            ExchangeId::BinanceSpot,
+            "binance_btc_call_50k_new",
+            "BTC1-33333-C",
+            Underlying::new("btc", "usd"),
+            rustrade_instrument::instrument::quote::InstrumentQuoteAsset::UnderlyingQuote,
+            InstrumentKind::Option(OptionContract {
+                contract_size: dec!(1),
+                settlement_asset: "usd".into(),
+                kind: OptionKind::Call,
+                exercise: OptionExercise::European,
+                expiry,
+                strike: dec!(33_333),
+            }),
+            None,
+        ))
+        // index 2: spot underlying — the CorporateAction target.
+        .add_instrument(Instrument::spot(
+            ExchangeId::BinanceSpot,
+            "binance_spot_btc_usd",
+            "BTCUSD",
+            Underlying::new("btc", "usd"),
+            None,
+        ))
+        .build();
+
+    let clock = HistoricalClock::new(STARTING_TIMESTAMP);
+    let state = EngineState::builder(&instruments, DefaultGlobalData, |_| {
+        DefaultInstrumentMarketData::default()
+    })
+    .time_engine_start(STARTING_TIMESTAMP)
+    .trading_state(trading_state)
+    .balances([
+        (ExchangeId::BinanceSpot, "usd", STARTING_BALANCE_USDT),
+        (ExchangeId::BinanceSpot, "btc", STARTING_BALANCE_BTC),
+    ])
+    .build();
+
+    Engine::new(
+        clock,
+        state,
+        MultiExchangeTxMap::from_iter([(ExchangeId::BinanceSpot, Some(execution_tx))]),
+        TestBuyAndHoldStrategy { id: strategy_id() },
+        DefaultRiskManager::default(),
+    )
+}
+
+/// Build an option-engine Account `Trade` for an arbitrary instrument index, with USD-quote
+/// (`AssetIndex(1)`) zero fees. Returned (not processed) so the caller can `engine.process` an open
+/// or route a close fill through `process_with_audit` when the resulting `PositionExit` matters.
+fn option_trade_event(
+    instrument: usize,
+    time_plus: u64,
+    side: Side,
+    price: Decimal,
+    quantity: Decimal,
+    tag: &str,
+) -> EngineEvent<DataKind> {
+    EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+        exchange: ExchangeIndex(0),
+        kind: AccountEventKind::Trade(Trade {
+            id: TradeId::new(tag),
+            order_id: OrderId::new(tag),
+            instrument: InstrumentIndex(instrument),
+            strategy: strategy_id(),
+            time_exchange: time_plus_days(STARTING_TIMESTAMP, time_plus),
+            side,
+            price,
+            quantity,
+            fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
+        }),
+    }))
+}
+
+/// End-to-end proof that a downstream wrapper can handle a **non-standard** split's option-identity
+/// change with existing primitives only — no runtime instrument re-registration. Both the old option
+/// and the new identity are pre-declared at construction; the engine emits the signal, the wrapper
+/// closes the old option via the normal `Command` path, and trades the pre-declared new identity on
+/// its post-split data.
+///
+/// NOTE: the close trigger here is *pre-planned* (the test injects the `Command` directly), not
+/// *reactive-from-output* — the reactive decision logic lives in the wrapper and is unit-tested
+/// there. This direct `process_with_audit` path is the only one where the observable is visible
+/// (`backtest()` hardcodes `AuditMode::Disabled`); the backtest counterpart asserts plumbing only.
+#[test]
+fn test_corporate_action_option_non_standard_wrapper_close_and_new_identity() {
+    let (execution_tx, mut execution_rx) = mpsc_unbounded();
+    let mut engine = build_two_option_engine(TradingState::Disabled, execution_tx); // Netting
+
+    // Hold the OLD option (idx0): long 2 contracts @ premium 1000. The NEW identity (idx1) holds
+    // nothing at split time.
+    engine.process(option_trade_event(
+        0,
+        1,
+        Side::Buy,
+        dec!(1_000),
+        dec!(2),
+        "old-open",
+    ));
+    // A live mark on the old option — `close_open_positions_with_market_orders` only flattens
+    // instruments with a current price feed (it skips stale/price-less instruments).
+    engine.process(market_event_trade(2, 0, dec!(1_200)));
+
+    // --- Step 1: a NON-STANDARD split on the spot underlying (idx2) signals an identity change. ---
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSD-3-2-split".into(),
+        instrument: InstrumentIndex(2),
+        // 3:2 fractional forward ⇒ non-standard (the OCC assigns a new contract identity).
+        kind: CorporateActionKind::StockSplit { ratio: dec!(1.5) },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
+    };
+    let audit_tick = process_with_audit(&mut engine, ca_event);
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+
+    // Exactly one identity-change signal, naming the OLD option and NOT the position-less new identity.
+    let signals: Vec<_> = outputs
+        .iter()
+        .filter_map(|o| match o {
+            EngineOutput::OptionPositionsRequireIdentityChange {
+                split_instrument,
+                ratio,
+                affected_options,
+            } => Some((*split_instrument, *ratio, affected_options.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(signals.len(), 1);
+    assert_eq!(signals[0].0, InstrumentIndex(2));
+    assert_eq!(signals[0].1, dec!(1.5));
+    assert!(
+        signals[0].2.contains(&InstrumentIndex(0)),
+        "the held old option must be flagged"
+    );
+    assert!(
+        !signals[0].2.contains(&InstrumentIndex(1)),
+        "the position-less pre-declared new identity must NOT be flagged"
+    );
+
+    // The old option is untouched (the engine cannot mechanically adjust a non-standard split).
+    let old_option = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    let InstrumentKind::Option(contract) = &old_option.instrument.kind else {
+        panic!("instrument 0 must be an option");
+    };
+    assert_eq!(contract.strike, dec!(50_000));
+    assert_eq!(
+        old_option
+            .position
+            .positions
+            .values()
+            .next()
+            .unwrap()
+            .quantity_abs,
+        dec!(2)
+    );
+
+    // The equity split is applied + id recorded on the Spot target (idx2) regardless.
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(2))
+            .corporate_actions_processed
+            .contains("BTCUSD-3-2-split")
+    );
+
+    // --- Step 2: the wrapper closes the OLD option via the normal Command path. ---
+    let audit_tick = process_with_audit(&mut engine, command_close_position(0));
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+    // A Commanded(ClosePositions) output fires, carrying a reduce-only Sell order for the old option.
+    let commanded_sell = outputs.iter().any(|o| match o {
+        EngineOutput::Commanded(ActionOutput::ClosePositions(out)) => {
+            out.opens.sent.iter().any(|order| {
+                order.key.instrument == InstrumentIndex(0) && order.state.side == Side::Sell
+            })
+        }
+        _ => false,
+    });
+    assert!(
+        commanded_sell,
+        "expected a Commanded ClosePositions Sell for the old option"
+    );
+    // The close order is actually dispatched to the execution manager.
+    assert!(matches!(
+        execution_rx.next().unwrap(),
+        ExecutionRequest::Open(order)
+            if order.key.instrument == InstrumentIndex(0) && order.state.side == Side::Sell
+    ));
+
+    // Simulate the close fill: a Sell trade of the full quantity nets the old position to zero.
+    let audit_tick = process_with_audit(
+        &mut engine,
+        option_trade_event(0, 11, Side::Sell, dec!(1_500), dec!(2), "old-close"),
+    );
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+    assert!(
+        outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::PositionExit(p) if p.instrument == InstrumentIndex(0)
+        )),
+        "closing the old option must emit a PositionExit"
+    );
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .position
+            .positions
+            .is_empty(),
+        "the old option slot must be empty after the close fill"
+    );
+
+    // --- Step 3: the pre-declared new identity trades on its post-split data. ---
+    // The new identity prints only after the split (natural — it did not exist before).
+    engine.process(market_event_trade(12, 1, dec!(900)));
+    engine.process(option_trade_event(
+        1,
+        13,
+        Side::Buy,
+        dec!(800),
+        dec!(3),
+        "new-open",
+    ));
+
+    assert_eq!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(1))
+            .position
+            .positions
+            .len(),
+        1,
+        "the pre-declared new identity must trade once exposure migrates to it"
+    );
+    // Exposure migrated entirely from the old identity to the new one — no runtime re-registration.
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .position
+            .positions
+            .is_empty()
+    );
 }
 
 // ---------------------------------------------------------------------------
