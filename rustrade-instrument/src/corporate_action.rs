@@ -76,6 +76,10 @@ impl CorporateActionKind {
     /// asserts it, so this is only ever reached with a positive `ratio`.
     #[must_use]
     pub fn split_kind(&self) -> Option<SplitAdjustmentKind> {
+        // No `_` catch-all: `CorporateActionKind` is `#[non_exhaustive]`, so adding a future
+        // non-split variant (dividend, spin-off, …) makes this match fail to compile, forcing an
+        // explicit `None` mapping here rather than silently classifying it as `NonStandard`. The
+        // `Option` return already expresses "not a split ⇒ no split kind".
         match self {
             Self::StockSplit { ratio } => {
                 Some(if *ratio > Decimal::ONE && ratio.fract().is_zero() {
@@ -84,10 +88,6 @@ impl CorporateActionKind {
                     SplitAdjustmentKind::NonStandard
                 })
             }
-            // No `_` catch-all: `CorporateActionKind` is `#[non_exhaustive]`, so adding a future
-            // non-split variant (dividend, spin-off, …) makes this match fail to compile, forcing an
-            // explicit `None` mapping here rather than silently classifying it as `NonStandard`. The
-            // `Option` return already expresses "not a split ⇒ no split kind".
         }
     }
 }
