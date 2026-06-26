@@ -628,6 +628,17 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
     /// value. `pnl_unrealised` is **never** scaled by `ratio` (that would assume the price moved
     /// exactly as the split predicted).
     ///
+    /// ## The immediate post-split `pnl_unrealised` is approximate — do not use it for risk checks
+    /// The recompute pairs `last_price` with the **post-split** basis. In live trading a split is
+    /// typically injected at split-open *before* the first post-split print, so `last_price` is
+    /// still a **pre-split** price valued against a post-split basis — transiently **overstating**
+    /// `pnl_unrealised` for a forward split (and understating it for a reverse split) by roughly the
+    /// split ratio. It self-corrects on the next market tick. The arithmetic is correct given its
+    /// inputs; it is the price/basis era mismatch that makes the value unreliable. Treat the
+    /// post-split snapshot's `pnl_unrealised` as approximate and **do not** drive hard risk decisions
+    /// off it until a post-split price has arrived. (In backtests this window does not arise: the
+    /// split is injected at its own simulated timestamp, ordered before same-instant prints.)
+    ///
     /// # What is left untouched
     /// `pnl_realised`, `fees_enter`, `fees_exit` (all `$`-denominated and already realised),
     /// `side`, `instrument`, `trades`, `contract_size`.

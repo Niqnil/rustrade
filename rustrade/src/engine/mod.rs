@@ -663,14 +663,16 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     ///    - action kind is not a stock split ⇒ [`UnsupportedCorporateActionReason::ActionKindNotSupported`]
     ///      (the compiler-mandated arm for the `#[non_exhaustive]` [`CorporateActionKind`]).
     /// 3. Snapshot resting orders into [`EngineOutput::OpenOrdersAtSplit`] (no cancellation).
-    /// 4. Apply the split to every open position via [`Position::apply_split`]; emit one
+    /// 4. Apply the split to every open position via
+    ///    [`Position::apply_split`](crate::engine::state::position::Position::apply_split); emit one
     ///    [`EngineOutput::SplitRemainder`] per position that disposed a fractional sliver. A
     ///    position floored to zero quantity is removed and folded as an
     ///    [`EngineOutput::PositionExit`].
     /// 5. Scan for option positions on the same underlying and handle them per the OCC
     ///    standard/non-standard rule ([`CorporateActionKind::split_kind`]):
     ///    - **standard** (whole-number forward split) ⇒ adjust each option **in place**
-    ///      (strike ÷ `ratio`, contracts × `ratio` via [`Position::apply_split`], multiplier
+    ///      (strike ÷ `ratio`, contracts × `ratio` via
+    ///      [`Position::apply_split`](crate::engine::state::position::Position::apply_split), multiplier
     ///      unchanged), emitting one [`EngineOutput::OptionPositionAdjustedForSplit`] per position
     ///      plus — if the option has resting orders — an [`EngineOutput::OpenOrdersAtSplit`] for them
     ///      (a real broker price-adjusts them; the engine cancels nothing). Because option positions
@@ -688,6 +690,13 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     /// **recorded** (the quantity/basis arithmetic needs no price); `pnl_unrealised` is set to
     /// zero with a warning and corrected on the next market tick. This is **not** retryable —
     /// contrast `process_contract_expiry`, which bails and is retryable.
+    ///
+    /// # Approximate `pnl_unrealised` immediately after the split
+    /// Even *with* a last price, the eagerly recomputed `pnl_unrealised` is approximate until the
+    /// next market tick: in live the split arrives before the first post-split print, so a pre-split
+    /// price is valued against the post-split basis (overstated for forward splits, understated for
+    /// reverse). Do not drive hard risk checks off the immediate post-split snapshot — see
+    /// [`Position::apply_split`](crate::engine::state::position::Position::apply_split).
     pub fn process_corporate_action<OnTradingDisabled, OnDisconnect>(
         &mut self,
         id: &SmolStr,

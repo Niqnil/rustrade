@@ -69,7 +69,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   — account-scoped and post-hoc — **not** a `StockSplitSource`: it derives no split ratio (the raw
   `principal_adjust_factor` is surfaced but is a TIPS field, not a ratio), leaving ratio
   derivation/verification and reconcile policy to the caller. XML is parsed with the new `quick-xml`
-  dependency (pulled in only by the `ibkr` feature). A runnable example
+  dependency (pulled in only by the `ibkr` feature). The Flex `token` is passed as a `t=` URL query
+  parameter, so transport errors strip the request URL before it reaches `IbkrFlexError::Http`
+  (`reqwest`'s `Error: Display` would otherwise embed the full URL, leaking the token into logs); the
+  variant is documented to never carry the URL. A runnable example
   (`ibkr_flex_corporate_actions`, `--features ibkr`) sketches the wrapper-side reconcile.
 
 ### Changed

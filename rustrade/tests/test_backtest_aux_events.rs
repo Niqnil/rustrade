@@ -9,8 +9,14 @@
 //! tie-break / clock-seed logic itself is unit-tested in `backtest::tests`.
 //!
 //! Deep audit-replica + post-split position parity is covered separately via the direct
-//! `process_with_audit` path (it cannot run through `backtest`, which hardcodes
-//! `AuditMode::Disabled`).
+//! `Engine::process_with_audit` path, which `backtest` cannot reach (it hardcodes
+//! `AuditMode::Disabled`, so per-event outputs and final engine state are not observable here). The
+//! value-bearing assertions on post-split `quantity_abs` / `price_entry_average` / `SplitRemainder`
+//! live in `test_engine_process_engine_event_with_audit.rs` —
+//! `test_corporate_action_replica_parity_floor_split` and
+//! `test_corporate_action_injected_mid_stream_clock_and_outputs`. The two files form **one**
+//! contract: this file proves an aux event traverses the `backtest` async/merge/clock-seed path;
+//! that file proves the engine applies the split correctly.
 
 use std::{fs::File, io::BufReader, sync::Arc};
 
@@ -178,6 +184,13 @@ fn split_event(effective: &str, ratio: Decimal) -> Timed<EngineEvent> {
 
 /// A `CorporateAction` injected mid-stream flows through the merge + engine and the backtest
 /// completes (full plumbing: threading, merge, clock seed, `stream::iter`, shutdown).
+///
+/// Plumbing-only by necessity: a mid-stream split is notional-preserving and the position stays
+/// open, so it leaves no trace in the summary-level `trading_summary` (unlike the
+/// before-first-tick case, whose clock seed IS summary-observable — see
+/// `backtest_runs_with_aux_event_before_first_market_event`). The post-split quantity/basis
+/// economics for this exact mid-stream scenario are asserted at the engine seam in
+/// `test_corporate_action_injected_mid_stream_clock_and_outputs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backtest_runs_with_corporate_action_injected_mid_stream() {
     let aux = AuxEventsInMemory::new(Arc::new(vec![split_event("2025-03-24T22:30:00Z", dec!(2))]));
@@ -217,6 +230,18 @@ async fn backtest_runs_with_aux_event_before_first_market_event() {
         .expect("backtest with an aux event before the first market tick must complete");
 
     assert_eq!(summary.id, "early-split");
+
+    // Value-bearing seam check (not just "it ran"): the 21:45 aux event is BEFORE the first market
+    // tick (22:00), so it can only influence the engine's start time if the aux source was actually
+    // drained and merged. The clock seeds from `min(first_market, first_aux)`, freezing
+    // `time_engine_start` into [21:45, 22:00); a swallowed aux event would leave it at ~22:00. Exact
+    // equality is avoided because `HistoricalClock::time()` adds a sub-ms wall-clock delta when
+    // `meta.time_start` is captured at `Engine::new` — the 15-minute bracket absorbs that jitter.
+    let start = summary.trading_summary.time_engine_start;
+    assert!(
+        start >= ts("2025-03-24T21:45:00Z") && start < ts("2025-03-24T22:00:00Z"),
+        "clock must seed from the 21:45 aux event, before the 22:00 first market tick; got {start}"
+    );
 }
 
 /// The aux source threads through the concurrent `run_backtests` sweep unchanged.

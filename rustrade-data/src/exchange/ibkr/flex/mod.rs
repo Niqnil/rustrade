@@ -84,8 +84,19 @@ pub enum IbkrFlexError {
     EnvVar(String),
 
     /// Transport-level HTTP error (connection, timeout, or non-2xx status).
+    ///
+    /// The inner [`reqwest::Error`] **never carries the request URL.** The Flex token is
+    /// transmitted as `t=<TOKEN>` in every request URL, and `reqwest::Error`'s `Display` and
+    /// `Debug` both embed that URL verbatim when present. The `From<reqwest::Error>` conversion
+    /// for this type always strips it via [`reqwest::Error::without_url`] before the error is
+    /// stored, covering every reqwest site that attaches a URL (`send`, `error_for_status`, body
+    /// decode); `Client::build()` errors carry no URL, so the strip is a no-op for them. The
+    /// `source()` chain (hyper/IO transport errors) is preserved and does not independently carry
+    /// the URL.
+    ///
+    /// Safe to log or display without credential scrubbing.
     #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(reqwest::Error),
 
     /// The Flex service returned a non-success status (e.g. invalid token, throttled, expired).
     #[error("Flex service error ({code}): {message}")]
@@ -107,6 +118,25 @@ pub enum IbkrFlexError {
     /// The statement or status XML could not be parsed.
     #[error("Flex XML parse error: {0}")]
     Parse(String),
+}
+
+/// Convert a [`reqwest::Error`] into [`IbkrFlexError::Http`] **with its request URL stripped**.
+///
+/// The Flex `token` rides in the `t=` query parameter (IBKR's protocol), so it is part of every
+/// request URL. `reqwest::Error`'s `Display`/`Debug` embed the stored URL verbatim — e.g.
+/// `"... for url (https://.../SendRequest?t=<TOKEN>&q=...)"` — so an unstripped error would leak the
+/// credential into any log that formats [`IbkrFlexError::Http`] (the shipped example does exactly
+/// that).
+///
+/// Stripping lives in this single conversion rather than per-call-site discipline so the
+/// "[`IbkrFlexError::Http`] never carries the URL" invariant is enforced by the type system: every
+/// `?` on a `reqwest::Error` — at the request sites *and* any path added later — routes through here.
+/// [`reqwest::Error::without_url`] sets the stored URL to `None` (a no-op for `Client::build()`
+/// errors, which carry none) while preserving the diagnostic kind/status and `source()` chain.
+impl From<reqwest::Error> for IbkrFlexError {
+    fn from(error: reqwest::Error) -> Self {
+        IbkrFlexError::Http(error.without_url())
+    }
 }
 
 /// Credentials for the IBKR Flex Web Service: an Activity-statement Flex `token` and the id of a
@@ -236,6 +266,12 @@ impl IbkrFlexClient {
     /// plaintext. The poll URL returned by SendRequest is required to be `https://` for the same
     /// reason — the token must never traverse an unencrypted connection.
     ///
+    /// For the same reason, [`IbkrFlexError::Http`] must never embed the request URL: a
+    /// `reqwest::Error`'s `Display` includes the URL it was building, which would carry `t=<TOKEN>`
+    /// into any log that formats the error. The `From<reqwest::Error>` conversion for
+    /// [`IbkrFlexError`] strips the URL via [`reqwest::Error::without_url`] before the error is
+    /// stored, so a plain `?` is safe here and in any request path added later.
+    ///
     /// Two IBKR hosts are involved: `ndcdyn.interactivebrokers.com` (the hard-coded `FLEX_BASE_URL`
     /// that serves `SendRequest`) and `gdcdyn.interactivebrokers.com` (the statement-download host
     /// that `SendRequest` returns in its poll URL). The poll host is deliberately **not** pinned to
@@ -253,6 +289,8 @@ impl IbkrFlexClient {
         let send_url = format!("{}/SendRequest", self.base_url);
         debug!("Requesting IBKR Flex statement generation");
 
+        // Plain `?` is safe: `IbkrFlexError`'s `From<reqwest::Error>` strips the token-bearing
+        // request URL from every error (see the impl above).
         let body = self
             .http
             .get(&send_url)
@@ -273,6 +311,7 @@ impl IbkrFlexClient {
         } = parse_send_request_response(&body)?;
 
         for attempt in 1..=POLL_MAX_ATTEMPTS {
+            // Plain `?` as above: the `From` impl strips the token-bearing URL from any reqwest error.
             let body = self
                 .http
                 .get(&url)

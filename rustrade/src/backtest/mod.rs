@@ -175,6 +175,26 @@ where
 /// Run a single backtest with the given parameters.
 ///
 /// Simulates a trading strategy using historical market data and generates performance metrics.
+///
+/// # Auxiliary (non-market) event injection
+/// Events from [`BacktestArgsConstant::aux_events`] (corporate actions, contract expiries, commands)
+/// are **pre-merged** with the market stream into one time-ordered stream before the engine, so each
+/// is processed at the correct point in simulated time. An aux event sharing a timestamp with a
+/// market event is ordered **first** (so e.g. a split applies before same-instant fills), and the
+/// engine clock is seeded from `min(first_market_event, first_aux_event)` — an aux event scheduled
+/// before the first market tick still orders and stamps correctly. The merge/tie-break/seed logic is
+/// unit-tested in `backtest::tests`.
+///
+/// # What the returned summary does and does not contain
+/// This function returns only a [`BacktestSummary`] whose `trading_summary` aggregates statistics
+/// derived from **closed** positions (PnL, returns, drawdown per `TearSheet`). It does **not** expose
+/// final engine/position state: a position left **open** at the end of the run — e.g. one that took a
+/// stock split but no subsequent closing fill — contributes nothing to `trading_summary`, and a
+/// notional-preserving split moves no aggregate metric on its own. Callers needing to inspect
+/// post-run positions (or assert that a corporate action mutated a position) must drive their own
+/// engine harness; the split *economics* are asserted at the `Engine::process_with_audit` seam (see
+/// the `test_corporate_action_*` tests), which this path cannot reach because it hardcodes
+/// [`AuditMode::Disabled`] — the per-event `EngineOutput` stream is therefore not observable here.
 pub async fn backtest<
     MarketData,
     SummaryInterval,
