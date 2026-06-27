@@ -43,7 +43,6 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, Utc};
-use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use rustrade::{
     EngineEvent, SplitRoundingPolicy, Timed,
@@ -73,7 +72,7 @@ use rustrade_data::{
     subscription::trade::PublicTrade,
 };
 use rustrade_instrument::{
-    corporate_action::{CorporateActionKind, split_effective_instant},
+    corporate_action::{CorporateActionKind, SplitRatio, split_effective_instant},
     exchange::ExchangeId,
     index::IndexedInstruments,
     instrument::InstrumentIndex,
@@ -137,8 +136,11 @@ async fn main() {
             //    second event with a *different* id (a reversal followed by the corrected split).
             id: "EXAMPLE-2025-03-24-split".into(),
             instrument: split_instrument,
-            // A 2-for-1 forward split: `ratio = split_to / split_from = 2`.
-            kind: CorporateActionKind::StockSplit { ratio: dec!(2) },
+            // A 2-for-1 forward split: `ratio = split_to / split_from = 2`. `SplitRatio` validates
+            // the ratio is strictly positive (it is also derivable via `stock_split(2, 1)`).
+            kind: CorporateActionKind::StockSplit {
+                ratio: SplitRatio::new(dec!(2)).expect("2 is a valid (positive) split ratio"),
+            },
             // 3: rounding policy matching the broker. `Floor` = whole-share broker (disposes the
             //    fractional sliver as cash-in-lieu, reported via `SplitRemainder`); `Fractional` =
             //    fractional-share broker (no remainder).
@@ -197,7 +199,7 @@ async fn main() {
 fn live_injection_sketch(
     feed_tx: &UnboundedTx<EngineEvent>,
     instrument: InstrumentIndex,
-    ratio: Decimal,
+    ratio: SplitRatio,
     effective_date: NaiveDate,
 ) {
     let event = EngineEvent::CorporateAction {
@@ -246,7 +248,9 @@ fn standard_option_split_sketch(equity: InstrumentIndex, effective_date: NaiveDa
         instrument: equity,
         // A whole-number forward split ⇒ `split_kind()` is `Some(Standard)` ⇒ options on the
         // underlying are adjusted in place rather than flagged for an identity change.
-        kind: CorporateActionKind::StockSplit { ratio: dec!(2) },
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(2)).expect("2 is a valid (positive) split ratio"),
+        },
         policy: SplitRoundingPolicy::Fractional,
         effective_time: split_effective_instant(effective_date),
     }
@@ -293,7 +297,10 @@ fn non_standard_option_split_wrapper_sketch(
             EngineEvent::CorporateAction {
                 id: format!("MSFT-{effective_date}-reverse-split").into(),
                 instrument: equity,
-                kind: CorporateActionKind::StockSplit { ratio: dec!(0.5) },
+                kind: CorporateActionKind::StockSplit {
+                    ratio: SplitRatio::new(dec!(0.5))
+                        .expect("0.5 is a valid (positive) split ratio"),
+                },
                 policy: SplitRoundingPolicy::Fractional,
                 effective_time,
             },

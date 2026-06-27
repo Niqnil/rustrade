@@ -41,7 +41,7 @@ use rustrade_execution::{
 use rustrade_instrument::{
     Side,
     asset::AssetIndex,
-    corporate_action::{CorporateActionKind, SplitAdjustmentKind},
+    corporate_action::{CorporateActionKind, SplitAdjustmentKind, SplitRatio},
     exchange::ExchangeIndex,
     instrument::{
         InstrumentIndex,
@@ -765,7 +765,13 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             });
             return outputs;
         };
-        let ratio = *ratio;
+        // `ratio` is a validated `SplitRatio` (always `> 0`, enforced at construction and on
+        // deserialization), so the engine's split arithmetic can never receive a degenerate ratio
+        // through the event path. Copy the `SplitRatio` out (it is `Copy`) to carry the type-level
+        // invariant unbroken into the output records, and extract the inner `Decimal` for the
+        // arithmetic below.
+        let ratio: SplitRatio = *ratio;
+        let ratio_decimal = ratio.get();
 
         // Step 3: snapshot resting orders as an observable — do NOT cancel (a broker price-adjusts
         // them, so an engine-side cancel would diverge from the broker).
@@ -810,7 +816,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             };
 
             let side = position.side;
-            let result = position.apply_split(ratio, policy, last_price);
+            let result = position.apply_split(ratio_decimal, policy, last_price);
             // Read the post-split basis AFTER apply_split overwrote it (Convention A): quantity
             // and price then share the post-split era, valuing the disposed sliver with one
             // multiply and no ratio knowledge.
@@ -838,6 +844,18 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                     exit.time_exit = engine_time;
                     instrument_state.tear_sheet.update_from_position(&exit);
                     outputs.push(EngineOutput::PositionExit(exit));
+
+                    // Prune the hedging fill-routing map for the removed position. This must prune
+                    // by VALUE (the removed `PositionId`), NOT via `cleanup_routing_tables` (which
+                    // retains by `ClientOrderId` still present in `self.orders`): the split
+                    // deliberately leaves the position's resting order in place (a broker
+                    // price-adjusts it), so its CID is still in `orders` and `cleanup_routing_tables`
+                    // would keep the now-dangling `cid → removed_pos_id` mapping. Left stale, an
+                    // `OmsMode::Hedging` late fill on that order would resolve the dead id and
+                    // silently reopen a floored-out position.
+                    instrument_state
+                        .position_ids
+                        .retain(|_, mapped| *mapped != pos_id);
                 }
             }
         }
@@ -850,17 +868,16 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             });
         }
 
-        // Step 5: options-on-underlying handling. A split targets the underlying equity; option
-        // positions on that underlying must also be adjusted (standard split) or flagged for a
-        // wrapper-side identity change (non-standard split). Mirror of the spot-given-option scan
-        // in process_contract_expiry: find Option instruments whose underlying matches this
-        // equity's, on the same exchange, that hold positions.
+        // Step 5: options-on-underlying handling. A split targets the underlying equity; listed
+        // options on that underlying must also be adjusted (standard split) or flagged for a
+        // wrapper-side identity change (non-standard split). The scan mirrors the spot-given-option
+        // scan in process_contract_expiry, inverted: find Option instruments whose underlying
+        // matches this equity's, on the same exchange.
         //
         // Both `base` AND `quote` are matched: `Underlying` is a full pair identity, and a
-        // `CorporateAction` targets a single `InstrumentIndex` (only that instrument's positions
-        // are split). Without the quote filter, a BTC/USDT split would also flag BTC/USDC option
-        // positions that the engine itself never adjusted — false-positive noise. Mirrors the
-        // base+quote filter in process_contract_expiry's underlying-spot scan.
+        // `CorporateAction` targets a single `InstrumentIndex`. Without the quote filter, a
+        // BTC/USDT split would also touch BTC/USDC options the engine never adjusted — wrong.
+        // Mirrors the base+quote filter in process_contract_expiry's underlying-spot scan.
         let (equity_base, equity_quote, equity_exchange) = {
             let equity = self.state.instruments.instrument_index(key);
             (
@@ -869,126 +886,155 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 equity.instrument.exchange,
             )
         };
-        let affected_options: Vec<InstrumentIndex> = self
-            .state
-            .instruments
-            .0
-            .values()
-            .filter(|state| {
-                state.is_affected_option_on_underlying(
-                    &equity_base,
-                    &equity_quote,
-                    &equity_exchange,
-                )
-            })
-            .map(|state| state.key)
-            .collect();
-        if !affected_options.is_empty() {
-            // Classify the split for OPTION handling (extracted to keep this handler's branching
-            // flat). `true` ⇒ adjust the options in place (standard split); `false` ⇒ signal a
-            // downstream identity change. A future `#[non_exhaustive]` `SplitAdjustmentKind` variant
-            // is handled conservatively as non-standard and `warn!`-surfaced (observable beats
-            // silent) — see [`option_split_adjust_in_place`].
-            if option_split_adjust_in_place(id, key, kind) {
-                // STANDARD (whole-number forward split, OCC Art. VI §11): the option keeps its
-                // contract identity. Adjust each affected option IN PLACE — strike ÷ ratio,
-                // contracts × ratio (via apply_split), multiplier (contract_size) unchanged.
-                for opt_key in affected_options {
-                    let option_state = self.state.instruments.instrument_index_mut(&opt_key);
 
-                    // Snapshot the option's resting orders as an observable BEFORE adjusting — a
-                    // broker price-adjusts them, so the engine cancels nothing, but
-                    // the wrapper must know (and a backtest MockExchange would otherwise fill a
-                    // now-stale-premium resting order against the post-split print).
-                    let option_orders: Vec<OpenOrderAtSplit> = option_state
-                        .orders
-                        .orders()
-                        .map(|order| OpenOrderAtSplit {
-                            cid: order.key.cid.clone(),
-                            price_pre_split: order.price,
-                            quantity_pre_split: order.quantity,
-                        })
-                        .collect();
+        // Classify the split for OPTION handling up front (cheap; only `warn!`s on an unexpected
+        // classification). `true` ⇒ adjust the options in place (standard split); `false` ⇒ signal
+        // a downstream identity change. A future `#[non_exhaustive]` `SplitAdjustmentKind` variant
+        // is handled conservatively as non-standard and `warn!`-surfaced (observable beats silent)
+        // — see [`option_split_adjust_in_place`].
+        if option_split_adjust_in_place(id, key, kind) {
+            // STANDARD (whole-number forward split, OCC Art. VI §11): the option keeps its contract
+            // identity, so the adjustment is purely mechanical (strike ÷ ratio; contracts × ratio
+            // for held positions; multiplier/contract_size unchanged). Adjust the strike of EVERY
+            // registered option on the underlying — held OR unheld. The instrument set is fixed at
+            // construction, so an option that is unheld at split time can have a position opened
+            // later and then settle at expiry against its strike; leaving it on the pre-split strike
+            // would mis-settle that future position. Unheld options get the strike correction
+            // SILENTLY (a registry fix, no position event); held options additionally get
+            // per-position `apply_split` + observables.
+            let options_on_underlying: Vec<InstrumentIndex> = self
+                .state
+                .instruments
+                .0
+                .values()
+                .filter(|state| {
+                    state.is_option_on_underlying(&equity_base, &equity_quote, &equity_exchange)
+                })
+                .map(|state| state.key)
+                .collect();
 
-                    // The OPTION's own last price (premium) for the eager pnl_unrealised recompute
-                    // — not the underlying equity's. None ⇒ 0 (+ warn), mirroring the equity path:
-                    // the split is still applied, corrected on the next market tick.
-                    let option_last_price = option_state.data.price();
-                    if option_last_price.is_none() {
-                        warn!(
-                            %id,
-                            instrument = ?opt_key,
-                            "CorporateAction: option last price unavailable — pnl_unrealised set to \
-                             0 after the standard-split adjustment, corrected on the next market \
-                             tick. The split is still applied (not retryable)."
-                        );
-                    }
+            for opt_key in options_on_underlying {
+                let option_state = self.state.instruments.instrument_index_mut(&opt_key);
 
-                    // Adjust the strike in place. The scan only matched Option instruments, so the
-                    // `else` is defensive (unreachable); skip rather than misadjust if it ever hits.
-                    let InstrumentKind::Option(ref mut contract) = option_state.instrument.kind
-                    else {
-                        continue;
-                    };
-                    let strike_pre_split = contract.strike;
-                    contract.strike /= ratio;
-                    let strike_post_split = contract.strike;
+                // Adjust the strike in place. The scan only matched Option instruments, so the
+                // `else` arm is unreachable; fail loudly rather than silently misadjust if that
+                // invariant is ever broken (a re-borrow on a freshly-collected key cannot miss).
+                let InstrumentKind::Option(ref mut contract) = option_state.instrument.kind else {
+                    unreachable!(
+                        "is_option_on_underlying matched a non-Option instrument {opt_key:?}"
+                    );
+                };
+                let strike_pre_split = contract.strike;
+                contract.strike /= ratio_decimal;
+                let strike_post_split = contract.strike;
 
-                    // Apply the split to EACH of the option's positions (N in Hedging) and emit one
-                    // per-position record. A whole-number ratio × an integer contract count leaves a
-                    // whole contract count ⇒ no fractional remainder, no CIL, no floor-to-zero,
-                    // regardless of `policy`.
-                    let opt_position_ids: Vec<PositionId> =
-                        option_state.position.positions.keys().cloned().collect();
-                    for pos_id in opt_position_ids {
-                        // Gate the observable on the mutation actually happening, mirroring the
-                        // equity loop's `else { continue; }`: an OptionPositionAdjustedForSplit
-                        // record asserts the position WAS adjusted, so never emit it for a position
-                        // the re-borrow could not find.
-                        if let Some(position) = option_state.position.positions.get_mut(&pos_id) {
-                            // Option contract counts are whole, and a standard split is a
-                            // whole-number ratio, so `integer × integer` stays integer with no
-                            // fractional remainder — the equity's `SplitRoundingPolicy` (a
-                            // whole-share-lot concept) does not govern option legs. Enforce that
-                            // invariant on the INPUT with a hard `assert!` (NOT `debug_assert!`,
-                            // which compiles out in release): a non-integer contract count is state
-                            // corruption that must fail observably, never be silently floored (under
-                            // `Floor`) or silently carried (under `Fractional`). Asserting the input
-                            // — rather than the post-split `remainder` — is the meaningful check:
-                            // under `Fractional` the remainder is always zero by construction, so a
-                            // remainder assert would be vacuous. With the invariant upheld the
-                            // disposal is provably zero, so no SplitRemainder/CIL or floor-to-zero
-                            // close is possible here.
-                            assert!(
-                                position.quantity_abs.fract().is_zero(),
-                                "option position {pos_id:?} holds a non-integer contract count {} \
-                                 before a standard split — data corruption",
-                                position.quantity_abs,
-                            );
-                            position.apply_split(ratio, policy, option_last_price);
-                            outputs.push(EngineOutput::OptionPositionAdjustedForSplit {
-                                option_instrument: opt_key,
-                                ratio,
-                                strike_pre_split,
-                                strike_post_split,
-                                position_id: pos_id,
-                            });
-                        }
-                    }
-
-                    if !option_orders.is_empty() {
-                        outputs.push(EngineOutput::OpenOrdersAtSplit {
-                            instrument: opt_key,
-                            orders: option_orders,
-                        });
-                    }
+                // Unheld option: the strike correction above is the whole job — no positions to
+                // split, no observable (a silent registry fix; the user-chosen behaviour).
+                if option_state.position.positions.is_empty() {
+                    continue;
                 }
-            } else {
-                // NON-STANDARD (every reverse split, every fractional forward split): the OCC
-                // assigns a new contract identity (new deliverable / symbol e.g. MSFT → MSFT1),
-                // which the engine cannot represent (fixed-at-construction instrument set). Leave
-                // the options at pre-split terms and signal the wrapper. The equity split itself is
-                // still applied and the `id` recorded below.
+
+                // Snapshot the held option's resting orders as an observable BEFORE adjusting its
+                // positions — a broker price-adjusts them, so the engine cancels nothing, but the
+                // wrapper must know (and a backtest MockExchange would otherwise fill a
+                // now-stale-premium resting order against the post-split print).
+                let option_orders: Vec<OpenOrderAtSplit> = option_state
+                    .orders
+                    .orders()
+                    .map(|order| OpenOrderAtSplit {
+                        cid: order.key.cid.clone(),
+                        price_pre_split: order.price,
+                        quantity_pre_split: order.quantity,
+                    })
+                    .collect();
+
+                // The OPTION's own last price (premium) for the eager pnl_unrealised recompute —
+                // not the underlying equity's. None ⇒ 0 (+ warn), mirroring the equity path: the
+                // split is still applied, corrected on the next market tick.
+                let option_last_price = option_state.data.price();
+                if option_last_price.is_none() {
+                    warn!(
+                        %id,
+                        instrument = ?opt_key,
+                        "CorporateAction: option last price unavailable — pnl_unrealised set to 0 \
+                         after the standard-split adjustment, corrected on the next market tick. \
+                         The split is still applied (not retryable)."
+                    );
+                }
+
+                // Apply the split to EACH of the option's positions (N in Hedging) and emit one
+                // per-position record. A whole-number ratio × an integer contract count leaves a
+                // whole contract count ⇒ no fractional remainder, no CIL, no floor-to-zero,
+                // regardless of `policy`.
+                let opt_position_ids: Vec<PositionId> =
+                    option_state.position.positions.keys().cloned().collect();
+                for pos_id in opt_position_ids {
+                    // `pos_id` was just collected from this same positions map in a single-threaded
+                    // engine, so the re-borrow cannot miss; fail loudly (matching the strike-adjust
+                    // `unreachable!` above) if that ever changes, rather than silently skipping an
+                    // OptionPositionAdjustedForSplit whose contract asserts the position WAS adjusted.
+                    let Some(position) = option_state.position.positions.get_mut(&pos_id) else {
+                        unreachable!(
+                            "position id {pos_id:?} collected from this option's positions map"
+                        );
+                    };
+
+                    // Option contract counts are whole, and a standard split is a whole-number
+                    // ratio, so `integer × integer` stays integer with no fractional remainder —
+                    // the equity's `SplitRoundingPolicy` (a whole-share-lot concept) does not govern
+                    // option legs. Enforce that invariant on the INPUT with a hard `assert!` (NOT
+                    // `debug_assert!`, which compiles out in release): a non-integer contract count
+                    // is state corruption that must fail observably, never be silently floored
+                    // (under `Floor`) or silently carried (under `Fractional`). Asserting the input
+                    // — rather than the post-split `remainder` — is the meaningful check: under
+                    // `Fractional` the remainder is always zero by construction, so a remainder
+                    // assert would be vacuous. With the invariant upheld the disposal is provably
+                    // zero, so no SplitRemainder/CIL or floor-to-zero close is possible here.
+                    assert!(
+                        position.quantity_abs.fract().is_zero(),
+                        "option position {pos_id:?} holds a non-integer contract count {} before a \
+                         standard split — data corruption",
+                        position.quantity_abs,
+                    );
+                    position.apply_split(ratio_decimal, policy, option_last_price);
+                    outputs.push(EngineOutput::OptionPositionAdjustedForSplit {
+                        option_instrument: opt_key,
+                        ratio,
+                        strike_pre_split,
+                        strike_post_split,
+                        position_id: pos_id,
+                    });
+                }
+
+                if !option_orders.is_empty() {
+                    outputs.push(EngineOutput::OpenOrdersAtSplit {
+                        instrument: opt_key,
+                        orders: option_orders,
+                    });
+                }
+            }
+        } else {
+            // NON-STANDARD (every reverse split, every fractional forward split): the OCC assigns a
+            // new contract identity (new deliverable / symbol e.g. MSFT → MSFT1), which the engine
+            // cannot represent (fixed-at-construction instrument set) — and there is no correct
+            // in-place strike fix, since the deliverable itself changes. Touch NO option strikes;
+            // only signal the wrapper about HELD option positions that need an identity change. The
+            // equity split itself is still applied and the `id` recorded below.
+            let affected_options: Vec<InstrumentIndex> = self
+                .state
+                .instruments
+                .0
+                .values()
+                .filter(|state| {
+                    state.is_affected_option_on_underlying(
+                        &equity_base,
+                        &equity_quote,
+                        &equity_exchange,
+                    )
+                })
+                .map(|state| state.key)
+                .collect();
+            if !affected_options.is_empty() {
                 warn!(
                     %id,
                     instrument = ?key,
@@ -1171,8 +1217,9 @@ pub enum EngineOutput<
     OptionPositionAdjustedForSplit {
         /// The option instrument whose strike and position were adjusted.
         option_instrument: InstrumentKey,
-        /// The (whole-number, `> 1`) forward split ratio that was applied.
-        ratio: Decimal,
+        /// The forward split ratio that was applied, as a validated [`SplitRatio`] (always `> 0`;
+        /// in practice a whole number `> 1`, since this variant is emitted only for standard splits).
+        ratio: SplitRatio,
         /// The option strike before the split was applied.
         strike_pre_split: Decimal,
         /// The option strike after the split (`= strike_pre_split / ratio`).
@@ -1208,8 +1255,9 @@ pub enum EngineOutput<
     OptionPositionsRequireIdentityChange {
         /// The underlying equity instrument that was split.
         split_instrument: InstrumentKey,
-        /// The split ratio that was applied to the underlying.
-        ratio: Decimal,
+        /// The split ratio that was applied to the underlying, as a validated [`SplitRatio`]
+        /// (always `> 0`).
+        ratio: SplitRatio,
         /// Option instruments (holding positions) on that underlying that require a wrapper-side
         /// identity change; left at pre-split terms by the engine.
         affected_options: Vec<InstrumentKey>,

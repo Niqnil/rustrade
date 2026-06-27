@@ -192,7 +192,9 @@ mod tests {
     use rust_decimal::Decimal;
     use rustrade_data::event::MarketEvent;
     use rustrade_instrument::{
-        corporate_action::CorporateActionKind, exchange::ExchangeId, instrument::InstrumentIndex,
+        corporate_action::{CorporateActionKind, SplitRatio},
+        exchange::ExchangeId,
+        instrument::InstrumentIndex,
     };
 
     fn market_event(time_exchange: DateTime<Utc>) -> EngineEvent<()> {
@@ -357,7 +359,7 @@ mod tests {
             id: "test-split".into(),
             instrument: InstrumentIndex::new(0),
             kind: CorporateActionKind::StockSplit {
-                ratio: Decimal::new(2, 0),
+                ratio: SplitRatio::new(Decimal::new(2, 0)).unwrap(),
             },
             policy: SplitRoundingPolicy::Fractional,
             effective_time,

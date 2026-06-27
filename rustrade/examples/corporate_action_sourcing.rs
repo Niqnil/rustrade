@@ -169,16 +169,19 @@ impl StockSplitSource for DemoSplitSource {
         _filter: &CorporateActionFilter,
     ) -> impl Stream<Item = Result<CorporateAction<SmolStr>, Self::Error>> + Send {
         futures::stream::iter([
-            // Apple 4-for-1, 2020-08-31.
+            // Apple 4-for-1, 2020-08-31. A real source feeds the provider's `split_to`/`split_from`
+            // straight into `stock_split`, which derives the validated ratio in one place.
             Ok(CorporateAction::new(
                 SmolStr::new("AAPL"),
-                CorporateActionKind::StockSplit { ratio: dec!(4) },
+                CorporateActionKind::stock_split(dec!(4), dec!(1))
+                    .expect("4-for-1 is a valid split"),
                 NaiveDate::from_ymd_opt(2020, 8, 31),
             )),
             // NVIDIA 10-for-1, 2024-06-10.
             Ok(CorporateAction::new(
                 SmolStr::new("NVDA"),
-                CorporateActionKind::StockSplit { ratio: dec!(10) },
+                CorporateActionKind::stock_split(dec!(10), dec!(1))
+                    .expect("10-for-1 is a valid split"),
                 NaiveDate::from_ymd_opt(2024, 6, 10),
             )),
         ])

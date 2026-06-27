@@ -929,7 +929,7 @@ async fn test_corporate_actions_splits_specific_ticker() {
 #[ignore]
 async fn test_corporate_actions_splits_via_source_trait() {
     use chrono::NaiveDate;
-    use rustrade_instrument::corporate_action::CorporateActionKind;
+    use rustrade_instrument::corporate_action::{CorporateActionKind, SplitRatio};
     use rustrade_integration::corporate_action::{CorporateActionFilter, StockSplitSource};
     use smol_str::SmolStr;
 
@@ -963,7 +963,7 @@ async fn test_corporate_actions_splits_via_source_trait() {
     assert_eq!(
         nvda.kind,
         CorporateActionKind::StockSplit {
-            ratio: Decimal::from(10)
+            ratio: SplitRatio::new(Decimal::from(10)).unwrap()
         }
     );
 

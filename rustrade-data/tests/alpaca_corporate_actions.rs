@@ -37,7 +37,7 @@ use chrono::NaiveDate;
 use futures::StreamExt;
 use rust_decimal::Decimal;
 use rustrade_data::exchange::alpaca::AlpacaRestClient;
-use rustrade_instrument::corporate_action::{CorporateAction, CorporateActionKind};
+use rustrade_instrument::corporate_action::{CorporateAction, CorporateActionKind, SplitRatio};
 use rustrade_integration::corporate_action::{CorporateActionFilter, StockSplitSource};
 use smol_str::SmolStr;
 
@@ -82,7 +82,7 @@ async fn nvda_forward_split_2024_via_source() {
     assert_eq!(
         nvda.kind,
         CorporateActionKind::StockSplit {
-            ratio: Decimal::from(10)
+            ratio: SplitRatio::new(Decimal::from(10)).unwrap()
         }
     );
 }
@@ -103,7 +103,7 @@ async fn atra_reverse_split_2024_via_source() {
     assert_eq!(
         atra.kind,
         CorporateActionKind::StockSplit {
-            ratio: Decimal::new(4, 2)
+            ratio: SplitRatio::new(Decimal::new(4, 2)).unwrap()
         }
     );
 }

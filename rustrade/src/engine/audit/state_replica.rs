@@ -283,6 +283,11 @@ where
                 let CorporateActionKind::StockSplit { ratio } = kind else {
                     return;
                 };
+                // Unwrap the validated `SplitRatio` to its inner `Decimal` for the arithmetic
+                // below. Unlike the live handler — which keeps the typed `SplitRatio` (as `ratio`)
+                // to carry into its output records and names the inner value `ratio_decimal` — the
+                // replica emits no outputs, so it shadows `ratio` directly with the `Decimal`.
+                let ratio = ratio.get();
 
                 // Last price for the eager `pnl_unrealised` recompute — same source the live
                 // handler reads. Identical here because the replica replayed the same market data.
@@ -329,6 +334,15 @@ where
                             .positions
                             .shift_remove(&exit.position_id);
                         instrument_state.tear_sheet.update_from_position(exit);
+                        // Mirror the live handler's Hedging fill-routing prune on floor-to-zero
+                        // (engine/mod.rs): drop the now-dangling `cid → removed_pos_id` mapping by
+                        // VALUE. Without this, the replica retains a stale routing entry the live
+                        // engine has already pruned, so the full-state `assert_eq!` over
+                        // `InstrumentState` (which includes `position_ids`) diverges for any
+                        // `OmsMode::Hedging` position floored to zero by a reverse split.
+                        instrument_state
+                            .position_ids
+                            .retain(|_, mapped| *mapped != exit.position_id);
                     }
                 }
 
@@ -362,13 +376,17 @@ where
                             equity.instrument.exchange,
                         )
                     };
-                    let affected_options: Vec<InstrumentIndex> = self
+                    // Scan ALL options on the underlying (held OR unheld), mirroring the live
+                    // handler: a standard split divides the strike of every registered option so
+                    // the registry stays consistent for positions opened later. Unheld options get
+                    // the strike fix only; held options additionally event-replay `apply_split`.
+                    let options_on_underlying: Vec<InstrumentIndex> = self
                         .replica_engine_state()
                         .instruments
                         .0
                         .values()
                         .filter(|state| {
-                            state.is_affected_option_on_underlying(
+                            state.is_option_on_underlying(
                                 &equity_base,
                                 &equity_quote,
                                 &equity_exchange,
@@ -376,38 +394,54 @@ where
                         })
                         .map(|state| state.key)
                         .collect();
-                    for opt_key in affected_options {
+                    for opt_key in options_on_underlying {
                         let option_state = self
                             .replica_engine_state_mut()
                             .instruments
                             .instrument_index_mut(&opt_key);
-                        let option_last_price = option_state.data.price();
-                        // Mirror the live handler's `else { continue; }`: the scan only matched
-                        // Option instruments, so this is defensive (unreachable) — skip the whole
-                        // iteration rather than apply_split without adjusting the strike if it hits.
+                        // Mirror the live handler's loud unreachable: the scan only matched Option
+                        // instruments, so a non-Option here is corruption — fail observably rather
+                        // than apply_split without adjusting the strike.
                         let InstrumentKind::Option(ref mut contract) = option_state.instrument.kind
                         else {
-                            continue;
+                            unreachable!(
+                                "replica: is_option_on_underlying matched a non-Option instrument \
+                                 {opt_key:?}"
+                            );
                         };
                         contract.strike /= ratio;
+
+                        // Unheld option: strike correction is the whole job (silent registry fix),
+                        // mirroring the live handler.
+                        if option_state.position.positions.is_empty() {
+                            continue;
+                        }
+                        let option_last_price = option_state.data.price();
                         let opt_position_ids: Vec<PositionId> =
                             option_state.position.positions.keys().cloned().collect();
                         for pos_id in opt_position_ids {
-                            if let Some(position) = option_state.position.positions.get_mut(&pos_id)
-                            {
-                                // Mirror the live handler's input invariant (see
-                                // `process_corporate_action`): option contract counts are whole, so a
-                                // non-integer count is corruption that must fail observably — not be
-                                // silently floored/carried. Keeps live and replica behaviour identical
-                                // (a live panic here must be a replica panic, or audit parity drifts).
-                                assert!(
-                                    position.quantity_abs.fract().is_zero(),
-                                    "replica: option position {pos_id:?} holds a non-integer contract \
-                                     count {} before a standard split — data corruption",
-                                    position.quantity_abs,
+                            // `pos_id` was just collected from this map; fail loudly (matching the
+                            // strike-adjust `unreachable!` above) if that ever changes, mirroring the
+                            // live handler.
+                            let Some(position) = option_state.position.positions.get_mut(&pos_id)
+                            else {
+                                unreachable!(
+                                    "replica: position id {pos_id:?} collected from this option's \
+                                     positions map"
                                 );
-                                position.apply_split(ratio, policy, option_last_price);
-                            }
+                            };
+                            // Mirror the live handler's input invariant (see
+                            // `process_corporate_action`): option contract counts are whole, so a
+                            // non-integer count is corruption that must fail observably — not be
+                            // silently floored/carried. Keeps live and replica behaviour identical
+                            // (a live panic here must be a replica panic, or audit parity drifts).
+                            assert!(
+                                position.quantity_abs.fract().is_zero(),
+                                "replica: option position {pos_id:?} holds a non-integer contract \
+                                 count {} before a standard split — data corruption",
+                                position.quantity_abs,
+                            );
+                            position.apply_split(ratio, policy, option_last_price);
                         }
                     }
                 }

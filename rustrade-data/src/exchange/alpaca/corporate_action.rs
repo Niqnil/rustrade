@@ -104,6 +104,7 @@ mod tests {
     use super::*;
     use chrono::NaiveDate;
     use rust_decimal::Decimal;
+    use rustrade_instrument::corporate_action::SplitRatio;
 
     fn split(symbol: &str, new_rate: i64, old_rate: i64, ex_date: NaiveDate) -> AlpacaStockSplit {
         AlpacaStockSplit {
@@ -150,7 +151,7 @@ mod tests {
         assert_eq!(
             action.kind,
             CorporateActionKind::StockSplit {
-                ratio: Decimal::from(10)
+                ratio: SplitRatio::new(Decimal::from(10)).unwrap()
             }
         );
     }
@@ -168,7 +169,7 @@ mod tests {
         assert_eq!(
             action.kind,
             CorporateActionKind::StockSplit {
-                ratio: Decimal::new(4, 2)
+                ratio: SplitRatio::new(Decimal::new(4, 2)).unwrap()
             }
         );
     }

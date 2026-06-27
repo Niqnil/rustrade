@@ -22,9 +22,10 @@ use std::sync::Arc;
 ///   an implementation backed by a single-pass cursor must not let one consume events the other
 ///   needs.
 ///
-/// # Limitation
-/// The harness currently `collect`s the entire `stream` into memory to perform the time-merge, so
-/// lazy streaming is not preserved — sources too large to fit in memory are not yet supported.
+/// # Memory model
+/// The time-merge consumes this stream **lazily** (it is polled on demand, never collected), so the
+/// harness's memory overhead is O(1) in the dataset size — a source streamed item-by-item stays
+/// streamed end to end.
 pub trait BacktestMarketData {
     /// The type of market events provided by this data source.
     type Kind;

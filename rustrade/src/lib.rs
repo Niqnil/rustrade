@@ -60,8 +60,7 @@ use rustrade_data::{
 };
 use rustrade_execution::AccountEvent;
 use rustrade_instrument::{
-    asset::AssetIndex, corporate_action::CorporateActionKind, exchange::ExchangeIndex,
-    instrument::InstrumentIndex,
+    asset::AssetIndex, exchange::ExchangeIndex, instrument::InstrumentIndex,
 };
 use rustrade_integration::Terminal;
 use serde::{Deserialize, Serialize};
@@ -71,6 +70,17 @@ use smol_str::SmolStr;
 /// Re-export of [`SplitRoundingPolicy`] so callers can construct
 /// [`EngineEvent::CorporateAction`] without depending on the engine's internal module layout.
 pub use crate::engine::state::position::SplitRoundingPolicy;
+
+/// Re-export of the corporate-action public API so callers can build and handle
+/// [`EngineEvent::CorporateAction`] without a direct `rustrade_instrument` dependency — mirroring
+/// the [`SplitRoundingPolicy`] re-export above. [`CorporateActionKind`] is the event's market-fact
+/// `kind`, [`SplitRatio`]/[`InvalidSplitRatio`] are its validated ratio and construction error,
+/// [`SplitAdjustmentKind`] is the OCC option classification, and [`split_effective_instant`]
+/// resolves an effective date to the engine's stamping instant.
+pub use rustrade_instrument::corporate_action::{
+    CorporateActionKind, InvalidSplitRatio, SplitAdjustmentKind, SplitRatio,
+    split_effective_instant,
+};
 
 /// Algorithmic trading `Engine`, and entry points for processing input `Events`.
 ///

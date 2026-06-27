@@ -17,11 +17,18 @@ use std::sync::Arc;
 /// The default implementation, [`NoAuxEvents`], yields nothing — existing backtests opt out at
 /// zero cost.
 ///
-/// # Caller obligation
-/// [`aux_events`](Self::aux_events) MUST yield events sorted ascending by [`Timed::time`]. The
-/// merge with the market stream is a two-way merge that relies on both inputs already being
-/// sorted; out-of-order aux events produce an out-of-order engine feed (and, in backtest, a
-/// non-monotonic [`HistoricalClock`](crate::engine::clock::HistoricalClock)).
+/// # Caller obligations
+/// - [`aux_events`](Self::aux_events) MUST yield events sorted ascending by [`Timed::time`]. The
+///   merge with the market stream is a two-way merge that relies on both inputs already being
+///   sorted; out-of-order aux events produce an out-of-order engine feed (and, in backtest, a
+///   non-monotonic [`HistoricalClock`](crate::engine::clock::HistoricalClock)).
+/// - For an [`EngineEvent::CorporateAction`](crate::EngineEvent::CorporateAction), the wrapping
+///   [`Timed::time`] MUST equal the action's `effective_time`. These are two independent knobs: the
+///   merge **positions** the event in the stream by `Timed::time`, while the handler advances the
+///   [`HistoricalClock`](crate::engine::clock::HistoricalClock) to `effective_time` and stamps the
+///   adjustment there. A mismatch is silently honored — the action would be *ordered* at one instant
+///   but *take effect* at another — so the adjustment fires at the wrong simulated time. This is not
+///   enforced (the handler cannot see the wrapping `Timed`); keep them equal.
 ///
 /// # Limitation — `ContractExpiry` does not advance the backtest clock
 /// [`EngineEvent::ContractExpiry`](crate::EngineEvent::ContractExpiry) carries no timestamp (unlike

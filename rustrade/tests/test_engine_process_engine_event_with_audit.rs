@@ -61,7 +61,7 @@ use rustrade_execution::{
 use rustrade_instrument::{
     Side, Underlying,
     asset::AssetIndex,
-    corporate_action::CorporateActionKind,
+    corporate_action::{CorporateActionKind, SplitRatio},
     exchange::{ExchangeId, ExchangeIndex},
     index::IndexedInstruments,
     instrument::{
@@ -1607,7 +1607,9 @@ fn test_corporate_action_replica_parity_floor_split() {
     let ca_event = EngineEvent::CorporateAction {
         id: "BTCUSDT-reverse-1-2".into(),
         instrument: InstrumentIndex(0),
-        kind: CorporateActionKind::StockSplit { ratio: dec!(0.5) },
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(0.5)).unwrap(),
+        },
         policy: SplitRoundingPolicy::Floor,
         effective_time,
     };
@@ -1714,7 +1716,9 @@ fn test_corporate_action_idempotent() {
     let ca_event = EngineEvent::CorporateAction {
         id: "AAPL-2026-split".into(),
         instrument: InstrumentIndex(0),
-        kind: CorporateActionKind::StockSplit { ratio: dec!(0.5) },
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(0.5)).unwrap(),
+        },
         policy: SplitRoundingPolicy::Floor,
         effective_time,
     };
@@ -1812,7 +1816,9 @@ fn test_corporate_action_replica_parity_short_reverse_split() {
     let ca_event = EngineEvent::CorporateAction {
         id: "BTCUSDT-reverse-1-2-short".into(),
         instrument: InstrumentIndex(0),
-        kind: CorporateActionKind::StockSplit { ratio: dec!(0.5) },
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(0.5)).unwrap(),
+        },
         policy: SplitRoundingPolicy::Floor,
         effective_time,
     };
@@ -1902,7 +1908,9 @@ fn test_corporate_action_replica_parity_unsupported_non_spot() {
     let ca_event = EngineEvent::CorporateAction {
         id: "opt-split".into(),
         instrument: InstrumentIndex(0),
-        kind: CorporateActionKind::StockSplit { ratio: dec!(2) },
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(2)).unwrap(),
+        },
         policy: SplitRoundingPolicy::Floor,
         effective_time,
     };
@@ -1989,7 +1997,9 @@ fn test_corporate_action_injected_mid_stream_clock_and_outputs() {
     let ca_event = EngineEvent::CorporateAction {
         id: "BTCUSDT-reverse-1-2".into(),
         instrument: InstrumentIndex(0),
-        kind: CorporateActionKind::StockSplit { ratio: dec!(0.5) },
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(0.5)).unwrap(),
+        },
         policy: SplitRoundingPolicy::Floor,
         effective_time,
     };
@@ -2134,7 +2144,9 @@ fn test_corporate_action_option_standard_split_adjusts_in_place() {
     let ca_event = EngineEvent::CorporateAction {
         id: "BTCUSD-2-1-split".into(),
         instrument: InstrumentIndex(1),
-        kind: CorporateActionKind::StockSplit { ratio: dec!(2) },
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(2)).unwrap(),
+        },
         policy: SplitRoundingPolicy::Floor,
         effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
     };
@@ -2176,7 +2188,7 @@ fn test_corporate_action_option_standard_split_adjusts_in_place() {
                 position_id,
             } => Some((
                 *option_instrument,
-                *ratio,
+                ratio.get(),
                 *strike_pre_split,
                 *strike_post_split,
                 position_id.clone(),
@@ -2241,7 +2253,9 @@ fn test_corporate_action_option_standard_split_no_orders_suppresses_open_orders_
     let ca_event = EngineEvent::CorporateAction {
         id: "BTCUSD-2-1-split".into(),
         instrument: InstrumentIndex(1),
-        kind: CorporateActionKind::StockSplit { ratio: dec!(2) },
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(2)).unwrap(),
+        },
         policy: SplitRoundingPolicy::Floor,
         effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
     };
@@ -2291,7 +2305,9 @@ fn test_corporate_action_option_standard_split_hedging_per_position() {
     let ca_event = EngineEvent::CorporateAction {
         id: "BTCUSD-2-1-split".into(),
         instrument: InstrumentIndex(1),
-        kind: CorporateActionKind::StockSplit { ratio: dec!(2) },
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(2)).unwrap(),
+        },
         policy: SplitRoundingPolicy::Floor,
         effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
     };
@@ -2353,7 +2369,9 @@ fn test_corporate_action_option_non_standard_requires_identity_change() {
         let ca_event = EngineEvent::CorporateAction {
             id: id.into(),
             instrument: InstrumentIndex(1),
-            kind: CorporateActionKind::StockSplit { ratio },
+            kind: CorporateActionKind::StockSplit {
+                ratio: SplitRatio::new(ratio).unwrap(),
+            },
             policy: SplitRoundingPolicy::Floor,
             effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
         };
@@ -2389,7 +2407,7 @@ fn test_corporate_action_option_non_standard_requires_identity_change() {
                     split_instrument,
                     ratio: r,
                     affected_options,
-                } => Some((*split_instrument, *r, affected_options.clone())),
+                } => Some((*split_instrument, r.get(), affected_options.clone())),
                 _ => None,
             })
             .collect();
@@ -2446,7 +2464,9 @@ fn test_corporate_action_option_replica_parity_standard_split() {
     let ca_event = EngineEvent::CorporateAction {
         id: "BTCUSD-2-1-split".into(),
         instrument: InstrumentIndex(1),
-        kind: CorporateActionKind::StockSplit { ratio: dec!(2) },
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(2)).unwrap(),
+        },
         policy: SplitRoundingPolicy::Floor,
         effective_time,
     };
@@ -2649,7 +2669,9 @@ fn test_corporate_action_option_non_standard_wrapper_close_and_new_identity() {
         id: "BTCUSD-3-2-split".into(),
         instrument: InstrumentIndex(2),
         // 3:2 fractional forward ⇒ non-standard (the OCC assigns a new contract identity).
-        kind: CorporateActionKind::StockSplit { ratio: dec!(1.5) },
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(1.5)).unwrap(),
+        },
         policy: SplitRoundingPolicy::Floor,
         effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
     };
@@ -2667,7 +2689,7 @@ fn test_corporate_action_option_non_standard_wrapper_close_and_new_identity() {
                 split_instrument,
                 ratio,
                 affected_options,
-            } => Some((*split_instrument, *ratio, affected_options.clone())),
+            } => Some((*split_instrument, ratio.get(), affected_options.clone())),
             _ => None,
         })
         .collect();
@@ -3631,5 +3653,355 @@ fn test_contract_expiry_clears_pending_fills() {
     assert!(
         instr.pending_fills.is_empty(),
         "pending_fills must be cleared during contract expiry"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CorporateAction — additional audit-path coverage:
+//   equity-leg OpenOrdersAtSplit, forward split on a populated spot, the
+//   Fractional rounding policy, a post-split unheld-option strike fix, and the
+//   hedging routing-table prune on a floor-to-zero reverse split.
+// ---------------------------------------------------------------------------
+
+/// Equity/spot path: a resting order on the splitting instrument is surfaced via
+/// `OpenOrdersAtSplit` (and left in the book — a broker price-adjusts it, the engine never cancels).
+/// The option path already asserts this observable; this pins it on the equity leg too.
+#[test]
+fn test_corporate_action_spot_split_surfaces_open_orders_at_split() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx); // Netting spot
+
+    // Last price for the eager pnl recompute, plus a long position on Spot instrument 0.
+    engine.process(market_event_trade(1, 0, dec!(100)));
+    open_position_via_trade(&mut engine, 0, 2, Side::Buy, dec!(100), dec!(10), "pos");
+
+    // A resting order on the same instrument (cid = gen_cid(0)), left unfilled (0 of 1 filled).
+    engine.process(account_event_order_response(0, 1, Side::Buy, 1.0, 0.0));
+
+    // 1:2 reverse split on instrument 0.
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSDT-reverse-1-2".into(),
+        instrument: InstrumentIndex(0),
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(0.5)).unwrap(),
+        },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
+    };
+    let audit_tick = process_with_audit(&mut engine, ca_event);
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+
+    // The resting order is surfaced for the equity instrument, carrying its pre-split terms.
+    let surfaced = outputs
+        .iter()
+        .find_map(|o| match o {
+            EngineOutput::OpenOrdersAtSplit { instrument, orders }
+                if *instrument == InstrumentIndex(0) =>
+            {
+                Some(orders.clone())
+            }
+            _ => None,
+        })
+        .expect("equity split must surface the instrument's resting orders via OpenOrdersAtSplit");
+    assert!(
+        surfaced
+            .iter()
+            .any(|order| order.cid == gen_cid(0) && order.quantity_pre_split == dec!(1)),
+        "OpenOrdersAtSplit must carry the resting order at its pre-split quantity"
+    );
+
+    // The order is NOT cancelled — it still rests in the engine's order book post-split.
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .orders
+            .0
+            .contains_key(&gen_cid(0)),
+        "the resting order must be left in place (surfaced, not cancelled)"
+    );
+}
+
+/// Forward split (`ratio > 1`) on a populated spot position via the audit path: contracts scale up,
+/// basis scales down, the high-water mark scales (unfloored), and pnl is recomputed from the mark —
+/// with NO `SplitRemainder` (an integer ratio on a whole quantity disposes nothing). Existing
+/// coverage exercises only reverse (`0.5`) splits on populated spot, or forward on empty spot.
+#[test]
+fn test_corporate_action_forward_split_populated_spot() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx); // Netting spot
+
+    // Mark 100, long 10 @ 100 on Spot instrument 0.
+    engine.process(market_event_trade(1, 0, dec!(100)));
+    open_position_via_trade(&mut engine, 0, 2, Side::Buy, dec!(100), dec!(10), "pos");
+
+    // 2:1 forward split.
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSDT-forward-2-1".into(),
+        instrument: InstrumentIndex(0),
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(2)).unwrap(),
+        },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
+    };
+    let audit_tick = process_with_audit(&mut engine, ca_event);
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+
+    // Position scaled: qty 10×2 = 20, avg 100/2 = 50, high-water 10×2 = 20 (unfloored),
+    // pnl_unrealised recomputed from the mark 100 = (100 - 50) × 20 = 1000.
+    let instrument_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    assert_eq!(instrument_state.position.positions.len(), 1);
+    let position = instrument_state.position.positions.values().next().unwrap();
+    assert_eq!(position.quantity_abs, dec!(20));
+    assert_eq!(position.price_entry_average, dec!(50));
+    assert_eq!(position.quantity_abs_max, dec!(20));
+    assert_eq!(position.pnl_unrealised, dec!(1000));
+
+    // A whole-number forward split on a whole quantity disposes no fractional sliver.
+    assert!(
+        !outputs
+            .iter()
+            .any(|o| matches!(o, EngineOutput::SplitRemainder { .. })),
+        "a forward split on a whole quantity must not emit a SplitRemainder"
+    );
+
+    // The split id is recorded on the target.
+    assert!(
+        instrument_state
+            .corporate_actions_processed
+            .contains("BTCUSDT-forward-2-1")
+    );
+}
+
+/// `SplitRoundingPolicy::Fractional` (fractional-share brokers, e.g. Alpaca) keeps the exact
+/// fractional share count: the quantity is NOT floored and NO `SplitRemainder` is emitted, even when
+/// the scaled quantity is fractional. Previously only smoke-tested through the audit-disabled
+/// backtest path; asserted here on the observable audit path, the `Floor` counterpart's mirror.
+#[test]
+fn test_corporate_action_fractional_policy_keeps_fractional_quantity() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx); // Netting spot
+
+    // Mark 100, long 21 @ 100 on Spot instrument 0.
+    engine.process(market_event_trade(1, 0, dec!(100)));
+    open_position_via_trade(&mut engine, 0, 2, Side::Buy, dec!(100), dec!(21), "pos");
+
+    // 1:2 reverse split under Fractional: 21 × 0.5 = 10.5 kept (NOT floored to 10).
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSDT-reverse-frac".into(),
+        instrument: InstrumentIndex(0),
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(0.5)).unwrap(),
+        },
+        policy: SplitRoundingPolicy::Fractional,
+        effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
+    };
+    let audit_tick = process_with_audit(&mut engine, ca_event);
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+
+    // The fractional quantity is preserved exactly: qty 10.5, avg 100/0.5 = 200,
+    // pnl_unrealised = (100 - 200) × 10.5 = -1050.
+    let instrument_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    let position = instrument_state.position.positions.values().next().unwrap();
+    assert_eq!(position.quantity_abs, dec!(10.5));
+    assert_eq!(position.price_entry_average, dec!(200));
+    assert_eq!(position.pnl_unrealised, dec!(-1050));
+
+    // Fractional disposes nothing — no cash-in-lieu observable, and the slot is not floored to zero.
+    assert!(
+        !outputs
+            .iter()
+            .any(|o| matches!(o, EngineOutput::SplitRemainder { .. })),
+        "Fractional policy must not dispose a remainder (no SplitRemainder)"
+    );
+    assert!(
+        !outputs
+            .iter()
+            .any(|o| matches!(o, EngineOutput::PositionExit(_))),
+        "a Fractional reverse split must not close the position"
+    );
+}
+
+/// A standard split silently corrects the strike of an UNHELD option on the underlying (a registry
+/// fix, no observable), so a position opened on that option AFTER the split settles at expiry against
+/// the POST-split strike. Proves the strike adjustment is not gated on holding a position at split
+/// time — the instrument set is fixed at construction, so an unheld option can be traded later.
+#[test]
+fn test_corporate_action_unheld_option_strike_adjusted_then_settles_post_split() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx); // Netting
+
+    // Marks for the option (idx0) and spot underlying (idx1). NO option position is opened — the
+    // option is unheld at split time.
+    engine.process(market_event_trade(1, 0, dec!(1200)));
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+
+    // 2:1 standard forward split on the Spot underlying (idx1).
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSD-2-1-split".into(),
+        instrument: InstrumentIndex(1),
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(2)).unwrap(),
+        },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
+    };
+    let audit_tick = process_with_audit(&mut engine, ca_event);
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+
+    // The unheld option's strike was silently halved (50_000 → 25_000) ...
+    let option_state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    let InstrumentKind::Option(contract) = &option_state.instrument.kind else {
+        panic!("instrument 0 must be an option");
+    };
+    assert_eq!(contract.strike, dec!(25_000));
+    // ... with NO per-position observable (nothing was held to adjust).
+    assert!(
+        !outputs
+            .iter()
+            .any(|o| matches!(o, EngineOutput::OptionPositionAdjustedForSplit { .. })),
+        "an unheld option's strike fix must be silent (no OptionPositionAdjustedForSplit)"
+    );
+
+    // Now open a fresh position on the option (post-split) and settle it at expiry. Spot at 30_000 is
+    // ITM against the POST-split strike 25_000 (intrinsic 5_000) but would be OTM against the stale
+    // 50_000 strike — so the settlement pnl pins which strike was used.
+    open_option_position_via_trade(
+        &mut engine,
+        11,
+        Side::Buy,
+        dec!(1_000),
+        dec!(1),
+        "post-split",
+    );
+    engine.process(market_event_trade(12, 1, dec!(30_000)));
+
+    let exited = engine.process_contract_expiry(&InstrumentIndex(0));
+    assert_eq!(exited.len(), 1);
+    // Intrinsic 5_000 (= 30_000 − post-split strike 25_000), premium 1_000, 1 contract:
+    // pnl = (5_000 − 1_000) × 1 = 4_000. Against the stale 50_000 strike it would be −1_000.
+    assert_eq!(exited[0].pnl_realised, dec!(4_000));
+}
+
+/// A reverse split that floors a Hedging position to zero must prune the `position_ids` routing entry
+/// by VALUE (the removed `PositionId`), not via the `cleanup_routing_tables` CID-retention path: the
+/// split deliberately leaves the position's resting order in place, so its CID is still in `orders`.
+/// Without the value-prune a late fill on that order would resolve the dead id and silently REOPEN
+/// the floored-out position.
+#[test]
+fn test_corporate_action_floor_to_zero_prunes_hedging_routing() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine_with_oms(TradingState::Disabled, execution_tx, OmsMode::Hedging);
+
+    // Last price for the eager pnl recompute on Spot instrument 0.
+    engine.process(market_event_trade(1, 0, dec!(100)));
+
+    // Open a Hedging position routed through an explicit PositionId, leaving the order RESTING (acked
+    // + filled, but with no terminal fully-filled snapshot ⇒ the CID stays in `orders`).
+    let cid = ClientOrderId::new("cid-floor");
+    let pos_id = PositionId::new("leg-floor");
+    let exchange_id = OrderId::new("exch-floor");
+    send_open_order_with_position_id(
+        &mut engine,
+        cid.clone(),
+        pos_id.clone(),
+        Side::Buy,
+        dec!(100),
+        false,
+    );
+    send_order_ack(&mut engine, cid.clone(), exchange_id.clone(), Side::Buy);
+    send_fill(&mut engine, exchange_id.clone(), Side::Buy, dec!(100));
+
+    // Pre-split sanity: position open, routing entry present, order resting.
+    let instr = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    assert!(instr.position.positions.contains_key(&pos_id));
+    assert!(instr.position_ids.values().any(|v| *v == pos_id));
+    assert!(instr.orders.0.contains_key(&cid));
+
+    // 1:2 reverse split under Floor: qty 1 → floor(0.5) = 0 ⇒ slot removed.
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSDT-floor-to-zero".into(),
+        instrument: InstrumentIndex(0),
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(0.5)).unwrap(),
+        },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time: time_plus_days(STARTING_TIMESTAMP, 10),
+    };
+    let audit_tick = process_with_audit(&mut engine, ca_event);
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => &audit.outputs,
+        _ => panic!("expected EngineAudit::Process"),
+    };
+
+    // The floored position exited, and its routing entry was pruned by value ...
+    assert!(
+        outputs
+            .iter()
+            .any(|o| matches!(o, EngineOutput::PositionExit(p) if p.position_id == pos_id)),
+        "the floored-to-zero position must emit a PositionExit"
+    );
+    let instr = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    assert!(
+        !instr.position.positions.contains_key(&pos_id),
+        "floored position must be removed"
+    );
+    assert!(
+        !instr.position_ids.values().any(|v| *v == pos_id),
+        "the floored position's routing entry must be pruned by value"
+    );
+    // ... while the resting order itself is left in place (the split price-adjusts, never cancels).
+    assert!(
+        instr.orders.0.contains_key(&cid),
+        "the split must leave the resting order in the book"
+    );
+
+    // A late fill on that still-resting order must NOT resurrect the floored PositionId. With the
+    // routing entry pruned, the fill routes via the no-mapping fallback to a position keyed by the
+    // raw exchange OrderId — a fresh slot, never the dead `leg-floor`.
+    send_fill(&mut engine, exchange_id.clone(), Side::Buy, dec!(100));
+    let instr = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    assert!(
+        !instr.position.positions.contains_key(&pos_id),
+        "a late fill must not silently reopen the floored-out position"
+    );
+    assert!(
+        instr
+            .position
+            .positions
+            .contains_key(&PositionId::new(exchange_id.0.clone())),
+        "the late fill opens a fresh slot under the raw order id (no-mapping fallback)"
     );
 }

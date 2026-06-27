@@ -50,7 +50,9 @@ use rustrade_data::{
     subscription::trade::PublicTrade,
 };
 use rustrade_instrument::{
-    corporate_action::CorporateActionKind, exchange::ExchangeId, index::IndexedInstruments,
+    corporate_action::{CorporateActionKind, SplitRatio},
+    exchange::ExchangeId,
+    index::IndexedInstruments,
     instrument::InstrumentIndex,
 };
 use rustrade_integration::collection::one_or_many::OneOrMany;
@@ -174,7 +176,9 @@ fn split_event(effective: &str, ratio: Decimal) -> Timed<EngineEvent> {
         EngineEvent::CorporateAction {
             id: "btcusdt-2025-03-24-split".into(),
             instrument: InstrumentIndex::new(0),
-            kind: CorporateActionKind::StockSplit { ratio },
+            kind: CorporateActionKind::StockSplit {
+                ratio: SplitRatio::new(ratio).unwrap(),
+            },
             policy: SplitRoundingPolicy::Fractional,
             effective_time: ts(effective),
         },

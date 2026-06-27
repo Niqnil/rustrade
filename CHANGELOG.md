@@ -43,12 +43,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   effective-date range; they yield the new generic `CorporateAction<K>` descriptor
   (`rustrade-instrument`), keyed by an unresolved provider symbol (`SmolStr`) at the source boundary.
   A shared `CorporateActionKind::stock_split(split_to, split_from)` helper computes the ratio
-  identically across providers. A reference implementation for the Massive REST client is feature-
+  identically across providers as a validated `SplitRatio` newtype (strictly `> 0`, making a
+  degenerate ratio unconstructible; build it via `SplitRatio::new` → `Option` or
+  `TryFrom<Decimal>` → `InvalidSplitRatio`, with transparent, validated serde). A reference implementation for the Massive REST client is feature-
   gated behind `massive` in `rustrade-data`. The action *kind* is encoded in the trait name (a
   `DividendSource` sibling is the future path) rather than a unified trait with a kind filter; push /
   account-scoped sources (e.g. IBKR) are intentionally out of this PULL trait. A runnable example
   (`rustrade`, `corporate_action_sourcing`, `--features massive`/`--features alpaca`) shows
   source → resolve → inject.
+- **`rustrade` crate-root re-exports for the corporate-action API.** `CorporateActionKind`,
+  `SplitRatio`, `InvalidSplitRatio`, `SplitAdjustmentKind`, and `split_effective_instant` are now
+  re-exported from `rustrade` (alongside the existing `SplitRoundingPolicy`), and `SplitRatio` gains
+  an infallible `From<SplitRatio> for Decimal` conversion — so callers can build and handle
+  `EngineEvent::CorporateAction` without a direct `rustrade_instrument` dependency.
 - **Alpaca `StockSplitSource` implementation** (`rustrade-data`, feature-gated `alpaca`). A second
   reference source: `impl StockSplitSource for AlpacaRestClient` wraps Alpaca's
   `GET /v1beta1/corporate-actions` endpoint (available on the free/Basic plan), with a new
@@ -58,8 +65,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `payable_date` — which can precede `ex_date` for forward splits and would apply the split early
   (pinned by a provenance test). New shared `AlpacaRestClient` / `AlpacaRestError` transport (auth +
   rate-limit retry) factored out of the options client so every Alpaca REST surface shares one
-  client; the existing `AlpacaOptionsError` is now an alias of `AlpacaRestError` (same variants, no
-  signature change).
+  client; the existing `AlpacaOptionsError` is now a type alias of the (`#[non_exhaustive]`)
+  `AlpacaRestError`, which gains an `InvalidCredential` variant (see the Changed entry below for the
+  error-variant change this implies for the options client).
 - **IBKR Flex Web Service corporate-action reconciliation** (`rustrade-data`, feature-gated `ibkr`).
   A new `rustrade_data::exchange::ibkr::flex` surface fetches an account's *Activity* Flex statement
   over HTTPS (`IbkrFlexClient` / `IbkrFlexConfig`, env vars `IBKR_FLEX_TOKEN` / `IBKR_FLEX_QUERY_ID`)
@@ -87,9 +95,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`EngineOutput` is now `#[non_exhaustive]`** (`rustrade`). New engine-driven outputs (e.g. the
   corporate-action observables above) can be added without further breaking changes. **Breaking**
   for downstream code matching `EngineOutput` exhaustively — add a wildcard (`_`) arm.
-- **`BacktestArgsConstant` gains a required `aux_events` field** (`rustrade`). **Breaking** for
-  downstream code constructing it via a struct literal — add `aux_events: NoAuxEvents` (the new
-  generic parameter `AuxEvents` defaults to `NoAuxEvents`) or supply a custom `AuxEventSource`.
+- **Corporate-action `ratio` fields are typed `SplitRatio`, not `Decimal`** (`rustrade`). The new
+  `EngineOutput::OptionPositionAdjustedForSplit` and `OptionPositionsRequireIdentityChange` outputs
+  carry `ratio: SplitRatio`, preserving the strictly-`> 0` type invariant across the observation
+  boundary (it was previously discarded back to a raw `Decimal`). `InvalidSplitRatio`'s rejected
+  value is now read via `.rejected()` rather than a public tuple field. Relevant only to code
+  tracking this unreleased corporate-action line.
+- **`BacktestArgsConstant` gains a required `aux_events` field, and `run_backtests` / `backtest` gain
+  an `AuxEvents` generic** (`rustrade`). **Breaking** for downstream code constructing
+  `BacktestArgsConstant` via a struct literal — add `aux_events: NoAuxEvents` (the struct's new
+  `AuxEvents` parameter defaults to `NoAuxEvents`) or supply a custom `AuxEventSource`. The
+  `run_backtests` / `backtest` **functions** also gain a trailing `Aux` type parameter; function type
+  parameters cannot carry a default, so callers that spell the generics explicitly (turbofish, or a
+  fully type-annotated function pointer) must account for the extra argument. Callers that rely on
+  inference are unaffected.
+- **Alpaca client error variants** (`rustrade-data`, feature-gated `alpaca`). `AlpacaOptionsError` is
+  now a type alias of the shared `AlpacaRestError`, which adds an `InvalidCredential` variant. The
+  `AlpacaOptionsClient` constructor now reports a credential that cannot be encoded as an HTTP header
+  value as `InvalidCredential`, where the credential-error path previously surfaced as `EnvVar`.
+  `AlpacaRestError` is `#[non_exhaustive]`, so exhaustive matchers already require a wildcard arm;
+  only callers that branched on the specific credential-error variant need to update.
+- **`MarketDataInMemory::new` now hard-asserts sorted input** (`rustrade`). Construction `assert!`s —
+  in all builds, not behind `debug_assert!` — that events are sorted ascending by
+  `MarketEvent::time_exchange`; previously unsorted input was accepted silently and would yield a
+  non-monotonic backtest clock and out-of-order engine feed. Mirrors `AuxEventsInMemory::new`.
+  **Breaking** only for callers that were (incorrectly) supplying unsorted data — observable failure
+  over silent corruption.
 
 ### Removed
 

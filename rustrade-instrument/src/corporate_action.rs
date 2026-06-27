@@ -3,6 +3,106 @@ use derive_more::Constructor;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+/// A validated stock-split ratio: strictly positive (`> 0`).
+///
+/// `SplitRatio` makes a degenerate ratio **unconstructible**. Every value is `> 0`, so the engine's
+/// split arithmetic (`Position::apply_split` in the `rustrade` crate and the
+/// `EngineEvent::CorporateAction` handler) can never receive a zero or negative ratio *through the
+/// type system* — the failure mode is moved from a runtime panic to a compile-time guarantee.
+///
+/// Construct with [`SplitRatio::new`] (returns `Option`), [`SplitRatio::try_from`] (returns a typed
+/// [`InvalidSplitRatio`] error, for `?`-propagation), or via [`CorporateActionKind::stock_split`]
+/// which builds one from a provider's `split_to` / `split_from` pair. Read the inner value with
+/// [`SplitRatio::get`].
+///
+/// # Serde
+/// Serializes **transparently** as its inner [`Decimal`] (the wire format is a JSON string — the
+/// same format a raw [`Decimal`] field produces — so persisted [`CorporateAction`] / `EngineEvent`
+/// payloads are unchanged). Deserialization is
+/// **validated**: a non-positive ratio on the wire is a hard deserialization error, so a
+/// persisted/replayed event can never reintroduce a degenerate ratio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct SplitRatio(Decimal);
+
+impl SplitRatio {
+    /// Construct a `SplitRatio`, returning `Some` iff `ratio` is strictly positive (`> 0`).
+    ///
+    /// Returns `None` for zero or negative input — the same degeneracy
+    /// [`CorporateActionKind::stock_split`] rejects, enforced here at the type boundary.
+    #[must_use]
+    pub fn new(ratio: Decimal) -> Option<Self> {
+        (ratio > Decimal::ZERO).then_some(Self(ratio))
+    }
+
+    /// The inner ratio value, always `> 0`.
+    #[must_use]
+    pub const fn get(self) -> Decimal {
+        self.0
+    }
+}
+
+impl From<SplitRatio> for Decimal {
+    /// Infallible downcast: every [`SplitRatio`] is a valid [`Decimal`]. The inverse of the
+    /// validated [`TryFrom<Decimal>`] upcast — prefer `.into()` / `Decimal::from(ratio)` over
+    /// [`SplitRatio::get`] in generic (`impl Into<Decimal>`) contexts.
+    fn from(ratio: SplitRatio) -> Self {
+        ratio.0
+    }
+}
+
+impl std::fmt::Display for SplitRatio {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Error from constructing a [`SplitRatio`] from a non-positive [`Decimal`].
+///
+/// Carries the rejected value so callers (and serde's deserializer) can report it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidSplitRatio(Decimal);
+
+impl InvalidSplitRatio {
+    /// The rejected (non-positive) [`Decimal`] that failed the `> 0` invariant.
+    #[must_use]
+    pub const fn rejected(self) -> Decimal {
+        self.0
+    }
+}
+
+impl std::fmt::Display for InvalidSplitRatio {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "split ratio must be strictly positive, got {}", self.0)
+    }
+}
+
+impl std::error::Error for InvalidSplitRatio {}
+
+impl TryFrom<Decimal> for SplitRatio {
+    type Error = InvalidSplitRatio;
+
+    /// Fallible construction for `?`-propagation. Mirrors [`SplitRatio::new`]'s `> 0` rule but
+    /// returns the rejected value in [`InvalidSplitRatio`] instead of discarding it (`None`).
+    fn try_from(ratio: Decimal) -> Result<Self, Self::Error> {
+        SplitRatio::new(ratio).ok_or(InvalidSplitRatio(ratio))
+    }
+}
+
+// Validated deserialization: read the inner `Decimal`, then enforce the `> 0` invariant via
+// `TryFrom` (the single source of validation logic). A hand-written impl is still required because
+// `#[serde(transparent)]` `Serialize` and `#[serde(try_from)]` `Deserialize` cannot coexist on one
+// derive — this keeps the transparent wire format while reusing `TryFrom`'s check.
+impl<'de> Deserialize<'de> for SplitRatio {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let ratio = <Decimal as Deserialize>::deserialize(deserializer)?;
+        SplitRatio::try_from(ratio).map_err(serde::de::Error::custom)
+    }
+}
+
 /// A corporate-action market fact — *what* happened to an instrument, independent of any
 /// account, broker, or rounding policy.
 ///
@@ -30,8 +130,9 @@ pub enum CorporateActionKind {
     /// - **Reverse** split → `ratio < 1` (e.g. a 1-for-10 reverse split is `0.1`; share count
     ///   scales down, per-share price scales up).
     StockSplit {
-        /// `split_to / split_from`. See the variant docs for the forward/reverse convention.
-        ratio: Decimal,
+        /// `split_to / split_from`, as a validated [`SplitRatio`] (always `> 0`). See the variant
+        /// docs for the forward/reverse convention.
+        ratio: SplitRatio,
     },
 }
 
@@ -44,9 +145,12 @@ impl CorporateActionKind {
     /// shares *before* (`split_from`): a 2-for-1 forward split is `split_to = 2, split_from = 1`
     /// (`ratio = 2`); a 1-for-10 reverse split is `split_to = 1, split_from = 10` (`ratio = 0.1`).
     ///
-    /// Returns `None` for **degenerate** inputs — a `split_from` of zero (division by zero) or any
-    /// non-positive `ratio` (including a `split_to` of zero) — rather than panicking or fabricating
-    /// a nonsensical action. Callers should treat `None` as bad source data and log + skip it, per
+    /// Returns `None` for **degenerate** inputs rather than panicking or fabricating a nonsensical
+    /// action. Both share counts must be strictly positive: a non-positive `split_to` or
+    /// `split_from` (zero or negative) is rejected up front. This also closes the both-negative
+    /// normalization hole, where two negative components would divide to a positive quotient (e.g.
+    /// `-2 / -1 = 2`) and otherwise slip through. The resulting quotient is then re-validated as a
+    /// [`SplitRatio`] (`> 0`). Callers should treat `None` as bad source data and log + skip it, per
     /// the library's "observable failures over silent ones" principle.
     ///
     /// Note: `ratio` is computed at `rust_decimal`'s 28-significant-digit precision, so an inexact
@@ -54,9 +158,13 @@ impl CorporateActionKind {
     /// consumes it.
     #[must_use]
     pub fn stock_split(split_to: Decimal, split_from: Decimal) -> Option<Self> {
+        let positive = |d: Decimal| d > Decimal::ZERO;
+        if !positive(split_to) || !positive(split_from) {
+            return None;
+        }
         split_to
             .checked_div(split_from)
-            .filter(|ratio| ratio.is_sign_positive() && !ratio.is_zero())
+            .and_then(SplitRatio::new)
             .map(|ratio| Self::StockSplit { ratio })
     }
 
@@ -82,7 +190,8 @@ impl CorporateActionKind {
         // `Option` return already expresses "not a split ⇒ no split kind".
         match self {
             Self::StockSplit { ratio } => {
-                Some(if *ratio > Decimal::ONE && ratio.fract().is_zero() {
+                let ratio = ratio.get();
+                Some(if ratio > Decimal::ONE && ratio.fract().is_zero() {
                     SplitAdjustmentKind::Standard
                 } else {
                     SplitAdjustmentKind::NonStandard
@@ -186,28 +295,30 @@ mod tests {
         assert_eq!(instant.to_rfc3339(), "2026-06-22T00:00:00+00:00");
     }
 
+    /// Build a `StockSplit` from a raw ratio for assertions (panics on a non-positive ratio, which
+    /// is fine in test code).
+    fn split_kind_with(ratio: Decimal) -> CorporateActionKind {
+        CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(ratio).unwrap(),
+        }
+    }
+
     #[test]
     fn stock_split_computes_ratio_from_components() {
         // Forward 2-for-1.
         assert_eq!(
             CorporateActionKind::stock_split(Decimal::from(2), Decimal::from(1)),
-            Some(CorporateActionKind::StockSplit {
-                ratio: Decimal::from(2)
-            })
+            Some(split_kind_with(Decimal::from(2)))
         );
         // Reverse 1-for-10 → 0.1.
         assert_eq!(
             CorporateActionKind::stock_split(Decimal::from(1), Decimal::from(10)),
-            Some(CorporateActionKind::StockSplit {
-                ratio: Decimal::new(1, 1)
-            })
+            Some(split_kind_with(Decimal::new(1, 1)))
         );
         // Inexact 3-for-2 → 1.5.
         assert_eq!(
             CorporateActionKind::stock_split(Decimal::from(3), Decimal::from(2)),
-            Some(CorporateActionKind::StockSplit {
-                ratio: Decimal::new(15, 1)
-            })
+            Some(split_kind_with(Decimal::new(15, 1)))
         );
     }
 
@@ -223,17 +334,81 @@ mod tests {
             CorporateActionKind::stock_split(Decimal::ZERO, Decimal::from(5)),
             None
         );
-        // Non-positive ratio (negative component).
+        // Single negative component.
         assert_eq!(
             CorporateActionKind::stock_split(Decimal::from(-2), Decimal::from(1)),
+            None
+        );
+        // Both-negative components: -2 / -1 = 2 is positive and would slip past a quotient-only
+        // check, but the component guard rejects it (no real provider reports negative share counts).
+        assert_eq!(
+            CorporateActionKind::stock_split(Decimal::from(-2), Decimal::from(-1)),
             None
         );
     }
 
     #[test]
+    fn split_ratio_rejects_non_positive() {
+        assert!(SplitRatio::new(Decimal::from(2)).is_some());
+        assert!(SplitRatio::new(Decimal::new(1, 1)).is_some()); // 0.1
+        assert!(SplitRatio::new(Decimal::ZERO).is_none());
+        assert!(SplitRatio::new(Decimal::from(-1)).is_none());
+        assert_eq!(
+            SplitRatio::new(Decimal::from(2)).unwrap().get(),
+            Decimal::from(2)
+        );
+        // `From<SplitRatio> for Decimal` is the infallible inverse of `get()`.
+        assert_eq!(
+            Decimal::from(SplitRatio::new(Decimal::from(2)).unwrap()),
+            Decimal::from(2)
+        );
+    }
+
+    #[test]
+    fn split_ratio_try_from_matches_new_and_carries_rejected_value() {
+        // Same `> 0` rule as `new`, but `?`-friendly and the error carries the rejected value.
+        assert_eq!(
+            SplitRatio::try_from(Decimal::from(2)).unwrap().get(),
+            Decimal::from(2)
+        );
+        assert_eq!(
+            SplitRatio::try_from(Decimal::from(-3)),
+            Err(InvalidSplitRatio(Decimal::from(-3)))
+        );
+        assert_eq!(
+            SplitRatio::try_from(Decimal::ZERO),
+            Err(InvalidSplitRatio(Decimal::ZERO))
+        );
+    }
+
+    #[test]
+    fn split_ratio_serde_roundtrips_and_validates() {
+        // Serializes transparently as a JSON string — the same wire format a raw `Decimal`
+        // produces (wire format unchanged).
+        let ratio = SplitRatio::new(Decimal::from(2)).unwrap();
+        let json = serde_json::to_string(&ratio).unwrap();
+        assert_eq!(json, "\"2\"");
+        assert_eq!(serde_json::from_str::<SplitRatio>(&json).unwrap(), ratio);
+
+        // A fractional positive ratio (e.g. a 1-for-2 reverse split = 0.5) round-trips through the
+        // validating `Deserialize` impl — the `> 0` re-check accepts sub-integer ratios.
+        let frac = SplitRatio::new(Decimal::new(5, 1)).unwrap(); // 0.5
+        let frac_json = serde_json::to_string(&frac).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SplitRatio>(&frac_json).unwrap(),
+            frac
+        );
+
+        // A non-positive ratio on the wire is rejected at deserialization — a persisted/replayed
+        // event can never reintroduce a degenerate ratio.
+        assert!(serde_json::from_str::<SplitRatio>("\"0\"").is_err());
+        assert!(serde_json::from_str::<SplitRatio>("\"-1\"").is_err());
+    }
+
+    #[test]
     fn split_kind_classifies_per_occ_rules() {
         use SplitAdjustmentKind::{NonStandard, Standard};
-        let split = |ratio| CorporateActionKind::StockSplit { ratio };
+        let split = split_kind_with;
 
         // Standard: whole-number forward splits.
         assert_eq!(split(Decimal::from(2)).split_kind(), Some(Standard)); // 2-for-1
@@ -260,9 +435,7 @@ mod tests {
 
     #[test]
     fn corporate_action_descriptor_is_generic_over_the_key() {
-        let kind = CorporateActionKind::StockSplit {
-            ratio: Decimal::from(4),
-        };
+        let kind = split_kind_with(Decimal::from(4));
         let date = NaiveDate::from_ymd_opt(2020, 8, 31);
 
         // Source boundary: keyed by an unresolved provider symbol.

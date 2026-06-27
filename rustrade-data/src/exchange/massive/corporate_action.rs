@@ -113,6 +113,7 @@ mod tests {
     use super::*;
     use chrono::NaiveDate;
     use rust_decimal::Decimal;
+    use rustrade_instrument::corporate_action::SplitRatio;
 
     #[test]
     fn build_split_queries_fans_out_per_symbol() {
@@ -160,7 +161,7 @@ mod tests {
         assert_eq!(
             action.kind,
             CorporateActionKind::StockSplit {
-                ratio: Decimal::from(4)
+                ratio: SplitRatio::new(Decimal::from(4)).unwrap()
             }
         );
         // Pins the provenance: `effective_date` is mapped from the raw split's `execution_date`.
@@ -192,7 +193,7 @@ mod tests {
                 futures::stream::iter([Ok(CorporateAction::new(
                     SmolStr::new("TSLA"),
                     CorporateActionKind::StockSplit {
-                        ratio: Decimal::from(3),
+                        ratio: SplitRatio::new(Decimal::from(3)).unwrap(),
                     },
                     NaiveDate::from_ymd_opt(2022, 8, 25),
                 ))])

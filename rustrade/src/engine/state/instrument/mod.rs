@@ -360,13 +360,16 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     InstrumentState<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
 {
     /// `true` if this is an **option** written on the underlying `(base, quote)` traded on
-    /// `exchange` that currently holds at least one open position — i.e. exactly the options a
-    /// corporate action on the underlying spot must also adjust.
+    /// `exchange` — held or not. A standard (whole-number forward) split must divide the strike of
+    /// **every** such registered option, not only those currently holding a position: the
+    /// instrument set is fixed at construction, so an option that is unheld at split time can still
+    /// have a position opened later and then settle at expiry against its strike. Leaving an unheld
+    /// option on its pre-split strike would mis-settle that future position.
     ///
-    /// Single-sources the affected-option scan shared by the live engine handler
+    /// Single-sources the option scan shared by the live engine handler
     /// (`process_corporate_action`) and the audit replica, so the predicate cannot drift between
-    /// them (the replica-parity test guards observable behaviour; this guards the predicate itself).
-    pub(crate) fn is_affected_option_on_underlying(
+    /// them. [`Self::is_affected_option_on_underlying`] layers the holds-a-position gate on top.
+    pub(crate) fn is_option_on_underlying(
         &self,
         base: &AssetKey,
         quote: &AssetKey,
@@ -380,7 +383,28 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             && self.instrument.underlying.base == *base
             && self.instrument.underlying.quote == *quote
             && self.instrument.exchange == *exchange
-            && !self.position.positions.is_empty()
+    }
+
+    /// `true` if this is an **option** on the underlying `(base, quote)` traded on `exchange` that
+    /// currently **holds at least one open position** — i.e. the options whose held positions a
+    /// corporate action must event-adjust (per-position `apply_split` + observables) or, on a
+    /// non-standard split, flag for a wrapper-side identity change.
+    ///
+    /// This is [`Self::is_option_on_underlying`] plus the non-empty-position gate. The strike
+    /// correction on a standard split uses the broader [`Self::is_option_on_underlying`] (it must
+    /// also reach unheld options); this narrower predicate selects the options that carry a
+    /// position event.
+    pub(crate) fn is_affected_option_on_underlying(
+        &self,
+        base: &AssetKey,
+        quote: &AssetKey,
+        exchange: &ExchangeKey,
+    ) -> bool
+    where
+        AssetKey: PartialEq,
+        ExchangeKey: PartialEq,
+    {
+        self.is_option_on_underlying(base, quote, exchange) && !self.position.positions.is_empty()
     }
 
     /// Updates the instrument state using an account snapshot from the exchange.
