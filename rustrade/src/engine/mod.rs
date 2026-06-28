@@ -653,9 +653,17 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     /// dispatch; the engine's event loop does this automatically via the clock's time-exchange
     /// handling, so a direct caller (e.g. a test) must advance the clock first.
     ///
+    /// Note this is clock-kind dependent: under `HistoricalClock` (backtest) the clock is advanced
+    /// to `effective_time`, so outputs carry it; under `LiveClock` the clock is **not** advanceable
+    /// and outputs are stamped at `Utc::now()`, not `effective_time` (correct for live — the
+    /// adjustment happens now — but worth noting if you compare live and replayed stamps).
+    ///
     /// # Algorithm
     /// 1. Idempotency guard on `id` (per-instrument `corporate_actions_processed` set). A
-    ///    duplicate `id` is skipped with a warning.
+    ///    duplicate `id` is skipped with a warning. This holds within a live session but does **not**
+    ///    survive a snapshot taken before the set existed; see the `corporate_actions_processed`
+    ///    field on [`InstrumentState`](crate::engine::state::instrument::InstrumentState) for the
+    ///    migration caveat.
     /// 2. **Unsupported guards (no silent no-op, `id` not recorded ⇒ retryable).** The
     ///    instrument-kind check runs **first** so a split on an option is attributed to the
     ///    instrument, not the (supported) kind:
@@ -996,7 +1004,15 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                          standard split — data corruption",
                         position.quantity_abs,
                     );
-                    position.apply_split(ratio_decimal, policy, option_last_price);
+                    // Pass `Fractional` explicitly, NOT the equity's `policy`: the assert above
+                    // guarantees an integer contract count so no remainder can arise (the policy is
+                    // a no-op here), and threading the equity's whole-share-lot policy into the
+                    // option path would falsely imply it governs option legs. It does not.
+                    position.apply_split(
+                        ratio_decimal,
+                        SplitRoundingPolicy::Fractional,
+                        option_last_price,
+                    );
                     outputs.push(EngineOutput::OptionPositionAdjustedForSplit {
                         option_instrument: opt_key,
                         ratio,
@@ -1168,6 +1184,10 @@ pub enum EngineOutput<
     /// closes the now-zero-quantity slot and books its realised PnL, while this `SplitRemainder`
     /// records the disposed fractional sliver as cash-in-lieu. So when both share a `position_id`,
     /// this `SplitRemainder` is the position's **entire** remaining disposal.
+    ///
+    /// **Ordering contract:** within the handler's output `Vec` the `SplitRemainder` is always
+    /// emitted **before** its paired `PositionExit`, so a consumer that books cash-in-lieu before
+    /// finalising the close can rely on encountering them in that order.
     SplitRemainder {
         /// Instrument whose position was split.
         instrument: InstrumentKey,

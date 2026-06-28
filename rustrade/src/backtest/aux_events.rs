@@ -71,6 +71,35 @@ impl<MarketKind, ExchangeKey, AssetKey, InstrumentKey>
     }
 }
 
+/// Panic if `events` are not sorted ascending by [`Timed::time`] (the [`AuxEventSource`] caller
+/// obligation).
+///
+/// Shared by [`AuxEventsInMemory::new`] (early detection at construction, before any backtest runs)
+/// and the backtest harness's pre-merge step (the load-bearing check for *any* [`AuxEventSource`]
+/// impl — a custom source backed by a DB or file never goes through `AuxEventsInMemory`, so this is
+/// the only guard on its events). A hard panic in all builds — not `debug_assert!` — because a
+/// violation silently feeds the engine a non-monotonic timeline (and
+/// [`HistoricalClock`](crate::engine::clock::HistoricalClock)) in release rather than failing. The
+/// O(N) scan is negligible against the caller's own O(N log N) sort, and the message names the
+/// offending pair so a failing custom source is debuggable without a rebuild.
+pub(crate) fn assert_aux_events_sorted<MarketKind, ExchangeKey, AssetKey, InstrumentKey>(
+    events: &[Timed<EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>>],
+) {
+    if let Some((i, w)) = events
+        .windows(2)
+        .enumerate()
+        .find(|(_, w)| w[0].time > w[1].time)
+    {
+        panic!(
+            "AuxEventSource events must be sorted ascending by Timed::time; \
+             events[{i}].time={:?} > events[{}].time={:?}",
+            w[0].time,
+            i + 1,
+            w[1].time,
+        );
+    }
+}
+
 /// In-memory [`AuxEventSource`] backed by an [`Arc`]'d, pre-sorted `Vec`.
 ///
 /// Mirrors [`MarketDataInMemory`](super::market_data::MarketDataInMemory): cloning is O(1) (an
@@ -99,13 +128,9 @@ impl<MarketKind, ExchangeKey, AssetKey, InstrumentKey>
     pub fn new(
         events: Arc<Vec<Timed<EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>>>>,
     ) -> Self {
-        // Hard assert (not `debug_assert!`): `events` ordering is a caller-supplied external
-        // invariant, and a violation would silently corrupt the simulated timeline in release
-        // rather than panic. The O(N) scan is negligible against the caller's own O(N log N) sort.
-        assert!(
-            events.windows(2).all(|w| w[0].time <= w[1].time),
-            "AuxEventsInMemory events must be sorted ascending by Timed::time"
-        );
+        // Enforce the caller's ascending-`Timed::time` obligation at construction, shared with the
+        // backtest harness's pre-merge check. See [`assert_aux_events_sorted`].
+        assert_aux_events_sorted(&events);
         Self { events }
     }
 }
@@ -124,5 +149,48 @@ where
     ) -> impl Iterator<Item = Timed<EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>>>
     {
         self.events.iter().cloned()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)] // Test code: panics on bad fixture input are acceptable
+mod tests {
+    use super::*;
+    use crate::shutdown::Shutdown;
+    use chrono::DateTime;
+
+    fn at(secs: i64) -> Timed<EngineEvent> {
+        Timed::new(
+            EngineEvent::Shutdown(Shutdown),
+            DateTime::from_timestamp(secs, 0).expect("valid timestamp"),
+        )
+    }
+
+    #[test]
+    fn assert_aux_events_sorted_accepts_ascending_and_equal_timestamps() {
+        // Ascending and *equal* adjacent timestamps both satisfy the contract (the check is `<=`).
+        assert_aux_events_sorted::<DataKind, ExchangeIndex, AssetIndex, InstrumentIndex>(&[
+            at(1_000),
+            at(1_000),
+            at(2_000),
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "events[1].time")]
+    fn assert_aux_events_sorted_panics_on_unsorted_pair() {
+        // The second pair (index 1) is out of order; the message must name that pair.
+        assert_aux_events_sorted::<DataKind, ExchangeIndex, AssetIndex, InstrumentIndex>(&[
+            at(1_000),
+            at(3_000),
+            at(2_000),
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "sorted ascending by Timed::time")]
+    fn aux_events_in_memory_new_rejects_unsorted() {
+        // `AuxEventsInMemory::new` must delegate to the shared check rather than accept unsorted input.
+        let _ = AuxEventsInMemory::<DataKind>::new(Arc::new(vec![at(2_000), at(1_000)]));
     }
 }

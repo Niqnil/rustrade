@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Maximum symbols per snapshot request (Alpaca API limit).
 const MAX_SYMBOLS_PER_REQUEST: usize = 100;
@@ -218,10 +218,10 @@ impl AlpacaOptionsClient {
 
         loop {
             if pages >= MAX_PAGES {
-                debug!(
+                warn!(
                     pages,
                     snapshots = all_snapshots.len(),
-                    "reached max pages limit"
+                    "Alpaca option snapshots hit the max-pages safety limit; returning truncated results"
                 );
                 break;
             }

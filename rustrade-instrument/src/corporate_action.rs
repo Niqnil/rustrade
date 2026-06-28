@@ -267,6 +267,16 @@ pub fn split_effective_instant(date: NaiveDate) -> DateTime<Utc> {
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Constructor, Deserialize, Serialize,
 )]
+// Public descriptor likely to grow (e.g. an action `id` or `declaration_date`). `#[non_exhaustive]`
+// blocks downstream struct-literal construction and forces `..` in their destructuring patterns, so
+// adding a field stays non-breaking for consumers that only read or match. There is no `Default`, so
+// the derived `CorporateAction::new` is the only constructor; its arity grows with each field, making
+// a new field a breaking change for direct `::new` callers (call it out in the changelog when added).
+// `#[non_exhaustive]` shields only *Rust-code* matching/construction: this struct also derives
+// `Deserialize`, so a new field without `#[serde(default)]` is still a breaking change at the data
+// layer — it fails to deserialize payloads written before the field existed. Give new fields
+// `#[serde(default)]` (or accept the serde break deliberately).
+#[non_exhaustive]
 pub struct CorporateAction<K> {
     /// The instrument the action applies to — a provider symbol at the source boundary, an engine
     /// instrument key after the wrapper's resolution.

@@ -58,11 +58,11 @@ where
 }
 
 fn year_2024(symbol: &str) -> CorporateActionFilter {
-    CorporateActionFilter {
-        symbols: vec![SmolStr::new(symbol)],
-        start: NaiveDate::from_ymd_opt(2024, 1, 1),
-        end: NaiveDate::from_ymd_opt(2024, 12, 31),
-    }
+    CorporateActionFilter::new(
+        vec![SmolStr::new(symbol)],
+        NaiveDate::from_ymd_opt(2024, 1, 1),
+        NaiveDate::from_ymd_opt(2024, 12, 31),
+    )
 }
 
 #[tokio::test]

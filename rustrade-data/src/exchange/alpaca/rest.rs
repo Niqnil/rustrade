@@ -192,14 +192,17 @@ impl AlpacaRestClient {
         loop {
             attempts += 1;
 
-            // `try_clone` returns `None` only for streaming bodies; safe for these GET requests.
+            // `try_clone` returns `None` only for streaming request bodies. This function is
+            // documented (and used) exclusively for GET/query-string requests, which always clone,
+            // so `None` is an unreachable programmer error — a caller passed a streaming-body
+            // request to a retry path that requires cloneability. Panic loudly (the most observable
+            // failure) rather than mislabel it as a server-side `InvalidResponse`. `request_with_retry`
+            // is `pub(crate)`, so every call site is internal and statically auditable; if it is ever
+            // widened to `pub`, return an `Err` here so external callers can recover instead of aborting.
+            #[allow(clippy::expect_used)]
             let response = request
                 .try_clone()
-                .ok_or_else(|| {
-                    AlpacaRestError::InvalidResponse(
-                        "request body is not cloneable; cannot retry".into(),
-                    )
-                })?
+                .expect("request_with_retry requires a cloneable request (GET / no streaming body)")
                 .send()
                 .await?;
 

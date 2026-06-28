@@ -938,11 +938,11 @@ async fn test_corporate_actions_splits_via_source_trait() {
     let client = MassiveRestClient::from_env().expect("Failed to create client");
 
     // NVIDIA's 10-for-1 forward split executed on 2024-06-10 (a real, stable historical split).
-    let filter = CorporateActionFilter {
-        symbols: vec![SmolStr::new("NVDA")],
-        start: NaiveDate::from_ymd_opt(2024, 1, 1),
-        end: NaiveDate::from_ymd_opt(2024, 12, 31),
-    };
+    let filter = CorporateActionFilter::new(
+        vec![SmolStr::new("NVDA")],
+        NaiveDate::from_ymd_opt(2024, 1, 1),
+        NaiveDate::from_ymd_opt(2024, 12, 31),
+    );
 
     let actions: Vec<_> = client.fetch_splits(&filter).collect::<Vec<_>>().await;
 

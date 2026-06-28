@@ -15,6 +15,10 @@
     missing_debug_implementations,
     rust_2018_idioms
 )]
+// Inherited from the barter-rs upstream: the generic, trait-heavy public API legitimately produces
+// complex nested types and many-argument constructors, and `type_alias_bounds` fires on
+// documentation-bearing alias bounds kept intentionally. Denying these adds churn without improving
+// the API.
 #![allow(clippy::type_complexity, clippy::too_many_arguments, type_alias_bounds)]
 
 //! # Barter-Instrument

@@ -43,11 +43,11 @@ use smol_str::SmolStr;
 #[tokio::main]
 async fn main() {
     // A reference-data query: these symbols, splits effective on/after 2020-01-01.
-    let filter = CorporateActionFilter {
-        symbols: vec![SmolStr::new("AAPL"), SmolStr::new("NVDA")],
-        start: NaiveDate::from_ymd_opt(2020, 1, 1),
-        end: None,
-    };
+    let filter = CorporateActionFilter::new(
+        vec![SmolStr::new("AAPL"), SmolStr::new("NVDA")],
+        NaiveDate::from_ymd_opt(2020, 1, 1),
+        None,
+    );
 
     // Source the splits from the first available provider (feature-gated + credentialed), falling
     // back to a canned offline source. Every provider goes through the same generic `collect_splits`.

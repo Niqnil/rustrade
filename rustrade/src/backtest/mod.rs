@@ -5,7 +5,7 @@ use crate::{EngineEvent, Timed};
 /// using market data, and analyzing the performance of these simulations.
 use crate::{
     backtest::{
-        aux_events::{AuxEventSource, NoAuxEvents},
+        aux_events::{AuxEventSource, NoAuxEvents, assert_aux_events_sorted},
         market_data::BacktestMarketData,
         summary::{BacktestSummary, MultiBacktestSummary},
     },
@@ -264,8 +264,8 @@ where
     // Lazily merge the market stream with the auxiliary (non-market) events into a single
     // time-ordered stream BEFORE the engine channel, so an injected event (e.g. a corporate action)
     // is processed at the correct point in simulated time. The market side stays lazy — it is never
-    // collected — so peak memory is O(1) in the dataset size, and the common no-aux case streams
-    // exactly as a pre-corporate-action backtest did. Merging into one stream — rather than
+    // collected — so peak memory is O(1) in the dataset size, and the common no-aux case adds only
+    // negligible per-event overhead vs a pre-corporate-action backtest. Merging into one stream — rather than
     // forwarding market and aux as two producers into the engine feed — is what preserves the time
     // order (two `forward_to` tasks would interleave non-deterministically). See [`AuxEventSource`].
     let market_first = args_constant.market_data.time_first_event().await?;
@@ -273,6 +273,12 @@ where
     // The aux side is tiny (corporate actions / expiries number in the handful), so collecting it is
     // cheap and lets the merge peek it synchronously.
     let aux = args_constant.aux_events.aux_events().collect::<Vec<_>>();
+    // Enforce the `AuxEventSource` contract before the merge below, which relies on `aux` being sorted
+    // ascending by `Timed::time`. A custom source yielding unsorted events would otherwise silently feed
+    // the engine a non-monotonic timeline in release builds — wrong results with no failure point. Hard
+    // panic shared with `AuxEventsInMemory::new`; the aux set is handful-sized, so the O(n) scan is
+    // immeasurable. See [`assert_aux_events_sorted`].
+    assert_aux_events_sorted(&aux);
 
     // Seed the clock from the earliest of the first market event and the first aux event, so an aux
     // event scheduled before the first market tick still orders and stamps correctly.
@@ -340,8 +346,8 @@ where
 /// (non-market) events.
 ///
 /// The market side stays **lazy** — it is polled on demand and never collected, so peak memory is
-/// O(1) in the dataset size and the common no-aux case streams exactly as a pre-corporate-action
-/// backtest did. The aux side is tiny (corporate actions / expiries number in the handful), so it is
+/// O(1) in the dataset size and the common no-aux case adds only negligible per-event overhead
+/// versus a pre-corporate-action backtest. The aux side is tiny (corporate actions / expiries number in the handful), so it is
 /// held as a `Peekable` iterator and peeked synchronously to decide ordering.
 ///
 /// # Ordering contract

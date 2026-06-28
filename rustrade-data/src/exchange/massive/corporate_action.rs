@@ -117,11 +117,11 @@ mod tests {
 
     #[test]
     fn build_split_queries_fans_out_per_symbol() {
-        let filter = CorporateActionFilter {
-            symbols: vec![SmolStr::new("AAPL"), SmolStr::new("NVDA")],
-            start: NaiveDate::from_ymd_opt(2020, 1, 1),
-            end: NaiveDate::from_ymd_opt(2024, 12, 31),
-        };
+        let filter = CorporateActionFilter::new(
+            vec![SmolStr::new("AAPL"), SmolStr::new("NVDA")],
+            NaiveDate::from_ymd_opt(2020, 1, 1),
+            NaiveDate::from_ymd_opt(2024, 12, 31),
+        );
 
         let queries = build_split_queries(&filter);
         assert_eq!(queries.len(), 2);
@@ -134,11 +134,7 @@ mod tests {
 
     #[test]
     fn build_split_queries_empty_symbols_is_one_unfiltered_query() {
-        let filter = CorporateActionFilter {
-            symbols: vec![],
-            start: NaiveDate::from_ymd_opt(2023, 1, 1),
-            end: None,
-        };
+        let filter = CorporateActionFilter::new(vec![], NaiveDate::from_ymd_opt(2023, 1, 1), None);
 
         let queries = build_split_queries(&filter);
         assert_eq!(queries.len(), 1);

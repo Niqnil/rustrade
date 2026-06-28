@@ -8,7 +8,7 @@ use rust_decimal::Decimal;
 use rustrade_instrument::instrument::kind::option::{OptionExercise, OptionKind};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Maximum contracts per page (Alpaca API limit).
 const MAX_PAGE_SIZE: usize = 10_000;
@@ -286,10 +286,10 @@ impl AlpacaOptionsClient {
 
         loop {
             if pages >= MAX_PAGES {
-                debug!(
+                warn!(
                     pages,
                     contracts = all_contracts.len(),
-                    "reached max pages limit"
+                    "Alpaca option contracts hit the max-pages safety limit; returning truncated results"
                 );
                 break;
             }

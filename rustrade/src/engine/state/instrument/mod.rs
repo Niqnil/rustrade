@@ -309,6 +309,15 @@ pub struct InstrumentState<
     ///
     /// A hash set (insertion order is never read — only `contains`/`insert`), consistent with the
     /// sibling `FnvHashMap` routing fields below.
+    ///
+    /// # Schema migration
+    ///
+    /// `#[serde(default)]` lets snapshots taken before this field existed deserialize with an empty
+    /// set. Consequence: a consumer that snapshots an `InstrumentState` **after** applying a
+    /// corporate action, then reloads it and re-injects the **same** action `id`, finds the set
+    /// empty and applies the action twice (quantity doubled again, basis halved again). Idempotency
+    /// holds within a live session; deduping replay across a pre-field snapshot is the consumer's
+    /// responsibility (e.g. pre-populate this set with already-applied ids on upgrade).
     #[serde(default)]
     pub corporate_actions_processed: FnvHashSet<SmolStr>,
 

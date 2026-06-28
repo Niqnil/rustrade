@@ -1,6 +1,6 @@
 //! [`StockSplitSource`] implementation for the shared Alpaca REST client.
 //!
-//! Adapts the lower-level [`AlpacaRestClient::fetch_splits_raw`](super::reference) raw-split stream into
+//! Adapts the lower-level [`AlpacaRestClient::fetch_splits_raw`](super::AlpacaRestClient::fetch_splits_raw) raw-split stream into
 //! the provider-agnostic [`CorporateAction`] sourcing descriptor, computing the split ratio via the
 //! shared [`CorporateActionKind::stock_split`] helper so Alpaca derives ratios identically to every
 //! other provider.
@@ -117,11 +117,11 @@ mod tests {
 
     #[test]
     fn build_query_joins_symbols_and_dates() {
-        let filter = CorporateActionFilter {
-            symbols: vec![SmolStr::new("NVDA"), SmolStr::new("AAPL")],
-            start: NaiveDate::from_ymd_opt(2024, 1, 1),
-            end: NaiveDate::from_ymd_opt(2024, 12, 31),
-        };
+        let filter = CorporateActionFilter::new(
+            vec![SmolStr::new("NVDA"), SmolStr::new("AAPL")],
+            NaiveDate::from_ymd_opt(2024, 1, 1),
+            NaiveDate::from_ymd_opt(2024, 12, 31),
+        );
 
         let query = build_query(&filter);
         assert_eq!(query.symbols, vec!["NVDA".to_string(), "AAPL".to_string()]);

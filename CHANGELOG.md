@@ -42,6 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behind the new `corporate-action` feature, on by default) model fetching splits by symbol +
   effective-date range; they yield the new generic `CorporateAction<K>` descriptor
   (`rustrade-instrument`), keyed by an unresolved provider symbol (`SmolStr`) at the source boundary.
+  Both `CorporateActionFilter` and `CorporateAction<K>` are `#[non_exhaustive]`, so adding a field is
+  non-breaking for downstream code that only reads or matches them (matches must use `..`). They are
+  constructed via the derived `::new`, whose arity grows with each field — so a new field is still a
+  breaking change for direct `::new` callers (`CorporateActionFilter` also derives `Default`, making
+  `Default::default()` + per-field assignment its forward-compatible construction path). `#[non_exhaustive]`
+  shields only Rust-code matching/construction: `CorporateAction<K>` also derives serde `Deserialize`,
+  so adding a field without `#[serde(default)]` is still a breaking change at the data layer (it fails
+  to deserialize payloads written before the field existed).
   A shared `CorporateActionKind::stock_split(split_to, split_from)` helper computes the ratio
   identically across providers as a validated `SplitRatio` newtype (strictly `> 0`, making a
   degenerate ratio unconstructible; build it via `SplitRatio::new` → `Option` or
@@ -80,7 +88,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dependency (pulled in only by the `ibkr` feature). The Flex `token` is passed as a `t=` URL query
   parameter, so transport errors strip the request URL before it reaches `IbkrFlexError::Http`
   (`reqwest`'s `Error: Display` would otherwise embed the full URL, leaking the token into logs); the
-  variant is documented to never carry the URL. A runnable example
+  variant is documented to never carry the URL. The HTTP client also enforces HTTPS-only transport
+  and rejects redirects (`https_only(true)` + `redirect::Policy::none()`), so the token cannot leak
+  via an HTTPS→HTTP downgrade redirect. A runnable example
   (`ibkr_flex_corporate_actions`, `--features ibkr`) sketches the wrapper-side reconcile.
 
 ### Changed

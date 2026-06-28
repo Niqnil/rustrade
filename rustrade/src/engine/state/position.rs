@@ -641,7 +641,10 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
     ///
     /// # What is left untouched
     /// `pnl_realised`, `fees_enter`, `fees_exit` (all `$`-denominated and already realised),
-    /// `side`, `instrument`, `trades`, `contract_size`.
+    /// `side`, `instrument`, `trades`, `contract_size`. Also `time_exchange_update`: a split is a
+    /// corporate-action fact, not a market print, so it deliberately does not bump the
+    /// last-market-update timestamp — that field can therefore read months stale after a reverse
+    /// split until the next real tick arrives.
     ///
     /// # Return value & caller obligations
     /// Returns [`SplitResult`] whose `remainder` is the post-split fractional shares disposed

@@ -24,6 +24,7 @@
 //! Such a source maps its data onto the same [`CorporateAction`] descriptor via its own adapter.
 
 use chrono::NaiveDate;
+use derive_more::Constructor;
 use futures::Stream;
 use smol_str::SmolStr;
 
@@ -41,7 +42,12 @@ pub use rustrade_instrument::corporate_action::{CorporateAction, CorporateAction
 /// `symbols` holds **provider** ticker strings (e.g. `"AAPL"`), not resolved engine keys. An empty
 /// `symbols` list means "no symbol restriction". How a source maps multiple symbols onto its
 /// transport (one request per symbol vs a single batched request) is an implementation detail.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+// Public filter likely to grow (e.g. pagination cursor/limit). `#[non_exhaustive]` keeps adding
+// fields non-breaking for downstream users; construct via `CorporateActionFilter::new(..)`, or
+// `Default::default()` followed by per-field assignment when forward-compatibility matters
+// (struct-update syntax is unavailable to downstream crates on a `#[non_exhaustive]` struct).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Constructor)]
+#[non_exhaustive]
 pub struct CorporateActionFilter {
     /// Provider ticker symbols to fetch; empty means no symbol restriction.
     pub symbols: Vec<SmolStr>,

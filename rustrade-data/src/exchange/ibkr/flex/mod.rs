@@ -234,6 +234,18 @@ impl IbkrFlexClient {
     pub fn new(config: IbkrFlexConfig) -> Result<Self, IbkrFlexError> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+            // Transport-layer token protection. The Flex `token` rides in every request URL's `t=`
+            // query parameter, so it must never traverse an unencrypted connection. Two guards work
+            // together: `redirect::Policy::none()` stops reqwest auto-following any redirect, so a 3xx
+            // can never bounce the token to another (possibly `http://`) URL behind our back; and
+            // `https_only(true)` rejects any request whose own URL is not `https`, catching a
+            // misconfigured `http://` base URL before the token reaches the wire. This client issues
+            // two GETs to known HTTPS endpoints and expects no redirects, so an unexpected 3xx is
+            // returned unfollowed and surfaces downstream as a body-parse error — never as a silent
+            // scheme downgrade. (The content-layer scheme check on the SendRequest poll URL cannot
+            // intercept redirects reqwest would otherwise follow, which is why these guards exist.)
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self {
             http,
@@ -444,7 +456,14 @@ fn classify_get_statement(xml: &str) -> Result<GetStatementOutcome, IbkrFlexErro
                     "failed to parse Flex GetStatement status response: {e}"
                 ))
             })?;
-            if resp.error_code.as_deref() == Some(GENERATION_IN_PROGRESS_CODE) {
+            // "Generation in progress" always arrives as ErrorCode 1019 *with* Status=Warn per the
+            // IBKR Flex v3 protocol (see the `GET_IN_PROGRESS` fixture). Require both: a 1019 under
+            // Status=Fail would be a terminal error IBKR mislabeled, and retrying it would only burn
+            // the poll budget before timing out. The status compare is case-insensitive to tolerate
+            // label-casing variance.
+            if resp.error_code.as_deref() == Some(GENERATION_IN_PROGRESS_CODE)
+                && resp.status.eq_ignore_ascii_case("warn")
+            {
                 Ok(GetStatementOutcome::InProgress)
             } else {
                 Err(flex_error(resp, "GetStatement"))
@@ -597,6 +616,68 @@ mod tests {
             classify_get_statement(GET_IN_PROGRESS).unwrap(),
             GetStatementOutcome::InProgress
         );
+    }
+
+    #[test]
+    fn get_statement_in_progress_code_is_case_insensitive_on_status() {
+        // The `Status=Warn` check uses `eq_ignore_ascii_case`, so casing variance (e.g. all-caps
+        // `WARN`) must still classify a 1019 as retryable rather than fail fast on a terminal error.
+        const WARN_UPPER_1019: &str = r#"<FlexStatementResponse>
+            <Status>WARN</Status>
+            <ErrorCode>1019</ErrorCode>
+            <ErrorMessage>Statement generation in progress. Please try again shortly.</ErrorMessage>
+        </FlexStatementResponse>"#;
+        assert_eq!(
+            classify_get_statement(WARN_UPPER_1019).unwrap(),
+            GetStatementOutcome::InProgress
+        );
+    }
+
+    #[test]
+    fn get_statement_in_progress_code_under_fail_status_is_a_flex_error() {
+        // ErrorCode 1019 is only retryable under Status=Warn. If IBKR ever returns 1019 under
+        // Status=Fail, treat it as a terminal error instead of retrying a failure until the poll
+        // budget is exhausted.
+        const FAIL_1019: &str = r#"<FlexStatementResponse>
+            <Status>Fail</Status>
+            <ErrorCode>1019</ErrorCode>
+            <ErrorMessage>Statement generation in progress. Please try again shortly.</ErrorMessage>
+        </FlexStatementResponse>"#;
+        match classify_get_statement(FAIL_1019) {
+            Err(IbkrFlexError::Flex { code, .. }) => assert_eq!(code, "1019"),
+            other => panic!("expected terminal Flex error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_statement_1019_without_status_is_a_flex_error() {
+        // `Status` deserializes via `#[serde(default)]`, so a 1019 envelope with no `<Status>`
+        // element yields `status == ""`. Retryability requires Status=Warn, so a missing status is
+        // treated as terminal rather than retried until the poll budget is exhausted.
+        const NO_STATUS_1019: &str = r#"<FlexStatementResponse>
+            <ErrorCode>1019</ErrorCode>
+            <ErrorMessage>Statement generation in progress. Please try again shortly.</ErrorMessage>
+        </FlexStatementResponse>"#;
+        match classify_get_statement(NO_STATUS_1019) {
+            Err(IbkrFlexError::Flex { code, .. }) => assert_eq!(code, "1019"),
+            other => panic!("expected terminal Flex error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_statement_1019_under_success_status_is_a_flex_error() {
+        // 1019 is only retryable under Status=Warn. A 1019 reported under Status=Success is a
+        // self-contradictory envelope; treat it as terminal rather than retrying it until the poll
+        // budget is exhausted.
+        const SUCCESS_1019: &str = r#"<FlexStatementResponse>
+            <Status>Success</Status>
+            <ErrorCode>1019</ErrorCode>
+            <ErrorMessage>Statement generation in progress. Please try again shortly.</ErrorMessage>
+        </FlexStatementResponse>"#;
+        match classify_get_statement(SUCCESS_1019) {
+            Err(IbkrFlexError::Flex { code, .. }) => assert_eq!(code, "1019"),
+            other => panic!("expected terminal Flex error, got {other:?}"),
+        }
     }
 
     #[test]
