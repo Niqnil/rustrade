@@ -15,11 +15,15 @@ description = "High performance & normalised WebSocket intergration for leading 
 default = []
 ibkr = ["dep:ibapi", "dep:time", "dep:quick-xml", "rustrade-instrument/ibkr"]
 hyperliquid = ["dep:hyperliquid_rust_sdk"]
-# `serde-float` lets the corporate-actions client deserialize `new_rate`/`old_rate` JSON numbers
-# into `Decimal` (same approach as the Massive split client).
-alpaca = ["rust_decimal/serde-float"]
+# `serde-with-float` provides the field-level `rust_decimal::serde::float` / `float_option`
+# helpers the clients use to deserialize `new_rate`/`old_rate` (and Massive's price/size) JSON
+# numbers into `Decimal`. It deliberately does NOT enable the global `serde-float` feature, whose
+# extra effect is to flip every `Decimal`'s default serialization workspace-wide to a lossy f64
+# number (Cargo unifies features across the build). Keeping it field-level preserves the
+# deterministic, lossless string wire format for all other `Decimal` values.
+alpaca = ["rust_decimal/serde-with-float"]
 databento = ["dep:databento"]
-massive = ["dep:tokio-tungstenite", "dep:urlencoding", "rust_decimal/serde-float", "serde_json/raw_value"]
+massive = ["dep:tokio-tungstenite", "dep:urlencoding", "rust_decimal/serde-with-float", "serde_json/raw_value"]
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
