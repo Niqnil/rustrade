@@ -2806,9 +2806,9 @@ dependencies = [
 
 [[package]]
 name = "itertools"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+checksum = "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc"
 dependencies = [
  "either",
 ]
@@ -3708,7 +3708,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -4419,7 +4419,7 @@ dependencies = [
  "fnv",
  "futures",
  "indexmap",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "parking_lot",
  "pin-project",
  "prettytable-rs",
@@ -4452,7 +4452,7 @@ dependencies = [
  "futures-util",
  "hyperliquid_rust_sdk",
  "ibapi",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "parking_lot",
  "reqwest 0.13.4",
  "rust_decimal",
@@ -4492,7 +4492,7 @@ dependencies = [
  "hyperliquid_rust_sdk",
  "ibapi",
  "indexmap",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "lru",
  "parking_lot",
  "rand 0.10.1",
@@ -4546,7 +4546,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "indexmap",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "pin-project",
  "prost",
  "reqwest 0.13.4",
