@@ -23,7 +23,9 @@ use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
 use rustrade::{
     backtest::{
-        BacktestArgsConstant, BacktestArgsDynamic, backtest,
+        BacktestArgsConstant, BacktestArgsDynamic,
+        aux_events::NoAuxEvents,
+        backtest,
         market_data::{BacktestMarketData, MarketDataInMemory},
     },
     engine::{
@@ -100,6 +102,7 @@ async fn main() {
         market_data,
         summary_interval: Daily,
         engine_state,
+        aux_events: NoAuxEvents,
     });
 
     // DefaultStrategy/DefaultRiskManager are no-ops — this example demonstrates the

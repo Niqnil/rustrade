@@ -13,11 +13,17 @@ description = "High performance & normalised WebSocket intergration for leading 
 
 [features]
 default = []
-ibkr = ["dep:ibapi", "dep:time", "rustrade-instrument/ibkr"]
+ibkr = ["dep:ibapi", "dep:time", "dep:quick-xml", "rustrade-instrument/ibkr"]
 hyperliquid = ["dep:hyperliquid_rust_sdk"]
-alpaca = []
+# `serde-with-float` provides the field-level `rust_decimal::serde::float` / `float_option`
+# helpers the clients use to deserialize `new_rate`/`old_rate` (and Massive's price/size) JSON
+# numbers into `Decimal`. It deliberately does NOT enable the global `serde-float` feature, whose
+# extra effect is to flip every `Decimal`'s default serialization workspace-wide to a lossy f64
+# number (Cargo unifies features across the build). Keeping it field-level preserves the
+# deterministic, lossless string wire format for all other `Decimal` values.
+alpaca = ["rust_decimal/serde-with-float"]
 databento = ["dep:databento"]
-massive = ["dep:tokio-tungstenite", "dep:urlencoding", "rust_decimal/serde-float", "serde_json/raw_value"]
+massive = ["dep:tokio-tungstenite", "dep:urlencoding", "rust_decimal/serde-with-float", "serde_json/raw_value"]
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
@@ -28,7 +34,7 @@ serial_test = { workspace = true }  # For Massive WebSocket tests (1 connection 
 
 [dependencies]
 # Rustrade Ecosystem
-rustrade-integration = { workspace = true, features = ["channel", "collection", "error", "protocol", "serde", "subscription", "stream"] }
+rustrade-integration = { workspace = true, features = ["channel", "collection", "corporate-action", "error", "protocol", "serde", "subscription", "stream"] }
 rustrade-instrument = { workspace = true }
 rustrade-macro = { workspace = true }
 
@@ -70,6 +76,9 @@ fnv = { workspace = true }
 # IBKR (optional, behind "ibkr" feature)
 ibapi = { version = "=3.0.1", optional = true, default-features = false, features = ["sync"] }
 time = { version = "0.3", optional = true, features = ["macros"] }
+# XML parser for IBKR Flex Web Service statements (corporate-action reconciliation). New normal dep
+# (serde-xml-rs/xml-rs are only a build-dep of time-tz via ibapi, not reusable). Note for tier-2 review.
+quick-xml = { workspace = true, optional = true }
 
 # Hyperliquid (optional, behind "hyperliquid" feature)
 hyperliquid_rust_sdk = { version = "0.6", optional = true }
@@ -110,4 +119,8 @@ required-features = ["ibkr"]
 
 [[example]]
 name = "ibkr_market_data"
+required-features = ["ibkr"]
+
+[[example]]
+name = "ibkr_flex_corporate_actions"
 required-features = ["ibkr"]

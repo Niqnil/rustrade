@@ -857,7 +857,7 @@ async fn test_corporate_actions_splits() {
     tracing::info!(%two_years_ago, "Fetching recent stock splits");
 
     let splits: Vec<_> = client
-        .fetch_splits(&query)
+        .fetch_splits_raw(&query)
         .take(10)
         .collect::<Vec<_>>()
         .await;
@@ -899,7 +899,7 @@ async fn test_corporate_actions_splits_specific_ticker() {
     tracing::info!("Fetching NVDA stock splits");
 
     let splits: Vec<_> = client
-        .fetch_splits(&query)
+        .fetch_splits_raw(&query)
         .take(5)
         .collect::<Vec<_>>()
         .await;
@@ -918,6 +918,59 @@ async fn test_corporate_actions_splits_specific_ticker() {
     }
 
     tracing::info!(count = splits.len(), "Fetched NVDA splits");
+}
+
+/// Drive `MassiveRestClient` through the [`StockSplitSource::fetch_splits`] **trait** method
+/// (not the inherent `fetch_splits_raw`), asserting the provider-agnostic `CorporateAction`
+/// mapping end-to-end. Mirrors the Alpaca `nvda_forward_split_2024_via_source` test so both
+/// providers' trait impls have parallel live coverage — the raw tests above exercise only
+/// `fetch_splits_raw`, leaving the `StockSplitSource` adapter untested without this.
+#[tokio::test]
+#[ignore]
+async fn test_corporate_actions_splits_via_source_trait() {
+    use chrono::NaiveDate;
+    use rustrade_instrument::corporate_action::{CorporateActionKind, SplitRatio};
+    use rustrade_integration::corporate_action::{CorporateActionFilter, StockSplitSource};
+    use smol_str::SmolStr;
+
+    init_logging();
+
+    let client = MassiveRestClient::from_env().expect("Failed to create client");
+
+    // NVIDIA's 10-for-1 forward split executed on 2024-06-10 (a real, stable historical split).
+    let filter = CorporateActionFilter::new(
+        vec![SmolStr::new("NVDA")],
+        NaiveDate::from_ymd_opt(2024, 1, 1),
+        NaiveDate::from_ymd_opt(2024, 12, 31),
+    );
+
+    let actions: Vec<_> = client.fetch_splits(&filter).collect::<Vec<_>>().await;
+
+    // Distinguish "API returned nothing" (bad credentials / wrong date window) from "returned
+    // splits but the target date is missing" — the `find` below conflates both into one panic.
+    assert!(
+        !actions.is_empty(),
+        "fetch_splits returned no actions for NVDA in 2024 — check credentials and date range"
+    );
+
+    let nvda = actions
+        .iter()
+        .map(|result| result.as_ref().expect("fetch_splits yielded an error"))
+        .find(|action| action.effective_date == NaiveDate::from_ymd_opt(2024, 6, 10))
+        .expect("NVDA 2024-06-10 split should be present in the result set");
+
+    assert_eq!(nvda.instrument, "NVDA");
+    assert_eq!(
+        nvda.kind,
+        CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(Decimal::from(10)).unwrap()
+        }
+    );
+
+    tracing::info!(
+        count = actions.len(),
+        "Fetched NVDA splits via StockSplitSource trait"
+    );
 }
 
 // ============================================================================

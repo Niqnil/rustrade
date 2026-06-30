@@ -5,7 +5,10 @@ use criterion::{Criterion, Throughput};
 use rust_decimal::Decimal;
 use rustrade::{
     backtest,
-    backtest::{BacktestArgsConstant, BacktestArgsDynamic, market_data::MarketDataInMemory},
+    backtest::{
+        BacktestArgsConstant, BacktestArgsDynamic, aux_events::NoAuxEvents,
+        market_data::MarketDataInMemory,
+    },
     engine::{
         Engine, Processor,
         clock::HistoricalClock,
@@ -472,6 +475,7 @@ fn args_constant(
         market_data,
         summary_interval: Daily,
         engine_state,
+        aux_events: NoAuxEvents,
     })
 }
 

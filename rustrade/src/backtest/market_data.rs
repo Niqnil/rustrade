@@ -7,14 +7,37 @@ use std::sync::Arc;
 
 /// Interface that provides the backtest MarketStream and associated
 /// [`HistoricalClock`](crate::engine::clock::HistoricalClock).
+///
+/// # Caller obligations
+/// The backtest harness time-merges this market data with any
+/// [`AuxEventSource`](super::aux_events::AuxEventSource) events into a single ordered engine feed,
+/// so an implementation MUST uphold:
+/// - [`stream`](Self::stream) yields events sorted ascending by `time_exchange`. The merge is a
+///   two-way merge that assumes both inputs are already sorted; an unsorted stream produces an
+///   out-of-order engine feed and a non-monotonic
+///   [`HistoricalClock`](crate::engine::clock::HistoricalClock).
+/// - [`time_first_event`](Self::time_first_event) and [`stream`](Self::stream) are *coherent*: they
+///   describe the same dataset, and `time_first_event` equals the `time_exchange` of the first
+///   [`MarketStreamEvent::Item`] that `stream` will yield. The harness calls them independently, so
+///   an implementation backed by a single-pass cursor must not let one consume events the other
+///   needs.
+///
+/// # Memory model
+/// The time-merge consumes this stream **lazily** (it is polled on demand, never collected), so the
+/// harness's memory overhead is O(1) in the dataset size — a source streamed item-by-item stays
+/// streamed end to end.
 pub trait BacktestMarketData {
     /// The type of market events provided by this data source.
     type Kind;
 
     /// Return the `DateTime<Utc>` of the first event in the market data `Stream`.
+    ///
+    /// Must be coherent with [`stream`](Self::stream) — see the trait-level caller obligations.
     fn time_first_event(&self) -> impl Future<Output = Result<DateTime<Utc>, BarterError>>;
 
-    /// Return a `Stream` of `MarketStreamEvent`s.
+    /// Return a `Stream` of `MarketStreamEvent`s, sorted ascending by `time_exchange`.
+    ///
+    /// See the trait-level caller obligations for the sort and coherence requirements.
     fn stream(
         &self,
     ) -> impl Future<
@@ -59,10 +82,12 @@ where
 }
 
 impl<Kind> MarketDataInMemory<Kind> {
-    /// Create a new in-memory market data source from a vector of market events.
+    /// Create a new in-memory market data source from a pre-sorted vector of market events.
     ///
     /// # Panics
-    /// Panics if `events` contains no `MarketStreamEvent::Item` variant.
+    /// - Panics if `events` contains no [`MarketStreamEvent::Item`] variant.
+    /// - Panics if the [`Item`](MarketStreamEvent::Item) timestamps are not sorted ascending by
+    ///   `time_exchange` (the [`BacktestMarketData`] caller obligation).
     #[allow(clippy::expect_used)] // Caller contract: events must contain at least one MarketStreamEvent::Item variant
     pub fn new(events: Arc<Vec<MarketStreamEvent<InstrumentIndex, Kind>>>) -> Self {
         let time_first_event = events
@@ -72,6 +97,22 @@ impl<Kind> MarketDataInMemory<Kind> {
                 _ => None,
             })
             .expect("cannot construct MarketDataInMemory using an empty Vec<MarketStreamEvent>");
+
+        // Hard assert (not `debug_assert!`): event ordering is a caller-supplied external invariant
+        // that the harness's time-merge with `AuxEventSource` events relies on; an unsorted stream
+        // would silently produce a non-monotonic clock and wrong simulation results in release.
+        // Mirrors `AuxEventsInMemory::new`. `Reconnecting` events carry no timestamp (the harness
+        // carries the prior time forward), so only `Item` timestamps are checked.
+        assert!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    MarketStreamEvent::Item(event) => Some(event.time_exchange),
+                    _ => None,
+                })
+                .is_sorted(),
+            "MarketDataInMemory events must be sorted ascending by MarketEvent::time_exchange"
+        );
 
         Self {
             time_first_event,

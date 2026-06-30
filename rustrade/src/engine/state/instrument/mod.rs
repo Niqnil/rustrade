@@ -7,7 +7,7 @@ use crate::{
     statistic::summary::instrument::TearSheetGenerator,
 };
 use chrono::{DateTime, Utc};
-use fnv::FnvHashMap;
+use fnv::{FnvHashMap, FnvHashSet};
 use itertools::Either;
 use rustrade_data::event::MarketEvent;
 use rustrade_execution::{
@@ -27,11 +27,13 @@ use rustrade_instrument::{
     index::IndexedInstruments,
     instrument::{
         Instrument, InstrumentIndex,
+        kind::InstrumentKind,
         name::{InstrumentNameExchange, InstrumentNameInternal},
     },
 };
 use rustrade_integration::collection::{FnvIndexMap, snapshot::Snapshot};
 use serde::{Deserialize, Serialize};
+use smol_str::SmolStr;
 use std::fmt::Debug;
 use tracing::{debug, warn};
 
@@ -293,6 +295,32 @@ pub struct InstrumentState<
     #[serde(default)]
     pub expiration_processed: bool,
 
+    /// Set of corporate-action `id`s already applied to this instrument (idempotency key).
+    ///
+    /// A `CorporateAction` event carries a caller-assigned unique `id`; the handler records it
+    /// here once applied and skips (with a warning) any `id` already present. Scope is
+    /// per-instrument — naturally bounded by the number of corporate actions an instrument sees,
+    /// so no global store / LRU is required. This per-instrument-set keyed on `id` alone is
+    /// intentional and sufficient for stock splits (a split event targets a single instrument);
+    /// revisit for future multi-instrument actions (e.g. spin-offs).
+    ///
+    /// Rejected actions (unsupported instrument/action kind) are deliberately **not** recorded,
+    /// so they remain retryable once support is added.
+    ///
+    /// A hash set (insertion order is never read — only `contains`/`insert`), consistent with the
+    /// sibling `FnvHashMap` routing fields below.
+    ///
+    /// # Schema migration
+    ///
+    /// `#[serde(default)]` lets snapshots taken before this field existed deserialize with an empty
+    /// set. Consequence: a consumer that snapshots an `InstrumentState` **after** applying a
+    /// corporate action, then reloads it and re-injects the **same** action `id`, finds the set
+    /// empty and applies the action twice (quantity doubled again, basis halved again). Idempotency
+    /// holds within a live session; deduping replay across a pre-field snapshot is the consumer's
+    /// responsibility (e.g. pre-populate this set with already-applied ids on upgrade).
+    #[serde(default)]
+    pub corporate_actions_processed: FnvHashSet<SmolStr>,
+
     /// Maps `ClientOrderId` → `PositionId` for hedging-mode fill routing.
     ///
     /// Populated by `InFlightRequestRecorder::record_in_flight_open` when an order carrying
@@ -340,6 +368,54 @@ pub struct InstrumentState<
 impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     InstrumentState<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
 {
+    /// `true` if this is an **option** written on the underlying `(base, quote)` traded on
+    /// `exchange` — held or not. A standard (whole-number forward) split must divide the strike of
+    /// **every** such registered option, not only those currently holding a position: the
+    /// instrument set is fixed at construction, so an option that is unheld at split time can still
+    /// have a position opened later and then settle at expiry against its strike. Leaving an unheld
+    /// option on its pre-split strike would mis-settle that future position.
+    ///
+    /// Single-sources the option scan shared by the live engine handler
+    /// (`process_corporate_action`) and the audit replica, so the predicate cannot drift between
+    /// them. [`Self::is_affected_option_on_underlying`] layers the holds-a-position gate on top.
+    pub(crate) fn is_option_on_underlying(
+        &self,
+        base: &AssetKey,
+        quote: &AssetKey,
+        exchange: &ExchangeKey,
+    ) -> bool
+    where
+        AssetKey: PartialEq,
+        ExchangeKey: PartialEq,
+    {
+        matches!(&self.instrument.kind, InstrumentKind::Option(_))
+            && self.instrument.underlying.base == *base
+            && self.instrument.underlying.quote == *quote
+            && self.instrument.exchange == *exchange
+    }
+
+    /// `true` if this is an **option** on the underlying `(base, quote)` traded on `exchange` that
+    /// currently **holds at least one open position** — i.e. the options whose held positions a
+    /// corporate action must event-adjust (per-position `apply_split` + observables) or, on a
+    /// non-standard split, flag for a wrapper-side identity change.
+    ///
+    /// This is [`Self::is_option_on_underlying`] plus the non-empty-position gate. The strike
+    /// correction on a standard split uses the broader [`Self::is_option_on_underlying`] (it must
+    /// also reach unheld options); this narrower predicate selects the options that carry a
+    /// position event.
+    pub(crate) fn is_affected_option_on_underlying(
+        &self,
+        base: &AssetKey,
+        quote: &AssetKey,
+        exchange: &ExchangeKey,
+    ) -> bool
+    where
+        AssetKey: PartialEq,
+        ExchangeKey: PartialEq,
+    {
+        self.is_option_on_underlying(base, quote, exchange) && !self.position.positions.is_empty()
+    }
+
     /// Updates the instrument state using an account snapshot from the exchange.
     ///
     /// This updates active orders for the instrument, using timestamps where relevant to ensure
@@ -799,6 +875,7 @@ where
         data: _,
         fee_model: _,
         expiration_processed: _,
+        corporate_actions_processed: _,
         position_ids: _,
         pending_fills: _,
         exchange_id_to_cid: _,
@@ -876,6 +953,7 @@ where
                         data: instrument_data_init(instrument),
                         fee_model: FeeModelConfig::default(),
                         expiration_processed: false,
+                        corporate_actions_processed: FnvHashSet::default(),
                         position_ids: FnvHashMap::default(),
                         pending_fills: Vec::new(),
                         exchange_id_to_cid: FnvHashMap::default(),

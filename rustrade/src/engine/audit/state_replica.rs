@@ -3,7 +3,7 @@ use crate::{
     engine::{
         EngineMeta, EngineOutput, Processor,
         audit::{AuditTick, EngineAudit, ProcessAudit, context::EngineContext},
-        state::{EngineState, instrument::data::InstrumentDataState},
+        state::{EngineState, instrument::data::InstrumentDataState, position::PositionId},
     },
     execution::AccountStreamEvent,
 };
@@ -11,7 +11,10 @@ use rustrade_integration::collection::none_one_or_many::NoneOneOrMany;
 // (used by `update_from_event` to inspect the live engine's outputs)
 use rustrade_data::{event::MarketEvent, streams::consumer::MarketStreamEvent};
 use rustrade_execution::AccountEvent;
-use rustrade_instrument::instrument::InstrumentIndex;
+use rustrade_instrument::{
+    corporate_action::{CorporateActionKind, SplitAdjustmentKind},
+    instrument::{InstrumentIndex, kind::InstrumentKind},
+};
 use rustrade_integration::Terminal;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -136,6 +139,17 @@ where
     ///   replica cannot independently determine which branch the live engine took, so it
     ///   mirrors the decision by inspecting `PositionExit` outputs.
     ///
+    /// - **`CorporateAction`**: a *hybrid*. `Position::apply_split` is deterministic, so the
+    ///   adjustment (quantity / basis / unrealised PnL) is **event-replayed** for every position
+    ///   from the payload — after re-running the same guards (idempotency / non-`Spot` /
+    ///   unsupported-kind, all of which skip without mutating). The Floor-to-zero **close** is
+    ///   **output-mirrored** (like `ContractExpiry`): the live handler stamps the closing
+    ///   `PositionExit.time_exit` with `self.time()`, which is wall-clock-derived on
+    ///   `HistoricalClock` and therefore cannot be reproduced from the payload, so the replica
+    ///   removes the slot and folds the *live* `PositionExit` into the tear sheet. Parity (incl.
+    ///   tear sheets) is asserted by the replica-parity integration test, which guards against the
+    ///   live handler and this arm drifting apart.
+    ///
     /// Adding a new event type: choose event replay (deterministic transition) or output
     /// mirroring (conditional/non-deterministic) based on whether the replica can reproduce
     /// the live engine's branching from the event alone.
@@ -228,6 +242,216 @@ where
                     instrument_state.pending_fills.clear();
                     instrument_state.expiration_processed = true;
                 }
+            }
+            EngineEvent::CorporateAction {
+                id,
+                instrument,
+                kind,
+                policy,
+                effective_time: _,
+            } => {
+                // Hybrid replay (mirrors the live `process_corporate_action`):
+                //  - `apply_split` is deterministic ⇒ event-replay it for every position to
+                //    reproduce the quantity / basis / unrealised-PnL adjustment exactly.
+                //  - the Floor-to-zero close is OUTPUT-MIRRORED (like the `ContractExpiry` arm),
+                //    because the live handler stamps the closing `PositionExit.time_exit` with
+                //    `self.time()`, which is wall-clock-derived on `HistoricalClock` and cannot be
+                //    reproduced from the payload. Folding the *live* exit keeps tear-sheet parity
+                //    exact. Keep this branch structurally symmetric with the live handler — the
+                //    replica-parity test fails if they drift. Warnings are intentionally omitted
+                //    (the live engine already logged them for this event).
+
+                // Guards — each skips WITHOUT mutating or recording `id`, exactly as the live
+                // handler does, so the replica never applies an action the live engine rejected.
+                {
+                    let instrument_state = self
+                        .replica_engine_state_mut()
+                        .instruments
+                        .instrument_index_mut(&instrument);
+                    // Idempotency: already applied (the set mirrors the live engine's).
+                    if instrument_state.corporate_actions_processed.contains(&id) {
+                        return;
+                    }
+                    // Unsupported instrument kind (checked first, like the live handler): equity
+                    // splits only apply to `Spot`. `id` not recorded ⇒ retryable.
+                    if !matches!(instrument_state.instrument.kind, InstrumentKind::Spot) {
+                        return;
+                    }
+                }
+                // Unsupported action kind — the compiler-mandated arm for the `#[non_exhaustive]`
+                // `CorporateActionKind` (runtime-unreachable in this phase). `id` not recorded.
+                let CorporateActionKind::StockSplit { ratio } = kind else {
+                    return;
+                };
+                // Unwrap the validated `SplitRatio` to its inner `Decimal` for the arithmetic
+                // below. Unlike the live handler — which keeps the typed `SplitRatio` (as `ratio`)
+                // to carry into its output records and names the inner value `ratio_decimal` — the
+                // replica emits no outputs, so it shadows `ratio` directly with the `Decimal`.
+                let ratio = ratio.get();
+
+                // Last price for the eager `pnl_unrealised` recompute — same source the live
+                // handler reads. Identical here because the replica replayed the same market data.
+                let last_price = self
+                    .replica_engine_state()
+                    .instruments
+                    .instrument_index(&instrument)
+                    .data
+                    .price();
+
+                // Event-replay `apply_split` on ALL positions (N in Hedging). Collect ids first to
+                // avoid a borrow conflict with the per-position re-borrow, like the live handler.
+                let position_ids: Vec<PositionId> = self
+                    .replica_engine_state()
+                    .instruments
+                    .instrument_index(&instrument)
+                    .position
+                    .positions
+                    .keys()
+                    .cloned()
+                    .collect();
+                for pos_id in position_ids {
+                    let instrument_state = self
+                        .replica_engine_state_mut()
+                        .instruments
+                        .instrument_index_mut(&instrument);
+                    if let Some(position) = instrument_state.position.positions.get_mut(&pos_id) {
+                        position.apply_split(ratio, policy, last_price);
+                    }
+                }
+
+                // Mirror Floor-to-zero closes from the live `PositionExit` outputs: remove the slot
+                // and fold the live exit into the tear sheet (carrying the live `time_exit`).
+                for output in outputs.iter() {
+                    if let EngineOutput::PositionExit(exit) = output
+                        && exit.instrument == instrument
+                    {
+                        let instrument_state = self
+                            .replica_engine_state_mut()
+                            .instruments
+                            .instrument_index_mut(&instrument);
+                        instrument_state
+                            .position
+                            .positions
+                            .shift_remove(&exit.position_id);
+                        instrument_state.tear_sheet.update_from_position(exit);
+                        // Mirror the live handler's Hedging fill-routing prune on floor-to-zero
+                        // (engine/mod.rs): drop the now-dangling `cid → removed_pos_id` mapping by
+                        // VALUE. Without this, the replica retains a stale routing entry the live
+                        // engine has already pruned, so the full-state `assert_eq!` over
+                        // `InstrumentState` (which includes `position_ids`) diverges for any
+                        // `OmsMode::Hedging` position floored to zero by a reverse split.
+                        instrument_state
+                            .position_ids
+                            .retain(|_, mapped| *mapped != exit.position_id);
+                    }
+                }
+
+                // Standard option adjustment (mirrors the live handler's option-handling step).
+                // For a STANDARD (whole-number forward) split, the engine adjusts each option on
+                // this underlying IN PLACE: strike ÷ ratio + apply_split per option position. This
+                // is fully deterministic (strike division + apply_split reading the option's own
+                // replayed price), so it is PURE event-replay — options never floor-to-zero on a
+                // forward split, so no output-mirror is needed (unlike the equity Floor-to-zero
+                // close above). NON-standard splits leave options untouched (the live handler only
+                // emits a signal and mutates no option state), so this whole block is skipped.
+                //
+                // Classify via a `match` (not the old `if matches!`) to stay structurally symmetric
+                // with the live handler. `SplitAdjustmentKind` is `#[non_exhaustive]` (another
+                // crate) and cannot be matched exhaustively here; only a Standard split mutates
+                // option state in the replica — NonStandard, any future variant, and the unreachable
+                // None deliberately skip (the live handler emits only a signal output for them, which
+                // the replica, mirroring state not outputs, has nothing to apply). Warnings are
+                // intentionally omitted (see the block comment above).
+                let adjust_options_in_place =
+                    matches!(kind.split_kind(), Some(SplitAdjustmentKind::Standard));
+                if adjust_options_in_place {
+                    let (equity_base, equity_quote, equity_exchange) = {
+                        let equity = self
+                            .replica_engine_state()
+                            .instruments
+                            .instrument_index(&instrument);
+                        (
+                            equity.instrument.underlying.base,
+                            equity.instrument.underlying.quote,
+                            equity.instrument.exchange,
+                        )
+                    };
+                    // Scan ALL options on the underlying (held OR unheld), mirroring the live
+                    // handler: a standard split divides the strike of every registered option so
+                    // the registry stays consistent for positions opened later. Unheld options get
+                    // the strike fix only; held options additionally event-replay `apply_split`.
+                    let options_on_underlying: Vec<InstrumentIndex> = self
+                        .replica_engine_state()
+                        .instruments
+                        .0
+                        .values()
+                        .filter(|state| {
+                            state.is_option_on_underlying(
+                                &equity_base,
+                                &equity_quote,
+                                &equity_exchange,
+                            )
+                        })
+                        .map(|state| state.key)
+                        .collect();
+                    for opt_key in options_on_underlying {
+                        let option_state = self
+                            .replica_engine_state_mut()
+                            .instruments
+                            .instrument_index_mut(&opt_key);
+                        // Mirror the live handler's loud unreachable: the scan only matched Option
+                        // instruments, so a non-Option here is corruption — fail observably rather
+                        // than apply_split without adjusting the strike.
+                        let InstrumentKind::Option(ref mut contract) = option_state.instrument.kind
+                        else {
+                            unreachable!(
+                                "replica: is_option_on_underlying matched a non-Option instrument \
+                                 {opt_key:?}"
+                            );
+                        };
+                        contract.strike /= ratio;
+
+                        // Unheld option: strike correction is the whole job (silent registry fix),
+                        // mirroring the live handler.
+                        if option_state.position.positions.is_empty() {
+                            continue;
+                        }
+                        let option_last_price = option_state.data.price();
+                        let opt_position_ids: Vec<PositionId> =
+                            option_state.position.positions.keys().cloned().collect();
+                        for pos_id in opt_position_ids {
+                            // `pos_id` was just collected from this map; fail loudly (matching the
+                            // strike-adjust `unreachable!` above) if that ever changes, mirroring the
+                            // live handler.
+                            let Some(position) = option_state.position.positions.get_mut(&pos_id)
+                            else {
+                                unreachable!(
+                                    "replica: position id {pos_id:?} collected from this option's \
+                                     positions map"
+                                );
+                            };
+                            // Mirror the live handler's input invariant (see
+                            // `process_corporate_action`): option contract counts are whole, so a
+                            // non-integer count is corruption that must fail observably — not be
+                            // silently floored/carried. Keeps live and replica behaviour identical
+                            // (a live panic here must be a replica panic, or audit parity drifts).
+                            assert!(
+                                position.quantity_abs.fract().is_zero(),
+                                "replica: option position {pos_id:?} holds a non-integer contract \
+                                 count {} before a standard split — data corruption",
+                                position.quantity_abs,
+                            );
+                            position.apply_split(ratio, policy, option_last_price);
+                        }
+                    }
+                }
+
+                // Record `id` — the action has now been applied (mirrors the live handler).
+                self.replica_engine_state_mut()
+                    .instruments
+                    .instrument_index_mut(&instrument)
+                    .corporate_actions_processed
+                    .insert(id);
             }
         }
     }

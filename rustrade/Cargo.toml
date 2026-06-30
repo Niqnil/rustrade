@@ -11,6 +11,13 @@ documentation = "https://docs.rs/rustrade"
 readme = "README.md"
 description = "Framework for building high-performance live-trading, paper-trading and back-testing systems"
 
+[features]
+# Forward provider market-data features so the corporate-action *sourcing* example can drive a real
+# `StockSplitSource` impl (Massive's `MassiveRestClient` / Alpaca's `AlpacaRestClient`). Both off by
+# default — the engine itself needs no provider; the example falls back to a canned offline source.
+massive = ["rustrade-data/massive"]
+alpaca = ["rustrade-data/alpaca"]
+
 [[bench]]
 name = "backtest"
 path = "benches/backtest/mod.rs"

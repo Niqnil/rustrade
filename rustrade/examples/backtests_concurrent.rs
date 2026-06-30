@@ -4,6 +4,7 @@ use rust_decimal::Decimal;
 use rustrade::{
     backtest::{
         BacktestArgsConstant, BacktestArgsDynamic,
+        aux_events::NoAuxEvents,
         market_data::{BacktestMarketData, MarketDataInMemory},
         run_backtests,
     },
@@ -73,6 +74,7 @@ async fn main() {
         market_data,
         summary_interval: Daily,
         engine_state,
+        aux_events: NoAuxEvents,
     });
 
     // Define dummy dynamic backtest arguments

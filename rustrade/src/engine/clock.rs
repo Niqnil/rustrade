@@ -174,6 +174,10 @@ impl<MarketEventKind: Debug> TimeExchange for EngineEvent<MarketEventKind> {
                 AccountEventKind::Trade(trade) => Some(trade.time_exchange),
                 _ => None,
             },
+            // The corporate action carries its own resolved effective instant, so the
+            // `HistoricalClock` advances to it — the adjustment is ordered and stamped exactly
+            // (no look-ahead onto the prior session's market events).
+            Self::CorporateAction { effective_time, .. } => Some(*effective_time),
             _ => None,
         }
     }
@@ -183,9 +187,15 @@ impl<MarketEventKind: Debug> TimeExchange for EngineEvent<MarketEventKind> {
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use crate::engine::state::position::SplitRoundingPolicy;
     use chrono::TimeDelta;
+    use rust_decimal::Decimal;
     use rustrade_data::event::MarketEvent;
-    use rustrade_instrument::{exchange::ExchangeId, instrument::InstrumentIndex};
+    use rustrade_instrument::{
+        corporate_action::{CorporateActionKind, SplitRatio},
+        exchange::ExchangeId,
+        instrument::InstrumentIndex,
+    };
 
     fn market_event(time_exchange: DateTime<Utc>) -> EngineEvent<()> {
         EngineEvent::Market(MarketStreamEvent::Item(MarketEvent {
@@ -341,6 +351,58 @@ mod tests {
         assert!(
             (95..=105).contains(&delta_ms),
             "Historical clock time delta outside expected range"
+        );
+    }
+
+    fn corporate_action_event(effective_time: DateTime<Utc>) -> EngineEvent<()> {
+        EngineEvent::CorporateAction {
+            id: "test-split".into(),
+            instrument: InstrumentIndex::new(0),
+            kind: CorporateActionKind::StockSplit {
+                ratio: SplitRatio::new(Decimal::new(2, 0)).unwrap(),
+            },
+            policy: SplitRoundingPolicy::Fractional,
+            effective_time,
+        }
+    }
+
+    #[test]
+    fn test_corporate_action_advances_clock_to_effective_time() {
+        use chrono::{NaiveDate, NaiveTime};
+
+        // Midnight UTC of the effective date, plus two intraday market events on that date.
+        let effective = NaiveDate::from_ymd_opt(2026, 6, 22)
+            .unwrap()
+            .and_time(NaiveTime::MIN)
+            .and_utc();
+        let intraday_open = effective + TimeDelta::hours(13) + TimeDelta::minutes(30);
+        let intraday_later = intraday_open + TimeDelta::hours(2);
+
+        // The event reports its `effective_time` as its exchange time.
+        assert_eq!(
+            corporate_action_event(effective).time_exchange(),
+            Some(effective),
+            "CorporateAction must report effective_time as its exchange time"
+        );
+
+        // In-order: the midnight split precedes that day's intraday events — the clock
+        // advances to the split, then monotonically through the intraday prints.
+        let mut clock = HistoricalClock::new(effective - TimeDelta::days(1));
+        clock.process(&corporate_action_event(effective));
+        assert_eq!(clock.inner.read().time_exchange_last, effective);
+        clock.process(&market_event(intraday_open));
+        assert_eq!(clock.inner.read().time_exchange_last, intraday_open);
+        clock.process(&market_event(intraday_later));
+        assert_eq!(clock.inner.read().time_exchange_last, intraday_later);
+
+        // Out-of-order safety: a midnight split arriving after that day's intraday events
+        // must not regress the clock (same monotonic guard as any other event).
+        let mut clock = HistoricalClock::new(intraday_later);
+        clock.process(&corporate_action_event(effective));
+        assert_eq!(
+            clock.inner.read().time_exchange_last,
+            intraday_later,
+            "an earlier midnight split must not regress time_exchange_last"
         );
     }
 }
