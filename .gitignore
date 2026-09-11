@@ -17,3 +17,6 @@ CLAUDE.md
 docs/
 .claude/
 .directory
+
+# MEGAsync local trash (this repo is a MEGAsync sync root)
+.debris/
