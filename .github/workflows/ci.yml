@@ -69,7 +69,17 @@ jobs:
     name: cargo test
     needs: [fmt, check]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # This job debug-builds the whole workspace with `--all-features` (ethers, aws-lc-sys, ring and
+    # every exchange SDK) and then runs both `--lib --bins --tests` and the doc-tests against that
+    # one build. Observed wall-clock on a warm cache is 11m35s-14m20s, so a 15-minute budget left
+    # as little as 40 seconds of headroom. Any `Cargo.lock` change invalidates the cache, and a
+    # cold build then runs past the limit: the job is cancelled, and a cancellation reports as a
+    # red required check that is indistinguishable from a genuine test failure at a glance. That
+    # blocks otherwise-good dependency PRs and costs a full re-run to diagnose.
+    #
+    # 25 minutes keeps a real hang bounded while leaving room for a cold cache. Revisit if the
+    # warm-cache figure climbs far enough to erode the margin again.
+    timeout-minutes: 25
     steps:
       - name: Checkout sources
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
