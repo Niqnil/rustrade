@@ -137,7 +137,7 @@ hyperliquid_rust_sdk = { version = "0.6", optional = true }
 # `chrono` enables `DateTimeRange: From<(DateTime<Utc>, DateTime<Utc>)>`, so the
 # candle historical path can build `GetRangeParams` from a chrono range without a
 # manual chrono->time conversion (chrono is already a core dependency).
-databento = { version = "0.54", optional = true, features = ["chrono"] }
+databento = { version = "0.61", optional = true, features = ["chrono"] }
 
 # Massive (optional, behind "massive" feature)
 tokio-tungstenite = { version = "0.30", optional = true, features = ["native-tls"] }
