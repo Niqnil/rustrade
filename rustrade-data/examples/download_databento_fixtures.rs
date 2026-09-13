@@ -1,7 +1,22 @@
-//! Download minimal DBN fixtures for testing.
+//! Download DBN samples from Databento for local inspection.
 //!
-//! This example downloads small samples of market data from Databento and saves
-//! them as compressed DBN files for use in offline transformer tests.
+//! # ⚠️ Output must never be committed
+//!
+//! Databento licenses market data per subscriber. Its User Agreement defines "Redistribution" to
+//! cover the publication or distribution of covered data and "all other means of furnishing such
+//! data or other information derived from the same to entities other than Customer", and requires
+//! the customer to keep use internal absent prior written approval from both Databento and the
+//! relevant exchange. `GLBX.MDP3` is CME Group data, so committing anything this example writes to
+//! a public repository breaches that agreement. See
+//! <https://databento.com/legal/databento-user-agreement>.
+//!
+//! Output therefore goes to `local-data/databento/`, which is gitignored.
+//!
+//! Nothing in CI depends on this. The offline transformer tests do **not** read what this writes —
+//! they generate their own synthetic DBN fixtures at run time, precisely so that no licensed data
+//! has to live in the repository. See `rustrade-data/tests/databento_transformer.rs`. This example
+//! exists so someone holding a Databento licence can pull real records and inspect them locally,
+//! for example to confirm our decoding against an actual capture.
 //!
 //! # Usage
 //!
@@ -9,17 +24,15 @@
 //! # Set API key in .env or environment
 //! export DATABENTO_API_KEY=db-xxxxx
 //!
-//! # Run from rustrade-data directory
+//! # Run from the rustrade-data directory
 //! cargo run --example download_databento_fixtures --features databento
 //! ```
 //!
 //! # Output
 //!
-//! Creates files in `tests/fixtures/databento/`:
+//! Creates files in `local-data/databento/`:
 //! - `es_trades_sample.dbn.zst` - ES futures trades (~100-500 records)
 //! - `es_quotes_sample.dbn.zst` - ES futures MBP-1 quotes (~100-500 records)
-//!
-//! These fixtures are committed to the repo so CI can run tests without API access.
 
 use databento::HistoricalClient;
 use databento::dbn::decode::DbnMetadata;
@@ -30,12 +43,13 @@ use std::fs::File;
 use std::path::Path;
 use time::macros::datetime;
 
-const FIXTURES_DIR: &str = "tests/fixtures/databento";
+/// Gitignored: see the module docs above. Must not point anywhere tracked by git.
+const OUTPUT_DIR: &str = "local-data/databento";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create fixtures directory
-    std::fs::create_dir_all(FIXTURES_DIR)?;
+    std::fs::create_dir_all(OUTPUT_DIR)?;
 
     let mut client = HistoricalClient::builder().key_from_env()?.build()?;
 
@@ -46,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Download MBP-1 quotes - 5 minutes
     download_quotes(&mut client).await?;
 
-    println!("\nDone! Fixtures saved to {FIXTURES_DIR}/");
+    println!("\nDone! Samples saved to {OUTPUT_DIR}/ (gitignored — do not commit them).");
     Ok(())
 }
 
@@ -63,7 +77,7 @@ async fn download_trades(client: &mut HistoricalClient) -> Result<(), Box<dyn st
 
     let mut decoder = client.timeseries().get_range(&params).await?;
 
-    let output_path = Path::new(FIXTURES_DIR).join("es_trades_sample.dbn.zst");
+    let output_path = Path::new(OUTPUT_DIR).join("es_trades_sample.dbn.zst");
     let file = File::create(&output_path)?;
 
     // Create encoder with metadata from decoder, using zstd compression
@@ -100,7 +114,7 @@ async fn download_quotes(client: &mut HistoricalClient) -> Result<(), Box<dyn st
 
     let mut decoder = client.timeseries().get_range(&params).await?;
 
-    let output_path = Path::new(FIXTURES_DIR).join("es_quotes_sample.dbn.zst");
+    let output_path = Path::new(OUTPUT_DIR).join("es_quotes_sample.dbn.zst");
     let file = File::create(&output_path)?;
 
     let metadata = decoder.metadata().clone();
