@@ -1754,6 +1754,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bug additionally requires `catch_unwind` around a panicking key `Drop`, and the cache is keyed on
   plain owned data, so the workspace could not trigger it. The bump is a `Cargo.lock`-only patch
   within the existing `0.18` constraint.
+- Updated `h2` to 0.4.19 to clear RUSTSEC-2026-0258 (empty `DATA` frames were accepted and queued
+  without limit: unbounded memory growth if streams are not actively drained, or a panic if the
+  queued length overflows). A transitive dependency via `hyper` 1.x and `reqwest` 0.12; the bump is
+  a `Cargo.lock`-only patch within the existing `0.4` constraint (upstream patched it in 0.4.16).
+  A second, older `h2` 0.3.27 remains in the tree and has **no** patched release — upstream shipped
+  the fix only on the `0.4` line, so no bump is available. Every path to it runs through the
+  `hyperliquid` feature (`hyperliquid_rust_sdk` 0.6 and the optional `ethers` 2.0, both gated on it)
+  into `reqwest` 0.11 and `hyper` 0.14, so it is not compiled under the default feature set. It is
+  recorded as an accepted exception in `deny.toml` next to the other `hyperliquid_rust_sdk`
+  advisories, to be dropped once that SDK moves off `reqwest` 0.11.
 
 ## [0.5.0] - 2026-06-19
 

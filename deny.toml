@@ -40,6 +40,20 @@ ignore = [
     { id = "RUSTSEC-2026-0098", reason = "webpki URI name constraints; transitive via hyperliquid_rust_sdk; low impact for API client" },
     { id = "RUSTSEC-2026-0099", reason = "webpki wildcard name constraints; transitive via hyperliquid_rust_sdk; low impact for API client" },
     { id = "RUSTSEC-2026-0104", reason = "rustls-webpki CRL panic; transitive via hyperliquid_rust_sdk; CRLs not used" },
+
+    # h2 queues empty DATA frames without limit (low-severity DoS: unbounded memory, or a panic if
+    # the length overflows). Two instances were in the lockfile; only one is ours to fix:
+    #   * h2 0.4.x, via hyper 1.x / reqwest 0.12 -- FIXED, bumped to 0.4.19 (patched >= 0.4.16).
+    #   * h2 0.3.27, kept here. Upstream shipped the fix only on the 0.4 line, so no patched 0.3.x
+    #     exists and no bump is available to us. Every path to it runs through the `hyperliquid`
+    #     feature -- hyperliquid_rust_sdk 0.6 and our own optional ethers 2.0, both gated on it --
+    #     then reqwest 0.11 -> hyper 0.14, so it is not compiled under the default feature set.
+    # NOTE: cargo-deny's [advisories.ignore] takes only `id`/`reason`, so this suppression cannot be
+    # scoped to the 0.3 line -- it silences this advisory for h2 0.4.x too. Cargo.lock therefore
+    # pins the 0.4 line forward at 0.4.19, and that pin is the thing protecting us there, not this
+    # gate. Re-check the 0.4 entry in Cargo.lock if h2 is ever downgraded or re-resolved.
+    # Drop this entry once hyperliquid_rust_sdk and ethers move off reqwest 0.11.
+    { id = "RUSTSEC-2026-0258", reason = "h2 0.3 has no patched release; reached only via the hyperliquid feature (hyperliquid_rust_sdk/ethers -> reqwest 0.11 -> hyper 0.14)" },
 ]
 
 # Licenses - strict permissive only
