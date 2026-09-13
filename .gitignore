@@ -20,3 +20,15 @@ docs/
 
 # MEGAsync local trash (this repo is a MEGAsync sync root)
 .debris/
+
+# Provider-sourced market data must never be committed to this public repository.
+# Databento licenses per subscriber and its User Agreement prohibits "Redistribution" —
+# publishing or furnishing covered data to anyone other than the Customer — without prior
+# written approval from both Databento and the relevant exchange:
+# https://databento.com/legal/databento-user-agreement
+# `download_databento_fixtures` writes here; the offline tests generate synthetic DBN instead.
+local-data/
+
+# This path held committed Databento (CME GLBX.MDP3) captures until they were replaced by
+# synthetic fixtures generated in-test. Kept ignored so they cannot drift back in.
+rustrade-data/tests/fixtures/databento/
