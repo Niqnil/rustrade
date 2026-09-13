@@ -123,7 +123,7 @@ vecmap-rs = { workspace = true }
 fnv = { workspace = true }
 
 # IBKR (optional, behind "ibkr" feature)
-ibapi = { version = "=3.2.0", optional = true, default-features = false, features = ["sync"] }
+ibapi = { version = "=3.3.0", optional = true, default-features = false, features = ["sync"] }
 time = { version = "0.3", optional = true, features = ["macros"] }
 # XML parser for IBKR Flex Web Service statements (corporate-action reconciliation). New normal dep
 # (serde-xml-rs/xml-rs are only a build-dep of time-tz via ibapi, not reusable). Note for tier-2 review.
