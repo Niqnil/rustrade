@@ -2,6 +2,22 @@
 
 Thank you for your interest in contributing to rustrade!
 
+## Prerequisites
+
+A stable Rust toolchain (pinned by `rust-toolchain.toml`; MSRV is `1.95`).
+
+**Linux contributors also need the [mold](https://github.com/rui314/mold) linker.**
+`.cargo/config.toml` sets `-fuse-ld=mold` unconditionally for
+`x86_64-unknown-linux-gnu`, so without it every link fails:
+
+```bash
+sudo apt install mold        # Debian/Ubuntu
+```
+
+mold is used because this workspace links large binaries against several exchange
+SDKs at once, where the default linker is markedly slower. macOS and Windows are
+unaffected — the flag is scoped to the Linux GNU target.
+
 ## Branching Strategy
 
 | Branch | Purpose |
@@ -55,23 +71,70 @@ Before submitting a PR, ensure:
 1. **Formatting:** `cargo fmt --all`
 2. **Lints:** `cargo clippy --workspace --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious -D clippy::style -W clippy::complexity -D clippy::perf`
    - Note: `complexity` is `-W` (warn) not `-D` (deny) because the codebase intentionally allows `type_complexity` and `too_many_arguments` in some areas.
-3. **Tests pass:** `cargo test --workspace --all-features` (or specific test files)
+3. **Tests pass** — the two commands CI runs:
+   ```bash
+   cargo test --workspace --all-features --lib --bins --tests
+   cargo test --workspace --all-features --doc
+   ```
+   See [Testing](#testing) for why the target list is spelled out rather than left
+   to default, and for running a single test file while iterating.
 
 ## Testing
 
-**Unit tests** run in CI and require no API keys:
+**Unit and doc tests** run in CI and require no API keys:
 ```bash
-cargo test --workspace --lib
+cargo test --workspace --all-features --lib --bins --tests
+cargo test --workspace --all-features --doc
 ```
 
-**Integration tests** require exchange credentials and run locally only:
+`--all-features` is not optional here. Every exchange integration sits behind its own
+Cargo feature and the crates declare `default = []`, so without it none of the
+integration code compiles at all — the run reports success while that code goes
+entirely unbuilt.
+
+### Why the target list is spelled out
+
+`--lib --bins --tests` selects targets explicitly so that **example binaries are never
+linked**. Under `--all-features` an example links against every exchange SDK at once,
+and the combined debug information overflows a 32-bit relocation, which the linker
+rejects outright. Leaving the target list to default builds examples implicitly and
+runs into exactly this.
+
+Examples are still fully type-checked:
+
+```bash
+cargo check --workspace --all-targets --all-features
+```
+
+`cargo check` and `cargo clippy` perform no code generation and never invoke the
+linker, so `--all-targets` is both safe and correct there.
+
+### Running a single test file
+
+While iterating, narrow to one target instead of running the whole sweep:
+
+```bash
+cargo test --lib <filter>
+cargo test --test <file>
+```
+
+### Integration tests
+
+Integration tests talk to live exchange APIs. They need credentials, are marked
+`#[ignore]` so they never run in the default suite, and are gated behind their
+provider's feature:
+
 ```bash
 cp .env.template .env
 # Edit .env with your API keys
-cargo test --workspace --all-features
+
+cargo test -p rustrade-execution --features alpaca --test alpaca_integration -- --ignored
+cargo test -p rustrade-data --features alpaca --test alpaca_data -- --ignored
 ```
 
-Integration tests are marked with `#[ignore]` by default to avoid running in CI.
+Both halves matter. Without `--features <provider>` the test file's contents are gated
+out and the binary holds no tests at all; without `-- --ignored` the `#[ignore]` markers
+mean none of them run. Either omission produces a green run that asserted nothing.
 
 ## Changelog & Versioning
 
