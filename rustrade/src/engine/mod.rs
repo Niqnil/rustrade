@@ -23,7 +23,7 @@ use crate::{
     },
     execution::{AccountStreamEvent, request::ExecutionRequest},
     risk::RiskManager,
-    shutdown::SyncShutdown,
+    shutdown::{Shutdown, SyncShutdown},
     statistic::summary::TradingSummaryGenerator,
     strategy::{
         algo::AlgoStrategy, close_positions::ClosePositionsStrategy,
@@ -138,6 +138,15 @@ pub struct EngineMeta {
     pub time_start: DateTime<Utc>,
     /// Monotonically increasing [`Sequence`] associated with the number of events processed.
     pub sequence: Sequence,
+
+    /// Whether a [`Shutdown::AfterDrain`] is in progress.
+    ///
+    /// While set, the `Engine` generates no new orders and ends the run as soon as nothing is
+    /// left in flight. Cleared by [`Engine::reset_metadata`].
+    ///
+    /// `#[serde(default)]` so metadata serialised before this field existed still loads.
+    #[serde(default)]
+    pub draining: bool,
 }
 
 impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
@@ -163,8 +172,25 @@ where
     fn process(&mut self, event: EngineEvent<InstrumentData::MarketEventKind>) -> Self::Audit {
         self.clock.process(&event);
 
+        // Whether this event may provoke new algo orders. `ContractExpiry` and `CorporateAction`
+        // are engine-driven settlements that apply regardless of `TradingState` and never do.
+        let mut generates_algo_orders = true;
+
         let process_audit = match &event {
-            EngineEvent::Shutdown(_) => return EngineAudit::process(event),
+            EngineEvent::Shutdown(Shutdown::Immediate) => return EngineAudit::process(event),
+            EngineEvent::Shutdown(Shutdown::AfterDrain) => {
+                // Nothing outstanding, so there is nothing to wait for.
+                if !self.state.has_requests_in_flight() {
+                    return EngineAudit::Process(ProcessAudit::with_event(event).with_shutdown());
+                }
+
+                // Otherwise stop generating orders and keep processing until the responses already
+                // on their way have landed. Terminating here instead discards them — which for a
+                // backtest means discarding every fill and rejection the run produced, since the
+                // requests were sent while draining a feed that is now exhausted.
+                self.meta.draining = true;
+                return EngineAudit::process(event);
+            }
             EngineEvent::Command(command) => {
                 let output = self.action(command);
 
@@ -195,8 +221,9 @@ where
                     audit = audit.add_output(position_exited);
                 }
                 // ContractExpiry settles regardless of TradingState and does not
-                // trigger algo order generation — return early before that check.
-                return EngineAudit::from(audit);
+                // trigger algo order generation.
+                generates_algo_orders = false;
+                audit
             }
             EngineEvent::CorporateAction {
                 id,
@@ -209,17 +236,28 @@ where
                 // Fold each observable output (SplitRemainder / OpenOrdersAtSplit /
                 // OptionPositionAdjustedForSplit / OptionPositionsRequireIdentityChange /
                 // PositionExit / UnsupportedCorporateAction) into the audit. Like ContractExpiry, a
-                // corporate action is engine-driven and
-                // settles regardless of TradingState — return early before algo generation.
+                // corporate action is engine-driven and settles regardless of TradingState.
                 let mut audit = ProcessAudit::with_event(event);
                 for output in outputs {
                     audit = audit.add_output(output);
                 }
-                return EngineAudit::from(audit);
+                generates_algo_orders = false;
+                audit
             }
         };
 
-        if let TradingState::Enabled = self.state.trading {
+        // A drain in progress outranks everything below: no new orders, and the run ends the
+        // moment the last outstanding request resolves. Checked after the event has been applied,
+        // so the response that clears the final in-flight order is itself processed first.
+        if self.meta.draining {
+            return if self.state.has_requests_in_flight() {
+                EngineAudit::from(process_audit)
+            } else {
+                EngineAudit::Process(process_audit.with_shutdown())
+            };
+        }
+
+        if generates_algo_orders && matches!(self.state.trading, TradingState::Enabled) {
             let output = self.generate_algo_orders();
 
             if output.is_empty() {
@@ -1417,6 +1455,7 @@ where
             meta: EngineMeta {
                 time_start: clock.time(),
                 sequence: Sequence(0),
+                draining: false,
             },
             clock,
             state,
@@ -1435,6 +1474,7 @@ where
     pub fn reset_metadata(&mut self) {
         self.meta.time_start = self.clock.time();
         self.meta.sequence = Sequence(0);
+        self.meta.draining = false;
     }
 }
 

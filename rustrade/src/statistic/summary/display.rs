@@ -12,8 +12,41 @@ where
     pub fn print_summary(&self) {
         println!();
         self.title_table().printstd();
+        if let Some(notice) = self.rejection_notice() {
+            println!("{notice}");
+        }
         self.instrument_table().printstd();
         self.asset_table().printstd();
+    }
+
+    /// A banner describing rejected open requests, or `None` when there were none.
+    ///
+    /// Printed above the tables rather than below them: every figure in those tables is computed
+    /// over fills, so a session whose opens were all rejected renders a tear sheet of zeros that
+    /// is otherwise indistinguishable from a strategy that deliberately stayed flat.
+    pub fn rejection_notice(&self) -> Option<String> {
+        if self.orders_rejected == 0 {
+            return None;
+        }
+
+        let reason = self
+            .instruments
+            .values()
+            .find_map(|sheet| sheet.first_rejection_reason.as_deref())
+            .unwrap_or("reason not recorded");
+
+        Some(if self.rejected_every_order() {
+            format!(
+                "!! ALL {} open requests were REJECTED: this session filled nothing, and every \
+                 figure below was computed over zero trades. First reason: {reason}",
+                self.orders_rejected
+            )
+        } else {
+            format!(
+                "!! {} of {} open requests were rejected. First reason: {reason}",
+                self.orders_rejected, self.orders_opened
+            )
+        })
     }
     fn title_table(&self) -> Table {
         let mut title_table = Table::new();
@@ -108,6 +141,12 @@ where
         table.add_row(header_row);
 
         // Add metric rows
+        self.add_instrument_metric_row(&mut table, "Orders Opened", |ts| {
+            ts.orders_opened.to_string()
+        });
+        self.add_instrument_metric_row(&mut table, "Orders Rejected", |ts| {
+            ts.orders_rejected.to_string()
+        });
         self.add_instrument_metric_row(&mut table, "PnL", |ts| format!("{:.2}", ts.pnl));
         self.add_instrument_metric_row(&mut table, &format!("Return {interval}"), |ts| {
             format_percentage(ts.pnl_return.value, 2)
@@ -292,6 +331,8 @@ mod tests {
             instruments: FnvIndexMap::default(),
             assets,
             basis,
+            orders_opened: 0,
+            orders_rejected: 0,
         }
     }
 

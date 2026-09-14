@@ -79,6 +79,24 @@ pub struct EngineState<GlobalData, InstrumentData> {
 }
 
 impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
+    /// Whether any instrument has an order awaiting a response from its exchange.
+    ///
+    /// This is the `Engine`'s own record of what it is owed: entries are created only for requests
+    /// that were successfully *sent* (`record_in_flight_opens(opens.sent_iter())`), so a request
+    /// the engine failed to send leaves nothing behind to wait on.
+    ///
+    /// Drives the [`Shutdown::AfterDrain`] barrier — see
+    /// [`Orders::has_request_in_flight`](order::Orders::has_request_in_flight) for what counts as
+    /// in flight.
+    ///
+    /// [`Shutdown::AfterDrain`]: crate::shutdown::Shutdown::AfterDrain
+    pub fn has_requests_in_flight(&self) -> bool {
+        self.instruments
+            .0
+            .values()
+            .any(|instrument| instrument.orders.has_request_in_flight())
+    }
+
     /// Construct an [`EngineStateBuilder`] to assist with `EngineState` initialisation.
     pub fn builder<FnInstrumentData>(
         instruments: &IndexedInstruments,

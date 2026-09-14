@@ -260,16 +260,29 @@ pub enum EngineEvent<
 impl<MarketKind, ExchangeKey, AssetKey, InstrumentKey> Terminal
     for EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>
 {
+    /// Only [`Shutdown::Immediate`] is terminal on the event alone.
+    ///
+    /// [`Shutdown::AfterDrain`] asks the `Engine` to finish what is in flight first, so whether it
+    /// ends the run depends on `Engine` state this event cannot see. The `Engine` decides, and
+    /// records the decision on the audit it returns — see [`ProcessAudit::shutdown`].
+    ///
+    /// [`ProcessAudit::shutdown`]: crate::engine::audit::ProcessAudit::shutdown
     fn is_terminal(&self) -> bool {
-        matches!(self, Self::Shutdown(_))
+        matches!(self, Self::Shutdown(Shutdown::Immediate))
     }
 }
 
 impl<MarketKind, ExchangeKey, AssetKey, InstrumentKey>
     EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>
 {
+    /// Stop at once, abandoning anything in flight. See [`Shutdown::Immediate`].
     pub fn shutdown() -> Self {
-        Self::Shutdown(Shutdown)
+        Self::Shutdown(Shutdown::Immediate)
+    }
+
+    /// Stop once nothing is in flight. See [`Shutdown::AfterDrain`].
+    pub fn shutdown_after_drain() -> Self {
+        Self::Shutdown(Shutdown::AfterDrain)
     }
 }
 

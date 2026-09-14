@@ -256,7 +256,7 @@ mod tests {
 
     fn at(secs: i64) -> Timed<EngineEvent> {
         Timed::new(
-            EngineEvent::Shutdown(Shutdown),
+            EngineEvent::Shutdown(Shutdown::Immediate),
             DateTime::from_timestamp(secs, 0).expect("valid timestamp"),
         )
     }

@@ -142,6 +142,7 @@ impl<Event, Output> EngineAudit<Event, Output> {
             event: event.into(),
             outputs: NoneOneOrMany::One(output.into()),
             errors: NoneOneOrMany::from_iter(unrecoverable),
+            shutdown: false,
         })
     }
 
@@ -165,6 +166,20 @@ pub struct ProcessAudit<Event, Output> {
     pub event: Event,
     pub outputs: NoneOneOrMany<Output>,
     pub errors: NoneOneOrMany<UnrecoverableEngineError>,
+
+    /// Set when the `Engine` decided to stop for a reason the `event` alone does not express.
+    ///
+    /// Currently that means a [`Shutdown::AfterDrain`] drain completed: the event that ends the run
+    /// is then the ordinary account update which resolved the last in-flight order, and nothing
+    /// about that event is terminal. Carried on the audit rather than re-derived so a
+    /// [`StateReplicaManager`] reaches the same stop decision from the stream alone.
+    ///
+    /// `#[serde(default)]` so audits serialised before this field existed still load.
+    ///
+    /// [`Shutdown::AfterDrain`]: crate::shutdown::Shutdown::AfterDrain
+    /// [`StateReplicaManager`]: crate::engine::audit::state_replica::StateReplicaManager
+    #[serde(default)]
+    pub shutdown: bool,
 }
 
 impl<Event, Output> Terminal for ProcessAudit<Event, Output>
@@ -172,7 +187,7 @@ where
     Event: Terminal,
 {
     fn is_terminal(&self) -> bool {
-        self.event.is_terminal() || !self.errors.is_empty()
+        self.shutdown || self.event.is_terminal() || !self.errors.is_empty()
     }
 }
 
@@ -185,6 +200,7 @@ impl<Event, Output> ProcessAudit<Event, Output> {
             event: event.into(),
             outputs: NoneOneOrMany::None,
             errors: NoneOneOrMany::None,
+            shutdown: false,
         }
     }
 
@@ -197,6 +213,7 @@ impl<Event, Output> ProcessAudit<Event, Output> {
             event: event.into(),
             outputs: NoneOneOrMany::One(output.into()),
             errors: NoneOneOrMany::None,
+            shutdown: false,
         }
     }
 }
@@ -213,6 +230,7 @@ impl<Event, OnTradingDisabled, OnDisconnect>
                 event: event.into(),
                 outputs: NoneOneOrMany::One(EngineOutput::OnTradingDisabled(disabled)),
                 errors: NoneOneOrMany::None,
+                shutdown: false,
             }
         } else {
             Self::with_event(event)
@@ -260,12 +278,14 @@ impl<Event, Output> ProcessAudit<Event, Output> {
             event,
             outputs,
             errors,
+            shutdown,
         } = self;
 
         Self {
             event,
             outputs: outputs.extend(NoneOneOrMany::One(output.into())),
             errors,
+            shutdown,
         }
     }
 
@@ -277,13 +297,23 @@ impl<Event, Output> ProcessAudit<Event, Output> {
             event,
             outputs,
             errors,
+            shutdown,
         } = self;
 
         Self {
             event,
             outputs,
             errors: errors.extend(errs),
+            shutdown,
         }
+    }
+
+    /// Mark this audit as ending the run, for a reason the event alone does not express.
+    ///
+    /// See [`ProcessAudit::shutdown`].
+    pub fn with_shutdown(mut self) -> Self {
+        self.shutdown = true;
+        self
     }
 }
 

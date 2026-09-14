@@ -56,6 +56,21 @@ impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
     pub fn clear(&mut self) {
         self.0.clear();
     }
+
+    /// Whether any tracked order is awaiting a response from the exchange.
+    ///
+    /// True for [`ActiveOrderState::OpenInFlight`] and [`ActiveOrderState::CancelInFlight`] — a
+    /// request has been sent and its outcome is not yet known. An order merely *resting* at the
+    /// exchange ([`ActiveOrderState::Open`]) is **not** in flight: nothing is owed in reply, and a
+    /// limit order that never fills must not hold up a drain.
+    pub fn has_request_in_flight(&self) -> bool {
+        self.0.values().any(|order| {
+            matches!(
+                order.state,
+                ActiveOrderState::OpenInFlight(_) | ActiveOrderState::CancelInFlight(_)
+            )
+        })
+    }
 }
 
 impl<ExchangeKey, InstrumentKey> OrderManager<ExchangeKey, InstrumentKey>

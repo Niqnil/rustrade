@@ -36,6 +36,26 @@ pub struct TearSheet<Interval> {
     pub pnl_drawdown_max: Option<MaxDrawdown>,
     pub win_rate: Option<WinRate>,
     pub profit_factor: Option<ProfitFactor>,
+
+    /// Open requests the engine sent to the exchange for this instrument.
+    ///
+    /// `#[serde(default)]` so tear sheets serialised before this field existed still load.
+    #[serde(default)]
+    pub orders_opened: usize,
+
+    /// Of those, how many the exchange rejected.
+    ///
+    /// A session where this equals `orders_opened` traded nothing, however healthy the rest of
+    /// the sheet looks: every ratio below is computed over zero fills. Without this field that
+    /// case is indistinguishable from a strategy that chose not to trade.
+    #[serde(default)]
+    pub orders_rejected: usize,
+
+    /// Why the first rejection happened, verbatim from the exchange.
+    ///
+    /// Kept so diagnosing an empty session does not require re-running with logging enabled.
+    #[serde(default)]
+    pub first_rejection_reason: Option<String>,
 }
 
 /// Generator for a [`TearSheet`].
@@ -51,6 +71,18 @@ pub struct TearSheetGenerator {
     pub pnl_drawdown: DrawdownGenerator,
     pub pnl_drawdown_mean: MeanDrawdownGenerator,
     pub pnl_drawdown_max: MaxDrawdownGenerator,
+
+    /// Open requests sent for this instrument. See [`TearSheet::orders_opened`].
+    #[serde(default)]
+    pub orders_opened: usize,
+
+    /// Open requests the exchange rejected. See [`TearSheet::orders_rejected`].
+    #[serde(default)]
+    pub orders_rejected: usize,
+
+    /// First rejection reason seen. See [`TearSheet::first_rejection_reason`].
+    #[serde(default)]
+    pub first_rejection_reason: Option<String>,
 }
 
 impl TearSheetGenerator {
@@ -63,6 +95,22 @@ impl TearSheetGenerator {
             pnl_drawdown: DrawdownGenerator::default(),
             pnl_drawdown_mean: MeanDrawdownGenerator::default(),
             pnl_drawdown_max: MaxDrawdownGenerator::default(),
+            orders_opened: 0,
+            orders_rejected: 0,
+            first_rejection_reason: None,
+        }
+    }
+
+    /// Record that the engine sent an open request for this instrument.
+    pub fn record_open_requested(&mut self) {
+        self.orders_opened = self.orders_opened.saturating_add(1);
+    }
+
+    /// Record that the exchange rejected an open request, keeping the first reason given.
+    pub fn record_open_rejected(&mut self, reason: impl Into<String>) {
+        self.orders_rejected = self.orders_rejected.saturating_add(1);
+        if self.first_rejection_reason.is_none() {
+            self.first_rejection_reason = Some(reason.into());
         }
     }
 
@@ -157,6 +205,9 @@ impl TearSheetGenerator {
             pnl_drawdown_max,
             win_rate,
             profit_factor,
+            orders_opened: self.orders_opened,
+            orders_rejected: self.orders_rejected,
+            first_rejection_reason: self.first_rejection_reason.clone(),
         }
     }
 

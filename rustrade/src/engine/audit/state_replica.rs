@@ -41,6 +41,10 @@ impl<State, Updates> StateReplicaManager<State, Updates> {
             meta_start: EngineMeta {
                 time_start: snapshot.context.time,
                 sequence: snapshot.context.sequence,
+                // The replica seeds from a snapshot taken before any drain begins, and follows the
+                // live Engine's stop decision via `ProcessAudit::shutdown` rather than tracking a
+                // drain of its own.
+                draining: false,
             },
             state_replica: snapshot,
             updates,
