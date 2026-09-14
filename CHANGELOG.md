@@ -533,6 +533,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now writes to a gitignored `local-data/databento/` and says plainly that committing it is a
   breach.
 
+- **`ibapi` 3.2.0 → 3.3.0** (`rustrade-data`, `rustrade-execution`, `rustrade-instrument`, `ibkr`
+  feature). Two consequences reach this crate's public API, because `ibapi` types are exposed
+  directly on it — `HistoricalRequest::bar_size` is an `ibapi` `BarSize` and `ToDuration` is
+  re-exported from `rustrade-data::exchange::ibkr::historical`:
+  - **`BarSize` gains a `Min4` variant**, mapped here to a fixed 4-minute `IntervalStep` so
+    `Candle::close_time` stays the exclusive `open + interval` boundary at that resolution. The enum
+    is **not** `#[non_exhaustive]`, so downstream exhaustive `match`es over `BarSize` need a new arm.
+    The variant is inserted between `Min3` and `Min5` — at index 8, not appended — but every
+    existing variant keeps its exact TWS wire string (`Display` drives the wire, matched on variant
+    identity, never on ordinal) and its serde *name*. So nothing shifts for the TWS protocol or for
+    a name-based format (JSON, TOML, YAML). **A positional serde format is the exception**: under
+    `bincode`/`postcard` every variant from index 8 onward moves by one, and any `BarSize` persisted
+    that way needs migrating. rustrade itself uses no such format and does not persist `BarSize`.
+  - **`ibapi`'s `fundamental` module is gone** — `Client::fundamental_data`, `FundamentalData`,
+    `FundamentalReportType`, and `TickType::FundamentalRatios` (tick id 47, which now decodes as
+    `Unknown`). IBKR removed `reqFundamentalData` from the TWS API in 10.47. A breaking removal in
+    an upstream *minor* release; rustrade never used any of it, so nothing here changed, but a
+    downstream crate reaching through to those items via its own `ibapi` dependency will not compile
+    against 3.3.0.
+
+  Also inherited, and worth knowing if you run the `ibkr` feature against a live gateway: **the
+  handshake now advertises TWS server version 225 instead of 221**, so a modern TWS may negotiate
+  newer field layouts. No decoder in `ibapi` branches on the four new version constants, and the
+  order wire is unchanged — 3.x places orders over protobuf, and the encoder delta is two optional
+  fields that are omitted at their default values, so the bytes rustrade sends for an order are
+  byte-identical to 3.2.0. But this repo's IBKR integration tests all require a live TWS and are
+  `#[ignore]`d, so **the bump has not been exercised against a real gateway.**
+
+  `ibapi` is tier-2 and pinned; re-reviewed at 3.3.0 with the dependency surface confirmed
+  unchanged — see `.github/tier2-dependencies.txt`.
+
 - **Silent assumptions in the new LSE and streaming code are now observable.** None of these change
   a decoded value; each replaces a quiet assumption with something a caller can see.
   - `merge_time_sorted` trips a `debug_assert!` naming the offending input when one is not sorted
