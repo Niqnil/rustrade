@@ -364,7 +364,7 @@ impl MockExchange {
         // (called above) currently rejects Limit orders, ensuring FillModel::fill_price never receives
         // a non-marketable limit order. If Limit support is added later, the fill model must enforce
         // limit-price semantics (e.g. a limit buy must not fill above the limit price).
-        let fill_price = self
+        let maybe_fill_price = self
             .fill_model
             .fill_price(
                 request.state.side,
@@ -389,8 +389,30 @@ impl MockExchange {
                 market_prices.best_ask,
                 market_prices.last_price.or(request.state.price),
             )
-            .or(request.state.price)
-            .expect("fill_price must be available from market data or request price");
+            .or(request.state.price);
+
+        // No price anywhere. That means no market data has been supplied for this instrument and
+        // the order carries no limit price of its own to fall back on -- ordinary user data (a
+        // first tick, a thin instrument, a subscription that was never made), not a violated
+        // internal invariant, so it is rejected rather than panicked on.
+        //
+        // A panic here is also strictly less informative. `MockExchange::run` is a spawned task:
+        // killing it drops the request receiver, every later order comes back as
+        // `ConnectivityError::ExchangeOffline`, and the run completes over the whole dataset
+        // having filled nothing, reporting only a `JoinError` at teardown.
+        let Some(fill_price) = maybe_fill_price else {
+            let reason = format!(
+                "no market price available for {} and OrderKind::{:?} carries no limit price",
+                request.key.instrument, request.state.kind
+            );
+            return (
+                build_open_order_err_response(
+                    request,
+                    UnindexedOrderError::Rejected(ApiError::OrderRejected(reason)),
+                ),
+                None,
+            );
+        };
 
         let time_exchange = self.time_exchange();
 
@@ -430,13 +452,22 @@ impl MockExchange {
                     .balance_mut(&underlying.quote)
                     .expect("MockExchange has Balance for all configured Instrument assets");
 
-                // Currently we only supported MarketKind orders, so they should be identical
-                assert_eq!(current.balance.total, current.balance.free);
-
                 let quote_required = order_notional_quote + order_fees_quote;
                 let maybe_new_balance = current.balance.free - quote_required;
 
-                if maybe_new_balance >= Decimal::ZERO {
+                // Every order this exchange supports fills immediately, so nothing is ever held on
+                // reserve and `total` must equal `free`. An `initial_state` that says otherwise --
+                // a snapshot copied from a live account with margin reserved, say -- cannot be
+                // modelled here: the fill path below writes both fields from one number and would
+                // erase the reserved portion without saying so. That is user configuration rather
+                // than an internal invariant, so reject.
+                if current.balance.total != current.balance.free {
+                    Err(ApiError::OrderRejected(format!(
+                        "MockExchange cannot model a reserved balance for {}: \
+                         total {} != free {}",
+                        underlying.quote, current.balance.total, current.balance.free
+                    )))
+                } else if maybe_new_balance >= Decimal::ZERO {
                     current.balance.free = maybe_new_balance;
                     current.balance.total = maybe_new_balance;
                     current.time_exchange = time_exchange;
@@ -468,9 +499,6 @@ impl MockExchange {
                     .balance_mut(&underlying.base)
                     .expect("MockExchange has Balance for all configured Instrument assets");
 
-                // Currently we only supported MarketKind orders, so they should be identical
-                assert_eq!(current.balance.total, current.balance.free);
-
                 let order_value_base = request.state.quantity.abs();
                 // Fee is quote-denominated; convert to base for deduction.
                 //
@@ -493,7 +521,16 @@ impl MockExchange {
 
                 let maybe_new_balance = current.balance.free - base_required;
 
-                if maybe_new_balance >= Decimal::ZERO {
+                // See the quote-side arm: immediate fills mean nothing is ever on reserve, so a
+                // configured `total != free` cannot be modelled and is rejected rather than
+                // asserted on.
+                if current.balance.total != current.balance.free {
+                    Err(ApiError::OrderRejected(format!(
+                        "MockExchange cannot model a reserved balance for {}: \
+                         total {} != free {}",
+                        underlying.base, current.balance.total, current.balance.free
+                    )))
+                } else if maybe_new_balance >= Decimal::ZERO {
                     current.balance.free = maybe_new_balance;
                     current.balance.total = maybe_new_balance;
                     current.time_exchange = time_exchange;
@@ -1320,6 +1357,94 @@ mod tests {
             btc.balance.free,
             d("9"),
             "base balance must decrease by quantity only"
+        );
+    }
+
+    /// Reproduces the wiring `MockExecution` actually uses: an all-`None` [`MarketPrices`] and a
+    /// Market order, which carries no limit price of its own to fall back on.
+    ///
+    /// This combination used to hit an `expect`. Because `MockExchange::run` is a spawned task,
+    /// that killed the exchange, dropped the request receiver, and turned every later order into
+    /// `ExchangeOffline` -- so a backtest ran to completion over the whole dataset having filled
+    /// nothing and surfaced only a `JoinError` at teardown.
+    #[test]
+    fn a_market_order_with_no_market_data_is_rejected_rather_than_panicking() {
+        let mut exchange = make_exchange("10", "10000000");
+
+        let (response, notifications) =
+            exchange.open_order(buy_request("1.0"), MarketPrices::default());
+
+        assert!(
+            notifications.is_none(),
+            "a rejected order must not notify a fill"
+        );
+        assert!(
+            matches!(
+                response.state,
+                OrderState::Inactive(InactiveOrderState::OpenFailed(
+                    UnindexedOrderError::Rejected(_)
+                ))
+            ),
+            "expected a rejection, got {:?}",
+            response.state
+        );
+
+        let usd = exchange.account.balance_mut(&quote()).unwrap();
+        assert_eq!(
+            usd.balance.free,
+            d("10000000"),
+            "a rejected order must not move the balance"
+        );
+    }
+
+    /// A `total != free` balance is user configuration -- an `initial_state` copied from a live
+    /// account with margin reserved -- not an internal invariant. It used to be an `assert_eq!`,
+    /// which panicked the exchange task on the first order.
+    #[test]
+    fn a_reserved_quote_balance_is_rejected_rather_than_asserted() {
+        let mut exchange = make_exchange("10", "10000000");
+        exchange
+            .account
+            .balance_mut(&quote())
+            .unwrap()
+            .balance
+            .total = d("20000000");
+
+        let (response, notifications) =
+            exchange.open_order(buy_request("1.0"), market_prices("50000"));
+
+        assert!(notifications.is_none());
+        assert!(
+            matches!(
+                response.state,
+                OrderState::Inactive(InactiveOrderState::OpenFailed(
+                    UnindexedOrderError::Rejected(_)
+                ))
+            ),
+            "expected a rejection, got {:?}",
+            response.state
+        );
+    }
+
+    /// The sell path debits the base asset, so it carries its own copy of the reserve check.
+    #[test]
+    fn a_reserved_base_balance_is_rejected_rather_than_asserted() {
+        let mut exchange = make_exchange("10", "10000000");
+        exchange.account.balance_mut(&base()).unwrap().balance.total = d("20");
+
+        let (response, notifications) =
+            exchange.open_order(sell_request("1.0"), market_prices("50000"));
+
+        assert!(notifications.is_none());
+        assert!(
+            matches!(
+                response.state,
+                OrderState::Inactive(InactiveOrderState::OpenFailed(
+                    UnindexedOrderError::Rejected(_)
+                ))
+            ),
+            "expected a rejection, got {:?}",
+            response.state
         );
     }
 }
