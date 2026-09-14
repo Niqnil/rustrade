@@ -147,6 +147,57 @@ urlencoding = { version = "2.1", optional = true }
 # target still builds with the feature off and libtest reports "0 passed" -- a green run that
 # asserted nothing. Declaring it here makes `cargo test --test <name>` fail with a message naming
 # the missing feature instead.
+#
+# EVERY test file carrying a file-level `#![cfg(feature = "...")]` must be listed here. Any that
+# is not is silently exempt from the guarantee above.
+
+[[test]]
+name = "alpaca_corporate_actions"
+required-features = ["alpaca"]
+
+[[test]]
+name = "alpaca_data"
+required-features = ["alpaca"]
+
+[[test]]
+name = "alpaca_pagination"
+required-features = ["alpaca"]
+
+[[test]]
+name = "databento_integration"
+required-features = ["databento"]
+
+[[test]]
+name = "databento_transformer"
+required-features = ["databento"]
+
+[[test]]
+name = "hyperliquid_data"
+required-features = ["hyperliquid"]
+
+[[test]]
+name = "hyperliquid_spot_data"
+required-features = ["hyperliquid"]
+
+[[test]]
+name = "ibkr_flex_corporate_actions"
+required-features = ["ibkr"]
+
+[[test]]
+name = "ibkr_integration"
+required-features = ["ibkr"]
+
+[[test]]
+name = "lse_export"
+required-features = ["lse"]
+
+[[test]]
+name = "lse_vault"
+required-features = ["lse"]
+
+[[test]]
+name = "lse_vault_canary"
+required-features = ["lse"]
 
 [[test]]
 name = "lse_ws_handshake"
@@ -155,6 +206,22 @@ required-features = ["lse"]
 [[test]]
 name = "lse_ws_canary"
 required-features = ["lse"]
+
+[[test]]
+name = "lse_export_canary"
+required-features = ["lse-parquet"]
+
+[[test]]
+name = "lse_parquet"
+required-features = ["lse-parquet"]
+
+[[test]]
+name = "massive_integration"
+required-features = ["massive"]
+
+[[test]]
+name = "massive_pagination"
+required-features = ["massive"]
 
 # Examples that depend on optional features. Without `required-features`,
 # `cargo check --all-targets` (default features) fails to compile them.

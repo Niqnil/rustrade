@@ -41,6 +41,10 @@
 //! Connection and subscription tests work anytime.
 //!
 //! Crypto streams (BTC/USD, etc.) are available 24/7 and are the primary validation.
+//!
+//! - WebSocket tests are marked `#[serial]` to prevent connection conflicts. Alpaca rejects
+//!   concurrent data-stream connections with "auth failed: connection limit exceeded", so
+//!   running them in parallel fails every connection but the one that wins the race.
 
 #![cfg(feature = "alpaca")]
 // Test code: unwrap/expect panics are the correct failure mode for test assertions
@@ -57,7 +61,8 @@ use rustrade_data::{
     subscription::{quote::Quotes, trade::PublicTrades},
 };
 use rustrade_instrument::instrument::market_data::kind::MarketDataInstrumentKind;
-use std::time::Duration;
+use serial_test::serial;
+use std::{collections::BTreeSet, time::Duration};
 use tracing_subscriber::{EnvFilter, fmt};
 
 fn init_logging() {
@@ -76,6 +81,7 @@ fn init_logging() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_crypto_trade_stream_connection() {
     init_logging();
 
@@ -103,6 +109,7 @@ async fn test_crypto_trade_stream_connection() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_crypto_trade_stream_receives_data() {
     init_logging();
 
@@ -125,28 +132,38 @@ async fn test_crypto_trade_stream_receives_data() {
         .select_all()
         .with_error_handler(|e| tracing::warn!(?e, "Stream error"));
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    // Poll until the deadline rather than asserting on each 30-second window. Alpaca's crypto
+    // feed carries its own venue's fills, not a consolidated tape, so trades are sparse: a run of
+    // the sibling multi-symbol test observed three BTC trades across 120 seconds. A quiet
+    // 30-second window is therefore ordinary, and asserting inside the loop turned the first one
+    // into a failure while the rest of the budget went unused. The deadline is sized against that
+    // observed rate instead.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    let mut non_trade_events = 0usize;
 
     while tokio::time::Instant::now() < deadline {
-        let timeout = tokio::time::timeout(Duration::from_secs(30), stream.next()).await;
-        assert!(timeout.is_ok(), "Timeout waiting for crypto trade data");
-
-        let event = timeout.unwrap();
-        assert!(event.is_some(), "Stream ended without data");
-
-        if let Event::Item(trade) = event.unwrap() {
-            tracing::info!(?trade, "Received crypto trade");
-            assert!(trade.kind.price > Decimal::ZERO, "Invalid trade price");
-            assert!(trade.kind.amount > Decimal::ZERO, "Invalid trade amount");
-            return;
+        match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
+            // A quiet window is not a failure on this feed; only the deadline ends the loop.
+            Err(_) => continue,
+            Ok(None) => panic!("Stream ended without data (non-trade events={non_trade_events})"),
+            Ok(Some(Event::Item(trade))) => {
+                tracing::info!(?trade, "Received crypto trade");
+                assert!(trade.kind.price > Decimal::ZERO, "Invalid trade price");
+                assert!(trade.kind.amount > Decimal::ZERO, "Invalid trade amount");
+                return;
+            }
+            // Reconnects and other non-item events carry no payload to assert on, but counting
+            // them separates a silent stream from one that is alive and simply has no trades.
+            Ok(Some(_)) => non_trade_events += 1,
         }
     }
 
-    panic!("No crypto trade events received within timeout");
+    panic!("No crypto trades received within 180s (non-trade events={non_trade_events})");
 }
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_crypto_quote_stream_connection() {
     init_logging();
 
@@ -174,6 +191,7 @@ async fn test_crypto_quote_stream_connection() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_crypto_quote_stream_receives_data() {
     init_logging();
 
@@ -196,36 +214,48 @@ async fn test_crypto_quote_stream_receives_data() {
         .select_all()
         .with_error_handler(|e| tracing::warn!(?e, "Stream error"));
 
+    // Same shape as the trade test above: a quiet window must not end the run early. Quotes tick
+    // continuously and independently of trade flow, so 60 seconds is ample here.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut non_quote_events = 0usize;
 
     while tokio::time::Instant::now() < deadline {
-        let timeout = tokio::time::timeout(Duration::from_secs(30), stream.next()).await;
-        assert!(timeout.is_ok(), "Timeout waiting for crypto quote data");
-
-        let event = timeout.unwrap();
-        assert!(event.is_some(), "Stream ended without data");
-
-        if let Event::Item(quote) = event.unwrap() {
-            tracing::info!(?quote, "Received crypto quote");
-            assert!(quote.kind.bid_price > Decimal::ZERO, "Invalid bid price");
-            assert!(quote.kind.ask_price > Decimal::ZERO, "Invalid ask price");
-            assert!(
-                quote.kind.ask_price >= quote.kind.bid_price,
-                "Ask < Bid (crossed market)"
-            );
-            return;
+        match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
+            Err(_) => continue,
+            Ok(None) => panic!("Stream ended without data (non-quote events={non_quote_events})"),
+            Ok(Some(Event::Item(quote))) => {
+                tracing::info!(?quote, "Received crypto quote");
+                assert!(quote.kind.bid_price > Decimal::ZERO, "Invalid bid price");
+                assert!(quote.kind.ask_price > Decimal::ZERO, "Invalid ask price");
+                assert!(
+                    quote.kind.ask_price >= quote.kind.bid_price,
+                    "Ask < Bid (crossed market)"
+                );
+                return;
+            }
+            Ok(Some(_)) => non_quote_events += 1,
         }
     }
 
-    panic!("No crypto quote events received within timeout");
+    panic!("No crypto quotes received within 60s (non-quote events={non_quote_events})");
 }
 
+/// Verifies that two subscriptions share one connection and both deliver, and that each
+/// instrument's base name round-trips as subscribed.
+///
+/// Subscribes to [`Quotes`] rather than `PublicTrades` on purpose. Alpaca's crypto feed carries
+/// its own venue's fills, not a consolidated tape, so trades there are sparse and bursty: a run
+/// of this test against `PublicTrades` saw three BTC trades and no ETH trade in 120 seconds, and
+/// an earlier run saw the reverse. That made the assertion one about market liquidity, which no
+/// choice of timeout makes deterministic. Quotes tick on both symbols continuously and
+/// independently of trade flow, so they exercise the same property reliably.
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_crypto_multiple_symbols() {
     init_logging();
 
-    let streams = Streams::<PublicTrades>::builder()
+    let streams = Streams::<Quotes>::builder()
         .subscribe(
             AlpacaSubscriber::from_env().unwrap(),
             [
@@ -234,14 +264,14 @@ async fn test_crypto_multiple_symbols() {
                     "btc",
                     "usd",
                     MarketDataInstrumentKind::Spot,
-                    PublicTrades,
+                    Quotes,
                 ),
                 (
                     AlpacaCrypto::default(),
                     "eth",
                     "usd",
                     MarketDataInstrumentKind::Spot,
-                    PublicTrades,
+                    Quotes,
                 ),
             ],
         )
@@ -261,27 +291,42 @@ async fn test_crypto_multiple_symbols() {
 
     let mut btc_seen = false;
     let mut eth_seen = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    // Track what actually arrived so a failure distinguishes the three causes that look
+    // identical from the outside: a stream that delivered nothing (events == 0), a symbol
+    // that never quoted in the window (events > 0 but its base absent), and a base name
+    // that did not round-trip as subscribed (bases holds something unexpected).
+    let mut events = 0usize;
+    let mut bases = BTreeSet::<String>::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 
     while !(btc_seen && eth_seen) && tokio::time::Instant::now() < deadline {
         let timeout = tokio::time::timeout(Duration::from_secs(30), stream.next()).await;
         if let Ok(Some(Event::Item(event))) = timeout {
-            match event.instrument.base.as_ref() {
+            events += 1;
+            let base = event.instrument.base.as_ref();
+            bases.insert(base.to_string());
+            match base {
                 "btc" => {
                     btc_seen = true;
-                    tracing::info!("Received BTC trade");
+                    tracing::info!("Received BTC quote");
                 }
                 "eth" => {
                     eth_seen = true;
-                    tracing::info!("Received ETH trade");
+                    tracing::info!("Received ETH quote");
                 }
                 _ => {}
             }
         }
     }
 
-    assert!(btc_seen, "No BTC trades received within timeout");
-    assert!(eth_seen, "No ETH trades received within timeout");
+    assert!(
+        btc_seen,
+        "No BTC quotes received within timeout (events={events}, bases={bases:?}, eth_seen={eth_seen})"
+    );
+    assert!(
+        eth_seen,
+        "No ETH quotes received within timeout (events={events}, bases={bases:?}, btc_seen={btc_seen})"
+    );
 }
 
 // ============================================================================
@@ -792,10 +837,15 @@ async fn test_fetch_aapl_chain_snapshot_with_greeks() {
     let today = Utc::now().date_naive();
     let thirty_days = today + chrono::Duration::days(30);
 
+    // `limit` is the PAGE SIZE, not a cap on results: `fetch_contracts` pages until the
+    // chain is exhausted. A page size of 10 walks the whole 30-day AAPL chain ten contracts
+    // at a time and trips the client's 100-page runaway guard with
+    // `PaginationLimitExceeded { pages: 101, limit: 100 }`. Use the same page size as
+    // `test_fetch_aapl_option_contracts`, which covers a wider window without tripping it.
     let query = AlpacaOptionContractQuery::new(vec!["AAPL".into()])
         .expiration_gte(today)
         .expiration_lte(thirty_days)
-        .limit(10);
+        .limit(100);
 
     let contracts = client
         .fetch_contracts(&query)
@@ -804,8 +854,14 @@ async fn test_fetch_aapl_chain_snapshot_with_greeks() {
 
     assert!(!contracts.is_empty(), "No contracts to fetch snapshots for");
 
-    // Fetch snapshots for these contracts
-    let symbols: Vec<String> = contracts.iter().map(|c| c.symbol.clone()).collect();
+    // Snapshot only a small slice. The snapshot endpoint takes an explicit symbol list and
+    // the full 30-day AAPL chain runs to thousands of contracts, which is both needlessly
+    // slow and far more than this test needs to verify Greeks come back populated.
+    let symbols: Vec<String> = contracts
+        .iter()
+        .take(10)
+        .map(|c| c.symbol.clone())
+        .collect();
 
     let snapshots = client
         .fetch_snapshots(&symbols, AlpacaOptionFeed::Indicative)
