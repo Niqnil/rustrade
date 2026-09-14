@@ -130,6 +130,34 @@ temp-env = { workspace = true }
 # Serial test execution for integration tests that share exchange state
 serial_test = { workspace = true }
 
+# Integration tests whose contents are entirely feature-gated. Without `required-features`, the
+# target still builds with the feature off and libtest reports "0 passed" -- a green run that
+# asserted nothing. Declaring it here makes `cargo test --test <name>` fail with a message naming
+# the missing feature instead.
+#
+# EVERY test file carrying a file-level `#![cfg(feature = "...")]` must be listed here. Any that
+# is not is silently exempt from the guarantee above.
+
+[[test]]
+name = "alpaca_integration"
+required-features = ["alpaca"]
+
+[[test]]
+name = "binance_conditional_orders"
+required-features = ["binance"]
+
+[[test]]
+name = "hyperliquid_execution"
+required-features = ["hyperliquid"]
+
+[[test]]
+name = "hyperliquid_spot_execution"
+required-features = ["hyperliquid"]
+
+[[test]]
+name = "ibkr_execution"
+required-features = ["ibkr"]
+
 # Examples that depend on optional features. Without `required-features`,
 # `cargo check --all-targets` (default features) fails to compile them.
 
