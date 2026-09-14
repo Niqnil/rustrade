@@ -23,7 +23,7 @@ use rustrade_execution::{
         Order, OrderKey,
         id::{ClientOrderId, OrderId, PositionId},
         request::OrderResponseCancel,
-        state::{ActiveOrderState, OrderState},
+        state::{ActiveOrderState, InactiveOrderState, OrderState},
     },
     trade::Trade,
 };
@@ -776,6 +776,15 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         AssetKey: Debug + Clone,
         InstrumentKey: Debug + Clone + PartialEq,
     {
+        // Count a rejected open before anything downstream consumes the snapshot. This is the
+        // difference between "the strategy chose not to trade" and "this session could not
+        // trade", and once the snapshot is dropped nothing can tell the two apart. Debug rather
+        // than Display for the reason: `OrderError`'s Display needs `AssetKey: Display` and
+        // `InstrumentKey: Display`, and requiring those here would narrow this method's callers.
+        if let OrderState::Inactive(InactiveOrderState::OpenFailed(error)) = &order.0.state {
+            self.tear_sheet.record_open_rejected(format!("{error:?}"));
+        }
+
         // Detect an OpenInFlight → Open transition BEFORE mutating orders so we can
         // capture both the CID and the new exchange OrderId in a single pass.
         //

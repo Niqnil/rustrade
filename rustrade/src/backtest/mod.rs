@@ -256,6 +256,13 @@ where
 ///   (e.g. assert a corporate action rescaled an open position's `quantity_abs` /
 ///   `price_entry_average`) without driving their own engine harness.
 ///
+/// # Errors
+/// Returns [`BarterError::BacktestAllOrdersRejected`] when the strategy sent open requests and
+/// the exchange rejected every one of them. Such a run filled nothing, so its statistics describe
+/// no trading at all. Partial rejections are not an error — an insufficient balance is a
+/// legitimate simulated outcome — and a strategy that sends no requests is unaffected. Per-instrument
+/// counts and the first reason are on each `TearSheet`.
+///
 /// This path hardcodes [`AuditMode::Disabled`], so the per-event `EngineOutput` audit stream is not
 /// observable here; the split *economics per event* are asserted at the `Engine::process_with_audit`
 /// seam (see the `test_corporate_action_*` tests). The terminal `engine_state` exposes the net effect.
@@ -468,6 +475,23 @@ where
     let trading_summary = engine
         .trading_summary_generator(args_dynamic.risk_free_return)
         .generate(args_constant.summary_interval);
+
+    // A run in which every open request was rejected measured nothing: the summary it would
+    // return is a tear sheet of zeros, which reads exactly like a strategy that chose to stay
+    // flat. Report it as the failure it is rather than handing back a plausible-looking result.
+    // Partial rejections are left alone -- an insufficient balance is a legitimate simulated
+    // outcome that a strategy should experience -- and a strategy that sends no requests at all
+    // never trips this.
+    if trading_summary.rejected_every_order() {
+        return Err(BarterError::BacktestAllOrdersRejected {
+            rejected: trading_summary.orders_rejected,
+            reason: trading_summary
+                .instruments
+                .values()
+                .find_map(|sheet| sheet.first_rejection_reason.clone())
+                .unwrap_or_else(|| "reason not recorded".to_string()),
+        });
+    }
 
     // `trading_summary_generator` only borrows the engine, so the terminal state can be moved out
     // here and returned for direct post-run inspection (open positions, balances, instrument state).

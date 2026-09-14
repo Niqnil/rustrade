@@ -48,9 +48,35 @@ pub struct TradingSummary<Interval> {
     /// so summaries serialised before this field existed load as [`BalanceBasis::Gross`].
     #[serde(default)]
     pub basis: BalanceBasis,
+
+    /// Open requests sent this session, summed over every instrument.
+    ///
+    /// `#[serde(default)]` so summaries serialised before this field existed still load.
+    #[serde(default)]
+    pub orders_opened: usize,
+
+    /// Of those, how many the exchange rejected.
+    ///
+    /// See [`Self::rejected_every_order`] for why this is worth checking before reading any
+    /// other figure in the summary.
+    #[serde(default)]
+    pub orders_rejected: usize,
 }
 
 impl<Interval> TradingSummary<Interval> {
+    /// Whether every open request this session was rejected.
+    ///
+    /// When true, the session filled nothing and every ratio in this summary was computed over
+    /// zero trades — a tear sheet of zeros that looks like a flat strategy rather than a broken
+    /// run. A strategy that simply chose not to trade sends no requests at all and so is not
+    /// reported here.
+    ///
+    /// Per-instrument counts and the first rejection reason are on each
+    /// [`TearSheet`](super::summary::instrument::TearSheet).
+    pub fn rejected_every_order(&self) -> bool {
+        self.orders_opened > 0 && self.orders_rejected == self.orders_opened
+    }
+
     /// Duration of trading that the `TradingSummary` covers.
     pub fn trading_duration(&self) -> TimeDelta {
         self.time_engine_end
@@ -184,12 +210,24 @@ impl TradingSummaryGenerator {
             .map(|generator| generator.basis)
             .unwrap_or_default();
 
+        let (orders_opened, orders_rejected) =
+            self.instruments
+                .values()
+                .fold((0usize, 0usize), |(opened, rejected), generator| {
+                    (
+                        opened.saturating_add(generator.orders_opened),
+                        rejected.saturating_add(generator.orders_rejected),
+                    )
+                });
+
         TradingSummary {
             time_engine_start: self.time_engine_start,
             time_engine_end: self.time_engine_now,
             instruments,
             assets,
             basis,
+            orders_opened,
+            orders_rejected,
         }
     }
 }

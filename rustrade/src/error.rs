@@ -45,6 +45,18 @@ pub enum BarterError {
     /// shifts the variant index any index-based serializer writes.
     #[error("backtest market data: {0}")]
     BacktestMarketData(String),
+
+    /// Every open request the strategy sent was rejected, so the session filled nothing.
+    ///
+    /// The statistics such a run produces are a tear sheet of zeros, indistinguishable at a
+    /// glance from a strategy that deliberately stayed flat. That is a failed run rather than a
+    /// result, so it is reported as an error instead of being returned as one.
+    ///
+    /// A strategy that sends no requests at all is unaffected.
+    #[error(
+        "backtest filled nothing: all {rejected} open requests were rejected (first reason: {reason})"
+    )]
+    BacktestAllOrdersRejected { rejected: usize, reason: String },
 }
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]
 #[error("RxDropped")]
