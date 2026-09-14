@@ -524,6 +524,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The `databento` module now documents that the data it retrieves is not redistributable**
+  (`rustrade-data`). Our MIT licence covers *our code* and confers no rights in a provider's data —
+  the same split already recorded for London Strategic Edge. The module rustdoc now states the
+  restriction, spells out what it means in practice (retrieved records are for internal use; do not
+  commit them as fixtures, example datasets, CI artifacts or golden files) and links the terms. The
+  `download_databento_fixtures` example previously instructed the reader to commit its output; it
+  now writes to a gitignored `local-data/databento/` and says plainly that committing it is a
+  breach.
+
 - **Silent assumptions in the new LSE and streaming code are now observable.** None of these change
   a decoded value; each replaces a quiet assumption with something a caller can see.
   - `merge_time_sorted` trips a `debug_assert!` naming the offending input when one is not sorted
@@ -1033,6 +1042,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   option alongside an aggregate warning.
 
 ### Removed
+
+- **Committed Databento DBN test fixtures** (`rustrade-data`). `es_trades_sample.dbn.zst` and
+  `es_quotes_sample.dbn.zst` held real CME `GLBX.MDP3` records. Databento licenses market data per
+  subscriber, and its [User Agreement](https://databento.com/legal/databento-user-agreement) defines
+  "Redistribution" to cover the publication or distribution of covered data and "all other means of
+  furnishing such data or other information derived from the same to entities other than Customer",
+  requiring use to stay internal absent prior written approval from **both** Databento and the
+  relevant exchange. Shipping those captures in a public MIT repository was exactly that, so they
+  are gone and the paths are gitignored to stop them returning. The offline transformer tests now
+  generate synthetic DBN at run time instead, which also makes them stricter: every record is known,
+  so they assert that *all* records transform rather than merely that some do. The trade-off is
+  honest and recorded in the test module — encoding and decoding with the same `dbn` version is a
+  round trip, so wire-format drift affecting both halves equally would not be caught. Consumers are
+  unaffected: fixtures were never part of the published crate.
 
 - **`EngineOutput::OptionPositionsUnadjustedForSplit`** (`rustrade`). The placeholder option-split
   signal is removed in favour of the precise pair `OptionPositionAdjustedForSplit` (standard, applied)

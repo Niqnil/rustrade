@@ -22,6 +22,30 @@
 //! Requires `DATABENTO_API_KEY` environment variable from an active Databento
 //! subscription.
 //!
+//! # ⚠️ Data licensing — redistribution is prohibited
+//!
+//! This crate is MIT-licensed. That covers **our code** and says nothing about the **data** a
+//! Databento subscription retrieves through it.
+//!
+//! Databento licenses market data per subscriber. Its User Agreement defines "Redistribution" to
+//! cover the publication or distribution of covered data and "all other means of furnishing such
+//! data or other information derived from the same to entities other than Customer", and requires
+//! the customer to limit use to internal purposes and "not to engage in any Redistribution of
+//! Third-Party Data" — except where permitted by the relevant exchange's own agreement or by prior
+//! written approval from both that exchange and Databento, each in their sole discretion. Much of
+//! what is reachable here is exchange data (`GLBX.MDP3` is CME Group), so both gates apply.
+//!
+//! In practice, for anyone using this module:
+//!
+//! - **Do not commit retrieved data** — not as test fixtures, example datasets, CI artifacts or
+//!   golden files. This repository's offline tests generate synthetic DBN records for exactly this
+//!   reason rather than replaying a capture.
+//! - Records you receive are for your own internal use; passing them on, or deriving a feed or
+//!   product from them for third parties, needs written permission you almost certainly do not
+//!   have by default.
+//!
+//! Terms: <https://databento.com/legal/databento-user-agreement>
+//!
 //! # Testing Status
 //!
 //! **NOT tested in CI** — no permission to use credentials for CI.
