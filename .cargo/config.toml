@@ -1,4 +1,16 @@
 [target.x86_64-unknown-linux-gnu]
 # Requires mold linker: https://github.com/rui314/mold
 # Install: sudo apt install mold
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+rustflags = [
+    "-C", "link-arg=-fuse-ld=mold",
+    # Keep debug info out of the linked image. Debug builds of this workspace are
+    # dominated by `.debug_str` (monomorphised type names), and in the examples that
+    # instantiate the stream machinery across every exchange it reaches 70-96% of the
+    # 4 GiB ceiling on a 32-bit relocation -- one of them crosses it and fails to link
+    # outright. Emitting DWARF to `.dwo` sidecars instead leaves ~0.07% behind.
+    #
+    # Scoped to the Linux GNU target rather than set in `[profile.dev]` because
+    # Windows-MSVC accepts only `packed`/`off`. It costs nothing in release, which
+    # emits no debug info to split.
+    "-C", "split-debuginfo=unpacked",
+]

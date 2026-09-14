@@ -122,10 +122,13 @@ jobs:
           shared-key: "rustrade-ci-test"
 
       - name: Run cargo test
-        # Exclude examples to avoid mold linker hitting .debug_str section size limits
-        run: cargo test --locked --workspace --all-features --lib --bins --tests
+        # `--examples` links the example binaries rather than only type-checking them.
+        # That is viable because `.cargo/config.toml` sets `-C split-debuginfo=unpacked`;
+        # without it the multi-exchange examples carry enough `.debug_str` to overflow a
+        # 32-bit relocation and the link fails.
+        run: cargo test --locked --workspace --all-features --lib --bins --tests --examples
 
-      # `--lib --bins --tests` above excludes doc-tests, so without this step a rustdoc example
+      # The target list above excludes doc-tests, so without this step a rustdoc example
       # that no longer compiles ships green. Separate from the step above so a failure here is
       # attributable at a glance; it reuses that step's build.
       - name: Run doc-tests
