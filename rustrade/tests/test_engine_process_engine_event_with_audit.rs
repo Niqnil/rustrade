@@ -5787,3 +5787,81 @@ fn test_untracked_exchange_reconnecting_is_reported_without_disconnect_or_mutati
         "an untracked exchange must not become tracked by reporting it"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Shutdown semantics
+//
+// `Shutdown` carries two meanings and the difference between them is only observable when
+// something is in flight, so that is what these pin down. The `Immediate` case matters most: it is
+// what live trading relies on, and a refactor of the drain could quietly make stopping wait on a
+// venue that may be slow or unreachable without any of the backtest tests noticing.
+// ---------------------------------------------------------------------------------------------
+
+/// Drives the engine until it has an order in flight, returning it ready for a shutdown event.
+fn engine_with_an_order_in_flight() -> TestEngine {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Enabled, execution_tx);
+
+    // The strategy opens on the first priced tick; the request is recorded in flight as it is sent.
+    engine.process(market_event_trade(1, 0, dec!(100)));
+
+    assert!(
+        engine.state.has_requests_in_flight(),
+        "fixture is only meaningful with an order in flight"
+    );
+
+    engine
+}
+
+#[test]
+fn test_shutdown_immediate_is_terminal_even_with_an_order_in_flight() {
+    use rustrade::shutdown::Shutdown;
+    use rustrade_integration::Terminal;
+
+    let mut engine = engine_with_an_order_in_flight();
+
+    let audit = engine.process(EngineEvent::Shutdown(Shutdown::Immediate));
+
+    assert!(
+        audit.is_terminal(),
+        "Immediate must stop at once rather than wait on the venue"
+    );
+    assert!(
+        !engine.meta.draining,
+        "Immediate must not put the engine into a drain"
+    );
+}
+
+#[test]
+fn test_shutdown_after_drain_waits_while_an_order_is_in_flight() {
+    use rustrade::shutdown::Shutdown;
+    use rustrade_integration::Terminal;
+
+    let mut engine = engine_with_an_order_in_flight();
+
+    let audit = engine.process(EngineEvent::Shutdown(Shutdown::AfterDrain));
+
+    assert!(
+        !audit.is_terminal(),
+        "AfterDrain must keep processing while a response is still owed"
+    );
+    assert!(engine.meta.draining, "the engine should now be draining");
+}
+
+#[test]
+fn test_shutdown_after_drain_is_terminal_when_nothing_is_in_flight() {
+    use rustrade::shutdown::Shutdown;
+    use rustrade_integration::Terminal;
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx);
+
+    assert!(!engine.state.has_requests_in_flight());
+
+    let audit = engine.process(EngineEvent::Shutdown(Shutdown::AfterDrain));
+
+    assert!(
+        audit.is_terminal(),
+        "with nothing owed there is nothing to drain, so this is an immediate stop"
+    );
+}
