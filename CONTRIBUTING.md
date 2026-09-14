@@ -18,6 +18,15 @@ mold is used because this workspace links large binaries against several exchang
 SDKs at once, where the default linker is markedly slower. macOS and Windows are
 unaffected — the flag is scoped to the Linux GNU target.
 
+That same target also sets `-C split-debuginfo=unpacked`, which writes DWARF to `.dwo`
+sidecar files next to the object files instead of into the linked binary. Debug builds
+here are dominated by `.debug_str` — monomorphised type names — and the examples that
+instantiate the stream machinery across every exchange come within a few percent of the
+4 GiB ceiling on a 32-bit relocation, with one crossing it and failing to link. Splitting
+the debug info leaves well under one percent of that behind. The visible cost is a
+`target/` directory holding thousands of `.dwo` files; `cargo clean` clears them with
+everything else.
+
 ## Branching Strategy
 
 | Branch | Purpose |
@@ -73,7 +82,7 @@ Before submitting a PR, ensure:
    - Note: `complexity` is `-W` (warn) not `-D` (deny) because the codebase intentionally allows `type_complexity` and `too_many_arguments` in some areas.
 3. **Tests pass** — the two commands CI runs:
    ```bash
-   cargo test --workspace --all-features --lib --bins --tests
+   cargo test --workspace --all-features --lib --bins --tests --examples
    cargo test --workspace --all-features --doc
    ```
    See [Testing](#testing) for why the target list is spelled out rather than left
@@ -83,7 +92,7 @@ Before submitting a PR, ensure:
 
 **Unit and doc tests** run in CI and require no API keys:
 ```bash
-cargo test --workspace --all-features --lib --bins --tests
+cargo test --workspace --all-features --lib --bins --tests --examples
 cargo test --workspace --all-features --doc
 ```
 
@@ -94,20 +103,21 @@ entirely unbuilt.
 
 ### Why the target list is spelled out
 
-`--lib --bins --tests` selects targets explicitly so that **example binaries are never
-linked**. Under `--all-features` an example links against every exchange SDK at once,
-and the combined debug information overflows a 32-bit relocation, which the linker
-rejects outright. Leaving the target list to default builds examples implicitly and
-runs into exactly this.
+Naming the targets keeps doc-tests out of the first command so that the second owns
+them outright. A rustdoc example that stops compiling then fails a step of its own,
+rather than disappearing into a sweep of everything at once.
 
-Examples are still fully type-checked:
+`--examples` is there because linking an example catches what type-checking it cannot:
+errors that only surface once generic code is monomorphised and the binary is actually
+produced. Under `--all-features` these are the largest binaries the workspace makes, so
+they are also where the linker limits described under [Prerequisites](#prerequisites)
+show up first.
+
+Benches are not in either command. They are type-checked, along with everything else, by:
 
 ```bash
 cargo check --workspace --all-targets --all-features
 ```
-
-`cargo check` and `cargo clippy` perform no code generation and never invoke the
-linker, so `--all-targets` is both safe and correct there.
 
 ### Running a single test file
 
