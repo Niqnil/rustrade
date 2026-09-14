@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Order-rejection counters on the trading summary** (`rustrade`). `TearSheet` gains
+  `orders_opened`, `orders_rejected` and `first_rejection_reason`; `TradingSummary` gains the
+  session totals and a `rejected_every_order()` helper. Without these a session that *could not*
+  trade reads exactly like one that *chose not to* — every ratio in the sheet is computed over zero
+  fills either way — and the exchange's reason was recorded nowhere, so diagnosing an empty session
+  meant re-running it with logging enabled. `print_summary` now prints a banner above the tables
+  when every open was rejected. All fields are `#[serde(default)]`, so sheets serialised before
+  they existed still load.
+
 - **`InstrumentKind::Cfd` — contracts-for-difference are now modelled** (`rustrade-instrument`).
   CFDs previously had no correct representation: `Spot` would pollute every downstream `Spot`
   filter — including the corporate-action and option-settlement scans, which mean specifically
@@ -523,6 +532,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Fixed entry below. Appended last to the (`#[non_exhaustive]`) enum, which derives `Ord`.
 
 ### Changed
+
+- **`backtest` now fails a run in which every open request was rejected** (`rustrade`), returning
+  the new `BarterError::BacktestAllOrdersRejected { rejected, reason }` — carrying the exchange's
+  own first reason — instead of a summary of zeros that looks like a flat strategy. Partial
+  rejections are deliberately left alone, since an insufficient balance is a legitimate simulated
+  outcome a strategy should experience, and a strategy that sends no requests at all never trips it.
+
+- **`Shutdown` is now an enum** (`rustrade`): `Shutdown::Immediate` keeps today's behaviour — stop
+  at once, abandoning anything in flight — and the new `Shutdown::AfterDrain` stops generating
+  orders and terminates only once no order is left `OpenInFlight` or `CancelInFlight`.
+  `System::shutdown_after_backtest` sends `AfterDrain`; `System::shutdown` and `System::abort`
+  still send `Immediate`, so live shutdown does not start waiting on a venue that may be slow or
+  unreachable. The drain is bounded by each `ExecutionManager`'s `request_timeout`, and orders
+  merely *resting* at the venue do not hold it up.
+  *Breaking:* `Shutdown` was a unit struct, so every construction site needs a variant — which is a
+  compile error rather than a silent change of behaviour. `EngineEvent::shutdown()` is unchanged
+  and still means `Immediate`; `EngineEvent::shutdown_after_drain()` is new.
+
+- **`ProcessAudit` carries a `shutdown` flag** (`rustrade`) recording that the `Engine` stopped for
+  a reason the audited event does not itself express — currently a completed `AfterDrain` drain,
+  where the terminating event is the ordinary account update that resolved the last in-flight
+  order. Kept on the audit so an `AuditManager` replica reaches the same stop decision from the
+  stream alone. `#[serde(default)]`, but `ProcessAudit`'s derived `new` gains an argument.
+
+- **`EngineMeta` carries a `draining` flag** (`rustrade`) for the same barrier, cleared by
+  `Engine::reset_metadata`. `#[serde(default)]`.
 
 - **The `databento` module now documents that the data it retrieves is not redistributable**
   (`rustrade-data`). Our MIT licence covers *our code* and confers no rights in a provider's data —
@@ -1130,6 +1165,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lexicographic field-order) derived orderings with it.
 
 ### Fixed
+
+- **Backtests discarded every order response** (`rustrade`). No backtest could observe a fill, a
+  rejection, a balance update or a trade: each run reported a tear sheet of zeros indistinguishable
+  from a strategy that chose to stay flat. The `Engine` reads market and account events from a
+  single FIFO feed, and `System::shutdown_after_backtest` enqueued its stop as soon as the market
+  stream had been *forwarded* into that feed rather than *processed* out of it — so the stop sat
+  ahead of every account event the run was about to produce, and `sync_run` terminated on it
+  without ever reading them. Reproduced identically at `latency_ms: 0`, so the mock exchange's
+  wall-clock latency model was not the cause. Ordering alone cannot fix this, because the responses
+  are provoked *by* processing the final market events and are therefore always behind any marker
+  placed after them; the fix is a quiescence barrier — see `Shutdown::AfterDrain` under *Changed*.
+  This is also why the mock exchange's missing fill price went unnoticed: the rejection it produces
+  was being generated all along and then discarded here.
 
 - **Twenty-one rustdoc link defects across the workspace** (`rustrade`, `rustrade-execution`,
   `rustrade-integration`), each of which rendered as dead or misdirected text on docs.rs. **Six**

@@ -74,11 +74,19 @@ where
     Event: Debug + Clone + Send,
 {
     /// Shutdown the `System` gracefully.
+    ///
+    /// Sends [`Shutdown::Immediate`], so the `Engine` stops at once and any execution request still
+    /// in flight is abandoned — whatever those requests would have reported never arrives. That is
+    /// normally what live trading wants: stopping should not wait on a venue that may be slow or
+    /// unreachable.
+    ///
+    /// A caller that would rather wait for those responses can send [`Shutdown::AfterDrain`] itself
+    /// via [`System::send`] instead of calling this.
     pub async fn shutdown(mut self) -> Result<(Engine, Engine::Audit), JoinError>
     where
         Event: From<Shutdown>,
     {
-        self.send(Shutdown);
+        self.send(Shutdown::Immediate);
 
         let (engine, shutdown_audit) = self.engine.await?;
 
@@ -112,7 +120,7 @@ where
     where
         Event: From<Shutdown>,
     {
-        self.send(Shutdown);
+        self.send(Shutdown::Immediate);
 
         let (engine, shutdown_audit) = self.engine.await?;
 
@@ -126,6 +134,18 @@ where
     ///
     /// **Note that for live & paper-trading this market stream will never end, so use
     /// System::shutdown() for that use case**.
+    ///
+    /// # Why this sends [`Shutdown::AfterDrain`]
+    /// The `Engine` reads market events and account events from a **single FIFO feed**, and the
+    /// task forwarding the market stream into it completes as soon as the stream has been
+    /// *forwarded* — not when the `Engine` has *processed* it. A stop enqueued at that moment
+    /// therefore sits ahead of every account event the run is about to produce, and the `Engine`
+    /// terminates on it without ever reading them.
+    ///
+    /// Ordering alone cannot fix that: the responses are provoked *by* processing the final market
+    /// events, so they are necessarily behind any marker placed after those events.
+    /// [`Shutdown::AfterDrain`] instead has the `Engine` stop generating new orders and wait until
+    /// nothing is left in flight, which is the only point at which the run has genuinely finished.
     ///
     /// # Panics
     /// Panics if the Engine task has already dropped its receiver (i.e., panicked).
@@ -145,12 +165,14 @@ where
             audit: _,
         } = self;
 
-        // Wait for MarketStream to finish forwarding to Engine before initiating Shutdown
+        // Wait for the MarketStream to finish forwarding before initiating shutdown. Note that
+        // this returns once the events are IN the feed, not once the Engine has processed them --
+        // which is precisely why the stop below has to be `AfterDrain` rather than immediate.
         market_to_engine.await?;
 
         #[allow(clippy::expect_used)] // Critical invariant: Engine must be alive during shutdown
         feed_tx
-            .send(Shutdown)
+            .send(Shutdown::AfterDrain)
             .expect("Engine cannot drop Feed receiver");
         drop(feed_tx);
 
