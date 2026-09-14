@@ -62,7 +62,7 @@ use rustrade_data::{
 };
 use rustrade_instrument::instrument::market_data::kind::MarketDataInstrumentKind;
 use serial_test::serial;
-use std::time::Duration;
+use std::{collections::BTreeSet, time::Duration};
 use tracing_subscriber::{EnvFilter, fmt};
 
 fn init_logging() {
@@ -271,12 +271,21 @@ async fn test_crypto_multiple_symbols() {
 
     let mut btc_seen = false;
     let mut eth_seen = false;
+    // Track what actually arrived so a failure distinguishes the three causes that look
+    // identical from the outside: a stream that delivered nothing (events == 0), a symbol
+    // that never traded in the window (events > 0 but its base absent), and a base name
+    // that did not round-trip as subscribed (bases holds something unexpected).
+    let mut events = 0usize;
+    let mut bases = BTreeSet::<String>::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
 
     while !(btc_seen && eth_seen) && tokio::time::Instant::now() < deadline {
         let timeout = tokio::time::timeout(Duration::from_secs(30), stream.next()).await;
         if let Ok(Some(Event::Item(event))) = timeout {
-            match event.instrument.base.as_ref() {
+            events += 1;
+            let base = event.instrument.base.as_ref();
+            bases.insert(base.to_string());
+            match base {
                 "btc" => {
                     btc_seen = true;
                     tracing::info!("Received BTC trade");
@@ -290,8 +299,14 @@ async fn test_crypto_multiple_symbols() {
         }
     }
 
-    assert!(btc_seen, "No BTC trades received within timeout");
-    assert!(eth_seen, "No ETH trades received within timeout");
+    assert!(
+        btc_seen,
+        "No BTC trades received within timeout (events={events}, bases={bases:?}, eth_seen={eth_seen})"
+    );
+    assert!(
+        eth_seen,
+        "No ETH trades received within timeout (events={events}, bases={bases:?}, btc_seen={btc_seen})"
+    );
 }
 
 // ============================================================================
@@ -802,10 +817,15 @@ async fn test_fetch_aapl_chain_snapshot_with_greeks() {
     let today = Utc::now().date_naive();
     let thirty_days = today + chrono::Duration::days(30);
 
+    // `limit` is the PAGE SIZE, not a cap on results: `fetch_contracts` pages until the
+    // chain is exhausted. A page size of 10 walks the whole 30-day AAPL chain ten contracts
+    // at a time and trips the client's 100-page runaway guard with
+    // `PaginationLimitExceeded { pages: 101, limit: 100 }`. Use the same page size as
+    // `test_fetch_aapl_option_contracts`, which covers a wider window without tripping it.
     let query = AlpacaOptionContractQuery::new(vec!["AAPL".into()])
         .expiration_gte(today)
         .expiration_lte(thirty_days)
-        .limit(10);
+        .limit(100);
 
     let contracts = client
         .fetch_contracts(&query)
@@ -814,8 +834,14 @@ async fn test_fetch_aapl_chain_snapshot_with_greeks() {
 
     assert!(!contracts.is_empty(), "No contracts to fetch snapshots for");
 
-    // Fetch snapshots for these contracts
-    let symbols: Vec<String> = contracts.iter().map(|c| c.symbol.clone()).collect();
+    // Snapshot only a small slice. The snapshot endpoint takes an explicit symbol list and
+    // the full 30-day AAPL chain runs to thousands of contracts, which is both needlessly
+    // slow and far more than this test needs to verify Greeks come back populated.
+    let symbols: Vec<String> = contracts
+        .iter()
+        .take(10)
+        .map(|c| c.symbol.clone())
+        .collect();
 
     let snapshots = client
         .fetch_snapshots(&symbols, AlpacaOptionFeed::Indicative)
