@@ -1205,6 +1205,7 @@ fn bar_size_to_step(bar_size: BarSize) -> IntervalStep {
         BarSize::Min => IntervalStep::Fixed(ChronoDuration::minutes(1)),
         BarSize::Min2 => IntervalStep::Fixed(ChronoDuration::minutes(2)),
         BarSize::Min3 => IntervalStep::Fixed(ChronoDuration::minutes(3)),
+        BarSize::Min4 => IntervalStep::Fixed(ChronoDuration::minutes(4)),
         BarSize::Min5 => IntervalStep::Fixed(ChronoDuration::minutes(5)),
         BarSize::Min10 => IntervalStep::Fixed(ChronoDuration::minutes(10)),
         BarSize::Min15 => IntervalStep::Fixed(ChronoDuration::minutes(15)),
@@ -1371,6 +1372,25 @@ mod tests {
         // zero (trade count) or a nonsensical negative (volume).
         assert_eq!(candle.trade_count, None);
         assert_eq!(candle.volume, None);
+    }
+
+    #[test]
+    fn bar_to_candle_four_minute_boundary() {
+        // `BarSize::Min4` arrived in ibapi 3.3.0. Pin its step here so the arm
+        // added to `bar_size_to_step` is the 4-minute one and not a copy-paste
+        // of a neighbouring arm — a wrong step silently mislabels every
+        // `close_time` for this resolution rather than failing loudly.
+        let open = datetime!(2024-01-15 16:00 UTC);
+        let bar = bar_at(open.into());
+
+        let candle = bar_to_candle(&bar, BarSize::Min4).unwrap();
+
+        assert_eq!(
+            candle.close_time,
+            DateTime::from_timestamp(open.unix_timestamp(), 0).unwrap()
+                + ChronoDuration::minutes(4)
+        );
+        assert_eq!(candle.close_time.minute(), 4);
     }
 
     #[test]
