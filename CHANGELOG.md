@@ -533,6 +533,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now writes to a gitignored `local-data/databento/` and says plainly that committing it is a
   breach.
 
+- **`binance-sdk` 60.0.0 → 69.1.0** (`rustrade-execution`, `binance` feature). Nine majors, but the
+  version number tracks Binance's REST surface rather than dependency churn: the SDK's dependency
+  set is byte-for-byte identical across the whole range, and the only manifest change is the removal
+  of an `nft` feature we never enabled. The bump is **behaviour-preserving on the wire** — no request
+  this crate sends changes shape or value — and the entire migration is a consequence of the SDK
+  replacing stringly-typed parameters with generated enums:
+  - **`isIsolated`, order `type` and `sideEffectType` are now typed enums**, one generated per
+    endpoint, where they were `String`. Every variant serialises to the string it replaces
+    (`"TRUE"`/`"FALSE"`, `"LIMIT"`, `"AUTO_BORROW_REPAY"`, …), so the margin cross/isolated mode,
+    order kinds and borrow policy all map exactly as before — the compiler now checks what was
+    previously a hand-built string.
+  - **`GET /api/v3/openOrders` returns its own response struct** (`GetOpenOrdersResponseInner`)
+    rather than sharing `allOrders`' `AllOrdersResponseInner`. The two are structurally identical;
+    the open-order converter is now generic over the ten fields it actually reads, so a future SDK
+    change to any *other* field cannot silently affect open-order parsing.
+
+  No public API of this crate changes: the SDK enums are confined to the client internals, and
+  `MarginSideEffect` / `BinanceOrderType` keep their existing shape. The three
+  `binance_sdk::common` internals the margin user-data stream depends on were re-verified against
+  the 69.1.0 source and all still hold — `common/websocket.rs` is in fact byte-identical between the
+  two versions, so the sequential-callback guarantee the margin `account_stream` relies on for
+  soundness is unchanged. **Known, pre-existing and not introduced by this bump:** binance-sdk logs
+  the full signed WebSocket request — including `apiKey` and `signature` — at `DEBUG` level
+  (`api_secret` is never logged). Enabling `DEBUG` tracing for that crate will put short-lived
+  credentials in your logs.
+
 - **`ibapi` 3.2.0 → 3.3.0** (`rustrade-data`, `rustrade-execution`, `rustrade-instrument`, `ibkr`
   feature). Two consequences reach this crate's public API, because `ibapi` types are exposed
   directly on it — `HistoricalRequest::bar_size` is an `ibapi` `BarSize` and `ToDuration` is
