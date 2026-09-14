@@ -229,13 +229,22 @@ async fn test_crypto_quote_stream_receives_data() {
     panic!("No crypto quote events received within timeout");
 }
 
+/// Verifies that two subscriptions share one connection and both deliver, and that each
+/// instrument's base name round-trips as subscribed.
+///
+/// Subscribes to [`Quotes`] rather than `PublicTrades` on purpose. Alpaca's crypto feed carries
+/// its own venue's fills, not a consolidated tape, so trades there are sparse and bursty: a run
+/// of this test against `PublicTrades` saw three BTC trades and no ETH trade in 120 seconds, and
+/// an earlier run saw the reverse. That made the assertion one about market liquidity, which no
+/// choice of timeout makes deterministic. Quotes tick on both symbols continuously and
+/// independently of trade flow, so they exercise the same property reliably.
 #[tokio::test]
 #[ignore]
 #[serial]
 async fn test_crypto_multiple_symbols() {
     init_logging();
 
-    let streams = Streams::<PublicTrades>::builder()
+    let streams = Streams::<Quotes>::builder()
         .subscribe(
             AlpacaSubscriber::from_env().unwrap(),
             [
@@ -244,14 +253,14 @@ async fn test_crypto_multiple_symbols() {
                     "btc",
                     "usd",
                     MarketDataInstrumentKind::Spot,
-                    PublicTrades,
+                    Quotes,
                 ),
                 (
                     AlpacaCrypto::default(),
                     "eth",
                     "usd",
                     MarketDataInstrumentKind::Spot,
-                    PublicTrades,
+                    Quotes,
                 ),
             ],
         )
@@ -273,11 +282,11 @@ async fn test_crypto_multiple_symbols() {
     let mut eth_seen = false;
     // Track what actually arrived so a failure distinguishes the three causes that look
     // identical from the outside: a stream that delivered nothing (events == 0), a symbol
-    // that never traded in the window (events > 0 but its base absent), and a base name
+    // that never quoted in the window (events > 0 but its base absent), and a base name
     // that did not round-trip as subscribed (bases holds something unexpected).
     let mut events = 0usize;
     let mut bases = BTreeSet::<String>::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 
     while !(btc_seen && eth_seen) && tokio::time::Instant::now() < deadline {
         let timeout = tokio::time::timeout(Duration::from_secs(30), stream.next()).await;
@@ -288,11 +297,11 @@ async fn test_crypto_multiple_symbols() {
             match base {
                 "btc" => {
                     btc_seen = true;
-                    tracing::info!("Received BTC trade");
+                    tracing::info!("Received BTC quote");
                 }
                 "eth" => {
                     eth_seen = true;
-                    tracing::info!("Received ETH trade");
+                    tracing::info!("Received ETH quote");
                 }
                 _ => {}
             }
@@ -301,11 +310,11 @@ async fn test_crypto_multiple_symbols() {
 
     assert!(
         btc_seen,
-        "No BTC trades received within timeout (events={events}, bases={bases:?}, eth_seen={eth_seen})"
+        "No BTC quotes received within timeout (events={events}, bases={bases:?}, eth_seen={eth_seen})"
     );
     assert!(
         eth_seen,
-        "No ETH trades received within timeout (events={events}, bases={bases:?}, btc_seen={btc_seen})"
+        "No ETH quotes received within timeout (events={events}, bases={bases:?}, btc_seen={btc_seen})"
     );
 }
 
