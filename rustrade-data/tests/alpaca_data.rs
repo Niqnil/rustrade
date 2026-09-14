@@ -132,24 +132,33 @@ async fn test_crypto_trade_stream_receives_data() {
         .select_all()
         .with_error_handler(|e| tracing::warn!(?e, "Stream error"));
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    // Poll until the deadline rather than asserting on each 30-second window. Alpaca's crypto
+    // feed carries its own venue's fills, not a consolidated tape, so trades are sparse: a run of
+    // the sibling multi-symbol test observed three BTC trades across 120 seconds. A quiet
+    // 30-second window is therefore ordinary, and asserting inside the loop turned the first one
+    // into a failure while the rest of the budget went unused. The deadline is sized against that
+    // observed rate instead.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    let mut non_trade_events = 0usize;
 
     while tokio::time::Instant::now() < deadline {
-        let timeout = tokio::time::timeout(Duration::from_secs(30), stream.next()).await;
-        assert!(timeout.is_ok(), "Timeout waiting for crypto trade data");
-
-        let event = timeout.unwrap();
-        assert!(event.is_some(), "Stream ended without data");
-
-        if let Event::Item(trade) = event.unwrap() {
-            tracing::info!(?trade, "Received crypto trade");
-            assert!(trade.kind.price > Decimal::ZERO, "Invalid trade price");
-            assert!(trade.kind.amount > Decimal::ZERO, "Invalid trade amount");
-            return;
+        match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
+            // A quiet window is not a failure on this feed; only the deadline ends the loop.
+            Err(_) => continue,
+            Ok(None) => panic!("Stream ended without data (non-trade events={non_trade_events})"),
+            Ok(Some(Event::Item(trade))) => {
+                tracing::info!(?trade, "Received crypto trade");
+                assert!(trade.kind.price > Decimal::ZERO, "Invalid trade price");
+                assert!(trade.kind.amount > Decimal::ZERO, "Invalid trade amount");
+                return;
+            }
+            // Reconnects and other non-item events carry no payload to assert on, but counting
+            // them separates a silent stream from one that is alive and simply has no trades.
+            Ok(Some(_)) => non_trade_events += 1,
         }
     }
 
-    panic!("No crypto trade events received within timeout");
+    panic!("No crypto trades received within 180s (non-trade events={non_trade_events})");
 }
 
 #[tokio::test]
@@ -205,28 +214,30 @@ async fn test_crypto_quote_stream_receives_data() {
         .select_all()
         .with_error_handler(|e| tracing::warn!(?e, "Stream error"));
 
+    // Same shape as the trade test above: a quiet window must not end the run early. Quotes tick
+    // continuously and independently of trade flow, so 60 seconds is ample here.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut non_quote_events = 0usize;
 
     while tokio::time::Instant::now() < deadline {
-        let timeout = tokio::time::timeout(Duration::from_secs(30), stream.next()).await;
-        assert!(timeout.is_ok(), "Timeout waiting for crypto quote data");
-
-        let event = timeout.unwrap();
-        assert!(event.is_some(), "Stream ended without data");
-
-        if let Event::Item(quote) = event.unwrap() {
-            tracing::info!(?quote, "Received crypto quote");
-            assert!(quote.kind.bid_price > Decimal::ZERO, "Invalid bid price");
-            assert!(quote.kind.ask_price > Decimal::ZERO, "Invalid ask price");
-            assert!(
-                quote.kind.ask_price >= quote.kind.bid_price,
-                "Ask < Bid (crossed market)"
-            );
-            return;
+        match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
+            Err(_) => continue,
+            Ok(None) => panic!("Stream ended without data (non-quote events={non_quote_events})"),
+            Ok(Some(Event::Item(quote))) => {
+                tracing::info!(?quote, "Received crypto quote");
+                assert!(quote.kind.bid_price > Decimal::ZERO, "Invalid bid price");
+                assert!(quote.kind.ask_price > Decimal::ZERO, "Invalid ask price");
+                assert!(
+                    quote.kind.ask_price >= quote.kind.bid_price,
+                    "Ask < Bid (crossed market)"
+                );
+                return;
+            }
+            Ok(Some(_)) => non_quote_events += 1,
         }
     }
 
-    panic!("No crypto quote events received within timeout");
+    panic!("No crypto quotes received within 60s (non-quote events={non_quote_events})");
 }
 
 /// Verifies that two subscriptions share one connection and both deliver, and that each
