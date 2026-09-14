@@ -655,11 +655,11 @@ where
 /// Venue-neutral Binance order type — the single source of truth for mapping a rustrade
 /// [`OrderKind`] to Binance order semantics, shared by the spot and margin clients.
 ///
-/// Spot maps this to the WS-API `OrderPlaceTypeEnum`; margin maps it to the REST `r#type`
-/// **string** (the margin SDK types the field as a plain `String`, not an enum) via
-/// [`as_binance_str`](Self::as_binance_str). Keeping the decision logic here (in
-/// [`classify_order_kind_tif`]) avoids duplicating the match arms across the two clients,
-/// which differ only in their SDK output types.
+/// Each client maps this onto its own SDK's per-endpoint order-type enum (spot's WS-API
+/// `OrderPlaceTypeEnum`, margin's REST `MarginAccountNewOrderTypeEnum`), so neither ever builds
+/// the wire string by hand. Keeping the decision logic here (in [`classify_order_kind_tif`])
+/// avoids duplicating the match arms across the two clients, which differ only in their SDK
+/// output types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BinanceOrderType {
     Market,
@@ -669,21 +669,6 @@ pub(crate) enum BinanceOrderType {
     StopLossLimit,
     TakeProfit,
     TakeProfitLimit,
-}
-
-impl BinanceOrderType {
-    /// The Binance API order-type wire string (e.g. `"STOP_LOSS_LIMIT"`).
-    pub(crate) fn as_binance_str(self) -> &'static str {
-        match self {
-            BinanceOrderType::Market => "MARKET",
-            BinanceOrderType::Limit => "LIMIT",
-            BinanceOrderType::LimitMaker => "LIMIT_MAKER",
-            BinanceOrderType::StopLoss => "STOP_LOSS",
-            BinanceOrderType::StopLossLimit => "STOP_LOSS_LIMIT",
-            BinanceOrderType::TakeProfit => "TAKE_PROFIT",
-            BinanceOrderType::TakeProfitLimit => "TAKE_PROFIT_LIMIT",
-        }
-    }
 }
 
 /// Venue-neutral Binance time-in-force. Both spot and margin expose exactly `GTC`/`IOC`/`FOK`

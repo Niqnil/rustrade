@@ -1785,15 +1785,61 @@ fn filter_and_convert_balances(
         .collect()
 }
 
+/// The subset of a Binance spot order-response struct that [`convert_open_order`] reads.
+///
+/// `GET /api/v3/allOrders` and `GET /api/v3/openOrders` return structurally identical orders, but
+/// binance-sdk generates a *distinct* response type per endpoint (`AllOrdersResponseInner` and
+/// `GetOpenOrdersResponseInner`) with no shared trait. Rather than duplicate the converter or
+/// adapt all 32 fields, this trait names the 10 fields the conversion actually depends on — so the
+/// dependency surface is explicit, and a future SDK change to any *other* field cannot silently
+/// affect open-order parsing.
+trait SpotOrderFields {
+    fn order_id(&self) -> Option<i64>;
+    fn client_order_id(&self) -> Option<&str>;
+    fn side(&self) -> Option<&str>;
+    fn price(&self) -> Option<&str>;
+    fn orig_qty(&self) -> Option<&str>;
+    fn executed_qty(&self) -> Option<&str>;
+    fn order_type(&self) -> Option<&str>;
+    fn time_in_force(&self) -> Option<&str>;
+    fn time(&self) -> Option<i64>;
+    fn symbol(&self) -> Option<&str>;
+}
+
+/// Implement [`SpotOrderFields`] for SDK response types that share these field names.
+///
+/// The two endpoint structs declare the same fields with the same types, so the accessors are
+/// identical; a macro keeps them from drifting apart under hand-editing.
+macro_rules! impl_spot_order_fields {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl SpotOrderFields for $t {
+                fn order_id(&self) -> Option<i64> { self.order_id }
+                fn client_order_id(&self) -> Option<&str> { self.client_order_id.as_deref() }
+                fn side(&self) -> Option<&str> { self.side.as_deref() }
+                fn price(&self) -> Option<&str> { self.price.as_deref() }
+                fn orig_qty(&self) -> Option<&str> { self.orig_qty.as_deref() }
+                fn executed_qty(&self) -> Option<&str> { self.executed_qty.as_deref() }
+                fn order_type(&self) -> Option<&str> { self.r#type.as_deref() }
+                fn time_in_force(&self) -> Option<&str> { self.time_in_force.as_deref() }
+                fn time(&self) -> Option<i64> { self.time }
+                fn symbol(&self) -> Option<&str> { self.symbol.as_deref() }
+            }
+        )*
+    };
+}
+
+impl_spot_order_fields!(
+    binance_sdk::spot::rest_api::AllOrdersResponseInner,
+    binance_sdk::spot::rest_api::GetOpenOrdersResponseInner,
+);
+
 /// Convert a Binance open order into rustrade's Open state order.
-// `AllOrdersResponseInner` is the response type for both `GET /api/v3/allOrders`
-// and `GET /api/v3/openOrders` in binance-sdk =50.0.0 — they share the same struct.
-// Verified against the SDK source. Re-verify on SDK upgrade if open-orders parsing breaks.
-fn convert_open_order(
-    o: &binance_sdk::spot::rest_api::AllOrdersResponseInner,
+fn convert_open_order<T: SpotOrderFields>(
+    o: &T,
     instrument: &InstrumentNameExchange,
 ) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
-    let order_id_raw = match o.order_id {
+    let order_id_raw = match o.order_id() {
         Some(id) => id,
         None => {
             warn!(%instrument, "BinanceSpot open order missing orderId");
@@ -1801,15 +1847,14 @@ fn convert_open_order(
         }
     };
     let order_id = OrderId(format_smolstr!("{}", order_id_raw));
-    if o.client_order_id.is_none() {
+    if o.client_order_id().is_none() {
         warn!(%instrument, order_id = %order_id_raw, "BinanceSpot open order missing clientOrderId, using orderId as fallback — order may not reconcile with engine state");
     }
     let cid = ClientOrderId::new(
-        o.client_order_id
-            .as_deref()
+        o.client_order_id()
             .unwrap_or(&format_smolstr!("{}", order_id_raw)),
     );
-    let side = match o.side.as_deref() {
+    let side = match o.side() {
         // parse_side already logs a warning on unknown values
         Some(s) => parse_side(s)?,
         None => {
@@ -1817,19 +1862,15 @@ fn convert_open_order(
             return None;
         }
     };
-    let price = o.price.as_deref().and_then(|s| Decimal::from_str(s).ok());
-    let quantity = match o
-        .orig_qty
-        .as_deref()
-        .and_then(|s| Decimal::from_str(s).ok())
-    {
+    let price = o.price().and_then(|s| Decimal::from_str(s).ok());
+    let quantity = match o.orig_qty().and_then(|s| Decimal::from_str(s).ok()) {
         Some(v) => v,
         None => {
             warn!(%instrument, order_id = %order_id_raw, "BinanceSpot open order missing/unparseable origQty");
             return None;
         }
     };
-    let filled_qty = match o.executed_qty.as_deref() {
+    let filled_qty = match o.executed_qty() {
         Some(s) => match Decimal::from_str(s) {
             Ok(v) => v,
             Err(_) => {
@@ -1839,7 +1880,7 @@ fn convert_open_order(
         },
         None => Decimal::ZERO,
     };
-    let kind = match o.r#type.as_deref() {
+    let kind = match o.order_type() {
         // parse_order_kind already logs a warning on unknown values
         Some(t) => parse_order_kind(t)?,
         None => {
@@ -1847,8 +1888,11 @@ fn convert_open_order(
             return None;
         }
     };
-    let time_in_force = parse_time_in_force(o.time_in_force.as_deref().unwrap_or("GTC"));
-    let time_exchange = match o.time.and_then(|ms| Utc.timestamp_millis_opt(ms).single()) {
+    let time_in_force = parse_time_in_force(o.time_in_force().unwrap_or("GTC"));
+    let time_exchange = match o
+        .time()
+        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+    {
         Some(ts) => ts,
         None => {
             warn!(%instrument, order_id = %order_id_raw, "BinanceSpot open order missing/unparseable time, using now");
@@ -1878,10 +1922,10 @@ fn convert_open_order(
 /// rather than supplied by the caller. Used by the no-symbol "return all" path
 /// ([`fetch_all_open_orders`]), where each order may belong to a different instrument. Drops
 /// (with a warning) any order missing `symbol`; otherwise delegates to [`convert_open_order`].
-fn convert_open_order_owned_symbol(
-    o: &binance_sdk::spot::rest_api::AllOrdersResponseInner,
+fn convert_open_order_owned_symbol<T: SpotOrderFields>(
+    o: &T,
 ) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
-    let instrument = match o.symbol.as_deref() {
+    let instrument = match o.symbol() {
         Some(s) => InstrumentNameExchange::new(s),
         None => {
             warn!("BinanceSpot open order missing symbol in return-all query, dropping order");
@@ -3725,8 +3769,8 @@ mod tests {
     // convert_open_order tests
     // ---------------------------------------------------------------------------
 
-    fn make_base_open_order() -> binance_sdk::spot::rest_api::AllOrdersResponseInner {
-        binance_sdk::spot::rest_api::AllOrdersResponseInner {
+    fn make_base_open_order() -> binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
+        binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
             order_id: Some(12345),
             client_order_id: Some("cid-abc".to_string()),
             side: Some("BUY".to_string()),
@@ -3738,6 +3782,32 @@ mod tests {
             time: Some(1_700_000_000_000),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn test_convert_open_order_all_orders_response_converts_identically() {
+        // `convert_open_order` is generic over `SpotOrderFields`; the live open-orders path feeds
+        // it `GetOpenOrdersResponseInner` (what every other test here uses) while `allOrders`
+        // would feed it `AllOrdersResponseInner`. Pin that the second impl reads the same fields,
+        // so the two endpoint structs cannot drift apart unnoticed.
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+        let all_orders = binance_sdk::spot::rest_api::AllOrdersResponseInner {
+            order_id: Some(12345),
+            client_order_id: Some("cid-abc".to_string()),
+            side: Some("BUY".to_string()),
+            r#type: Some("LIMIT".to_string()),
+            price: Some("50000.00".to_string()),
+            orig_qty: Some("0.01".to_string()),
+            executed_qty: Some("0.0".to_string()),
+            time_in_force: Some("GTC".to_string()),
+            time: Some(1_700_000_000_000),
+            ..Default::default()
+        };
+        let from_all_orders =
+            convert_open_order(&all_orders, &instrument).expect("valid order should convert");
+        let from_open_orders = convert_open_order(&make_base_open_order(), &instrument)
+            .expect("valid order should convert");
+        assert_eq!(from_all_orders, from_open_orders);
     }
 
     #[test]
@@ -3756,7 +3826,7 @@ mod tests {
     #[test]
     fn test_convert_open_order_owned_symbol_recovers_instrument() {
         // The no-symbol "return all" path derives the instrument from each order's own `symbol`.
-        let o = binance_sdk::spot::rest_api::AllOrdersResponseInner {
+        let o = binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
             symbol: Some("ETHUSDT".to_string()),
             ..make_base_open_order()
         };
@@ -3776,7 +3846,7 @@ mod tests {
     #[test]
     fn test_convert_open_order_missing_order_id_returns_none() {
         let instrument = InstrumentNameExchange::new("BTCUSDT");
-        let o = binance_sdk::spot::rest_api::AllOrdersResponseInner {
+        let o = binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
             order_id: None,
             ..make_base_open_order()
         };
@@ -3789,7 +3859,7 @@ mod tests {
     #[test]
     fn test_convert_open_order_missing_side_returns_none() {
         let instrument = InstrumentNameExchange::new("BTCUSDT");
-        let o = binance_sdk::spot::rest_api::AllOrdersResponseInner {
+        let o = binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
             side: None,
             ..make_base_open_order()
         };
@@ -3802,7 +3872,7 @@ mod tests {
     #[test]
     fn test_convert_open_order_missing_type_returns_none() {
         let instrument = InstrumentNameExchange::new("BTCUSDT");
-        let o = binance_sdk::spot::rest_api::AllOrdersResponseInner {
+        let o = binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
             r#type: None,
             ..make_base_open_order()
         };
@@ -3815,7 +3885,7 @@ mod tests {
     #[test]
     fn test_convert_open_order_executed_qty_none_defaults_to_zero() {
         let instrument = InstrumentNameExchange::new("BTCUSDT");
-        let o = binance_sdk::spot::rest_api::AllOrdersResponseInner {
+        let o = binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
             executed_qty: None,
             ..make_base_open_order()
         };
@@ -3831,7 +3901,7 @@ mod tests {
     #[test]
     fn test_convert_open_order_executed_qty_unparseable_defaults_to_zero() {
         let instrument = InstrumentNameExchange::new("BTCUSDT");
-        let o = binance_sdk::spot::rest_api::AllOrdersResponseInner {
+        let o = binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
             executed_qty: Some("bad-value".to_string()),
             ..make_base_open_order()
         };
