@@ -11,6 +11,10 @@
 #
 # Pinned entries include: # review-date | risk-factors
 # The auto-merge workflow reads this file and applies 'tier-2' label.
+# The "tier-2 pins" CI job (.github/scripts/check-tier2-pins.sh) enforces that every PINNED
+# entry above matches the `=` requirement in every manifest declaring that crate, so a bump
+# cannot land while leaving this record behind. CI cannot verify that the re-verification a
+# pinned entry mandates was actually performed — only that this file was not left untouched.
 
 ibapi=3.3.0  # 2026-09-14 | Financial protocol, community-maintained, no official SDK. Reviewed 3.2.0->3.3.0, all four properties recorded at 3.2.0 re-verified and still hold: zero unsafe (also no transmute/from_raw/extern "C"/asm!; holds by inspection, not by lint — upstream has no #![forbid(unsafe_code)]), no build.rs, dependency tree byte-identical vs 3.2.0 (both Cargo.toml and Cargo.lock differ by the version line alone; 9 direct deps under our `default-features = false, features = ["sync"]` selection, unchanged), still only a caller-supplied TWS socket (reconnect reuses the caller's address — no fallback host, no telemetry) + the opt-in local recorder dir (IBAPI_RECORDING_DIR; recorder.rs byte-identical). Env set unchanged (IBAPI_RECORDING_DIR, IBAPI_TIMEZONE_ALIASES); no process spawn, no obfuscation; published from git b140b312d1136d240f3b5651a89f4778e01aa222.
 #   New in 3.3.0, reviewed: `src/config` — despite the name it reads NO local files and NO env vars. It wraps two TWS wire messages (ReqConfig=108/UpdateConfig=109) over the already-open socket, whose protobuf types already existed in 3.2.0. Version-gated, #[must_use] builder, not reachable during connect/handshake.
