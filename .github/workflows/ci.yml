@@ -34,6 +34,22 @@ jobs:
       - name: Run cargo fmt
         run: cargo fmt --all -- --check
 
+  tier2-pins:
+    name: tier-2 pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      # Only `cargo metadata --no-deps` is run, which reads the workspace manifests without
+      # resolving or building anything -- no toolchain components and no network are needed.
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+
+      - name: Check tier-2 pins match the record
+        run: ./.github/scripts/check-tier2-pins.sh
+
   check:
     name: cargo check
     runs-on: ubuntu-latest
