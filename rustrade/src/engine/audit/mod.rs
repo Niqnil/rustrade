@@ -171,13 +171,13 @@ pub struct ProcessAudit<Event, Output> {
     ///
     /// Currently that means a [`Shutdown::AfterDrain`] drain completed: the event that ends the run
     /// is then the ordinary account update which resolved the last in-flight order, and nothing
-    /// about that event is terminal. Carried on the audit rather than re-derived so an
-    /// [`AuditManager`] replica reaches the same stop decision from the stream alone.
+    /// about that event is terminal. Carried on the audit rather than re-derived so a
+    /// [`StateReplicaManager`] reaches the same stop decision from the stream alone.
     ///
     /// `#[serde(default)]` so audits serialised before this field existed still load.
     ///
     /// [`Shutdown::AfterDrain`]: crate::shutdown::Shutdown::AfterDrain
-    /// [`AuditManager`]: crate::engine::audit::manager::AuditManager
+    /// [`StateReplicaManager`]: crate::engine::audit::state_replica::StateReplicaManager
     #[serde(default)]
     pub shutdown: bool,
 }

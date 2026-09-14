@@ -72,7 +72,7 @@ impl<Interval> TradingSummary<Interval> {
     /// reported here.
     ///
     /// Per-instrument counts and the first rejection reason are on each
-    /// [`TearSheet`](super::summary::instrument::TearSheet).
+    /// [`TearSheet`].
     pub fn rejected_every_order(&self) -> bool {
         self.orders_opened > 0 && self.orders_rejected == self.orders_opened
     }

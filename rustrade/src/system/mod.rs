@@ -80,8 +80,9 @@ where
     /// normally what live trading wants: stopping should not wait on a venue that may be slow or
     /// unreachable.
     ///
-    /// A caller that would rather wait for those responses can send [`Shutdown::AfterDrain`] itself
-    /// via [`System::send`] instead of calling this.
+    /// A caller that would rather wait for those responses sends [`Shutdown::AfterDrain`] into the
+    /// `Engine` feed itself instead of calling this — as
+    /// [`shutdown_after_backtest`](Self::shutdown_after_backtest) does.
     pub async fn shutdown(mut self) -> Result<(Engine, Engine::Audit), JoinError>
     where
         Event: From<Shutdown>,
