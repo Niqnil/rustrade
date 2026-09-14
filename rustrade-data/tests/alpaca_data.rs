@@ -41,6 +41,10 @@
 //! Connection and subscription tests work anytime.
 //!
 //! Crypto streams (BTC/USD, etc.) are available 24/7 and are the primary validation.
+//!
+//! - WebSocket tests are marked `#[serial]` to prevent connection conflicts. Alpaca rejects
+//!   concurrent data-stream connections with "auth failed: connection limit exceeded", so
+//!   running them in parallel fails every connection but the one that wins the race.
 
 #![cfg(feature = "alpaca")]
 // Test code: unwrap/expect panics are the correct failure mode for test assertions
@@ -57,6 +61,7 @@ use rustrade_data::{
     subscription::{quote::Quotes, trade::PublicTrades},
 };
 use rustrade_instrument::instrument::market_data::kind::MarketDataInstrumentKind;
+use serial_test::serial;
 use std::time::Duration;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -76,6 +81,7 @@ fn init_logging() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_crypto_trade_stream_connection() {
     init_logging();
 
@@ -103,6 +109,7 @@ async fn test_crypto_trade_stream_connection() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_crypto_trade_stream_receives_data() {
     init_logging();
 
@@ -147,6 +154,7 @@ async fn test_crypto_trade_stream_receives_data() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_crypto_quote_stream_connection() {
     init_logging();
 
@@ -174,6 +182,7 @@ async fn test_crypto_quote_stream_connection() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_crypto_quote_stream_receives_data() {
     init_logging();
 
@@ -222,6 +231,7 @@ async fn test_crypto_quote_stream_receives_data() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn test_crypto_multiple_symbols() {
     init_logging();
 
