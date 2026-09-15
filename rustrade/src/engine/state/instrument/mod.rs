@@ -814,9 +814,23 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             .map(|o| matches!(o.state, ActiveOrderState::OpenInFlight(_)))
             .unwrap_or(false);
 
+        // Any transition out of OpenInFlight that carries the exchange OrderId resolves the
+        // CID <-> OrderId mapping, and so must drive (a) and (b) below.
+        //
+        // FullyFilled is not an edge case: a venue that answers the REST open with an
+        // already-filled order reports the fill and the ack in the same response, and never
+        // publishes an intermediate Open. Binance (`newOrderRespType=FULL`), Alpaca and IBKR all
+        // do this for marketable orders. When the corresponding Trade arrives on the websocket
+        // first -- the common case, websockets being faster than a REST round trip -- it is parked
+        // in `pending_fills` awaiting an ack that, if only Open were matched here, would never
+        // qualify. The fill would then sit unreplayed for the rest of the run: the position never
+        // opens while the balance is debited, leaving the two ledgers disagreeing.
         let ack_exchange_id: Option<OrderId> = if currently_open_in_flight {
             match &order.0.state {
                 OrderState::Active(ActiveOrderState::Open(open)) => Some(open.id.clone()),
+                OrderState::Inactive(InactiveOrderState::FullyFilled(filled)) => {
+                    Some(filled.id.clone())
+                }
                 _ => None,
             }
         } else {

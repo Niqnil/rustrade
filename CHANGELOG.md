@@ -1166,6 +1166,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Fills were silently lost when a venue acknowledged an order as already filled**
+  (`rustrade`). In `OmsMode::Hedging`, a `Trade` that arrives before the order acknowledgement is
+  parked in `pending_fills` and replayed once the acknowledgement resolves the exchange `OrderId`.
+  That replay was armed only on the `OpenInFlight -> Active(Open)` transition, so an
+  acknowledgement whose terminal state was `Inactive(FullyFilled)` never triggered it and the fill
+  was never applied. This is not an edge case: a venue that answers the REST open with an
+  already-filled order reports the fill and the acknowledgement in one response and never publishes
+  an intermediate `Open` — Binance (`newOrderRespType=FULL`), Alpaca and IBKR all do this for
+  marketable orders — and the corresponding websocket `Trade` normally wins the race against the
+  REST round trip. The position therefore never opened while the balance was still debited, leaving
+  the two ledgers disagreeing for the rest of the session, reported only as an unreplayed entry in
+  `pending_fills`. `Netting` mode was unaffected, since it resolves `PositionId::NETTING` without
+  consulting orders at all.
+
 - **Backtests discarded every order response** (`rustrade`). No backtest could observe a fill, a
   rejection, a balance update or a trade: each run reported a tear sheet of zeros indistinguishable
   from a strategy that chose to stay flat. The `Engine` reads market and account events from a
