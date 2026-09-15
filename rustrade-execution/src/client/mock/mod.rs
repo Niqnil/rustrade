@@ -10,7 +10,7 @@ use crate::{
     fee::FeeModelConfig,
     fill::SimFillConfig,
     order::{
-        Order, OrderEvent, OrderKey,
+        Order, OrderKey,
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Open, OrderState, UnindexedOrderState},
     },
@@ -213,7 +213,7 @@ where
             .send(MockExchangeRequest::cancel_order(
                 self.time_request(),
                 response_tx,
-                into_owned_request(request),
+                request.into_owned_instrument(),
             ))
             .is_err()
         {
@@ -242,7 +242,7 @@ where
     ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        let request = into_owned_request(request);
+        let request = request.into_owned_instrument();
 
         if self
             .request_tx
@@ -361,31 +361,6 @@ where
                 self.mocked_exchange,
             ))
         })
-    }
-}
-
-fn into_owned_request<Kind>(
-    request: OrderEvent<Kind, ExchangeId, &InstrumentNameExchange>,
-) -> OrderEvent<Kind, ExchangeId, InstrumentNameExchange> {
-    let OrderEvent {
-        key:
-            OrderKey {
-                exchange,
-                instrument,
-                strategy,
-                cid,
-            },
-        state,
-    } = request;
-
-    OrderEvent {
-        key: OrderKey {
-            exchange,
-            instrument: instrument.clone(),
-            strategy,
-            cid,
-        },
-        state,
     }
 }
 
