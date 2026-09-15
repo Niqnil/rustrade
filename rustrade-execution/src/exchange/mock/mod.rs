@@ -110,11 +110,10 @@ impl MockExchange {
 
     /// Serves requests until the request channel closes, then lets queued fills finish.
     ///
-    /// Filled opens are not emitted inline: they are queued and drained by a single emitter task,
-    /// so that emission order equals booking order across fills — see
-    /// [`respond_open_with_latency`](Self::respond_open_with_latency). Dropping `emit_tx` when the
-    /// request loop ends closes that queue, and awaiting the emitter lets it finish what is still
-    /// queued, so shutting the venue down cannot strand a fill the client is still waiting on.
+    /// Filled opens are not emitted inline: they are queued and drained by a single task, so that
+    /// emission order equals booking order *across* fills, not merely within one. Closing the
+    /// request channel closes that queue in turn, and this method returns only once the queue has
+    /// drained, so shutting the venue down cannot strand a fill the client is still waiting on.
     pub async fn run(mut self) {
         let (emit_tx, emit_rx) = mpsc::unbounded_channel();
         let emitter = tokio::spawn(Self::emit_queued_opens(
