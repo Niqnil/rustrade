@@ -580,7 +580,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   account events those produced, and only then closes its channel, which ends the `Engine`'s feed
   and with it the run. `System::shutdown_after_backtest` correspondingly **awaits**
   `account_to_engine` instead of aborting it. `Shutdown::Immediate`, which is what live trading
-  uses, is unchanged. (#280)
+  uses, is unchanged. (#281)
 
 - **`ExecutionManager` owns its AccountStream; `init` no longer returns it separately**
   (`rustrade`). `init` returned the AccountStream merged with the response channel, which ended the
@@ -1255,7 +1255,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failed on roughly a third of runs before. Fill *timing* within the market feed is a separate,
   still-open defect ([#289](https://github.com/Niqnil/rustrade/issues/289)), so anything derived
   from when a fill was priced against the feed — `pnl_unrealised`, `time_exchange_update`,
-  tear-sheet series — is not yet deterministic. (#280)
+  tear-sheet series — is not yet deterministic. (#281)
 
 - **Fills were silently lost when a venue acknowledged an order as already filled**
   (`rustrade`). In `OmsMode::Hedging`, a `Trade` that arrives before the order acknowledgement is
