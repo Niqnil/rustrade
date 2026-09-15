@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use rustrade_data::streams::consumer::MarketStreamEvent;
 use rustrade_execution::AccountEventKind;
 use serde::{Deserialize, Serialize};
-use std::{fmt::Debug, ops::Add, sync::Arc};
+use std::{fmt::Debug, sync::Arc};
 use tracing::{debug, error, warn};
 
 /// Defines how an [`Engine`](super::Engine) will determine the current time.
@@ -68,7 +68,19 @@ impl<Event> Processor<&Event> for LiveClock {
     fn process(&mut self, _: &Event) -> Self::Audit {}
 }
 
-/// Historical `Clock` using processed event timestamps to estimate current historical time.
+/// Historical `Clock` whose "now" is the `time_exchange` of the most recent event processed.
+///
+/// [`time`](EngineClock::time) is a pure function of the events replayed so far: it returns that
+/// timestamp verbatim and never consults the wall clock. Two replays of the same data therefore
+/// read the same time at the same point, which is what makes a backtest reproducible — the clock
+/// stamps simulated fills, trades and balances through the simulated exchange, and seeds
+/// `time_engine_start`/`time_engine_end`, the denominator of every annualised statistic.
+///
+/// The consequence to know: between events the clock does **not** advance. A strategy that reads
+/// `time()` twice without an intervening event sees one instant, and a sparse feed leaves it
+/// standing still for as long as the data does. That is the correct reading of simulated time — no
+/// simulated time passes where no data does — but it differs from a wall clock, and code that
+/// measures elapsed time by differencing `time()` will measure the data rather than itself.
 ///
 /// Note that this cannot be initialised without a starting `last_exchange_timestamp`.
 #[derive(Debug, Clone)]
@@ -79,7 +91,6 @@ pub struct HistoricalClock {
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 struct HistoricalClockInner {
     time_exchange_last: DateTime<Utc>,
-    time_live_last_event: DateTime<Utc>,
 }
 
 impl HistoricalClock {
@@ -88,7 +99,6 @@ impl HistoricalClock {
         Self {
             inner: Arc::new(parking_lot::RwLock::new(HistoricalClockInner {
                 time_exchange_last: last_exchange_time,
-                time_live_last_event: Utc::now(),
             })),
         }
     }
@@ -96,33 +106,17 @@ impl HistoricalClock {
 
 impl EngineClock for HistoricalClock {
     fn time(&self) -> DateTime<Utc> {
-        let lock = self.inner.read();
-        let time_live_last_event = lock.time_live_last_event;
-        let time_exchange_last = lock.time_exchange_last;
-        drop(lock);
-
-        let delta_since_last_event_live_time =
-            Utc::now().signed_duration_since(time_live_last_event);
-
-        // Edge case: only add TimeDelta if it's positive to handle out of order updates
-        match delta_since_last_event_live_time {
-            delta if delta.num_milliseconds() >= 0 => time_exchange_last.add(delta),
-            _ => time_exchange_last,
-        }
+        self.inner.read().time_exchange_last
     }
 
     fn advance_to(&self, time: DateTime<Utc>) {
         let mut lock = self.inner.write();
-        // Monotonic: only advance strictly forwards; an earlier — or equal — `time` is a no-op, so
-        // the clock never regresses and repeated advances to the same instant (e.g. several
-        // instruments expiring together) don't keep re-basing the wall-clock delta. This is
-        // stricter than `process`'s in-order branch (`>=`, which re-anchors on an equal
-        // `time_exchange`) — here there is no boundary event to stamp, so the strict `>` is the
-        // cheaper, equivalent choice. On a genuine advance the `time_live_last_event` reset re-bases
-        // the wall-clock delta so `time()` reads from the new `time_exchange_last`.
+        // Monotonic: only advance strictly forwards, so the clock never regresses. An earlier — or
+        // equal — `time` is a no-op. This is stricter than `process`'s in-order branch (`>=`), but
+        // equivalent in effect: assigning `time_exchange_last` a value it already holds changes
+        // nothing now that no wall-clock anchor is re-based alongside it.
         if time > lock.time_exchange_last {
             lock.time_exchange_last = time;
-            lock.time_live_last_event = Utc::now();
         }
     }
 }
@@ -151,7 +145,6 @@ where
                 "HistoricalClock updating based on input event time_exchange"
             );
             lock.time_exchange_last = time_event_exchange;
-            lock.time_live_last_event = Utc::now();
             return;
         };
 
@@ -252,7 +245,6 @@ mod tests {
             time_initial: DateTime<Utc>,
             input_events: Vec<EngineEvent<()>>,
             expected_time_exchange_last: DateTime<Utc>,
-            delay_ms: Option<u64>,
         }
 
         // Create a fixed initial time to use as a base
@@ -272,7 +264,6 @@ mod tests {
                 time_initial: time_base,
                 input_events: vec![market_event(plus_ms(1000))],
                 expected_time_exchange_last: plus_ms(1000),
-                delay_ms: None,
             },
             // TC1: Out of order event - earlier than current
             TestCase {
@@ -280,7 +271,6 @@ mod tests {
                 time_initial: plus_ms(1000),
                 input_events: vec![market_event(plus_ms(500))],
                 expected_time_exchange_last: plus_ms(1000), // Should not update
-                delay_ms: None,
             },
             // TC2: Equal timestamp event
             TestCase {
@@ -288,7 +278,6 @@ mod tests {
                 time_initial: plus_ms(1000),
                 input_events: vec![market_event(plus_ms(1000))],
                 expected_time_exchange_last: plus_ms(1000), // Should maintain current time
-                delay_ms: None,
             },
             // TC3: Multiple events in order
             TestCase {
@@ -300,7 +289,6 @@ mod tests {
                     market_event(plus_ms(3000)),
                 ],
                 expected_time_exchange_last: plus_ms(3000),
-                delay_ms: Some(10), // Small delay between events
             },
             // TC4: Multiple events out of order
             TestCase {
@@ -312,7 +300,6 @@ mod tests {
                     market_event(plus_ms(2000)),
                 ],
                 expected_time_exchange_last: plus_ms(3000),
-                delay_ms: Some(10),
             },
             // TC5: Event with no timestamp
             TestCase {
@@ -322,7 +309,6 @@ mod tests {
                     ExchangeId::BinanceSpot,
                 ))],
                 expected_time_exchange_last: plus_ms(1000), // Should not update
-                delay_ms: None,
             },
             // TC6: Mixed events with and without timestamps
             TestCase {
@@ -334,7 +320,6 @@ mod tests {
                     market_event(plus_ms(2000)),
                 ],
                 expected_time_exchange_last: plus_ms(2000),
-                delay_ms: Some(10),
             },
         ];
 
@@ -345,11 +330,6 @@ mod tests {
             // Process all events
             for event in test.input_events.iter() {
                 clock.process(event);
-
-                // Add delay if specified
-                if let Some(delay) = test.delay_ms {
-                    spin_sleep::sleep(std::time::Duration::from_millis(delay));
-                }
             }
 
             assert_eq!(
@@ -362,32 +342,40 @@ mod tests {
         }
     }
 
+    /// Simulated time advances with the data, never with the host.
+    ///
+    /// This is the property the whole clock exists for: it stamps simulated fills, trades and
+    /// balances, so any wall-clock component would make two replays of one dataset disagree. The
+    /// assertion is deliberately the exact inverse of what this test asserted while `time()`
+    /// interpolated between events.
     #[test]
-    fn test_historical_clock_time_delta_calculation() {
+    fn test_historical_clock_time_does_not_advance_with_wall_clock() {
         let time_base = DateTime::<Utc>::MIN_UTC;
         let clock = HistoricalClock::new(time_base);
 
-        // Get initial time
         let time_1 = clock.time();
-
-        // Sleep to simulate time passing
         spin_sleep::sleep(std::time::Duration::from_millis(100));
-
-        // Get time after delay
         let time_2 = clock.time();
 
-        // Verify time has increased
-        assert!(
-            time_2 > time_1,
-            "Historical clock time should increase with wall clock"
+        assert_eq!(
+            time_1, time_base,
+            "a clock that has processed no event reads its seed"
+        );
+        assert_eq!(
+            time_2, time_1,
+            "100ms of wall time passed and no event did, so simulated time must not move"
         );
 
-        // Verify increase is reasonable (eg/ close to our sleep duration)
-        let delta_ms = time_2.signed_duration_since(time_1).num_milliseconds();
+        // An event is the only thing that advances it.
+        let mut clock = clock;
+        clock.process(&market_event(
+            time_base.checked_add_signed(TimeDelta::seconds(7)).unwrap(),
+        ));
 
-        assert!(
-            (95..=105).contains(&delta_ms),
-            "Historical clock time delta outside expected range"
+        assert_eq!(
+            clock.time(),
+            time_base.checked_add_signed(TimeDelta::seconds(7)).unwrap(),
+            "processing an event advances the clock to that event's time_exchange"
         );
     }
 
