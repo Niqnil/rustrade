@@ -571,6 +571,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`HistoricalClock` no longer mixes wall-clock time into simulated time** (`rustrade`).
+  `time()` returned the most recent event's `time_exchange` *plus the real time elapsed since that
+  event was processed*; it now returns that timestamp verbatim. The interpolation existed so the
+  clock would not appear frozen on a sparse feed — a presentation property bought at the cost of
+  reproducibility, because this clock is not merely read for display. It is closed into the
+  simulated exchange client, which calls it on every request, and the resulting instant stamps
+  `Filled::time_exchange`, `Trade::time_exchange` and `AssetBalance::time_exchange`; it also seeds
+  `TradingSummary::time_engine_start`/`time_engine_end`, the denominator of every annualised
+  statistic. A fill's timestamp was therefore `last_event.time_exchange + wall_clock_elapsed +
+  latency_ms / 2`, and it fed back — `process` advances the clock off `trade.time_exchange`, so the
+  drift ratcheted simulated time forward and produced the out-of-order-event warnings the clock
+  logs about itself. Measured on a three-event backtest, 50 runs previously produced **50 distinct**
+  sets of terminal timestamps; they now produce **one**. Backtests run concurrently
+  (`run_backtests` joins them), so sibling runs were perturbing each other's results.
+
+  **Behaviour change to know about:** between events the clock does not advance. A strategy that
+  reads `time()` twice without an intervening event sees one instant, and a sparse feed leaves it
+  standing still for as long as the data does. That is the correct reading of simulated time — no
+  simulated time passes where no data does — but code that measures elapsed real time by
+  differencing `time()` will now measure the dataset instead. `LiveClock` is unchanged and remains
+  the right clock for live trading. No serialised format changes: the affected field was private
+  and `HistoricalClock` derives only `Debug`/`Clone`.
+
+  This removes wall-clock dependence from the *timestamps* in a backtest. It does not make a
+  backtest reproducible on its own — where a fill lands among market events is still decided by
+  task scheduling ([#289](https://github.com/Niqnil/rustrade/issues/289)), which is why the same
+  fixture still varies between three and four orders opened. (#289)
+
 - **A drained shutdown now ends from the execution side rather than on request quiescence**
   (`rustrade`). `Shutdown::AfterDrain` previously terminated the `Engine` as soon as nothing was
   `OpenInFlight` or `CancelInFlight`. That signal is wrong: an order's *response* is what clears it
