@@ -5865,3 +5865,78 @@ fn test_shutdown_after_drain_is_terminal_when_nothing_is_in_flight() {
         "with nothing owed there is nothing to drain, so this is an immediate stop"
     );
 }
+
+/// A fill that arrives before an ack whose terminal state is `FullyFilled` is still replayed.
+///
+/// Mirrors a venue that answers the REST open with an already-filled order (Binance
+/// `newOrderRespType=FULL`, and `MockExchange` for every market order) while the fill
+/// itself arrived first on the websocket. `ack_exchange_id` is set only for
+/// `ack_exchange_id` must therefore be set for `Inactive(FullyFilled(_))` as well as
+/// `Active(Open(_))`; when it was set only for the latter the replay never ran and the
+/// fill was silently lost, leaving the position and balance ledgers disagreeing.
+#[test]
+fn test_hedging_pending_fill_replayed_on_fully_filled_ack() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_hedging_option_engine(TradingState::Disabled, execution_tx);
+
+    let cid = ClientOrderId::new("cid-ff");
+    let pos_id = PositionId::new("leg-ff");
+    let exchange_id = OrderId::new("exch-ff");
+
+    send_open_order_with_position_id(
+        &mut engine,
+        cid.clone(),
+        pos_id.clone(),
+        Side::Buy,
+        dec!(1_000),
+        false,
+    );
+
+    // Fill arrives BEFORE the ack — buffered, exactly as the Open-ack test asserts.
+    send_fill(&mut engine, exchange_id.clone(), Side::Buy, dec!(1_000));
+    {
+        let instr = engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0));
+        assert_eq!(instr.pending_fills.len(), 1, "fill should be buffered");
+    }
+
+    // Ack arrives, but terminal: Inactive(FullyFilled) rather than Active(Open).
+    let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+        exchange: ExchangeIndex(0),
+        kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+            key: OrderKey {
+                exchange: ExchangeIndex(0),
+                instrument: InstrumentIndex(0),
+                strategy: strategy_id(),
+                cid: cid.clone(),
+            },
+            side: Side::Buy,
+            price: Some(dec!(1_000)),
+            quantity: dec!(1),
+            kind: OrderKind::Limit,
+            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+            state: OrderState::fully_filled(Filled::new(
+                exchange_id.clone(),
+                time_plus_days(STARTING_TIMESTAMP, 2),
+                dec!(1),
+                None,
+            )),
+        })),
+    }));
+    engine.process(event);
+
+    let instr = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    assert!(
+        instr.position.positions.contains_key(&pos_id),
+        "pending fill should be replayed on a FullyFilled ack, opening {pos_id}"
+    );
+    assert!(
+        instr.pending_fills.is_empty(),
+        "pending_fills should be drained after replay"
+    );
+}
