@@ -1893,6 +1893,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recorded as an accepted exception in `deny.toml` next to the other `hyperliquid_rust_sdk`
   advisories, to be dropped once that SDK moves off `reqwest` 0.11.
 
+- Updated `rustls` to 0.23.45 to clear RUSTSEC-2026-0285 (TLS 1.3 handshake messages were accepted
+  at the wrong encryption level when they followed a key-changing message in the same record — for
+  example a plaintext `EncryptedExtensions` packed into the `ServerHello` record. RFC 8446 s5.1
+  requires terminating such a connection with `unexpected_message`. The handshake transcript stays
+  authenticated, so a network-position attacker cannot alter or complete a handshake; the practical
+  effect is that a peer can send in plaintext handshake messages that should have been encrypted,
+  without rustls rejecting the connection. Functionally the same bug as Go's CVE-2025-61730).
+  Unlike the transitive advisories above this one is squarely on a hot path: `rustls` 0.23 is the
+  TLS implementation behind every HTTPS and WSS connection the workspace makes, via `reqwest`,
+  `tokio-tungstenite`, `hyper-rustls` and `rustls-platform-verifier`.
+
+  Two details worth recording. First, `cargo update -p rustls` alone resolves to 0.23.43, which is
+  **still vulnerable** — the patched range is `>=0.23.45`, so the bump needs `--precise`. Second,
+  reaching 0.23.45 also moves `aws-lc-rs` 1.16.3 -> 1.18.1, `aws-lc-sys` 0.40.0 -> 0.45.0 and
+  `rustls-webpki` 0.103.13 -> 0.103.15, so this is not the single-package lockfile patch the
+  entries above were; `aws-lc-sys` in particular is a cryptographic C library built through a
+  `build.rs`. All four crates declare `rust-version = "1.71"`, well under the workspace MSRV of
+  1.95, and the change is still confined to `Cargo.lock` with no manifest constraint edited.
+
+  The tree also carries an older `rustls` 0.21.12, which the advisory lists as unaffected
+  (`<0.23.13`).
+
 ## [0.5.0] - 2026-06-19
 
 ### Changed
