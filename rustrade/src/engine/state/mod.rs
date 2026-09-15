@@ -17,6 +17,7 @@ use fnv::FnvHashMap;
 use rustrade_data::event::MarketEvent;
 use rustrade_execution::{
     AccountEvent, AccountEventKind, UnindexedAccountSnapshot, balance::AssetBalance,
+    market::MarketSnapshot,
 };
 use rustrade_instrument::{
     Keyed,
@@ -57,6 +58,55 @@ pub mod builder;
 /// specific global data.
 pub mod global;
 
+/// Supplies the market state an order request is stamped with as it is sent.
+///
+/// The `Engine` samples this for each open request it emits, and the result travels with the order
+/// on [`RequestOpen::market`](rustrade_execution::order::request::RequestOpen::market). It exists so
+/// a simulated venue — which owns no book — has a price to fill against; live venues ignore it.
+///
+/// # Why the `Engine` samples it rather than the venue
+///
+/// The market feed is forwarded into an unbounded, unpaced channel by an independent task, so a
+/// venue reading that feed itself would race ahead of the engine and fill orders against prices
+/// from arbitrarily far in the future. The instant the engine emits a request is the one point with
+/// a well-defined position on the simulated timeline, so that is where the sample is taken.
+///
+/// # Implementing this
+///
+/// [`EngineState`] implements it already, delegating to
+/// [`InstrumentDataState::market_snapshot`], so the standard engine needs nothing. Implement it on
+/// a custom `State` to make simulated fills work there too; returning `None` keeps the pre-existing
+/// behaviour, in which a simulated venue can price a limit order and must reject a market one.
+///
+/// # Type Parameters
+/// * `InstrumentKey` - Type used to identify an instrument (defaults to [`InstrumentIndex`]).
+pub trait MarketSnapshotSource<InstrumentKey = InstrumentIndex> {
+    /// Market state for `key` right now, or `None` if this state tracks none for it.
+    fn market_snapshot(&self, key: &InstrumentKey) -> Option<MarketSnapshot>;
+}
+
+impl<GlobalData, InstrumentData> MarketSnapshotSource<InstrumentIndex>
+    for EngineState<GlobalData, InstrumentData>
+where
+    InstrumentData: InstrumentDataState,
+{
+    /// Delegates to the instrument's own [`InstrumentDataState::market_snapshot`].
+    ///
+    /// # Panics
+    /// Panics if `key` is not a tracked instrument, as
+    /// [`InstrumentStates::instrument_index`] does. Every key reaching here came off an order the
+    /// `Engine` generated from this same state, so an untracked one is a corrupted index rather
+    /// than ordinary input.
+    fn market_snapshot(&self, key: &InstrumentIndex) -> Option<MarketSnapshot> {
+        Some(
+            self.instruments
+                .instrument_index(key)
+                .data
+                .market_snapshot(),
+        )
+    }
+}
+
 /// Algorithmic trading `Engine` state.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Constructor)]
 pub struct EngineState<GlobalData, InstrumentData> {
@@ -85,9 +135,14 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     /// that were successfully *sent* (`record_in_flight_opens(opens.sent_iter())`), so a request
     /// the engine failed to send leaves nothing behind to wait on.
     ///
-    /// Drives the [`Shutdown::AfterDrain`] barrier — see
-    /// [`Orders::has_request_in_flight`](order::Orders::has_request_in_flight) for what counts as
-    /// in flight.
+    /// See [`Orders::has_request_in_flight`](order::Orders::has_request_in_flight) for what counts
+    /// as in flight.
+    ///
+    /// # Not a shutdown signal
+    /// This deliberately does **not** decide when a [`Shutdown::AfterDrain`] run has finished. A
+    /// response clears an order from flight, but the `Trade` and balance that the fill consists of
+    /// are delivered separately and may still be unread, so quiescence here is reached while the
+    /// run is genuinely incomplete. The `ExecutionManager`s own that decision instead.
     ///
     /// [`Shutdown::AfterDrain`]: crate::shutdown::Shutdown::AfterDrain
     pub fn has_requests_in_flight(&self) -> bool {

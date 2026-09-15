@@ -5,10 +5,11 @@ use crate::{
     error::{ApiError, UnindexedApiError, UnindexedOrderError},
     exchange::mock::{
         account::AccountState,
-        request::{MarketPrices, MockExchangeRequest, MockExchangeRequestKind},
+        request::{MockExchangeRequest, MockExchangeRequestKind},
     },
     fee::{FeeModel, FeeModelConfig},
     fill::{FillModel, SimFillConfig},
+    market::MarketSnapshot,
     order::{
         Order, OrderKey, OrderKind, UnindexedOrder,
         id::OrderId,
@@ -179,15 +180,19 @@ impl MockExchange {
                 MockExchangeRequestKind::OpenOrder {
                     response_tx,
                     request,
-                    market_prices,
                 } => {
-                    let (response, notifications) = self.open_order(request, market_prices);
-                    self.respond_with_latency(response_tx, response);
+                    // Read off the request rather than carried separately, so the venue prices
+                    // against exactly the snapshot its sender stamped -- see `open_order`.
+                    let market = request.state.market;
+                    let (response, notifications) = self.open_order(request, market);
 
-                    if let Some(notifications) = notifications {
+                    // Book the trade against this exchange's own ledger synchronously, before
+                    // anything is handed to a task, so a subsequent request on this loop sees it.
+                    if let Some(notifications) = &notifications {
                         self.account.ack_trade(notifications.trade.clone());
-                        self.send_notifications_with_latency(notifications);
                     }
+
+                    self.respond_open_with_latency(response_tx, response, notifications);
                 }
             }
         }
@@ -271,34 +276,67 @@ impl MockExchange {
         });
     }
 
-    /// Sends the provided `OpenOrderNotifications` via the `MockExchanges`
-    /// `broadcast::Sender<UnindexedAccountEvent>` after waiting for the latency
-    /// [`Duration`].
+    /// Emits everything one filled open owes the client, in venue order, from a **single** task.
     ///
-    /// Used to simulate network latency between the exchange and client.
-    fn send_notifications_with_latency(&self, notifications: OpenOrderNotifications) {
-        let balance = self.build_account_event(notifications.balance);
-        let trade = self.build_account_event(notifications.trade);
+    /// The order is `AssetBalance` snapshot, then [`Trade`], then the [`oneshot`] response, after
+    /// one shared latency sleep. It mirrors a real venue: the trade is booked before the order can
+    /// be reported `FullyFilled`, and putting the response last makes "the client has its response"
+    /// imply "every account event for this order has already been sent".
+    ///
+    /// # Why one task rather than two
+    /// These were previously two independently spawned tasks — one for the oneshot, one for the
+    /// broadcast notifications. Each slept for the same latency and then raced, so the response
+    /// could resolve the caller's in-flight request *before* the trade that opens the position had
+    /// been sent. A drain barrier that terminates on request quiescence then tore the run down with
+    /// the trade and balance still unsent, truncating both ledgers non-deterministically.
+    ///
+    /// Sequencing them behind one sleep removes that race at the source: there is no second task
+    /// left to lose.
+    fn respond_open_with_latency(
+        &self,
+        response_tx: oneshot::Sender<
+            Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
+        >,
+        response: Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
+        notifications: Option<OpenOrderNotifications>,
+    ) {
+        let events = notifications.map(|notifications| {
+            (
+                self.build_account_event(notifications.balance),
+                self.build_account_event(notifications.trade),
+            )
+        });
 
         let exchange = self.exchange;
         let latency = std::time::Duration::from_millis(self.latency_ms);
-        let tx = self.event_tx.clone();
+        let event_tx = self.event_tx.clone();
+
         tokio::spawn(async move {
             tokio::time::sleep(latency).await;
 
-            if tx.send(balance).is_err() {
-                error!(
-                    %exchange,
-                    kind = "Snapshot<AssetBalance<AssetNameExchange>",
-                    "MockExchange failed to send AccountEvent notification to client"
-                );
+            if let Some((balance, trade)) = events {
+                if event_tx.send(balance).is_err() {
+                    error!(
+                        %exchange,
+                        kind = "Snapshot<AssetBalance<AssetNameExchange>",
+                        "MockExchange failed to send AccountEvent notification to client"
+                    );
+                }
+
+                if event_tx.send(trade).is_err() {
+                    error!(
+                        %exchange,
+                        kind = "Trade<AssetNameExchange, InstrumentNameExchange>",
+                        "MockExchange failed to send AccountEvent notification to client"
+                    );
+                }
             }
 
-            if tx.send(trade).is_err() {
+            if response_tx.send(response).is_err() {
                 error!(
                     %exchange,
-                    kind = "Trade<AssetNameExchange, InstrumentNameExchange>",
-                    "MockExchange failed to send AccountEvent notification to client"
+                    kind = "OrderResponseOpen",
+                    "MockExchange failed to send oneshot response to client"
                 );
             }
         });
@@ -330,11 +368,13 @@ impl MockExchange {
     pub fn open_order(
         &mut self,
         request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
-        market_prices: MarketPrices,
+        market: Option<MarketSnapshot>,
     ) -> (
         Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
         Option<OpenOrderNotifications>,
     ) {
+        let market_supplied = market.is_some();
+
         if let Err(error) = self.validate_order_kind_supported(request.state.kind) {
             return (build_open_order_err_response(request, error), None);
         }
@@ -356,14 +396,16 @@ impl MockExchange {
         // Compute fill price via the configured FillModel.
         //
         // For limit orders, pass the limit price as `order_price`; for market orders pass `None`
-        // so the model can select the best available market price (bid/ask/last).  When no market
-        // data is present (standard MockExecution passes all-None MarketPrices), `request.state.price`
-        // is used as the `last_price` fallback so behaviour is identical to the pre-FillModel path.
+        // so the model can select the best available market price (bid/ask/last). `market` is the
+        // snapshot the request's sender observed when it decided to trade -- for a market order it
+        // is the only price source there is, since `request.state.price` is `None` by construction
+        // for `OrderKind::Market`. A limit order additionally falls back to its own limit price.
         //
         // Invariant: `fill_price` is only called for marketable orders. `validate_order_kind_supported`
         // (called above) currently rejects Limit orders, ensuring FillModel::fill_price never receives
         // a non-marketable limit order. If Limit support is added later, the fill model must enforce
         // limit-price semantics (e.g. a limit buy must not fill above the limit price).
+        let market = market.unwrap_or_default();
         let maybe_fill_price = self
             .fill_model
             .fill_price(
@@ -385,25 +427,32 @@ impl MockExchange {
                         ..
                     } => Some(trigger_price),
                 },
-                market_prices.best_bid,
-                market_prices.best_ask,
-                market_prices.last_price.or(request.state.price),
+                market.best_bid,
+                market.best_ask,
+                market.last_price.or(request.state.price),
             )
             .or(request.state.price);
 
-        // No price anywhere. That means no market data has been supplied for this instrument and
-        // the order carries no limit price of its own to fall back on -- ordinary user data (a
-        // first tick, a thin instrument, a subscription that was never made), not a violated
+        // No price anywhere. Ordinary user data -- a cold start, a thin instrument, a subscription
+        // that was never made, or a caller that supplied no snapshot at all -- not a violated
         // internal invariant, so it is rejected rather than panicked on.
         //
         // A panic here is also strictly less informative. `MockExchange::run` is a spawned task:
         // killing it drops the request receiver, every later order comes back as
         // `ConnectivityError::ExchangeOffline`, and the run completes over the whole dataset
         // having filled nothing, reporting only a `JoinError` at teardown.
+        //
+        // The two causes get different messages because they have different fixes: an absent
+        // snapshot is a wiring problem in the caller, an empty one is a timing problem in the data.
         let Some(fill_price) = maybe_fill_price else {
+            let cause = if market_supplied {
+                "no market price available yet"
+            } else {
+                "the request carried no market snapshot (RequestOpen::market was None)"
+            };
             let reason = format!(
-                "no market price available for {} and OrderKind::{:?} carries no limit price",
-                request.key.instrument, request.state.kind
+                "cannot price {} for {}: {cause} and OrderKind::{:?} carries no limit price",
+                request.key.instrument, request.key.exchange, request.state.kind
             );
             return (
                 build_open_order_err_response(
@@ -707,7 +756,6 @@ mod tests {
         UnindexedAccountSnapshot,
         balance::{AssetBalance, Balance},
         error::ApiError,
-        exchange::mock::request::MarketPrices,
         fee::{FeeModelConfig, PercentageFeeModel},
         fill::{BidAskFillModel, SimFillConfig},
         order::{
@@ -823,6 +871,7 @@ mod tests {
                 time_in_force: TimeInForce::ImmediateOrCancel,
                 position_id: None,
                 reduce_only: false,
+                market: None,
             },
         }
     }
@@ -844,17 +893,19 @@ mod tests {
                 time_in_force: TimeInForce::ImmediateOrCancel,
                 position_id: None,
                 reduce_only: false,
+                market: None,
             },
         }
     }
 
-    fn market_prices(price: &str) -> MarketPrices {
+    /// A snapshot whose three prices are all `price`, wrapped as the venue receives it.
+    fn market_prices(price: &str) -> Option<MarketSnapshot> {
         let p = Some(d(price));
-        MarketPrices {
+        Some(MarketSnapshot {
             best_bid: p,
             best_ask: p,
             last_price: p,
-        }
+        })
     }
 
     /// `contract_size` of the CFD fixture below, as a per-point multiplier a real index CFD carries.
@@ -943,6 +994,7 @@ mod tests {
                 time_in_force: TimeInForce::ImmediateOrCancel,
                 position_id: None,
                 reduce_only: false,
+                market: None,
             },
         }
     }
@@ -1224,11 +1276,11 @@ mod tests {
         let mut exchange = make_exchange("0", "10000"); // 0 BTC, 10 000 USDT
         exchange.fill_model = SimFillConfig::BidAsk(BidAskFillModel);
 
-        let market_prices = MarketPrices {
+        let market_prices = Some(MarketSnapshot {
             best_bid: Some(d("99.5")),
             best_ask: Some(d("100.5")),
             last_price: Some(d("100.0")),
-        };
+        });
 
         // Market buy of 1 BTC; reference price 100 is only used as a fallback
         // when fill_model returns None — BidAsk returns best_ask so it is not used.
@@ -1360,40 +1412,109 @@ mod tests {
         );
     }
 
-    /// Reproduces the wiring `MockExecution` actually uses: an all-`None` [`MarketPrices`] and a
-    /// Market order, which carries no limit price of its own to fall back on.
+    /// A Market order the venue cannot price is rejected, not panicked on.
     ///
-    /// This combination used to hit an `expect`. Because `MockExchange::run` is a spawned task,
-    /// that killed the exchange, dropped the request receiver, and turned every later order into
-    /// `ExchangeOffline` -- so a backtest ran to completion over the whole dataset having filled
-    /// nothing and surfaced only a `JoinError` at teardown.
+    /// A Market order carries no limit price of its own to fall back on, so with no usable
+    /// snapshot there is no price anywhere. This used to hit an `expect`. Because
+    /// `MockExchange::run` is a spawned task, that killed the exchange, dropped the request
+    /// receiver, and turned every later order into `ExchangeOffline` -- so a backtest ran to
+    /// completion over the whole dataset having filled nothing and surfaced only a `JoinError` at
+    /// teardown.
+    ///
+    /// Both unpriceable cases are covered, because they mean different things: `None` is a caller
+    /// that sampled no snapshot at all, `Some(empty)` is a cold start where one was sampled and the
+    /// instrument had no price yet.
     #[test]
-    fn a_market_order_with_no_market_data_is_rejected_rather_than_panicking() {
-        let mut exchange = make_exchange("10", "10000000");
+    fn a_market_order_that_cannot_be_priced_is_rejected_rather_than_panicking() {
+        for market in [None, Some(MarketSnapshot::default())] {
+            let mut exchange = make_exchange("10", "10000000");
 
-        let (response, notifications) =
-            exchange.open_order(buy_request("1.0"), MarketPrices::default());
+            let (response, notifications) = exchange.open_order(buy_request("1.0"), market);
 
-        assert!(
-            notifications.is_none(),
-            "a rejected order must not notify a fill"
-        );
-        assert!(
-            matches!(
-                response.state,
+            assert!(
+                notifications.is_none(),
+                "a rejected order must not notify a fill (market={market:?})"
+            );
+            assert!(
+                matches!(
+                    response.state,
+                    OrderState::Inactive(InactiveOrderState::OpenFailed(
+                        UnindexedOrderError::Rejected(_)
+                    ))
+                ),
+                "expected a rejection, got {:?} (market={market:?})",
+                response.state
+            );
+
+            let usd = exchange.account.balance_mut(&quote()).unwrap();
+            assert_eq!(
+                usd.balance.free,
+                d("10000000"),
+                "a rejected order must not move the balance (market={market:?})"
+            );
+        }
+    }
+
+    /// The rejection names which of the two unpriceable causes occurred, because their fixes
+    /// differ: an absent snapshot is a wiring problem in the caller, an empty one is a timing
+    /// problem in the data.
+    #[test]
+    fn an_unpriceable_rejection_distinguishes_an_absent_snapshot_from_an_empty_one() {
+        let reason_of = |market| {
+            let mut exchange = make_exchange("10", "10000000");
+            match exchange.open_order(buy_request("1.0"), market).0.state {
                 OrderState::Inactive(InactiveOrderState::OpenFailed(
-                    UnindexedOrderError::Rejected(_)
-                ))
-            ),
-            "expected a rejection, got {:?}",
-            response.state
+                    UnindexedOrderError::Rejected(ApiError::OrderRejected(reason)),
+                )) => reason,
+                other => panic!("expected an OrderRejected, got {other:?}"),
+            }
+        };
+
+        assert!(
+            reason_of(None).contains("no market snapshot"),
+            "an absent snapshot must be named as such, got: {}",
+            reason_of(None)
         );
+        assert!(
+            reason_of(Some(MarketSnapshot::default())).contains("no market price available yet"),
+            "an empty snapshot must read as a cold start, got: {}",
+            reason_of(Some(MarketSnapshot::default()))
+        );
+    }
+
+    /// A Market order fills at the snapshot the request carried -- the property #279 was about.
+    ///
+    /// With the default `LastPriceFillModel` the fill price is the snapshot's `last_price`, so this
+    /// pins that a market order priced purely from `RequestOpen::market` both fills and fills at
+    /// the right price.
+    #[test]
+    fn a_market_order_fills_at_the_price_its_snapshot_carried() {
+        let mut exchange = make_exchange("0", "10000");
+
+        let (response, notifications) = exchange.open_order(
+            buy_request("1.0"),
+            Some(MarketSnapshot::from_last_price(Some(d("100")))),
+        );
+
+        let OrderState::Inactive(InactiveOrderState::FullyFilled(ref filled)) = response.state
+        else {
+            panic!("expected a filled order, got {:?}", response.state)
+        };
+        assert_eq!(
+            filled.avg_price,
+            Some(d("100")),
+            "a market order must fill at its snapshot's last price"
+        );
+        assert_eq!(filled.filled_quantity, d("1.0"));
+
+        let notifications = notifications.expect("a filled order must notify a trade");
+        assert_eq!(notifications.trade.price, d("100"));
 
         let usd = exchange.account.balance_mut(&quote()).unwrap();
         assert_eq!(
             usd.balance.free,
-            d("10000000"),
-            "a rejected order must not move the balance"
+            d("9900"),
+            "a 1 BTC buy at 100 must debit 100 quote"
         );
     }
 

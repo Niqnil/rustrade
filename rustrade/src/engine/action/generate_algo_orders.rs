@@ -4,7 +4,7 @@ use crate::{
         action::send_requests::{SendCancelsAndOpensOutput, SendRequests, SendRequestsOutput},
         error::UnrecoverableEngineError,
         execution_tx::ExecutionTxMap,
-        state::order::in_flight_recorder::InFlightRequestRecorder,
+        state::{MarketSnapshotSource, order::in_flight_recorder::InFlightRequestRecorder},
     },
     risk::{RiskApproved, RiskManager, RiskRefused},
     strategy::algo::AlgoStrategy,
@@ -36,7 +36,8 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk, ExchangeKey, InstrumentKey>
     GenerateAlgoOrders<ExchangeKey, InstrumentKey>
     for Engine<Clock, State, ExecutionTxs, Strategy, Risk>
 where
-    State: InFlightRequestRecorder<ExchangeKey, InstrumentKey>,
+    State:
+        InFlightRequestRecorder<ExchangeKey, InstrumentKey> + MarketSnapshotSource<InstrumentKey>,
     ExecutionTxs: ExecutionTxMap<ExchangeKey, InstrumentKey>,
     Strategy: AlgoStrategy<ExchangeKey, InstrumentKey, State = State>,
     Risk: RiskManager<ExchangeKey, InstrumentKey, State = State>,
@@ -51,9 +52,16 @@ where
         let (cancels, opens, refused_cancels, refused_opens) =
             self.risk.check(&self.state, cancels, opens);
 
-        // Send risk approved order requests
+        // Send risk approved order requests.
+        //
+        // Each open is stamped with the market this state holds *now*, before it goes out. This is
+        // the request's decision point, and the only instant with a well-defined position on a
+        // simulated timeline -- see `MarketSnapshotSource`.
         let cancels = self.send_requests(cancels.into_iter().map(|RiskApproved(cancel)| cancel));
-        let opens = self.send_requests(opens.into_iter().map(|RiskApproved(open)| open));
+        let opens = self.send_requests(opens.into_iter().map(|RiskApproved(mut open)| {
+            open.state.market = self.state.market_snapshot(&open.key.instrument);
+            open
+        }));
 
         // Collect remaining Iterators (so we can access &mut self)
         let cancels_refused = refused_cancels.into_iter().map(Box::new).collect();
