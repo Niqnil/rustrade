@@ -4,7 +4,7 @@ use crate::{
         action::send_requests::{SendCancelsAndOpensOutput, SendRequests},
         execution_tx::ExecutionTxMap,
         state::{
-            instrument::filter::InstrumentFilter,
+            MarketSnapshotSource, instrument::filter::InstrumentFilter,
             order::in_flight_recorder::InFlightRequestRecorder,
         },
     },
@@ -41,7 +41,8 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk, ExchangeKey, AssetKey, Instrume
     ClosePositions<ExchangeKey, AssetKey, InstrumentKey>
     for Engine<Clock, State, ExecutionTxs, Strategy, Risk>
 where
-    State: InFlightRequestRecorder<ExchangeKey, InstrumentKey>,
+    State:
+        InFlightRequestRecorder<ExchangeKey, InstrumentKey> + MarketSnapshotSource<InstrumentKey>,
     ExecutionTxs: ExecutionTxMap<ExchangeKey, InstrumentKey>,
     Strategy: ClosePositionsStrategy<ExchangeKey, AssetKey, InstrumentKey, State = State>,
     ExchangeKey: Debug + Clone,
@@ -56,9 +57,14 @@ where
 
         // Bypass risk checks...
 
-        // Send order requests
+        // Send order requests, stamping each open with the market this state holds now -- see
+        // `MarketSnapshotSource`. A close is an ordinary open request to the venue, and a simulated
+        // one needs a price just as much as an entry does.
         let cancels = self.send_requests(cancels);
-        let opens = self.send_requests(opens);
+        let opens = self.send_requests(opens.into_iter().map(|mut open| {
+            open.state.market = self.state.market_snapshot(&open.key.instrument);
+            open
+        }));
 
         // Record in flight order requests
         self.state.record_in_flight_cancels(cancels.sent_iter());

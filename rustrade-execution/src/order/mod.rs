@@ -258,6 +258,7 @@ where
                     time_in_force,
                     position_id: _,
                     reduce_only: _, // used by adapters (e.g., Alpaca) to derive position_intent
+                    market: _,      // decision-time provenance; not part of the resulting Order
                 },
         } = value;
 

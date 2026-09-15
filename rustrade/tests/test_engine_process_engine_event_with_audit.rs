@@ -48,7 +48,8 @@ use rustrade_data::{
     subscription::trade::PublicTrade,
 };
 use rustrade_execution::{
-    AccountEvent, AccountEventKind, AccountSnapshot, FeeModelConfig, PerContractFeeModel,
+    AccountEvent, AccountEventKind, AccountSnapshot, FeeModelConfig, MarketSnapshot,
+    PerContractFeeModel,
     balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate},
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
@@ -173,6 +174,9 @@ fn test_engine_process_engine_event_with_audit() {
             quantity: dec!(1),
             position_id: None,
             reduce_only: false,
+            // Stamped by the Engine as it emits the request: the last trade this instrument
+            // processed above, and no book because the feed carries trades only.
+            market: Some(MarketSnapshot::from_last_price(Some(dec!(10000)))),
         },
     };
     let eth_btc_buy_order = OrderRequestOpen {
@@ -190,6 +194,7 @@ fn test_engine_process_engine_event_with_audit() {
             quantity: dec!(1),
             position_id: None,
             reduce_only: false,
+            market: Some(MarketSnapshot::from_last_price(Some(dec!(0.1)))),
         },
     };
     assert_eq!(
@@ -380,6 +385,8 @@ fn test_engine_process_engine_event_with_audit() {
             quantity: dec!(1),
             position_id: Some(PositionId::NETTING),
             reduce_only: true, // closing position
+            // A close is stamped like any other open the Engine emits.
+            market: Some(MarketSnapshot::from_last_price(Some(dec!(20000)))),
         },
     };
     assert_eq!(
@@ -540,10 +547,21 @@ fn test_engine_process_engine_event_with_audit() {
             quantity: dec!(1),
             position_id: None,
             reduce_only: true, // closing position
+            // The commanding caller supplies no market, as a caller outside the Engine cannot
+            // know what the Engine has processed. The Engine stamps its own before sending.
+            market: None,
         },
     };
+    // What the Engine actually sends: the same request, stamped with the market it observed as it
+    // emitted it -- the last trade instrument 1 processed above, and no book because the feed
+    // carries trades only.
+    let eth_btc_sell_order_sent = {
+        let mut sent = eth_btc_sell_order.clone();
+        sent.state.market = Some(MarketSnapshot::from_last_price(Some(dec!(0.05))));
+        sent
+    };
     let event = EngineEvent::Command(Command::SendOpenRequests(OneOrMany::One(
-        eth_btc_sell_order.clone(),
+        eth_btc_sell_order,
     )));
     let audit = process_with_audit(&mut engine, event.clone());
     assert_eq!(audit.context.sequence, Sequence(21));
@@ -552,7 +570,7 @@ fn test_engine_process_engine_event_with_audit() {
         EngineAudit::process_with_output(
             event,
             EngineOutput::Commanded(ActionOutput::OpenOrders(SendRequestsOutput {
-                sent: NoneOneOrMany::One(Box::new(eth_btc_sell_order.clone())),
+                sent: NoneOneOrMany::One(Box::new(eth_btc_sell_order_sent.clone())),
                 errors: NoneOneOrMany::None,
             }))
         )
@@ -561,7 +579,7 @@ fn test_engine_process_engine_event_with_audit() {
     // Ensure ExecutionRequest for Sequence(21) Command::SendOpenRequests was sent to ExecutionManager
     assert_eq!(
         execution_rx.next().unwrap(),
-        ExecutionRequest::Open(eth_btc_sell_order)
+        ExecutionRequest::Open(eth_btc_sell_order_sent)
     );
 
     // Simulate LIMIT OpenOrder response for Sequence(21) eth_btc_sell_order (0/1 quantity filled)
@@ -920,6 +938,7 @@ impl AlgoStrategy for TestBuyAndHoldStrategy {
                         quantity: dec!(1),
                         position_id: None,
                         reduce_only: false,
+                        market: None,
                     },
                 })
             });
@@ -3751,6 +3770,7 @@ fn send_open_order_with_position_id(
             quantity: dec!(1),
             position_id: Some(position_id),
             reduce_only,
+            market: None,
         },
     };
     let event = EngineEvent::Command(Command::SendOpenRequests(OneOrMany::One(request)));
@@ -5848,12 +5868,22 @@ fn test_shutdown_after_drain_waits_while_an_order_is_in_flight() {
     assert!(engine.meta.draining, "the engine should now be draining");
 }
 
+/// `AfterDrain` hands the stop to the execution side rather than taking it itself.
+///
+/// Even with nothing in flight the `Engine` does not terminate here. Request quiescence is the
+/// wrong signal: an order's response clears it from flight, but the `Trade` and balance that fill
+/// actually consists of travel separately and may not have been read yet. Stopping on quiescence
+/// truncated those ledgers by a varying amount each run.
+///
+/// So the `Engine` only marks itself draining and signals every `ExecutionManager`. Each manager
+/// finishes what it owes, forwards the account events that produced, and closes its channel; that
+/// is what ends the feed and, with it, the run.
 #[test]
-fn test_shutdown_after_drain_is_terminal_when_nothing_is_in_flight() {
+fn test_shutdown_after_drain_defers_the_stop_to_execution() {
     use rustrade::shutdown::Shutdown;
     use rustrade_integration::Terminal;
 
-    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let (execution_tx, mut execution_rx) = mpsc_unbounded();
     let mut engine = build_engine(TradingState::Disabled, execution_tx);
 
     assert!(!engine.state.has_requests_in_flight());
@@ -5861,8 +5891,19 @@ fn test_shutdown_after_drain_is_terminal_when_nothing_is_in_flight() {
     let audit = engine.process(EngineEvent::Shutdown(Shutdown::AfterDrain));
 
     assert!(
-        audit.is_terminal(),
-        "with nothing owed there is nothing to drain, so this is an immediate stop"
+        !audit.is_terminal(),
+        "the Engine must keep processing until the execution side ends its feed, even with \
+         nothing in flight"
+    );
+    assert!(engine.meta.draining, "the engine should now be draining");
+
+    // Safe to block on: the drain is expected to have queued this already.
+    assert_eq!(
+        execution_rx.next().unwrap(),
+        ExecutionRequest::Drain,
+        "entering a drain must tell the ExecutionManagers to drain too - nothing else does, and \
+         without it the run has no way to end. It must be Drain, not Shutdown: Shutdown abandons \
+         whatever is in flight, which is the truncation this exists to prevent"
     );
 }
 
@@ -5870,10 +5911,10 @@ fn test_shutdown_after_drain_is_terminal_when_nothing_is_in_flight() {
 ///
 /// Mirrors a venue that answers the REST open with an already-filled order (Binance
 /// `newOrderRespType=FULL`, and `MockExchange` for every market order) while the fill
-/// itself arrived first on the websocket. `ack_exchange_id` is set only for
-/// `ack_exchange_id` must therefore be set for `Inactive(FullyFilled(_))` as well as
-/// `Active(Open(_))`; when it was set only for the latter the replay never ran and the
-/// fill was silently lost, leaving the position and balance ledgers disagreeing.
+/// itself arrived first on the websocket. `ack_exchange_id` must therefore be set for
+/// `Inactive(FullyFilled(_))` as well as `Active(Open(_))`; when it was set only for the
+/// latter the replay never ran and the fill was silently lost, leaving the position and
+/// balance ledgers disagreeing.
 #[test]
 fn test_hedging_pending_fill_replayed_on_fully_filled_ack() {
     let (execution_tx, _execution_rx) = mpsc_unbounded();

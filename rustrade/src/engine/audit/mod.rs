@@ -167,15 +167,20 @@ pub struct ProcessAudit<Event, Output> {
     pub outputs: NoneOneOrMany<Output>,
     pub errors: NoneOneOrMany<UnrecoverableEngineError>,
 
-    /// Set when the `Engine` decided to stop for a reason the `event` alone does not express.
+    /// Set when the `Engine` decides to stop for a reason the `event` alone does not express.
     ///
-    /// Currently that means a [`Shutdown::AfterDrain`] drain completed: the event that ends the run
-    /// is then the ordinary account update which resolved the last in-flight order, and nothing
-    /// about that event is terminal. Carried on the audit rather than re-derived so a
-    /// [`StateReplicaManager`] reaches the same stop decision from the stream alone.
+    /// Carried on the audit rather than re-derived so a [`StateReplicaManager`] reaches the same
+    /// stop decision from the stream alone.
+    ///
+    /// No built-in `Engine` path sets this today. A [`Shutdown::AfterDrain`] once did — it ended
+    /// the run on an ordinary account update that resolved the last in-flight order — but that
+    /// stopped too early to be correct and the execution side now ends the run by ending the feed,
+    /// which is terminal in its own right. The field remains for custom [`Processor`] implementors
+    /// that need the same escape hatch, and for audit compatibility.
     ///
     /// `#[serde(default)]` so audits serialised before this field existed still load.
     ///
+    /// [`Processor`]: crate::engine::Processor
     /// [`Shutdown::AfterDrain`]: crate::shutdown::Shutdown::AfterDrain
     /// [`StateReplicaManager`]: crate::engine::audit::state_replica::StateReplicaManager
     #[serde(default)]

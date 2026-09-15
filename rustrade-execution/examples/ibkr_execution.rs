@@ -139,6 +139,7 @@ async fn main() {
         time_in_force: TimeInForce::GoodUntilEndOfDay,
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = OrderEvent {

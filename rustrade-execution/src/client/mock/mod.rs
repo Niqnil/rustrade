@@ -6,7 +6,7 @@ use crate::{
         ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
         UnindexedOrderError,
     },
-    exchange::mock::request::{MarketPrices, MockExchangeRequest},
+    exchange::mock::request::MockExchangeRequest,
     fee::FeeModelConfig,
     fill::SimFillConfig,
     order::{
@@ -249,8 +249,11 @@ where
             .send(MockExchangeRequest::open_order(
                 self.time_request(),
                 response_tx,
+                // Carries the snapshot the engine sampled when it decided to send this order on
+                // `RequestOpen::market`. It is the venue's only price source for a Market order,
+                // which carries no limit price of its own. `None` there means nothing sampled
+                // one, and the venue rejects rather than guessing.
                 request.clone(),
-                MarketPrices::default(), // no market-data subscription; FillModel uses last_price=Some(request.state.price) as fallback, so fill equals request price
             ))
             .is_err()
         {

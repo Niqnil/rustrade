@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`MarketSnapshot`, and `RequestOpen::market` to carry it — a simulated venue can now price a
+  market order** (`rustrade-execution`). `MockExchange` keeps no book of its own and a market order
+  carries no limit price, so it could not price a fill at all and rejected every one: no backtest
+  against it could ever fill anything. `RequestOpen` gains `market: Option<MarketSnapshot>`
+  (`best_bid`, `best_ask`, `last_price`, each optional), which the `Engine` stamps at the instant it
+  emits the request. Sampling at the *engine* rather than at the venue is deliberate and not an
+  implementation detail: a venue holding its own market-data tee would drain the unbounded, unpaced
+  backtest market channel ahead of the `Engine` and fill at end-of-history prices, which is
+  unbounded look-ahead. The emit instant is the one point with a well-defined position on the
+  simulated timeline. The `Engine` always overwrites the field when it sends, so a strategy that
+  clones an old request cannot smuggle a stale price into a fill. **Live venues must ignore it** —
+  they have a real book, and the field describes what the *engine* saw when it decided. It is
+  `#[serde(default)]`, so requests serialised before it existed still load. `None` (no snapshot
+  supplied) and an empty snapshot are reported as different rejections on purpose: the first is a
+  wiring bug in the caller, the second a cold start or a thin instrument, and the fixes differ.
+  (#279)
+
+- **`InstrumentDataState::market_snapshot`** (`rustrade`), which supplies the above. It is
+  **defaulted** to `MarketSnapshot::from_last_price(self.price())`, so it is purely additive for
+  existing custom implementors; `DefaultInstrumentMarketData` overrides it to carry its L1 best bid
+  and ask as well as the last traded price.
+
+- **`MarketSnapshotSource`** (`rustrade`), with a blanket implementation on `EngineState`, resolving
+  an instrument's snapshot at each point the `Engine` emits an order request.
+
+- **`ExecutionRequest::Drain`** (`rustrade`), the graceful counterpart to `ExecutionRequest::Shutdown`.
+  `Shutdown` abandons whatever is in flight — what a live stop wants, and what `System::shutdown`
+  still does — while `Drain` finishes the in-flight requests, forwards the account events they
+  produced, and only then closes the manager's channel. These were previously the same message, so
+  a drained backtest shutdown and an abrupt live one could not be told apart at the manager.
+  *Note:* `ExecutionRequest` is not `#[non_exhaustive]`, so downstream exhaustive `match`es need a
+  new arm.
+
+- **`AFTER_DRAIN_DEADLINE`** (`rustrade`), bounding how long `System::shutdown_after_backtest` waits
+  for the account feed to drain. A backtest finishes well inside it; it exists so that calling that
+  method against a *live* system — whose AccountStream reconnects indefinitely and so never ends —
+  fails loudly instead of hanging.
+
 - **Order-rejection counters on the trading summary** (`rustrade`). `TearSheet` gains
   `orders_opened`, `orders_rejected` and `first_rejection_reason`; `TradingSummary` gains the
   session totals and a `rejected_every_order()` helper. Without these a session that *could not*
@@ -532,6 +570,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Fixed entry below. Appended last to the (`#[non_exhaustive]`) enum, which derives `Ord`.
 
 ### Changed
+
+- **A drained shutdown now ends from the execution side rather than on request quiescence**
+  (`rustrade`). `Shutdown::AfterDrain` previously terminated the `Engine` as soon as nothing was
+  `OpenInFlight` or `CancelInFlight`. That signal is wrong: an order's *response* is what clears it
+  from flight, but the `Trade` and the balance that the fill actually consists of are delivered
+  separately and may not have been read yet. `Shutdown::AfterDrain` now only marks the `Engine`
+  draining and signals every `ExecutionManager`; each manager finishes what it owes, forwards the
+  account events those produced, and only then closes its channel, which ends the `Engine`'s feed
+  and with it the run. `System::shutdown_after_backtest` correspondingly **awaits**
+  `account_to_engine` instead of aborting it. `Shutdown::Immediate`, which is what live trading
+  uses, is unchanged. (#281)
+
+- **`ExecutionManager` owns its AccountStream; `init` no longer returns it separately**
+  (`rustrade`). `init` returned the AccountStream merged with the response channel, which ended the
+  combined stream as soon as *either* side finished and left the manager unable to sequence the
+  two — it did not hold the thing it had to drain. It now returns a single `Stream` carrying
+  everything the manager emits, responses and account events alike, which ends exactly when the
+  manager has finished. `ExecutionManager` gains an `account_stream` field, and its `RequestStream`
+  and `Client` parameters gain a `'static` bound (both already had to satisfy it in practice, since
+  the manager is spawned as a task). Its `Debug` implementation is now hand-written rather than
+  derived, because a boxed `Stream` is not `Debug`.
+
+- **`MockExchange::open_order` takes the market snapshot as an explicit second argument**
+  (`rustrade-execution`), so a downstream mock wrapper can override the price the venue fills at.
+  `MockExchange::run` reads it off the request before forwarding.
+
+- **`MockExchange` emits a filled order's events from one ordered task** (`rustrade-execution`).
+  It previously spawned two independent tasks per fill — one for the response, one for the balance
+  and trade notifications — which slept for the same latency and then raced. It now sleeps once and
+  sends balance, then trade, then the response. That mirrors a real venue (a trade is booked before
+  the order can be reported `FullyFilled`) and makes "the client has its response" imply "every
+  account event for this order has already been sent".
 
 - **`backtest` now fails a run in which every open request was rejected** (`rustrade`), returning
   the new `BarterError::BacktestAllOrdersRejected { rejected, reason }` — carrying the exchange's
@@ -1135,6 +1205,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **`MarketPrices`** (`rustrade-execution`), structurally identical to the new `MarketSnapshot` that
+  replaces it, and **`market_prices` from `MockExchangeRequestKind::OpenOrder`**. Once `RequestOpen`
+  carried the snapshot, the channel message held it twice — two copies that could disagree with
+  nothing to arbitrate between them — and the variant grew to three times the size of the next
+  largest. The venue now reads the snapshot off the request it was sent.
+
 - **Committed Databento DBN test fixtures** (`rustrade-data`). `es_trades_sample.dbn.zst` and
   `es_quotes_sample.dbn.zst` held real CME `GLBX.MDP3` records. Databento licenses market data per
   subscriber, and its [User Agreement](https://databento.com/legal/databento-user-agreement) defines
@@ -1165,6 +1241,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lexicographic field-order) derived orderings with it.
 
 ### Fixed
+
+- **A backtest's fills were truncated non-deterministically at shutdown** (`rustrade`). Every run of
+  the same deterministic backtest could end in a different state. A filled order produces three
+  separate things — the balance it debits, the `Trade` it consists of, and the response reporting it
+  filled — and only the last of those clears the request from flight. Ending the run there cut off
+  whatever had not yet been read, and because the response channel and the account stream were
+  merged round-robin, the two ledgers were truncated by *different* amounts: observed runs debited
+  three fills' worth of quote while holding two fills' worth of position, and one debited without
+  opening a position at all. Balances, position quantity, trade counts and trade arrival order all
+  varied run to run. Fixed by the ordering and shutdown-sequencing changes described above; the
+  regression test asserts that quote debited equals the notional the position ledger holds, which
+  failed on roughly a third of runs before. Fill *timing* within the market feed is a separate,
+  still-open defect ([#289](https://github.com/Niqnil/rustrade/issues/289)), so anything derived
+  from when a fill was priced against the feed — `pnl_unrealised`, `time_exchange_update`,
+  tear-sheet series — is not yet deterministic. (#281)
 
 - **Fills were silently lost when a venue acknowledged an order as already filled**
   (`rustrade`). In `OmsMode::Hedging`, a `Trade` that arrives before the order acknowledgement is

@@ -80,6 +80,8 @@ pub mod fill;
 pub use fill::{BidAskFillModel, FillModel, LastPriceFillModel, MidpointFillModel, SimFillConfig};
 pub mod indexer;
 pub mod map;
+pub mod market;
+pub use market::MarketSnapshot;
 pub mod order;
 pub mod position;
 pub mod trade;
