@@ -569,7 +569,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whose target is not the unique deliverable instrument on its `(base, quote, exchange)` — see the
   Fixed entry below. Appended last to the (`#[non_exhaustive]`) enum, which derives `Ord`.
 
+- **`SimulatedVenue` and `VenueOutcome`** (`rustrade-execution`), the simulated venue's state
+  machine split out from the async exchange that drives it — see the Changed entry below.
+
+- **`OrderKey::into_owned_instrument` and `OrderEvent::into_owned_instrument`**
+  (`rustrade-execution`), cloning a borrowed instrument key into an owned one. An index that maps an
+  `InstrumentIndex` back to an exchange-native name hands out a borrow of the name it owns, so
+  anything that stores that key, sends it to another task, or hands it to a venue has to rebuild it
+  field by field. `rustrade-execution` already carried one private copy of that rebuild; a second
+  driver for the simulated venue would have needed another.
+
 ### Changed
+
+- **The simulated venue's state machine is split from the async exchange that drives it**
+  (`rustrade-execution`). `MockExchange` was one type doing two jobs: it owned the ledger, the
+  pricing and the fill accounting, *and* the channels, the spawned tasks and the latency sleeps.
+  Everything in the first group moves to a new `SimulatedVenue` — synchronous, transport-free and
+  latency-free — which `MockExchange` now holds as `pub venue: SimulatedVenue` alongside
+  `latency_ms`, `request_rx` and `event_tx`. What a backtest observes is unchanged; what changes is
+  that the venue can be driven by something other than a `tokio` task without reimplementing it, and
+  that a request's **ordering obligation is carried by the venue's return type** rather than by the
+  comments on one driver's queue.
+
+  `SimulatedVenue::open_order` and `cancel_order` return
+  `VenueOutcome<Response> { events: Vec<UnindexedAccountEvent>, response: Response }`, whose rustdoc
+  states that obligation: every event must reach the client **before** the response, and in the
+  order given. A balance here is an absolute restatement rather than a delta — successive fills
+  report `9_999_500`, `9_999_000`, `9_998_500` — so a driver that delivers two out of order does not
+  merely reorder history, it leaves the client holding the wrong number. The guarantee is the
+  venue's to state; enforcing it stays each driver's to keep.
+
+  **This is not a pure refactor, and it breaks the public API:**
+  - `MockExchange`'s `exchange`, `fee_model`, `fill_model`, `instruments` and `account` fields moved
+    onto the venue — `exchange.account` becomes `exchange.venue.account`. `order_sequence` and
+    `time_exchange_latest` are **no longer public**: resetting the sequence mints duplicate
+    `OrderId`s and `TradeId` is derived from it, so the duplicate would reach the trade ledger.
+    Read them through `SimulatedVenue::order_sequence` and `SimulatedVenue::time_exchange`; the
+    clock advances only through `SimulatedVenue::advance_time`, which takes the instant the caller's
+    own latency model produced. `instruments` stays public — a consumer mutating it is a supported
+    bypass, and the rustdoc says so.
+  - `MockExchange::open_order`, `cancel_order`, `account_snapshot`, `time_exchange`,
+    `validate_order_kind_supported` and `find_instrument_data` are gone; call them on `venue`. They
+    are deliberately **not** forwarded, and `MockExchange` deliberately does **not** `Deref` to its
+    venue: with either, `mock_exchange.open_order(..)` would still compile and book a fill whose
+    events never enter the emission queue — silently reintroducing the out-of-order delivery fixed
+    under #294 below, by way of a typo.
+  - `open_order` takes **only** the request. It previously also took the market snapshot as a
+    separate argument while `RequestOpen::market` already carried one, so a single path held two
+    copies that could disagree with nothing to arbitrate. Set the snapshot on the request.
+  - `OpenOrderNotifications` is no longer public: it was `open_order`'s second return value, and
+    what it described is now `VenueOutcome::events`.
+  - `cancel_order` is replaced rather than moved. Its body was `unimplemented!()` — the only one in
+    either crate — and it returned a type its own request channel cannot accept: a seven-field
+    `Order<.., Result<Cancelled, _>>` where `MockExchangeRequestKind::CancelOrder` wants the
+    two-field `UnindexedOrderResponseCancel`. It could not answer the channel it existed for. The
+    venue now returns a correctly typed rejection: only Market orders are accepted and they fill on
+    arrival, so no order ever rests to be cancelled, and that is a property of the venue rather than
+    of any transport carrying it. A driver forwards the rejection instead of dropping the caller's
+    `oneshot`.
+  - The venue acknowledges its own fill. `ack_trade` previously ran in the driver, so the ledger and
+    the events describing it were written on opposite sides of the seam and a driver could update
+    one without the other. A later request on the venue now sees the trade regardless of when its
+    events are delivered.
+  - The venue's rejection reasons and its unfunded-balance panic now name `SimulatedVenue` rather
+    than `MockExchange`, because that is the type that produces them and a second driver will have
+    no `MockExchange` anywhere in the picture. Code matching on those strings needs updating; the
+    `ExecutionBuilder` panic that screens instrument kinds is unrelated and unchanged.
+
+  Groundwork for [#289](https://github.com/Niqnil/rustrade/issues/289) and Stage 3 of
+  [#279](https://github.com/Niqnil/rustrade/issues/279): a deterministic backtest driver needs to
+  decide *when* a fill's events land relative to market events, which it can only do if something
+  other than a spawned task can ask the venue what those events are.
 
 - **`HistoricalClock` no longer mixes wall-clock time into simulated time** (`rustrade`).
   `time()` returned the most recent event's `time_exchange` *plus the real time elapsed since that
@@ -1269,6 +1339,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lexicographic field-order) derived orderings with it.
 
 ### Fixed
+
+- **A simulated account snapshot ordered one instrument's orders arbitrarily** (`rustrade-execution`).
+  `account_snapshot` sorts the account's open and cancelled orders with an *unstable* sort keyed on
+  `instrument` alone, then chunks by instrument. Every order on one instrument therefore shares a
+  key, and an unstable sort leaves tied elements in whatever order they arrived in — here, a hash
+  map's iteration order. Two snapshots of the same account could list the same orders differently,
+  which makes them incomparable between runs and makes any golden hash over one a flake. The key is
+  now `(instrument, cid)`; `cid` is unique per order, so it is total.
 
 - **`MockExchange` emitted each fill from its own task, so absolute balance snapshots could reach
   the client out of the order the venue booked them** (`rustrade-execution`). A mock balance is a
