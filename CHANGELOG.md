@@ -1242,6 +1242,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`MockExchange` emitted each fill from its own task, so absolute balance snapshots could reach
+  the client out of the order the venue booked them** (`rustrade-execution`). A mock balance is a
+  full restatement rather than a delta — successive fills report `9_999_500`, `9_999_000`,
+  `9_998_500` — so applying them out of order does not merely reorder history, it yields the wrong
+  balance. Every filled open was handed to its own `tokio::spawn`; at `latency_ms: 0` those tasks
+  all became runnable at once and raced, and the snapshot that arrived last won rather than the one
+  booked last. Fills are now queued and drained by a **single** emitter task, so emission order
+  equals booking order across fills, not merely within one — each fill's latency is still measured
+  from the instant it was booked, so queueing adds no delay of its own. `MockExchange::run` closes
+  the queue and awaits the emitter before returning, so shutting the venue down cannot strand a
+  booked fill.
+
+  This was invisible in practice because the timestamp each snapshot carries derives from
+  `HistoricalClock`, which mixes in wall-clock time and so happened to hand every snapshot a unique,
+  strictly increasing value — letting the engine's staleness guard discard the out-of-order ones and
+  leave the correct balance standing. **Correctness rested on that accident**, which is a bug of its
+  own ([#280](https://github.com/Niqnil/rustrade/issues/280)) that any fix to simulated-time
+  reproducibility removes; with a pure clock, fills booked between two market events share a
+  timestamp, the guard can no longer discriminate, and a backtest reports a wrong final balance. The
+  ordering is the venue's contract to keep, because by the time the engine sees two snapshots out of
+  order the information needed to sequence them is already gone. Regression test asserts the
+  broadcast order directly: it fails on every run without the fix. (#294)
+
 - **A backtest's fills were truncated non-deterministically at shutdown** (`rustrade`). Every run of
   the same deterministic backtest could end in a different state. A filled order produces three
   separate things — the balance it debits, the `Trade` it consists of, and the response reporting it

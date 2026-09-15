@@ -108,7 +108,20 @@ impl MockExchange {
         }
     }
 
+    /// Serves requests until the request channel closes, then lets queued fills finish.
+    ///
+    /// Filled opens are not emitted inline: they are queued and drained by a single task, so that
+    /// emission order equals booking order *across* fills, not merely within one. Closing the
+    /// request channel closes that queue in turn, and this method returns only once the queue has
+    /// drained, so shutting the venue down cannot strand a fill the client is still waiting on.
     pub async fn run(mut self) {
+        let (emit_tx, emit_rx) = mpsc::unbounded_channel();
+        let emitter = tokio::spawn(Self::emit_queued_opens(
+            emit_rx,
+            self.event_tx.clone(),
+            self.exchange,
+        ));
+
         while let Some(request) = self.request_rx.recv().await {
             self.update_time_exchange(request.time_request);
 
@@ -192,9 +205,21 @@ impl MockExchange {
                         self.account.ack_trade(notifications.trade.clone());
                     }
 
-                    self.respond_open_with_latency(response_tx, response, notifications);
+                    self.respond_open_with_latency(&emit_tx, response_tx, response, notifications);
                 }
             }
+        }
+
+        // Nothing further will be queued, so close the queue and let the emitter finish draining
+        // it. A fill booked on the final request would otherwise be dropped with the task, which is
+        // precisely the truncation the drain exists to prevent.
+        drop(emit_tx);
+        if let Err(error) = emitter.await {
+            error!(
+                exchange = %self.exchange,
+                %error,
+                "MockExchange emitter task did not shut down cleanly; queued fills may be lost"
+            );
         }
 
         info!(exchange = %self.exchange, "MockExchange shutting down");
@@ -276,24 +301,30 @@ impl MockExchange {
         });
     }
 
-    /// Emits everything one filled open owes the client, in venue order, from a **single** task.
+    /// Queues everything one filled open owes the client, to be emitted in venue order.
     ///
-    /// The order is `AssetBalance` snapshot, then [`Trade`], then the [`oneshot`] response, after
-    /// one shared latency sleep. It mirrors a real venue: the trade is booked before the order can
-    /// be reported `FullyFilled`, and putting the response last makes "the client has its response"
-    /// imply "every account event for this order has already been sent".
+    /// The order is `AssetBalance` snapshot, then [`Trade`], then the [`oneshot`] response. It
+    /// mirrors a real venue: the trade is booked before the order can be reported `FullyFilled`,
+    /// and putting the response last makes "the client has its response" imply "every account event
+    /// for this order has already been sent".
     ///
-    /// # Why one task rather than two
-    /// These were previously two independently spawned tasks — one for the oneshot, one for the
-    /// broadcast notifications. Each slept for the same latency and then raced, so the response
-    /// could resolve the caller's in-flight request *before* the trade that opens the position had
-    /// been sent. A drain barrier that terminates on request quiescence then tore the run down with
-    /// the trade and balance still unsent, truncating both ledgers non-deterministically.
+    /// # Why a queue rather than a task per fill
+    /// A `MockExchange` balance is an **absolute snapshot**, not a delta: successive fills report
+    /// `9_999_500`, then `9_999_000`, then `9_998_500`. Applying them out of order therefore does
+    /// not merely reorder history, it yields the wrong balance.
     ///
-    /// Sequencing them behind one sleep removes that race at the source: there is no second task
-    /// left to lose.
+    /// Each fill previously got its own [`tokio::spawn`]. Those tasks raced — at `latency_ms: 0`
+    /// they all become runnable at once — so snapshots reached the client in arbitrary order and
+    /// the last to *arrive* won. That was invisible only because the timestamp they carry was
+    /// contaminated with wall-clock time and so happened to be unique and strictly increasing,
+    /// which let the engine's staleness guard discard the out-of-order ones. Correcting the clock
+    /// removes that accident, so the ordering has to be real.
+    ///
+    /// One queue, drained by one task, makes emission order equal booking order by construction.
+    /// Ordering holds *across* fills, not just within one.
     fn respond_open_with_latency(
         &self,
+        emit_tx: &mpsc::UnboundedSender<PendingOpenEmission>,
         response_tx: oneshot::Sender<
             Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
         >,
@@ -307,14 +338,43 @@ impl MockExchange {
             )
         });
 
-        let exchange = self.exchange;
-        let latency = std::time::Duration::from_millis(self.latency_ms);
-        let event_tx = self.event_tx.clone();
+        // Stamped at booking time, not at emission time, so the delay each fill waits is measured
+        // from when the venue booked *it*. `latency_ms` is fixed for the exchange, so these are
+        // non-decreasing in queue order and the drain never sleeps away a fill's own latency twice.
+        let ready_at =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(self.latency_ms);
 
-        tokio::spawn(async move {
-            tokio::time::sleep(latency).await;
+        // Failure means the emitter is gone, which happens only once `run` has returned. There is
+        // no client left to notify, so there is nothing to do but say so.
+        if emit_tx
+            .send(PendingOpenEmission {
+                ready_at,
+                events,
+                response_tx,
+                response,
+            })
+            .is_err()
+        {
+            error!(
+                exchange = %self.exchange,
+                "MockExchange could not queue a filled open: the emitter has stopped"
+            );
+        }
+    }
 
-            if let Some((balance, trade)) = events {
+    /// Drains queued fills in order, emitting each one's account events before its response.
+    ///
+    /// Runs until `emit_rx` closes — which happens when [`MockExchange::run`] returns — and then
+    /// finishes whatever is still queued, so a shutdown cannot strand a booked fill.
+    async fn emit_queued_opens(
+        mut emit_rx: mpsc::UnboundedReceiver<PendingOpenEmission>,
+        event_tx: broadcast::Sender<UnindexedAccountEvent>,
+        exchange: ExchangeId,
+    ) {
+        while let Some(emission) = emit_rx.recv().await {
+            tokio::time::sleep_until(emission.ready_at).await;
+
+            if let Some((balance, trade)) = emission.events {
                 if event_tx.send(balance).is_err() {
                     error!(
                         %exchange,
@@ -332,14 +392,14 @@ impl MockExchange {
                 }
             }
 
-            if response_tx.send(response).is_err() {
+            if emission.response_tx.send(emission.response).is_err() {
                 error!(
                     %exchange,
                     kind = "OrderResponseOpen",
                     "MockExchange failed to send oneshot response to client"
                 );
             }
-        });
+        }
     }
 
     pub fn account_stream(&self) -> BoxStream<'static, UnindexedAccountEvent> {
@@ -748,6 +808,17 @@ pub struct OpenOrderNotifications {
     pub trade: Trade<AssetNameExchange, InstrumentNameExchange>,
 }
 
+/// One filled open awaiting emission, held in booking order by [`MockExchange`]'s emitter queue.
+#[derive(Debug)]
+struct PendingOpenEmission {
+    /// When this fill's latency expires, measured from the instant the venue booked it.
+    ready_at: tokio::time::Instant,
+    /// The account events the fill produced, absent when the open was rejected.
+    events: Option<(UnindexedAccountEvent, UnindexedAccountEvent)>,
+    response_tx: oneshot::Sender<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>>,
+    response: Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
@@ -852,6 +923,83 @@ mod tests {
         );
 
         MockExchange::new(config, request_rx, event_tx, instruments)
+    }
+
+    /// A `MockExchange` balance is an absolute restatement, so emission order *is* the answer.
+    ///
+    /// Each fill used to be emitted by its own spawned task. Those tasks raced, so the snapshots
+    /// `9_999_500`, `9_999_000`, `9_998_500`, ... reached the client in arbitrary order and the
+    /// last to arrive won — which is not the same thing as the last to be booked. That went
+    /// unnoticed only because the timestamp each snapshot carries is derived from a clock
+    /// contaminated with wall-clock time, and so happened to be unique and increasing, letting the
+    /// engine discard the out-of-order ones as stale. Correcting that clock removes the accident.
+    ///
+    /// Asserted on the broadcast stream rather than on any downstream balance, because the ordering
+    /// is the venue's contract to keep: the engine cannot repair snapshots it receives out of order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn open_order_emissions_are_ordered_across_fills() {
+        const FILLS: usize = 8;
+        const DEBIT_PER_FILL: &str = "500";
+
+        let usdt_start = "10000000";
+        let mut exchange = make_exchange("100", usdt_start);
+
+        // `make_exchange` keeps neither end of the channels; this test drives both.
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut events) = broadcast::channel(64);
+        exchange.request_rx = request_rx;
+        exchange.event_tx = event_tx;
+
+        let venue = tokio::spawn(exchange.run());
+
+        let mut responses = Vec::with_capacity(FILLS);
+        for nth in 0..FILLS {
+            let (response_tx, response_rx) = oneshot::channel();
+            let mut request = buy_request("0.01");
+            request.key.cid = ClientOrderId::new(format!("cid-{nth}"));
+            request.state.market = market_prices("50000");
+
+            request_tx
+                .send(MockExchangeRequest::open_order(
+                    Utc::now(),
+                    response_tx,
+                    request,
+                ))
+                .unwrap();
+            responses.push(response_rx);
+        }
+
+        // Closing the request channel ends `run`, which drains the emitter before returning.
+        drop(request_tx);
+        venue.await.unwrap();
+
+        for response in responses {
+            let response = response.await.expect("every open is answered");
+            assert!(
+                matches!(
+                    response.state,
+                    OrderState::Active(_) | OrderState::Inactive(_)
+                ),
+                "the account is funded and the instrument priced, so every open fills: {response:?}"
+            );
+        }
+
+        let balances = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event.kind {
+                AccountEventKind::BalanceSnapshot(snapshot) => Some(snapshot.0.balance.total),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        // One balance snapshot per fill, each debiting the quote asset by the same notional.
+        let expected = (1..=FILLS)
+            .map(|nth| d(usdt_start) - d(DEBIT_PER_FILL) * Decimal::from(nth))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            balances, expected,
+            "balance snapshots must reach the client in the order the venue booked them"
+        );
     }
 
     fn buy_request(quantity: &str) -> OrderRequestOpen<ExchangeId, InstrumentNameExchange> {
