@@ -140,6 +140,7 @@ where
             time_in_force: TimeInForce::ImmediateOrCancel,
             position_id: None, // caller sets this when hedging-mode routing is required
             reduce_only: true, // closing existing position
+            market: None,
         },
     }
 }

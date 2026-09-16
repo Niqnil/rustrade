@@ -6,6 +6,19 @@ on:
     - cron: "0 15 * * 3"
   workflow_dispatch:
 
+concurrency:
+  # Deliberately the same group as `alpaca-integration.yml`: both run against the ONE Alpaca paper
+  # account, so they must exclude each other, not merely exclude themselves. Two overlapping runs
+  # contend for it -- one hits "connection limit exceeded" on the market-data stream while the other
+  # trips "cannot open a long buy while a short sell order is open" on a resting order it did not
+  # place. This workflow previously declared no concurrency at all, so a scheduled run could land on
+  # top of any push or PR run.
+  #
+  # `cancel-in-progress: false` matters as much as the shared group: cancelling a run mid-test can
+  # leave a resting order behind that poisons the next one.
+  group: alpaca-paper-account
+  cancel-in-progress: false
+
 env:
   MOLD_VERSION: "2.35.1"
   ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}

@@ -262,11 +262,9 @@ impl<MarketKind, ExchangeKey, AssetKey, InstrumentKey> Terminal
 {
     /// Only [`Shutdown::Immediate`] is terminal on the event alone.
     ///
-    /// [`Shutdown::AfterDrain`] asks the `Engine` to finish what is in flight first, so whether it
-    /// ends the run depends on `Engine` state this event cannot see. The `Engine` decides, and
-    /// records the decision on the audit it returns — see [`ProcessAudit::shutdown`].
-    ///
-    /// [`ProcessAudit::shutdown`]: crate::engine::audit::ProcessAudit::shutdown
+    /// [`Shutdown::AfterDrain`] asks the execution side to finish what is in flight first, so it
+    /// never ends the run by itself: the `Engine` marks itself draining and stops when the feed
+    /// ends, which is what the last `ExecutionManager` closing its channel produces.
     fn is_terminal(&self) -> bool {
         matches!(self, Self::Shutdown(Shutdown::Immediate))
     }
@@ -280,7 +278,7 @@ impl<MarketKind, ExchangeKey, AssetKey, InstrumentKey>
         Self::Shutdown(Shutdown::Immediate)
     }
 
-    /// Stop once nothing is in flight. See [`Shutdown::AfterDrain`].
+    /// Stop once the execution side has finished what is in flight. See [`Shutdown::AfterDrain`].
     pub fn shutdown_after_drain() -> Self {
         Self::Shutdown(Shutdown::AfterDrain)
     }

@@ -9,30 +9,10 @@ use crate::{
     trade::Trade,
 };
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
 use rustrade_instrument::{
     asset::name::AssetNameExchange, exchange::ExchangeId, instrument::name::InstrumentNameExchange,
 };
 use tokio::sync::oneshot;
-
-/// Market price snapshot passed alongside an order request so the
-/// [`FillModel`](crate::fill::FillModel) can compute a realistic fill price.
-///
-/// All fields are optional. When a field is `None` the fill model falls back
-/// to the next available price (see each [`FillModel`](crate::fill::FillModel)
-/// implementation for exact semantics).
-///
-/// The standard [`MockExecution`](crate::client::mock::MockExecution) client
-/// populates all fields as `None` (it has no market-data subscription).
-/// Downstream consumers that want realistic slippage should construct a
-/// custom execution wrapper that injects current bid/ask/last prices before
-/// forwarding the request.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct MarketPrices {
-    pub best_bid: Option<Decimal>,
-    pub best_ask: Option<Decimal>,
-    pub last_price: Option<Decimal>,
-}
 
 #[derive(Debug)]
 pub struct MockExchangeRequest {
@@ -117,14 +97,12 @@ impl MockExchangeRequest {
             Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
         >,
         request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
-        market_prices: MarketPrices,
     ) -> Self {
         Self::new(
             time_request,
             MockExchangeRequestKind::OpenOrder {
                 response_tx,
                 request,
-                market_prices,
             },
         )
     }
@@ -154,7 +132,13 @@ pub enum MockExchangeRequestKind {
     OpenOrder {
         response_tx:
             oneshot::Sender<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>>,
+        /// The order to open, carrying on
+        /// [`RequestOpen::market`](crate::order::request::RequestOpen::market) the market its
+        /// sender observed when it decided to open it.
+        ///
+        /// That snapshot is the venue's only price source for a Market order, which carries no
+        /// limit price of its own. It is not repeated as a field of its own here: two copies of
+        /// the same snapshot on one message could disagree, and nothing could arbitrate.
         request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
-        market_prices: MarketPrices,
     },
 }

@@ -10,6 +10,7 @@ use rustrade_data::{
 };
 use rustrade_execution::{
     AccountEvent,
+    market::MarketSnapshot,
     order::request::{OrderRequestCancel, OrderRequestOpen},
 };
 use rustrade_instrument::{
@@ -53,6 +54,33 @@ pub trait InstrumentDataState<
     /// - Close of the most recent `Candle`.
     /// - Volume-weighted mid-price from an `OrderBookL2`.
     fn price(&self) -> Option<Decimal>;
+
+    /// Market state for this instrument right now, for a simulated venue to price a fill against.
+    ///
+    /// The `Engine` samples this when it emits an order request and carries the result on
+    /// [`RequestOpen::market`](rustrade_execution::order::request::RequestOpen::market). A
+    /// simulated venue has no book of its own, so for a market order — which carries no limit price
+    /// — this snapshot is the only thing standing between a fill and a rejection.
+    ///
+    /// # Default body
+    ///
+    /// Reports [`price`](Self::price) as the last traded price and no book. That is what a state
+    /// tracking a single price can honestly say, and it is enough for the default
+    /// [`LastPriceFillModel`](rustrade_execution::fill::LastPriceFillModel) to fill. Override it to
+    /// supply bid and ask, which the
+    /// [`BidAskFillModel`](rustrade_execution::fill::BidAskFillModel) and
+    /// [`MidpointFillModel`](rustrade_execution::fill::MidpointFillModel) need in order to model
+    /// the spread.
+    ///
+    /// # Look-ahead
+    ///
+    /// Return only what this state has already processed. The point of sampling here rather than at
+    /// the venue is that this instant has a well-defined position on the simulated timeline;
+    /// reaching past it for a price that has not been consumed yet would reintroduce exactly the
+    /// look-ahead that sampling here avoids.
+    fn market_snapshot(&self) -> MarketSnapshot {
+        MarketSnapshot::from_last_price(self.price())
+    }
 }
 
 /// Basic [`InstrumentDataState`] implementation that tracks the [`OrderBookL1`], last traded price,
@@ -184,6 +212,26 @@ impl InstrumentDataState for DefaultInstrumentMarketData {
             (Some((_, price)), None) => Some(price),
             (None, Some(candle)) => Some(candle.close),
             (None, None) => None,
+        }
+    }
+
+    /// Both sides of the L1 book, plus [`price`](Self::price) as the last traded price.
+    ///
+    /// # Why `last_price` is `price`, not `last_traded_price`
+    ///
+    /// `price` is this state's considered answer to "what is this instrument worth right now",
+    /// across all three inputs it tracks — including a candle close on a bar feed, where
+    /// `last_traded_price` is `None` and a fill model reading it would find nothing to price
+    /// against. Feeding the fill model the same mark the engine values positions at also keeps a
+    /// simulated fill consistent with the PnL computed from it.
+    ///
+    /// The book's own sides are passed through unchanged rather than folded into that answer, so a
+    /// fill model that wants to model the spread sees the real one.
+    fn market_snapshot(&self) -> MarketSnapshot {
+        MarketSnapshot {
+            best_bid: self.l1.best_bid.map(|level| level.price),
+            best_ask: self.l1.best_ask.map(|level| level.price),
+            last_price: self.price(),
         }
     }
 }

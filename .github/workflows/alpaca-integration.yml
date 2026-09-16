@@ -11,8 +11,17 @@ on:
     branches: ["main", "develop"]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Keyed on the ACCOUNT, not the ref. These workflows share one Alpaca paper account, so two runs
+  # that overlap contend for it: one hits "connection limit exceeded" on the market-data stream
+  # while the other trips "cannot open a long buy while a short sell order is open" on a resting
+  # order it did not place. Keying on `github.ref` put a `develop` push and an open PR in different
+  # groups, so they never excluded each other -- and since this fires on both `push: develop` and
+  # `pull_request`, merging anything while a PR was open reliably overlapped.
+  #
+  # `cancel-in-progress: false` matters as much as the constant group: cancelling a run mid-test can
+  # leave a resting order behind that poisons the next one.
+  group: alpaca-paper-account
+  cancel-in-progress: false
 
 env:
   MOLD_VERSION: "2.35.1"

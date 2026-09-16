@@ -13,7 +13,7 @@ use crate::{
         command::Command,
         execution_tx::ExecutionTxMap,
         state::{
-            EngineState,
+            EngineState, MarketSnapshotSource,
             connectivity::UntrackedExchange,
             instrument::{OptionSplitPlan, data::InstrumentDataState},
             order::{Orders, in_flight_recorder::InFlightRequestRecorder, manager::OrderManager},
@@ -179,16 +179,17 @@ where
         let process_audit = match &event {
             EngineEvent::Shutdown(Shutdown::Immediate) => return EngineAudit::process(event),
             EngineEvent::Shutdown(Shutdown::AfterDrain) => {
-                // Nothing outstanding, so there is nothing to wait for.
-                if !self.state.has_requests_in_flight() {
-                    return EngineAudit::Process(ProcessAudit::with_event(event).with_shutdown());
-                }
-
-                // Otherwise stop generating orders and keep processing until the responses already
-                // on their way have landed. Terminating here instead discards them — which for a
-                // backtest means discarding every fill and rejection the run produced, since the
-                // requests were sent while draining a feed that is now exhausted.
+                // Stop generating new orders, and tell every ExecutionManager to drain. The run
+                // ends when the account feed ends, not here: each manager finishes its in-flight
+                // requests, forwards the account events those produced, and only then closes its
+                // channel, which ends the feed and terminates this Engine with `FeedEnded`.
+                //
+                // The Engine deliberately does *not* decide the moment itself. Its only local
+                // signal is request quiescence, and a response resolves an in-flight request
+                // before the trade that opens the position has necessarily been read — stopping
+                // on it truncated the trade and balance ledgers by a varying amount every run.
                 self.meta.draining = true;
+                self.drain_execution();
                 return EngineAudit::process(event);
             }
             EngineEvent::Command(command) => {
@@ -246,15 +247,11 @@ where
             }
         };
 
-        // A drain in progress outranks everything below: no new orders, and the run ends the
-        // moment the last outstanding request resolves. Checked after the event has been applied,
-        // so the response that clears the final in-flight order is itself processed first.
+        // A drain in progress outranks everything below: no new orders. The run is *not* ended
+        // here — see the `Shutdown::AfterDrain` arm above for why the execution side owns that
+        // decision.
         if self.meta.draining {
-            return if self.state.has_requests_in_flight() {
-                EngineAudit::from(process_audit)
-            } else {
-                EngineAudit::Process(process_audit.with_shutdown())
-            };
+            return EngineAudit::from(process_audit);
         }
 
         if generates_algo_orders && matches!(self.state.trading, TradingState::Enabled) {
@@ -290,10 +287,30 @@ where
 impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     Engine<Clock, EngineState<GlobalData, InstrumentData>, ExecutionTxs, Strategy, Risk>
 {
+    /// Tell every `ExecutionManager` to finish what it has in flight and then stop.
+    ///
+    /// Sends [`ExecutionRequest::Drain`], the graceful counterpart to the
+    /// [`ExecutionRequest::Shutdown`] that [`SyncShutdown::shutdown`] sends. Used on entry to a
+    /// [`Shutdown::AfterDrain`]: the managers, not the
+    /// `Engine`, decide when the run has genuinely finished, because only they can see whether the
+    /// account events belonging to a completed request have been read yet.
+    ///
+    /// Send failures are ignored — a manager that has already stopped needs no telling.
+    ///
+    /// [`Shutdown::AfterDrain`]: crate::shutdown::Shutdown::AfterDrain
+    pub fn drain_execution(&self)
+    where
+        ExecutionTxs: ExecutionTxMap,
+    {
+        self.execution_txs.iter().for_each(|execution_tx| {
+            let _send_result = execution_tx.send(ExecutionRequest::Drain);
+        });
+    }
+
     /// Action an `Engine` [`Command`], producing an [`ActionOutput`] of work done.
     pub fn action(&mut self, command: &Command) -> ActionOutput
     where
-        InstrumentData: InFlightRequestRecorder,
+        InstrumentData: InstrumentDataState + InFlightRequestRecorder,
         ExecutionTxs: ExecutionTxMap,
         Strategy: ClosePositionsStrategy<State = EngineState<GlobalData, InstrumentData>>,
         Risk: RiskManager,
@@ -310,7 +327,13 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             }
             Command::SendOpenRequests(requests) => {
                 info!(?requests, "Engine actioning user Command::SendOpenRequests");
-                let output = self.send_requests(requests.clone());
+                // Stamped like any other open the Engine emits -- a user command is no less a
+                // decision point than an algo order, and a simulated venue needs a price for it
+                // just the same. See `MarketSnapshotSource`.
+                let output = self.send_requests(requests.iter().cloned().map(|mut open| {
+                    open.state.market = self.state.market_snapshot(&open.key.instrument);
+                    open
+                }));
                 self.state.record_in_flight_opens(output.sent_iter());
                 ActionOutput::OpenOrders(output)
             }
