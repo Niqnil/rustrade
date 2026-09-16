@@ -274,6 +274,29 @@ where
     /// seeding balances and instruments it is what marks that venue's account connection healthy,
     /// which the `Engine` would otherwise wait on forever.
     ///
+    /// # Opening balances are stamped at the session start
+    ///
+    /// The seeded balances are re-stamped to `clock`'s instant, discarding the `time_exchange` each
+    /// carried in the venue's configured initial state.
+    ///
+    /// A seeding snapshot is not an observation on the simulated timeline — it is the account's
+    /// opening condition, and the session opens at `clock`'s instant by definition. The configured
+    /// stamp describes when those balances were captured in the real world, which a simulation has
+    /// no use for: the clock is seeded from the market and auxiliary sources, so a balance stamped
+    /// before the first market event arrives behind a clock already wound forward to it, and one
+    /// stamped after it would wind the clock past the session start before any market event had
+    /// been seen.
+    ///
+    /// Leaving it alone was not a workable alternative. `time_engine_start` is derived from the
+    /// dataset at run time, so a static configuration cannot be written to agree with it, and the
+    /// mismatch surfaced as `HistoricalClock received out-of-order events` logged at ERROR — once
+    /// per venue, per run — for a configuration that was never wrong.
+    ///
+    /// Orders carried in a configured initial state keep their own stamps; they contribute to
+    /// [`AccountSnapshot::time_most_recent`](rustrade_execution::AccountSnapshot::time_most_recent)
+    /// alongside the balances, so a seeded order stamped ahead of the session start still advances
+    /// the clock.
+    ///
     /// # Panics
     /// Panics if a venue's initial snapshot references an asset or instrument absent from that
     /// venue's own index — see the type-level `# Panics`.
@@ -282,12 +305,19 @@ where
         source: Source,
         clock: HistoricalClock,
     ) -> Self {
+        let time_engine_start = clock.time();
+
         let seeding = venues
             .values()
             .map(|slot| {
+                let mut snapshot = slot.venue.account_snapshot();
+                for balance in &mut snapshot.balances {
+                    balance.time_exchange = time_engine_start;
+                }
+
                 let snapshot = UnindexedAccountEvent {
                     exchange: slot.venue.exchange,
-                    kind: AccountEventKind::Snapshot(slot.venue.account_snapshot()),
+                    kind: AccountEventKind::Snapshot(snapshot),
                 };
 
                 index_account_event(&slot.indexer, snapshot)
@@ -1223,5 +1253,65 @@ mod tests {
             "a second full fill is delivered, so the budget was reset rather than accumulated"
         );
         assert_eq!(harness.runner.error(), None);
+    }
+
+    /// A configured opening balance stamped before the session start must not arrive behind the
+    /// clock.
+    ///
+    /// `time_engine_start` is derived from the dataset at run time, so a static configuration
+    /// cannot be written to agree with it. Before the seeding snapshot was stamped at the session
+    /// start, every such run logged `HistoricalClock received out-of-order events` at ERROR — once
+    /// per venue, per run — for a configuration that was never wrong.
+    #[tokio::test]
+    async fn seeded_balances_are_stamped_at_the_session_start() {
+        let instruments = IndexedInstruments::new([instrument(EXCHANGE, "btc", "usdt")]);
+        let SimExecutionBuild { venues, .. } = SimExecutionBuilder::new(&instruments)
+            .add_venue(config(0))
+            .unwrap()
+            .build();
+
+        // `config`'s balances are stamped `at(0)`; open the session long after that, which is the
+        // ordinary case — opening balances are captured before the data the run replays.
+        let session_start = at(60_000);
+        let clock = HistoricalClock::new(session_start);
+        let source: Vec<Timed<EngineEvent<DataKind>>> = Vec::new();
+        let mut runner = SimRunner::new(venues, stream::iter(source), clock.clone());
+
+        let event = runner
+            .next()
+            .await
+            .expect("the seeding snapshot is queued ahead of every source event");
+
+        let EngineEvent::Account(AccountStreamEvent::Item(event)) = event else {
+            panic!("the first event a venue produces is its seeding account snapshot");
+        };
+        let AccountEventKind::Snapshot(snapshot) = event.kind else {
+            panic!("the seeding account event is a snapshot");
+        };
+
+        assert_eq!(
+            snapshot.balances.len(),
+            2,
+            "the fixture funds two assets, so two balances must be seeded"
+        );
+        for balance in &snapshot.balances {
+            assert_eq!(
+                balance.time_exchange, session_start,
+                "a seeded balance is the account's opening condition, so it is stamped at the \
+                 instant the session opens - not at whatever the configuration recorded"
+            );
+        }
+
+        assert_eq!(
+            snapshot.time_most_recent(),
+            Some(session_start),
+            "the snapshot the clock reads must be the session start, not an earlier instant"
+        );
+        assert_eq!(
+            clock.time(),
+            session_start,
+            "the clock must be left where it started: a seeding snapshot is an opening condition, \
+             not an observation that moves the simulated instant"
+        );
     }
 }

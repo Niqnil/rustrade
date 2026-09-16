@@ -1456,6 +1456,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A simulated venue's opening balances are stamped at the session start** (`rustrade`), rather than
+  carrying whatever `time_exchange` the configured initial state recorded. `SimRunner` queues each
+  venue's seeding snapshot ahead of every source event, but the `HistoricalClock` is seeded from the
+  market and auxiliary sources — so a balance captured before the replayed data, which is the
+  ordinary case, arrived behind a clock already wound forward to the first market event. That was
+  reported as `HistoricalClock received out-of-order events` at **ERROR**, once per venue per run,
+  for a configuration that was never wrong: `time_engine_start` is derived from the dataset at run
+  time, so no static configuration can be written to agree with it.
+
+  A seeding snapshot is not an observation on the simulated timeline — it is the account's opening
+  condition, and the session opens at the clock's instant by definition. Reported results are
+  unchanged: the affected backtest examples produce byte-identical tear sheets, and the clock never
+  regressed (it only logged), so this removes spurious ERROR output and gives
+  `AssetState::time_exchange` the session start instead of an unrelated past date. Orders carried in
+  a configured initial state keep their own stamps.
+
 - **Backtests are reproducible: the same dataset and strategy now produce the same result, run to
   run** (`rustrade`). `backtest()` previously assembled its engine through `SystemBuild`, which
   inserts two forwarding tasks feeding one unbounded channel, and an always-ready market source
