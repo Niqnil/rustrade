@@ -614,6 +614,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`quick-xml` 0.41 → 0.42** (`rustrade-data`, `ibkr` feature). The bump's headline break is that
+  `QName<'a>` now wraps `&'a str` rather than `&'a [u8]`, with `AsRef<str>` replacing
+  `AsRef<[u8]>`. Our exposure is a single line: `root_element_name` in the IBKR Flex parser no
+  longer wraps the element name in `String::from_utf8_lossy`. **No behaviour change** — that reader
+  is built with `Reader::from_str`, so its input was already guaranteed UTF-8 and the lossy
+  conversion could never have substituted a replacement character. The two `quick_xml::de::from_str`
+  call sites, which do the bulk of Flex parsing, are untouched.
+
+  The bump adds and removes no dependency: the lockfile delta is the version line alone, and
+  `quick-xml`'s own `[dependencies]` section is byte-identical across the two releases. We continue
+  to take `features = ["serialize"]` only, so `encoding`/`encoding_rs` — the non-UTF-8 decoding path
+  this release reworks — is still not compiled. `#![forbid(unsafe_code)]` remains crate-wide. The
+  tier-2 re-review this crate's entry mandates is recorded in `.github/tier2-dependencies.txt`.
+
 - **`binance-sdk` 69.1.0 → 69.2.3** (`rustrade-execution`, `binance` feature). No code change: this
   bump needs none, unlike 60.0.0 → 69.1.0. The three `binance_sdk::common` internals the margin
   user-data stream couples to were re-verified before merge, and the first two hold by construction

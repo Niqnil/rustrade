@@ -129,6 +129,25 @@ binance-sdk=69.2.3  # 2026-09-14 | Exchange SDK, signing/IO. PINNED: margin user
 # `spot` and `margin_trading`, so none of it is compiled. No consumer-side API churn: this bump needs
 # no code change, unlike 60.0.0 -> 69.1.0.
 quick-xml  # 2026-07-08 | New direct dep (XML parsing of broker Flex statements). Reviewed @ 0.41.0: #![forbid(unsafe_code)] crate-wide, zero net-new transitive deps (serde+memchr only, both already in tree), no RUSTSEC advisories, de-facto-standard parser. Not pinned — any version bump still needs review.
+#   Re-reviewed @ 0.42.0 (2026-09-16), the review this entry's "any version bump still needs
+#   review" mandates. All four properties recorded at 0.41.0 re-verified and still hold:
+#   `#![forbid(unsafe_code)]` is still crate-wide (the 9 `unsafe` occurrences under src/ are all
+#   in comments explaining where `get_unchecked`/`unreachable_unchecked` COULD be used and
+#   deliberately is not -- zero real unsafe, same count and same sites as 0.41.0); no build.rs in
+#   either version; the `[dependencies]` section is byte-identical between the two; and the
+#   lockfile delta for this bump is version-only -- 2 lines changed, no package added or removed,
+#   so "zero net-new transitive deps (serde+memchr only)" still stands. No RUSTSEC advisories.
+#   BREAKING, and the reason this bump needed code: `QName<'a>` changed from `pub &'a [u8]`
+#   (name.rs:102) to `pub &'a str` (name.rs:118), and its `AsRef<[u8]>` impl became `AsRef<str>`.
+#   That byte->str migration touches most of src/, but our exposure is one line. We take only
+#   `features = ["serialize"]` (= serde); `encoding` (= encoding_rs) is NOT enabled, so the
+#   non-UTF-8 decoding path this change reworks is not compiled for us at all.
+#   Consumer-side change, recorded so the next bump knows the shape: ibkr/flex/mod.rs
+#   `root_element_name` dropped its `String::from_utf8_lossy(...)` wrapper. NOT a behaviour
+#   change -- that reader is built with `Reader::from_str`, so its input was already guaranteed
+#   UTF-8 and the lossy conversion could never have substituted a replacement character. The two
+#   `quick_xml::de::from_str` call sites (the serde path, which is the bulk of Flex parsing) are
+#   untouched by the QName change.
 parquet  # 2026-07-28 | New direct dep (Parquet decode of provider bulk exports). Reviewed @ 59.1.0 and re-verified @ 59.3.0 (2026-09-13), Apache-2.0, apache/arrow-rs (ASF-governed, ~65M downloads). MUST stay `default-features = false, features = ["zstd"]` — that is what keeps `arrow` out, and re-enabling defaults pulls arrow-array/buffer/data/schema/select/ipc, base64, brotli, flate2, lz4, snap and simdutf8 in one line. Under the pinned feature set: no build.rs; no network, process-spawn or env access anywhere in the library (the only `env::var` is in `src/bin/parquet-fromcsv.rs`, a CLI binary we do not build); 19 `unsafe` sites in the compiled paths, all in columnar decode hot spots (bit packing, RLE, byte-stream-split, bloom filter) and idiomatic for the crate class. Tree is 12 direct deps. Net-new surface, measured by diffing Cargo.lock before/after rather than eyeballed: COMPILED ON ORDINARY TARGETS — seq-macro, twox-hash, libm, num-bigint 0.5 (see below), and a second major of ahash (0.8.12, now built alongside the pre-existing 0.7.8). libm is not a new dependency edge: it arrives because parquet's tree turns on the `libm` feature of the already-present num-traits. LOCKFILE-ONLY — const-random and const-random-macro enter Cargo.lock via ahash 0.8 but are target-gated and absent from `cargo tree` on every target we ship; parquet gates ahash's `compile-time-rng` feature (the only thing that pulls const-random) on `cfg(target_arch = "wasm32")`, so they build only for wasm32. Re-check them if this workspace ever targets it -- any downstream consumer targeting wasm32 will compile const-random-macro: const-random-macro is a build-time proc-macro pulling getrandom + tiny-keccak, i.e. a compile-time RNG. ALREADY PRESENT, not new — zstd/zstd-safe/zstd-sys, chrono, bytes, hashbrown, half, num-*, getrandom, once_cell, zerocopy, tiny-keccak. Verified the arrow-free column-reader API compiles and decodes real 4-column and 7-column artifacts (370,531 rows) — the feature reduction is real, not theoretical. 59.2.0 dropped the `paste` dependency outright, which retires the RUSTSEC-2024-0436 exception this entry used to carry: `paste` is no longer in Cargo.lock at all, so there is nothing left to accept. 59.2.0 also moved parquet from num-bigint 0.4 to 0.5 (deps: num-integer + num-traits only, no new surface); 0.4.6 remains in the tree for other consumers, which `bans.multiple-versions = "warn"` permits. 59.3.0 changes the dependency set no further — its list is byte-identical to 59.2.0, and no `arrow-*` crate appears anywhere in Cargo.lock. Not pinned — any version bump still needs review, and must re-check that `arrow` has not become non-optional.
 #   UPDATE 2026-09-16: the second ahash major recorded above is gone, and not through anything
 #   parquet did. rust_decimal 1.43.0 (#288) dropped its rkyv 0.7 support, which removed rkyv,
