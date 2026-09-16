@@ -614,6 +614,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`binance-sdk` 69.1.0 → 69.2.3** (`rustrade-execution`, `binance` feature). No code change: this
+  bump needs none, unlike 60.0.0 → 69.1.0. The three `binance_sdk::common` internals the margin
+  user-data stream couples to were re-verified before merge, and the first two hold by construction
+  — `common/websocket.rs` is byte-identical to 69.1.0, so `WebsocketApi::send_message`, the
+  `WebsocketMessageSendOptions` signing fields and `WebsocketEventEmitter::subscribe`'s sequential
+  event drain are unchanged. `common::utils::send_request` keeps its 7-argument shape and still
+  injects `timestamp`, signs with the URL-encoded `get_signature`, appends `signature` and sets
+  `X-MBX-APIKEY`, so the hand-rolled `userListenToken` POST is still signed as intended.
+
+  One behaviour change is worth knowing even though it does not reach us: `build_websocket_api_message`
+  now signs a **signed** WebSocket frame over the plain payload (`get_signature_unencoded`) rather
+  than the URL-encoded one. Binance's WS API signs the plain payload, so this is a fix — but every
+  `send_message` call here passes `WebsocketMessageSendOptions::new()`, i.e. unsigned with no API
+  key, because the listen token is the sole auth on those frames. The signed branch is unreachable
+  from this crate today; 69.2.3 is simply the first version in which it would be correct.
+
+  The new `stocks` feature, and the `wss://nbstream.binance.com/equity` host that comes with it, are
+  not enabled — we take `spot` and `margin_trading` only.
+
 - **The balance assertions in `SimulatedVenue` now panic on the engine's thread** (`rustrade`).
   Nothing about when they fire has changed — an unfunded quote asset was always a panic — but with
   no task between the venue and the engine, the panic surfaces on the caller's thread rather than
