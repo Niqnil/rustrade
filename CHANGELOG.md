@@ -614,6 +614,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING: `FillModel::fill_price` takes a `&MarketSnapshot`** (`rustrade-execution`), replacing
+  the three trailing `Option<Decimal>` price arguments.
+
+  ```rust
+  // before
+  fn fill_price(&self, side, order_price, best_bid, best_ask, last_price) -> Option<Decimal>;
+  // after
+  fn fill_price(&self, side, order_price, market: &MarketSnapshot) -> Option<Decimal>;
+  ```
+
+  Three arguments of one type in a fixed order make a transposition a silent mispricing rather than
+  a compile error, and every increase in the simulated venue's fidelity — sizes at the touch, depth,
+  queue position — would have had to arrive as another argument, breaking every implementation
+  again. As struct fields they are additive. Implementations read `market.best_bid` and so on; the
+  built-in models are unchanged in behaviour.
+
+  The simulated venue now passes its snapshot as it holds it. It used to fold the order's own limit
+  price into the `last_price` argument, which handed the model a market reporting the order's own
+  price as a trade that happened. The limit price already reaches the model as `order_price`.
+
+- **BREAKING: `FeeModel::compute_fee` takes a `Liquidity`** (`rustrade-execution`), naming whether
+  the fill made or took liquidity. `PercentageFeeModel` gains an optional `maker_rate`, and
+  `PercentageFeeModel::new` / `::maker_taker` replace literal construction.
+
+  Venues price the two sides differently, often by a wide margin, and a maker rebate is the whole
+  economics of quoting. Without the flag every fill is charged the taker rate — which
+  systematically overstates the cost of exactly the strategies that rest orders to earn the maker
+  side, and does it silently. `Liquidity::Taker` is the default and the conservative direction: it
+  overstates cost rather than inventing profit.
+
+  **Existing behaviour and configuration are unchanged.** `maker_rate` defaults to absent, in which
+  case `rate` is charged on both sides, and a config written before the field existed deserialises
+  and prices identically. Both current call sites pass `Liquidity::Taker`: every order the
+  simulated venue accepts is marketable on arrival, and `InstrumentState` has no maker/taker
+  information to read, since a `Trade` does not carry one. A maker rebate is a negative
+  `maker_rate`.
+
 - **A simulated venue's open orders keep their arrival stamps** (`rustrade-execution`).
   `AccountState::update_time_exchange` rewrote `Open::time_exchange` on every open order each time
   the venue's clock advanced. Only balances are restated now.
