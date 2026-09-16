@@ -32,7 +32,9 @@ use crate::{
 };
 use crate::{
     engine::Engine,
-    execution::sim::{SimExecutionBuild, SimExecutionBuilder, SimRunner, log_venue_summary},
+    execution::sim::{
+        SimExecutionBuild, SimExecutionBuilder, SimRunner, VenueMarketUpdate, log_venue_summary,
+    },
 };
 use chrono::{DateTime, Utc};
 use fnv::FnvHashSet;
@@ -140,6 +142,9 @@ pub async fn run_backtests<
 ) -> Result<MultiBacktestSummary<SummaryInterval>, BarterError>
 where
     MarketData: BacktestMarketData<Kind = InstrumentData::MarketEventKind>,
+    // The simulated venues are fed each market event before the `Engine` sees it, which needs
+    // a way to read a market out of this kind. Satisfied by `DataKind`.
+    InstrumentData::MarketEventKind: VenueMarketUpdate,
     SummaryInterval: TimeInterval,
     Strategy: AlgoStrategy<State = EngineState<GlobalData, InstrumentData>>
         + ClosePositionsStrategy<State = EngineState<GlobalData, InstrumentData>>
@@ -292,6 +297,9 @@ pub async fn backtest<
 ) -> Result<BacktestResult<SummaryInterval, EngineState<GlobalData, InstrumentData>>, BarterError>
 where
     MarketData: BacktestMarketData<Kind = InstrumentData::MarketEventKind>,
+    // The simulated venues are fed each market event before the `Engine` sees it, which needs
+    // a way to read a market out of this kind. Satisfied by `DataKind`.
+    InstrumentData::MarketEventKind: VenueMarketUpdate,
     SummaryInterval: TimeInterval,
     Strategy: AlgoStrategy<State = EngineState<GlobalData, InstrumentData>>
         + ClosePositionsStrategy<State = EngineState<GlobalData, InstrumentData>>

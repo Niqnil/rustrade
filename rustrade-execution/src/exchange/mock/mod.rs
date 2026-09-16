@@ -21,7 +21,7 @@ pub mod account;
 pub mod request;
 pub mod venue;
 
-pub use venue::{CancelOutcome, OpenOutcome, SimulatedVenue, VenueOutcome};
+pub use venue::{CancelOutcome, OpenOutcome, SimulatedVenue, VenueInstrumentMarket, VenueOutcome};
 
 /// Asynchronous driver for a [`SimulatedVenue`]: channels, simulated latency, emission ordering.
 ///

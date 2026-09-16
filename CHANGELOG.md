@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A simulated venue holds its own view of each instrument it trades** (`rustrade-execution`,
+  `rustrade`). `SimulatedVenue::apply_market` records a `MarketSnapshot` and the instant it was
+  observed, readable through `SimulatedVenue::market`; `SimRunner` routes every source market event
+  to the venues trading that instrument **before** returning it to the `Engine`.
+
+  Routing before is the whole ordering rule: an order the `Engine` sends in reaction to the tick at
+  `T` must be matched against the market as of `T`, not `T-1`. Returning first and routing on the
+  next poll would reverse that at zero latency.
+
+  This is the substrate resting orders need, and it is inert on its own. **No fill price moves**: a
+  market order is still priced from the snapshot its own request carried, and the committed tear
+  sheet is byte-identical. An order that rests is the thing that cannot be priced that way, because
+  the market it must be matched against has not happened when the request is made.
+
+  `MockExchange` has no market feed, so a venue driven by it reports `market` as `None` forever.
+  That difference is documented as a property of the type rather than left as an accident of wiring.
+
+- **`VenueMarketUpdate`** (`rustrade`), implemented for `DataKind`: how a stream of market events
+  becomes the venue's view. Stateful by necessity — a trade carries no book, an L1 update no trade
+  price — so it names an associated `State` rather than being a plain conversion.
+
+  The shipped implementation **is** `DefaultInstrumentMarketData`, delegating to the same
+  `Processor` and `market_snapshot` the engine calls, so the venue's market and the engine's agree
+  by construction rather than by two derivations happening to match. `tests/test_sim_venue_market_agreement.rs`
+  pins it over the full 50,000-event fixture, comparing after every event.
+
+  This matters more than it reads: `last_price` is **not** the last trade price. With both sides of
+  an L1 book present it is the volume-weighted mid — the microprice. A venue that re-derived it as
+  "the most recent trade" would diverge by a median of 1.5–1.7x the *half-spread*, exceeding the
+  half-spread around 60% of the time on the committed fixture.
+
 - **`SimRunner` — backtests are now driven by a deterministic discrete-event simulator**
   (`rustrade`). A `Stream<Item = EngineEvent>` that merges the time-ordered market/auxiliary source
   with the account events its own `SimulatedVenue`s produce, and is polled **inline** by the
@@ -613,6 +644,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   driver for the simulated venue would have needed another.
 
 ### Changed
+
+- **BREAKING: `SimRunner` and `backtest` require `MarketKind: VenueMarketUpdate`**
+  (`rustrade`). Satisfied by `DataKind`, so no in-tree caller changes. A custom market event kind
+  needs one small implementation — see `VenueMarketUpdate`, and prefer delegating to the engine's
+  own `InstrumentDataState` over re-deriving prices.
 
 - **BREAKING: `FillModel::fill_price` takes a `&MarketSnapshot`** (`rustrade-execution`), replacing
   the three trailing `Option<Decimal>` price arguments.

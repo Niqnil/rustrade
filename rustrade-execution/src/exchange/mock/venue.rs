@@ -51,6 +51,19 @@ pub type OpenOutcome = VenueOutcome<Order<ExchangeId, InstrumentNameExchange, Un
 /// Response type of [`SimulatedVenue::cancel_order`].
 pub type CancelOutcome = VenueOutcome<UnindexedOrderResponseCancel>;
 
+/// A venue's view of one instrument, and when it last changed.
+///
+/// The instant is carried alongside the prices rather than inside them because a
+/// [`MarketSnapshot`] says what the market is, not when it was observed — and a matching engine
+/// needs both: an order resting since `T` may only be matched against a market at or after `T`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VenueInstrumentMarket {
+    /// Prices as of [`time_exchange`](Self::time_exchange).
+    pub snapshot: MarketSnapshot,
+    /// When this view was last replaced.
+    pub time_exchange: DateTime<Utc>,
+}
+
 /// Simulated venue state machine: synchronous, transport-free and latency-free.
 ///
 /// Fills every market order immediately and keeps its own balance ledger. It has no channels and
@@ -109,6 +122,12 @@ pub struct SimulatedVenue {
     pub fill_model: SimFillConfig,
     pub instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
     pub account: AccountState,
+    /// This venue's own view of each instrument it trades, as of the last
+    /// [`apply_market`](Self::apply_market).
+    ///
+    /// Empty unless a driver feeds it — see [`apply_market`](Self::apply_market) for which drivers
+    /// do. Read through [`market`](Self::market).
+    market: FnvHashMap<InstrumentNameExchange, VenueInstrumentMarket>,
     /// Monotone `OrderId` source. Private: resetting it mints duplicate ids, and
     /// `TradeId` is derived from it, so the duplicate would reach the trade ledger.
     order_sequence: u64,
@@ -128,6 +147,7 @@ impl SimulatedVenue {
             fill_model: config.fill_model,
             instruments,
             account: AccountState::from(config.initial_state.clone()),
+            market: FnvHashMap::default(),
             order_sequence: 0,
             time_exchange_latest: Default::default(),
         }
@@ -144,6 +164,43 @@ impl SimulatedVenue {
 
     pub fn time_exchange(&self) -> DateTime<Utc> {
         self.time_exchange_latest
+    }
+
+    /// Records this venue's own view of `instrument` as of `time_exchange`.
+    ///
+    /// `snapshot` **replaces** whatever was held: it is a complete view of the instrument, not a
+    /// partial update, so a field that is `None` means the feed supplies no such price rather than
+    /// "unchanged". Whoever calls this owns the state machine that folds a stream of market events
+    /// into that view.
+    ///
+    /// # Not every driver supplies this
+    /// A venue only has market state if something feeds it one. `SimRunner` does, routing each
+    /// source market event to the venues trading that instrument before the `Engine` sees it.
+    /// `MockExchange` has no market feed and cannot acquire one without re-creating the look-ahead
+    /// hazard that motivated the split, so a venue driven by it reports [`market`](Self::market) as
+    /// `None` forever. That difference is a property of this type, not an accident of wiring.
+    ///
+    /// # This is recorded, not yet priced against
+    /// Nothing in this venue reads it to price a fill today. A market order is still priced from
+    /// the snapshot its own request carried
+    /// ([`RequestOpen::market`](crate::order::request::RequestOpen::market)), which is what keeps
+    /// the venue's results identical whether or not a driver feeds it. It is the substrate resting
+    /// orders need: an order that rests has no request-time snapshot to be matched against, because
+    /// the market it must be matched against has not happened yet.
+    pub fn apply_market(
+        &mut self,
+        instrument: &InstrumentNameExchange,
+        snapshot: MarketSnapshot,
+        time_exchange: DateTime<Utc>,
+    ) {
+        let entry = self.market.entry(instrument.clone()).or_default();
+        entry.snapshot = snapshot;
+        entry.time_exchange = time_exchange;
+    }
+
+    /// This venue's view of `instrument`, or `None` if nothing has fed it one.
+    pub fn market(&self, instrument: &InstrumentNameExchange) -> Option<&VenueInstrumentMarket> {
+        self.market.get(instrument)
     }
 
     /// Number of orders this venue has booked, and so the next `OrderId` it will mint.
