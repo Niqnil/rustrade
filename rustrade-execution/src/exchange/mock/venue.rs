@@ -89,6 +89,19 @@ pub type CancelOutcome = VenueOutcome<UnindexedOrderResponseCancel>;
 ///   spot buy debits quote without crediting base, and a spot sell the reverse. Balances therefore
 ///   track cash committed, not portfolio value; position-derived statistics come from the engine.
 /// - **Only [`OrderKind::Market`] is accepted**; every other kind is rejected.
+///
+/// # Reserved balances
+/// The ledger distinguishes held from spendable: `free` is what an order may draw on, `total` is
+/// what the account holds, and the difference is held against something. An `initial_state` copied
+/// from a live account with margin reserved is therefore usable as configured — it was rejected
+/// outright while every order filled on arrival and the ledger could not represent the state.
+///
+/// Every order this venue currently accepts still fills on arrival, so it reserves and settles in
+/// one step ([`AccountState::debit_filled`]) and emits **one** balance restatement per fill. A
+/// configured reservation is carried through untouched: settling lowers `total` by the settled
+/// amount and leaves the rest held.
+///
+/// [`AccountState::debit_filled`]: crate::exchange::mock::account::AccountState::debit_filled
 #[derive(Debug)]
 pub struct SimulatedVenue {
     pub exchange: ExchangeId,
@@ -266,7 +279,6 @@ impl SimulatedVenue {
     /// early returns and the ordering contract -- ack the trade, then emit balance before trade --
     /// is the part a reader needs to find. Splitting keeps that contract in a ten-line caller
     /// instead of at the end of a three-hundred-line one.
-    #[allow(clippy::expect_used)] // Mock exchange: panic if test data is incomplete
     fn open_order_inner(
         &mut self,
         request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
@@ -382,76 +394,28 @@ impl SimulatedVenue {
             self.fee_model
                 .compute_fee(fill_price, request.state.quantity, contract_size);
 
-        let balance_change_result = match (cash_settled, request.state.side) {
-            // Both directions of a CFD, and the buy side of a spot trade, post quote-denominated
-            // cash -- so they are one arm, not two identical ones.
-            //
-            // A CFD is a cash-settled position on a price, not an exchange of the two underlying
-            // assets: there is nothing to deliver in either direction. A CFD short is a margin
-            // position rather than a stock loan, so -- unlike a spot sell -- it requires no base
-            // inventory, which would otherwise force the caller to fund a phantom balance in an
-            // index or a commodity to open one.
-            //
-            // For a CFD the notional stands in for a margin requirement: this mock models no
-            // leverage, so "you must hold the full notional to open the position" is the
-            // conservative reading, and it is the same requirement a spot buy already carries.
-            (true, _) | (false, Side::Buy) => {
-                #[allow(clippy::expect_used)]
-                // Invariant: SimulatedVenue - balances exist for all configured instruments
-                let current = self
-                    .account
-                    .balance_mut(&underlying.quote)
-                    .expect("SimulatedVenue has Balance for all configured Instrument assets");
-
-                let quote_required = order_notional_quote + order_fees_quote;
-                let maybe_new_balance = current.balance.free - quote_required;
-
-                // Every order this exchange supports fills immediately, so nothing is ever held on
-                // reserve and `total` must equal `free`. An `initial_state` that says otherwise --
-                // a snapshot copied from a live account with margin reserved, say -- cannot be
-                // modelled here: the fill path below writes both fields from one number and would
-                // erase the reserved portion without saying so. That is user configuration rather
-                // than an internal invariant, so reject.
-                if current.balance.total != current.balance.free {
-                    Err(ApiError::OrderRejected(format!(
-                        "SimulatedVenue cannot model a reserved balance for {}: \
-                         total {} != free {}",
-                        underlying.quote, current.balance.total, current.balance.free
-                    )))
-                } else if maybe_new_balance >= Decimal::ZERO {
-                    current.balance.free = maybe_new_balance;
-                    current.balance.total = maybe_new_balance;
-                    current.time_exchange = time_exchange;
-
-                    Ok((
-                        current.clone(),
-                        AssetFees::new(
-                            underlying.quote.clone(),
-                            order_fees_quote,
-                            Some(order_fees_quote),
-                        ),
-                    ))
-                } else {
-                    Err(ApiError::BalanceInsufficient(
-                        underlying.quote.clone(),
-                        format!(
-                            "Available Balance: {}, Required Balance inc. fees: {}",
-                            current.balance.free, quote_required
-                        ),
-                    ))
-                }
-            }
+        // Which asset the order pays with, and how much of it.
+        //
+        // Both directions of a CFD, and the buy side of a spot trade, post quote-denominated cash
+        // -- so they are one arm, not two identical ones.
+        //
+        // A CFD is a cash-settled position on a price, not an exchange of the two underlying
+        // assets: there is nothing to deliver in either direction. A CFD short is a margin position
+        // rather than a stock loan, so -- unlike a spot sell -- it requires no base inventory,
+        // which would otherwise force the caller to fund a phantom balance in an index or a
+        // commodity to open one.
+        //
+        // For a CFD the notional stands in for a margin requirement: this mock models no leverage,
+        // so "you must hold the full notional to open the position" is the conservative reading,
+        // and it is the same requirement a spot buy already carries.
+        let (asset_debited, amount_required) = match (cash_settled, request.state.side) {
+            (true, _) | (false, Side::Buy) => (
+                underlying.quote.clone(),
+                order_notional_quote + order_fees_quote,
+            ),
             (false, Side::Sell) => {
-                // Selling Instrument requires sufficient BaseAsset Balance
-                #[allow(clippy::expect_used)]
-                // Invariant: SimulatedVenue - balances exist for all configured instruments
-                let current = self
-                    .account
-                    .balance_mut(&underlying.base)
-                    .expect("SimulatedVenue has Balance for all configured Instrument assets");
-
-                let order_value_base = request.state.quantity.abs();
-                // Fee is quote-denominated; convert to base for deduction.
+                // Selling a spot instrument delivers the base asset, so the debit is denominated in
+                // base and the quote-denominated fee is converted at the fill price.
                 //
                 // Note: for `PerContractFeeModel` this conversion is nonsensical (a flat commission
                 // divided by a price). Only `Spot` reaches this branch -- a cash-settled kind is
@@ -468,47 +432,47 @@ impl SimulatedVenue {
                 } else {
                     order_fees_quote / fill_price
                 };
-                let base_required = order_value_base + order_fees_base;
 
-                let maybe_new_balance = current.balance.free - base_required;
-
-                // See the quote-side arm: immediate fills mean nothing is ever on reserve, so a
-                // configured `total != free` cannot be modelled and is rejected rather than
-                // asserted on.
-                if current.balance.total != current.balance.free {
-                    Err(ApiError::OrderRejected(format!(
-                        "SimulatedVenue cannot model a reserved balance for {}: \
-                         total {} != free {}",
-                        underlying.base, current.balance.total, current.balance.free
-                    )))
-                } else if maybe_new_balance >= Decimal::ZERO {
-                    current.balance.free = maybe_new_balance;
-                    current.balance.total = maybe_new_balance;
-                    current.time_exchange = time_exchange;
-
-                    Ok((
-                        current.clone(),
-                        AssetFees::new(
-                            underlying.quote.clone(),
-                            order_fees_quote,
-                            Some(order_fees_quote),
-                        ),
-                    ))
-                } else {
-                    Err(ApiError::BalanceInsufficient(
-                        underlying.base,
-                        format!(
-                            "Available Balance: {}, Required Balance inc. fees: {}",
-                            current.balance.free, base_required
-                        ),
-                    ))
-                }
+                (
+                    underlying.base.clone(),
+                    request.state.quantity.abs() + order_fees_base,
+                )
             }
         };
 
+        // Reserve-then-settle in one step. A market order fills on arrival, so the two collapse
+        // together and the client sees a single balance restatement -- see
+        // `AccountState::debit_filled`. A configured `total != free` (an `initial_state` copied
+        // from a live account with margin reserved) is carried through untouched rather than
+        // rejected: the ledger now represents a held amount, so there is nothing left to refuse.
+        let balance_change_result =
+            self.account
+                .debit_filled(&asset_debited, amount_required, time_exchange);
+
         let (balance_snapshot, fees) = match balance_change_result {
-            Ok((balance_snapshot, fees)) => (Snapshot(balance_snapshot), fees),
-            Err(error) => return (build_open_order_err_response(request, error), None),
+            Ok(balance_snapshot) => (
+                Snapshot(balance_snapshot),
+                AssetFees::new(
+                    underlying.quote.clone(),
+                    order_fees_quote,
+                    Some(order_fees_quote),
+                ),
+            ),
+            Err(insufficient) => {
+                return (
+                    build_open_order_err_response(
+                        request,
+                        ApiError::BalanceInsufficient(
+                            asset_debited,
+                            format!(
+                                "Available Balance: {}, Required Balance inc. fees: {}",
+                                insufficient.free, insufficient.required
+                            ),
+                        ),
+                    ),
+                    None,
+                );
+            }
         };
 
         let order_id = self.order_id_sequence_fetch_add();
@@ -1370,47 +1334,99 @@ mod tests {
         );
     }
 
-    /// A `total != free` balance is user configuration -- an `initial_state` copied from a live
-    /// account with margin reserved -- not an internal invariant. It used to be an `assert_eq!`,
-    /// which panicked the exchange task on the first order.
+    /// A configured reservation is honoured, not refused.
+    ///
+    /// `total != free` is ordinary user configuration -- an `initial_state` copied from a live
+    /// account with margin reserved. It was once an `assert_eq!` that panicked the exchange task on
+    /// the first order, then a rejection, because a ledger where every order filled on arrival had
+    /// no way to represent an amount held back. It has one now: the order draws on `free`, and the
+    /// held amount is still held afterwards.
     #[test]
-    fn a_reserved_quote_balance_is_rejected_rather_than_asserted() {
+    fn a_configured_quote_reservation_survives_a_fill() {
         let mut venue = make_venue("10", "10000000");
         venue.account.balance_mut(&quote()).unwrap().balance.total = d("20000000");
 
         let outcome = venue.open_order(buy_request("1.0", market_prices("50000")));
 
-        assert!(outcome.events.is_empty());
         assert!(
-            matches!(
-                outcome.response.state,
-                OrderState::Inactive(InactiveOrderState::OpenFailed(
-                    UnindexedOrderError::Rejected(_)
-                ))
-            ),
-            "expected a rejection, got {:?}",
+            matches!(outcome.response.state, OrderState::Inactive(_)),
+            "a market order fills on arrival, got {:?}",
             outcome.response.state
+        );
+
+        let usdt = venue.account.balance_mut(&quote()).unwrap().balance;
+        assert_eq!(
+            usdt.free,
+            d("10000000") - d("50000"),
+            "the fill draws the notional from the spendable side"
+        );
+        assert_eq!(
+            usdt.total - usdt.free,
+            d("10000000"),
+            "the configured reservation must be untouched by an unrelated fill"
         );
     }
 
-    /// The sell path debits the base asset, so it carries its own copy of the reserve check.
+    /// The sell path debits the base asset, so the reservation must survive there too.
     #[test]
-    fn a_reserved_base_balance_is_rejected_rather_than_asserted() {
+    fn a_configured_base_reservation_survives_a_fill() {
         let mut venue = make_venue("10", "10000000");
         venue.account.balance_mut(&base()).unwrap().balance.total = d("20");
 
         let outcome = venue.open_order(sell_request("1.0", market_prices("50000")));
 
-        assert!(outcome.events.is_empty());
+        assert!(
+            matches!(outcome.response.state, OrderState::Inactive(_)),
+            "a market order fills on arrival, got {:?}",
+            outcome.response.state
+        );
+
+        let btc = venue.account.balance_mut(&base()).unwrap().balance;
+        assert_eq!(
+            btc.free,
+            d("10") - d("1"),
+            "the fill delivers one base unit from the spendable side"
+        );
+        assert_eq!(
+            btc.total - btc.free,
+            d("10"),
+            "the configured reservation must be untouched by an unrelated fill"
+        );
+    }
+
+    /// An order larger than `free` is refused even when `total` would cover it.
+    ///
+    /// The whole point of a reservation is that the held portion is not spendable. Sizing against
+    /// `total` would let one order spend what another is already holding.
+    #[test]
+    fn a_reservation_is_not_spendable() {
+        let mut venue = make_venue("10", "100");
+        // free 100, total 10_000_000: only 100 may be spent.
+        venue.account.balance_mut(&quote()).unwrap().balance.total = d("10000000");
+
+        let outcome = venue.open_order(buy_request("1.0", market_prices("50000")));
+
         assert!(
             matches!(
                 outcome.response.state,
                 OrderState::Inactive(InactiveOrderState::OpenFailed(
-                    UnindexedOrderError::Rejected(_)
+                    UnindexedOrderError::Rejected(ApiError::BalanceInsufficient(_, _))
                 ))
             ),
-            "expected a rejection, got {:?}",
+            "expected an insufficient-balance rejection, got {:?}",
             outcome.response.state
+        );
+        assert!(
+            outcome.events.is_empty(),
+            "a refused order moves nothing, so it restates nothing"
+        );
+
+        let usdt = venue.account.balance_mut(&quote()).unwrap().balance;
+        assert_eq!(usdt.free, d("100"), "a refused reserve must not move free");
+        assert_eq!(
+            usdt.total,
+            d("10000000"),
+            "a refused reserve must not move total"
         );
     }
 

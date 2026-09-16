@@ -614,6 +614,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The simulated venue's ledger models a reserved balance** (`rustrade-execution`). `free` is what
+  an order may draw on, `total` is what the account holds, and the difference is held against
+  something — the split `Balance` has always described and this ledger could not previously
+  represent.
+
+  An `initial_state` copied from a live account with margin reserved is now usable as configured.
+  It was formerly refused outright with `SimulatedVenue cannot model a reserved balance`, because a
+  ledger in which every order fills on arrival had no way to express an amount held back, and the
+  fill path wrote `free` and `total` from one number — so carrying the configuration would have
+  erased the reserved portion silently. `AccountState` gains `reserve`, `settle` and `debit_filled`,
+  and the two hand-rolled balance arms in `open_order` collapse onto them.
+
+  **Reported results are unchanged**, which is checked rather than asserted: a market order fills on
+  arrival, so it reserves and settles in one step and emits exactly **one** balance restatement, as
+  before. A balance is an absolute restatement rather than a delta, so emitting the intermediate
+  state would have reported a balance the account never held. The committed tear-sheet artifact in
+  `rustrade/tests/data/` is byte-identical across the change.
+
 - **`quick-xml` 0.41 → 0.42** (`rustrade-data`, `ibkr` feature). The bump's headline break is that
   `QName<'a>` now wraps `&'a str` rather than `&'a [u8]`, with `AsRef<str>` replacing
   `AsRef<[u8]>`. Our exposure is a single line: `root_element_name` in the IBKR Flex parser no
