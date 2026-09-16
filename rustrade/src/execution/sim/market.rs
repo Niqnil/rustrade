@@ -28,7 +28,7 @@ use std::fmt::Debug;
 /// The venue's answer must match the `Engine`'s, because the two price the same fill. The
 /// [`DataKind`] implementation gets that by construction: its [`State`](Self::State) **is**
 /// [`DefaultInstrumentMarketData`], and its two methods delegate to the same
-/// [`Processor`](crate::engine::Processor) and
+/// [`Processor`] and
 /// [`InstrumentDataState::market_snapshot`] the engine calls. A custom implementation that
 /// re-derives prices instead takes on the burden of agreeing with whatever
 /// [`InstrumentDataState`] the engine was built with — see
