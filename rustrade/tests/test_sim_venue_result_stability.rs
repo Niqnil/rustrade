@@ -8,9 +8,9 @@
 //! balances behind.
 //!
 //! "Must not change" is only a claim until something checks it. This runs a fixed strategy over the
-//! committed market-data fixture and canonicalises the resulting [`TradingSummary`] to JSON, so the
-//! whole tear sheet — realised PnL, fee totals, per-asset closing balances, trade counts — can be
-//! compared byte-for-byte across a change.
+//! committed market-data fixture and compares the resulting tear sheet — realised PnL, fee totals,
+//! per-asset closing balances, drawdown windows, trade counts — byte-for-byte against a committed
+//! golden artifact, so a result that moves fails CI rather than waiting to be noticed.
 //!
 //! # Why the summary rather than the engine state
 //!
@@ -85,6 +85,8 @@ use serde::Deserialize;
 const CONFIG_PATH: &str = "examples/config/backtest_config.json";
 const FILE_PATH_MARKET_DATA: &str =
     "examples/data/binance_spot_trades_l1_btcusdt_ethusdt_solusdt.json";
+/// The expected tear sheet. Derived from [`FILE_PATH_MARKET_DATA`], which is redistributable.
+const GOLDEN_PATH: &str = "tests/data/sim_venue_stability_summary.txt";
 
 /// One order every `ORDER_EVERY_N_CALLS` calls, at most [`MAX_ORDERS`] in total.
 ///
@@ -331,19 +333,92 @@ async fn run() -> BacktestResult<Daily, ProbeState> {
     .expect("the stability fixture must complete")
 }
 
-/// Canonical JSON for the run's tear sheet — the artifact a change is diffed against.
+/// The first differing line of two tear sheets, with a little context either side.
+///
+/// A whole-file diff of a 185-line `Debug` dump buries the one line that moved. A result change
+/// here is usually a single number, and the line it is on is the entire diagnosis.
+fn first_difference(expected: &str, actual: &str) -> String {
+    let mut report = String::new();
+
+    let expected: Vec<&str> = expected.lines().collect();
+    let actual: Vec<&str> = actual.lines().collect();
+
+    let Some(line) = (0..expected.len().max(actual.len()))
+        .find(|index| expected.get(*index) != actual.get(*index))
+    else {
+        // Unreachable while the caller only calls this on a mismatch, but a panic in the failure
+        // reporter would replace a useful message with a useless one.
+        return "the two differ, but no differing line was found (trailing newline?)".to_string();
+    };
+
+    let context = line.saturating_sub(2)..(line + 3).min(expected.len().max(actual.len()));
+    report.push_str(&format!("first difference at line {}:\n", line + 1));
+    for index in context {
+        let expected_line = expected.get(index).copied().unwrap_or("<end of file>");
+        let actual_line = actual.get(index).copied().unwrap_or("<end of file>");
+        if expected_line == actual_line {
+            report.push_str(&format!("   {expected_line}\n"));
+        } else {
+            report.push_str(&format!("  -{expected_line}\n  +{actual_line}\n"));
+        }
+    }
+
+    report.push_str(&format!(
+        "\n({} expected lines, {} actual)",
+        expected.len(),
+        actual.len()
+    ));
+    report
+}
+
+/// The run's tear sheet, compared against the committed golden artifact.
+///
+/// Stage 3's acceptance criterion is that an existing backtest reports what it reported before. That
+/// is only a claim until something checks it, and a claim a human re-reads off a log is checked once
+/// and then forgotten. Committing the expected tear sheet makes the criterion CI's problem.
+///
+/// The artifact is `Debug`, not JSON: `TradingSummary::assets` is keyed by `ExchangeAsset`, a
+/// struct, and `serde_json` rejects non-string map keys, so `to_string` on a funded summary fails
+/// outright (tracked as issue #301). `Debug` is total, and stable for as long as `TradingSummary`'s
+/// own shape is.
+///
+/// # Regenerating
+///
+/// A change to `TradingSummary`'s *shape* — a new field, a renamed one — legitimately rewrites this
+/// file without any result having moved. Regenerate with:
+///
+/// ```text
+/// UPDATE_GOLDEN=1 cargo test -p rustrade --test test_sim_venue_result_stability
+/// ```
+///
+/// and read the diff before committing it. A diff confined to added fields is a shape change; a diff
+/// touching a number is a result change, and needs explaining rather than accepting.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sim_venue_backtest_summary_is_stable() {
     let result = run().await;
     let summary = &result.summary.trading_summary;
+    let actual = format!("{summary:#?}\n");
 
-    // `Debug`, not JSON: `TradingSummary::assets` is keyed by `ExchangeAsset`, a struct, and
-    // `serde_json` rejects non-string map keys — `to_string` on a funded summary fails outright.
-    // `Debug` is total, and stable for as long as `TradingSummary`'s own shape is, which is exactly
-    // the window this fixture defends.
-    println!("---8<--- TRADING SUMMARY ---8<---");
-    println!("{summary:#?}");
-    println!("---8<--- END ---8<---");
+    if std::env::var_os("UPDATE_GOLDEN").is_some() {
+        std::fs::write(GOLDEN_PATH, &actual).expect("golden artifact must be writable");
+        println!("UPDATE_GOLDEN set: rewrote {GOLDEN_PATH}");
+    } else {
+        let expected = std::fs::read_to_string(GOLDEN_PATH).unwrap_or_else(|error| {
+            panic!(
+                "golden artifact {GOLDEN_PATH} must be readable ({error}); regenerate it with \
+                 UPDATE_GOLDEN=1"
+            )
+        });
+
+        if actual != expected {
+            panic!(
+                "the simulated venue's reported tear sheet changed.\n\n{}\n\nIf the change is \
+                 intended, regenerate with `UPDATE_GOLDEN=1 cargo test -p rustrade --test \
+                 test_sim_venue_result_stability` and justify every moved number in the PR.",
+                first_difference(&expected, &actual)
+            );
+        }
+    }
 
     // The fixture is only meaningful if it actually traded. A silent regression to zero fills would
     // otherwise make every later comparison vacuously "stable".

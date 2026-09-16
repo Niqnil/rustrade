@@ -1,0 +1,185 @@
+TradingSummary {
+    time_engine_start: 2025-03-25T23:07:00.715Z,
+    time_engine_end: 2025-03-25T23:10:05.263956551Z,
+    instruments: {
+        InstrumentNameInternal(
+            "binance_spot-btcusdt",
+        ): TearSheet {
+            pnl: 0,
+            pnl_return: RateOfReturn {
+                value: 0,
+                interval: Daily,
+            },
+            sharpe_ratio: SharpeRatio {
+                value: 79228162514264337593543950335,
+                interval: Daily,
+            },
+            sortino_ratio: SortinoRatio {
+                value: 79228162514264337593543950335,
+                interval: Daily,
+            },
+            calmar_ratio: CalmarRatio {
+                value: 79228162514264337593543950335,
+                interval: Daily,
+            },
+            pnl_drawdown: None,
+            pnl_drawdown_mean: None,
+            pnl_drawdown_max: None,
+            win_rate: None,
+            profit_factor: None,
+            orders_opened: 14,
+            orders_rejected: 0,
+            first_rejection_reason: None,
+        },
+        InstrumentNameInternal(
+            "binance_spot-ethusdt",
+        ): TearSheet {
+            pnl: 0,
+            pnl_return: RateOfReturn {
+                value: 0,
+                interval: Daily,
+            },
+            sharpe_ratio: SharpeRatio {
+                value: 79228162514264337593543950335,
+                interval: Daily,
+            },
+            sortino_ratio: SortinoRatio {
+                value: 79228162514264337593543950335,
+                interval: Daily,
+            },
+            calmar_ratio: CalmarRatio {
+                value: 79228162514264337593543950335,
+                interval: Daily,
+            },
+            pnl_drawdown: None,
+            pnl_drawdown_mean: None,
+            pnl_drawdown_max: None,
+            win_rate: None,
+            profit_factor: None,
+            orders_opened: 13,
+            orders_rejected: 0,
+            first_rejection_reason: None,
+        },
+        InstrumentNameInternal(
+            "binance_spot-solusdt",
+        ): TearSheet {
+            pnl: 0,
+            pnl_return: RateOfReturn {
+                value: 0,
+                interval: Daily,
+            },
+            sharpe_ratio: SharpeRatio {
+                value: 79228162514264337593543950335,
+                interval: Daily,
+            },
+            sortino_ratio: SortinoRatio {
+                value: 79228162514264337593543950335,
+                interval: Daily,
+            },
+            calmar_ratio: CalmarRatio {
+                value: 79228162514264337593543950335,
+                interval: Daily,
+            },
+            pnl_drawdown: None,
+            pnl_drawdown_mean: None,
+            pnl_drawdown_max: None,
+            win_rate: None,
+            profit_factor: None,
+            orders_opened: 13,
+            orders_rejected: 0,
+            first_rejection_reason: None,
+        },
+    },
+    assets: {
+        ExchangeAsset {
+            exchange: BinanceSpot,
+            asset: AssetNameInternal(
+                "btc",
+            ),
+        }: TearSheetAsset {
+            balance_end: Some(
+                Balance {
+                    total: 0.1,
+                    free: 0.1,
+                    margin: None,
+                },
+            ),
+            drawdown: None,
+            drawdown_mean: None,
+            drawdown_max: None,
+        },
+        ExchangeAsset {
+            exchange: BinanceSpot,
+            asset: AssetNameInternal(
+                "eth",
+            ),
+        }: TearSheetAsset {
+            balance_end: Some(
+                Balance {
+                    total: 1,
+                    free: 1,
+                    margin: None,
+                },
+            ),
+            drawdown: None,
+            drawdown_mean: None,
+            drawdown_max: None,
+        },
+        ExchangeAsset {
+            exchange: BinanceSpot,
+            asset: AssetNameInternal(
+                "sol",
+            ),
+        }: TearSheetAsset {
+            balance_end: Some(
+                Balance {
+                    total: 10,
+                    free: 10,
+                    margin: None,
+                },
+            ),
+            drawdown: None,
+            drawdown_mean: None,
+            drawdown_max: None,
+        },
+        ExchangeAsset {
+            exchange: BinanceSpot,
+            asset: AssetNameInternal(
+                "usdt",
+            ),
+        }: TearSheetAsset {
+            balance_end: Some(
+                Balance {
+                    total: 8687.584214995091768785772817,
+                    free: 8687.584214995091768785772817,
+                    margin: None,
+                },
+            ),
+            drawdown: Some(
+                Drawdown {
+                    value: 0.1312415785004908231214227183,
+                    time_start: 2025-03-24T21:30:00Z,
+                    time_end: 2025-03-25T23:08:24.199491154Z,
+                },
+            ),
+            drawdown_mean: Some(
+                MeanDrawdown {
+                    mean_drawdown: 0.1312415785004908231214227183,
+                    mean_drawdown_ms: 92304199,
+                },
+            ),
+            drawdown_max: Some(
+                MaxDrawdown(
+                    Drawdown {
+                        value: 0.1312415785004908231214227183,
+                        time_start: 2025-03-24T21:30:00Z,
+                        time_end: 2025-03-25T23:08:24.199491154Z,
+                    },
+                ),
+            ),
+        },
+    },
+    basis: Gross,
+    orders_opened: 40,
+    orders_rejected: 0,
+}
