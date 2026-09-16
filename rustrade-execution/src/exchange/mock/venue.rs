@@ -7,7 +7,7 @@ use crate::{
     error::{ApiError, UnindexedApiError, UnindexedOrderError},
     exchange::mock::account::AccountState,
     fee::{FeeModel, FeeModelConfig, Liquidity},
-    fill::{FillModel, SimFillConfig},
+    fill::{FillContext, FillModel, SimFillConfig},
     market::MarketSnapshot,
     order::{
         Order, OrderKind, UnindexedOrder,
@@ -366,45 +366,25 @@ impl SimulatedVenue {
 
         // Compute fill price via the configured FillModel.
         //
-        // For limit orders, pass the limit price as `order_price`; for market orders pass `None`
-        // so the model can select the best available market price (bid/ask/last). `market` is the
-        // snapshot the request's sender observed when it decided to trade -- for a market order it
-        // is the only price source there is, since `request.state.price` is `None` by construction
-        // for `OrderKind::Market`.
+        // `market` is the snapshot the request's sender observed when it decided to trade -- for a
+        // market order it is the only price source there is, since `request.state.price` is `None`
+        // by construction for `OrderKind::Market`.
         //
-        // The snapshot is passed as the venue holds it. The order's own limit price reaches the
-        // model as `order_price` and as the trailing fallback below, so folding it into the
-        // snapshot's `last_price` would hand the model a market that reports the order's own price
-        // as a trade that happened.
+        // The order's own price is deliberately NOT handed to the model. A limit constrains the
+        // result, not the pricing: a model reads the book and returns where a taker prints, and
+        // this venue is what bounds that by the order's terms. See `FillModel`'s contract.
         //
-        // Invariant: `fill_price` is only called for marketable orders. `validate_order_kind_supported`
-        // (called above) currently rejects Limit orders, ensuring FillModel::fill_price never receives
-        // a non-marketable limit order. If Limit support is added later, the fill model must enforce
-        // limit-price semantics (e.g. a limit buy must not fill above the limit price).
+        // Invariant: `fill_price` is only called for an order that will fill on arrival.
+        // `validate_order_kind_supported` (called above) rejects every kind but `Market`, so no
+        // limit reaches this call yet and there is nothing to bound. When limits are accepted, the
+        // clamp belongs here, next to the model call that needs bounding -- not inside the model.
         let market = market.unwrap_or_default();
         let maybe_fill_price = self
             .fill_model
-            .fill_price(
-                request.state.side,
-                match request.state.kind {
-                    // unreachable: validate_order_kind_supported (called above) already
-                    // rejects non-Market orders with Err, so these arms are never reached.
-                    // Kept for exhaustiveness; passes the limit/trigger price so fill models
-                    // that gain support in future behave correctly without a separate change.
-                    OrderKind::Market => None,
-                    OrderKind::Limit
-                    | OrderKind::StopLimit { .. }
-                    | OrderKind::TakeProfitLimit { .. }
-                    | OrderKind::TrailingStopLimit { .. } => request.state.price,
-                    OrderKind::Stop { trigger_price }
-                    | OrderKind::TakeProfit { trigger_price }
-                    | OrderKind::TrailingStop {
-                        offset: trigger_price,
-                        ..
-                    } => Some(trigger_price),
-                },
-                &market,
-            )
+            .fill_price(&FillContext::new(request.state.side, &market))
+            // Inert for every order this venue currently accepts: `OrderKind::Market` carries no
+            // price, so this is `.or(None)`. It survives as the last resort for a request whose
+            // kind does carry one and whose market is empty.
             .or(request.state.price);
 
         // No price anywhere. Ordinary user data -- a cold start, a thin instrument, a subscription
@@ -1608,5 +1588,43 @@ mod tests {
             cids, expected,
             "orders on one instrument must be ordered by a key no two of them share"
         );
+    }
+
+    /// A limit order is rejected before any fill model is consulted.
+    ///
+    /// This pins the vacuity that makes the current state safe. A [`FillModel`] no longer honours a
+    /// limit price — bounding a fill by the order's own terms belongs to this venue — but the clamp
+    /// that will do so is not written yet, because nothing can reach it:
+    /// [`validate_order_kind_supported`](SimulatedVenue::validate_order_kind_supported) returns
+    /// `Err` for every kind but `Market`, and `Market` carries no price.
+    ///
+    /// The snapshot is chosen so the omission would be visible if the guard ever stopped holding.
+    /// `MidpointFillModel` would price this buy at 50,000 against a limit of 40,000 — a fill 25%
+    /// above the order's own limit — so a `Filled` response here means the clamp is owed and
+    /// missing, not merely that a rejection message changed.
+    #[test]
+    fn a_limit_order_is_rejected_before_a_fill_model_is_consulted() {
+        let mut venue = make_venue("100", "10000000");
+        venue.fill_model = SimFillConfig::Midpoint(crate::fill::MidpointFillModel);
+
+        let mut request = buy_request("1", market_prices("50000"));
+        request.state.kind = OrderKind::Limit;
+        request.state.price = Some(d("40000"));
+
+        let outcome = venue.open_order(request);
+
+        assert!(
+            outcome.events.is_empty(),
+            "a rejected order moves no balance and books no trade"
+        );
+        match outcome.response.state {
+            OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                ApiError::OrderRejected(ref reason),
+            ))) => assert!(
+                reason.contains("does not support OrderKind::Limit"),
+                "the rejection must name the unsupported kind, got: {reason}"
+            ),
+            other => panic!("a limit order must be rejected by kind, got: {other:?}"),
+        }
     }
 }

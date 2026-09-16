@@ -44,11 +44,10 @@ pub struct MockExecutionConfig {
     pub fee_model: FeeModelConfig,
     /// Fill model used by the mock exchange to compute execution prices.
     ///
-    /// Defaults to [`SimFillConfig::LastPrice`], which fills at the
-    /// order price (identical to pre-FillModel behaviour). Switch to
-    /// [`SimFillConfig::BidAsk`] or [`SimFillConfig::Midpoint`] for
-    /// more realistic spread-cost simulation when market prices are injected
-    /// alongside orders.
+    /// Defaults to [`SimFillConfig::LastPrice`], which fills at the snapshot's `last_price`,
+    /// falling back to the side of the book a taker would cross to. Switch to
+    /// [`SimFillConfig::BidAsk`] or [`SimFillConfig::Midpoint`] for more realistic spread-cost
+    /// simulation when market prices are injected alongside orders.
     #[serde(default)]
     pub fill_model: SimFillConfig,
 }

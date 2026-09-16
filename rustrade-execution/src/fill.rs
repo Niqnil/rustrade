@@ -3,147 +3,132 @@ use rust_decimal::Decimal;
 use rustrade_instrument::Side;
 use serde::{Deserialize, Serialize};
 
-/// Simulates the execution price for a backtest fill.
+/// Everything a [`FillModel`] may price from.
 ///
-/// Called by the mock exchange engine when deciding at what price a pending
-/// order should be filled against incoming market data.
+/// # Fields are added, never removed
+///
+/// An implementation only ever reads this, so every increase in the simulated venue's fidelity —
+/// the order's quantity for a size-aware impact model, sizes at the touch, depth, a queue
+/// position — arrives as a new field rather than as a new parameter on
+/// [`fill_price`](FillModel::fill_price). That is what `#[non_exhaustive]` is for here:
+/// constructing one outside this crate would turn each such addition back into a breaking change,
+/// which is the churn this type exists to end.
+///
+/// The order's limit price is deliberately absent — see [`FillModel`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct FillContext<'a> {
+    /// Which way the order trades.
+    pub side: Side,
+    /// The venue's view of the instrument. Every field is optional and absence is ordinary; see
+    /// [`MarketSnapshot`].
+    pub market: &'a MarketSnapshot,
+}
+
+impl<'a> FillContext<'a> {
+    pub fn new(side: Side, market: &'a MarketSnapshot) -> Self {
+        Self { side, market }
+    }
+}
+
+/// Prices a fill the venue has already decided will happen.
 ///
 /// # Backtest-only
 ///
-/// This trait is only relevant for simulated execution via `MockExchange`.
-/// Live execution clients receive real fill prices from the venue — they do
-/// not use `FillModel`.
+/// Only simulated execution consults a `FillModel`. Live execution clients receive real fill
+/// prices from the venue.
+///
+/// # Called only for a taker
+///
+/// A market order, or a limit order that is marketable when it arrives. A resting order matched
+/// later fills at *its own limit price* and never reaches a fill model: a maker is paid the price
+/// it quoted, and price improvement accrues to the aggressor that crossed it.
+///
+/// # This model does not see the limit price, and must not
+///
+/// A limit constrains the *result*, not the pricing. The venue clamps whatever is returned to the
+/// order's limit — never above a buy's, never below a sell's — so an implementation models
+/// slippage and spread and cannot produce a fill outside the order's terms.
+///
+/// Reading the limit here is how two of the three models this crate ships came to return the limit
+/// *itself* for a marketable order: a buy limit of 51,000 arriving against an ask of 50,000 filled
+/// at 51,000 — a worse price than a market order got under the same configuration. The third
+/// returned the midpoint even when it sat above a buy's limit. Removing the parameter is what
+/// makes that class of error unwritable rather than merely documented.
 ///
 /// # Extensibility
 ///
-/// Implement this trait to model slippage, market impact, or other execution
-/// dynamics. The built-in models ([`LastPriceFillModel`], [`BidAskFillModel`],
-/// [`MidpointFillModel`]) provide baseline behavior; custom implementations
-/// can add fixed or random slippage, volume-based price impact, or other
-/// realistic execution simulation.
+/// Implement this to model slippage, market impact, or other execution dynamics. The built-in
+/// models ([`LastPriceFillModel`], [`BidAskFillModel`], [`MidpointFillModel`]) are baselines.
 ///
-/// # Arguments
+/// # Returns
 ///
-/// * `side` — order side (Buy or Sell).
-/// * `order_price` — limit price if limit order; `None` for market orders.
-/// * `market` — the venue's view of the instrument. Every field is optional and absence is
-///   ordinary; see [`MarketSnapshot`].
-///
-/// Returns `None` if insufficient market data is available to determine a
-/// fill price (e.g. no prices at all on the first tick of a backtest).
-///
-/// # Why the market arrives as one struct
-///
-/// This took the three prices as separate trailing `Option<Decimal>` arguments. They are the same
-/// type in a fixed order, so transposing two of them is a silent mispricing rather than a compile
-/// error — and every increase in fidelity the simulated venue could gain (sizes at the touch,
-/// depth, a queue position) would have to arrive as another argument, breaking every implementation
-/// again. As a struct, those are additive fields.
+/// `None` when the context carries nothing this model can price from — no prices at all on the
+/// first ticks of a backtest, say. The venue turns that into a rejection naming the instrument
+/// rather than a panic.
 pub trait FillModel {
-    fn fill_price(
-        &self,
-        side: Side,
-        order_price: Option<Decimal>,
-        market: &MarketSnapshot,
-    ) -> Option<Decimal>;
+    fn fill_price(&self, fill: &FillContext<'_>) -> Option<Decimal>;
 }
 
-/// Fills at the last trade price for market orders, or the order's limit
-/// price for limit orders.
+/// Fills at the last traded price, falling back to the price a taker would have to cross to.
 ///
-/// Fallback chain: `order_price` → `last_price` → `best_ask` (Buy) / `best_bid` (Sell).
+/// Fallback chain: `last_price` → `best_ask` (Buy) / `best_bid` (Sell).
 ///
-/// The simplest fill model — ignores spread entirely. Useful when spread
-/// modeling is handled elsewhere or when deterministic fills are preferred.
+/// The simplest fill model — it ignores the spread entirely. Useful when spread modelling is
+/// handled elsewhere, or when deterministic fills are preferred.
+///
+/// Note that with both sides of an L1 book present, `last_price` is the *microprice* rather than
+/// the most recent print; see [`MarketSnapshot`].
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Deserialize, Serialize,
 )]
 pub struct LastPriceFillModel;
 
 impl FillModel for LastPriceFillModel {
-    fn fill_price(
-        &self,
-        side: Side,
-        order_price: Option<Decimal>,
-        market: &MarketSnapshot,
-    ) -> Option<Decimal> {
-        order_price.or(market.last_price).or(match side {
-            Side::Buy => market.best_ask,
-            Side::Sell => market.best_bid,
+    fn fill_price(&self, fill: &FillContext<'_>) -> Option<Decimal> {
+        fill.market.last_price.or(match fill.side {
+            Side::Buy => fill.market.best_ask,
+            Side::Sell => fill.market.best_bid,
         })
     }
 }
 
-/// Fills market orders at the current best ask (buys) or best bid (sells),
-/// crossing the spread as a market order taker would.
+/// Fills at the current best ask (buys) or best bid (sells), crossing the spread as a taker does.
 ///
-/// Limit orders fill at the limit price (the price is already favorable
-/// relative to the market when fill is triggered).
-///
-/// Falls back to `last_price` if bid/ask are not available. This model is
-/// more realistic than [`LastPriceFillModel`] for strategies that frequently
-/// cross the spread.
+/// Falls back to `last_price` when the relevant side of the book is absent. More realistic than
+/// [`LastPriceFillModel`] for strategies that frequently cross the spread.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Deserialize, Serialize,
 )]
 pub struct BidAskFillModel;
 
 impl FillModel for BidAskFillModel {
-    fn fill_price(
-        &self,
-        side: Side,
-        order_price: Option<Decimal>,
-        market: &MarketSnapshot,
-    ) -> Option<Decimal> {
-        if let Some(limit) = order_price {
-            // Limit order: fill at the limit price (caller is responsible for
-            // only calling fill_price when the limit is marketable).
-            return Some(limit);
-        }
-        // Market order: taker crosses the spread.
-        match side {
-            Side::Buy => market.best_ask.or(market.last_price),
-            Side::Sell => market.best_bid.or(market.last_price),
+    fn fill_price(&self, fill: &FillContext<'_>) -> Option<Decimal> {
+        match fill.side {
+            Side::Buy => fill.market.best_ask.or(fill.market.last_price),
+            Side::Sell => fill.market.best_bid.or(fill.market.last_price),
         }
     }
 }
 
-/// Fills at the midpoint of best bid and best ask.
+/// Fills at the midpoint of best bid and best ask, falling back to `last_price`.
 ///
-/// Falls back to `order_price`, then `last_price` when the book is incomplete.
+/// Useful when modelling execution quality between taker (crossing the spread) and maker (resting
+/// at the quote), or when both sides of the book are always present in the backtest feed.
 ///
-/// Useful when modelling execution quality between taker (crossing spread)
-/// and maker (resting at the limit), or when bid/ask data is always
-/// available in the backtest feed.
+/// # It is optimistic for a taker
 ///
-/// # Note on `order_price` (limit orders)
-///
-/// Unlike [`BidAskFillModel`], this model does **not** honour `order_price`
-/// when both bid and ask are present — it always fills at the midpoint
-/// regardless of the limit price. When the book is incomplete (only one
-/// side present or neither), `order_price` is preferred over `last_price`
-/// to avoid a fill at a worse price than the limit due to a stale last-trade
-/// price (above the limit for buys, below the limit for sells).
-///
-/// The caller is responsible for invoking `fill_price` only when a limit
-/// order is marketable (i.e., the limit has already been crossed). Using
-/// `MidpointFillModel` for strategies that require limit-price guarantees
-/// may result in fills at the midpoint rather than the limit.
+/// A midpoint is not a price anyone is offering, so a crossing order modelled this way saves half
+/// the spread it would really have paid. The venue bounds the result by the order's own limit;
+/// nothing bounds it by the touch.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Deserialize, Serialize,
 )]
 pub struct MidpointFillModel;
 
 impl FillModel for MidpointFillModel {
-    fn fill_price(
-        &self,
-        _side: Side,
-        order_price: Option<Decimal>,
-        market: &MarketSnapshot,
-    ) -> Option<Decimal> {
-        market
-            .mid_price()
-            .or_else(|| order_price.or(market.last_price))
+    fn fill_price(&self, fill: &FillContext<'_>) -> Option<Decimal> {
+        fill.market.mid_price().or(fill.market.last_price)
     }
 }
 
@@ -166,16 +151,11 @@ impl Default for SimFillConfig {
 }
 
 impl FillModel for SimFillConfig {
-    fn fill_price(
-        &self,
-        side: Side,
-        order_price: Option<Decimal>,
-        market: &MarketSnapshot,
-    ) -> Option<Decimal> {
+    fn fill_price(&self, fill: &FillContext<'_>) -> Option<Decimal> {
         match self {
-            SimFillConfig::LastPrice(model) => model.fill_price(side, order_price, market),
-            SimFillConfig::BidAsk(model) => model.fill_price(side, order_price, market),
-            SimFillConfig::Midpoint(model) => model.fill_price(side, order_price, market),
+            SimFillConfig::LastPrice(model) => model.fill_price(fill),
+            SimFillConfig::BidAsk(model) => model.fill_price(fill),
+            SimFillConfig::Midpoint(model) => model.fill_price(fill),
         }
     }
 }
@@ -207,17 +187,8 @@ mod tests {
     fn last_price_market_buy_uses_last() {
         let market = prices();
         assert_eq!(
-            LastPriceFillModel.fill_price(Side::Buy, None, &market),
+            LastPriceFillModel.fill_price(&FillContext::new(Side::Buy, &market)),
             Some(d("100.0"))
-        );
-    }
-
-    #[test]
-    fn last_price_limit_uses_order_price() {
-        let market = prices();
-        assert_eq!(
-            LastPriceFillModel.fill_price(Side::Buy, Some(d("99.0")), &market),
-            Some(d("99.0"))
         );
     }
 
@@ -225,7 +196,7 @@ mod tests {
     fn bid_ask_market_buy_uses_ask() {
         let market = prices();
         assert_eq!(
-            BidAskFillModel.fill_price(Side::Buy, None, &market),
+            BidAskFillModel.fill_price(&FillContext::new(Side::Buy, &market)),
             Some(d("100.5"))
         );
     }
@@ -234,7 +205,7 @@ mod tests {
     fn bid_ask_market_sell_uses_bid() {
         let market = prices();
         assert_eq!(
-            BidAskFillModel.fill_price(Side::Sell, None, &market),
+            BidAskFillModel.fill_price(&FillContext::new(Side::Sell, &market)),
             Some(d("99.5"))
         );
     }
@@ -243,7 +214,7 @@ mod tests {
     fn midpoint_uses_mid() {
         let market = prices();
         assert_eq!(
-            MidpointFillModel.fill_price(Side::Buy, None, &market),
+            MidpointFillModel.fill_price(&FillContext::new(Side::Buy, &market)),
             Some(d("100.0"))
         );
     }
@@ -251,7 +222,10 @@ mod tests {
     #[test]
     fn midpoint_falls_back_to_last_when_no_bid_ask() {
         assert_eq!(
-            MidpointFillModel.fill_price(Side::Buy, None, &snapshot(None, None, Some(d("100.0")))),
+            MidpointFillModel.fill_price(&FillContext::new(
+                Side::Buy,
+                &snapshot(None, None, Some(d("100.0")))
+            )),
             Some(d("100.0"))
         );
     }
@@ -263,8 +237,8 @@ mod tests {
         let market = prices();
         let cfg = SimFillConfig::LastPrice(LastPriceFillModel);
         assert_eq!(
-            cfg.fill_price(Side::Buy, None, &market),
-            LastPriceFillModel.fill_price(Side::Buy, None, &market)
+            cfg.fill_price(&FillContext::new(Side::Buy, &market)),
+            LastPriceFillModel.fill_price(&FillContext::new(Side::Buy, &market))
         );
     }
 
@@ -273,8 +247,8 @@ mod tests {
         let market = prices();
         let cfg = SimFillConfig::BidAsk(BidAskFillModel);
         assert_eq!(
-            cfg.fill_price(Side::Sell, None, &market),
-            BidAskFillModel.fill_price(Side::Sell, None, &market)
+            cfg.fill_price(&FillContext::new(Side::Sell, &market)),
+            BidAskFillModel.fill_price(&FillContext::new(Side::Sell, &market))
         );
     }
 
@@ -283,8 +257,8 @@ mod tests {
         let market = prices();
         let cfg = SimFillConfig::Midpoint(MidpointFillModel);
         assert_eq!(
-            cfg.fill_price(Side::Buy, None, &market),
-            MidpointFillModel.fill_price(Side::Buy, None, &market)
+            cfg.fill_price(&FillContext::new(Side::Buy, &market)),
+            MidpointFillModel.fill_price(&FillContext::new(Side::Buy, &market))
         );
     }
 
@@ -303,11 +277,13 @@ mod tests {
         // No market data at all — e.g. first tick of a backtest before any prices arrive.
         // The mock exchange falls back to request.state.price when fill_price returns None.
         assert_eq!(
-            LastPriceFillModel.fill_price(Side::Buy, None, &snapshot(None, None, None)),
+            LastPriceFillModel
+                .fill_price(&FillContext::new(Side::Buy, &snapshot(None, None, None))),
             None
         );
         assert_eq!(
-            LastPriceFillModel.fill_price(Side::Sell, None, &snapshot(None, None, None)),
+            LastPriceFillModel
+                .fill_price(&FillContext::new(Side::Sell, &snapshot(None, None, None))),
             None
         );
     }
@@ -317,83 +293,72 @@ mod tests {
         // When last_price=None but bid/ask are present, the model falls back to
         // bid/ask (as documented in the fallback chain). This exercises the tertiary
         // fallback that was previously untested.
+        let market = snapshot(Some(d("99.5")), Some(d("100.5")), None);
         assert_eq!(
-            LastPriceFillModel.fill_price(
-                Side::Buy,
-                None,
-                &snapshot(Some(d("99.5")), Some(d("100.5")), None)
-            ),
+            LastPriceFillModel.fill_price(&FillContext::new(Side::Buy, &market)),
             Some(d("100.5")),
             "Buy with no last_price should fall back to best_ask"
         );
         assert_eq!(
-            LastPriceFillModel.fill_price(
-                Side::Sell,
-                None,
-                &snapshot(Some(d("99.5")), Some(d("100.5")), None)
-            ),
+            LastPriceFillModel.fill_price(&FillContext::new(Side::Sell, &market)),
             Some(d("99.5")),
             "Sell with no last_price should fall back to best_bid"
         );
     }
 
-    #[test]
-    fn bid_ask_limit_order_wins_over_bid_ask() {
-        // Limit price must take priority over bid/ask even when both are present.
-        let market = prices();
-        let limit = Some(d("98.0"));
-        assert_eq!(
-            BidAskFillModel.fill_price(Side::Buy, limit, &market),
-            limit,
-            "limit price should beat best_ask for buy"
-        );
-        assert_eq!(
-            BidAskFillModel.fill_price(Side::Sell, limit, &market),
-            limit,
-            "limit price should beat best_bid for sell"
-        );
-    }
-
+    /// A partial book falls back to the last price, whichever side is missing.
+    ///
+    /// These replace a pair that asserted the *limit* beat a stale `last_price` on a partial book.
+    /// That special case existed only to stop a limit buy filling above its own limit, which is now
+    /// the venue's job — and doing it here was what let the complete-book arm keep filling above a
+    /// limit unnoticed.
     #[test]
     fn midpoint_with_only_bid_falls_back_to_last() {
-        // Partial book: only bid present, no ask. Should fall back to last_price.
         assert_eq!(
-            MidpointFillModel.fill_price(
+            MidpointFillModel.fill_price(&FillContext::new(
                 Side::Buy,
-                None,
                 &snapshot(Some(d("99.5")), None, Some(d("100.0")))
-            ),
+            )),
             Some(d("100.0"))
         );
     }
 
     #[test]
     fn midpoint_with_only_ask_falls_back_to_last() {
-        // Partial book: only ask present, no bid. Should fall back to last_price
-        // (order_price is None, so order_price.or(last_price) = last_price).
         assert_eq!(
-            MidpointFillModel.fill_price(
+            MidpointFillModel.fill_price(&FillContext::new(
                 Side::Sell,
-                None,
                 &snapshot(None, Some(d("100.5")), Some(d("100.0")))
-            ),
+            )),
             Some(d("100.0"))
         );
     }
 
+    /// A complete book prices at the midpoint even where that sits far from the last print.
+    ///
+    /// This case had no coverage at all, and it is where the model used to fill a limit buy above
+    /// its own limit: `mid_price()` won outright and the limit was never consulted. There is no
+    /// limit to consult now — bounding the result is the venue's job — so what this pins is that
+    /// the midpoint wins over `last_price`, which is the whole content of the model.
     #[test]
-    fn midpoint_partial_book_prefers_order_price_over_last() {
-        // With a partial book (one side missing), limit price takes priority over
-        // a potentially stale last_price. Previously last_price would win, which
-        // could fill a limit buy above its own limit.
+    fn midpoint_complete_book_prices_at_mid_not_last() {
+        let market = snapshot(Some(d("99.5")), Some(d("100.5")), Some(d("110.0")));
         assert_eq!(
-            MidpointFillModel.fill_price(
-                Side::Buy,
-                Some(d("100.0")),
-                &snapshot(Some(d("99.5")), None, Some(d("110.0")))
-            ),
+            MidpointFillModel.fill_price(&FillContext::new(Side::Buy, &market)),
             Some(d("100.0")),
-            "partial book: limit price should beat stale last_price"
+            "the midpoint of 99.5/100.5, not the stale 110.0 print"
         );
+    }
+
+    /// No model reads the side it is not given, and none invents a price from nothing.
+    #[test]
+    fn every_model_returns_none_on_an_empty_snapshot() {
+        let empty = MarketSnapshot::default();
+        for side in [Side::Buy, Side::Sell] {
+            let fill = FillContext::new(side, &empty);
+            assert_eq!(LastPriceFillModel.fill_price(&fill), None);
+            assert_eq!(BidAskFillModel.fill_price(&fill), None);
+            assert_eq!(MidpointFillModel.fill_price(&fill), None);
+        }
     }
 }
