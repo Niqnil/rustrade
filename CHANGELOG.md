@@ -645,6 +645,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING**: **`FillModel::fill_price` takes a single `FillContext`, and a fill model no longer
+  sees the order's limit price** (`rustrade-execution`).
+
+  ```rust
+  // before
+  fn fill_price(&self, side, order_price, best_bid, best_ask, last_price) -> Option<Decimal>;
+  // after
+  fn fill_price(&self, fill: &FillContext<'_>) -> Option<Decimal>;
+  ```
+
+  Two problems went with the old signature. Three prices of one type in a fixed order make a
+  transposition a silent mispricing rather than a compile error, and every increase in the
+  simulated venue's fidelity — sizes at the touch, depth, a queue position — would have had to
+  arrive as yet another argument, breaking every implementation again. **`FillContext` is
+  `#[non_exhaustive]`**, so this is the last such break: an implementation only reads it, and all
+  of those can arrive as added fields.
+
+  The limit price is gone rather than moved. A limit constrains the *result*, not the pricing: a
+  model reads the book and answers where a taker prints, and bounding that by the order's own terms
+  is the venue's job. Letting the model see the limit is how two of the three shipped models came
+  to return the limit *itself* for a marketable order — a buy limit of 51,000 arriving against an
+  ask of 50,000 filled at 51,000, a worse price than a market order got under the same
+  configuration — while `MidpointFillModel` returned the midpoint even where that sat above a buy's
+  limit. The trait's own docs acknowledged the latter and pushed the obligation onto the caller.
+  Removing the parameter makes that class of error unwritable instead of merely documented.
+
+  The venue also used to fold the order's limit into the `last_price` argument, handing the model a
+  market that reported the order's own price as a trade that happened. It now passes its snapshot
+  as it holds it.
+
+  **No behaviour changes on any path reachable today.** A simulated venue accepts only
+  `OrderKind::Market`, which carries no price by construction, so every model was already being
+  called with `order_price: None` — the branches deleted here were unreachable. The committed tear
+  sheet is byte-identical.
+
+  Migration is mechanical: `fill_price(side, _, market)` becomes `fill_price(fill)`, reading
+  `fill.side` and `fill.market`.
+
 - **BREAKING: a simulated venue's open orders are held in price-time priority**
   (`rustrade-execution`). `AccountState`'s open orders move from a
   `FnvHashMap<ClientOrderId, _>` to `OpenOrders`, which keeps the map for lookup by id and adds a
@@ -671,26 +709,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`rustrade`). Satisfied by `DataKind`, so no in-tree caller changes. A custom market event kind
   needs one small implementation — see `VenueMarketUpdate`, and prefer delegating to the engine's
   own `InstrumentDataState` over re-deriving prices.
-
-- **BREAKING: `FillModel::fill_price` takes a `&MarketSnapshot`** (`rustrade-execution`), replacing
-  the three trailing `Option<Decimal>` price arguments.
-
-  ```rust
-  // before
-  fn fill_price(&self, side, order_price, best_bid, best_ask, last_price) -> Option<Decimal>;
-  // after
-  fn fill_price(&self, side, order_price, market: &MarketSnapshot) -> Option<Decimal>;
-  ```
-
-  Three arguments of one type in a fixed order make a transposition a silent mispricing rather than
-  a compile error, and every increase in the simulated venue's fidelity — sizes at the touch, depth,
-  queue position — would have had to arrive as another argument, breaking every implementation
-  again. As struct fields they are additive. Implementations read `market.best_bid` and so on; the
-  built-in models are unchanged in behaviour.
-
-  The simulated venue now passes its snapshot as it holds it. It used to fold the order's own limit
-  price into the `last_price` argument, which handed the model a market reporting the order's own
-  price as a trade that happened. The limit price already reaches the model as `order_price`.
 
 - **BREAKING: `FeeModel::compute_fee` takes a `Liquidity`** (`rustrade-execution`), naming whether
   the fill made or took liquidity. `PercentageFeeModel` gains an optional `maker_rate`, and
