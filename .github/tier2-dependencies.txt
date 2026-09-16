@@ -25,7 +25,7 @@ ibapi=3.3.0  # 2026-09-14 | Financial protocol, community-maintained, no officia
 #   3.3.0 rolls up 3.2.1's transport rework, which is NOT fully described in the upstream changelog. Request-less TWS errors (id == -1) outside the 2100..=2169 warning range — which includes the connectivity codes 1100/1101/1102/1300 — now fail in-flight one-shot requests instead of hanging, and the sync shared-queue drain in `send_shared_request` makes concurrent callers of the SAME one-shot API able to discard each other's response. NEITHER REACHES US: rustrade calls none of the affected one-shot APIs (next_valid_order_id, managed_accounts, server_time, family_codes, market_rule, market_depth_exchanges, news_providers, scanner_parameters, wsh_metadata). `client.next_order_id()` is a different method — a local counter increment, byte-identical across the two versions, not a request. Re-check this if the wrapper ever starts calling one of those.
 #   NOT VERIFIABLE OFF-GATEWAY: the handshake now advertises server version 225 (was 221), so a modern TWS may negotiate the 222/224 field layouts. No decoder branches on them. The ibkr integration tests are all #[ignore]d (they need a live TWS), so this bump has NOT been exercised against a real gateway — do that before relying on it in production.
 #   Other additive breaks that cost us nothing, verified: TickType gained 6 odd-lot variants and lost FundamentalRatios=47 (explicit discriminants, so no renumbering; our quotes.rs matches use `_` fallbacks), and `Order` gained 2 public fields (we build orders with `..Order::default()`).
-binance-sdk=69.1.0  # 2026-09-14 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
+binance-sdk=69.2.3  # 2026-09-14 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
 #   1. common::websocket::WebsocketApi::send_message      — signature + WebsocketMessageSendOptions signing fields (margin WS subscribe send)
 #   2. ws.common.events.subscribe (WebsocketEventEmitter) — receive/event-callback path (margin WS event delivery)
 #   3. common::utils::send_request                        — signature + HMAC signing + X-MBX-APIKEY header (hand-rolled `userListenToken` POST; SDK binds no endpoint for it)
@@ -88,6 +88,46 @@ binance-sdk=69.1.0  # 2026-09-14 | Exchange SDK, signing/IO. PINNED: margin user
 # the enforcement; this file is the record. They must move together, and a bump that edits only the
 # manifest has skipped a required step.
 
+#
+# Re-verified against the vendored =69.2.3 source on 2026-09-16 (69.1.0 -> 69.2.3). All 3 internals
+# still hold, and 1 and 2 hold by construction: `common/websocket.rs` is again BYTE-IDENTICAL
+# (md5 38b5990bb85497fdbcec39984732509b, the same hash this entry recorded at 69.1.0 and 60.0.0).
+# Only TWO files in `common/` differ at all: constants.rs and utils.rs.
+#   1. `send_message` — websocket.rs unchanged, so the signature and the four
+#      WebsocketMessageSendOptions fields (with_api_key / is_signed / is_session_logon /
+#      is_session_logout) are unchanged. Both margin WS call sites still match.
+#   2. `WebsocketEventEmitter::subscribe` — websocket.rs unchanged, so the one-task-per-subscription
+#      sequential `while let Some(event) = rx.recv().await` drain is intact. That is the contract the
+#      non-atomic `Option::take()` in the margin `account_stream` callback relies on for soundness.
+#   3. `send_request` — 7-arg shape unchanged (utils.rs:951). Still injects `timestamp`, signs via
+#      `configuration.signature_gen.get_signature(...)` (utils.rs:980 — the URL-ENCODED variant,
+#      unchanged), appends `signature` to the query string, and sets `X-MBX-APIKEY`. The hand-rolled
+#      `POST /sapi/v1/userListenToken` is therefore still signed as intended.
+#
+# BEHAVIOUR CHANGE, recorded because it is invisible in the changelog and it is on a path we could
+# one day take: `build_websocket_api_message` (utils.rs:1304, non-test) changed how it signs a
+# SIGNED WebSocket frame — 69.1.0 used `get_signature(&sorted, None)` over the URL-encoded payload,
+# 69.2.3 uses the new `get_signature_unencoded(&sorted)` over the plain payload. Binance's WS API
+# signs the plain payload, so this is a genuine fix, not a regression. IT DOES NOT REACH US: both
+# our `send_message` call sites pass `WebsocketMessageSendOptions::new()`, i.e. unsigned and with no
+# API key — the listen token is the sole auth on those frames — so the `is_signed` branch is
+# unreachable from rustrade. Re-check this the day any WS frame here sets `is_signed: true`; 69.2.3
+# is the first version where that path signs correctly.
+#
+# Security: PASS, and marginally improved. The new `build_plain_query_string` validates every key
+# and value through `ensure_safe_plain_query_component` (utils.rs:625), rejecting `&`, `=` and ASCII
+# control characters rather than letting them be spliced unescaped into a signature payload.
+# `get_signature` itself is unchanged in behaviour; it was only refactored to share a new private
+# `sign_payload`. Real `unsafe` constructs: 10 in BOTH versions, all `std::env::set_var`/`remove_var`
+# at utils.rs:1492-1542, all below the `#[cfg(test)]` at utils.rs:1353. (A bare `\bunsafe\b` grep
+# reports 10 -> 17; the 7 extra are the word "unsafe" inside the new validator's error strings and
+# doc comments, the same over-count caveat this file already records for `dbn`.)
+#
+# Dependency surface: `[dependencies]`, `[dev-dependencies]` and `[build-dependencies]` byte-for-byte
+# identical to 69.1.0. build.rs identical. New `stocks` feature (and with it the constants
+# STOCKS_REST_API_PROD_URL and a new WS host `wss://nbstream.binance.com/equity`) — we enable only
+# `spot` and `margin_trading`, so none of it is compiled. No consumer-side API churn: this bump needs
+# no code change, unlike 60.0.0 -> 69.1.0.
 quick-xml  # 2026-07-08 | New direct dep (XML parsing of broker Flex statements). Reviewed @ 0.41.0: #![forbid(unsafe_code)] crate-wide, zero net-new transitive deps (serde+memchr only, both already in tree), no RUSTSEC advisories, de-facto-standard parser. Not pinned — any version bump still needs review.
 #   Re-reviewed @ 0.42.0 (2026-09-16), the review this entry's "any version bump still needs
 #   review" mandates. All four properties recorded at 0.41.0 re-verified and still hold:
