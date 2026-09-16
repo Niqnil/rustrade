@@ -297,6 +297,12 @@ where
     /// alongside the balances, so a seeded order stamped ahead of the session start still advances
     /// the clock.
     ///
+    /// The stamp is load-bearing for more than the clock: the seeded balance is the first point in
+    /// each asset's equity series, and a drawdown window opens at the instant of its running peak.
+    /// So a seeding stamp is where every reported drawdown is measured *from*, and stamping it
+    /// anywhere but the session start inflates
+    /// [`Drawdown::duration`](crate::statistic::metric::drawdown::Drawdown::duration) by the gap.
+    ///
     /// # Panics
     /// Panics if a venue's initial snapshot references an asset or instrument absent from that
     /// venue's own index — see the type-level `# Panics`.

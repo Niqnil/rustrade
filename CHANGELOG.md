@@ -1466,11 +1466,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   time, so no static configuration can be written to agree with it.
 
   A seeding snapshot is not an observation on the simulated timeline — it is the account's opening
-  condition, and the session opens at the clock's instant by definition. Reported results are
-  unchanged: the affected backtest examples produce byte-identical tear sheets, and the clock never
-  regressed (it only logged), so this removes spurious ERROR output and gives
-  `AssetState::time_exchange` the session start instead of an unrelated past date. Orders carried in
-  a configured initial state keep their own stamps.
+  condition, and the session opens at the clock's instant by definition. Orders carried in a
+  configured initial state keep their own stamps.
+
+  **This corrects a reported statistic.** `DrawdownGenerator::init` takes its first peak's instant
+  from the first equity point, which is the seeding balance — so every drawdown was measured from
+  whenever the configured balances happened to be captured, not from the session start. On the
+  three-minute example fixture, whose configured stamp sits 25.6 hours before the data,
+  `TearSheetAsset::drawdown_mean` reported a mean drawdown duration of **92,304,199 ms (25.6 hours)
+  over a 185-second backtest**; it is now **83,484 ms**. `Drawdown::time_start` and the
+  `MaxDrawdown` window move with it. Drawdown *magnitudes* are unaffected, as are fill prices, PnL,
+  fees and closing balances. The affected backtest examples still print
+  byte-identical tear sheets — `TradingSummary::print_summary` renders drawdown magnitudes only,
+  never a duration or a window start — so the wrong figure was reachable through the struct rather
+  than through the printed table.
 
 - **Backtests are reproducible: the same dataset and strategy now produce the same result, run to
   run** (`rustrade`). `backtest()` previously assembled its engine through `SystemBuild`, which
