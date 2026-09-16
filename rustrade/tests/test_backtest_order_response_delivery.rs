@@ -1,35 +1,41 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics acceptable
 
-//! Integration coverage for the drained shutdown a backtest ends through.
+//! Integration coverage for how a backtest ends, and for the order responses it still owes when it
+//! does.
 //!
 //! A market stream ending says only that there is no more *input*. The order responses that input
-//! provoked are still in flight, and they are forwarded into the **same** FIFO feed the market
-//! events came down. Terminating the moment the market stream has been *forwarded* therefore
-//! enqueues the stop ahead of every one of those responses, and the `Engine` never reads them — so
-//! the run reports a tear sheet of zeros that is indistinguishable from a strategy which chose to
-//! stay flat.
+//! provoked are still owed, so a run that stops the moment the input does never reads them — and
+//! reports a tear sheet of zeros indistinguishable from a strategy which chose to stay flat.
 //!
 //! Waiting for the `Engine`'s own requests to fall quiet is not enough either. A filled order
 //! produces a *response* and, separately, the `Trade` and balance that the fill actually consists
 //! of. Stopping when the response resolves the last in-flight request cuts the run off while those
-//! are still in the account channel, so the balance ledger and the position ledger each lose a
-//! different, run-dependent number of fills — and can end up contradicting each other within a
-//! single run. The end of a run is therefore owned by the execution side: each `ExecutionManager`
-//! finishes its in-flight requests, forwards the account events they produced, and only then closes
-//! its channel, which is what ends the `Engine`'s feed.
+//! are still owed, so the balance ledger and the position ledger each lose a different number of
+//! fills — and can end up contradicting each other within a single run.
 //!
-//! [`assert_ledgers_reconcile`] is the regression assertion for that: it holds on every run here,
-//! and failed on roughly a third of runs before the drain moved.
+//! `SimRunner` removes both by construction rather than by timing: it owns the queue of what each
+//! venue owes, and ends only once the market source is exhausted **and** that queue is empty.
+//! [`assert_ledgers_reconcile`] is the regression assertion for it, and failed on roughly a third of
+//! runs before the drain moved.
 //!
-//! `latency_ms` is **zero** throughout: none of this depends on the mock exchange's simulated
-//! network delay, which is a separate defect.
+//! # These runs are deterministic, and that is asserted
+//! Account events are interleaved into the market stream in *simulated* time on the `Engine`'s own
+//! thread, so a fill stamped at instant `T` reaches the `Engine` before the market event at `T`
+//! marks the resulting position to that price. Everything derived from where a fill lands in the
+//! sequence is therefore a function of the dataset alone: `pnl_unrealised`,
+//! `Position::time_exchange_update` and the order counts are asserted exactly, at fixed values.
 //!
-//! # What these tests deliberately do not assert
-//! A backtest's market feed is unpaced and its account events land at a scheduler-determined point
-//! within it, so anything derived from *when* a fill was priced against the feed — `pnl_unrealised`,
-//! `Position::time_exchange_update`, tear-sheet series — still varies run to run, as does the number
-//! of orders a per-event strategy emits. Only quantities that a complete set of fills determines are
-//! asserted here.
+//! Under the forwarded feed these were scheduler-dependent — a fill could land after the market
+//! events that should have marked it, leaving a position that was never priced — so each of them is
+//! also a guard on that not returning.
+//!
+//! The three market events carry **rising prices**, so a position marked to the last of them has a
+//! `pnl_unrealised` that only the correct interleaving produces. A flat fixture would report zero
+//! whether the fill landed in the right place or not.
+//!
+//! `latency_ms` is **zero** throughout. That is what makes
+//! [`a_strategy_trading_on_its_own_fills_is_reported_rather_than_hung`] possible: at zero simulated
+//! latency, a strategy that trades on its own fills is a zero-delay cycle.
 
 use std::sync::{
     Arc,
@@ -59,7 +65,7 @@ use rustrade::{
         },
     },
     error::BarterError,
-    execution::request::ExecutionRequest,
+    execution::{request::ExecutionRequest, sim::DEFAULT_FEEDBACK_LIMIT},
     risk::DefaultRiskManager,
     statistic::time::Daily,
     strategy::{
@@ -110,8 +116,7 @@ fn ts(raw: &str) -> DateTime<Utc> {
 /// calls.
 ///
 /// `limit = 1` sends a single order; `usize::MAX` never stops on its own, which is what pins the
-/// drain's suppression of new orders — see
-/// [`draining_suppresses_new_orders_so_the_run_terminates`].
+/// feedback guard — see [`a_strategy_trading_on_its_own_fills_is_reported_rather_than_hung`].
 ///
 /// # Why emission is gated on the instrument having a price
 /// The `Engine` calls this for the initial account snapshot as well as for market events, and
@@ -149,8 +154,10 @@ impl OneShotStrategy {
         }
     }
 
-    /// Never stops generating. Without the drain suppressing new orders, every response would
-    /// provoke another order and the run would never reach quiescence.
+    /// Never stops generating: one order per call, and the `Engine` calls the strategy for
+    /// account events as well as for market events. Against a venue with zero simulated latency
+    /// that is a zero-delay feedback cycle rather than a strategy — see
+    /// [`a_strategy_trading_on_its_own_fills_is_reported_rather_than_hung`].
     fn always() -> Self {
         Self {
             sent: AtomicUsize::new(0),
@@ -280,13 +287,15 @@ fn args_constant()
     let instruments = IndexedInstruments::new([instrument(EXCHANGE, "btc", "usdt")]);
     let key = instruments.instruments()[0].key;
 
+    // Rising, so a position marked to the last event has a non-zero `pnl_unrealised` that only the
+    // correct fill placement produces. See the module docs.
     let market_events = [
-        "2025-03-24T22:00:00Z",
-        "2025-03-24T22:30:00Z",
-        "2025-03-24T23:00:00Z",
+        ("2025-03-24T22:00:00Z", dec!(50_000)),
+        ("2025-03-24T22:30:00Z", dec!(51_000)),
+        ("2025-03-24T23:00:00Z", dec!(52_000)),
     ]
     .into_iter()
-    .map(|time| {
+    .map(|(time, price)| {
         let time = ts(time);
         MarketStreamEvent::Item(MarketEvent {
             time_exchange: time,
@@ -295,7 +304,7 @@ fn args_constant()
             instrument: key,
             kind: DataKind::Trade(PublicTrade {
                 id: "t".into(),
-                price: dec!(50_000),
+                price,
                 amount: dec!(0.01),
                 side: None,
             }),
@@ -477,56 +486,68 @@ async fn a_fill_reaches_the_engine_whole_instead_of_being_truncated_at_shutdown(
     );
     assert_eq!(position.trades.len(), 1, "one fill is one trade");
 
+    // The fill is provoked by the first market event and delivered at that same instant, ahead of
+    // the two that follow -- so both of them mark it, and the last one to do so sets the timestamp.
+    // A fill landing after them instead leaves a position that was never priced: `pnl_unrealised`
+    // of zero and a `time_exchange_update` of the entry. That is what the forwarded feed produced
+    // on some runs, and these two assertions are the guard on it.
+    assert_eq!(
+        position.pnl_unrealised,
+        dec!(20),
+        "0.01 entered at 50_000 and marked to the closing 52_000 is 20, with zero fees"
+    );
+    assert_eq!(
+        position.time_exchange_update,
+        ts("2025-03-24T23:00:00Z"),
+        "the last market event marks the position, so it owns the update timestamp"
+    );
+
     assert_ledgers_reconcile(&result);
 }
 
-/// A drain must not let the strategy keep feeding itself.
+/// A strategy that trades on its own fills at zero simulated latency is reported, not spun on.
 ///
-/// The strategy here generates an order on every call. Each response it receives would provoke
-/// another order, so without the drain suppressing new orders the run never reaches quiescence and
-/// never terminates. The timeout turns that into a legible failure rather than a hung test.
+/// The strategy here opens an order on every call, and the `Engine` calls it for account events as
+/// well as for market events. At `latency_ms: 0` the response to each of those orders is stamped at
+/// the very instant of the request that provoked it, so it outranks every later market event:
+/// simulated time never advances, the market source is never drawn again, and the queue of owed
+/// deliverables grows without bound.
+///
+/// No discrete-event simulator can resolve that by scheduling alone — there is no instant to place
+/// the response at that is both after its cause and before the next input — so it is a property of
+/// the *configuration*, and the library's job is to say so. Before the feedback guard it presented
+/// as a silent spin at 100% CPU for as long as it was left running.
+///
+/// # Why there is no `tokio::time::timeout` here
+/// The other runs in this file wrap themselves in one. It would buy nothing here: the spin this
+/// guards never awaits anything pending, so the run never yields to the runtime and no timer can
+/// fire against it. A regression would hang until the CI job's own timeout, which is precisely why
+/// the condition has to be detected in the runner rather than waited out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn draining_suppresses_new_orders_so_the_run_terminates() {
-    let run = backtest(
+async fn a_strategy_trading_on_its_own_fills_is_reported_rather_than_hung() {
+    let error = backtest(
         args_constant(),
         args_dynamic("always", OneShotStrategy::always()),
-    );
+    )
+    .await
+    .expect_err("a zero-delay feedback cycle is a failed configuration, not a run");
 
-    let result = tokio::time::timeout(std::time::Duration::from_secs(20), run)
-        .await
-        .expect("a drain that suppresses new orders terminates; this timing out means it did not");
-
-    let result = result.expect("every open fills, so the run produces a summary");
-
-    let summary = &result.summary.trading_summary;
-    assert_eq!(
-        summary.orders_rejected, 0,
-        "the instrument is priced and the account funded, so nothing is rejected"
-    );
-    assert!(
-        summary.orders_opened >= 3,
-        "one order per market event at least should have been sent, got {}",
-        summary.orders_opened
-    );
-
-    // Every order sent was answered *and* its fill delivered in full. Not asserted exactly: this
-    // strategy emits per processed event, and how many account events the Engine gets through
-    // before the stop is scheduler-dependent, so `orders_opened` is 3 or 4 run to run.
-    let trades: usize = result
-        .engine_state
-        .instruments
-        .instruments(&InstrumentFilter::None)
-        .flat_map(|instrument| instrument.position.positions.values())
-        .map(|position| position.trades.len())
-        .sum();
-
-    assert_eq!(
-        trades, summary.orders_opened,
-        "every one of the {} orders sent must have produced a delivered fill, got {trades}",
-        summary.orders_opened
-    );
-
-    assert_ledgers_reconcile(&result);
+    match error {
+        BarterError::SimFeedbackLoop {
+            exchange,
+            time,
+            limit,
+        } => {
+            assert_eq!(exchange, EXCHANGE);
+            assert_eq!(
+                time,
+                ts("2025-03-24T22:00:00Z"),
+                "the cycle closes on the first market event, and the clock never leaves it"
+            );
+            assert_eq!(limit, DEFAULT_FEEDBACK_LIMIT);
+        }
+        other => panic!("expected SimFeedbackLoop, got {other:?}"),
+    }
 }
 
 /// The fast path: nothing in flight when the stop arrives, so there is nothing to drain.
