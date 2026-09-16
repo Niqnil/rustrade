@@ -6,7 +6,7 @@ use crate::{
     client::mock::MockExecutionConfig,
     error::{ApiError, UnindexedApiError, UnindexedOrderError},
     exchange::mock::account::AccountState,
-    fee::{FeeModel, FeeModelConfig},
+    fee::{FeeModel, FeeModelConfig, Liquidity},
     fill::{FillModel, SimFillConfig},
     market::MarketSnapshot,
     order::{
@@ -313,7 +313,12 @@ impl SimulatedVenue {
         // so the model can select the best available market price (bid/ask/last). `market` is the
         // snapshot the request's sender observed when it decided to trade -- for a market order it
         // is the only price source there is, since `request.state.price` is `None` by construction
-        // for `OrderKind::Market`. A limit order additionally falls back to its own limit price.
+        // for `OrderKind::Market`.
+        //
+        // The snapshot is passed as the venue holds it. The order's own limit price reaches the
+        // model as `order_price` and as the trailing fallback below, so folding it into the
+        // snapshot's `last_price` would hand the model a market that reports the order's own price
+        // as a trade that happened.
         //
         // Invariant: `fill_price` is only called for marketable orders. `validate_order_kind_supported`
         // (called above) currently rejects Limit orders, ensuring FillModel::fill_price never receives
@@ -341,9 +346,7 @@ impl SimulatedVenue {
                         ..
                     } => Some(trigger_price),
                 },
-                market.best_bid,
-                market.best_ask,
-                market.last_price.or(request.state.price),
+                &market,
             )
             .or(request.state.price);
 
@@ -390,9 +393,14 @@ impl SimulatedVenue {
         // passing it is what keeps that decision in the models rather than making this a second
         // place the multiplier can be lost.
         let order_notional_quote = fill_price * request.state.quantity.abs() * contract_size;
-        let order_fees_quote =
-            self.fee_model
-                .compute_fee(fill_price, request.state.quantity, contract_size);
+        // Taker: every order this venue accepts is marketable on arrival, so every fill takes
+        // liquidity. When resting orders land, an order matched while on the book is the maker.
+        let order_fees_quote = self.fee_model.compute_fee(
+            fill_price,
+            request.state.quantity,
+            contract_size,
+            Liquidity::Taker,
+        );
 
         // Which asset the order pays with, and how much of it.
         //
@@ -976,7 +984,7 @@ mod tests {
             let mut venue = make_cfd_venue(
                 "200000",
                 // 0.1% of the scaled notional.
-                FeeModelConfig::Percentage(PercentageFeeModel { rate: d("0.001") }),
+                FeeModelConfig::Percentage(PercentageFeeModel::new(d("0.001"))),
             );
 
             let outcome = venue.open_order(cfd_request(side, "1", market_prices("5000")));
@@ -1190,7 +1198,7 @@ mod tests {
     #[test]
     fn percentage_fee_model_deducts_correct_fee_on_buy() {
         // 0.1% fee rate
-        let fee_model = FeeModelConfig::Percentage(PercentageFeeModel { rate: d("0.001") });
+        let fee_model = FeeModelConfig::Percentage(PercentageFeeModel::new(d("0.001")));
         let mut venue = make_venue_with_fee("0", "10000", fee_model);
 
         // Buy 10 BTC at price 100 USDT each
@@ -1224,7 +1232,7 @@ mod tests {
     #[test]
     fn percentage_fee_model_deducts_correct_fee_on_sell() {
         // 0.1% fee rate
-        let fee_model = FeeModelConfig::Percentage(PercentageFeeModel { rate: d("0.001") });
+        let fee_model = FeeModelConfig::Percentage(PercentageFeeModel::new(d("0.001")));
         let mut venue = make_venue_with_fee("10", "0", fee_model);
 
         // Sell 1 BTC at price 100 USDT
@@ -1259,7 +1267,7 @@ mod tests {
     #[test]
     fn percentage_fee_with_zero_price_returns_zero_fee() {
         // Edge case: if fill_price is zero, fee computation must not divide by zero
-        let fee_model = FeeModelConfig::Percentage(PercentageFeeModel { rate: d("0.001") });
+        let fee_model = FeeModelConfig::Percentage(PercentageFeeModel::new(d("0.001")));
         let mut venue = make_venue_with_fee("10", "0", fee_model);
 
         // Sell 1 BTC at price 0 (degenerate case)
