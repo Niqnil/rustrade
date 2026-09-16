@@ -6,7 +6,9 @@ use crate::{
     shutdown::Shutdown,
 };
 use chrono::{DateTime, TimeDelta, Utc};
+use fnv::FnvHashMap;
 use futures::{Stream, stream::FusedStream};
+use rustrade_data::streams::consumer::MarketStreamEvent;
 use rustrade_execution::{
     AccountEvent, AccountEventKind, UnindexedAccountEvent,
     exchange::mock::{SimulatedVenue, VenueOutcome},
@@ -15,7 +17,7 @@ use rustrade_execution::{
 };
 use rustrade_instrument::{
     exchange::{ExchangeId, ExchangeIndex},
-    instrument::name::InstrumentNameExchange,
+    instrument::{InstrumentIndex, name::InstrumentNameExchange},
 };
 use rustrade_integration::{
     channel::UnboundedRx,
@@ -31,8 +33,10 @@ use tracing::info;
 
 /// Builds the execution half of a deterministic simulation.
 pub mod builder;
+pub mod market;
 
 pub use builder::{SimExecutionBuild, SimExecutionBuilder};
+pub use market::VenueMarketUpdate;
 
 /// One simulated venue and everything needed to drive it deterministically.
 ///
@@ -206,6 +210,7 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 pub struct SimRunner<Source, MarketKind>
 where
     Source: Stream,
+    MarketKind: VenueMarketUpdate,
 {
     #[pin]
     source: futures::stream::Peekable<Source>,
@@ -232,6 +237,12 @@ where
     /// Latch: [`Shutdown::AfterDrain`] is emitted exactly once, when the source is exhausted.
     drain_signalled: bool,
     terminated: bool,
+    /// Per-instrument market state, folded from the source and handed to the venues trading it.
+    ///
+    /// Keyed by instrument rather than by venue because the market is a property of the instrument:
+    /// two venues trading it see one market, and folding the stream once is both cheaper and the
+    /// only way they cannot disagree.
+    market: FnvHashMap<InstrumentIndex, MarketKind::State>,
 }
 
 /// Manual because [`futures::stream::Peekable`] is [`Debug`] only when its `Source` is, and
@@ -239,6 +250,7 @@ where
 impl<Source, MarketKind> std::fmt::Debug for SimRunner<Source, MarketKind>
 where
     Source: Stream,
+    MarketKind: VenueMarketUpdate,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SimRunner")
@@ -261,6 +273,7 @@ where
 impl<Source, MarketKind> SimRunner<Source, MarketKind>
 where
     Source: Stream,
+    MarketKind: VenueMarketUpdate,
 {
     /// Construct a `SimRunner` over the provided venues and time-ordered source.
     ///
@@ -343,6 +356,7 @@ where
             source_done: false,
             drain_signalled: false,
             terminated: false,
+            market: FnvHashMap::default(),
         }
     }
 
@@ -379,6 +393,7 @@ where
 impl<Source, MarketKind> Stream for SimRunner<Source, MarketKind>
 where
     Source: Stream<Item = Timed<EngineEvent<MarketKind>>>,
+    MarketKind: VenueMarketUpdate,
 {
     type Item = EngineEvent<MarketKind>;
 
@@ -470,6 +485,13 @@ where
                 Poll::Ready(Some(timed)) => {
                     // A source event is the only thing that proves simulated time is advancing.
                     *this.since_source = 0;
+
+                    // Routed BEFORE the event is returned, which is the whole ordering rule: an
+                    // order the `Engine` sends in reaction to the tick at `T` must be matched
+                    // against the market as of `T`, not `T-1`. Returning first and routing on the
+                    // next poll would reverse that at zero latency.
+                    route_market(this.venues, this.market, &timed.value);
+
                     Poll::Ready(Some(timed.value))
                 }
                 Poll::Ready(None) => {
@@ -478,6 +500,46 @@ where
                 }
                 Poll::Pending => Poll::Pending,
             };
+        }
+    }
+}
+
+/// Folds one source event into per-instrument market state and hands it to every venue trading it.
+///
+/// Anything that is not a market data item is ignored: an account event, a command or a reconnect
+/// carries no price. A reconnect in particular is deliberately *not* treated as clearing the
+/// market — a gap in a feed does not mean the instrument stopped having a price, and a venue that
+/// forgot its market on every reconnect would refuse to match orders it should have matched.
+///
+/// A venue that does not trade the instrument is skipped: its own index is what decides, so a
+/// runner driving several venues never leaks one venue's instruments into another's view.
+fn route_market<MarketKind>(
+    venues: &mut FnvIndexMap<ExchangeIndex, SimVenue>,
+    market: &mut FnvHashMap<InstrumentIndex, MarketKind::State>,
+    event: &EngineEvent<MarketKind>,
+) where
+    MarketKind: VenueMarketUpdate,
+{
+    let EngineEvent::Market(MarketStreamEvent::Item(event)) = event else {
+        return;
+    };
+
+    let state = market.entry(event.instrument).or_default();
+    MarketKind::apply(state, event);
+    let snapshot = MarketKind::snapshot(state);
+
+    for slot in venues.values_mut() {
+        // `Err` means this venue does not trade the instrument, which is ordinary on a multi-venue
+        // run and not a misconfiguration.
+        if let Ok(name) = slot
+            .indexer
+            .map
+            .find_instrument_name_exchange(event.instrument)
+        {
+            // Cloned because `apply_market` keys on the owned name; the map borrow ends here.
+            let name = name.clone();
+            slot.venue
+                .apply_market(&name, snapshot, event.time_exchange);
         }
     }
 }
@@ -509,6 +571,7 @@ fn check_feedback(
 impl<Source, MarketKind> FusedStream for SimRunner<Source, MarketKind>
 where
     Source: Stream<Item = Timed<EngineEvent<MarketKind>>>,
+    MarketKind: VenueMarketUpdate,
 {
     /// Terminated exactly once a poll has returned `Ready(None)`, which is the latch `poll_next`
     /// sets — so this cannot drift from the stream's actual behaviour.
@@ -778,6 +841,7 @@ mod tests {
         AccountSnapshot,
         balance::{AssetBalance, Balance},
         client::mock::MockExecutionConfig,
+        exchange::mock::VenueInstrumentMarket,
         market::MarketSnapshot,
         order::{
             OrderKey, OrderKind, TimeInForce,
@@ -952,6 +1016,17 @@ mod tests {
         /// Read the next event's label, as the engine's feed would read the event itself.
         async fn next(&mut self) -> Option<&'static str> {
             self.runner.next().await.as_ref().map(label)
+        }
+
+        /// The fixture venue's own view of the fixture instrument, if anything has routed it one.
+        fn venue_market(&self) -> Option<VenueInstrumentMarket> {
+            self.runner
+                .venues()
+                .get(&self.exchange)
+                .expect("the fixture venue is registered")
+                .venue
+                .market(&InstrumentNameExchange::new("btc_usdt"))
+                .copied()
         }
 
         /// Drain the rest of the run into labels.
@@ -1319,5 +1394,62 @@ mod tests {
             "the clock must be left where it started: a seeding snapshot is an opening condition, \
              not an observation that moves the simulated instant"
         );
+    }
+
+    /// The venue is fed each market event, and is fed it **before** the `Engine` is.
+    ///
+    /// The routing is behaviour-neutral today — nothing in the venue reads its market to price a
+    /// fill — which is exactly why it needs pinning. A route that silently stopped working would
+    /// change no result and fail no other test, right up until resting orders started matching
+    /// against a market that was never delivered.
+    #[tokio::test]
+    async fn a_market_event_reaches_the_venues_before_the_engine_sees_it() {
+        let mut harness = Harness::new(0, vec![market(1_000, dec!(50_000))]);
+
+        assert!(
+            harness.venue_market().is_none(),
+            "a venue has no market until one is routed to it"
+        );
+
+        assert_eq!(
+            harness.next().await,
+            Some("snapshot"),
+            "the seeding snapshot leads"
+        );
+        assert!(
+            harness.venue_market().is_none(),
+            "an account event carries no price, so it must not touch the venue's market"
+        );
+
+        assert_eq!(harness.next().await, Some("market"));
+
+        let market = harness
+            .venue_market()
+            .expect("the venue must hold the market event just emitted");
+        assert_eq!(
+            market.time_exchange,
+            at(1_000),
+            "the venue's market is stamped with the event's own instant"
+        );
+        assert_eq!(
+            market.snapshot.last_price,
+            Some(dec!(50_000)),
+            "a trade at 50,000 is the instrument's price"
+        );
+    }
+
+    /// Later events replace earlier ones, so the venue tracks the market rather than its first
+    /// sight of it.
+    #[tokio::test]
+    async fn the_venues_market_advances_with_the_source() {
+        let mut harness = Harness::new(
+            0,
+            vec![market(1_000, dec!(50_000)), market(2_000, dec!(50_500))],
+        );
+        let _ = harness.rest().await;
+
+        let market = harness.venue_market().expect("both events were routed");
+        assert_eq!(market.time_exchange, at(2_000));
+        assert_eq!(market.snapshot.last_price, Some(dec!(50_500)));
     }
 }

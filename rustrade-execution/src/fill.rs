@@ -1,3 +1,4 @@
+use crate::market::MarketSnapshot;
 use rust_decimal::Decimal;
 use rustrade_instrument::Side;
 use serde::{Deserialize, Serialize};
@@ -25,20 +26,25 @@ use serde::{Deserialize, Serialize};
 ///
 /// * `side` — order side (Buy or Sell).
 /// * `order_price` — limit price if limit order; `None` for market orders.
-/// * `best_bid` — current best bid in the order book, if available.
-/// * `best_ask` — current best ask in the order book, if available.
-/// * `last_price` — most recent trade price, if available.
+/// * `market` — the venue's view of the instrument. Every field is optional and absence is
+///   ordinary; see [`MarketSnapshot`].
 ///
 /// Returns `None` if insufficient market data is available to determine a
 /// fill price (e.g. no prices at all on the first tick of a backtest).
+///
+/// # Why the market arrives as one struct
+///
+/// This took the three prices as separate trailing `Option<Decimal>` arguments. They are the same
+/// type in a fixed order, so transposing two of them is a silent mispricing rather than a compile
+/// error — and every increase in fidelity the simulated venue could gain (sizes at the touch,
+/// depth, a queue position) would have to arrive as another argument, breaking every implementation
+/// again. As a struct, those are additive fields.
 pub trait FillModel {
     fn fill_price(
         &self,
         side: Side,
         order_price: Option<Decimal>,
-        best_bid: Option<Decimal>,
-        best_ask: Option<Decimal>,
-        last_price: Option<Decimal>,
+        market: &MarketSnapshot,
     ) -> Option<Decimal>;
 }
 
@@ -59,13 +65,11 @@ impl FillModel for LastPriceFillModel {
         &self,
         side: Side,
         order_price: Option<Decimal>,
-        best_bid: Option<Decimal>,
-        best_ask: Option<Decimal>,
-        last_price: Option<Decimal>,
+        market: &MarketSnapshot,
     ) -> Option<Decimal> {
-        order_price.or(last_price).or(match side {
-            Side::Buy => best_ask,
-            Side::Sell => best_bid,
+        order_price.or(market.last_price).or(match side {
+            Side::Buy => market.best_ask,
+            Side::Sell => market.best_bid,
         })
     }
 }
@@ -89,9 +93,7 @@ impl FillModel for BidAskFillModel {
         &self,
         side: Side,
         order_price: Option<Decimal>,
-        best_bid: Option<Decimal>,
-        best_ask: Option<Decimal>,
-        last_price: Option<Decimal>,
+        market: &MarketSnapshot,
     ) -> Option<Decimal> {
         if let Some(limit) = order_price {
             // Limit order: fill at the limit price (caller is responsible for
@@ -100,8 +102,8 @@ impl FillModel for BidAskFillModel {
         }
         // Market order: taker crosses the spread.
         match side {
-            Side::Buy => best_ask.or(last_price),
-            Side::Sell => best_bid.or(last_price),
+            Side::Buy => market.best_ask.or(market.last_price),
+            Side::Sell => market.best_bid.or(market.last_price),
         }
     }
 }
@@ -137,14 +139,11 @@ impl FillModel for MidpointFillModel {
         &self,
         _side: Side,
         order_price: Option<Decimal>,
-        best_bid: Option<Decimal>,
-        best_ask: Option<Decimal>,
-        last_price: Option<Decimal>,
+        market: &MarketSnapshot,
     ) -> Option<Decimal> {
-        match (best_bid, best_ask) {
-            (Some(bid), Some(ask)) => Some((bid + ask) / Decimal::TWO),
-            _ => order_price.or(last_price),
-        }
+        market
+            .mid_price()
+            .or_else(|| order_price.or(market.last_price))
     }
 }
 
@@ -171,20 +170,12 @@ impl FillModel for SimFillConfig {
         &self,
         side: Side,
         order_price: Option<Decimal>,
-        best_bid: Option<Decimal>,
-        best_ask: Option<Decimal>,
-        last_price: Option<Decimal>,
+        market: &MarketSnapshot,
     ) -> Option<Decimal> {
         match self {
-            SimFillConfig::LastPrice(m) => {
-                m.fill_price(side, order_price, best_bid, best_ask, last_price)
-            }
-            SimFillConfig::BidAsk(m) => {
-                m.fill_price(side, order_price, best_bid, best_ask, last_price)
-            }
-            SimFillConfig::Midpoint(m) => {
-                m.fill_price(side, order_price, best_bid, best_ask, last_price)
-            }
+            SimFillConfig::LastPrice(model) => model.fill_price(side, order_price, market),
+            SimFillConfig::BidAsk(model) => model.fill_price(side, order_price, market),
+            SimFillConfig::Midpoint(model) => model.fill_price(side, order_price, market),
         }
     }
 }
@@ -198,51 +189,61 @@ mod tests {
         s.parse().unwrap()
     }
 
-    fn prices() -> (Option<Decimal>, Option<Decimal>, Option<Decimal>) {
-        (Some(d("99.5")), Some(d("100.5")), Some(d("100.0")))
+    /// Bid 99.5 / ask 100.5 / last 100.0 — a complete snapshot, mid also 100.0.
+    fn prices() -> MarketSnapshot {
+        MarketSnapshot::new(Some(d("99.5")), Some(d("100.5")), Some(d("100.0")))
+    }
+
+    /// A snapshot from three literal prices, for the partial-book cases.
+    fn snapshot(
+        bid: Option<Decimal>,
+        ask: Option<Decimal>,
+        last: Option<Decimal>,
+    ) -> MarketSnapshot {
+        MarketSnapshot::new(bid, ask, last)
     }
 
     #[test]
     fn last_price_market_buy_uses_last() {
-        let (bid, ask, last) = prices();
+        let market = prices();
         assert_eq!(
-            LastPriceFillModel.fill_price(Side::Buy, None, bid, ask, last),
+            LastPriceFillModel.fill_price(Side::Buy, None, &market),
             Some(d("100.0"))
         );
     }
 
     #[test]
     fn last_price_limit_uses_order_price() {
-        let (bid, ask, last) = prices();
+        let market = prices();
         assert_eq!(
-            LastPriceFillModel.fill_price(Side::Buy, Some(d("99.0")), bid, ask, last),
+            LastPriceFillModel.fill_price(Side::Buy, Some(d("99.0")), &market),
             Some(d("99.0"))
         );
     }
 
     #[test]
     fn bid_ask_market_buy_uses_ask() {
-        let (bid, ask, last) = prices();
+        let market = prices();
         assert_eq!(
-            BidAskFillModel.fill_price(Side::Buy, None, bid, ask, last),
+            BidAskFillModel.fill_price(Side::Buy, None, &market),
             Some(d("100.5"))
         );
     }
 
     #[test]
     fn bid_ask_market_sell_uses_bid() {
-        let (bid, ask, last) = prices();
+        let market = prices();
         assert_eq!(
-            BidAskFillModel.fill_price(Side::Sell, None, bid, ask, last),
+            BidAskFillModel.fill_price(Side::Sell, None, &market),
             Some(d("99.5"))
         );
     }
 
     #[test]
     fn midpoint_uses_mid() {
-        let (bid, ask, last) = prices();
+        let market = prices();
         assert_eq!(
-            MidpointFillModel.fill_price(Side::Buy, None, bid, ask, last),
+            MidpointFillModel.fill_price(Side::Buy, None, &market),
             Some(d("100.0"))
         );
     }
@@ -250,7 +251,7 @@ mod tests {
     #[test]
     fn midpoint_falls_back_to_last_when_no_bid_ask() {
         assert_eq!(
-            MidpointFillModel.fill_price(Side::Buy, None, None, None, Some(d("100.0"))),
+            MidpointFillModel.fill_price(Side::Buy, None, &snapshot(None, None, Some(d("100.0")))),
             Some(d("100.0"))
         );
     }
@@ -259,31 +260,31 @@ mod tests {
 
     #[test]
     fn fill_model_config_last_price_dispatches() {
-        let (bid, ask, last) = prices();
+        let market = prices();
         let cfg = SimFillConfig::LastPrice(LastPriceFillModel);
         assert_eq!(
-            cfg.fill_price(Side::Buy, None, bid, ask, last),
-            LastPriceFillModel.fill_price(Side::Buy, None, bid, ask, last),
+            cfg.fill_price(Side::Buy, None, &market),
+            LastPriceFillModel.fill_price(Side::Buy, None, &market)
         );
     }
 
     #[test]
     fn fill_model_config_bid_ask_dispatches() {
-        let (bid, ask, last) = prices();
+        let market = prices();
         let cfg = SimFillConfig::BidAsk(BidAskFillModel);
         assert_eq!(
-            cfg.fill_price(Side::Sell, None, bid, ask, last),
-            BidAskFillModel.fill_price(Side::Sell, None, bid, ask, last),
+            cfg.fill_price(Side::Sell, None, &market),
+            BidAskFillModel.fill_price(Side::Sell, None, &market)
         );
     }
 
     #[test]
     fn fill_model_config_midpoint_dispatches() {
-        let (bid, ask, last) = prices();
+        let market = prices();
         let cfg = SimFillConfig::Midpoint(MidpointFillModel);
         assert_eq!(
-            cfg.fill_price(Side::Buy, None, bid, ask, last),
-            MidpointFillModel.fill_price(Side::Buy, None, bid, ask, last),
+            cfg.fill_price(Side::Buy, None, &market),
+            MidpointFillModel.fill_price(Side::Buy, None, &market)
         );
     }
 
@@ -302,11 +303,11 @@ mod tests {
         // No market data at all — e.g. first tick of a backtest before any prices arrive.
         // The mock exchange falls back to request.state.price when fill_price returns None.
         assert_eq!(
-            LastPriceFillModel.fill_price(Side::Buy, None, None, None, None),
+            LastPriceFillModel.fill_price(Side::Buy, None, &snapshot(None, None, None)),
             None
         );
         assert_eq!(
-            LastPriceFillModel.fill_price(Side::Sell, None, None, None, None),
+            LastPriceFillModel.fill_price(Side::Sell, None, &snapshot(None, None, None)),
             None
         );
     }
@@ -317,7 +318,11 @@ mod tests {
         // bid/ask (as documented in the fallback chain). This exercises the tertiary
         // fallback that was previously untested.
         assert_eq!(
-            LastPriceFillModel.fill_price(Side::Buy, None, Some(d("99.5")), Some(d("100.5")), None),
+            LastPriceFillModel.fill_price(
+                Side::Buy,
+                None,
+                &snapshot(Some(d("99.5")), Some(d("100.5")), None)
+            ),
             Some(d("100.5")),
             "Buy with no last_price should fall back to best_ask"
         );
@@ -325,9 +330,7 @@ mod tests {
             LastPriceFillModel.fill_price(
                 Side::Sell,
                 None,
-                Some(d("99.5")),
-                Some(d("100.5")),
-                None
+                &snapshot(Some(d("99.5")), Some(d("100.5")), None)
             ),
             Some(d("99.5")),
             "Sell with no last_price should fall back to best_bid"
@@ -337,15 +340,15 @@ mod tests {
     #[test]
     fn bid_ask_limit_order_wins_over_bid_ask() {
         // Limit price must take priority over bid/ask even when both are present.
-        let (bid, ask, last) = prices();
+        let market = prices();
         let limit = Some(d("98.0"));
         assert_eq!(
-            BidAskFillModel.fill_price(Side::Buy, limit, bid, ask, last),
+            BidAskFillModel.fill_price(Side::Buy, limit, &market),
             limit,
             "limit price should beat best_ask for buy"
         );
         assert_eq!(
-            BidAskFillModel.fill_price(Side::Sell, limit, bid, ask, last),
+            BidAskFillModel.fill_price(Side::Sell, limit, &market),
             limit,
             "limit price should beat best_bid for sell"
         );
@@ -355,7 +358,11 @@ mod tests {
     fn midpoint_with_only_bid_falls_back_to_last() {
         // Partial book: only bid present, no ask. Should fall back to last_price.
         assert_eq!(
-            MidpointFillModel.fill_price(Side::Buy, None, Some(d("99.5")), None, Some(d("100.0"))),
+            MidpointFillModel.fill_price(
+                Side::Buy,
+                None,
+                &snapshot(Some(d("99.5")), None, Some(d("100.0")))
+            ),
             Some(d("100.0"))
         );
     }
@@ -368,9 +375,7 @@ mod tests {
             MidpointFillModel.fill_price(
                 Side::Sell,
                 None,
-                None,
-                Some(d("100.5")),
-                Some(d("100.0"))
+                &snapshot(None, Some(d("100.5")), Some(d("100.0")))
             ),
             Some(d("100.0"))
         );
@@ -385,9 +390,7 @@ mod tests {
             MidpointFillModel.fill_price(
                 Side::Buy,
                 Some(d("100.0")),
-                Some(d("99.5")),
-                None,
-                Some(d("110.0"))
+                &snapshot(Some(d("99.5")), None, Some(d("110.0")))
             ),
             Some(d("100.0")),
             "partial book: limit price should beat stale last_price"

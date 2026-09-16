@@ -18,10 +18,11 @@ use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::{error, info};
 
 pub mod account;
+pub mod orders;
 pub mod request;
 pub mod venue;
 
-pub use venue::{CancelOutcome, OpenOutcome, SimulatedVenue, VenueOutcome};
+pub use venue::{CancelOutcome, OpenOutcome, SimulatedVenue, VenueInstrumentMarket, VenueOutcome};
 
 /// Asynchronous driver for a [`SimulatedVenue`]: channels, simulated latency, emission ordering.
 ///

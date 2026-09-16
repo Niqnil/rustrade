@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A simulated venue holds its own view of each instrument it trades** (`rustrade-execution`,
+  `rustrade`). `SimulatedVenue::apply_market` records a `MarketSnapshot` and the instant it was
+  observed, readable through `SimulatedVenue::market`; `SimRunner` routes every source market event
+  to the venues trading that instrument **before** returning it to the `Engine`.
+
+  Routing before is the whole ordering rule: an order the `Engine` sends in reaction to the tick at
+  `T` must be matched against the market as of `T`, not `T-1`. Returning first and routing on the
+  next poll would reverse that at zero latency.
+
+  This is the substrate resting orders need, and it is inert on its own. **No fill price moves**: a
+  market order is still priced from the snapshot its own request carried, and the committed tear
+  sheet is byte-identical. An order that rests is the thing that cannot be priced that way, because
+  the market it must be matched against has not happened when the request is made.
+
+  `MockExchange` has no market feed, so a venue driven by it reports `market` as `None` forever.
+  That difference is documented as a property of the type rather than left as an accident of wiring.
+
+- **`VenueMarketUpdate`** (`rustrade`), implemented for `DataKind`: how a stream of market events
+  becomes the venue's view. Stateful by necessity — a trade carries no book, an L1 update no trade
+  price — so it names an associated `State` rather than being a plain conversion.
+
+  The shipped implementation **is** `DefaultInstrumentMarketData`, delegating to the same
+  `Processor` and `market_snapshot` the engine calls, so the venue's market and the engine's agree
+  by construction rather than by two derivations happening to match. `tests/test_sim_venue_market_agreement.rs`
+  pins it over the full 50,000-event fixture, comparing after every event.
+
+  This matters more than it reads: `last_price` is **not** the last trade price. With both sides of
+  an L1 book present it is the volume-weighted mid — the microprice. A venue that re-derived it as
+  "the most recent trade" would diverge by a median of 1.5–1.7x the *half-spread*, exceeding the
+  half-spread around 60% of the time on the committed fixture.
+
 - **`SimRunner` — backtests are now driven by a deterministic discrete-event simulator**
   (`rustrade`). A `Stream<Item = EngineEvent>` that merges the time-ordered market/auxiliary source
   with the account events its own `SimulatedVenue`s produce, and is polled **inline** by the
@@ -613,6 +644,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   driver for the simulated venue would have needed another.
 
 ### Changed
+
+- **BREAKING: a simulated venue's open orders are held in price-time priority**
+  (`rustrade-execution`). `AccountState`'s open orders move from a
+  `FnvHashMap<ClientOrderId, _>` to `OpenOrders`, which keeps the map for lookup by id and adds a
+  per-instrument, per-side queue ordered by `(price, arrival, insertion)`.
+  `AccountState::orders_open` keeps its iterator signature; `AccountState::new` now takes
+  `OpenOrders`, and `AccountState::orders` exposes it.
+
+  A tick that crosses two resting orders with only enough balance to fill one fills whichever comes
+  first. Read off a hash map that is an arbitrary choice, which a rebuild or a different
+  `ClientOrderId` can silently reverse — so two runs of one backtest need not agree. Price-time
+  priority is both the reproducible rule and the one real venues use. It has to be the structure
+  rather than a sort at the call site, or matching sorts every open order on every tick.
+
+  Insertion sequence is part of the key, not decoration: two orders at one price and one instant
+  otherwise compare equal, and a `BTreeMap` would keep only one — an order vanishing from the book
+  rather than merely being mis-ranked.
+
+  An open order with no limit price is kept for reporting but never queued. An order with no price
+  to wait at has nothing to wait for; it can only arrive through a configured `initial_state`.
+
+  Nothing rests yet, so no result moves and the committed tear sheet is byte-identical.
+
+- **BREAKING: `SimRunner` and `backtest` require `MarketKind: VenueMarketUpdate`**
+  (`rustrade`). Satisfied by `DataKind`, so no in-tree caller changes. A custom market event kind
+  needs one small implementation — see `VenueMarketUpdate`, and prefer delegating to the engine's
+  own `InstrumentDataState` over re-deriving prices.
+
+- **BREAKING: `FillModel::fill_price` takes a `&MarketSnapshot`** (`rustrade-execution`), replacing
+  the three trailing `Option<Decimal>` price arguments.
+
+  ```rust
+  // before
+  fn fill_price(&self, side, order_price, best_bid, best_ask, last_price) -> Option<Decimal>;
+  // after
+  fn fill_price(&self, side, order_price, market: &MarketSnapshot) -> Option<Decimal>;
+  ```
+
+  Three arguments of one type in a fixed order make a transposition a silent mispricing rather than
+  a compile error, and every increase in the simulated venue's fidelity — sizes at the touch, depth,
+  queue position — would have had to arrive as another argument, breaking every implementation
+  again. As struct fields they are additive. Implementations read `market.best_bid` and so on; the
+  built-in models are unchanged in behaviour.
+
+  The simulated venue now passes its snapshot as it holds it. It used to fold the order's own limit
+  price into the `last_price` argument, which handed the model a market reporting the order's own
+  price as a trade that happened. The limit price already reaches the model as `order_price`.
+
+- **BREAKING: `FeeModel::compute_fee` takes a `Liquidity`** (`rustrade-execution`), naming whether
+  the fill made or took liquidity. `PercentageFeeModel` gains an optional `maker_rate`, and
+  `PercentageFeeModel::new` / `::maker_taker` replace literal construction.
+
+  Venues price the two sides differently, often by a wide margin, and a maker rebate is the whole
+  economics of quoting. Without the flag every fill is charged the taker rate — which
+  systematically overstates the cost of exactly the strategies that rest orders to earn the maker
+  side, and does it silently. `Liquidity::Taker` is the default and the conservative direction: it
+  overstates cost rather than inventing profit.
+
+  **Existing behaviour and configuration are unchanged.** `maker_rate` defaults to absent, in which
+  case `rate` is charged on both sides, and a config written before the field existed deserialises
+  and prices identically. Both current call sites pass `Liquidity::Taker`: every order the
+  simulated venue accepts is marketable on arrival, and `InstrumentState` has no maker/taker
+  information to read, since a `Trade` does not carry one. A maker rebate is a negative
+  `maker_rate`.
+
+- **A simulated venue's open orders keep their arrival stamps** (`rustrade-execution`).
+  `AccountState::update_time_exchange` rewrote `Open::time_exchange` on every open order each time
+  the venue's clock advanced. Only balances are restated now.
+
+  An order does not become a different order because time passed, and the stamp is the instant the
+  venue accepted it. Rewriting it was invisible only because nothing rests: every order fills on
+  arrival, so the orders it could reach were those an `initial_state` seeded — which it moved to
+  whenever the clock last ticked, and the further the run got, the wronger they were. It was also
+  O(open orders) on every event.
+
+- **The simulated venue's ledger models a reserved balance** (`rustrade-execution`). `free` is what
+  an order may draw on, `total` is what the account holds, and the difference is held against
+  something — the split `Balance` has always described and this ledger could not previously
+  represent.
+
+  An `initial_state` copied from a live account with margin reserved is now usable as configured.
+  It was formerly refused outright with `SimulatedVenue cannot model a reserved balance`, because a
+  ledger in which every order fills on arrival had no way to express an amount held back, and the
+  fill path wrote `free` and `total` from one number — so carrying the configuration would have
+  erased the reserved portion silently. `AccountState` gains `reserve`, `settle` and `debit_filled`,
+  and the two hand-rolled balance arms in `open_order` collapse onto them.
+
+  **Reported results are unchanged**, which is checked rather than asserted: a market order fills on
+  arrival, so it reserves and settles in one step and emits exactly **one** balance restatement, as
+  before. A balance is an absolute restatement rather than a delta, so emitting the intermediate
+  state would have reported a balance the account never held. The committed tear-sheet artifact in
+  `rustrade/tests/data/` is byte-identical across the change.
 
 - **`quick-xml` 0.41 → 0.42** (`rustrade-data`, `ibkr` feature). The bump's headline break is that
   `QName<'a>` now wraps `&'a str` rather than `&'a [u8]`, with `AsRef<str>` replacing

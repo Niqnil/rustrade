@@ -6,7 +6,7 @@ use crate::{
     client::mock::MockExecutionConfig,
     error::{ApiError, UnindexedApiError, UnindexedOrderError},
     exchange::mock::account::AccountState,
-    fee::{FeeModel, FeeModelConfig},
+    fee::{FeeModel, FeeModelConfig, Liquidity},
     fill::{FillModel, SimFillConfig},
     market::MarketSnapshot,
     order::{
@@ -51,6 +51,19 @@ pub type OpenOutcome = VenueOutcome<Order<ExchangeId, InstrumentNameExchange, Un
 /// Response type of [`SimulatedVenue::cancel_order`].
 pub type CancelOutcome = VenueOutcome<UnindexedOrderResponseCancel>;
 
+/// A venue's view of one instrument, and when it last changed.
+///
+/// The instant is carried alongside the prices rather than inside them because a
+/// [`MarketSnapshot`] says what the market is, not when it was observed — and a matching engine
+/// needs both: an order resting since `T` may only be matched against a market at or after `T`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VenueInstrumentMarket {
+    /// Prices as of [`time_exchange`](Self::time_exchange).
+    pub snapshot: MarketSnapshot,
+    /// When this view was last replaced.
+    pub time_exchange: DateTime<Utc>,
+}
+
 /// Simulated venue state machine: synchronous, transport-free and latency-free.
 ///
 /// Fills every market order immediately and keeps its own balance ledger. It has no channels and
@@ -89,6 +102,19 @@ pub type CancelOutcome = VenueOutcome<UnindexedOrderResponseCancel>;
 ///   spot buy debits quote without crediting base, and a spot sell the reverse. Balances therefore
 ///   track cash committed, not portfolio value; position-derived statistics come from the engine.
 /// - **Only [`OrderKind::Market`] is accepted**; every other kind is rejected.
+///
+/// # Reserved balances
+/// The ledger distinguishes held from spendable: `free` is what an order may draw on, `total` is
+/// what the account holds, and the difference is held against something. An `initial_state` copied
+/// from a live account with margin reserved is therefore usable as configured — it was rejected
+/// outright while every order filled on arrival and the ledger could not represent the state.
+///
+/// Every order this venue currently accepts still fills on arrival, so it reserves and settles in
+/// one step ([`AccountState::debit_filled`]) and emits **one** balance restatement per fill. A
+/// configured reservation is carried through untouched: settling lowers `total` by the settled
+/// amount and leaves the rest held.
+///
+/// [`AccountState::debit_filled`]: crate::exchange::mock::account::AccountState::debit_filled
 #[derive(Debug)]
 pub struct SimulatedVenue {
     pub exchange: ExchangeId,
@@ -96,6 +122,12 @@ pub struct SimulatedVenue {
     pub fill_model: SimFillConfig,
     pub instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
     pub account: AccountState,
+    /// This venue's own view of each instrument it trades, as of the last
+    /// [`apply_market`](Self::apply_market).
+    ///
+    /// Empty unless a driver feeds it — see [`apply_market`](Self::apply_market) for which drivers
+    /// do. Read through [`market`](Self::market).
+    market: FnvHashMap<InstrumentNameExchange, VenueInstrumentMarket>,
     /// Monotone `OrderId` source. Private: resetting it mints duplicate ids, and
     /// `TradeId` is derived from it, so the duplicate would reach the trade ledger.
     order_sequence: u64,
@@ -115,6 +147,7 @@ impl SimulatedVenue {
             fill_model: config.fill_model,
             instruments,
             account: AccountState::from(config.initial_state.clone()),
+            market: FnvHashMap::default(),
             order_sequence: 0,
             time_exchange_latest: Default::default(),
         }
@@ -131,6 +164,43 @@ impl SimulatedVenue {
 
     pub fn time_exchange(&self) -> DateTime<Utc> {
         self.time_exchange_latest
+    }
+
+    /// Records this venue's own view of `instrument` as of `time_exchange`.
+    ///
+    /// `snapshot` **replaces** whatever was held: it is a complete view of the instrument, not a
+    /// partial update, so a field that is `None` means the feed supplies no such price rather than
+    /// "unchanged". Whoever calls this owns the state machine that folds a stream of market events
+    /// into that view.
+    ///
+    /// # Not every driver supplies this
+    /// A venue only has market state if something feeds it one. `SimRunner` does, routing each
+    /// source market event to the venues trading that instrument before the `Engine` sees it.
+    /// `MockExchange` has no market feed and cannot acquire one without re-creating the look-ahead
+    /// hazard that motivated the split, so a venue driven by it reports [`market`](Self::market) as
+    /// `None` forever. That difference is a property of this type, not an accident of wiring.
+    ///
+    /// # This is recorded, not yet priced against
+    /// Nothing in this venue reads it to price a fill today. A market order is still priced from
+    /// the snapshot its own request carried
+    /// ([`RequestOpen::market`](crate::order::request::RequestOpen::market)), which is what keeps
+    /// the venue's results identical whether or not a driver feeds it. It is the substrate resting
+    /// orders need: an order that rests has no request-time snapshot to be matched against, because
+    /// the market it must be matched against has not happened yet.
+    pub fn apply_market(
+        &mut self,
+        instrument: &InstrumentNameExchange,
+        snapshot: MarketSnapshot,
+        time_exchange: DateTime<Utc>,
+    ) {
+        let entry = self.market.entry(instrument.clone()).or_default();
+        entry.snapshot = snapshot;
+        entry.time_exchange = time_exchange;
+    }
+
+    /// This venue's view of `instrument`, or `None` if nothing has fed it one.
+    pub fn market(&self, instrument: &InstrumentNameExchange) -> Option<&VenueInstrumentMarket> {
+        self.market.get(instrument)
     }
 
     /// Number of orders this venue has booked, and so the next `OrderId` it will mint.
@@ -266,7 +336,6 @@ impl SimulatedVenue {
     /// early returns and the ordering contract -- ack the trade, then emit balance before trade --
     /// is the part a reader needs to find. Splitting keeps that contract in a ten-line caller
     /// instead of at the end of a three-hundred-line one.
-    #[allow(clippy::expect_used)] // Mock exchange: panic if test data is incomplete
     fn open_order_inner(
         &mut self,
         request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
@@ -301,7 +370,12 @@ impl SimulatedVenue {
         // so the model can select the best available market price (bid/ask/last). `market` is the
         // snapshot the request's sender observed when it decided to trade -- for a market order it
         // is the only price source there is, since `request.state.price` is `None` by construction
-        // for `OrderKind::Market`. A limit order additionally falls back to its own limit price.
+        // for `OrderKind::Market`.
+        //
+        // The snapshot is passed as the venue holds it. The order's own limit price reaches the
+        // model as `order_price` and as the trailing fallback below, so folding it into the
+        // snapshot's `last_price` would hand the model a market that reports the order's own price
+        // as a trade that happened.
         //
         // Invariant: `fill_price` is only called for marketable orders. `validate_order_kind_supported`
         // (called above) currently rejects Limit orders, ensuring FillModel::fill_price never receives
@@ -329,9 +403,7 @@ impl SimulatedVenue {
                         ..
                     } => Some(trigger_price),
                 },
-                market.best_bid,
-                market.best_ask,
-                market.last_price.or(request.state.price),
+                &market,
             )
             .or(request.state.price);
 
@@ -378,80 +450,37 @@ impl SimulatedVenue {
         // passing it is what keeps that decision in the models rather than making this a second
         // place the multiplier can be lost.
         let order_notional_quote = fill_price * request.state.quantity.abs() * contract_size;
-        let order_fees_quote =
-            self.fee_model
-                .compute_fee(fill_price, request.state.quantity, contract_size);
+        // Taker: every order this venue accepts is marketable on arrival, so every fill takes
+        // liquidity. When resting orders land, an order matched while on the book is the maker.
+        let order_fees_quote = self.fee_model.compute_fee(
+            fill_price,
+            request.state.quantity,
+            contract_size,
+            Liquidity::Taker,
+        );
 
-        let balance_change_result = match (cash_settled, request.state.side) {
-            // Both directions of a CFD, and the buy side of a spot trade, post quote-denominated
-            // cash -- so they are one arm, not two identical ones.
-            //
-            // A CFD is a cash-settled position on a price, not an exchange of the two underlying
-            // assets: there is nothing to deliver in either direction. A CFD short is a margin
-            // position rather than a stock loan, so -- unlike a spot sell -- it requires no base
-            // inventory, which would otherwise force the caller to fund a phantom balance in an
-            // index or a commodity to open one.
-            //
-            // For a CFD the notional stands in for a margin requirement: this mock models no
-            // leverage, so "you must hold the full notional to open the position" is the
-            // conservative reading, and it is the same requirement a spot buy already carries.
-            (true, _) | (false, Side::Buy) => {
-                #[allow(clippy::expect_used)]
-                // Invariant: SimulatedVenue - balances exist for all configured instruments
-                let current = self
-                    .account
-                    .balance_mut(&underlying.quote)
-                    .expect("SimulatedVenue has Balance for all configured Instrument assets");
-
-                let quote_required = order_notional_quote + order_fees_quote;
-                let maybe_new_balance = current.balance.free - quote_required;
-
-                // Every order this exchange supports fills immediately, so nothing is ever held on
-                // reserve and `total` must equal `free`. An `initial_state` that says otherwise --
-                // a snapshot copied from a live account with margin reserved, say -- cannot be
-                // modelled here: the fill path below writes both fields from one number and would
-                // erase the reserved portion without saying so. That is user configuration rather
-                // than an internal invariant, so reject.
-                if current.balance.total != current.balance.free {
-                    Err(ApiError::OrderRejected(format!(
-                        "SimulatedVenue cannot model a reserved balance for {}: \
-                         total {} != free {}",
-                        underlying.quote, current.balance.total, current.balance.free
-                    )))
-                } else if maybe_new_balance >= Decimal::ZERO {
-                    current.balance.free = maybe_new_balance;
-                    current.balance.total = maybe_new_balance;
-                    current.time_exchange = time_exchange;
-
-                    Ok((
-                        current.clone(),
-                        AssetFees::new(
-                            underlying.quote.clone(),
-                            order_fees_quote,
-                            Some(order_fees_quote),
-                        ),
-                    ))
-                } else {
-                    Err(ApiError::BalanceInsufficient(
-                        underlying.quote.clone(),
-                        format!(
-                            "Available Balance: {}, Required Balance inc. fees: {}",
-                            current.balance.free, quote_required
-                        ),
-                    ))
-                }
-            }
+        // Which asset the order pays with, and how much of it.
+        //
+        // Both directions of a CFD, and the buy side of a spot trade, post quote-denominated cash
+        // -- so they are one arm, not two identical ones.
+        //
+        // A CFD is a cash-settled position on a price, not an exchange of the two underlying
+        // assets: there is nothing to deliver in either direction. A CFD short is a margin position
+        // rather than a stock loan, so -- unlike a spot sell -- it requires no base inventory,
+        // which would otherwise force the caller to fund a phantom balance in an index or a
+        // commodity to open one.
+        //
+        // For a CFD the notional stands in for a margin requirement: this mock models no leverage,
+        // so "you must hold the full notional to open the position" is the conservative reading,
+        // and it is the same requirement a spot buy already carries.
+        let (asset_debited, amount_required) = match (cash_settled, request.state.side) {
+            (true, _) | (false, Side::Buy) => (
+                underlying.quote.clone(),
+                order_notional_quote + order_fees_quote,
+            ),
             (false, Side::Sell) => {
-                // Selling Instrument requires sufficient BaseAsset Balance
-                #[allow(clippy::expect_used)]
-                // Invariant: SimulatedVenue - balances exist for all configured instruments
-                let current = self
-                    .account
-                    .balance_mut(&underlying.base)
-                    .expect("SimulatedVenue has Balance for all configured Instrument assets");
-
-                let order_value_base = request.state.quantity.abs();
-                // Fee is quote-denominated; convert to base for deduction.
+                // Selling a spot instrument delivers the base asset, so the debit is denominated in
+                // base and the quote-denominated fee is converted at the fill price.
                 //
                 // Note: for `PerContractFeeModel` this conversion is nonsensical (a flat commission
                 // divided by a price). Only `Spot` reaches this branch -- a cash-settled kind is
@@ -468,47 +497,47 @@ impl SimulatedVenue {
                 } else {
                     order_fees_quote / fill_price
                 };
-                let base_required = order_value_base + order_fees_base;
 
-                let maybe_new_balance = current.balance.free - base_required;
-
-                // See the quote-side arm: immediate fills mean nothing is ever on reserve, so a
-                // configured `total != free` cannot be modelled and is rejected rather than
-                // asserted on.
-                if current.balance.total != current.balance.free {
-                    Err(ApiError::OrderRejected(format!(
-                        "SimulatedVenue cannot model a reserved balance for {}: \
-                         total {} != free {}",
-                        underlying.base, current.balance.total, current.balance.free
-                    )))
-                } else if maybe_new_balance >= Decimal::ZERO {
-                    current.balance.free = maybe_new_balance;
-                    current.balance.total = maybe_new_balance;
-                    current.time_exchange = time_exchange;
-
-                    Ok((
-                        current.clone(),
-                        AssetFees::new(
-                            underlying.quote.clone(),
-                            order_fees_quote,
-                            Some(order_fees_quote),
-                        ),
-                    ))
-                } else {
-                    Err(ApiError::BalanceInsufficient(
-                        underlying.base,
-                        format!(
-                            "Available Balance: {}, Required Balance inc. fees: {}",
-                            current.balance.free, base_required
-                        ),
-                    ))
-                }
+                (
+                    underlying.base.clone(),
+                    request.state.quantity.abs() + order_fees_base,
+                )
             }
         };
 
+        // Reserve-then-settle in one step. A market order fills on arrival, so the two collapse
+        // together and the client sees a single balance restatement -- see
+        // `AccountState::debit_filled`. A configured `total != free` (an `initial_state` copied
+        // from a live account with margin reserved) is carried through untouched rather than
+        // rejected: the ledger now represents a held amount, so there is nothing left to refuse.
+        let balance_change_result =
+            self.account
+                .debit_filled(&asset_debited, amount_required, time_exchange);
+
         let (balance_snapshot, fees) = match balance_change_result {
-            Ok((balance_snapshot, fees)) => (Snapshot(balance_snapshot), fees),
-            Err(error) => return (build_open_order_err_response(request, error), None),
+            Ok(balance_snapshot) => (
+                Snapshot(balance_snapshot),
+                AssetFees::new(
+                    underlying.quote.clone(),
+                    order_fees_quote,
+                    Some(order_fees_quote),
+                ),
+            ),
+            Err(insufficient) => {
+                return (
+                    build_open_order_err_response(
+                        request,
+                        ApiError::BalanceInsufficient(
+                            asset_debited,
+                            format!(
+                                "Available Balance: {}, Required Balance inc. fees: {}",
+                                insufficient.free, insufficient.required
+                            ),
+                        ),
+                    ),
+                    None,
+                );
+            }
         };
 
         let order_id = self.order_id_sequence_fetch_add();
@@ -783,6 +812,63 @@ mod tests {
         assert_eq!(filled_balance(&outcome).time_exchange, time_exchange);
     }
 
+    /// A resting order's arrival stamp survives the clock moving past it.
+    ///
+    /// `advance_time` used to rewrite `time_exchange` on every open order. Nothing rested, so the
+    /// only orders it could reach were those an `initial_state` seeded — and it moved them to
+    /// whenever the clock last ticked. Arrival order is half of price-time priority, so an order
+    /// whose arrival instant is rewritten on every event has no arrival instant at all.
+    #[test]
+    fn advancing_the_clock_does_not_restamp_a_resting_order() {
+        let arrived = "2025-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let much_later = "2025-06-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        let mut venue = make_venue("100", "10000000");
+        venue.account = AccountState::new(
+            venue
+                .account
+                .balances()
+                .cloned()
+                .map(|balance| (balance.asset.clone(), balance))
+                .collect(),
+            [Order {
+                key: OrderKey {
+                    exchange: EXCHANGE,
+                    instrument: instrument_name(),
+                    strategy: StrategyId::new("test"),
+                    cid: ClientOrderId::new("resting"),
+                },
+                side: Side::Buy,
+                price: Some(d("50000")),
+                quantity: d("1"),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                state: Open {
+                    id: OrderId::new("resting"),
+                    time_exchange: arrived,
+                    filled_quantity: Decimal::ZERO,
+                },
+            }]
+            .into_iter()
+            .collect(),
+            Default::default(),
+            Vec::new(),
+        );
+
+        venue.advance_time(much_later);
+
+        let resting = venue.orders_open(&[]);
+        assert_eq!(resting.len(), 1, "the seeded order must still be open");
+        assert_eq!(
+            resting[0].state.time_exchange, arrived,
+            "an order does not become a different order because time passed"
+        );
+
+        // Balances do move: a venue restates them as of now, and they carry no ordering role.
+        let usdt = venue.balances(&[quote()]);
+        assert_eq!(usdt[0].time_exchange, much_later);
+    }
+
     /// A cancel is rejected, and the rejection is the venue's rather than any driver's.
     ///
     /// Only Market orders are accepted and they fill on arrival, so nothing ever rests to be
@@ -952,7 +1038,7 @@ mod tests {
             let mut venue = make_cfd_venue(
                 "200000",
                 // 0.1% of the scaled notional.
-                FeeModelConfig::Percentage(PercentageFeeModel { rate: d("0.001") }),
+                FeeModelConfig::Percentage(PercentageFeeModel::new(d("0.001"))),
             );
 
             let outcome = venue.open_order(cfd_request(side, "1", market_prices("5000")));
@@ -1166,7 +1252,7 @@ mod tests {
     #[test]
     fn percentage_fee_model_deducts_correct_fee_on_buy() {
         // 0.1% fee rate
-        let fee_model = FeeModelConfig::Percentage(PercentageFeeModel { rate: d("0.001") });
+        let fee_model = FeeModelConfig::Percentage(PercentageFeeModel::new(d("0.001")));
         let mut venue = make_venue_with_fee("0", "10000", fee_model);
 
         // Buy 10 BTC at price 100 USDT each
@@ -1200,7 +1286,7 @@ mod tests {
     #[test]
     fn percentage_fee_model_deducts_correct_fee_on_sell() {
         // 0.1% fee rate
-        let fee_model = FeeModelConfig::Percentage(PercentageFeeModel { rate: d("0.001") });
+        let fee_model = FeeModelConfig::Percentage(PercentageFeeModel::new(d("0.001")));
         let mut venue = make_venue_with_fee("10", "0", fee_model);
 
         // Sell 1 BTC at price 100 USDT
@@ -1235,7 +1321,7 @@ mod tests {
     #[test]
     fn percentage_fee_with_zero_price_returns_zero_fee() {
         // Edge case: if fill_price is zero, fee computation must not divide by zero
-        let fee_model = FeeModelConfig::Percentage(PercentageFeeModel { rate: d("0.001") });
+        let fee_model = FeeModelConfig::Percentage(PercentageFeeModel::new(d("0.001")));
         let mut venue = make_venue_with_fee("10", "0", fee_model);
 
         // Sell 1 BTC at price 0 (degenerate case)
@@ -1370,47 +1456,99 @@ mod tests {
         );
     }
 
-    /// A `total != free` balance is user configuration -- an `initial_state` copied from a live
-    /// account with margin reserved -- not an internal invariant. It used to be an `assert_eq!`,
-    /// which panicked the exchange task on the first order.
+    /// A configured reservation is honoured, not refused.
+    ///
+    /// `total != free` is ordinary user configuration -- an `initial_state` copied from a live
+    /// account with margin reserved. It was once an `assert_eq!` that panicked the exchange task on
+    /// the first order, then a rejection, because a ledger where every order filled on arrival had
+    /// no way to represent an amount held back. It has one now: the order draws on `free`, and the
+    /// held amount is still held afterwards.
     #[test]
-    fn a_reserved_quote_balance_is_rejected_rather_than_asserted() {
+    fn a_configured_quote_reservation_survives_a_fill() {
         let mut venue = make_venue("10", "10000000");
         venue.account.balance_mut(&quote()).unwrap().balance.total = d("20000000");
 
         let outcome = venue.open_order(buy_request("1.0", market_prices("50000")));
 
-        assert!(outcome.events.is_empty());
         assert!(
-            matches!(
-                outcome.response.state,
-                OrderState::Inactive(InactiveOrderState::OpenFailed(
-                    UnindexedOrderError::Rejected(_)
-                ))
-            ),
-            "expected a rejection, got {:?}",
+            matches!(outcome.response.state, OrderState::Inactive(_)),
+            "a market order fills on arrival, got {:?}",
             outcome.response.state
+        );
+
+        let usdt = venue.account.balance_mut(&quote()).unwrap().balance;
+        assert_eq!(
+            usdt.free,
+            d("10000000") - d("50000"),
+            "the fill draws the notional from the spendable side"
+        );
+        assert_eq!(
+            usdt.total - usdt.free,
+            d("10000000"),
+            "the configured reservation must be untouched by an unrelated fill"
         );
     }
 
-    /// The sell path debits the base asset, so it carries its own copy of the reserve check.
+    /// The sell path debits the base asset, so the reservation must survive there too.
     #[test]
-    fn a_reserved_base_balance_is_rejected_rather_than_asserted() {
+    fn a_configured_base_reservation_survives_a_fill() {
         let mut venue = make_venue("10", "10000000");
         venue.account.balance_mut(&base()).unwrap().balance.total = d("20");
 
         let outcome = venue.open_order(sell_request("1.0", market_prices("50000")));
 
-        assert!(outcome.events.is_empty());
+        assert!(
+            matches!(outcome.response.state, OrderState::Inactive(_)),
+            "a market order fills on arrival, got {:?}",
+            outcome.response.state
+        );
+
+        let btc = venue.account.balance_mut(&base()).unwrap().balance;
+        assert_eq!(
+            btc.free,
+            d("10") - d("1"),
+            "the fill delivers one base unit from the spendable side"
+        );
+        assert_eq!(
+            btc.total - btc.free,
+            d("10"),
+            "the configured reservation must be untouched by an unrelated fill"
+        );
+    }
+
+    /// An order larger than `free` is refused even when `total` would cover it.
+    ///
+    /// The whole point of a reservation is that the held portion is not spendable. Sizing against
+    /// `total` would let one order spend what another is already holding.
+    #[test]
+    fn a_reservation_is_not_spendable() {
+        let mut venue = make_venue("10", "100");
+        // free 100, total 10_000_000: only 100 may be spent.
+        venue.account.balance_mut(&quote()).unwrap().balance.total = d("10000000");
+
+        let outcome = venue.open_order(buy_request("1.0", market_prices("50000")));
+
         assert!(
             matches!(
                 outcome.response.state,
                 OrderState::Inactive(InactiveOrderState::OpenFailed(
-                    UnindexedOrderError::Rejected(_)
+                    UnindexedOrderError::Rejected(ApiError::BalanceInsufficient(_, _))
                 ))
             ),
-            "expected a rejection, got {:?}",
+            "expected an insufficient-balance rejection, got {:?}",
             outcome.response.state
+        );
+        assert!(
+            outcome.events.is_empty(),
+            "a refused order moves nothing, so it restates nothing"
+        );
+
+        let usdt = venue.account.balance_mut(&quote()).unwrap().balance;
+        assert_eq!(usdt.free, d("100"), "a refused reserve must not move free");
+        assert_eq!(
+            usdt.total,
+            d("10000000"),
+            "a refused reserve must not move total"
         );
     }
 

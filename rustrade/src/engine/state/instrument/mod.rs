@@ -18,7 +18,7 @@ use itertools::Either;
 use rust_decimal::Decimal;
 use rustrade_data::event::MarketEvent;
 use rustrade_execution::{
-    FeeModel, FeeModelConfig, InstrumentAccountSnapshot,
+    FeeModel, FeeModelConfig, InstrumentAccountSnapshot, Liquidity,
     order::{
         Order, OrderKey,
         id::{ClientOrderId, OrderId, PositionId},
@@ -1089,9 +1089,17 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         // For spot instruments this is 1. Used for both fee computation and PnL calculation.
         let contract_size = self.instrument.kind.contract_size();
 
-        let computed_fee = self
-            .fee_model
-            .compute_fee(trade.price, trade.quantity, contract_size);
+        // Taker, because a `Trade` does not say which side of the book it was on. Every execution
+        // client reports fills without a maker/taker flag, so there is nothing here to read one
+        // from, and guessing taker is the conservative direction: it overstates cost rather than
+        // inventing profit. A venue that reports its own fees is the accurate path — see the
+        // double-counting warning on `FeeModelConfig`.
+        let computed_fee = self.fee_model.compute_fee(
+            trade.price,
+            trade.quantity,
+            contract_size,
+            Liquidity::Taker,
+        );
 
         let augmented;
         let effective_trade = if computed_fee.is_zero() {
