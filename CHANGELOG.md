@@ -1456,6 +1456,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The `backtests_concurrent` example runs again** (`rustrade`). It panicked at startup, before the
+  first backtest, with `MarketDataInMemory events must be sorted ascending by
+  MarketEvent::time_exchange`. `MarketDataInMemory::new` requires and asserts global time ordering
+  because the backtest merges market and auxiliary events onto one timeline; the recorded
+  three-instrument capture the example reads is interleaved and holds over ten thousand inversions,
+  so it never satisfied that. The example's `market_data_from_file` helper now sorts (stably) before
+  constructing, which is what the benches reading the same file already did, and its rustdoc explains
+  why any substituted capture needs the same. Also asserts the corpus is `Item`-only, since the sort
+  key collapses `Reconnecting` to `None` and would otherwise hoist a reconnect to the front of the
+  run. Introduced when the assertion arrived with the auxiliary-event seam; examples are linked by
+  CI but not executed, so nothing caught it.
+
 - **A simulated venue's opening balances are stamped at the session start** (`rustrade`), rather than
   carrying whatever `time_exchange` the configured initial state recorded. `SimRunner` queues each
   venue's seeding snapshot ahead of every source event, but the `HistoricalClock` is seeded from the
