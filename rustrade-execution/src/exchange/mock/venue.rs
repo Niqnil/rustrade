@@ -831,27 +831,24 @@ mod tests {
                 .cloned()
                 .map(|balance| (balance.asset.clone(), balance))
                 .collect(),
-            [(
-                ClientOrderId::new("resting"),
-                Order {
-                    key: OrderKey {
-                        exchange: EXCHANGE,
-                        instrument: instrument_name(),
-                        strategy: StrategyId::new("test"),
-                        cid: ClientOrderId::new("resting"),
-                    },
-                    side: Side::Buy,
-                    price: Some(d("50000")),
-                    quantity: d("1"),
-                    kind: OrderKind::Limit,
-                    time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                    state: Open {
-                        id: OrderId::new("resting"),
-                        time_exchange: arrived,
-                        filled_quantity: Decimal::ZERO,
-                    },
+            [Order {
+                key: OrderKey {
+                    exchange: EXCHANGE,
+                    instrument: instrument_name(),
+                    strategy: StrategyId::new("test"),
+                    cid: ClientOrderId::new("resting"),
                 },
-            )]
+                side: Side::Buy,
+                price: Some(d("50000")),
+                quantity: d("1"),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                state: Open {
+                    id: OrderId::new("resting"),
+                    time_exchange: arrived,
+                    filled_quantity: Decimal::ZERO,
+                },
+            }]
             .into_iter()
             .collect(),
             Default::default(),

@@ -1,31 +1,53 @@
 use crate::{
     UnindexedAccountSnapshot,
     balance::AssetBalance,
+    exchange::mock::orders::{OpenOrders, as_open},
     order::{
         Order,
         id::ClientOrderId,
-        state::{ActiveOrderState, Cancelled, InactiveOrderState, Open, OrderState},
+        state::{Cancelled, InactiveOrderState, Open, OrderState},
     },
     trade::Trade,
 };
 use chrono::{DateTime, Utc};
-use derive_more::Constructor;
 use fnv::FnvHashMap;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
     asset::name::AssetNameExchange, exchange::ExchangeId, instrument::name::InstrumentNameExchange,
 };
 
-#[derive(Debug, Constructor)]
+#[derive(Debug)]
 pub struct AccountState {
     balances: FnvHashMap<AssetNameExchange, AssetBalance<AssetNameExchange>>,
-    orders_open: FnvHashMap<ClientOrderId, Order<ExchangeId, InstrumentNameExchange, Open>>,
+    orders_open: OpenOrders,
     orders_cancelled:
         FnvHashMap<ClientOrderId, Order<ExchangeId, InstrumentNameExchange, Cancelled>>,
     trades: Vec<Trade<AssetNameExchange, InstrumentNameExchange>>,
 }
 
 impl AccountState {
+    pub fn new(
+        balances: FnvHashMap<AssetNameExchange, AssetBalance<AssetNameExchange>>,
+        orders_open: OpenOrders,
+        orders_cancelled: FnvHashMap<
+            ClientOrderId,
+            Order<ExchangeId, InstrumentNameExchange, Cancelled>,
+        >,
+        trades: Vec<Trade<AssetNameExchange, InstrumentNameExchange>>,
+    ) -> Self {
+        Self {
+            balances,
+            orders_open,
+            orders_cancelled,
+            trades,
+        }
+    }
+
+    /// This account's open orders, indexed for lookup and ordered for matching.
+    pub fn orders(&self) -> &OpenOrders {
+        &self.orders_open
+    }
+
     /// Restates every balance as of `time_exchange`.
     ///
     /// # Open orders keep their own stamps
@@ -51,10 +73,12 @@ impl AccountState {
         self.balances.values()
     }
 
+    /// Every open order, in no particular order — see [`OpenOrders::resting`] for the order a
+    /// venue matches in.
     pub fn orders_open(
         &self,
     ) -> impl Iterator<Item = &Order<ExchangeId, InstrumentNameExchange, Open>> + '_ {
-        self.orders_open.values()
+        self.orders_open.iter()
     }
 
     pub fn orders_cancelled(
@@ -213,25 +237,19 @@ impl From<UnindexedAccountSnapshot> for AccountState {
             .collect();
 
         let (orders_open, orders_cancelled) = instruments.into_iter().fold(
-            (FnvHashMap::default(), FnvHashMap::default()),
+            (OpenOrders::default(), FnvHashMap::default()),
             |(mut orders_open, mut orders_cancelled), snapshot| {
                 for order in snapshot.orders {
-                    match order.state {
-                        OrderState::Active(ActiveOrderState::Open(open)) => {
-                            orders_open.insert(
-                                order.key.cid.clone(),
-                                Order {
-                                    key: order.key,
-                                    side: order.side,
-                                    price: order.price,
-                                    quantity: order.quantity,
-                                    kind: order.kind,
-                                    time_in_force: order.time_in_force,
-                                    state: open,
-                                },
-                            );
+                    match &order.state {
+                        OrderState::Active(_) => {
+                            // `as_open` yields `None` for an active order that is not yet open —
+                            // an `OpenInFlight`, which has no venue-side existence to record.
+                            if let Some(open) = as_open(order) {
+                                orders_open.insert(open);
+                            }
                         }
                         OrderState::Inactive(InactiveOrderState::Cancelled(cancelled)) => {
+                            let cancelled = cancelled.clone();
                             orders_cancelled.insert(
                                 order.key.cid.clone(),
                                 Order {

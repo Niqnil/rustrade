@@ -645,6 +645,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING: a simulated venue's open orders are held in price-time priority**
+  (`rustrade-execution`). `AccountState`'s open orders move from a
+  `FnvHashMap<ClientOrderId, _>` to `OpenOrders`, which keeps the map for lookup by id and adds a
+  per-instrument, per-side queue ordered by `(price, arrival, insertion)`.
+  `AccountState::orders_open` keeps its iterator signature; `AccountState::new` now takes
+  `OpenOrders`, and `AccountState::orders` exposes it.
+
+  A tick that crosses two resting orders with only enough balance to fill one fills whichever comes
+  first. Read off a hash map that is an arbitrary choice, which a rebuild or a different
+  `ClientOrderId` can silently reverse — so two runs of one backtest need not agree. Price-time
+  priority is both the reproducible rule and the one real venues use. It has to be the structure
+  rather than a sort at the call site, or matching sorts every open order on every tick.
+
+  Insertion sequence is part of the key, not decoration: two orders at one price and one instant
+  otherwise compare equal, and a `BTreeMap` would keep only one — an order vanishing from the book
+  rather than merely being mis-ranked.
+
+  An open order with no limit price is kept for reporting but never queued. An order with no price
+  to wait at has nothing to wait for; it can only arrive through a configured `initial_state`.
+
+  Nothing rests yet, so no result moves and the committed tear sheet is byte-identical.
+
 - **BREAKING: `SimRunner` and `backtest` require `MarketKind: VenueMarketUpdate`**
   (`rustrade`). Satisfied by `DataKind`, so no in-tree caller changes. A custom market event kind
   needs one small implementation — see `VenueMarketUpdate`, and prefer delegating to the engine's

@@ -18,6 +18,7 @@ use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::{error, info};
 
 pub mod account;
+pub mod orders;
 pub mod request;
 pub mod venue;
 
