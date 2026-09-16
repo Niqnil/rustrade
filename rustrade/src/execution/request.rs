@@ -11,8 +11,25 @@ use std::{
 /// Represents an `Engine` request to the `ExecutionManager`.
 #[derive(Debug, Clone, PartialEq, PartialOrd, Deserialize, Serialize, From)]
 pub enum ExecutionRequest<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex> {
-    /// Request `ExecutionManager` shutdown.
+    /// Stop now, abandoning every request still in flight.
+    ///
+    /// Whatever those requests would have reported never arrives. This is what a live stop wants:
+    /// it should not wait on a venue that may be slow or unreachable.
     Shutdown,
+
+    /// Finish what is in flight, forward the account events that produced, then stop.
+    ///
+    /// The manager stops accepting new requests, awaits every in-flight open and cancel (each
+    /// bounded by its `request_timeout`, so this cannot hang), forwards the account events already
+    /// made available alongside those responses, and only then closes its channel.
+    ///
+    /// # Why this is distinct from [`Shutdown`](Self::Shutdown)
+    /// Closing the channel is how a manager reports "I am finished", and a caller may be waiting on
+    /// exactly that to end a run. A fill is delivered as a balance, a `Trade` and a response, of
+    /// which only the response clears the request from flight — so a stop that closes the channel
+    /// as soon as the responses are in truncates the other two. Draining is the graceful form and a
+    /// backtest needs it; abandoning is the abrupt form and live trading wants that.
+    Drain,
 
     /// Request to cancel an existing `Order`.
     Cancel(OrderRequestCancel<ExchangeKey, InstrumentKey>),

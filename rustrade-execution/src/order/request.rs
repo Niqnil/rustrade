@@ -1,5 +1,6 @@
 use crate::{
     error::OrderError,
+    market::MarketSnapshot,
     order::{
         OrderEvent, OrderKind, TimeInForce,
         id::{OrderId, PositionId},
@@ -75,6 +76,44 @@ pub struct RequestOpen {
     /// their `reduceOnly` parameter or ignore it entirely.
     #[serde(default)]
     pub reduce_only: bool,
+
+    /// Market state observed at the instant this request was created, if any was sampled.
+    ///
+    /// This is **decision-time provenance**, not an instruction to the venue. It records what the
+    /// sender was looking at when it chose to trade, which is the one price a fill can be measured
+    /// against after the fact — implementation shortfall is the difference between this and the
+    /// price actually obtained.
+    ///
+    /// # Live venues must ignore this field
+    ///
+    /// No live exchange adapter reads it and none should: a venue prices a fill from its own book,
+    /// and an adapter that forwarded these prices would be sending the client's view of the market
+    /// back as an instruction. Every adapter in this crate leaves it untouched.
+    ///
+    /// # Simulated venues fill from it
+    ///
+    /// A simulated venue has no book of its own, so this snapshot is its only price source.
+    /// [`MockExecution`](crate::client::mock::MockExecution) forwards it to
+    /// [`MockExchange`](crate::exchange::mock::MockExchange), which prices the fill through its
+    /// [`FillModel`](crate::fill::FillModel). Without it a market order carries no price at all —
+    /// `price` is `None` by construction for [`OrderKind::Market`] — and the venue can only reject.
+    ///
+    /// Sampling it at creation rather than at fill time is deliberate. It is the one instant with a
+    /// well-defined position on a simulated timeline: everything the sender had seen by then is in
+    /// it, and nothing it had not seen can be. A venue that sampled the feed itself would be
+    /// reading a stream it shares with the engine but does not pace, and could fill against prices
+    /// from arbitrarily far in the future.
+    ///
+    /// # `None` versus an empty snapshot
+    ///
+    /// `None` means no snapshot was taken — a live path, or a caller that constructed the request
+    /// directly. `Some` holding a [`MarketSnapshot::is_empty`] snapshot means one was taken and the
+    /// instrument had no price yet, which is what a cold start looks like. A simulated venue
+    /// distinguishes the two in its rejection, because the fixes differ.
+    ///
+    /// `#[serde(default)]` so requests serialised before this field existed still load.
+    #[serde(default)]
+    pub market: Option<MarketSnapshot>,
 }
 
 #[derive(

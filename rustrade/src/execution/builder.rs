@@ -38,7 +38,7 @@ use rustrade_integration::channel::{Channel, UnboundedTx, mpsc_unbounded};
 use std::{collections::BTreeSet, pin::Pin, sync::Arc, time::Duration};
 use tokio::{
     sync::{broadcast, mpsc},
-    task::{AbortHandle, JoinError, JoinHandle},
+    task::{JoinError, JoinHandle},
 };
 
 type ExecutionInitFuture =
@@ -402,20 +402,6 @@ impl AsyncShutdown for ExecutionHandles {
     }
 }
 
-impl ExecutionHandles {
-    /// [`AbortHandle`]s for every execution task, without consuming the handles.
-    ///
-    /// Enumerates the same task set as [`IntoIterator`] — a task added to this struct must be added
-    /// to both.
-    pub(crate) fn abort_handles(&self) -> impl Iterator<Item = AbortHandle> + '_ {
-        self.mock_exchanges
-            .iter()
-            .chain(&self.managers)
-            .chain(&self.account_to_engines)
-            .map(JoinHandle::abort_handle)
-    }
-}
-
 impl IntoIterator for ExecutionHandles {
     type Item = JoinHandle<()>;
     type IntoIter = std::vec::IntoIter<Self::Item>;
@@ -453,7 +439,7 @@ impl IntoIterator for ExecutionHandles {
 /// [`MockExchange`]: rustrade_execution::exchange::mock::MockExchange
 // Invariant: IndexedInstruments - all referenced assets exist; panics for unsupported InstrumentKind
 #[allow(clippy::unwrap_used)]
-fn generate_mock_exchange_instruments(
+pub(crate) fn generate_mock_exchange_instruments(
     instruments: &IndexedInstruments,
     exchange: ExchangeId,
 ) -> FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>> {
@@ -599,7 +585,7 @@ fn generate_mock_exchange_instruments(
 /// so its kind is not this client's concern.
 ///
 /// [`Instrument::data_exchange`]: rustrade_instrument::instrument::Instrument::data_exchange
-fn validate_supported_instrument_kinds(
+pub(crate) fn validate_supported_instrument_kinds(
     instruments: &IndexedInstruments,
     exchange: ExchangeId,
     supported: &[InstrumentKindDiscriminant],

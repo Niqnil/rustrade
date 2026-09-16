@@ -9,6 +9,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`SimRunner` — backtests are now driven by a deterministic discrete-event simulator**
+  (`rustrade`). A `Stream<Item = EngineEvent>` that merges the time-ordered market/auxiliary source
+  with the account events its own `SimulatedVenue`s produce, and is polled **inline** by the
+  `Engine`'s own task. There is deliberately no channel and no forwarding task between the feed and
+  the engine: the `Engine` sends its execution requests synchronously inside `process`, so by the
+  time `process` returns they are already queued on this runner's receivers, and the next poll books
+  them and schedules what they produce — all before the next market event is drawn.
+
+  The ordering within one simulated instant is now a stated contract rather than a scheduling
+  accident: auxiliary events (0) lead, then account events (1), then market data (2). Account before
+  market is the rule the type exists for — a fill stamped at `T` must reach the `Engine` before the
+  market event at `T` marks the resulting position to that price. Within one instant and class,
+  delivery follows booking order, so "the `Engine` has the response" implies "the `Engine` has
+  already seen every account event for that order". Simulated latency is applied to the queue key
+  and never slept on, so a run's wall-clock duration does not scale with the latency being modelled.
+
+- **`SimExecutionBuilder` / `SimExecutionBuild`** (`rustrade`), the deterministic counterpart to
+  `ExecutionBuilder`. The difference is what each does with a venue's request receiver:
+  `ExecutionBuilder` hands it to an `ExecutionManager` on its own task, which is what made response
+  timing a function of the tokio scheduler, while this builder keeps it for `SimRunner` to drain
+  inline. Nothing is spawned, connected or awaited — `build` is synchronous.
+
+- **`BarterError::SimFeedbackLoop`, `SimRunner::with_feedback_limit` and `DEFAULT_FEEDBACK_LIMIT`**
+  (`rustrade`). A strategy that opens an order in response to its own fill, against a venue whose
+  simulated round trip is **zero**, is a zero-delay feedback cycle: the response is stamped at the
+  very instant of the request that provoked it, so it outranks every later source event, simulated
+  time never advances and the market source is never drawn again. No discrete-event simulator can
+  resolve that by scheduling alone — there is no instant to place the response at that is both after
+  its cause and before the next input. Such a run is now abandoned after
+  `DEFAULT_FEEDBACK_LIMIT` (10,000) account events with no intervening source event, and reports the
+  venue and the instant time stopped at. The asynchronous path does not report this; it masks the
+  cycle by racing an unpaced market stream ahead of the engine, which is the non-determinism below.
+
+- **`MarketSnapshot`, and `RequestOpen::market` to carry it — a simulated venue can now price a
+  market order** (`rustrade-execution`). `MockExchange` keeps no book of its own and a market order
+  carries no limit price, so it could not price a fill at all and rejected every one: no backtest
+  against it could ever fill anything. `RequestOpen` gains `market: Option<MarketSnapshot>`
+  (`best_bid`, `best_ask`, `last_price`, each optional), which the `Engine` stamps at the instant it
+  emits the request. Sampling at the *engine* rather than at the venue is deliberate and not an
+  implementation detail: a venue holding its own market-data tee would drain the unbounded, unpaced
+  backtest market channel ahead of the `Engine` and fill at end-of-history prices, which is
+  unbounded look-ahead. The emit instant is the one point with a well-defined position on the
+  simulated timeline. The `Engine` always overwrites the field when it sends, so a strategy that
+  clones an old request cannot smuggle a stale price into a fill. **Live venues must ignore it** —
+  they have a real book, and the field describes what the *engine* saw when it decided. It is
+  `#[serde(default)]`, so requests serialised before it existed still load. `None` (no snapshot
+  supplied) and an empty snapshot are reported as different rejections on purpose: the first is a
+  wiring bug in the caller, the second a cold start or a thin instrument, and the fixes differ.
+  (#279)
+
+- **`InstrumentDataState::market_snapshot`** (`rustrade`), which supplies the above. It is
+  **defaulted** to `MarketSnapshot::from_last_price(self.price())`, so it is purely additive for
+  existing custom implementors; `DefaultInstrumentMarketData` overrides it to carry its L1 best bid
+  and ask as well as the last traded price.
+
+- **`MarketSnapshotSource`** (`rustrade`), with a blanket implementation on `EngineState`, resolving
+  an instrument's snapshot at each point the `Engine` emits an order request.
+
+- **`ExecutionRequest::Drain`** (`rustrade`), the graceful counterpart to `ExecutionRequest::Shutdown`.
+  `Shutdown` abandons whatever is in flight — what a live stop wants, and what `System::shutdown`
+  still does — while `Drain` finishes the in-flight requests, forwards the account events they
+  produced, and only then closes the manager's channel. These were previously the same message, so
+  a drained backtest shutdown and an abrupt live one could not be told apart at the manager.
+  *Note:* `ExecutionRequest` is not `#[non_exhaustive]`, so downstream exhaustive `match`es need a
+  new arm.
+
+- **`AFTER_DRAIN_DEADLINE`** (`rustrade`), bounding how long `System::shutdown_after_backtest` waits
+  for the account feed to drain. A backtest finishes well inside it; it exists so that calling that
+  method against a *live* system — whose AccountStream reconnects indefinitely and so never ends —
+  fails loudly instead of hanging.
+
 - **Order-rejection counters on the trading summary** (`rustrade`). `TearSheet` gains
   `orders_opened`, `orders_rejected` and `first_rejection_reason`; `TradingSummary` gains the
   session totals and a `rejected_every_order()` helper. Without these a session that *could not*
@@ -531,7 +602,143 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whose target is not the unique deliverable instrument on its `(base, quote, exchange)` — see the
   Fixed entry below. Appended last to the (`#[non_exhaustive]`) enum, which derives `Ord`.
 
+- **`SimulatedVenue` and `VenueOutcome`** (`rustrade-execution`), the simulated venue's state
+  machine split out from the async exchange that drives it — see the Changed entry below.
+
+- **`OrderKey::into_owned_instrument` and `OrderEvent::into_owned_instrument`**
+  (`rustrade-execution`), cloning a borrowed instrument key into an owned one. An index that maps an
+  `InstrumentIndex` back to an exchange-native name hands out a borrow of the name it owns, so
+  anything that stores that key, sends it to another task, or hands it to a venue has to rebuild it
+  field by field. `rustrade-execution` already carried one private copy of that rebuild; a second
+  driver for the simulated venue would have needed another.
+
 ### Changed
+
+- **The balance assertions in `SimulatedVenue` now panic on the engine's thread** (`rustrade`).
+  Nothing about when they fire has changed — an unfunded quote asset was always a panic — but with
+  no task between the venue and the engine, the panic surfaces on the caller's thread rather than
+  inside a spawned task whose `JoinError` the caller had to interpret. `cfd_panics_when_the_quote_asset_is_unfunded`
+  pins the message, which is unchanged.
+
+- **The simulated venue's state machine is split from the async exchange that drives it**
+  (`rustrade-execution`). `MockExchange` was one type doing two jobs: it owned the ledger, the
+  pricing and the fill accounting, *and* the channels, the spawned tasks and the latency sleeps.
+  Everything in the first group moves to a new `SimulatedVenue` — synchronous, transport-free and
+  latency-free — which `MockExchange` now holds as `pub venue: SimulatedVenue` alongside
+  `latency_ms`, `request_rx` and `event_tx`. What a backtest observes is unchanged; what changes is
+  that the venue can be driven by something other than a `tokio` task without reimplementing it, and
+  that a request's **ordering obligation is carried by the venue's return type** rather than by the
+  comments on one driver's queue.
+
+  `SimulatedVenue::open_order` and `cancel_order` return
+  `VenueOutcome<Response> { events: Vec<UnindexedAccountEvent>, response: Response }`, whose rustdoc
+  states that obligation: every event must reach the client **before** the response, and in the
+  order given. A balance here is an absolute restatement rather than a delta — successive fills
+  report `9_999_500`, `9_999_000`, `9_998_500` — so a driver that delivers two out of order does not
+  merely reorder history, it leaves the client holding the wrong number. The guarantee is the
+  venue's to state; enforcing it stays each driver's to keep.
+
+  **This is not a pure refactor, and it breaks the public API:**
+  - `MockExchange`'s `exchange`, `fee_model`, `fill_model`, `instruments` and `account` fields moved
+    onto the venue — `exchange.account` becomes `exchange.venue.account`. `order_sequence` and
+    `time_exchange_latest` are **no longer public**: resetting the sequence mints duplicate
+    `OrderId`s and `TradeId` is derived from it, so the duplicate would reach the trade ledger.
+    Read them through `SimulatedVenue::order_sequence` and `SimulatedVenue::time_exchange`; the
+    clock advances only through `SimulatedVenue::advance_time`, which takes the instant the caller's
+    own latency model produced. `instruments` stays public — a consumer mutating it is a supported
+    bypass, and the rustdoc says so.
+  - `MockExchange::open_order`, `cancel_order`, `account_snapshot`, `time_exchange`,
+    `validate_order_kind_supported` and `find_instrument_data` are gone; call them on `venue`. They
+    are deliberately **not** forwarded, and `MockExchange` deliberately does **not** `Deref` to its
+    venue: with either, `mock_exchange.open_order(..)` would still compile and book a fill whose
+    events never enter the emission queue — silently reintroducing the out-of-order delivery fixed
+    under #294 below, by way of a typo.
+  - `open_order` takes **only** the request. It previously also took the market snapshot as a
+    separate argument while `RequestOpen::market` already carried one, so a single path held two
+    copies that could disagree with nothing to arbitrate. Set the snapshot on the request.
+  - `OpenOrderNotifications` is no longer public: it was `open_order`'s second return value, and
+    what it described is now `VenueOutcome::events`.
+  - `cancel_order` is replaced rather than moved. Its body was `unimplemented!()` — the only one in
+    either crate — and it returned a type its own request channel cannot accept: a seven-field
+    `Order<.., Result<Cancelled, _>>` where `MockExchangeRequestKind::CancelOrder` wants the
+    two-field `UnindexedOrderResponseCancel`. It could not answer the channel it existed for. The
+    venue now returns a correctly typed rejection: only Market orders are accepted and they fill on
+    arrival, so no order ever rests to be cancelled, and that is a property of the venue rather than
+    of any transport carrying it. A driver forwards the rejection instead of dropping the caller's
+    `oneshot`.
+  - The venue acknowledges its own fill. `ack_trade` previously ran in the driver, so the ledger and
+    the events describing it were written on opposite sides of the seam and a driver could update
+    one without the other. A later request on the venue now sees the trade regardless of when its
+    events are delivered.
+  - The venue's rejection reasons and its unfunded-balance panic now name `SimulatedVenue` rather
+    than `MockExchange`, because that is the type that produces them and a second driver will have
+    no `MockExchange` anywhere in the picture. Code matching on those strings needs updating; the
+    `ExecutionBuilder` panic that screens instrument kinds is unrelated and unchanged.
+
+  Groundwork for [#289](https://github.com/Niqnil/rustrade/issues/289) and Stage 3 of
+  [#279](https://github.com/Niqnil/rustrade/issues/279): a deterministic backtest driver needs to
+  decide *when* a fill's events land relative to market events, which it can only do if something
+  other than a spawned task can ask the venue what those events are.
+
+- **`HistoricalClock` no longer mixes wall-clock time into simulated time** (`rustrade`).
+  `time()` returned the most recent event's `time_exchange` *plus the real time elapsed since that
+  event was processed*; it now returns that timestamp verbatim. The interpolation existed so the
+  clock would not appear frozen on a sparse feed — a presentation property bought at the cost of
+  reproducibility, because this clock is not merely read for display. It is closed into the
+  simulated exchange client, which calls it on every request, and the resulting instant stamps
+  `Filled::time_exchange`, `Trade::time_exchange` and `AssetBalance::time_exchange`; it also seeds
+  `TradingSummary::time_engine_start`/`time_engine_end`, the denominator of every annualised
+  statistic. A fill's timestamp was therefore `last_event.time_exchange + wall_clock_elapsed +
+  latency_ms / 2`, and it fed back — `process` advances the clock off `trade.time_exchange`, so the
+  drift ratcheted simulated time forward and produced the out-of-order-event warnings the clock
+  logs about itself. Measured on a three-event backtest, 50 runs previously produced **50 distinct**
+  sets of terminal timestamps; they now produce **one**. Backtests run concurrently
+  (`run_backtests` joins them), so sibling runs were perturbing each other's results.
+
+  **Behaviour change to know about:** between events the clock does not advance. A strategy that
+  reads `time()` twice without an intervening event sees one instant, and a sparse feed leaves it
+  standing still for as long as the data does. That is the correct reading of simulated time — no
+  simulated time passes where no data does — but code that measures elapsed real time by
+  differencing `time()` will now measure the dataset instead. `LiveClock` is unchanged and remains
+  the right clock for live trading. No serialised format changes: the affected field was private
+  and `HistoricalClock` derives only `Debug`/`Clone`.
+
+  This removes wall-clock dependence from the *timestamps* in a backtest. It does not make a
+  backtest reproducible on its own — where a fill lands among market events is still decided by
+  task scheduling ([#289](https://github.com/Niqnil/rustrade/issues/289)), which is why the same
+  fixture still varies between three and four orders opened. (#289)
+
+- **A drained shutdown now ends from the execution side rather than on request quiescence**
+  (`rustrade`). `Shutdown::AfterDrain` previously terminated the `Engine` as soon as nothing was
+  `OpenInFlight` or `CancelInFlight`. That signal is wrong: an order's *response* is what clears it
+  from flight, but the `Trade` and the balance that the fill actually consists of are delivered
+  separately and may not have been read yet. `Shutdown::AfterDrain` now only marks the `Engine`
+  draining and signals every `ExecutionManager`; each manager finishes what it owes, forwards the
+  account events those produced, and only then closes its channel, which ends the `Engine`'s feed
+  and with it the run. `System::shutdown_after_backtest` correspondingly **awaits**
+  `account_to_engine` instead of aborting it. `Shutdown::Immediate`, which is what live trading
+  uses, is unchanged. (#281)
+
+- **`ExecutionManager` owns its AccountStream; `init` no longer returns it separately**
+  (`rustrade`). `init` returned the AccountStream merged with the response channel, which ended the
+  combined stream as soon as *either* side finished and left the manager unable to sequence the
+  two — it did not hold the thing it had to drain. It now returns a single `Stream` carrying
+  everything the manager emits, responses and account events alike, which ends exactly when the
+  manager has finished. `ExecutionManager` gains an `account_stream` field, and its `RequestStream`
+  and `Client` parameters gain a `'static` bound (both already had to satisfy it in practice, since
+  the manager is spawned as a task). Its `Debug` implementation is now hand-written rather than
+  derived, because a boxed `Stream` is not `Debug`.
+
+- **`MockExchange::open_order` takes the market snapshot as an explicit second argument**
+  (`rustrade-execution`), so a downstream mock wrapper can override the price the venue fills at.
+  `MockExchange::run` reads it off the request before forwarding.
+
+- **`MockExchange` emits a filled order's events from one ordered task** (`rustrade-execution`).
+  It previously spawned two independent tasks per fill — one for the response, one for the balance
+  and trade notifications — which slept for the same latency and then raced. It now sleeps once and
+  sends balance, then trade, then the response. That mirrors a real venue (a trade is booked before
+  the order can be reported `FullyFilled`) and makes "the client has its response" imply "every
+  account event for this order has already been sent".
 
 - **`backtest` now fails a run in which every open request was rejected** (`rustrade`), returning
   the new `BarterError::BacktestAllOrdersRejected { rejected, reason }` — carrying the exchange's
@@ -1135,6 +1342,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **`MarketPrices`** (`rustrade-execution`), structurally identical to the new `MarketSnapshot` that
+  replaces it, and **`market_prices` from `MockExchangeRequestKind::OpenOrder`**. Once `RequestOpen`
+  carried the snapshot, the channel message held it twice — two copies that could disagree with
+  nothing to arbitrate between them — and the variant grew to three times the size of the next
+  largest. The venue now reads the snapshot off the request it was sent.
+
 - **Committed Databento DBN test fixtures** (`rustrade-data`). `es_trades_sample.dbn.zst` and
   `es_quotes_sample.dbn.zst` held real CME `GLBX.MDP3` records. Databento licenses market data per
   subscriber, and its [User Agreement](https://databento.com/legal/databento-user-agreement) defines
@@ -1165,6 +1378,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lexicographic field-order) derived orderings with it.
 
 ### Fixed
+
+- **Backtests are reproducible: the same dataset and strategy now produce the same result, run to
+  run** (`rustrade`). `backtest()` previously assembled its engine through `SystemBuild`, which
+  inserts two forwarding tasks feeding one unbounded channel, and an always-ready market source
+  raced arbitrarily far ahead of the engine on another task. Account events therefore landed at a
+  scheduler-determined index within the market stream. Balance and position *quantities* survived
+  that, because they do not depend on where in the sequence a fill lands — every time-derived
+  statistic did not. A fill could be delivered after the market events that should have marked it,
+  leaving a position that was never priced: a terminal `pnl_unrealised` of zero for a position the
+  run genuinely held, a `Position::time_exchange_update` of the entry instant, tear-sheet series
+  drawn against the wrong bars, and an order count that varied between runs of the same input.
+
+  `backtest()` no longer uses `SystemBuild`. It polls a `SimRunner` inline instead, so fill
+  placement is a function of the dataset alone. Fifty runs of the same fixture now produce one
+  outcome where they previously varied. Paper trading is unaffected: the asynchronous
+  `MockExchange`/`MockExecution` path is untouched, and only `backtest()` switches. (#289)
+
+- **No wall-clock timing remains on the backtest path** (`rustrade`). The simulated venue's latency
+  was a real `tokio::time::sleep`, and `ExecutionBuilder` applied a 1-second wall-clock timeout to
+  each dummy execution request. Both made a run's *outcome* depend on how fast the machine executing
+  it happened to be, which is the same class of defect as the non-determinism above rather than a
+  performance note. `SimRunner` applies latency as an offset on its queue key and has no timeouts
+  at all. `shutdown_after_backtest` and `AFTER_DRAIN_DEADLINE` remain public and still serve the
+  asynchronous path. (#280)
+
+- **A backtest can no longer end while a fill it provoked is still owed** (`rustrade`). Exhausting
+  the market source now yields `Shutdown::AfterDrain` before the queue is drained, so the `Engine`
+  stops generating new orders while everything already booked is delivered in full, and the stream
+  ends only once nothing is outstanding. Suppression happens at the `Engine` rather than by
+  discarding requests at the venue, so a request that was accepted is always answered.
+
+- **A simulated account snapshot ordered one instrument's orders arbitrarily** (`rustrade-execution`).
+  `account_snapshot` sorts the account's open and cancelled orders with an *unstable* sort keyed on
+  `instrument` alone, then chunks by instrument. Every order on one instrument therefore shares a
+  key, and an unstable sort leaves tied elements in whatever order they arrived in — here, a hash
+  map's iteration order. Two snapshots of the same account could list the same orders differently,
+  which makes them incomparable between runs and makes any golden hash over one a flake. The key is
+  now `(instrument, cid)`; `cid` is unique per order, so it is total.
+
+- **`MockExchange` emitted each fill from its own task, so absolute balance snapshots could reach
+  the client out of the order the venue booked them** (`rustrade-execution`). A mock balance is a
+  full restatement rather than a delta — successive fills report `9_999_500`, `9_999_000`,
+  `9_998_500` — so applying them out of order does not merely reorder history, it yields the wrong
+  balance. Every filled open was handed to its own `tokio::spawn`; at `latency_ms: 0` those tasks
+  all became runnable at once and raced, and the snapshot that arrived last won rather than the one
+  booked last. Fills are now queued and drained by a **single** emitter task, so emission order
+  equals booking order across fills, not merely within one — each fill's latency is still measured
+  from the instant it was booked, so queueing adds no delay of its own. `MockExchange::run` closes
+  the queue and awaits the emitter before returning, so shutting the venue down cannot strand a
+  booked fill.
+
+  This was invisible in practice because the timestamp each snapshot carries derives from
+  `HistoricalClock`, which mixes in wall-clock time and so happened to hand every snapshot a unique,
+  strictly increasing value — letting the engine's staleness guard discard the out-of-order ones and
+  leave the correct balance standing. **Correctness rested on that accident**, which is a bug of its
+  own ([#280](https://github.com/Niqnil/rustrade/issues/280)) that any fix to simulated-time
+  reproducibility removes; with a pure clock, fills booked between two market events share a
+  timestamp, the guard can no longer discriminate, and a backtest reports a wrong final balance. The
+  ordering is the venue's contract to keep, because by the time the engine sees two snapshots out of
+  order the information needed to sequence them is already gone. Regression test asserts the
+  broadcast order directly: it fails on every run without the fix. (#294)
+
+- **A backtest's fills were truncated non-deterministically at shutdown** (`rustrade`). Every run of
+  the same deterministic backtest could end in a different state. A filled order produces three
+  separate things — the balance it debits, the `Trade` it consists of, and the response reporting it
+  filled — and only the last of those clears the request from flight. Ending the run there cut off
+  whatever had not yet been read, and because the response channel and the account stream were
+  merged round-robin, the two ledgers were truncated by *different* amounts: observed runs debited
+  three fills' worth of quote while holding two fills' worth of position, and one debited without
+  opening a position at all. Balances, position quantity, trade counts and trade arrival order all
+  varied run to run. Fixed by the ordering and shutdown-sequencing changes described above; the
+  regression test asserts that quote debited equals the notional the position ledger holds, which
+  failed on roughly a third of runs before. Fill *timing* within the market feed is a separate,
+  still-open defect ([#289](https://github.com/Niqnil/rustrade/issues/289)), so anything derived
+  from when a fill was priced against the feed — `pnl_unrealised`, `time_exchange_update`,
+  tear-sheet series — is not yet deterministic. (#281)
+
+- **Fills were silently lost when a venue acknowledged an order as already filled**
+  (`rustrade`). In `OmsMode::Hedging`, a `Trade` that arrives before the order acknowledgement is
+  parked in `pending_fills` and replayed once the acknowledgement resolves the exchange `OrderId`.
+  That replay was armed only on the `OpenInFlight -> Active(Open)` transition, so an
+  acknowledgement whose terminal state was `Inactive(FullyFilled)` never triggered it and the fill
+  was never applied. This is not an edge case: a venue that answers the REST open with an
+  already-filled order reports the fill and the acknowledgement in one response and never publishes
+  an intermediate `Open` — Binance (`newOrderRespType=FULL`), Alpaca and IBKR all do this for
+  marketable orders — and the corresponding websocket `Trade` normally wins the race against the
+  REST round trip. The position therefore never opened while the balance was still debited, leaving
+  the two ledgers disagreeing for the rest of the session, reported only as an unreplayed entry in
+  `pending_fills`. `Netting` mode was unaffected, since it resolves `PositionId::NETTING` without
+  consulting orders at all.
 
 - **Backtests discarded every order response** (`rustrade`). No backtest could observe a fill, a
   rejection, a balance update or a trade: each run reported a tear sheet of zeros indistinguishable
@@ -1892,6 +2195,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into `reqwest` 0.11 and `hyper` 0.14, so it is not compiled under the default feature set. It is
   recorded as an accepted exception in `deny.toml` next to the other `hyperliquid_rust_sdk`
   advisories, to be dropped once that SDK moves off `reqwest` 0.11.
+
+- Updated `rustls` to 0.23.45 to clear RUSTSEC-2026-0285 (TLS 1.3 handshake messages were accepted
+  at the wrong encryption level when they followed a key-changing message in the same record — for
+  example a plaintext `EncryptedExtensions` packed into the `ServerHello` record. RFC 8446 s5.1
+  requires terminating such a connection with `unexpected_message`. The handshake transcript stays
+  authenticated, so a network-position attacker cannot alter or complete a handshake; the practical
+  effect is that a peer can send in plaintext handshake messages that should have been encrypted,
+  without rustls rejecting the connection. Functionally the same bug as Go's CVE-2025-61730).
+  Unlike the transitive advisories above this one is squarely on a hot path: `rustls` 0.23 is the
+  TLS implementation behind every HTTPS and WSS connection the workspace makes, via `reqwest`,
+  `tokio-tungstenite`, `hyper-rustls` and `rustls-platform-verifier`.
+
+  Two details worth recording. First, `cargo update -p rustls` alone resolves to 0.23.43, which is
+  **still vulnerable** — the patched range is `>=0.23.45`, so the bump needs `--precise`. Second,
+  reaching 0.23.45 also moves `aws-lc-rs` 1.16.3 -> 1.18.1, `aws-lc-sys` 0.40.0 -> 0.45.0 and
+  `rustls-webpki` 0.103.13 -> 0.103.15, so this is not the single-package lockfile patch the
+  entries above were; `aws-lc-sys` in particular is a cryptographic C library built through a
+  `build.rs`. All four crates declare `rust-version = "1.71"`, well under the workspace MSRV of
+  1.95, and the change is still confined to `Cargo.lock` with no manifest constraint edited.
+
+  The tree also carries an older `rustls` 0.21.12, which the advisory lists as unaffected
+  (`<0.23.13`).
 
 ## [0.5.0] - 2026-06-19
 

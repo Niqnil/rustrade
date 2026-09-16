@@ -19,8 +19,18 @@ use rustrade_integration::{
     channel::{Tx, UnboundedRx, UnboundedTx},
     collection::{one_or_many::OneOrMany, snapshot::SnapUpdates},
 };
-use std::fmt::Debug;
-use tokio::task::{AbortHandle, JoinError, JoinHandle};
+use std::{fmt::Debug, time::Duration};
+use tokio::task::{JoinError, JoinHandle};
+use tracing::error;
+
+/// Upper bound on how long [`System::shutdown_after_backtest`] waits for the account feed to drain.
+///
+/// A backtest's drain is bounded by the `request_timeout` each `ExecutionManager` applies to its
+/// in-flight requests, plus the account events already queued behind them, so it completes far
+/// inside this. The deadline is a guard against the one misuse that has no natural end: calling
+/// `shutdown_after_backtest` on a live system, whose AccountStream reconnects indefinitely and
+/// therefore never finishes. Reaching it logs an error and severs the feed.
+pub const AFTER_DRAIN_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Provides a `SystemBuilder` for constructing a Barter trading system, and associated types.
 pub mod builder;
@@ -96,26 +106,6 @@ where
         Ok((engine, shutdown_audit))
     }
 
-    /// [`AbortHandle`]s for every task this `System` spawned, engine included.
-    ///
-    /// [`JoinHandle::abort_handle`] only borrows, so this observes the task tree without consuming
-    /// or disturbing it, and the returned handles stay valid after `self` is moved into a shutdown
-    /// method.
-    ///
-    /// # Why this exists
-    /// A `System` that is *dropped* rather than shut down leaves its tasks **detached**, not
-    /// cancelled — that is what dropping a [`JoinHandle`] means. Two of them then cannot terminate
-    /// on their own: the engine ends only on the explicit `Shutdown` that
-    /// [`shutdown_after_backtest`](Self::shutdown_after_backtest) sends, and `account_to_engine`
-    /// only on the explicit abort it performs — each skipped precisely when the future holding the
-    /// `System` is dropped. Holding these across a cancellable await forces the teardown the
-    /// graceful path would have done.
-    pub(crate) fn abort_handles(&self) -> Vec<AbortHandle> {
-        std::iter::once(self.engine.abort_handle())
-            .chain(self.handles.abort_handles())
-            .collect()
-    }
-
     /// Shutdown the `System` ungracefully.
     pub async fn abort(self) -> Result<(Engine, Engine::Audit), JoinError>
     where
@@ -148,6 +138,12 @@ where
     /// [`Shutdown::AfterDrain`] instead has the `Engine` stop generating new orders and wait until
     /// nothing is left in flight, which is the only point at which the run has genuinely finished.
     ///
+    /// # Deadline
+    /// The drain is bounded by [`AFTER_DRAIN_DEADLINE`]. A backtest finishes it in the time its
+    /// in-flight requests take to resolve, so the deadline is never reached in normal use — it
+    /// exists so that calling this against a *live* system, whose AccountStream never ends, fails
+    /// slowly and loudly instead of hanging forever.
+    ///
     /// # Panics
     /// Panics if the Engine task has already dropped its receiver (i.e., panicked).
     pub async fn shutdown_after_backtest(self) -> Result<(Engine, Engine::Audit), JoinError>
@@ -177,9 +173,28 @@ where
             .expect("Engine cannot drop Feed receiver");
         drop(feed_tx);
 
+        // `account_to_engine` must finish BEFORE the Engine can: it holds the last `feed_tx` clone,
+        // and dropping that clone is what ends the feed and terminates the Engine. Aborting it here
+        // (as this once did) severs the account feed while the managers are still draining into it,
+        // which is exactly the truncation `Shutdown::AfterDrain` exists to prevent.
+        let account_to_engine_abort = account_to_engine.abort_handle();
+        match tokio::time::timeout(AFTER_DRAIN_DEADLINE, account_to_engine).await {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                // Only reachable if an execution stream never ends -- ie/ this was called against a
+                // live system, whose AccountStream is infinite by design. Fall back to severing it
+                // so the Engine still terminates rather than hanging forever.
+                error!(
+                    deadline = ?AFTER_DRAIN_DEADLINE,
+                    "shutdown_after_backtest timed out draining the account feed - aborting it. \
+                     Live systems must use System::shutdown, not shutdown_after_backtest"
+                );
+                account_to_engine_abort.abort();
+            }
+        }
+
         let (engine, shutdown_audit) = engine.await?;
 
-        account_to_engine.abort();
         execution.shutdown().await?;
 
         Ok((engine, shutdown_audit))
@@ -287,16 +302,5 @@ impl SystemAuxillaryHandles {
             .chain(std::iter::once(self.market_to_engine))
             .chain(std::iter::once(self.account_to_engine))
             .for_each(|handle| handle.abort());
-    }
-
-    /// [`AbortHandle`]s for every auxiliary task, without consuming the handles.
-    ///
-    /// Enumerates the same task set as [`abort`](Self::abort) — a task added to this struct must be
-    /// added to both.
-    pub(crate) fn abort_handles(&self) -> impl Iterator<Item = AbortHandle> + '_ {
-        self.execution.abort_handles().chain([
-            self.market_to_engine.abort_handle(),
-            self.account_to_engine.abort_handle(),
-        ])
     }
 }

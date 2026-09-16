@@ -16,6 +16,7 @@ use crate::{
         Processor,
         clock::HistoricalClock,
         execution_tx::MultiExchangeTxMap,
+        run::async_run,
         state::{
             EngineState, connectivity::reconcile_venue_roles, instrument::data::InstrumentDataState,
         },
@@ -27,12 +28,11 @@ use crate::{
         algo::AlgoStrategy, close_positions::ClosePositionsStrategy,
         on_disconnect::OnDisconnectStrategy, on_trading_disabled::OnTradingDisabled,
     },
-    system::{builder::EngineFeedMode, config::ExecutionConfig},
+    system::config::ExecutionConfig,
 };
 use crate::{
     engine::Engine,
-    execution::builder::{ExecutionBuild, ExecutionBuilder},
-    system::builder::{AuditMode, SystemBuild},
+    execution::sim::{SimExecutionBuild, SimExecutionBuilder, SimRunner, log_venue_summary},
 };
 use chrono::{DateTime, Utc};
 use fnv::FnvHashSet;
@@ -107,35 +107,6 @@ pub struct BacktestArgsDynamic<Strategy, Risk> {
     /// Risk management rules.
     pub risk: Risk,
 }
-/// Aborts a [`System`](crate::system::System)'s task tree if the run holding it is dropped before
-/// its graceful shutdown completes.
-///
-/// # Why a guard rather than relying on drop
-/// Dropping a [`JoinHandle`](tokio::task::JoinHandle) **detaches** its task; it does not cancel it.
-/// So dropping a `backtest` future — which is precisely what [`run_backtests`] does to every
-/// sibling the moment one resolves `Err` — leaves that run's tasks running with no handle left to
-/// observe or stop them. Two of them cannot even finish on their own: the engine ends only on the
-/// explicit `Shutdown` that `System::shutdown_after_backtest` sends, and `account_to_engine` only on
-/// the explicit abort it performs, both of which are skipped by the drop. What survives is a
-/// permanently parked engine and execution task group still holding its `EngineState`, plus a market
-/// source that keeps fetching — and, on a metered provider, keeps spending — for a result no one
-/// will read. Each cancelled run adds another set, so a long-lived process accumulates them.
-///
-/// # Why aborting mid-run is sound here
-/// An abort lands at an arbitrary await point and can leave engine state half-updated. That is
-/// harmless in this position because the guard only ever fires on a run whose result is being
-/// discarded: [`run_backtests`] retains no per-run terminal `EngineState` even when it succeeds.
-struct AbortOnDrop(Vec<tokio::task::AbortHandle>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        // Aborting an already-finished task is a no-op, so the normal path needs no disarming.
-        for handle in &self.0 {
-            handle.abort();
-        }
-    }
-}
-
 /// Run multiple backtests concurrently, each with different strategy parameters.
 ///
 /// Takes the shared constants and an iterator of different strategy configurations,
@@ -263,9 +234,15 @@ where
 /// legitimate simulated outcome — and a strategy that sends no requests is unaffected. Per-instrument
 /// counts and the first reason are on each `TearSheet`.
 ///
-/// This path hardcodes [`AuditMode::Disabled`], so the per-event `EngineOutput` audit stream is not
-/// observable here; the split *economics per event* are asserted at the `Engine::process_with_audit`
-/// seam (see the `test_corporate_action_*` tests). The terminal `engine_state` exposes the net effect.
+/// Returns [`BarterError::SimFeedbackLoop`] when the strategy trades on its own fills against a
+/// venue whose simulated round trip is zero. That is a zero-delay cycle rather than a slow run — no
+/// scheduling can order a response both after its cause and before the next input — so it is
+/// reported instead of being run. See [`SimRunner`].
+///
+/// This path drives the engine through [`async_run`], which generates no audit stream, so the
+/// per-event `EngineOutput` audit is not observable here; the split *economics per event* are
+/// asserted at the `Engine::process_with_audit` seam (see the `test_corporate_action_*` tests). The
+/// terminal `engine_state` exposes the net effect.
 ///
 /// # Market source failure
 /// A [`BacktestMarketData`] source that fails part-way through — a truncated file, a decode error, a
@@ -363,7 +340,10 @@ where
     // forwarding market and aux as two producers into the engine feed — is what preserves the time
     // order (two `forward_to` tasks would interleave non-deterministically). See [`AuxEventSource`].
     let market_first = args_constant.market_data.time_first_event().await?;
-    let raw_market = args_constant.market_data.stream().await?;
+    // Boxed so the merged feed is `Unpin`, which is what lets the engine poll it inline via
+    // `async_run` rather than through a forwarding task. A `BacktestMarketData` source is an
+    // `impl Stream` with no `Unpin` guarantee, and this is the one place that can pin it.
+    let raw_market = Box::pin(args_constant.market_data.stream().await?);
     // The aux side is tiny (corporate actions / expiries number in the handful), so collecting it is
     // cheap and lets the merge peek it synchronously.
     let aux = args_constant.aux_events.aux_events().collect::<Vec<_>>();
@@ -394,19 +374,19 @@ where
         .map_or(market_first, |first| market_first.min(first.time));
     let clock = HistoricalClock::new(clock_start);
 
-    // Build Execution infrastructure
-    let ExecutionBuild {
+    // Build the simulated venues. Nothing is spawned, connected or awaited: `SimRunner` drives
+    // them inline on the engine's own thread, which is what makes a run reproducible.
+    let SimExecutionBuild {
         execution_tx_map,
-        account_channel,
-        futures,
+        venues,
     } = args_constant
         .executions
         .clone()
         .into_iter()
         .try_fold(
-            ExecutionBuilder::new(&args_constant.instruments),
+            SimExecutionBuilder::new(&args_constant.instruments),
             |builder, config| match config {
-                ExecutionConfig::Mock(mock_config) => builder.add_mock(mock_config, clock.clone()),
+                ExecutionConfig::Mock(mock_config) => builder.add_venue(mock_config),
             },
         )?
         .build();
@@ -426,49 +406,47 @@ where
         &execution_venues,
     );
 
-    let engine = Engine::new(
-        clock,
+    let mut engine = Engine::new(
+        clock.clone(),
         engine_state,
         execution_tx_map,
         args_dynamic.strategy,
         args_dynamic.risk,
     );
 
-    // Drive the engine from the single lazily-merged time-ordered stream. Its item is `EngineEvent`,
-    // which the engine's feed accepts directly (`Event: From<MarketStream::Item>` is satisfied
-    // reflexively), so it flows through `SystemBuild`'s existing single market-forwarding task and
-    // `shutdown_after_backtest` needs no change.
+    // Lazily merge the market stream with the aux events into one time-ordered stream.
     // Per-run, so concurrent `run_backtests` runs never observe each other's source failures.
     let source_error = Arc::new(OnceLock::new());
-    let market_stream =
-        merge_market_with_aux(raw_market, market_first, aux, Arc::clone(&source_error));
+    let source = merge_market_with_aux(raw_market, market_first, aux, Arc::clone(&source_error));
 
-    let system = SystemBuild::new(
-        engine,
-        EngineFeedMode::Stream,
-        AuditMode::Disabled,
-        market_stream,
-        account_channel,
-        futures,
-    )
-    .init()
-    .await?;
+    // Interleave the venues' account events into that stream in simulated time, and let the engine
+    // poll the result **inline**. There is deliberately no channel and no forwarding task between
+    // the two: the engine sends its execution requests synchronously inside `process`, so polling
+    // the feed inline is what lets a fill be booked and scheduled before the next market event is
+    // drawn. Forwarding through a channel instead is what made fill placement — and therefore every
+    // time-derived statistic — a function of the tokio scheduler rather than of the dataset.
+    let mut feed = SimRunner::new(venues, source, clock);
 
-    // Armed as soon as there is a task tree to abort — `init` returns the first handles this run
-    // owns — and held to the end of the run. The earlier awaits need no guard: the only tasks `init`
-    // spawns before its last fallible await are the `MockExchange` runners, and each ends on its own
-    // once the dropped future releases the last request sender. Every other task is spawned after
-    // that await, so a drop cannot strand one mid-init. See `AbortOnDrop`: without it, this run being
-    // cancelled — which is exactly what `run_backtests` does to every sibling when one fails — parks
-    // its task group forever.
-    let _abort_on_drop = AbortOnDrop(system.abort_handles());
+    // Ends when the source is exhausted *and* every scheduled deliverable has been drained, so the
+    // run cannot stop while a fill it provoked is still owed. That is the whole of this path's
+    // shutdown: no `Shutdown` to enqueue behind the account events it would truncate, no task tree
+    // to abort, and nothing to await beyond the engine loop itself.
+    let _shutdown_audit = async_run(&mut feed, &mut engine).await;
 
-    let (engine, _shutdown_audit) = system.shutdown_after_backtest().await?;
+    log_venue_summary(feed.venues());
 
-    // The market source failing mid-run is the one way this path can produce a complete-looking
-    // summary over an incomplete dataset, so it is checked before any statistic is generated. The
-    // merge has ended and its task has been awaited by this point, so the slot is settled.
+    // A feed ending says only that there is no more input; it does not say the run completed. Both
+    // ways it can end early produce a complete-looking summary over an incomplete dataset, so both
+    // are checked before any statistic is generated. The feed has ended by this point, so each is
+    // settled.
+    //
+    // The source failing is the dataset's fault; a feedback loop is the configuration's. Neither
+    // can reach the caller as a tear sheet.
     if let Some(error) = source_error.get() {
+        return Err(error.clone());
+    }
+
+    if let Some(error) = feed.error() {
         return Err(error.clone());
     }
 
@@ -546,8 +524,15 @@ where
 /// rather than left to that consumer. [`FusedStream`] reports the same latch, so a `select!` over
 /// this stream needs no redundant `.fuse()`.
 ///
-/// The yielded item is a bare [`EngineEvent`]; the engine reads simulated time itself (via the
-/// market event's exchange timestamp), so the ordering time is internal to this merge.
+/// # The ordering time is published, not discarded
+/// Each item is a [`Timed`] [`EngineEvent`] carrying the instant this merge ordered it by. The
+/// engine ignores the wrapper and reads simulated time from the event itself, but a consumer that
+/// must interleave a *third* source against this one needs that instant before it can decide which
+/// side leads — and for a [`MarketStreamEvent::Reconnecting`], which carries no timestamp of its
+/// own, this merge's carried-forward `last_market_time` is the only place it exists. See
+/// [`SimRunner`], which schedules simulated account events against it.
+///
+/// [`SimRunner`]: crate::execution::sim::SimRunner
 #[pin_project::pin_project]
 struct TimedMergeStream<St, MarketKind, ExchangeKey, AssetKey, InstrumentKey>
 where
@@ -570,7 +555,7 @@ where
     EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>:
         From<MarketStreamEvent<InstrumentKey, MarketKind>>,
 {
-    type Item = EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>;
+    type Item = Timed<EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
@@ -599,7 +584,7 @@ where
                     if aux_time <= market_time {
                         // Aux leads or ties — emit it. `aux.peek()` was `Some`, so `next()` is
                         // `Some`.
-                        Poll::Ready(this.aux.next().map(|timed| timed.value))
+                        Poll::Ready(this.aux.next())
                     } else {
                         let polled = this.market.as_mut().poll_next(cx);
                         take_market(polled, this.last_market_time, this.source_error)
@@ -614,7 +599,7 @@ where
                     take_market(polled, this.last_market_time, this.source_error)
                 }
                 // Market exhausted — drain the remaining aux events in order.
-                Poll::Ready(None) => Poll::Ready(this.aux.next().map(|timed| timed.value)),
+                Poll::Ready(None) => Poll::Ready(this.aux.next()),
             },
         };
 
@@ -670,7 +655,7 @@ fn take_market<MarketKind, ExchangeKey, AssetKey, InstrumentKey>(
     polled: Poll<Option<Result<MarketStreamEvent<InstrumentKey, MarketKind>, BarterError>>>,
     last_market_time: &mut DateTime<Utc>,
     source_error: &Arc<OnceLock<BarterError>>,
-) -> Poll<Option<EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>>>
+) -> Poll<Option<Timed<EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>>>>
 where
     EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>:
         From<MarketStreamEvent<InstrumentKey, MarketKind>>,
@@ -711,13 +696,20 @@ where
     }
 }
 
-/// Convert a market event to an [`EngineEvent`], advancing `last_market_time` on an `Item` so a later
-/// [`MarketStreamEvent::Reconnecting`] (which has no timestamp) can inherit the prior time for
-/// ordering.
+/// Convert a market event to a [`Timed`] [`EngineEvent`], advancing `last_market_time` on an `Item`
+/// so a later [`MarketStreamEvent::Reconnecting`] (which has no timestamp) can inherit the prior
+/// time for ordering.
+///
+/// The [`Timed::time`] returned is the instant the merge ordered this event by — the event's own
+/// `time_exchange`, or the carried-forward `last_market_time` for a `Reconnecting`. Publishing it
+/// rather than discarding it is what lets a downstream consumer interleave against this stream
+/// without re-deriving an ordering key the merge has already computed. See [`SimRunner`].
+///
+/// [`SimRunner`]: crate::execution::sim::SimRunner
 fn convert_market<MarketKind, ExchangeKey, AssetKey, InstrumentKey>(
     event: MarketStreamEvent<InstrumentKey, MarketKind>,
     last_market_time: &mut DateTime<Utc>,
-) -> EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>
+) -> Timed<EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>>
 where
     EngineEvent<MarketKind, ExchangeKey, AssetKey, InstrumentKey>:
         From<MarketStreamEvent<InstrumentKey, MarketKind>>,
@@ -725,7 +717,10 @@ where
     if let MarketStreamEvent::Item(market_event) = &event {
         *last_market_time = market_event.time_exchange;
     }
-    EngineEvent::from(event)
+    Timed {
+        value: EngineEvent::from(event),
+        time: *last_market_time,
+    }
 }
 
 /// Build a [`TimedMergeStream`]. `seed` is the fallback ordering time for a leading
@@ -827,8 +822,12 @@ mod tests {
         aux: Vec<Timed<EngineEvent<DataKind>>>,
     ) -> (Vec<EngineEvent<DataKind>>, Option<BarterError>) {
         let source_error = Arc::new(OnceLock::new());
+        // The merge's `Timed` wrapper is unwrapped here: these tests assert the *ordering* the
+        // merge produces, which the sequence of values already expresses. `SimRunner`'s own tests
+        // cover the published time.
         let merged =
             merge_market_with_aux(stream::iter(market), seed, aux, Arc::clone(&source_error))
+                .map(|timed| timed.value)
                 .collect::<Vec<_>>()
                 .await;
 
@@ -1057,7 +1056,15 @@ mod tests {
         let mut merged =
             merge_market_with_aux(stream::iter(market), at(0), aux, Arc::clone(&source_error));
 
-        assert_eq!(merged.next().await.as_ref().and_then(market_id), Some(0));
+        assert_eq!(
+            merged
+                .next()
+                .await
+                .map(|timed| timed.value)
+                .as_ref()
+                .and_then(market_id),
+            Some(0)
+        );
         assert!(merged.next().await.is_none(), "the error ends the stream");
         assert!(merged.is_terminated());
 
@@ -1085,9 +1092,25 @@ mod tests {
         );
 
         assert!(!merged.is_terminated());
-        assert_eq!(merged.next().await.as_ref().and_then(market_id), Some(0));
+        assert_eq!(
+            merged
+                .next()
+                .await
+                .map(|timed| timed.value)
+                .as_ref()
+                .and_then(market_id),
+            Some(0)
+        );
         assert!(!merged.is_terminated());
-        assert_eq!(merged.next().await.as_ref().and_then(expiry_id), Some(100));
+        assert_eq!(
+            merged
+                .next()
+                .await
+                .map(|timed| timed.value)
+                .as_ref()
+                .and_then(expiry_id),
+            Some(100)
+        );
         // Still not terminated: nothing has returned `None` yet, and claiming otherwise would make
         // a `select!` drop the last event.
         assert!(!merged.is_terminated());

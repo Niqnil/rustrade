@@ -5081,6 +5081,7 @@ mod tests {
                     time_in_force: TimeInForce::ImmediateOrCancel,
                     position_id: None,
                     reduce_only: true, // This should map to SellToClose
+                    market: None,
                 },
             };
 
@@ -5179,6 +5180,7 @@ mod tests {
                     time_in_force: TimeInForce::ImmediateOrCancel,
                     position_id: None,
                     reduce_only: false, // This should map to BuyToOpen
+                    market: None,
                 },
             };
 
