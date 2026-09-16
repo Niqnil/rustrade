@@ -771,6 +771,7 @@ impl AlgoStrategy for LoseMoneyStrategy {
                         time_in_force: TimeInForce::ImmediateOrCancel,
                         position_id: None,
                         reduce_only: false,
+                        market: None,
                     },
                 })
             });
