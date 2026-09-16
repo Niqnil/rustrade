@@ -929,7 +929,7 @@ async fn resolve_aapl_call_option(client: &IbkrHistoricalData) -> Contract {
     // `fut_fop_exchange` must be empty to get every exchange's parameters; a
     // routing exchange like "SMART" filters the result to zero rows.
     let chains = client
-        .fetch_option_chain("AAPL", "", SecurityType::Stock, AAPL_UNDERLYING_CONID)
+        .fetch_option_chain("AAPL", None, SecurityType::Stock, AAPL_UNDERLYING_CONID)
         .await
         .expect("fetch AAPL option chain to resolve a valid option contract");
 
@@ -1119,7 +1119,7 @@ async fn test_fetch_option_chain() {
     // to return every exchange's parameters (a routing exchange like "SMART"
     // filters the result to zero rows).
     let chains = client
-        .fetch_option_chain("AAPL", "", SecurityType::Stock, AAPL_UNDERLYING_CONID)
+        .fetch_option_chain("AAPL", None, SecurityType::Stock, AAPL_UNDERLYING_CONID)
         .await;
 
     match chains {

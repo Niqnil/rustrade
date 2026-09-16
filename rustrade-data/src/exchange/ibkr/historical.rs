@@ -657,9 +657,12 @@ impl IbkrHistoricalData {
     /// # Arguments
     ///
     /// * `symbol` - Underlying symbol (e.g., "AAPL")
-    /// * `exchange` - `fut_fop_exchange` filter. Pass `""` for all exchanges
-    ///   (recommended); a routing exchange like "SMART" filters the result to
-    ///   zero rows.
+    /// * `exchange` - TWS's `fut_fop_exchange` filter, which narrows the chain
+    ///   to a *futures* options exchange. Pass `None` for every underlying that
+    ///   is not a future: TWS then returns one entry per listing exchange.
+    ///   Naming a routing exchange — `Some("SMART")` included — filters the
+    ///   result to zero rows. Only pass `Some(..)` for a futures underlying,
+    ///   e.g. `Some("CME")`.
     /// * `security_type` - Type of underlying (typically `SecurityType::Stock`)
     /// * `contract_id` - IB contract ID of the underlying. Must be a valid
     ///   conId; IBKR's `reqSecDefOptParams` rejects `0` with
@@ -692,8 +695,10 @@ impl IbkrHistoricalData {
     /// let client = IbkrHistoricalData::connect("127.0.0.1:4002", 102)?;
     ///
     /// // 265598 is AAPL's underlying conId; resolve via contract details for other symbols.
-    /// // Empty exchange returns every exchange's option parameters.
-    /// let chains = client.fetch_option_chain("AAPL", "", SecurityType::Stock, 265598).await?;
+    /// // `None` returns every listing exchange's option parameters.
+    /// let chains = client
+    ///     .fetch_option_chain("AAPL", None, SecurityType::Stock, 265598)
+    ///     .await?;
     /// if let Some(reason) = &chains.truncation_error {
     ///     eprintln!("chain enumeration was cut short: {reason}");
     /// }
@@ -704,26 +709,35 @@ impl IbkrHistoricalData {
     pub async fn fetch_option_chain(
         &self,
         symbol: &str,
-        exchange: &str,
+        exchange: Option<&str>,
         security_type: SecurityType,
         contract_id: i32,
     ) -> Result<OptionChainResult, DataError> {
         let client = self.client.clone();
         let symbol = symbol.to_string();
-        let exchange = exchange.to_string();
+        let exchange = exchange.map(str::to_string);
 
         debug!(
             symbol = %symbol,
-            exchange = %exchange,
+            exchange = ?exchange,
             "Fetching option chain"
         );
 
         let chains = tokio::task::spawn_blocking(move || {
-            let subscription = client
-                .option_chain(&symbol, &exchange, security_type, contract_id)
+            // ibapi 4.0: `option_chain` returns a builder and `exchange` is a
+            // setter rather than a positional argument. An unset exchange is
+            // now omitted from the wire entirely instead of being sent as an
+            // empty string; TWS treats the two identically.
+            let builder = client.option_chain(&symbol, security_type, contract_id);
+            let builder = match exchange.as_deref() {
+                Some(exchange) => builder.exchange(exchange),
+                None => builder,
+            };
+            let subscription = builder
+                .subscribe()
                 .map_err(|e| DataError::Socket(format!("option_chain: {e}")))?;
 
-            // ibapi 3.x: `iter_data()` yields `Result<OptionChain, Error>`,
+            // ibapi: `iter_data()` yields `Result<OptionChain, Error>`,
             // filtering subscription-level notices, so an `Err` here is a
             // genuine mid-stream failure. Option chains use the same
             // Subscription/StreamDecoder machinery as historical ticks (N
@@ -1102,7 +1116,18 @@ fn warn_if_short_tick_fetch(symbol: &str, received: usize, requested: i32) {
 ///
 /// # Returns
 ///
-/// Returns `None` if price is non-finite (invalid data from IB).
+/// Returns `None` if the price is non-finite, or if the tick carries no usable
+/// size (invalid data from IB — see the note on sizes below).
+///
+/// # Sizes are optional as of ibapi 4.0
+///
+/// `TickLast::size` is `Option<f64>`, not `i32`. `None` means TWS sent no value
+/// at all — the field was absent, empty, or one of TWS's "unset" sentinels —
+/// which is distinct from a real `Some(0.0)`. [`PublicTrade`] has no encoding
+/// for "size unknown", and substituting zero would reintroduce exactly the
+/// silent data loss the `Option<f64>` change fixed, so such a tick is dropped
+/// with a `warn!` rather than fabricated. Fractional sizes (crypto, fractional
+/// shares) now survive: the old `i32` decode truncated `0.5` to `0`.
 fn tick_last_to_public_trade(tick: &TickLast, seq: usize) -> Option<PublicTrade> {
     if !tick.price.is_finite() {
         warn!(
@@ -1112,8 +1137,16 @@ fn tick_last_to_public_trade(tick: &TickLast, seq: usize) -> Option<PublicTrade>
         return None;
     }
 
+    let Some(size) = tick.size.filter(|size| size.is_finite()) else {
+        warn!(
+            size = ?tick.size,
+            "Historical tick has no usable size, skipping"
+        );
+        return None;
+    };
+
     let price = Decimal::try_from(tick.price).ok()?;
-    let amount = Decimal::from(tick.size);
+    let amount = Decimal::try_from(size).ok()?;
 
     Some(PublicTrade {
         id: generate_tick_id(tick.timestamp, tick.price, tick.size, seq),
@@ -1147,16 +1180,22 @@ fn parse_tick_timestamp(timestamp: OffsetDateTime) -> Option<DateTime<Utc>> {
 /// uniqueness within a batch when multiple trades have identical
 /// (timestamp, price, size) — common since IB timestamps have only
 /// 1-second resolution.
+///
+/// `size` is hashed through [`f64::to_bits`], as `price` already was, because
+/// `f64` is not [`Hash`]. Hashing the `Option` rather than an unwrapped value
+/// keeps "TWS sent no size" distinct from a real zero. Note that this makes the
+/// generated id a function of the ibapi wire type: the same logical tick hashed
+/// as `i32` under ibapi 3.x and as `Option<f64>` here produces different ids.
 fn generate_tick_id(
     timestamp: OffsetDateTime,
     price: f64,
-    size: i32,
+    size: Option<f64>,
     seq: usize,
 ) -> smol_str::SmolStr {
     let mut hasher = fnv::FnvHasher::default();
     timestamp.unix_timestamp_nanos().hash(&mut hasher);
     price.to_bits().hash(&mut hasher);
-    size.hash(&mut hasher);
+    size.map(f64::to_bits).hash(&mut hasher);
     seq.hash(&mut hasher);
     format_smolstr!("{:016x}", hasher.finish())
 }
@@ -1165,7 +1204,14 @@ fn generate_tick_id(
 ///
 /// # Returns
 ///
-/// Returns `None` if any price is non-finite (invalid data from IB).
+/// Returns `None` if any price is non-finite, or if either side carries no
+/// usable size (invalid data from IB).
+///
+/// As of ibapi 4.0 `size_bid`/`size_ask` are `Option<f64>`; see
+/// [`tick_last_to_public_trade`] for why an absent size drops the tick rather
+/// than decoding as zero. Both sides are required because [`Level`] has no
+/// encoding for a known price at an unknown size, and a substituted zero would
+/// misrepresent the book.
 fn tick_bid_ask_to_order_book_l1(tick: &TickBidAsk) -> Option<OrderBookL1> {
     if !tick.price_bid.is_finite() || !tick.price_ask.is_finite() {
         warn!(
@@ -1176,10 +1222,22 @@ fn tick_bid_ask_to_order_book_l1(tick: &TickBidAsk) -> Option<OrderBookL1> {
         return None;
     }
 
+    let (Some(size_bid), Some(size_ask)) = (
+        tick.size_bid.filter(|size| size.is_finite()),
+        tick.size_ask.filter(|size| size.is_finite()),
+    ) else {
+        warn!(
+            size_bid = ?tick.size_bid,
+            size_ask = ?tick.size_ask,
+            "Historical tick has no usable size, skipping"
+        );
+        return None;
+    };
+
     let bid_price = Decimal::try_from(tick.price_bid).ok()?;
     let ask_price = Decimal::try_from(tick.price_ask).ok()?;
-    let bid_amount = Decimal::from(tick.size_bid);
-    let ask_amount = Decimal::from(tick.size_ask);
+    let bid_amount = Decimal::try_from(size_bid).ok()?;
+    let ask_amount = Decimal::try_from(size_ask).ok()?;
 
     Some(OrderBookL1 {
         last_update_time: parse_tick_timestamp(tick.timestamp)?,
@@ -1312,8 +1370,8 @@ fn bar_to_candle(
 }
 
 #[cfg(test)]
-// Test code may unwrap freely since panics indicate test failure
-#[allow(clippy::unwrap_used)]
+// Test code may unwrap/expect freely since panics indicate test failure
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use chrono::{Datelike, Timelike};
@@ -1476,7 +1534,7 @@ mod tests {
     // Historical Tick Conversion Tests
     // ========================================================================
 
-    fn make_tick_last(unix_time: i64, price: f64, size: i32) -> TickLast {
+    fn make_tick_last(unix_time: i64, price: f64, size: Option<f64>) -> TickLast {
         use ibapi::market_data::historical::TickAttributeLast;
 
         TickLast {
@@ -1496,9 +1554,9 @@ mod tests {
     fn make_tick_bid_ask(
         unix_time: i64,
         bid_price: f64,
-        bid_size: i32,
+        bid_size: Option<f64>,
         ask_price: f64,
-        ask_size: i32,
+        ask_size: Option<f64>,
     ) -> TickBidAsk {
         use ibapi::market_data::historical::TickAttributeBidAsk;
 
@@ -1520,7 +1578,7 @@ mod tests {
     fn tick_last_converts_to_public_trade() {
         use rust_decimal_macros::dec;
 
-        let tick = make_tick_last(1700000000, 150.25, 100);
+        let tick = make_tick_last(1700000000, 150.25, Some(100.0));
         let trade = tick_last_to_public_trade(&tick, 0).unwrap();
 
         assert_eq!(trade.price, dec!(150.25));
@@ -1531,18 +1589,97 @@ mod tests {
 
     #[test]
     fn tick_last_rejects_non_finite_price() {
-        let tick = make_tick_last(1700000000, f64::NAN, 100);
+        let tick = make_tick_last(1700000000, f64::NAN, Some(100.0));
         assert!(tick_last_to_public_trade(&tick, 0).is_none());
 
-        let tick = make_tick_last(1700000000, f64::INFINITY, 100);
+        let tick = make_tick_last(1700000000, f64::INFINITY, Some(100.0));
         assert!(tick_last_to_public_trade(&tick, 0).is_none());
+    }
+
+    /// The point of ibapi 4.0's `Option<f64>` size: the old `i32` decode
+    /// truncated a fractional wire size such as `0.5` to `0`, silently losing
+    /// real data on crypto and fractional-share feeds.
+    #[test]
+    fn tick_last_preserves_fractional_size() {
+        use rust_decimal_macros::dec;
+
+        let tick = make_tick_last(1700000000, 150.25, Some(0.5));
+        let trade = tick_last_to_public_trade(&tick, 0).expect("fractional size is valid");
+
+        assert_eq!(trade.amount, dec!(0.5));
+    }
+
+    /// `None` is TWS sending no size at all, which is distinct from a real
+    /// zero. `PublicTrade` cannot encode "size unknown", so the tick is dropped
+    /// rather than fabricated as zero.
+    #[test]
+    fn tick_last_without_size_is_dropped() {
+        assert!(tick_last_to_public_trade(&make_tick_last(1700000000, 150.25, None), 0).is_none());
+    }
+
+    /// A non-finite size is as unusable as a non-finite price.
+    #[test]
+    fn tick_last_with_non_finite_size_is_dropped() {
+        let nan = make_tick_last(1700000000, 150.25, Some(f64::NAN));
+        assert!(tick_last_to_public_trade(&nan, 0).is_none());
+
+        let inf = make_tick_last(1700000000, 150.25, Some(f64::INFINITY));
+        assert!(tick_last_to_public_trade(&inf, 0).is_none());
+    }
+
+    /// `Some(0.0)` is a genuine zero TWS reported, not an absent field, so it
+    /// must survive where `None` is dropped.
+    #[test]
+    fn tick_last_keeps_a_real_zero_size() {
+        use rust_decimal_macros::dec;
+
+        let tick = make_tick_last(1700000000, 150.25, Some(0.0));
+        let trade = tick_last_to_public_trade(&tick, 0).expect("a reported zero is real data");
+
+        assert_eq!(trade.amount, dec!(0));
+    }
+
+    /// The generated id hashes the `Option`, so "no size" and a real zero do
+    /// not collide.
+    #[test]
+    fn tick_id_distinguishes_absent_size_from_zero() {
+        let absent = make_tick_last(1700000000, 150.25, None);
+        let zero = make_tick_last(1700000000, 150.25, Some(0.0));
+
+        assert_ne!(
+            generate_tick_id(absent.timestamp, absent.price, absent.size, 0),
+            generate_tick_id(zero.timestamp, zero.price, zero.size, 0)
+        );
+    }
+
+    /// Either side missing a size makes the whole L1 snapshot unusable: `Level`
+    /// has no encoding for a known price at an unknown size.
+    #[test]
+    fn tick_bid_ask_without_size_is_dropped() {
+        let no_bid = make_tick_bid_ask(1700000000, 150.00, None, 150.05, Some(300.0));
+        assert!(tick_bid_ask_to_order_book_l1(&no_bid).is_none());
+
+        let no_ask = make_tick_bid_ask(1700000000, 150.00, Some(500.0), 150.05, None);
+        assert!(tick_bid_ask_to_order_book_l1(&no_ask).is_none());
+    }
+
+    /// Fractional book sizes survive the same way trade sizes do.
+    #[test]
+    fn tick_bid_ask_preserves_fractional_sizes() {
+        use rust_decimal_macros::dec;
+
+        let tick = make_tick_bid_ask(1700000000, 150.00, Some(0.25), 150.05, Some(0.75));
+        let l1 = tick_bid_ask_to_order_book_l1(&tick).expect("fractional sizes are valid");
+
+        assert_eq!(l1.best_bid.expect("bid").amount, dec!(0.25));
+        assert_eq!(l1.best_ask.expect("ask").amount, dec!(0.75));
     }
 
     #[test]
     fn tick_last_generates_unique_ids() {
-        let tick1 = make_tick_last(1700000000, 150.25, 100);
-        let tick2 = make_tick_last(1700000001, 150.25, 100);
-        let tick3 = make_tick_last(1700000000, 150.26, 100);
+        let tick1 = make_tick_last(1700000000, 150.25, Some(100.0));
+        let tick2 = make_tick_last(1700000001, 150.25, Some(100.0));
+        let tick3 = make_tick_last(1700000000, 150.26, Some(100.0));
 
         let id1 = generate_tick_id(tick1.timestamp, tick1.price, tick1.size, 0);
         let id2 = generate_tick_id(tick2.timestamp, tick2.price, tick2.size, 0);
@@ -1555,8 +1692,8 @@ mod tests {
 
     #[test]
     fn tick_last_same_data_same_seq_same_id() {
-        let tick1 = make_tick_last(1700000000, 150.25, 100);
-        let tick2 = make_tick_last(1700000000, 150.25, 100);
+        let tick1 = make_tick_last(1700000000, 150.25, Some(100.0));
+        let tick2 = make_tick_last(1700000000, 150.25, Some(100.0));
 
         let id1 = generate_tick_id(tick1.timestamp, tick1.price, tick1.size, 0);
         let id2 = generate_tick_id(tick2.timestamp, tick2.price, tick2.size, 0);
@@ -1566,8 +1703,8 @@ mod tests {
 
     #[test]
     fn tick_last_same_data_different_seq_different_id() {
-        let tick1 = make_tick_last(1700000000, 150.25, 100);
-        let tick2 = make_tick_last(1700000000, 150.25, 100);
+        let tick1 = make_tick_last(1700000000, 150.25, Some(100.0));
+        let tick2 = make_tick_last(1700000000, 150.25, Some(100.0));
 
         let id1 = generate_tick_id(tick1.timestamp, tick1.price, tick1.size, 0);
         let id2 = generate_tick_id(tick2.timestamp, tick2.price, tick2.size, 1);
@@ -1579,7 +1716,7 @@ mod tests {
     fn tick_bid_ask_converts_to_order_book_l1() {
         use rust_decimal_macros::dec;
 
-        let tick = make_tick_bid_ask(1700000000, 150.00, 500, 150.05, 300);
+        let tick = make_tick_bid_ask(1700000000, 150.00, Some(500.0), 150.05, Some(300.0));
         let l1 = tick_bid_ask_to_order_book_l1(&tick).unwrap();
 
         let bid = l1.best_bid.unwrap();
@@ -1594,10 +1731,10 @@ mod tests {
 
     #[test]
     fn tick_bid_ask_rejects_non_finite_prices() {
-        let tick = make_tick_bid_ask(1700000000, f64::NAN, 500, 150.05, 300);
+        let tick = make_tick_bid_ask(1700000000, f64::NAN, Some(500.0), 150.05, Some(300.0));
         assert!(tick_bid_ask_to_order_book_l1(&tick).is_none());
 
-        let tick = make_tick_bid_ask(1700000000, 150.00, 500, f64::INFINITY, 300);
+        let tick = make_tick_bid_ask(1700000000, 150.00, Some(500.0), f64::INFINITY, Some(300.0));
         assert!(tick_bid_ask_to_order_book_l1(&tick).is_none());
     }
 
@@ -1663,10 +1800,10 @@ mod tests {
         // Two good ticks, then an IB error, then a tick that must never be
         // reached because iteration stops at the first `Err`.
         let items: Vec<Result<TickLast, ibapi::Error>> = vec![
-            Ok(make_tick_last(1_700_000_000, 100.0, 10)),
-            Ok(make_tick_last(1_700_000_001, 101.0, 10)),
+            Ok(make_tick_last(1_700_000_000, 100.0, Some(10.0))),
+            Ok(make_tick_last(1_700_000_001, 101.0, Some(10.0))),
             Err(ibapi::Error::Simple("boom".into())),
-            Ok(make_tick_last(1_700_000_002, 999.0, 10)),
+            Ok(make_tick_last(1_700_000_002, 999.0, Some(10.0))),
         ];
         let mut on_error_calls = 0;
 
@@ -1694,8 +1831,8 @@ mod tests {
     #[test]
     fn collect_ticks_clean_end_of_data_is_not_truncated() {
         let items: Vec<Result<TickLast, ibapi::Error>> = vec![
-            Ok(make_tick_last(1_700_000_000, 100.0, 10)),
-            Ok(make_tick_last(1_700_000_001, 101.0, 10)),
+            Ok(make_tick_last(1_700_000_000, 100.0, Some(10.0))),
+            Ok(make_tick_last(1_700_000_001, 101.0, Some(10.0))),
         ];
 
         let fetched = collect_ticks(
@@ -1715,8 +1852,8 @@ mod tests {
         // A NaN price is a data-quality drop, not a wire truncation: the tick is
         // filtered by the map closure but `truncation_error` stays `None`.
         let items: Vec<Result<TickLast, ibapi::Error>> = vec![
-            Ok(make_tick_last(1_700_000_000, f64::NAN, 10)),
-            Ok(make_tick_last(1_700_000_001, 100.0, 10)),
+            Ok(make_tick_last(1_700_000_000, f64::NAN, Some(10.0))),
+            Ok(make_tick_last(1_700_000_001, 100.0, Some(10.0))),
         ];
 
         let fetched = collect_ticks(

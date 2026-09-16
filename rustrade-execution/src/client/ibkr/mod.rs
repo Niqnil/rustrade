@@ -226,17 +226,31 @@ const PLACEMENT_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// (`ORDER_REJECTION_CODE_RANGE`), but IBKR uses code 399 as a generic order
 /// message — e.g. *"Your order will not be placed at the exchange until
 /// 09:30:00 US/Eastern"* — for an order that is in fact **accepted and held**
-/// (it proceeds to `PreSubmitted`). ibapi surfaces such codes as
-/// `Err(Error::Notice)` and terminates the subscription, so the eventual
-/// `OrderStatus(PreSubmitted)` is observable only via the order-update/account
-/// stream, never on the placement subscription itself. We therefore report the
-/// order as live-but-pending ([`PlacementOutcome::HeldPending`]) rather than
-/// rejected when one of these codes arrives.
+/// (it proceeds to `PreSubmitted`). We therefore report the order as
+/// live-but-pending ([`PlacementOutcome::HeldPending`]) rather than rejected
+/// when one of these codes arrives.
 ///
-/// This list documents the known gap between ibapi's range heuristic and IBKR's
-/// actual protocol semantics. If IBKR adds further informational codes in the
-/// 200-399 range, an out-of-RTH placement test will surface them and they can be
-/// added here.
+/// # ibapi 4.0 splits code 399 by message text
+///
+/// `is_warning_message` now classifies a 399 whose text carries a `Warning:`
+/// line as a warning, and `classify_error` routes a warning owned by a
+/// request-bound subscription as a non-terminal `RoutedItem::Notice` rather
+/// than a stream-ending `RoutedItem::Error`. `timeout_iter_data` drops notices,
+/// so the two forms now reach [`await_order_placement`] differently:
+///
+/// - **399 carrying a `Warning:` line** — dropped, and the subscription stays
+///   open. The eventual `OrderStatus(PreSubmitted)` therefore arrives on the
+///   placement subscription itself and yields
+///   [`PlacementOutcome::Accepted`] without this list being consulted. Under
+///   ibapi 3.x that status was reachable only via the order-update/account
+///   stream, because the notice had already closed the subscription.
+/// - **399 without one** — still `Err(Error::Notice)`, still closes the
+///   subscription, and is still matched against this list.
+///
+/// The list stays load-bearing for the second form. It documents the known gap
+/// between ibapi's range heuristic and IBKR's actual protocol semantics; if
+/// IBKR adds further informational codes in the 200-399 range, an out-of-RTH
+/// placement test will surface them and they can be added here.
 const INFORMATIONAL_ORDER_CODES: &[i32] = &[399];
 
 /// Outcome of awaiting the initial status on an order-placement subscription.
@@ -247,6 +261,7 @@ const INFORMATIONAL_ORDER_CODES: &[i32] = &[399];
 /// Every variant carries a distinct order-placement outcome that callers must
 /// dispatch on; dropping a value would silently discard the order's status.
 #[must_use]
+#[derive(Debug)]
 enum PlacementOutcome {
     /// The order was acknowledged by IB and its order-id mapping must be
     /// retained so the account stream can resolve its terminal/fill state. This
@@ -259,9 +274,12 @@ enum PlacementOutcome {
     /// non-informational TWS notice, or a transport error. Carries the
     /// human-readable reason.
     Rejected(String),
-    /// An informational notice (see [`INFORMATIONAL_ORDER_CODES`]) closed the
-    /// subscription. The order is live/held; its authoritative status will
-    /// arrive via the order-update/account stream. Carries the notice text.
+    /// The order exists, but the placement subscription could not classify its
+    /// state: either an informational notice (see
+    /// [`INFORMATIONAL_ORDER_CODES`]) closed the subscription, or TWS reported
+    /// a status ibapi does not model (`OrderStatusKind::Unknown`). Either way
+    /// the order is live/held and its authoritative status will arrive via the
+    /// order-update/account stream. Carries the notice or status text.
     HeldPending(String),
     /// The subscription ended — or [`PLACEMENT_STATUS_TIMEOUT`] elapsed —
     /// without any terminal status or informational notice. The order may or
@@ -277,15 +295,21 @@ enum PlacementOutcome {
 ///
 /// # Why notices are not blanket rejections
 ///
-/// ibapi 3.x delivers any TWS error frame outside the warning range
-/// (`2100..=2169`) as `Err(Error::Notice)` and then closes the subscription. IB
-/// emits informational order messages (e.g. code 399, order held until RTH) the
-/// same way, so treating every `Err` as a rejection would falsely reject orders
-/// that are actually live. We instead key off the notice code: known
-/// informational codes yield [`PlacementOutcome::HeldPending`]; all other
-/// notices and transport errors yield [`PlacementOutcome::Rejected`]. The
-/// `OrderStatus` event — when one is delivered before the closing notice —
-/// remains authoritative.
+/// ibapi delivers a TWS error frame that it does not classify as a warning as
+/// `Err(Error::Notice)`, and then closes the subscription. IB emits
+/// informational order messages (e.g. code 399, order held until RTH) the same
+/// way, so treating every `Err` as a rejection would falsely reject orders that
+/// are actually live. We instead key off the notice code: known informational
+/// codes yield [`PlacementOutcome::HeldPending`]; all other notices and
+/// transport errors yield [`PlacementOutcome::Rejected`]. The `OrderStatus`
+/// event — when one is delivered before the closing notice — remains
+/// authoritative.
+///
+/// ibapi 4.0 widened that warning classification beyond the `2100..=2169` range
+/// to include code 0 and the `Warning:` form of code 399, and now routes a
+/// warning owned by a request-bound subscription as a non-terminal notice that
+/// `timeout_iter_data` drops rather than an `Err` that ends the stream. See
+/// [`INFORMATIONAL_ORDER_CODES`] for what that changes here.
 fn await_order_placement<I>(events: I) -> PlacementOutcome
 where
     I: IntoIterator<Item = Result<ibapi::orders::PlaceOrder, ibapi::Error>>,
@@ -312,7 +336,7 @@ where
                 | OrderStatusKind::PreSubmitted
                 | OrderStatusKind::PendingSubmit
                 // A marketable order can fill before any working status is
-                // delivered on the placement subscription — ibapi 3.x sends
+                // delivered on the placement subscription — ibapi sends
                 // `OrderStatus(Filled)` directly in that case. The order is
                 // live, not rejected; its authoritative terminal/fill state
                 // arrives via the account stream. Report it accepted so the
@@ -347,6 +371,29 @@ where
                 // `PLACEMENT_STATUS_TIMEOUT` backstop yields `NoStatus` if none
                 // arrives.
                 OrderStatusKind::ApiPending => {}
+                // TWS reported a status ibapi does not model. The order exists
+                // — TWS is reporting on it — but neither we nor ibapi can
+                // classify it: `is_active()` and `is_terminal()` are both false
+                // for this variant. Report it live-but-indeterminate, which
+                // retains the order-id mapping so the account stream can
+                // resolve the real state.
+                //
+                // Deliberately NOT falling through to the `PLACEMENT_STATUS_TIMEOUT`
+                // backstop the way `ApiPending` does: that yields `NoStatus`,
+                // and on the bracket path `NoStatus` cancels all three legs —
+                // a destructive response to a status we merely failed to
+                // recognise.
+                OrderStatusKind::Unknown(ref raw) => {
+                    warn!(
+                        ib_order_id = status.order_id,
+                        status = raw.as_str(),
+                        "unmodelled IBKR order status during placement; \
+                         treating as live, account stream is authoritative"
+                    );
+                    return PlacementOutcome::HeldPending(format!(
+                        "unmodelled order status: {raw}"
+                    ));
+                }
             }
         }
         // Non-status events (OpenOrder, ExecutionData, CommissionReport): keep
@@ -1909,9 +1956,16 @@ impl ExecutionClient for IbkrClient {
 /// | `Filled`                                    | FullyFilled          | Order fully executed                        |
 /// | `Submitted`/`PreSubmitted`/`PendingSubmit`  | Active(Open)         | Order working on exchange                   |
 /// | `ApiPending`/`PendingCancel`/`ApiCancelled` | Active(Open)         | Transitional; await a confirmed terminal    |
+/// | `Unknown(raw)`                              | Active(Open) + warn  | Unmodelled status; stream is authoritative  |
 ///
 /// The match is exhaustive over `OrderStatusKind` (no wildcard), so a new ibapi
-/// status variant becomes a compile error rather than a silent `Active(Open)`.
+/// *variant* becomes a compile error rather than a silent `Active(Open)`.
+///
+/// Since ibapi 4.0 a new TWS *status string* no longer reaches that guard: it
+/// decodes to `OrderStatusKind::Unknown(raw)` instead of failing the whole
+/// subscription with `Error::Parse`. This function handles that variant
+/// explicitly and logs it at `warn!`, so an unrecognised status is observable
+/// rather than silent — but it is no longer a compile error.
 ///
 /// # Cancelled vs Expired Differentiation
 ///
@@ -1981,6 +2035,23 @@ fn make_order_from_status(
         | OrderStatusKind::ApiPending
         | OrderStatusKind::PendingCancel
         | OrderStatusKind::ApiCancelled => {
+            OrderState::active(Open::new(order_id, Utc::now(), filled_qty))
+        }
+        // A status string ibapi does not model. Upstream declines to classify
+        // it — `is_active()` and `is_terminal()` are both false — and so do we:
+        // report it active/Open so the order-id mapping is retained and the
+        // account stream can still resolve the order's real state. The
+        // alternative, treating it as a rejection, would drop the mapping for
+        // an order that may well be live in the market and discard its
+        // executions and commissions. An order that is in fact dead and left
+        // Open here is reaped by `OrderIdMap::clear_stale`.
+        OrderStatusKind::Unknown(ref raw) => {
+            warn!(
+                ib_id,
+                status = raw.as_str(),
+                "unmodelled IBKR order status; treating as live, account \
+                 stream is authoritative"
+            );
             OrderState::active(Open::new(order_id, Utc::now(), filled_qty))
         }
     };
@@ -2118,6 +2189,141 @@ mod contract_config_tests {
             E::UnrecognizedSecurityType {
                 security_type: "BOND".to_string()
             }
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
+mod order_status_tests {
+    use super::*;
+    use ibapi::orders::{OrderStatus, OrderStatusKind, PlaceOrder};
+
+    fn status(kind: OrderStatusKind, filled: f64) -> Result<PlaceOrder, ibapi::Error> {
+        Ok(PlaceOrder::OrderStatus(OrderStatus {
+            order_id: 42,
+            status: kind,
+            filled,
+            ..OrderStatus::default()
+        }))
+    }
+
+    fn ctx() -> OrderContext {
+        OrderContext {
+            instrument: InstrumentNameExchange::new("AAPL"),
+            side: Side::Buy,
+            price: Some(Decimal::from(150)),
+            quantity: Decimal::from(10),
+            kind: OrderKind::Limit,
+            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+        }
+    }
+
+    /// ibapi 4.0 preserves an unrecognised TWS status as
+    /// `OrderStatusKind::Unknown(raw)` instead of failing the subscription with
+    /// `Error::Parse`. Placement must treat it as live-but-indeterminate: the
+    /// order exists, so the order-id mapping has to survive for the account
+    /// stream to resolve it.
+    #[test]
+    fn unknown_status_is_held_pending_during_placement() {
+        let events = vec![status(OrderStatusKind::Unknown("Reclassified".into()), 0.0)];
+
+        match await_order_placement(events) {
+            PlacementOutcome::HeldPending(reason) => {
+                assert!(
+                    reason.contains("Reclassified"),
+                    "the raw status must reach the caller, got {reason:?}"
+                );
+            }
+            other => panic!("expected HeldPending, got {other:?}"),
+        }
+    }
+
+    /// Specifically *not* the `ApiPending` treatment. Falling through to the
+    /// `PLACEMENT_STATUS_TIMEOUT` backstop yields `NoStatus`, which on the
+    /// bracket path cancels all three legs — so an unrecognised status must
+    /// produce a decision here rather than deferring to the timeout.
+    #[test]
+    fn unknown_status_does_not_fall_through_to_no_status() {
+        let events = vec![status(OrderStatusKind::Unknown("Reclassified".into()), 0.0)];
+        assert!(!matches!(
+            await_order_placement(events),
+            PlacementOutcome::NoStatus
+        ));
+
+        // ApiPending, by contrast, keeps waiting and exhausts the iterator.
+        let events = vec![status(OrderStatusKind::ApiPending, 0.0)];
+        assert!(matches!(
+            await_order_placement(events),
+            PlacementOutcome::NoStatus
+        ));
+    }
+
+    /// Regression anchors: the statuses that were already decisive must keep
+    /// their outcomes across the 4.0 migration.
+    #[test]
+    fn known_statuses_keep_their_placement_outcomes() {
+        assert!(matches!(
+            await_order_placement(vec![status(OrderStatusKind::Submitted, 0.0)]),
+            PlacementOutcome::Accepted { .. }
+        ));
+        assert!(matches!(
+            await_order_placement(vec![status(OrderStatusKind::Filled, 10.0)]),
+            PlacementOutcome::Accepted { filled } if filled == 10.0
+        ));
+        assert!(matches!(
+            await_order_placement(vec![status(OrderStatusKind::Inactive, 0.0)]),
+            PlacementOutcome::Rejected(_)
+        ));
+        assert!(matches!(
+            await_order_placement(vec![status(OrderStatusKind::Cancelled, 0.0)]),
+            PlacementOutcome::Rejected(_)
+        ));
+    }
+
+    /// An unmodelled status must not be reported as terminal. Treating it as a
+    /// rejection would drop the order-id mapping for an order that may well be
+    /// live in the market, discarding its executions and commissions.
+    #[test]
+    fn unknown_status_maps_to_active_open() {
+        let raw = OrderStatus {
+            order_id: 42,
+            status: OrderStatusKind::Unknown("Reclassified".into()),
+            filled: 3.0,
+            ..OrderStatus::default()
+        };
+
+        let order = make_order_from_status(
+            &raw,
+            ClientOrderId::new("cid-1"),
+            &ctx(),
+            &PendingCancels::new(),
+        );
+
+        assert!(
+            matches!(order.state, OrderState::Active(_)),
+            "unmodelled status must stay active, got {:?}",
+            order.state
+        );
+    }
+
+    /// An unmodelled status must not consume a pending cancel: the entry has to
+    /// survive for the confirmed `Cancelled` that may still follow.
+    #[test]
+    fn unknown_status_leaves_pending_cancel_intact() {
+        let pending = PendingCancels::new();
+        pending.insert(42);
+
+        let raw = OrderStatus {
+            order_id: 42,
+            status: OrderStatusKind::Unknown("Reclassified".into()),
+            ..OrderStatus::default()
+        };
+        let _ = make_order_from_status(&raw, ClientOrderId::new("cid-1"), &ctx(), &pending);
+
+        assert!(
+            pending.remove(42),
+            "the pending cancel must still be there for the confirmed Cancelled"
         );
     }
 }

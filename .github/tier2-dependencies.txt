@@ -16,7 +16,7 @@
 # cannot land while leaving this record behind. CI cannot verify that the re-verification a
 # pinned entry mandates was actually performed — only that this file was not left untouched.
 
-ibapi=3.3.0  # 2026-09-14 | Financial protocol, community-maintained, no official SDK. Reviewed 3.2.0->3.3.0, all four properties recorded at 3.2.0 re-verified and still hold: zero unsafe (also no transmute/from_raw/extern "C"/asm!; holds by inspection, not by lint — upstream has no #![forbid(unsafe_code)]), no build.rs, dependency tree byte-identical vs 3.2.0 (both Cargo.toml and Cargo.lock differ by the version line alone; 9 direct deps under our `default-features = false, features = ["sync"]` selection, unchanged), still only a caller-supplied TWS socket (reconnect reuses the caller's address — no fallback host, no telemetry) + the opt-in local recorder dir (IBAPI_RECORDING_DIR; recorder.rs byte-identical). Env set unchanged (IBAPI_RECORDING_DIR, IBAPI_TIMEZONE_ALIASES); no process spawn, no obfuscation; published from git b140b312d1136d240f3b5651a89f4778e01aa222.
+ibapi=4.0.1  # 2026-09-14 | Financial protocol, community-maintained, no official SDK. Reviewed 3.2.0->3.3.0, all four properties recorded at 3.2.0 re-verified and still hold: zero unsafe (also no transmute/from_raw/extern "C"/asm!; holds by inspection, not by lint — upstream has no #![forbid(unsafe_code)]), no build.rs, dependency tree byte-identical vs 3.2.0 (both Cargo.toml and Cargo.lock differ by the version line alone; 9 direct deps under our `default-features = false, features = ["sync"]` selection, unchanged), still only a caller-supplied TWS socket (reconnect reuses the caller's address — no fallback host, no telemetry) + the opt-in local recorder dir (IBAPI_RECORDING_DIR; recorder.rs byte-identical). Env set unchanged (IBAPI_RECORDING_DIR, IBAPI_TIMEZONE_ALIASES); no process spawn, no obfuscation; published from git b140b312d1136d240f3b5651a89f4778e01aa222.
 #   New in 3.3.0, reviewed: `src/config` — despite the name it reads NO local files and NO env vars. It wraps two TWS wire messages (ReqConfig=108/UpdateConfig=109) over the already-open socket, whose protobuf types already existed in 3.2.0. Version-gated, #[must_use] builder, not reachable during connect/handshake.
 #   NOTE (capability, not vulnerability): `update_config()` can write the gateway's own safety settings — read_only_api, the bypass_* order precautions, trusted_ips, allow_localhost_only, socket_port, master_client_id. rustrade does not call it and does not re-export it; keep it out of the wrapper surface unless there is a deliberate reason.
 #   Upstream BREAKING in a minor release: the `fundamental` module was removed (IBKR retired reqFundamentalData in TWS API 10.47). rustrade never used it — verified no reference to fundamental_data / FundamentalData / FundamentalReportType / TickType::FundamentalRatios.
@@ -25,6 +25,74 @@ ibapi=3.3.0  # 2026-09-14 | Financial protocol, community-maintained, no officia
 #   3.3.0 rolls up 3.2.1's transport rework, which is NOT fully described in the upstream changelog. Request-less TWS errors (id == -1) outside the 2100..=2169 warning range — which includes the connectivity codes 1100/1101/1102/1300 — now fail in-flight one-shot requests instead of hanging, and the sync shared-queue drain in `send_shared_request` makes concurrent callers of the SAME one-shot API able to discard each other's response. NEITHER REACHES US: rustrade calls none of the affected one-shot APIs (next_valid_order_id, managed_accounts, server_time, family_codes, market_rule, market_depth_exchanges, news_providers, scanner_parameters, wsh_metadata). `client.next_order_id()` is a different method — a local counter increment, byte-identical across the two versions, not a request. Re-check this if the wrapper ever starts calling one of those.
 #   NOT VERIFIABLE OFF-GATEWAY: the handshake now advertises server version 225 (was 221), so a modern TWS may negotiate the 222/224 field layouts. No decoder branches on them. The ibkr integration tests are all #[ignore]d (they need a live TWS), so this bump has NOT been exercised against a real gateway — do that before relying on it in production.
 #   Other additive breaks that cost us nothing, verified: TickType gained 6 odd-lot variants and lost FundamentalRatios=47 (explicit discriminants, so no renumbering; our quotes.rs matches use `_` fallbacks), and `Order` gained 2 public fields (we build orders with `..Order::default()`).
+#
+# Re-verified against the vendored =4.0.1 source on 2026-09-16 (3.3.0 -> 4.0.1). A MAJOR bump, so
+# every property this entry mandates was re-checked rather than spot-checked. Published from git
+# b05574806d153b1ca304d9d2905c9ca3015727eb (3.3.0 was b140b312d1136d240f3b5651a89f4778e01aa222).
+#
+# ORDER WIRE FORMAT: unchanged, and provably so. `src/orders/common/encoders.rs` -- the whole
+# outbound order encoder -- is BYTE-IDENTICAL to 3.3.0, md5 049bed6ba1d842eedeb81ec639852583. The
+# 4.0 order-side churn is all decode and routing: `OrderStatusKind` gained `Unknown(String)`, and
+# order-bound notices were reclassified. Nothing this crate sends to TWS changed shape.
+#
+# The four standing properties all still hold:
+#   1. ZERO unsafe -- 0 real constructs in both versions, and no `transmute`, `from_raw`,
+#      `extern "C"` or `asm!` anywhere in `src/`. Still by inspection, not by lint: upstream has no
+#      #![forbid(unsafe_code)].
+#   2. NO build.rs -- still absent.
+#   3. DEPENDENCY TREE -- `[dependencies]` is byte-for-byte identical to 3.3.0 under our
+#      `default-features = false, features = ["sync"]` selection. The only manifest deltas are the
+#      version line, one new example (`replay_raw_capture`), and two DEV-dependencies we never
+#      compile (serial_test 3.1.1 -> 4.0.1, temp-env gains the `async_closure` feature).
+#   4. NETWORK SURFACE -- still only the caller-supplied TWS socket. No new hosts: the URL set in
+#      `src/` is identical to 3.3.0 and is entirely doc links. No process spawn, no telemetry, no
+#      obfuscation.
+#
+# ENV SURFACE CHANGED -- one addition, opt-in: `IBAPI_RAW_CAPTURE_DIR` joins `IBAPI_RECORDING_DIR`
+# and `IBAPI_TIMEZONE_ALIASES`. Set it to a directory and every connection writes a byte-for-byte
+# copy of the inbound socket stream, length prefixes included, to local disk. CAPABILITY NOTE, not a
+# vulnerability: those captures are UNREDACTED wire bytes, so they carry account ids, positions and
+# orders in the clear, and an unwritable path now warns and disables the tap rather than panicking
+# during `Client::connect`. Unset here and never set by rustrade; treat any capture directory as
+# credential-adjacent if it is ever turned on for debugging.
+#
+# TRANSPORT REWORK, re-audited because this entry mandates it. Broader than 3.2.1's: routing.rs,
+# sync.rs, async.rs, common.rs and recorder.rs all changed, and raw_capture.rs is new. The parts
+# that reach rustrade:
+#   a. NOTICE RECLASSIFICATION, and it is the one change here with a behavioural effect the
+#      compiler cannot catch. `is_warning_message` now classifies code 0 and the `Warning:` form of
+#      code 399 as warnings, and `classify_error` routes a warning owned by a request-bound
+#      subscription as a non-terminal `RoutedItem::Notice` instead of a stream-ending
+#      `RoutedItem::Error`. `iter_data()`/`timeout_iter_data()` DROP notices. So a held-until-RTH
+#      399 no longer closes a `place_order` subscription: it is dropped, the subscription stays
+#      open, and the following `OrderStatus(PreSubmitted)` now arrives there. The 399 form WITHOUT a
+#      `Warning:` line still surfaces as `Err(Error::Notice)`. Both paths are handled and documented
+#      at `INFORMATIONAL_ORDER_CODES` in rustrade-execution/src/client/ibkr/mod.rs.
+#   b. Frame validation: a 4-byte length prefix that cannot describe a TWS message (under the
+#      message-id width, or over the official 16 MiB `Constants.MaxMsgSize` cap) now raises
+#      `Error::InvalidFrame` and drives a reconnect, where 3.3.0 would size an allocation from it.
+#      Classified as `is_connection_lost`, so both dispatchers reconnect. Strictly a hardening.
+#   c. One-shot requests now narrow the inbound frame to the message type they asked for before
+#      decoding, and retry-on-connection-reset is uniform (at most three attempts) across the
+#      one-shots that previously had none or had unbounded retries. We call none of the affected
+#      one-shot APIs -- the 3.3.0 note in this entry lists them and that list is unchanged.
+#   d. Code 202 (cancel confirmation) is now a non-terminal notice on request-bound subscriptions
+#      rather than the `Err` that used to end a `cancel_order` subscription. DOES NOT REACH US:
+#      every `cancel_order` call site drops the returned subscription without iterating it.
+#
+# Consumer-side API churn this bump required (recorded so the next bump knows the shape):
+# `OrderStatusKind` gained `Unknown(String)` and lost `Copy`; historical tick sizes moved from `i32`
+# to `Option<f64>` (`TickLast.size`, `TickBidAsk.size_bid`/`size_ask`), which is a real fix -- the
+# old `i32` parse truncated a fractional crypto size of `0.5` to `0`; and `option_chain` became a
+# builder with `exchange` as a setter.
+#
+# NOT VERIFIABLE OFF-GATEWAY, and stronger than at 3.3.0 because this is a major bump touching the
+# transport: the ibkr integration tests are all #[ignore]d (they need a live TWS), and CI does not
+# run them. NOTHING has exercised 4.0.1's handshake, order path, reconnect loop or the reclassified
+# notice routing against a real gateway. The notice change in (a) in particular alters what a
+# `place_order` subscription observes for a held order, and only a live out-of-RTH placement can
+# confirm the `OrderStatus(PreSubmitted)` actually arrives where this bump implies it will. Do that
+# before relying on 4.0.1 in production.
 binance-sdk=69.1.0  # 2026-09-14 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
 #   1. common::websocket::WebsocketApi::send_message      — signature + WebsocketMessageSendOptions signing fields (margin WS subscribe send)
 #   2. ws.common.events.subscribe (WebsocketEventEmitter) — receive/event-callback path (margin WS event delivery)
