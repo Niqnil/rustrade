@@ -1579,6 +1579,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The `backtests_concurrent` example runs again** (`rustrade`). It panicked at startup, before the
+  first backtest, with `MarketDataInMemory events must be sorted ascending by
+  MarketEvent::time_exchange`. `MarketDataInMemory::new` requires and asserts global time ordering
+  because the backtest merges market and auxiliary events onto one timeline; the recorded
+  three-instrument capture the example reads is interleaved and holds over ten thousand inversions,
+  so it never satisfied that. The example's `market_data_from_file` helper now sorts (stably) before
+  constructing, which is what the benches reading the same file already did, and its rustdoc explains
+  why any substituted capture needs the same. Also asserts the corpus is `Item`-only, since the sort
+  key collapses `Reconnecting` to `None` and would otherwise hoist a reconnect to the front of the
+  run. Introduced when the assertion arrived with the auxiliary-event seam; examples are linked by
+  CI but not executed, so nothing caught it.
+
+- **A simulated venue's opening balances are stamped at the session start** (`rustrade`), rather than
+  carrying whatever `time_exchange` the configured initial state recorded. `SimRunner` queues each
+  venue's seeding snapshot ahead of every source event, but the `HistoricalClock` is seeded from the
+  market and auxiliary sources — so a balance captured before the replayed data, which is the
+  ordinary case, arrived behind a clock already wound forward to the first market event. That was
+  reported as `HistoricalClock received out-of-order events` at **ERROR**, once per venue per run,
+  for a configuration that was never wrong: `time_engine_start` is derived from the dataset at run
+  time, so no static configuration can be written to agree with it.
+
+  A seeding snapshot is not an observation on the simulated timeline — it is the account's opening
+  condition, and the session opens at the clock's instant by definition. Orders carried in a
+  configured initial state keep their own stamps.
+
+  **This corrects a reported statistic.** `DrawdownGenerator::init` takes its first peak's instant
+  from the first equity point, which is the seeding balance — so every drawdown was measured from
+  whenever the configured balances happened to be captured, not from the session start. On the
+  three-minute example fixture, whose configured stamp sits 25.6 hours before the data,
+  `TearSheetAsset::drawdown_mean` reported a mean drawdown duration of **92,304,199 ms (25.6 hours)
+  over a 185-second backtest**; it is now **83,484 ms**. `Drawdown::time_start` and the
+  `MaxDrawdown` window move with it. Drawdown *magnitudes* are unaffected, as are fill prices, PnL,
+  fees and closing balances. The affected backtest examples still print
+  byte-identical tear sheets — `TradingSummary::print_summary` renders drawdown magnitudes only,
+  never a duration or a window start — so the wrong figure was reachable through the struct rather
+  than through the printed table.
+
 - **Backtests are reproducible: the same dataset and strategy now produce the same result, run to
   run** (`rustrade`). `backtest()` previously assembled its engine through `SystemBuild`, which
   inserts two forwarding tasks feeding one unbounded channel, and an always-ready market source

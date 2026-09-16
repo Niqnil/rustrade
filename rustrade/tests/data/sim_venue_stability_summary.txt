@@ -158,21 +158,21 @@ TradingSummary {
             drawdown: Some(
                 Drawdown {
                     value: 0.1312415785004908231214227183,
-                    time_start: 2025-03-24T21:30:00Z,
+                    time_start: 2025-03-25T23:07:00.715Z,
                     time_end: 2025-03-25T23:08:24.199491154Z,
                 },
             ),
             drawdown_mean: Some(
                 MeanDrawdown {
                     mean_drawdown: 0.1312415785004908231214227183,
-                    mean_drawdown_ms: 92304199,
+                    mean_drawdown_ms: 83484,
                 },
             ),
             drawdown_max: Some(
                 MaxDrawdown(
                     Drawdown {
                         value: 0.1312415785004908231214227183,
-                        time_start: 2025-03-24T21:30:00Z,
+                        time_start: 2025-03-25T23:07:00.715Z,
                         time_end: 2025-03-25T23:08:24.199491154Z,
                     },
                 ),
