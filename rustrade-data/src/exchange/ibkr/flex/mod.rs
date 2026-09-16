@@ -977,7 +977,7 @@ fn root_element_name(xml: &str) -> Option<SmolStr> {
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                return Some(SmolStr::new(String::from_utf8_lossy(e.name().as_ref())));
+                return Some(SmolStr::new(e.name().as_ref()));
             }
             Ok(Event::Eof) | Err(_) => return None,
             Ok(_) => {}

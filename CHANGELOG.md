@@ -614,6 +614,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`quick-xml` 0.41 → 0.42** (`rustrade-data`, `ibkr` feature). The bump's headline break is that
+  `QName<'a>` now wraps `&'a str` rather than `&'a [u8]`, with `AsRef<str>` replacing
+  `AsRef<[u8]>`. Our exposure is a single line: `root_element_name` in the IBKR Flex parser no
+  longer wraps the element name in `String::from_utf8_lossy`. **No behaviour change** — that reader
+  is built with `Reader::from_str`, so its input was already guaranteed UTF-8 and the lossy
+  conversion could never have substituted a replacement character. The two `quick_xml::de::from_str`
+  call sites, which do the bulk of Flex parsing, are untouched.
+
+  The bump adds and removes no dependency: the lockfile delta is the version line alone, and
+  `quick-xml`'s own `[dependencies]` section is byte-identical across the two releases. We continue
+  to take `features = ["serialize"]` only, so `encoding`/`encoding_rs` — the non-UTF-8 decoding path
+  this release reworks — is still not compiled. `#![forbid(unsafe_code)]` remains crate-wide. The
+  tier-2 re-review this crate's entry mandates is recorded in `.github/tier2-dependencies.txt`.
+
+- **`binance-sdk` 69.1.0 → 69.2.3** (`rustrade-execution`, `binance` feature). No code change: this
+  bump needs none, unlike 60.0.0 → 69.1.0. The three `binance_sdk::common` internals the margin
+  user-data stream couples to were re-verified before merge, and the first two hold by construction
+  — `common/websocket.rs` is byte-identical to 69.1.0, so `WebsocketApi::send_message`, the
+  `WebsocketMessageSendOptions` signing fields and `WebsocketEventEmitter::subscribe`'s sequential
+  event drain are unchanged. `common::utils::send_request` keeps its 7-argument shape and still
+  injects `timestamp`, signs with the URL-encoded `get_signature`, appends `signature` and sets
+  `X-MBX-APIKEY`, so the hand-rolled `userListenToken` POST is still signed as intended.
+
+  One behaviour change is worth knowing even though it does not reach us: `build_websocket_api_message`
+  now signs a **signed** WebSocket frame over the plain payload (`get_signature_unencoded`) rather
+  than the URL-encoded one. Binance's WS API signs the plain payload, so this is a fix — but every
+  `send_message` call here passes `WebsocketMessageSendOptions::new()`, i.e. unsigned with no API
+  key, because the listen token is the sole auth on those frames. The signed branch is unreachable
+  from this crate today; 69.2.3 is simply the first version in which it would be correct.
+
+  The new `stocks` feature, and the `wss://nbstream.binance.com/equity` host that comes with it, are
+  not enabled — we take `spot` and `margin_trading` only.
+
 - **`ibapi` 3.3.0 → 4.0.1** (`rustrade-data`, `rustrade-execution`, `ibkr` feature). A major upgrade
   with four consumer-visible changes. **The outbound order wire format is unchanged and provably so**
   — ibapi's entire order encoder (`src/orders/common/encoders.rs`) is byte-identical across the two
