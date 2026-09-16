@@ -647,6 +647,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The new `stocks` feature, and the `wss://nbstream.binance.com/equity` host that comes with it, are
   not enabled — we take `spot` and `margin_trading` only.
 
+- **`ibapi` 3.3.0 → 4.0.1** (`rustrade-data`, `rustrade-execution`, `ibkr` feature). A major upgrade
+  with four consumer-visible changes. **The outbound order wire format is unchanged and provably so**
+  — ibapi's entire order encoder (`src/orders/common/encoders.rs`) is byte-identical across the two
+  versions. All of the 4.0 order-side churn is on the decode and routing side.
+
+- **BREAKING: `IbkrHistoricalData::fetch_option_chain` takes `exchange: Option<&str>`**
+  (`rustrade-data`), replacing `&str` where `""` meant "all exchanges". The parameter is TWS's
+  `fut_fop_exchange`, a *futures*-options filter: for any underlying that is not a future, pass
+  `None` and TWS returns one entry per listing exchange. Naming a routing exchange — `Some("SMART")`
+  included — filters the result to zero rows, which the old signature made easy to do by accident.
+  `None` is now omitted from the wire entirely rather than sent as an empty string; TWS treats the
+  two identically. Migration: pass `None` where you passed `""`.
+
+- **Historical IBKR tick sizes are decimal, and a tick with no size is dropped** (`rustrade-data`).
+  ibapi 4.0 types `TickLast::size` and `TickBidAsk::size_bid`/`size_ask` as `Option<f64>` instead of
+  `i32`, because IBKR models sizes as decimals on the wire and the old integer parse silently
+  truncated them — a crypto tick of `0.5` decoded as `0`. Fractional sizes now survive into
+  `PublicTrade::amount` and `OrderBookL1` levels. `None` means TWS sent no value at all, which is
+  distinct from a real `Some(0.0)`; since neither type can encode "size unknown", such a tick is
+  dropped with a `warn!` rather than fabricated as zero. **Also note**: the synthetic id in
+  `PublicTrade::id` is derived from the tick's size, so the same logical tick now hashes to a
+  different id than it did under ibapi 3.x.
+
+- **An unrecognised IBKR order status is reported live rather than rejected** (`rustrade-execution`).
+  ibapi 4.0 preserves a status string it does not model as `OrderStatusKind::Unknown(raw)` instead of
+  failing the whole subscription with `Error::Parse` — which previously could take down the
+  long-lived order-update stream the moment IBKR shipped a new status. rustrade treats that variant
+  as active/`Open` and logs it at `warn!` with the raw string. That keeps the order-id mapping alive
+  so the account stream can resolve the order's real state; treating it as a rejection would drop the
+  mapping for an order that may well be live in the market and discard its executions and
+  commissions. An order that is in fact dead is reaped by the existing stale-mapping sweep. During
+  placement the same status yields "held/pending" rather than falling through to the placement
+  timeout, which on the bracket-order path would have cancelled all three legs.
+
+- **Behaviour change to know about, with no compile-time signal**: ibapi 4.0 classifies a code-399
+  order message carrying a `Warning:` line as a warning, and routes a warning owned by a
+  request-bound subscription as a non-terminal notice — which `iter_data()`/`timeout_iter_data()`
+  drop. A held-until-RTH 399 therefore no longer closes a `place_order` subscription; it is dropped,
+  the subscription stays open, and the following `OrderStatus(PreSubmitted)` now arrives there
+  instead of only on the account stream. The 399 form *without* a `Warning:` line still surfaces as
+  an error and is still treated as "held/pending". Both paths are handled. IBKR integration tests
+  require a live TWS gateway and are `#[ignore]`d, so this bump has **not** been exercised against a
+  real gateway.
+
 - **The balance assertions in `SimulatedVenue` now panic on the engine's thread** (`rustrade`).
   Nothing about when they fire has changed — an unfunded quote asset was always a panic — but with
   no task between the venue and the engine, the panic surfaces on the caller's thread rather than
