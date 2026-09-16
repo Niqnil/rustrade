@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`SimRunner` — backtests are now driven by a deterministic discrete-event simulator**
+  (`rustrade`). A `Stream<Item = EngineEvent>` that merges the time-ordered market/auxiliary source
+  with the account events its own `SimulatedVenue`s produce, and is polled **inline** by the
+  `Engine`'s own task. There is deliberately no channel and no forwarding task between the feed and
+  the engine: the `Engine` sends its execution requests synchronously inside `process`, so by the
+  time `process` returns they are already queued on this runner's receivers, and the next poll books
+  them and schedules what they produce — all before the next market event is drawn.
+
+  The ordering within one simulated instant is now a stated contract rather than a scheduling
+  accident: auxiliary events (0) lead, then account events (1), then market data (2). Account before
+  market is the rule the type exists for — a fill stamped at `T` must reach the `Engine` before the
+  market event at `T` marks the resulting position to that price. Within one instant and class,
+  delivery follows booking order, so "the `Engine` has the response" implies "the `Engine` has
+  already seen every account event for that order". Simulated latency is applied to the queue key
+  and never slept on, so a run's wall-clock duration does not scale with the latency being modelled.
+
+- **`SimExecutionBuilder` / `SimExecutionBuild`** (`rustrade`), the deterministic counterpart to
+  `ExecutionBuilder`. The difference is what each does with a venue's request receiver:
+  `ExecutionBuilder` hands it to an `ExecutionManager` on its own task, which is what made response
+  timing a function of the tokio scheduler, while this builder keeps it for `SimRunner` to drain
+  inline. Nothing is spawned, connected or awaited — `build` is synchronous.
+
+- **`BarterError::SimFeedbackLoop`, `SimRunner::with_feedback_limit` and `DEFAULT_FEEDBACK_LIMIT`**
+  (`rustrade`). A strategy that opens an order in response to its own fill, against a venue whose
+  simulated round trip is **zero**, is a zero-delay feedback cycle: the response is stamped at the
+  very instant of the request that provoked it, so it outranks every later source event, simulated
+  time never advances and the market source is never drawn again. No discrete-event simulator can
+  resolve that by scheduling alone — there is no instant to place the response at that is both after
+  its cause and before the next input. Such a run is now abandoned after
+  `DEFAULT_FEEDBACK_LIMIT` (10,000) account events with no intervening source event, and reports the
+  venue and the instant time stopped at. The asynchronous path does not report this; it masks the
+  cycle by racing an unpaced market stream ahead of the engine, which is the non-determinism below.
+
 - **`MarketSnapshot`, and `RequestOpen::market` to carry it — a simulated venue can now price a
   market order** (`rustrade-execution`). `MockExchange` keeps no book of its own and a market order
   carries no limit price, so it could not price a fill at all and rejected every one: no backtest
@@ -580,6 +613,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   driver for the simulated venue would have needed another.
 
 ### Changed
+
+- **The balance assertions in `SimulatedVenue` now panic on the engine's thread** (`rustrade`).
+  Nothing about when they fire has changed — an unfunded quote asset was always a panic — but with
+  no task between the venue and the engine, the panic surfaces on the caller's thread rather than
+  inside a spawned task whose `JoinError` the caller had to interpret. `cfd_panics_when_the_quote_asset_is_unfunded`
+  pins the message, which is unchanged.
 
 - **The simulated venue's state machine is split from the async exchange that drives it**
   (`rustrade-execution`). `MockExchange` was one type doing two jobs: it owned the ledger, the
@@ -1339,6 +1378,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lexicographic field-order) derived orderings with it.
 
 ### Fixed
+
+- **Backtests are reproducible: the same dataset and strategy now produce the same result, run to
+  run** (`rustrade`). `backtest()` previously assembled its engine through `SystemBuild`, which
+  inserts two forwarding tasks feeding one unbounded channel, and an always-ready market source
+  raced arbitrarily far ahead of the engine on another task. Account events therefore landed at a
+  scheduler-determined index within the market stream. Balance and position *quantities* survived
+  that, because they do not depend on where in the sequence a fill lands — every time-derived
+  statistic did not. A fill could be delivered after the market events that should have marked it,
+  leaving a position that was never priced: a terminal `pnl_unrealised` of zero for a position the
+  run genuinely held, a `Position::time_exchange_update` of the entry instant, tear-sheet series
+  drawn against the wrong bars, and an order count that varied between runs of the same input.
+
+  `backtest()` no longer uses `SystemBuild`. It polls a `SimRunner` inline instead, so fill
+  placement is a function of the dataset alone. Fifty runs of the same fixture now produce one
+  outcome where they previously varied. Paper trading is unaffected: the asynchronous
+  `MockExchange`/`MockExecution` path is untouched, and only `backtest()` switches. (#289)
+
+- **No wall-clock timing remains on the backtest path** (`rustrade`). The simulated venue's latency
+  was a real `tokio::time::sleep`, and `ExecutionBuilder` applied a 1-second wall-clock timeout to
+  each dummy execution request. Both made a run's *outcome* depend on how fast the machine executing
+  it happened to be, which is the same class of defect as the non-determinism above rather than a
+  performance note. `SimRunner` applies latency as an offset on its queue key and has no timeouts
+  at all. `shutdown_after_backtest` and `AFTER_DRAIN_DEADLINE` remain public and still serve the
+  asynchronous path. (#280)
+
+- **A backtest can no longer end while a fill it provoked is still owed** (`rustrade`). Exhausting
+  the market source now yields `Shutdown::AfterDrain` before the queue is drained, so the `Engine`
+  stops generating new orders while everything already booked is delivered in full, and the stream
+  ends only once nothing is outstanding. Suppression happens at the `Engine` rather than by
+  discarding requests at the venue, so a request that was accepted is always answered.
 
 - **A simulated account snapshot ordered one instrument's orders arbitrarily** (`rustrade-execution`).
   `account_snapshot` sorts the account's open and cancelled orders with an *unstable* sort keyed on
