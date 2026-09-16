@@ -747,6 +747,66 @@ mod tests {
         assert_eq!(filled_balance(&outcome).time_exchange, time_exchange);
     }
 
+    /// A resting order's arrival stamp survives the clock moving past it.
+    ///
+    /// `advance_time` used to rewrite `time_exchange` on every open order. Nothing rested, so the
+    /// only orders it could reach were those an `initial_state` seeded — and it moved them to
+    /// whenever the clock last ticked. Arrival order is half of price-time priority, so an order
+    /// whose arrival instant is rewritten on every event has no arrival instant at all.
+    #[test]
+    fn advancing_the_clock_does_not_restamp_a_resting_order() {
+        let arrived = "2025-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let much_later = "2025-06-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        let mut venue = make_venue("100", "10000000");
+        venue.account = AccountState::new(
+            venue
+                .account
+                .balances()
+                .cloned()
+                .map(|balance| (balance.asset.clone(), balance))
+                .collect(),
+            [(
+                ClientOrderId::new("resting"),
+                Order {
+                    key: OrderKey {
+                        exchange: EXCHANGE,
+                        instrument: instrument_name(),
+                        strategy: StrategyId::new("test"),
+                        cid: ClientOrderId::new("resting"),
+                    },
+                    side: Side::Buy,
+                    price: Some(d("50000")),
+                    quantity: d("1"),
+                    kind: OrderKind::Limit,
+                    time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                    state: Open {
+                        id: OrderId::new("resting"),
+                        time_exchange: arrived,
+                        filled_quantity: Decimal::ZERO,
+                    },
+                },
+            )]
+            .into_iter()
+            .collect(),
+            Default::default(),
+            Vec::new(),
+        );
+
+        venue.advance_time(much_later);
+
+        let resting = venue.orders_open(&[]);
+        assert_eq!(resting.len(), 1, "the seeded order must still be open");
+        assert_eq!(
+            resting[0].state.time_exchange, arrived,
+            "an order does not become a different order because time passed"
+        );
+
+        // Balances do move: a venue restates them as of now, and they carry no ordering role.
+        let usdt = venue.balances(&[quote()]);
+        assert_eq!(usdt[0].time_exchange, much_later);
+    }
+
     /// A cancel is rejected, and the rejection is the venue's rather than any driver's.
     ///
     /// Only Market orders are accepted and they fill on arrival, so nothing ever rests to be

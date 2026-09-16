@@ -614,6 +614,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A simulated venue's open orders keep their arrival stamps** (`rustrade-execution`).
+  `AccountState::update_time_exchange` rewrote `Open::time_exchange` on every open order each time
+  the venue's clock advanced. Only balances are restated now.
+
+  An order does not become a different order because time passed, and the stamp is the instant the
+  venue accepted it. Rewriting it was invisible only because nothing rests: every order fills on
+  arrival, so the orders it could reach were those an `initial_state` seeded — which it moved to
+  whenever the clock last ticked, and the further the run got, the wronger they were. It was also
+  O(open orders) on every event.
+
 - **The simulated venue's ledger models a reserved balance** (`rustrade-execution`). `free` is what
   an order may draw on, `total` is what the account holds, and the difference is held against
   something — the split `Balance` has always described and this ledger could not previously

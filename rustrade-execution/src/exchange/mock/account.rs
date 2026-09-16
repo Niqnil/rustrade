@@ -26,13 +26,24 @@ pub struct AccountState {
 }
 
 impl AccountState {
+    /// Restates every balance as of `time_exchange`.
+    ///
+    /// # Open orders keep their own stamps
+    /// [`Open::time_exchange`](crate::order::state::Open::time_exchange) is the instant the venue
+    /// accepted the order, and an order does not become a different order because time passed. This
+    /// used to rewrite it on every advance, which was invisible only because nothing rested: the
+    /// venue filled every order on arrival, so `orders_open` held at most what an `initial_state`
+    /// seeded.
+    ///
+    /// It is not invisible once orders rest. Arrival order is half of price-time priority, so
+    /// rewriting it would make a matching engine's tie-break depend on when the clock last moved
+    /// rather than on when each order arrived — and since every order would be rewritten to the
+    /// same instant, there would be no tie-break left at all. It would also make every open order
+    /// look newer than the engine's copy on each advance, which is exactly what the `rustrade`
+    /// engine's `OrderManager` recency guard reads to decide whether an update is stale.
     pub fn update_time_exchange(&mut self, time_exchange: DateTime<Utc>) {
         for balance in self.balances.values_mut() {
             balance.time_exchange = time_exchange;
-        }
-
-        for order in self.orders_open.values_mut() {
-            order.state.time_exchange = time_exchange;
         }
     }
 
