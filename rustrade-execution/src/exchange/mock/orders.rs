@@ -1,7 +1,7 @@
 //! Resting orders, held in the order a venue would match them.
 
 use crate::order::{
-    Order, UnindexedOrder,
+    Order, TimeInForce, UnindexedOrder,
     id::ClientOrderId,
     state::{ActiveOrderState, Open},
 };
@@ -12,7 +12,7 @@ use rustrade_instrument::{
     Side, asset::name::AssetNameExchange, exchange::ExchangeId,
     instrument::name::InstrumentNameExchange,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// An open order held by a simulated venue.
 pub type OpenOrder = Order<ExchangeId, InstrumentNameExchange, Open>;
@@ -100,6 +100,19 @@ impl QueuePosition {
 /// map — a snapshot must report everything the account holds — but is absent from the queues, so
 /// matching can never reach it. It can only arrive through a configured `initial_state`.
 ///
+/// # Why a third index for deadlines
+///
+/// A [`TimeInForce::GoodTillDate`] order retires at a stated instant, and the venue sweeps for such
+/// orders on every clock advance *and* every market tick. Neither of the other two indices can
+/// answer "which orders are past their deadline": a deadline is unrelated to price, so the
+/// price-time queues cannot be walked with a `take_while` the way matching walks them, and the map
+/// is unordered. Answering from either would mean scanning every open order on every tick.
+///
+/// A third index therefore holds **only** the orders that have a deadline, keyed by it. A sweep is
+/// a range query that stops at the first order still working, so it costs nothing when nothing can
+/// expire — which is every venue whose orders are all `GoodUntilCancelled`, including every
+/// market-order-only backtest.
+///
 /// # Reservations, and the ones that are not there
 ///
 /// An order the venue booked itself carries the [`Reservation`] the venue took for it, so a fill
@@ -115,8 +128,23 @@ pub struct OpenOrders {
     by_id: FnvHashMap<ClientOrderId, RestingOrder>,
     /// Per instrument and side, best first. Values are keys into [`by_id`](Self::by_id).
     queues: FnvHashMap<(InstrumentNameExchange, Side), BTreeMap<QueuePosition, ClientOrderId>>,
+    /// Every order carrying a deadline, earliest first — see the type's note on deadlines.
+    ///
+    /// Keyed on `(deadline, cid)` rather than on the deadline alone because two orders can share
+    /// one instant. No further tie-break is needed: a [`ClientOrderId`] is unique across open
+    /// orders, since [`by_id`](Self::by_id) is keyed by it, so the pair is already total — and
+    /// therefore a sweep's order is reproducible between runs.
+    expiries: BTreeSet<(DateTime<Utc>, ClientOrderId)>,
     /// Monotone across every instrument, so insertion order is total even across queues.
     seq: u64,
+}
+
+/// The instant `order` retires at of its own accord, or `None` if it works until cancelled.
+fn deadline_of(order: &OpenOrder) -> Option<DateTime<Utc>> {
+    match order.time_in_force {
+        TimeInForce::GoodTillDate { expiry } => Some(expiry),
+        _ => None,
+    }
 }
 
 impl OpenOrders {
@@ -146,11 +174,15 @@ impl OpenOrders {
                 order: replaced,
                 reservation,
             }) => {
-                self.dequeue(&replaced);
+                self.unindex(&replaced);
                 reservation
             }
             None => None,
         };
+
+        if let Some(expiry) = deadline_of(&order) {
+            self.expiries.insert((expiry, order.key.cid.clone()));
+        }
 
         if let Some(price) = order.price {
             self.seq += 1;
@@ -169,8 +201,35 @@ impl OpenOrders {
     /// Removes and returns the order held under `cid`, with whatever is held against it.
     pub fn remove(&mut self, cid: &ClientOrderId) -> Option<RestingOrder> {
         let resting = self.by_id.remove(cid)?;
-        self.dequeue(&resting.order);
+        self.unindex(&resting.order);
         Some(resting)
+    }
+
+    /// Every order whose deadline has been reached by `now`, earliest deadline first.
+    ///
+    /// "Reached" is inclusive: an order with a deadline of exactly `now` is returned, because a
+    /// [`TimeInForce::GoodTillDate`] order stops working *at* its stated instant rather than after
+    /// it. The venue relies on this to make a deadline an unconditional cutoff — see
+    /// `SimulatedVenue::advance_time`.
+    ///
+    /// Returned rather than iterated because the caller retires each one, which borrows `self`
+    /// mutably. The walk stops at the first order still working, so it costs a single comparison
+    /// when nothing is due, whatever the size of the book.
+    pub fn expired_as_of(&self, now: DateTime<Utc>) -> Vec<ClientOrderId> {
+        self.expiries
+            .iter()
+            .take_while(|(expiry, _)| *expiry <= now)
+            .map(|(_, cid)| cid.clone())
+            .collect()
+    }
+
+    /// Takes `order` out of every index that ranks it, leaving [`by_id`](Self::by_id) to its caller.
+    fn unindex(&mut self, order: &OpenOrder) {
+        self.dequeue(order);
+
+        if let Some(expiry) = deadline_of(order) {
+            self.expiries.remove(&(expiry, order.key.cid.clone()));
+        }
     }
 
     pub fn get(&self, cid: &ClientOrderId) -> Option<&OpenOrder> {
@@ -301,6 +360,14 @@ mod tests {
 
     fn instrument() -> InstrumentNameExchange {
         InstrumentNameExchange::new("btc_usdt")
+    }
+
+    fn gtd(cid: &str, expiry_millis: i64) -> OpenOrder {
+        let mut order = order(cid, Side::Buy, Some(dec!(100)), 1_000);
+        order.time_in_force = TimeInForce::GoodTillDate {
+            expiry: at(expiry_millis),
+        };
+        order
     }
 
     fn order(cid: &str, side: Side, price: Option<Decimal>, millis: i64) -> OpenOrder {
@@ -481,6 +548,92 @@ mod tests {
             ["priced"],
             "an order with no price to wait at has nothing to wait for"
         );
+    }
+
+    /// Only orders that carry a deadline are indexed for the sweep, and only once reached.
+    #[test]
+    fn only_orders_past_their_deadline_are_swept() {
+        let open: OpenOrders = [
+            order("no_deadline", Side::Buy, Some(dec!(100)), 1_000),
+            gtd("due", 5_000),
+            gtd("later", 9_000),
+        ]
+        .into_iter()
+        .collect();
+
+        assert!(
+            open.expired_as_of(at(4_999)).is_empty(),
+            "nothing is due before the earliest deadline"
+        );
+        assert_eq!(
+            open.expired_as_of(at(5_000)),
+            [ClientOrderId::new("due")],
+            "a deadline is reached at its instant, not after it"
+        );
+        assert_eq!(
+            open.expired_as_of(at(9_999)),
+            [ClientOrderId::new("due"), ClientOrderId::new("later")],
+            "earliest deadline first, and an order without one is never swept"
+        );
+    }
+
+    /// Two orders sharing one deadline are both swept, in a reproducible order.
+    ///
+    /// Without the id in the key they compare equal and a `BTreeSet` keeps one — an order silently
+    /// outliving its own deadline.
+    #[test]
+    fn orders_sharing_a_deadline_are_both_swept_in_id_order() {
+        let open: OpenOrders = [gtd("b", 5_000), gtd("a", 5_000)].into_iter().collect();
+
+        assert_eq!(
+            open.expired_as_of(at(5_000)),
+            [ClientOrderId::new("a"), ClientOrderId::new("b")],
+            "the tie is broken by id, which does not depend on map iteration"
+        );
+    }
+
+    /// An order that leaves the book takes its deadline with it, whichever way it left.
+    #[test]
+    fn a_removed_order_is_no_longer_swept() {
+        let mut open: OpenOrders = [gtd("gone", 5_000), gtd("stays", 5_000)]
+            .into_iter()
+            .collect();
+
+        open.remove(&ClientOrderId::new("gone"));
+
+        assert_eq!(
+            open.expired_as_of(at(5_000)),
+            [ClientOrderId::new("stays")],
+            "a deadline that outlived its order would retire an order twice"
+        );
+    }
+
+    /// Replacing an order replaces its deadline, rather than leaving the old one behind.
+    #[test]
+    fn reinserting_one_id_replaces_its_deadline() {
+        let mut open: OpenOrders = [gtd("amended", 5_000)].into_iter().collect();
+
+        open.insert(gtd("amended", 9_000), None);
+
+        assert!(
+            open.expired_as_of(at(5_000)).is_empty(),
+            "the superseded deadline must not survive the amendment"
+        );
+        assert_eq!(
+            open.expired_as_of(at(9_000)),
+            [ClientOrderId::new("amended")]
+        );
+    }
+
+    /// Amending a deadline away leaves nothing to sweep.
+    #[test]
+    fn replacing_a_deadline_with_good_until_cancelled_clears_it() {
+        let mut open: OpenOrders = [gtd("amended", 5_000)].into_iter().collect();
+
+        open.insert(order("amended", Side::Buy, Some(dec!(100)), 1_000), None);
+
+        assert!(open.expired_as_of(at(9_000)).is_empty());
+        assert_eq!(open.len(), 1, "the order itself is still open");
     }
 
     #[test]

@@ -75,14 +75,18 @@ impl MockExchange {
     /// drained, so shutting the venue down cannot strand a fill the client is still waiting on.
     pub async fn run(mut self) {
         let (emit_tx, emit_rx) = mpsc::unbounded_channel();
-        let emitter = tokio::spawn(Self::emit_queued_opens(
+        let emitter = tokio::spawn(Self::emit_queued_output(
             emit_rx,
             self.event_tx.clone(),
             self.venue.exchange,
         ));
 
         while let Some(request) = self.request_rx.recv().await {
-            self.advance_venue_time(request.time_request);
+            // Advancing the clock can retire an order whose deadline has passed. Those events
+            // answer no request, and are queued before this request's own output so that the
+            // client sees the expiry before anything the request goes on to produce.
+            let expiries = self.advance_venue_time(request.time_request);
+            self.queue_emission(&emit_tx, expiries, None);
 
             match request.kind {
                 MockExchangeRequestKind::FetchAccountSnapshot { response_tx } => {
@@ -114,12 +118,13 @@ impl MockExchange {
                     response_tx,
                     request,
                 } => {
-                    error!(
-                        exchange = %self.venue.exchange,
-                        ?request,
-                        "MockExchange received cancel request but only Market orders are supported"
-                    );
+                    // The venue releases what the cancelled order held before returning, so the
+                    // restatement it owes is queued ahead of the response, exactly as an open's is.
+                    // A venue this driver builds rests only orders a configured `initial_state`
+                    // seeded, which hold no reservation, so `events` is empty in practice today —
+                    // but dropping it on the floor would be a silent loss the moment that changes.
                     let outcome = self.venue.cancel_order(request);
+                    self.queue_emission(&emit_tx, outcome.events, None);
                     let _ = response_tx.send(outcome.response);
                 }
                 MockExchangeRequestKind::OpenOrder {
@@ -150,7 +155,11 @@ impl MockExchange {
     }
 
     /// Applies this driver's latency model, then advances the venue to the resulting instant.
-    fn advance_venue_time(&mut self, time_request: DateTime<Utc>) {
+    ///
+    /// Returns whatever the advance retired — see [`SimulatedVenue::advance_time`]. The caller must
+    /// deliver them; dropping them would leave the client holding an order the venue no longer has.
+    #[must_use]
+    fn advance_venue_time(&mut self, time_request: DateTime<Utc>) -> Vec<UnindexedAccountEvent> {
         let client_to_exchange_latency = self.latency_ms / 2;
 
         let time_exchange = time_request
@@ -203,42 +212,70 @@ impl MockExchange {
     /// booking order by construction.
     fn respond_open_with_latency(
         &self,
-        emit_tx: &mpsc::UnboundedSender<PendingOpenEmission>,
+        emit_tx: &mpsc::UnboundedSender<PendingEmission>,
         response_tx: oneshot::Sender<
             Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
         >,
         outcome: OpenOutcome,
     ) {
-        // Stamped at booking time, not at emission time, so the delay each fill waits is measured
-        // from when the venue booked *it*. `latency_ms` is fixed for the exchange, so these are
-        // non-decreasing in queue order and the drain never sleeps away a fill's own latency twice.
+        self.queue_emission(
+            emit_tx,
+            outcome.events,
+            Some(PendingOpenResponse {
+                response_tx,
+                response: outcome.response,
+            }),
+        );
+    }
+
+    /// Queues account events, and any response they precede, for the emitter to drain in order.
+    ///
+    /// Everything this venue produces goes through here rather than to `event_tx` directly, so
+    /// that emission order equals production order across *all* of it -- fills, expiries and
+    /// cancel restatements alike. Sending any of them inline would let it overtake a batch still
+    /// waiting out its latency, and an absolute balance delivered out of order is the wrong
+    /// balance, not merely a late one.
+    fn queue_emission(
+        &self,
+        emit_tx: &mpsc::UnboundedSender<PendingEmission>,
+        events: Vec<UnindexedAccountEvent>,
+        response: Option<PendingOpenResponse>,
+    ) {
+        if events.is_empty() && response.is_none() {
+            return;
+        }
+
+        // Stamped at production time, not at emission time, so the delay each batch waits is
+        // measured from when the venue produced *it*. `latency_ms` is fixed for the exchange, so
+        // these are non-decreasing in queue order and the drain never sleeps away a latency twice.
         let ready_at =
             tokio::time::Instant::now() + std::time::Duration::from_millis(self.latency_ms);
 
         // Failure means the emitter is gone, which happens only once `run` has returned. There is
         // no client left to notify, so there is nothing to do but say so.
         if emit_tx
-            .send(PendingOpenEmission {
+            .send(PendingEmission {
                 ready_at,
-                events: outcome.events,
-                response_tx,
-                response: outcome.response,
+                events,
+                response,
             })
             .is_err()
         {
             error!(
                 exchange = %self.venue.exchange,
-                "MockExchange could not queue a filled open: the emitter has stopped"
+                "MockExchange could not queue venue output: the emitter has stopped"
             );
         }
     }
 
-    /// Drains queued fills in order, emitting each one's account events before its response.
+    /// Drains queued venue output in order, emitting each batch's account events before its
+    /// response.
     ///
     /// Runs until `emit_rx` closes -- which happens when [`MockExchange::run`] returns -- and then
-    /// finishes whatever is still queued, so a shutdown cannot strand a booked fill.
-    async fn emit_queued_opens(
-        mut emit_rx: mpsc::UnboundedReceiver<PendingOpenEmission>,
+    /// finishes whatever is still queued, so a shutdown cannot strand a booked fill or a swept
+    /// expiry.
+    async fn emit_queued_output(
+        mut emit_rx: mpsc::UnboundedReceiver<PendingEmission>,
         event_tx: broadcast::Sender<UnindexedAccountEvent>,
         exchange: ExchangeId,
     ) {
@@ -255,7 +292,16 @@ impl MockExchange {
                 }
             }
 
-            if emission.response_tx.send(emission.response).is_err() {
+            // Absent for events nothing requested, such as an order retired by its own deadline.
+            let Some(PendingOpenResponse {
+                response_tx,
+                response,
+            }) = emission.response
+            else {
+                continue;
+            };
+
+            if response_tx.send(response).is_err() {
                 error!(
                     %exchange,
                     kind = "OrderResponseOpen",
@@ -281,13 +327,30 @@ impl MockExchange {
     }
 }
 
-/// One filled open awaiting emission, held in booking order by [`MockExchange`]'s emitter queue.
+/// One batch of venue output awaiting emission, held in booking order by [`MockExchange`]'s
+/// emitter queue.
+///
+/// # Why a response is optional
+/// Not everything this venue produces answers a request. An order retired by its own deadline is
+/// swept whenever the clock advances -- which happens on *every* request, before that request is
+/// even looked at -- so the events belong to nobody's response. They must still be delivered in
+/// the same ordered stream as everything else: a balance is an absolute restatement, so an expiry
+/// overtaking a fill still queued behind its latency would leave the client holding the wrong
+/// balance, which is the exact failure this queue exists to prevent.
 #[derive(Debug)]
-struct PendingOpenEmission {
-    /// When this fill's latency expires, measured from the instant the venue booked it.
+struct PendingEmission {
+    /// When this batch's latency expires, measured from the instant the venue produced it.
     ready_at: tokio::time::Instant,
-    /// The account events the fill produced, in the order the venue requires.
+    /// The account events the venue produced, in the order it requires.
     events: Vec<UnindexedAccountEvent>,
+    /// The response to send once every event above has been emitted, if this batch answers a
+    /// request at all.
+    response: Option<PendingOpenResponse>,
+}
+
+/// An open response and the channel owed it.
+#[derive(Debug)]
+struct PendingOpenResponse {
     response_tx: oneshot::Sender<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>>,
     response: Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
 }
@@ -301,19 +364,20 @@ struct PendingOpenEmission {
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 pub(crate) mod fixtures {
     use crate::{
-        UnindexedAccountSnapshot,
+        InstrumentAccountSnapshot, UnindexedAccountSnapshot,
         balance::{AssetBalance, Balance},
         client::mock::MockExecutionConfig,
         fee::FeeModelConfig,
         fill::SimFillConfig,
         market::MarketSnapshot,
         order::{
-            OrderEvent, OrderKey, OrderKind, TimeInForce,
-            id::{ClientOrderId, StrategyId},
+            Order, OrderEvent, OrderKey, OrderKind, TimeInForce, UnindexedOrder,
+            id::{ClientOrderId, OrderId, StrategyId},
             request::{OrderRequestOpen, RequestOpen},
+            state::{Open, OrderState},
         },
     };
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
     use fnv::FnvHashMap;
     use rust_decimal::Decimal;
     use rustrade_instrument::{
@@ -382,6 +446,62 @@ pub(crate) mod fixtures {
             fee_model,
             fill_model,
         )
+    }
+
+    /// A spot config whose account already holds one open order, as `initial_state` seeds it.
+    ///
+    /// The only way an order can rest on a venue [`MockExchange`] drives: that venue is
+    /// [`VenueRegime::RequestPriced`], which refuses `OrderKind::Limit` outright.
+    ///
+    /// [`VenueRegime::RequestPriced`]: crate::exchange::mock::venue::VenueRegime::RequestPriced
+    pub(super) fn spot_config_holding(
+        btc: &str,
+        usdt: &str,
+        order: UnindexedOrder,
+    ) -> MockExecutionConfig {
+        MockExecutionConfig::new(
+            EXCHANGE,
+            UnindexedAccountSnapshot {
+                exchange: EXCHANGE,
+                balances: vec![funded(base(), d(btc)), funded(quote(), d(usdt))],
+                instruments: vec![InstrumentAccountSnapshot {
+                    instrument: instrument_name(),
+                    orders: vec![order],
+                    position: None,
+                    isolated: None,
+                }],
+            },
+            0, // latency_ms
+            FeeModelConfig::default(),
+            SimFillConfig::default(),
+        )
+    }
+
+    /// An open buy resting at `price`, retiring itself at `expiry`.
+    pub(super) fn seeded_gtd(
+        cid: &str,
+        price: &str,
+        opened: DateTime<Utc>,
+        expiry: DateTime<Utc>,
+    ) -> UnindexedOrder {
+        Order {
+            key: OrderKey {
+                exchange: EXCHANGE,
+                instrument: instrument_name(),
+                strategy: StrategyId::new("test"),
+                cid: ClientOrderId::new(cid),
+            },
+            side: Side::Buy,
+            price: Some(d(price)),
+            quantity: d("0.01"),
+            kind: OrderKind::Limit,
+            time_in_force: TimeInForce::GoodTillDate { expiry },
+            state: OrderState::active(Open::new(
+                OrderId::new(cid),
+                opened,
+                rust_decimal::Decimal::ZERO,
+            )),
+        }
     }
 
     /// The spot fixture: `btc` of the base asset and `usdt` of the quote, both fully free.
@@ -644,6 +764,72 @@ mod tests {
     /// forwards it rather than leaving the caller's `oneshot` to be dropped — which is what the
     /// previous, mistyped implementation did, since it could not produce the channel's response
     /// type at all.
+    /// An order retired by its own deadline reaches the client, in the emitter's queue rather than
+    /// around it.
+    ///
+    /// The sweep runs synchronously at the top of `run`'s loop, while the emitter may still be
+    /// asleep waiting out an earlier batch's latency. Sending it straight to `event_tx` would let
+    /// it overtake that batch — and a balance is an absolute restatement, so a snapshot applied out
+    /// of order leaves the client holding the wrong number, not merely a late one. This asserts the
+    /// expiry lands *after* the fill booked before it.
+    #[tokio::test(start_paused = true)]
+    async fn a_swept_expiry_is_emitted_behind_the_fill_booked_before_it() {
+        let opened = Utc::now();
+        let expiry = opened + chrono::TimeDelta::seconds(30);
+
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut events) = broadcast::channel(64);
+
+        let mut config =
+            spot_config_holding("100", "10000000", seeded_gtd("gtd", "1", opened, expiry));
+        // Non-zero, so the emitter is genuinely asleep when the next request sweeps.
+        config.latency_ms = 50;
+
+        let exchange = MockExchange::new(config, request_rx, event_tx, spot_instruments());
+        let driver = tokio::spawn(exchange.run());
+
+        // Booked before the deadline, so its fill is queued and still waiting out its latency.
+        let (fill_tx, fill_rx) = oneshot::channel();
+        request_tx
+            .send(MockExchangeRequest::open_order(
+                opened,
+                fill_tx,
+                buy_request("0.01", market_prices("50000")),
+            ))
+            .unwrap();
+
+        // A second request stamped past the deadline: advancing the clock for it sweeps the
+        // seeded order while the fill above is still in the emitter's queue.
+        let (snapshot_tx, snapshot_rx) = oneshot::channel();
+        request_tx
+            .send(MockExchangeRequest::fetch_account_snapshot(
+                expiry + chrono::TimeDelta::seconds(1),
+                snapshot_tx,
+            ))
+            .unwrap();
+
+        drop(request_tx);
+        driver.await.unwrap();
+        fill_rx.await.expect("the open is answered");
+        let _ = snapshot_rx.await;
+
+        let kinds = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|event| match event.kind {
+                AccountEventKind::BalanceSnapshot(_) => "balance",
+                AccountEventKind::Trade(_) => "trade",
+                AccountEventKind::OrderSnapshot(_) => "order",
+                _ => "other",
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            kinds,
+            ["balance", "trade", "order"],
+            "the fill's events must all precede the sweep, which for a seeded order — held with \
+             no reservation — owes only its terminal snapshot"
+        );
+    }
+
     #[tokio::test]
     async fn a_cancel_request_is_answered_rather_than_dropped() {
         let (request_tx, request_rx) = mpsc::unbounded_channel();

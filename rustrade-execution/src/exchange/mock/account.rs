@@ -5,7 +5,7 @@ use crate::{
     order::{
         Order,
         id::ClientOrderId,
-        state::{Cancelled, InactiveOrderState, Open, OrderState},
+        state::{Cancelled, Expired, InactiveOrderState, Open, OrderState},
     },
     trade::Trade,
 };
@@ -28,6 +28,13 @@ pub struct AccountState {
     /// [`trades`](Self::trades). Grows with the run, like `trades` and `orders_cancelled` — a
     /// simulated venue's ledgers are bounded by the dataset, not reaped.
     orders_filled: FnvHashSet<ClientOrderId>,
+    /// Orders retired by their own deadline, kept so they reach a later account snapshot and so a
+    /// cancel arriving after one can say *why* it failed.
+    ///
+    /// Whole orders rather than ids alone, unlike [`orders_filled`](Self::orders_filled): nothing
+    /// else records an expiry, so a snapshot has no other source for it — whereas a fill is already
+    /// in [`trades`](Self::trades). Grows with the run, like `trades` and `orders_cancelled`.
+    orders_expired: FnvHashMap<ClientOrderId, Order<ExchangeId, InstrumentNameExchange, Expired>>,
     trades: Vec<Trade<AssetNameExchange, InstrumentNameExchange>>,
 }
 
@@ -46,6 +53,7 @@ impl AccountState {
             orders_open,
             orders_cancelled,
             orders_filled: FnvHashSet::default(),
+            orders_expired: FnvHashMap::default(),
             trades,
         }
     }
@@ -79,6 +87,17 @@ impl AccountState {
     /// Whether `cid` names an order this account filled.
     pub fn is_filled(&self, cid: &ClientOrderId) -> bool {
         self.orders_filled.contains(cid)
+    }
+
+    /// Records that `order` reached its own deadline, so it is reported by a later account snapshot
+    /// and a cancel arriving after it can be told apart from a cancel for an unknown order.
+    pub fn ack_expired(&mut self, order: Order<ExchangeId, InstrumentNameExchange, Expired>) {
+        self.orders_expired.insert(order.key.cid.clone(), order);
+    }
+
+    /// Whether `cid` names an order that reached its deadline while this account held it.
+    pub fn is_expired(&self, cid: &ClientOrderId) -> bool {
+        self.orders_expired.contains_key(cid)
     }
 
     /// Restates every balance as of `time_exchange`.
@@ -118,6 +137,12 @@ impl AccountState {
         &self,
     ) -> impl Iterator<Item = &Order<ExchangeId, InstrumentNameExchange, Cancelled>> + '_ {
         self.orders_cancelled.values()
+    }
+
+    pub fn orders_expired(
+        &self,
+    ) -> impl Iterator<Item = &Order<ExchangeId, InstrumentNameExchange, Expired>> + '_ {
+        self.orders_expired.values()
     }
 
     pub fn trades(
@@ -342,6 +367,7 @@ impl From<UnindexedAccountSnapshot> for AccountState {
             orders_open,
             orders_cancelled,
             orders_filled: FnvHashSet::default(),
+            orders_expired: FnvHashMap::default(),
             trades: vec![],
         }
     }
