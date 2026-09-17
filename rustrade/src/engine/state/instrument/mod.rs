@@ -472,6 +472,18 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
     }
 }
 
+/// Maximum number of retired orders for which [`InstrumentState::retired_routing`] keeps fill
+/// routing, per instrument.
+///
+/// The map exists to cover the gap between a venue reporting an order finished and reporting its
+/// last fill, so the bound only has to span the orders that retire *within* that gap. Sixty-four
+/// is generous for that and costs a few kilobytes per instrument at worst.
+///
+/// Eviction is oldest-retirement-first. A fill for an order evicted before it arrived routes by
+/// the same fallback as before, and is counted by
+/// [`TearSheet::fills_unmatched`](crate::statistic::summary::instrument::TearSheet::fills_unmatched).
+pub const MAX_RETIRED_ROUTING: usize = 64;
+
 /// Represents the current state of an instrument, including its [`Position`](super::position::Position), [`Orders`], and
 /// user provided instrument data.
 ///
@@ -607,6 +619,54 @@ pub struct InstrumentState<
     /// per fill. This index reduces that to two O(1) hash-map lookups.
     #[serde(default = "FnvHashMap::default")]
     pub exchange_id_to_cid: FnvHashMap<OrderId, ClientOrderId>,
+
+    /// Fill routing for orders that have already left [`Self::orders`], so a fill arriving *after*
+    /// its order's terminal snapshot still reaches the `PositionId` the strategy chose.
+    ///
+    /// # Why this is separate from the live maps
+    ///
+    /// [`Self::position_ids`] and [`Self::exchange_id_to_cid`] are keyed by orders still tracked in
+    /// [`Self::orders`], and `cleanup_routing_tables` prunes them to exactly that set. Retiring an
+    /// order therefore destroys the routing a late fill for it needs. `update_from_order_snapshot`
+    /// compensates by re-inserting the entries for the order it has just retired — but into those
+    /// same live maps, so retiring the *next* order prunes them again. That compensation covers one
+    /// order per instrument; this map covers the rest.
+    ///
+    /// # Population
+    ///
+    /// By demotion, not by a second write path: `cleanup_routing_tables` joins each
+    /// `exchange_id_to_cid` entry it is about to drop against `position_ids`, and moves the
+    /// successful joins here. A join that fails contributes nothing, which is what keeps the
+    /// corporate-action case out — that path prunes `position_ids` **by value** while leaving the
+    /// order and its `exchange_id_to_cid` entry in place, so the join has no `PositionId` to find
+    /// and the resting order's fills keep falling through to the fallback, as they must.
+    ///
+    /// Only populated under [`OmsMode::Hedging`], where a fill
+    /// has more than one position slot it could belong to. Always empty under `Netting`.
+    ///
+    /// # Lookup order and precedence
+    ///
+    /// [`Self::update_from_trade`] consults this map only once both live lookups have missed, so a
+    /// live order always wins over a retired one — relevant because exchange `OrderId` uniqueness
+    /// is a venue guarantee this library does not enforce. It is consulted **before** the
+    /// `OpenInFlight` check that buffers a fill into [`Self::pending_fills`], because a fill for an
+    /// order that has already retired can never be released by a later ack.
+    ///
+    /// # Bound
+    ///
+    /// Insertion-ordered and capped at [`MAX_RETIRED_ROUTING`]; inserting at capacity evicts the
+    /// oldest entry. Insertion order is retirement order, which is the order in which entries stop
+    /// being worth keeping. There is deliberately no time-based reap: a fill belongs to its order's
+    /// position however late it arrives, so retaining an entry on a quiet instrument costs only
+    /// memory, and memory is what the cap already bounds.
+    ///
+    /// # Schema migration
+    ///
+    /// `#[serde(default)]` lets snapshots taken before this field existed deserialize with an empty
+    /// map. A fill for an order retired before such a snapshot then routes by the fallback, exactly
+    /// as it did before this field existed.
+    #[serde(default = "FnvIndexMap::default")]
+    pub retired_routing: FnvIndexMap<OrderId, PositionId>,
 }
 
 impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
@@ -726,27 +786,64 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// maps from growing unboundedly across the lifetime of a long-running engine
     /// in Hedging mode.
     ///
-    /// # Known limitation — terminal-state late fills (Hedging mode)
+    /// # Terminal-state late fills (Hedging mode)
     ///
     /// Routing-table lifetime is coupled to membership of `self.orders`, so retiring an order
-    /// drops the `exchange_id → CID` entry that a fill arriving *after* its terminal snapshot
-    /// would need. [`Self::update_from_order_snapshot`] compensates for the order it has just
-    /// retired: it re-inserts that entry and restores the order's `position_ids` mapping, so the
-    /// common ordering — venue reports the order finished, then reports the fill — still routes
-    /// to the `PositionId` the strategy chose.
+    /// would drop the `exchange_id → CID → PositionId` chain that a fill arriving *after* its
+    /// terminal snapshot needs. Rather than dropping it, this method **demotes** it into
+    /// [`Self::retired_routing`], which is not keyed by `self.orders` and therefore survives
+    /// later retirements. [`Self::update_from_trade`] consults it once both live lookups miss.
     ///
-    /// That window holds **exactly one** retired order per instrument. Retiring the next one runs
-    /// this method first, which prunes the previous order's entries before the new ones are
-    /// restored. A fill for any order retired before the most recent therefore finds nothing
-    /// here, falls through to a linear scan over active orders, finds nothing there either, and
-    /// opens a position under the raw `OrderId` with a `warn!`.
+    /// Only a chain that resolves end to end is demoted, and that is what keeps the
+    /// corporate-action case out. That path prunes `position_ids` **by value** while leaving the
+    /// order and its `exchange_id_to_cid` entry in place, so the join finds no `PositionId` and
+    /// keeps nothing — deliberately, because routing a late fill there would reopen a position a
+    /// reverse split floored to zero.
+    ///
+    /// [`Self::update_from_order_snapshot`] separately restores the *live* entries for the order
+    /// it has just retired. That remains necessary rather than redundant: an order that fills
+    /// fully on ack has no `exchange_id_to_cid` entry at the moment this method runs — it is
+    /// written afterwards — so there is nothing here to demote, and those restored entries are
+    /// what the *next* retirement's demotion finds.
+    ///
+    /// The window is bounded at [`MAX_RETIRED_ROUTING`] retirements per instrument, oldest
+    /// evicted first. A fill for an order retired beyond that bound still opens a position under
+    /// the raw `OrderId`.
     ///
     /// Additional mitigation: `AlpacaClient`'s dedup LRU cache filters fills whose
     /// `{order_id}:{filled_qty}` key was already processed, covering the most
-    /// common duplicate-fill scenario. Closing the class requires decoupling routing-table
-    /// lifetime from `self.orders` — a bounded "recently retired" map with its own reap policy —
-    /// and is deferred until Hedging mode production use.
+    /// common duplicate-fill scenario.
     fn cleanup_routing_tables(&mut self) {
+        // Demote before pruning. An entry about to be dropped is precisely the routing a fill
+        // arriving after its order's terminal snapshot would need, so it moves to
+        // `retired_routing` instead of being discarded.
+        //
+        // The join is what keeps this honest. Only an entry that still resolves all the way to a
+        // `PositionId` is kept; the corporate-action split path prunes `position_ids` by value
+        // while leaving the order and its `exchange_id_to_cid` entry in place, so its join fails
+        // here and a late fill on that resting order still reaches the fallback, which is the
+        // behaviour that stops a floored-out position being silently reopened.
+        //
+        // Hedging only: under `Netting` every fill keys to one slot, so there is no routing
+        // decision to preserve. Collecting allocates nothing until there is something to demote,
+        // which is only on a retirement -- not on the steady-state calls that dominate.
+        if matches!(self.position.mode, OmsMode::Hedging) && !self.exchange_id_to_cid.is_empty() {
+            let demoted: Vec<(OrderId, PositionId)> = self
+                .exchange_id_to_cid
+                .iter()
+                .filter(|(_, cid)| !self.orders.0.contains_key(*cid))
+                .filter_map(|(exchange_id, cid)| {
+                    self.position_ids
+                        .get(cid)
+                        .map(|pos_id| (exchange_id.clone(), pos_id.clone()))
+                })
+                .collect();
+
+            for (exchange_id, position_id) in demoted {
+                self.insert_retired_routing(exchange_id, position_id);
+            }
+        }
+
         if !self.position_ids.is_empty() {
             self.position_ids
                 .retain(|cid, _| self.orders.0.contains_key(cid));
@@ -755,6 +852,33 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             self.exchange_id_to_cid
                 .retain(|_, cid| self.orders.0.contains_key(cid));
         }
+    }
+
+    /// Record fill routing for a retired order, evicting the oldest entry at
+    /// [`MAX_RETIRED_ROUTING`].
+    ///
+    /// Re-recording an order already present refreshes its `PositionId` without moving it in the
+    /// insertion order and without growing the map, which `IndexMap::insert` gives for free. That
+    /// is the routine case rather than an edge one: an order tracked as `Open` is demoted at its
+    /// own retirement, `update_from_order_snapshot` then restores its live entries, and the next
+    /// retirement's cleanup demotes it a second time.
+    fn insert_retired_routing(&mut self, exchange_id: OrderId, position_id: PositionId) {
+        let at_capacity = !self.retired_routing.contains_key(&exchange_id)
+            && self.retired_routing.len() >= MAX_RETIRED_ROUTING;
+
+        if at_capacity
+            && let Some((evicted_id, evicted_position)) = self.retired_routing.shift_remove_index(0)
+        {
+            debug!(
+                evicted_order_id = %evicted_id,
+                evicted_position_id = %evicted_position,
+                capacity = MAX_RETIRED_ROUTING,
+                "Retired-order fill routing at capacity — evicting oldest retirement. A fill \
+                 for the evicted order would now open a position under its raw order ID."
+            );
+        }
+
+        self.retired_routing.insert(exchange_id, position_id);
     }
 
     /// Updates the instrument state from an [`Order`] snapshot.
@@ -776,18 +900,20 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// `OmsMode::Hedging`. NautilusTrader similarly emits single `PositionClosed`
     /// events per state transition rather than batching multiple closes.
     ///
-    /// # Known limitation — late fills in `OmsMode::Hedging`
+    /// # Late fills in `OmsMode::Hedging`
     ///
     /// A terminal update untracks the order, which would otherwise drop the routing entry that a
     /// fill arriving *after* it needs. This method re-establishes that entry for the order it has
     /// just retired, so the common ordering — venue reports the order finished, then reports the
     /// fill — still routes to the `PositionId` the caller supplied on the open request.
     ///
-    /// That window covers **one** retired order per instrument: retiring the next order prunes
-    /// the previous one's entry. A fill for an order retired before the most recent one opens a
-    /// position under `PositionId::new(trade.order_id)` and logs a `warn!`, which nothing in the
-    /// audit stream records. Hedging consumers that need to detect this must reconcile positions
-    /// against their own record of the `PositionId`s they requested.
+    /// Those restored entries live in the maps keyed by `self.orders`, so the *next* retirement
+    /// prunes them. What outlives it is [`Self::retired_routing`], which `cleanup_routing_tables`
+    /// demotes them into at that moment — so routing survives up to [`MAX_RETIRED_ROUTING`]
+    /// retirements per instrument rather than one. Beyond that bound, or where a corporate action
+    /// deliberately dropped the order's `PositionId` mapping, a fill opens a position under
+    /// `PositionId::new(trade.order_id)`; see [`Self::update_from_trade`] for which tear-sheet
+    /// counter records it and why they are counted apart.
     pub fn update_from_order_snapshot(
         &mut self,
         order: Snapshot<&Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>>,
@@ -1044,16 +1170,18 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// second position rather than joining the one its own order opened — and no later event
     /// rejoins them.
     ///
-    /// Two distinct things reach it, and only one of them is fixable:
+    /// Two distinct things reach it:
     ///
-    /// - The **late-fill window** documented on `cleanup_routing_tables`, which compensates
-    ///   for exactly one retired order per instrument. A fill for any order retired before the most
-    ///   recent finds nothing to route by. Closing this class means decoupling routing-table
-    ///   lifetime from `self.orders`, and is deferred rather than impossible.
+    /// - The **late-fill window** documented on `cleanup_routing_tables`. Routing for a retired
+    ///   order is demoted into [`Self::retired_routing`] rather than dropped, and this method
+    ///   consults it once both live lookups have missed, so the window spans
+    ///   [`MAX_RETIRED_ROUTING`] retirements per instrument instead of one. A fill for an order
+    ///   retired beyond that bound still reaches the fallback.
     /// - The **corporate-action split path**, which deliberately drops a resting order's
     ///   `PositionId` mapping because retaining it would let a late fill reopen a position the
     ///   split floored to zero. This one is reachable by design, so the fallback is load-bearing
-    ///   and no lifetime change removes it.
+    ///   and no lifetime change removes it. Demotion cannot mask it either: demoting requires a
+    ///   `PositionId` to join against, which is exactly what that path removed.
     ///
     /// What the caller is owed meanwhile is that it be visible, so each occurrence increments a
     /// counter on the [`TearSheetGenerator`] rather than only emitting a `warn!`:
@@ -1147,46 +1275,66 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                             pos_id
                         }
                         None => {
-                            // No Open/CancelInFlight order matched. Two cases:
+                            // A fill for an order this engine has already retired. Its live routing was pruned
+                            // when the order left `orders`, but `cleanup_routing_tables` demoted it
+                            // rather than dropping it, so the `PositionId` the strategy chose is
+                            // still recoverable and the order's PnL stays in one slot.
                             //
-                            // (a) Fill-before-ack race: fill arrived before the REST ack
-                            //     that maps its exchange OrderId to this order's ClientOrderId.
-                            //     The order is still OpenInFlight. Queue for replay after ack.
-                            //
-                            // (b) Truly external order (not submitted through this engine,
-                            //     or removed by snapshot reconciliation). Fall back to raw
-                            //     OrderId as a best-effort position key.
-                            //
-                            // Check for OpenInFlight only in this no-match case (avoids
-                            // unnecessary scan when match is found in the common case).
-                            let has_in_flight = self.orders.0.values().any(|order| {
-                                matches!(order.state, ActiveOrderState::OpenInFlight(_))
-                            });
-                            if has_in_flight {
+                            // Checked before the `OpenInFlight` buffer below, and that order
+                            // matters: a buffered fill is only ever released by an ack for an order
+                            // still tracked in `orders`, so a fill buffered for an already-retired
+                            // order would never be replayed and never dropped.
+                            if let Some(pos_id) = self.retired_routing.get(&trade.order_id).cloned()
+                            {
                                 debug!(
                                     order_id = %trade.order_id,
-                                    "Hedging fill arrived before order ack (OpenInFlight \
-                                     race) — queuing for replay after ack"
+                                    position_id = %pos_id,
+                                    "Hedging fill arrived after its order retired — routed by \
+                                     retired-order routing"
                                 );
-                                self.pending_fills.push(trade.clone());
-                                return None;
-                            }
+                                pos_id
+                            } else {
+                                // No Open/CancelInFlight order matched. Two cases:
+                                //
+                                // (a) Fill-before-ack race: fill arrived before the REST ack
+                                //     that maps its exchange OrderId to this order's ClientOrderId.
+                                //     The order is still OpenInFlight. Queue for replay after ack.
+                                //
+                                // (b) Truly external order (not submitted through this engine,
+                                //     or removed by snapshot reconciliation). Fall back to raw
+                                //     OrderId as a best-effort position key.
+                                //
+                                // Check for OpenInFlight only in this no-match case (avoids
+                                // unnecessary scan when match is found in the common case).
+                                let has_in_flight = self.orders.0.values().any(|order| {
+                                    matches!(order.state, ActiveOrderState::OpenInFlight(_))
+                                });
+                                if has_in_flight {
+                                    debug!(
+                                        order_id = %trade.order_id,
+                                        "Hedging fill arrived before order ack (OpenInFlight \
+                                         race) — queuing for replay after ack"
+                                    );
+                                    self.pending_fills.push(trade.clone());
+                                    return None;
+                                }
 
-                            let pos_id = PositionId::new(trade.order_id.0.clone());
-                            warn!(
-                                order_id = %trade.order_id,
-                                position_id = %pos_id,
-                                "Hedging fill routing: no order match — opening new \
-                                 position under raw order ID. Occurs for externally-placed \
-                                 orders or orders removed by snapshot reconciliation."
-                            );
-                            // Counted separately from the case above: the cause is a fill this
-                            // engine has no order for, not a mapping it lost, and one position per
-                            // external order is a defensible outcome rather than a split.
-                            self.tear_sheet.record_fill_unmatched(&pos_id, || {
-                                format!("no order matched {}", trade.order_id)
-                            });
-                            pos_id
+                                let pos_id = PositionId::new(trade.order_id.0.clone());
+                                warn!(
+                                    order_id = %trade.order_id,
+                                    position_id = %pos_id,
+                                    "Hedging fill routing: no order match — opening new \
+                                     position under raw order ID. Occurs for externally-placed \
+                                     orders or orders removed by snapshot reconciliation."
+                                );
+                                // Counted separately from the case above: the cause is a fill this
+                                // engine has no order for, not a mapping it lost, and one position per
+                                // external order is a defensible outcome rather than a split.
+                                self.tear_sheet.record_fill_unmatched(&pos_id, || {
+                                    format!("no order matched {}", trade.order_id)
+                                });
+                                pos_id
+                            }
                         }
                     }
                 }
@@ -1321,6 +1469,7 @@ where
         position_ids: _,
         pending_fills: _,
         exchange_id_to_cid: _,
+        retired_routing: _,
     } = state;
 
     InstrumentAccountSnapshot {
@@ -1400,6 +1549,7 @@ where
                         position_ids: FnvHashMap::default(),
                         pending_fills: Vec::new(),
                         exchange_id_to_cid: FnvHashMap::default(),
+                        retired_routing: FnvIndexMap::default(),
                     },
                 )
             })
@@ -1417,7 +1567,7 @@ mod tests {
         order::{
             OrderKind, TimeInForce,
             id::{ClientOrderId, OrderId, PositionId, StrategyId},
-            state::{CancelInFlight, Open, OpenInFlight},
+            state::{CancelInFlight, Cancelled, Open, OpenInFlight},
         },
         trade::{AssetFees, Trade, TradeId},
     };
@@ -1940,5 +2090,275 @@ mod tests {
             "Netting keys every fill to one slot, so no routing failure can split a position"
         );
         assert!(state.pending_fills.is_empty());
+    }
+
+    // --- Late-fill routing after retirement --------------------------------------------------
+    //
+    // `cleanup_routing_tables` demotes a retiring order's routing into `retired_routing` instead
+    // of dropping it, so the window covers `MAX_RETIRED_ROUTING` retirements rather than the one
+    // that `update_from_order_snapshot` restores live entries for.
+
+    /// Retire an order by reporting it complete — an `Open` carrying its whole quantity as
+    /// filled, which is how IBKR and REST reconciliation report a finished order.
+    ///
+    /// This is the path `update_from_order_snapshot` restores live routing for, so after this the
+    /// order is reachable both live and (from the next retirement onwards) via `retired_routing`.
+    fn complete_order(
+        state: &mut InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex>,
+        cid: &ClientOrderId,
+        exchange_id: &OrderId,
+    ) {
+        state.update_from_order_snapshot(Snapshot(&order(
+            cid.clone(),
+            OrderState::active(Open::new(exchange_id.clone(), TIME, dec!(10))),
+        )));
+    }
+
+    /// Retire an order by cancelling it.
+    ///
+    /// Unlike completion, a `Cancelled` snapshot carries no `OrderId` that
+    /// `update_from_order_snapshot`'s compensation recognises, so it strips the order's live
+    /// routing outright rather than restoring it. A venue reporting an IOC's partial fill after
+    /// the cancel that closed it lands exactly here — which is why `Cancelled` carries a
+    /// `filled_quantity` at all.
+    fn cancel_order(
+        state: &mut InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex>,
+        cid: &ClientOrderId,
+        exchange_id: &OrderId,
+    ) {
+        state.update_from_order_snapshot(Snapshot(&order(
+            cid.clone(),
+            OrderState::inactive(Cancelled::new(exchange_id.clone(), TIME, Decimal::ZERO)),
+        )));
+    }
+
+    #[test]
+    fn a_late_fill_routes_after_a_later_order_has_also_retired() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let (cid_a, oid_a, pos_a) = (
+            ClientOrderId::new("cid-a"),
+            OrderId::new("oid-a"),
+            PositionId::new("position-a"),
+        );
+        let (cid_b, oid_b, pos_b) = (
+            ClientOrderId::new("cid-b"),
+            OrderId::new("oid-b"),
+            PositionId::new("position-b"),
+        );
+
+        rest_order_at_exchange(&mut state, &cid_a, &oid_a, Some(&pos_a));
+        complete_order(&mut state, &cid_a, &oid_a);
+
+        // Retiring the *next* order is what used to close the window: its `cleanup_routing_tables`
+        // call prunes the entries restored for A before any fill of A's could use them.
+        rest_order_at_exchange(&mut state, &cid_b, &oid_b, Some(&pos_b));
+        complete_order(&mut state, &cid_b, &oid_b);
+
+        assert!(
+            !state.exchange_id_to_cid.contains_key(&oid_a),
+            "A's live routing is gone — precisely the state the retired map exists to cover"
+        );
+        assert_eq!(state.retired_routing.get(&oid_a), Some(&pos_a));
+
+        state.update_from_trade(&fill(oid_a, Side::Buy, dec!(4)));
+
+        assert_eq!(
+            open_position_ids(&state),
+            vec![pos_a],
+            "a fill arriving after a later order also retired still belongs to its own position"
+        );
+        assert_eq!(state.tear_sheet.fills_routed_by_fallback, 0);
+        assert_eq!(state.tear_sheet.fills_unmatched, 0);
+    }
+
+    #[test]
+    fn a_late_fill_on_the_most_recently_completed_order_still_routes() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let cid = ClientOrderId::new("cid-a");
+        let oid = OrderId::new("oid-a");
+        let pos = PositionId::new("position-a");
+
+        rest_order_at_exchange(&mut state, &cid, &oid, Some(&pos));
+        complete_order(&mut state, &cid, &oid);
+
+        state.update_from_trade(&fill(oid, Side::Buy, dec!(4)));
+
+        assert_eq!(
+            open_position_ids(&state),
+            vec![pos],
+            "the one-order compensation must keep working — demotion supplements it, not replaces it"
+        );
+        assert_eq!(state.tear_sheet.fills_unmatched, 0);
+    }
+
+    #[test]
+    fn a_late_fill_after_a_cancel_routes() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let cid = ClientOrderId::new("cid-a");
+        let oid = OrderId::new("oid-a");
+        let pos = PositionId::new("position-a");
+
+        rest_order_at_exchange(&mut state, &cid, &oid, Some(&pos));
+        cancel_order(&mut state, &cid, &oid);
+
+        // No compensation runs for a cancel, so before demotion existed this order's window was
+        // zero retirements wide, not one.
+        assert!(!state.exchange_id_to_cid.contains_key(&oid));
+        assert_eq!(state.retired_routing.get(&oid), Some(&pos));
+
+        state.update_from_trade(&fill(oid, Side::Buy, dec!(4)));
+
+        assert_eq!(
+            open_position_ids(&state),
+            vec![pos],
+            "an IOC's fill reported after the cancel that closed it belongs to its own position"
+        );
+        assert_eq!(state.tear_sheet.fills_unmatched, 0);
+    }
+
+    #[test]
+    fn a_late_fill_is_not_buffered_behind_an_unrelated_in_flight_order() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let (cid_a, oid_a, pos_a) = (
+            ClientOrderId::new("cid-a"),
+            OrderId::new("oid-a"),
+            PositionId::new("position-a"),
+        );
+
+        rest_order_at_exchange(&mut state, &cid_a, &oid_a, Some(&pos_a));
+        cancel_order(&mut state, &cid_a, &oid_a);
+
+        // An unrelated order still awaiting its ack. The no-match arm buffers a fill into
+        // `pending_fills` whenever one of these exists — but a buffered fill is only released by
+        // an ack for an order still tracked in `orders`, so a fill for the already-retired A would
+        // never be replayed and never dropped.
+        state.update_from_order_snapshot(Snapshot(&order(
+            ClientOrderId::new("cid-c"),
+            OrderState::active(OpenInFlight),
+        )));
+
+        state.update_from_trade(&fill(oid_a, Side::Buy, dec!(4)));
+
+        assert!(
+            state.pending_fills.is_empty(),
+            "the retired map is consulted before the buffer, so nothing is parked here to leak"
+        );
+        assert_eq!(open_position_ids(&state), vec![pos_a]);
+    }
+
+    #[test]
+    fn a_corporate_action_pruned_mapping_is_never_demoted() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let cid = ClientOrderId::new("cid-a");
+        let oid = OrderId::new("oid-a");
+        let pos = PositionId::new("position-a");
+
+        rest_order_at_exchange(&mut state, &cid, &oid, Some(&pos));
+
+        // What the corporate-action split handler does to a position it floors to zero: prune the
+        // routing entry BY VALUE, leaving the resting order itself in place for the broker to
+        // price-adjust.
+        state.position_ids.retain(|_, mapped| *mapped != pos);
+
+        // Retiring it now makes it a demotion candidate. The join must still fail.
+        complete_order(&mut state, &cid, &oid);
+
+        assert!(
+            state.retired_routing.is_empty(),
+            "demotion joins through `position_ids`, which is exactly what the split path removed"
+        );
+
+        state.update_from_trade(&fill(oid.clone(), Side::Buy, dec!(4)));
+
+        assert_eq!(
+            open_position_ids(&state),
+            vec![PositionId::new(oid.0.clone())],
+            "the fill must reach the fallback, not silently reopen the floored-out position"
+        );
+        assert_eq!(state.tear_sheet.fills_unmatched, 1);
+    }
+
+    #[test]
+    fn a_live_order_outranks_a_retired_entry_for_the_same_exchange_id() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let cid = ClientOrderId::new("cid-live");
+        let oid = OrderId::new("oid-shared");
+        let pos_live = PositionId::new("position-live");
+
+        // Exchange `OrderId` uniqueness is a venue guarantee this library does not enforce, so
+        // pin the precedence rather than assuming the collision cannot happen.
+        state
+            .retired_routing
+            .insert(oid.clone(), PositionId::new("position-stale"));
+
+        rest_order_at_exchange(&mut state, &cid, &oid, Some(&pos_live));
+        state.update_from_trade(&fill(oid, Side::Buy, dec!(4)));
+
+        assert_eq!(
+            open_position_ids(&state),
+            vec![pos_live],
+            "a live order's routing wins over a retired entry for the same exchange id"
+        );
+    }
+
+    #[test]
+    fn retired_routing_evicts_the_oldest_retirement_at_capacity() {
+        let mut state = instrument_state(OmsMode::Hedging);
+
+        let ids: Vec<(ClientOrderId, OrderId, PositionId)> = (0..=MAX_RETIRED_ROUTING)
+            .map(|i| {
+                (
+                    ClientOrderId::new(format!("cid-{i}")),
+                    OrderId::new(format!("oid-{i}")),
+                    PositionId::new(format!("position-{i}")),
+                )
+            })
+            .collect();
+
+        for (cid, oid, pos) in &ids {
+            rest_order_at_exchange(&mut state, cid, oid, Some(pos));
+            cancel_order(&mut state, cid, oid);
+        }
+
+        assert_eq!(
+            state.retired_routing.len(),
+            MAX_RETIRED_ROUTING,
+            "one retirement past capacity must not grow the map"
+        );
+
+        let (_, oldest_oid, _) = &ids[0];
+        let (_, newest_oid, newest_pos) = &ids[MAX_RETIRED_ROUTING];
+        assert!(
+            !state.retired_routing.contains_key(oldest_oid),
+            "eviction is oldest-retirement-first"
+        );
+        assert_eq!(state.retired_routing.get(newest_oid), Some(newest_pos));
+
+        // A fill for the evicted order routes as it did before this map existed, and is counted.
+        state.update_from_trade(&fill(oldest_oid.clone(), Side::Buy, dec!(4)));
+        assert_eq!(state.tear_sheet.fills_unmatched, 1);
+        assert_eq!(
+            open_position_ids(&state),
+            vec![PositionId::new(oldest_oid.0.clone())]
+        );
+    }
+
+    #[test]
+    fn netting_mode_never_populates_retired_routing() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let cid = ClientOrderId::new("cid-a");
+        let oid = OrderId::new("oid-a");
+        let pos = PositionId::new("position-a");
+
+        rest_order_at_exchange(&mut state, &cid, &oid, Some(&pos));
+        cancel_order(&mut state, &cid, &oid);
+
+        assert!(
+            state.retired_routing.is_empty(),
+            "Netting keys every fill to one slot, so there is no routing decision to preserve"
+        );
+
+        state.update_from_trade(&fill(oid, Side::Buy, dec!(4)));
+        assert_eq!(open_position_ids(&state), vec![PositionId::NETTING]);
     }
 }

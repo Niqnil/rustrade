@@ -110,6 +110,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Hedging fill arriving after its order retired now reaches the position the strategy chose**
+  (`rustrade`). In `OmsMode::Hedging`, routing-table lifetime was coupled to membership of
+  `InstrumentState::orders`: retiring an order pruned the `exchange_id → ClientOrderId → PositionId`
+  chain that a fill arriving *after* its terminal snapshot needs, so the fill opened a position under
+  its raw exchange `OrderId` and that order's PnL was split across two slots with nothing to rejoin
+  them. `update_from_order_snapshot` compensated — but by restoring those entries into the same live
+  maps, so the next retirement pruned them again. The window held **one** order per instrument, and
+  only for an order retired as `Open`-with-nothing-left or `FullyFilled`. A **cancelled** order got no
+  compensation at all, so an IOC's fill reported after the cancel that closed it never routed — which
+  is the case `Cancelled::filled_quantity` exists for.
+
+  `cleanup_routing_tables` now **demotes** that chain into a new `InstrumentState::retired_routing`
+  instead of dropping it, and `update_from_trade` consults it once both live lookups have missed. The
+  window spans `MAX_RETIRED_ROUTING` (64) retirements per instrument, evicting oldest first; a fill
+  beyond that bound falls back exactly as before.
+
+  Only a chain that resolves end to end is demoted, and that is what keeps the corporate-action split
+  path out of it. That path prunes `position_ids` **by value** while leaving the order resting, so the
+  join finds no `PositionId`, nothing is kept, and a late fill there still reaches the fallback —
+  deliberately, because routing it would reopen a position a reverse split floored to zero. The
+  one-order compensation is retained rather than replaced: an order that fills fully on ack has no
+  `exchange_id_to_cid` entry at the moment `cleanup_routing_tables` runs, so there is nothing to
+  demote, and the entries it restores are what the *next* retirement demotes.
+
+  Two consequences beyond the split itself are also closed. Because both live lookups missed, the fill
+  reached the no-order-matched arm and was counted under `TearSheet::fills_unmatched` — conflating it
+  with a genuinely external fill, for which one position per order is a defensible reading, and
+  leaving the split-position banner silent on a real split. And before falling back, that arm buffers
+  a fill into `pending_fills` whenever any *other* order is `OpenInFlight`; a buffered fill is only
+  released by an ack for an order still tracked in `orders`, so a fill for an already-retired order
+  was never replayed and never dropped, growing that `Vec` for the rest of the run. The retired map is
+  consulted before the buffer, so neither happens.
+
+  `retired_routing` is `#[serde(default)]` so existing snapshots load, stays empty under
+  `OmsMode::Netting` where one position key makes the failure unreachable, and is cleared alongside
+  the other routing tables on contract expiry in both the live handler and the audit replica.
+
 - **Hyperliquid trade ids identify the fill rather than the transaction** (`rustrade-execution`).
   A `Trade`'s id came from `fill.hash`, which is the L1 transaction hash. One aggressive order
   sweeping several resting orders produces several fills under a single hash, so those fills all
