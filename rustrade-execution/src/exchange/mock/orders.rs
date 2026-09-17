@@ -518,7 +518,11 @@ mod tests {
         assert!(open.is_empty());
         assert!(resting_cids(&open, Side::Buy).is_empty());
 
-        open.insert(order("c", Side::Buy, Some(dec!(98)), 3_000), None);
+        assert!(
+            open.insert(order("c", Side::Buy, Some(dec!(98)), 3_000), None)
+                .is_none(),
+            "a fresh id displaces nothing"
+        );
         assert_eq!(resting_cids(&open, Side::Buy), ["c"]);
     }
 
@@ -533,8 +537,12 @@ mod tests {
         .into_iter()
         .collect();
 
-        // Amended down to behind `other`.
-        open.insert(order("amended", Side::Buy, Some(dec!(98)), 2_000), None);
+        // Amended down to behind `other`. Nothing is held against a seeded order, so the
+        // displaced one returns no reservation.
+        assert!(
+            open.insert(order("amended", Side::Buy, Some(dec!(98)), 2_000), None)
+                .is_none()
+        );
 
         assert_eq!(open.len(), 2, "a replacement is not a second order");
         assert_eq!(
@@ -626,7 +634,10 @@ mod tests {
     fn reinserting_one_id_replaces_its_deadline() {
         let mut open: OpenOrders = [gtd("amended", 5_000)].into_iter().collect();
 
-        open.insert(gtd("amended", 9_000), None);
+        assert!(
+            open.insert(gtd("amended", 9_000), None).is_none(),
+            "nothing is held against a seeded order"
+        );
 
         assert!(
             open.expired_as_of(at(5_000)).is_empty(),
@@ -643,7 +654,11 @@ mod tests {
     fn replacing_a_deadline_with_good_until_cancelled_clears_it() {
         let mut open: OpenOrders = [gtd("amended", 5_000)].into_iter().collect();
 
-        open.insert(order("amended", Side::Buy, Some(dec!(100)), 1_000), None);
+        assert!(
+            open.insert(order("amended", Side::Buy, Some(dec!(100)), 1_000), None)
+                .is_none(),
+            "nothing is held against a seeded order"
+        );
 
         assert!(open.expired_as_of(at(9_000)).is_empty());
         assert_eq!(open.len(), 1, "the order itself is still open");
