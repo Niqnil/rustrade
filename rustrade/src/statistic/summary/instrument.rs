@@ -21,7 +21,16 @@ use crate::{
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use rust_decimal::Decimal;
+use rustrade_execution::order::id::PositionId;
 use serde::{Deserialize, Serialize};
+
+/// How many distinct fallback-keyed [`PositionId`]s a tear sheet retains.
+///
+/// The counters are authoritative for *how many* fills were misrouted; this list exists so a
+/// consumer can go and look the positions up, and a handful is enough to start a reconciliation.
+/// Bounding it keeps a pathological session — a venue replaying thousands of unmatched fills —
+/// from growing the tear sheet without limit.
+pub const MAX_FALLBACK_POSITIONS: usize = 16;
 
 /// TearSheet summarising the trading performance related to an instrument.
 #[derive(Debug, Clone, PartialEq, PartialOrd, Deserialize, Serialize)]
@@ -56,6 +65,51 @@ pub struct TearSheet<Interval> {
     /// Kept so diagnosing an empty session does not require re-running with logging enabled.
     #[serde(default)]
     pub first_rejection_reason: Option<String>,
+
+    /// Fills that reached a position slot keyed by their raw exchange `OrderId` because the order
+    /// they belong to carried no `PositionId` mapping — `OmsMode::Hedging` only.
+    ///
+    /// Each one **splits that order's PnL across two position slots**: the fill opens a second
+    /// position instead of joining the one its own order opened. Every statistic above is computed
+    /// per position, so a non-zero count here means they are computed over a partition of the
+    /// instrument's activity that the strategy never chose. Treat any non-zero value as a
+    /// reconciliation signal, not a warning.
+    ///
+    /// Reachable by design as well as by defect: the corporate-action split path deliberately drops
+    /// these mappings while leaving the order resting, so a late fill on a split instrument lands
+    /// here.
+    #[serde(default)]
+    pub fills_routed_by_fallback: usize,
+
+    /// Fills for which no order was tracked at all, also keyed by raw exchange `OrderId` —
+    /// `OmsMode::Hedging` only.
+    ///
+    /// Counted apart from [`Self::fills_routed_by_fallback`] because the cause is different and so
+    /// is the remedy. These are orders this engine never submitted, or that snapshot reconciliation
+    /// removed; one position per external order is a defensible reading rather than a split of
+    /// something that should have been whole. A consumer trading the same account from elsewhere
+    /// should expect this to be non-zero.
+    #[serde(default)]
+    pub fills_unmatched: usize,
+
+    /// Why the first fill of either kind above could not be routed.
+    ///
+    /// Shared by both counters, for the same reason [`Self::first_rejection_reason`] exists: the
+    /// first occurrence is what identifies the cause, and keeping it means diagnosing a split
+    /// position does not require re-running with logging enabled.
+    #[serde(default)]
+    pub first_fallback_detail: Option<String>,
+
+    /// The distinct positions opened by either fallback above, so a consumer reconciling this
+    /// instrument can look them up rather than parse [`Self::first_fallback_detail`].
+    ///
+    /// Each entry is a `PositionId` built from a raw exchange `OrderId`, which is what makes the
+    /// position identifiable as unrouted rather than strategy-chosen. Deduplicated — an order
+    /// filling ten times through the fallback lands in one position, not ten — and capped at
+    /// [`MAX_FALLBACK_POSITIONS`]. When the counters exceed the length of this list, the list is
+    /// the first `MAX_FALLBACK_POSITIONS` and the counters remain exact.
+    #[serde(default)]
+    pub fallback_positions: Vec<PositionId>,
 }
 
 /// Generator for a [`TearSheet`].
@@ -83,6 +137,24 @@ pub struct TearSheetGenerator {
     /// First rejection reason seen. See [`TearSheet::first_rejection_reason`].
     #[serde(default)]
     pub first_rejection_reason: Option<String>,
+
+    /// Fills routed by the raw-`OrderId` fallback despite a known order.
+    /// See [`TearSheet::fills_routed_by_fallback`].
+    #[serde(default)]
+    pub fills_routed_by_fallback: usize,
+
+    /// Fills routed by the raw-`OrderId` fallback with no order tracked at all.
+    /// See [`TearSheet::fills_unmatched`].
+    #[serde(default)]
+    pub fills_unmatched: usize,
+
+    /// First unroutable-fill detail seen. See [`TearSheet::first_fallback_detail`].
+    #[serde(default)]
+    pub first_fallback_detail: Option<String>,
+
+    /// Distinct positions opened by a fallback routing. See [`TearSheet::fallback_positions`].
+    #[serde(default)]
+    pub fallback_positions: Vec<PositionId>,
 }
 
 impl TearSheetGenerator {
@@ -98,6 +170,10 @@ impl TearSheetGenerator {
             orders_opened: 0,
             orders_rejected: 0,
             first_rejection_reason: None,
+            fills_routed_by_fallback: 0,
+            fills_unmatched: 0,
+            first_fallback_detail: None,
+            fallback_positions: Vec::new(),
         }
     }
 
@@ -111,6 +187,58 @@ impl TearSheetGenerator {
         self.orders_rejected = self.orders_rejected.saturating_add(1);
         if self.first_rejection_reason.is_none() {
             self.first_rejection_reason = Some(reason.into());
+        }
+    }
+
+    /// Record a fill that opened `position_id` under its raw exchange `OrderId` because the order
+    /// it belongs to had no `PositionId` mapping. See [`TearSheet::fills_routed_by_fallback`].
+    ///
+    /// `detail` is called only if this is the first unroutable fill of the session, which is why
+    /// it is a closure rather than a `String`: the caller would otherwise format one per misrouted
+    /// fill to discard all but the first.
+    pub fn record_fill_routed_by_fallback(
+        &mut self,
+        position_id: &PositionId,
+        detail: impl FnOnce() -> String,
+    ) {
+        self.fills_routed_by_fallback = self.fills_routed_by_fallback.saturating_add(1);
+        self.record_fallback_position(position_id, detail);
+    }
+
+    /// Record a fill that opened `position_id` under its raw exchange `OrderId` because no order
+    /// matched it at all. See [`TearSheet::fills_unmatched`].
+    ///
+    /// `detail` is called only if this is the first unroutable fill of the session.
+    pub fn record_fill_unmatched(
+        &mut self,
+        position_id: &PositionId,
+        detail: impl FnOnce() -> String,
+    ) {
+        self.fills_unmatched = self.fills_unmatched.saturating_add(1);
+        self.record_fallback_position(position_id, detail);
+    }
+
+    /// Note the position a fallback routing opened, and the reason if it is the first one.
+    ///
+    /// `detail` is a closure because only the first caller's string is ever kept, while the
+    /// callers are on a path that a corporate-action split can drive repeatedly — formatting
+    /// eagerly would allocate once per misrouted fill to discard all but one. This mirrors what
+    /// `tracing` does for a disabled log level at the same call sites.
+    fn record_fallback_position(
+        &mut self,
+        position_id: &PositionId,
+        detail: impl FnOnce() -> String,
+    ) {
+        if self.first_fallback_detail.is_none() {
+            self.first_fallback_detail = Some(detail());
+        }
+
+        // Deduplicated rather than appended: one order filling repeatedly through the fallback is
+        // one suspect position, and the counters already carry the number of fills.
+        if self.fallback_positions.len() < MAX_FALLBACK_POSITIONS
+            && !self.fallback_positions.contains(position_id)
+        {
+            self.fallback_positions.push(position_id.clone());
         }
     }
 
@@ -208,6 +336,10 @@ impl TearSheetGenerator {
             orders_opened: self.orders_opened,
             orders_rejected: self.orders_rejected,
             first_rejection_reason: self.first_rejection_reason.clone(),
+            fills_routed_by_fallback: self.fills_routed_by_fallback,
+            fills_unmatched: self.fills_unmatched,
+            first_fallback_detail: self.first_fallback_detail.clone(),
+            fallback_positions: self.fallback_positions.clone(),
         }
     }
 

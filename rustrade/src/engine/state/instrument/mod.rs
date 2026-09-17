@@ -1036,6 +1036,41 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// subsequent fills routed to that ID will update the wrong-direction
     /// position. Strategies running in Hedging mode must close existing
     /// positions explicitly rather than rely on flip semantics.
+    ///
+    /// # Unroutable fills in Hedging mode
+    ///
+    /// A fill whose `PositionId` cannot be resolved opens a position keyed by its raw exchange
+    /// `OrderId`. That **splits the order's PnL across two position slots** — the fill starts a
+    /// second position rather than joining the one its own order opened — and no later event
+    /// rejoins them.
+    ///
+    /// Two distinct things reach it, and only one of them is fixable:
+    ///
+    /// - The **late-fill window** documented on `cleanup_routing_tables`, which compensates
+    ///   for exactly one retired order per instrument. A fill for any order retired before the most
+    ///   recent finds nothing to route by. Closing this class means decoupling routing-table
+    ///   lifetime from `self.orders`, and is deferred rather than impossible.
+    /// - The **corporate-action split path**, which deliberately drops a resting order's
+    ///   `PositionId` mapping because retaining it would let a late fill reopen a position the
+    ///   split floored to zero. This one is reachable by design, so the fallback is load-bearing
+    ///   and no lifetime change removes it.
+    ///
+    /// What the caller is owed meanwhile is that it be visible, so each occurrence increments a
+    /// counter on the [`TearSheetGenerator`] rather than only emitting a `warn!`:
+    ///
+    /// - [`TearSheet::fills_routed_by_fallback`](crate::statistic::summary::instrument::TearSheet::fills_routed_by_fallback)
+    ///   — an order was found, but nothing said where its fills belong. This is the split.
+    /// - [`TearSheet::fills_unmatched`](crate::statistic::summary::instrument::TearSheet::fills_unmatched)
+    ///   — no order matched at all, so the fill is external or was reconciled away. One position
+    ///   per external order is a defensible reading rather than a split.
+    ///
+    /// Both are `0` in `OmsMode::Netting`, where every fill keys to a single slot and no routing
+    /// failure is possible. A consumer that reconciles positions should treat the first as an
+    /// error signal and the second as expected only if it knows the account is traded elsewhere.
+    /// The positions themselves are listed on
+    /// [`TearSheet::fallback_positions`](crate::statistic::summary::instrument::TearSheet::fallback_positions),
+    /// and both counters are summed onto
+    /// [`TradingSummary`](crate::statistic::summary::TradingSummary) for the session.
     pub fn update_from_trade(
         &mut self,
         trade: &Trade<AssetKey, InstrumentKey>,
@@ -1103,6 +1138,12 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                                 "Hedging fill: order found but no position_id mapping — \
                                  using raw OrderId as position key"
                             );
+                            // Counted, not just logged: this splits the order's PnL across two
+                            // position slots, and a log line is not something a consumer can
+                            // reconcile against after the fact.
+                            self.tear_sheet.record_fill_routed_by_fallback(&pos_id, || {
+                                format!("no PositionId mapping for order {}", trade.order_id)
+                            });
                             pos_id
                         }
                         None => {
@@ -1139,6 +1180,12 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                                  position under raw order ID. Occurs for externally-placed \
                                  orders or orders removed by snapshot reconciliation."
                             );
+                            // Counted separately from the case above: the cause is a fill this
+                            // engine has no order for, not a mapping it lost, and one position per
+                            // external order is a defensible outcome rather than a split.
+                            self.tear_sheet.record_fill_unmatched(&pos_id, || {
+                                format!("no order matched {}", trade.order_id)
+                            });
                             pos_id
                         }
                     }
@@ -1358,4 +1405,540 @@ where
             })
             .collect(),
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // test code: panics acceptable
+mod tests {
+    use super::*;
+    use crate::engine::state::EngineState;
+    use rust_decimal_macros::dec;
+    use rustrade_execution::{
+        order::{
+            OrderKind, TimeInForce,
+            id::{ClientOrderId, OrderId, PositionId, StrategyId},
+            state::{CancelInFlight, Open, OpenInFlight},
+        },
+        trade::{AssetFees, Trade, TradeId},
+    };
+    use rustrade_instrument::{Side, test_utils::instrument as test_instrument};
+
+    const EXCHANGE: ExchangeId = ExchangeId::BinanceSpot;
+    const TIME: DateTime<Utc> = DateTime::<Utc>::MIN_UTC;
+
+    /// The single instrument every test here trades, as an owned [`InstrumentState`] in the
+    /// requested [`OmsMode`].
+    ///
+    /// Built through [`EngineState::builder`] rather than as a struct literal so the routing tables
+    /// start in exactly the state the engine gives them, and so a field added to
+    /// [`InstrumentState`] later cannot bypass this harness — the real construction path chooses
+    /// its initial value, not a literal here that would silently keep compiling.
+    fn instrument_state(
+        mode: OmsMode,
+    ) -> InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex> {
+        let instruments = IndexedInstruments::new([test_instrument(EXCHANGE, "btc", "usdt")]);
+
+        let state: EngineState<(), ()> = EngineState::builder(&instruments, (), |_| ())
+            .oms_mode(mode)
+            .time_engine_start(TIME)
+            .build();
+
+        state
+            .instruments
+            .0
+            .into_iter()
+            .next()
+            .expect("builder was handed exactly one instrument")
+            .1
+    }
+
+    /// An order snapshot in whichever `state` the caller needs, for the harness instrument.
+    fn order(
+        cid: ClientOrderId,
+        state: OrderState<AssetIndex, InstrumentIndex>,
+    ) -> Order<ExchangeIndex, InstrumentIndex, OrderState<AssetIndex, InstrumentIndex>> {
+        Order {
+            key: OrderKey {
+                exchange: ExchangeIndex(0),
+                instrument: InstrumentIndex(0),
+                strategy: StrategyId::new("strategy"),
+                cid,
+            },
+            side: Side::Buy,
+            price: Some(dec!(100)),
+            quantity: dec!(10),
+            kind: OrderKind::Limit,
+            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+            state,
+        }
+    }
+
+    /// A fill reported against exchange `order_id`, with zero fees so an assertion reads the
+    /// routing outcome rather than the fee model.
+    fn fill(
+        order_id: OrderId,
+        side: Side,
+        quantity: Decimal,
+    ) -> Trade<AssetIndex, InstrumentIndex> {
+        Trade {
+            id: TradeId::new("trade"),
+            order_id,
+            instrument: InstrumentIndex(0),
+            strategy: StrategyId::new("strategy"),
+            time_exchange: TIME,
+            side,
+            price: dec!(100),
+            quantity,
+            fees: AssetFees {
+                asset: AssetIndex(0),
+                fees: Decimal::ZERO,
+                fees_quote: Some(Decimal::ZERO),
+            },
+        }
+    }
+
+    /// Drive an order from submission to resting `Open` at the exchange, learning the
+    /// `OrderId → ClientOrderId` mapping exactly as a venue ack would.
+    ///
+    /// `position_id` is what the strategy asked the fill to be booked against; passing `None`
+    /// models an order this engine never submitted (external, or restored by reconciliation),
+    /// which is precisely the state the raw-`OrderId` fallback exists to catch.
+    fn rest_order_at_exchange(
+        state: &mut InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex>,
+        cid: &ClientOrderId,
+        exchange_id: &OrderId,
+        position_id: Option<&PositionId>,
+    ) {
+        state.update_from_order_snapshot(Snapshot(&order(
+            cid.clone(),
+            OrderState::active(OpenInFlight),
+        )));
+
+        // `record_in_flight_open` writes this when the submitted request carries a `PositionId`.
+        // It has to land while the CID is tracked in `orders.0`, or `cleanup_routing_tables`
+        // prunes it on the very next snapshot.
+        if let Some(position_id) = position_id {
+            state.position_ids.insert(cid.clone(), position_id.clone());
+        }
+
+        state.update_from_order_snapshot(Snapshot(&order(
+            cid.clone(),
+            OrderState::active(Open::new(exchange_id.clone(), TIME, Decimal::ZERO)),
+        )));
+    }
+
+    /// The `PositionId`s currently holding an open position, in map order.
+    fn open_position_ids(
+        state: &InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex>,
+    ) -> Vec<PositionId> {
+        state.position.positions.keys().cloned().collect()
+    }
+
+    // --- Routing that works -------------------------------------------------------------------
+    //
+    // These three pin the paths a correct fix must leave untouched.
+
+    #[test]
+    fn a_fill_routes_to_the_strategys_position_through_the_reverse_index() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let cid = ClientOrderId::new("cid-1");
+        let exchange_id = OrderId::new("oid-1");
+        let position_id = PositionId::new("strategy-chosen");
+
+        rest_order_at_exchange(&mut state, &cid, &exchange_id, Some(&position_id));
+
+        // Both tables are warm, so this is the O(1) fast path.
+        assert_eq!(state.exchange_id_to_cid.get(&exchange_id), Some(&cid));
+        assert_eq!(state.position_ids.get(&cid), Some(&position_id));
+
+        state.update_from_trade(&fill(exchange_id, Side::Buy, dec!(4)));
+
+        assert_eq!(
+            open_position_ids(&state),
+            vec![position_id],
+            "a routable fill belongs to the position the strategy named"
+        );
+    }
+
+    #[test]
+    fn a_fill_routes_to_the_strategys_position_when_the_reverse_index_is_cold() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let cid = ClientOrderId::new("cid-1");
+        let exchange_id = OrderId::new("oid-1");
+        let position_id = PositionId::new("strategy-chosen");
+
+        rest_order_at_exchange(&mut state, &cid, &exchange_id, Some(&position_id));
+
+        // Evict only the reverse index, leaving the order resting and its PositionId mapped. This
+        // is the state an order restored by snapshot reconciliation is in, and it forces the O(n)
+        // scan rather than the fast path.
+        state.exchange_id_to_cid.clear();
+
+        state.update_from_trade(&fill(exchange_id, Side::Buy, dec!(4)));
+
+        assert_eq!(
+            open_position_ids(&state),
+            vec![position_id],
+            "the slow-path scan must reach the same position as the reverse index"
+        );
+    }
+
+    #[test]
+    fn a_fill_routes_to_the_strategys_position_while_its_cancel_is_in_flight() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let cid = ClientOrderId::new("cid-1");
+        let exchange_id = OrderId::new("oid-1");
+        let position_id = PositionId::new("strategy-chosen");
+
+        rest_order_at_exchange(&mut state, &cid, &exchange_id, Some(&position_id));
+
+        // A cancel is sent but not yet acked. The order is still working at the venue, so it can
+        // still fill — the race the `CancelInFlight` arm of the scan exists for.
+        state.update_from_order_snapshot(Snapshot(&order(
+            cid.clone(),
+            OrderState::active(CancelInFlight {
+                order: Some(Open::new(exchange_id.clone(), TIME, Decimal::ZERO)),
+            }),
+        )));
+
+        state.update_from_trade(&fill(exchange_id, Side::Buy, dec!(4)));
+
+        assert_eq!(
+            open_position_ids(&state),
+            vec![position_id],
+            "a fill racing a cancel still belongs to the strategy's position"
+        );
+    }
+
+    // --- The raw-`OrderId` fallback ------------------------------------------------------------
+    //
+    // Characterisation, not endorsement: these pin what the engine does today so a change to it is
+    // visible as a diff here rather than as a silently different PnL split.
+
+    #[test]
+    fn a_fill_whose_order_lost_its_mapping_opens_a_position_under_the_raw_order_id() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let cid = ClientOrderId::new("cid-1");
+        let exchange_id = OrderId::new("oid-1");
+        let position_id = PositionId::new("strategy-chosen");
+
+        rest_order_at_exchange(&mut state, &cid, &exchange_id, Some(&position_id));
+
+        // Open a position the fill below ought to join.
+        state.update_from_trade(&fill(exchange_id.clone(), Side::Buy, dec!(4)));
+        assert_eq!(open_position_ids(&state), vec![position_id.clone()]);
+
+        // Now lose just the CID → PositionId mapping, with the order still resting and still
+        // indexed. `Some(None)`: the scan finds the order but nothing says where its fills go.
+        state.position_ids.remove(&cid);
+
+        state.update_from_trade(&fill(exchange_id.clone(), Side::Buy, dec!(4)));
+
+        assert_eq!(
+            open_position_ids(&state),
+            vec![position_id, PositionId::new(exchange_id.0.clone())],
+            "TODAY: the second fill opens a phantom position keyed by the raw exchange OrderId \
+             instead of joining the position its own order opened, splitting the PnL across two \
+             slots with only a warning to say so"
+        );
+    }
+
+    #[test]
+    fn a_fill_for_an_untracked_order_opens_a_position_under_the_raw_order_id() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let exchange_id = OrderId::new("oid-external");
+
+        // No order at all: placed outside this engine, or dropped by snapshot reconciliation.
+        // Nothing is `OpenInFlight`, so the fill cannot be queued for a later ack either.
+        state.update_from_trade(&fill(exchange_id.clone(), Side::Buy, dec!(4)));
+
+        assert_eq!(
+            open_position_ids(&state),
+            vec![PositionId::new(exchange_id.0.clone())],
+            "TODAY: an unroutable fill opens a position keyed by the raw exchange OrderId"
+        );
+        assert!(
+            state.pending_fills.is_empty(),
+            "with nothing in flight there is no ack to wait for, so the fill is not queued"
+        );
+    }
+
+    // --- Fill-before-ack, which is routed correctly ---------------------------------------------
+
+    #[test]
+    fn a_fill_arriving_before_the_ack_is_queued_rather_than_routed() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let cid = ClientOrderId::new("cid-1");
+        let exchange_id = OrderId::new("oid-1");
+        let position_id = PositionId::new("strategy-chosen");
+
+        state.update_from_order_snapshot(Snapshot(&order(
+            cid.clone(),
+            OrderState::active(OpenInFlight),
+        )));
+        state.position_ids.insert(cid.clone(), position_id.clone());
+
+        // The websocket fill beats the REST ack, so no order carries this exchange OrderId yet.
+        state.update_from_trade(&fill(exchange_id.clone(), Side::Buy, dec!(4)));
+
+        assert!(
+            open_position_ids(&state).is_empty(),
+            "the fill must not open a position before the ack says where it belongs"
+        );
+        assert_eq!(
+            state.pending_fills.len(),
+            1,
+            "it is held until the ack supplies the OrderId → CID mapping"
+        );
+    }
+
+    #[test]
+    fn a_queued_fill_is_replayed_to_the_strategys_position_when_the_ack_lands() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let cid = ClientOrderId::new("cid-1");
+        let exchange_id = OrderId::new("oid-1");
+        let position_id = PositionId::new("strategy-chosen");
+
+        state.update_from_order_snapshot(Snapshot(&order(
+            cid.clone(),
+            OrderState::active(OpenInFlight),
+        )));
+        state.position_ids.insert(cid.clone(), position_id.clone());
+        state.update_from_trade(&fill(exchange_id.clone(), Side::Buy, dec!(4)));
+
+        // The ack arrives and carries the exchange OrderId, settling the mapping.
+        state.update_from_order_snapshot(Snapshot(&order(
+            cid.clone(),
+            OrderState::active(Open::new(exchange_id.clone(), TIME, dec!(4))),
+        )));
+
+        assert!(
+            state.pending_fills.is_empty(),
+            "the ack drains everything queued against its OrderId"
+        );
+        assert_eq!(
+            open_position_ids(&state),
+            vec![position_id],
+            "the replayed fill lands in the strategy's position, not under the raw OrderId"
+        );
+    }
+
+    // --- The fallback is counted, not only logged ----------------------------------------------
+
+    #[test]
+    fn a_fill_whose_order_lost_its_mapping_is_counted_as_a_fallback_routing() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let cid = ClientOrderId::new("cid-1");
+        let exchange_id = OrderId::new("oid-1");
+
+        rest_order_at_exchange(
+            &mut state,
+            &cid,
+            &exchange_id,
+            Some(&PositionId::new("strategy-chosen")),
+        );
+        state.position_ids.remove(&cid);
+
+        state.update_from_trade(&fill(exchange_id, Side::Buy, dec!(4)));
+
+        assert_eq!(
+            state.tear_sheet.fills_routed_by_fallback, 1,
+            "a split position must be countable, not just greppable in the logs"
+        );
+        assert_eq!(
+            state.tear_sheet.fills_unmatched, 0,
+            "an order WAS found, so this is not the unmatched case"
+        );
+        assert_eq!(
+            state.tear_sheet.first_fallback_detail.as_deref(),
+            Some("no PositionId mapping for order oid-1"),
+            "the first occurrence names the cause and the order it happened to"
+        );
+    }
+
+    #[test]
+    fn a_fill_for_an_untracked_order_is_counted_as_unmatched() {
+        let mut state = instrument_state(OmsMode::Hedging);
+
+        state.update_from_trade(&fill(OrderId::new("oid-external"), Side::Buy, dec!(4)));
+
+        assert_eq!(state.tear_sheet.fills_unmatched, 1);
+        assert_eq!(
+            state.tear_sheet.fills_routed_by_fallback, 0,
+            "no order was found, so this is not the lost-mapping case"
+        );
+        assert_eq!(
+            state.tear_sheet.first_fallback_detail.as_deref(),
+            Some("no order matched oid-external")
+        );
+    }
+
+    #[test]
+    fn a_routable_fill_counts_against_neither_cause() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let cid = ClientOrderId::new("cid-1");
+        let exchange_id = OrderId::new("oid-1");
+
+        rest_order_at_exchange(
+            &mut state,
+            &cid,
+            &exchange_id,
+            Some(&PositionId::new("strategy-chosen")),
+        );
+
+        state.update_from_trade(&fill(exchange_id, Side::Buy, dec!(4)));
+
+        assert_eq!(state.tear_sheet.fills_routed_by_fallback, 0);
+        assert_eq!(state.tear_sheet.fills_unmatched, 0);
+        assert_eq!(
+            state.tear_sheet.first_fallback_detail, None,
+            "a clean session must leave the diagnostic empty, or it means nothing"
+        );
+    }
+
+    #[test]
+    fn the_first_fallback_detail_survives_a_later_failure_of_the_other_cause() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let cid = ClientOrderId::new("cid-1");
+        let exchange_id = OrderId::new("oid-1");
+
+        rest_order_at_exchange(
+            &mut state,
+            &cid,
+            &exchange_id,
+            Some(&PositionId::new("strategy-chosen")),
+        );
+        state.position_ids.remove(&cid);
+        state.update_from_trade(&fill(exchange_id, Side::Buy, dec!(4)));
+
+        // A different cause, later. The detail is shared between both counters, so this pins that
+        // it is genuinely first-wins rather than last-wins.
+        state.update_from_trade(&fill(OrderId::new("oid-external"), Side::Buy, dec!(4)));
+
+        assert_eq!(state.tear_sheet.fills_routed_by_fallback, 1);
+        assert_eq!(state.tear_sheet.fills_unmatched, 1);
+        assert_eq!(
+            state.tear_sheet.first_fallback_detail.as_deref(),
+            Some("no PositionId mapping for order oid-1"),
+            "the earliest cause is the one that identifies the session's problem"
+        );
+    }
+
+    #[test]
+    fn netting_mode_counts_no_fallback_routing_for_an_untracked_order() {
+        let mut state = instrument_state(OmsMode::Netting);
+
+        state.update_from_trade(&fill(OrderId::new("oid-external"), Side::Buy, dec!(4)));
+
+        assert_eq!(
+            (
+                state.tear_sheet.fills_routed_by_fallback,
+                state.tear_sheet.fills_unmatched
+            ),
+            (0, 0),
+            "Netting resolves every fill to one slot, so neither counter can move"
+        );
+    }
+
+    #[test]
+    fn the_fallback_counters_reach_the_generated_tear_sheet() {
+        use crate::statistic::time::Daily;
+
+        let mut state = instrument_state(OmsMode::Hedging);
+        state.update_from_trade(&fill(OrderId::new("oid-external"), Side::Buy, dec!(4)));
+
+        // A counter the summary never carries is a counter nobody can read.
+        let sheet = state.tear_sheet.generate(Decimal::ZERO, Daily);
+
+        assert_eq!(sheet.fills_unmatched, 1);
+        assert_eq!(sheet.fills_routed_by_fallback, 0);
+        assert_eq!(
+            sheet.first_fallback_detail.as_deref(),
+            Some("no order matched oid-external")
+        );
+    }
+
+    #[test]
+    fn a_fallback_routing_records_the_position_it_opened_so_it_can_be_looked_up() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let exchange_id = OrderId::new("oid-external");
+
+        state.update_from_trade(&fill(exchange_id.clone(), Side::Buy, dec!(4)));
+
+        assert_eq!(
+            state.tear_sheet.fallback_positions,
+            vec![PositionId::new(exchange_id.0.clone())],
+            "a consumer reconciling this instrument needs the id, not a sentence to parse"
+        );
+        assert_eq!(
+            open_position_ids(&state),
+            state.tear_sheet.fallback_positions,
+            "the recorded id must be the position that actually exists"
+        );
+    }
+
+    #[test]
+    fn repeated_fills_through_the_fallback_record_one_position_but_count_every_fill() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let exchange_id = OrderId::new("oid-external");
+
+        for _ in 0..3 {
+            state.update_from_trade(&fill(exchange_id.clone(), Side::Buy, dec!(1)));
+        }
+
+        assert_eq!(
+            state.tear_sheet.fallback_positions.len(),
+            1,
+            "one order filling three times is one suspect position, not three"
+        );
+        assert_eq!(
+            state.tear_sheet.fills_unmatched, 3,
+            "the counter stays exact even though the list deduplicates"
+        );
+    }
+
+    #[test]
+    fn the_recorded_position_list_stops_at_its_cap_while_the_counter_does_not() {
+        use crate::statistic::summary::instrument::MAX_FALLBACK_POSITIONS;
+
+        let mut state = instrument_state(OmsMode::Hedging);
+        let overshoot = MAX_FALLBACK_POSITIONS + 5;
+
+        // A distinct external order each time, so every one is a new position.
+        for i in 0..overshoot {
+            state.update_from_trade(&fill(OrderId::new(format!("oid-{i}")), Side::Buy, dec!(1)));
+        }
+
+        assert_eq!(
+            state.tear_sheet.fallback_positions.len(),
+            MAX_FALLBACK_POSITIONS,
+            "the list is bounded so a pathological session cannot grow the tear sheet without limit"
+        );
+        assert_eq!(
+            state.tear_sheet.fills_unmatched, overshoot,
+            "the counter remains authoritative for how many fills were misrouted"
+        );
+        assert_eq!(
+            state.tear_sheet.fallback_positions.first(),
+            Some(&PositionId::new("oid-0")),
+            "the retained entries are the first seen, so the list pairs with first_fallback_detail"
+        );
+    }
+
+    // --- Netting, where the fallback is unreachable ---------------------------------------------
+
+    #[test]
+    fn netting_mode_routes_an_unroutable_fill_to_the_single_netting_slot() {
+        let mut state = instrument_state(OmsMode::Netting);
+
+        // The same untracked fill that opens a phantom position under Hedging.
+        state.update_from_trade(&fill(OrderId::new("oid-external"), Side::Buy, dec!(4)));
+
+        assert_eq!(
+            open_position_ids(&state),
+            vec![PositionId::NETTING],
+            "Netting keys every fill to one slot, so no routing failure can split a position"
+        );
+        assert!(state.pending_fills.is_empty());
+    }
 }
