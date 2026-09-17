@@ -28,8 +28,9 @@ pub struct Reservation {
     pub asset: AssetNameExchange,
     /// How much of it is held, inclusive of the fee the fill will charge.
     ///
-    /// Held against the order's **unfilled** quantity alone. That is its whole quantity for an
-    /// order that rested without trading, which is every order this venue currently books.
+    /// Held against the order's **unfilled** quantity alone — its whole quantity for an order that
+    /// rested without trading, and the remainder alone for one the book filled in part before it
+    /// rested, or one a configured `initial_state` seeded already part-filled.
     pub amount: Decimal,
 }
 
@@ -162,6 +163,12 @@ impl OpenOrders {
     /// `reservation` is `None` only for an order the venue did not book itself — see the type's
     /// note on reservations. It is a parameter rather than a later setter so that an order cannot
     /// reach the book in a state where what is held against it has not yet been decided.
+    ///
+    /// `#[must_use]` because dropping a displaced reservation leaks it: nothing else knows the
+    /// order it belonged to is gone, so `free` stays down for the rest of the run and
+    /// [`Balance::used`](crate::balance::Balance::used) overstates by the same amount, silently.
+    #[must_use = "a displaced order's reservation is still held against the account, and dropping \
+                  it leaks the hold for the rest of the run"]
     pub fn insert(
         &mut self,
         order: OpenOrder,
@@ -325,7 +332,10 @@ impl FromIterator<OpenOrder> for OpenOrders {
     fn from_iter<T: IntoIterator<Item = OpenOrder>>(orders: T) -> Self {
         let mut open = Self::default();
         for order in orders {
-            open.insert(order, None);
+            // Nothing is held against a seeded order, so a displaced one leaks nothing -- see
+            // `AccountState::from`, which makes the same argument where the duplicate would come
+            // from.
+            let _displaced = open.insert(order, None);
         }
         open
     }

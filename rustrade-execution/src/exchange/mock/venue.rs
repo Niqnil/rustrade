@@ -6,12 +6,12 @@ use crate::{
     client::mock::MockExecutionConfig,
     error::{ApiError, UnindexedApiError, UnindexedOrderError},
     exchange::mock::{
-        account::AccountState,
+        account::{AccountState, Debit},
         orders::{OpenOrder, Reservation, RestingOrder},
     },
     fee::{FeeModel, FeeModelConfig, Liquidity},
     fill::{FillContext, FillModel, SimFillConfig},
-    market::MarketSnapshot,
+    market::{MarketDepth, MarketSnapshot},
     order::{
         Order, OrderKind, TimeInForce, UnindexedOrder,
         id::{ClientOrderId, OrderId},
@@ -54,15 +54,29 @@ pub type OpenOutcome = VenueOutcome<Order<ExchangeId, InstrumentNameExchange, Un
 /// Response type of [`SimulatedVenue::cancel_order`].
 pub type CancelOutcome = VenueOutcome<UnindexedOrderResponseCancel>;
 
-/// A venue's view of one instrument, and when it last changed.
+/// A venue's view of one instrument: what it is worth, how much of it is left to take, and when
+/// that view was last replaced.
 ///
 /// The instant is carried alongside the prices rather than inside them because a
 /// [`MarketSnapshot`] says what the market is, not when it was observed — and a matching engine
 /// needs both: an order resting since `T` may only be matched against a market at or after `T`.
+/// The remaining depth is here for the same reason and one more: it is not even a property of the
+/// market, but of what this account has already taken out of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VenueInstrumentMarket {
     /// Prices as of [`time_exchange`](Self::time_exchange).
     pub snapshot: MarketSnapshot,
+
+    /// What is **left** of the size reported with [`snapshot`](Self::snapshot), after every taker
+    /// fill this venue has struck against it.
+    ///
+    /// Reset wholesale by [`apply_market`](SimulatedVenue::apply_market), because a new
+    /// observation is a new statement of what is on offer rather than an increment to the old
+    /// one. Between two such observations it only ever falls, which is what stops two market
+    /// orders arriving in the same tick from each taking the whole of a size that was only ever
+    /// displayed once. Reading a size does not consume it; filling against it does.
+    pub depth: MarketDepth,
+
     /// When this view was last replaced.
     pub time_exchange: DateTime<Utc>,
 }
@@ -140,7 +154,9 @@ pub enum VenueRegime {
 ///   retiring one at its deadline. Such an order may also arrive **part-filled**, carrying an
 ///   [`Open::filled_quantity`] this venue did not produce: only the remainder ever trades here,
 ///   and a fill that completes it reports no `avg_price`, because the price of the part that
-///   traded elsewhere is not something this venue can know.
+///   traded elsewhere is not something this venue can know. An order **this** venue part-filled
+///   before resting is the same shape, and reports no `avg_price` for the same reason — the two
+///   fills were struck at different prices and this state carries one of them.
 ///
 /// # How an order is priced
 ///
@@ -183,19 +199,29 @@ pub enum VenueRegime {
 /// trades-only feed there is no book at all, so a book-only rule would never match anything.
 ///
 /// # What matching does not model
-/// - **No queue position.** An order that crosses fills in full, whatever size rests ahead of it.
-///   [`OpenOrders`] ranks orders by price then arrival, so *which* of this account's orders fills
-///   first is reproducible — but the book it is matched against has no sizes to be ahead in.
-/// - **No size cap, and so no partial fills.** A crossing order fills its whole *remaining*
-///   quantity at one price. Every order this venue books itself is therefore either untouched or
-///   terminal, and its [`Cancelled::filled_quantity`] is zero. A configured `initial_state` may
-///   seed one that already carries a filled quantity, and this venue works around that quantity
-///   rather than adding to it: it fills, cancels and expires such an order for what is left of it,
-///   and reports the seeded amount back unchanged.
-/// - **No size cap means immediate-or-cancel and fill-or-kill coincide.** Both reduce to
-///   "marketable ⇒ fill in full; not marketable ⇒ retire having traded nothing". They diverge only
-///   once an order can fill in part, at which point fill-or-kill must refuse a partial fill that
-///   immediate-or-cancel accepts.
+/// - **No queue position.** Nothing rests ahead of this account's orders. [`OpenOrders`] ranks
+///   them by price then arrival, so *which* of them fills first is reproducible, but they are
+///   matched against a book with no other participants in it — an order that crosses is never
+///   waiting behind anyone.
+/// - **Only a taker is capped by size.** An order aggressing on arrival fills at most what
+///   [`VenueInstrumentMarket::depth`] says is on offer, and draws that down as it takes it. A
+///   **resting** order is not capped: when the market reaches it, it fills its whole remaining
+///   quantity at its limit however little traded there. Capping it honestly would need the volume
+///   that actually printed through the limit, which this venue's feed does not carry — a
+///   [`MarketSnapshot`] is a view of the market, not a record of what traded — and capping it by
+///   the size on the *opposite* side would be a number shaped like a cap that measures nothing a
+///   cap should.
+/// - **A capped taker's remainder is a maker, and makers are not capped.** So an order the book
+///   could only partly fill rests the rest, and the very next tick that still crosses it fills
+///   that remainder in full. The cap bounds what one order takes from one observation; it does not
+///   make liquidity scarce for longer than that.
+/// - **Absent size means unlimited, not unfillable.** A feed with no sizes — trades only, candles,
+///   a price-only export, or a [`RequestPriced`](VenueRegime::RequestPriced) venue, which has no
+///   market at all — caps nothing. See [`MarketDepth`].
+/// - **Depth is this account's own bound, not the market's.** It is reset by each
+///   [`apply_market`](Self::apply_market) rather than accumulated, so it stops two of this
+///   account's orders double-spending one observation's size and claims nothing about anyone
+///   else's.
 ///
 /// # Which [`TimeInForce`] this venue honours
 /// An unsupported one is **rejected**, never quietly treated as good-until-cancelled: that would
@@ -210,8 +236,10 @@ pub enum VenueRegime {
 /// | `GoodUntilEndOfDay` | **rejected** | fills |
 /// | `AtOpen` / `AtClose` | **rejected** | **rejected** |
 ///
-/// A market order fills in full on arrival, which honours every time in force that bounds *how
-/// long* an order works — so most of the table is moot for one. The two exceptions are real:
+/// A market order works only on arrival, which honours every time in force that bounds *how long*
+/// an order works — so most of the table is moot for one. (It fills in full wherever the book has
+/// the size; what it cannot fill is cancelled, since it has no limit price to rest at.) The two
+/// exceptions are real:
 /// `post_only` on a market order is a promise never to take liquidity, which is all a market order
 /// does; and `AtOpen`/`AtClose` say *when* an order executes rather than how long it lasts, so
 /// honouring them needs a session calendar this venue has not got. Filling one on arrival would be
@@ -237,12 +265,22 @@ pub enum VenueRegime {
 /// from a live account with margin reserved is therefore usable as configured — it was rejected
 /// outright while every order filled on arrival and the ledger could not represent the state.
 ///
-/// An order that fills on arrival reserves and settles in one step
-/// ([`AccountState::debit_filled`]), so it emits **one** balance restatement. An order that rests
-/// reserves when it is booked and settles that same amount when it fills, so it emits one
-/// restatement then and one more on the fill — never an intermediate balance the account did not
-/// hold. A configured reservation is carried through untouched: settling lowers `total` by the
-/// settled amount and leaves the rest held.
+/// Every arrival is **one** commitment against the ledger ([`AccountState::commit`]) and therefore
+/// **one** balance restatement, whichever of the three shapes it has: an order that fills outright
+/// settles and holds nothing; one that rests holds and settles nothing; one the book fills in part
+/// does both at once, settling what traded and holding against the remainder it leaves resting. An
+/// order that rests emits one more restatement later, when the market reaches it and the hold is
+/// settled — never an intermediate balance the account did not hold. A configured reservation is
+/// carried through untouched: settling lowers `total` by the settled amount and leaves the rest
+/// held.
+///
+/// **An order is funded whole or refused whole.** The two legs of a part-filled arrival are asked
+/// for together, so an account that cannot cover both has the order rejected with nothing moved.
+/// It is not filled for the part it could afford: choosing that would be this venue substituting a
+/// disposition for the one the sender asked for. Note the consequence, which is easy to be
+/// surprised by — a capped order costs *more* than the same order filling outright, because its
+/// remainder is held at the order's own limit while the fill struck a better price, so an order
+/// can be refused for a size the book was willing to sell it.
 ///
 /// The reservation is **exactly** what the fill will settle, not a conservative over-estimate: both
 /// come from one computation at the order's own limit and its own liquidity side. A conservative
@@ -250,7 +288,7 @@ pub enum VenueRegime {
 /// restatements for one fill and reporting balances the account never held, while
 /// [`Balance::used`](crate::balance::Balance::used) misreported for the order's whole life.
 ///
-/// [`AccountState::debit_filled`]: crate::exchange::mock::account::AccountState::debit_filled
+/// [`AccountState::commit`]: crate::exchange::mock::account::AccountState::commit
 #[derive(Debug)]
 pub struct SimulatedVenue {
     pub exchange: ExchangeId,
@@ -264,9 +302,19 @@ pub struct SimulatedVenue {
     /// Empty unless a driver feeds it — see [`apply_market`](Self::apply_market) for which drivers
     /// do. Read through [`market`](Self::market).
     market: FnvHashMap<InstrumentNameExchange, VenueInstrumentMarket>,
-    /// Monotone `OrderId` source. Private: resetting it mints duplicate ids, and
-    /// `TradeId` is derived from it, so the duplicate would reach the trade ledger.
+    /// Monotone `OrderId` source. Private: resetting it mints duplicate ids, which a consumer
+    /// keying a position on an order would silently merge.
+    ///
+    /// Counts every order this venue booked, including those that retired without trading, so it
+    /// is also what [`order_sequence`](Self::order_sequence) reports.
     order_sequence: u64,
+    /// Monotone `TradeId` source, independent of [`order_sequence`](Self::order_sequence).
+    ///
+    /// Separate because one order can print more than once — a taker the book fills in part rests
+    /// the remainder and prints again when it is crossed — so an id derived from the order's would
+    /// collide between the two. A real venue mints trade ids independently for the same reason;
+    /// the link back to the order is [`Trade::order_id`], which is typed rather than parsed.
+    trade_sequence: u64,
     /// Read via [`time_exchange`](Self::time_exchange), advanced only by
     /// [`advance_time`](Self::advance_time).
     time_exchange_latest: DateTime<Utc>,
@@ -317,6 +365,7 @@ impl SimulatedVenue {
             account: AccountState::from(config.initial_state.clone()),
             market: FnvHashMap::default(),
             order_sequence: 0,
+            trade_sequence: 0,
             time_exchange_latest: Default::default(),
             regime,
         }
@@ -432,6 +481,20 @@ impl SimulatedVenue {
     /// "unchanged". Whoever calls this owns the state machine that folds a stream of market events
     /// into that view.
     ///
+    /// # `depth` replaces what is left, it does not add to it
+    /// [`MarketDepth`] is the size on offer as of this observation, and it is stored as the size
+    /// still *available* — drawn down by every taker fill struck against it until the next call
+    /// replaces it. That is the only thing that stops two market orders arriving between two
+    /// observations from each taking the whole of a size that was displayed once: reading a
+    /// stored size does not consume it, so without the draw-down both would see it undiminished.
+    ///
+    /// It bounds this account's own aggression within one observation and claims nothing more. It
+    /// is not queue position against the rest of the market, which stays unmodelled — see the
+    /// type's `# What matching does not model`.
+    ///
+    /// A feed with no sizes passes [`MarketDepth::UNKNOWN`], which caps nothing. See
+    /// [`MarketDepth`] for why that, and not "nothing is available", is what absent size means.
+    ///
     /// # Not every driver supplies this
     /// A venue only has market state if something feeds it one. `SimRunner` does, routing each
     /// source market event to the venues trading that instrument before the `Engine` sees it.
@@ -464,10 +527,12 @@ impl SimulatedVenue {
         &mut self,
         instrument: &InstrumentNameExchange,
         snapshot: MarketSnapshot,
+        depth: MarketDepth,
         time_exchange: DateTime<Utc>,
     ) -> Vec<UnindexedAccountEvent> {
         let entry = self.market.entry(instrument.clone()).or_default();
         entry.snapshot = snapshot;
+        entry.depth = depth;
         entry.time_exchange = time_exchange;
 
         // Swept before matching, so an order whose deadline this tick has reached cannot trade on
@@ -564,7 +629,7 @@ impl SimulatedVenue {
 
             let order_id = order.state.id.clone();
             let trade = Trade {
-                id: TradeId(order_id.0.clone()),
+                id: self.trade_id_sequence_fetch_add(),
                 order_id: order_id.clone(),
                 instrument: order.key.instrument.clone(),
                 strategy: order.key.strategy.clone(),
@@ -630,7 +695,7 @@ impl SimulatedVenue {
             #[allow(clippy::expect_used)] // Documented panic: a mis-specified `initial_state`.
             return self
                 .account
-                .debit_filled(&settlement.asset, settlement.amount, time_exchange)
+                .commit(&settlement.settled(), time_exchange)
                 .unwrap_or_else(|insufficient| {
                     panic!(
                         "SimulatedVenue cannot afford the fill of resting order {}, which was \
@@ -665,6 +730,10 @@ impl SimulatedVenue {
     }
 
     /// Number of orders this venue has booked, and so the next `OrderId` it will mint.
+    ///
+    /// Counts every order it gave an id to, including those that retired without ever trading. It
+    /// is **not** a count of trades — one order can print more than once, and trade ids are minted
+    /// from a sequence of their own.
     pub fn order_sequence(&self) -> u64 {
         self.order_sequence
     }
@@ -719,17 +788,14 @@ impl SimulatedVenue {
         let market = self.pricing_market(&request);
         let (response, notifications) = self.open_order_inner(request, market);
 
+        // Everything is already committed -- the trade acknowledged, the order recorded or booked,
+        // the ledger moved. All that is left is to package it in the order a driver must deliver
+        // it: the balance that pays for a fill before the fill that spent it.
         let events = match notifications {
-            Some(OpenOrderNotifications::Filled { balance, trade }) => {
-                // Booked before the events are built, so a subsequent request on this venue sees
-                // the trade regardless of when a driver gets around to delivering them.
-                self.account.ack_trade(trade.clone());
-                self.account.ack_filled(response.key.cid.clone());
-                vec![
-                    self.build_account_event(balance),
-                    self.build_account_event(trade),
-                ]
-            }
+            Some(OpenOrderNotifications::Filled { balance, trade }) => vec![
+                self.build_account_event(balance),
+                self.build_account_event(trade),
+            ],
             // Already on the book: `open_order_inner` put it there, holding the reservation this
             // balance restates.
             Some(OpenOrderNotifications::Rested { balance }) => {
@@ -744,10 +810,11 @@ impl SimulatedVenue {
     /// Takes a resting order off the book, releasing whatever is held against it.
     ///
     /// Returns `[balance]` and a [`Cancelled`] carrying the quantity filled before the cancel
-    /// arrived -- zero for every order this venue booked itself, since it models no partial fills,
-    /// and otherwise whatever a configured `initial_state` seeded, which is carried through rather
-    /// than added to. An order the venue holds nothing against releases nothing and reports no
-    /// balance; see this type's note on `initial_state`.
+    /// arrived -- which is whatever the order had done: nothing for one that rested untouched, the
+    /// taker part for one the book could only partly fill on arrival, and whatever a configured
+    /// `initial_state` seeded, carried through rather than added to. An order the venue holds
+    /// nothing against releases nothing and reports no balance; see this type's note on
+    /// `initial_state`.
     ///
     /// # A cancel that finds nothing says which nothing it found
     /// A cancel racing its own order's fill is the reason this distinguishes three cases rather
@@ -873,9 +940,15 @@ impl SimulatedVenue {
     /// Decides one open's fate, moves the balance it pays with, and commits nothing else.
     ///
     /// Kept separate from [`open_order`](Self::open_order) rather than inlined: this body has
-    /// several early returns and the ordering contract -- ack the trade, then emit balance before
-    /// trade -- is the part a reader needs to find. Splitting keeps that contract in a short caller
-    /// instead of at the end of a long one.
+    /// several early returns, and the ordering contract -- emit the balance before the trade it
+    /// paid for -- is the part a reader needs to find. Splitting keeps that contract in a short
+    /// caller instead of at the end of a long one.
+    ///
+    /// Everything an arrival commits is committed *here*, by whichever function decides the
+    /// order's fate: [`fill_on_arrival`](Self::fill_on_arrival) acknowledges its own trade and
+    /// records what the order became, exactly as [`cancel_on_arrival`](Self::cancel_on_arrival),
+    /// [`expire_on_arrival`](Self::expire_on_arrival) and [`rest_order`](Self::rest_order) already
+    /// do. The caller is left owning event order and nothing else.
     ///
     /// `market` is the snapshot the request carried, and is used only by an order that is priced
     /// from it -- see the type's `# How an order is priced`.
@@ -948,11 +1021,15 @@ impl SimulatedVenue {
             // asserting, because filling an order this function could not account for is the one
             // wrong answer.
             //
-            // The two aggressing arms are one call because this venue caps no fill, so neither one
-            // leaves a remainder for them to disagree over -- see `Disposition`.
+            // The two aggressing arms differ in what becomes of a remainder the book could not
+            // fill: `ImmediateOrCancel` keeps what it got and retires the rest, `FillOrKill`
+            // would rather trade nothing -- see `Remainder`.
             return match disposition(request.state.kind, request.state.time_in_force, true, now) {
-                Disposition::FillAndCancel | Disposition::FillOrNothing => {
-                    self.fill_on_arrival(request, market, &terms)
+                Disposition::FillAndCancel => {
+                    self.fill_on_arrival(request, market, &terms, Remainder::Cancel)
+                }
+                Disposition::FillOrNothing => {
+                    self.fill_on_arrival(request, market, &terms, Remainder::Kill)
                 }
                 Disposition::Expire => self.expire_on_arrival(request, now),
                 Disposition::FillAndRest | Disposition::CancelUnfilled | Disposition::Rest => {
@@ -987,10 +1064,16 @@ impl SimulatedVenue {
             marketable,
             now,
         ) {
-            // One call for the three: they differ only in what becomes of a remainder, and a fill
-            // this venue caps nowhere leaves none -- see `Disposition`.
-            Disposition::FillAndRest | Disposition::FillAndCancel | Disposition::FillOrNothing => {
-                self.fill_on_arrival(request, market, &terms)
+            // The three differ only in what becomes of a remainder the book could not fill, which
+            // is exactly what they are asked here -- see `Remainder`.
+            Disposition::FillAndRest => {
+                self.fill_on_arrival(request, market, &terms, Remainder::Rest { limit })
+            }
+            Disposition::FillAndCancel => {
+                self.fill_on_arrival(request, market, &terms, Remainder::Cancel)
+            }
+            Disposition::FillOrNothing => {
+                self.fill_on_arrival(request, market, &terms, Remainder::Kill)
             }
             // Nothing has traded, so the whole quantity is what rests.
             Disposition::Rest => self.rest_order(request, limit, &terms, Decimal::ZERO),
@@ -1094,12 +1177,36 @@ impl SimulatedVenue {
         )
     }
 
-    /// Fills an order that is marketable the moment it arrives, debiting what it pays with.
+    /// Trades an order against the book the moment it arrives, for as much of it as the book has.
+    ///
+    /// # What the book has is what it fills
+    /// The fill is capped at the size on offer to this side
+    /// ([`VenueInstrumentMarket::depth`]), and that size is drawn down by what this fill takes, so
+    /// a second order arriving before the next [`apply_market`](Self::apply_market) sees only what
+    /// the first left. A feed supplying no size caps nothing — see [`MarketDepth`].
+    ///
+    /// `remainder` decides what becomes of the quantity the book could not fill, and it is the
+    /// order's own time in force that chose it — see [`Remainder`] and [`Disposition`].
+    ///
+    /// # An order is funded whole or refused whole
+    /// An order that fills in part and rests the rest owes the ledger two things at one instant: a
+    /// settlement for what traded and a hold against what did not. They are asked for as one
+    /// requirement ([`AccountState::commit`]), so an account that cannot cover both has the order
+    /// refused with nothing moved — rather than filled for the part it could afford, which would
+    /// be this venue choosing a disposition the sender did not ask for.
+    ///
+    /// That makes a capped order *dearer* than the same order filling outright, because the
+    /// remainder is held at the order's own limit while the fill struck a better price. An order
+    /// can therefore be refused for a size the book was willing to sell it.
+    ///
+    /// [`VenueInstrumentMarket::depth`]: VenueInstrumentMarket::depth
+    /// [`AccountState::commit`]: crate::exchange::mock::account::AccountState::commit
     fn fill_on_arrival(
         &mut self,
         request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
         market: Option<MarketSnapshot>,
         terms: &InstrumentTerms,
+        remainder: Remainder,
     ) -> (
         Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
         Option<OpenOrderNotifications>,
@@ -1161,78 +1268,241 @@ impl SimulatedVenue {
         };
 
         let time_exchange = self.time_exchange();
+        let side = request.state.side;
 
-        // Marketable on arrival, so this fill takes liquidity and is charged the taker rate.
-        let settlement = self.settlement(
-            terms,
-            request.state.side,
-            request.state.quantity,
-            fill_price,
-            Liquidity::Taker,
-        );
+        // What the book has to give this order, which is all of it wherever no size is known.
+        let filled_quantity = match self.depth_available(&request.key.instrument, side) {
+            Some(available) => request.state.quantity.min(available),
+            None => request.state.quantity,
+        };
+        let unfilled = request.state.quantity - filled_quantity;
 
-        // Reserve-then-settle in one step. An order that fills on arrival collapses the two
-        // together and the client sees a single balance restatement -- see
-        // `AccountState::debit_filled`. A configured `total != free` (an `initial_state` copied
-        // from a live account with margin reserved) is carried through untouched rather than
-        // rejected: the ledger represents a held amount, so there is nothing left to refuse.
-        let balance_snapshot =
-            match self
-                .account
-                .debit_filled(&settlement.asset, settlement.amount, time_exchange)
-            {
-                Ok(balance_snapshot) => balance_snapshot,
-                Err(insufficient) => {
-                    return (
-                        build_open_order_err_response(
-                            request,
-                            ApiError::BalanceInsufficient(
-                                settlement.asset,
-                                format!(
-                                    "Available Balance: {}, Required Balance inc. fees: {}",
-                                    insufficient.free, insufficient.required
-                                ),
-                            ),
-                        ),
-                        None,
-                    );
+        // Nothing trades: either the book has no size left to give, or the order would rather
+        // trade nothing than trade in part. `FillOrKill` is the second case and the only one --
+        // this is where it stops coinciding with `ImmediateOrCancel`, which takes what it can get.
+        // The whole order then meets the fate its remainder would have.
+        if filled_quantity <= Decimal::ZERO || (unfilled > Decimal::ZERO && remainder.is_kill()) {
+            return match remainder {
+                // Nothing has traded, so the whole quantity is what rests.
+                Remainder::Rest { limit } => self.rest_order(request, limit, terms, Decimal::ZERO),
+                Remainder::Cancel | Remainder::Kill => {
+                    self.cancel_on_arrival(request, time_exchange)
                 }
             };
+        }
+
+        // Marketable on arrival, so this fill takes liquidity and is charged the taker rate.
+        let fill = self.settlement(terms, side, filled_quantity, fill_price, Liquidity::Taker);
+
+        // What holding the remainder will cost, priced exactly as the fill that settles it will be
+        // -- the unfilled quantity, at the order's own limit, as the maker. Computed before
+        // anything moves, so both legs are asked of the ledger as one requirement.
+        let held = match remainder {
+            Remainder::Rest { limit } if unfilled > Decimal::ZERO => {
+                Some(self.settlement(terms, side, unfilled, limit, Liquidity::Maker))
+            }
+            _ => None,
+        };
+
+        // One commitment for the whole arrival. A configured `total != free` (an `initial_state`
+        // copied from a live account with margin reserved) is carried through untouched rather
+        // than rejected: the ledger represents a held amount, so there is nothing left to refuse.
+        let debit = match &held {
+            Some(held) => fill.settled_holding(held),
+            None => fill.settled(),
+        };
+
+        let balance = match self.account.commit(&debit, time_exchange) {
+            Ok(balance) => balance,
+            Err(insufficient) => {
+                return (
+                    build_open_order_err_response(
+                        request,
+                        ApiError::BalanceInsufficient(
+                            debit.asset,
+                            format!(
+                                "Available Balance: {}, Required Balance inc. fees: {}",
+                                insufficient.free, insufficient.required
+                            ),
+                        ),
+                    ),
+                    None,
+                );
+            }
+        };
+
+        // Taken off the book only now that it is paid for, so a refused order consumes nothing.
+        self.consume_depth(&request.key.instrument, side, filled_quantity);
 
         let order_id = self.order_id_sequence_fetch_add();
-        let trade_id = TradeId(order_id.0.clone());
-
-        let order_response = Order {
-            key: request.key.clone(),
-            side: request.state.side,
-            price: request.state.price,
-            quantity: request.state.quantity,
-            kind: request.state.kind,
-            time_in_force: request.state.time_in_force,
-            state: OrderState::fully_filled(Filled::new(
-                order_id.clone(),
-                time_exchange,
-                request.state.quantity,
-                Some(fill_price),
-            )),
+        let trade = Trade {
+            id: self.trade_id_sequence_fetch_add(),
+            order_id: order_id.clone(),
+            instrument: request.key.instrument.clone(),
+            strategy: request.key.strategy.clone(),
+            time_exchange,
+            side,
+            price: fill_price,
+            quantity: filled_quantity,
+            fees: fill.fees,
         };
 
-        let notifications = OpenOrderNotifications::Filled {
-            balance: Snapshot(balance_snapshot),
-            trade: Trade {
-                id: trade_id,
-                order_id,
-                instrument: request.key.instrument,
-                strategy: request.key.strategy,
-                time_exchange,
-                side: request.state.side,
+        // Booked here rather than by the caller, so that whatever this order became is decided in
+        // one place: every other arrival already acknowledges its own outcome.
+        self.account.ack_trade(trade.clone());
+
+        let (state, released) = self.retire_filled(
+            &request,
+            order_id,
+            Fill {
+                quantity: filled_quantity,
                 price: fill_price,
-                quantity: request.state.quantity,
-                fees: settlement.fees,
             },
-        };
+            held,
+            time_exchange,
+        );
 
-        (order_response, Some(notifications))
+        (
+            Order {
+                key: request.key,
+                side,
+                price: request.state.price,
+                quantity: request.state.quantity,
+                kind: request.state.kind,
+                time_in_force: request.state.time_in_force,
+                state,
+            },
+            Some(OpenOrderNotifications::Filled {
+                // A displaced order's hold is given back after this order's own is taken, so the
+                // later restatement is the one that is true.
+                balance: Snapshot(released.unwrap_or(balance)),
+                trade,
+            }),
+        )
+    }
+
+    /// Records what an order that traded on arrival became, and reports the state it answers with.
+    ///
+    /// The three outcomes are the three things a taker fill can leave behind: nothing, a remainder
+    /// with nowhere to wait, or a remainder on the book. Returns the balance a displaced order's
+    /// released hold restated, if this order replaced one.
+    fn retire_filled(
+        &mut self,
+        request: &OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
+        order_id: OrderId,
+        fill: Fill,
+        held: Option<Settlement>,
+        time_exchange: DateTime<Utc>,
+    ) -> (UnindexedOrderState, Option<AssetBalance<AssetNameExchange>>) {
+        // Spelled out per arm rather than shared: a closure would be monomorphic in the state
+        // type, and the two arms that record an order record two different ones.
+        match held {
+            // The book could not fill all of it and the remainder waits at the order's own limit,
+            // carrying what has already traded so `Open::quantity_remaining` stays true for the
+            // rest of its life -- which is what `match_resting` settles and prints.
+            Some(held) => {
+                let open = Open::new(order_id, time_exchange, fill.quantity);
+                let released = self.book_rested(
+                    Order {
+                        key: request.key.clone(),
+                        side: request.state.side,
+                        price: request.state.price,
+                        quantity: request.state.quantity,
+                        kind: request.state.kind,
+                        time_in_force: request.state.time_in_force,
+                        state: open.clone(),
+                    },
+                    Reservation {
+                        asset: held.asset,
+                        amount: held.amount,
+                    },
+                    time_exchange,
+                );
+
+                (OrderState::active(open), released)
+            }
+
+            // Either it filled outright, or what is left has nowhere to wait.
+            None if fill.quantity == request.state.quantity => {
+                // One fill is the whole of this order, so its price is also the mean of every
+                // fill behind the total -- which is exactly when `avg_price` may be reported.
+                let filled = Filled::new(
+                    order_id,
+                    time_exchange,
+                    request.state.quantity,
+                    Some(fill.price),
+                );
+                self.account.ack_filled(request.key.cid.clone());
+
+                (OrderState::fully_filled(filled), None)
+            }
+
+            // A market order carries no price, so its remainder has nothing to rest at and retires
+            // carrying what did trade -- which is what `Cancelled::filled_quantity` is for, and the
+            // first time this venue makes it non-zero.
+            None => {
+                let cancelled = Cancelled {
+                    id: order_id,
+                    time_exchange,
+                    filled_quantity: fill.quantity,
+                };
+                self.account.ack_cancelled(Order {
+                    key: request.key.clone(),
+                    side: request.state.side,
+                    price: request.state.price,
+                    quantity: request.state.quantity,
+                    kind: request.state.kind,
+                    time_in_force: request.state.time_in_force,
+                    state: cancelled.clone(),
+                });
+
+                (OrderState::inactive(cancelled), None)
+            }
+        }
+    }
+
+    /// What is left to take at the best price on the far side of `side`, where a feed says.
+    fn depth_available(&self, instrument: &InstrumentNameExchange, side: Side) -> Option<Decimal> {
+        self.market
+            .get(instrument)
+            .and_then(|market| market.depth.available_to(side))
+    }
+
+    /// Draws down what an aggressor on `side` can still take, by what this one just took.
+    fn consume_depth(
+        &mut self,
+        instrument: &InstrumentNameExchange,
+        side: Side,
+        quantity: Decimal,
+    ) {
+        if let Some(market) = self.market.get_mut(instrument) {
+            market.depth.consume(side, quantity);
+        }
+    }
+
+    /// Puts `order` on the book holding `reservation`, and gives back whatever it displaced.
+    ///
+    /// Re-opening a [`ClientOrderId`] that is already resting replaces the order under it.
+    /// [`OpenOrders::insert`] hands the displaced order's own reservation back rather than dropping
+    /// it, because it is still held against this account and nothing else will ever release it --
+    /// so it is released here, and the balance that restates is returned. Dropping it instead
+    /// leaves `free` permanently short and
+    /// [`Balance::used`](crate::balance::Balance::used) permanently overstated.
+    ///
+    /// Nothing is displaced until the replacement has been paid for, so an order this account
+    /// could not fund leaves the one already resting exactly where it was.
+    ///
+    /// [`OpenOrders::insert`]: super::orders::OpenOrders::insert
+    fn book_rested(
+        &mut self,
+        order: OpenOrder,
+        reservation: Reservation,
+        time_exchange: DateTime<Utc>,
+    ) -> Option<AssetBalance<AssetNameExchange>> {
+        let Reservation { asset, amount } =
+            self.account.orders_mut().insert(order, Some(reservation))?;
+
+        Some(self.account.release(&asset, amount, time_exchange))
     }
 
     /// Puts what is left of an order onto the book, holding what that remainder's fill will cost.
@@ -1247,9 +1517,12 @@ impl SimulatedVenue {
     ///
     /// The reservation is what the fill will settle, computed once here and settled unchanged --
     /// never a conservative over-estimate. A conservative reservation would have to be released and
-    /// re-debited on the fill, and `debit_filled`'s contract is that a fill produces exactly **one**
-    /// balance restatement; the extra ones would report balances the account never held, and
-    /// [`Balance::used`](crate::balance::Balance::used) would misreport for the order's whole life.
+    /// re-debited on the fill, and [`AccountState::commit`]'s contract is that an arrival produces
+    /// exactly **one** balance restatement; the extra ones would report balances the account never
+    /// held, and [`Balance::used`](crate::balance::Balance::used) would misreport for the order's
+    /// whole life.
+    ///
+    /// [`AccountState::commit`]: crate::exchange::mock::account::AccountState::commit
     fn rest_order(
         &mut self,
         request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
@@ -1272,28 +1545,24 @@ impl SimulatedVenue {
             Liquidity::Maker,
         );
 
-        let balance_snapshot =
-            match self
-                .account
-                .reserve(&settlement.asset, settlement.amount, time_exchange)
-            {
-                Ok(balance_snapshot) => balance_snapshot,
-                Err(insufficient) => {
-                    return (
-                        build_open_order_err_response(
-                            request,
-                            ApiError::BalanceInsufficient(
-                                settlement.asset,
-                                format!(
-                                    "Available Balance: {}, Required Balance inc. fees: {}",
-                                    insufficient.free, insufficient.required
-                                ),
+        let balance_snapshot = match self.account.commit(&settlement.reserved(), time_exchange) {
+            Ok(balance_snapshot) => balance_snapshot,
+            Err(insufficient) => {
+                return (
+                    build_open_order_err_response(
+                        request,
+                        ApiError::BalanceInsufficient(
+                            settlement.asset,
+                            format!(
+                                "Available Balance: {}, Required Balance inc. fees: {}",
+                                insufficient.free, insufficient.required
                             ),
                         ),
-                        None,
-                    );
-                }
-            };
+                    ),
+                    None,
+                );
+            }
+        };
 
         // The order rests carrying whatever it has already done, so the book, the client and this
         // venue's own later arithmetic all read the same remainder off it.
@@ -1303,7 +1572,7 @@ impl SimulatedVenue {
             filled_quantity,
         );
 
-        self.account.orders_mut().insert(
+        let released = self.book_rested(
             Order {
                 key: request.key.clone(),
                 side: request.state.side,
@@ -1313,10 +1582,11 @@ impl SimulatedVenue {
                 time_in_force: request.state.time_in_force,
                 state: open.clone(),
             },
-            Some(Reservation {
+            Reservation {
                 asset: settlement.asset,
                 amount: settlement.amount,
-            }),
+            },
+            time_exchange,
         );
 
         let order_response = Order {
@@ -1332,7 +1602,9 @@ impl SimulatedVenue {
         (
             order_response,
             Some(OpenOrderNotifications::Rested {
-                balance: Snapshot(balance_snapshot),
+                // A displaced order's hold is given back after this order's own is taken, so the
+                // later restatement is the one that is true.
+                balance: Snapshot(released.unwrap_or(balance_snapshot)),
             }),
         )
     }
@@ -1510,7 +1782,18 @@ impl SimulatedVenue {
     fn order_id_sequence_fetch_add(&mut self) -> OrderId {
         let sequence = self.order_sequence;
         self.order_sequence += 1;
-        OrderId::new(sequence.to_smolstr())
+        OrderId(sequence.to_smolstr())
+    }
+
+    /// Mints the next `TradeId`, which no other trade from this venue instance carries.
+    ///
+    /// Not derived from the order's id: one order can print twice — filling in part on arrival and
+    /// again when its remainder is crossed — and two trades under one id would be indistinguishable
+    /// to anything reconciling them. See [`TradeId`] for what a consumer may assume of one.
+    fn trade_id_sequence_fetch_add(&mut self) -> TradeId {
+        let sequence = self.trade_sequence;
+        self.trade_sequence += 1;
+        TradeId(sequence.to_smolstr())
     }
 
     fn build_account_event<Kind>(&self, kind: Kind) -> UnindexedAccountEvent
@@ -1551,10 +1834,11 @@ fn crosses(side: Side, limit: Decimal, market: &MarketSnapshot) -> bool {
 /// on whether the order is marketable when it arrives, which is not known here -- see
 /// [`Disposition`].
 ///
-/// # Most of a time in force is moot for an order that fills on arrival
-/// A [`OrderKind::Market`] order fills in full the instant it arrives, which satisfies every time
-/// in force that governs *how long* an order works: there is no remainder to cancel, and no later
-/// instant at which it could still be working.
+/// # Most of a time in force is moot for an order that works only on arrival
+/// A [`OrderKind::Market`] order trades the instant it arrives and never afterwards, which
+/// satisfies every time in force that governs *how long* an order works: there is no later instant
+/// at which it could still be working, and a remainder the book could not fill has no limit price
+/// to wait at, so it is cancelled rather than kept.
 ///
 /// [`TimeInForce::AtOpen`] and [`TimeInForce::AtClose`] are not of that kind. They govern *when* an
 /// order executes, not how long it lasts, and honouring them needs a session calendar this venue
@@ -1622,13 +1906,12 @@ fn validate_time_in_force_supported(
 /// and `FillOrKill` all turn on whether the order is marketable when it arrives, and
 /// `GoodTillDate` turns on the clock.
 ///
-/// # Three ways to aggress, which this venue cannot yet tell apart
+/// # Three ways to aggress, which differ only over a remainder
 /// What an aggressing order's time in force really decides is the fate of the quantity the book
 /// could not fill: it rests, or it retires, or -- for [`TimeInForce::FillOrKill`] -- nothing trades
-/// at all. This venue caps no fill, so an order that is marketable is marketable in full and there
-/// is never a remainder for the three to disagree over; see [`SimulatedVenue`]'s
-/// `# What matching does not model`. They are distinguished here regardless, because which of them
-/// an order asked for is a property of the order rather than of what the book happened to hold.
+/// at all. Which of them an order asked for is a property of the order rather than of what the
+/// book happened to hold, so all three are decided here and the answer is handed to
+/// [`fill_on_arrival`](SimulatedVenue::fill_on_arrival) as a [`Remainder`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Disposition {
     /// Trade against the book now as the aggressor, resting whatever does not fill.
@@ -1658,15 +1941,13 @@ enum Disposition {
 /// carrying no limit price has nothing to wait at, so a market order aggresses and retires whatever
 /// is left of it, whichever time in force it carries.
 ///
-/// # Immediate-or-cancel and fill-or-kill coincide here, and only here
-/// This venue models no order size, so nothing can partially fill: an order is marketable in full
-/// or not at all ([`SimulatedVenue`]'s `# What matching does not model`). Both therefore reduce to
-/// "marketable ⇒ fill in full; not marketable ⇒ retire having traded nothing", which is why
-/// [`Disposition::FillAndCancel`] and [`Disposition::FillOrNothing`] name one observable behaviour
-/// between them today. They diverge once an order can fill in part, at which point fill-or-kill
-/// must refuse a partial fill that immediate-or-cancel accepts. Accepting both and saying why they
-/// agree is honest; refusing fill-or-kill would claim this venue cannot model something it models
-/// exactly as well as the sibling it does accept.
+/// # Immediate-or-cancel and fill-or-kill differ only when the book is too thin
+/// Both aggress on arrival and neither waits, so while the book can fill an order whole they are
+/// the same instruction. They part exactly where a fill is capped by the size on offer:
+/// [`Disposition::FillAndCancel`] takes what there is and retires the rest, while
+/// [`Disposition::FillOrNothing`] would rather trade nothing than trade in part, and so trades
+/// nothing. Which one an order gets is decided here; what they then do with the remainder is
+/// [`Remainder`]'s.
 fn disposition(
     order_kind: OrderKind,
     time_in_force: TimeInForce,
@@ -1705,6 +1986,33 @@ fn disposition(
     }
 }
 
+/// What becomes of the quantity an arriving order's book could not fill.
+///
+/// The half of a [`Disposition`] that [`fill_on_arrival`](SimulatedVenue::fill_on_arrival) needs,
+/// derived at the two call sites that can reach it. Carrying the limit price *here* rather than
+/// re-reading [`RequestOpen::price`](crate::order::request::RequestOpen::price) is what makes
+/// "rest what is left" unrepresentable for an order that has nowhere to rest it: a market order
+/// carries no price, so it cannot construct [`Rest`](Self::Rest) at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Remainder {
+    /// Joins the book at this limit and waits to be crossed.
+    Rest { limit: Decimal },
+    /// Retires as [`Cancelled`], carrying whatever did trade.
+    Cancel,
+    /// Nothing trades at all. An order that cannot be filled in full would rather be filled not at
+    /// all, so there is never a remainder for this arm to dispose of -- only a whole order to
+    /// retire untouched.
+    Kill,
+}
+
+impl Remainder {
+    /// Whether a remainder is refused rather than disposed of, which is what makes
+    /// [`TimeInForce::FillOrKill`] differ from [`TimeInForce::ImmediateOrCancel`].
+    fn is_kill(self) -> bool {
+        matches!(self, Self::Kill)
+    }
+}
+
 fn build_open_order_err_response<E>(
     request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
     error: E,
@@ -1725,13 +2033,21 @@ where
 
 /// What one open owes the client, before it is committed and packaged into events.
 ///
-/// Internal to [`SimulatedVenue::open_order`]: it exists only to keep the ordering contract -- ack
-/// the trade, then emit balance before trade -- visible in one short place rather than at the end
-/// of the pricing body.
+/// Internal to [`SimulatedVenue::open_order`]: it exists only to keep the ordering contract --
+/// emit the balance before the trade it paid for -- visible in one short place rather than at the
+/// end of the pricing body. Nothing here is uncommitted; it is what to *say*, not what to do.
 ///
 /// An enum rather than an optional trade because the two outcomes owe different things and a
 /// missing trade is not an absent field: a rested open has a balance and *no* trade, and nothing
 /// about it is incomplete.
+///
+/// # One arrival owes one balance
+/// Including the arrival that both settles a fill and holds against the remainder it leaves
+/// resting. Those are one event at the venue and one commitment in the ledger
+/// ([`AccountState::commit`]), so they restate the balance once — see that method for why an
+/// intermediate would report a balance the account never held.
+///
+/// [`AccountState::commit`]: crate::exchange::mock::account::AccountState::commit
 // `large_enum_variant`: boxing the `Trade` would trade one move of ~300 bytes for a heap
 // allocation on every fill, which is the wrong way round for a backtest that does millions of
 // them. The value is built once per order and destructured immediately, and the struct this
@@ -1761,6 +2077,16 @@ struct InstrumentTerms {
     cash_settled: bool,
 }
 
+/// How much of an arriving order traded, and at what price.
+///
+/// One value because the two are decided together and used together: the quantity is what the
+/// book had to give, and the price is what it gave it at.
+#[derive(Debug, Clone, Copy)]
+struct Fill {
+    quantity: Decimal,
+    price: Decimal,
+}
+
 /// What one order pays with, how much of it, and the fee inside that amount.
 #[derive(Debug, Clone)]
 struct Settlement {
@@ -1770,6 +2096,51 @@ struct Settlement {
     amount: Decimal,
     /// Always quote-denominated, whatever [`asset`](Self::asset) is.
     fees: AssetFees<AssetNameExchange>,
+}
+
+impl Settlement {
+    /// The whole of this settlement leaves the account, because the whole of it traded.
+    fn settled(&self) -> Debit {
+        Debit {
+            asset: self.asset.clone(),
+            settled: self.amount,
+            reserved: Decimal::ZERO,
+        }
+    }
+
+    /// The whole of this settlement is held, because the order it belongs to is still working.
+    fn reserved(&self) -> Debit {
+        Debit {
+            asset: self.asset.clone(),
+            settled: Decimal::ZERO,
+            reserved: self.amount,
+        }
+    }
+
+    /// This settlement traded and `remainder` is held against what is still working: one order
+    /// that the book filled in part and that rested the rest.
+    ///
+    /// # Panics
+    /// Debug-asserts that both settlements pay with the same asset. They come from one order, so
+    /// they share its side and its instrument, and [`SimulatedVenue::settlement`] decides the
+    /// asset from nothing else — a disagreement would mean one order paying with two assets.
+    fn settled_holding(&self, remainder: &Settlement) -> Debit {
+        debug_assert!(
+            self.asset == remainder.asset,
+            "one order settled {} of {} and reserved {} of {}: an order pays with one asset, so \
+             two settlements of it cannot name two",
+            self.amount,
+            self.asset,
+            remainder.amount,
+            remainder.asset
+        );
+
+        Debit {
+            asset: self.asset.clone(),
+            settled: self.amount,
+            reserved: remainder.amount,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1882,7 +2253,12 @@ mod tests {
 
         assert!(
             venue
-                .apply_market(&instrument_name(), book("49000", "49100"), time(1))
+                .apply_market(
+                    &instrument_name(),
+                    book("49000", "49100"),
+                    MarketDepth::UNKNOWN,
+                    time(1)
+                )
                 .is_empty(),
             "an empty book fills nothing"
         );
@@ -1991,10 +2367,6 @@ mod tests {
         let trades = venue.trades(before);
         assert_eq!(trades.len(), 1, "the venue must acknowledge its own trade");
         assert_eq!(trades[0].price, d("50000"));
-        assert_eq!(
-            trades[0].id.0, trades[0].order_id.0,
-            "TradeId derives from OrderId"
-        );
     }
 
     /// `advance_time` is the venue's only clock input, and it stamps everything produced after it.
@@ -2922,7 +3294,12 @@ mod tests {
         advance(&mut venue, time(2));
 
         // Straight through the limit: the offer is 100 better than the order asked for.
-        let events = venue.apply_market(&instrument_name(), book("47800", "47900"), time(2));
+        let events = venue.apply_market(
+            &instrument_name(),
+            book("47800", "47900"),
+            MarketDepth::UNKNOWN,
+            time(2),
+        );
 
         assert_eq!(
             events.len(),
@@ -2957,7 +3334,12 @@ mod tests {
         let (mut venue, _) = venue_resting_one_buy("48000");
         advance(&mut venue, time(2));
 
-        let events = venue.apply_market(&instrument_name(), book("47800", "47900"), time(2));
+        let events = venue.apply_market(
+            &instrument_name(),
+            book("47800", "47900"),
+            MarketDepth::UNKNOWN,
+            time(2),
+        );
 
         assert!(
             matches!(events[0].kind, AccountEventKind::BalanceSnapshot(_)),
@@ -2983,7 +3365,12 @@ mod tests {
         let (mut venue, _) = venue_resting_one_buy("48000");
         advance(&mut venue, time(2));
 
-        let events = venue.apply_market(&instrument_name(), book("47800", "47900"), time(2));
+        let events = venue.apply_market(
+            &instrument_name(),
+            book("47800", "47900"),
+            MarketDepth::UNKNOWN,
+            time(2),
+        );
 
         assert!(
             matches!(
@@ -3009,7 +3396,12 @@ mod tests {
         let reserved = d("48009.6");
         let free_while_resting = venue.balances(&[quote()]).remove(0).balance.free;
 
-        let events = venue.apply_market(&instrument_name(), book("47800", "47900"), time(2));
+        let events = venue.apply_market(
+            &instrument_name(),
+            book("47800", "47900"),
+            MarketDepth::UNKNOWN,
+            time(2),
+        );
 
         let balance = balance_of(&events[0]);
         assert_eq!(
@@ -3068,7 +3460,12 @@ mod tests {
         );
 
         advance(&mut venue, time(2));
-        let events = venue.apply_market(&instrument_name(), book("47800", "47900"), time(2));
+        let events = venue.apply_market(
+            &instrument_name(),
+            book("47800", "47900"),
+            MarketDepth::UNKNOWN,
+            time(2),
+        );
 
         assert_eq!(
             events.len(),
@@ -3115,7 +3512,12 @@ mod tests {
             .insert(seeded_part_filled("48000", "1", "0.4"), None);
 
         advance(&mut venue, time(2));
-        let events = venue.apply_market(&instrument_name(), book("47800", "47900"), time(2));
+        let events = venue.apply_market(
+            &instrument_name(),
+            book("47800", "47900"),
+            MarketDepth::UNKNOWN,
+            time(2),
+        );
 
         let filled = match &order_of(&events[2]).state {
             OrderState::Inactive(InactiveOrderState::FullyFilled(filled)) => filled,
@@ -3177,7 +3579,12 @@ mod tests {
         }
 
         advance(&mut venue, time(2));
-        let events = venue.apply_market(&instrument_name(), book("47800", "47900"), time(2));
+        let events = venue.apply_market(
+            &instrument_name(),
+            book("47800", "47900"),
+            MarketDepth::UNKNOWN,
+            time(2),
+        );
 
         assert_eq!(events.len(), 3);
         assert_eq!(
@@ -3259,7 +3666,12 @@ mod tests {
         advance(&mut venue, time(1));
         assert!(
             venue
-                .apply_market(&instrument_name(), book("47800", "47900"), time(1))
+                .apply_market(
+                    &instrument_name(),
+                    book("47800", "47900"),
+                    MarketDepth::UNKNOWN,
+                    time(1)
+                )
                 .is_empty()
         );
 
@@ -3311,7 +3723,7 @@ mod tests {
         };
         assert!(
             venue
-                .apply_market(&instrument_name(), stale, time(1))
+                .apply_market(&instrument_name(), stale, MarketDepth::UNKNOWN, time(1))
                 .is_empty()
         );
 
@@ -3341,7 +3753,12 @@ mod tests {
         advance(&mut aggressor, time(1));
         assert!(
             aggressor
-                .apply_market(&instrument_name(), touching(), time(1))
+                .apply_market(
+                    &instrument_name(),
+                    touching(),
+                    MarketDepth::UNKNOWN,
+                    time(1)
+                )
                 .is_empty()
         );
         let on_arrival = aggressor.open_order(limit_request("a", Side::Buy, "1", limit, gtc()));
@@ -3357,13 +3774,23 @@ mod tests {
         advance(&mut maker, time(1));
         assert!(
             maker
-                .apply_market(&instrument_name(), book("49000", "49100"), time(1))
+                .apply_market(
+                    &instrument_name(),
+                    book("49000", "49100"),
+                    MarketDepth::UNKNOWN,
+                    time(1)
+                )
                 .is_empty()
         );
         let rested = maker.open_order(limit_request("b", Side::Buy, "1", limit, gtc()));
         assert_eq!(rested.events.len(), 1, "it rested rather than filling");
         advance(&mut maker, time(2));
-        let resting_events = maker.apply_market(&instrument_name(), touching(), time(2));
+        let resting_events = maker.apply_market(
+            &instrument_name(),
+            touching(),
+            MarketDepth::UNKNOWN,
+            time(2),
+        );
         let resting_price = trade_of(&resting_events[1]).price;
 
         assert_eq!(
@@ -3386,7 +3813,12 @@ mod tests {
         advance(&mut venue, time(1));
         assert!(
             venue
-                .apply_market(&instrument_name(), book("49000", "49100"), time(1))
+                .apply_market(
+                    &instrument_name(),
+                    book("49000", "49100"),
+                    MarketDepth::UNKNOWN,
+                    time(1)
+                )
                 .is_empty()
         );
 
@@ -3398,7 +3830,12 @@ mod tests {
 
         advance(&mut venue, time(2));
         // Crosses `best` and `mid`, leaves `worst` alone.
-        let events = venue.apply_market(&instrument_name(), book("47900", "48000"), time(2));
+        let events = venue.apply_market(
+            &instrument_name(),
+            book("47900", "48000"),
+            MarketDepth::UNKNOWN,
+            time(2),
+        );
 
         let filled: Vec<_> = events
             .iter()
@@ -3432,7 +3869,12 @@ mod tests {
         advance(&mut venue, time(1));
         assert!(
             venue
-                .apply_market(&instrument_name(), traded("49000"), time(1))
+                .apply_market(
+                    &instrument_name(),
+                    traded("49000"),
+                    MarketDepth::UNKNOWN,
+                    time(1)
+                )
                 .is_empty()
         );
 
@@ -3440,7 +3882,12 @@ mod tests {
         assert_eq!(outcome.events.len(), 1, "49000 traded does not reach 48000");
 
         advance(&mut venue, time(2));
-        let events = venue.apply_market(&instrument_name(), traded("47500"), time(2));
+        let events = venue.apply_market(
+            &instrument_name(),
+            traded("47500"),
+            MarketDepth::UNKNOWN,
+            time(2),
+        );
 
         assert_eq!(events.len(), 3, "a print through the limit fills it");
         assert_eq!(trade_of(&events[1]).price, d("48000"));
@@ -3462,7 +3909,7 @@ mod tests {
 
         assert!(
             venue
-                .apply_market(&instrument_name(), inside, time(2))
+                .apply_market(&instrument_name(), inside, MarketDepth::UNKNOWN, time(2))
                 .is_empty(),
             "the offer is 48100, so a 48000 bid is not crossed however the trade price reads"
         );
@@ -3480,7 +3927,12 @@ mod tests {
         advance(&mut venue, time(1));
         assert!(
             venue
-                .apply_market(&instrument_name(), book("47000", "47100"), time(1))
+                .apply_market(
+                    &instrument_name(),
+                    book("47000", "47100"),
+                    MarketDepth::UNKNOWN,
+                    time(1)
+                )
                 .is_empty()
         );
 
@@ -3493,7 +3945,12 @@ mod tests {
         );
 
         advance(&mut venue, time(2));
-        let events = venue.apply_market(&instrument_name(), book("48100", "48200"), time(2));
+        let events = venue.apply_market(
+            &instrument_name(),
+            book("48100", "48200"),
+            MarketDepth::UNKNOWN,
+            time(2),
+        );
 
         assert_eq!(trade_of(&events[1]).price, d("48000"), "at its own limit");
         let balance = balance_of(&events[0]);
@@ -3512,7 +3969,12 @@ mod tests {
         advance(&mut venue, time(1));
         assert!(
             venue
-                .apply_market(&instrument_name(), book("49000", "49100"), time(1))
+                .apply_market(
+                    &instrument_name(),
+                    book("49000", "49100"),
+                    MarketDepth::UNKNOWN,
+                    time(1)
+                )
                 .is_empty()
         );
 
@@ -3527,7 +3989,12 @@ mod tests {
         );
 
         advance(&mut venue, time(2));
-        let events = venue.apply_market(&instrument_name(), book("47800", "47900"), time(2));
+        let events = venue.apply_market(
+            &instrument_name(),
+            book("47800", "47900"),
+            MarketDepth::UNKNOWN,
+            time(2),
+        );
 
         assert_eq!(
             balance_of(&events[0]).balance.total,
@@ -3544,7 +4011,12 @@ mod tests {
         advance(&mut venue, time(1));
         assert!(
             venue
-                .apply_market(&instrument_name(), book("49000", "49100"), time(1))
+                .apply_market(
+                    &instrument_name(),
+                    book("49000", "49100"),
+                    MarketDepth::UNKNOWN,
+                    time(1)
+                )
                 .is_empty()
         );
 
@@ -3612,7 +4084,12 @@ mod tests {
     fn a_cancel_that_loses_the_race_to_its_own_fill_reports_the_fill() {
         let (mut venue, _) = venue_resting_one_buy("48000");
         advance(&mut venue, time(2));
-        let events = venue.apply_market(&instrument_name(), book("47800", "47900"), time(2));
+        let events = venue.apply_market(
+            &instrument_name(),
+            book("47800", "47900"),
+            MarketDepth::UNKNOWN,
+            time(2),
+        );
         assert_eq!(events.len(), 3, "the order filled first");
 
         let outcome = venue.cancel_order(OrderEvent {
@@ -3705,7 +4182,12 @@ mod tests {
             advance(&mut venue, time(1));
             assert!(
                 venue
-                    .apply_market(&instrument_name(), book("49000", "49100"), time(1))
+                    .apply_market(
+                        &instrument_name(),
+                        book("49000", "49100"),
+                        MarketDepth::UNKNOWN,
+                        time(1)
+                    )
                     .is_empty()
             );
 
@@ -3809,7 +4291,12 @@ mod tests {
         advance(&mut venue, time(1));
         assert!(
             venue
-                .apply_market(&instrument_name(), book("49000", "49100"), time(1))
+                .apply_market(
+                    &instrument_name(),
+                    book("49000", "49100"),
+                    MarketDepth::UNKNOWN,
+                    time(1)
+                )
                 .is_empty()
         );
 
@@ -3841,7 +4328,12 @@ mod tests {
         advance(&mut venue, time(1));
         assert!(
             venue
-                .apply_market(&instrument_name(), book("49000", "49100"), time(1))
+                .apply_market(
+                    &instrument_name(),
+                    book("49000", "49100"),
+                    MarketDepth::UNKNOWN,
+                    time(1)
+                )
                 .is_empty()
         );
 
@@ -3874,7 +4366,12 @@ mod tests {
             advance(&mut venue, time(1));
             assert!(
                 venue
-                    .apply_market(&instrument_name(), book("49000", "49100"), time(1))
+                    .apply_market(
+                        &instrument_name(),
+                        book("49000", "49100"),
+                        MarketDepth::UNKNOWN,
+                        time(1)
+                    )
                     .is_empty()
             );
 
@@ -3908,7 +4405,12 @@ mod tests {
             advance(&mut venue, time(1));
             assert!(
                 venue
-                    .apply_market(&instrument_name(), traded("49000"), time(1))
+                    .apply_market(
+                        &instrument_name(),
+                        traded("49000"),
+                        MarketDepth::UNKNOWN,
+                        time(1)
+                    )
                     .is_empty()
             );
 
@@ -4030,7 +4532,12 @@ mod tests {
 
         // An ask of 47000 crosses a limit of 48000, so this tick would have filled the order — but
         // it also reaches the deadline.
-        let events = venue.apply_market(&instrument_name(), book("46900", "47000"), time(5));
+        let events = venue.apply_market(
+            &instrument_name(),
+            book("46900", "47000"),
+            MarketDepth::UNKNOWN,
+            time(5),
+        );
 
         assert_eq!(events.len(), 2, "a release and an expiry, not a fill");
         assert!(
@@ -4083,7 +4590,12 @@ mod tests {
         advance(&mut venue, time(9));
         assert!(
             venue
-                .apply_market(&instrument_name(), traded("47000"), time(9))
+                .apply_market(
+                    &instrument_name(),
+                    traded("47000"),
+                    MarketDepth::UNKNOWN,
+                    time(9)
+                )
                 .is_empty()
         );
 
@@ -4212,7 +4724,12 @@ mod tests {
 
         // A market for an instrument this venue holds no order on.
         let elsewhere = InstrumentNameExchange::new("eth_usdt");
-        let events = venue.apply_market(&elsewhere, book("2000", "2001"), time(6));
+        let events = venue.apply_market(
+            &elsewhere,
+            book("2000", "2001"),
+            MarketDepth::UNKNOWN,
+            time(6),
+        );
 
         assert_eq!(
             events.len(),
@@ -4270,7 +4787,12 @@ mod tests {
         advance(&mut venue, time(1));
         assert!(
             venue
-                .apply_market(&instrument_name(), traded("49000"), time(1))
+                .apply_market(
+                    &instrument_name(),
+                    traded("49000"),
+                    MarketDepth::UNKNOWN,
+                    time(1)
+                )
                 .is_empty()
         );
 
@@ -4324,5 +4846,394 @@ mod tests {
             ),
             ref other => panic!("an unpriceable market order must be rejected, got: {other:?}"),
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // A taker takes only what is on offer.
+    // ---------------------------------------------------------------------------------------
+
+    /// The same size on both sides, so a test need only say how much.
+    fn sized(amount: &str) -> MarketDepth {
+        MarketDepth::new(Some(d(amount)), Some(d(amount)))
+    }
+
+    /// A venue fed one book carrying `depth`, priced off that book rather than off a last trade.
+    ///
+    /// The offer is 47900 throughout, so a buy limited at 48000 is marketable and prints at 47900.
+    fn venue_offering(depth: MarketDepth) -> SimulatedVenue {
+        venue_offering_funded("1000000", depth)
+    }
+
+    fn venue_offering_funded(usdt: &str, depth: MarketDepth) -> SimulatedVenue {
+        let mut venue = make_market_venue_with(
+            "10",
+            usdt,
+            maker_taker_fee(),
+            SimFillConfig::BidAsk(BidAskFillModel),
+        );
+        advance(&mut venue, time(1));
+        assert!(
+            venue
+                .apply_market(&instrument_name(), book("47800", "47900"), depth, time(1))
+                .is_empty(),
+            "an empty book fills nothing"
+        );
+        venue
+    }
+
+    fn free_quote(venue: &SimulatedVenue) -> Decimal {
+        venue.balances(&[quote()])[0].balance.free
+    }
+
+    fn total_quote(venue: &SimulatedVenue) -> Decimal {
+        venue.balances(&[quote()])[0].balance.total
+    }
+
+    /// A market order has no limit price, so what the book could not fill has nowhere to wait.
+    #[test]
+    fn a_market_order_fills_what_the_book_has_and_cancels_what_it_has_not() {
+        let mut venue = venue_offering(sized("0.4"));
+
+        let outcome = venue.open_order(buy_request("1", None));
+
+        assert_eq!(outcome.events.len(), 2, "a fill owes balance, then trade");
+        let trade = trade_of(&outcome.events[1]);
+        assert_eq!(
+            trade.quantity,
+            d("0.4"),
+            "it took the whole offer and no more"
+        );
+        assert_eq!(trade.price, d("47900"));
+
+        match &outcome.response.state {
+            OrderState::Inactive(InactiveOrderState::Cancelled(cancelled)) => assert_eq!(
+                cancelled.filled_quantity,
+                d("0.4"),
+                "the remainder retires carrying what did trade"
+            ),
+            other => panic!("a market order's unfillable remainder is cancelled, got: {other:?}"),
+        }
+        assert!(
+            venue.orders_open(&[]).is_empty(),
+            "a market order has no price to rest the remainder at"
+        );
+    }
+
+    /// The condition under which the two coincided has expired, which is this test.
+    #[test]
+    fn fill_or_kill_refuses_the_partial_fill_immediate_or_cancel_accepts() {
+        // One book, one size, one order -- only the time in force differs.
+        let mut immediate = venue_offering(sized("0.4"));
+        let mut all_or_nothing = venue_offering(sized("0.4"));
+
+        let ioc = immediate.open_order(limit_request(
+            "ioc",
+            Side::Buy,
+            "1",
+            "48000",
+            TimeInForce::ImmediateOrCancel,
+        ));
+        let fok = all_or_nothing.open_order(limit_request(
+            "fok",
+            Side::Buy,
+            "1",
+            "48000",
+            TimeInForce::FillOrKill,
+        ));
+
+        assert_eq!(
+            trade_of(&ioc.events[1]).quantity,
+            d("0.4"),
+            "immediate-or-cancel keeps what the book could give it"
+        );
+
+        assert!(
+            fok.events.is_empty(),
+            "fill-or-kill would rather trade nothing than trade in part"
+        );
+        assert!(
+            all_or_nothing.trades(time(0)).is_empty(),
+            "and nothing reached the ledger either"
+        );
+        assert_eq!(
+            free_quote(&all_or_nothing),
+            d("1000000"),
+            "a killed order moves no balance"
+        );
+    }
+
+    /// One arrival, one balance -- whatever it did with the part the book could not fill.
+    #[test]
+    fn a_capped_limit_order_fills_what_it_can_and_rests_the_remainder() {
+        let mut venue = venue_offering(sized("0.4"));
+
+        let outcome = venue.open_order(limit_request("split", Side::Buy, "1", "48000", gtc()));
+
+        assert_eq!(
+            outcome.events.len(),
+            2,
+            "one arrival restates one balance and prints one trade, even settling and holding at \
+             once"
+        );
+        let trade = trade_of(&outcome.events[1]);
+        assert_eq!(trade.quantity, d("0.4"));
+        assert_eq!(
+            trade.price,
+            d("47900"),
+            "the part that traded took the offer"
+        );
+
+        let open = rested_open(&outcome);
+        assert_eq!(
+            open.filled_quantity,
+            d("0.4"),
+            "the remainder rests carrying what has already traded"
+        );
+        assert_eq!(open.quantity_remaining(d("1")), d("0.6"));
+        assert_eq!(venue.orders_open(&[]).len(), 1);
+
+        // Settled the taker leg, still holding the maker one: 19179.16 spent, 28805.76 held.
+        assert_eq!(total_quote(&venue), d("1000000") - d("19179.16"));
+        assert_eq!(
+            free_quote(&venue),
+            d("1000000") - d("19179.16") - d("28805.76")
+        );
+    }
+
+    /// An order that fills in part, rests, and is later crossed settles exactly the remainder --
+    /// twice in total, summing to the original, with no third restatement.
+    #[test]
+    fn an_order_filled_in_part_then_crossed_settles_the_remainder_and_no_more() {
+        let mut venue = venue_offering(sized("0.4"));
+
+        let arrival = venue.open_order(limit_request("split", Side::Buy, "1", "48000", gtc()));
+        let taker = trade_of(&arrival.events[1]).clone();
+
+        // The market reaches what is resting.
+        let fills = venue.apply_market(
+            &instrument_name(),
+            book("48000", "48000"),
+            MarketDepth::UNKNOWN,
+            time(2),
+        );
+        assert_eq!(fills.len(), 3, "a resting fill owes balance, trade, order");
+        let maker = trade_of(&fills[1]);
+
+        assert_eq!(maker.quantity, d("0.6"), "only the remainder crosses");
+        assert_eq!(
+            maker.price,
+            d("48000"),
+            "a maker is paid the price it quoted, not the one the book moved to"
+        );
+        assert_eq!(
+            taker.quantity + maker.quantity,
+            d("1"),
+            "the two fills are the whole order, and no more than it"
+        );
+
+        assert_ne!(
+            taker.id, maker.id,
+            "one order printing twice must print two distinguishable trades"
+        );
+        assert_eq!(
+            taker.order_id, maker.order_id,
+            "and both must still say which order they belong to"
+        );
+
+        // 0.4 taken at 47900 plus 10bp, then 0.6 quoted at 48000 plus 2bp. Nothing else moved.
+        let spent = d("19179.16") + d("28805.76");
+        assert_eq!(total_quote(&venue), d("1000000") - spent);
+        assert_eq!(
+            free_quote(&venue),
+            d("1000000") - spent,
+            "the order is done, so nothing is still held against it"
+        );
+    }
+
+    /// Reading a stored size does not consume it -- only filling against it does.
+    #[test]
+    fn a_second_order_on_one_observation_sees_only_what_the_first_left() {
+        let mut venue = venue_offering(sized("1"));
+
+        let first = venue.open_order(limit_request(
+            "first",
+            Side::Buy,
+            "0.6",
+            "48000",
+            TimeInForce::ImmediateOrCancel,
+        ));
+        assert_eq!(trade_of(&first.events[1]).quantity, d("0.6"));
+
+        let second = venue.open_order(limit_request(
+            "second",
+            Side::Buy,
+            "0.6",
+            "48000",
+            TimeInForce::ImmediateOrCancel,
+        ));
+        assert_eq!(
+            trade_of(&second.events[1]).quantity,
+            d("0.4"),
+            "the offer was displayed once, so the two of them share it"
+        );
+
+        let third = venue.open_order(limit_request(
+            "third",
+            Side::Buy,
+            "0.6",
+            "48000",
+            TimeInForce::ImmediateOrCancel,
+        ));
+        assert!(
+            third.events.is_empty(),
+            "the offer is exhausted until the next observation replaces it"
+        );
+    }
+
+    /// A new observation states what is on offer now; it is not an increment on what was.
+    #[test]
+    fn a_new_observation_replaces_the_remaining_size_rather_than_adding_to_it() {
+        let mut venue = venue_offering(sized("1"));
+
+        let taken = venue.open_order(limit_request(
+            "first",
+            Side::Buy,
+            "0.6",
+            "48000",
+            TimeInForce::ImmediateOrCancel,
+        ));
+        assert_eq!(trade_of(&taken.events[1]).quantity, d("0.6"));
+
+        assert!(
+            venue
+                .apply_market(
+                    &instrument_name(),
+                    book("47800", "47900"),
+                    sized("1"),
+                    time(2)
+                )
+                .is_empty()
+        );
+
+        let after = venue.open_order(limit_request(
+            "second",
+            Side::Buy,
+            "1",
+            "48000",
+            TimeInForce::ImmediateOrCancel,
+        ));
+        assert_eq!(
+            trade_of(&after.events[1]).quantity,
+            d("1"),
+            "the fresh observation offers a whole unit again"
+        );
+    }
+
+    /// No size information is not no size. A price-only feed must keep filling exactly as it did.
+    #[test]
+    fn a_feed_supplying_no_size_caps_nothing() {
+        let mut venue = venue_offering(MarketDepth::UNKNOWN);
+
+        let outcome = venue.open_order(limit_request(
+            "uncapped",
+            Side::Buy,
+            "5",
+            "48000",
+            TimeInForce::ImmediateOrCancel,
+        ));
+
+        assert_eq!(
+            trade_of(&outcome.events[1]).quantity,
+            d("5"),
+            "an absent size caps nothing, however large the order"
+        );
+    }
+
+    /// A reported *absence* of size is the other thing, and it does stop a fill.
+    #[test]
+    fn a_marketable_order_with_nothing_on_offer_rests_rather_than_filling() {
+        let mut venue = venue_offering(MarketDepth::new(Some(d("1")), Some(Decimal::ZERO)));
+
+        let outcome = venue.open_order(limit_request("nothing", Side::Buy, "1", "48000", gtc()));
+
+        assert_eq!(
+            outcome.events.len(),
+            1,
+            "nothing traded, so it owes only the hold it took"
+        );
+        assert_eq!(rested_open(&outcome).filled_quantity, Decimal::ZERO);
+    }
+
+    /// A capped order costs **more** than the same order filling outright: its remainder is held at
+    /// the order's own limit while the fill struck a better price. So an account can afford the
+    /// whole order and still not afford the split -- and it is refused whole rather than filled for
+    /// the part it could pay for, which would be this venue choosing a disposition nobody asked for.
+    #[test]
+    fn an_order_that_cannot_fund_both_legs_is_refused_with_nothing_moved() {
+        // 47947.90 buys the whole of it at the offer; the split wants 47984.92.
+        const FUNDED: &str = "47950";
+
+        let mut uncapped = venue_offering_funded(FUNDED, MarketDepth::UNKNOWN);
+        let affordable =
+            uncapped.open_order(limit_request("whole", Side::Buy, "1", "48000", gtc()));
+        assert_eq!(
+            trade_of(&affordable.events[1]).quantity,
+            d("1"),
+            "uncapped, this very order is affordable and fills outright"
+        );
+
+        let mut venue = venue_offering_funded(FUNDED, sized("0.4"));
+        let outcome = venue.open_order(limit_request("split", Side::Buy, "1", "48000", gtc()));
+
+        assert!(outcome.events.is_empty(), "a refused order moves nothing");
+        assert!(
+            matches!(
+                outcome.response.state,
+                OrderState::Inactive(InactiveOrderState::OpenFailed(_))
+            ),
+            "and says so, rather than filling the part it could afford: {:?}",
+            outcome.response.state
+        );
+        assert_eq!(free_quote(&venue), d(FUNDED), "the ledger is as it was");
+        assert_eq!(total_quote(&venue), d(FUNDED));
+        assert!(venue.trades(time(0)).is_empty(), "and nothing traded");
+        assert!(venue.orders_open(&[]).is_empty());
+    }
+
+    /// Re-opening a resting `ClientOrderId` replaces the order under it, and what was held against
+    /// the one displaced is given back rather than left held against nothing.
+    #[test]
+    fn replacing_a_resting_order_releases_what_was_held_against_it() {
+        let (mut venue, first) = venue_resting_one_buy("48000");
+        assert_eq!(
+            free_quote(&venue),
+            d("1000000") - d("48009.6"),
+            "the first order holds its whole notional plus the maker fee"
+        );
+
+        // Same cid, half the size.
+        let second = venue.open_order(limit_request("resting", Side::Buy, "0.5", "48000", gtc()));
+
+        assert_eq!(
+            venue.orders_open(&[]).len(),
+            1,
+            "one cid, one resting order"
+        );
+        assert_eq!(
+            free_quote(&venue),
+            d("1000000") - d("24004.8"),
+            "only the replacement's own reservation is still held"
+        );
+        assert_eq!(
+            balance_of(&second.events[0]).balance.free,
+            free_quote(&venue),
+            "and the balance it restated is the one that is true afterwards"
+        );
+        assert_eq!(
+            total_quote(&venue),
+            d("1000000"),
+            "nothing settled: a replaced order traded nothing"
+        );
+        drop(first);
     }
 }

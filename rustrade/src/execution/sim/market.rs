@@ -4,8 +4,9 @@ use crate::engine::{
     Processor,
     state::instrument::data::{DefaultInstrumentMarketData, InstrumentDataState},
 };
+use rust_decimal::Decimal;
 use rustrade_data::event::{DataKind, MarketEvent};
-use rustrade_execution::market::MarketSnapshot;
+use rustrade_execution::market::{MarketDepth, MarketSnapshot};
 use rustrade_instrument::instrument::InstrumentIndex;
 use std::fmt::Debug;
 
@@ -44,6 +45,22 @@ pub trait VenueMarketUpdate: Sized {
 
     /// The venue-visible market implied by everything folded into `state` so far.
     fn snapshot(state: &Self::State) -> MarketSnapshot;
+
+    /// How much is on offer at each side of [`snapshot`](Self::snapshot), where the feed says.
+    ///
+    /// This is what bounds a taker fill at a simulated venue. Returning a size for a side makes
+    /// an arriving order fill at most that much of itself there; returning `None` leaves it
+    /// uncapped.
+    ///
+    /// # Default body
+    ///
+    /// [`MarketDepth::UNKNOWN`] — no size information, which caps nothing. That is the honest
+    /// answer for a state tracking prices alone, and it keeps a price-only feed filling exactly
+    /// as it did before sizes existed. See [`MarketDepth`] for why absent size means unlimited
+    /// rather than unfillable.
+    fn depth(_state: &Self::State) -> MarketDepth {
+        MarketDepth::UNKNOWN
+    }
 }
 
 impl VenueMarketUpdate for DataKind {
@@ -58,5 +75,112 @@ impl VenueMarketUpdate for DataKind {
 
     fn snapshot(state: &Self::State) -> MarketSnapshot {
         InstrumentDataState::market_snapshot(state)
+    }
+
+    /// The best levels' own sizes, read off the same [`OrderBookL1`] whose prices
+    /// [`snapshot`](Self::snapshot) reports — so the size and the price a fill is capped and
+    /// struck at come from one observation rather than two.
+    ///
+    /// # A zero amount is no size *information*, not an empty book
+    ///
+    /// A level carrying a price and a zero amount is what a feed that publishes no sizes looks
+    /// like — a bulk export, an FX quote tape — and it is reported on every row rather than on a
+    /// degenerate one. `DefaultInstrumentMarketData` already reads it that way when it prices the
+    /// book, falling back from the volume-weighted mid to the plain mid. Reading it as "nothing is
+    /// on offer" here would stop such a feed filling anything at all, so it maps to `None` and
+    /// caps nothing.
+    ///
+    /// An instrument with no book — a trades-only or candle feed — holds the default
+    /// [`OrderBookL1`], whose levels are absent, and so reports [`MarketDepth::UNKNOWN`] by the
+    /// same route.
+    ///
+    /// [`OrderBookL1`]: rustrade_data::subscription::book::OrderBookL1
+    fn depth(state: &Self::State) -> MarketDepth {
+        fn sized(level: Option<rustrade_data::books::Level>) -> Option<Decimal> {
+            level
+                .map(|level| level.amount)
+                .filter(|amount| !amount.is_zero())
+        }
+
+        MarketDepth::new(sized(state.l1.best_bid), sized(state.l1.best_ask))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
+mod tests {
+    use super::*;
+    use chrono::{DateTime, Utc};
+    use rust_decimal_macros::dec;
+    use rustrade_data::{books::Level, subscription::book::OrderBookL1};
+
+    fn book(bid: Option<Level>, ask: Option<Level>) -> DefaultInstrumentMarketData {
+        DefaultInstrumentMarketData {
+            l1: OrderBookL1 {
+                last_update_time: DateTime::<Utc>::MIN_UTC,
+                best_bid: bid,
+                best_ask: ask,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn depth_reads_the_sizes_off_the_same_book_the_snapshot_prices_from() {
+        let state = book(
+            Some(Level::new(dec!(99), dec!(4))),
+            Some(Level::new(dec!(101), dec!(7))),
+        );
+
+        assert_eq!(
+            <DataKind as VenueMarketUpdate>::depth(&state),
+            MarketDepth::new(Some(dec!(4)), Some(dec!(7)))
+        );
+        assert_eq!(
+            <DataKind as VenueMarketUpdate>::snapshot(&state).best_ask,
+            Some(dec!(101))
+        );
+    }
+
+    #[test]
+    fn a_feed_publishing_prices_without_sizes_reports_no_size_rather_than_no_liquidity() {
+        // A bulk export or an FX quote tape: every row priced, every amount zero. Reading that as
+        // an empty book would stop such a feed filling anything at all.
+        let state = book(
+            Some(Level::new(dec!(99), Decimal::ZERO)),
+            Some(Level::new(dec!(101), Decimal::ZERO)),
+        );
+
+        assert_eq!(
+            <DataKind as VenueMarketUpdate>::depth(&state),
+            MarketDepth::UNKNOWN
+        );
+        assert!(
+            <DataKind as VenueMarketUpdate>::snapshot(&state)
+                .best_bid
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn one_sided_size_information_caps_only_the_side_that_has_it() {
+        let state = book(
+            Some(Level::new(dec!(99), Decimal::ZERO)),
+            Some(Level::new(dec!(101), dec!(7))),
+        );
+
+        assert_eq!(
+            <DataKind as VenueMarketUpdate>::depth(&state),
+            MarketDepth::new(None, Some(dec!(7)))
+        );
+    }
+
+    #[test]
+    fn an_instrument_with_no_book_reports_no_size() {
+        // What a trades-only or candle feed holds: the default book, whose levels are absent.
+        assert_eq!(
+            <DataKind as VenueMarketUpdate>::depth(&DefaultInstrumentMarketData::default()),
+            MarketDepth::UNKNOWN
+        );
     }
 }

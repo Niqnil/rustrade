@@ -32,6 +32,7 @@ use std::{
     io::{BufRead, BufReader},
 };
 
+use rust_decimal::Decimal;
 use rustrade::{
     engine::{
         Processor,
@@ -132,6 +133,95 @@ fn venue_market_update_agrees_with_the_engines_instrument_state() {
         engine_states.len(),
         3,
         "the fixture covers three instruments"
+    );
+}
+
+/// The size a venue caps a taker by is the size on the very book the snapshot priced from.
+///
+/// [`VenueMarketUpdate::depth`] and [`VenueMarketUpdate::snapshot`] must read one observation, not
+/// two: a fill struck at a price from one book and capped by a size from another is a fill that
+/// never existed. They agree by construction today — both project the same held [`OrderBookL1`] —
+/// and this pins that, because the cheapest way to break it is to start tracking sizes separately.
+///
+/// # Why this needs the real fixture
+///
+/// `sim_venue_stability_summary.txt` cannot catch a regression here. Its 40 orders buy `0.001`,
+/// and at the instants they arrive the book is always deeper than that, so the cap never binds and
+/// the golden artifact is identical whether depth reaches the venue correctly, arrives as garbage,
+/// or never arrives at all. Depth that silently stopped flowing would look exactly like depth that
+/// flowed and never bit.
+///
+/// So this asserts the two things that artifact cannot: that the sizes are really there, and that
+/// a taker large enough would really be capped by them.
+#[test]
+fn venue_depth_is_the_size_on_the_book_the_venue_priced_from() {
+    let events = market_data();
+
+    let mut states: Vec<(InstrumentIndex, <DataKind as VenueMarketUpdate>::State)> = Vec::new();
+    let mut sized = 0_usize;
+    let mut thinner_than_a_tenth = 0_usize;
+
+    for (index, event) in events.iter().enumerate() {
+        let MarketStreamEvent::Item(event) = event else {
+            continue;
+        };
+
+        let state = match states.iter_mut().find(|(key, _)| *key == event.instrument) {
+            Some((_, state)) => state,
+            None => {
+                states.push((event.instrument, Default::default()));
+                &mut states.last_mut().expect("just pushed").1
+            }
+        };
+        <DataKind as VenueMarketUpdate>::apply(state, event);
+
+        let depth = <DataKind as VenueMarketUpdate>::depth(state);
+        let snapshot = <DataKind as VenueMarketUpdate>::snapshot(state);
+
+        // One observation, read twice: the price and the size must come off the same level.
+        assert_eq!(
+            depth.best_ask,
+            state
+                .l1
+                .best_ask
+                .map(|level| level.amount)
+                .filter(|amount| !amount.is_zero()),
+            "the venue's ask size diverged from the book it prices from at event {index}"
+        );
+        assert_eq!(
+            depth.best_bid,
+            state
+                .l1
+                .best_bid
+                .map(|level| level.amount)
+                .filter(|amount| !amount.is_zero()),
+            "the venue's bid size diverged from the book it prices from at event {index}"
+        );
+        assert_eq!(
+            depth.best_ask.is_some(),
+            snapshot.best_ask.is_some(),
+            "a priced level and a sized level are the same level at event {index}"
+        );
+
+        if let Some(ask) = depth.best_ask {
+            sized += 1;
+            // A tenth of a Bitcoin is a size a real taker sends, and this capture is thin enough
+            // to refuse it outright often enough to matter.
+            if ask < Decimal::new(1, 1) && event.instrument == InstrumentIndex(0) {
+                thinner_than_a_tenth += 1;
+            }
+        }
+    }
+
+    assert!(
+        sized > 30_000,
+        "this fixture is mostly L1 and every row of it carries sizes, got {sized} sized \
+         observations"
+    );
+    assert!(
+        thinner_than_a_tenth > 0,
+        "the cap must be reachable on committed data, or nothing in this repo exercises it \
+         end to end"
     );
 }
 
