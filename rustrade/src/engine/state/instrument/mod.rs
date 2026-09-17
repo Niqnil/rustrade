@@ -1036,6 +1036,29 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// subsequent fills routed to that ID will update the wrong-direction
     /// position. Strategies running in Hedging mode must close existing
     /// positions explicitly rather than rely on flip semantics.
+    ///
+    /// # Unroutable fills in Hedging mode
+    ///
+    /// A fill whose `PositionId` cannot be resolved opens a position keyed by its raw exchange
+    /// `OrderId`. That **splits the order's PnL across two position slots** — the fill starts a
+    /// second position rather than joining the one its own order opened — and no later event
+    /// rejoins them.
+    ///
+    /// The fallback is load-bearing and is not going away: the corporate-action split path
+    /// deliberately drops a resting order's `PositionId` mapping (retaining it would let a late
+    /// fill reopen a floored-out position), so this state is reachable by design and not only by
+    /// defect. What the caller is owed is that it be visible, so each occurrence increments a
+    /// counter on the [`TearSheetGenerator`] rather than only emitting a `warn!`:
+    ///
+    /// - [`TearSheet::fills_routed_by_fallback`](crate::statistic::summary::instrument::TearSheet::fills_routed_by_fallback)
+    ///   — an order was found, but nothing said where its fills belong. This is the split.
+    /// - [`TearSheet::fills_unmatched`](crate::statistic::summary::instrument::TearSheet::fills_unmatched)
+    ///   — no order matched at all, so the fill is external or was reconciled away. One position
+    ///   per external order is a defensible reading rather than a split.
+    ///
+    /// Both are `0` in `OmsMode::Netting`, where every fill keys to a single slot and no routing
+    /// failure is possible. A consumer that reconciles positions should treat the first as an
+    /// error signal and the second as expected only if it knows the account is traded elsewhere.
     pub fn update_from_trade(
         &mut self,
         trade: &Trade<AssetKey, InstrumentKey>,
@@ -1103,6 +1126,13 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                                 "Hedging fill: order found but no position_id mapping — \
                                  using raw OrderId as position key"
                             );
+                            // Counted, not just logged: this splits the order's PnL across two
+                            // position slots, and a log line is not something a consumer can
+                            // reconcile against after the fact.
+                            self.tear_sheet.record_fill_routed_by_fallback(format!(
+                                "no PositionId mapping for order {}",
+                                trade.order_id
+                            ));
                             pos_id
                         }
                         None => {
@@ -1139,6 +1169,13 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                                  position under raw order ID. Occurs for externally-placed \
                                  orders or orders removed by snapshot reconciliation."
                             );
+                            // Counted separately from the case above: the cause is a fill this
+                            // engine has no order for, not a mapping it lost, and one position per
+                            // external order is a defensible outcome rather than a split.
+                            self.tear_sheet.record_fill_unmatched(format!(
+                                "no order matched {}",
+                                trade.order_id
+                            ));
                             pos_id
                         }
                     }
@@ -1673,6 +1710,141 @@ mod tests {
             open_position_ids(&state),
             vec![position_id],
             "the replayed fill lands in the strategy's position, not under the raw OrderId"
+        );
+    }
+
+    // --- The fallback is counted, not only logged ----------------------------------------------
+
+    #[test]
+    fn a_fill_whose_order_lost_its_mapping_is_counted_as_a_fallback_routing() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let cid = ClientOrderId::new("cid-1");
+        let exchange_id = OrderId::new("oid-1");
+
+        rest_order_at_exchange(
+            &mut state,
+            &cid,
+            &exchange_id,
+            Some(&PositionId::new("strategy-chosen")),
+        );
+        state.position_ids.remove(&cid);
+
+        state.update_from_trade(&fill(exchange_id, Side::Buy, dec!(4)));
+
+        assert_eq!(
+            state.tear_sheet.fills_routed_by_fallback, 1,
+            "a split position must be countable, not just greppable in the logs"
+        );
+        assert_eq!(
+            state.tear_sheet.fills_unmatched, 0,
+            "an order WAS found, so this is not the unmatched case"
+        );
+        assert_eq!(
+            state.tear_sheet.first_fallback_detail.as_deref(),
+            Some("no PositionId mapping for order oid-1"),
+            "the first occurrence names the cause and the order it happened to"
+        );
+    }
+
+    #[test]
+    fn a_fill_for_an_untracked_order_is_counted_as_unmatched() {
+        let mut state = instrument_state(OmsMode::Hedging);
+
+        state.update_from_trade(&fill(OrderId::new("oid-external"), Side::Buy, dec!(4)));
+
+        assert_eq!(state.tear_sheet.fills_unmatched, 1);
+        assert_eq!(
+            state.tear_sheet.fills_routed_by_fallback, 0,
+            "no order was found, so this is not the lost-mapping case"
+        );
+        assert_eq!(
+            state.tear_sheet.first_fallback_detail.as_deref(),
+            Some("no order matched oid-external")
+        );
+    }
+
+    #[test]
+    fn a_routable_fill_counts_against_neither_cause() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let cid = ClientOrderId::new("cid-1");
+        let exchange_id = OrderId::new("oid-1");
+
+        rest_order_at_exchange(
+            &mut state,
+            &cid,
+            &exchange_id,
+            Some(&PositionId::new("strategy-chosen")),
+        );
+
+        state.update_from_trade(&fill(exchange_id, Side::Buy, dec!(4)));
+
+        assert_eq!(state.tear_sheet.fills_routed_by_fallback, 0);
+        assert_eq!(state.tear_sheet.fills_unmatched, 0);
+        assert_eq!(
+            state.tear_sheet.first_fallback_detail, None,
+            "a clean session must leave the diagnostic empty, or it means nothing"
+        );
+    }
+
+    #[test]
+    fn the_first_fallback_detail_survives_a_later_failure_of_the_other_cause() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let cid = ClientOrderId::new("cid-1");
+        let exchange_id = OrderId::new("oid-1");
+
+        rest_order_at_exchange(
+            &mut state,
+            &cid,
+            &exchange_id,
+            Some(&PositionId::new("strategy-chosen")),
+        );
+        state.position_ids.remove(&cid);
+        state.update_from_trade(&fill(exchange_id, Side::Buy, dec!(4)));
+
+        // A different cause, later. The detail is shared between both counters, so this pins that
+        // it is genuinely first-wins rather than last-wins.
+        state.update_from_trade(&fill(OrderId::new("oid-external"), Side::Buy, dec!(4)));
+
+        assert_eq!(state.tear_sheet.fills_routed_by_fallback, 1);
+        assert_eq!(state.tear_sheet.fills_unmatched, 1);
+        assert_eq!(
+            state.tear_sheet.first_fallback_detail.as_deref(),
+            Some("no PositionId mapping for order oid-1"),
+            "the earliest cause is the one that identifies the session's problem"
+        );
+    }
+
+    #[test]
+    fn netting_mode_counts_no_fallback_routing_for_an_untracked_order() {
+        let mut state = instrument_state(OmsMode::Netting);
+
+        state.update_from_trade(&fill(OrderId::new("oid-external"), Side::Buy, dec!(4)));
+
+        assert_eq!(
+            (
+                state.tear_sheet.fills_routed_by_fallback,
+                state.tear_sheet.fills_unmatched
+            ),
+            (0, 0),
+            "Netting resolves every fill to one slot, so neither counter can move"
+        );
+    }
+
+    #[test]
+    fn the_fallback_counters_reach_the_generated_tear_sheet() {
+        use crate::statistic::time::Daily;
+
+        let mut state = instrument_state(OmsMode::Hedging);
+        state.update_from_trade(&fill(OrderId::new("oid-external"), Side::Buy, dec!(4)));
+
+        // A counter the summary never carries is a counter nobody can read.
+        let sheet = state.tear_sheet.generate(Decimal::ZERO, Daily);
+
+        assert_eq!(sheet.fills_unmatched, 1);
+        assert_eq!(sheet.fills_routed_by_fallback, 0);
+        assert_eq!(
+            sheet.first_fallback_detail.as_deref(),
+            Some("no order matched oid-external")
         );
     }
 

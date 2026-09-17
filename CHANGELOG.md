@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **An unroutable Hedging fill is now counted, not only logged** (`rustrade`). In
+  `OmsMode::Hedging`, a fill whose `PositionId` cannot be resolved opens a position keyed by its raw
+  exchange `OrderId`, splitting that order's PnL across two position slots. Until now the only trace
+  was a `warn!`, so nothing downstream could tell a split session from a clean one.
+
+  `TearSheet` and `TearSheetGenerator` gain three fields, all `#[serde(default)]` so sheets
+  serialised before they existed still load:
+  - `fills_routed_by_fallback` — an order was found, but nothing said where its fills belong. This
+    is the split, and a non-zero value means every per-position statistic on the sheet is computed
+    over a partition the strategy never chose.
+  - `fills_unmatched` — no order matched at all, so the fill is external or was removed by snapshot
+    reconciliation. Counted apart because one position per external order is a defensible reading
+    rather than a split; an account traded from elsewhere should expect this to be non-zero.
+  - `first_fallback_detail` — why the first fill of either kind could not be routed, so diagnosing a
+    split position does not require re-running with logging enabled.
+
+  Both counters stay `0` in `OmsMode::Netting`, where a single position key makes the failure
+  unreachable. Routing behaviour is unchanged: the fallback is load-bearing, not a defect to remove —
+  the corporate-action split path deliberately drops a resting order's `PositionId` mapping, because
+  retaining it would let a late fill reopen a floored-out position. The contract is now stated on
+  `InstrumentState::update_from_trade`.
+
 - **`SimulatedVenue` caps a taker fill by the size on offer, so an order can fill in part**
   (`rustrade-execution`). An arriving order that aggresses now trades at most what the book says is
   available on the far side, and draws that size down as it takes it — so two orders arriving

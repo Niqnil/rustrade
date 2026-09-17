@@ -30,6 +30,9 @@ TradingSummary {
             orders_opened: 14,
             orders_rejected: 0,
             first_rejection_reason: None,
+            fills_routed_by_fallback: 0,
+            fills_unmatched: 0,
+            first_fallback_detail: None,
         },
         InstrumentNameInternal(
             "binance_spot-ethusdt",
@@ -59,6 +62,9 @@ TradingSummary {
             orders_opened: 13,
             orders_rejected: 0,
             first_rejection_reason: None,
+            fills_routed_by_fallback: 0,
+            fills_unmatched: 0,
+            first_fallback_detail: None,
         },
         InstrumentNameInternal(
             "binance_spot-solusdt",
@@ -88,6 +94,9 @@ TradingSummary {
             orders_opened: 13,
             orders_rejected: 0,
             first_rejection_reason: None,
+            fills_routed_by_fallback: 0,
+            fills_unmatched: 0,
+            first_fallback_detail: None,
         },
     },
     assets: {

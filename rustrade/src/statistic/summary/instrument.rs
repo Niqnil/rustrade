@@ -56,6 +56,40 @@ pub struct TearSheet<Interval> {
     /// Kept so diagnosing an empty session does not require re-running with logging enabled.
     #[serde(default)]
     pub first_rejection_reason: Option<String>,
+
+    /// Fills that reached a position slot keyed by their raw exchange `OrderId` because the order
+    /// they belong to carried no `PositionId` mapping — `OmsMode::Hedging` only.
+    ///
+    /// Each one **splits that order's PnL across two position slots**: the fill opens a second
+    /// position instead of joining the one its own order opened. Every statistic above is computed
+    /// per position, so a non-zero count here means they are computed over a partition of the
+    /// instrument's activity that the strategy never chose. Treat any non-zero value as a
+    /// reconciliation signal, not a warning.
+    ///
+    /// Reachable by design as well as by defect: the corporate-action split path deliberately drops
+    /// these mappings while leaving the order resting, so a late fill on a split instrument lands
+    /// here.
+    #[serde(default)]
+    pub fills_routed_by_fallback: usize,
+
+    /// Fills for which no order was tracked at all, also keyed by raw exchange `OrderId` —
+    /// `OmsMode::Hedging` only.
+    ///
+    /// Counted apart from [`Self::fills_routed_by_fallback`] because the cause is different and so
+    /// is the remedy. These are orders this engine never submitted, or that snapshot reconciliation
+    /// removed; one position per external order is a defensible reading rather than a split of
+    /// something that should have been whole. A consumer trading the same account from elsewhere
+    /// should expect this to be non-zero.
+    #[serde(default)]
+    pub fills_unmatched: usize,
+
+    /// Why the first fill of either kind above could not be routed.
+    ///
+    /// Shared by both counters, for the same reason [`Self::first_rejection_reason`] exists: the
+    /// first occurrence is what identifies the cause, and keeping it means diagnosing a split
+    /// position does not require re-running with logging enabled.
+    #[serde(default)]
+    pub first_fallback_detail: Option<String>,
 }
 
 /// Generator for a [`TearSheet`].
@@ -83,6 +117,20 @@ pub struct TearSheetGenerator {
     /// First rejection reason seen. See [`TearSheet::first_rejection_reason`].
     #[serde(default)]
     pub first_rejection_reason: Option<String>,
+
+    /// Fills routed by the raw-`OrderId` fallback despite a known order.
+    /// See [`TearSheet::fills_routed_by_fallback`].
+    #[serde(default)]
+    pub fills_routed_by_fallback: usize,
+
+    /// Fills routed by the raw-`OrderId` fallback with no order tracked at all.
+    /// See [`TearSheet::fills_unmatched`].
+    #[serde(default)]
+    pub fills_unmatched: usize,
+
+    /// First unroutable-fill detail seen. See [`TearSheet::first_fallback_detail`].
+    #[serde(default)]
+    pub first_fallback_detail: Option<String>,
 }
 
 impl TearSheetGenerator {
@@ -98,6 +146,9 @@ impl TearSheetGenerator {
             orders_opened: 0,
             orders_rejected: 0,
             first_rejection_reason: None,
+            fills_routed_by_fallback: 0,
+            fills_unmatched: 0,
+            first_fallback_detail: None,
         }
     }
 
@@ -111,6 +162,27 @@ impl TearSheetGenerator {
         self.orders_rejected = self.orders_rejected.saturating_add(1);
         if self.first_rejection_reason.is_none() {
             self.first_rejection_reason = Some(reason.into());
+        }
+    }
+
+    /// Record a fill that opened a position under its raw exchange `OrderId` because the order it
+    /// belongs to had no `PositionId` mapping. See [`TearSheet::fills_routed_by_fallback`].
+    pub fn record_fill_routed_by_fallback(&mut self, detail: impl Into<String>) {
+        self.fills_routed_by_fallback = self.fills_routed_by_fallback.saturating_add(1);
+        self.record_first_fallback_detail(detail);
+    }
+
+    /// Record a fill that opened a position under its raw exchange `OrderId` because no order
+    /// matched it at all. See [`TearSheet::fills_unmatched`].
+    pub fn record_fill_unmatched(&mut self, detail: impl Into<String>) {
+        self.fills_unmatched = self.fills_unmatched.saturating_add(1);
+        self.record_first_fallback_detail(detail);
+    }
+
+    /// Keep the first unroutable-fill detail, whichever counter saw it.
+    fn record_first_fallback_detail(&mut self, detail: impl Into<String>) {
+        if self.first_fallback_detail.is_none() {
+            self.first_fallback_detail = Some(detail.into());
         }
     }
 
@@ -208,6 +280,9 @@ impl TearSheetGenerator {
             orders_opened: self.orders_opened,
             orders_rejected: self.orders_rejected,
             first_rejection_reason: self.first_rejection_reason.clone(),
+            fills_routed_by_fallback: self.fills_routed_by_fallback,
+            fills_unmatched: self.fills_unmatched,
+            first_fallback_detail: self.first_fallback_detail.clone(),
         }
     }
 
