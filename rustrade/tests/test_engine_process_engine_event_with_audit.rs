@@ -3685,18 +3685,22 @@ fn test_contract_expiry_short_call_otm() {
 // T3: Hedging mode fill routing
 // ---------------------------------------------------------------------------
 
-type HedgingTestEngine = Engine<
-    HistoricalClock,
-    EngineState<DefaultGlobalData, DefaultInstrumentMarketData>,
-    MultiExchangeTxMap<UnboundedTx<ExecutionRequest>>,
-    TestBuyAndHoldStrategy,
-    DefaultRiskManager<EngineState<DefaultGlobalData, DefaultInstrumentMarketData>>,
->;
-
 fn build_hedging_option_engine(
     trading_state: TradingState,
     execution_tx: UnboundedTx<ExecutionRequest>,
-) -> HedgingTestEngine {
+) -> TestEngine {
+    build_option_spot_engine_with_oms(trading_state, execution_tx, OmsMode::Hedging)
+}
+
+/// Sibling of [`build_hedging_option_engine`] that leaves the `OmsMode` to the caller, so a
+/// behaviour pinned in `Hedging` can be contrasted against `Netting` on an otherwise identical
+/// engine. Named for its instrument set — one option at index 0, one spot at index 1 — since
+/// [`build_option_engine_with_oms`] already belongs to the three-instrument fixture above.
+fn build_option_spot_engine_with_oms(
+    trading_state: TradingState,
+    execution_tx: UnboundedTx<ExecutionRequest>,
+    oms_mode: OmsMode,
+) -> TestEngine {
     let expiry = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
         .unwrap()
         .with_timezone(&Utc);
@@ -3733,7 +3737,7 @@ fn build_hedging_option_engine(
     })
     .time_engine_start(STARTING_TIMESTAMP)
     .trading_state(trading_state)
-    .oms_mode(OmsMode::Hedging)
+    .oms_mode(oms_mode)
     .balances([(ExchangeId::BinanceSpot, "usd", STARTING_BALANCE_USDT)])
     .build();
 
@@ -3748,7 +3752,7 @@ fn build_hedging_option_engine(
 
 /// Send an open order request with an explicit PositionId and return the CID used.
 fn send_open_order_with_position_id(
-    engine: &mut HedgingTestEngine,
+    engine: &mut TestEngine,
     cid: ClientOrderId,
     position_id: PositionId,
     side: Side,
@@ -3780,7 +3784,7 @@ fn send_open_order_with_position_id(
 /// Simulate the exchange acknowledging an open order (assigns exchange OrderId).
 /// `side` must match the side of the original open request to reflect real exchange behaviour.
 fn send_order_ack(
-    engine: &mut HedgingTestEngine,
+    engine: &mut TestEngine,
     cid: ClientOrderId,
     exchange_order_id: OrderId,
     side: Side,
@@ -3810,12 +3814,7 @@ fn send_order_ack(
 }
 
 /// Send a fill for an order identified by its exchange OrderId.
-fn send_fill(
-    engine: &mut HedgingTestEngine,
-    exchange_order_id: OrderId,
-    side: Side,
-    price: Decimal,
-) {
+fn send_fill(engine: &mut TestEngine, exchange_order_id: OrderId, side: Side, price: Decimal) {
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
         kind: AccountEventKind::Trade(Trade {
@@ -3835,14 +3834,22 @@ fn send_fill(
     engine.process(event);
 }
 
-/// Simulate the exchange confirming that an order was fully filled (terminal snapshot).
+/// Simulate the exchange confirming that an order was fully filled (terminal snapshot), in the
+/// explicit `InactiveOrderState::FullyFilled` encoding.
 ///
-/// This removes the order from `orders.0` (via `Orders::update_from_order_snapshot`)
-/// and triggers `cleanup_routing_tables`, which prunes the corresponding CID entries
-/// from `position_ids` and `exchange_id_to_cid`. Call this after `send_fill` to mirror
-/// real exchange behaviour: exchanges send both a Trade event AND an updated OrderSnapshot
-/// once an order is fully filled.
-fn send_fully_filled_snapshot(engine: &mut HedgingTestEngine, cid: ClientOrderId) {
+/// This removes the order from `orders.0` (via `Orders::update_from_order_snapshot`).
+/// Call this after `send_fill` to mirror real exchange behaviour: exchanges send both a Trade
+/// event AND an updated OrderSnapshot once an order is fully filled.
+///
+/// `exchange_order_id` must be the id the exchange assigned to this order — the same one its
+/// ack and its fills carry — since it is what the engine indexes the order's routing entry by.
+///
+/// See [`send_fully_filled_open_snapshot`] for the other encoding of the same fact.
+fn send_fully_filled_snapshot(
+    engine: &mut TestEngine,
+    cid: ClientOrderId,
+    exchange_order_id: OrderId,
+) {
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
         kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
@@ -3858,7 +3865,7 @@ fn send_fully_filled_snapshot(engine: &mut HedgingTestEngine, cid: ClientOrderId
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
             state: OrderState::fully_filled(Filled::new(
-                OrderId::new("test_order"),
+                exchange_order_id,
                 time_plus_days(STARTING_TIMESTAMP, 2),
                 dec!(1),
                 None,
@@ -3940,6 +3947,377 @@ fn test_hedging_fill_routing_fallback_for_unknown_order() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// A fill that arrives after its own order's terminal snapshot
+// ---------------------------------------------------------------------------
+
+/// Which of the two encodings a venue uses to report that an order is finished.
+///
+/// They denote the same fact and the engine must treat them alike. Both are emitted in practice:
+/// the explicit terminal state is what most in-tree integrations send, while a working-status
+/// snapshot carrying `filled == quantity` is IBKR's normal ordering, and is also what REST
+/// reconciliation produces for an order that completed mid-request on any venue.
+#[derive(Clone, Copy, Debug)]
+enum TerminalEncoding {
+    /// `ActiveOrderState::Open` with nothing left to fill.
+    FullyFilledOpen,
+    /// `InactiveOrderState::FullyFilled`.
+    Inactive,
+}
+
+/// Terminal snapshot in the `Open`-with-nothing-remaining encoding — sibling of
+/// [`send_fully_filled_snapshot`], which sends the explicit terminal state.
+fn send_fully_filled_open_snapshot(
+    engine: &mut TestEngine,
+    cid: ClientOrderId,
+    exchange_order_id: OrderId,
+) {
+    let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+        exchange: ExchangeIndex(0),
+        kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+            key: OrderKey {
+                exchange: ExchangeIndex(0),
+                instrument: InstrumentIndex(0),
+                strategy: strategy_id(),
+                cid,
+            },
+            side: Side::Buy,
+            price: Some(dec!(1_000)),
+            quantity: dec!(1),
+            kind: OrderKind::Limit,
+            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+            // filled_quantity == quantity: the order is finished, said without a distinct state.
+            state: OrderState::active(Open {
+                id: exchange_order_id,
+                time_exchange: time_plus_days(STARTING_TIMESTAMP, 2),
+                filled_quantity: dec!(1),
+            }),
+        })),
+    }));
+    engine.process(event);
+}
+
+/// Drive the sequence in which a venue reports an order finished *before* it reports the fill,
+/// asserting on the way through that the finished order stops being tracked as active.
+///
+/// `concurrent_in_flight` leaves a second, unacked order on the instrument. It selects *how* an
+/// unroutable fill goes wrong, not whether it does: with an `OpenInFlight` order present
+/// `update_from_trade` parks the fill in `pending_fills` awaiting an ack that will never name it,
+/// and it is lost silently; without one the fill falls back to the raw exchange `OrderId` and
+/// opens a position the strategy never asked for.
+fn drive_fill_after_terminal_snapshot(
+    engine: &mut TestEngine,
+    cid: &ClientOrderId,
+    pos_id: &PositionId,
+    exchange_id: &OrderId,
+    terminal: TerminalEncoding,
+    concurrent_in_flight: bool,
+) {
+    // Submitted with an explicit PositionId, then acked — so the order is tracked as `Open` and
+    // its exchange OrderId is indexed.
+    send_open_order_with_position_id(
+        engine,
+        cid.clone(),
+        pos_id.clone(),
+        Side::Buy,
+        dec!(1_000),
+        false,
+    );
+    send_order_ack(engine, cid.clone(), exchange_id.clone(), Side::Buy);
+
+    if concurrent_in_flight {
+        send_open_order_with_position_id(
+            engine,
+            ClientOrderId::new("cid-concurrent"),
+            PositionId::new("leg-concurrent"),
+            Side::Buy,
+            dec!(1_000),
+            false,
+        );
+    }
+
+    match terminal {
+        TerminalEncoding::FullyFilledOpen => {
+            send_fully_filled_open_snapshot(engine, cid.clone(), exchange_id.clone())
+        }
+        TerminalEncoding::Inactive => {
+            send_fully_filled_snapshot(engine, cid.clone(), exchange_id.clone())
+        }
+    }
+
+    // Whichever encoding the venue used, the order is finished and nothing may still hold it as a
+    // working order — otherwise the strategy reads a resting order the exchange no longer has.
+    assert!(
+        !engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .orders
+            .0
+            .contains_key(cid),
+        "a fully filled order must not remain tracked as active ({terminal:?})"
+    );
+
+    // Only now does the fill land.
+    send_fill(engine, exchange_id.clone(), Side::Buy, dec!(1_000));
+}
+
+/// In `OmsMode::Hedging`, assert the fill opened exactly one position and it is the one the
+/// strategy asked for — not the raw-`OrderId` fallback, and not nothing at all.
+fn assert_fill_routed_to_position_id(
+    engine: &TestEngine,
+    pos_id: &PositionId,
+    exchange_id: &OrderId,
+    label: &str,
+) {
+    let instr = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    assert!(
+        instr.pending_fills.is_empty(),
+        "{label}: the fill must not be parked awaiting an ack that will never name it"
+    );
+    assert!(
+        !instr
+            .position
+            .positions
+            .contains_key(&PositionId::new(exchange_id.0.clone())),
+        "{label}: the fill must not open a position under the raw exchange OrderId"
+    );
+    assert!(
+        instr.position.positions.contains_key(pos_id),
+        "{label}: the fill must open a position under the caller-supplied PositionId"
+    );
+    assert_eq!(
+        instr.position.positions.len(),
+        1,
+        "{label}: exactly one position"
+    );
+}
+
+/// Venue reports a fully-filled `Open` snapshot, then the fill.
+///
+/// Before the fix the snapshot left the order tracked as a working order, which is what kept its
+/// routing entry — and so its fill — alive by accident.
+#[test]
+fn test_hedging_fill_after_fully_filled_open_snapshot_routes_to_position_id() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_hedging_option_engine(TradingState::Disabled, execution_tx);
+
+    let cid = ClientOrderId::new("cid-a");
+    let pos_id = PositionId::new("leg-a");
+    let exchange_id = OrderId::new("exch-a");
+
+    drive_fill_after_terminal_snapshot(
+        &mut engine,
+        &cid,
+        &pos_id,
+        &exchange_id,
+        TerminalEncoding::FullyFilledOpen,
+        false,
+    );
+
+    assert_fill_routed_to_position_id(&engine, &pos_id, &exchange_id, "fully-filled Open");
+}
+
+/// As above, with another order in flight — which is what turns an unroutable fill from a
+/// mis-routed position into a silently discarded one.
+#[test]
+fn test_hedging_fill_after_fully_filled_open_snapshot_routes_with_another_order_in_flight() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_hedging_option_engine(TradingState::Disabled, execution_tx);
+
+    let cid = ClientOrderId::new("cid-a");
+    let pos_id = PositionId::new("leg-a");
+    let exchange_id = OrderId::new("exch-a");
+
+    drive_fill_after_terminal_snapshot(
+        &mut engine,
+        &cid,
+        &pos_id,
+        &exchange_id,
+        TerminalEncoding::FullyFilledOpen,
+        true,
+    );
+
+    assert_fill_routed_to_position_id(
+        &engine,
+        &pos_id,
+        &exchange_id,
+        "fully-filled Open, concurrent in-flight",
+    );
+}
+
+/// Venue reports the explicit terminal state, then the fill. This is the encoding every in-tree
+/// integration actually emits, and it mis-routed before this fix — the `Open` arm's tracking leak
+/// was the only reason the other encoding did not.
+#[test]
+fn test_hedging_fill_after_terminal_fully_filled_snapshot_routes_to_position_id() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_hedging_option_engine(TradingState::Disabled, execution_tx);
+
+    let cid = ClientOrderId::new("cid-a");
+    let pos_id = PositionId::new("leg-a");
+    let exchange_id = OrderId::new("exch-a");
+
+    drive_fill_after_terminal_snapshot(
+        &mut engine,
+        &cid,
+        &pos_id,
+        &exchange_id,
+        TerminalEncoding::Inactive,
+        false,
+    );
+
+    assert_fill_routed_to_position_id(&engine, &pos_id, &exchange_id, "terminal FullyFilled");
+}
+
+/// As above, with another order in flight — the sequence in which the fill was lost outright
+/// rather than mis-routed.
+#[test]
+fn test_hedging_fill_after_terminal_fully_filled_snapshot_routes_with_another_order_in_flight() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_hedging_option_engine(TradingState::Disabled, execution_tx);
+
+    let cid = ClientOrderId::new("cid-a");
+    let pos_id = PositionId::new("leg-a");
+    let exchange_id = OrderId::new("exch-a");
+
+    drive_fill_after_terminal_snapshot(
+        &mut engine,
+        &cid,
+        &pos_id,
+        &exchange_id,
+        TerminalEncoding::Inactive,
+        true,
+    );
+
+    assert_fill_routed_to_position_id(
+        &engine,
+        &pos_id,
+        &exchange_id,
+        "terminal FullyFilled, concurrent in-flight",
+    );
+}
+
+/// `OmsMode::Netting` counterpart of the four sequences above.
+///
+/// Netting resolves every fill to [`PositionId::NETTING`] without consulting either routing
+/// table, so neither axis can change where the fill lands and all four cases must agree. What
+/// netting does share with hedging is the tracking half of the fix: a fully-filled `Open`
+/// snapshot must retire the order in both modes. Asserted inside
+/// `drive_fill_after_terminal_snapshot`.
+#[test]
+fn test_netting_fill_after_terminal_snapshot_opens_one_netting_position() {
+    for (terminal, concurrent_in_flight) in [
+        (TerminalEncoding::FullyFilledOpen, false),
+        (TerminalEncoding::FullyFilledOpen, true),
+        (TerminalEncoding::Inactive, false),
+        (TerminalEncoding::Inactive, true),
+    ] {
+        let label = format!("{terminal:?}, concurrent_in_flight={concurrent_in_flight}");
+        let (execution_tx, _execution_rx) = mpsc_unbounded();
+        let mut engine = build_option_spot_engine_with_oms(
+            TradingState::Disabled,
+            execution_tx,
+            OmsMode::Netting,
+        );
+
+        let cid = ClientOrderId::new("cid-a");
+        let pos_id = PositionId::new("leg-a");
+        let exchange_id = OrderId::new("exch-a");
+
+        drive_fill_after_terminal_snapshot(
+            &mut engine,
+            &cid,
+            &pos_id,
+            &exchange_id,
+            terminal,
+            concurrent_in_flight,
+        );
+
+        let instr = engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0));
+        assert!(
+            instr.pending_fills.is_empty(),
+            "{label}: netting never parks a fill"
+        );
+        assert!(
+            instr.position.positions.contains_key(&PositionId::NETTING),
+            "{label}: the fill opens the netting position"
+        );
+        assert_eq!(
+            instr.position.positions.len(),
+            1,
+            "{label}: exactly one position"
+        );
+    }
+}
+
+/// Where the fix stops.
+///
+/// Only the most recently retired order keeps its routing entry, because retiring the next order
+/// prunes it — see the known-limitation note on `cleanup_routing_tables`. A fill for anything
+/// older finds nothing and opens a position under the raw exchange `OrderId`. Pinned so that the
+/// bound the documentation claims is a checked one, and so that closing this window later is a
+/// visible change rather than a silent one.
+#[test]
+fn test_hedging_late_fill_misroutes_once_a_later_order_prunes_the_routing_entry() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_hedging_option_engine(TradingState::Disabled, execution_tx);
+
+    let cid_a = ClientOrderId::new("cid-a");
+    let pos_id_a = PositionId::new("leg-a");
+    let exchange_id_a = OrderId::new("exch-a");
+
+    send_open_order_with_position_id(
+        &mut engine,
+        cid_a.clone(),
+        pos_id_a.clone(),
+        Side::Buy,
+        dec!(1_000),
+        false,
+    );
+    send_order_ack(&mut engine, cid_a.clone(), exchange_id_a.clone(), Side::Buy);
+    send_fully_filled_snapshot(&mut engine, cid_a.clone(), exchange_id_a.clone());
+
+    // A second order retires the first one's grace window: every order snapshot runs
+    // `cleanup_routing_tables`, which drops entries for CIDs no longer tracked.
+    let cid_b = ClientOrderId::new("cid-b");
+    let exchange_id_b = OrderId::new("exch-b");
+    send_open_order_with_position_id(
+        &mut engine,
+        cid_b.clone(),
+        PositionId::new("leg-b"),
+        Side::Buy,
+        dec!(1_000),
+        false,
+    );
+    send_order_ack(&mut engine, cid_b.clone(), exchange_id_b, Side::Buy);
+
+    // Only now does the first order's fill arrive.
+    send_fill(&mut engine, exchange_id_a.clone(), Side::Buy, dec!(1_000));
+
+    let instr = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    assert!(
+        !instr.position.positions.contains_key(&pos_id_a),
+        "the window has closed, so the fill cannot reach the strategy's PositionId"
+    );
+    assert!(
+        instr
+            .position
+            .positions
+            .contains_key(&PositionId::new(exchange_id_a.0.clone())),
+        "and falls back to the raw exchange OrderId"
+    );
+}
+
 #[test]
 fn test_hedging_position_ids_cleanup_on_position_exit() {
     let (execution_tx, _execution_rx) = mpsc_unbounded();
@@ -3961,7 +4339,7 @@ fn test_hedging_position_ids_cleanup_on_position_exit() {
     send_order_ack(&mut engine, cid_a.clone(), exchange_id_a.clone(), Side::Buy);
     send_fill(&mut engine, exchange_id_a.clone(), Side::Buy, dec!(1_000));
     // Exchange confirms cid_a is fully filled — removes it from orders.0 and cleans up routing tables.
-    send_fully_filled_snapshot(&mut engine, cid_a.clone());
+    send_fully_filled_snapshot(&mut engine, cid_a.clone(), exchange_id_a.clone());
 
     // Close the same position with a sell fill using a new CID/order.
     let cid_b = ClientOrderId::new("cid-b");
@@ -3981,9 +4359,9 @@ fn test_hedging_position_ids_cleanup_on_position_exit() {
         exchange_id_b.clone(),
         Side::Sell,
     );
-    send_fill(&mut engine, exchange_id_b, Side::Sell, dec!(2_000));
+    send_fill(&mut engine, exchange_id_b.clone(), Side::Sell, dec!(2_000));
     // Exchange confirms cid_b is fully filled — removes it from orders.0 and cleans up routing tables.
-    send_fully_filled_snapshot(&mut engine, cid_b.clone());
+    send_fully_filled_snapshot(&mut engine, cid_b.clone(), exchange_id_b.clone());
 
     let instr = engine
         .state
@@ -3994,8 +4372,33 @@ fn test_hedging_position_ids_cleanup_on_position_exit() {
         instr.position.positions.is_empty(),
         "position should be closed"
     );
-    // All position_ids entries that routed to the closed position are cleaned up once
-    // both orders' terminal snapshots have arrived (mirroring real exchange behaviour).
+    // The order retired last keeps its routing entry for one more order update, so a fill
+    // arriving after its terminal snapshot can still reach the position the strategy chose.
+    assert_eq!(
+        instr.position_ids.get(&cid_b),
+        Some(&pos_id_a),
+        "the order retired last keeps its routing entry until the next order update"
+    );
+
+    // Any subsequent order update closes that window: `cleanup_routing_tables` runs before the
+    // entry is restored, and drops entries for CIDs no longer tracked. That is what bounds both
+    // maps — at most one retired order is held per instrument at a time.
+    let cid_c = ClientOrderId::new("cid-c");
+    send_open_order_with_position_id(
+        &mut engine,
+        cid_c.clone(),
+        PositionId::new("leg-c"),
+        Side::Buy,
+        dec!(1_000),
+        false,
+    );
+    send_order_ack(&mut engine, cid_c, OrderId::new("exch-c"), Side::Buy);
+
+    let instr = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    // All position_ids entries that routed to the closed position are now cleaned up.
     assert!(
         !instr.position_ids.values().any(|v| *v == pos_id_a),
         "position_ids entries for closed position should be removed"
@@ -4160,7 +4563,7 @@ fn test_fee_model_zero_no_fees_on_trade() {
 // ---------------------------------------------------------------------------
 
 /// Helper: send a cancel ack for an order (marks it as cancelled via OrderResponseCancel).
-fn send_cancel_ack(engine: &mut HedgingTestEngine, cid: ClientOrderId, exchange_order_id: OrderId) {
+fn send_cancel_ack(engine: &mut TestEngine, cid: ClientOrderId, exchange_order_id: OrderId) {
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
         kind: AccountEventKind::OrderCancelled(OrderResponseCancel {

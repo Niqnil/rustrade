@@ -1597,6 +1597,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An order reported as fully filled by an `Open` snapshot is no longer tracked as active**
+  (`rustrade`). `OrderManager`'s `Open` → `Open` transition overwrote the tracked state without
+  checking whether anything remained to fill, so an order the engine held as `Open` that received a
+  snapshot with `filled_quantity == quantity` stayed active indefinitely.
+
+  The check was already applied on the two other transitions that accept an `Open` update — an
+  untracked order declines to be inserted, and an `OpenInFlight` order is removed — so the arm for
+  an order already `Open` was the one place a completed order could survive. The consequence is a
+  phantom resting order: a strategy asking whether it already has an order working answers yes
+  forever, a later cancel is rejected as unknown or terminal, and the entry never leaves the map.
+
+  Not reachable from a simulated venue, which reports a completed market order as `FullyFilled`
+  directly and so never holds it as `Open` first. A live venue may legitimately report completion
+  as an order snapshot rather than as a distinct state, which is how the gap arises in practice.
+
+  The staleness gate still outranks the new check: an out-of-sequence snapshot claiming a full fill
+  does not retire an order that is still live.
+
+- **A fill that arrives after its own order's terminal snapshot now routes to the strategy's
+  chosen `PositionId`** in `OmsMode::Hedging` (`rustrade`). Routing-table lifetime is coupled to
+  membership of the active-order map, so retiring an order dropped the
+  `exchange OrderId → ClientOrderId` entry that a later fill for that order needs.
+  `InstrumentState::update_from_order_snapshot` already compensated when the order was retired
+  straight out of `OpenInFlight`; it now does the same when a terminal update retires an order the
+  engine was tracking as `Open`.
+
+  Both orderings occur. A venue may report the fill before the terminal state or after it: IBKR
+  reports a working order status carrying `filled == quantity` while deliberately withholding the
+  trade until the matching commission report lands, and REST reconciliation can serialise an order
+  that completed mid-request on any venue. Before this change such a fill fell through to a raw
+  `OrderId` position key — opening a position the strategy never asked for — or, if another order
+  was in flight at the time, was parked awaiting an ack that would never name it and was lost
+  without trace.
+
+  The fix that precedes it is what exposed this one. Retiring a fully-filled `Open` order is
+  correct, but it removed that encoding's accidental immunity: while the completed order stayed
+  tracked, its routing entry stayed with it. The explicit `FullyFilled` encoding — what every
+  in-tree integration emits — never had that immunity and mis-routed already.
+
+  **This narrows the window rather than closing it.** Exactly one retired order per instrument
+  keeps its routing entry, and the next order update on that instrument prunes it, which is what
+  keeps both maps bounded. A fill for an order retired before the most recent one still opens a
+  position under the raw `OrderId` with a warning — see the known-limitation note on
+  `InstrumentState::update_from_order_snapshot`. Closing the class requires decoupling routing-table
+  lifetime from the active-order map, which is not attempted here.
+
+  `OmsMode::Netting` is unaffected throughout: it resolves every fill to `PositionId::NETTING`
+  without consulting either routing table. It does share the tracking fix above.
+
 - **The `backtests_concurrent` example runs again** (`rustrade`). It panicked at startup, before the
   first backtest, with `MarketDataInMemory events must be sorted ascending by
   MarketEvent::time_exchange`. `MarketDataInMemory::new` requires and asserts global time ordering
