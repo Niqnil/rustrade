@@ -717,7 +717,17 @@ fn drain_requests(
                         })
                         .into_owned_instrument();
 
-                    slot.venue.advance_time(arrives);
+                    // Advancing the clock can retire an order whose deadline has passed. Nothing
+                    // requested those events, so they pay `from_venue` alone — the same one leg a
+                    // tick-caused fill pays — and are scheduled ahead of this request's own
+                    // response, which they precede in fact as well as in the queue.
+                    schedule_events(
+                        pending,
+                        seq,
+                        *exchange,
+                        delivers,
+                        slot.venue.advance_time(arrives),
+                    );
 
                     schedule(
                         pending,
@@ -739,7 +749,16 @@ fn drain_requests(
                         })
                         .into_owned_instrument();
 
-                    slot.venue.advance_time(arrives);
+                    // Swept before the cancel is served, so a cancel arriving after its order's
+                    // deadline is answered `OrderAlreadyExpired` rather than succeeding against an
+                    // order that should already have been retired.
+                    schedule_events(
+                        pending,
+                        seq,
+                        *exchange,
+                        delivers,
+                        slot.venue.advance_time(arrives),
+                    );
 
                     schedule(
                         pending,
@@ -947,7 +966,7 @@ mod tests {
         order::{
             OrderKey, OrderKind, TimeInForce,
             id::{ClientOrderId, StrategyId},
-            request::{OrderRequestOpen, RequestOpen},
+            request::{OrderRequestCancel, OrderRequestOpen, RequestCancel, RequestOpen},
         },
     };
     use rustrade_instrument::{
@@ -1128,6 +1147,42 @@ mod tests {
                     reduce_only: false,
                     market: None,
                 },
+            }));
+        }
+
+        /// A resting buy that retires itself at `expiry`, returning the id so it can be cancelled.
+        fn send_limit_gtd(&self, price: Decimal, expiry: DateTime<Utc>) -> ClientOrderId {
+            let cid = ClientOrderId::random();
+            self.send(ExecutionRequest::Open(OrderRequestOpen {
+                key: OrderKey {
+                    exchange: self.exchange,
+                    instrument: instrument_key(),
+                    strategy: StrategyId::new("test"),
+                    cid: cid.clone(),
+                },
+                state: RequestOpen {
+                    side: Side::Buy,
+                    price: Some(price),
+                    quantity: dec!(0.01),
+                    kind: OrderKind::Limit,
+                    time_in_force: TimeInForce::GoodTillDate { expiry },
+                    position_id: None,
+                    reduce_only: false,
+                    market: None,
+                },
+            }));
+            cid
+        }
+
+        fn send_cancel(&self, cid: ClientOrderId) {
+            self.send(ExecutionRequest::Cancel(OrderRequestCancel {
+                key: OrderKey {
+                    exchange: self.exchange,
+                    instrument: instrument_key(),
+                    strategy: StrategyId::new("test"),
+                    cid,
+                },
+                state: RequestCancel { id: None },
             }));
         }
 
@@ -1737,6 +1792,78 @@ mod tests {
                 "after_drain"
             ],
             "the fill is visible one `from_venue` leg after the tick that caused it"
+        );
+    }
+
+    /// A deadline reached by a market tick reaches the `Engine`, rather than being eaten.
+    ///
+    /// The order rests below the market and is never crossed, so nothing but its deadline can
+    /// retire it.
+    #[tokio::test]
+    async fn a_deadline_reached_by_a_tick_is_delivered() {
+        let mut harness = Harness::new(
+            0,
+            vec![
+                market(10, dec!(200)),
+                market(500, dec!(200)),
+                market(700, dec!(200)),
+            ],
+        );
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        // Far below the market, so only the deadline at 500 can retire it.
+        harness.send_limit_gtd(dec!(1), at(500));
+
+        assert_eq!(
+            harness.rest().await,
+            vec![
+                "balance",
+                "order",  // the open rests
+                "market", // the tick at 500, which reaches the deadline as it is applied
+                "balance",
+                "order", // and so retires it: release, then the terminal snapshot
+                "market",
+                "after_drain"
+            ],
+            "an expiry follows the tick that reached it, exactly as a resting fill does — a \
+             market is applied on emit, so anything it retires is drawn on a later poll"
+        );
+    }
+
+    /// A deadline reached while advancing the clock for an unrelated request is delivered too.
+    ///
+    /// Nothing ticks between the open and the cancel, so only `advance_time`'s sweep can find it —
+    /// this is the entry point a tick-driven sweep alone would miss.
+    #[tokio::test]
+    async fn a_deadline_reached_by_a_request_is_delivered_and_the_cancel_is_told_why() {
+        let mut harness = Harness::new(0, vec![market(10, dec!(200)), market(900, dec!(200))]);
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        let cid = harness.send_limit_gtd(dec!(1), at(500));
+
+        assert_eq!(harness.next().await, Some("balance"));
+        assert_eq!(harness.next().await, Some("order"));
+
+        // Past the deadline, with no tick in between.
+        harness.clock.advance_to(at(600));
+        harness.send_cancel(cid);
+
+        assert_eq!(
+            harness.rest().await,
+            vec![
+                "balance",
+                "order",     // swept by the advance the cancel provoked
+                "cancelled", // the cancel itself, answered `OrderAlreadyExpired`
+                "market",
+                "after_drain"
+            ],
+            "the sweep precedes the response to the request that provoked it"
         );
     }
 }

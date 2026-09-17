@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The simulated venue honours `post_only`, `ImmediateOrCancel`, `FillOrKill` and `GoodTillDate`**
+  (`rustrade-execution`, `rustrade`). A post-only order that would take liquidity on arrival is
+  cancelled rather than filled, and rests otherwise. An immediate-or-cancel or fill-or-kill order
+  fills in full if it is marketable and otherwise retires with `filled_quantity` zero — the two
+  coincide **because** this venue models no order size, and will diverge only once an order can fill
+  in part. A `GoodTillDate` order rests until its stated instant and is then retired as
+  `Inactive(Expired)`, releasing what was held against it.
+
+  `GoodUntilEndOfDay`, `AtOpen` and `AtClose` remain rejected on a limit order: honouring them needs
+  a session calendar this venue has not got, and treating them as good-until-cancelled would leave
+  an order working that its sender asked to have cancelled.
+
+  **A deadline is swept, not scheduled.** This venue has no timer, so a `GoodTillDate` order is
+  retired when a driver next calls `advance_time` or `apply_market`, whichever comes first — and
+  the sweep spans every instrument, because a deadline is a property of the clock rather than of a
+  book. A deadline is an unconditional cutoff: an order is retired even by the very tick that would
+  have crossed it, and one that arrives already past its deadline never rests and never trades.
+
+- **`SimulatedVenue::advance_time` returns the orders its advance retired, and is `#[must_use]`**
+  (`rustrade-execution`, `rustrade`). ⚠️ **Breaking**: it previously returned `()`. Per retired order
+  the events are `[balance, order]` — the released reservation, then the terminal snapshot — or
+  `[order]` alone for an order the venue never took a reservation for. A driver that advances the
+  clock and drops the result has silently eaten the expiries, which is why the value must be used.
+
+- **`ApiError::OrderAlreadyExpired`** (`rustrade-execution`): the state conflict a cancel hits when
+  its order's own deadline retired it first. Distinct from `OrderAlreadyCancelled` because nobody
+  asked for it, which is what a caller reconciling its local state needs to know. `ApiError` is
+  `#[non_exhaustive]`, so this is additive for downstream matches.
+
+- **The simulated venue rejects a `TimeInForce` a market order cannot keep** (`rustrade-execution`).
+  ⚠️ **Behaviour change**: `AtOpen`, `AtClose` and `GoodUntilCancelled { post_only: true }` on an
+  `OrderKind::Market` order were accepted and filled on arrival; they are now rejected. The first two
+  say *when* an order executes rather than how long it works — this library's own IBKR client turns
+  them into real market-on-close and limit-on-close orders — so filling one immediately is a wrong
+  fill rather than an ignored flag. The third is a promise never to take liquidity, which is all a
+  market order does. Every `TimeInForce` that merely bounds how long an order works is still
+  accepted on a market order, which fills in full on arrival and so honours all of them.
+
+- **`MockExchange` emits everything the venue produces through one ordered queue**
+  (`rustrade-execution`). Expiries swept when the clock advances, and the balance a cancel releases,
+  now go through the same drain that already ordered filled opens, rather than around it. A
+  `SimulatedVenue` balance is an absolute restatement, so an event overtaking a batch still waiting
+  out its latency leaves the client holding the wrong balance, not merely a late one. The cancel
+  path was previously dropping its events entirely.
+
 - **The simulated venue accepts `OrderKind::Limit`, rests what the market has not reached, and
   matches it against its own view** (`rustrade-execution`, `rustrade`). A limit order that is
   already marketable fills on arrival; one that is not rests on the book and fills when a later

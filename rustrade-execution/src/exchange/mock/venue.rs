@@ -16,7 +16,7 @@ use crate::{
         Order, OrderKind, TimeInForce, UnindexedOrder,
         id::{ClientOrderId, OrderId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
+        state::{Cancelled, Expired, Filled, Open, OrderState, UnindexedOrderState},
     },
     trade::{AssetFees, Trade, TradeId},
 };
@@ -135,7 +135,8 @@ pub enum VenueRegime {
 ///   which order any held portion belongs to. Such an order still matches, and its fill debits the
 ///   ledger then — so the seeded balances must cover it, exactly as they must cover a market order.
 ///   They cannot? That is a mis-specified fixture, and it **panics**, in the same class as an
-///   absent balance. Cancelling one releases nothing and restates no balance.
+///   absent balance. Cancelling one releases nothing and restates no balance, and neither does
+///   retiring one at its deadline.
 ///
 /// # How a limit order is priced
 /// - **Marketable on arrival** — priced by the [`FillModel`] against this venue's market, then
@@ -163,11 +164,42 @@ pub enum VenueRegime {
 /// - **No size cap, and so no partial fills.** A crossing order fills its whole quantity at one
 ///   price. Every order is therefore either untouched or terminal, and
 ///   [`Cancelled::filled_quantity`] is always zero.
-/// - **[`TimeInForce`] beyond [`GoodUntilCancelled`](TimeInForce::GoodUntilCancelled) with
-///   `post_only: false` is rejected on a limit order**, rather than treated as good-until-cancelled
-///   — which would silently leave an order working that its sender asked to have cancelled. A
-///   market order fills in full on arrival, which honours every time in force, so the restriction
-///   does not reach one.
+/// - **No size cap means immediate-or-cancel and fill-or-kill coincide.** Both reduce to
+///   "marketable ⇒ fill in full; not marketable ⇒ retire having traded nothing". They diverge only
+///   once an order can fill in part, at which point fill-or-kill must refuse a partial fill that
+///   immediate-or-cancel accepts.
+///
+/// # Which [`TimeInForce`] this venue honours
+/// An unsupported one is **rejected**, never quietly treated as good-until-cancelled: that would
+/// leave an order working that its sender asked to have cancelled.
+///
+/// | [`TimeInForce`] | [`OrderKind::Limit`] | [`OrderKind::Market`] |
+/// |---|---|---|
+/// | `GoodUntilCancelled { post_only: false }` | rests, or fills if marketable | fills |
+/// | `GoodUntilCancelled { post_only: true }` | rests, or **cancels** if marketable | **rejected** |
+/// | `ImmediateOrCancel` / `FillOrKill` | fills if marketable, else **cancels** | fills |
+/// | `GoodTillDate { expiry }` | rests until `expiry`, then **expires** | fills |
+/// | `GoodUntilEndOfDay` | **rejected** | fills |
+/// | `AtOpen` / `AtClose` | **rejected** | **rejected** |
+///
+/// A market order fills in full on arrival, which honours every time in force that bounds *how
+/// long* an order works — so most of the table is moot for one. The two exceptions are real:
+/// `post_only` on a market order is a promise never to take liquidity, which is all a market order
+/// does; and `AtOpen`/`AtClose` say *when* an order executes rather than how long it lasts, so
+/// honouring them needs a session calendar this venue has not got. Filling one on arrival would be
+/// a wrong fill rather than an ignored flag.
+///
+/// ## A deadline is swept, not scheduled
+/// This venue has no timer. A [`GoodTillDate`](TimeInForce::GoodTillDate) order is retired when a
+/// driver next calls [`advance_time`](Self::advance_time) or [`apply_market`](Self::apply_market),
+/// whichever comes first, and the sweep spans every instrument rather than only the one that
+/// ticked. A deadline falling after the last such call is never reached at all — see
+/// [`advance_time`](Self::advance_time) for what that means for a caller.
+///
+/// A deadline is an unconditional cutoff. An order reaching it is retired even if the very tick
+/// that reached it would have crossed it, and an order that arrives already past its deadline is
+/// retired without resting and without trading — otherwise whether an expired order traded would
+/// depend on where the book happened to be.
 ///
 /// [`OpenOrders`]: super::orders::OpenOrders
 ///
@@ -267,13 +299,98 @@ impl SimulatedVenue {
         self.regime
     }
 
-    /// Sets the instant this venue stamps on everything it produces from now on.
+    /// Sets the instant this venue stamps on everything it produces from now on, retiring any
+    /// order whose deadline that instant has reached.
     ///
     /// The caller owns the latency model: a driver simulating a network delay passes an instant
     /// already offset by it. The venue itself models no delay.
-    pub fn advance_time(&mut self, time_exchange: DateTime<Utc>) {
+    ///
+    /// # Deadlines are swept from here and from [`apply_market`](Self::apply_market), never on a
+    /// clock of their own
+    /// A [`TimeInForce::GoodTillDate`] order must stop working at the instant it says, not at
+    /// whenever the next market tick happens to arrive -- otherwise a cancel sent after the
+    /// nominal deadline would succeed against an order that should already have been retired, and
+    /// an instrument that stops ticking would hold its expired orders open indefinitely. So both
+    /// of this venue's inputs sweep.
+    ///
+    /// The sweep is **not** scoped to any instrument: a deadline is a property of the clock, not of
+    /// a book. An order on a quiet instrument is retired by activity anywhere on the venue.
+    ///
+    /// ## The residual limitation, stated plainly
+    /// This venue has no timer. Nothing retires an order until a driver next advances the clock or
+    /// feeds a market, so a deadline falling after the last such call is never reached at all. A
+    /// driver that stops driving leaves orders working past their deadline, and that is a property
+    /// of the simulation rather than something a caller can configure away.
+    ///
+    /// # Returns the expiries it caused, which a driver must deliver
+    /// Per retired order the events are `[balance, order]` -- the released reservation, then the
+    /// terminal [`Expired`] snapshot -- or `[order]` alone for an order this venue never took a
+    /// reservation for, exactly as [`cancel_order`](Self::cancel_order) reports one.
+    ///
+    /// `#[must_use]` because a driver that advances the clock and drops the result has silently
+    /// eaten the expiries, leaving its client holding orders the venue no longer has and a balance
+    /// it has already released.
+    #[must_use]
+    pub fn advance_time(&mut self, time_exchange: DateTime<Utc>) -> Vec<UnindexedAccountEvent> {
         self.time_exchange_latest = time_exchange;
-        self.account.update_time_exchange(time_exchange)
+        self.account.update_time_exchange(time_exchange);
+        self.sweep_expired(time_exchange)
+    }
+
+    /// Retires every order whose deadline `time_exchange` has reached, releasing what it held.
+    ///
+    /// Shared by this venue's two inputs so that a deadline means the same thing whichever one
+    /// reaches it first -- see [`advance_time`](Self::advance_time).
+    ///
+    /// Deadlines are collected before anything is retired, because retiring removes from the very
+    /// index the sweep walks. [`OpenOrders::expired_as_of`] yields them by deadline then
+    /// [`ClientOrderId`], so the events are in the same order on every run.
+    ///
+    /// [`OpenOrders::expired_as_of`]: super::orders::OpenOrders::expired_as_of
+    fn sweep_expired(&mut self, time_exchange: DateTime<Utc>) -> Vec<UnindexedAccountEvent> {
+        let expired = self.account.orders().expired_as_of(time_exchange);
+
+        if expired.is_empty() {
+            return Vec::new();
+        }
+
+        let mut events = Vec::with_capacity(expired.len() * 2);
+
+        for cid in expired {
+            // Collected from this same index with nothing in between, so this always finds it.
+            let Some(RestingOrder { order, reservation }) = self.account.orders_mut().remove(&cid)
+            else {
+                continue;
+            };
+
+            // Released before the terminal snapshot, so a consumer applying them in order never
+            // sees an order retired against a balance that still holds its reservation. An order
+            // the venue took nothing for releases nothing -- see `OpenOrders`.
+            if let Some(Reservation { asset, amount }) = reservation {
+                let balance = self.account.release(&asset, amount, time_exchange);
+                events.push(self.build_account_event(Snapshot(balance)));
+            }
+
+            let expired_order = Order {
+                key: order.key,
+                side: order.side,
+                price: order.price,
+                quantity: order.quantity,
+                kind: order.kind,
+                time_in_force: order.time_in_force,
+                state: Expired {
+                    id: order.state.id,
+                    time_exchange,
+                    filled_quantity: order.state.filled_quantity,
+                },
+            };
+
+            self.account.ack_expired(expired_order.clone());
+
+            events.push(self.build_account_event(Snapshot(UnindexedOrder::from(expired_order))));
+        }
+
+        events
     }
 
     pub fn time_exchange(&self) -> DateTime<Utc> {
@@ -324,7 +441,11 @@ impl SimulatedVenue {
         entry.snapshot = snapshot;
         entry.time_exchange = time_exchange;
 
-        self.match_resting(instrument, snapshot, time_exchange)
+        // Swept before matching, so an order whose deadline this tick has reached cannot trade on
+        // the very tick that retires it -- see `advance_time`.
+        let mut events = self.sweep_expired(time_exchange);
+        events.append(&mut self.match_resting(instrument, snapshot, time_exchange));
+        events
     }
 
     /// Fills every resting order on `instrument` that `snapshot` has moved to or through.
@@ -630,6 +751,8 @@ impl SimulatedVenue {
             ApiError::OrderAlreadyFullyFilled.into()
         } else if self.account.is_cancelled(cid) {
             ApiError::OrderAlreadyCancelled.into()
+        } else if self.account.is_expired(cid) {
+            ApiError::OrderAlreadyExpired.into()
         } else {
             UnindexedOrderError::Rejected(ApiError::OrderRejected(format!(
                 "SimulatedVenue is not holding an open order with {cid}"
@@ -652,7 +775,13 @@ impl SimulatedVenue {
             .cloned()
             .map(UnindexedOrder::from);
 
-        let orders_all = orders_open.chain(orders_cancelled);
+        let orders_expired = self
+            .account
+            .orders_expired()
+            .cloned()
+            .map(UnindexedOrder::from);
+
+        let orders_all = orders_open.chain(orders_cancelled).chain(orders_expired);
         // Sorted on `(instrument, cid)` rather than `instrument` alone: the sort is unstable, so a
         // key shared by several orders leaves their relative order unspecified, and a snapshot that
         // lists the same account's orders in a different order on each run is not comparable
@@ -711,9 +840,21 @@ impl SimulatedVenue {
             Err(error) => return (build_open_order_err_response(request, error), None),
         };
 
+        let now = self.time_exchange();
+
         if request.state.kind != OrderKind::Limit {
-            // Every other kind this venue accepts is marketable on arrival by definition.
-            return self.fill_on_arrival(request, market, &terms);
+            // Every other kind this venue accepts is marketable on arrival by definition, so only
+            // `Fill` and `Expire` are reachable: `Rest` needs a non-marketable order, and
+            // `CancelUnfilled` needs `post_only`, which the static gate already refused on a market
+            // order. The remaining arm retires the order unfilled rather than asserting, because
+            // filling an order this function could not account for is the one wrong answer.
+            return match disposition(request.state.time_in_force, true, now) {
+                Disposition::Fill => self.fill_on_arrival(request, market, &terms),
+                Disposition::Expire => self.expire_on_arrival(request, now),
+                Disposition::CancelUnfilled | Disposition::Rest => {
+                    self.cancel_on_arrival(request, now)
+                }
+            };
         }
 
         let Some(limit) = request.state.price else {
@@ -738,11 +879,110 @@ impl SimulatedVenue {
             .market(&request.key.instrument)
             .map(|market| market.snapshot);
 
-        if venue_market.is_some_and(|market| crosses(request.state.side, limit, &market)) {
-            self.fill_on_arrival(request, venue_market, &terms)
-        } else {
-            self.rest_order(request, limit, &terms)
+        let marketable =
+            venue_market.is_some_and(|market| crosses(request.state.side, limit, &market));
+
+        match disposition(request.state.time_in_force, marketable, now) {
+            Disposition::Fill => self.fill_on_arrival(request, venue_market, &terms),
+            Disposition::Rest => self.rest_order(request, limit, &terms),
+            Disposition::CancelUnfilled => self.cancel_on_arrival(request, now),
+            Disposition::Expire => self.expire_on_arrival(request, now),
         }
+    }
+
+    /// Retires an order that asked to work only on arrival and could not, having traded nothing.
+    ///
+    /// Reached by a non-marketable [`TimeInForce::ImmediateOrCancel`] or
+    /// [`TimeInForce::FillOrKill`], and by a `post_only` order that would have taken liquidity.
+    /// Nothing was reserved and nothing traded, so this owes no balance restatement -- only the
+    /// terminal response.
+    fn cancel_on_arrival(
+        &mut self,
+        request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
+        now: DateTime<Utc>,
+    ) -> (
+        Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
+        Option<OpenOrderNotifications>,
+    ) {
+        let cancelled = Cancelled {
+            id: self.order_id_sequence_fetch_add(),
+            time_exchange: now,
+            filled_quantity: Decimal::ZERO,
+        };
+
+        self.account.ack_cancelled(Order {
+            key: request.key.clone(),
+            side: request.state.side,
+            price: request.state.price,
+            quantity: request.state.quantity,
+            kind: request.state.kind,
+            time_in_force: request.state.time_in_force,
+            state: cancelled.clone(),
+        });
+
+        (
+            Order {
+                key: request.key,
+                side: request.state.side,
+                price: request.state.price,
+                quantity: request.state.quantity,
+                kind: request.state.kind,
+                time_in_force: request.state.time_in_force,
+                state: OrderState::inactive(cancelled),
+            },
+            None,
+        )
+    }
+
+    /// Retires an order whose [`TimeInForce::GoodTillDate`] deadline had already passed when it
+    /// arrived.
+    ///
+    /// Such an order is never rested, and never traded -- not even when the book would have filled
+    /// it, since an order past its deadline has stopped working and whether it *could* have traded
+    /// is not a question this venue asks. With no independent clock, deadlines are swept only when
+    /// a driver advances it or feeds it a market, so an order accepted past its own deadline would
+    /// work until something else happened to touch the venue -- and if nothing did, for the rest of
+    /// the run. Retiring it here makes the deadline mean what it says.
+    ///
+    /// Reported as expired rather than rejected because nothing was wrong with the request: its
+    /// price, size and funding were never examined, and calling it a rejection would tell a
+    /// consumer's statistics the venue refused an order it merely found too late.
+    fn expire_on_arrival(
+        &mut self,
+        request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
+        now: DateTime<Utc>,
+    ) -> (
+        Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
+        Option<OpenOrderNotifications>,
+    ) {
+        let expired = Expired {
+            id: self.order_id_sequence_fetch_add(),
+            time_exchange: now,
+            filled_quantity: Decimal::ZERO,
+        };
+
+        self.account.ack_expired(Order {
+            key: request.key.clone(),
+            side: request.state.side,
+            price: request.state.price,
+            quantity: request.state.quantity,
+            kind: request.state.kind,
+            time_in_force: request.state.time_in_force,
+            state: expired.clone(),
+        });
+
+        (
+            Order {
+                key: request.key,
+                side: request.state.side,
+                price: request.state.price,
+                quantity: request.state.quantity,
+                kind: request.state.kind,
+                time_in_force: request.state.time_in_force,
+                state: OrderState::expired(expired),
+            },
+            None,
+        )
     }
 
     /// Fills an order that is marketable the moment it arrives, debiting what it pays with.
@@ -1184,38 +1424,66 @@ fn crosses(side: Side, limit: Decimal, market: &MarketSnapshot) -> bool {
     }
 }
 
-/// Whether this venue can honour `time_in_force` for an order of `order_kind`.
+/// Whether this venue can honour `time_in_force` for an order of `order_kind` **at all**.
 ///
-/// # Every [`TimeInForce`] is honoured for an order that fills on arrival
+/// This is the static half of the time-in-force decision: it asks only whether the pair could ever
+/// be honoured, never what the order should then do. What a supported time in force *does* depends
+/// on whether the order is marketable when it arrives, which is not known here -- see
+/// [`Disposition`].
+///
+/// # Most of a time in force is moot for an order that fills on arrival
 /// A [`OrderKind::Market`] order fills in full the instant it arrives, which satisfies every time
-/// in force there is -- there is no remainder to cancel, and no later instant at which the order
-/// could still be working. So the gate applies only to an order that can rest.
+/// in force that governs *how long* an order works: there is no remainder to cancel, and no later
+/// instant at which it could still be working.
+///
+/// [`TimeInForce::AtOpen`] and [`TimeInForce::AtClose`] are not of that kind. They govern *when* an
+/// order executes, not how long it lasts, and honouring them needs a session calendar this venue
+/// has not got. Accepting one would fill it immediately, at a price that is not the auction it
+/// asked for -- a wrong fill rather than an ignored flag. This library takes them seriously
+/// elsewhere: its IBKR client turns them into real market-on-close and limit-on-close orders, which
+/// is correct only because a real venue has the calendar. So they are refused here for the same
+/// reason on both order kinds.
+///
+/// [`TimeInForce::GoodUntilCancelled`] with `post_only` is likewise refused on a market order, as
+/// a promise never to take liquidity is one a market order cannot keep.
 ///
 /// # Errors
-/// Returns [`ApiError::OrderRejected`] for a [`OrderKind::Limit`] carrying any time in force other
-/// than a non-post-only [`TimeInForce::GoodUntilCancelled`], naming what it would take to honour
-/// it. Rejecting is the point: treating an unsupported time in force as `GoodUntilCancelled` would
-/// silently leave an order working that its sender asked to have cancelled.
+/// Returns [`ApiError::OrderRejected`] naming what it would take to honour the pair. Rejecting is
+/// the point: treating an unsupported time in force as `GoodUntilCancelled` would silently leave an
+/// order working that its sender asked to have cancelled, and treating an unsupported one as
+/// "fill now" answers a question the sender did not ask.
 fn validate_time_in_force_supported(
     order_kind: OrderKind,
     time_in_force: TimeInForce,
 ) -> Result<(), UnindexedOrderError> {
-    if order_kind != OrderKind::Limit {
-        return Ok(());
-    }
+    const NO_CALENDAR: &str = "a session calendar, which this venue does not have";
 
-    let missing = match time_in_force {
-        TimeInForce::GoodUntilCancelled { post_only: false } => return Ok(()),
-        TimeInForce::GoodUntilCancelled { post_only: true } => {
-            "rejecting an order that would take liquidity on arrival"
+    let missing = match (order_kind, time_in_force) {
+        // Governs *when* an order executes, not how long it works, whatever the kind.
+        (_, TimeInForce::AtOpen | TimeInForce::AtClose) => NO_CALENDAR,
+
+        // A market order takes liquidity by definition, so it cannot promise not to.
+        (OrderKind::Market, TimeInForce::GoodUntilCancelled { post_only: true }) => {
+            "an order that both takes liquidity and refuses to"
         }
-        TimeInForce::ImmediateOrCancel | TimeInForce::FillOrKill => {
-            "cancelling an order that is not marketable on arrival"
-        }
-        TimeInForce::GoodTillDate { .. } => "expiring a resting order at a stated instant",
-        TimeInForce::GoodUntilEndOfDay | TimeInForce::AtOpen | TimeInForce::AtClose => {
-            "a session calendar, which this venue does not have"
-        }
+
+        // Every other time in force bounds how long an order works, which is moot for one that
+        // fills in full on arrival.
+        (OrderKind::Market, _) => return Ok(()),
+
+        (OrderKind::Limit, TimeInForce::GoodUntilEndOfDay) => NO_CALENDAR,
+
+        // Honoured -- what each one then does is `Disposition`'s decision, not this one.
+        (
+            OrderKind::Limit,
+            TimeInForce::GoodUntilCancelled { .. }
+            | TimeInForce::ImmediateOrCancel
+            | TimeInForce::FillOrKill
+            | TimeInForce::GoodTillDate { .. },
+        ) => return Ok(()),
+
+        // Every other kind is rejected before this gate is reached.
+        (_, _) => return Ok(()),
     };
 
     Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
@@ -1224,6 +1492,61 @@ fn validate_time_in_force_supported(
              OrderKind::{order_kind:?}: it does not model {missing}"
         ),
     )))
+}
+
+/// What a supported time in force makes one arriving order do.
+///
+/// The marketability-dependent half of the time-in-force decision, split from
+/// [`validate_time_in_force_supported`] because three of the four time in forces this venue
+/// honours on a limit order need context that gate cannot see: `post_only`, `ImmediateOrCancel`
+/// and `FillOrKill` all turn on whether the order is marketable when it arrives, and
+/// `GoodTillDate` turns on the clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    /// Trade against the book now, as the aggressor.
+    Fill,
+    /// Join the book and wait to be crossed.
+    Rest,
+    /// Retire immediately having traded nothing, because the order asked to work only now and
+    /// could not: a non-marketable `ImmediateOrCancel` or `FillOrKill`, or a `post_only` order
+    /// that would have taken liquidity.
+    CancelUnfilled,
+    /// Retire immediately having traded nothing, because the order's own deadline has passed.
+    Expire,
+}
+
+/// Decide what one order does, given whether it is marketable and what time it is.
+///
+/// `marketable` is [`crosses`] for a limit order, and `true` for every other kind this venue
+/// accepts -- each of those is marketable on arrival by definition, which is what lets one function
+/// answer for both.
+///
+/// # Immediate-or-cancel and fill-or-kill coincide here, and only here
+/// This venue models no order size, so nothing can partially fill: an order is marketable in full
+/// or not at all ([`SimulatedVenue`]'s `# What matching does not model`). Both therefore reduce to
+/// "marketable ⇒ fill in full; not marketable ⇒ retire having traded nothing". They diverge only
+/// once an order can fill in part, at which point fill-or-kill must refuse a partial fill that
+/// immediate-or-cancel accepts. Accepting both and saying why they agree is honest; refusing
+/// fill-or-kill would claim this venue cannot model something it models exactly as well as the
+/// sibling it does accept.
+fn disposition(time_in_force: TimeInForce, marketable: bool, now: DateTime<Utc>) -> Disposition {
+    match time_in_force {
+        // Post-only means "never take liquidity", so being marketable is what disqualifies it.
+        TimeInForce::GoodUntilCancelled { post_only: true } if marketable => {
+            Disposition::CancelUnfilled
+        }
+
+        // A deadline already reached retires the order whatever the book is doing. Checked before
+        // marketability so that a deadline is an unconditional cutoff rather than one an order can
+        // trade its way past at the very instant it expires.
+        TimeInForce::GoodTillDate { expiry } if now >= expiry => Disposition::Expire,
+
+        _ if marketable => Disposition::Fill,
+
+        TimeInForce::ImmediateOrCancel | TimeInForce::FillOrKill => Disposition::CancelUnfilled,
+
+        _ => Disposition::Rest,
+    }
 }
 
 fn build_open_order_err_response<E>(
@@ -1299,7 +1622,7 @@ mod tests {
     use super::*;
     use crate::{
         error::OrderError,
-        exchange::mock::fixtures::*,
+        exchange::mock::{fixtures::*, orders::as_open},
         fee::PercentageFeeModel,
         fill::BidAskFillModel,
         order::{
@@ -1399,7 +1722,7 @@ mod tests {
     /// than fill on arrival.
     fn venue_resting_one_buy(limit: &str) -> (SimulatedVenue, OpenOutcome) {
         let mut venue = make_market_venue("10", "1000000");
-        venue.advance_time(time(1));
+        advance(&mut venue, time(1));
 
         assert!(
             venue
@@ -1416,6 +1739,19 @@ mod tests {
         );
 
         (venue, outcome)
+    }
+
+    /// Advances `venue`, asserting the advance retired nothing.
+    ///
+    /// Every existing test predates deadlines and holds only `GoodUntilCancelled` orders, so a
+    /// sweep that produced anything would mean an order retired that nothing asked to expire.
+    /// Asserting that beats discarding the value: it is the same one line, and it pins the
+    /// property instead of hiding it.
+    fn advance(venue: &mut SimulatedVenue, time_exchange: DateTime<Utc>) {
+        assert!(
+            venue.advance_time(time_exchange).is_empty(),
+            "advancing to {time_exchange} retired an order this test never gave a deadline"
+        );
     }
 
     fn time(seconds: i64) -> DateTime<Utc> {
@@ -1511,7 +1847,7 @@ mod tests {
         let mut venue = make_venue("100", "10000000");
         let time_exchange = "2025-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
 
-        venue.advance_time(time_exchange);
+        advance(&mut venue, time_exchange);
         assert_eq!(venue.time_exchange(), time_exchange);
 
         let outcome = venue.open_order(buy_request("0.01", market_prices("50000")));
@@ -1562,7 +1898,7 @@ mod tests {
             Vec::new(),
         );
 
-        venue.advance_time(much_later);
+        advance(&mut venue, much_later);
 
         let resting = venue.orders_open(&[]);
         assert_eq!(resting.len(), 1, "the seeded order must still be open");
@@ -2427,7 +2763,7 @@ mod tests {
     #[test]
     fn a_resting_order_fills_at_its_own_limit_and_is_never_improved_by_the_book() {
         let (mut venue, _) = venue_resting_one_buy("48000");
-        venue.advance_time(time(2));
+        advance(&mut venue, time(2));
 
         // Straight through the limit: the offer is 100 better than the order asked for.
         let events = venue.apply_market(&instrument_name(), book("47800", "47900"), time(2));
@@ -2463,7 +2799,7 @@ mod tests {
     #[test]
     fn a_resting_fill_reports_its_trade_before_the_order_that_produced_it() {
         let (mut venue, _) = venue_resting_one_buy("48000");
-        venue.advance_time(time(2));
+        advance(&mut venue, time(2));
 
         let events = venue.apply_market(&instrument_name(), book("47800", "47900"), time(2));
 
@@ -2489,7 +2825,7 @@ mod tests {
     #[test]
     fn a_resting_fill_reports_its_order_as_terminal_rather_than_as_a_complete_open() {
         let (mut venue, _) = venue_resting_one_buy("48000");
-        venue.advance_time(time(2));
+        advance(&mut venue, time(2));
 
         let events = venue.apply_market(&instrument_name(), book("47800", "47900"), time(2));
 
@@ -2512,7 +2848,7 @@ mod tests {
     #[test]
     fn a_resting_order_settles_exactly_what_it_reserved() {
         let (mut venue, _) = venue_resting_one_buy("48000");
-        venue.advance_time(time(2));
+        advance(&mut venue, time(2));
 
         let reserved = d("48009.6");
         let free_while_resting = venue.balances(&[quote()]).remove(0).balance.free;
@@ -2546,7 +2882,7 @@ mod tests {
             maker_taker_fee(),
             SimFillConfig::BidAsk(BidAskFillModel),
         );
-        venue.advance_time(time(1));
+        advance(&mut venue, time(1));
         assert!(
             venue
                 .apply_market(&instrument_name(), book("47800", "47900"), time(1))
@@ -2590,7 +2926,7 @@ mod tests {
             // `LastPriceFillModel`, which reads `last_price` and never consults the book.
             SimFillConfig::default(),
         );
-        venue.advance_time(time(1));
+        advance(&mut venue, time(1));
 
         // The offer is inside the limit, so the order is marketable -- but the trade price the
         // model reads is well above it.
@@ -2628,7 +2964,7 @@ mod tests {
             maker_taker_fee(),
             SimFillConfig::BidAsk(BidAskFillModel),
         );
-        aggressor.advance_time(time(1));
+        advance(&mut aggressor, time(1));
         assert!(
             aggressor
                 .apply_market(&instrument_name(), touching(), time(1))
@@ -2644,7 +2980,7 @@ mod tests {
             maker_taker_fee(),
             SimFillConfig::BidAsk(BidAskFillModel),
         );
-        maker.advance_time(time(1));
+        advance(&mut maker, time(1));
         assert!(
             maker
                 .apply_market(&instrument_name(), book("49000", "49100"), time(1))
@@ -2652,7 +2988,7 @@ mod tests {
         );
         let rested = maker.open_order(limit_request("b", Side::Buy, "1", limit, gtc()));
         assert_eq!(rested.events.len(), 1, "it rested rather than filling");
-        maker.advance_time(time(2));
+        advance(&mut maker, time(2));
         let resting_events = maker.apply_market(&instrument_name(), touching(), time(2));
         let resting_price = trade_of(&resting_events[1]).price;
 
@@ -2673,7 +3009,7 @@ mod tests {
     #[test]
     fn matching_fills_in_price_time_order_and_stops_at_the_first_order_that_does_not_cross() {
         let mut venue = make_market_venue("10", "1000000");
-        venue.advance_time(time(1));
+        advance(&mut venue, time(1));
         assert!(
             venue
                 .apply_market(&instrument_name(), book("49000", "49100"), time(1))
@@ -2686,7 +3022,7 @@ mod tests {
             assert_eq!(outcome.events.len(), 1, "{cid} must rest");
         }
 
-        venue.advance_time(time(2));
+        advance(&mut venue, time(2));
         // Crosses `best` and `mid`, leaves `worst` alone.
         let events = venue.apply_market(&instrument_name(), book("47900", "48000"), time(2));
 
@@ -2719,7 +3055,7 @@ mod tests {
     #[test]
     fn a_feed_with_no_book_matches_on_the_trade_price() {
         let mut venue = make_market_venue("10", "1000000");
-        venue.advance_time(time(1));
+        advance(&mut venue, time(1));
         assert!(
             venue
                 .apply_market(&instrument_name(), traded("49000"), time(1))
@@ -2729,7 +3065,7 @@ mod tests {
         let outcome = venue.open_order(limit_request("t", Side::Buy, "1", "48000", gtc()));
         assert_eq!(outcome.events.len(), 1, "49000 traded does not reach 48000");
 
-        venue.advance_time(time(2));
+        advance(&mut venue, time(2));
         let events = venue.apply_market(&instrument_name(), traded("47500"), time(2));
 
         assert_eq!(events.len(), 3, "a print through the limit fills it");
@@ -2741,7 +3077,7 @@ mod tests {
     #[test]
     fn a_price_inside_the_spread_does_not_cross_a_resting_order() {
         let (mut venue, _) = venue_resting_one_buy("48000");
-        venue.advance_time(time(2));
+        advance(&mut venue, time(2));
 
         // The microprice sits inside the spread and below the limit; the offer does not.
         let inside = MarketSnapshot {
@@ -2767,7 +3103,7 @@ mod tests {
     #[test]
     fn a_resting_sell_reserves_base_and_settles_it() {
         let mut venue = make_market_venue("10", "1000000");
-        venue.advance_time(time(1));
+        advance(&mut venue, time(1));
         assert!(
             venue
                 .apply_market(&instrument_name(), book("47000", "47100"), time(1))
@@ -2782,7 +3118,7 @@ mod tests {
             "a spot sell delivers the base asset, so that is what is held"
         );
 
-        venue.advance_time(time(2));
+        advance(&mut venue, time(2));
         let events = venue.apply_market(&instrument_name(), book("48100", "48200"), time(2));
 
         assert_eq!(trade_of(&events[1]).price, d("48000"), "at its own limit");
@@ -2799,7 +3135,7 @@ mod tests {
         let rebate =
             FeeModelConfig::Percentage(PercentageFeeModel::maker_taker(d("-0.0001"), d("0.001")));
         let mut venue = make_market_venue_with("10", "1000000", rebate, SimFillConfig::default());
-        venue.advance_time(time(1));
+        advance(&mut venue, time(1));
         assert!(
             venue
                 .apply_market(&instrument_name(), book("49000", "49100"), time(1))
@@ -2816,7 +3152,7 @@ mod tests {
             "a rebate means less is held than the notional"
         );
 
-        venue.advance_time(time(2));
+        advance(&mut venue, time(2));
         let events = venue.apply_market(&instrument_name(), book("47800", "47900"), time(2));
 
         assert_eq!(
@@ -2831,7 +3167,7 @@ mod tests {
     #[test]
     fn a_limit_order_that_cannot_be_afforded_is_rejected_without_resting() {
         let mut venue = make_market_venue("10", "1000");
-        venue.advance_time(time(1));
+        advance(&mut venue, time(1));
         assert!(
             venue
                 .apply_market(&instrument_name(), book("49000", "49100"), time(1))
@@ -2865,7 +3201,7 @@ mod tests {
     #[test]
     fn a_cancel_releases_the_reservation_and_restates_the_balance() {
         let (mut venue, _) = venue_resting_one_buy("48000");
-        venue.advance_time(time(2));
+        advance(&mut venue, time(2));
 
         let outcome = venue.cancel_order(OrderEvent {
             key: OrderKey {
@@ -2901,7 +3237,7 @@ mod tests {
     #[test]
     fn a_cancel_that_loses_the_race_to_its_own_fill_reports_the_fill() {
         let (mut venue, _) = venue_resting_one_buy("48000");
-        venue.advance_time(time(2));
+        advance(&mut venue, time(2));
         let events = venue.apply_market(&instrument_name(), book("47800", "47900"), time(2));
         assert_eq!(events.len(), 3, "the order filled first");
 
@@ -2985,10 +3321,6 @@ mod tests {
     #[test]
     fn a_limit_order_is_rejected_for_every_time_in_force_this_venue_cannot_honour() {
         let unsupported = [
-            TimeInForce::GoodUntilCancelled { post_only: true },
-            TimeInForce::ImmediateOrCancel,
-            TimeInForce::FillOrKill,
-            TimeInForce::GoodTillDate { expiry: time(9) },
             TimeInForce::GoodUntilEndOfDay,
             TimeInForce::AtOpen,
             TimeInForce::AtClose,
@@ -2996,7 +3328,7 @@ mod tests {
 
         for time_in_force in unsupported {
             let mut venue = make_market_venue("10", "1000000");
-            venue.advance_time(time(1));
+            advance(&mut venue, time(1));
             assert!(
                 venue
                     .apply_market(&instrument_name(), book("49000", "49100"), time(1))
@@ -3026,18 +3358,16 @@ mod tests {
         }
     }
 
-    /// The time-in-force gate must not reach a market order. One fills in full on arrival, which
-    /// satisfies every time in force there is — and rejecting one would be a regression.
+    /// A time in force that only bounds *how long* an order works is moot for one that fills in
+    /// full on arrival, and must not stop a market order filling.
     #[test]
-    fn a_market_order_is_accepted_whatever_its_time_in_force() {
+    fn a_market_order_is_accepted_for_every_time_in_force_that_only_bounds_how_long_it_works() {
         for time_in_force in [
             TimeInForce::GoodUntilCancelled { post_only: false },
             TimeInForce::ImmediateOrCancel,
             TimeInForce::FillOrKill,
             TimeInForce::GoodTillDate { expiry: time(9) },
             TimeInForce::GoodUntilEndOfDay,
-            TimeInForce::AtOpen,
-            TimeInForce::AtClose,
         ] {
             let mut venue = make_venue("10", "1000000");
             let mut request = buy_request("1", market_prices("48000"));
@@ -3054,5 +3384,502 @@ mod tests {
                 outcome.response.state
             );
         }
+    }
+
+    /// The two kinds of time in force a market order cannot keep, as opposed to the many it makes
+    /// moot.
+    ///
+    /// `AtOpen` and `AtClose` say *when* an order executes rather than how long it works, and
+    /// honouring them needs a session calendar. Filling one on arrival would answer a question its
+    /// sender did not ask, at a price that is not the auction it wanted — this library's own IBKR
+    /// client turns them into real market-on-close orders, so they are not a flag to be ignored.
+    /// `post_only` is refused because a market order takes liquidity by definition.
+    #[test]
+    fn a_market_order_is_rejected_for_a_time_in_force_it_cannot_keep() {
+        for time_in_force in [
+            TimeInForce::GoodUntilCancelled { post_only: true },
+            TimeInForce::AtOpen,
+            TimeInForce::AtClose,
+        ] {
+            let mut venue = make_venue("10", "1000000");
+            let mut request = buy_request("1", market_prices("48000"));
+            request.state.time_in_force = time_in_force;
+
+            let outcome = venue.open_order(request);
+
+            assert!(
+                outcome.events.is_empty(),
+                "{time_in_force} must move no balance"
+            );
+            match outcome.response.state {
+                OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                    ApiError::OrderRejected(ref reason),
+                ))) => assert!(
+                    reason.contains("does not model"),
+                    "the rejection must say what is missing, got: {reason}"
+                ),
+                ref other => panic!("{time_in_force} must be rejected, got: {other:?}"),
+            }
+        }
+    }
+
+    // --- Stage 3b-ii: post-only -------------------------------------------------------------
+
+    /// Post-only means "never take liquidity", so being marketable is what disqualifies the order.
+    ///
+    /// It retires having traded nothing rather than being rejected: the request was valid, and the
+    /// venue did exactly what `post_only` asked of it.
+    #[test]
+    fn a_post_only_order_that_would_take_liquidity_is_cancelled_having_traded_nothing() {
+        let mut venue = make_market_venue("10", "1000000");
+        advance(&mut venue, time(1));
+        assert!(
+            venue
+                .apply_market(&instrument_name(), book("49000", "49100"), time(1))
+                .is_empty()
+        );
+
+        // Buying at 50000 crosses an ask of 49100, so this order would be the aggressor.
+        let outcome = venue.open_order(limit_request(
+            "post",
+            Side::Buy,
+            "1",
+            "50000",
+            TimeInForce::GoodUntilCancelled { post_only: true },
+        ));
+
+        assert!(outcome.events.is_empty(), "nothing was reserved or traded");
+        assert!(venue.orders_open(&[]).is_empty(), "it must not rest");
+        assert!(venue.trades(time(0)).is_empty(), "it must not trade");
+
+        match outcome.response.state {
+            OrderState::Inactive(InactiveOrderState::Cancelled(ref cancelled)) => {
+                assert_eq!(cancelled.filled_quantity, Decimal::ZERO)
+            }
+            ref other => panic!("a marketable post-only order must be cancelled, got: {other:?}"),
+        }
+    }
+
+    /// The same order that does *not* cross is exactly what post-only is for, and rests normally.
+    #[test]
+    fn a_post_only_order_that_would_rest_is_accepted_and_reserves() {
+        let mut venue = make_market_venue("10", "1000000");
+        advance(&mut venue, time(1));
+        assert!(
+            venue
+                .apply_market(&instrument_name(), book("49000", "49100"), time(1))
+                .is_empty()
+        );
+
+        let outcome = venue.open_order(limit_request(
+            "post",
+            Side::Buy,
+            "1",
+            "48000",
+            TimeInForce::GoodUntilCancelled { post_only: true },
+        ));
+
+        assert_eq!(rested_open(&outcome).filled_quantity, Decimal::ZERO);
+        assert_eq!(venue.orders_open(&[]).len(), 1);
+        assert_eq!(
+            balance_of(&outcome.events[0]).balance.free,
+            d("1000000") - d("48000") - d("9.6"),
+            "resting post-only reserves the notional plus the 2bp maker fee its fill will charge"
+        );
+    }
+
+    // --- Stage 3b-ii: immediate-or-cancel and fill-or-kill -----------------------------------
+
+    /// Both retire unfilled when the book is not there to trade against, and neither rests.
+    ///
+    /// They coincide because this venue models no order size — see `disposition`.
+    #[test]
+    fn a_non_marketable_immediate_order_is_cancelled_having_traded_nothing() {
+        for time_in_force in [TimeInForce::ImmediateOrCancel, TimeInForce::FillOrKill] {
+            let mut venue = make_market_venue("10", "1000000");
+            advance(&mut venue, time(1));
+            assert!(
+                venue
+                    .apply_market(&instrument_name(), book("49000", "49100"), time(1))
+                    .is_empty()
+            );
+
+            let outcome =
+                venue.open_order(limit_request("ioc", Side::Buy, "1", "48000", time_in_force));
+
+            assert!(
+                outcome.events.is_empty(),
+                "{time_in_force} must move no balance"
+            );
+            assert!(
+                venue.orders_open(&[]).is_empty(),
+                "{time_in_force} must not rest"
+            );
+            match outcome.response.state {
+                OrderState::Inactive(InactiveOrderState::Cancelled(ref cancelled)) => assert_eq!(
+                    cancelled.filled_quantity,
+                    Decimal::ZERO,
+                    "{time_in_force} traded nothing"
+                ),
+                ref other => panic!("{time_in_force} must be cancelled, got: {other:?}"),
+            }
+        }
+    }
+
+    /// Marketable, and both fill in full against the book as the aggressor.
+    #[test]
+    fn a_marketable_immediate_order_fills_in_full() {
+        for time_in_force in [TimeInForce::ImmediateOrCancel, TimeInForce::FillOrKill] {
+            let mut venue = make_market_venue("10", "1000000");
+            advance(&mut venue, time(1));
+            assert!(
+                venue
+                    .apply_market(&instrument_name(), traded("49000"), time(1))
+                    .is_empty()
+            );
+
+            let outcome =
+                venue.open_order(limit_request("ioc", Side::Buy, "1", "50000", time_in_force));
+
+            assert!(
+                matches!(
+                    outcome.response.state,
+                    OrderState::Inactive(InactiveOrderState::FullyFilled(_))
+                ),
+                "{time_in_force} must fill, got: {:?}",
+                outcome.response.state
+            );
+        }
+    }
+
+    // --- Stage 3b-ii: deadlines -------------------------------------------------------------
+
+    /// A deadline in the future rests like any other order, and nothing retires it early.
+    #[test]
+    fn a_good_till_date_order_rests_until_its_deadline() {
+        let mut venue = make_market_venue("10", "1000000");
+        advance(&mut venue, time(1));
+
+        let outcome = venue.open_order(limit_request(
+            "gtd",
+            Side::Buy,
+            "1",
+            "48000",
+            TimeInForce::GoodTillDate { expiry: time(9) },
+        ));
+
+        assert_eq!(rested_open(&outcome).filled_quantity, Decimal::ZERO);
+
+        // Short of the deadline, so the sweep must find nothing.
+        advance(&mut venue, time(8));
+        assert_eq!(venue.orders_open(&[]).len(), 1, "still working at time(8)");
+    }
+
+    /// Advancing to the deadline retires the order, releases what it held, and says so in order.
+    #[test]
+    fn advancing_to_a_deadline_releases_the_reservation_then_reports_the_order() {
+        let mut venue = make_market_venue("10", "1000000");
+        advance(&mut venue, time(1));
+
+        let outcome = venue.open_order(limit_request(
+            "gtd",
+            Side::Buy,
+            "1",
+            "48000",
+            TimeInForce::GoodTillDate { expiry: time(9) },
+        ));
+        let reserved = balance_of(&outcome.events[0]).balance.free;
+
+        let events = venue.advance_time(time(9));
+
+        assert_eq!(events.len(), 2, "one release and one terminal snapshot");
+        assert_eq!(
+            balance_of(&events[0]).balance.free,
+            reserved + d("48000") + d("9.6"),
+            "the release restates exactly what resting took"
+        );
+
+        let order = order_of(&events[1]);
+        match order.state {
+            OrderState::Inactive(InactiveOrderState::Expired(ref expired)) => {
+                assert_eq!(expired.time_exchange, time(9));
+                assert_eq!(expired.filled_quantity, Decimal::ZERO);
+            }
+            ref other => panic!("the order must be reported expired, got: {other:?}"),
+        }
+
+        assert!(venue.orders_open(&[]).is_empty(), "it must leave the book");
+    }
+
+    /// The deadline is reached *at* its instant, not after it.
+    ///
+    /// The boundary is the whole contract: a caller reading "good till `T`" must be able to say
+    /// whether the order is working at `T`, and this pins the answer to "no".
+    #[test]
+    fn a_deadline_is_reached_at_its_instant_not_after_it() {
+        let mut venue = make_market_venue("10", "1000000");
+        advance(&mut venue, time(1));
+
+        let _ = venue.open_order(limit_request(
+            "gtd",
+            Side::Buy,
+            "1",
+            "48000",
+            TimeInForce::GoodTillDate { expiry: time(5) },
+        ));
+
+        // One second short: still working.
+        advance(&mut venue, time(4));
+        assert_eq!(venue.orders_open(&[]).len(), 1);
+
+        // Exactly the stated instant: retired.
+        assert_eq!(venue.advance_time(time(5)).len(), 2);
+        assert!(venue.orders_open(&[]).is_empty());
+    }
+
+    /// A tick that both reaches a deadline and crosses the order retires it rather than filling it.
+    ///
+    /// The deadline is an unconditional cutoff: whether an order trades at the very instant it
+    /// expires must not depend on whether the market happened to cross there.
+    #[test]
+    fn a_deadline_is_swept_before_the_tick_that_would_have_filled_it() {
+        let mut venue = make_market_venue("10", "1000000");
+        advance(&mut venue, time(1));
+
+        let _ = venue.open_order(limit_request(
+            "gtd",
+            Side::Buy,
+            "1",
+            "48000",
+            TimeInForce::GoodTillDate { expiry: time(5) },
+        ));
+
+        // An ask of 47000 crosses a limit of 48000, so this tick would have filled the order — but
+        // it also reaches the deadline.
+        let events = venue.apply_market(&instrument_name(), book("46900", "47000"), time(5));
+
+        assert_eq!(events.len(), 2, "a release and an expiry, not a fill");
+        assert!(
+            venue.trades(time(0)).is_empty(),
+            "an expired order must not trade on the tick that retired it"
+        );
+        assert!(matches!(
+            order_of(&events[1]).state,
+            OrderState::Inactive(InactiveOrderState::Expired(_))
+        ));
+    }
+
+    /// An order whose deadline has already passed on arrival never reaches the book.
+    ///
+    /// With no independent clock, an order accepted past its own deadline would work until
+    /// something else happened to touch the venue — and if nothing did, for the rest of the run.
+    #[test]
+    fn a_good_till_date_order_that_has_already_expired_is_never_rested() {
+        let mut venue = make_market_venue("10", "1000000");
+        advance(&mut venue, time(9));
+
+        let outcome = venue.open_order(limit_request(
+            "stale",
+            Side::Buy,
+            "1",
+            "48000",
+            TimeInForce::GoodTillDate { expiry: time(5) },
+        ));
+
+        assert!(outcome.events.is_empty(), "nothing was reserved");
+        assert!(venue.orders_open(&[]).is_empty(), "it must not rest");
+        match outcome.response.state {
+            OrderState::Inactive(InactiveOrderState::Expired(ref expired)) => {
+                assert_eq!(expired.time_exchange, time(9), "stamped when it was found");
+                assert_eq!(expired.filled_quantity, Decimal::ZERO);
+            }
+            ref other => panic!("a stale deadline must expire, not {other:?}"),
+        }
+    }
+
+    /// A stale deadline retires the order even when the book would have filled it.
+    ///
+    /// The same unconditional cutoff as on the tick path: an order whose deadline has elapsed has
+    /// stopped working, so whether it *could* have traded is not a question the venue asks. The
+    /// alternative would execute an order its sender had already asked to be finished with, and
+    /// make the outcome depend on where the book happened to be.
+    #[test]
+    fn a_stale_deadline_retires_an_order_the_book_would_have_filled() {
+        let mut venue = make_market_venue("10", "1000000");
+        advance(&mut venue, time(9));
+        assert!(
+            venue
+                .apply_market(&instrument_name(), traded("47000"), time(9))
+                .is_empty()
+        );
+
+        let outcome = venue.open_order(limit_request(
+            "stale",
+            Side::Buy,
+            "1",
+            "48000",
+            TimeInForce::GoodTillDate { expiry: time(5) },
+        ));
+
+        assert!(
+            matches!(
+                outcome.response.state,
+                OrderState::Inactive(InactiveOrderState::Expired(_))
+            ),
+            "a marketable order past its deadline must expire, not fill: {:?}",
+            outcome.response.state
+        );
+        assert!(
+            venue.trades(time(0)).is_empty(),
+            "it must not trade on its way out"
+        );
+    }
+
+    /// A cancel arriving after its order's deadline is told *why* it found nothing.
+    #[test]
+    fn a_cancel_after_a_deadline_is_answered_already_expired() {
+        let mut venue = make_market_venue("10", "1000000");
+        advance(&mut venue, time(1));
+
+        let _ = venue.open_order(limit_request(
+            "gtd",
+            Side::Buy,
+            "1",
+            "48000",
+            TimeInForce::GoodTillDate { expiry: time(5) },
+        ));
+        assert_eq!(venue.advance_time(time(6)).len(), 2);
+
+        let outcome = venue.cancel_order(OrderEvent {
+            key: OrderKey {
+                exchange: EXCHANGE,
+                instrument: instrument_name(),
+                strategy: StrategyId::new("test"),
+                cid: ClientOrderId::new("gtd"),
+            },
+            state: RequestCancel { id: None },
+        });
+
+        assert_eq!(
+            outcome.response.state,
+            Err(OrderError::Rejected(ApiError::OrderAlreadyExpired)),
+            "a cancel that lost to a deadline must not read as an unknown order"
+        );
+    }
+
+    /// An expired order is still part of the account, and a later snapshot reports it.
+    #[test]
+    fn an_expired_order_enters_the_account_snapshot() {
+        let mut venue = make_market_venue("10", "1000000");
+        advance(&mut venue, time(1));
+
+        let _ = venue.open_order(limit_request(
+            "gtd",
+            Side::Buy,
+            "1",
+            "48000",
+            TimeInForce::GoodTillDate { expiry: time(5) },
+        ));
+        assert_eq!(venue.advance_time(time(5)).len(), 2);
+
+        let snapshot = venue.account_snapshot();
+        let orders = &snapshot.instruments[0].orders;
+        assert_eq!(orders.len(), 1);
+        assert!(matches!(
+            orders[0].state,
+            OrderState::Inactive(InactiveOrderState::Expired(_))
+        ));
+    }
+
+    /// Deadlines are swept in deadline order, so a run's events do not depend on map iteration.
+    #[test]
+    fn deadlines_are_swept_earliest_first() {
+        let mut venue = make_market_venue("10", "1000000");
+        advance(&mut venue, time(1));
+
+        // Booked latest-deadline first, so insertion order is the opposite of sweep order.
+        for (cid, expiry) in [("late", time(7)), ("early", time(5)), ("middle", time(6))] {
+            let _ = venue.open_order(limit_request(
+                cid,
+                Side::Buy,
+                "1",
+                "48000",
+                TimeInForce::GoodTillDate { expiry },
+            ));
+        }
+
+        let events = venue.advance_time(time(9));
+
+        // Each retirement is a release then a snapshot, so the orders are at the odd indices.
+        let swept: Vec<_> = events
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .map(|event| order_of(event).key.cid.0.to_string())
+            .collect();
+
+        assert_eq!(swept, ["early", "middle", "late"]);
+    }
+
+    /// A deadline is a property of the clock, not of a book: an order on an instrument that never
+    /// ticks again is still retired by activity elsewhere on the venue.
+    #[test]
+    fn a_deadline_on_a_quiet_instrument_is_swept_by_a_tick_on_another() {
+        let mut venue = make_market_venue("10", "1000000");
+        advance(&mut venue, time(1));
+
+        let _ = venue.open_order(limit_request(
+            "gtd",
+            Side::Buy,
+            "1",
+            "48000",
+            TimeInForce::GoodTillDate { expiry: time(5) },
+        ));
+
+        // A market for an instrument this venue holds no order on.
+        let elsewhere = InstrumentNameExchange::new("eth_usdt");
+        let events = venue.apply_market(&elsewhere, book("2000", "2001"), time(6));
+
+        assert_eq!(
+            events.len(),
+            2,
+            "the quiet instrument's order still retires"
+        );
+        assert!(venue.orders_open(&[]).is_empty());
+    }
+
+    /// An order the venue took nothing for releases nothing, exactly as cancelling one does.
+    #[test]
+    fn expiring_an_order_seeded_with_no_reservation_restates_no_balance() {
+        let expiry = time(5);
+        let seeded = Order {
+            key: OrderKey {
+                exchange: EXCHANGE,
+                instrument: instrument_name(),
+                strategy: StrategyId::new("test"),
+                cid: ClientOrderId::new("seeded"),
+            },
+            side: Side::Buy,
+            price: Some(d("48000")),
+            quantity: d("1"),
+            kind: OrderKind::Limit,
+            time_in_force: TimeInForce::GoodTillDate { expiry },
+            state: OrderState::active(Open::new(OrderId::new("seeded"), time(1), Decimal::ZERO)),
+        };
+
+        let mut venue = make_market_venue("10", "1000000");
+        venue.account.orders_mut().insert(
+            as_open(seeded).expect("the seeded order is Open"),
+            // As `initial_state` seeds one: the venue never took anything for it.
+            None,
+        );
+
+        let events = venue.advance_time(expiry);
+
+        assert_eq!(events.len(), 1, "the terminal snapshot alone, no release");
+        assert!(matches!(
+            order_of(&events[0]).state,
+            OrderState::Inactive(InactiveOrderState::Expired(_))
+        ));
     }
 }

@@ -14,7 +14,9 @@ use rustrade_instrument::{
     instrument::{InstrumentIndex, name::InstrumentNameExchange},
 };
 use serde::{Deserialize, Serialize};
-use state::{ActiveOrderState, Cancelled, InactiveOrderState, Open, OpenInFlight, OrderState};
+use state::{
+    ActiveOrderState, Cancelled, Expired, InactiveOrderState, Open, OpenInFlight, OrderState,
+};
 
 /// `Order` related identifiers.
 pub mod id;
@@ -392,6 +394,32 @@ impl<ExchangeKey, AssetKey, InstrumentKey> From<Order<ExchangeKey, InstrumentKey
             kind,
             time_in_force,
             state: OrderState::Inactive(InactiveOrderState::Cancelled(state)),
+        }
+    }
+}
+
+impl<ExchangeKey, AssetKey, InstrumentKey> From<Order<ExchangeKey, InstrumentKey, Expired>>
+    for Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>
+{
+    fn from(value: Order<ExchangeKey, InstrumentKey, Expired>) -> Self {
+        let Order {
+            key,
+            side,
+            price,
+            quantity,
+            kind,
+            time_in_force,
+            state,
+        } = value;
+
+        Self {
+            key,
+            side,
+            price,
+            quantity,
+            kind,
+            time_in_force,
+            state: OrderState::Inactive(InactiveOrderState::Expired(state)),
         }
     }
 }
