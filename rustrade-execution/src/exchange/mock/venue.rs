@@ -83,7 +83,8 @@ pub enum VenueRegime {
     RequestPriced,
 
     /// A driver feeds [`apply_market`](SimulatedVenue::apply_market), so an order can rest and be
-    /// matched against that feed later.
+    /// matched against that feed later — and **every** fill, market orders included, is priced
+    /// from that feed rather than from the snapshot a request carried.
     ///
     /// The regime of [`SimulatedVenue::new_market_driven`], and what `SimRunner` drives.
     MarketDriven,
@@ -138,24 +139,45 @@ pub enum VenueRegime {
 ///   absent balance. Cancelling one releases nothing and restates no balance, and neither does
 ///   retiring one at its deadline.
 ///
-/// # How a limit order is priced
-/// - **Marketable on arrival** — priced by the [`FillModel`] against this venue's market, then
-///   clamped to the order's limit: a buy never fills above it, a sell never below. Charged
-///   [`Liquidity::Taker`].
-/// - **Resting** — fills at its own limit price exactly, and never reaches the [`FillModel`].
-///   Deriving a better price from the book would credit price improvement no resting order can
-///   obtain: a maker is paid the price it quoted, and improvement accrues to the aggressor that
-///   crossed it. Charged [`Liquidity::Maker`].
+/// # How an order is priced
 ///
-/// The two agree exactly at the crossing point — an order arriving when `best_ask == limit` fills
-/// at the limit either way — and diverge only where the order genuinely is, or is not, marketable.
-/// Marketability is judged on `best_ask`/`best_bid`, falling back to `last_price` when the feed
-/// supplies no book: with the default `LastPriceFillModel` and a trades-only feed there is no book
-/// at all, so a book-only rule would never match anything.
+/// Every fill is priced from **one** market, and which market that is depends only on the
+/// [`VenueRegime`]: this venue's own on a [`MarketDriven`](VenueRegime::MarketDriven) one, and the
+/// snapshot the request carried
+/// ([`RequestOpen::market`](crate::order::request::RequestOpen::market)) on a
+/// [`RequestPriced`](VenueRegime::RequestPriced) one. A limit order is only ever accepted on a
+/// `MarketDriven` venue, so it is always priced from the venue's own market; a market order follows
+/// the regime.
 ///
-/// A market order is unaffected by any of this. It is still priced from the snapshot its own
-/// request carried, which is what keeps a backtest's market-order fills identical whether or not a
-/// driver feeds this venue a market.
+/// That a `MarketDriven` venue prices a market order from its own book — rather than from the
+/// sender's view at decision time — is what makes a driver's request latency price-relevant instead
+/// of a pure delivery delay. The market may move between an order being decided and arriving, and a
+/// fill is struck against the book it arrives to. `RequestOpen::market` is then decision-time
+/// provenance and nothing else, which is what it is documented to be, and the difference between it
+/// and the fill is implementation shortfall — a quantity that is identically zero when the two are
+/// the same snapshot.
+///
+/// A `MarketDriven` venue that has not been fed an instrument **rejects** a market order in it as
+/// unpriceable rather than falling back to the requester's snapshot: a venue with no market for an
+/// instrument cannot fill a market order in it, and saying so is the observable failure. Silently
+/// pricing from the requester's view would make the fill depend on which of the two happened to
+/// hold a price, and would re-admit the very `RequestPriced` behaviour the regime exists to
+/// distinguish.
+///
+/// Given that market, the three cases are:
+/// - **A market order**, and **a limit order marketable on arrival** — priced by the [`FillModel`].
+///   A limit order is then *clamped* to its own limit: a buy never fills above it, a sell never
+///   below. Both are charged [`Liquidity::Taker`].
+/// - **A resting limit order** — fills at its own limit price exactly, and never reaches the
+///   [`FillModel`]. Deriving a better price from the book would credit price improvement no resting
+///   order can obtain: a maker is paid the price it quoted, and improvement accrues to the
+///   aggressor that crossed it. Charged [`Liquidity::Maker`].
+///
+/// The marketable and resting rules agree exactly at the crossing point — an order arriving when
+/// `best_ask == limit` fills at the limit either way — and diverge only where the order genuinely
+/// is, or is not, marketable. Marketability is judged on `best_ask`/`best_bid`, falling back to
+/// `last_price` when the feed supplies no book: with the default `LastPriceFillModel` and a
+/// trades-only feed there is no book at all, so a book-only rule would never match anything.
 ///
 /// # What matching does not model
 /// - **No queue position.** An order that crosses fills in full, whatever size rests ahead of it.
@@ -411,14 +433,15 @@ impl SimulatedVenue {
     /// hazard that motivated the split, so a venue driven by it reports [`market`](Self::market) as
     /// `None` forever. That difference is a property of this type, not an accident of wiring.
     ///
-    /// # What it prices, and what it does not
-    /// This is the market a **resting** order is matched against, and the one a limit order's
-    /// marketability is judged on — see the type's `# How a limit order is priced`.
+    /// # What it prices
+    /// Everything this venue fills. It is the market a **resting** order is matched against, the
+    /// one a limit order's marketability is judged on, and — on a
+    /// [`MarketDriven`](VenueRegime::MarketDriven) venue, which is the only kind that has one — the
+    /// one a **market** order is priced from. See the type's `# How an order is priced`.
     ///
-    /// A market order is deliberately *not* priced from it. It is still priced from the snapshot
-    /// its own request carried
-    /// ([`RequestOpen::market`](crate::order::request::RequestOpen::market)), which is what keeps
-    /// this venue's market-order results identical whether or not a driver feeds it.
+    /// So feeding this is not optional for a `MarketDriven` venue: an instrument it has never been
+    /// fed cannot fill a market order, and says so rather than reaching for the requester's
+    /// snapshot.
     ///
     /// # Returns the fills it caused, which a driver must deliver
     /// Applying a market is what makes a resting order fill, so this returns every account event
@@ -504,7 +527,7 @@ impl SimulatedVenue {
             };
 
             // A resting order fills at its own limit, never at a price derived from the book --
-            // see the type's `# How a limit order is priced` -- and takes no liquidity, so it is
+            // see the type's `# How an order is priced` -- and takes no liquidity, so it is
             // charged the maker rate.
             let settlement =
                 self.settlement(&terms, order.side, order.quantity, limit, Liquidity::Maker);
@@ -644,17 +667,18 @@ impl SimulatedVenue {
     /// `[balance]` alone -- the reservation now held against it -- and no trade, because nothing
     /// traded.
     ///
-    /// A Market order carries no limit price, so the venue prices it against
-    /// [`RequestOpen::market`](crate::order::request::RequestOpen::market) -- the snapshot its
-    /// sender stamped at decision time. A Limit order is judged and priced against this venue's own
-    /// market instead; see the type's `# How a limit order is priced`.
+    /// A Market order carries no limit price, so the venue prices it from whichever market its
+    /// [`VenueRegime`] gives it -- its own on a [`MarketDriven`](VenueRegime::MarketDriven) venue,
+    /// and [`RequestOpen::market`](crate::order::request::RequestOpen::market) on a
+    /// [`RequestPriced`](VenueRegime::RequestPriced) one. A Limit order is always judged and priced
+    /// against this venue's own market; see the type's `# How an order is priced`.
     pub fn open_order(
         &mut self,
         request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
     ) -> OpenOutcome {
-        // Single source: the snapshot the request carries. Passing it separately would allow two
-        // copies on one path to disagree, with nothing to arbitrate.
-        let market = request.state.market;
+        // Chosen here so one path holds one snapshot: threading both through would allow two copies
+        // to disagree, with nothing to arbitrate.
+        let market = self.pricing_market(&request);
         let (response, notifications) = self.open_order_inner(request, market);
 
         let events = match notifications {
@@ -815,7 +839,41 @@ impl SimulatedVenue {
     /// instead of at the end of a long one.
     ///
     /// `market` is the snapshot the request carried, and is used only by an order that is priced
-    /// from it -- see the type's `# How a limit order is priced`.
+    /// from it -- see the type's `# How an order is priced`.
+    /// The market an arriving order is priced against, which is the venue's own wherever it has
+    /// one.
+    ///
+    /// # Why the regime decides, and why there is no fallback
+    /// A [`MarketDriven`](VenueRegime::MarketDriven) venue owns a book, and a fill is priced from
+    /// the book the order reaches -- that is what a venue *is*. Its driver routes each market event
+    /// to it before the client that will react sees it, and books the request at the instant it
+    /// arrives, so this snapshot is the market as of that arrival: neither stale, nor from a future
+    /// the sender could not have seen.
+    ///
+    /// [`RequestPriced`](VenueRegime::RequestPriced) has no book at all, so the snapshot the
+    /// request carried is its only price source. That is the whole of the difference, and it is why
+    /// `MockExchange`'s results do not move.
+    ///
+    /// A `MarketDriven` venue that has not been fed this instrument answers `None` rather than
+    /// falling back to the request's snapshot. A venue with no market for an instrument cannot fill
+    /// a market order in it, and saying so is the observable failure; silently pricing from the
+    /// requester's view would make the fill depend on which of the two happened to hold a price,
+    /// and would re-admit exactly the request-priced behaviour the regime exists to distinguish.
+    /// [`fill_on_arrival`](Self::fill_on_arrival) reports it as an unpriceable order, naming the
+    /// absent snapshot.
+    fn pricing_market(
+        &self,
+        request: &OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
+    ) -> Option<MarketSnapshot> {
+        match self.regime {
+            VenueRegime::RequestPriced => request.state.market,
+            // `VenueInstrumentMarket` is `Copy`, so this leaves no borrow outstanding.
+            VenueRegime::MarketDriven => self
+                .market(&request.key.instrument)
+                .map(|market| market.snapshot),
+        }
+    }
+
     fn open_order_inner(
         &mut self,
         request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
@@ -871,19 +929,14 @@ impl SimulatedVenue {
             );
         };
 
-        // A limit order is judged against this venue's own market, not the requester's snapshot:
-        // the venue is what owns the book an order rests on, and a resting order has no
-        // request-time snapshot to be matched against at all. `VenueInstrumentMarket` is `Copy`, so
-        // this leaves no borrow outstanding against the `&mut self` below.
-        let venue_market = self
-            .market(&request.key.instrument)
-            .map(|market| market.snapshot);
-
-        let marketable =
-            venue_market.is_some_and(|market| crosses(request.state.side, limit, &market));
+        // The same snapshot the order will be priced from, so marketability and price cannot be
+        // decided against two different views of the book. `validate_order_kind_supported` has
+        // already refused a limit order on a `RequestPriced` venue, so on this path
+        // `pricing_market` is this venue's own market by construction.
+        let marketable = market.is_some_and(|market| crosses(request.state.side, limit, &market));
 
         match disposition(request.state.time_in_force, marketable, now) {
-            Disposition::Fill => self.fill_on_arrival(request, venue_market, &terms),
+            Disposition::Fill => self.fill_on_arrival(request, market, &terms),
             Disposition::Rest => self.rest_order(request, limit, &terms),
             Disposition::CancelUnfilled => self.cancel_on_arrival(request, now),
             Disposition::Expire => self.expire_on_arrival(request, now),
@@ -3881,5 +3934,74 @@ mod tests {
             order_of(&events[0]).state,
             OrderState::Inactive(InactiveOrderState::Expired(_))
         ));
+    }
+
+    // --- Stage 4: market orders are priced from the book they arrive to ---------------------
+
+    /// A market-driven venue prices a market order from its own book, ignoring the requester's.
+    ///
+    /// The request carries a deliberately different snapshot, so a fill at the venue's price can
+    /// only have come from the venue's own market — the two are far enough apart that no fill
+    /// model or rounding could confuse them.
+    #[test]
+    fn a_market_driven_venue_prices_a_market_order_from_its_own_book() {
+        let mut venue = make_market_venue("10", "1000000");
+        advance(&mut venue, time(1));
+        assert!(
+            venue
+                .apply_market(&instrument_name(), traded("49000"), time(1))
+                .is_empty()
+        );
+
+        // What the sender was looking at when it decided, which is not what the venue holds.
+        let outcome = venue.open_order(buy_request("1.0", Some(traded("40000"))));
+
+        assert_eq!(
+            filled_price(&outcome.response),
+            d("49000"),
+            "the fill is struck against the venue's book, not the snapshot the request carried"
+        );
+    }
+
+    /// The same request on a request-priced venue still fills at the snapshot it carried.
+    ///
+    /// The regime is the whole of the difference, which is why `MockExchange`'s results do not
+    /// move: it drives a `RequestPriced` venue and reads `market()` as `None` forever.
+    #[test]
+    fn a_request_priced_venue_still_prices_a_market_order_from_the_request() {
+        let mut venue = make_venue("10", "1000000");
+
+        let outcome = venue.open_order(buy_request("1.0", Some(traded("40000"))));
+
+        assert_eq!(
+            filled_price(&outcome.response),
+            d("40000"),
+            "with no book of its own, the request's snapshot is still the only price source"
+        );
+    }
+
+    /// A market-driven venue that has never been fed an instrument rejects a market order in it
+    /// rather than reaching for the requester's snapshot.
+    ///
+    /// Falling back would make the fill depend on which of the two happened to hold a price, and
+    /// would re-admit the request-priced behaviour the regime exists to distinguish. The request
+    /// here carries a perfectly good snapshot, and is refused anyway.
+    #[test]
+    fn a_market_driven_venue_with_no_book_rejects_a_market_order_rather_than_using_the_request() {
+        let mut venue = make_market_venue("10", "1000000");
+        advance(&mut venue, time(1));
+
+        let outcome = venue.open_order(buy_request("1.0", Some(traded("49000"))));
+
+        assert!(outcome.events.is_empty(), "nothing was debited or traded");
+        match outcome.response.state {
+            OrderState::Inactive(InactiveOrderState::OpenFailed(
+                UnindexedOrderError::Rejected(ApiError::OrderRejected(ref reason)),
+            )) => assert!(
+                reason.contains("no market snapshot"),
+                "the rejection must name the venue's absent market, got: {reason}"
+            ),
+            ref other => panic!("an unpriceable market order must be rejected, got: {other:?}"),
+        }
     }
 }
