@@ -112,7 +112,9 @@ impl<'a> SimExecutionBuilder<'a> {
         let leg = TimeDelta::milliseconds((config.latency_ms / 2) as i64);
 
         let venue = SimVenue {
-            venue: SimulatedVenue::new(
+            // Market-driven: `SimRunner::poll_next` routes every source market event to this
+            // venue before the `Engine` sees it, which is what lets it accept resting orders.
+            venue: SimulatedVenue::new_market_driven(
                 &config,
                 generate_mock_exchange_instruments(self.instruments, exchange),
             ),

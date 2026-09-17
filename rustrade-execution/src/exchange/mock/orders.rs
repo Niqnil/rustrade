@@ -8,11 +8,42 @@ use crate::order::{
 use chrono::{DateTime, Utc};
 use fnv::FnvHashMap;
 use rust_decimal::Decimal;
-use rustrade_instrument::{Side, exchange::ExchangeId, instrument::name::InstrumentNameExchange};
+use rustrade_instrument::{
+    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
+    instrument::name::InstrumentNameExchange,
+};
 use std::collections::BTreeMap;
 
 /// An open order held by a simulated venue.
 pub type OpenOrder = Order<ExchangeId, InstrumentNameExchange, Open>;
+
+/// The balance a venue is holding against one resting order.
+///
+/// Recorded so the venue settles on a fill, and releases on a cancel, **exactly** what it took when
+/// the order rested — rather than recomputing an amount that a changed fee model or contract size
+/// could make disagree with the one the client was told about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reservation {
+    /// The asset the order pays with: quote for a buy or a CFD, base for a spot sell.
+    pub asset: AssetNameExchange,
+    /// How much of it is held, inclusive of the fee the fill will charge.
+    pub amount: Decimal,
+}
+
+/// One resting order, and whatever the venue is holding against it.
+///
+/// The two are one value rather than two collections because they have exactly one lifetime: an
+/// order that leaves the book takes its reservation with it, and a reservation that outlives its
+/// order is held against nothing.
+#[derive(Debug, Clone)]
+pub struct RestingOrder {
+    pub order: OpenOrder,
+    /// What the venue holds against [`order`](Self::order), or `None` if it holds nothing.
+    ///
+    /// `None` for an order that arrived through a configured `initial_state`: the venue did not
+    /// take that balance and has nothing of its own to give back. See [`OpenOrders`].
+    pub reservation: Option<Reservation>,
+}
 
 /// One order's place in one side of one instrument's queue.
 ///
@@ -68,9 +99,20 @@ impl QueuePosition {
 /// holds: an order with no price to wait at has nothing to wait for. Such an order is kept in the
 /// map — a snapshot must report everything the account holds — but is absent from the queues, so
 /// matching can never reach it. It can only arrive through a configured `initial_state`.
+///
+/// # Reservations, and the ones that are not there
+///
+/// An order the venue booked itself carries the [`Reservation`] the venue took for it, so a fill
+/// settles and a cancel releases the same amount that was held — see [`RestingOrder`].
+///
+/// An order seeded by a configured `initial_state` carries `None`, because the venue never took
+/// anything for it. Cancelling such an order therefore releases nothing and restates no balance.
+/// That is the honest answer rather than a convenient one: the snapshot says an order is resting
+/// and says what the balances are, but not which order any held portion belongs to, so a venue
+/// that credited a release would be inventing the amount.
 #[derive(Debug, Default)]
 pub struct OpenOrders {
-    by_id: FnvHashMap<ClientOrderId, OpenOrder>,
+    by_id: FnvHashMap<ClientOrderId, RestingOrder>,
     /// Per instrument and side, best first. Values are keys into [`by_id`](Self::by_id).
     queues: FnvHashMap<(InstrumentNameExchange, Side), BTreeMap<QueuePosition, ClientOrderId>>,
     /// Monotone across every instrument, so insertion order is total even across queues.
@@ -78,14 +120,37 @@ pub struct OpenOrders {
 }
 
 impl OpenOrders {
-    /// Inserts `order`, replacing any order already held under its [`ClientOrderId`].
+    /// Inserts `order` holding `reservation` against it, replacing any order already held under
+    /// its [`ClientOrderId`].
     ///
     /// A replacement keeps the new order's price and arrival, so amending an order loses its queue
-    /// position — which is what a venue does when the amendment changes price.
-    pub fn insert(&mut self, order: OpenOrder) {
-        if let Some(replaced) = self.by_id.insert(order.key.cid.clone(), order.clone()) {
-            self.dequeue(&replaced);
-        }
+    /// position — which is what a venue does when the amendment changes price. The replaced order's
+    /// own reservation is returned rather than dropped, because it is still held against the
+    /// account and only its caller knows the ledger to give it back to.
+    ///
+    /// `reservation` is `None` only for an order the venue did not book itself — see the type's
+    /// note on reservations. It is a parameter rather than a later setter so that an order cannot
+    /// reach the book in a state where what is held against it has not yet been decided.
+    pub fn insert(
+        &mut self,
+        order: OpenOrder,
+        reservation: Option<Reservation>,
+    ) -> Option<Reservation> {
+        let resting = RestingOrder {
+            order: order.clone(),
+            reservation,
+        };
+
+        let released = match self.by_id.insert(order.key.cid.clone(), resting) {
+            Some(RestingOrder {
+                order: replaced,
+                reservation,
+            }) => {
+                self.dequeue(&replaced);
+                reservation
+            }
+            None => None,
+        };
 
         if let Some(price) = order.price {
             self.seq += 1;
@@ -97,17 +162,19 @@ impl OpenOrders {
                     order.key.cid,
                 );
         }
+
+        released
     }
 
-    /// Removes and returns the order held under `cid`, if there is one.
-    pub fn remove(&mut self, cid: &ClientOrderId) -> Option<OpenOrder> {
-        let order = self.by_id.remove(cid)?;
-        self.dequeue(&order);
-        Some(order)
+    /// Removes and returns the order held under `cid`, with whatever is held against it.
+    pub fn remove(&mut self, cid: &ClientOrderId) -> Option<RestingOrder> {
+        let resting = self.by_id.remove(cid)?;
+        self.dequeue(&resting.order);
+        Some(resting)
     }
 
     pub fn get(&self, cid: &ClientOrderId) -> Option<&OpenOrder> {
-        self.by_id.get(cid)
+        self.by_id.get(cid).map(|resting| &resting.order)
     }
 
     pub fn len(&self) -> usize {
@@ -123,7 +190,7 @@ impl OpenOrders {
     /// Callers that need a reproducible sequence must impose one — [`resting`](Self::resting) for
     /// matching, or an explicit sort for a snapshot.
     pub fn iter(&self) -> impl Iterator<Item = &OpenOrder> + '_ {
-        self.by_id.values()
+        self.by_id.values().map(|resting| &resting.order)
     }
 
     /// One instrument's resting orders on one side, **best price first** and earliest first within
@@ -142,6 +209,7 @@ impl OpenOrders {
             .flat_map(|queue| queue.values())
             // `by_id` and `queues` are written only together, so a queued id is always present.
             .filter_map(|cid| self.by_id.get(cid))
+            .map(|resting| &resting.order)
     }
 
     fn dequeue(&mut self, order: &OpenOrder) {
@@ -158,11 +226,27 @@ impl OpenOrders {
         // The position's `seq` is not known from the order, so this finds it by value. Queues are
         // per instrument and side, and an order appears in exactly one, so this is a scan of one
         // instrument's book rather than of every open order.
-        if let Some(position) = queue
+        let position = queue
             .range(QueuePosition::new(order.side, price, order.state.time_exchange, 0)..)
             .find(|(_, queued)| *queued == &order.key.cid)
-            .map(|(position, _)| *position)
-        {
+            .map(|(position, _)| *position);
+
+        // A priced order is queued by `insert` and dequeued only from here, so failing to find one
+        // means its `price`, `side` or `state.time_exchange` changed while it was on the book: the
+        // range above no longer covers where it was filed. That silently leaves a queued id with no
+        // order behind it, which `resting` then silently filters out — invisible in both
+        // directions, and it would corrupt price-time priority for every later match. Asserted
+        // rather than tolerated, because there is no correct way to carry on from it.
+        debug_assert!(
+            position.is_some(),
+            "OpenOrders lost the queue position of {} ({} {price} at {}): its ranking fields were \
+             mutated while it was on the book",
+            order.key.cid,
+            order.side,
+            order.state.time_exchange
+        );
+
+        if let Some(position) = position {
             queue.remove(&position);
         }
 
@@ -172,11 +256,14 @@ impl OpenOrders {
     }
 }
 
+/// Collects orders the venue did not book itself, so none of them carries a [`Reservation`].
+///
+/// This is the `initial_state` path — see [`OpenOrders`]'s note on reservations.
 impl FromIterator<OpenOrder> for OpenOrders {
     fn from_iter<T: IntoIterator<Item = OpenOrder>>(orders: T) -> Self {
         let mut open = Self::default();
         for order in orders {
-            open.insert(order);
+            open.insert(order, None);
         }
         open
     }
@@ -327,7 +414,7 @@ mod tests {
         .collect();
 
         let removed = open.remove(&ClientOrderId::new("a")).expect("a is open");
-        assert_eq!(removed.key.cid, ClientOrderId::new("a"));
+        assert_eq!(removed.order.key.cid, ClientOrderId::new("a"));
 
         assert_eq!(resting_cids(&open, Side::Buy), ["b"]);
         assert_eq!(open.len(), 1);
@@ -351,7 +438,7 @@ mod tests {
         assert!(open.is_empty());
         assert!(resting_cids(&open, Side::Buy).is_empty());
 
-        open.insert(order("c", Side::Buy, Some(dec!(98)), 3_000));
+        open.insert(order("c", Side::Buy, Some(dec!(98)), 3_000), None);
         assert_eq!(resting_cids(&open, Side::Buy), ["c"]);
     }
 
@@ -367,7 +454,7 @@ mod tests {
         .collect();
 
         // Amended down to behind `other`.
-        open.insert(order("amended", Side::Buy, Some(dec!(98)), 2_000));
+        open.insert(order("amended", Side::Buy, Some(dec!(98)), 2_000), None);
 
         assert_eq!(open.len(), 2, "a replacement is not a second order");
         assert_eq!(

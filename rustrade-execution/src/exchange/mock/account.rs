@@ -10,7 +10,7 @@ use crate::{
     trade::Trade,
 };
 use chrono::{DateTime, Utc};
-use fnv::FnvHashMap;
+use fnv::{FnvHashMap, FnvHashSet};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
     asset::name::AssetNameExchange, exchange::ExchangeId, instrument::name::InstrumentNameExchange,
@@ -22,6 +22,12 @@ pub struct AccountState {
     orders_open: OpenOrders,
     orders_cancelled:
         FnvHashMap<ClientOrderId, Order<ExchangeId, InstrumentNameExchange, Cancelled>>,
+    /// Orders that filled, kept only so a cancel arriving after one can say *why* it failed.
+    ///
+    /// Ids alone: nothing reads the order back, and the fill itself is already in
+    /// [`trades`](Self::trades). Grows with the run, like `trades` and `orders_cancelled` — a
+    /// simulated venue's ledgers are bounded by the dataset, not reaped.
+    orders_filled: FnvHashSet<ClientOrderId>,
     trades: Vec<Trade<AssetNameExchange, InstrumentNameExchange>>,
 }
 
@@ -39,6 +45,7 @@ impl AccountState {
             balances,
             orders_open,
             orders_cancelled,
+            orders_filled: FnvHashSet::default(),
             trades,
         }
     }
@@ -46,6 +53,32 @@ impl AccountState {
     /// This account's open orders, indexed for lookup and ordered for matching.
     pub fn orders(&self) -> &OpenOrders {
         &self.orders_open
+    }
+
+    /// This account's open orders, for a venue booking, matching or cancelling one.
+    pub fn orders_mut(&mut self) -> &mut OpenOrders {
+        &mut self.orders_open
+    }
+
+    /// Records that `order` was cancelled, so it is reported by a later account snapshot and a
+    /// second cancel for it can be told apart from a cancel for an order that never existed.
+    pub fn ack_cancelled(&mut self, order: Order<ExchangeId, InstrumentNameExchange, Cancelled>) {
+        self.orders_cancelled.insert(order.key.cid.clone(), order);
+    }
+
+    /// Whether `cid` names an order this account cancelled.
+    pub fn is_cancelled(&self, cid: &ClientOrderId) -> bool {
+        self.orders_cancelled.contains_key(cid)
+    }
+
+    /// Records that `cid` filled, so a cancel that loses the race to it can say so.
+    pub fn ack_filled(&mut self, cid: ClientOrderId) {
+        self.orders_filled.insert(cid);
+    }
+
+    /// Whether `cid` names an order this account filled.
+    pub fn is_filled(&self, cid: &ClientOrderId) -> bool {
+        self.orders_filled.contains(cid)
     }
 
     /// Restates every balance as of `time_exchange`.
@@ -176,6 +209,38 @@ impl AccountState {
         balance.clone()
     }
 
+    /// Gives `amount` of `asset` back to `free`, undoing a [`reserve`](Self::reserve) that will
+    /// never be settled.
+    ///
+    /// Only `free` moves: nothing left the account, so `total` is unchanged. This is what a
+    /// cancelled, expired or rejected order does to the balance held against it.
+    ///
+    /// # Panics
+    /// Panics if `asset` has no balance — see [`reserve`](Self::reserve). Releasing more than is
+    /// held would take `free` above `total` and break the ledger's invariant, so it panics in debug
+    /// builds; callers release an amount they reserved.
+    pub fn release(
+        &mut self,
+        asset: &AssetNameExchange,
+        amount: Decimal,
+        time_exchange: DateTime<Utc>,
+    ) -> AssetBalance<AssetNameExchange> {
+        let balance = self.balance_expect(asset);
+
+        debug_assert!(
+            balance.balance.free + amount <= balance.balance.total,
+            "releasing {amount} of {asset} would take free {} above total {}: only a reserved \
+             amount may be released",
+            balance.balance.free,
+            balance.balance.total
+        );
+
+        balance.balance.free += amount;
+        balance.time_exchange = time_exchange;
+
+        balance.clone()
+    }
+
     /// Reserves and immediately settles `amount` of `asset`: the ledger move an order that fills on
     /// arrival makes.
     ///
@@ -245,7 +310,8 @@ impl From<UnindexedAccountSnapshot> for AccountState {
                             // `as_open` yields `None` for an active order that is not yet open —
                             // an `OpenInFlight`, which has no venue-side existence to record.
                             if let Some(open) = as_open(order) {
-                                orders_open.insert(open);
+                                // Seeded, not booked here: the venue holds nothing against it.
+                                orders_open.insert(open, None);
                             }
                         }
                         OrderState::Inactive(InactiveOrderState::Cancelled(cancelled)) => {
@@ -275,6 +341,7 @@ impl From<UnindexedAccountSnapshot> for AccountState {
             balances,
             orders_open,
             orders_cancelled,
+            orders_filled: FnvHashSet::default(),
             trades: vec![],
         }
     }

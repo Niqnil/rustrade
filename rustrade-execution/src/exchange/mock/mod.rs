@@ -363,6 +363,14 @@ pub(crate) mod fixtures {
         balances: Vec<AssetBalance<AssetNameExchange>>,
         fee_model: FeeModelConfig,
     ) -> MockExecutionConfig {
+        config_from_balances_with_fill(balances, fee_model, SimFillConfig::default())
+    }
+
+    pub(super) fn config_from_balances_with_fill(
+        balances: Vec<AssetBalance<AssetNameExchange>>,
+        fee_model: FeeModelConfig,
+        fill_model: SimFillConfig,
+    ) -> MockExecutionConfig {
         MockExecutionConfig::new(
             EXCHANGE,
             UnindexedAccountSnapshot {
@@ -372,7 +380,7 @@ pub(crate) mod fixtures {
             },
             0, // latency_ms
             fee_model,
-            SimFillConfig::default(),
+            fill_model,
         )
     }
 
@@ -385,6 +393,19 @@ pub(crate) mod fixtures {
         config_from_balances(
             vec![funded(base(), d(btc)), funded(quote(), d(usdt))],
             fee_model,
+        )
+    }
+
+    pub(super) fn spot_config_with_fill(
+        btc: &str,
+        usdt: &str,
+        fee_model: FeeModelConfig,
+        fill_model: SimFillConfig,
+    ) -> MockExecutionConfig {
+        config_from_balances_with_fill(
+            vec![funded(base(), d(btc)), funded(quote(), d(usdt))],
+            fee_model,
+            fill_model,
         )
     }
 
@@ -456,6 +477,60 @@ pub(crate) mod fixtures {
         market: Option<MarketSnapshot>,
     ) -> OrderRequestOpen<ExchangeId, InstrumentNameExchange> {
         request(instrument_name(), Side::Sell, quantity, market)
+    }
+
+    /// The terms a plainly resting order carries: on the book until somebody cancels it.
+    pub(super) fn gtc() -> TimeInForce {
+        TimeInForce::GoodUntilCancelled { post_only: false }
+    }
+
+    /// A Limit order at `price`, carrying its own `cid` so several can rest at once.
+    ///
+    /// `market` is deliberately `None`: a limit order is judged and priced against the venue's own
+    /// market, never against a snapshot its sender stamped.
+    pub(super) fn limit_request(
+        cid: &str,
+        side: Side,
+        quantity: &str,
+        price: &str,
+        time_in_force: TimeInForce,
+    ) -> OrderRequestOpen<ExchangeId, InstrumentNameExchange> {
+        OrderEvent {
+            key: OrderKey {
+                exchange: EXCHANGE,
+                instrument: instrument_name(),
+                strategy: StrategyId::new("test"),
+                cid: ClientOrderId::new(cid),
+            },
+            state: RequestOpen {
+                side,
+                price: Some(d(price)),
+                quantity: d(quantity),
+                kind: OrderKind::Limit,
+                time_in_force,
+                position_id: None,
+                reduce_only: false,
+                market: None,
+            },
+        }
+    }
+
+    /// Both sides of a book and no trade price, which is what an L1-only feed supplies.
+    pub(super) fn book(best_bid: &str, best_ask: &str) -> MarketSnapshot {
+        MarketSnapshot {
+            best_bid: Some(d(best_bid)),
+            best_ask: Some(d(best_ask)),
+            last_price: None,
+        }
+    }
+
+    /// A trade price and no book, which is what a trades-only feed supplies.
+    pub(super) fn traded(last_price: &str) -> MarketSnapshot {
+        MarketSnapshot {
+            best_bid: None,
+            best_ask: None,
+            last_price: Some(d(last_price)),
+        }
     }
 
     /// A snapshot whose three prices are all `price`, wrapped as the venue receives it.
