@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A simulated request is booked when it reaches its venue, not when the `Engine` sends it**
+  (`rustrade`). `SimRunner` queues each `ExecutionRequest` at `time + to_venue` alongside the
+  account events its venues produce, and runs it only once the queue reaches that instant — by which
+  point every market event up to it has already been routed to the venue. `to_venue` therefore
+  becomes price-relevant rather than a pure delivery delay.
+
+  Three outcomes that were previously unrepresentable:
+
+  - **A tick that prints while a request is in flight no longer fills it.** The order is not on the
+    book yet, so liquidity that was gone before the order existed can no longer trade against it.
+  - **An order that is marketable when it arrives crosses as the aggressor**, paying the book,
+    instead of resting at a price the market had already left and being filled there later.
+  - **A cancel can lose to a fill.** A fill struck between a cancel being sent and arriving retires
+    the order first, and the cancel is answered `ApiError::OrderAlreadyFullyFilled`. Booking on
+    observation made the cancel win every such race, at any latency.
+
+  **Results are unchanged at `latency_ms: 0`**, where the two instants coincide on every request,
+  and the committed tear sheet is byte-identical at the fixture's `latency_ms: 100` because a market
+  order is still priced from the snapshot its own request carried. Of the entries merged at one
+  instant, a venue-bound action now leads — which is what the previous booking-on-observation order
+  did structurally, and what keeps this change from moving an existing result.
+
 - **The simulated venue honours `post_only`, `ImmediateOrCancel`, `FillOrKill` and `GoodTillDate`**
   (`rustrade-execution`, `rustrade`). A post-only order that would take liquidity on arrival is
   cancelled rather than filled, and rests otherwise. An immediate-or-cancel or fill-or-kill order
