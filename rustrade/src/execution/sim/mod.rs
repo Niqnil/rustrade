@@ -116,6 +116,14 @@ impl Ord for ScheduledEvent {
 /// Generous enough that no realistic strategy reaches it — it allows roughly three thousand orders
 /// opened simultaneously against one market event — and small enough that a runaway is reported in
 /// milliseconds rather than filling memory first.
+///
+/// # Resting fills spend from the same budget
+/// A tick that crosses many resting orders at once emits three deliverables per fill, so around
+/// three thousand simultaneous fills reach this limit too. The budget is per source event —
+/// `since_source` is reset when a source event is returned, *before* that event is routed to the
+/// venues — so the accounting is right, but a run abandoned this way is reporting a wide book
+/// rather than the feedback cycle [`BarterError::SimFeedbackLoop`] names. Raise the limit with
+/// [`SimRunner::with_feedback_limit`] if that is the case.
 pub const DEFAULT_FEEDBACK_LIMIT: usize = 10_000;
 
 /// Priority of an account deliverable within one instant. See [`SimRunner`]'s ordering contract.
@@ -174,11 +182,41 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 /// produced precedes that request's response, so "the `Engine` has the response" implies "the
 /// `Engine` has already seen every account event for that order".
 ///
+/// ## The table has three rows, and a fill caused by market data does not add a fourth
+///
+/// A resting order filled by a tick looks at first like an exception to "account leads market",
+/// since it must follow the very event that caused it. It is not, and the four claims below are
+/// the whole of why.
+///
+/// 1. **`class` is within-instant precedence between a deliverable and the *source*, not a record
+///    of what caused what.** It answers "of the things stamped `T`, which does the `Engine` see
+///    first", and nothing else. Causality is not expressible in it and does not need to be.
+/// 2. **Every scheduled deliverable ranks as an account event — class 1 — whatever produced it.**
+///    A fill provoked by a request and a fill provoked by a tick are both account events to the
+///    `Engine` and are marked identically, which is why the pending peek may hard-code the class
+///    rather than deriving it per payload.
+/// 3. **Causality is structural, not a matter of priority.** The queue is only ever consulted
+///    against the *next* source event, and market state is applied and matched when an event is
+///    **emitted**, never when it is peeked. So anything a tick enqueues is enqueued during the poll
+///    that returns that tick, and is therefore drawn from the queue only on a later poll — after
+///    the tick, at any latency, without any rule saying so.
+/// 4. **At `from_venue = 0` it is delivered immediately after its tick and before the remaining
+///    source events at that instant**, because the fill and those events share an instant and
+///    class 1 beats class 2. So the position the fill opens is still marked to `T`, which is the
+///    property the contract is really about.
+///
+/// Claims 3 and 4 together are the contract for a tick-caused fill: booked at `T`, marked at `T`,
+/// and never delivered before its own cause.
+///
 /// # Latency is simulated, never slept
 /// A request issued at `T` reaches its venue at `T + to_venue` and its result becomes visible at
 /// `T + to_venue + from_venue`. Both are simulated offsets applied to the queue key, so a run's
 /// wall-clock duration does not scale with the latency being modelled, and delivery order is a
 /// function of the dataset alone.
+///
+/// A fill nothing requested — a resting order crossed by a tick — pays `from_venue` alone. There
+/// was no request to carry to the venue, so there is no such leg to charge, and the fill becomes
+/// visible at `time_exchange + from_venue`.
 ///
 /// # Termination
 /// Exhausting the source yields [`Shutdown::AfterDrain`] once, and only then is the queue drained
@@ -192,6 +230,21 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 /// a no-op here: this runner, not the execution side, owns the moment a simulated run ends.
 /// [`ExecutionRequest::Shutdown`] abandons whatever is still scheduled, matching its documented
 /// meaning.
+///
+/// ## A position opened during the drain is never marked
+///
+/// `Shutdown::AfterDrain` is emitted *before* the queue is emptied, so everything drained after it
+/// is delivered with no market event left to follow. A position opened by any of it is therefore
+/// booked but never marked, and `pnl_unrealised` — which is event-driven — keeps its post-trade
+/// value.
+///
+/// This is a property of **termination**, not of resting orders: it applies identically to a market
+/// order sent in reply to the last source event, and
+/// `source_exhaustion_asks_the_engine_to_stop_before_the_queue_is_drained` has asserted it for one
+/// since before limit orders existed. Fixing it would mean marking to the last known price when the
+/// summary is generated, which belongs to the statistics layer. It cannot be fixed here: the only
+/// thing this runner could do is emit a market event of its own, and that would be a fabricated
+/// observation in a stream whose whole contract is that every market event came from the source.
 ///
 /// # Zero-delay feedback cycles are reported, not spun on
 /// A strategy that opens an order in response to its own fill, against a venue whose simulated
@@ -364,9 +417,10 @@ where
     /// run is abandoned as a zero-delay feedback cycle. Defaults to [`DEFAULT_FEEDBACK_LIMIT`].
     ///
     /// Raise it for a strategy that legitimately opens more than a few thousand orders against a
-    /// single market event. Raising it will not rescue a true zero-delay cycle — that has no limit
-    /// at which it terminates — so a run hitting even a large limit is almost always reporting the
-    /// configuration described in [`BarterError::SimFeedbackLoop`].
+    /// single market event, or for a book deep enough that one tick fills that many resting orders
+    /// — see [`DEFAULT_FEEDBACK_LIMIT`]. Raising it will not rescue a true zero-delay cycle — that
+    /// has no limit at which it terminates — so a run hitting even a large limit is otherwise
+    /// reporting the configuration described in [`BarterError::SimFeedbackLoop`].
     pub fn with_feedback_limit(mut self, limit: usize) -> Self {
         self.feedback_limit = limit;
         self
@@ -490,7 +544,13 @@ where
                     // order the `Engine` sends in reaction to the tick at `T` must be matched
                     // against the market as of `T`, not `T-1`. Returning first and routing on the
                     // next poll would reverse that at zero latency.
-                    route_market(this.venues, this.market, &timed.value);
+                    route_market(
+                        this.venues,
+                        this.market,
+                        this.pending,
+                        this.seq,
+                        &timed.value,
+                    );
 
                     Poll::Ready(Some(timed.value))
                 }
@@ -504,7 +564,8 @@ where
     }
 }
 
-/// Folds one source event into per-instrument market state and hands it to every venue trading it.
+/// Folds one source event into per-instrument market state, hands it to every venue trading it,
+/// and schedules whatever resting orders it filled.
 ///
 /// Anything that is not a market data item is ignored: an account event, a command or a reconnect
 /// carries no price. A reconnect in particular is deliberately *not* treated as clearing the
@@ -513,9 +574,19 @@ where
 ///
 /// A venue that does not trade the instrument is skipped: its own index is what decides, so a
 /// runner driving several venues never leaks one venue's instruments into another's view.
+///
+/// # A tick-caused fill pays one latency leg, not two
+/// `to_venue` is the delay from the `Engine` issuing a request to the venue acting on it. Nothing
+/// was issued here — the market moved and the venue acted on its own book — so there is no such
+/// leg to pay, and the fill becomes visible at `time_exchange + from_venue`. Charging both would
+/// model a round trip that never happened, and at `from_venue = 0` the fill is delivered
+/// immediately after the tick that caused it, which is what marks the position it opens to that
+/// tick's price.
 fn route_market<MarketKind>(
     venues: &mut FnvIndexMap<ExchangeIndex, SimVenue>,
     market: &mut FnvHashMap<InstrumentIndex, MarketKind::State>,
+    pending: &mut BinaryHeap<Reverse<ScheduledEvent>>,
+    seq: &mut u64,
     event: &EngineEvent<MarketKind>,
 ) where
     MarketKind: VenueMarketUpdate,
@@ -528,19 +599,34 @@ fn route_market<MarketKind>(
     MarketKind::apply(state, event);
     let snapshot = MarketKind::snapshot(state);
 
-    for slot in venues.values_mut() {
+    for (exchange, slot) in venues.iter_mut() {
         // `Err` means this venue does not trade the instrument, which is ordinary on a multi-venue
         // run and not a misconfiguration.
-        if let Ok(name) = slot
+        let Ok(name) = slot
             .indexer
             .map
             .find_instrument_name_exchange(event.instrument)
-        {
-            // Cloned because `apply_market` keys on the owned name; the map borrow ends here.
-            let name = name.clone();
-            slot.venue
-                .apply_market(&name, snapshot, event.time_exchange);
+        else {
+            continue;
+        };
+
+        // Cloned because `apply_market` keys on the owned name; the map borrow ends here.
+        let name = name.clone();
+        let fills = slot
+            .venue
+            .apply_market(&name, snapshot, event.time_exchange);
+
+        if fills.is_empty() {
+            continue;
         }
+
+        let delivers = checked_offset(
+            event.time_exchange,
+            slot.from_venue,
+            "a resting fill arriving at the Engine",
+        );
+
+        schedule_events(pending, seq, *exchange, delivers, fills);
     }
 }
 
@@ -700,6 +786,29 @@ fn schedule<Response>(
 ) {
     let VenueOutcome { events, response } = outcome;
 
+    schedule_events(pending, seq, exchange, time, events);
+
+    pending.push(Reverse(ScheduledEvent {
+        time,
+        seq: *seq,
+        exchange,
+        payload: wrap(response),
+    }));
+    *seq += 1;
+}
+
+/// Push account events onto the queue, in the order the venue gave them.
+///
+/// Split out of [`schedule`] because a fill caused by a market event has no response to accompany
+/// it: nothing requested it, so there is nobody to answer. Giving [`schedule`] an
+/// `Option<Response>` instead would make every request-driven caller state that it does have one.
+fn schedule_events(
+    pending: &mut BinaryHeap<Reverse<ScheduledEvent>>,
+    seq: &mut u64,
+    exchange: ExchangeIndex,
+    time: DateTime<Utc>,
+    events: Vec<UnindexedAccountEvent>,
+) {
     for event in events {
         pending.push(Reverse(ScheduledEvent {
             time,
@@ -709,14 +818,6 @@ fn schedule<Response>(
         }));
         *seq += 1;
     }
-
-    pending.push(Reverse(ScheduledEvent {
-        time,
-        seq: *seq,
-        exchange,
-        payload: wrap(response),
-    }));
-    *seq += 1;
 }
 
 /// Pop the earliest scheduled deliverable and index it for the `Engine`.
@@ -1001,6 +1102,31 @@ mod tests {
                     position_id: None,
                     reduce_only: false,
                     market: Some(MarketSnapshot::new(None, None, Some(price))),
+                },
+            }));
+        }
+
+        /// Queue a resting buy limit at `price`.
+        ///
+        /// It carries no `MarketSnapshot`: a limit order is judged and priced against the venue's
+        /// own market, which this runner routes to it from the source.
+        fn send_limit(&self, price: Decimal) {
+            self.send(ExecutionRequest::Open(OrderRequestOpen {
+                key: OrderKey {
+                    exchange: self.exchange,
+                    instrument: instrument_key(),
+                    strategy: StrategyId::new("test"),
+                    cid: ClientOrderId::random(),
+                },
+                state: RequestOpen {
+                    side: Side::Buy,
+                    price: Some(price),
+                    quantity: dec!(0.01),
+                    kind: OrderKind::Limit,
+                    time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                    position_id: None,
+                    reduce_only: false,
+                    market: None,
                 },
             }));
         }
@@ -1451,5 +1577,166 @@ mod tests {
         let market = harness.venue_market().expect("both events were routed");
         assert_eq!(market.time_exchange, at(2_000));
         assert_eq!(market.snapshot.last_price, Some(dec!(50_500)));
+    }
+
+    /// A fill caused by a market event is delivered *after* that event, because it cannot precede
+    /// its own cause — and immediately after it, so the position it opens is marked to that tick.
+    ///
+    /// This is the one place the ordering contract's "account events lead market data" reads as an
+    /// exception. It is not: the contract is about *marking*, and a fill delivered immediately
+    /// after the tick that caused it is booked at that instant and marked at that instant.
+    #[tokio::test]
+    async fn a_resting_fill_follows_the_tick_that_caused_it() {
+        let mut harness = Harness::new(
+            0,
+            vec![
+                market(10, dec!(200)),
+                market(20, dec!(90)),
+                market(30, dec!(200)),
+            ],
+        );
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        // 200 traded, so a bid at 100 is not marketable and rests.
+        harness.clock.advance_to(at(10));
+        harness.send_limit(dec!(100));
+
+        assert_eq!(
+            harness.rest().await,
+            vec![
+                // The reservation, then the response saying the order is working.
+                "balance",
+                "order",
+                // The tick that crosses it...
+                "market",
+                // ...and only then the fill it caused, trade before terminal order.
+                "balance",
+                "trade",
+                "order",
+                "market",
+                "after_drain"
+            ],
+            "the fill follows its cause, and its trade precedes the order it terminated"
+        );
+    }
+
+    /// Within the instant that caused it, a resting fill still leads the remaining market events —
+    /// so a position opened at `T` is marked to `T` rather than left unmarked until the next
+    /// instant, which is the ordering #289 exists to prevent.
+    ///
+    /// This fails if the class of a scheduled deliverable is ever changed from account (1) to
+    /// something ranking below market data.
+    #[tokio::test]
+    async fn a_resting_fill_precedes_the_remaining_market_events_at_its_instant() {
+        let mut harness = Harness::new(
+            0,
+            vec![
+                market(10, dec!(200)),
+                market(20, dec!(90)),
+                market(20, dec!(91)),
+            ],
+        );
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        harness.send_limit(dec!(100));
+
+        assert_eq!(
+            harness.rest().await,
+            vec![
+                "balance",
+                "order", //
+                "market",
+                "balance",
+                "trade",
+                "order", //
+                "market",
+                "after_drain"
+            ],
+            "the fill leads the second market event at instant 20, which marks it to that instant"
+        );
+    }
+
+    /// An auxiliary event at the fill's instant still leads it, exactly as it leads a fill provoked
+    /// by a request: a corporate action or expiry adjusts a position before any fill stamped at
+    /// that instant is applied to it.
+    #[tokio::test]
+    async fn an_aux_event_at_a_resting_fills_instant_still_leads() {
+        let mut harness = Harness::new(
+            0,
+            vec![
+                market(10, dec!(200)),
+                expiry(20),
+                market(20, dec!(90)),
+                market(30, dec!(200)),
+            ],
+        );
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        harness.send_limit(dec!(100));
+
+        assert_eq!(
+            harness.rest().await,
+            vec![
+                "balance",
+                "order", //
+                "aux",
+                "market",
+                "balance",
+                "trade",
+                "order", //
+                "market",
+                "after_drain"
+            ],
+            "the aux event at instant 20 leads the tick that caused the fill, and so the fill"
+        );
+    }
+
+    /// A tick-caused fill pays `from_venue` alone. Nothing was requested, so there is no
+    /// `to_venue` leg to pay — charging both would model a round trip that never happened.
+    #[tokio::test]
+    async fn a_resting_fill_pays_one_latency_leg_not_two() {
+        // 200ms round trip, so each leg is 100ms.
+        let mut harness = Harness::new(
+            200,
+            vec![
+                market(10, dec!(200)),
+                market(500, dec!(90)),
+                market(550, dec!(200)),
+                market(700, dec!(200)),
+            ],
+        );
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        harness.send_limit(dec!(100));
+
+        assert_eq!(
+            harness.rest().await,
+            vec![
+                // The open pays both legs: requested at 10, visible at 210.
+                "balance",
+                "order", //
+                // The tick at 500 crosses it; the fill is visible at 600, so it lands after the
+                // event at 550 and before the one at 700. Two legs would have put it at 700.
+                "market",
+                "market",
+                "balance",
+                "trade",
+                "order", //
+                "market",
+                "after_drain"
+            ],
+            "the fill is visible one `from_venue` leg after the tick that caused it"
+        );
     }
 }

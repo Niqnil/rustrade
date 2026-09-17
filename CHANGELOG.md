@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The simulated venue accepts `OrderKind::Limit`, rests what the market has not reached, and
+  matches it against its own view** (`rustrade-execution`, `rustrade`). A limit order that is
+  already marketable fills on arrival; one that is not rests on the book and fills when a later
+  market update crosses it. `SimulatedVenue::apply_market` now returns the account events those
+  fills produced — `[balance, trade, order]` per filled order, trade before the terminal snapshot —
+  and is `#[must_use]`, so a driver that applies a market and drops the result is a compiler
+  warning rather than a silently eaten fill.
+
+  **Two pricing rules, and they are not the same rule.** A marketable-on-arrival limit is the
+  aggressor: it is priced by the `FillModel` and then *clamped* to its own limit, and charged
+  `Liquidity::Taker`. A resting order is the passive side: it fills at **its own limit price
+  exactly**, never reaching the `FillModel`, and is charged `Liquidity::Maker`. Deriving a resting
+  fill's price from the book would credit price improvement no maker can obtain — a maker is paid
+  the price it quoted, and improvement accrues to whoever crossed it. The two agree exactly where
+  the market meets the limit, and diverge only where the order genuinely is, or is not, marketable.
+
+  **Market-order pricing does not move.** A market order is still priced from the snapshot its own
+  request carried, so the committed tear sheet is byte-identical and this release's result-changing
+  surface is confined to orders that could not be placed before.
+
+  Marketability is judged on `best_ask`/`best_bid`, falling back to `last_price` when the feed
+  supplies no book at all — with a trades-only feed there is no book, so a book-only rule would
+  never match anything.
+
+  **Known limitations**, stated on `SimulatedVenue`: no queue position, no size cap and therefore no
+  partial fills, so a crossing order fills its whole quantity at one price.
+
+- **`VenueRegime`, and a second `SimulatedVenue` constructor** (`rustrade-execution`).
+  `SimulatedVenue::new` keeps today's behaviour and rejects limit orders;
+  `SimulatedVenue::new_market_driven` marks a venue whose driver feeds `apply_market`, and only that
+  regime accepts them. `SimExecutionBuilder` uses it; `MockExchange` does not.
+
+  The gate is the point. Without it, a limit order placed through a driver with no market feed would
+  be accepted and then rest forever with nothing that could ever match it —
+  accepted-and-silently-never-filled, which is worse than a flat rejection naming the reason.
+
+- **`SimulatedVenue::cancel_order` is real** (`rustrade-execution`). It takes a resting order off the
+  book, releases what was held against it, restates the balance, and returns
+  `Cancelled { filled_quantity }`. A cancel that finds no resting order says *which* nothing it
+  found: `ApiError::OrderAlreadyFullyFilled` when the fill won the race — which a non-zero
+  `to_venue` latency makes reachable, and which tells the caller to reconcile rather than retry —
+  `ApiError::OrderAlreadyCancelled` for a second cancel, and a rejection naming the id only for one
+  the venue never booked.
+
+- **`AccountState::release`** (`rustrade-execution`): returns a reserved amount to `free` without
+  moving `total`, which is what a cancelled order does to the balance held against it.
+
 - **A simulated venue holds its own view of each instrument it trades** (`rustrade-execution`,
   `rustrade`). `SimulatedVenue::apply_market` records a `MarketSnapshot` and the instant it was
   observed, readable through `SimulatedVenue::market`; `SimRunner` routes every source market event
@@ -18,10 +65,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `T` must be matched against the market as of `T`, not `T-1`. Returning first and routing on the
   next poll would reverse that at zero latency.
 
-  This is the substrate resting orders need, and it is inert on its own. **No fill price moves**: a
-  market order is still priced from the snapshot its own request carried, and the committed tear
-  sheet is byte-identical. An order that rests is the thing that cannot be priced that way, because
-  the market it must be matched against has not happened when the request is made.
+  This is the substrate resting orders need; `apply_market` now also matches them, and returns the
+  fills it caused. **No fill price moves for a market order**: it is still priced from the snapshot
+  its own request carried, and the committed tear sheet is byte-identical. An order that rests is
+  the thing that cannot be priced that way, because the market it must be matched against has not
+  happened when the request is made.
 
   `MockExchange` has no market feed, so a venue driven by it reports `market` as `None` forever.
   That difference is documented as a property of the type rather than left as an accident of wiring.
@@ -39,6 +87,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an L1 book present it is the volume-weighted mid — the microprice. A venue that re-derived it as
   "the most recent trade" would diverge by a median of 1.5–1.7x the *half-spread*, exceeding the
   half-spread around 60% of the time on the committed fixture.
+
+- **Balance reservations for resting orders** (`rustrade-execution`). A resting order holds
+  **exactly** what its fill will settle — computed once, at the order's own limit and its own
+  liquidity side — rather than a conservative over-estimate. A conservative reservation would have
+  to be released and re-debited on the fill, producing two or three balance restatements for one
+  fill and reporting balances the account never held, while `Balance::used` misreported for the
+  order's whole life.
+
+  A resting order seeded by a configured `initial_state` is the one exception: the venue never took
+  that balance, so it holds nothing against it and releases nothing when it is cancelled. Such an
+  order still matches, and its fill debits the ledger then.
 
 - **`SimRunner` — backtests are now driven by a deterministic discrete-event simulator**
   (`rustrade`). A `Stream<Item = EngineEvent>` that merges the time-ordered market/auxiliary source
@@ -688,7 +747,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FnvHashMap<ClientOrderId, _>` to `OpenOrders`, which keeps the map for lookup by id and adds a
   per-instrument, per-side queue ordered by `(price, arrival, insertion)`.
   `AccountState::orders_open` keeps its iterator signature; `AccountState::new` now takes
-  `OpenOrders`, and `AccountState::orders` exposes it.
+  `OpenOrders`, and `AccountState::orders`/`orders_mut` expose it.
+
+  `OpenOrders::insert` takes the `Reservation` held against the order — `None` only for one the
+  venue did not book itself — and `OpenOrders::remove` hands both back as a `RestingOrder`. The
+  reservation is a field of the order rather than a parallel map because the two have exactly one
+  lifetime: an order leaving the book takes its reservation with it, and a reservation outliving its
+  order is held against nothing.
 
   A tick that crosses two resting orders with only enough balance to fill one fills whichever comes
   first. Read off a hash map that is an arbitrary choice, which a rebuild or a different

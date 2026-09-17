@@ -141,16 +141,22 @@ impl OneShotStrategy {
         }
     }
 
-    /// Sends a single order the mock exchange refuses outright, whatever the market looks like.
+    /// Sends a single order the venue refuses outright, whatever the market looks like.
     ///
-    /// `MockExchange` supports only [`OrderKind::Market`] and checks that before it tries to price
-    /// anything, so this rejects on every run rather than only on those where the order happened to
-    /// be generated before the first market event.
+    /// [`OrderKind::Stop`] is rejected by kind, before the venue tries to price anything, so this
+    /// rejects on every run rather than only on those where the order happened to be generated
+    /// before the first market event.
+    ///
+    /// Deliberately *not* [`OrderKind::Limit`]: a market-driven venue accepts those now, and this
+    /// test is about a rejection reaching the `Engine` rather than about which rejection it is.
+    /// Picking a kind the venue will never model keeps it that way.
     fn once_rejected() -> Self {
         Self {
             sent: AtomicUsize::new(0),
+            kind: OrderKind::Stop {
+                trigger_price: dec!(50_000),
+            },
             limit: 1,
-            kind: OrderKind::Limit,
         }
     }
 
@@ -201,8 +207,8 @@ impl AlgoStrategy for OneShotStrategy {
                 },
                 state: RequestOpen {
                     side: Side::Buy,
-                    // A Limit order carries one so the request is well-formed; the mock rejects it
-                    // on `kind` before reading it.
+                    // A priced kind carries one so the request is well-formed; the venue rejects
+                    // it on `kind` before reading it.
                     price: (self.kind != OrderKind::Market).then(|| dec!(50_000)),
                     quantity: dec!(0.01),
                     kind: self.kind,
@@ -430,7 +436,7 @@ async fn a_rejected_open_reaches_the_engine_instead_of_being_discarded_at_shutdo
                 "one open was sent, so one rejection is expected"
             );
             assert!(
-                reason.contains("does not support OrderKind::Limit"),
+                reason.contains("does not support OrderKind::Stop"),
                 "the exchange's own reason must be carried through verbatim, got: {reason}"
             );
         }
