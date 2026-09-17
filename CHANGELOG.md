@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A resting order that arrived part-filled no longer settles and prints its whole quantity**
+  (`rustrade-execution`). `SimulatedVenue`'s matching built its settlement, its `Trade` and its
+  terminal snapshot from an order's full `quantity`, ignoring the `Open::filled_quantity` the order
+  carried. An order that reached the book with part of its quantity already done — which a
+  configured `initial_state` copied out of a live account may seed — therefore paid for that part a
+  second time in the balance ledger, and printed a trade larger than the quantity that was left to
+  trade. It now settles and prints the remainder alone.
+
+  A fill that completes such an order also reports no `avg_price`. This venue struck one of the
+  fills behind the order's total and never saw the other, so its own limit is that fill's price
+  rather than the mean of both — `Filled::avg_price` is optional for exactly that, and a consumer
+  needing the mean has both trades to compute it from. An order that reached the book with nothing
+  done still reports the price it filled at, unchanged.
+
+  Resting holds the same invariant from the other side: an order is booked reserving against its
+  unfilled remainder and carrying what it has already done, so what is held and what is later
+  settled are the same quantity at the same price. Both are the whole quantity for every order this
+  venue books itself, which fills nothing before it rests — so no existing result moves.
+
 ### Changed
 
 - **A market-driven simulated venue prices a market order from its own book**

@@ -27,6 +27,9 @@ pub struct Reservation {
     /// The asset the order pays with: quote for a buy or a CFD, base for a spot sell.
     pub asset: AssetNameExchange,
     /// How much of it is held, inclusive of the fee the fill will charge.
+    ///
+    /// Held against the order's **unfilled** quantity alone. That is its whole quantity for an
+    /// order that rested without trading, which is every order this venue currently books.
     pub amount: Decimal,
 }
 
