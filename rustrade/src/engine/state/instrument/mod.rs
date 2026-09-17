@@ -728,16 +728,24 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     ///
     /// # Known limitation — terminal-state late fills (Hedging mode)
     ///
-    /// When an order transitions from `Open` to a terminal state (e.g. `FullyFilled`
-    /// via an exchange snapshot), this method removes the `exchange_id → CID` entry
-    /// from `exchange_id_to_cid`. Any fill event that arrives *after* the terminal
-    /// snapshot for the same exchange `OrderId` will fall through to a linear scan
-    /// and, finding nothing, may open a spurious position in Hedging mode.
+    /// Routing-table lifetime is coupled to membership of `self.orders`, so retiring an order
+    /// drops the `exchange_id → CID` entry that a fill arriving *after* its terminal snapshot
+    /// would need. [`Self::update_from_order_snapshot`] compensates for the order it has just
+    /// retired: it re-inserts that entry and restores the order's `position_ids` mapping, so the
+    /// common ordering — venue reports the order finished, then reports the fill — still routes
+    /// to the `PositionId` the strategy chose.
     ///
-    /// Primary mitigation: `AlpacaClient`'s dedup LRU cache filters fills whose
+    /// That window holds **exactly one** retired order per instrument. Retiring the next one runs
+    /// this method first, which prunes the previous order's entries before the new ones are
+    /// restored. A fill for any order retired before the most recent therefore finds nothing
+    /// here, falls through to a linear scan over active orders, finds nothing there either, and
+    /// opens a position under the raw `OrderId` with a `warn!`.
+    ///
+    /// Additional mitigation: `AlpacaClient`'s dedup LRU cache filters fills whose
     /// `{order_id}:{filled_qty}` key was already processed, covering the most
-    /// common duplicate-fill scenario. A full fix requires a "recently closed"
-    /// map with TTL semantics and is deferred until Hedging mode production use.
+    /// common duplicate-fill scenario. Closing the class requires decoupling routing-table
+    /// lifetime from `self.orders` — a bounded "recently retired" map with its own reap policy —
+    /// and is deferred until Hedging mode production use.
     fn cleanup_routing_tables(&mut self) {
         if !self.position_ids.is_empty() {
             self.position_ids
@@ -767,6 +775,19 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// case requires position flips, which are documented as undefined behaviour in
     /// `OmsMode::Hedging`. NautilusTrader similarly emits single `PositionClosed`
     /// events per state transition rather than batching multiple closes.
+    ///
+    /// # Known limitation — late fills in `OmsMode::Hedging`
+    ///
+    /// A terminal update untracks the order, which would otherwise drop the routing entry that a
+    /// fill arriving *after* it needs. This method re-establishes that entry for the order it has
+    /// just retired, so the common ordering — venue reports the order finished, then reports the
+    /// fill — still routes to the `PositionId` the caller supplied on the open request.
+    ///
+    /// That window covers **one** retired order per instrument: retiring the next order prunes
+    /// the previous one's entry. A fill for an order retired before the most recent one opens a
+    /// position under `PositionId::new(trade.order_id)` and logs a `warn!`, which nothing in the
+    /// audit stream records. Hedging consumers that need to detect this must reconcile positions
+    /// against their own record of the `PositionId`s they requested.
     pub fn update_from_order_snapshot(
         &mut self,
         order: Snapshot<&Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>>,
@@ -814,8 +835,40 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             .map(|o| matches!(o.state, ActiveOrderState::OpenInFlight(_)))
             .unwrap_or(false);
 
-        // Any transition out of OpenInFlight that carries the exchange OrderId resolves the
-        // CID <-> OrderId mapping, and so must drive (a) and (b) below.
+        // An order already tracked as `Open` whose life this update ends needs the same
+        // treatment, for the opposite reason. The mapping is not being learned here, it is about
+        // to be destroyed: `Orders::update_from_order_snapshot` untracks the order, so the
+        // `cleanup_routing_tables` call below prunes both `exchange_id_to_cid` and
+        // `position_ids` for its CID. A fill arriving after the terminal snapshot would then
+        // resolve to nothing and open a position under the raw `OrderId`.
+        //
+        // The orderings are both real. A venue may report the fill before the terminal state
+        // (handled by `currently_open_in_flight` above) or after it -- IBKR reports a working
+        // `orderStatus` carrying `filled == quantity` while deliberately withholding the `Trade`
+        // until the matching `CommissionReport` lands, and REST reconciliation can serialise an
+        // order that completed mid-request on any venue.
+        let currently_open = self
+            .orders
+            .0
+            .get(&order.0.key.cid)
+            .map(|o| matches!(o.state, ActiveOrderState::Open(_)))
+            .unwrap_or(false);
+
+        // Whether this update ends the order's life at the exchange. An explicitly terminal state,
+        // or an `Open` with nothing left to fill -- some venues report a completed order that way
+        // rather than with a distinct state, and it denotes the same fact.
+        let update_retires_order = match &order.0.state {
+            OrderState::Inactive(_) => true,
+            OrderState::Active(ActiveOrderState::Open(open)) => {
+                open.quantity_remaining(order.0.quantity).is_zero()
+            }
+            OrderState::Active(_) => false,
+        };
+
+        // Two kinds of update settle the CID <-> OrderId mapping, and both must drive (a) and
+        // (b) below: a transition out of OpenInFlight that carries the exchange OrderId, which
+        // learns the mapping, and a terminal update on an order tracked as Open, which is about
+        // to lose it.
         //
         // FullyFilled is not an edge case: a venue that answers the REST open with an
         // already-filled order reports the fill and the ack in the same response, and never
@@ -825,32 +878,42 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         // in `pending_fills` awaiting an ack that, if only Open were matched here, would never
         // qualify. The fill would then sit unreplayed for the rest of the run: the position never
         // opens while the balance is debited, leaving the two ledgers disagreeing.
-        let ack_exchange_id: Option<OrderId> = if currently_open_in_flight {
-            match &order.0.state {
-                OrderState::Active(ActiveOrderState::Open(open)) => Some(open.id.clone()),
-                OrderState::Inactive(InactiveOrderState::FullyFilled(filled)) => {
-                    Some(filled.id.clone())
+        //
+        // Nothing else qualifies. A steady-state `Open` -> `Open` update that leaves the order
+        // working needs neither: its mapping is already indexed and no pruning is coming, so
+        // widening this would pay a `ClientOrderId` clone on every call to re-insert what is
+        // already there.
+        let ack_exchange_id: Option<OrderId> =
+            if currently_open_in_flight || (currently_open && update_retires_order) {
+                match &order.0.state {
+                    OrderState::Active(ActiveOrderState::Open(open)) => Some(open.id.clone()),
+                    OrderState::Inactive(InactiveOrderState::FullyFilled(filled)) => {
+                        Some(filled.id.clone())
+                    }
+                    _ => None,
                 }
-                _ => None,
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         self.orders.update_from_order_snapshot(order);
         self.cleanup_routing_tables();
 
-        // On OpenInFlight → Open: update reverse index and replay pending fills.
+        // Mapping settled: index it (or re-index what cleanup just pruned) and replay any fills
+        // that were waiting on it.
         if let Some(exchange_id) = ack_exchange_id {
-            // Clone the CID here, not at method entry — paid only on the
-            // OpenInFlight→Open transition, not on every call.
+            // Clone the CID here, not at method entry — paid only on the transitions that settle
+            // the mapping, not on every call.
             let cid = order.0.key.cid.clone();
             // (a) PERF-1: O(1) reverse index for subsequent fill routing.
             self.exchange_id_to_cid
                 .insert(exchange_id.clone(), cid.clone());
 
-            // C1 fix: restore the CID → PositionId entry if cleanup_routing_tables removed it
-            // because the order was fully filled (removed from orders.0) before deferred replay.
+            // C1 fix: restore the CID → PositionId entry that cleanup_routing_tables removed
+            // because this update retired the order (removed it from orders.0). Needed both by
+            // the deferred replay below and by a fill still to come: without it
+            // `update_from_trade` resolves the exchange OrderId to a CID that has no PositionId,
+            // and falls back to opening a position under the raw OrderId.
             if let Some(pos_id) = pre_update_pos_id {
                 self.position_ids.entry(cid).or_insert(pos_id);
             }
