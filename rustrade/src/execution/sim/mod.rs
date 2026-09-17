@@ -1304,6 +1304,10 @@ mod tests {
         /// Stand in for the `Engine`: queue a market buy on the venue's channel, stamped with the
         /// price the strategy saw. `Engine::send_requests` does this synchronously inside `process`,
         /// which is why the runner observes it on the very next poll.
+        ///
+        /// The stamp is decision-time provenance only. This runner drives a market-driven venue,
+        /// which prices the fill from its own book — so `price` is what the strategy was looking
+        /// at, not what it will pay.
         fn send_open(&self, price: Decimal) {
             self.send(ExecutionRequest::Open(OrderRequestOpen {
                 key: OrderKey {
@@ -2360,6 +2364,55 @@ mod tests {
             cancel_outcomes(&events),
             vec![Err("order rejected: order already fully filled".to_string())],
             "the cancel is told to reconcile against the fill rather than being granted"
+        );
+    }
+
+    /// Latency is price-relevant: the same script at two latencies fills a market order at two
+    /// prices, differing by exactly the ticks that printed while the order was in flight.
+    ///
+    /// This is the property modelling `to_venue` is *for*. While a market order was priced from
+    /// the snapshot its own request carried, `latency_ms` changed only when a result was delivered
+    /// and never what it was — so a backtest could raise it to any value and report identical
+    /// fills, which is a silent way of saying latency does not matter.
+    #[tokio::test]
+    async fn market_order_fill_price_moves_by_the_ticks_a_request_flies_over() {
+        async fn fill_price_at(latency_ms: u64) -> Decimal {
+            let mut harness = Harness::new(
+                latency_ms,
+                vec![
+                    market(0, dec!(100)),
+                    // Inside the flight interval at 200ms (a 100ms leg), outside it at zero.
+                    market(50, dec!(110)),
+                    // Outside it at both: a venue pricing from here would be reading a tick the
+                    // order cannot have reached, which is the look-ahead this design forbids.
+                    market(150, dec!(999)),
+                    market(400, dec!(100)),
+                ],
+            );
+
+            assert_eq!(harness.next().await, Some("snapshot"));
+            assert_eq!(harness.next().await, Some("market"));
+
+            harness.clock.advance_to(at(0));
+            // Deliberately not a price the venue holds at any instant: a fill here would mean the
+            // request's own snapshot had priced it.
+            harness.send_open(dec!(1));
+
+            let events = harness.rest_events().await;
+            let prices = trade_prices(&events);
+            assert_eq!(prices.len(), 1, "the script sends exactly one market order");
+            prices[0]
+        }
+
+        assert_eq!(
+            fill_price_at(0).await,
+            dec!(100),
+            "with no flight time the order is priced at the market it was decided against"
+        );
+        assert_eq!(
+            fill_price_at(200).await,
+            dec!(110),
+            "a 100ms outbound leg carries the order over the tick at 50, and it pays that market"
         );
     }
 }

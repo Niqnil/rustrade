@@ -2,15 +2,24 @@
 
 //! Result stability for the simulated venue.
 //!
-//! The simulated venue is gaining market state of its own, and with it balance reservations and a
-//! restructured open-order store. None of that is meant to change what an existing backtest
-//! reports: an order that filled before must still fill, at the same price, leaving the same
-//! balances behind.
+//! This runs a fixed strategy over the committed market-data fixture and compares the resulting
+//! tear sheet — realised PnL, fee totals, per-asset closing balances, drawdown windows, trade
+//! counts — byte-for-byte against a committed golden artifact, so a result that moves fails CI
+//! rather than waiting to be noticed.
 //!
-//! "Must not change" is only a claim until something checks it. This runs a fixed strategy over the
-//! committed market-data fixture and compares the resulting tear sheet — realised PnL, fee totals,
-//! per-asset closing balances, drawdown windows, trade counts — byte-for-byte against a committed
-//! golden artifact, so a result that moves fails CI rather than waiting to be noticed.
+//! # What it is defending
+//!
+//! Most of the work this guards is not supposed to move a number at all: market state on the venue,
+//! balance reservations, a restructured open-order store, limit orders, time in force, and booking
+//! each request at the instant it reaches its venue all left this artifact byte-identical. An order
+//! that filled before must still fill, at the same price, leaving the same balances behind, and
+//! "must not change" is only a claim until something checks it.
+//!
+//! It is not a claim that the number may *never* move. Pricing a market order from the venue's own
+//! book rather than from the snapshot its request carried moved it deliberately: the fixture runs at
+//! `latency_ms: 100`, so each order now pays the market 50ms after it was decided rather than the
+//! market it was decided against. The job of this test is to make that a diff somebody signed off
+//! on, not to forbid it.
 //!
 //! # Why the summary rather than the engine state
 //!

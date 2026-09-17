@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **A market-driven simulated venue prices a market order from its own book**
+  (`rustrade-execution`, `rustrade`). ⚠️ **Behaviour change, and it moves backtest results at a
+  non-zero `latency_ms`.** A `SimulatedVenue` in `VenueRegime::MarketDriven` — the regime `SimRunner`
+  drives — now prices every fill from the market its driver feeds it, as a live venue prices from
+  its own book. It previously used `RequestOpen::market`, the snapshot the sender stamped at
+  decision time.
+
+  Combined with booking each request at the instant it arrives, this is what makes `to_venue`
+  price-relevant: an order pays the market it reaches, not the market it was decided against. While
+  a market order was priced from its request, `latency_ms` changed only *when* a result was
+  delivered and never *what* it was, so a backtest could raise it to any value and report identical
+  fills. `RequestOpen::market` is now decision-time provenance alone on this path, which is what it
+  is documented to be, and the gap between it and the fill is implementation shortfall — a quantity
+  that was identically zero while the two were the same snapshot.
+
+  `VenueRegime::RequestPriced` is unchanged and still prices from the request, so `MockExchange` and
+  `MockExecution` results do not move. **Nor does anything at `latency_ms: 0`**, where the two
+  snapshots are the same instant's.
+
+  A `MarketDriven` venue that has never been fed an instrument now **rejects** a market order in it
+  as unpriceable rather than falling back to the requester's snapshot. Falling back would make the
+  fill depend on which of the two happened to hold a price.
+
+  **The committed tear sheet moved by one number**: closing USDT on the 40-order fixture, by
+  0.0029 on 1312.42 spent — 0.022bp, the price drift over one 50ms outbound leg. Nothing else in the
+  artifact changed, because the fixture opens positions and never closes them, so no realised PnL
+  or return statistic depends on the fill price.
+
 ### Added
 
 - **A simulated request is booked when it reaches its venue, not when the `Engine` sends it**

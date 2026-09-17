@@ -150,28 +150,28 @@ TradingSummary {
         }: TearSheetAsset {
             balance_end: Some(
                 Balance {
-                    total: 8687.584214995091768785772817,
-                    free: 8687.584214995091768785772817,
+                    total: 8687.581287327198174975737838,
+                    free: 8687.581287327198174975737838,
                     margin: None,
                 },
             ),
             drawdown: Some(
                 Drawdown {
-                    value: 0.1312415785004908231214227183,
+                    value: 0.1312418712672801825024262162,
                     time_start: 2025-03-25T23:07:00.715Z,
                     time_end: 2025-03-25T23:08:24.199491154Z,
                 },
             ),
             drawdown_mean: Some(
                 MeanDrawdown {
-                    mean_drawdown: 0.1312415785004908231214227183,
+                    mean_drawdown: 0.1312418712672801825024262162,
                     mean_drawdown_ms: 83484,
                 },
             ),
             drawdown_max: Some(
                 MaxDrawdown(
                     Drawdown {
-                        value: 0.1312415785004908231214227183,
+                        value: 0.1312418712672801825024262162,
                         time_start: 2025-03-25T23:07:00.715Z,
                         time_end: 2025-03-25T23:08:24.199491154Z,
                     },
