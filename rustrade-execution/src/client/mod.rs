@@ -7,7 +7,7 @@
 //! | [`binance`] | Auto (1s→30s backoff) | 10k LRU | REST after reconnect | 30s |
 //! | [`alpaca`] | Auto (1s→30s backoff) | 2k LRU | REST after reconnect | 35s |
 //! | [`ibkr`] | Caller responsibility | N/A | Caller responsibility | N/A |
-//! | [`hyperliquid`] | SDK-managed | SDK-managed | N/A | SDK-managed |
+//! | [`hyperliquid`] | SDK-managed | 10k LRU, fills only | Caller responsibility | SDK-managed |
 //!
 //! # Resilience Philosophy
 //!
@@ -19,7 +19,11 @@
 //! and client ID coordination — decisions that belong in the caller's wrapper. See
 //! [`ibkr`] module docs for caller responsibilities.
 //!
-//! **Hyperliquid** delegates to the official SDK's `with_reconnect()` mechanism.
+//! **Hyperliquid** delegates reconnection to the official SDK's `with_reconnect()` mechanism, but
+//! deduplicates fills itself: the SDK resubscribes on reconnect and the venue opens a `userFills`
+//! subscription with a snapshot, so every reconnect redelivers fills already seen. It does not
+//! recover fills missed while disconnected — callers needing that call
+//! [`ExecutionClient::fetch_trades`], whose results are not deduplicated against the stream.
 //!
 //! # Known Limitations
 //!
@@ -47,6 +51,12 @@ use rustrade_instrument::{
     instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use std::future::Future;
+
+// Account-event deduplication over rustrade's own event type. Gated on the clients that use it
+// so a build selecting neither does not compile it unused. Alpaca deduplicates too, but against
+// a raw `SmolStr` fill key rather than this cache, so it is deliberately not in this list.
+#[cfg(any(feature = "binance", feature = "hyperliquid"))]
+pub(crate) mod dedup;
 
 // Alpaca ExecutionClient implementation (options, equities, crypto — single unified API)
 #[cfg(feature = "alpaca")]

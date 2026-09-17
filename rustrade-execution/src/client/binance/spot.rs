@@ -2521,6 +2521,7 @@ fn convert_order_kind_tif(
 mod tests {
     use super::*;
     use crate::client::binance::shared::*;
+    use crate::client::dedup::{DedupEventKind, DedupKey};
     use crate::order::TrailingOffsetType;
     use binance_sdk::common::errors::WebsocketError;
     use smol_str::SmolStr;
