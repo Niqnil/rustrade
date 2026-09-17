@@ -35,6 +35,10 @@ pub mod manager;
 /// 2. Open - Order confirmed as open on exchange
 /// 3. CancelInFlight - Cancellation request sent to exchange
 /// 4. Cancelled/Expired/FullyFilled - Terminal states, once achieved order is no longer tracked.
+///
+/// A venue need not use a distinct state to report completion: an `Open` snapshot with no quantity
+/// remaining is terminal too, and is untracked on the same rule. Every arm that accepts an `Open`
+/// update applies it, so an order cannot be retained as active once it has nothing left to fill.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Constructor)]
 pub struct Orders<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex>(
     pub FnvHashMap<ClientOrderId, Order<ExchangeKey, InstrumentKey, ActiveOrderState>>,
@@ -209,8 +213,29 @@ where
                     "OrderManager received an OpenInFlight recording for an Open order - ignoring"
                 );
             }
-            (ActiveOrderState::Open(current), ActiveOrderState::Open(update)) => {
-                if current.time_exchange <= update.time_exchange {
+            (ActiveOrderState::Open(current), ActiveOrderState::Open(open)) => {
+                if current.time_exchange <= open.time_exchange {
+                    // A venue may report a completed fill as an Open snapshot with nothing left to
+                    // fill, rather than as a distinct terminal state. That order is finished, so
+                    // it stops being tracked -- exactly as the OpenInFlight -> Open arm above
+                    // already does. Retaining it would leave the strategy reading a resting order
+                    // that no longer exists on the exchange.
+                    //
+                    // Nested inside the staleness gate deliberately: an out-of-sequence snapshot
+                    // claiming a full fill must not retire an order that is still live.
+                    if open.quantity_remaining(update.quantity).is_zero() {
+                        debug!(
+                            exchange = ?snapshot.key.exchange,
+                            instrument = ?snapshot.key.instrument,
+                            strategy = %snapshot.key.strategy,
+                            cid = %snapshot.key.cid,
+                            update = ?snapshot,
+                            "OrderManager removing an Open order a more recent snapshot reports as fully filled"
+                        );
+                        current_entry.remove();
+                        return;
+                    }
+
                     debug!(
                         exchange = ?snapshot.key.exchange,
                         instrument = ?snapshot.key.instrument,
@@ -219,7 +244,7 @@ where
                         update = ?snapshot,
                         "OrderManager updating an Open order from a more recent snapshot"
                     );
-                    current_entry.get_mut().state = ActiveOrderState::Open(update);
+                    current_entry.get_mut().state = ActiveOrderState::Open(open);
                 } else {
                     debug!(
                         exchange = ?snapshot.key.exchange,
@@ -859,6 +884,43 @@ mod tests {
                 input: Snapshot(order(
                     cid.clone(),
                     OrderState::active(ActiveOrderState::Open(open(time_plus_secs(time_base, 1)))),
+                )),
+                expected: orders([order(
+                    cid.clone(),
+                    ActiveOrderState::Open(open(time_plus_secs(time_base, 1))),
+                )]),
+            },
+            TestCase {
+                // The shape this arm used to retain as active. `order` builds `quantity: dec!(1)`,
+                // so `filled_quantity: dec!(1)` leaves nothing remaining.
+                name: "tracked Open, Snapshot is active Open but fully filled, so remove",
+                state: orders([order(cid.clone(), ActiveOrderState::Open(open(time_base)))]),
+                input: Snapshot(order(
+                    cid.clone(),
+                    OrderState::active(Open {
+                        id: OrderId(SmolStr::default()),
+                        time_exchange: time_plus_secs(time_base, 1),
+                        filled_quantity: dec!(1),
+                    }),
+                )),
+                expected: Orders::default(),
+            },
+            TestCase {
+                // The staleness gate outranks the full-fill collapse. An out-of-sequence snapshot
+                // claiming completion must not retire an order that is still live -- otherwise the
+                // engine forgets a resting order the exchange still holds.
+                name: "tracked Open, Snapshot is active Open fully filled but older, so ignore",
+                state: orders([order(
+                    cid.clone(),
+                    ActiveOrderState::Open(open(time_plus_secs(time_base, 1))),
+                )]),
+                input: Snapshot(order(
+                    cid.clone(),
+                    OrderState::active(Open {
+                        id: OrderId(SmolStr::default()),
+                        time_exchange: time_base,
+                        filled_quantity: dec!(1),
+                    }),
                 )),
                 expected: orders([order(
                     cid.clone(),
