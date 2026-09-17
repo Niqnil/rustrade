@@ -3453,10 +3453,17 @@ mod tests {
         let mut venue = make_market_venue("10", "1000000");
         advance(&mut venue, time(1));
 
-        venue.account.orders_mut().insert(
-            seeded_part_filled("48000", "1", "0.4"),
-            // As `initial_state` seeds one: the venue never took anything for it.
-            None,
+        assert!(
+            venue
+                .account
+                .orders_mut()
+                .insert(
+                    seeded_part_filled("48000", "1", "0.4"),
+                    // As `initial_state` seeds one: the venue never took anything for it.
+                    None,
+                )
+                .is_none(),
+            "an empty book displaces nothing"
         );
 
         advance(&mut venue, time(2));
@@ -3506,10 +3513,14 @@ mod tests {
         let mut venue = make_market_venue("10", "1000000");
         advance(&mut venue, time(1));
 
-        venue
-            .account
-            .orders_mut()
-            .insert(seeded_part_filled("48000", "1", "0.4"), None);
+        assert!(
+            venue
+                .account
+                .orders_mut()
+                .insert(seeded_part_filled("48000", "1", "0.4"), None)
+                .is_none(),
+            "an empty book displaces nothing"
+        );
 
         advance(&mut venue, time(2));
         let events = venue.apply_market(
@@ -4759,10 +4770,17 @@ mod tests {
         };
 
         let mut venue = make_market_venue("10", "1000000");
-        venue.account.orders_mut().insert(
-            as_open(seeded).expect("the seeded order is Open"),
-            // As `initial_state` seeds one: the venue never took anything for it.
-            None,
+        assert!(
+            venue
+                .account
+                .orders_mut()
+                .insert(
+                    as_open(seeded).expect("the seeded order is Open"),
+                    // As `initial_state` seeds one: the venue never took anything for it.
+                    None,
+                )
+                .is_none(),
+            "an empty book displaces nothing"
         );
 
         let events = venue.advance_time(expiry);
