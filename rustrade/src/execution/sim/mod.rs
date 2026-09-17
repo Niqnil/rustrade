@@ -13,7 +13,11 @@ use rustrade_execution::{
     AccountEvent, AccountEventKind, UnindexedAccountEvent,
     exchange::mock::{SimulatedVenue, VenueOutcome},
     indexer::AccountEventIndexer,
-    order::{Order, request::UnindexedOrderResponseCancel, state::UnindexedOrderState},
+    order::{
+        Order,
+        request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
+        state::UnindexedOrderState,
+    },
 };
 use rustrade_instrument::{
     exchange::{ExchangeId, ExchangeIndex},
@@ -60,6 +64,9 @@ pub struct SimVenue {
     /// [`ExecutionManager`]: crate::execution::manager::ExecutionManager
     pub request_rx: UnboundedRx<ExecutionRequest>,
     /// Simulated delay from the `Engine` issuing a request to the venue acting on it.
+    ///
+    /// The venue really does act at that later instant, against the market it holds then — see
+    /// [`SimRunner`]'s `# A request is booked when it arrives`.
     pub to_venue: TimeDelta,
     /// Simulated delay from the venue acting to the `Engine` observing the result.
     pub from_venue: TimeDelta,
@@ -79,20 +86,59 @@ enum Deliverable {
     CancelResponse(UnindexedOrderResponseCancel),
 }
 
-/// One deliverable and the simulated instant it becomes visible to the `Engine`.
+/// A request the `Engine` has issued and its venue has not yet acted on.
+///
+/// Indexed and owned at the moment it was drained rather than when it is acted on, so a
+/// misconfigured key is reported against the request that carried it — see [`SimRunner`]'s
+/// `# Panics`.
+#[derive(Debug)]
+enum Action {
+    Open(OrderRequestOpen<ExchangeId, InstrumentNameExchange>),
+    Cancel(OrderRequestCancel<ExchangeId, InstrumentNameExchange>),
+}
+
+/// What one queue entry holds: something owed to the `Engine`, or something owed to a venue.
+///
+/// Both directions share one queue because both are events on one simulated timeline and their
+/// relative order is the thing that has to be decided. Splitting them into two queues would make
+/// "is this order booked against the market as of its arrival instant" a comparison between two
+/// data structures rather than a pop from one.
+#[derive(Debug)]
+enum Payload {
+    /// Engine-bound: emitted by [`SimRunner`] as an [`EngineEvent`].
+    Deliver(Deliverable),
+    /// Venue-bound: executed against [`SimVenue::venue`], and never emitted.
+    Act(Action),
+}
+
+/// One payload and the simulated instant it comes due.
 #[derive(Debug)]
 struct ScheduledEvent {
     time: DateTime<Utc>,
-    /// Monotone tie-break within one instant. Ordering on `time` alone would be unspecified: a
-    /// [`BinaryHeap`] is not a stable sort, so equal keys pop in an arbitrary order.
+    /// Precedence within one instant. See [`SimRunner`]'s ordering contract.
+    ///
+    /// Part of [`Ord`] rather than of the peek alone. Comparing it only where the queue is
+    /// weighed against the source would let [`BinaryHeap::peek`] answer with a low-priority entry
+    /// while a high-priority one sat behind it at the same instant — #289 reintroduced silently,
+    /// and invisible to the result-stability fixture, whose strategy sends one order kind.
+    class: u8,
+    /// Monotone tie-break within one instant and class. Ordering on `(time, class)` alone would be
+    /// unspecified: a [`BinaryHeap`] is not a stable sort, so equal keys pop in an arbitrary order.
     seq: u64,
     exchange: ExchangeIndex,
-    payload: Deliverable,
+    payload: Payload,
+}
+
+impl ScheduledEvent {
+    /// The key this entry is ordered by, and the one a peek is compared against.
+    fn key(&self) -> (DateTime<Utc>, u8, u64) {
+        (self.time, self.class, self.seq)
+    }
 }
 
 impl PartialEq for ScheduledEvent {
     fn eq(&self, other: &Self) -> bool {
-        (self.time, self.seq) == (other.time, other.seq)
+        self.key() == other.key()
     }
 }
 
@@ -106,7 +152,7 @@ impl PartialOrd for ScheduledEvent {
 
 impl Ord for ScheduledEvent {
     fn cmp(&self, other: &Self) -> Ordering {
-        (self.time, self.seq).cmp(&(other.time, other.seq))
+        self.key().cmp(&other.key())
     }
 }
 
@@ -124,22 +170,40 @@ impl Ord for ScheduledEvent {
 /// venues — so the accounting is right, but a run abandoned this way is reporting a wide book
 /// rather than the feedback cycle [`BarterError::SimFeedbackLoop`] names. Raise the limit with
 /// [`SimRunner::with_feedback_limit`] if that is the case.
+///
+/// # Booking a request does not spend from it
+/// Only what the `Engine` is shown is counted. A venue acting on a request emits nothing, and
+/// every action produces at least a response, so a cycle is still bounded by the deliverables it
+/// generates — and the limit means the same number of emitted events it always did.
 pub const DEFAULT_FEEDBACK_LIMIT: usize = 10_000;
 
-/// Priority of an account deliverable within one instant. See [`SimRunner`]'s ordering contract.
-const CLASS_ACCOUNT: u8 = 1;
+/// Precedence of a venue-bound action within one instant. See [`SimRunner`]'s ordering contract.
+///
+/// Lowest, so a venue has acted on everything it was handed for instant `T` before the `Engine` is
+/// shown anything stamped `T` — which is what the drain-then-peek order of an earlier design did
+/// structurally, and what keeps this change from moving any existing result.
+const CLASS_ACTION: u8 = 0;
 
-/// Priority of a source event within one instant. See [`SimRunner`]'s ordering contract.
+/// Precedence of an auxiliary or control event within one instant.
+const CLASS_AUX: u8 = 1;
+
+/// Precedence of an account deliverable within one instant.
+const CLASS_ACCOUNT: u8 = 2;
+
+/// Precedence of a market data event within one instant.
+const CLASS_MARKET: u8 = 3;
+
+/// Precedence of a source event within one instant. See [`SimRunner`]'s ordering contract.
 fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
     match event {
         // Market data is marked to last, so a fill at the same instant is already in the position
         // it prices. This is the ordering #289 is about.
-        EngineEvent::Market(_) => 2,
+        EngineEvent::Market(_) => CLASS_MARKET,
         // An account event injected into the source ranks with the ones this runner schedules.
         EngineEvent::Account(_) => CLASS_ACCOUNT,
         // Auxiliary and control events lead, matching the merge this runner reads from: a stock
         // split adjusts a position before any fill stamped at that instant is applied to it.
-        _ => 0,
+        _ => CLASS_AUX,
     }
 }
 
@@ -153,8 +217,8 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 /// # Why inline polling is the whole point
 /// The `Engine` sends its execution requests synchronously *inside* `Engine::process`, so by the
 /// time `process` returns, every request that event provoked is already queued on this runner's
-/// receivers. The next poll therefore observes them, books them against the venue, and schedules
-/// what they produce — all before the next source event is drawn.
+/// receivers. The next poll therefore observes them and queues each one at the instant its venue
+/// will act on it — all before the next source event is drawn.
 ///
 /// Forwarding the source through a channel instead, as a live system does, hands that decision to
 /// the tokio scheduler: an always-ready market source races arbitrarily far ahead of the engine and
@@ -162,27 +226,64 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 /// survive that, because they do not depend on where in the sequence a fill lands; every
 /// time-derived statistic does not.
 ///
+/// # A request is booked when it arrives
+///
+/// Observing a request and acting on it are separate instants. A request the `Engine` issued at
+/// `T` is queued the moment it is observed, but stamped `T + to_venue`, and the venue does not see
+/// it until the queue reaches that instant — by which time every source event up to it has been
+/// routed. So an order is matched against the market its venue actually holds when it arrives.
+///
+/// Three things follow that are otherwise unrepresentable, and each is pinned by a test:
+///
+/// - **A tick that prints while a request is in flight cannot fill it.** The order is not on the
+///   book yet. Booking on the poll that observed the request instead would let liquidity that was
+///   gone before the order existed trade against it.
+/// - **An order that is marketable when it arrives crosses as the aggressor**, paying the book,
+///   rather than resting at a price the market had already left and being filled there later.
+/// - **A cancel can lose to a fill.** A fill struck between a cancel being sent and arriving
+///   retires the order first, and the cancel is answered
+///   [`ApiError::OrderAlreadyFullyFilled`](rustrade_execution::error::ApiError::OrderAlreadyFullyFilled).
+///   This is the race `to_venue` exists to model; booking on observation made the cancel win every
+///   time, at any latency.
+///
+/// At `latency_ms: 0` the two instants coincide on every request, so none of this moves a result
+/// that a zero-latency run already produced.
+///
 /// # Ordering contract
-/// Deliverables and source events are merged on `(time, class)`, where `class` breaks a tie within
+/// Queue entries and source events are merged on `(time, class)`, where `class` breaks a tie within
 /// one instant:
 ///
-/// | class | events |
+/// | class | entries |
 /// |---|---|
-/// | 0 | auxiliary and control — corporate actions, contract expiries |
-/// | 1 | account — balances, trades, order responses |
-/// | 2 | market data |
+/// | 0 | venue-bound actions — the requests this runner has yet to book |
+/// | 1 | auxiliary and control — corporate actions, contract expiries |
+/// | 2 | account — balances, trades, order responses |
+/// | 3 | market data |
 ///
-/// Auxiliary events keeping the tie matches the source merge this runner reads from: a stock split
-/// must adjust a position before any fill stamped at that instant is applied to it. Account events
-/// preceding market data at one instant is the rule this type exists for — a fill stamped at `T`
-/// must reach the `Engine` before the market event at `T` marks the resulting position to that
-/// price, or the terminal `pnl_unrealised` describes a position the run did not hold.
+/// Actions leading is the tie-break described above: of the things stamped `T`, a venue acts on
+/// what it was handed before the `Engine` is shown anything. Auxiliary events keeping the next tie
+/// matches the source merge this runner reads from: a stock split must adjust a position before any
+/// fill stamped at that instant is applied to it. Account events preceding market data at one
+/// instant is the rule this type exists for — a fill stamped at `T` must reach the `Engine` before
+/// the market event at `T` marks the resulting position to that price, or the terminal
+/// `pnl_unrealised` describes a position the run did not hold.
+///
+/// `class` is compared inside the queue's own ordering, not only where the queue is weighed against
+/// the source. Comparing it at the peek alone would let the queue hand back a low-priority entry
+/// while a high-priority one sat behind it at the same instant.
 ///
 /// Within one instant and class, delivery follows booking order: every account event a request
 /// produced precedes that request's response, so "the `Engine` has the response" implies "the
 /// `Engine` has already seen every account event for that order".
 ///
-/// ## The table has three rows, and a fill caused by market data does not add a fourth
+/// ## Only three of the four classes are ever emitted
+///
+/// An action is a queue entry, not an event: it is run against its venue and produces the next
+/// entries, and the `Engine` never sees it. It shares the queue because both directions are events
+/// on one simulated timeline and their relative order is precisely the thing that has to be
+/// decided.
+///
+/// ## A fill caused by market data does not add a class of its own
 ///
 /// A resting order filled by a tick looks at first like an exception to "account leads market",
 /// since it must follow the very event that caused it. It is not, and the four claims below are
@@ -191,19 +292,17 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 /// 1. **`class` is within-instant precedence between a deliverable and the *source*, not a record
 ///    of what caused what.** It answers "of the things stamped `T`, which does the `Engine` see
 ///    first", and nothing else. Causality is not expressible in it and does not need to be.
-/// 2. **Every scheduled deliverable ranks as an account event — class 1 — whatever produced it.**
-///    A fill provoked by a request and a fill provoked by a tick are both account events to the
-///    `Engine` and are marked identically, which is why the pending peek may hard-code the class
-///    rather than deriving it per payload.
-/// 3. **Causality is structural, not a matter of priority.** The queue is only ever consulted
-///    against the *next* source event, and market state is applied and matched when an event is
-///    **emitted**, never when it is peeked. So anything a tick enqueues is enqueued during the poll
-///    that returns that tick, and is therefore drawn from the queue only on a later poll — after
-///    the tick, at any latency, without any rule saying so.
+/// 2. **Every scheduled deliverable ranks as an account event, whatever produced it.** A fill
+///    provoked by a request and a fill provoked by a tick are both account events to the `Engine`
+///    and are marked identically.
+/// 3. **Causality is structural, not a matter of priority.** Market state is applied and matched
+///    when an event is **emitted**, never when it is peeked. So anything a tick enqueues is
+///    enqueued during the poll that returns that tick, and is therefore drawn from the queue only
+///    on a later poll — after the tick, at any latency, without any rule saying so.
 /// 4. **At `from_venue = 0` it is delivered immediately after its tick and before the remaining
-///    source events at that instant**, because the fill and those events share an instant and
-///    class 1 beats class 2. So the position the fill opens is still marked to `T`, which is the
-///    property the contract is really about.
+///    source events at that instant**, because the fill and those events share an instant and the
+///    account class beats the market one. So the position the fill opens is still marked to `T`,
+///    which is the property the contract is really about.
 ///
 /// Claims 3 and 4 together are the contract for a tick-caused fill: booked at `T`, marked at `T`,
 /// and never delivered before its own cause.
@@ -213,6 +312,10 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 /// `T + to_venue + from_venue`. Both are simulated offsets applied to the queue key, so a run's
 /// wall-clock duration does not scale with the latency being modelled, and delivery order is a
 /// function of the dataset alone.
+///
+/// `to_venue` is price-relevant, not merely a delivery delay: it is the interval during which the
+/// market may move away from an order that has not arrived — see `# A request is booked when it
+/// arrives`.
 ///
 /// A fill nothing requested — a resting order crossed by a tick — pays `from_venue` alone. There
 /// was no request to carry to the venue, so there is no such leg to charge, and the fill becomes
@@ -229,7 +332,8 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 /// cut the ledgers short. The [`ExecutionRequest::Drain`] the `Engine` sends in reply is therefore
 /// a no-op here: this runner, not the execution side, owns the moment a simulated run ends.
 /// [`ExecutionRequest::Shutdown`] abandons whatever is still scheduled, matching its documented
-/// meaning.
+/// meaning — including any request that has not yet reached its venue, which is therefore never
+/// booked at all rather than booked and then left unreported.
 ///
 /// ## A position opened during the drain is never marked
 ///
@@ -474,7 +578,11 @@ where
                 return Poll::Ready(None);
             }
 
-            let account_leads = if *this.source_done {
+            // Whether the queue's earliest entry comes due at or before the source's next event.
+            // No longer only a question about account events: an entry may be a request its venue
+            // has yet to act on, which has to be weighed against the source for the same reason —
+            // it is due at an instant, and the market as of that instant is what it acts against.
+            let queue_leads = if *this.source_done {
                 // Ask the Engine to stop generating *before* draining what it is already owed.
                 // Doing so is what bounds the drain: the Engine suppresses further algo orders on
                 // this event, so nothing new is booked while the queue empties. Suppressing at the
@@ -506,10 +614,10 @@ where
 
                 this.pending
                     .peek()
-                    .is_some_and(|Reverse(next)| (next.time, CLASS_ACCOUNT) <= ordering)
+                    .is_some_and(|Reverse(next)| (next.time, next.class) <= ordering)
             };
 
-            if account_leads {
+            if queue_leads {
                 // Checked before popping, so the diagnostic can name the event that would have been
                 // emitted rather than one already gone.
                 if let Some(error) = check_feedback(
@@ -524,14 +632,20 @@ where
                     return Poll::Ready(None);
                 }
 
-                if let Some(event) = pop_due(this.venues, this.pending) {
-                    *this.since_source += 1;
-                    return Poll::Ready(Some(event));
+                match step(this.venues, this.pending, this.seq) {
+                    Step::Emitted(event) => {
+                        *this.since_source += 1;
+                        return Poll::Ready(Some(event));
+                    }
+                    // A venue acted. Nothing to emit, and what it produced is now queued, so the
+                    // next iteration weighs that against the source exactly as it did this one.
+                    Step::Acted => continue,
+                    // Nothing left owed and no source to draw from: the run is over.
+                    Step::Empty => {
+                        *this.terminated = true;
+                        return Poll::Ready(None);
+                    }
                 }
-
-                // Nothing left owed and no source to draw from: the run is over.
-                *this.terminated = true;
-                return Poll::Ready(None);
             }
 
             // The peeked item is buffered, so this returns it synchronously.
@@ -633,8 +747,15 @@ fn route_market<MarketKind>(
 /// Decide whether emitting another account deliverable would exceed the feedback budget.
 ///
 /// Returns the error to abandon the run with, or `None` to proceed. `None` on an empty queue or an
-/// unregistered venue is deliberate: neither can emit anything, and [`pop_due`] already owns the
+/// unregistered venue is deliberate: neither can emit anything, and [`step`] already owns the
 /// diagnostic for the latter.
+///
+/// # An action at the head is not what the budget counts
+/// The budget counts what the `Engine` is *shown*, so a venue-bound action is let through: it
+/// emits nothing, and reporting against it would name a request rather than the deliverable the
+/// run stopped on. It cannot defer the guard indefinitely either — every action this runner
+/// queues produces at least a response, so the head becomes a deliverable within one step and the
+/// limit is reached on the same count it would have been.
 fn check_feedback(
     venues: &FnvIndexMap<ExchangeIndex, SimVenue>,
     pending: &BinaryHeap<Reverse<ScheduledEvent>>,
@@ -646,6 +767,10 @@ fn check_feedback(
     }
 
     let Reverse(next) = pending.peek()?;
+
+    if matches!(next.payload, Payload::Act(_)) {
+        return None;
+    }
 
     Some(BarterError::SimFeedbackLoop {
         exchange: venues.get(&next.exchange)?.venue.exchange,
@@ -673,7 +798,18 @@ enum RequestDrain {
     Abandon,
 }
 
-/// Book every queued request against its venue, scheduling what each one produces.
+/// Queue every request the `Engine` has issued at the instant its venue will act on it.
+///
+/// Nothing is booked here. A request is indexed, stamped `now + to_venue`, and pushed onto the
+/// same queue the venues' output waits in, so that [`act`] runs it against the market as of its
+/// own arrival instant rather than as of the instant it was sent — see [`SimRunner`]'s
+/// `# A request is booked when it arrives`.
+///
+/// # Indexed here, acted on later
+/// Translating the keys at this point keeps the panic on the poll that observed the request, where
+/// the `Engine` call that produced it is still the nearest thing in the stack trace. It also keeps
+/// [`Action`] free of the `Engine`'s index types, so nothing in the queue needs a venue to be
+/// interpreted.
 ///
 /// # Why `rx.rx.try_recv()` rather than the receiver's `Iterator`
 /// [`UnboundedRx`]'s `Iterator` impl `continue`s on `TryRecvError::Empty`, so `next()` spins
@@ -693,87 +829,115 @@ fn drain_requests(
             // One arrival instant per request, so the venue's ledger and the events describing it
             // agree on when it happened.
             let arrives = checked_offset(now, slot.to_venue, "a request arriving at the venue");
-            let delivers = checked_offset(
-                arrives,
-                slot.from_venue,
-                "a venue response arriving at the Engine",
-            );
 
-            match request {
+            let action = match request {
                 // This runner already owes the Engine every scheduled deliverable and ends only
                 // once it has emitted them, so a graceful drain has nothing left to ask for. The
                 // Engine sends one in reply to the `Shutdown::AfterDrain` this runner itself emits
                 // on source exhaustion; see the type's `# Termination`.
-                ExecutionRequest::Drain => {}
-                ExecutionRequest::Shutdown => drain = RequestDrain::Abandon,
-                ExecutionRequest::Open(request) => {
-                    let request = slot
-                        .indexer
+                ExecutionRequest::Drain => continue,
+                ExecutionRequest::Shutdown => {
+                    drain = RequestDrain::Abandon;
+                    continue;
+                }
+                ExecutionRequest::Open(request) => Action::Open(
+                    slot.indexer
                         .order_request(&request)
                         .unwrap_or_else(|error| {
                             panic!(
                                 "SimRunner received open request for non-configured key: {error}"
                             )
                         })
-                        .into_owned_instrument();
-
-                    // Advancing the clock can retire an order whose deadline has passed. Nothing
-                    // requested those events, so they pay `from_venue` alone — the same one leg a
-                    // tick-caused fill pays — and are scheduled ahead of this request's own
-                    // response, which they precede in fact as well as in the queue.
-                    schedule_events(
-                        pending,
-                        seq,
-                        *exchange,
-                        delivers,
-                        slot.venue.advance_time(arrives),
-                    );
-
-                    schedule(
-                        pending,
-                        seq,
-                        *exchange,
-                        delivers,
-                        slot.venue.open_order(request),
-                        Deliverable::OpenResponse,
-                    );
-                }
-                ExecutionRequest::Cancel(request) => {
-                    let request = slot
-                        .indexer
+                        .into_owned_instrument(),
+                ),
+                ExecutionRequest::Cancel(request) => Action::Cancel(
+                    slot.indexer
                         .order_request(&request)
                         .unwrap_or_else(|error| {
                             panic!(
                                 "SimRunner received cancel request for non-configured key: {error}"
                             )
                         })
-                        .into_owned_instrument();
+                        .into_owned_instrument(),
+                ),
+            };
 
-                    // Swept before the cancel is served, so a cancel arriving after its order's
-                    // deadline is answered `OrderAlreadyExpired` rather than succeeding against an
-                    // order that should already have been retired.
-                    schedule_events(
-                        pending,
-                        seq,
-                        *exchange,
-                        delivers,
-                        slot.venue.advance_time(arrives),
-                    );
-
-                    schedule(
-                        pending,
-                        seq,
-                        *exchange,
-                        delivers,
-                        slot.venue.cancel_order(request),
-                        Deliverable::CancelResponse,
-                    );
-                }
-            }
+            pending.push(Reverse(ScheduledEvent {
+                time: arrives,
+                class: CLASS_ACTION,
+                seq: *seq,
+                exchange: *exchange,
+                payload: Payload::Act(action),
+            }));
+            *seq += 1;
         }
     }
 
     drain
+}
+
+/// Run one request against its venue, scheduling everything that comes back.
+///
+/// Called only from [`step`], and only once the queue has established that `time` is the earliest
+/// instant anything is due at — so every market event up to `time` has already been routed and the
+/// venue's book is the one this request actually arrives to.
+///
+/// The venue's clock is advanced first, which is what makes a deadline an unconditional cutoff: an
+/// order whose [`TimeInForce::GoodTillDate`] deadline fell between this request being sent and it
+/// arriving is retired before the request is served, so a cancel for it is answered
+/// `OrderAlreadyExpired` rather than succeeding. Nothing requested those expiries, so they pay
+/// `from_venue` alone — the same one leg a tick-caused fill pays — and are scheduled ahead of this
+/// request's own response, which they precede in fact as well as in the queue.
+///
+/// # Panics
+/// Panics if `exchange` is not registered, or if a simulated timestamp overflows — see
+/// [`SimRunner`]'s `# Panics`.
+///
+/// [`TimeInForce::GoodTillDate`]: rustrade_execution::order::TimeInForce::GoodTillDate
+fn act(
+    venues: &mut FnvIndexMap<ExchangeIndex, SimVenue>,
+    pending: &mut BinaryHeap<Reverse<ScheduledEvent>>,
+    seq: &mut u64,
+    exchange: ExchangeIndex,
+    time: DateTime<Utc>,
+    action: Action,
+) {
+    let slot = venues.get_mut(&exchange).unwrap_or_else(|| {
+        panic!("SimRunner scheduled an action for an unregistered venue: {exchange}")
+    });
+
+    let delivers = checked_offset(
+        time,
+        slot.from_venue,
+        "a venue response arriving at the Engine",
+    );
+
+    schedule_events(
+        pending,
+        seq,
+        exchange,
+        delivers,
+        slot.venue.advance_time(time),
+    );
+
+    match action {
+        Action::Open(request) => schedule(
+            pending,
+            seq,
+            exchange,
+            delivers,
+            slot.venue.open_order(request),
+            Deliverable::OpenResponse,
+        ),
+        Action::Cancel(request) => schedule(
+            pending,
+            seq,
+            exchange,
+            delivers,
+            slot.venue.cancel_order(request),
+            Deliverable::CancelResponse,
+        ),
+    }
 }
 
 /// Apply a simulated latency offset, refusing to schedule an event before its own cause.
@@ -809,9 +973,10 @@ fn schedule<Response>(
 
     pending.push(Reverse(ScheduledEvent {
         time,
+        class: CLASS_ACCOUNT,
         seq: *seq,
         exchange,
-        payload: wrap(response),
+        payload: Payload::Deliver(wrap(response)),
     }));
     *seq += 1;
 }
@@ -831,35 +996,71 @@ fn schedule_events(
     for event in events {
         pending.push(Reverse(ScheduledEvent {
             time,
+            class: CLASS_ACCOUNT,
             seq: *seq,
             exchange,
-            payload: Deliverable::Account(event),
+            payload: Payload::Deliver(Deliverable::Account(event)),
         }));
         *seq += 1;
     }
 }
 
-/// Pop the earliest scheduled deliverable and index it for the `Engine`.
+/// What one pop from the queue did.
+///
+/// Popping used to mean emitting: the queue held only deliverables, so an entry and an
+/// [`EngineEvent`] were the same thing. Now that a venue-bound action waits in the same queue, a
+/// pop can advance the simulation without producing anything for the `Engine`, and the caller has
+/// to be able to tell that from an empty queue — otherwise a run ends with its last orders
+/// unbooked.
+#[derive(Debug)]
+// The large variant is the point: this is a return value, destructured at its single call site and
+// either handed straight to `Poll::Ready` or dropped. Boxing it would buy stack bytes that
+// `Poll::Ready(Some(event))` immediately re-materialises, and charge a heap allocation for every
+// event a run emits.
+#[allow(clippy::large_enum_variant)]
+enum Step<MarketKind> {
+    /// A deliverable was popped and indexed.
+    Emitted(EngineEvent<MarketKind>),
+    /// An action was popped and run against its venue. Nothing to emit; poll again.
+    Acted,
+    /// The queue is empty.
+    Empty,
+}
+
+/// Pop the earliest queue entry: emit it if the `Engine` is owed it, run it if a venue is.
 ///
 /// # Panics
-/// Panics if the deliverable's venue is absent, or if its keys are absent from that venue's index —
-/// see [`SimRunner`]'s `# Panics`.
-fn pop_due<MarketKind>(
-    venues: &FnvIndexMap<ExchangeIndex, SimVenue>,
+/// Panics if the entry's venue is absent, or if a deliverable's keys are absent from that venue's
+/// index — see [`SimRunner`]'s `# Panics`.
+fn step<MarketKind>(
+    venues: &mut FnvIndexMap<ExchangeIndex, SimVenue>,
     pending: &mut BinaryHeap<Reverse<ScheduledEvent>>,
-) -> Option<EngineEvent<MarketKind>> {
-    let Reverse(ScheduledEvent {
-        time: _,
+    seq: &mut u64,
+) -> Step<MarketKind> {
+    let Some(Reverse(ScheduledEvent {
+        time,
+        class: _,
         seq: _,
         exchange,
         payload,
-    }) = pending.pop()?;
+    })) = pending.pop()
+    else {
+        return Step::Empty;
+    };
+
+    let payload = match payload {
+        Payload::Act(action) => {
+            act(venues, pending, seq, exchange, time, action);
+            return Step::Acted;
+        }
+        Payload::Deliver(payload) => payload,
+    };
 
     let slot = venues.get(&exchange).unwrap_or_else(|| {
         panic!("SimRunner scheduled an event for an unregistered venue: {exchange}")
     });
 
-    Some(match payload {
+    Step::Emitted(match payload {
         Deliverable::Account(event) => index_account_event(&slot.indexer, event),
         Deliverable::OpenResponse(order) => {
             let Order {
@@ -1129,13 +1330,14 @@ mod tests {
         ///
         /// It carries no `MarketSnapshot`: a limit order is judged and priced against the venue's
         /// own market, which this runner routes to it from the source.
-        fn send_limit(&self, price: Decimal) {
+        fn send_limit(&self, price: Decimal) -> ClientOrderId {
+            let cid = ClientOrderId::random();
             self.send(ExecutionRequest::Open(OrderRequestOpen {
                 key: OrderKey {
                     exchange: self.exchange,
                     instrument: instrument_key(),
                     strategy: StrategyId::new("test"),
-                    cid: ClientOrderId::random(),
+                    cid: cid.clone(),
                 },
                 state: RequestOpen {
                     side: Side::Buy,
@@ -1148,6 +1350,7 @@ mod tests {
                     market: None,
                 },
             }));
+            cid
         }
 
         /// A resting buy that retires itself at `expiry`, returning the id so it can be cancelled.
@@ -1212,12 +1415,69 @@ mod tests {
 
         /// Drain the rest of the run into labels.
         async fn rest(&mut self) -> Vec<&'static str> {
-            let mut labels = Vec::new();
-            while let Some(event) = self.runner.next().await {
-                labels.push(label(&event));
-            }
-            labels
+            self.rest_events()
+                .await
+                .iter()
+                .map(label)
+                .collect::<Vec<_>>()
         }
+
+        /// Drain the rest of the run into whole events, for the assertions a label cannot make —
+        /// the price a fill was struck at, or which error a cancel was answered with.
+        async fn rest_events(&mut self) -> Vec<EngineEvent<DataKind>> {
+            let mut events = Vec::new();
+            while let Some(event) = self.runner.next().await {
+                events.push(event);
+            }
+            events
+        }
+    }
+
+    /// The price of every trade in a run, in delivery order.
+    fn trade_prices(events: &[EngineEvent<DataKind>]) -> Vec<Decimal> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+                    kind: AccountEventKind::Trade(trade),
+                    ..
+                })) => Some(trade.price),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every cancel response in a run, as `Ok(())` or the error it was refused with.
+    fn cancel_outcomes(events: &[EngineEvent<DataKind>]) -> Vec<Result<(), String>> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+                    kind: AccountEventKind::OrderCancelled(response),
+                    ..
+                })) => Some(
+                    response
+                        .state
+                        .as_ref()
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A filler deliverable, for tests that care about a queue entry's key rather than its
+    /// contents.
+    fn filler() -> Payload {
+        Payload::Deliver(Deliverable::Account(UnindexedAccountEvent {
+            exchange: EXCHANGE,
+            kind: AccountEventKind::Snapshot(AccountSnapshot {
+                exchange: EXCHANGE,
+                balances: vec![],
+                instruments: vec![],
+            }),
+        }))
     }
 
     /// Equal times must not decide the order between themselves: a `BinaryHeap` is not a stable
@@ -1225,21 +1485,11 @@ mod tests {
     /// and the balance of a fill could follow the response that reports it.
     #[test]
     fn scheduled_events_pop_in_time_then_seq_order() {
-        fn filler() -> Deliverable {
-            Deliverable::Account(UnindexedAccountEvent {
-                exchange: EXCHANGE,
-                kind: AccountEventKind::Snapshot(AccountSnapshot {
-                    exchange: EXCHANGE,
-                    balances: vec![],
-                    instruments: vec![],
-                }),
-            })
-        }
-
         let mut heap = BinaryHeap::new();
         for (millis, seq) in [(20, 5), (10, 1), (10, 3), (10, 2), (5, 9)] {
             heap.push(Reverse(ScheduledEvent {
                 time: at(millis),
+                class: CLASS_ACCOUNT,
                 seq,
                 exchange: ExchangeIndex::new(0),
                 payload: filler(),
@@ -1251,6 +1501,43 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(popped, vec![(5, 9), (10, 1), (10, 2), (10, 3), (20, 5)]);
+    }
+
+    /// `class` orders the queue itself, not only the comparison against the source.
+    ///
+    /// Comparing it at the peek alone would let the queue hand back a low-priority entry while a
+    /// high-priority one sat behind it at the same instant — an action booked after the fill it
+    /// was supposed to precede. The pins that would catch it elsewhere cannot: the result-stability
+    /// fixture sends one order kind, so a class inversion leaves its artifact byte-identical.
+    #[test]
+    fn scheduled_events_pop_in_class_order_before_seq_order() {
+        let mut heap = BinaryHeap::new();
+        // Pushed with `seq` ascending *against* class, so an `Ord` that ignored class would pop
+        // them in exactly the reverse of the expected order rather than coincidentally agreeing.
+        for (class, seq) in [
+            (CLASS_MARKET, 0),
+            (CLASS_ACCOUNT, 1),
+            (CLASS_AUX, 2),
+            (CLASS_ACTION, 3),
+        ] {
+            heap.push(Reverse(ScheduledEvent {
+                time: at(10),
+                class,
+                seq,
+                exchange: ExchangeIndex::new(0),
+                payload: filler(),
+            }));
+        }
+
+        let popped = std::iter::from_fn(|| heap.pop())
+            .map(|Reverse(event)| event.class)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            popped,
+            vec![CLASS_ACTION, CLASS_AUX, CLASS_ACCOUNT, CLASS_MARKET],
+            "at one instant the venue acts first and market data is marked last"
+        );
     }
 
     /// The venue's opening account state must reach the `Engine` before any market data.
@@ -1437,7 +1724,7 @@ mod tests {
         assert_eq!(
             harness.rest().await,
             Vec::<&str>::new(),
-            "the fill was booked but is abandoned unread, and no source event follows"
+            "the order is abandoned before its venue ever sees it, and no source event follows"
         );
         assert!(harness.runner.is_terminated());
     }
@@ -1864,6 +2151,215 @@ mod tests {
                 "after_drain"
             ],
             "the sweep precedes the response to the request that provoked it"
+        );
+    }
+
+    /// A tick between a request being sent and reaching its venue cannot fill it: the order was
+    /// not on the book yet.
+    ///
+    /// The market dips through the limit at instant 50 and recovers by 100, while the order does
+    /// not arrive until 110. Booking on the poll that observed the request instead would put the
+    /// order on a book as of instant 10 and let the dip trade against it — a fill against
+    /// liquidity that was gone before the order existed, and the strongest form of the look-ahead
+    /// this runner exists to remove.
+    #[tokio::test]
+    async fn a_tick_before_an_order_arrives_cannot_fill_it() {
+        // 200ms round trip, so each leg is 100ms.
+        let mut harness = Harness::new(
+            200,
+            vec![
+                market(10, dec!(200)),
+                market(50, dec!(90)),
+                market(100, dec!(200)),
+                market(900, dec!(200)),
+            ],
+        );
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        harness.send_limit(dec!(100));
+
+        let events = harness.rest_events().await;
+
+        assert_eq!(
+            events.iter().map(label).collect::<Vec<_>>(),
+            vec![
+                // Both ticks precede the order's arrival at 110, so neither can see it.
+                "market",
+                "market",
+                // It arrives to the recovered market and rests, visible at 210.
+                "balance",
+                "order",
+                "market",
+                "after_drain"
+            ],
+            "the order rests on the book it arrives to, having missed the dip entirely"
+        );
+        assert!(
+            trade_prices(&events).is_empty(),
+            "an order that was still in flight when the market dipped has traded nothing"
+        );
+    }
+
+    /// An order that *is* marketable on arrival takes the book it arrives to, at that book's price.
+    ///
+    /// The mirror of the test above: the dip at instant 50 does not recover, so the order reaches
+    /// the venue marketable and crosses as the aggressor. The price is what distinguishes the two
+    /// bookings — an order resting first and being matched later fills at its own limit, because a
+    /// maker is paid the price it posted, while an aggressor pays the book.
+    #[tokio::test]
+    async fn an_order_marketable_on_arrival_takes_the_book_it_arrives_to() {
+        let mut harness = Harness::new(
+            200,
+            vec![
+                market(10, dec!(200)),
+                market(50, dec!(90)),
+                market(900, dec!(200)),
+            ],
+        );
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        harness.send_limit(dec!(100));
+
+        let events = harness.rest_events().await;
+
+        assert_eq!(
+            events.iter().map(label).collect::<Vec<_>>(),
+            vec![
+                "market", //
+                "balance",
+                "trade",
+                "order", //
+                "market",
+                "after_drain"
+            ],
+            "the order fills on arrival rather than resting"
+        );
+        assert_eq!(
+            trade_prices(&events),
+            vec![dec!(90)],
+            "an aggressor pays the market it arrived to, not the limit it would have rested at"
+        );
+    }
+
+    /// A tick stamped at the very instant an order arrives does not get to price it.
+    ///
+    /// The tie has to be broken somewhere and this runner breaks it towards the venue: of the
+    /// things stamped `T`, a venue acts on what it was handed before it is shown anything else.
+    /// That is what an earlier design did structurally by booking every request before the source
+    /// was peeked, and keeping it is what makes booking at the arrival instant leave every
+    /// existing result untouched at `latency_ms: 0`, where the two instants coincide on every
+    /// request.
+    #[tokio::test]
+    async fn a_tick_at_the_arrival_instant_does_not_price_the_order() {
+        let mut harness = Harness::new(
+            200,
+            vec![
+                market(10, dec!(200)),
+                // Stamped at exactly `10 + to_venue`.
+                market(110, dec!(90)),
+                market(900, dec!(200)),
+            ],
+        );
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        harness.send_limit(dec!(100));
+
+        let events = harness.rest_events().await;
+
+        assert_eq!(
+            events.iter().map(label).collect::<Vec<_>>(),
+            vec![
+                // The tick at 110, emitted after the venue has already booked the order against
+                // the market as of instant 10 — the booking is not an emission, so it leaves no
+                // label of its own.
+                "market",
+                // The order rested, visible one `from_venue` leg later at 210.
+                "balance",
+                "order", //
+                // And the tick that followed it onto the book crossed it, also visible at 210.
+                "balance",
+                "trade",
+                "order", //
+                "market",
+                "after_drain"
+            ],
+            "the order rests first and is crossed second, rather than arriving marketable"
+        );
+        assert_eq!(
+            trade_prices(&events),
+            vec![dec!(100)],
+            "it rested first, so it was filled at its own limit rather than at the tick's price"
+        );
+    }
+
+    /// A cancel loses to a fill that happened while it was in flight, and is told so.
+    ///
+    /// The race `to_venue` exists to model. The order is crossed at instant 340 by a tick the
+    /// `Engine` has not seen the consequences of, while the cancel it sent at 300 does not reach
+    /// the venue until 400. Booking the cancel on the poll that observed it would let it win every
+    /// such race no matter how large the latency, which is the opposite of what modelling latency
+    /// is for.
+    #[tokio::test]
+    async fn a_cancel_loses_to_a_fill_struck_while_it_was_in_flight() {
+        let mut harness = Harness::new(
+            200,
+            vec![
+                market(10, dec!(200)),
+                market(300, dec!(200)),
+                market(340, dec!(90)),
+                market(900, dec!(200)),
+            ],
+        );
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        let cid = harness.send_limit(dec!(100));
+
+        assert_eq!(harness.next().await, Some("balance"));
+        assert_eq!(harness.next().await, Some("order"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        // Sent at 300, so it reaches the venue at 400 — after the tick at 340.
+        harness.clock.advance_to(at(300));
+        harness.send_cancel(cid);
+
+        let events = harness.rest_events().await;
+
+        assert_eq!(
+            events.iter().map(label).collect::<Vec<_>>(),
+            vec![
+                // The tick at 340 crosses the resting order; the fill is visible at 440.
+                "market",
+                "balance",
+                "trade",
+                "order",
+                // The cancel reaches the venue at 400 and is answered at 500.
+                "cancelled",
+                "market",
+                "after_drain"
+            ],
+            "the fill is delivered whole, and the cancel is answered after it"
+        );
+        assert_eq!(
+            trade_prices(&events),
+            vec![dec!(100)],
+            "the resting order filled at its own limit before the cancel could reach the venue"
+        );
+        assert_eq!(
+            cancel_outcomes(&events),
+            vec![Err("order rejected: order already fully filled".to_string())],
+            "the cancel is told to reconcile against the fill rather than being granted"
         );
     }
 }
