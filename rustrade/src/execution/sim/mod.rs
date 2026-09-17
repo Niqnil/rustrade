@@ -712,6 +712,7 @@ fn route_market<MarketKind>(
     let state = market.entry(event.instrument).or_default();
     MarketKind::apply(state, event);
     let snapshot = MarketKind::snapshot(state);
+    let depth = MarketKind::depth(state);
 
     for (exchange, slot) in venues.iter_mut() {
         // `Err` means this venue does not trade the instrument, which is ordinary on a multi-venue
@@ -728,7 +729,7 @@ fn route_market<MarketKind>(
         let name = name.clone();
         let fills = slot
             .venue
-            .apply_market(&name, snapshot, event.time_exchange);
+            .apply_market(&name, snapshot, depth, event.time_exchange);
 
         if fills.is_empty() {
             continue;

@@ -85,7 +85,7 @@ pub use fill::{
 pub mod indexer;
 pub mod map;
 pub mod market;
-pub use market::MarketSnapshot;
+pub use market::{MarketDepth, MarketSnapshot};
 pub mod order;
 pub mod position;
 pub mod trade;

@@ -1,4 +1,5 @@
 use rust_decimal::Decimal;
+use rustrade_instrument::Side;
 use serde::{Deserialize, Serialize};
 
 /// Market state for a single instrument at a single instant.
@@ -82,6 +83,83 @@ impl MarketSnapshot {
     }
 }
 
+/// How much is on offer at each side's best price, where the feed says.
+///
+/// Carried **alongside** a [`MarketSnapshot`] rather than inside it. A snapshot is the view a
+/// [`FillModel`](crate::fill::FillModel) prices from and the view
+/// [`RequestOpen::market`](crate::order::request::RequestOpen::market) persists, and a size is
+/// neither: a fill model answers *where* a taker prints, while *how much* that price can absorb is
+/// the venue's own arithmetic — and only the venue tracks what is left of it as its orders eat
+/// into it.
+///
+/// # Absent size means unlimited, not unfillable
+///
+/// `None` says this feed supplies no size information. That is the ordinary case, not a
+/// degenerate one: a trades-only feed, a candle feed, a bulk price export and a venue with no
+/// market feed at all every one of them report it on every observation. A venue reading `None`
+/// therefore caps nothing. The opposite reading — no size information means no size — would
+/// silently stop every price-only backtest from filling anything.
+///
+/// `Some(amount)` is a size that was actually reported, and `Some(Decimal::ZERO)` is a reported
+/// *absence* of size: there is nothing to take, so an aggressor takes nothing. Whoever derives
+/// this from a feed owns that distinction — a feed publishing prices with a zero amount on every
+/// row is stating the former, not the latter, and must say `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MarketDepth {
+    /// Size resting at [`MarketSnapshot::best_bid`], if the feed supplies one.
+    pub best_bid: Option<Decimal>,
+
+    /// Size resting at [`MarketSnapshot::best_ask`], if the feed supplies one.
+    pub best_ask: Option<Decimal>,
+}
+
+impl MarketDepth {
+    /// Neither side's size is known, so nothing consulting this is capped.
+    ///
+    /// What a feed carrying no book reports, and what every [`MarketDepth::default()`] is.
+    pub const UNKNOWN: Self = Self {
+        best_bid: None,
+        best_ask: None,
+    };
+
+    /// Construct a `MarketDepth` from the size on each side.
+    pub fn new(best_bid: Option<Decimal>, best_ask: Option<Decimal>) -> Self {
+        Self { best_bid, best_ask }
+    }
+
+    /// What an aggressor on `side` can take: the ask for a buy, the bid for a sell.
+    ///
+    /// The far side of the book, because that is the side an order on this one trades against —
+    /// the same rule that decides whether a limit order crosses at all.
+    pub fn available_to(&self, side: Side) -> Option<Decimal> {
+        match side {
+            Side::Buy => self.best_ask,
+            Side::Sell => self.best_bid,
+        }
+    }
+
+    /// Reduces what an aggressor on `side` can still take by `quantity`, never below zero.
+    ///
+    /// A side whose size is unknown stays unknown: there is nothing to draw down, and an
+    /// unbounded quantity less a finite one is still unbounded.
+    pub fn consume(&mut self, side: Side, quantity: Decimal) {
+        debug_assert!(
+            quantity >= Decimal::ZERO,
+            "consuming a negative quantity {quantity} of depth would create size that was never \
+             on offer"
+        );
+
+        let available = match side {
+            Side::Buy => &mut self.best_ask,
+            Side::Sell => &mut self.best_bid,
+        };
+
+        if let Some(available) = available {
+            *available = (*available - quantity).max(Decimal::ZERO);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +175,35 @@ mod tests {
         assert!(!MarketSnapshot::from_last_price(Some(dec!(100))).is_empty());
         assert!(!MarketSnapshot::new(Some(dec!(99)), None, None).is_empty());
         assert!(!MarketSnapshot::new(None, Some(dec!(101)), None).is_empty());
+    }
+
+    #[test]
+    fn depth_is_taken_from_the_far_side_of_the_book() {
+        let depth = MarketDepth::new(Some(dec!(5)), Some(dec!(3)));
+        assert_eq!(depth.available_to(Side::Buy), Some(dec!(3)));
+        assert_eq!(depth.available_to(Side::Sell), Some(dec!(5)));
+    }
+
+    #[test]
+    fn an_unknown_size_stays_unknown_however_much_is_taken() {
+        let mut depth = MarketDepth::UNKNOWN;
+        depth.consume(Side::Buy, dec!(1000));
+        assert_eq!(depth.available_to(Side::Buy), None);
+        assert_eq!(MarketDepth::default(), MarketDepth::UNKNOWN);
+    }
+
+    #[test]
+    fn consuming_draws_down_only_the_side_taken_from() {
+        let mut depth = MarketDepth::new(Some(dec!(5)), Some(dec!(3)));
+        depth.consume(Side::Buy, dec!(2));
+        assert_eq!(depth, MarketDepth::new(Some(dec!(5)), Some(dec!(1))));
+    }
+
+    #[test]
+    fn consuming_more_than_is_on_offer_leaves_nothing_rather_than_a_debt() {
+        let mut depth = MarketDepth::new(None, Some(dec!(3)));
+        depth.consume(Side::Buy, dec!(10));
+        assert_eq!(depth.available_to(Side::Buy), Some(Decimal::ZERO));
     }
 
     #[test]

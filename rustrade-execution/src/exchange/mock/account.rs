@@ -266,28 +266,45 @@ impl AccountState {
         balance.clone()
     }
 
-    /// Reserves and immediately settles `amount` of `asset`: the ledger move an order that fills on
-    /// arrival makes.
+    /// Commits one arriving order's whole ledger effect, or none of it.
     ///
-    /// Expressed as the two steps rather than one subtraction because it is the same path a resting
-    /// order takes, with the interval between them collapsed to nothing. The client sees **one**
-    /// balance restatement, not two — a fill is atomic at the venue, and a balance is an absolute
-    /// restatement rather than a delta, so emitting the intermediate state would report a balance
-    /// the account never had.
+    /// One order's arrival can both settle a fill and take a hold: a taker that the book could
+    /// only partly fill settles what traded and reserves against the remainder it leaves resting.
+    /// Those are one event at the venue, so they are one operation here — and because
+    /// [`reserve`](Self::reserve) tests `free` before it moves anything, an arrival this account
+    /// cannot afford leaves the ledger exactly as it found it.
+    ///
+    /// # Why this is not two calls
+    /// Settling first and reserving second is the same two moves in the order that can fail
+    /// halfway: the settle commits, the reserve is refused, and nothing puts back what `total`
+    /// has already lost — [`release`](Self::release) moves only `free`, and its own assertion
+    /// fires if it is used as a rollback. The venue would then hold a balance its client never
+    /// hears about, silently and for the rest of the run. Asking for the whole requirement up
+    /// front is what makes that state unreachable rather than merely avoided.
+    ///
+    /// # One arrival, one restatement
+    /// The returned balance is the only one an arrival owes. A balance is an absolute restatement
+    /// rather than a delta, and a fill is atomic at the venue, so emitting the state between the
+    /// settle and the hold would report a balance the account never held — for the same reason a
+    /// conservative reservation that had to be released and re-debited would.
     ///
     /// # Errors
-    /// [`BalanceInsufficient`] if `free` does not cover `amount`, leaving the ledger untouched.
+    /// [`BalanceInsufficient`] if `free` does not cover
+    /// [`settled`](Debit::settled) + [`reserved`](Debit::reserved), leaving the ledger untouched.
     ///
     /// # Panics
-    /// Panics if `asset` has no balance — see [`reserve`](Self::reserve).
-    pub fn debit_filled(
+    /// Panics if the asset has no balance — see [`reserve`](Self::reserve).
+    pub fn commit(
         &mut self,
-        asset: &AssetNameExchange,
-        amount: Decimal,
+        debit: &Debit,
         time_exchange: DateTime<Utc>,
     ) -> Result<AssetBalance<AssetNameExchange>, BalanceInsufficient> {
-        self.reserve(asset, amount, time_exchange)?;
-        Ok(self.settle(asset, amount, time_exchange))
+        // Asked for as one requirement, so a refusal refuses the arrival rather than half of it.
+        self.reserve(&debit.asset, debit.settled + debit.reserved, time_exchange)?;
+
+        // Infallible: `total` cannot fall below `free`, which the reserve above has already taken
+        // the whole requirement out of. Whatever was reserved and not settled stays held.
+        Ok(self.settle(&debit.asset, debit.settled, time_exchange))
     }
 
     #[allow(clippy::expect_used)] // Documented panic: an absent balance is a mis-specified fixture.
@@ -299,6 +316,35 @@ impl AccountState {
             .get_mut(asset)
             .expect("SimulatedVenue has Balance for all configured Instrument assets")
     }
+}
+
+/// What one arriving order does to one asset's balance, as a single commitment.
+///
+/// Both fields are denominated in [`asset`](Self::asset) and inclusive of fees. They are one
+/// asset, not two, because they come from one order: which asset an order pays with is decided by
+/// its instrument and its side, and an order has one of each. That is what makes an arrival a
+/// single ledger operation rather than two that must be kept in step.
+///
+/// The three arrivals a [`SimulatedVenue`] can have are the three shapes of this type:
+///
+/// | arrival | `settled` | `reserved` |
+/// |---|---|---|
+/// | fills in full | the fill | zero |
+/// | rests, having traded nothing | zero | the reservation |
+/// | fills in part and rests the remainder | the fill | the remainder's reservation |
+///
+/// [`SimulatedVenue`]: crate::exchange::mock::SimulatedVenue
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Debit {
+    /// Which asset the order pays with: quote for a buy or a CFD, base for a spot sell.
+    pub asset: AssetNameExchange,
+
+    /// Left the account outright, because it traded. Lowers `free` and `total` alike.
+    pub settled: Decimal,
+
+    /// Held against a remainder that is still working. Lowers `free` and leaves `total`, so it is
+    /// still the account's until whatever it is held against settles or is released.
+    pub reserved: Decimal,
 }
 
 /// A ledger operation asked for more of an asset than `free` covers.
@@ -335,8 +381,18 @@ impl From<UnindexedAccountSnapshot> for AccountState {
                             // `as_open` yields `None` for an active order that is not yet open —
                             // an `OpenInFlight`, which has no venue-side existence to record.
                             if let Some(open) = as_open(order) {
-                                // Seeded, not booked here: the venue holds nothing against it.
-                                orders_open.insert(open, None);
+                                // Seeded, not booked here: the venue holds nothing against it, so
+                                // a displaced entry can leak nothing. A snapshot listing one
+                                // `ClientOrderId` twice is a mis-specified fixture rather than a
+                                // runtime condition, and the later order silently replacing the
+                                // earlier is what it would otherwise get.
+                                let cid = open.key.cid.clone();
+                                let displaced = orders_open.insert(open, None);
+                                debug_assert!(
+                                    displaced.is_none(),
+                                    "account snapshot lists {cid} as open more than once, so only \
+                                     the last of them reaches the book"
+                                );
                             }
                         }
                         OrderState::Inactive(InactiveOrderState::Cancelled(cancelled)) => {

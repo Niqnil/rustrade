@@ -7,7 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`SimulatedVenue` caps a taker fill by the size on offer, so an order can fill in part**
+  (`rustrade-execution`). An arriving order that aggresses now trades at most what the book says is
+  available on the far side, and draws that size down as it takes it — so two orders arriving
+  between two market observations share one displayed size instead of each taking the whole of it.
+
+  The new `MarketDepth` carries that size alongside a `MarketSnapshot` rather than inside it: a
+  snapshot says what the market is worth and is what a `FillModel` prices from, while a size is what
+  the venue's own arithmetic bounds a quantity by. `SimulatedVenue::apply_market` takes it as a new
+  parameter, and `VenueMarketUpdate` (in `rustrade`) grows a `depth` method that defaults to
+  "no size information".
+
+  **Absent size means unlimited, not unfillable.** A trades-only feed, a candle feed, a price-only
+  export and a `VenueRegime::RequestPriced` venue all supply no size and are capped by nothing, so
+  price-only backtests and `MockExecution` results are unchanged. A level that carries a price and a
+  *zero* amount is read the same way, because that is what a feed publishing prices without sizes
+  looks like on every row.
+
+  Consequences, each covered by a test:
+  - **`ImmediateOrCancel` and `FillOrKill` no longer coincide.** Immediate-or-cancel keeps what the
+    book could give it and cancels the rest; fill-or-kill refuses a partial fill and trades nothing.
+    Their agreement has been documented as conditional since they were accepted, and this is that
+    condition expiring.
+  - **A marketable limit order the book cannot fill whole now fills in part and rests the
+    remainder**, carrying what already traded in `Open::filled_quantity`.
+  - **A market order's unfillable remainder is cancelled**, carrying `Cancelled::filled_quantity` —
+    which is the first time this venue makes that field non-zero for an order it booked itself.
+  - **An order that cannot fund both legs is refused whole.** A capped order costs more than the
+    same order filling outright, because its remainder is held at the order's own limit while the
+    fill struck a better price, so an account can afford the whole order and not the split. It is
+    rejected rather than filled for the part it could pay for.
+
+  Only takers are capped. A resting order still fills its whole remaining quantity when the market
+  reaches it: capping a maker honestly needs the volume that actually printed through its limit,
+  which this venue's feed does not carry.
+
+### Changed
+
+- **`SimulatedVenue` mints trade ids from a sequence of their own** (`rustrade-execution`). They
+  were derived from the order's id, which was unique only while one order produced at most one
+  fill — no longer true now that an order can fill in part on arrival and again when its remainder
+  is crossed, where the two trades would have collided. `Trade::order_id` is still how a trade says
+  which order it belongs to.
+
+  `TradeId` also gains the documentation it never had, and a `Display` impl for parity with the
+  other id types. Note what it now states: **uniqueness is the venue's to define and is often
+  narrower than global** (Binance's are per symbol), and the derived `Ord` is lexicographic byte
+  order carrying no chronological meaning — order trades by `Trade::time_exchange`.
+
+- **`AccountState::debit_filled` is replaced by `AccountState::commit`** (`rustrade-execution`),
+  taking a `Debit` that names the asset once and splits an arrival into what it settled and what it
+  holds. **Breaking.** One arrival is now one fallible ledger operation and one balance
+  restatement, including the arrival that both settles a fill and holds against a resting
+  remainder. Settling and then reserving as two calls could commit the first and be refused the
+  second, leaving the venue's ledger permanently short with no event to say so; asking for the whole
+  requirement up front makes that state unreachable rather than merely avoided.
+
 ### Fixed
+
+- **A replaced resting order no longer leaks the balance held against it** (`rustrade-execution`).
+  Re-opening a `ClientOrderId` that was already resting replaced the order under it, and
+  `OpenOrders::insert` returns the displaced order's reservation precisely because it is still held
+  against the account — but `SimulatedVenue` discarded it. Nothing else would ever release it, so
+  `free` stayed down and `Balance::used` overstated by that amount for the rest of the run,
+  silently. It is now released, and `OpenOrders::insert` is `#[must_use]` so it cannot be dropped
+  again without a warning.
 
 - **A resting order that arrived part-filled no longer settles and prints its whole quantity**
   (`rustrade-execution`). `SimulatedVenue`'s matching built its settlement, its `Trade` and its

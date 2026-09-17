@@ -7,8 +7,44 @@ use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use std::fmt::{Display, Formatter};
 
+/// A venue's own identifier for one trade, carried through opaquely.
+///
+/// # Uniqueness is the venue's to define, and is often narrower than global
+///
+/// This library does not mint these — it passes through whatever the venue said, so what an id
+/// distinguishes is whatever that venue distinguishes. Binance's are **per symbol**, which is why
+/// this crate's own deduplication keys on the instrument alongside the id rather than on the id
+/// alone; Hyperliquid reports a transaction hash that can cover several matches at once. A
+/// consumer that needs a key should use `(exchange, instrument, TradeId)` and not assume any part
+/// of it is redundant.
+///
+/// [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue) mints ids unique within one venue
+/// instance for its lifetime — and, because each venue counts from zero, **not** across the
+/// several a multi-exchange backtest holds. That is the same scoping a real venue gives, for the
+/// same reason.
+///
+/// # `Ord` is byte order, not time order
+///
+/// The derived comparison is lexicographic over the underlying string, so `"10" < "9"`. It exists
+/// so this type can key a map or a set; it carries no chronological meaning and is not a stand-in
+/// for one. Order trades by [`Trade::time_exchange`].
+///
+/// # Finding the order behind a trade
+///
+/// Use [`Trade::order_id`], which is typed. Do **not** parse this id: one order can print more
+/// than once, several venues embed structure of their own here (IBKR's `execution_id` is
+/// dot-separated, Alpaca's can be a UUID), and no format is common to them.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, From)]
 pub struct TradeId<T = SmolStr>(pub T);
+
+impl<T> Display for TradeId<T>
+where
+    T: Display,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self.0, f)
+    }
+}
 
 impl TradeId {
     pub fn new<S: AsRef<str>>(id: S) -> Self {
