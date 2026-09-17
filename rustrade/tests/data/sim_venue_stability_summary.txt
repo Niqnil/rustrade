@@ -33,6 +33,7 @@ TradingSummary {
             fills_routed_by_fallback: 0,
             fills_unmatched: 0,
             first_fallback_detail: None,
+            fallback_positions: [],
         },
         InstrumentNameInternal(
             "binance_spot-ethusdt",
@@ -65,6 +66,7 @@ TradingSummary {
             fills_routed_by_fallback: 0,
             fills_unmatched: 0,
             first_fallback_detail: None,
+            fallback_positions: [],
         },
         InstrumentNameInternal(
             "binance_spot-solusdt",
@@ -97,6 +99,7 @@ TradingSummary {
             fills_routed_by_fallback: 0,
             fills_unmatched: 0,
             first_fallback_detail: None,
+            fallback_positions: [],
         },
     },
     assets: {
@@ -191,4 +194,6 @@ TradingSummary {
     basis: Gross,
     orders_opened: 40,
     orders_rejected: 0,
+    fills_routed_by_fallback: 0,
+    fills_unmatched: 0,
 }

@@ -21,7 +21,16 @@ use crate::{
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use rust_decimal::Decimal;
+use rustrade_execution::order::id::PositionId;
 use serde::{Deserialize, Serialize};
+
+/// How many distinct fallback-keyed [`PositionId`]s a tear sheet retains.
+///
+/// The counters are authoritative for *how many* fills were misrouted; this list exists so a
+/// consumer can go and look the positions up, and a handful is enough to start a reconciliation.
+/// Bounding it keeps a pathological session — a venue replaying thousands of unmatched fills —
+/// from growing the tear sheet without limit.
+pub const MAX_FALLBACK_POSITIONS: usize = 16;
 
 /// TearSheet summarising the trading performance related to an instrument.
 #[derive(Debug, Clone, PartialEq, PartialOrd, Deserialize, Serialize)]
@@ -90,6 +99,17 @@ pub struct TearSheet<Interval> {
     /// position does not require re-running with logging enabled.
     #[serde(default)]
     pub first_fallback_detail: Option<String>,
+
+    /// The distinct positions opened by either fallback above, so a consumer reconciling this
+    /// instrument can look them up rather than parse [`Self::first_fallback_detail`].
+    ///
+    /// Each entry is a `PositionId` built from a raw exchange `OrderId`, which is what makes the
+    /// position identifiable as unrouted rather than strategy-chosen. Deduplicated — an order
+    /// filling ten times through the fallback lands in one position, not ten — and capped at
+    /// [`MAX_FALLBACK_POSITIONS`]. When the counters exceed the length of this list, the list is
+    /// the first `MAX_FALLBACK_POSITIONS` and the counters remain exact.
+    #[serde(default)]
+    pub fallback_positions: Vec<PositionId>,
 }
 
 /// Generator for a [`TearSheet`].
@@ -131,6 +151,10 @@ pub struct TearSheetGenerator {
     /// First unroutable-fill detail seen. See [`TearSheet::first_fallback_detail`].
     #[serde(default)]
     pub first_fallback_detail: Option<String>,
+
+    /// Distinct positions opened by a fallback routing. See [`TearSheet::fallback_positions`].
+    #[serde(default)]
+    pub fallback_positions: Vec<PositionId>,
 }
 
 impl TearSheetGenerator {
@@ -149,6 +173,7 @@ impl TearSheetGenerator {
             fills_routed_by_fallback: 0,
             fills_unmatched: 0,
             first_fallback_detail: None,
+            fallback_positions: Vec::new(),
         }
     }
 
@@ -165,24 +190,55 @@ impl TearSheetGenerator {
         }
     }
 
-    /// Record a fill that opened a position under its raw exchange `OrderId` because the order it
-    /// belongs to had no `PositionId` mapping. See [`TearSheet::fills_routed_by_fallback`].
-    pub fn record_fill_routed_by_fallback(&mut self, detail: impl Into<String>) {
+    /// Record a fill that opened `position_id` under its raw exchange `OrderId` because the order
+    /// it belongs to had no `PositionId` mapping. See [`TearSheet::fills_routed_by_fallback`].
+    ///
+    /// `detail` is called only if this is the first unroutable fill of the session, which is why
+    /// it is a closure rather than a `String`: the caller would otherwise format one per misrouted
+    /// fill to discard all but the first.
+    pub fn record_fill_routed_by_fallback(
+        &mut self,
+        position_id: &PositionId,
+        detail: impl FnOnce() -> String,
+    ) {
         self.fills_routed_by_fallback = self.fills_routed_by_fallback.saturating_add(1);
-        self.record_first_fallback_detail(detail);
+        self.record_fallback_position(position_id, detail);
     }
 
-    /// Record a fill that opened a position under its raw exchange `OrderId` because no order
+    /// Record a fill that opened `position_id` under its raw exchange `OrderId` because no order
     /// matched it at all. See [`TearSheet::fills_unmatched`].
-    pub fn record_fill_unmatched(&mut self, detail: impl Into<String>) {
+    ///
+    /// `detail` is called only if this is the first unroutable fill of the session.
+    pub fn record_fill_unmatched(
+        &mut self,
+        position_id: &PositionId,
+        detail: impl FnOnce() -> String,
+    ) {
         self.fills_unmatched = self.fills_unmatched.saturating_add(1);
-        self.record_first_fallback_detail(detail);
+        self.record_fallback_position(position_id, detail);
     }
 
-    /// Keep the first unroutable-fill detail, whichever counter saw it.
-    fn record_first_fallback_detail(&mut self, detail: impl Into<String>) {
+    /// Note the position a fallback routing opened, and the reason if it is the first one.
+    ///
+    /// `detail` is a closure because only the first caller's string is ever kept, while the
+    /// callers are on a path that a corporate-action split can drive repeatedly — formatting
+    /// eagerly would allocate once per misrouted fill to discard all but one. This mirrors what
+    /// `tracing` does for a disabled log level at the same call sites.
+    fn record_fallback_position(
+        &mut self,
+        position_id: &PositionId,
+        detail: impl FnOnce() -> String,
+    ) {
         if self.first_fallback_detail.is_none() {
-            self.first_fallback_detail = Some(detail.into());
+            self.first_fallback_detail = Some(detail());
+        }
+
+        // Deduplicated rather than appended: one order filling repeatedly through the fallback is
+        // one suspect position, and the counters already carry the number of fills.
+        if self.fallback_positions.len() < MAX_FALLBACK_POSITIONS
+            && !self.fallback_positions.contains(position_id)
+        {
+            self.fallback_positions.push(position_id.clone());
         }
     }
 
@@ -283,6 +339,7 @@ impl TearSheetGenerator {
             fills_routed_by_fallback: self.fills_routed_by_fallback,
             fills_unmatched: self.fills_unmatched,
             first_fallback_detail: self.first_fallback_detail.clone(),
+            fallback_positions: self.fallback_positions.clone(),
         }
     }
 

@@ -24,12 +24,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     rather than a split; an account traded from elsewhere should expect this to be non-zero.
   - `first_fallback_detail` — why the first fill of either kind could not be routed, so diagnosing a
     split position does not require re-running with logging enabled.
+  - `fallback_positions` — the distinct positions those fills opened, so a consumer can look them up
+    instead of parsing the detail string. Deduplicated and capped at `MAX_FALLBACK_POSITIONS` (16);
+    the counters stay exact when the list saturates.
+
+  `TradingSummary` carries the two counters summed over every instrument, alongside the existing
+  `orders_opened` / `orders_rejected`, plus a `has_split_positions()` helper. `print_summary` prints
+  a `split_position_notice()` banner above the tables, beside the existing rejection banner and for
+  the same reason: those tables are computed per position, so an order whose PnL was divided between
+  two slots is reported as two ordinary-looking partial results.
+
+  The banner and the helper key off `fills_routed_by_fallback` alone. `fills_unmatched` is reported
+  but never raises it, because an account also traded by hand or by another system produces unmatched
+  fills during correct operation, and a banner that fires on a healthy session is one people learn to
+  scroll past.
 
   Both counters stay `0` in `OmsMode::Netting`, where a single position key makes the failure
-  unreachable. Routing behaviour is unchanged: the fallback is load-bearing, not a defect to remove —
-  the corporate-action split path deliberately drops a resting order's `PositionId` mapping, because
-  retaining it would let a late fill reopen a floored-out position. The contract is now stated on
-  `InstrumentState::update_from_trade`.
+  unreachable. Routing behaviour is unchanged. Two things reach the fallback and only one is fixable:
+  the late-fill window documented on `cleanup_routing_tables`, which is deferred rather than
+  impossible; and the corporate-action split path, which deliberately drops a resting order's
+  `PositionId` mapping because retaining it would let a late fill reopen a floored-out position. The
+  contract is now stated on `InstrumentState::update_from_trade`.
 
 - **`SimulatedVenue` caps a taker fill by the size on offer, so an order can fill in part**
   (`rustrade-execution`). An arriving order that aggresses now trades at most what the book says is

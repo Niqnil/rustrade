@@ -1044,10 +1044,18 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// second position rather than joining the one its own order opened — and no later event
     /// rejoins them.
     ///
-    /// The fallback is load-bearing and is not going away: the corporate-action split path
-    /// deliberately drops a resting order's `PositionId` mapping (retaining it would let a late
-    /// fill reopen a floored-out position), so this state is reachable by design and not only by
-    /// defect. What the caller is owed is that it be visible, so each occurrence increments a
+    /// Two distinct things reach it, and only one of them is fixable:
+    ///
+    /// - The **late-fill window** documented on `cleanup_routing_tables`, which compensates
+    ///   for exactly one retired order per instrument. A fill for any order retired before the most
+    ///   recent finds nothing to route by. Closing this class means decoupling routing-table
+    ///   lifetime from `self.orders`, and is deferred rather than impossible.
+    /// - The **corporate-action split path**, which deliberately drops a resting order's
+    ///   `PositionId` mapping because retaining it would let a late fill reopen a position the
+    ///   split floored to zero. This one is reachable by design, so the fallback is load-bearing
+    ///   and no lifetime change removes it.
+    ///
+    /// What the caller is owed meanwhile is that it be visible, so each occurrence increments a
     /// counter on the [`TearSheetGenerator`] rather than only emitting a `warn!`:
     ///
     /// - [`TearSheet::fills_routed_by_fallback`](crate::statistic::summary::instrument::TearSheet::fills_routed_by_fallback)
@@ -1059,6 +1067,10 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// Both are `0` in `OmsMode::Netting`, where every fill keys to a single slot and no routing
     /// failure is possible. A consumer that reconciles positions should treat the first as an
     /// error signal and the second as expected only if it knows the account is traded elsewhere.
+    /// The positions themselves are listed on
+    /// [`TearSheet::fallback_positions`](crate::statistic::summary::instrument::TearSheet::fallback_positions),
+    /// and both counters are summed onto
+    /// [`TradingSummary`](crate::statistic::summary::TradingSummary) for the session.
     pub fn update_from_trade(
         &mut self,
         trade: &Trade<AssetKey, InstrumentKey>,
@@ -1129,10 +1141,9 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                             // Counted, not just logged: this splits the order's PnL across two
                             // position slots, and a log line is not something a consumer can
                             // reconcile against after the fact.
-                            self.tear_sheet.record_fill_routed_by_fallback(format!(
-                                "no PositionId mapping for order {}",
-                                trade.order_id
-                            ));
+                            self.tear_sheet.record_fill_routed_by_fallback(&pos_id, || {
+                                format!("no PositionId mapping for order {}", trade.order_id)
+                            });
                             pos_id
                         }
                         None => {
@@ -1172,10 +1183,9 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                             // Counted separately from the case above: the cause is a fill this
                             // engine has no order for, not a mapping it lost, and one position per
                             // external order is a defensible outcome rather than a split.
-                            self.tear_sheet.record_fill_unmatched(format!(
-                                "no order matched {}",
-                                trade.order_id
-                            ));
+                            self.tear_sheet.record_fill_unmatched(&pos_id, || {
+                                format!("no order matched {}", trade.order_id)
+                            });
                             pos_id
                         }
                     }
@@ -1845,6 +1855,73 @@ mod tests {
         assert_eq!(
             sheet.first_fallback_detail.as_deref(),
             Some("no order matched oid-external")
+        );
+    }
+
+    #[test]
+    fn a_fallback_routing_records_the_position_it_opened_so_it_can_be_looked_up() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let exchange_id = OrderId::new("oid-external");
+
+        state.update_from_trade(&fill(exchange_id.clone(), Side::Buy, dec!(4)));
+
+        assert_eq!(
+            state.tear_sheet.fallback_positions,
+            vec![PositionId::new(exchange_id.0.clone())],
+            "a consumer reconciling this instrument needs the id, not a sentence to parse"
+        );
+        assert_eq!(
+            open_position_ids(&state),
+            state.tear_sheet.fallback_positions,
+            "the recorded id must be the position that actually exists"
+        );
+    }
+
+    #[test]
+    fn repeated_fills_through_the_fallback_record_one_position_but_count_every_fill() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let exchange_id = OrderId::new("oid-external");
+
+        for _ in 0..3 {
+            state.update_from_trade(&fill(exchange_id.clone(), Side::Buy, dec!(1)));
+        }
+
+        assert_eq!(
+            state.tear_sheet.fallback_positions.len(),
+            1,
+            "one order filling three times is one suspect position, not three"
+        );
+        assert_eq!(
+            state.tear_sheet.fills_unmatched, 3,
+            "the counter stays exact even though the list deduplicates"
+        );
+    }
+
+    #[test]
+    fn the_recorded_position_list_stops_at_its_cap_while_the_counter_does_not() {
+        use crate::statistic::summary::instrument::MAX_FALLBACK_POSITIONS;
+
+        let mut state = instrument_state(OmsMode::Hedging);
+        let overshoot = MAX_FALLBACK_POSITIONS + 5;
+
+        // A distinct external order each time, so every one is a new position.
+        for i in 0..overshoot {
+            state.update_from_trade(&fill(OrderId::new(format!("oid-{i}")), Side::Buy, dec!(1)));
+        }
+
+        assert_eq!(
+            state.tear_sheet.fallback_positions.len(),
+            MAX_FALLBACK_POSITIONS,
+            "the list is bounded so a pathological session cannot grow the tear sheet without limit"
+        );
+        assert_eq!(
+            state.tear_sheet.fills_unmatched, overshoot,
+            "the counter remains authoritative for how many fills were misrouted"
+        );
+        assert_eq!(
+            state.tear_sheet.fallback_positions.first(),
+            Some(&PositionId::new("oid-0")),
+            "the retained entries are the first seen, so the list pairs with first_fallback_detail"
         );
     }
 
