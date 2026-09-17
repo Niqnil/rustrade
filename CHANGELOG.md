@@ -46,6 +46,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Account-event deduplication moved to `client::dedup`** (`rustrade-execution`), shared by the
+  Binance and Hyperliquid clients instead of living inside `client::binance::shared`. Crate-internal
+  only — nothing public moved, and Binance call sites are unchanged via a re-export. The cache's
+  documentation is now venue-neutral, and says why the key carries the instrument: venue ids are
+  routinely per-symbol rather than global.
+
 - **`SimulatedVenue` mints trade ids from a sequence of their own** (`rustrade-execution`). They
   were derived from the order's id, which was unique only while one order produced at most one
   fill — no longer true now that an order can fill in part on arrival and again when its remainder
@@ -66,6 +72,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requirement up front makes that state unreachable rather than merely avoided.
 
 ### Fixed
+
+- **Hyperliquid trade ids identify the fill rather than the transaction** (`rustrade-execution`).
+  A `Trade`'s id came from `fill.hash`, which is the L1 transaction hash. One aggressive order
+  sweeping several resting orders produces several fills under a single hash, so those fills all
+  arrived carrying the same `TradeId`. Anything reconciling on it — which is what a caller does with
+  `fetch_trades` after a reconnect — treated a multi-level sweep as one fill and dropped the rest,
+  understating both filled quantity and fees. The id is now the venue's `tid`, which is per-fill.
+
+  On the REST path this required parsing `userFills` into this client's own `UserFill` rather than
+  `hyperliquid_rust_sdk`'s `UserFillsResponse`, which models neither `tid` nor `feeToken` and — with
+  no `deny_unknown_fields` — discards both silently. The request goes through the SDK's own HTTP
+  client, so base URL, TLS and error mapping are unchanged. A response without `tid` now fails
+  loudly instead of falling back to the hash, because a silent fallback restores the defect
+  invisibly.
+
+  Hyperliquid documents `tid` as unique per fill but qualified by coin rather than globally, so
+  callers reconciling across instruments should qualify it the same way.
+
+- **Hyperliquid spot fills report the fee asset the venue charged** (`rustrade-execution`). The REST
+  path inferred it from the side — base for a buy, quote for a sell — because the SDK's response
+  type does not expose `feeToken`. It is available now that this client parses the response itself,
+  and the inference survives only as a fallback. The stream path already used `feeToken` and is
+  unchanged. The quote-equivalence test alongside it became case-insensitive, matching the stream:
+  the fee asset is no longer a substring of `coin` and so is no longer byte-equal to the quote asset
+  by construction.
+
+- **Hyperliquid deduplicates fills on the account stream** (`rustrade-execution`). The `userFills`
+  subscription opens with a snapshot of recent fills and the SDK resubscribes on reconnect, so every
+  reconnect redelivered fills already sent. A trade is a delta the consumer accumulates, so each
+  redelivery double-counted filled quantity and fees. The module documentation claimed
+  deduplication was "SDK-managed; no custom dedup cache needed", which was never true.
+
+  Order updates are deliberately not deduplicated: they assert absolute state, so a replayed one is
+  idempotent while a dropped one could strand a consumer on stale state. `fetch_trades` does not
+  deduplicate either — it answers the window it was asked for.
+
+  This had to land with the id fix rather than after it. Keyed on the old hash-derived id, the cache
+  would have discarded the second and subsequent fills of every sweep.
 
 - **A replaced resting order no longer leaks the balance held against it** (`rustrade-execution`).
   Re-opening a `ClientOrderId` that was already resting replaced the order under it, and

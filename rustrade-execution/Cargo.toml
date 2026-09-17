@@ -46,6 +46,15 @@ hyperliquid = [
     "dep:ethers",
     "dep:tokio-util",
     "dep:uuid",
+    # The SDK's `UserFillsResponse` drops `tid` and `feeToken`, so this client parses the
+    # `userFills` response itself. No new crate enters the graph — serde_json is already a
+    # direct dependency of the alpaca and binance features, and a transitive dependency of
+    # hyperliquid_rust_sdk.
+    "dep:serde_json",
+    # Account-event dedup cache: the WS fills subscription replays its snapshot on every
+    # reconnect. Both are already direct dependencies under other features.
+    "dep:lru",
+    "dep:parking_lot",
 ]
 
 [dependencies]
