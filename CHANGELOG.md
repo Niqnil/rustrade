@@ -2720,6 +2720,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`cmov` and `rand` bumped to their patched releases, retiring one advisory suppression.**
+  `Cargo.lock` moves `cmov` 0.5.3 → 0.5.4 and `rand` 0.9.2 → 0.9.3. Nothing else in the graph
+  changes: 660 packages before and after, with no crate added or removed.
+
+  `cmov` (CVE-2026-50185 / GHSA-3rjw-m598-pq24) could return **wrong results** on `aarch64` when the
+  high bits of a register were set, in the constant-time conditional-move primitives reached through
+  `hmac`, `sha1` and `sha2` — which on this workspace is request signing. `x86_64`, where CI runs,
+  was never affected; this is a library, and consumers run `aarch64`.
+
+  `rand` (GHSA-cq8v-f236-94qc) is an unsoundness whose precondition — the `log` feature plus a custom
+  logger that itself draws from `rand::rng()` — is not met anywhere here. The bump matters for a
+  different reason: it removes the last vulnerable `rand` from the lockfile, which is the exit
+  criterion `deny.toml` recorded for `RUSTSEC-2026-0097`. That suppression is now dropped from both
+  `deny.toml` and the CI audit job's ignore list rather than left to rot.
+
+  `deny.toml` also gains a note on a limitation neither gate can work around: `cargo audit` and
+  `cargo deny` read the RustSec database, which is a subset of GHSA, so an advisory carrying a CVE
+  but no RUSTSEC id cannot fail either of them. `cmov` was exactly that case. Dependabot reads GHSA
+  and is the only detector for that class.
+
 - **The London Strategic Edge vault client no longer follows redirects, so `x-api-key` cannot be
   forwarded to another host** (`rustrade-data`, `lse` feature). The client was built with no
   `.redirect(...)`, so `reqwest` applied its default `Policy::limited(10)`. On a cross-host
