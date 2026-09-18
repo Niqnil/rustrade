@@ -240,15 +240,32 @@ async fn test_crypto_quote_stream_receives_data() {
     panic!("No crypto quotes received within 60s (non-quote events={non_quote_events})");
 }
 
-/// Verifies that two subscriptions share one connection and both deliver, and that each
-/// instrument's base name round-trips as subscribed.
+/// Verifies that two instruments subscribe over a single connection, and that any event which
+/// does arrive routes to one of them.
 ///
-/// Subscribes to [`Quotes`] rather than `PublicTrades` on purpose. Alpaca's crypto feed carries
-/// its own venue's fills, not a consolidated tape, so trades there are sparse and bursty: a run
-/// of this test against `PublicTrades` saw three BTC trades and no ETH trade in 120 seconds, and
-/// an earlier run saw the reverse. That made the assertion one about market liquidity, which no
-/// choice of timeout makes deterministic. Quotes tick on both symbols continuously and
-/// independently of trade flow, so they exercise the same property reliably.
+/// ### Why this no longer waits for both symbols to tick
+///
+/// It used to: it required a quote for BTC/USD *and* ETH/USD within 60s, and failed about a
+/// quarter of CI runs. The subscription was never at fault. On every failing run Alpaca was sent
+/// `{"action":"subscribe","quotes":["BTC/USD","ETH/USD"]}` and confirmed
+/// `quotes: ["BTC/USD", "ETH/USD"]`, and no event was dropped, misrouted or failed to
+/// deserialise -- the second symbol simply had not ticked yet.
+///
+/// Alpaca's crypto feed publishes a quote when top-of-book changes, and the delay before a given
+/// symbol *first* ticks is both large and highly variable. A single 300s window over four symbols
+/// confirmed on one connection measured first-quote delays of 1s (BTC), 15s (LTC), 96s (SOL) and
+/// 132s (ETH); ETH then delivered 76 quotes in the remaining 168s. No deadline distinguishes "not
+/// subscribed" from "not yet ticked", so waiting on both symbols asserted market activity rather
+/// than library behaviour.
+///
+/// What carries the subscription assertion instead is
+/// [`AlpacaWebSocketSubValidator`](rustrade_data::exchange::alpaca::validator::AlpacaWebSocketSubValidator):
+/// `init()` now succeeds only once Alpaca has confirmed every requested symbol *by name*, so the
+/// `streams.is_ok()` assertion below is the multi-instrument check this test previously
+/// approximated by waiting for data -- and it is deterministic.
+///
+/// The window that follows is a bonus: it cannot require data, but any event it does see must
+/// belong to a subscribed instrument, which is what catches misrouting.
 #[tokio::test]
 #[ignore]
 #[serial]
@@ -278,6 +295,9 @@ async fn test_crypto_multiple_symbols() {
         .init()
         .await;
 
+    // Alpaca confirms the symbols it registered, and the validator holds `init()` open until every
+    // requested one is named. Reaching here therefore means both were subscribed -- a partial
+    // subscription fails above, reporting which symbol was missing.
     assert!(
         streams.is_ok(),
         "Failed to subscribe to multiple crypto symbols: {:?}",
@@ -289,44 +309,36 @@ async fn test_crypto_multiple_symbols() {
         .select_all()
         .with_error_handler(|e| tracing::warn!(?e, "Stream error"));
 
-    let mut btc_seen = false;
-    let mut eth_seen = false;
-    // Track what actually arrived so a failure distinguishes the three causes that look
-    // identical from the outside: a stream that delivered nothing (events == 0), a symbol
-    // that never quoted in the window (events > 0 but its base absent), and a base name
-    // that did not round-trip as subscribed (bases holds something unexpected).
+    let subscribed = BTreeSet::from(["btc".to_string(), "eth".to_string()]);
+    let mut seen = BTreeSet::<String>::new();
     let mut events = 0usize;
-    let mut bases = BTreeSet::<String>::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
 
-    while !(btc_seen && eth_seen) && tokio::time::Instant::now() < deadline {
-        let timeout = tokio::time::timeout(Duration::from_secs(30), stream.next()).await;
-        if let Ok(Some(Event::Item(event))) = timeout {
-            events += 1;
-            let base = event.instrument.base.as_ref();
-            bases.insert(base.to_string());
-            match base {
-                "btc" => {
-                    btc_seen = true;
-                    tracing::info!("Received BTC quote");
-                }
-                "eth" => {
-                    eth_seen = true;
-                    tracing::info!("Received ETH quote");
-                }
-                _ => {}
+    while seen.len() < subscribed.len() && tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Event::Item(event))) => {
+                events += 1;
+                let base = event.instrument.base.as_ref().to_string();
+                // A quote can only reach here by matching a SubscriptionId this test registered,
+                // so an unknown base means the instrument map routed an event to the wrong
+                // instrument -- the one failure a quiet market cannot explain away.
+                assert!(
+                    subscribed.contains(&base),
+                    "Quote routed to an instrument that was never subscribed: \
+                     base={base}, subscribed={subscribed:?}"
+                );
+                seen.insert(base);
             }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => break,
         }
     }
 
-    assert!(
-        btc_seen,
-        "No BTC quotes received within timeout (events={events}, bases={bases:?}, eth_seen={eth_seen})"
-    );
-    assert!(
-        eth_seen,
-        "No ETH quotes received within timeout (events={events}, bases={bases:?}, btc_seen={btc_seen})"
-    );
+    // Deliberately not asserted: which symbols ticked is market activity. Logged so a run that
+    // saw nothing is still legible, and so the first-tick delays above can be re-measured.
+    tracing::info!(events, ?seen, "crypto multi-symbol quote window closed");
 }
 
 // ============================================================================

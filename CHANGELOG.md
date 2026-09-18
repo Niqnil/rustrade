@@ -142,6 +142,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **BREAKING: an Alpaca subscription is now confirmed symbol by symbol, not by counting replies**
+  (`rustrade-data`). Alpaca answers a multi-symbol subscribe with a single frame listing the
+  symbols it actually registered. The client used the standard validator, which succeeds once it
+  has seen the expected *number* of non-error replies — and `expected_responses` was 1. A
+  confirmation naming one of two requested symbols was therefore indistinguishable from one naming
+  both, and the caller was handed a stream silently subscribed to less than it asked for. The same
+  gap let `[{"T":"success", ...}]`, which names no symbols at all, satisfy the subscribe.
+
+  `AlpacaWebSocketSubValidator` replaces the counting validator: every requested subscription must
+  be named in a confirmation before `init()` returns, and anything still outstanding when the
+  timeout expires fails the subscribe and is reported by name.
+
+  **This can surface as a subscribe error where one previously succeeded** — that is the point, but
+  it is a behaviour change for anyone who was unknowingly running a partial subscription. The
+  `Connector::SubValidator` associated type for the Alpaca connectors changes accordingly, and the
+  `expected_responses` override is gone, since coverage rather than a count now decides.
+
+  Note this does **not** mean a confirmed symbol will produce data promptly. Alpaca's crypto feed
+  publishes a quote on top-of-book change, and the delay before a symbol first ticks is large and
+  variable — 1s, 15s, 96s and 132s for four symbols confirmed on one connection in a single 300s
+  window. Absence of data is not evidence of a failed subscription.
+
 - **An Alpaca fill recovered after a disconnect now reports where it left the order**
   (`rustrade-execution`). Recovery reads the account-activities endpoint, whose FILL activities
   carry the order's cumulative filled quantity as `cum_qty`. The client discarded that field, so a
