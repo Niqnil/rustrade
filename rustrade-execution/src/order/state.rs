@@ -98,12 +98,29 @@ impl ActiveOrderState {
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct OpenInFlight;
 
+/// An order the exchange reports as working, in the state the exchange last reported it.
+///
+/// Successive `Open` values for one order describe that order over time -- an acknowledgement,
+/// then each partial fill -- so consumers order them by [`Open::time_exchange`] and discard one
+/// older than the state they already hold. Producers must stamp it accordingly; see that field.
 #[derive(
     Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
 )]
 pub struct Open {
     pub id: OrderId,
+    /// When the exchange last reported this state -- **not** when the order was created.
+    ///
+    /// ## Producer obligation
+    ///
+    /// A client building this from a venue response must use the venue's last-update field
+    /// (Binance `updateTime`, Alpaca `updated_at`) rather than its creation field. Creation time
+    /// is identical across every snapshot of one order, so a snapshot stamped with it cannot be
+    /// ordered against the states that followed it and is discarded as stale by any consumer
+    /// applying the rule above -- silently, and precisely for the partially-filled orders a
+    /// reconciliation fetch exists to repair.
     pub time_exchange: DateTime<Utc>,
+    /// Cumulative quantity filled across every execution against this order, as the exchange
+    /// reports it -- not the size of the most recent execution.
     pub filled_quantity: Decimal,
 }
 

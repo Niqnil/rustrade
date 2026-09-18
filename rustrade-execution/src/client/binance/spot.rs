@@ -1807,6 +1807,9 @@ trait SpotOrderFields {
     fn order_type(&self) -> Option<&str>;
     fn time_in_force(&self) -> Option<&str>;
     fn time(&self) -> Option<i64>;
+    /// When the order last changed state, as opposed to [`SpotOrderFields::time`], which is when
+    /// it was created. Both `allOrders` and `openOrders` carry it.
+    fn update_time(&self) -> Option<i64>;
     fn symbol(&self) -> Option<&str>;
 }
 
@@ -1827,6 +1830,7 @@ macro_rules! impl_spot_order_fields {
                 fn order_type(&self) -> Option<&str> { self.r#type.as_deref() }
                 fn time_in_force(&self) -> Option<&str> { self.time_in_force.as_deref() }
                 fn time(&self) -> Option<i64> { self.time }
+                fn update_time(&self) -> Option<i64> { self.update_time }
                 fn symbol(&self) -> Option<&str> { self.symbol.as_deref() }
             }
         )*
@@ -1893,8 +1897,14 @@ fn convert_open_order<T: SpotOrderFields>(
         }
     };
     let time_in_force = parse_time_in_force(o.time_in_force().unwrap_or("GTC"));
+    // `update_time` over `time`: `Open::time_exchange` orders an order's states, and the engine
+    // discards a snapshot older than the state it already tracks. `time` is the creation stamp and
+    // is identical across every snapshot of one order, so a snapshot carrying it is discarded the
+    // moment a WebSocket fill has advanced the tracked order past creation -- which is exactly the
+    // partially-filled order this fetch exists to reconcile.
     let time_exchange = match o
-        .time()
+        .update_time()
+        .or_else(|| o.time())
         .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
     {
         Some(ts) => ts,
@@ -3036,9 +3046,138 @@ mod tests {
         let key2 = DedupKey {
             instrument: SmolStr::from("BTCUSDT"),
             id: SmolStr::from("12345"),
-            kind: DedupEventKind::New,
+            kind: DedupEventKind::OrderState {
+                filled_quantity: Decimal::ZERO,
+            },
         };
         assert!(!is_duplicate(&cache, key2));
+    }
+
+    /// Two order-state snapshots for one order differ only by cumulative filled quantity, and
+    /// must not be deduplicated against each other -- otherwise the acknowledgement (`z = 0`)
+    /// swallows every fill snapshot that follows it.
+    #[test]
+    fn dedup_distinguishes_order_states_and_still_collapses_a_replay() {
+        let cache = new_dedup_cache();
+        let state = |filled: &str| DedupKey {
+            instrument: SmolStr::from("BTCUSDT"),
+            id: SmolStr::from("12345"),
+            kind: DedupEventKind::OrderState {
+                filled_quantity: Decimal::from_str(filled).unwrap(),
+            },
+        };
+
+        // Acknowledgement, then two fills on the same order: three distinct states.
+        assert!(!is_duplicate(&cache, state("0")), "ack is new");
+        assert!(
+            !is_duplicate(&cache, state("1")),
+            "first fill is not the ack"
+        );
+        assert!(
+            !is_duplicate(&cache, state("2")),
+            "second fill is not the first"
+        );
+
+        // A re-delivered snapshot still collides, which is what keeps a replayed
+        // acknowledgement from resurrecting an order that has since retired.
+        assert!(
+            is_duplicate(&cache, state("0")),
+            "replayed ack is a duplicate"
+        );
+        assert!(
+            is_duplicate(&cache, state("2")),
+            "replayed fill is a duplicate"
+        );
+
+        // Decimal hashes normalised, so the venue's chosen representation does not split a key.
+        assert!(
+            is_duplicate(&cache, state("2.00")),
+            "2.00 must be the same key as 2"
+        );
+    }
+
+    /// Drive frames through the same two stages the live WebSocket callback does: convert, then
+    /// apply the dedup gate. Returns what a consumer would actually receive.
+    ///
+    /// Every other test in this file calls `convert_execution_report` directly. That is the wrong
+    /// altitude to prove a fill reaches anyone: the converter can be perfectly correct while the
+    /// gate downstream of it discards what the converter produced.
+    fn drive_ws_pipeline(frames: &[&str]) -> Vec<UnindexedAccountEvent> {
+        use crate::client::dedup::dedup_key_from_event;
+
+        let cache = new_dedup_cache();
+        let mut delivered = Vec::new();
+        let mut buf = Vec::new();
+        for frame in frames {
+            let _ = convert_user_data_events(frame, &mut buf);
+            for ev in buf.drain(..) {
+                if let Some(key) = dedup_key_from_event(&ev)
+                    && is_duplicate(&cache, key)
+                {
+                    continue;
+                }
+                delivered.push(ev);
+            }
+        }
+        delivered
+    }
+
+    const WS_NEW: &str = r#"{"e":"executionReport","s":"BTCUSDT","i":12345,"c":"client-1",
+        "x":"NEW","X":"NEW","S":"BUY","o":"LIMIT","f":"GTC","q":"2","p":"100","z":"0",
+        "T":1700000000000}"#;
+
+    const WS_PARTIAL_FILL: &str = r#"{"e":"executionReport","s":"BTCUSDT","i":12345,"c":"client-1",
+        "x":"TRADE","X":"PARTIALLY_FILLED","S":"BUY","o":"LIMIT","f":"GTC","q":"2","p":"100",
+        "z":"1","l":"1","L":"100","t":555,"n":"0.1","N":"USDT","T":1700000001000}"#;
+
+    /// A fill's order snapshot must survive the dedup gate that sits between the converter and the
+    /// consumer.
+    ///
+    /// The acknowledgement and the fill describe one order id, so a key built from the id alone
+    /// makes the second look like a replay of the first. `Open::filled_quantity` then never leaves
+    /// the `0` the acknowledgement carried, which is the defect the converter change was meant to
+    /// fix -- fixed in the converter, undone one stage later.
+    #[test]
+    fn ws_fill_snapshot_survives_the_dedup_gate() {
+        use crate::order::state::ActiveOrderState;
+
+        let delivered = drive_ws_pipeline(&[WS_NEW, WS_PARTIAL_FILL]);
+
+        assert_eq!(
+            delivered.len(),
+            3,
+            "expected the ack snapshot, then the fill's execution and its snapshot, got: {delivered:?}"
+        );
+
+        let snapshots: Vec<Decimal> = delivered
+            .iter()
+            .filter_map(|ev| match &ev.kind {
+                AccountEventKind::OrderSnapshot(snap) => match &snap.0.state {
+                    OrderState::Active(ActiveOrderState::Open(open)) => Some(open.filled_quantity),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            snapshots,
+            vec![Decimal::ZERO, Decimal::ONE],
+            "the fill's snapshot must reach the consumer carrying the advanced filled quantity"
+        );
+    }
+
+    /// The gate must still collapse a genuinely re-delivered frame, because a replayed
+    /// acknowledgement for a retired order is re-inserted as a live resting order by the engine.
+    #[test]
+    fn ws_replayed_frame_is_still_deduplicated() {
+        let delivered = drive_ws_pipeline(&[WS_NEW, WS_PARTIAL_FILL, WS_NEW, WS_PARTIAL_FILL]);
+
+        assert_eq!(
+            delivered.len(),
+            3,
+            "re-delivering both frames must add nothing, got: {delivered:?}"
+        );
     }
 
     #[test]
@@ -4006,6 +4145,41 @@ mod tests {
         let from_open_orders = convert_open_order(&make_base_open_order(), &instrument)
             .expect("valid order should convert");
         assert_eq!(from_all_orders, from_open_orders);
+    }
+
+    /// A REST order snapshot is stamped with when the order last changed, not when it was created.
+    ///
+    /// The engine discards an `Open` snapshot older than the state it already tracks, so a
+    /// snapshot carrying `time` is thrown away as soon as a WebSocket fill has advanced the
+    /// tracked order past creation -- the exact order a reconciliation fetch is meant to repair.
+    #[test]
+    fn test_convert_open_order_prefers_update_time_over_creation_time() {
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+
+        let updated = binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
+            update_time: Some(1_700_000_005_000),
+            ..make_base_open_order()
+        };
+        let order = convert_open_order(&updated, &instrument).expect("valid order should convert");
+        assert_eq!(
+            order.state.time_exchange,
+            Utc.timestamp_millis_opt(1_700_000_005_000)
+                .single()
+                .unwrap(),
+            "update_time must win over time"
+        );
+
+        // Falls back to `time` when the venue omits `update_time`, rather than to `now` -- which
+        // would be worse than creation time, since it is not a venue-reported instant at all.
+        let order = convert_open_order(&make_base_open_order(), &instrument)
+            .expect("valid order should convert");
+        assert_eq!(
+            order.state.time_exchange,
+            Utc.timestamp_millis_opt(1_700_000_000_000)
+                .single()
+                .unwrap(),
+            "absent update_time falls back to time"
+        );
     }
 
     #[test]
