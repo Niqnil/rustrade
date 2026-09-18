@@ -164,6 +164,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   variable — 1s, 15s, 96s and 132s for four symbols confirmed on one connection in a single 300s
   window. Absence of data is not evidence of a failed subscription.
 
+- **An Alpaca fill recovered after a disconnect now reports where it left the order**
+  (`rustrade-execution`). Recovery reads the account-activities endpoint, whose FILL activities
+  carry the order's cumulative filled quantity as `cum_qty`. The client discarded that field, so a
+  recovered fill advanced the position and left the order untouched — precisely the orders a
+  reconnect exists to repair. It is now parsed into `Trade::order_filled_quantity`, so the order
+  advances from the fill itself, with no extra API call and no reconciliation fetch.
+
+  **This also corrects a dedup mis-keying between the two paths.** Both key a fill as
+  `"{order_id}:{cumulative}"`, but only the WebSocket path used the venue's own cumulative;
+  recovery reconstructed one by counting executions from zero *within the recovery batch*. For an
+  order that had already partly filled before the window, the two paths therefore produced
+  different keys for the same execution, and it could be delivered twice. The key is now taken from
+  `cum_qty`, so it agrees with the WebSocket path by construction rather than by reconstruction.
+  Where Alpaca omits the field the previous counting behaviour is kept unchanged, including its
+  limitations.
+
+  Binance Spot and Margin recovery is unaffected and unchanged: REST `myTrades` reports executions
+  only, with no cumulative, so a recovered fill there still reports `None` rather than a figure
+  invented from a second endpoint. Both clients now say so at the call site, and
+  `Trade::order_filled_quantity` documents which producers report it.
+
 - **A Binance Spot fill's order snapshot now reaches the consumer** (`rustrade-execution`). The
   account stream deduplicates events before forwarding them, and an order snapshot's dedup key was
   the order's exchange id alone. An order's acknowledgement and every fill against it carry that one
