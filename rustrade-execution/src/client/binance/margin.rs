@@ -1125,6 +1125,12 @@ impl ExecutionClient for BinanceMargin {
     /// [`ExecutionClient::fetch_open_orders`] after each reconnect to reconcile order state — only
     /// TRADE fills are recovered, not order-lifecycle events.
     ///
+    /// That reconciliation is also the only way a recovered fill reaches the order. A live fill
+    /// carries the order's cumulative filled quantity in [`Trade::order_filled_quantity`]
+    /// (`executionReport`'s `z`) and advances the order by itself; a fill recovered from REST
+    /// `myTrades` carries no cumulative, so `order_filled_quantity` is `None` and
+    /// `filled_quantity` stays where it stood before the gap.
+    ///
     /// # Isolated mode (multiplexed `userListenToken`)
     /// Under `is_isolated = true` a **separate** manager drives the stream (the cross path above is
     /// left untouched). It acquires one per-symbol `userListenToken` for each
@@ -2203,6 +2209,10 @@ fn register_user_data_listener(
 ///
 /// Only TRADE fills are recovered — order-lifecycle events (NEW/CANCELED) require a
 /// `fetch_open_orders` reconciliation by the caller. Mirrors `BinanceSpot::recover_fills`.
+///
+/// The recovered trades carry no `order_filled_quantity`: `myTrades` reports executions only,
+/// with no cumulative and no order status, so a recovered fill advances the position but not
+/// the order. Only that same reconciliation closes the gap.
 async fn recover_margin_fills(
     rest: &Arc<RestApi>,
     rate_limiter: &Arc<RateLimitTracker>,

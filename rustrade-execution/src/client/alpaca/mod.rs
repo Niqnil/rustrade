@@ -307,8 +307,10 @@ impl ExponentialBackoff {
 /// WS fills: `convert_trade_update` sets `trade_id = order.id + ":" + order.filled_qty`
 /// (cumulative from the order update payload).
 ///
-/// REST fills: `recover_fills` accumulates per-execution qty per order and overrides
-/// `trade.id` to the same format before inserting into the cache.
+/// REST fills: `recover_fills` reads the activity's own `cum_qty` -- the same figure the WS path
+/// reads -- and overrides `trade.id` to the same format before inserting into the cache. Where
+/// Alpaca omits `cum_qty` it falls back to accumulating per-execution qty within the batch, which
+/// is correct only for an order whose fills lie wholly inside the recovery window.
 ///
 /// Using cumulative qty (not per-execution qty) means two equal-size partial fills
 /// on the same order produce distinct keys (`order:1` and `order:2`), preventing
@@ -590,6 +592,14 @@ struct AlpacaActivity {
     price: String,
     qty: String,
     transaction_time: String,
+    /// The order's cumulative filled quantity as of this execution, as Alpaca reported it --
+    /// the same figure the WebSocket path reads from `order.filled_qty`.
+    ///
+    /// Alpaca's schema lists this on trade activities without qualifying by fill type -- unlike
+    /// `leaves_qty`, which it documents as partial-fill-specific. It is parsed as optional
+    /// regardless, so an omission degrades to the fallback below rather than discarding the
+    /// whole activity.
+    cum_qty: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1243,10 +1253,17 @@ impl ExecutionClient for AlpacaClient {
     ///
     /// After a reconnect, missed fills are recovered from the REST activities endpoint
     /// using `direction=asc` to match the chronological order in which the WS stream
-    /// advanced `filled_qty`. The dedup key `"{order_id}:{cum_qty}"` is synthesised
-    /// by accumulating per-execution qty in that order. If Alpaca returns activities
-    /// out of chronological order (e.g. at pagination boundaries), dedup keys will
-    /// diverge and fills may be dropped or duplicated for that order.
+    /// advanced `filled_qty`. The dedup key `"{order_id}:{cum_qty}"` is taken from the
+    /// activity's own `cum_qty`, so it matches the WS path by construction and does not
+    /// depend on the order in which activities arrive.
+    ///
+    /// Only where Alpaca omits `cum_qty` does the key fall back to accumulating per-execution
+    /// qty within the batch. That fallback counts from zero per order, so it is correct only for
+    /// an order whose fills lie wholly inside the recovery window, and it is sensitive to
+    /// activities arriving out of chronological order (e.g. at pagination boundaries).
+    ///
+    /// A recovered fill also carries the order's cumulative filled quantity, so it advances the
+    /// order's `filled_quantity` without waiting for a `fetch_open_orders` reconciliation.
     ///
     /// # Lifecycle event deduplication
     ///
@@ -2735,18 +2752,22 @@ async fn recover_fills(
     let mut recovered = 0u32;
     let mut duplicates = 0u32;
 
-    // Track cumulative filled qty per order so that the synthesised TradeId matches
-    // the WS path: both produce "{order_id}:{cumulative_filled_qty}". This prevents
-    // same-size partial fill collisions (e.g. two 1-lot fills on a 2-lot order)
-    // and ensures cross-source dedup works correctly after reconnect.
+    // Fallback only. The dedup key is "{order_id}:{cumulative_filled_qty}" on both paths, and the
+    // cumulative is now taken from the activity's own `cum_qty` -- the same figure the WS path
+    // reads from `order.filled_qty` -- so the two agree by construction rather than by
+    // reconstruction.
     //
-    // Activities are fetched with direction=asc so they arrive in chronological order.
-    // Cumulative accumulation here must match the WS path's order.filled_qty progression.
-    // If Alpaca violates this ordering guarantee, dedup keys will diverge and fills
-    // may be dropped or duplicated.
-    // Borrow `activities` so &str keys into order_id strings remain valid for the
-    // entire loop. Consuming iteration would drop each activity at end of its iteration,
-    // invalidating keys that still need to be looked up by later fills on the same order.
+    // This counter is what the key falls back to when `cum_qty` is absent, which reproduces the
+    // previous behaviour exactly. That behaviour is correct only for an order whose fills lie
+    // entirely inside the recovery window: it counts from zero per order within the batch, so an
+    // order that had already partly filled before the window yields keys offset by the amount it
+    // filled earlier, and those keys match nothing the WS path ever emitted. Preferring `cum_qty`
+    // is what removes that failure mode.
+    //
+    // Activities are fetched with direction=asc, so accumulation here follows execution order.
+    // Borrow `activities` so &str keys into order_id strings remain valid for the entire loop:
+    // consuming iteration would drop each activity at the end of its iteration, invalidating keys
+    // that later fills on the same order still need to look up.
     let mut cumulative_qty: FnvHashMap<&str, Decimal> = FnvHashMap::default();
 
     for activity in &activities {
@@ -2790,10 +2811,20 @@ async fn recover_fills(
         // fill_dedup_key_from_event produces the same key for both sources.
         // Normalise the cumulative Decimal to strip trailing zeros so the string
         // representation matches the WS path (e.g. "1" == "1.00" after normalize).
+        //
+        // `order_filled_quantity` holds the venue's own cumulative, parsed by
+        // `convert_activity_to_trade`; `cumulative` is the intra-batch fallback described above.
+        //
+        // The counter is advanced for every activity, including those that carry `cum_qty` and so
+        // never consult it. That is deliberate: it keeps the fallback usable for a later activity
+        // on the same order that omits the field. A batch mixing both therefore interleaves two
+        // key schemes, and the fallback keys in it remain offset by whatever the order filled
+        // before the window -- the field's presence rescues an activity, not an order.
+        let key_cumulative = trade.order_filled_quantity.unwrap_or(cumulative);
         trade.id = TradeId(format_smolstr!(
             "{}:{}",
             activity.order_id,
-            cumulative.normalize()
+            key_cumulative.normalize()
         ));
 
         let event =
@@ -3026,6 +3057,9 @@ fn convert_activity_to_trade(
     let side = parse_side(&a.side)?;
     let price = Decimal::from_str(&a.price).ok()?;
     let quantity = Decimal::from_str(&a.qty).ok()?;
+    // `None` when Alpaca omitted the field or sent something unparseable, which is the honest
+    // report: the venue did not tell us where the order stands, rather than "nothing is filled".
+    let order_filled_quantity = a.cum_qty.as_deref().and_then(|s| Decimal::from_str(s).ok());
     let time_exchange = parse_timestamp(&a.transaction_time).unwrap_or_else(|| {
         warn!(id = %a.id, "Alpaca activity: unparseable transaction_time, using now");
         Utc::now()
@@ -3044,9 +3078,7 @@ fn convert_activity_to_trade(
         side,
         price,
         quantity,
-        // The account-activities response does carry the order's cumulative filled quantity, but
-        // this client does not parse it. Until it does, a recovered fill cannot advance the order.
-        None,
+        order_filled_quantity,
         AssetFees::new(
             AssetNameExchange::from("USD"),
             Decimal::ZERO,
@@ -4525,6 +4557,7 @@ mod tests {
             price: "not-a-number".to_string(),
             qty: "1".to_string(),
             transaction_time: "2025-04-18T14:30:00Z".to_string(),
+            cum_qty: Some("1".to_string()),
         };
         assert!(convert_activity_to_trade(&activity).is_none());
     }
@@ -5483,6 +5516,192 @@ mod tests {
                 body.get("position_intent").and_then(|v| v.as_str()),
                 Some("buy_to_open"),
                 "reduce_only=false + Side::Buy should produce position_intent=buy_to_open, got: {body}"
+            );
+        }
+
+        // -----------------------------------------------------------------------
+        // recover_fills — what a recovered fill reports, and how it is keyed
+        // -----------------------------------------------------------------------
+        //
+        // These drive `recover_fills` itself rather than re-deriving its arithmetic in the test.
+        // A key that is correct in isolation is worth nothing if the function does not produce it.
+
+        /// One FILL activity as Alpaca serves it. `cum_qty` is omitted entirely when `None`, which
+        /// is how the pre-existing fallback path is reached.
+        fn activity_json(
+            id: &str,
+            order_id: &str,
+            qty: &str,
+            cum_qty: Option<&str>,
+        ) -> serde_json::Value {
+            let mut v = serde_json::json!({
+                "id": id,
+                "order_id": order_id,
+                "symbol": "SPY",
+                "side": "buy",
+                "price": "100.00",
+                "qty": qty,
+                "transaction_time": "2025-04-18T14:30:00Z"
+            });
+            if let Some(c) = cum_qty {
+                v["cum_qty"] = serde_json::Value::String(c.to_string());
+            }
+            v
+        }
+
+        /// Serve `activities` from a mock and run `recover_fills` against it, returning every
+        /// event it forwarded.
+        async fn drive_recover_fills_with(
+            activities: Vec<serde_json::Value>,
+            dedup: SharedDedupCache,
+        ) -> Vec<UnindexedAccountEvent> {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::Value::Array(activities)),
+                )
+                .mount(&server)
+                .await;
+
+            let http = reqwest::Client::new();
+            let rl = RateLimitTracker::new();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            recover_fills(
+                &http,
+                &rl,
+                &[],
+                &server.uri(),
+                "2025-01-01T00:00:00Z",
+                &tx,
+                &dedup,
+            )
+            .await;
+            drop(tx);
+
+            let mut out = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                out.push(event);
+            }
+            out
+        }
+
+        async fn drive_recover_fills(
+            activities: Vec<serde_json::Value>,
+        ) -> Vec<UnindexedAccountEvent> {
+            drive_recover_fills_with(activities, new_dedup_cache()).await
+        }
+
+        fn trade_of(
+            event: &UnindexedAccountEvent,
+        ) -> &Trade<AssetNameExchange, InstrumentNameExchange> {
+            match &event.kind {
+                AccountEventKind::Trade(t) => t,
+                other => panic!("expected a Trade event, got {other:?}"),
+            }
+        }
+
+        /// A recovered fill reports where it left the order, so it advances `filled_quantity`
+        /// without waiting for a `fetch_open_orders` reconciliation that the caller may never make.
+        #[tokio::test]
+        async fn a_recovered_fill_reports_the_cumulative_alpaca_sent() {
+            let events = drive_recover_fills(vec![
+                activity_json("act-1", "ord-1", "2", Some("2")),
+                activity_json("act-2", "ord-1", "3", Some("5")),
+            ])
+            .await;
+
+            let reported: Vec<_> = events
+                .iter()
+                .map(|e| trade_of(e).order_filled_quantity)
+                .collect();
+            assert_eq!(
+                reported,
+                vec![
+                    Some(Decimal::from_str("2").unwrap()),
+                    Some(Decimal::from_str("5").unwrap())
+                ]
+            );
+        }
+
+        /// The dedup key comes from the venue's own cumulative, not from counting executions
+        /// within the recovery batch.
+        ///
+        /// An order that had already partly filled *before* the recovery window is the case that
+        /// separates the two, and it is the case the previous implementation got wrong: counting
+        /// from zero inside the batch yields a key the WebSocket path never emitted for that fill.
+        #[tokio::test]
+        async fn the_dedup_key_uses_the_venue_cumulative_not_an_intra_batch_count() {
+            // Three lots filled before the window; the recovered 2-lot fill takes the order to 5.
+            let events =
+                drive_recover_fills(vec![activity_json("act-1", "ord-1", "2", Some("5"))]).await;
+
+            assert_eq!(
+                trade_of(&events[0]).id.0.as_str(),
+                "ord-1:5",
+                "counting executions within the batch would key this as ord-1:2"
+            );
+        }
+
+        /// The property the key exists for: one fill delivered twice, by two different paths, is
+        /// one fill. Before the cumulative was carried this held only for an order whose fills lay
+        /// wholly inside the recovery window -- precisely the orders least in need of recovery.
+        #[tokio::test]
+        async fn a_fill_already_delivered_over_websocket_is_not_recovered_twice() {
+            let dedup = new_dedup_cache();
+
+            // The same execution as it arrived over WebSocket: 2 lots, leaving the order at 5.
+            let update = AlpacaTradeUpdate {
+                event: SmolStr::new("partial_fill"),
+                order: super::make_order_ws("ord-1", "SPY", "buy", "5"),
+                price: Some("100.00"),
+                qty: Some("2"),
+                timestamp: None,
+            };
+            let [ws_event, _snapshot] = convert_trade_update(update);
+            let ws_event = ws_event.expect("a partial_fill converts to a Trade");
+            let ws_key = fill_dedup_key_from_event(&ws_event)
+                .expect("a Trade carries a dedup key")
+                .clone();
+            assert!(
+                !is_duplicate(&dedup, &ws_key),
+                "precondition: first sighting"
+            );
+
+            let events = drive_recover_fills_with(
+                vec![activity_json("act-1", "ord-1", "2", Some("5"))],
+                dedup,
+            )
+            .await;
+
+            assert!(
+                events.is_empty(),
+                "a fill already delivered over WebSocket must not be re-delivered by recovery, \
+                 got {events:?}"
+            );
+        }
+
+        /// With `cum_qty` absent the key falls back to counting within the batch -- exactly what
+        /// shipped before -- and the fill reports no cumulative rather than a fabricated one.
+        #[tokio::test]
+        async fn without_a_reported_cumulative_the_previous_behaviour_is_preserved() {
+            let events = drive_recover_fills(vec![
+                activity_json("act-1", "ord-1", "2", None),
+                activity_json("act-2", "ord-1", "3", None),
+            ])
+            .await;
+
+            let keys: Vec<_> = events
+                .iter()
+                .map(|e| trade_of(e).id.0.as_str().to_owned())
+                .collect();
+            assert_eq!(keys, vec!["ord-1:2", "ord-1:5"], "intra-batch accumulation");
+
+            assert!(
+                events
+                    .iter()
+                    .all(|e| trade_of(e).order_filled_quantity.is_none()),
+                "a venue that reported no cumulative must not have one invented for it"
             );
         }
     }

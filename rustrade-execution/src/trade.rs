@@ -85,8 +85,9 @@ pub struct Trade<AssetKey, InstrumentKey> {
     /// |---|---|
     /// | Binance Spot / Margin WebSocket `executionReport` | yes (`z`) |
     /// | Binance Spot `myTrades` REST | no |
+    /// | Binance Margin `myTrades` REST | no |
     /// | Alpaca WebSocket `trade_updates` | yes (`order.filled_qty`) |
-    /// | Alpaca account-activities REST | no |
+    /// | Alpaca account-activities REST | yes (`cum_qty`) |
     /// | Interactive Brokers `ExecutionData` | yes (`cumulative_quantity`) |
     /// | Hyperliquid `userFills` | no |
     /// | `SimulatedVenue` | yes |
