@@ -246,12 +246,14 @@ where
                     // but the replica doesn't need to process them.
                     instrument_state.orders.clear();
                     instrument_state.exchange_id_to_cid.clear();
+                    instrument_state.retired_routing.clear();
                     instrument_state.position_ids.clear();
                     instrument_state.pending_fills.clear();
                     instrument_state.expiration_processed = true;
                 } else if instrument_state.position.positions.is_empty() {
                     instrument_state.orders.clear();
                     instrument_state.exchange_id_to_cid.clear();
+                    instrument_state.retired_routing.clear();
                     instrument_state.position_ids.clear();
                     instrument_state.pending_fills.clear();
                     instrument_state.expiration_processed = true;

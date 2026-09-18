@@ -525,6 +525,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             instrument_state.expiration_processed = true;
             instrument_state.orders.clear();
             instrument_state.exchange_id_to_cid.clear();
+            instrument_state.retired_routing.clear();
             instrument_state.position_ids.clear();
             // Clear pending_fills even when no positions exist — a fill-before-ack race
             // that was in progress at expiry should not accumulate orphaned fills.
@@ -744,6 +745,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
         instrument_state.expiration_processed = true;
         instrument_state.orders.clear();
         instrument_state.exchange_id_to_cid.clear();
+        instrument_state.retired_routing.clear();
         instrument_state.position_ids.clear();
         // Clear any fills buffered in a fill-before-ack race that was in progress at
         // expiry. Without this, orphaned pending_fills accumulate across expiry cycles

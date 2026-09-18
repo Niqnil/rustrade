@@ -4257,15 +4257,21 @@ fn test_netting_fill_after_terminal_snapshot_opens_one_netting_position() {
     }
 }
 
-/// Where the fix stops.
+/// How far the window reaches.
 ///
-/// Only the most recently retired order keeps its routing entry, because retiring the next order
-/// prunes it — see the known-limitation note on `cleanup_routing_tables`. A fill for anything
-/// older finds nothing and opens a position under the raw exchange `OrderId`. Pinned so that the
-/// bound the documentation claims is a checked one, and so that closing this window later is a
-/// visible change rather than a silent one.
+/// Retiring an order strips the routing a later fill needs, and `update_from_order_snapshot`
+/// restores it only into the maps keyed by `orders` — so the *next* order update prunes it again.
+/// `cleanup_routing_tables` now demotes it into `retired_routing` at that moment rather than
+/// dropping it, so the window spans `MAX_RETIRED_ROUTING` retirements rather than one.
+///
+/// This previously pinned the opposite: that the fill could not reach the strategy's `PositionId`
+/// once a later order pruned the entry. That assertion was written so closing the window would be
+/// a visible change rather than a silent one, and this is that change.
+///
+/// Driven end to end through the engine rather than against `InstrumentState` alone, because the
+/// audit replica replays the same events and this file asserts full-state equality between them.
 #[test]
-fn test_hedging_late_fill_misroutes_once_a_later_order_prunes_the_routing_entry() {
+fn test_hedging_late_fill_routes_after_a_later_order_prunes_the_live_entry() {
     let (execution_tx, _execution_rx) = mpsc_unbounded();
     let mut engine = build_hedging_option_engine(TradingState::Disabled, execution_tx);
 
@@ -4298,6 +4304,21 @@ fn test_hedging_late_fill_misroutes_once_a_later_order_prunes_the_routing_entry(
     );
     send_order_ack(&mut engine, cid_b.clone(), exchange_id_b, Side::Buy);
 
+    // The live entry is gone, but the routing it carried was demoted rather than dropped.
+    let instr = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    assert!(
+        !instr.position_ids.contains_key(&cid_a),
+        "the live routing entry is pruned, as it always was"
+    );
+    assert_eq!(
+        instr.retired_routing.get(&exchange_id_a),
+        Some(&pos_id_a),
+        "and is now held by the retired-order routing instead"
+    );
+
     // Only now does the first order's fill arrive.
     send_fill(&mut engine, exchange_id_a.clone(), Side::Buy, dec!(1_000));
 
@@ -4306,15 +4327,15 @@ fn test_hedging_late_fill_misroutes_once_a_later_order_prunes_the_routing_entry(
         .instruments
         .instrument_index(&InstrumentIndex(0));
     assert!(
-        !instr.position.positions.contains_key(&pos_id_a),
-        "the window has closed, so the fill cannot reach the strategy's PositionId"
+        instr.position.positions.contains_key(&pos_id_a),
+        "the fill reaches the PositionId the strategy chose"
     );
     assert!(
-        instr
+        !instr
             .position
             .positions
             .contains_key(&PositionId::new(exchange_id_a.0.clone())),
-        "and falls back to the raw exchange OrderId"
+        "so no second position is opened under the raw exchange OrderId"
     );
 }
 
@@ -4383,6 +4404,10 @@ fn test_hedging_position_ids_cleanup_on_position_exit() {
     // Any subsequent order update closes that window: `cleanup_routing_tables` runs before the
     // entry is restored, and drops entries for CIDs no longer tracked. That is what bounds both
     // maps — at most one retired order is held per instrument at a time.
+    //
+    // The routing itself is not lost at that point. The same call demotes it into
+    // `retired_routing`, which is bounded separately by `MAX_RETIRED_ROUTING`. What this pins is
+    // that the *live* maps stay bounded at one retired order, which is still true.
     let cid_c = ClientOrderId::new("cid-c");
     send_open_order_with_position_id(
         &mut engine,
