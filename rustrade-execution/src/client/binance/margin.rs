@@ -1318,7 +1318,7 @@ fn build_listen_token_query(
 /// Wire shape of the `POST /sapi/v1/userListenToken` response.
 #[derive(Deserialize)]
 struct UserListenTokenResponse {
-    // Phase 0 observed `token` on the live endpoint; accept `listenToken` defensively too.
+    // The live endpoint was observed returning `token`; accept `listenToken` defensively too.
     #[serde(alias = "listenToken")]
     token: String,
     #[serde(rename = "expirationTime")]
@@ -1427,7 +1427,7 @@ async fn connect_margin_ws(
 ///
 /// `userDataStream.subscribe.listenToken` is unbound in the SDK, so it is sent via the generic
 /// `send_message` with the literal method string. The frame is **unsigned with no API key** — the
-/// token is the sole auth (verified live in Phase 0); `WebsocketMessageSendOptions::new()` yields
+/// token is the sole auth (verified live); `WebsocketMessageSendOptions::new()` yields
 /// exactly that (no `.signed()`/`.with_api_key()`, no session logon).
 async fn subscribe_listen_token(ws: &Arc<WsApiBase>, token: &str) -> anyhow::Result<()> {
     // The SDK's `send_message` takes an owned `BTreeMap<String, Value>`, so the single-entry map and
@@ -1516,7 +1516,7 @@ fn convert_margin_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEv
     convert_margin_user_data_events_with(frame, buf, &mut cross_account_position_handler)
 }
 
-/// Frame discrimination for the WS-API user-data delivery (Phase 0 finding).
+/// Frame discrimination for the WS-API user-data delivery, as observed live.
 ///
 /// Each text frame is either an RPC response (`{ "id", "status", "result", … }` — e.g. the
 /// subscribe ack) or a pushed user-data event wrapped as `{ "subscriptionId", "event": { "e", … } }`.
@@ -4796,7 +4796,7 @@ mod tests {
 
     // -- User-data stream: frame discrimination + event conversion -----------------------------
 
-    /// Wrap an inner user-data `event` object in the WS-API push envelope (Phase 0 shape),
+    /// Wrap an inner user-data `event` object in the WS-API push envelope observed live,
     /// serialized to the on-wire JSON string the converter parses.
     fn push(event: serde_json::Value) -> String {
         serde_json::json!({ "subscriptionId": 1, "event": event }).to_string()

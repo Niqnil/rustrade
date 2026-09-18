@@ -1493,8 +1493,8 @@ async fn connection_manager(
         // WARNING — only fills (GET /api/v3/myTrades) are recovered here.
         // Order lifecycle events (NEW, CANCELED, EXPIRED) that occurred during the
         // disconnect window are NOT recovered. Open-order state may be stale until
-        // the next account_snapshot or fetch_open_orders call. The crypto repo wrapper
-        // MUST call fetch_open_orders after each reconnect to reconcile open-order state.
+        // the next account_snapshot or fetch_open_orders call. A caller MUST call
+        // fetch_open_orders after each reconnect to reconcile open-order state.
         if let Some(dt) = disconnect_time.take() {
             match tokio::time::timeout(
                 Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS),
@@ -2109,8 +2109,8 @@ fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -
             // balanceUpdate events are for deposits/withdrawals;
             // outboundAccountPosition covers balance changes from trades.
             // deposit/withdrawal balance changes are not forwarded to the consumer.
-            // The crypto repo wrapper should call fetch_balances or account_snapshot
-            // periodically to reconcile balances after external transfers.
+            // A caller should call fetch_balances or account_snapshot periodically to
+            // reconcile balances after external transfers.
             // No log here: this is the per-frame receive hot path.
             false
         }

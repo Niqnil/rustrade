@@ -1481,7 +1481,7 @@ impl ExecutionClient for AlpacaClient {
         let page = paginate_activities(&http, &self.rate_limiter, base, &after_str).await?;
 
         // Propagate truncation as an error so callers can detect incomplete results.
-        // The crypto repo can match on `Truncated` and alert operators.
+        // A caller can match on `Truncated` and alert rather than act on a partial page.
         if page.truncated {
             return Err(UnindexedClientError::Truncated {
                 limit: MAX_ACTIVITY_PAGES,

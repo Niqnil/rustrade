@@ -1122,8 +1122,8 @@ impl ExecutionClient for IbkrClient {
 
             // ibapi::Error is unstructured — we cannot distinguish connection failures
             // (transient, should retry) from API errors (e.g., invalid request).
-            // Mapped to Internal (non-transient) conservatively; the crypto repo wrapper
-            // should implement reconnect logic based on connection state, not error type.
+            // Mapped to Internal (non-transient) conservatively; a caller needing reconnect
+            // logic should drive it from connection state, not from the error type.
             let positions_sub = client
                 .positions()
                 .map_err(|e| UnindexedClientError::Internal(format!("positions: {e}")))?;
