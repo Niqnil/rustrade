@@ -7,25 +7,36 @@ all-features = true
 
 # Advisories - handled by cargo audit job, but deny can also check
 [advisories]
+# COVERAGE LIMIT -- a green `cargo audit` / `cargo deny` run does not mean Dependabot is clear.
+#
+# Both gates read the RustSec advisory database, which is a subset of GitHub's GHSA data. An
+# advisory carrying a CVE but no RUSTSEC id is invisible to both: it cannot fail CI, so there is
+# nothing for this list to suppress and nothing here that would record it. Dependabot reads GHSA
+# and is the only detector for that class, so check its alerts rather than trusting a green CI.
+# Two were live against this lockfile when this note was written:
+#   * cmov  GHSA-3rjw-m598-pq24 / CVE-2026-50185 -- wrong results on aarch64 in constant-time
+#     conditional moves, reached via hmac/sha1/sha2, i.e. request signing. FIXED by bumping to
+#     0.5.4; x86_64 was never affected, but this is a library and consumers run aarch64.
+#   * jsonwebtoken  GHSA-h395-gr6q-cpjc / CVE-2026-25537 -- type confusion enabling authorization
+#     bypass. Still present at 8.3.0, transitive via ethers-providers 2.0.14 and reachable only
+#     through the non-default `hyperliquid` feature. No bump is available to us: ethers 2.0 pins
+#     jsonwebtoken ^8 and the fix landed in 10.3.0. rustrade never verifies a JWT, so the
+#     precondition is not met here. Give it a real entry below if RustSec ever imports it.
+#
+# Dependabot also scans the DEFAULT branch (`main`), not `develop`, so its list lags `develop` by
+# the full release distance. Check the version in Cargo.lock on the branch you care about before
+# treating an alert as live.
 ignore = [
     # paste is a build-time proc-macro (no code shipped into the binary), archived upstream with
     # no vulnerability and no safe upgrade. Transitive via parquet 59.1.0 (latest) -> rustrade-data
     # `lse-parquet`. Revisit if arrow-rs migrates to `pastey`.
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; build-time proc-macro, transitive via parquet; no upgrade available" },
 
-    # rand unsoundness requires the `log` feature + a custom logger that itself draws from
-    # `rand::rng()` + a reseed. The `log` feature is not enabled anywhere in this workspace, so the
-    # precondition cannot be met. Still live against the committed lockfile, which carries rand
-    # 0.8.5 and 0.9.2 (patched: 0.8.6 / 0.9.3) transitively via tungstenite and proptest.
-    # quinn-proto is NOT a source: since the 0.11.16 bump it pulls rand 0.10.2, which is unaffected.
-    # Drop this entry only once `cargo audit` against `Cargo.lock` stops reporting it.
-    { id = "RUSTSEC-2026-0097", reason = "rand's log feature not enabled in this workspace (required for vulnerability)" },
-
     # rkyv is an *unenabled optional* dependency of rust_decimal (gated behind its `rkyv` feature,
     # which nothing here enables). It is in Cargo.lock only because the lockfile is feature-agnostic
     # and records every optional dep; `cargo tree -i rkyv --workspace --all-features --target all`
     # finds no path to it, and cargo deny's feature-aware graph does not flag it -- only cargo audit,
-    # which reads the lockfile directly. Same phantom-lockfile mechanism as RUSTSEC-2026-0097 above.
+    # which reads the lockfile directly: the lockfile records a dependency the build never compiles.
     # No upgrade exists: rust_decimal 1.42.1 pins rkyv ^0.7.46 and upstream declared 0.7 unsupported
     # (no backport, unlike RUSTSEC-2026-0001). Drop this entry once rust_decimal drops rkyv 0.7
     # (paupino/rust-decimal#819) or moves to rkyv >=0.8.17.
