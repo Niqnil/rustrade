@@ -576,6 +576,9 @@ struct AlpacaOrderResponse {
     trail_percent: Option<String>,
     trail_price: Option<String>,
     created_at: String,
+    /// When the order last changed state. Nullable in Alpaca's schema, so callers fall back to
+    /// `created_at` via [`order_state_time`].
+    updated_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1700,7 +1703,7 @@ impl AlpacaClient {
         match result {
             Ok(resp) => {
                 let exchange_order_id = OrderId(SmolStr::new(&resp.id));
-                let time_exchange = parse_timestamp(&resp.created_at).unwrap_or_else(Utc::now);
+                let time_exchange = order_state_time(&resp);
                 let filled_qty = Decimal::from_str(&resp.filled_qty).unwrap_or(Decimal::ZERO);
 
                 let state = if filled_qty >= request.quantity {
@@ -1905,7 +1908,7 @@ impl AlpacaClient {
         match result {
             Ok(resp) => {
                 let exchange_order_id = OrderId(SmolStr::new(&resp.id));
-                let time_exchange = parse_timestamp(&resp.created_at).unwrap_or_else(Utc::now);
+                let time_exchange = order_state_time(&resp);
                 let filled_qty = Decimal::from_str(&resp.filled_qty).unwrap_or(Decimal::ZERO);
 
                 let state = if filled_qty >= quantity {
@@ -2994,7 +2997,7 @@ fn convert_open_order(
         o.trail_price.as_deref(),
     )?;
     let time_in_force = parse_time_in_force(&o.time_in_force);
-    let time_exchange = parse_timestamp(&o.created_at).unwrap_or_else(Utc::now);
+    let time_exchange = order_state_time(o);
 
     Some(Order {
         key: OrderKey::new(
@@ -3373,6 +3376,24 @@ fn parse_time_in_force(s: &str) -> TimeInForce {
             TimeInForce::GoodUntilEndOfDay
         }
     }
+}
+
+/// When the exchange last reported this order's state.
+///
+/// [`Open::time_exchange`] orders an order's states, and the engine discards a snapshot older
+/// than the state it already tracks. `created_at` does not order them: it is the same value for
+/// every snapshot of one order, so a snapshot stamped with it is indistinguishable from the
+/// acknowledgement and is discarded the moment anything has advanced the tracked order past it.
+/// `updated_at` moves with each state change, which is what that comparison needs.
+///
+/// Falls back to `created_at` when the venue omits `updated_at`, and to now when neither parses.
+fn order_state_time(order: &AlpacaOrderResponse) -> DateTime<Utc> {
+    order
+        .updated_at
+        .as_deref()
+        .and_then(parse_timestamp)
+        .or_else(|| parse_timestamp(&order.created_at))
+        .unwrap_or_else(Utc::now)
 }
 
 fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
@@ -4481,6 +4502,7 @@ mod tests {
             trail_percent: None,
             trail_price: None,
             created_at: "2025-04-18T14:30:00Z".to_string(),
+            updated_at: None,
         };
         assert!(convert_open_order(&order).is_none());
     }
@@ -4541,6 +4563,36 @@ mod tests {
         assert_eq!(balances[0].asset.name().as_str(), "btc");
     }
 
+    /// `updated_at` orders an order's states; `created_at` is constant across all of them.
+    #[test]
+    fn order_state_time_prefers_updated_at() {
+        let mut resp = make_order_response("ord-1", "SPY");
+        resp.created_at = "2025-04-18T14:30:00Z".to_string();
+        resp.updated_at = Some("2025-04-18T15:45:00Z".to_string());
+        assert_eq!(
+            order_state_time(&resp),
+            parse_timestamp("2025-04-18T15:45:00Z").unwrap(),
+            "updated_at must win over created_at"
+        );
+
+        // Alpaca's schema makes updated_at nullable, so creation time is the fallback.
+        resp.updated_at = None;
+        assert_eq!(
+            order_state_time(&resp),
+            parse_timestamp("2025-04-18T14:30:00Z").unwrap(),
+            "absent updated_at falls back to created_at"
+        );
+
+        // An unparseable updated_at must not silently become `now`, which would order this state
+        // ahead of every later one.
+        resp.updated_at = Some("not-a-timestamp".to_string());
+        assert_eq!(
+            order_state_time(&resp),
+            parse_timestamp("2025-04-18T14:30:00Z").unwrap(),
+            "unparseable updated_at falls back to created_at"
+        );
+    }
+
     fn make_order_response(id: &str, symbol: &str) -> AlpacaOrderResponse {
         AlpacaOrderResponse {
             id: id.to_string(),
@@ -4556,6 +4608,7 @@ mod tests {
             trail_percent: None,
             trail_price: None,
             created_at: "2025-04-18T14:30:00Z".to_string(),
+            updated_at: None,
         }
     }
 

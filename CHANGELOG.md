@@ -110,6 +110,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Binance Spot fill's order snapshot now reaches the consumer** (`rustrade-execution`). The
+  account stream deduplicates events before forwarding them, and an order snapshot's dedup key was
+  the order's exchange id alone. An order's acknowledgement and every fill against it carry that one
+  id, so the acknowledgement — which reports nothing filled — suppressed each fill snapshot behind
+  it and `Open::filled_quantity` never moved. The defect fixed below was therefore corrected in the
+  converter and undone one stage later, on Binance Spot only; Alpaca derives dedup keys from
+  executions alone and was unaffected.
+
+  The key now carries the order's cumulative filled quantity, so successive states of one order stay
+  distinct while a genuinely re-delivered frame still collapses. That suppression is load-bearing
+  rather than an optimisation: a replayed acknowledgement for an order that has since retired is a
+  partially-filled snapshot for an untracked order, which the engine inserts as a live resting order.
+
+  Every test covering the change below drives the converter directly, which is upstream of the gate
+  that discarded its output. The new tests drive a frame through convert-then-deduplicate — the seam
+  where this failed.
+
+- **A REST order snapshot is stamped with when the order last changed, not when it was created**
+  (`rustrade-execution`, Alpaca and Binance Spot). The engine orders an order's states by
+  `Open::time_exchange` and discards a snapshot older than the state it already tracks. Both clients
+  stamped a fetched order with its creation time, which is identical across every snapshot of that
+  order — so once a WebSocket fill had advanced the tracked order, a reconciliation fetch was thrown
+  away as stale, silently, for exactly the partially-filled orders it exists to repair. Reconciling
+  order state after a reconnect is a documented caller obligation on both clients, and it had stopped
+  discharging anything.
+
+  Both clients now prefer the venue's last-update field (Binance `updateTime`, Alpaca `updated_at`),
+  falling back to creation time only where the venue omits it. `Open::time_exchange` and
+  `Open::filled_quantity` now document what a producer must put in them.
+
 - **A WebSocket partial fill now advances `Open::filled_quantity`** (`rustrade-execution`,
   Alpaca and Binance Spot). Both clients mapped one venue frame to at most one `AccountEvent`, and
   `filled_quantity` is only ever carried into engine state by an order snapshot. The fill arms
