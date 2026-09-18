@@ -52,6 +52,18 @@ rustrade is a collection of Rust libraries for live-trading, paper-trading, and 
 | **Alpaca** | ✅ Equities (IEX/SIP), Crypto, Options | ✅ Equities, Options, Crypto | WebSocket + REST |
 | **Hyperliquid** | ✅ Perps, Spot | ✅ Perps, Spot | WebSocket + REST |
 | **Interactive Brokers** | ✅ All asset classes | ✅ All asset classes | TWS/Gateway API |
+| **Bitfinex** | ✅ Spot | ❌ | WebSocket |
+| **BitMEX** | ✅ Perpetual | ❌ | WebSocket |
+| **Bybit** | ✅ Spot, Perpetual | ❌ | WebSocket |
+| **Coinbase** | ✅ Spot | ❌ | WebSocket |
+| **Gate.io** | ✅ Spot, Futures, Perpetual, Options | ❌ | WebSocket |
+| **Kraken** | ✅ Spot | ❌ | WebSocket |
+| **OKX** | ✅ Spot, Futures, Perpetual, Options | ❌ | WebSocket |
+
+An exchange with no execution client is market-data only. See
+[`rustrade-data`](rustrade-data/README.md) for the exact connector types and subscription
+kinds each one serves, and [`rustrade-execution`](rustrade-execution/README.md) for the order
+types each execution client accepts.
 
 ### Data Providers
 
@@ -59,6 +71,14 @@ rustrade is a collection of Rust libraries for live-trading, paper-trading, and 
 |----------|---------------|-------|
 | **Massive** | Stocks, Crypto, Forex, Options, Futures | Historical + live streaming |
 | **Databento** | Equities, Futures, Options | Nanosecond precision, DBN format |
+| **London Strategic Edge** | FX, Crypto, Equities/ETFs, Futures proxies, CFDs | Live ticks, historical candles, bulk export. ⚠️ Data is **not redistributable** |
+
+> **⚠️ London Strategic Edge data is NOT redistributable.** This integration's *code* is MIT
+> like the rest of the repository; the *data* it retrieves is not. LSE permits use for your own
+> research, trading and model training — including commercially — but prohibits redistributing,
+> reselling, or otherwise making the data available to third parties, in bulk or through any
+> competing feed, download service or interface. Do not commit retrieved data, publish it as
+> fixtures or example datasets, or re-serve it. Terms: <https://londonstrategicedge.com/terms>
 
 ## Quick Start
 
@@ -66,9 +86,9 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rustrade = "0.5"
-rustrade-data = { version = "0.5", features = ["hyperliquid"] }
-rustrade-execution = { version = "0.5", features = ["binance"] }
+rustrade = "0.6"
+rustrade-data = { version = "0.6", features = ["hyperliquid"] }
+rustrade-execution = { version = "0.6", features = ["binance"] }
 ```
 
 See the [examples](https://github.com/Niqnil/rustrade/tree/main/rustrade/examples) for complete working code.
