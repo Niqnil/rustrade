@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Binance Margin REST order snapshot is now stamped with when the order last changed, not when
+  it was created** (`rustrade-execution`, `binance` feature). The engine orders an order's states by
+  `Open::time_exchange` and discards any snapshot no newer than the state it already tracks. Margin
+  stamped every snapshot with the venue's creation time, which is identical across every snapshot of
+  one order, so margin had no usable ordering key: reconciliation snapshots compared equal and were
+  applied in whatever order they arrived, and any snapshot would be discarded outright as soon as
+  something advanced the order past creation — precisely the partially filled orders a reconciliation
+  fetch exists to repair. The converter now prefers the venue's `updateTime`, falling back to
+  creation time only where the venue omits it. Binance Spot has behaved this way since 0.6.0.
+
+- **Binance Spot and Margin now share one REST order-response converter** (`rustrade-execution`,
+  `binance` feature). The margin client carried a hand-maintained copy of the spot converter, and
+  the fix above is the second correction that reached spot and not margin. The `BinanceOrderFields`
+  trait, which names the eleven fields the conversion reads, now covers the margin open-orders
+  response alongside both spot responses, and the single converter is parameterised by `ExchangeId`.
+  Those eleven fields are identical in name and type across all three SDK types even though the
+  structs around them are not, so naming the read subset is what makes one converter safe to share.
+  No public API changes; diagnostics from this path now carry the venue as a structured `exchange`
+  field rather than a hard-coded message prefix.
+
 - **The London Strategic Edge vault canary no longer races the provider's concurrency cap**
   (`rustrade-data`, `lse` feature). The vault permits two concurrent requests and
   `LseVaultClient` never retries a `429` by design, so running the canary's four tests in
