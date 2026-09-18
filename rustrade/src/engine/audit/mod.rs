@@ -142,6 +142,7 @@ impl<Event, Output> EngineAudit<Event, Output> {
             event: event.into(),
             outputs: NoneOneOrMany::One(output.into()),
             errors: NoneOneOrMany::from_iter(unrecoverable),
+            shutdown: false,
         })
     }
 
@@ -165,6 +166,25 @@ pub struct ProcessAudit<Event, Output> {
     pub event: Event,
     pub outputs: NoneOneOrMany<Output>,
     pub errors: NoneOneOrMany<UnrecoverableEngineError>,
+
+    /// Set when the `Engine` decides to stop for a reason the `event` alone does not express.
+    ///
+    /// Carried on the audit rather than re-derived so a [`StateReplicaManager`] reaches the same
+    /// stop decision from the stream alone.
+    ///
+    /// No built-in `Engine` path sets this today. A [`Shutdown::AfterDrain`] once did — it ended
+    /// the run on an ordinary account update that resolved the last in-flight order — but that
+    /// stopped too early to be correct and the execution side now ends the run by ending the feed,
+    /// which is terminal in its own right. The field remains for custom [`Processor`] implementors
+    /// that need the same escape hatch, and for audit compatibility.
+    ///
+    /// `#[serde(default)]` so audits serialised before this field existed still load.
+    ///
+    /// [`Processor`]: crate::engine::Processor
+    /// [`Shutdown::AfterDrain`]: crate::shutdown::Shutdown::AfterDrain
+    /// [`StateReplicaManager`]: crate::engine::audit::state_replica::StateReplicaManager
+    #[serde(default)]
+    pub shutdown: bool,
 }
 
 impl<Event, Output> Terminal for ProcessAudit<Event, Output>
@@ -172,7 +192,7 @@ where
     Event: Terminal,
 {
     fn is_terminal(&self) -> bool {
-        self.event.is_terminal() || !self.errors.is_empty()
+        self.shutdown || self.event.is_terminal() || !self.errors.is_empty()
     }
 }
 
@@ -185,6 +205,7 @@ impl<Event, Output> ProcessAudit<Event, Output> {
             event: event.into(),
             outputs: NoneOneOrMany::None,
             errors: NoneOneOrMany::None,
+            shutdown: false,
         }
     }
 
@@ -197,6 +218,7 @@ impl<Event, Output> ProcessAudit<Event, Output> {
             event: event.into(),
             outputs: NoneOneOrMany::One(output.into()),
             errors: NoneOneOrMany::None,
+            shutdown: false,
         }
     }
 }
@@ -213,6 +235,7 @@ impl<Event, OnTradingDisabled, OnDisconnect>
                 event: event.into(),
                 outputs: NoneOneOrMany::One(EngineOutput::OnTradingDisabled(disabled)),
                 errors: NoneOneOrMany::None,
+                shutdown: false,
             }
         } else {
             Self::with_event(event)
@@ -229,6 +252,9 @@ impl<Event, OnTradingDisabled, OnDisconnect>
                 Self::with_output(event, EngineOutput::AccountDisconnect(disconnect))
             }
             UpdateFromAccountOutput::PositionExit(position) => Self::with_output(event, position),
+            UpdateFromAccountOutput::UntrackedExchange(untracked) => {
+                Self::with_output(event, EngineOutput::UntrackedExchange(untracked))
+            }
         }
     }
 
@@ -240,6 +266,9 @@ impl<Event, OnTradingDisabled, OnDisconnect>
             UpdateFromMarketOutput::None => Self::with_event(event),
             UpdateFromMarketOutput::OnDisconnect(disconnect) => {
                 Self::with_output(event, EngineOutput::MarketDisconnect(disconnect))
+            }
+            UpdateFromMarketOutput::UntrackedExchange(untracked) => {
+                Self::with_output(event, EngineOutput::UntrackedExchange(untracked))
             }
         }
     }
@@ -254,12 +283,14 @@ impl<Event, Output> ProcessAudit<Event, Output> {
             event,
             outputs,
             errors,
+            shutdown,
         } = self;
 
         Self {
             event,
             outputs: outputs.extend(NoneOneOrMany::One(output.into())),
             errors,
+            shutdown,
         }
     }
 
@@ -271,13 +302,23 @@ impl<Event, Output> ProcessAudit<Event, Output> {
             event,
             outputs,
             errors,
+            shutdown,
         } = self;
 
         Self {
             event,
             outputs,
             errors: errors.extend(errs),
+            shutdown,
         }
+    }
+
+    /// Mark this audit as ending the run, for a reason the event alone does not express.
+    ///
+    /// See [`ProcessAudit::shutdown`].
+    pub fn with_shutdown(mut self) -> Self {
+        self.shutdown = true;
+        self
     }
 }
 

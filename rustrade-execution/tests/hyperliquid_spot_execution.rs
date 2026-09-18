@@ -281,6 +281,7 @@ async fn test_spot_place_and_cancel_limit_order() {
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {
@@ -374,6 +375,7 @@ async fn test_spot_minimum_notional_validation() {
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {
@@ -502,6 +504,7 @@ async fn test_spot_account_stream_with_order() {
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {

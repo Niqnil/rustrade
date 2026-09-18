@@ -1,5 +1,34 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Example code: panics acceptable for demonstration
 
+//! Live market data driving a `MockExecution` system, with an audit stream.
+//!
+//! Every instrument here is priced and traded on the same venue. Two variations on that come up
+//! often enough to be worth knowing before adapting this example, and they are different things:
+//!
+//! # One instrument, priced somewhere other than where it trades
+//!
+//! The same shares, contract or pair, quoted by a data provider and executed at a broker. Give the
+//! `Instrument` a `DataVenue` — market data is then sourced from the data venue (under that venue's
+//! own symbol, if it spells it differently) while orders still route to the execution venue, and
+//! both roles stay on one instrument, so one position and one `pnl_unrealised`.
+//!
+//! # Two instruments, one priced and one traded
+//!
+//! A CFD or index proxy driving orders on the corresponding future, say. These are *different*
+//! economic instruments, with their own expiries, multipliers and basis, so they are registered as
+//! two ordinary `Instrument`s — not collapsed onto one with a `DataVenue`. The strategy reads the
+//! priced instrument's state and emits orders naming the traded one; nothing in `AlgoStrategy`
+//! couples the two. They keep separate ledgers: the position lives on the traded instrument, the
+//! priced instrument holds none, and the conversion between them (hedge ratio, quantity, basis) is
+//! yours to own.
+//!
+//! This is how an instrument kind no execution client accepts can still drive live trading: it
+//! prices the decision, and a different, executable instrument carries the order.
+//!
+//! Register execution clients only for the venues actually traded on. A venue that only supplies
+//! prices has no account to connect to, and `SystemBuilder` derives that from the execution clients
+//! registered here — so a data-only venue does not hold global connectivity at `Reconnecting`.
+
 use futures::StreamExt;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;

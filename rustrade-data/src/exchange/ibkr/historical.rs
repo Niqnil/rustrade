@@ -42,16 +42,18 @@
 //!     regular_trading_hours_only: true,
 //! };
 //!
-//! let trades = client.fetch_historical_ticks(request).await?;
+//! let fetched = client.fetch_historical_ticks(request).await?;
+//! let trades = fetched.ticks; // `fetched.truncation_error` flags a confirmed short read
 //! ```
 //!
 //! # Why Vec Instead of Stream
 //!
-//! The historical tick methods return `Vec<T>` rather than `Stream<Item = T>` because
-//! ibapi's underlying API is batch-oriented: you request up to 1000 ticks and IB sends
-//! them all in one response. Wrapping a fully-received batch in a Stream would add
-//! complexity without benefit. For large date ranges requiring multiple requests,
-//! consider implementing pagination at the caller level.
+//! The historical tick methods return a `Vec<T>` (wrapped in [`HistoricalTicks`])
+//! rather than `Stream<Item = T>` because ibapi's underlying API is batch-oriented:
+//! you request up to 1000 ticks and IB sends them all in one response. Wrapping a
+//! fully-received batch in a Stream would add complexity without benefit. For large
+//! date ranges requiring multiple requests, consider implementing pagination at the
+//! caller level.
 //!
 //! [`IbkrMarketStream`]: super::IbkrMarketStream
 
@@ -260,8 +262,9 @@ impl IbkrHistoricalData {
     ///
     /// # Returns
     ///
-    /// Vector of trades in chronological order. Invalid ticks (non-finite prices)
-    /// are filtered out with a warning.
+    /// A [`HistoricalTicks`] carrying the trades in chronological order plus a
+    /// `truncation_error` flag. Invalid ticks (non-finite prices) are filtered
+    /// out with a warning.
     ///
     /// # Errors
     ///
@@ -277,19 +280,19 @@ impl IbkrHistoricalData {
     ///   identical `(timestamp, price, size)` may collide across batches.
     ///   IB timestamps have only 1-second resolution and IB provides no
     ///   native unique identifier.
-    /// - A mid-stream IB API error ends iteration silently: ibapi 3.0.1's
-    ///   `TickSubscription` stores the error internally but exposes no public
-    ///   accessor, so a shorter-than-requested result may indicate truncation
-    ///   rather than genuine end-of-data. As a best-effort mitigation, this
-    ///   method emits a `warn!` when the number of raw ticks received is less
-    ///   than `request.number_of_ticks`. Because a short batch is also a normal
-    ///   end-of-data signal, treat the warning as a flag for investigation (or a
-    ///   prompt to paginate), **not** as proof of an error. Callers needing
-    ///   completeness guarantees should still validate the returned count.
+    /// - A mid-stream IB API error is surfaced two ways: ibapi 3.1+ yields it as
+    ///   an `Err` on the tick iterator, so this method logs a `warn!`, ends
+    ///   iteration, and sets [`HistoricalTicks::truncation_error`] on the
+    ///   returned value (the ticks received before the error are still returned).
+    ///   Separately, this method also emits a `warn!` when the number of raw ticks
+    ///   received is less than `request.number_of_ticks`. Because a short batch is
+    ///   also a normal end-of-data signal, treat that warning as a flag for
+    ///   investigation (or a prompt to paginate), **not** as proof of an error;
+    ///   `truncation_error.is_some()` is the authoritative signal for a confirmed error.
     pub async fn fetch_historical_ticks(
         &self,
         request: HistoricalTickRequest,
-    ) -> Result<Vec<PublicTrade>, DataError> {
+    ) -> Result<HistoricalTicks<PublicTrade>, DataError> {
         if request.start.is_none() && request.end.is_none() {
             return Err(DataError::Socket(
                 "HistoricalTickRequest: at least one of `start` or `end` must be set".into(),
@@ -305,7 +308,7 @@ impl IbkrHistoricalData {
             "Fetching historical trade ticks"
         );
 
-        let trades = tokio::task::spawn_blocking(move || {
+        let fetched = tokio::task::spawn_blocking(move || {
             let trading_hours = if request.regular_trading_hours_only {
                 TradingHours::Regular
             } else {
@@ -328,28 +331,26 @@ impl IbkrHistoricalData {
                 .trade()
                 .map_err(|e| DataError::Socket(format!("historical_ticks_trade: {e}")))?;
 
-            let mut trades =
-                Vec::with_capacity(usize::try_from(request.number_of_ticks).unwrap_or(0));
-            // `TickSubscription` yields `T` directly and stops silently on a
-            // mid-stream error (no public error accessor in ibapi 3.0.1), so a
-            // short result may be truncation rather than end-of-data. We count
-            // every *raw* tick received (not `trades.len()`, which also drops
-            // non-finite ticks) so the completeness check below reflects wire
-            // truncation, not data-quality filtering.
-            let mut received = 0usize;
-            for (seq, tick) in subscription.into_iter().enumerate() {
-                received += 1;
-                if let Some(trade) = tick_last_to_public_trade(&tick, seq) {
-                    trades.push(trade);
-                }
-            }
-            warn_if_short_tick_fetch(
+            // ibapi 3.1+ wraps tick items in a `SubscriptionItem` envelope and
+            // surfaces mid-stream IB errors as `Err` on the iterator (3.0.1 dropped
+            // them silently). `iter_data()` filters non-fatal notices (ibapi logs
+            // them at `warn!`) and yields `Result<TickLast, Error>`; `collect_ticks`
+            // drains it, stops at the first `Err`, and records the reason.
+            let fetched = collect_ticks(
+                subscription.iter_data(),
                 request.contract.symbol.0.as_str(),
-                received,
                 request.number_of_ticks,
+                tick_last_to_public_trade,
+                |e| {
+                    warn!(
+                        symbol = %request.contract.symbol.0,
+                        error = %e,
+                        "Historical trade tick stream ended with an IB error; \
+                         results may be truncated"
+                    );
+                },
             );
-
-            Ok::<_, DataError>(trades)
+            Ok::<_, DataError>(fetched)
         })
         .await
         .map_err(|e| {
@@ -360,9 +361,14 @@ impl IbkrHistoricalData {
             }
         })??;
 
-        debug!(symbol = %symbol, count = trades.len(), "Received historical trade ticks");
+        debug!(
+            symbol = %symbol,
+            count = fetched.ticks.len(),
+            truncation_error = ?fetched.truncation_error,
+            "Received historical trade ticks"
+        );
 
-        Ok(trades)
+        Ok(fetched)
     }
 
     /// Fetch historical bid/ask ticks for the given request.
@@ -376,8 +382,9 @@ impl IbkrHistoricalData {
     ///
     /// # Returns
     ///
-    /// Vector of L1 quotes in chronological order. Invalid ticks (non-finite prices)
-    /// are filtered out with a warning.
+    /// A [`HistoricalTicks`] carrying the L1 quotes in chronological order plus a
+    /// `truncation_error` flag. Invalid ticks (non-finite prices) are filtered
+    /// out with a warning.
     ///
     /// # Errors
     ///
@@ -387,20 +394,20 @@ impl IbkrHistoricalData {
     ///
     /// - Maximum 1000 ticks per request (IB limit)
     /// - For larger ranges, paginate using last tick's timestamp as new `start`
-    /// - A mid-stream IB API error ends iteration silently: ibapi 3.0.1's
-    ///   `TickSubscription` stores the error internally but exposes no public
-    ///   accessor, so a shorter-than-requested result may indicate truncation
-    ///   rather than genuine end-of-data. As a best-effort mitigation, this
-    ///   method emits a `warn!` when the number of raw ticks received is less
-    ///   than `request.number_of_ticks`. Because a short batch is also a normal
-    ///   end-of-data signal, treat the warning as a flag for investigation (or a
-    ///   prompt to paginate), **not** as proof of an error. Callers needing
-    ///   completeness guarantees should still validate the returned count.
+    /// - A mid-stream IB API error is surfaced two ways: ibapi 3.1+ yields it as
+    ///   an `Err` on the tick iterator, so this method logs a `warn!`, ends
+    ///   iteration, and sets [`HistoricalTicks::truncation_error`] on the
+    ///   returned value (the ticks received before the error are still returned).
+    ///   Separately, this method also emits a `warn!` when the number of raw ticks
+    ///   received is less than `request.number_of_ticks`. Because a short batch is
+    ///   also a normal end-of-data signal, treat that warning as a flag for
+    ///   investigation (or a prompt to paginate), **not** as proof of an error;
+    ///   `truncation_error.is_some()` is the authoritative signal for a confirmed error.
     pub async fn fetch_historical_bid_ask(
         &self,
         request: HistoricalTickRequest,
         ignore_size: bool,
-    ) -> Result<Vec<OrderBookL1>, DataError> {
+    ) -> Result<HistoricalTicks<OrderBookL1>, DataError> {
         if request.start.is_none() && request.end.is_none() {
             return Err(DataError::Socket(
                 "HistoricalTickRequest: at least one of `start` or `end` must be set".into(),
@@ -417,7 +424,7 @@ impl IbkrHistoricalData {
             "Fetching historical bid/ask ticks"
         );
 
-        let quotes = tokio::task::spawn_blocking(move || {
+        let fetched = tokio::task::spawn_blocking(move || {
             let trading_hours = if request.regular_trading_hours_only {
                 TradingHours::Regular
             } else {
@@ -444,28 +451,27 @@ impl IbkrHistoricalData {
                 .bid_ask(ignore_size)
                 .map_err(|e| DataError::Socket(format!("historical_ticks_bid_ask: {e}")))?;
 
-            let mut quotes =
-                Vec::with_capacity(usize::try_from(request.number_of_ticks).unwrap_or(0));
-            // `TickSubscription` yields `T` directly and stops silently on a
-            // mid-stream error (no public error accessor in ibapi 3.0.1), so a
-            // short result may be truncation rather than end-of-data. We count
-            // every *raw* tick received (not `quotes.len()`, which also drops
-            // non-finite ticks) so the completeness check below reflects wire
-            // truncation, not data-quality filtering.
-            let mut received = 0usize;
-            for tick in subscription {
-                received += 1;
-                if let Some(l1) = tick_bid_ask_to_order_book_l1(&tick) {
-                    quotes.push(l1);
-                }
-            }
-            warn_if_short_tick_fetch(
+            // ibapi 3.1+ wraps tick items in a `SubscriptionItem` envelope and
+            // surfaces mid-stream IB errors as `Err` on the iterator (3.0.1 dropped
+            // them silently). `iter_data()` filters non-fatal notices (ibapi logs
+            // them at `warn!`) and yields `Result<TickBidAsk, Error>`; `collect_ticks`
+            // drains it, stops at the first `Err`, and records the reason. The
+            // bid/ask decode needs no sequence index, so `seq` is ignored.
+            let fetched = collect_ticks(
+                subscription.iter_data(),
                 request.contract.symbol.0.as_str(),
-                received,
                 request.number_of_ticks,
+                |tick, _seq| tick_bid_ask_to_order_book_l1(tick),
+                |e| {
+                    warn!(
+                        symbol = %request.contract.symbol.0,
+                        error = %e,
+                        "Historical bid/ask tick stream ended with an IB error; \
+                         results may be truncated"
+                    );
+                },
             );
-
-            Ok::<_, DataError>(quotes)
+            Ok::<_, DataError>(fetched)
         })
         .await
         .map_err(|e| {
@@ -476,13 +482,18 @@ impl IbkrHistoricalData {
             }
         })??;
 
-        debug!(symbol = %symbol, count = quotes.len(), "Received historical bid/ask ticks");
+        debug!(
+            symbol = %symbol,
+            count = fetched.ticks.len(),
+            truncation_error = ?fetched.truncation_error,
+            "Received historical bid/ask ticks"
+        );
 
-        Ok(quotes)
+        Ok(fetched)
     }
 
     // ========================================================================
-    // Option Greeks Calculators (Phase 5A)
+    // Option Greeks Calculators
     // ========================================================================
 
     /// Calculate theoretical option Greeks given volatility and underlying price.
@@ -491,7 +502,7 @@ impl IbkrHistoricalData {
     /// and IB computes the theoretical Greeks. This does NOT fetch market data.
     ///
     /// For real-time Greeks based on live market prices, use the streaming API
-    /// (Phase 5B) with `TickTypes::OptionComputation`.
+    /// with `TickTypes::OptionComputation`.
     ///
     /// # Arguments
     ///
@@ -646,9 +657,12 @@ impl IbkrHistoricalData {
     /// # Arguments
     ///
     /// * `symbol` - Underlying symbol (e.g., "AAPL")
-    /// * `exchange` - `fut_fop_exchange` filter. Pass `""` for all exchanges
-    ///   (recommended); a routing exchange like "SMART" filters the result to
-    ///   zero rows.
+    /// * `exchange` - TWS's `fut_fop_exchange` filter, which narrows the chain
+    ///   to a *futures* options exchange. Pass `None` for every underlying that
+    ///   is not a future: TWS then returns one entry per listing exchange.
+    ///   Naming a routing exchange — `Some("SMART")` included — filters the
+    ///   result to zero rows. Only pass `Some(..)` for a futures underlying,
+    ///   e.g. `Some("CME")`.
     /// * `security_type` - Type of underlying (typically `SecurityType::Stock`)
     /// * `contract_id` - IB contract ID of the underlying. Must be a valid
     ///   conId; IBKR's `reqSecDefOptParams` rejects `0` with
@@ -656,11 +670,24 @@ impl IbkrHistoricalData {
     ///
     /// # Returns
     ///
-    /// Vector of [`OptionChainEntry`] for each exchange/trading class combination.
+    /// An [`OptionChainResult`] carrying one [`OptionChainEntry`] per
+    /// exchange/trading-class combination plus a
+    /// [`truncation_error`](OptionChainResult::truncation_error) flag.
     ///
     /// # Errors
     ///
-    /// Returns `DataError::Socket` if IB rejects the request.
+    /// Returns `DataError::Socket` if IB rejects the request up front.
+    ///
+    /// # Notes
+    ///
+    /// A mid-stream IB error (pacing/permission error, decode failure,
+    /// disconnect) does **not** discard the entries already decoded: each entry
+    /// is built from one complete IB message, so every received entry is valid
+    /// in isolation. This method logs a `warn!`, ends enumeration, and sets
+    /// [`OptionChainResult::truncation_error`] on the returned value — the
+    /// same contract as [`fetch_historical_ticks`](Self::fetch_historical_ticks).
+    /// Check `truncation_error.is_none()` before treating the entry list as the
+    /// complete chain catalog.
     ///
     /// # Example
     ///
@@ -668,8 +695,13 @@ impl IbkrHistoricalData {
     /// let client = IbkrHistoricalData::connect("127.0.0.1:4002", 102)?;
     ///
     /// // 265598 is AAPL's underlying conId; resolve via contract details for other symbols.
-    /// // Empty exchange returns every exchange's option parameters.
-    /// let chains = client.fetch_option_chain("AAPL", "", SecurityType::Stock, 265598).await?;
+    /// // `None` returns every listing exchange's option parameters.
+    /// let chains = client
+    ///     .fetch_option_chain("AAPL", None, SecurityType::Stock, 265598)
+    ///     .await?;
+    /// if let Some(reason) = &chains.truncation_error {
+    ///     eprintln!("chain enumeration was cut short: {reason}");
+    /// }
     /// for chain in chains {
     ///     println!("Exchange: {}, Expirations: {:?}", chain.exchange, chain.expirations);
     /// }
@@ -677,36 +709,67 @@ impl IbkrHistoricalData {
     pub async fn fetch_option_chain(
         &self,
         symbol: &str,
-        exchange: &str,
+        exchange: Option<&str>,
         security_type: SecurityType,
         contract_id: i32,
-    ) -> Result<Vec<OptionChainEntry>, DataError> {
+    ) -> Result<OptionChainResult, DataError> {
         let client = self.client.clone();
         let symbol = symbol.to_string();
-        let exchange = exchange.to_string();
+        let exchange = exchange.map(str::to_string);
 
         debug!(
             symbol = %symbol,
-            exchange = %exchange,
+            exchange = ?exchange,
             "Fetching option chain"
         );
 
         let chains = tokio::task::spawn_blocking(move || {
-            let subscription = client
-                .option_chain(&symbol, &exchange, security_type, contract_id)
+            // ibapi 4.0: `option_chain` returns a builder and `exchange` is a
+            // setter rather than a positional argument. An unset exchange is
+            // now omitted from the wire entirely instead of being sent as an
+            // empty string; TWS treats the two identically.
+            let builder = client.option_chain(&symbol, security_type, contract_id);
+            let builder = match exchange.as_deref() {
+                Some(exchange) => builder.exchange(exchange),
+                None => builder,
+            };
+            let subscription = builder
+                .subscribe()
                 .map_err(|e| DataError::Socket(format!("option_chain: {e}")))?;
 
-            // ibapi 3.x: `iter_data()` yields `Result<OptionChain, Error>`, filtering
-            // subscription-level notices. Surface the first error to the caller.
-            let mut entries = Vec::with_capacity(16);
-            for chain in subscription.iter_data() {
-                let chain = chain.map_err(|e| DataError::Socket(format!("option_chain: {e}")))?;
-                entries.push(OptionChainEntry::from_ib(&chain));
-            }
+            // ibapi: `iter_data()` yields `Result<OptionChain, Error>`,
+            // filtering subscription-level notices, so an `Err` here is a
+            // genuine mid-stream failure. Option chains use the same
+            // Subscription/StreamDecoder machinery as historical ticks (N
+            // complete per-exchange messages + an end sentinel swallowed as
+            // `EndOfStream`), so mirror the tick methods: keep the entries
+            // already decoded — each is a complete, valid message — record the
+            // reason, and stop, instead of discarding them with a fail-fast Err.
+            let (entries, _received, truncation_error) = drain_until_error(
+                subscription.iter_data(),
+                16,
+                |chain, _seq| Some(OptionChainEntry::from_ib(chain)),
+                |e| {
+                    warn!(
+                        symbol = %symbol,
+                        error = %e,
+                        "Option chain enumeration ended with an IB error; \
+                         entries may be incomplete"
+                    );
+                },
+            );
 
-            debug!(symbol = %symbol, count = entries.len(), "Received option chain entries");
+            debug!(
+                symbol = %symbol,
+                count = entries.len(),
+                truncation_error = ?truncation_error,
+                "Received option chain entries"
+            );
 
-            Ok::<_, DataError>(entries)
+            Ok::<_, DataError>(OptionChainResult {
+                entries,
+                truncation_error,
+            })
         })
         .await
         .map_err(|e| {
@@ -840,12 +903,181 @@ impl HistoricalTickRequest {
     }
 }
 
+/// Outcome of a historical tick fetch.
+///
+/// Wraps the collected ticks together with whether the stream was cut short by a
+/// mid-stream IB error. A short `ticks` count on its own is ambiguous — it is
+/// also the normal end-of-data signal — so
+/// [`truncation_error`](Self::truncation_error) disambiguates the *confirmed*
+/// error case, letting callers react programmatically (retry, alert, paginate)
+/// instead of parsing logs.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoricalTicks<T> {
+    /// Ticks collected in chronological order, up to the point the stream ended.
+    ///
+    /// Invalid ticks (non-finite prices) are filtered out, so this may be shorter
+    /// than the number of raw ticks IB sent.
+    pub ticks: Vec<T>,
+
+    /// `Some(reason)` if a mid-stream IB error ended the stream early — `reason`
+    /// is the formatted `ibapi::Error` — meaning [`ticks`](Self::ticks) may be
+    /// incomplete. `None` on a clean end-of-data, which can still return fewer
+    /// ticks than requested when that much history simply isn't available.
+    ///
+    /// The reason is a formatted string rather than a typed error, matching this
+    /// module's existing `DataError::Socket(String)` convention: `ibapi::Error`
+    /// is `#[non_exhaustive]` and not meaningfully sub-classifiable for this use
+    /// case, so a typed wrapper would create false precision and a second point
+    /// that must be kept in sync with `ibapi`'s version. Do not match on the
+    /// string contents — treat it as human-facing detail and use `.is_some()`
+    /// for the programmatic "was it truncated?" check.
+    pub truncation_error: Option<String>,
+}
+
+/// Consumes the wrapper and iterates its [`ticks`](HistoricalTicks::ticks),
+/// discarding [`truncation_error`](HistoricalTicks::truncation_error). Lets
+/// callers that only need the data write `for tick in fetched { .. }`, matching
+/// the pre-`HistoricalTicks` `Vec<T>` ergonomics; inspect the flag before
+/// iterating when truncation matters.
+impl<T> IntoIterator for HistoricalTicks<T> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.ticks.into_iter()
+    }
+}
+
+/// Outcome of an option chain fetch.
+///
+/// Wraps the collected [`OptionChainEntry`]s together with whether enumeration
+/// was cut short by a mid-stream IB error. An empty `entries` on its own is
+/// ambiguous — a wrong `exchange` filter also legitimately returns zero rows —
+/// so [`truncation_error`](Self::truncation_error) disambiguates the
+/// *confirmed* error case, letting callers react programmatically (retry,
+/// alert) instead of parsing logs.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub struct OptionChainResult {
+    /// Entries received before enumeration ended, one per
+    /// (exchange, trading class) combination.
+    ///
+    /// Each entry is decoded from one complete IB message, so every entry
+    /// present is valid in isolation even when the enumeration was truncated.
+    pub entries: Vec<OptionChainEntry>,
+
+    /// `Some(reason)` if a mid-stream IB error ended enumeration early —
+    /// `reason` is the formatted `ibapi::Error` — meaning
+    /// [`entries`](Self::entries) may be incomplete. `None` on a clean
+    /// end-of-enumeration; an empty `entries` with `None` means the underlying
+    /// genuinely has no listed options for the requested `exchange` filter,
+    /// not an error.
+    ///
+    /// The reason is a formatted string rather than a typed error for the same
+    /// reasons as [`HistoricalTicks::truncation_error`]: do not match on the
+    /// string contents — treat it as human-facing detail and use `.is_some()`
+    /// as the programmatic "was this truncated?" check.
+    pub truncation_error: Option<String>,
+}
+
+/// Consumes the wrapper and iterates its [`entries`](OptionChainResult::entries),
+/// discarding [`truncation_error`](OptionChainResult::truncation_error). Lets
+/// callers that only need the data write `for chain in chains { .. }`, matching
+/// the pre-`OptionChainResult` `Vec<OptionChainEntry>` ergonomics; inspect the
+/// flag before iterating when truncation matters.
+impl IntoIterator for OptionChainResult {
+    type Item = OptionChainEntry;
+    type IntoIter = std::vec::IntoIter<OptionChainEntry>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
+/// Drain a subscription iterator, stopping at the first `Err` yielded by
+/// `iter`. Shared by `collect_ticks` and `fetch_option_chain` — both consume
+/// the same `Subscription`/`iter_data()` machinery, whose `Err` is a genuine
+/// mid-stream failure, not a warning-level notice (`iter_data()` already
+/// filters non-fatal notices).
+///
+/// `map(&raw, seq)` decodes/validates a raw item; `seq` is the zero-based
+/// index among *raw* items received so far (gaps from rejected items are not
+/// reflected in `seq`, matching the numbering `tick_last_to_public_trade` uses
+/// for ID generation). Returning `None` from `map` silently drops an invalid
+/// item — a data-quality filter that does **not** count as truncation.
+///
+/// `on_error(&err)` runs exactly once, when `iter` yields `Err`, so callers
+/// can log a stream-specific message before this function records the
+/// formatted reason and stops.
+///
+/// Returns `(items, received, truncation_error)`, where `received` counts
+/// *raw* items pulled from `iter` before `map`'s filtering — so it reflects
+/// wire truncation rather than data-quality drops.
+fn drain_until_error<Raw, Out>(
+    iter: impl Iterator<Item = Result<Raw, ibapi::Error>>,
+    capacity: usize,
+    mut map: impl FnMut(&Raw, usize) -> Option<Out>,
+    on_error: impl FnOnce(&ibapi::Error),
+) -> (Vec<Out>, usize, Option<String>) {
+    let mut items = Vec::with_capacity(capacity);
+    let mut received = 0usize;
+    let mut truncation_error = None;
+
+    for (seq, item) in iter.enumerate() {
+        let raw = match item {
+            Ok(raw) => raw,
+            Err(e) => {
+                on_error(&e);
+                truncation_error = Some(e.to_string());
+                break;
+            }
+        };
+        received += 1;
+        if let Some(out) = map(&raw, seq) {
+            items.push(out);
+        }
+    }
+
+    (items, received, truncation_error)
+}
+
+/// Drain a tick iterator into a `HistoricalTicks<Out>` via
+/// [`drain_until_error`], layering the tick-specific short-fetch heuristic on
+/// top: the generic warning (`warn_if_short_tick_fetch`) fires only on a clean
+/// end-of-data — never alongside a confirmed truncation — so call sites no
+/// longer need to guard against a double warning themselves.
+fn collect_ticks<Raw, Out>(
+    iter: impl Iterator<Item = Result<Raw, ibapi::Error>>,
+    symbol: &str,
+    requested: i32,
+    map: impl FnMut(&Raw, usize) -> Option<Out>,
+    on_error: impl FnOnce(&ibapi::Error),
+) -> HistoricalTicks<Out> {
+    // Pre-size to the requested count (IB caps this at 1000); a mid-stream error
+    // or short end-of-data only ever leaves this over-allocated, never under.
+    let capacity = usize::try_from(requested).unwrap_or(0);
+    let (ticks, received, truncation_error) = drain_until_error(iter, capacity, map, on_error);
+
+    // Only run the ambiguous short-batch heuristic when the stream ended
+    // gracefully; a confirmed truncation is already recorded and logged above.
+    if truncation_error.is_none() {
+        warn_if_short_tick_fetch(symbol, received, requested);
+    }
+
+    HistoricalTicks {
+        ticks,
+        truncation_error,
+    }
+}
+
 /// Warn when a historical tick fetch returned fewer raw ticks than requested.
 ///
-/// ibapi 3.0.1's `TickSubscription` stops iterating silently on a mid-stream
-/// error — the error is stored in a private `Mutex` with no public accessor, so
-/// a short read is indistinguishable, through the public API, from a genuine
-/// end-of-data within the requested range.
+/// With ibapi 3.1+, an explicit mid-stream IB error is surfaced as an `Err` on
+/// the tick iterator and logged separately by the fetch loop. This warning
+/// therefore covers the *residual* ambiguous case: the stream ended gracefully
+/// (end-of-data) with fewer than `requested` ticks, which is indistinguishable
+/// through the public API from a genuine end-of-data within the requested range.
 ///
 /// This is therefore a **best-effort, flag-for-investigation** signal, **not** a
 /// precise error indicator: it fires on every legitimately short batch (e.g. the
@@ -863,10 +1095,9 @@ fn warn_if_short_tick_fetch(symbol: &str, received: usize, requested: i32) {
             symbol = %symbol,
             received,
             requested,
-            "Historical tick fetch returned fewer ticks than requested; this may be \
-             a legitimate end-of-data or a silent mid-stream IB error (ibapi 3.0.1 \
-             exposes no error accessor on TickSubscription). Investigate or paginate \
-             if completeness is required."
+            "Historical tick fetch returned fewer ticks than requested; this is \
+             usually a legitimate end-of-data boundary (any mid-stream IB error is \
+             logged separately). Investigate or paginate if completeness is required."
         );
     }
 }
@@ -885,7 +1116,18 @@ fn warn_if_short_tick_fetch(symbol: &str, received: usize, requested: i32) {
 ///
 /// # Returns
 ///
-/// Returns `None` if price is non-finite (invalid data from IB).
+/// Returns `None` if the price is non-finite, or if the tick carries no usable
+/// size (invalid data from IB — see the note on sizes below).
+///
+/// # Sizes are optional as of ibapi 4.0
+///
+/// `TickLast::size` is `Option<f64>`, not `i32`. `None` means TWS sent no value
+/// at all — the field was absent, empty, or one of TWS's "unset" sentinels —
+/// which is distinct from a real `Some(0.0)`. [`PublicTrade`] has no encoding
+/// for "size unknown", and substituting zero would reintroduce exactly the
+/// silent data loss the `Option<f64>` change fixed, so such a tick is dropped
+/// with a `warn!` rather than fabricated. Fractional sizes (crypto, fractional
+/// shares) now survive: the old `i32` decode truncated `0.5` to `0`.
 fn tick_last_to_public_trade(tick: &TickLast, seq: usize) -> Option<PublicTrade> {
     if !tick.price.is_finite() {
         warn!(
@@ -895,8 +1137,16 @@ fn tick_last_to_public_trade(tick: &TickLast, seq: usize) -> Option<PublicTrade>
         return None;
     }
 
+    let Some(size) = tick.size.filter(|size| size.is_finite()) else {
+        warn!(
+            size = ?tick.size,
+            "Historical tick has no usable size, skipping"
+        );
+        return None;
+    };
+
     let price = Decimal::try_from(tick.price).ok()?;
-    let amount = Decimal::from(tick.size);
+    let amount = Decimal::try_from(size).ok()?;
 
     Some(PublicTrade {
         id: generate_tick_id(tick.timestamp, tick.price, tick.size, seq),
@@ -930,16 +1180,22 @@ fn parse_tick_timestamp(timestamp: OffsetDateTime) -> Option<DateTime<Utc>> {
 /// uniqueness within a batch when multiple trades have identical
 /// (timestamp, price, size) — common since IB timestamps have only
 /// 1-second resolution.
+///
+/// `size` is hashed through [`f64::to_bits`], as `price` already was, because
+/// `f64` is not [`Hash`]. Hashing the `Option` rather than an unwrapped value
+/// keeps "TWS sent no size" distinct from a real zero. Note that this makes the
+/// generated id a function of the ibapi wire type: the same logical tick hashed
+/// as `i32` under ibapi 3.x and as `Option<f64>` here produces different ids.
 fn generate_tick_id(
     timestamp: OffsetDateTime,
     price: f64,
-    size: i32,
+    size: Option<f64>,
     seq: usize,
 ) -> smol_str::SmolStr {
     let mut hasher = fnv::FnvHasher::default();
     timestamp.unix_timestamp_nanos().hash(&mut hasher);
     price.to_bits().hash(&mut hasher);
-    size.hash(&mut hasher);
+    size.map(f64::to_bits).hash(&mut hasher);
     seq.hash(&mut hasher);
     format_smolstr!("{:016x}", hasher.finish())
 }
@@ -948,7 +1204,14 @@ fn generate_tick_id(
 ///
 /// # Returns
 ///
-/// Returns `None` if any price is non-finite (invalid data from IB).
+/// Returns `None` if any price is non-finite, or if either side carries no
+/// usable size (invalid data from IB).
+///
+/// As of ibapi 4.0 `size_bid`/`size_ask` are `Option<f64>`; see
+/// [`tick_last_to_public_trade`] for why an absent size drops the tick rather
+/// than decoding as zero. Both sides are required because [`Level`] has no
+/// encoding for a known price at an unknown size, and a substituted zero would
+/// misrepresent the book.
 fn tick_bid_ask_to_order_book_l1(tick: &TickBidAsk) -> Option<OrderBookL1> {
     if !tick.price_bid.is_finite() || !tick.price_ask.is_finite() {
         warn!(
@@ -959,10 +1222,22 @@ fn tick_bid_ask_to_order_book_l1(tick: &TickBidAsk) -> Option<OrderBookL1> {
         return None;
     }
 
+    let (Some(size_bid), Some(size_ask)) = (
+        tick.size_bid.filter(|size| size.is_finite()),
+        tick.size_ask.filter(|size| size.is_finite()),
+    ) else {
+        warn!(
+            size_bid = ?tick.size_bid,
+            size_ask = ?tick.size_ask,
+            "Historical tick has no usable size, skipping"
+        );
+        return None;
+    };
+
     let bid_price = Decimal::try_from(tick.price_bid).ok()?;
     let ask_price = Decimal::try_from(tick.price_ask).ok()?;
-    let bid_amount = Decimal::from(tick.size_bid);
-    let ask_amount = Decimal::from(tick.size_ask);
+    let bid_amount = Decimal::try_from(size_bid).ok()?;
+    let ask_amount = Decimal::try_from(size_ask).ok()?;
 
     Some(OrderBookL1 {
         last_update_time: parse_tick_timestamp(tick.timestamp)?,
@@ -988,6 +1263,7 @@ fn bar_size_to_step(bar_size: BarSize) -> IntervalStep {
         BarSize::Min => IntervalStep::Fixed(ChronoDuration::minutes(1)),
         BarSize::Min2 => IntervalStep::Fixed(ChronoDuration::minutes(2)),
         BarSize::Min3 => IntervalStep::Fixed(ChronoDuration::minutes(3)),
+        BarSize::Min4 => IntervalStep::Fixed(ChronoDuration::minutes(4)),
         BarSize::Min5 => IntervalStep::Fixed(ChronoDuration::minutes(5)),
         BarSize::Min10 => IntervalStep::Fixed(ChronoDuration::minutes(10)),
         BarSize::Min15 => IntervalStep::Fixed(ChronoDuration::minutes(15)),
@@ -1062,8 +1338,25 @@ fn bar_to_candle(
         Decimal::try_from(bar.low).map_err(|e| DataError::Socket(format!("parse low: {e}")))?;
     let close =
         Decimal::try_from(bar.close).map_err(|e| DataError::Socket(format!("parse close: {e}")))?;
-    let volume = Decimal::try_from(bar.volume)
-        .map_err(|e| DataError::Socket(format!("parse volume: {e}")))?;
+    // IB uses `-1` as the "not available" sentinel for both volume and trade
+    // count (e.g. on MIDPOINT/BID/ASK bars). Map the sentinel to `None` (unknown)
+    // rather than fabricating a zero — or, worse, a negative volume — that a
+    // consumer could not distinguish from a genuine value.
+    let volume = if bar.volume < 0.0 {
+        None
+    } else {
+        Some(
+            Decimal::try_from(bar.volume)
+                .map_err(|e| DataError::Socket(format!("parse volume: {e}")))?,
+        )
+    };
+    let trade_count = if bar.count < 0 {
+        None
+    } else {
+        // Non-negative by the guard above.
+        #[allow(clippy::cast_sign_loss)] // guarded: bar.count >= 0 in this branch
+        Some(bar.count as u64)
+    };
 
     Ok(Candle {
         close_time,
@@ -1072,14 +1365,13 @@ fn bar_to_candle(
         low,
         close,
         volume,
-        #[allow(clippy::cast_sign_loss)] // IB returns -1 when unavailable; .max(0) guarantees non-negative
-        trade_count: bar.count.max(0) as u64,
+        trade_count,
     })
 }
 
 #[cfg(test)]
-// Test code may unwrap freely since panics indicate test failure
-#[allow(clippy::unwrap_used)]
+// Test code may unwrap/expect freely since panics indicate test failure
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use chrono::{Datelike, Timelike};
@@ -1115,8 +1407,8 @@ mod tests {
         assert_eq!(candle.high, dec!(155));
         assert_eq!(candle.low, dec!(149));
         assert_eq!(candle.close, dec!(153.5));
-        assert_eq!(candle.volume, dec!(1_000_000));
-        assert_eq!(candle.trade_count, 50_000);
+        assert_eq!(candle.volume, Some(dec!(1_000_000)));
+        assert_eq!(candle.trade_count, Some(50_000));
 
         // close_time is the exclusive boundary: open + 1 hour.
         assert_eq!(
@@ -1127,14 +1419,36 @@ mod tests {
     }
 
     #[test]
-    fn bar_to_candle_handles_negative_count() {
+    fn bar_to_candle_maps_unavailable_sentinel_to_none() {
         let mut bar = bar_at(datetime!(2024-01-15 16:00 UTC).into());
-        bar.count = -1; // IB sometimes returns -1 for "not available"
+        bar.count = -1; // IB returns -1 for "not available"
+        bar.volume = -1.0; // same sentinel on volume-less bar types
 
         let candle = bar_to_candle(&bar, BarSize::Hour).unwrap();
 
-        // Negative count should clamp to 0
-        assert_eq!(candle.trade_count, 0);
+        // The -1 sentinel is "unknown", reported as `None` — never a fabricated
+        // zero (trade count) or a nonsensical negative (volume).
+        assert_eq!(candle.trade_count, None);
+        assert_eq!(candle.volume, None);
+    }
+
+    #[test]
+    fn bar_to_candle_four_minute_boundary() {
+        // `BarSize::Min4` arrived in ibapi 3.3.0. Pin its step here so the arm
+        // added to `bar_size_to_step` is the 4-minute one and not a copy-paste
+        // of a neighbouring arm — a wrong step silently mislabels every
+        // `close_time` for this resolution rather than failing loudly.
+        let open = datetime!(2024-01-15 16:00 UTC);
+        let bar = bar_at(open.into());
+
+        let candle = bar_to_candle(&bar, BarSize::Min4).unwrap();
+
+        assert_eq!(
+            candle.close_time,
+            DateTime::from_timestamp(open.unix_timestamp(), 0).unwrap()
+                + ChronoDuration::minutes(4)
+        );
+        assert_eq!(candle.close_time.minute(), 4);
     }
 
     #[test]
@@ -1220,7 +1534,7 @@ mod tests {
     // Historical Tick Conversion Tests
     // ========================================================================
 
-    fn make_tick_last(unix_time: i64, price: f64, size: i32) -> TickLast {
+    fn make_tick_last(unix_time: i64, price: f64, size: Option<f64>) -> TickLast {
         use ibapi::market_data::historical::TickAttributeLast;
 
         TickLast {
@@ -1240,9 +1554,9 @@ mod tests {
     fn make_tick_bid_ask(
         unix_time: i64,
         bid_price: f64,
-        bid_size: i32,
+        bid_size: Option<f64>,
         ask_price: f64,
-        ask_size: i32,
+        ask_size: Option<f64>,
     ) -> TickBidAsk {
         use ibapi::market_data::historical::TickAttributeBidAsk;
 
@@ -1264,7 +1578,7 @@ mod tests {
     fn tick_last_converts_to_public_trade() {
         use rust_decimal_macros::dec;
 
-        let tick = make_tick_last(1700000000, 150.25, 100);
+        let tick = make_tick_last(1700000000, 150.25, Some(100.0));
         let trade = tick_last_to_public_trade(&tick, 0).unwrap();
 
         assert_eq!(trade.price, dec!(150.25));
@@ -1275,18 +1589,97 @@ mod tests {
 
     #[test]
     fn tick_last_rejects_non_finite_price() {
-        let tick = make_tick_last(1700000000, f64::NAN, 100);
+        let tick = make_tick_last(1700000000, f64::NAN, Some(100.0));
         assert!(tick_last_to_public_trade(&tick, 0).is_none());
 
-        let tick = make_tick_last(1700000000, f64::INFINITY, 100);
+        let tick = make_tick_last(1700000000, f64::INFINITY, Some(100.0));
         assert!(tick_last_to_public_trade(&tick, 0).is_none());
+    }
+
+    /// The point of ibapi 4.0's `Option<f64>` size: the old `i32` decode
+    /// truncated a fractional wire size such as `0.5` to `0`, silently losing
+    /// real data on crypto and fractional-share feeds.
+    #[test]
+    fn tick_last_preserves_fractional_size() {
+        use rust_decimal_macros::dec;
+
+        let tick = make_tick_last(1700000000, 150.25, Some(0.5));
+        let trade = tick_last_to_public_trade(&tick, 0).expect("fractional size is valid");
+
+        assert_eq!(trade.amount, dec!(0.5));
+    }
+
+    /// `None` is TWS sending no size at all, which is distinct from a real
+    /// zero. `PublicTrade` cannot encode "size unknown", so the tick is dropped
+    /// rather than fabricated as zero.
+    #[test]
+    fn tick_last_without_size_is_dropped() {
+        assert!(tick_last_to_public_trade(&make_tick_last(1700000000, 150.25, None), 0).is_none());
+    }
+
+    /// A non-finite size is as unusable as a non-finite price.
+    #[test]
+    fn tick_last_with_non_finite_size_is_dropped() {
+        let nan = make_tick_last(1700000000, 150.25, Some(f64::NAN));
+        assert!(tick_last_to_public_trade(&nan, 0).is_none());
+
+        let inf = make_tick_last(1700000000, 150.25, Some(f64::INFINITY));
+        assert!(tick_last_to_public_trade(&inf, 0).is_none());
+    }
+
+    /// `Some(0.0)` is a genuine zero TWS reported, not an absent field, so it
+    /// must survive where `None` is dropped.
+    #[test]
+    fn tick_last_keeps_a_real_zero_size() {
+        use rust_decimal_macros::dec;
+
+        let tick = make_tick_last(1700000000, 150.25, Some(0.0));
+        let trade = tick_last_to_public_trade(&tick, 0).expect("a reported zero is real data");
+
+        assert_eq!(trade.amount, dec!(0));
+    }
+
+    /// The generated id hashes the `Option`, so "no size" and a real zero do
+    /// not collide.
+    #[test]
+    fn tick_id_distinguishes_absent_size_from_zero() {
+        let absent = make_tick_last(1700000000, 150.25, None);
+        let zero = make_tick_last(1700000000, 150.25, Some(0.0));
+
+        assert_ne!(
+            generate_tick_id(absent.timestamp, absent.price, absent.size, 0),
+            generate_tick_id(zero.timestamp, zero.price, zero.size, 0)
+        );
+    }
+
+    /// Either side missing a size makes the whole L1 snapshot unusable: `Level`
+    /// has no encoding for a known price at an unknown size.
+    #[test]
+    fn tick_bid_ask_without_size_is_dropped() {
+        let no_bid = make_tick_bid_ask(1700000000, 150.00, None, 150.05, Some(300.0));
+        assert!(tick_bid_ask_to_order_book_l1(&no_bid).is_none());
+
+        let no_ask = make_tick_bid_ask(1700000000, 150.00, Some(500.0), 150.05, None);
+        assert!(tick_bid_ask_to_order_book_l1(&no_ask).is_none());
+    }
+
+    /// Fractional book sizes survive the same way trade sizes do.
+    #[test]
+    fn tick_bid_ask_preserves_fractional_sizes() {
+        use rust_decimal_macros::dec;
+
+        let tick = make_tick_bid_ask(1700000000, 150.00, Some(0.25), 150.05, Some(0.75));
+        let l1 = tick_bid_ask_to_order_book_l1(&tick).expect("fractional sizes are valid");
+
+        assert_eq!(l1.best_bid.expect("bid").amount, dec!(0.25));
+        assert_eq!(l1.best_ask.expect("ask").amount, dec!(0.75));
     }
 
     #[test]
     fn tick_last_generates_unique_ids() {
-        let tick1 = make_tick_last(1700000000, 150.25, 100);
-        let tick2 = make_tick_last(1700000001, 150.25, 100);
-        let tick3 = make_tick_last(1700000000, 150.26, 100);
+        let tick1 = make_tick_last(1700000000, 150.25, Some(100.0));
+        let tick2 = make_tick_last(1700000001, 150.25, Some(100.0));
+        let tick3 = make_tick_last(1700000000, 150.26, Some(100.0));
 
         let id1 = generate_tick_id(tick1.timestamp, tick1.price, tick1.size, 0);
         let id2 = generate_tick_id(tick2.timestamp, tick2.price, tick2.size, 0);
@@ -1299,8 +1692,8 @@ mod tests {
 
     #[test]
     fn tick_last_same_data_same_seq_same_id() {
-        let tick1 = make_tick_last(1700000000, 150.25, 100);
-        let tick2 = make_tick_last(1700000000, 150.25, 100);
+        let tick1 = make_tick_last(1700000000, 150.25, Some(100.0));
+        let tick2 = make_tick_last(1700000000, 150.25, Some(100.0));
 
         let id1 = generate_tick_id(tick1.timestamp, tick1.price, tick1.size, 0);
         let id2 = generate_tick_id(tick2.timestamp, tick2.price, tick2.size, 0);
@@ -1310,8 +1703,8 @@ mod tests {
 
     #[test]
     fn tick_last_same_data_different_seq_different_id() {
-        let tick1 = make_tick_last(1700000000, 150.25, 100);
-        let tick2 = make_tick_last(1700000000, 150.25, 100);
+        let tick1 = make_tick_last(1700000000, 150.25, Some(100.0));
+        let tick2 = make_tick_last(1700000000, 150.25, Some(100.0));
 
         let id1 = generate_tick_id(tick1.timestamp, tick1.price, tick1.size, 0);
         let id2 = generate_tick_id(tick2.timestamp, tick2.price, tick2.size, 1);
@@ -1323,7 +1716,7 @@ mod tests {
     fn tick_bid_ask_converts_to_order_book_l1() {
         use rust_decimal_macros::dec;
 
-        let tick = make_tick_bid_ask(1700000000, 150.00, 500, 150.05, 300);
+        let tick = make_tick_bid_ask(1700000000, 150.00, Some(500.0), 150.05, Some(300.0));
         let l1 = tick_bid_ask_to_order_book_l1(&tick).unwrap();
 
         let bid = l1.best_bid.unwrap();
@@ -1338,10 +1731,10 @@ mod tests {
 
     #[test]
     fn tick_bid_ask_rejects_non_finite_prices() {
-        let tick = make_tick_bid_ask(1700000000, f64::NAN, 500, 150.05, 300);
+        let tick = make_tick_bid_ask(1700000000, f64::NAN, Some(500.0), 150.05, Some(300.0));
         assert!(tick_bid_ask_to_order_book_l1(&tick).is_none());
 
-        let tick = make_tick_bid_ask(1700000000, 150.00, 500, f64::INFINITY, 300);
+        let tick = make_tick_bid_ask(1700000000, 150.00, Some(500.0), f64::INFINITY, Some(300.0));
         assert!(tick_bid_ask_to_order_book_l1(&tick).is_none());
     }
 
@@ -1391,5 +1784,173 @@ mod tests {
         // it clamps to 0, so any non-negative `received` is treated as complete.
         warn_if_short_tick_fetch("AAPL", 0, -1);
         warn_if_short_tick_fetch("AAPL", 5, i32::MIN);
+    }
+
+    // ========================================================================
+    // collect_ticks: mid-stream error / truncation handling
+    // ========================================================================
+    //
+    // These exercise the `Err`/truncation branch that the live integration
+    // tests cannot reach without a real IB Gateway. `ibapi::Error::Simple` is a
+    // trivially constructible variant, so a fake `vec![Ok, Err, Ok]` iterator
+    // drives the exact match/break/bookkeeping the fetch methods rely on.
+
+    #[test]
+    fn collect_ticks_stops_and_records_reason_on_mid_stream_error() {
+        // Two good ticks, then an IB error, then a tick that must never be
+        // reached because iteration stops at the first `Err`.
+        let items: Vec<Result<TickLast, ibapi::Error>> = vec![
+            Ok(make_tick_last(1_700_000_000, 100.0, Some(10.0))),
+            Ok(make_tick_last(1_700_000_001, 101.0, Some(10.0))),
+            Err(ibapi::Error::Simple("boom".into())),
+            Ok(make_tick_last(1_700_000_002, 999.0, Some(10.0))),
+        ];
+        let mut on_error_calls = 0;
+
+        let fetched = collect_ticks(
+            items.into_iter(),
+            "TEST",
+            10,
+            tick_last_to_public_trade,
+            |_e| on_error_calls += 1,
+        );
+
+        assert_eq!(
+            fetched.ticks.len(),
+            2,
+            "ticks after the error must be dropped"
+        );
+        assert_eq!(
+            fetched.truncation_error.as_deref(),
+            Some("error occurred: boom"),
+            "the formatted ibapi::Error must be recorded"
+        );
+        assert_eq!(on_error_calls, 1, "on_error fires exactly once");
+    }
+
+    #[test]
+    fn collect_ticks_clean_end_of_data_is_not_truncated() {
+        let items: Vec<Result<TickLast, ibapi::Error>> = vec![
+            Ok(make_tick_last(1_700_000_000, 100.0, Some(10.0))),
+            Ok(make_tick_last(1_700_000_001, 101.0, Some(10.0))),
+        ];
+
+        let fetched = collect_ticks(
+            items.into_iter(),
+            "TEST",
+            2,
+            tick_last_to_public_trade,
+            |_e| panic!("on_error must not fire when the stream never yields Err"),
+        );
+
+        assert_eq!(fetched.ticks.len(), 2);
+        assert_eq!(fetched.truncation_error, None);
+    }
+
+    #[test]
+    fn collect_ticks_filters_non_finite_without_flagging_truncation() {
+        // A NaN price is a data-quality drop, not a wire truncation: the tick is
+        // filtered by the map closure but `truncation_error` stays `None`.
+        let items: Vec<Result<TickLast, ibapi::Error>> = vec![
+            Ok(make_tick_last(1_700_000_000, f64::NAN, Some(10.0))),
+            Ok(make_tick_last(1_700_000_001, 100.0, Some(10.0))),
+        ];
+
+        let fetched = collect_ticks(
+            items.into_iter(),
+            "TEST",
+            2,
+            tick_last_to_public_trade,
+            |_e| panic!("no error in this stream"),
+        );
+
+        assert_eq!(
+            fetched.ticks.len(),
+            1,
+            "NaN tick dropped by the map closure"
+        );
+        assert_eq!(
+            fetched.truncation_error, None,
+            "filtering is not truncation"
+        );
+    }
+
+    // ========================================================================
+    // drain_until_error: shared drain loop (ticks + option chains)
+    // ========================================================================
+    //
+    // The `collect_ticks` tests above exercise the helper through the tick
+    // path; these drive it directly with `OptionChain` items — the
+    // `fetch_option_chain` usage, whose truncation branch the live
+    // integration tests cannot reach without a real IB Gateway.
+
+    fn make_option_chain(exchange: &str) -> ibapi::contracts::OptionChain {
+        ibapi::contracts::OptionChain {
+            underlying_contract_id: 265598,
+            trading_class: "AAPL".to_string(),
+            multiplier: "100".to_string(),
+            exchange: exchange.to_string(),
+            expirations: vec!["20300118".to_string()],
+            strikes: vec![100.0, 105.0],
+        }
+    }
+
+    #[test]
+    fn drain_until_error_keeps_entries_decoded_before_the_error() {
+        // Two good chains, then an IB error, then a chain that must never be
+        // reached because iteration stops at the first `Err`.
+        let items: Vec<Result<ibapi::contracts::OptionChain, ibapi::Error>> = vec![
+            Ok(make_option_chain("SMART")),
+            Ok(make_option_chain("CBOE")),
+            Err(ibapi::Error::Simple("pacing violation".into())),
+            Ok(make_option_chain("NASDAQOM")),
+        ];
+        let mut on_error_calls = 0;
+
+        let (entries, received, truncation_error) = drain_until_error(
+            items.into_iter(),
+            16,
+            |chain, _seq| Some(OptionChainEntry::from_ib(chain)),
+            |_e| on_error_calls += 1,
+        );
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| e.exchange.as_str())
+                .collect::<Vec<_>>(),
+            vec!["SMART", "CBOE"],
+            "entries decoded before the error are preserved; later ones dropped"
+        );
+        assert_eq!(received, 2, "raw items received before the error");
+        // Substring, not exact match: the "error occurred: " prefix is
+        // ibapi's thiserror wording, and `truncation_error`'s own contract
+        // says not to match on the string contents.
+        assert!(
+            truncation_error
+                .as_deref()
+                .is_some_and(|reason| reason.contains("pacing violation")),
+            "the formatted ibapi::Error must be recorded, got {truncation_error:?}"
+        );
+        assert_eq!(on_error_calls, 1, "on_error fires exactly once");
+    }
+
+    #[test]
+    fn drain_until_error_clean_end_reports_no_truncation() {
+        let items: Vec<Result<ibapi::contracts::OptionChain, ibapi::Error>> = vec![
+            Ok(make_option_chain("SMART")),
+            Ok(make_option_chain("CBOE")),
+        ];
+
+        let (entries, received, truncation_error) = drain_until_error(
+            items.into_iter(),
+            16,
+            |chain, _seq| Some(OptionChainEntry::from_ib(chain)),
+            |_e| panic!("on_error must not fire when the stream never yields Err"),
+        );
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(received, 2);
+        assert_eq!(truncation_error, None);
     }
 }

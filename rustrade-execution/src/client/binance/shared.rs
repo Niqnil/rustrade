@@ -1,29 +1,32 @@
 //! Shared Binance execution infrastructure.
 //!
 //! Exchange-agnostic building blocks used by both the spot and margin clients:
-//! reconnect/backoff, rate-limit tracking, event deduplication, the
-//! connection-manager stream guard, Binance error parsing/classification, and the
-//! Binance-string → rustrade-enum parsers (side/order-kind/TIF).
+//! reconnect/backoff, rate-limit tracking, the connection-manager stream guard, Binance error
+//! parsing/classification, and the Binance-string → rustrade-enum parsers (side/order-kind/TIF).
 //!
-//! Nothing here is spot- or margin-specific: the dedup cache and parsers operate on
-//! rustrade's own types (`UnindexedAccountEvent`, `OrderKind`, `TimeInForce`, `Side`)
-//! or on Binance's stable wire strings, so both clients reuse them unchanged. The
-//! SDK-typed converters (which differ between spot's WS-API enums and margin's REST
-//! params) deliberately stay in their respective modules.
+//! Nothing here is spot- or margin-specific: the parsers operate on rustrade's own types
+//! (`OrderKind`, `TimeInForce`, `Side`) or on Binance's stable wire strings, so both clients
+//! reuse them unchanged. The SDK-typed converters (which differ between spot's WS-API enums and
+//! margin's REST params) deliberately stay in their respective modules.
+//!
+//! Event deduplication lives in [`crate::client::dedup`], shared with the other clients that
+//! need it, and is re-exported here so Binance call sites keep a single import site.
 
 use crate::{
-    AccountEventKind, UnindexedAccountEvent,
     error::{ApiError, ConnectivityError, OrderError, UnindexedClientError},
-    order::{OrderKind, TimeInForce, TrailingOffsetType, state::OrderState},
+    order::{OrderKind, TimeInForce, TrailingOffsetType},
+};
+
+// Deduplication moved to `client::dedup` when Hyperliquid needed the same machinery; re-exported
+// here so the spot and margin call sites keep naming one module.
+pub(crate) use crate::client::dedup::{
+    SharedDedupCache, dedup_key_from_event, is_duplicate, new_dedup_cache,
 };
 use binance_sdk::common::errors::{ConnectorError, WebsocketError};
-use lru::LruCache;
 use rustrade_instrument::{
     Side, asset::name::AssetNameExchange, instrument::name::InstrumentNameExchange,
 };
-use smol_str::SmolStr;
 use std::{
-    num::NonZeroUsize,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -108,15 +111,6 @@ const _: () = assert!(
 /// jitter between the actual WS close and when the monitor task records Utc::now().
 /// The dedup cache absorbs any resulting duplicate fills.
 pub(crate) const SIGNAL_RECOVERY_LOOKBACK_MS: i64 = 500;
-/// Size of the LRU dedup cache. 10k entries covers ~hours of high-frequency
-/// trading at typical fill rates; each entry is ~84-88 bytes (DedupKey =
-/// SmolStr[24] + SmolStr[24] + DedupEventKind[1] + padding[7] = 56 bytes, plus
-/// LruCache node overhead: 2 linked-list pointers[16] + hashbrown slot[~12-16]
-/// ≈ 28-32 bytes). At 10k: ~840-880 KB.
-/// At very high fill rates (>333 distinct fills/sec sustained during the 30s
-/// recovery window), LRU eviction could allow a fill to pass dedup twice.
-/// Increase this constant if such volumes are expected.
-pub(crate) const DEDUP_CACHE_SIZE: usize = 10_000;
 /// Maximum trades per Binance REST query.
 /// Stored as `usize` for direct use in `Vec::len()` comparisons; cast to `i32` at SDK call sites
 /// (`MyTradesParams::limit(i32)`).
@@ -131,115 +125,6 @@ const _: () = assert!(
 pub(crate) const DEFAULT_RATE_LIMIT_DELAY_SECS: u64 = 10;
 /// Maximum number of REST retry attempts on rate-limit errors.
 pub(crate) const MAX_RATE_LIMIT_RETRIES: u32 = 3;
-
-// ---------------------------------------------------------------------------
-// Dedup cache
-// ---------------------------------------------------------------------------
-
-/// Event kind discriminant for dedup keys. Using an enum instead of a SmolStr
-/// constant avoids constructing a string value on every event in the hot path.
-#[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
-pub(crate) enum DedupEventKind {
-    Trade,
-    New,
-    Cancelled,
-}
-
-/// Dedup cache key: (instrument, event ID, event kind).
-///
-/// Using separate `SmolStr` fields avoids the `format!("{}:{}", ...)` construction
-/// and the heap allocation when a combined string would exceed SmolStr's 23-byte
-/// inline limit. Both fields are already `SmolStr` values — no allocation needed.
-///
-/// - For TRADE events: instrument + trade_id + `DedupEventKind::Trade`
-/// - For NEW events: instrument + order_id + `DedupEventKind::New`
-/// - For CANCELED/EXPIRED: instrument + order_id + `DedupEventKind::Cancelled`
-#[derive(Debug, Hash, Eq, PartialEq)]
-pub(crate) struct DedupKey {
-    pub(crate) instrument: SmolStr,
-    pub(crate) id: SmolStr,
-    pub(crate) kind: DedupEventKind,
-}
-pub(crate) type SharedDedupCache = Arc<parking_lot::Mutex<LruCache<DedupKey, ()>>>;
-
-pub(crate) fn new_dedup_cache() -> SharedDedupCache {
-    // allow(clippy::unwrap_used) — NonZeroUsize::new on a literal constant
-    // cannot fail at runtime.
-    #[allow(clippy::unwrap_used)]
-    Arc::new(parking_lot::Mutex::new(LruCache::new(
-        NonZeroUsize::new(DEDUP_CACHE_SIZE).unwrap(),
-    )))
-}
-
-/// Extract a dedup key from an account event, if applicable.
-/// Returns None for events that don't need deduplication (e.g. balance snapshots).
-pub(crate) fn dedup_key_from_event(event: &UnindexedAccountEvent) -> Option<DedupKey> {
-    // Binance trade IDs and order IDs are per-symbol, NOT globally unique.
-    // The instrument field prevents cross-symbol collisions during multi-symbol
-    // recover_fills (buffer_unordered), where BTCUSDT trade 9001 and ETHUSDT trade
-    // 9001 are distinct fills with otherwise identical IDs.
-    match &event.kind {
-        AccountEventKind::Trade(trade) => Some(DedupKey {
-            instrument: trade.instrument.name().clone(),
-            id: trade.id.0.clone(),
-            kind: DedupEventKind::Trade,
-        }),
-        AccountEventKind::OrderSnapshot(snap) => {
-            // OrderSnapshot wraps Order<..., OrderState<...>>
-            // For NEW events the state is Active(Open { id, .. })
-            match &snap.0.state {
-                OrderState::Active(active) => {
-                    // ActiveOrderState variants: OpenInFlight, Open, CancelInFlight
-                    // We only get OrderSnapshot for NEW events (Open state)
-                    use crate::order::state::ActiveOrderState;
-                    match active {
-                        ActiveOrderState::Open(open) => Some(DedupKey {
-                            instrument: snap.0.key.instrument.name().clone(),
-                            id: open.id.0.clone(),
-                            kind: DedupEventKind::New,
-                        }),
-                        _ => None,
-                    }
-                }
-                _ => None,
-            }
-        }
-        AccountEventKind::OrderCancelled(resp) => match &resp.state {
-            Ok(cancelled) => Some(DedupKey {
-                instrument: resp.key.instrument.name().clone(),
-                id: cancelled.id.0.clone(),
-                kind: DedupEventKind::Cancelled,
-            }),
-            Err(_) => None, // error responses don't need dedup
-        },
-        _ => None, // BalanceSnapshot, BalanceStreamUpdate, InstrumentBalanceUpdate, Snapshot, StreamTerminated — no dedup needed
-    }
-}
-
-/// Check and insert a dedup key. Returns true if the event is a duplicate.
-/// Takes `key` by value to avoid cloning on the non-duplicate (common) path.
-pub(crate) fn is_duplicate(cache: &SharedDedupCache, key: DedupKey) -> bool {
-    // parking_lot::Mutex — never poisons (if a prior callback panicked,
-    // the mutex auto-unlocks cleanly). Blocking in async context is acceptable here:
-    // the lock is held for two hash ops on a bounded LRU cache (~microseconds), and
-    // contention is minimal: the WS callback task and recover_fills may run concurrently
-    // on separate Tokio worker threads; lock hold time is bounded to two hash operations
-    // (~microseconds), so thread stalls are negligible. Worst-case contention:
-    // recover_fills runs buffer_unordered(8) concurrently — under peak recovery load,
-    // the WS callback may block for the duration of a concurrent put, but recover_fills
-    // is bounded by FILL_RECOVERY_TIMEOUT_SECS and occurs only after reconnect.
-    // Note: with `worker_threads = 1`, the 8 concurrent `recover_fills` tasks all block
-    // on this mutex sequentially; upgrade to `tokio::sync::Mutex` if a single-worker
-    // runtime is required.
-    let mut guard = cache.lock();
-    // peek avoids promoting the duplicate to MRU position (we're about to
-    // discard it anyway), saving a linked-list move on the early-exit path.
-    if guard.peek(&key).is_some() {
-        return true;
-    }
-    guard.put(key, ());
-    false
-}
 
 // ---------------------------------------------------------------------------
 // Rate limit tracker
@@ -446,7 +331,6 @@ pub(crate) fn parse_order_kind(t: &str) -> Option<OrderKind> {
         // Mapping to Limit is imprecise (treats them as resting limit orders)
         // but preserves visibility into open orders. Dropping them (like the
         // pure stop variants above) would lose order tracking entirely.
-        // Acceptable for Phase 1: the crypto repo wrapper doesn't place stop orders.
         "LIMIT" | "LIMIT_MAKER" | "STOP_LOSS_LIMIT" | "TAKE_PROFIT_LIMIT" => Some(OrderKind::Limit),
         _ => {
             warn!(order_type = t, "unsupported Binance order type");
@@ -655,11 +539,11 @@ where
 /// Venue-neutral Binance order type — the single source of truth for mapping a rustrade
 /// [`OrderKind`] to Binance order semantics, shared by the spot and margin clients.
 ///
-/// Spot maps this to the WS-API `OrderPlaceTypeEnum`; margin maps it to the REST `r#type`
-/// **string** (the margin SDK types the field as a plain `String`, not an enum) via
-/// [`as_binance_str`](Self::as_binance_str). Keeping the decision logic here (in
-/// [`classify_order_kind_tif`]) avoids duplicating the match arms across the two clients,
-/// which differ only in their SDK output types.
+/// Each client maps this onto its own SDK's per-endpoint order-type enum (spot's WS-API
+/// `OrderPlaceTypeEnum`, margin's REST `MarginAccountNewOrderTypeEnum`), so neither ever builds
+/// the wire string by hand. Keeping the decision logic here (in [`classify_order_kind_tif`])
+/// avoids duplicating the match arms across the two clients, which differ only in their SDK
+/// output types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BinanceOrderType {
     Market,
@@ -669,21 +553,6 @@ pub(crate) enum BinanceOrderType {
     StopLossLimit,
     TakeProfit,
     TakeProfitLimit,
-}
-
-impl BinanceOrderType {
-    /// The Binance API order-type wire string (e.g. `"STOP_LOSS_LIMIT"`).
-    pub(crate) fn as_binance_str(self) -> &'static str {
-        match self {
-            BinanceOrderType::Market => "MARKET",
-            BinanceOrderType::Limit => "LIMIT",
-            BinanceOrderType::LimitMaker => "LIMIT_MAKER",
-            BinanceOrderType::StopLoss => "STOP_LOSS",
-            BinanceOrderType::StopLossLimit => "STOP_LOSS_LIMIT",
-            BinanceOrderType::TakeProfit => "TAKE_PROFIT",
-            BinanceOrderType::TakeProfitLimit => "TAKE_PROFIT_LIMIT",
-        }
-    }
 }
 
 /// Venue-neutral Binance time-in-force. Both spot and margin expose exactly `GTC`/`IOC`/`FOK`

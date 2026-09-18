@@ -53,7 +53,10 @@ fn okx_market(instrument: &MarketDataInstrument) -> OkxMarket {
     let MarketDataInstrument { base, quote, kind } = instrument;
 
     OkxMarket(match kind {
-        Spot => format_smolstr!("{base}-{quote}").to_uppercase_smolstr(),
+        // `Cfd` is unreachable -- Okx lists no CFDs, so `exchange_supports_instrument_kind` denies
+        // the subscription first. `Identifier` is infallible, so the arm exists only to keep this
+        // match total, and takes the identically shaped spot form.
+        Spot | Cfd => format_smolstr!("{base}-{quote}").to_uppercase_smolstr(),
         Future(contract) => format_smolstr!("{base}-{quote}-{}", format_expiry(contract.expiry))
             .to_uppercase_smolstr(),
         Perpetual => format_smolstr!("{base}-{quote}-SWAP").to_uppercase_smolstr(),

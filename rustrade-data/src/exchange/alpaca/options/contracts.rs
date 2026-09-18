@@ -2,13 +2,14 @@
 //!
 //! Implements `GET /v2/options/contracts` for querying available option contracts.
 
+use super::super::pagination::PaginationGuard;
 use super::{AlpacaOptionsClient, AlpacaOptionsError};
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use rustrade_instrument::instrument::kind::option::{OptionExercise, OptionKind};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Maximum contracts per page (Alpaca API limit).
 const MAX_PAGE_SIZE: usize = 10_000;
@@ -16,7 +17,8 @@ const MAX_PAGE_SIZE: usize = 10_000;
 /// Default page size for contract queries.
 const DEFAULT_PAGE_SIZE: usize = 1_000;
 
-/// Maximum pages to fetch before stopping (safety limit).
+/// Maximum pages a single fetch will follow before failing with a terminal
+/// `PaginationLimitExceeded` (a runaway backstop, not a business limit).
 const MAX_PAGES: usize = 100;
 
 /// Query parameters for option contract discovery.
@@ -160,8 +162,10 @@ impl AlpacaOptionContractQuery {
             ));
         }
         if let Some(style) = self.style {
-            // Alpaca only supports American and European styles; Bermudan is silently
-            // omitted from the request (the API would reject it).
+            // Alpaca only supports American and European styles. Bermudan has no API filter, so it
+            // is omitted here rather than silently returning an unfiltered result set the caller did
+            // not ask for. The omission is warned about once per logical query in `fetch_contracts`
+            // (this builder runs once per page, so warning here would repeat up to MAX_PAGES times).
             let style_str = match style {
                 OptionExercise::American => Some("american"),
                 OptionExercise::European => Some("european"),
@@ -263,7 +267,11 @@ struct ContractsResponse {
 impl AlpacaOptionsClient {
     /// Fetch option contracts matching the query.
     ///
-    /// Automatically paginates through all results up to the safety limit.
+    /// Automatically paginates through all results. Pagination is bounded: the fetch returns a
+    /// terminal [`AlpacaOptionsError::PaginationLimitExceeded`] if it exceeds 100 pages, and
+    /// [`AlpacaOptionsError::CyclicPagination`] if the server repeats a `page_token` — a
+    /// silently truncated result would be indistinguishable from a genuinely small one, so
+    /// incomplete pagination fails loudly instead.
     ///
     /// # Arguments
     ///
@@ -275,42 +283,46 @@ impl AlpacaOptionsClient {
     ///
     /// # Errors
     ///
-    /// Returns error on network failure, API error, or invalid response.
+    /// Returns error on network failure, API error, invalid response, or out-of-bounds
+    /// pagination (see above).
     pub async fn fetch_contracts(
         &self,
         query: &AlpacaOptionContractQuery,
     ) -> Result<Vec<AlpacaOptionContract>, AlpacaOptionsError> {
         let mut all_contracts = Vec::new();
         let mut page_token: Option<String> = None;
-        let mut pages = 0usize;
+        let mut guard = PaginationGuard::new(MAX_PAGES);
+
+        // Warn once per logical query (not once per page) if the caller requested a style Alpaca
+        // cannot filter on. `to_query_params` silently omits the `style` param in that case; this
+        // is where the caller learns their filter was dropped.
+        if query.style == Some(OptionExercise::Bermudan) {
+            warn!(
+                style = ?OptionExercise::Bermudan,
+                "AlpacaOptionContractQuery: exercise style is not supported by Alpaca; \
+                 omitting the `style` filter (results will not be style-restricted)"
+            );
+        }
 
         loop {
-            if pages >= MAX_PAGES {
-                debug!(
-                    pages,
-                    contracts = all_contracts.len(),
-                    "reached max pages limit"
-                );
-                break;
-            }
-            pages += 1;
+            guard.observe(page_token.as_deref())?;
 
             let mut params = query.to_query_params();
             if let Some(ref token) = page_token {
                 params.push(("page_token", token.clone()));
             }
 
-            let url = format!("{}/v2/options/contracts", self.broker_base);
-            let request = self.http.get(&url).query(&params);
+            let url = format!("{}/v2/options/contracts", self.rest.broker_base());
+            let request = self.rest.get(&url).query(&params);
 
-            let response: ContractsResponse = self.request_with_retry(request).await?;
+            let response: ContractsResponse = self.rest.request_with_retry(request).await?;
 
             let contracts = response.option_contracts.unwrap_or_default();
             let count = contracts.len();
             all_contracts.extend(contracts);
 
             debug!(
-                page = pages,
+                page = guard.pages(),
                 count,
                 total = all_contracts.len(),
                 "fetched contracts page"

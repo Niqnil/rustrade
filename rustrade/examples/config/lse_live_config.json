@@ -1,0 +1,81 @@
+{
+  "risk_free_return": 0.05,
+  "system": {
+    "executions": [
+      {
+        "mocked_exchange": "coinbase",
+        "latency_ms": 100,
+        "fee_model": { "Percentage": { "rate": "0.05" } },
+        "initial_state": {
+          "exchange": "coinbase",
+          "balances": [
+            {
+              "asset": "usd",
+              "balance": {
+                "total": 100000,
+                "free": 100000
+              },
+              "time_exchange": "2026-01-01T00:00:00Z"
+            },
+            {
+              "asset": "btc",
+              "balance": {
+                "total": 0,
+                "free": 0
+              },
+              "time_exchange": "2026-01-01T00:00:00Z"
+            },
+            {
+              "asset": "eth",
+              "balance": {
+                "total": 0,
+                "free": 0
+              },
+              "time_exchange": "2026-01-01T00:00:00Z"
+            }
+          ],
+          "instruments": [
+            {
+              "instrument": "BTC-USD",
+              "orders": []
+            },
+            {
+              "instrument": "ETH-USD",
+              "orders": []
+            }
+          ]
+        }
+      }
+    ],
+    "instruments": [
+      {
+        "exchange": "coinbase",
+        "name_exchange": "BTC-USD",
+        "underlying": {
+          "base": "btc",
+          "quote": "usd"
+        },
+        "quote": "underlying_quote",
+        "kind": "spot",
+        "data_venue": {
+          "exchange": "lse_crypto",
+          "name_exchange": "BTC/USD"
+        }
+      },
+      {
+        "exchange": "coinbase",
+        "name_exchange": "ETH-USD",
+        "underlying": {
+          "base": "eth",
+          "quote": "usd"
+        },
+        "quote": "underlying_quote",
+        "kind": "spot",
+        "data_venue": {
+          "exchange": "lse_crypto",
+          "name_exchange": "ETH/USD"
+        }
+      }
+    ]
+  }
+}

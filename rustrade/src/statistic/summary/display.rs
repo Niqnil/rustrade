@@ -12,8 +12,72 @@ where
     pub fn print_summary(&self) {
         println!();
         self.title_table().printstd();
+        if let Some(notice) = self.rejection_notice() {
+            println!("{notice}");
+        }
+        if let Some(notice) = self.split_position_notice() {
+            println!("{notice}");
+        }
         self.instrument_table().printstd();
         self.asset_table().printstd();
+    }
+
+    /// A banner describing rejected open requests, or `None` when there were none.
+    ///
+    /// Printed above the tables rather than below them: every figure in those tables is computed
+    /// over fills, so a session whose opens were all rejected renders a tear sheet of zeros that
+    /// is otherwise indistinguishable from a strategy that deliberately stayed flat.
+    pub fn rejection_notice(&self) -> Option<String> {
+        if self.orders_rejected == 0 {
+            return None;
+        }
+
+        let reason = self
+            .instruments
+            .values()
+            .find_map(|sheet| sheet.first_rejection_reason.as_deref())
+            .unwrap_or("reason not recorded");
+
+        Some(if self.rejected_every_order() {
+            format!(
+                "!! ALL {} open requests were REJECTED: this session filled nothing, and every \
+                 figure below was computed over zero trades. First reason: {reason}",
+                self.orders_rejected
+            )
+        } else {
+            format!(
+                "!! {} of {} open requests were rejected. First reason: {reason}",
+                self.orders_rejected, self.orders_opened
+            )
+        })
+    }
+
+    /// A banner describing fills booked against a position other than the one their order opened,
+    /// or `None` when there were none.
+    ///
+    /// Printed beside [`Self::rejection_notice`] and for the same reason: the tables below are
+    /// computed per position, so an order whose PnL was divided between two slots is reported as
+    /// two partial results that look like ordinary ones.
+    ///
+    /// Raised by [`TradingSummary::has_split_positions`] alone, so
+    /// [`TradingSummary::fills_unmatched`] never triggers it. A fill with no order behind it is
+    /// normal for an account traded from elsewhere, and a banner that fires during correct
+    /// operation is one people learn to scroll past — including on the occasions it means this.
+    pub fn split_position_notice(&self) -> Option<String> {
+        if !self.has_split_positions() {
+            return None;
+        }
+
+        let reason = self
+            .instruments
+            .values()
+            .find_map(|sheet| sheet.first_fallback_detail.as_deref())
+            .unwrap_or("reason not recorded");
+
+        Some(format!(
+            "!! {} fill(s) could not be routed to the position their order opened, so that PnL is              split across two position slots and the per-position figures below divide it. First              cause: {reason}",
+            self.fills_routed_by_fallback
+        ))
     }
     fn title_table(&self) -> Table {
         let mut title_table = Table::new();
@@ -108,6 +172,12 @@ where
         table.add_row(header_row);
 
         // Add metric rows
+        self.add_instrument_metric_row(&mut table, "Orders Opened", |ts| {
+            ts.orders_opened.to_string()
+        });
+        self.add_instrument_metric_row(&mut table, "Orders Rejected", |ts| {
+            ts.orders_rejected.to_string()
+        });
         self.add_instrument_metric_row(&mut table, "PnL", |ts| format!("{:.2}", ts.pnl));
         self.add_instrument_metric_row(&mut table, &format!("Return {interval}"), |ts| {
             format_percentage(ts.pnl_return.value, 2)
@@ -261,16 +331,20 @@ fn format_percentage(value: Decimal, precision: usize) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
-    use crate::statistic::{summary::asset::BalanceBasis, time::Annual365};
+    use crate::statistic::{
+        summary::{asset::BalanceBasis, instrument::TearSheetGenerator},
+        time::Annual365,
+    };
     use chrono::{DateTime, Utc};
     use rust_decimal_macros::dec;
     use rustrade_execution::balance::Balance;
     use rustrade_instrument::{
         asset::{ExchangeAsset, name::AssetNameInternal},
         exchange::ExchangeId,
+        instrument::name::InstrumentNameInternal,
     };
     use rustrade_integration::collection::FnvIndexMap;
 
@@ -292,6 +366,10 @@ mod tests {
             instruments: FnvIndexMap::default(),
             assets,
             basis,
+            orders_opened: 0,
+            orders_rejected: 0,
+            fills_routed_by_fallback: 0,
+            fills_unmatched: 0,
         }
     }
 
@@ -320,5 +398,85 @@ mod tests {
 
         assert!(rendered.contains("Balance (gross)"));
         assert!(rendered.contains("180.00000000")); // gross total
+    }
+
+    /// A summary carrying the given fallback tallies on both its single instrument and its session
+    /// totals, which is the shape [`TradingSummaryGenerator::generate`] produces.
+    fn summary_with_fallback(
+        fills_routed_by_fallback: usize,
+        fills_unmatched: usize,
+        detail: Option<&str>,
+    ) -> TradingSummary<Annual365> {
+        let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
+        generator.fills_routed_by_fallback = fills_routed_by_fallback;
+        generator.fills_unmatched = fills_unmatched;
+        generator.first_fallback_detail = detail.map(String::from);
+
+        let mut instruments = FnvIndexMap::default();
+        instruments.insert(
+            InstrumentNameInternal::new("btc_usdt"),
+            generator.generate(Decimal::ZERO, Annual365),
+        );
+
+        TradingSummary {
+            time_engine_start: DateTime::<Utc>::MIN_UTC,
+            time_engine_end: DateTime::<Utc>::MIN_UTC,
+            instruments,
+            assets: FnvIndexMap::default(),
+            basis: BalanceBasis::default(),
+            orders_opened: 0,
+            orders_rejected: 0,
+            fills_routed_by_fallback,
+            fills_unmatched,
+        }
+    }
+
+    #[test]
+    fn a_split_position_raises_a_banner_naming_its_first_cause() {
+        let summary = summary_with_fallback(2, 0, Some("no PositionId mapping for order oid-1"));
+
+        assert!(summary.has_split_positions());
+        let notice = summary
+            .split_position_notice()
+            .expect("a split session must announce itself above the tables");
+
+        assert!(
+            notice.contains('2'),
+            "the count belongs in the banner: {notice}"
+        );
+        assert!(
+            notice.contains("no PositionId mapping for order oid-1"),
+            "the first cause is what makes the banner actionable: {notice}"
+        );
+    }
+
+    #[test]
+    fn unmatched_fills_alone_raise_no_banner() {
+        // An account traded from elsewhere produces these during correct operation. A banner here
+        // would fire on a healthy session and train the reader to scroll past the one that matters.
+        let summary = summary_with_fallback(0, 12, Some("no order matched oid-external"));
+
+        assert!(!summary.has_split_positions());
+        assert_eq!(summary.split_position_notice(), None);
+    }
+
+    #[test]
+    fn a_clean_session_raises_no_banner() {
+        let summary = summary_with_fallback(0, 0, None);
+
+        assert!(!summary.has_split_positions());
+        assert_eq!(summary.split_position_notice(), None);
+    }
+
+    #[test]
+    fn a_split_banner_survives_a_missing_detail() {
+        // The counters and the detail are written together today, but the detail is an `Option` and
+        // a summary deserialised from an older run carries `None`. The banner must still appear.
+        let summary = summary_with_fallback(1, 0, None);
+
+        let notice = summary
+            .split_position_notice()
+            .expect("the count alone is enough to warrant the banner");
+        assert!(notice.contains("reason not recorded"), "{notice}");
     }
 }

@@ -31,10 +31,28 @@ impl InstrumentNameInternal {
     /// base and quote [`AssetNameExchange`]s.
     ///
     /// Generates an internal instrument identifier unique across exchanges.
+    ///
+    /// The exchange segment is [`ExchangeId::as_str`] — the same canonical `snake_case`
+    /// spelling [`Self::new_from_exchange`] uses — so both constructors resolve the same
+    /// instrument to the same name. See that method for why the two must agree.
+    ///
+    /// # No in-tree caller
+    /// Every constructor in this workspace now builds names from an `InstrumentNameExchange`, so
+    /// this is public API for downstream users whose instrument source gives them a base/quote
+    /// pair and no exchange symbol — not a path this library exercises. It is kept rather than
+    /// deleted because the must-agree invariant above is only meaningful while both spellings
+    /// exist, and a downstream caller reaching for it would otherwise hand-roll the format string
+    /// and reintroduce exactly the divergence that invariant exists to prevent. The agreement is
+    /// pinned by `test_both_constructors_agree_on_the_same_instrument` rather than by a caller.
     pub fn new_from_exchange_underlying<Ass>(exchange: ExchangeId, base: &Ass, quote: &Ass) -> Self
     where
         for<'a> &'a Ass: Into<&'a AssetNameExchange>,
     {
+        // Named explicitly rather than interpolating the `ExchangeId`. The two now agree --
+        // `ExchangeId`'s `Display` delegates to `as_str` -- but this is an identity key, and it
+        // costs nothing to depend on the one spelling that is defined to be canonical rather than
+        // on a `Display` impl remaining a delegation.
+        let exchange = exchange.as_str();
         Self::new(format_smolstr!(
             "{exchange}-{}_{}",
             base.into(),
@@ -46,6 +64,14 @@ impl InstrumentNameInternal {
     /// [`InstrumentNameExchange`].
     ///
     /// Generates an internal instrument identifier unique across exchanges.
+    ///
+    /// # Why the two constructors must agree
+    /// `InstrumentNameInternal` is an identity key, not a label: it keys the engine's instrument
+    /// state map and is the lookup argument of both `InstrumentStates::instrument` (which
+    /// **panics** when absent) and `IndexedInstruments::find_instrument_index`. Two spellings of
+    /// the same instrument are therefore two *different* instruments — one declared through a
+    /// JSON config and one built in-library would miss each other across that boundary. Both
+    /// constructors consequently spell the exchange segment with [`ExchangeId::as_str`].
     pub fn new_from_exchange<S>(exchange: ExchangeId, name_exchange: S) -> Self
     where
         S: Into<InstrumentNameExchange>,
@@ -162,5 +188,64 @@ impl<'de> serde::de::Deserialize<'de> for InstrumentNameExchange {
     {
         let name = std::borrow::Cow::<'de, str>::deserialize(deserializer)?;
         Ok(InstrumentNameExchange::new(name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every [`ExchangeId`] whose canonical `as_str` is multi-word, ie/ the variants where the
+    /// `Display` impl (which renders the bare variant name) and `as_str` diverge. Single-word
+    /// variants like `Kraken` cannot distinguish the two spellings, so they prove nothing here.
+    const MULTI_WORD_EXCHANGES: [ExchangeId; 4] = [
+        ExchangeId::BinanceSpot,
+        ExchangeId::BinanceFuturesUsd,
+        ExchangeId::AlpacaIex,
+        ExchangeId::HyperliquidPerp,
+    ];
+
+    #[test]
+    fn test_new_from_exchange_underlying_uses_canonical_exchange_str() {
+        // `ExchangeId` derives `derive_more::Display` with no format attribute, so interpolating
+        // it renders the *variant* name -- `BinanceSpot` -> lowercased "binancespot". The
+        // canonical spelling is `as_str`'s "binance_spot".
+        let actual = InstrumentNameInternal::new_from_exchange_underlying(
+            ExchangeId::BinanceSpot,
+            &AssetNameExchange::new("BTC"),
+            &AssetNameExchange::new("USDT"),
+        );
+
+        assert_eq!(actual, InstrumentNameInternal::new("binance_spot-btc_usdt"));
+    }
+
+    #[test]
+    fn test_both_constructors_agree_on_the_same_instrument() {
+        // Two public constructors for the same identity key. `new_from_exchange` is what the
+        // library builds names with today; `new_from_exchange_underlying` is offered to callers who
+        // hold the underlying pair rather than an assembled name, and has no in-tree caller. That
+        // is precisely why it needs pinning: `InstrumentNameInternal` is an identity key, so a
+        // downstream user reaching for the unused constructor while the library uses the other
+        // would silently split one instrument into two that never resolve to each other.
+        for exchange in MULTI_WORD_EXCHANGES {
+            let from_underlying = InstrumentNameInternal::new_from_exchange_underlying(
+                exchange,
+                &AssetNameExchange::new("btc"),
+                &AssetNameExchange::new("usdt"),
+            );
+            let from_name_exchange =
+                InstrumentNameInternal::new_from_exchange(exchange, "btc_usdt");
+
+            assert_eq!(
+                from_underlying, from_name_exchange,
+                "constructors disagree for {exchange:?}"
+            );
+            assert!(
+                from_underlying
+                    .name()
+                    .starts_with(&format!("{}-", exchange.as_str())),
+                "{exchange:?} name is not prefixed by its canonical as_str"
+            );
+        }
     }
 }

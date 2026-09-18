@@ -202,7 +202,7 @@ async fn test_historical_daily_bars() {
 
     for candle in candles.iter().take(5) {
         println!(
-            "  {} O:{:.2} H:{:.2} L:{:.2} C:{:.2} V:{:.0} T:{}",
+            "  {} O:{:.2} H:{:.2} L:{:.2} C:{:.2} V:{:?} T:{:?}",
             candle.close_time.format("%Y-%m-%d"),
             candle.open,
             candle.high,
@@ -246,8 +246,8 @@ async fn test_historical_daily_bars() {
         first.close
     );
     assert!(
-        !first.volume.is_sign_negative(),
-        "Volume {} should be non-negative",
+        first.volume.is_some_and(|v| !v.is_sign_negative()),
+        "Volume {:?} is absent or negative; a Trades bar always reports one",
         first.volume
     );
 }
@@ -378,8 +378,8 @@ async fn test_historical_midpoint_data() {
             first.close
         );
         assert_eq!(
-            first.trade_count, 0,
-            "Midpoint data should have no trade count"
+            first.trade_count, None,
+            "Midpoint data should have no trade count (unknown, not a fabricated 0)"
         );
     }
 }
@@ -449,7 +449,7 @@ async fn test_historical_ticks_trade() {
         result.err()
     );
 
-    let trades = result.unwrap();
+    let trades = result.unwrap().ticks;
     println!("Received {} trade ticks", trades.len());
 
     // May be empty outside market hours
@@ -502,7 +502,7 @@ async fn test_historical_ticks_bid_ask() {
         result.err()
     );
 
-    let quotes = result.unwrap();
+    let quotes = result.unwrap().ticks;
     println!("Received {} bid/ask ticks", quotes.len());
 
     // May be empty outside market hours
@@ -569,7 +569,8 @@ async fn test_historical_ticks_with_time_range() {
 
     // This may fail if the date is too old or no data available
     match result {
-        Ok(trades) => {
+        Ok(fetched) => {
+            let trades = fetched.ticks;
             println!("Received {} trade ticks", trades.len());
             for trade in trades.iter().take(3) {
                 println!("  Trade: price={:.2} amount={}", trade.price, trade.amount);
@@ -900,7 +901,7 @@ async fn test_contract_resolution() {
 }
 
 // ============================================================================
-// Option Greeks Calculator Tests (Phase 5A) — Tier 1: US Real-Time (FREE)
+// Option Greeks Calculator Tests — Tier 1: US Real-Time (FREE)
 // ============================================================================
 // Note: These are calculator functions, not data fetches. They don't require
 // OPRA subscription — they compute Greeks from user-provided inputs.
@@ -928,16 +929,20 @@ async fn resolve_aapl_call_option(client: &IbkrHistoricalData) -> Contract {
     // `fut_fop_exchange` must be empty to get every exchange's parameters; a
     // routing exchange like "SMART" filters the result to zero rows.
     let chains = client
-        .fetch_option_chain("AAPL", "", SecurityType::Stock, AAPL_UNDERLYING_CONID)
+        .fetch_option_chain("AAPL", None, SecurityType::Stock, AAPL_UNDERLYING_CONID)
         .await
         .expect("fetch AAPL option chain to resolve a valid option contract");
 
     // Prefer the standard SMART "AAPL" trading class (densest, most reliable
-    // strike/expiration coverage); fall back to any returned chain.
+    // strike/expiration coverage); fall back to any returned chain. Partial
+    // results are acceptable here: even a truncated enumeration is usable as
+    // long as it contains one workable entry (each entry is complete in
+    // isolation), which is exactly what `OptionChainResult` preserves.
     let chain = chains
+        .entries
         .iter()
         .find(|c| c.exchange == "SMART" && c.trading_class == "AAPL")
-        .or_else(|| chains.first())
+        .or_else(|| chains.entries.first())
         .expect("at least one AAPL option chain entry");
 
     // Earliest expiration at least ~2 weeks out: avoids about-to-expire
@@ -1114,11 +1119,12 @@ async fn test_fetch_option_chain() {
     // to return every exchange's parameters (a routing exchange like "SMART"
     // filters the result to zero rows).
     let chains = client
-        .fetch_option_chain("AAPL", "", SecurityType::Stock, AAPL_UNDERLYING_CONID)
+        .fetch_option_chain("AAPL", None, SecurityType::Stock, AAPL_UNDERLYING_CONID)
         .await;
 
     match chains {
-        Ok(entries) => {
+        Ok(result) => {
+            let entries = &result.entries;
             println!("Received {} option chain entries:", entries.len());
             for (i, entry) in entries.iter().take(3).enumerate() {
                 println!("Entry {}:", i + 1);
@@ -1141,6 +1147,15 @@ async fn test_fetch_option_chain() {
                 }
             }
 
+            // The pre-`OptionChainResult` API surfaced a mid-stream IB error as
+            // a bare `Err`; assert the flag so a truncated (but non-empty)
+            // enumeration still fails this test with the recorded reason.
+            assert!(
+                result.truncation_error.is_none(),
+                "option chain enumeration was truncated: {:?}",
+                result.truncation_error
+            );
+
             assert!(
                 !entries.is_empty(),
                 "Expected at least one option chain entry"
@@ -1155,7 +1170,7 @@ async fn test_fetch_option_chain() {
 }
 
 // ============================================================================
-// Real-Time Option Greeks Streaming Tests (Phase 5B) — Tier 3: OPRA (PAID)
+// Real-Time Option Greeks Streaming Tests — Tier 3: OPRA (PAID)
 // ============================================================================
 
 #[serial]

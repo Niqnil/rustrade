@@ -1,6 +1,6 @@
 [package]
 name = "rustrade-data"
-version = "0.5.0"
+version = "0.6.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,11 +13,35 @@ description = "High performance & normalised WebSocket intergration for leading 
 
 [features]
 default = []
-ibkr = ["dep:ibapi", "dep:time", "rustrade-instrument/ibkr"]
+ibkr = ["dep:ibapi", "dep:time", "dep:quick-xml", "rustrade-instrument/ibkr"]
 hyperliquid = ["dep:hyperliquid_rust_sdk"]
-alpaca = []
+# `serde-with-float` provides the field-level `rust_decimal::serde::float` / `float_option`
+# helpers the clients use to deserialize `new_rate`/`old_rate` (and Massive's price/size) JSON
+# numbers into `Decimal`. It deliberately does NOT enable the global `serde-float` feature, whose
+# extra effect is to flip every `Decimal`'s default serialization workspace-wide to a lossy f64
+# number (Cargo unifies features across the build). Keeping it field-level preserves the
+# deterministic, lossless string wire format for all other `Decimal` values.
+alpaca = ["rust_decimal/serde-with-float"]
 databento = ["dep:databento"]
-massive = ["dep:tokio-tungstenite", "dep:urlencoding", "rust_decimal/serde-float", "serde_json/raw_value"]
+# London Strategic Edge. No extra dependencies today; the feature exists so the integration is
+# opt-in from the start, matching every other provider in this crate.
+#
+# ⚠️ The data this integration retrieves is NOT redistributable, whatever this crate's own licence
+# says. See `exchange::lse` and https://londonstrategicedge.com/terms
+#
+# `sha2`/`hex` verify the SHA-256 the vault reports for a bulk export artifact; both are already in
+# the workspace tree via `rustrade-integration`, so this adds no new supply-chain surface.
+# `reqwest/stream` + `tokio/fs` stream a multi-gigabyte export to disk with `Range` resume rather
+# than buffering it in memory.
+lse = ["dep:sha2", "dep:hex", "reqwest/stream", "tokio/fs", "tokio/io-util"]
+# Decodes downloaded export artifacts into market events. Separate from `lse` so a consumer who
+# only wants files on disk pays no Parquet dependency cost.
+#
+# ⚠️ `parquet` MUST stay `default-features = false`: its defaults pull the whole `arrow` stack.
+# The column-reader API this uses needs none of it. Tier-2 reviewed — see
+# `.github/tier2-dependencies.txt`.
+lse-parquet = ["lse", "dep:parquet"]
+massive = ["dep:tokio-tungstenite", "dep:urlencoding", "rust_decimal/serde-with-float", "serde_json/raw_value"]
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
@@ -25,10 +49,21 @@ rust_decimal_macros = { workspace = true }
 time = { version = "0.3", features = ["macros"] }  # For ibkr tests and databento examples
 temp-env = { workspace = true }
 serial_test = { workspace = true }  # For Massive WebSocket tests (1 connection limit)
+wiremock = { workspace = true }  # For Massive/Alpaca REST pagination tests (mock next_url/page_token chains) and http.rs unit tests
+http = { workspace = true }  # Builds synthetic `reqwest::Response`s (via reqwest's `From<http::Response<_>>`) for socket-free transport tests; already in the tree via reqwest
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }  # `test-util` = paused-clock poll-timing tests
+tempfile = { workspace = true }  # Scratch directories for LSE export download/resume tests; already in the tree
+sha2 = { workspace = true }  # Computes the digest in synthetic LSE export job fixtures
+hex = { workspace = true }  # Encodes that digest as the provider does
+# Speaks the server half of the LSE WebSocket handshake in-process, so the guards that must run
+# *before* the first subscribe leaves the client can be tested by counting what reached the socket.
+# `wiremock` cannot serve this: the flow is a stateful conversation on a long-lived connection, not
+# a request/response exchange. Already in the tree via `rustrade-integration`'s `protocol` feature.
+tokio-tungstenite = { workspace = true }
 
 [dependencies]
 # Rustrade Ecosystem
-rustrade-integration = { workspace = true, features = ["channel", "collection", "error", "protocol", "serde", "subscription", "stream"] }
+rustrade-integration = { workspace = true, features = ["channel", "collection", "corporate-action", "error", "protocol", "serde", "subscription", "stream"] }
 rustrade-instrument = { workspace = true }
 rustrade-macro = { workspace = true }
 
@@ -43,6 +78,26 @@ futures-util = { workspace = true }
 # Used by the always-on Binance historical klines REST client (and the optional
 # Massive client). Plain dep — not feature-gated. Note for tier-2 review.
 async-stream = { workspace = true }
+
+# Integrity verification of London Strategic Edge bulk-export artifacts (the job record carries a
+# SHA-256). Optional, enabled by `lse`; already present in the workspace tree.
+sha2 = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+
+# Decodes London Strategic Edge bulk-export artifacts. `default-features = false` is load-bearing:
+# it keeps the entire `arrow` stack out of the tree, leaving only zstd (already present) and three
+# net-new crates.
+#
+# Measured artifact profile (the provider writes with ClickHouse 26.6.1): one row group, a flat
+# schema of primitives, PLAIN and RLE_DICTIONARY encodings, ZSTD compression, row-group statistics.
+# `zstd` is therefore the only codec feature enabled.
+#
+# ⚠️ If the provider ever switches its writer's codec, decoding fails with `LseError::Parquet`
+# carrying parquet's own "Disabled feature at compile time: <codec>" — observable and self-naming,
+# which is why the other codecs are not enabled pre-emptively. Adding e.g. `snap` here is a
+# one-line fix if that day comes; carrying the dependency for a switch that has not happened is
+# supply-chain surface a public library should not spend up front.
+parquet = { version = "59.1.0", default-features = false, features = ["zstd"], optional = true }
 
 # Protocol
 url = { workspace = true }
@@ -68,8 +123,11 @@ vecmap-rs = { workspace = true }
 fnv = { workspace = true }
 
 # IBKR (optional, behind "ibkr" feature)
-ibapi = { version = "=3.0.1", optional = true, default-features = false, features = ["sync"] }
+ibapi = { version = "=4.0.1", optional = true, default-features = false, features = ["sync"] }
 time = { version = "0.3", optional = true, features = ["macros"] }
+# XML parser for IBKR Flex Web Service statements (corporate-action reconciliation). New normal dep
+# (serde-xml-rs/xml-rs are only a build-dep of time-tz via ibapi, not reusable). Note for tier-2 review.
+quick-xml = { workspace = true, optional = true }
 
 # Hyperliquid (optional, behind "hyperliquid" feature)
 hyperliquid_rust_sdk = { version = "0.6", optional = true }
@@ -79,11 +137,91 @@ hyperliquid_rust_sdk = { version = "0.6", optional = true }
 # `chrono` enables `DateTimeRange: From<(DateTime<Utc>, DateTime<Utc>)>`, so the
 # candle historical path can build `GetRangeParams` from a chrono range without a
 # manual chrono->time conversion (chrono is already a core dependency).
-databento = { version = "0.53", optional = true, features = ["chrono"] }
+databento = { version = "0.61", optional = true, features = ["chrono"] }
 
 # Massive (optional, behind "massive" feature)
-tokio-tungstenite = { version = "0.29", optional = true, features = ["native-tls"] }
+tokio-tungstenite = { version = "0.30", optional = true, features = ["native-tls"] }
 urlencoding = { version = "2.1", optional = true }
+
+# Integration tests whose contents are entirely feature-gated. Without `required-features`, the
+# target still builds with the feature off and libtest reports "0 passed" -- a green run that
+# asserted nothing. Declaring it here makes `cargo test --test <name>` fail with a message naming
+# the missing feature instead.
+#
+# EVERY test file carrying a file-level `#![cfg(feature = "...")]` must be listed here. Any that
+# is not is silently exempt from the guarantee above.
+
+[[test]]
+name = "alpaca_corporate_actions"
+required-features = ["alpaca"]
+
+[[test]]
+name = "alpaca_data"
+required-features = ["alpaca"]
+
+[[test]]
+name = "alpaca_pagination"
+required-features = ["alpaca"]
+
+[[test]]
+name = "databento_integration"
+required-features = ["databento"]
+
+[[test]]
+name = "databento_transformer"
+required-features = ["databento"]
+
+[[test]]
+name = "hyperliquid_data"
+required-features = ["hyperliquid"]
+
+[[test]]
+name = "hyperliquid_spot_data"
+required-features = ["hyperliquid"]
+
+[[test]]
+name = "ibkr_flex_corporate_actions"
+required-features = ["ibkr"]
+
+[[test]]
+name = "ibkr_integration"
+required-features = ["ibkr"]
+
+[[test]]
+name = "lse_export"
+required-features = ["lse"]
+
+[[test]]
+name = "lse_vault"
+required-features = ["lse"]
+
+[[test]]
+name = "lse_vault_canary"
+required-features = ["lse"]
+
+[[test]]
+name = "lse_ws_handshake"
+required-features = ["lse"]
+
+[[test]]
+name = "lse_ws_canary"
+required-features = ["lse"]
+
+[[test]]
+name = "lse_export_canary"
+required-features = ["lse-parquet"]
+
+[[test]]
+name = "lse_parquet"
+required-features = ["lse-parquet"]
+
+[[test]]
+name = "massive_integration"
+required-features = ["massive"]
+
+[[test]]
+name = "massive_pagination"
+required-features = ["massive"]
 
 # Examples that depend on optional features. Without `required-features`,
 # `cargo check --all-targets` (default features) fails to compile them.
@@ -105,9 +243,25 @@ name = "hyperliquid_spot_market_data"
 required-features = ["hyperliquid"]
 
 [[example]]
+name = "lse_candles"
+required-features = ["lse"]
+
+[[example]]
+name = "lse_export"
+required-features = ["lse-parquet"]
+
+[[example]]
+name = "lse_market_data"
+required-features = ["lse"]
+
+[[example]]
 name = "ibkr_historical"
 required-features = ["ibkr"]
 
 [[example]]
 name = "ibkr_market_data"
+required-features = ["ibkr"]
+
+[[example]]
+name = "ibkr_flex_corporate_actions"
 required-features = ["ibkr"]

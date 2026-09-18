@@ -74,14 +74,21 @@ async fn main() {
 
             for candle in candles.iter().take(10) {
                 info!(
-                    "{:^12} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>12.0} {:>8}",
+                    "{:^12} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>12} {:>8}",
                     candle.close_time.format("%Y-%m-%d"),
                     candle.open,
                     candle.high,
                     candle.low,
                     candle.close,
-                    candle.volume,
-                    candle.trade_count
+                    // volume/trade_count are optional ("n/a" when the venue omits them).
+                    candle
+                        .volume
+                        .map(|v| format!("{v:.0}"))
+                        .unwrap_or_else(|| "n/a".to_string()),
+                    candle
+                        .trade_count
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "n/a".to_string())
                 );
             }
 

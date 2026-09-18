@@ -62,6 +62,15 @@ impl BinanceChannel {
     pub const fn spot_candle(interval: CandleInterval) -> Self {
         match interval {
             CandleInterval::Sec1 => Self("@kline_1s"),
+            // Binance serves no sub-minute kline other than `1s`. These follow the
+            // `@kline_<interval>` convention (keeping the drift-guard invariant total)
+            // but name streams Binance does not publish, so a SUBSCRIBE using one is
+            // rejected by the exchange and surfaced by `BinanceSubResponse::validate`.
+            // `supports_candle_interval` reports which those are, but only the dynamic builder
+            // consults it — see that function's docs for which path gates and which does not.
+            CandleInterval::Sec5 => Self("@kline_5s"),
+            CandleInterval::Sec15 => Self("@kline_15s"),
+            CandleInterval::Sec30 => Self("@kline_30s"),
             CandleInterval::Min1 => Self("@kline_1m"),
             CandleInterval::Min3 => Self("@kline_3m"),
             CandleInterval::Min5 => Self("@kline_5m"),
@@ -95,6 +104,10 @@ impl BinanceChannel {
     pub const fn futures_candle(interval: CandleInterval) -> Self {
         match interval {
             CandleInterval::Sec1 => Self("_perpetual@continuousKline_1s"),
+            // See `spot_candle`: Binance publishes no `5s`/`15s`/`30s` kline stream.
+            CandleInterval::Sec5 => Self("_perpetual@continuousKline_5s"),
+            CandleInterval::Sec15 => Self("_perpetual@continuousKline_15s"),
+            CandleInterval::Sec30 => Self("_perpetual@continuousKline_30s"),
             CandleInterval::Min1 => Self("_perpetual@continuousKline_1m"),
             CandleInterval::Min3 => Self("_perpetual@continuousKline_3m"),
             CandleInterval::Min5 => Self("_perpetual@continuousKline_5m"),

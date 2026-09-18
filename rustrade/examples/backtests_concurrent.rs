@@ -4,6 +4,7 @@ use rust_decimal::Decimal;
 use rustrade::{
     backtest::{
         BacktestArgsConstant, BacktestArgsDynamic,
+        aux_events::NoAuxEvents,
         market_data::{BacktestMarketData, MarketDataInMemory},
         run_backtests,
     },
@@ -73,6 +74,7 @@ async fn main() {
         market_data,
         summary_interval: Daily,
         engine_state,
+        aux_events: NoAuxEvents,
     });
 
     // Define dummy dynamic backtest arguments
@@ -130,6 +132,22 @@ pub fn load_config() -> Config {
     serde_json::from_reader(reader).expect("Failed to parse config file")
 }
 
+/// Reads a newline-delimited JSON market data file, ordered ready for
+/// [`MarketDataInMemory`](rustrade::backtest::market_data::MarketDataInMemory).
+///
+/// # Why the sort is here
+///
+/// `MarketDataInMemory::new` requires its events to be globally sorted ascending by
+/// `time_exchange`, and asserts it, because the backtest merges them against auxiliary events on
+/// one timeline — an unsorted stream would drive the clock backwards and silently produce wrong
+/// results.
+///
+/// A recorded multi-instrument capture does not satisfy that on its own. The file this example
+/// reads interleaves three instruments and holds over ten thousand inversions, so handing it
+/// straight to `MarketDataInMemory::new` panics before the first backtest starts. Any real capture
+/// you substitute will need the same treatment.
+///
+/// The sort is stable, so events sharing a timestamp keep their recorded order.
 pub fn market_data_from_file<InstrumentKey, Kind>(
     file_path: &str,
 ) -> Vec<MarketStreamEvent<InstrumentKey, Kind>>
@@ -140,11 +158,29 @@ where
     let file = File::open(file_path).unwrap();
     let reader = BufReader::new(file);
 
-    reader
+    let mut events = reader
         .lines()
         .map(|line_result| {
             let line = line_result.unwrap();
             serde_json::from_str::<MarketStreamEvent<InstrumentKey, Kind>>(&line).unwrap()
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    // `Reconnecting` carries no timestamp, so the sort key maps it to `None` — which `Option`'s
+    // `Ord` places before every `Some`, hoisting it to the front of the run whatever time it
+    // actually occurred at. This corpus is `Item`-only; assert it, so a capture containing
+    // reconnects fails loudly here rather than being quietly reordered.
+    assert!(
+        events
+            .iter()
+            .all(|event| matches!(event, MarketStreamEvent::Item(_))),
+        "market_data_from_file expects an Item-only corpus: the time sort cannot order \
+         Reconnecting events. Filter or stable-partition them first."
+    );
+    events.sort_by_key(|event| match event {
+        MarketStreamEvent::Item(event) => Some(event.time_exchange),
+        MarketStreamEvent::Reconnecting(_) => None,
+    });
+
+    events
 }

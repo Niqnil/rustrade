@@ -48,9 +48,71 @@ pub struct TradingSummary<Interval> {
     /// so summaries serialised before this field existed load as [`BalanceBasis::Gross`].
     #[serde(default)]
     pub basis: BalanceBasis,
+
+    /// Open requests sent this session, summed over every instrument.
+    ///
+    /// `#[serde(default)]` so summaries serialised before this field existed still load.
+    #[serde(default)]
+    pub orders_opened: usize,
+
+    /// Of those, how many the exchange rejected.
+    ///
+    /// See [`Self::rejected_every_order`] for why this is worth checking before reading any
+    /// other figure in the summary.
+    #[serde(default)]
+    pub orders_rejected: usize,
+
+    /// Fills this session that opened a position under their raw exchange `OrderId` despite
+    /// belonging to a known order, summed over every instrument — `OmsMode::Hedging` only.
+    ///
+    /// Non-zero means at least one order's PnL is **split across two position slots**, so the
+    /// per-position figures in this summary partition that order's activity in a way the strategy
+    /// never chose. See [`Self::has_split_positions`], and
+    /// [`TearSheet::fallback_positions`](instrument::TearSheet::fallback_positions) for which
+    /// positions to inspect.
+    #[serde(default)]
+    pub fills_routed_by_fallback: usize,
+
+    /// Fills this session for which no order was tracked at all, summed over every instrument —
+    /// `OmsMode::Hedging` only.
+    ///
+    /// Reported apart from [`Self::fills_routed_by_fallback`] because it is not by itself a fault:
+    /// an account also traded by hand or by another system produces these legitimately, and one
+    /// position per external order is a reasonable reading of them.
+    #[serde(default)]
+    pub fills_unmatched: usize,
 }
 
 impl<Interval> TradingSummary<Interval> {
+    /// Whether every open request this session was rejected.
+    ///
+    /// When true, the session filled nothing and every ratio in this summary was computed over
+    /// zero trades — a tear sheet of zeros that looks like a flat strategy rather than a broken
+    /// run. A strategy that simply chose not to trade sends no requests at all and so is not
+    /// reported here.
+    ///
+    /// Per-instrument counts and the first rejection reason are on each
+    /// [`TearSheet`].
+    pub fn rejected_every_order(&self) -> bool {
+        self.orders_opened > 0 && self.orders_rejected == self.orders_opened
+    }
+
+    /// Whether any fill was booked against a position other than the one its order opened.
+    ///
+    /// When true, at least one order's PnL is divided between two position slots and nothing
+    /// rejoins them, so every per-position figure in this summary describes a partition of the
+    /// session that the strategy did not choose. Worth checking before reading them.
+    ///
+    /// Deliberately does **not** consider [`Self::fills_unmatched`]: a fill with no order behind it
+    /// is expected whenever the account is traded from elsewhere, and folding it in here would
+    /// raise this flag on correct operation.
+    ///
+    /// The positions to inspect are on each
+    /// [`TearSheet::fallback_positions`](instrument::TearSheet::fallback_positions).
+    pub fn has_split_positions(&self) -> bool {
+        self.fills_routed_by_fallback > 0
+    }
+
     /// Duration of trading that the `TradingSummary` covers.
     pub fn trading_duration(&self) -> TimeDelta {
         self.time_engine_end
@@ -184,12 +246,29 @@ impl TradingSummaryGenerator {
             .map(|generator| generator.basis)
             .unwrap_or_default();
 
+        let (orders_opened, orders_rejected, fills_routed_by_fallback, fills_unmatched) =
+            self.instruments.values().fold(
+                (0usize, 0usize, 0usize, 0usize),
+                |(opened, rejected, fallback, unmatched), generator| {
+                    (
+                        opened.saturating_add(generator.orders_opened),
+                        rejected.saturating_add(generator.orders_rejected),
+                        fallback.saturating_add(generator.fills_routed_by_fallback),
+                        unmatched.saturating_add(generator.fills_unmatched),
+                    )
+                },
+            );
+
         TradingSummary {
             time_engine_start: self.time_engine_start,
             time_engine_end: self.time_engine_now,
             instruments,
             assets,
             basis,
+            orders_opened,
+            orders_rejected,
+            fills_routed_by_fallback,
+            fills_unmatched,
         }
     }
 }
@@ -310,5 +389,59 @@ mod tests {
     fn generate_with_no_assets_defaults_basis_to_gross() {
         let mut generator = generator_with_assets(FnvIndexMap::default());
         assert_eq!(generator.generate(Annual365).basis, BalanceBasis::Gross);
+    }
+
+    /// The session totals are the sum over instruments, not a copy of any one of them: a split can
+    /// happen on one instrument while another trades cleanly, and a summary that reported either in
+    /// isolation would mislead in opposite directions.
+    #[test]
+    fn generate_sums_fallback_counters_over_every_instrument() {
+        let mut instruments = FnvIndexMap::default();
+        for (name, routed, unmatched) in [("btc_usdt", 2usize, 1usize), ("eth_usdt", 3, 4)] {
+            let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
+            generator.fills_routed_by_fallback = routed;
+            generator.fills_unmatched = unmatched;
+            instruments.insert(InstrumentNameInternal::new(name), generator);
+        }
+
+        let summary = TradingSummaryGenerator::new(
+            dec!(0),
+            DateTime::<Utc>::MIN_UTC,
+            DateTime::<Utc>::MIN_UTC,
+            instruments,
+            FnvIndexMap::default(),
+        )
+        .generate(Annual365);
+
+        assert_eq!(summary.fills_routed_by_fallback, 5);
+        assert_eq!(summary.fills_unmatched, 5);
+        assert!(
+            summary.has_split_positions(),
+            "a split on any instrument is a split for the session"
+        );
+    }
+
+    /// `has_split_positions` keys off the split counter alone. An account traded from elsewhere
+    /// produces unmatched fills during correct operation, and flagging those would raise the alarm
+    /// on a healthy session.
+    #[test]
+    fn unmatched_fills_alone_do_not_flag_the_session_as_split() {
+        let mut instruments = FnvIndexMap::default();
+        let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
+        generator.fills_unmatched = 9;
+        instruments.insert(InstrumentNameInternal::new("btc_usdt"), generator);
+
+        let summary = TradingSummaryGenerator::new(
+            dec!(0),
+            DateTime::<Utc>::MIN_UTC,
+            DateTime::<Utc>::MIN_UTC,
+            instruments,
+            FnvIndexMap::default(),
+        )
+        .generate(Annual365);
+
+        assert_eq!(summary.fills_unmatched, 9);
+        assert_eq!(summary.fills_routed_by_fallback, 0);
+        assert!(!summary.has_split_positions());
     }
 }

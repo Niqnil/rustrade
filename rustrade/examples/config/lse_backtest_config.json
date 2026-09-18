@@ -1,0 +1,73 @@
+{
+  "risk_free_return": 0.05,
+  "system": {
+    "executions": [
+      {
+        "mocked_exchange": "lse_equities",
+        "latency_ms": 100,
+        "fee_model": { "Percentage": { "rate": "0.05" } },
+        "initial_state": {
+          "exchange": "lse_equities",
+          "balances": [
+            {
+              "asset": "usd",
+              "balance": {
+                "total": 100000,
+                "free": 100000
+              },
+              "time_exchange": "2024-01-01T00:00:00Z"
+            },
+            {
+              "asset": "aapl",
+              "balance": {
+                "total": 0,
+                "free": 0
+              },
+              "time_exchange": "2024-01-01T00:00:00Z"
+            },
+            {
+              "asset": "msft",
+              "balance": {
+                "total": 0,
+                "free": 0
+              },
+              "time_exchange": "2024-01-01T00:00:00Z"
+            }
+          ],
+          "instruments": [
+            {
+              "instrument": "AAPL",
+              "orders": []
+            },
+            {
+              "instrument": "MSFT",
+              "orders": []
+            }
+          ]
+        }
+      }
+    ],
+    "instruments": [
+      {
+        "exchange": "lse_equities",
+        "name_exchange": "AAPL",
+        "underlying": {
+          "base": "aapl",
+          "quote": "usd"
+        },
+        "quote": "underlying_quote",
+        "kind": "spot"
+      },
+      {
+        "exchange": "lse_equities",
+        "name_exchange": "MSFT",
+        "underlying": {
+          "base": "msft",
+          "quote": "usd"
+        },
+        "quote": "underlying_quote",
+        "kind": "spot"
+      }
+    ]
+  }
+}

@@ -131,8 +131,9 @@ impl BinanceKlineData {
                     high: self.high,
                     low: self.low,
                     close: self.close,
-                    volume: self.volume,
-                    trade_count: self.trade_count,
+                    // Binance klines carry real consolidated volume and trade count.
+                    volume: Some(self.volume),
+                    trade_count: Some(self.trade_count),
                 },
             })]),
             None => MarketIter(vec![Err(DataError::Socket(format!(
@@ -403,7 +404,7 @@ mod tests {
         let expected = Utc.timestamp_millis_opt(1638747720000).unwrap();
         assert_eq!(event.kind.close_time, expected);
         assert_eq!(event.time_exchange, expected);
-        assert_eq!(event.kind.trade_count, 100);
+        assert_eq!(event.kind.trade_count, Some(100));
     }
 
     #[test]
@@ -437,8 +438,8 @@ mod tests {
         assert_eq!(event.kind.high, dec!(18810.00));
         assert_eq!(event.kind.low, dec!(18786.54));
         assert_eq!(event.kind.close, dec!(18804.04));
-        assert_eq!(event.kind.volume, dec!(197.664));
-        assert_eq!(event.kind.trade_count, 543);
+        assert_eq!(event.kind.volume, Some(dec!(197.664)));
+        assert_eq!(event.kind.trade_count, Some(543));
     }
 
     /// Drift guard: for **every** [`CandleInterval`] the routing key baked at deserialize must
@@ -502,7 +503,9 @@ mod tests {
             MarketIter::<u64, Candle>::from((ExchangeId::BinanceSpot, 1u64, kline));
         assert_eq!(events.len(), 1);
         let event = events.into_iter().next().unwrap().unwrap();
-        assert_eq!(event.kind.volume, dec!(0));
-        assert_eq!(event.kind.trade_count, 0);
+        // Binance genuinely reports V=0 for a gap-filled bar: a real zero, so
+        // `Some(0)` — distinct from a producer that carries no volume (`None`).
+        assert_eq!(event.kind.volume, Some(dec!(0)));
+        assert_eq!(event.kind.trade_count, Some(0));
     }
 }

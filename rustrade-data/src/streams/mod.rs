@@ -5,6 +5,10 @@ use futures::Stream;
 use rustrade_instrument::exchange::ExchangeId;
 use rustrade_integration::channel::UnboundedRx;
 
+/// Bridges a blocking source — a Parquet artifact, a compressed archive — into a bounded,
+/// back-pressured `Stream`, off the async runtime's workers.
+pub mod blocking;
+
 /// Defines the [`StreamBuilder`] and [`MultiStreamBuilder`] APIs for ergonomically initialising
 /// [`MarketStream`](super::MarketStream) [`Streams`].
 pub mod builder;
@@ -12,6 +16,10 @@ pub mod builder;
 /// Central consumer loop functionality used by the [`StreamBuilder`] to
 /// drive a re-connecting [`MarketStream`](super::MarketStream).
 pub mod consumer;
+
+/// Lazily merge N time-sorted market streams into one, for replaying multi-instrument historical
+/// data as a single time-ordered feed.
+pub mod merge;
 
 /// Defines a [`ReconnectingStream`](reconnect::stream::ReconnectingStream) and associated logic
 /// for generating an auto reconnecting `Stream`.

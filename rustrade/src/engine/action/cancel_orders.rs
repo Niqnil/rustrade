@@ -56,7 +56,7 @@ where
         let cancels = self.send_requests(requests);
 
         // Record in flight order requests
-        self.state.record_in_flight_cancels(&cancels.sent);
+        self.state.record_in_flight_cancels(cancels.sent_iter());
 
         cancels
     }

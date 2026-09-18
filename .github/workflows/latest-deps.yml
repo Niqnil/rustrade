@@ -41,7 +41,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout sources
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install mold linker
         uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444  # v1
@@ -53,7 +53,7 @@ jobs:
 
       # Distinct cache key: this job mutates Cargo.lock, so it must not share the
       # `--locked` jobs' caches.
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
         with:
           shared-key: "rustrade-latest-deps"
 

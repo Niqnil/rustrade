@@ -19,8 +19,18 @@ use rustrade_integration::{
     channel::{Tx, UnboundedRx, UnboundedTx},
     collection::{one_or_many::OneOrMany, snapshot::SnapUpdates},
 };
-use std::fmt::Debug;
+use std::{fmt::Debug, time::Duration};
 use tokio::task::{JoinError, JoinHandle};
+use tracing::error;
+
+/// Upper bound on how long [`System::shutdown_after_backtest`] waits for the account feed to drain.
+///
+/// A backtest's drain is bounded by the `request_timeout` each `ExecutionManager` applies to its
+/// in-flight requests, plus the account events already queued behind them, so it completes far
+/// inside this. The deadline is a guard against the one misuse that has no natural end: calling
+/// `shutdown_after_backtest` on a live system, whose AccountStream reconnects indefinitely and
+/// therefore never finishes. Reaching it logs an error and severs the feed.
+pub const AFTER_DRAIN_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Provides a `SystemBuilder` for constructing a Barter trading system, and associated types.
 pub mod builder;
@@ -34,6 +44,9 @@ pub mod config;
 ///
 /// It provides methods for interacting with the system, such as sending `Engine` [`Command`]s,
 /// managing [`TradingState`], and shutting down gracefully.
+// `#[derive(Debug)]` bounds only the type parameters, never the associated types `Engine::Audit`
+// and `Engine::Snapshot` that `engine` and `audit` are built from, so it does not compile here. A
+// hand-written impl would have to demand those bounds of every caller that merely holds a `System`.
 #[allow(missing_debug_implementations)]
 pub struct System<Engine, Event>
 where
@@ -45,7 +58,19 @@ where
     /// Handles to auxiliary system components (execution components, event forwarding, etc.).
     pub handles: SystemAuxillaryHandles,
 
-    /// Transmitter for sending events to the `Engine`.
+    /// Transmitter for sending events directly to the `Engine`, bypassing any market/aux merge.
+    ///
+    /// # Ordering obligation (historical / backtest engines)
+    /// Events injected here do **not** pass through the backtest harness's time-ordering asserts
+    /// (`merge_market_with_aux` / `assert_aux_corporate_action_effective_times`). A
+    /// [`HistoricalClock`](crate::engine::clock::HistoricalClock) advances monotonically off each
+    /// event's `time_exchange` and never rewinds, so the caller must feed events in ascending
+    /// simulated-time order — including any injected
+    /// [`EngineEvent::CorporateAction`](crate::EngineEvent::CorporateAction), whose `effective_time`
+    /// the clock advances to *before* the action is validated. Injecting an out-of-order event moves
+    /// the clock forward (observably, via out-of-order logs) and subsequent earlier events will then
+    /// not advance it. A [`LiveClock`](crate::engine::clock::LiveClock) is unaffected (it reads
+    /// `Utc::now()`).
     pub feed_tx: UnboundedTx<Event>,
 
     /// Optional audit snapshot with updates (present when audit sending is enabled).
@@ -59,11 +84,20 @@ where
     Event: Debug + Clone + Send,
 {
     /// Shutdown the `System` gracefully.
+    ///
+    /// Sends [`Shutdown::Immediate`], so the `Engine` stops at once and any execution request still
+    /// in flight is abandoned — whatever those requests would have reported never arrives. That is
+    /// normally what live trading wants: stopping should not wait on a venue that may be slow or
+    /// unreachable.
+    ///
+    /// A caller that would rather wait for those responses sends [`Shutdown::AfterDrain`] into the
+    /// `Engine` feed itself instead of calling this — as
+    /// [`shutdown_after_backtest`](Self::shutdown_after_backtest) does.
     pub async fn shutdown(mut self) -> Result<(Engine, Engine::Audit), JoinError>
     where
         Event: From<Shutdown>,
     {
-        self.send(Shutdown);
+        self.send(Shutdown::Immediate);
 
         let (engine, shutdown_audit) = self.engine.await?;
 
@@ -77,7 +111,7 @@ where
     where
         Event: From<Shutdown>,
     {
-        self.send(Shutdown);
+        self.send(Shutdown::Immediate);
 
         let (engine, shutdown_audit) = self.engine.await?;
 
@@ -91,6 +125,24 @@ where
     ///
     /// **Note that for live & paper-trading this market stream will never end, so use
     /// System::shutdown() for that use case**.
+    ///
+    /// # Why this sends [`Shutdown::AfterDrain`]
+    /// The `Engine` reads market events and account events from a **single FIFO feed**, and the
+    /// task forwarding the market stream into it completes as soon as the stream has been
+    /// *forwarded* — not when the `Engine` has *processed* it. A stop enqueued at that moment
+    /// therefore sits ahead of every account event the run is about to produce, and the `Engine`
+    /// terminates on it without ever reading them.
+    ///
+    /// Ordering alone cannot fix that: the responses are provoked *by* processing the final market
+    /// events, so they are necessarily behind any marker placed after those events.
+    /// [`Shutdown::AfterDrain`] instead has the `Engine` stop generating new orders and wait until
+    /// nothing is left in flight, which is the only point at which the run has genuinely finished.
+    ///
+    /// # Deadline
+    /// The drain is bounded by [`AFTER_DRAIN_DEADLINE`]. A backtest finishes it in the time its
+    /// in-flight requests take to resolve, so the deadline is never reached in normal use — it
+    /// exists so that calling this against a *live* system, whose AccountStream never ends, fails
+    /// slowly and loudly instead of hanging forever.
     ///
     /// # Panics
     /// Panics if the Engine task has already dropped its receiver (i.e., panicked).
@@ -110,18 +162,39 @@ where
             audit: _,
         } = self;
 
-        // Wait for MarketStream to finish forwarding to Engine before initiating Shutdown
+        // Wait for the MarketStream to finish forwarding before initiating shutdown. Note that
+        // this returns once the events are IN the feed, not once the Engine has processed them --
+        // which is precisely why the stop below has to be `AfterDrain` rather than immediate.
         market_to_engine.await?;
 
         #[allow(clippy::expect_used)] // Critical invariant: Engine must be alive during shutdown
         feed_tx
-            .send(Shutdown)
+            .send(Shutdown::AfterDrain)
             .expect("Engine cannot drop Feed receiver");
         drop(feed_tx);
 
+        // `account_to_engine` must finish BEFORE the Engine can: it holds the last `feed_tx` clone,
+        // and dropping that clone is what ends the feed and terminates the Engine. Aborting it here
+        // (as this once did) severs the account feed while the managers are still draining into it,
+        // which is exactly the truncation `Shutdown::AfterDrain` exists to prevent.
+        let account_to_engine_abort = account_to_engine.abort_handle();
+        match tokio::time::timeout(AFTER_DRAIN_DEADLINE, account_to_engine).await {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                // Only reachable if an execution stream never ends -- ie/ this was called against a
+                // live system, whose AccountStream is infinite by design. Fall back to severing it
+                // so the Engine still terminates rather than hanging forever.
+                error!(
+                    deadline = ?AFTER_DRAIN_DEADLINE,
+                    "shutdown_after_backtest timed out draining the account feed - aborting it. \
+                     Live systems must use System::shutdown, not shutdown_after_backtest"
+                );
+                account_to_engine_abort.abort();
+            }
+        }
+
         let (engine, shutdown_audit) = engine.await?;
 
-        account_to_engine.abort();
         execution.shutdown().await?;
 
         Ok((engine, shutdown_audit))
@@ -197,7 +270,7 @@ where
 /// Collection of task handles for auxiliary system components that support the `Engine`.
 ///
 /// Used by the [`System`] to shut down auxillary components.
-#[allow(missing_debug_implementations)]
+#[derive(Debug)]
 pub struct SystemAuxillaryHandles {
     /// Handles for running execution components.
     pub execution: ExecutionHandles,

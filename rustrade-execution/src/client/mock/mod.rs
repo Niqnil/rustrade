@@ -6,11 +6,11 @@ use crate::{
         ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
         UnindexedOrderError,
     },
-    exchange::mock::request::{MarketPrices, MockExchangeRequest},
+    exchange::mock::request::MockExchangeRequest,
     fee::FeeModelConfig,
     fill::SimFillConfig,
     order::{
-        Order, OrderEvent, OrderKey,
+        Order, OrderKey,
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Open, OrderState, UnindexedOrderState},
     },
@@ -20,7 +20,9 @@ use chrono::{DateTime, Utc};
 use derive_more::Constructor;
 use futures::{StreamExt, stream::BoxStream};
 use rustrade_instrument::{
-    asset::name::AssetNameExchange, exchange::ExchangeId, instrument::name::InstrumentNameExchange,
+    asset::name::AssetNameExchange,
+    exchange::ExchangeId,
+    instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -42,11 +44,10 @@ pub struct MockExecutionConfig {
     pub fee_model: FeeModelConfig,
     /// Fill model used by the mock exchange to compute execution prices.
     ///
-    /// Defaults to [`SimFillConfig::LastPrice`], which fills at the
-    /// order price (identical to pre-FillModel behaviour). Switch to
-    /// [`SimFillConfig::BidAsk`] or [`SimFillConfig::Midpoint`] for
-    /// more realistic spread-cost simulation when market prices are injected
-    /// alongside orders.
+    /// Defaults to [`SimFillConfig::LastPrice`], which fills at the snapshot's `last_price`,
+    /// falling back to the side of the book a taker would cross to. Switch to
+    /// [`SimFillConfig::BidAsk`] or [`SimFillConfig::Midpoint`] for more realistic spread-cost
+    /// simulation when market prices are injected alongside orders.
     #[serde(default)]
     pub fill_model: SimFillConfig,
 }
@@ -109,6 +110,15 @@ where
     FnTime: Fn() -> DateTime<Utc> + Clone + Send + Sync,
 {
     const EXCHANGE: ExchangeId = ExchangeId::Mock;
+
+    // `MockExchange` models no expiry, funding schedule or contract chain, so `Perpetual`, `Future`
+    // and `Option` have no faithful projection onto it. `Spot` and `Cfd` need none: both are
+    // positions in an instrument that the mock can open, close and mark without simulating a
+    // lifecycle. Kept in step with the projection in `generate_mock_exchange_instruments`.
+    const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant] = &[
+        InstrumentKindDiscriminant::Spot,
+        InstrumentKindDiscriminant::Cfd,
+    ];
     type Config = MockExecutionClientConfig<FnTime>;
     type AccountStream = BoxStream<'static, UnindexedAccountEvent>;
 
@@ -202,7 +212,7 @@ where
             .send(MockExchangeRequest::cancel_order(
                 self.time_request(),
                 response_tx,
-                into_owned_request(request),
+                request.into_owned_instrument(),
             ))
             .is_err()
         {
@@ -231,15 +241,18 @@ where
     ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        let request = into_owned_request(request);
+        let request = request.into_owned_instrument();
 
         if self
             .request_tx
             .send(MockExchangeRequest::open_order(
                 self.time_request(),
                 response_tx,
+                // Carries the snapshot the engine sampled when it decided to send this order on
+                // `RequestOpen::market`. It is the venue's only price source for a Market order,
+                // which carries no limit price of its own. `None` there means nothing sampled
+                // one, and the venue rejects rather than guessing.
                 request.clone(),
-                MarketPrices::default(), // no market-data subscription; FillModel uses last_price=Some(request.state.price) as fallback, so fill equals request price
             ))
             .is_err()
         {
@@ -347,31 +360,6 @@ where
                 self.mocked_exchange,
             ))
         })
-    }
-}
-
-fn into_owned_request<Kind>(
-    request: OrderEvent<Kind, ExchangeId, &InstrumentNameExchange>,
-) -> OrderEvent<Kind, ExchangeId, InstrumentNameExchange> {
-    let OrderEvent {
-        key:
-            OrderKey {
-                exchange,
-                instrument,
-                strategy,
-                cid,
-            },
-        state,
-    } = request;
-
-    OrderEvent {
-        key: OrderKey {
-            exchange,
-            instrument: instrument.clone(),
-            strategy,
-            cid,
-        },
-        state,
     }
 }
 

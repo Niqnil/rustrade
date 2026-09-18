@@ -7,7 +7,7 @@
 //! | [`binance`] | Auto (1s→30s backoff) | 10k LRU | REST after reconnect | 30s |
 //! | [`alpaca`] | Auto (1s→30s backoff) | 2k LRU | REST after reconnect | 35s |
 //! | [`ibkr`] | Caller responsibility | N/A | Caller responsibility | N/A |
-//! | [`hyperliquid`] | SDK-managed | SDK-managed | N/A | SDK-managed |
+//! | [`hyperliquid`] | SDK-managed | 10k LRU, fills only | Caller responsibility | SDK-managed |
 //!
 //! # Resilience Philosophy
 //!
@@ -19,7 +19,11 @@
 //! and client ID coordination — decisions that belong in the caller's wrapper. See
 //! [`ibkr`] module docs for caller responsibilities.
 //!
-//! **Hyperliquid** delegates to the official SDK's `with_reconnect()` mechanism.
+//! **Hyperliquid** delegates reconnection to the official SDK's `with_reconnect()` mechanism, but
+//! deduplicates fills itself: the SDK resubscribes on reconnect and the venue opens a `userFills`
+//! subscription with a snapshot, so every reconnect redelivers fills already seen. It does not
+//! recover fills missed while disconnected — callers needing that call
+//! [`ExecutionClient::fetch_trades`], whose results are not deduplicated against the stream.
 //!
 //! # Known Limitations
 //!
@@ -42,9 +46,17 @@ use crate::{
 use chrono::{DateTime, Utc};
 use futures::Stream;
 use rustrade_instrument::{
-    asset::name::AssetNameExchange, exchange::ExchangeId, instrument::name::InstrumentNameExchange,
+    asset::name::AssetNameExchange,
+    exchange::ExchangeId,
+    instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use std::future::Future;
+
+// Account-event deduplication over rustrade's own event type. Gated on the clients that use it
+// so a build selecting neither does not compile it unused. Alpaca deduplicates too, but against
+// a raw `SmolStr` fill key rather than this cache, so it is deliberately not in this list.
+#[cfg(any(feature = "binance", feature = "hyperliquid"))]
+pub(crate) mod dedup;
 
 // Alpaca ExecutionClient implementation (options, equities, crypto — single unified API)
 #[cfg(feature = "alpaca")]
@@ -72,6 +84,31 @@ where
     Self: Clone,
 {
     const EXCHANGE: ExchangeId;
+
+    /// The [`InstrumentKindDiscriminant`]s this client can trade.
+    ///
+    /// A client works off [`InstrumentNameExchange`] strings and never inspects an instrument's
+    /// kind, so nothing downstream can infer this from the implementation — routing a `Future`
+    /// through a spot-only venue produces a rejected or, worse, misinterpreted order rather than a
+    /// type error. Declaring the set here lets [`ExecutionBuilder`] reject an unsupported
+    /// instrument set at build time, before any order is sent.
+    ///
+    /// Declare what the *venue and this implementation together* can actually route, not what the
+    /// exchange's product catalogue advertises. A kind the exchange offers but this client builds
+    /// no request for does not belong in the set.
+    ///
+    /// There is deliberately no default. A new client must state its capabilities rather than
+    /// inherit a permissive set that would silently admit every kind.
+    ///
+    /// It is a `const` and not a `fn supported_kinds(&self)` because [`ExecutionBuilder`] validates
+    /// the instrument set *before* [`Self::new`] is ever called — there is no instance to ask at the
+    /// point the answer is needed, and deferring validation until after construction would mean
+    /// standing up a client for a venue the engine is about to reject. A capability set that varies
+    /// with `Self::Config` therefore cannot be expressed here; it would need a separate
+    /// pre-construction hook on the config.
+    ///
+    /// [`ExecutionBuilder`]: https://docs.rs/rustrade/latest/rustrade/execution/builder/struct.ExecutionBuilder.html
+    const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant];
 
     type Config: Clone;
     // `+ Send` required so generic code (e.g. ExecutionManager) can pass
@@ -282,4 +319,103 @@ pub trait BracketOrderClient: ExecutionClient {
         &self,
         request: BracketOrderRequest<ExchangeId, &InstrumentNameExchange>,
     ) -> impl Future<Output = BracketOrderResult> + Send;
+}
+
+/// The capability table, pinned.
+///
+/// [`ExecutionClient::SUPPORTED_KINDS`] is a `const`: widening one, or adding a kind a client builds
+/// no request for, compiles and passes clippy. The only thing it changes is which instruments
+/// [`ExecutionBuilder`](https://docs.rs/rustrade/latest/rustrade/execution/builder/struct.ExecutionBuilder.html)
+/// admits — so the failure mode is not a broken build but an instrument reaching a venue that cannot
+/// encode it, as a silently wrong order. These assertions exist so that changing a client's declared
+/// capabilities is a deliberate edit to a test that says what the venue can route, rather than a
+/// one-word diff nothing observes.
+///
+/// The real-client cases are each gated on their own feature, matching the module gates above; the
+/// mock case is ungated, like its module. So with `default = []`, a bare
+/// `cargo test -p rustrade-execution` compiles only the mock assertion — pinning a real client's
+/// capabilities requires `--features <name>` or `--all-features`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::mock::MockExecution;
+
+    #[test]
+    fn mock_supports_only_the_kinds_it_can_model() {
+        // No expiry, funding schedule or contract chain in `MockExchange`, so `Perpetual`, `Future`
+        // and `Option` have no faithful projection onto it. Kept in step with the projection in
+        // `generate_mock_exchange_instruments`, which panics on a kind it cannot project.
+        assert_eq!(
+            <MockExecution<fn() -> DateTime<Utc>> as ExecutionClient>::SUPPORTED_KINDS,
+            &[
+                InstrumentKindDiscriminant::Spot,
+                InstrumentKindDiscriminant::Cfd
+            ]
+        );
+    }
+
+    #[cfg(feature = "binance")]
+    #[test]
+    fn binance_spot_and_margin_are_spot_only() {
+        use crate::client::binance::{BinanceMargin, BinanceSpot};
+
+        assert_eq!(
+            BinanceSpot::SUPPORTED_KINDS,
+            &[InstrumentKindDiscriminant::Spot]
+        );
+        // Cross margin trades the same spot instruments on borrowed funds -- the leverage is in the
+        // account, not the instrument kind.
+        assert_eq!(
+            BinanceMargin::SUPPORTED_KINDS,
+            &[InstrumentKindDiscriminant::Spot]
+        );
+    }
+
+    #[cfg(feature = "hyperliquid")]
+    #[test]
+    fn hyperliquid_splits_perpetual_and_spot_across_two_clients() {
+        use crate::client::hyperliquid::{HyperliquidClient, spot::HyperliquidSpotClient};
+
+        assert_eq!(
+            HyperliquidClient::SUPPORTED_KINDS,
+            &[InstrumentKindDiscriminant::Perpetual]
+        );
+        assert_eq!(
+            HyperliquidSpotClient::SUPPORTED_KINDS,
+            &[InstrumentKindDiscriminant::Spot]
+        );
+    }
+
+    #[cfg(feature = "alpaca")]
+    #[test]
+    fn alpaca_trades_equities_and_options() {
+        use crate::client::alpaca::AlpacaClient;
+
+        assert_eq!(
+            AlpacaClient::SUPPORTED_KINDS,
+            &[
+                InstrumentKindDiscriminant::Spot,
+                InstrumentKindDiscriminant::Option
+            ]
+        );
+    }
+
+    #[cfg(feature = "ibkr")]
+    #[test]
+    fn ibkr_omits_cfd_because_it_builds_no_contract_for_one() {
+        use crate::client::ibkr::IbkrClient;
+
+        // `ContractConfig::to_contract` builds `STK`, `FUT`, `OPT` and `CASH` and nothing else, so a
+        // CFD routed here would be encoded as some other security type -- exactly the silent
+        // wrong-symbol order this const exists to reject. Adding `Cfd` to the list requires adding
+        // the arm first.
+        assert_eq!(
+            IbkrClient::SUPPORTED_KINDS,
+            &[
+                InstrumentKindDiscriminant::Spot,
+                InstrumentKindDiscriminant::Future,
+                InstrumentKindDiscriminant::Option
+            ]
+        );
+    }
 }

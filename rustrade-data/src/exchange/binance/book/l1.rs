@@ -31,12 +31,15 @@ use serde::Deserialize;
 /// See docs: <https://binance-docs.github.io/apidocs/futures/en/#individual-symbol-book-ticker-streams>
 /// ```json
 /// {
+///     "e":"bookTicker",
 ///     "u":22606535573,
 ///     "s":"ETHUSDT",
 ///     "b":"1215.27000000",
 ///     "B":"32.49110000",
 ///     "a":"1215.28000000",
-///     "A":"13.93900000"
+///     "A":"13.93900000",
+///     "T":1671621244670,
+///     "E":1671621244673
 /// }
 /// ```
 // `Serialize` is intentionally not derived: the `subscription_id` field is deserialized from the
@@ -46,6 +49,22 @@ use serde::Deserialize;
 pub struct BinanceOrderBookL1 {
     #[serde(alias = "s", deserialize_with = "de_ob_l1_subscription_id")]
     pub subscription_id: SubscriptionId,
+    /// The venue's transaction time (`T`) **where Binance sends one**, else the host clock at
+    /// deserialisation.
+    ///
+    /// The two Binance surfaces this type serves differ, and the payload examples above show it:
+    /// USD-M futures `bookTicker` carries `T`, Spot `bookTicker` carries only `{u, s, b, B, a, A}`.
+    /// So on Spot the `default` fires on every message and this is a **local** instant, not a venue
+    /// one. It is propagated to both `MarketEvent::time_exchange` and
+    /// [`OrderBookL1::last_update_time`], which keeps those two consistent as that field's contract
+    /// requires — but it means neither can be ranked against a Binance *trade*'s timestamp, which
+    /// is the venue's. See `OrderBookL1::last_update_time` and, for the consumer side,
+    /// `DefaultInstrumentMarketData::price` in the `rustrade` crate.
+    ///
+    /// `Utc::now` rather than an `Option`: `time_exchange` is not optional, so the receipt instant
+    /// is the only available answer, and it is the correct ordering key for a live stream where
+    /// receipt order *is* arrival order. Recording such a feed to a file bakes the recorder's clock
+    /// in permanently, which is worth knowing before replaying one against venue-stamped data.
     #[serde(
         alias = "T",
         deserialize_with = "rustrade_integration::serde::de::de_u64_epoch_ms_as_datetime_utc",

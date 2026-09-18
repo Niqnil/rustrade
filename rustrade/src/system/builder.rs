@@ -237,10 +237,17 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             )?
             .build();
 
+        // Read before `execution_tx_map` is moved into the Engine below.
+        let execution_venues = execution
+            .execution_tx_map
+            .execution_venues()
+            .collect::<Vec<_>>();
+
         // Build EngineState
         let state = EngineStateBuilder::new(instruments, global_data, instrument_data_init)
             .time_engine_start(clock.time())
             .trading_state(trading_state)
+            .execution_venues(execution_venues)
             .balances(
                 balances
                     .into_iter()
@@ -435,5 +442,91 @@ where
             feed_tx,
             audit,
         })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panicking on a bad fixture is acceptable
+mod tests {
+    use super::*;
+    use crate::{
+        EngineEvent,
+        engine::{
+            clock::HistoricalClock,
+            state::{
+                connectivity::VenueRole, global::DefaultGlobalData,
+                instrument::data::DefaultInstrumentMarketData,
+            },
+        },
+        risk::DefaultRiskManager,
+        strategy::DefaultStrategy,
+    };
+    use chrono::{DateTime, Utc};
+    use rustrade_execution::{AccountSnapshot, client::mock::MockExecutionConfig};
+    use rustrade_instrument::test_utils::instrument;
+
+    /// Prices an instrument nothing is traded on, and has no execution client.
+    const DATA: ExchangeId = ExchangeId::BinanceSpot;
+
+    /// Trades a different instrument, via the registered mock client.
+    const EXECUTION: ExchangeId = ExchangeId::Coinbase;
+
+    type TestState = EngineState<DefaultGlobalData, DefaultInstrumentMarketData>;
+
+    fn mock_config(exchange: ExchangeId) -> ExecutionConfig {
+        ExecutionConfig::Mock(MockExecutionConfig {
+            mocked_exchange: exchange,
+            initial_state: AccountSnapshot {
+                exchange,
+                balances: vec![],
+                instruments: vec![],
+            },
+            latency_ms: 0,
+            fee_model: Default::default(),
+            fill_model: Default::default(),
+        })
+    }
+
+    /// `SystemBuilder` derives the account dimension from the execution clients it registers, so a
+    /// venue that prices instruments without being traded on is not given an account connection to
+    /// wait on.
+    ///
+    /// The derivation itself is three lines with no other observer: invert the
+    /// `execution_tx_map` filter and every venue silently reverts to
+    /// [`VenueRole::Both`] — reinstating a run whose global connectivity never leaves
+    /// `Reconnecting`, on the live path.
+    #[test]
+    fn execution_venues_are_derived_from_the_registered_execution_clients() {
+        // Two-instrument pattern: `DATA` prices one instrument that is never traded, `EXECUTION`
+        // trades another. Both are some instrument's `exchange`, so only the registered clients can
+        // tell them apart.
+        let instruments = IndexedInstruments::new([
+            instrument(DATA, "xau", "usd"),
+            instrument(EXECUTION, "btc", "usdt"),
+        ]);
+
+        let args = SystemArgs::new(
+            &instruments,
+            vec![mock_config(EXECUTION)],
+            HistoricalClock::new(DateTime::<Utc>::MIN_UTC),
+            DefaultStrategy::<TestState>::default(),
+            DefaultRiskManager::<TestState>::default(),
+            futures::stream::empty::<EngineEvent>(),
+            DefaultGlobalData,
+            |_| DefaultInstrumentMarketData::default(),
+        );
+
+        let system = SystemBuilder::new(args)
+            .build::<EngineEvent, _>()
+            .expect("a system with one mock execution client must build");
+
+        let connectivity = &system.engine.state.connectivity;
+
+        assert_eq!(
+            connectivity.connectivity(&DATA).role,
+            VenueRole::DataOnly,
+            "no execution client was registered for the pricing venue, so it holds no account"
+        );
+        assert_eq!(connectivity.connectivity(&EXECUTION).role, VenueRole::Both);
     }
 }

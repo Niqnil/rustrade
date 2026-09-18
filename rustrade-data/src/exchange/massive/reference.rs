@@ -3,6 +3,7 @@
 //! Provides access to ticker information, exchanges, market status, and holidays.
 
 use super::error::MassiveError;
+use super::pagination::PaginationGuard;
 use super::rest::MassiveRestClient;
 use async_stream::try_stream;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -1145,8 +1146,10 @@ impl MassiveRestClient {
             );
 
             let mut next_url: Option<String> = Some(initial_url);
+            let mut guard = PaginationGuard::default();
 
             while let Some(url) = next_url.take() {
+                guard.observe(&url)?;
                 debug!(url = %url, "Fetching tickers page");
 
                 let body = self.fetch_page_body(&url).await?;
@@ -1163,9 +1166,6 @@ impl MassiveRestClient {
                     }
                 }
 
-                if let Some(ref url) = parsed.next_url {
-                    Self::validate_next_url(url, base_url)?;
-                }
                 next_url = parsed.next_url;
             }
         }
@@ -1337,8 +1337,10 @@ impl MassiveRestClient {
             );
 
             let mut next_url: Option<String> = Some(initial_url);
+            let mut guard = PaginationGuard::default();
 
             while let Some(url) = next_url.take() {
+                guard.observe(&url)?;
                 debug!(url = %url, "Fetching dividends page");
 
                 let body = self.fetch_page_body(&url).await?;
@@ -1355,9 +1357,6 @@ impl MassiveRestClient {
                     }
                 }
 
-                if let Some(ref url) = parsed.next_url {
-                    Self::validate_next_url(url, base_url)?;
-                }
                 next_url = parsed.next_url;
             }
         }
@@ -1371,12 +1370,12 @@ impl MassiveRestClient {
     ///
     /// ```ignore
     /// let query = SplitQuery::new().ticker("AAPL").limit(100);
-    /// let mut stream = client.fetch_splits(&query);
+    /// let mut stream = client.fetch_splits_raw(&query);
     /// while let Some(split) = stream.next().await {
     ///     println!("{:?}", split?);
     /// }
     /// ```
-    pub fn fetch_splits<'a>(
+    pub fn fetch_splits_raw<'a>(
         &'a self,
         query: &'a SplitQuery,
     ) -> impl Stream<Item = Result<StockSplit, MassiveError>> + 'a {
@@ -1391,8 +1390,10 @@ impl MassiveRestClient {
             );
 
             let mut next_url: Option<String> = Some(initial_url);
+            let mut guard = PaginationGuard::default();
 
             while let Some(url) = next_url.take() {
+                guard.observe(&url)?;
                 debug!(url = %url, "Fetching splits page");
 
                 let body = self.fetch_page_body(&url).await?;
@@ -1409,9 +1410,6 @@ impl MassiveRestClient {
                     }
                 }
 
-                if let Some(ref url) = parsed.next_url {
-                    Self::validate_next_url(url, base_url)?;
-                }
                 next_url = parsed.next_url;
             }
         }

@@ -1,6 +1,6 @@
 [package]
 name = "rustrade-execution"
-version = "0.5.0"
+version = "0.6.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -46,6 +46,15 @@ hyperliquid = [
     "dep:ethers",
     "dep:tokio-util",
     "dep:uuid",
+    # The SDK's `UserFillsResponse` drops `tid` and `feeToken`, so this client parses the
+    # `userFills` response itself. No new crate enters the graph — serde_json is already a
+    # direct dependency of the alpaca and binance features, and a transitive dependency of
+    # hyperliquid_rust_sdk.
+    "dep:serde_json",
+    # Account-event dedup cache: the WS fills subscription replays its snapshot on every
+    # reconnect. Both are already direct dependencies under other features.
+    "dep:lru",
+    "dep:parking_lot",
 ]
 
 [dependencies]
@@ -94,7 +103,7 @@ reqwest = { workspace = true, optional = true } # HTTP client for Alpaca REST AP
 # `margin_trading` is bundled with `spot` under the single `binance` feature (one feature per
 # exchange, matching alpaca/ibkr/hyperliquid). It ships ahead of the BinanceMargin client being
 # fully wired so spot + margin compile together; spot-only users pay the margin module's build cost.
-binance-sdk = { version = "=55.0.0", features = ["spot", "margin_trading"], optional = true }
+binance-sdk = { version = "=69.2.3", features = ["spot", "margin_trading"], optional = true }
 anyhow = { workspace = true, optional = true }                              # Required: binance-sdk's public API returns anyhow::Result
 
 # Shared between "alpaca" and "binance" features
@@ -103,7 +112,7 @@ lru = { workspace = true, optional = true }         # Event deduplication cache 
 parking_lot = { workspace = true, optional = true } # Lighter mutex for dedup cache (no poisoning, no OS thread park)
 
 # IBKR (optional, behind "ibkr" feature)
-ibapi = { version = "=3.0.1", optional = true, default-features = false, features = [
+ibapi = { version = "=4.0.1", optional = true, default-features = false, features = [
     "sync",
 ] }
 chrono-tz = { workspace = true, optional = true }
@@ -129,6 +138,34 @@ serde_json = { workspace = true }
 temp-env = { workspace = true }
 # Serial test execution for integration tests that share exchange state
 serial_test = { workspace = true }
+
+# Integration tests whose contents are entirely feature-gated. Without `required-features`, the
+# target still builds with the feature off and libtest reports "0 passed" -- a green run that
+# asserted nothing. Declaring it here makes `cargo test --test <name>` fail with a message naming
+# the missing feature instead.
+#
+# EVERY test file carrying a file-level `#![cfg(feature = "...")]` must be listed here. Any that
+# is not is silently exempt from the guarantee above.
+
+[[test]]
+name = "alpaca_integration"
+required-features = ["alpaca"]
+
+[[test]]
+name = "binance_conditional_orders"
+required-features = ["binance"]
+
+[[test]]
+name = "hyperliquid_execution"
+required-features = ["hyperliquid"]
+
+[[test]]
+name = "hyperliquid_spot_execution"
+required-features = ["hyperliquid"]
+
+[[test]]
+name = "ibkr_execution"
+required-features = ["ibkr"]
 
 # Examples that depend on optional features. Without `required-features`,
 # `cargo check --all-targets` (default features) fails to compile them.

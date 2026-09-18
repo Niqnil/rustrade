@@ -11,7 +11,7 @@ use crate::{
     statistic::summary::asset::BalanceBasis,
 };
 use chrono::{DateTime, Utc};
-use fnv::FnvHashMap;
+use fnv::{FnvHashMap, FnvHashSet};
 use rustrade_execution::balance::{AssetBalance, Balance};
 use rustrade_instrument::{
     Keyed,
@@ -43,6 +43,9 @@ pub struct EngineStateBuilder<'a, GlobalData, FnInstrumentData> {
     /// [`BalanceBasis::NetAsset`] to compute drawdown and end-of-session balance from net asset
     /// value on margin accounts — see its docs for the net-must-stay-positive precondition.
     balance_basis: BalanceBasis,
+    /// Venues with a registered execution client, if known — see
+    /// [`EngineStateBuilder::execution_venues`].
+    execution_venues: Option<FnvHashSet<ExchangeId>>,
 }
 
 impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInstrumentData> {
@@ -67,7 +70,35 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
             instrument_data_init,
             oms_mode: OmsMode::Netting,
             balance_basis: BalanceBasis::default(),
+            execution_venues: None,
         }
+    }
+
+    /// Declare which venues have a registered execution client.
+    ///
+    /// Only these venues are given an account connection to wait on. Without this, the account
+    /// dimension is approximated from the instrument model — "is the execution venue of at least one
+    /// instrument" — which is correct whenever every venue holding instruments is also traded on,
+    /// and wrong for a venue that supplies prices without executing anything.
+    ///
+    /// That distinction matters for any configuration that prices an instrument on one venue and
+    /// trades a *different* instrument on another: the pricing venue would otherwise be assigned
+    /// [`VenueRole::Both`](crate::engine::state::connectivity::VenueRole::Both), wait forever on an
+    /// account connection nothing will ever establish, and hold
+    /// [`ConnectivityStates::global`](crate::engine::state::connectivity::ConnectivityStates::global)
+    /// at [`Health::Reconnecting`](crate::engine::state::connectivity::Health::Reconnecting) for the
+    /// life of the run.
+    ///
+    /// [`SystemBuilder`](crate::system::builder::SystemBuilder) calls this for you from the
+    /// execution clients it registers, and [`backtest`](crate::backtest::backtest) reconciles the
+    /// roles itself against the clients it builds per run. Provide it by hand when constructing an
+    /// `EngineState` for an engine you drive directly, where neither of those applies.
+    pub fn execution_venues<Iter>(mut self, venues: Iter) -> Self
+    where
+        Iter: IntoIterator<Item = ExchangeId>,
+    {
+        self.execution_venues = Some(venues.into_iter().collect());
+        self
     }
 
     /// Optionally provide the initial `TradingState`.
@@ -168,6 +199,7 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
             instrument_data_init,
             oms_mode,
             balance_basis,
+            execution_venues,
         } = self;
 
         // Default if not provided
@@ -178,7 +210,8 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
         let trading = trading_state.unwrap_or_default();
 
         // Construct empty ConnectivityStates
-        let connectivity = generate_empty_indexed_connectivity_states(instruments);
+        let connectivity =
+            generate_empty_indexed_connectivity_states(instruments, execution_venues.as_ref());
 
         // Update empty AssetStates from provided exchange asset Balances
         let mut assets = generate_empty_indexed_asset_states(instruments, balance_basis);
@@ -216,7 +249,7 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
 mod tests {
     use super::*;
     use crate::{
-        engine::state::EngineState,
+        engine::state::{EngineState, connectivity::VenueRole},
         statistic::{summary::TradingSummaryGenerator, time::Annual365},
     };
     use rust_decimal::Decimal;
@@ -252,5 +285,59 @@ mod tests {
         );
 
         assert_eq!(generator.generate(Annual365).basis, BalanceBasis::NetAsset);
+    }
+
+    /// End-to-end seam for [`EngineStateBuilder::execution_venues`]: the declared set has to reach
+    /// [`generate_empty_indexed_connectivity_states`] for the built state's roles to differ from
+    /// the instrument-model approximation. The generator is unit-tested at its own seam; this pins
+    /// the threading between the two, which is otherwise verified nowhere.
+    #[test]
+    fn declared_execution_venues_reach_the_built_connectivity_states() {
+        const DATA: ExchangeId = ExchangeId::BinanceSpot;
+        const EXECUTION: ExchangeId = ExchangeId::Coinbase;
+
+        // Two-instrument pattern: `DATA` prices an instrument that is never traded, `EXECUTION`
+        // trades a different one. Both are some instrument's `exchange`, so the instrument model
+        // alone claims both hold an account.
+        let instruments = IndexedInstruments::builder()
+            .add_instrument(Instrument::spot(
+                DATA,
+                "data_venue_xau_usd",
+                "XAUUSD",
+                Underlying::new("xau", "usd"),
+                None,
+            ))
+            .add_instrument(Instrument::spot(
+                EXECUTION,
+                "execution_venue_btc_usdt",
+                "BTCUSDT",
+                Underlying::new("btc", "usdt"),
+                None,
+            ))
+            .build();
+
+        let declared: EngineState<(), ()> = EngineState::builder(&instruments, (), |_| ())
+            .execution_venues([EXECUTION])
+            .build();
+
+        assert_eq!(
+            declared.connectivity.connectivity(&DATA).role,
+            VenueRole::DataOnly,
+            "the declared set is what says nothing executes on the pricing venue"
+        );
+        assert_eq!(
+            declared.connectivity.connectivity(&EXECUTION).role,
+            VenueRole::Both
+        );
+
+        // Non-vacuous: without the declaration the same collection approximates `DATA` as `Both`,
+        // so the assertion above can only pass if the set was actually threaded through.
+        let approximated: EngineState<(), ()> =
+            EngineState::builder(&instruments, (), |_| ()).build();
+
+        assert_eq!(
+            approximated.connectivity.connectivity(&DATA).role,
+            VenueRole::Both
+        );
     }
 }

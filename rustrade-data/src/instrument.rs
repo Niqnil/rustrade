@@ -96,7 +96,11 @@ where
     fn from(value: &Keyed<InstrumentKey, Instrument<ExchangeKey, AssetKey>>) -> Self {
         Self {
             key: value.key.clone(),
-            name_exchange: value.value.name_exchange.clone(),
+            // The DATA venue's symbol, not the execution venue's. These differ whenever the two
+            // venues spell one instrument differently (`BP.L` against `BP`), and subscribing under
+            // the execution venue's name would silently yield no ticks -- or another instrument's.
+            // Falls back to `name_exchange` for every single-venue instrument.
+            name_exchange: value.value.data_name_exchange().clone(),
             kind: MarketDataInstrumentKind::from(&value.value.kind),
         }
     }

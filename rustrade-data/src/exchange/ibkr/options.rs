@@ -12,11 +12,11 @@
 //!
 //! IB provides two ways to get Greeks:
 //!
-//! 1. **Calculators** (Phase 5A): You provide volatility/price inputs, IB computes Greeks.
+//! 1. **Calculators**: You provide volatility/price inputs, IB computes Greeks.
 //!    See [`IbkrHistoricalData::calculate_theoretical_greeks`] and
 //!    [`IbkrHistoricalData::calculate_implied_volatility`].
 //!
-//! 2. **Real-time ticks** (Phase 5B): Subscribe to option market data, receive
+//! 2. **Real-time ticks**: Subscribe to option market data, receive
 //!    Greeks computed from live prices via `TickTypes::OptionComputation`.
 //!
 //! # Subscription Requirements

@@ -582,6 +582,15 @@ fn assert_ohlcv_rtype_matches(rtype: u8, schema: Schema) -> Result<(), DataError
 /// * `exchange` - ExchangeId to tag events with
 /// * `instrument` - Instrument key to tag events with (use `Arc<K>` for efficiency)
 ///
+/// # ⚠️ Caller obligation: the file must contain exactly one instrument
+///
+/// Every record is tagged with the supplied `instrument`; the per-record
+/// `instrument_id` in the DBN header is **not** read. A multi-instrument file
+/// therefore decodes silently, with every event attributed to whichever key was
+/// passed — wrong prices on the wrong instrument, with no error. Use a
+/// single-instrument file, or resolve the header's `instrument_id` yourself as
+/// the live path does via `PitSymbolMap`.
+///
 /// # Errors
 ///
 /// Returns [`DataError::Databento`] if the file cannot be opened or the DBN
@@ -608,6 +617,15 @@ pub fn load_trades_from_dbn<K: Clone>(
 /// * `path` - Path to `.dbn` or `.dbn.zst` file
 /// * `exchange` - ExchangeId to tag events with
 /// * `instrument` - Instrument key to tag events with (use `Arc<K>` for efficiency)
+///
+/// # ⚠️ Caller obligation: the file must contain exactly one instrument
+///
+/// Every record is tagged with the supplied `instrument`; the per-record
+/// `instrument_id` in the DBN header is **not** read. A multi-instrument file
+/// therefore decodes silently, with every event attributed to whichever key was
+/// passed — wrong prices on the wrong instrument, with no error. Use a
+/// single-instrument file, or resolve the header's `instrument_id` yourself as
+/// the live path does via `PitSymbolMap`.
 ///
 /// # Errors
 ///

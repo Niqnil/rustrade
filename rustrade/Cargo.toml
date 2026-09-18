@@ -1,6 +1,6 @@
 [package]
 name = "rustrade"
-version = "0.5.0"
+version = "0.6.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -10,6 +10,24 @@ categories.workspace = true
 documentation = "https://docs.rs/rustrade"
 readme = "README.md"
 description = "Framework for building high-performance live-trading, paper-trading and back-testing systems"
+
+[features]
+# Forward provider market-data features so the corporate-action *sourcing* example can drive a real
+# `StockSplitSource` impl (Massive's `MassiveRestClient` / Alpaca's `AlpacaRestClient`). Both off by
+# default — the engine itself needs no provider; the example falls back to a canned offline source.
+massive = ["rustrade-data/massive"]
+alpaca = ["rustrade-data/alpaca"]
+# Forwarded so the streaming-backtest example can build a market data factory from a real provider.
+# The engine itself is provider-agnostic; nothing under `src/` is gated on this.
+lse = ["rustrade-data/lse"]
+
+[[example]]
+name = "engine_backtest_with_lse_candles"
+required-features = ["lse"]
+
+[[example]]
+name = "engine_sync_with_lse_market_data_and_mock_execution"
+required-features = ["lse"]
 
 [[bench]]
 name = "backtest"

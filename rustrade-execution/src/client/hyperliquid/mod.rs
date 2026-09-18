@@ -15,7 +15,9 @@
 //!
 //! # Architecture
 //!
-//! - REST (`InfoClient`): account_snapshot, fetch_balances, fetch_open_orders, fetch_trades
+//! - REST (`InfoClient`): account_snapshot, fetch_balances, fetch_open_orders, fetch_trades.
+//!   `fetch_trades` posts to `/info` through the SDK's HTTP client but parses the response into
+//!   [`common::UserFill`] rather than the SDK's type, which drops `tid` and `feeToken`.
 //! - REST (`ExchangeClient`): open_order, cancel_order
 //! - WebSocket (`InfoClient` with `with_reconnect`): account_stream via UserFills + OrderUpdates subscriptions
 //!
@@ -27,13 +29,34 @@
 //! |----------------|----------------|
 //! | **Reconnection** | `InfoClient::with_reconnect()` handles WebSocket reconnection automatically |
 //! | **Heartbeat** | SDK manages WebSocket ping/pong internally |
-//! | **Deduplication** | SDK-managed; no custom dedup cache needed |
+//! | **Deduplication** | This client's own, on the fills stream. See below. |
 //! | **Fill recovery** | Not implemented — use [`ExecutionClient::fetch_trades`] after reconnect if needed |
 //!
 //! **Caller responsibilities**:
 //! - If fill recovery is critical, monitor for reconnection events and call `fetch_trades()`
 //! - REST clients (`InfoClient::new()`, `ExchangeClient::new()`) do NOT auto-reconnect;
 //!   only WebSocket streams via `with_reconnect()` do
+//!
+//! # Trade identity and duplicate fills
+//!
+//! A [`Trade`]'s id is the venue's `tid`, which identifies the fill. It is deliberately **not**
+//! `hash`, which identifies the transaction: one aggressive order sweeping several resting orders
+//! produces several fills under a single hash, and keying on the hash makes them indistinguishable.
+//! Hyperliquid documents `tid` as unique per fill but qualified by coin rather than globally, so
+//! callers reconciling across instruments should qualify it the same way.
+//!
+//! The fills subscription opens with a snapshot of recent fills and the SDK resubscribes on every
+//! reconnect, so the same fill is redelivered each time the socket comes back. A trade is a delta
+//! the consumer accumulates, so this client deduplicates the stream itself — the cache is scoped to
+//! one [`ExecutionClient::account_stream`] call and survives reconnects within it.
+//!
+//! Order updates are deliberately **not** deduplicated. They assert absolute state rather than a
+//! delta, so a replayed one is idempotent while a dropped one could strand a consumer on stale
+//! state.
+//!
+//! [`ExecutionClient::fetch_trades`] does not deduplicate: it answers the window it was asked for,
+//! and its results reach the caller rather than the stream. A caller feeding both into one consumer
+//! should expect overlap and reconcile on the trade id.
 //!
 //! # Conditional Orders (Stop, TakeProfit)
 //!
@@ -67,6 +90,7 @@ pub mod config;
 pub mod error;
 pub mod spot;
 
+use crate::client::dedup::{dedup_key_from_event, is_duplicate, new_dedup_cache};
 use crate::{
     AccountEvent, AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot,
     UnindexedAccountEvent, UnindexedAccountSnapshot,
@@ -89,7 +113,7 @@ use crate::{
 use chrono::{DateTime, Utc};
 use common::{
     CancelOnDropStream, cid_to_cloid, instrument_to_perp_coin, map_tif, millis_to_datetime,
-    parse_decimal, parse_side, perp_coin_to_instrument, round_to_5_sig_figs,
+    parse_decimal, parse_side, perp_coin_to_instrument, round_to_5_sig_figs, user_fills,
 };
 pub use config::{HyperliquidConfig, HyperliquidConfigError};
 use error::{map_order_error, map_sdk_error};
@@ -98,8 +122,10 @@ use futures::{StreamExt, stream::BoxStream};
 use hyperliquid_rust_sdk::{BaseUrl, ExchangeClient, InfoClient, Message, Subscription};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
-    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
-    instrument::name::InstrumentNameExchange,
+    Side,
+    asset::name::AssetNameExchange,
+    exchange::ExchangeId,
+    instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use rustrade_integration::collection::snapshot::Snapshot;
 use smol_str::{SmolStr, format_smolstr};
@@ -112,7 +138,7 @@ use std::{
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// USDC asset name on Hyperliquid (the only collateral asset for perps).
 const USDC_ASSET: &str = "USDC";
@@ -184,6 +210,11 @@ impl HyperliquidClient {
 
 impl ExecutionClient for HyperliquidClient {
     const EXCHANGE: ExchangeId = ExchangeId::HyperliquidPerp;
+
+    // Perpetuals only — spot is served by `HyperliquidSpotClient`, which uses different coin
+    // naming, asset indices and balance endpoints.
+    const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant] =
+        &[InstrumentKindDiscriminant::Perpetual];
 
     type Config = HyperliquidConfig;
     type AccountStream = BoxStream<'static, UnindexedAccountEvent>;
@@ -472,6 +503,11 @@ impl ExecutionClient for HyperliquidClient {
         // flag has no associated payload to synchronise; the channel send is the synchronisation point.
         let terminated = Arc::new(AtomicBool::new(false));
 
+        // Scoped to this stream rather than to the client: a fresh `account_stream` opens a fresh
+        // subscription, whose snapshot the new consumer has not seen. It must outlive a reconnect,
+        // which it does -- the SDK reconnects underneath this task, not around it.
+        let fills_dedup = new_dedup_cache();
+
         // Spawn task to process fills
         let fills_event_tx = event_tx.clone();
         let fills_cancel = cancel_token.clone();
@@ -505,10 +541,29 @@ impl ExecutionClient for HyperliquidClient {
                         };
                         match msg {
                             Message::UserFills(fills) => {
+                                // Hyperliquid opens a `userFills` subscription with a snapshot of
+                                // recent fills, and the SDK resubscribes on every reconnect. Each
+                                // reconnect therefore redelivers fills already sent. A trade is a
+                                // delta the consumer accumulates, so redelivering one double-counts
+                                // filled quantity and fees -- hence the dedup cache.
+                                //
+                                // Order updates on the sibling task are deliberately NOT deduped:
+                                // they are absolute state, so a replayed one is idempotent, while
+                                // dropping one could strand the consumer on stale state.
                                 for fill in fills.data.fills {
-                                    if let Some(event) = fill_to_account_event(&fill)
-                                        && fills_event_tx.send(event).is_err()
+                                    let Some(event) = fill_to_account_event(&fill) else {
+                                        continue;
+                                    };
+                                    if let Some(key) = dedup_key_from_event(&event)
+                                        && is_duplicate(&fills_dedup, key)
                                     {
+                                        trace!(
+                                            tid = fill.tid,
+                                            "Hyperliquid dedup: skipping fill already delivered"
+                                        );
+                                        continue;
+                                    }
+                                    if fills_event_tx.send(event).is_err() {
                                         debug!("Fills event channel closed");
                                         return;
                                     }
@@ -1109,11 +1164,7 @@ impl ExecutionClient for HyperliquidClient {
     ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError> {
         let address = self.wallet_h160();
 
-        let fills = self
-            .info_client
-            .user_fills(address)
-            .await
-            .map_err(map_sdk_error)?;
+        let fills = user_fills(&self.info_client, address).await?;
 
         // Clamp to 0 for dates before epoch (shouldn't happen in practice)
         #[allow(clippy::cast_sign_loss)] // timestamp_millis >= 0 after max(0)
@@ -1160,7 +1211,7 @@ impl ExecutionClient for HyperliquidClient {
             };
 
             result.push(Trade {
-                id: TradeId(SmolStr::new(&fill.hash)),
+                id: TradeId(format_smolstr!("{}", fill.tid)),
                 order_id: OrderId(format_smolstr!("{}", fill.oid)),
                 instrument,
                 strategy: StrategyId::unknown(),
@@ -1168,6 +1219,9 @@ impl ExecutionClient for HyperliquidClient {
                 side,
                 price,
                 quantity,
+                // `TradeInfo` carries no cumulative filled quantity; Hyperliquid reports order
+                // state as its own `OrderUpdate` message.
+                order_filled_quantity: None,
                 fees: AssetFees {
                     asset: AssetNameExchange::from("USDC"),
                     fees: fee,
@@ -1191,7 +1245,7 @@ fn fill_to_account_event(fill: &hyperliquid_rust_sdk::TradeInfo) -> Option<Unind
     let order_id = OrderId(format_smolstr!("{}", fill.oid));
 
     let trade = Trade {
-        id: TradeId(SmolStr::new(&fill.hash)),
+        id: TradeId(format_smolstr!("{}", fill.tid)),
         order_id,
         instrument,
         strategy: StrategyId::unknown(),
@@ -1199,6 +1253,9 @@ fn fill_to_account_event(fill: &hyperliquid_rust_sdk::TradeInfo) -> Option<Unind
         side,
         price,
         quantity,
+        // `TradeInfo` carries no cumulative filled quantity, so the order's state must be learned
+        // from an `OrderUpdate` -- which Hyperliquid sends as its own message.
+        order_filled_quantity: None,
         fees: AssetFees {
             asset: AssetNameExchange::from("USDC"),
             fees: fee,
@@ -1320,6 +1377,10 @@ mod tests {
         match event.kind {
             AccountEventKind::Trade(trade) => {
                 assert_eq!(trade.instrument.as_ref(), "BTC-USD-PERP");
+                assert_eq!(
+                    trade.id.0, "99999",
+                    "the id is the fill's tid, not its hash"
+                );
                 assert_eq!(trade.side, Side::Buy);
                 assert_eq!(trade.price, dec!(65000.5));
                 assert_eq!(trade.quantity, dec!(0.1));
@@ -1361,6 +1422,86 @@ mod tests {
             }
             _ => panic!("Expected Trade event"),
         }
+    }
+
+    /// Build a perp `TradeInfo` sharing one transaction hash with its siblings.
+    fn sweep_fill(tid: u64, px: &str) -> hyperliquid_rust_sdk::TradeInfo {
+        let json = format!(
+            r#"{{
+                "coin": "BTC", "side": "B", "px": "{px}", "sz": "0.1",
+                "time": 1714100000000, "hash": "0xonesweep", "startPosition": "0",
+                "dir": "Open Long", "closedPnl": "0", "oid": 4242, "cloid": null,
+                "crossed": true, "fee": "0.65", "feeToken": "USDC", "tid": {tid}
+            }}"#
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn a_trade_id_identifies_the_fill_not_the_transaction() {
+        // One aggressive order sweeping two resting levels: same `hash`, same `oid`, two fills.
+        // Deriving the id from `hash` gave both the same `TradeId`, so anything reconciling on it
+        // treated them as one fill and dropped the second -- understating filled quantity and fees.
+        let first = fill_to_account_event(&sweep_fill(111, "65000.5")).unwrap();
+        let second = fill_to_account_event(&sweep_fill(222, "65001.0")).unwrap();
+
+        let (AccountEventKind::Trade(first), AccountEventKind::Trade(second)) =
+            (first.kind, second.kind)
+        else {
+            panic!("Expected Trade events");
+        };
+
+        assert_eq!(first.order_id, second.order_id, "one order produced both");
+        assert_ne!(first.id, second.id, "but they are distinct fills");
+        assert_eq!(first.id.0, "111");
+        assert_eq!(second.id.0, "222");
+    }
+
+    #[test]
+    fn a_replayed_fill_is_delivered_once() {
+        // The `userFills` subscription opens with a snapshot of recent fills, and the SDK
+        // resubscribes on reconnect -- so the same fill arrives again on every reconnect.
+        let cache = new_dedup_cache();
+        let event = fill_to_account_event(&sweep_fill(111, "65000.5")).unwrap();
+        let replay = fill_to_account_event(&sweep_fill(111, "65000.5")).unwrap();
+
+        assert!(!is_duplicate(&cache, dedup_key_from_event(&event).unwrap()));
+        assert!(is_duplicate(&cache, dedup_key_from_event(&replay).unwrap()));
+    }
+
+    #[test]
+    fn both_fills_of_one_sweep_survive_dedup() {
+        // The guard against the fix and the dedup fighting each other: two fills of one sweep are
+        // not duplicates of one another, and dedup must not collapse what the id now separates.
+        let cache = new_dedup_cache();
+        let first = fill_to_account_event(&sweep_fill(111, "65000.5")).unwrap();
+        let second = fill_to_account_event(&sweep_fill(222, "65001.0")).unwrap();
+
+        assert!(!is_duplicate(&cache, dedup_key_from_event(&first).unwrap()));
+        assert!(!is_duplicate(
+            &cache,
+            dedup_key_from_event(&second).unwrap()
+        ));
+    }
+
+    #[test]
+    fn one_tid_on_two_instruments_is_two_fills() {
+        // Hyperliquid documents `tid` as qualified by coin rather than globally unique, which is
+        // why the dedup key carries the instrument.
+        let cache = new_dedup_cache();
+        let btc = fill_to_account_event(&sweep_fill(111, "65000.5")).unwrap();
+
+        let eth_json = r#"{
+            "coin": "ETH", "side": "B", "px": "3200", "sz": "1.5",
+            "time": 1714100000000, "hash": "0xother", "startPosition": "0",
+            "dir": "Open Long", "closedPnl": "0", "oid": 9, "cloid": null,
+            "crossed": true, "fee": "4.8", "feeToken": "USDC", "tid": 111
+        }"#;
+        let eth: hyperliquid_rust_sdk::TradeInfo = serde_json::from_str(eth_json).unwrap();
+        let eth = fill_to_account_event(&eth).unwrap();
+
+        assert!(!is_duplicate(&cache, dedup_key_from_event(&btc).unwrap()));
+        assert!(!is_duplicate(&cache, dedup_key_from_event(&eth).unwrap()));
     }
 
     #[test]

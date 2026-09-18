@@ -5,6 +5,8 @@
 //!
 //! Error mapping is in the `error` module.
 
+use crate::client::hyperliquid::error::map_sdk_error;
+use crate::error::UnindexedClientError;
 use crate::order::{TimeInForce, id::ClientOrderId};
 use chrono::{DateTime, TimeZone, Utc};
 use futures::Stream;
@@ -53,6 +55,83 @@ impl<S> Drop for CancelOnDropStream<S> {
 }
 
 /// Parse a decimal string from SDK response, logging warnings on failure.
+/// One fill from the `userFills` info endpoint, as the venue actually returns it.
+///
+/// # Why this exists rather than `hyperliquid_rust_sdk::UserFillsResponse`
+///
+/// The SDK's type does not model `tid`, the only per-fill identifier the endpoint offers, and it
+/// does not model `feeToken`. Neither omission is visible at runtime: the SDK does not set
+/// `deny_unknown_fields`, so both are parsed away silently. Without `tid` the only id left is
+/// `hash`, which identifies the *transaction* — one aggressive order sweeping several resting
+/// orders produces several fills under a single hash, and they are then indistinguishable.
+///
+/// Only the fields this client reads are declared. Unknown fields are ignored, so `hash`,
+/// `closedPnl`, `dir`, `startPosition`, `crossed` and `builderFee` cost nothing by being absent
+/// here.
+///
+/// Drop this in favour of the SDK type if it ever models `tid`.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserFill {
+    pub coin: String,
+    pub side: String,
+    pub px: String,
+    pub sz: String,
+    pub time: u64,
+    pub oid: u64,
+    pub fee: String,
+
+    /// Identifies this fill. `hash` identifies the transaction that contained it, and one
+    /// transaction can contain many fills.
+    ///
+    /// Declared required rather than `Option<u64>` deliberately. If the venue ever stops sending
+    /// it, this client should fail loudly at the parse — falling back to `hash` would silently
+    /// restore a duplicate-id defect that is invisible until fills go missing during
+    /// reconciliation.
+    ///
+    /// Hyperliquid documents this as unique per fill, but qualified by coin rather than global,
+    /// which is why the dedup cache keys on the instrument alongside it.
+    pub tid: u64,
+
+    /// Asset the fee is denominated in.
+    ///
+    /// Optional because, unlike every other field here, nothing proves the endpoint sends it: the
+    /// SDK's own type omits it, so it has never been observed through this dependency. The caller
+    /// falls back to inferring the asset from the side when it is absent.
+    pub fee_token: Option<String>,
+}
+
+/// Fetch `userFills` for `address`, parsing it into [`UserFill`] rather than the SDK's lossy type.
+///
+/// Issued through the SDK's own [`HttpClient`](hyperliquid_rust_sdk::InfoClient::http_client), so
+/// base URL, TLS configuration and error type are exactly those of every other info request this
+/// client makes — only the response type differs.
+///
+/// # Errors
+///
+/// Returns a transport error if the POST fails, or a parse error if the response does not match
+/// [`UserFill`] — which includes the case where `tid` has stopped being sent.
+pub async fn user_fills(
+    info_client: &hyperliquid_rust_sdk::InfoClient,
+    address: ethers::types::H160,
+) -> Result<Vec<UserFill>, UnindexedClientError> {
+    // `{:?}` on H160 renders the checksummed 0x-prefixed form the endpoint expects. `Display`
+    // abbreviates the middle of the address ("0x1234…5678"), so it must not be used here.
+    let body = format!(r#"{{"type":"userFills","user":"{address:?}"}}"#);
+
+    let raw = info_client
+        .http_client
+        .post("/info", body)
+        .await
+        .map_err(map_sdk_error)?;
+
+    // `Internal` rather than a connectivity error: a response that does not parse is a schema
+    // change or a venue-side regression, not a transient fault, and retrying will not fix it.
+    serde_json::from_str(&raw).map_err(|e| {
+        UnindexedClientError::Internal(format!("Hyperliquid userFills response did not parse: {e}"))
+    })
+}
+
 pub fn parse_decimal(value: &str, field: &str) -> Option<Decimal> {
     Decimal::from_str(value)
         .map_err(|e| warn!(%field, %value, %e, "Failed to parse decimal"))
@@ -339,5 +418,155 @@ mod tests {
 
         // Zero timestamp (Unix epoch) is valid
         assert!(millis_to_datetime(0).is_some());
+    }
+}
+
+#[cfg(test)]
+// Test code: panics on bad input are acceptable
+#[allow(clippy::unwrap_used)]
+mod user_fills_tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// One fill exactly as the `userFills` documentation shows it, including the two fields the
+    /// SDK's own response type drops.
+    const DOCUMENTED_FILL: &str = r#"{
+        "closedPnl": "0.0",
+        "coin": "AVAX",
+        "crossed": false,
+        "dir": "Open Long",
+        "hash": "0xa166e3fa63c25663024b03f2e0da011a00307e4017465df020210d3d432e7cb8",
+        "oid": 90542681,
+        "px": "18.435",
+        "side": "B",
+        "startPosition": "26.86",
+        "sz": "93.53",
+        "time": 1681222254710,
+        "fee": "0.01",
+        "feeToken": "USDC",
+        "builderFee": "0.01",
+        "tid": 118906512037719
+    }"#;
+
+    /// Build an `InfoClient` pointed at `uri`. `InfoClient::new` opens no connection -- it only
+    /// fills in the struct -- so this costs nothing and touches no network.
+    async fn info_client_against(uri: String) -> hyperliquid_rust_sdk::InfoClient {
+        let mut client = hyperliquid_rust_sdk::InfoClient::new(
+            None,
+            Some(hyperliquid_rust_sdk::BaseUrl::Localhost),
+        )
+        .await
+        .unwrap();
+        client.http_client.base_url = uri;
+        client
+    }
+
+    async fn serve(body: String) -> (MockServer, hyperliquid_rust_sdk::InfoClient) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/info"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
+            .mount(&server)
+            .await;
+        let client = info_client_against(server.uri()).await;
+        (server, client)
+    }
+
+    #[tokio::test]
+    async fn a_fill_carries_the_tid_and_fee_token_the_sdk_type_drops() {
+        let (_server, client) = serve(format!("[{DOCUMENTED_FILL}]")).await;
+
+        let fills = user_fills(&client, ethers::types::H160::zero())
+            .await
+            .unwrap();
+
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].tid, 118_906_512_037_719);
+        assert_eq!(fills[0].fee_token.as_deref(), Some("USDC"));
+        assert_eq!(fills[0].oid, 90_542_681);
+        assert_eq!(fills[0].coin, "AVAX");
+    }
+
+    #[tokio::test]
+    async fn one_transaction_can_carry_several_fills_and_they_are_told_apart_by_tid() {
+        // A single aggressive order sweeping three resting orders: one `hash`, one `oid`, three
+        // fills. This is the shape the old `TradeId(hash)` collapsed into one trade.
+        let sweep = r#"[
+            {"closedPnl":"0.0","coin":"AVAX","crossed":true,"dir":"Open Long",
+             "hash":"0xsweep","oid":1,"px":"18.40","side":"B","startPosition":"0",
+             "sz":"10","time":1681222254710,"fee":"0.01","feeToken":"USDC","tid":111},
+            {"closedPnl":"0.0","coin":"AVAX","crossed":true,"dir":"Open Long",
+             "hash":"0xsweep","oid":1,"px":"18.45","side":"B","startPosition":"10",
+             "sz":"10","time":1681222254710,"fee":"0.01","feeToken":"USDC","tid":222},
+            {"closedPnl":"0.0","coin":"AVAX","crossed":true,"dir":"Open Long",
+             "hash":"0xsweep","oid":1,"px":"18.50","side":"B","startPosition":"20",
+             "sz":"10","time":1681222254710,"fee":"0.01","feeToken":"USDC","tid":333}
+        ]"#;
+        let (_server, client) = serve(sweep.to_string()).await;
+
+        let fills = user_fills(&client, ethers::types::H160::zero())
+            .await
+            .unwrap();
+
+        let tids: Vec<u64> = fills.iter().map(|f| f.tid).collect();
+        assert_eq!(tids, vec![111, 222, 333]);
+    }
+
+    #[tokio::test]
+    async fn a_missing_fee_token_falls_back_rather_than_failing() {
+        // `feeToken` is the one field here that nothing proves the endpoint sends, so its absence
+        // must not cost the caller the whole response.
+        let without = DOCUMENTED_FILL.replace(r#""feeToken": "USDC","#, "");
+        let (_server, client) = serve(format!("[{without}]")).await;
+
+        let fills = user_fills(&client, ethers::types::H160::zero())
+            .await
+            .unwrap();
+
+        assert_eq!(fills.len(), 1);
+        assert!(fills[0].fee_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_missing_tid_fails_loudly_instead_of_falling_back_to_the_hash() {
+        // Silently reverting to `hash` would reinstate the duplicate-id defect, and it would only
+        // become visible as fills going missing during reconciliation.
+        let without = DOCUMENTED_FILL.replace(r#""tid": 118906512037719"#, r#""unused": 0"#);
+        let (_server, client) = serve(format!("[{without}]")).await;
+
+        let error = user_fills(&client, ethers::types::H160::zero())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, UnindexedClientError::Internal(msg) if msg.contains("userFills")),
+            "expected a parse failure naming the endpoint, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_request_names_the_address_in_full() {
+        // `Display` for H160 abbreviates the middle of an address, which the venue would not
+        // recognise. Only the `Debug` rendering is the full 0x-prefixed form.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/info"))
+            .and(wiremock::matchers::body_string_contains(
+                "0x000000000000000000000000000000000000dead",
+            ))
+            .and(wiremock::matchers::body_string_contains("userFills"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("[]", "application/json"))
+            .mount(&server)
+            .await;
+        let client = info_client_against(server.uri()).await;
+
+        let address = "0x000000000000000000000000000000000000dEaD"
+            .parse::<ethers::types::H160>()
+            .unwrap();
+
+        // The mock only answers a body carrying the full address, so reaching `Ok` is the
+        // assertion.
+        assert!(user_fills(&client, address).await.unwrap().is_empty());
     }
 }

@@ -7,7 +7,17 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// All errors generated in `rustrade-data`.
+///
+/// # Non-exhaustive
+/// Variants are added as integrations land, and two of the existing ones (`Databento`, `Lse` —
+/// not linked: each is behind its own feature, and this block is not) appear only under that
+/// feature, so the variant set a downstream `match` sees already depends on the feature selection
+/// it built
+/// with. A wildcard arm is required either way; `#[non_exhaustive]` makes that a compile-time
+/// contract rather than something a consumer discovers when a feature flag or a release moves.
+/// Matches *within* this crate stay exhaustively checked.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]
+#[non_exhaustive]
 pub enum DataError {
     #[error("failed to index market data Subscriptions: {0}")]
     Index(#[from] IndexError),
@@ -33,6 +43,26 @@ pub enum DataError {
     Databento {
         kind: DatabentoErrorKind,
         context: String,
+        message: String,
+    },
+
+    /// A London Strategic Edge integration error, flattened into this crate's common error type.
+    ///
+    /// [`LseError`](crate::exchange::lse::error::LseError) carries a `reqwest::Error`, which is
+    /// neither `Clone` nor serialisable, so it cannot be nested here structurally. Callers wanting
+    /// the full cause should handle `LseError` at the call site; this variant exists so an
+    /// LSE-sourced stream can compose with the crate's generic stream helpers. Same flattening as
+    /// [`Socket`](Self::Socket) applies to `SocketError`.
+    ///
+    /// `kind` survives that flattening, so a consumer can still tell a resumable
+    /// [`RateLimit`](crate::exchange::lse::error::LseErrorKind::RateLimit) from a terminal
+    /// [`Decode`](crate::exchange::lse::error::LseErrorKind::Decode) without substring-matching
+    /// `message` — which is the only thing a bare `String` left it. Same shape as the `Databento`
+    /// variant (not linked: it is behind the `databento` feature, which this variant is not).
+    #[cfg(feature = "lse")]
+    #[error("London Strategic Edge {kind} error: {message}")]
+    Lse {
+        kind: crate::exchange::lse::error::LseErrorKind,
         message: String,
     },
 
@@ -76,6 +106,16 @@ impl DataError {
 impl From<SocketError> for DataError {
     fn from(value: SocketError) -> Self {
         Self::Socket(value.to_string())
+    }
+}
+
+#[cfg(feature = "lse")]
+impl From<crate::exchange::lse::error::LseError> for DataError {
+    fn from(value: crate::exchange::lse::error::LseError) -> Self {
+        Self::Lse {
+            kind: value.kind(),
+            message: value.to_string(),
+        }
     }
 }
 

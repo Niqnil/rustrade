@@ -42,6 +42,24 @@ pub struct MultiExchangeTxMap<Tx = UnboundedTx<ExecutionRequest>>(
     FnvIndexMap<ExchangeId, Option<Tx>>,
 );
 
+impl<Tx> MultiExchangeTxMap<Tx> {
+    /// Venues that actually have a registered execution client.
+    ///
+    /// A venue is present in this map but holds `None` when the system tracks instruments for it
+    /// without trading on them — see the type-level note above on why the slot must still exist.
+    /// Having a transmitter is therefore what decides whether the engine will ever receive an
+    /// `AccountStream` event from that venue, which is precisely the account dimension
+    /// [`VenueRole`](crate::engine::state::connectivity::VenueRole) is derived from.
+    ///
+    /// Borrows `self`, so collect the result before moving the map into an
+    /// [`Engine`](crate::engine::Engine).
+    pub(crate) fn execution_venues(&self) -> impl Iterator<Item = ExchangeId> + '_ {
+        self.0
+            .iter()
+            .filter_map(|(exchange, tx)| tx.as_ref().map(|_| *exchange))
+    }
+}
+
 impl<Tx> FromIterator<(ExchangeId, Option<Tx>)> for MultiExchangeTxMap<Tx> {
     fn from_iter<Iter>(iter: Iter) -> Self
     where

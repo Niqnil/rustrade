@@ -91,7 +91,7 @@ pub fn futures_contract(
 /// Only `right` is validated here. `last_trade_date` and `strike` are forwarded
 /// to the IBKR contract as-is; an empty date or a `0.0` strike will build a
 /// (quietly wrong) contract. Presence of those fields is checked one level up in
-/// [`ContractConfig::to_contract`](super::ContractConfig::to_contract), which is
+/// [`ContractConfig`](super::ContractConfig)'s `to_contract`, which is
 /// the intended entry point for config-driven construction.
 pub fn option_contract(
     symbol: &str,

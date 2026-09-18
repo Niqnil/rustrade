@@ -30,6 +30,27 @@ impl<Interval> MultiBacktestSummary<Interval> {
     }
 }
 
+/// Full result of a single [`backtest`](super::backtest) run: the aggregate [`BacktestSummary`]
+/// **and** the terminal engine state.
+///
+/// [`BacktestSummary::trading_summary`] aggregates statistics derived from **closed** positions only,
+/// so it cannot answer questions about state left at the end of the run — e.g. a position still
+/// **open** at shutdown, or the effect of a notional-preserving corporate action that moves no
+/// aggregate metric. `engine_state` exposes that terminal [`EngineState`](crate::engine::state::EngineState):
+/// callers can inspect open positions, balances, and instrument state directly (e.g. assert a stock
+/// split rescaled an open position's `quantity_abs` / `price_entry_average`).
+///
+/// `State` is the engine's state type (`EngineState<GlobalData, InstrumentData>` for the standard
+/// [`backtest`](super::backtest) path); it is left generic so this module stays decoupled from the
+/// engine-state internals.
+#[derive(Debug, PartialEq)]
+pub struct BacktestResult<Interval, State> {
+    /// Aggregate performance summary derived from closed positions.
+    pub summary: BacktestSummary<Interval>,
+    /// Terminal engine state after the run completes (open positions, balances, instrument state).
+    pub engine_state: State,
+}
+
 /// Single backtest `TradingSummary` and associated metadata.
 #[derive(Debug, PartialEq)]
 pub struct BacktestSummary<Interval> {

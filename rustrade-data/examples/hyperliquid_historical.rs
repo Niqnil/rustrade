@@ -43,8 +43,16 @@ async fn main() {
     // Print first and last few candles
     for candle in candles.iter().take(3) {
         info!(
-            "  {} | O:{:.2} H:{:.2} L:{:.2} C:{:.2} V:{:.2}",
-            candle.close_time, candle.open, candle.high, candle.low, candle.close, candle.volume
+            "  {} | O:{:.2} H:{:.2} L:{:.2} C:{:.2} V:{}",
+            candle.close_time,
+            candle.open,
+            candle.high,
+            candle.low,
+            candle.close,
+            candle
+                .volume
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "n/a".to_string())
         );
     }
 
@@ -52,13 +60,16 @@ async fn main() {
         info!("  ...");
         for candle in candles.iter().rev().take(3).rev() {
             info!(
-                "  {} | O:{:.2} H:{:.2} L:{:.2} C:{:.2} V:{:.2}",
+                "  {} | O:{:.2} H:{:.2} L:{:.2} C:{:.2} V:{}",
                 candle.close_time,
                 candle.open,
                 candle.high,
                 candle.low,
                 candle.close,
-                candle.volume
+                candle
+                    .volume
+                    .map(|v| format!("{v:.2}"))
+                    .unwrap_or_else(|| "n/a".to_string())
             );
         }
     }

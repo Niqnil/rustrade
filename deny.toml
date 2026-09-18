@@ -7,11 +7,40 @@ all-features = true
 
 # Advisories - handled by cargo audit job, but deny can also check
 [advisories]
+# COVERAGE LIMIT -- a green `cargo audit` / `cargo deny` run does not mean Dependabot is clear.
+#
+# Both gates read the RustSec advisory database, which is a subset of GitHub's GHSA data. An
+# advisory carrying a CVE but no RUSTSEC id is invisible to both: it cannot fail CI, so there is
+# nothing for this list to suppress and nothing here that would record it. Dependabot reads GHSA
+# and is the only detector for that class, so check its alerts rather than trusting a green CI.
+# Two were live against this lockfile when this note was written:
+#   * cmov  GHSA-3rjw-m598-pq24 / CVE-2026-50185 -- wrong results on aarch64 in constant-time
+#     conditional moves, reached via hmac/sha1/sha2, i.e. request signing. FIXED by bumping to
+#     0.5.4; x86_64 was never affected, but this is a library and consumers run aarch64.
+#   * jsonwebtoken  GHSA-h395-gr6q-cpjc / CVE-2026-25537 -- type confusion enabling authorization
+#     bypass. Still present at 8.3.0, transitive via ethers-providers 2.0.14 and reachable only
+#     through the non-default `hyperliquid` feature. No bump is available to us: ethers 2.0 pins
+#     jsonwebtoken ^8 and the fix landed in 10.3.0. rustrade never verifies a JWT, so the
+#     precondition is not met here. Give it a real entry below if RustSec ever imports it.
+#
+# Dependabot also scans the DEFAULT branch (`main`), not `develop`, so its list lags `develop` by
+# the full release distance. Check the version in Cargo.lock on the branch you care about before
+# treating an alert as live.
 ignore = [
-    # lru IterMut unsoundness - only affects mutable iteration, we use peek/put only
-    { id = "RUSTSEC-2026-0002", reason = "lru IterMut unsoundness doesn't affect our peek/put usage" },
-    # rand unsoundness requires log feature + custom logger + reseed; log feature not enabled
-    { id = "RUSTSEC-2026-0097", reason = "rand's log feature not enabled in this workspace (required for vulnerability)" },
+    # paste is a build-time proc-macro (no code shipped into the binary), archived upstream with
+    # no vulnerability and no safe upgrade. Transitive via parquet 59.1.0 (latest) -> rustrade-data
+    # `lse-parquet`. Revisit if arrow-rs migrates to `pastey`.
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; build-time proc-macro, transitive via parquet; no upgrade available" },
+
+    # rkyv is an *unenabled optional* dependency of rust_decimal (gated behind its `rkyv` feature,
+    # which nothing here enables). It is in Cargo.lock only because the lockfile is feature-agnostic
+    # and records every optional dep; `cargo tree -i rkyv --workspace --all-features --target all`
+    # finds no path to it, and cargo deny's feature-aware graph does not flag it -- only cargo audit,
+    # which reads the lockfile directly: the lockfile records a dependency the build never compiles.
+    # No upgrade exists: rust_decimal 1.42.1 pins rkyv ^0.7.46 and upstream declared 0.7 unsupported
+    # (no backport, unlike RUSTSEC-2026-0001). Drop this entry once rust_decimal drops rkyv 0.7
+    # (paupino/rust-decimal#819) or moves to rkyv >=0.8.17.
+    { id = "RUSTSEC-2026-0235", reason = "rkyv is an unenabled optional dep of rust_decimal; never compiled in this workspace" },
 
     # hyperliquid_rust_sdk transitive dependencies (no direct control)
     { id = "RUSTSEC-2025-0057", reason = "fxhash unmaintained; transitive via hyperliquid_rust_sdk" },
@@ -22,6 +51,20 @@ ignore = [
     { id = "RUSTSEC-2026-0098", reason = "webpki URI name constraints; transitive via hyperliquid_rust_sdk; low impact for API client" },
     { id = "RUSTSEC-2026-0099", reason = "webpki wildcard name constraints; transitive via hyperliquid_rust_sdk; low impact for API client" },
     { id = "RUSTSEC-2026-0104", reason = "rustls-webpki CRL panic; transitive via hyperliquid_rust_sdk; CRLs not used" },
+
+    # h2 queues empty DATA frames without limit (low-severity DoS: unbounded memory, or a panic if
+    # the length overflows). Two instances were in the lockfile; only one is ours to fix:
+    #   * h2 0.4.x, via hyper 1.x / reqwest 0.12 -- FIXED, bumped to 0.4.19 (patched >= 0.4.16).
+    #   * h2 0.3.27, kept here. Upstream shipped the fix only on the 0.4 line, so no patched 0.3.x
+    #     exists and no bump is available to us. Every path to it runs through the `hyperliquid`
+    #     feature -- hyperliquid_rust_sdk 0.6 and our own optional ethers 2.0, both gated on it --
+    #     then reqwest 0.11 -> hyper 0.14, so it is not compiled under the default feature set.
+    # NOTE: cargo-deny's [advisories.ignore] takes only `id`/`reason`, so this suppression cannot be
+    # scoped to the 0.3 line -- it silences this advisory for h2 0.4.x too. Cargo.lock therefore
+    # pins the 0.4 line forward at 0.4.19, and that pin is the thing protecting us there, not this
+    # gate. Re-check the 0.4 entry in Cargo.lock if h2 is ever downgraded or re-resolved.
+    # Drop this entry once hyperliquid_rust_sdk and ethers move off reqwest 0.11.
+    { id = "RUSTSEC-2026-0258", reason = "h2 0.3 has no patched release; reached only via the hyperliquid feature (hyperliquid_rust_sdk/ethers -> reqwest 0.11 -> hyper 0.14)" },
 ]
 
 # Licenses - strict permissive only
@@ -59,19 +102,36 @@ license-files = [
 ]
 
 # Bans - minimal, rely on review process instead
+#
+# openssl / openssl-sys are still in the tree: `openssl 0.10.81` arrives via binance-sdk and via
+# native-tls (itself pulled by ethers' reqwest 0.11). The workspace itself uses rustls-tls, so this
+# is transitive-only and unconfigured by us. No `[[bans.skip]]` entry is needed while
+# `multiple-versions = "warn"` and only one version resolves -- a skip would be inert config
+# claiming to do something. Recorded here instead so the review trigger survives: re-check on
+# binance-sdk upgrades, and add skips if `multiple-versions` is ever raised to "deny".
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
 highlight = "all"
 
-# Known transitive dependencies from upstream crates (not directly controlled)
-[[bans.skip]]
-name = "openssl"
-reason = "binance-sdk 44.0.1 dependency; workspace uses rustls-tls; review on binance-sdk upgrades"
-
-[[bans.skip]]
-name = "openssl-sys"
-reason = "same as openssl"
+# The `arrow` stack must never enter the graph.
+#
+# `rustrade-data`'s optional `parquet` dependency is `default-features = false` precisely because
+# its defaults pull `arrow-array`/`buffer`/`data`/`schema`/`select`/`ipc` plus `base64`, `brotli`,
+# `flate2`, `lz4`, `snap` and `simdutf8`. The LSE export decoder reads Parquet through the column
+# API and needs none of it, and that exclusion is the whole supply-chain case for accepting
+# `parquet` at all (see `.github/tier2-dependencies.txt`).
+#
+# Until now that invariant lived only in comments, which nothing checks. Cargo unifies features
+# workspace-wide, so *any* future dependency pulling `parquet` with defaults re-admits the lot
+# silently. These entries make `cargo deny` fail the moment it happens. If arrow ever becomes a
+# deliberate dependency, that is a tier-2 review, and removing these lines is how it is recorded.
+deny = [
+    { name = "arrow" },
+    { name = "arrow-array" },
+    { name = "arrow-buffer" },
+    { name = "arrow-schema" },
+]
 
 # Sources - only allow crates.io
 [sources]

@@ -302,6 +302,7 @@ async fn test_place_and_cancel_limit_order() {
         time_in_force: TimeInForce::GoodUntilEndOfDay,
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {
@@ -503,6 +504,7 @@ async fn test_order_without_registered_contract() {
         time_in_force: TimeInForce::GoodUntilEndOfDay,
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {
@@ -612,6 +614,7 @@ async fn test_cancel_produces_cancelled_not_expired() {
         time_in_force: TimeInForce::GoodUntilEndOfDay, // DAY order - would be Expired if not cancelled
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {
@@ -698,7 +701,7 @@ async fn test_cancel_produces_cancelled_not_expired() {
 }
 
 // ============================================================================
-// Stop and Trailing Stop Order Tests (TG13 Phase 1 & 2) — Tier 0: Paper Account Only (FREE)
+// Stop and Trailing Stop Order Tests — Tier 0: Paper Account Only (FREE)
 // ============================================================================
 
 /// Test placing and cancelling a Stop order.
@@ -742,6 +745,7 @@ async fn test_place_and_cancel_stop_order() {
         time_in_force: TimeInForce::GoodUntilEndOfDay,
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {
@@ -843,6 +847,7 @@ async fn test_place_and_cancel_stop_limit_order() {
         time_in_force: TimeInForce::GoodUntilEndOfDay,
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {
@@ -946,6 +951,7 @@ async fn test_place_and_cancel_trailing_stop_percentage() {
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {
@@ -1051,6 +1057,7 @@ async fn test_place_and_cancel_trailing_stop_limit_absolute() {
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {
@@ -1114,7 +1121,7 @@ async fn test_place_and_cancel_trailing_stop_limit_absolute() {
 }
 
 // ============================================================================
-// Bracket Order Tests (TG13 Phase 3) — Tier 0: Paper Account Only (FREE)
+// Bracket Order Tests — Tier 0: Paper Account Only (FREE)
 // ============================================================================
 
 /// Test placing and cancelling a bracket order with OCA linkage.
@@ -1343,7 +1350,7 @@ async fn test_bracket_order_oca_group_linkage() {
 }
 
 // ============================================================================
-// Extended Time-in-Force Tests (TG13 Phase 6) — Tier 0: Paper Account Only (FREE)
+// Extended Time-in-Force Tests — Tier 0: Paper Account Only (FREE)
 // ============================================================================
 
 /// Test placing and cancelling a Good-Till-Date (GTD) order.
@@ -1386,6 +1393,7 @@ async fn test_place_and_cancel_gtd_order() {
         time_in_force: TimeInForce::GoodTillDate { expiry },
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {
@@ -1489,6 +1497,7 @@ async fn test_place_moo_order_premarket() {
         time_in_force: TimeInForce::AtOpen,
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {
@@ -1586,6 +1595,7 @@ async fn test_place_loo_order_premarket() {
         time_in_force: TimeInForce::AtOpen,
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {

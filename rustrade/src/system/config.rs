@@ -10,8 +10,9 @@ use rustrade_instrument::{
     exchange::ExchangeId,
     instrument::{
         Instrument,
+        data_venue::DataVenue,
         kind::{
-            InstrumentKind, future::FutureContract, option::OptionContract,
+            InstrumentKind, cfd::CfdContract, future::FutureContract, option::OptionContract,
             perpetual::PerpetualContract,
         },
         name::{InstrumentNameExchange, InstrumentNameInternal},
@@ -53,6 +54,13 @@ pub struct InstrumentConfig {
 
     /// Optional additional specifications for the instrument.
     pub spec: Option<InstrumentSpec<AssetNameExchange>>,
+
+    /// Optional venue to source this instrument's market data from, when it differs from
+    /// `exchange` — see [`DataVenue`].
+    ///
+    /// Defaulted so every config written before this field existed still deserialises.
+    #[serde(default)]
+    pub data_venue: Option<DataVenue<ExchangeId>>,
 }
 
 /// Configuration for an execution link.
@@ -70,10 +78,23 @@ impl From<InstrumentConfig> for Instrument<ExchangeId, Asset> {
     fn from(value: InstrumentConfig) -> Self {
         Self {
             exchange: value.exchange,
-            name_internal: InstrumentNameInternal::new_from_exchange_underlying(
+            // Derived from `name_exchange`, NOT from the underlying pair. `InstrumentNameInternal`
+            // is the identity key index-keyed engine state is built on, and it must be unique
+            // across the collection — so whatever it is derived from has to be what actually
+            // distinguishes two instruments on one exchange.
+            //
+            // `(exchange, base, quote)` does not: `ExchangeId::Okx` serves spot, futures,
+            // perpetuals and options under one variant, and an exchange offering both a stock and a
+            // CFD on one symbol is the reason `Cfd` is a distinct kind at all. Every such pair
+            // shares an underlying and would collide here, which `IndexedInstrumentsBuilder`
+            // rejects — leaving the pair inexpressible through `SystemConfig`.
+            //
+            // The exchange-side name is precisely the thing the venue itself uses to tell them
+            // apart (Okx `BTC-USDT` vs `BTC-USDT-SWAP`; IBKR `AAPL` vs `AAPL.CFD`), so deriving
+            // identity from it discriminates wherever the venue does.
+            name_internal: InstrumentNameInternal::new_from_exchange(
                 value.exchange,
-                &value.underlying.base,
-                &value.underlying.quote,
+                value.name_exchange.clone(),
             ),
             name_exchange: value.name_exchange,
             underlying: Underlying {
@@ -102,6 +123,10 @@ impl From<InstrumentConfig> for Instrument<ExchangeId, Asset> {
                     expiry: contract.expiry,
                     strike: contract.strike,
                 }),
+                InstrumentKind::Cfd(contract) => InstrumentKind::Cfd(CfdContract {
+                    contract_size: contract.contract_size,
+                    settlement_asset: Asset::new_from_exchange(contract.settlement_asset),
+                }),
             },
             spec: value.spec.map(|spec| InstrumentSpec {
                 price: spec.price,
@@ -118,6 +143,7 @@ impl From<InstrumentConfig> for Instrument<ExchangeId, Asset> {
                 },
                 notional: spec.notional,
             }),
+            data_venue: value.data_venue,
         }
     }
 }

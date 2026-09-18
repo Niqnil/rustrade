@@ -89,7 +89,13 @@ async fn test_historical_candles_hourly() {
     let first = &candles[0];
     assert!(first.open > Decimal::ZERO, "Invalid open price");
     assert!(first.high >= first.low, "High < Low");
-    assert!(!first.volume.is_sign_negative(), "Negative volume");
+    // `is_some_and`, not `is_none_or`: Hyperliquid's decoder always reports a volume, so accepting
+    // `None` here would silently pass a decoder that had stopped populating the field at all.
+    assert!(
+        first.volume.is_some_and(|v| !v.is_sign_negative()),
+        "Volume {:?} is absent or negative; Hyperliquid always reports one",
+        first.volume
+    );
 
     tracing::info!(count = candles.len(), "Received hourly candles");
 }

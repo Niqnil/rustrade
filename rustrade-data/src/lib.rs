@@ -3,7 +3,12 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    // A public item linking to a private one renders as dead, non-hyperlinked code on docs.rs — the
+    // reader is pointed at something they cannot open. Denied rather than warned because these
+    // accumulate silently: `cargo doc` is not part of the normal build or the pre-commit gate, so a
+    // warning here is one nobody sees. Fix by inlining the fact or linking a public item instead.
+    rustdoc::private_intra_doc_links
 )]
 #![warn(
     unused,
@@ -15,6 +20,10 @@
     missing_debug_implementations,
     rust_2018_idioms
 )]
+// Inherited from the barter-rs upstream: the generic, trait-heavy public API legitimately produces
+// complex nested types and many-argument constructors, and `type_alias_bounds` fires on
+// documentation-bearing alias bounds kept intentionally. Denying these adds churn without improving
+// the API.
 #![allow(clippy::type_complexity, clippy::too_many_arguments, type_alias_bounds)]
 
 //! # Barter-Data
@@ -105,6 +114,40 @@ use tracing_subscriber as _;
 // (tests/massive_integration.rs), which compile as separate units.
 #[cfg(test)]
 use serial_test as _;
+// wiremock is referenced by the pagination integration tests under the `massive` feature
+// (tests/massive_pagination.rs, a separate compilation unit) and by `exchange::http`'s unit tests,
+// which are no longer feature-gated and so reference it in every `cfg(test)` build. This stub is
+// therefore redundant today; it is kept alongside its siblings so re-gating those tests cannot
+// silently reintroduce the warning.
+#[cfg(test)]
+use wiremock as _;
+// time is only referenced by the integration tests under the `databento`/`ibkr` features
+// (tests/databento_integration.rs, tests/ibkr_integration.rs) and by a databento example, which
+// compile as separate units.
+#[cfg(test)]
+use time as _;
+// temp_env is only referenced by the in-tree unit tests under the `massive` feature
+// (exchange::massive::{live, rest}), so it is unused when that feature is off.
+#[cfg(test)]
+use temp_env as _;
+// http is only referenced by the in-tree unit tests under the `ibkr` feature
+// (exchange::ibkr::flex), which build synthetic `reqwest::Response`s without a socket.
+#[cfg(test)]
+use http as _;
+// tempfile, sha2 and hex are only referenced by the export-job integration tests under the `lse`
+// feature (tests/lse_export.rs), which compiles as a separate unit: tempfile supplies a scratch
+// directory for the download/resume cases, and sha2/hex compute the digest the synthetic job
+// records carry. (sha2 and hex are also non-dev dependencies under `lse`, so their stubs matter
+// only when that feature is off.)
+#[cfg(test)]
+use {hex as _, sha2 as _, tempfile as _};
+// tokio_tungstenite is a dev-dependency for the `lse` WebSocket handshake test
+// (tests/lse_ws_handshake.rs), which speaks the server half of the protocol in-process and compiles
+// as a separate unit. It is *also* a non-dev dependency under the `massive` feature, where the lib
+// itself uses it -- so this stub matters only when that feature is off, and the `cfg(test)` gate is
+// load-bearing: an unconditional `use` would fail to resolve in a non-test build without `massive`.
+#[cfg(test)]
+use tokio_tungstenite as _;
 
 use crate::{
     error::DataError,

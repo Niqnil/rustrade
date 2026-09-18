@@ -48,19 +48,31 @@
 //!
 //! - [`PublicTrades`](crate::subscription::trade::PublicTrades): Real-time trades
 //! - [`Quotes`](crate::subscription::quote::Quotes): Real-time quotes (NBBO for equities, bid/ask for crypto)
+//!
+//! # Subscription confirmation
+//!
+//! Alpaca answers a subscribe with one frame naming the symbols it registered. Initialisation
+//! does not return until **every** requested symbol has been named; if any is still outstanding
+//! when the subscription timeout expires, the subscribe fails and names what was missing. A
+//! partial subscription is therefore an error rather than a quietly reduced stream. See
+//! [`AlpacaWebSocketSubValidator`](crate::exchange::alpaca::validator::AlpacaWebSocketSubValidator).
+//!
+//! **A confirmed symbol is not a promise of prompt data.** Alpaca's crypto feed publishes a quote
+//! when top-of-book changes, so the delay before a given symbol first ticks is large and highly
+//! variable -- 1s, 15s, 96s and 132s for four symbols confirmed on one connection in a single
+//! 300s window. Callers must not infer a failed subscription from silence, and must not use the
+//! first event as a readiness signal for any particular instrument.
 
 use self::{
     channel::AlpacaChannel, market::AlpacaMarket, quote::AlpacaQuoteTransformer,
     subscription::AlpacaSubResponse, trade::AlpacaTradeTransformer,
+    validator::AlpacaWebSocketSubValidator,
 };
 use crate::{
     ExchangeWsStream, NoInitialSnapshots,
     exchange::{Connector, ExchangeServer, ExchangeSub, StreamSelector},
     instrument::InstrumentData,
-    subscriber::{
-        mapper::SubscriptionMapper,
-        validator::{SubscriptionValidator, WebSocketSubValidator},
-    },
+    subscriber::{mapper::SubscriptionMapper, validator::SubscriptionValidator},
     subscription::{quote::Quotes, trade::PublicTrades},
 };
 use futures::{SinkExt, StreamExt};
@@ -79,8 +91,19 @@ pub mod channel;
 pub mod market;
 pub mod options;
 pub mod quote;
+pub mod reference;
+pub mod rest;
 pub mod subscription;
 pub mod trade;
+pub mod validator;
+
+// `StockSplitSource` adapter for `AlpacaRestClient` (no public items of its own — just the impl).
+mod corporate_action;
+// Shared page-cap + `page_token` cycle guard for the paginated REST fetches.
+mod pagination;
+
+pub use reference::{AlpacaStockSplit, CorporateActionsQuery};
+pub use rest::{AlpacaRestClient, AlpacaRestError};
 
 /// IEX WebSocket URL (free US equities feed).
 pub const WEBSOCKET_URL_IEX: &str = "wss://stream.data.alpaca.markets/v2/iex";
@@ -155,7 +178,7 @@ where
     type Channel = AlpacaChannel;
     type Market = AlpacaMarket;
     type Subscriber = AlpacaSubscriber;
-    type SubValidator = WebSocketSubValidator;
+    type SubValidator = AlpacaWebSocketSubValidator;
     type SubResponse = AlpacaSubResponse;
 
     fn url() -> Result<Url, url::ParseError> {
@@ -184,10 +207,9 @@ where
         vec![WsMessage::text(payload.to_string())]
     }
 
-    fn expected_responses<InstrumentKey>(_map: &crate::subscription::Map<InstrumentKey>) -> usize {
-        // Alpaca sends a single subscription confirmation for all symbols in one subscribe message
-        1
-    }
+    // `expected_responses` is deliberately left at its default. `AlpacaWebSocketSubValidator`
+    // succeeds on coverage of the requested subscriptions rather than on a response count, so
+    // no count it could return would be consulted.
 }
 
 impl<Instrument, Server> StreamSelector<Instrument, PublicTrades> for Alpaca<Server>

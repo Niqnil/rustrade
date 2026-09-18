@@ -442,8 +442,8 @@ fn process_record<K: Clone>(
 /// First rejects the intervals Databento serves on no OHLCV path (via
 /// [`ensure_databento_ohlcv_supports`]), then additionally rejects `Hour1`/`Day1`:
 /// those are valid Databento schemas but are not reliably emitted by the live
-/// gateway, so they are historical-only here (the G21.1 hedge). Widening this is
-/// an additive change if a live key later confirms the larger bars stream.
+/// gateway, so they are historical-only here. Widening this is an additive
+/// change if a live key later confirms the larger bars stream.
 fn ensure_databento_live_ohlcv_supports(
     exchange: ExchangeId,
     interval: CandleInterval,
@@ -473,8 +473,8 @@ mod tests {
             Schema::Ohlcv1M
         );
 
-        // 1h/1d are valid Databento schemas but historical-only on the live feed
-        // (G21.1 hedge): rejected observably, not silently subscribed.
+        // 1h/1d are valid Databento schemas but historical-only on the live feed:
+        // rejected observably, not silently subscribed.
         for interval in [CandleInterval::Hour1, CandleInterval::Day1] {
             assert!(
                 matches!(

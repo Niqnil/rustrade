@@ -139,6 +139,7 @@ async fn test_stop_order() {
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {
@@ -231,6 +232,7 @@ async fn test_stop_limit_order() {
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {
@@ -310,6 +312,7 @@ async fn test_take_profit_order() {
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {
@@ -389,6 +392,7 @@ async fn test_take_profit_limit_order() {
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {
@@ -468,6 +472,7 @@ async fn test_trailing_stop_basis_points() {
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {
@@ -546,6 +551,7 @@ async fn test_trailing_stop_percentage() {
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {
@@ -627,6 +633,7 @@ async fn test_trailing_stop_absolute_rejected() {
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {
@@ -688,6 +695,7 @@ async fn test_trailing_stop_limit_rejected() {
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {

@@ -1,0 +1,82 @@
+name: "LSE Weekly"
+
+# Live-API drift detection for the London Strategic Edge integration.
+#
+# The canaries are `#[ignore]`d so a normal `cargo test` never spends the provider's export
+# allowance; this is the only thing that runs them. Weekly rather than per-PR for the same reason:
+# the export endpoint permits five jobs an hour, and the point is detecting provider-side drift,
+# which does not correlate with our commits.
+#
+# Both canaries SKIP (and pass) when `LSE_API_KEY` is unset, so a fork or an unconfigured repo
+# stays green. That makes an unset secret indistinguishable from a passing run *in the test*, which
+# is why the guard job below fails loudly instead.
+
+on:
+  schedule:
+    # Monday 07:00 UTC - before the London session, so a drift report lands before it matters.
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+env:
+  MOLD_VERSION: "2.35.1"
+
+jobs:
+  # The canaries treat a missing key as "skip and pass", which is right for PR CI and wrong here:
+  # a scheduled drift detector that silently tests nothing is worse than no detector, because it
+  # reports green. This job makes the misconfiguration the failure.
+  secret-present:
+    name: LSE_API_KEY configured
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Assert the secret exists
+        env:
+          LSE_API_KEY: ${{ secrets.LSE_API_KEY }}
+        run: |
+          if [ -z "$LSE_API_KEY" ]; then
+            echo "::error::LSE_API_KEY is not set. The canaries below would skip and report" \
+                 "green while never reaching the provider. Set it in repository secrets."
+            exit 1
+          fi
+          echo "LSE_API_KEY is present (${#LSE_API_KEY} characters)."
+
+  lse-canaries:
+    name: LSE live-API canaries
+    needs: secret-present
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      LSE_API_KEY: ${{ secrets.LSE_API_KEY }}
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Install mold linker
+        uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444  # v1
+        with:
+          mold-version: ${{ env.MOLD_VERSION }}
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
+        with:
+          shared-key: "rustrade-ci-test"
+
+      # Cheap and quota-free relative to the export job, so it runs first: an auth or catalog
+      # failure here explains an export failure below without spending an export.
+      - name: Vault canary (catalog, candles, usage)
+        id: vault-canary
+        continue-on-error: true
+        run: cargo test --locked --test lse_vault_canary --features lse -- --ignored --nocapture
+
+      # Spends one of five hourly export jobs.
+      - name: Export canary (job lifecycle, download, Parquet schema)
+        id: export-canary
+        continue-on-error: true
+        run: cargo test --locked --test lse_export_canary --features lse-parquet -- --ignored --nocapture
+
+      # Both run even if the first fails, so one report covers both surfaces.
+      - name: Check canary results
+        if: steps.vault-canary.outcome == 'failure' || steps.export-canary.outcome == 'failure'
+        run: exit 1

@@ -26,6 +26,10 @@
 // - balanceUpdate events (deposits/withdrawals) are silently ignored. The crypto
 //   repo wrapper should call fetch_balances or account_snapshot periodically to
 //   reconcile balances after external transfers.
+// - A TRADE report whose order status (X) is neither PARTIALLY_FILLED nor FILLED emits
+//   the execution but no order snapshot, so a fill arriving after its order's terminal
+//   report cannot resurrect a retired order as a resting one. That order's filled
+//   quantity is settled instead by the terminal report's own z, or by fetch_open_orders.
 
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
@@ -73,8 +77,10 @@ use chrono::{DateTime, TimeZone, Utc};
 use futures::stream::BoxStream;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
-    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
-    instrument::name::InstrumentNameExchange,
+    Side,
+    asset::name::AssetNameExchange,
+    exchange::ExchangeId,
+    instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use serde::Deserialize;
 use smol_str::format_smolstr;
@@ -515,6 +521,11 @@ async fn paginate_my_trades(
 
 impl ExecutionClient for BinanceSpot {
     const EXCHANGE: ExchangeId = ExchangeId::BinanceSpot;
+
+    // Binance Spot trades spot pairs only; its derivatives live on separate USD-M/COIN-M venues
+    // with their own APIs, which this client does not speak.
+    const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant] =
+        &[InstrumentKindDiscriminant::Spot];
     type Config = BinanceSpotConfig;
     type AccountStream = BoxStream<'static, UnindexedAccountEvent>;
 
@@ -615,6 +626,17 @@ impl ExecutionClient for BinanceSpot {
     /// Callers MUST also call [`ExecutionClient::fetch_open_orders`] after each
     /// reconnect to reconcile open-order state — order lifecycle events (NEW, CANCELED)
     /// are not recovered after a WS disconnect, only TRADE fills are.
+    ///
+    /// # A recovered fill does not advance the order
+    ///
+    /// A fill that arrives live over the WebSocket carries the order's cumulative filled
+    /// quantity in [`Trade::order_filled_quantity`] (`executionReport`'s `z`), so it advances
+    /// the order by itself. A fill recovered after a disconnect does not: it comes from REST
+    /// `myTrades`, which reports executions only and carries no cumulative, so
+    /// `order_filled_quantity` is `None` and the order's `filled_quantity` stands still.
+    /// The `fetch_open_orders` reconciliation above is therefore not merely for NEW and
+    /// CANCELED — without it, an order that filled across a disconnect keeps whatever
+    /// `filled_quantity` it held before the gap.
     async fn account_stream(
         &self,
         // _assets is intentionally ignored — Binance pushes outboundAccountPosition
@@ -1471,8 +1493,8 @@ async fn connection_manager(
         // WARNING — only fills (GET /api/v3/myTrades) are recovered here.
         // Order lifecycle events (NEW, CANCELED, EXPIRED) that occurred during the
         // disconnect window are NOT recovered. Open-order state may be stale until
-        // the next account_snapshot or fetch_open_orders call. The crypto repo wrapper
-        // MUST call fetch_open_orders after each reconnect to reconcile open-order state.
+        // the next account_snapshot or fetch_open_orders call. A caller MUST call
+        // fetch_open_orders after each reconnect to reconcile open-order state.
         if let Some(dt) = disconnect_time.take() {
             match tokio::time::timeout(
                 Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS),
@@ -1599,6 +1621,10 @@ async fn connection_manager(
 /// Fetches trades since `disconnect_time` via REST and sends them through the dedup
 /// cache. Trades already seen (from before the disconnect) are filtered out; only
 /// genuinely missed fills reach the consumer.
+///
+/// The recovered trades carry no `order_filled_quantity`: `myTrades` reports executions
+/// only, with no cumulative and no order status, so a recovered fill advances the position
+/// but not the order. Only a `fetch_open_orders` reconciliation closes that gap.
 // `.iter().cloned()` is required: Rust async closures cannot satisfy the HRTB
 // `for<'a> FnMut(&'a InstrumentNameExchange) -> impl Future + 'static` needed by
 // the iterator machinery, even when the clone is moved inside the closure body.
@@ -1778,15 +1804,65 @@ fn filter_and_convert_balances(
         .collect()
 }
 
+/// The subset of a Binance spot order-response struct that [`convert_open_order`] reads.
+///
+/// `GET /api/v3/allOrders` and `GET /api/v3/openOrders` return structurally identical orders, but
+/// binance-sdk generates a *distinct* response type per endpoint (`AllOrdersResponseInner` and
+/// `GetOpenOrdersResponseInner`) with no shared trait. Rather than duplicate the converter or
+/// adapt all 32 fields, this trait names the 10 fields the conversion actually depends on — so the
+/// dependency surface is explicit, and a future SDK change to any *other* field cannot silently
+/// affect open-order parsing.
+trait SpotOrderFields {
+    fn order_id(&self) -> Option<i64>;
+    fn client_order_id(&self) -> Option<&str>;
+    fn side(&self) -> Option<&str>;
+    fn price(&self) -> Option<&str>;
+    fn orig_qty(&self) -> Option<&str>;
+    fn executed_qty(&self) -> Option<&str>;
+    fn order_type(&self) -> Option<&str>;
+    fn time_in_force(&self) -> Option<&str>;
+    fn time(&self) -> Option<i64>;
+    /// When the order last changed state, as opposed to [`SpotOrderFields::time`], which is when
+    /// it was created. Both `allOrders` and `openOrders` carry it.
+    fn update_time(&self) -> Option<i64>;
+    fn symbol(&self) -> Option<&str>;
+}
+
+/// Implement [`SpotOrderFields`] for SDK response types that share these field names.
+///
+/// The two endpoint structs declare the same fields with the same types, so the accessors are
+/// identical; a macro keeps them from drifting apart under hand-editing.
+macro_rules! impl_spot_order_fields {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl SpotOrderFields for $t {
+                fn order_id(&self) -> Option<i64> { self.order_id }
+                fn client_order_id(&self) -> Option<&str> { self.client_order_id.as_deref() }
+                fn side(&self) -> Option<&str> { self.side.as_deref() }
+                fn price(&self) -> Option<&str> { self.price.as_deref() }
+                fn orig_qty(&self) -> Option<&str> { self.orig_qty.as_deref() }
+                fn executed_qty(&self) -> Option<&str> { self.executed_qty.as_deref() }
+                fn order_type(&self) -> Option<&str> { self.r#type.as_deref() }
+                fn time_in_force(&self) -> Option<&str> { self.time_in_force.as_deref() }
+                fn time(&self) -> Option<i64> { self.time }
+                fn update_time(&self) -> Option<i64> { self.update_time }
+                fn symbol(&self) -> Option<&str> { self.symbol.as_deref() }
+            }
+        )*
+    };
+}
+
+impl_spot_order_fields!(
+    binance_sdk::spot::rest_api::AllOrdersResponseInner,
+    binance_sdk::spot::rest_api::GetOpenOrdersResponseInner,
+);
+
 /// Convert a Binance open order into rustrade's Open state order.
-// `AllOrdersResponseInner` is the response type for both `GET /api/v3/allOrders`
-// and `GET /api/v3/openOrders` in binance-sdk =50.0.0 — they share the same struct.
-// Verified against the SDK source. Re-verify on SDK upgrade if open-orders parsing breaks.
-fn convert_open_order(
-    o: &binance_sdk::spot::rest_api::AllOrdersResponseInner,
+fn convert_open_order<T: SpotOrderFields>(
+    o: &T,
     instrument: &InstrumentNameExchange,
 ) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
-    let order_id_raw = match o.order_id {
+    let order_id_raw = match o.order_id() {
         Some(id) => id,
         None => {
             warn!(%instrument, "BinanceSpot open order missing orderId");
@@ -1794,15 +1870,14 @@ fn convert_open_order(
         }
     };
     let order_id = OrderId(format_smolstr!("{}", order_id_raw));
-    if o.client_order_id.is_none() {
+    if o.client_order_id().is_none() {
         warn!(%instrument, order_id = %order_id_raw, "BinanceSpot open order missing clientOrderId, using orderId as fallback — order may not reconcile with engine state");
     }
     let cid = ClientOrderId::new(
-        o.client_order_id
-            .as_deref()
+        o.client_order_id()
             .unwrap_or(&format_smolstr!("{}", order_id_raw)),
     );
-    let side = match o.side.as_deref() {
+    let side = match o.side() {
         // parse_side already logs a warning on unknown values
         Some(s) => parse_side(s)?,
         None => {
@@ -1810,19 +1885,15 @@ fn convert_open_order(
             return None;
         }
     };
-    let price = o.price.as_deref().and_then(|s| Decimal::from_str(s).ok());
-    let quantity = match o
-        .orig_qty
-        .as_deref()
-        .and_then(|s| Decimal::from_str(s).ok())
-    {
+    let price = o.price().and_then(|s| Decimal::from_str(s).ok());
+    let quantity = match o.orig_qty().and_then(|s| Decimal::from_str(s).ok()) {
         Some(v) => v,
         None => {
             warn!(%instrument, order_id = %order_id_raw, "BinanceSpot open order missing/unparseable origQty");
             return None;
         }
     };
-    let filled_qty = match o.executed_qty.as_deref() {
+    let filled_qty = match o.executed_qty() {
         Some(s) => match Decimal::from_str(s) {
             Ok(v) => v,
             Err(_) => {
@@ -1832,7 +1903,7 @@ fn convert_open_order(
         },
         None => Decimal::ZERO,
     };
-    let kind = match o.r#type.as_deref() {
+    let kind = match o.order_type() {
         // parse_order_kind already logs a warning on unknown values
         Some(t) => parse_order_kind(t)?,
         None => {
@@ -1840,8 +1911,17 @@ fn convert_open_order(
             return None;
         }
     };
-    let time_in_force = parse_time_in_force(o.time_in_force.as_deref().unwrap_or("GTC"));
-    let time_exchange = match o.time.and_then(|ms| Utc.timestamp_millis_opt(ms).single()) {
+    let time_in_force = parse_time_in_force(o.time_in_force().unwrap_or("GTC"));
+    // `update_time` over `time`: `Open::time_exchange` orders an order's states, and the engine
+    // discards a snapshot older than the state it already tracks. `time` is the creation stamp and
+    // is identical across every snapshot of one order, so a snapshot carrying it is discarded the
+    // moment a WebSocket fill has advanced the tracked order past creation -- which is exactly the
+    // partially-filled order this fetch exists to reconcile.
+    let time_exchange = match o
+        .update_time()
+        .or_else(|| o.time())
+        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+    {
         Some(ts) => ts,
         None => {
             warn!(%instrument, order_id = %order_id_raw, "BinanceSpot open order missing/unparseable time, using now");
@@ -1871,10 +1951,10 @@ fn convert_open_order(
 /// rather than supplied by the caller. Used by the no-symbol "return all" path
 /// ([`fetch_all_open_orders`]), where each order may belong to a different instrument. Drops
 /// (with a warning) any order missing `symbol`; otherwise delegates to [`convert_open_order`].
-fn convert_open_order_owned_symbol(
-    o: &binance_sdk::spot::rest_api::AllOrdersResponseInner,
+fn convert_open_order_owned_symbol<T: SpotOrderFields>(
+    o: &T,
 ) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
-    let instrument = match o.symbol.as_deref() {
+    let instrument = match o.symbol() {
         Some(s) => InstrumentNameExchange::new(s),
         None => {
             warn!("BinanceSpot open order missing symbol in return-all query, dropping order");
@@ -1963,6 +2043,8 @@ fn convert_my_trade(
         side,
         price,
         quantity,
+        // `myTrades` reports executions only -- no cumulative, no order status.
+        None,
         AssetFees::new(fee_asset, commission, None),
     ))
 }
@@ -2004,9 +2086,7 @@ fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -
             // matched branch deserializes its payload. The SDK struct ignores the unknown `e` tag.
             match serde_json::from_str::<binance_sdk::spot::websocket_api::ExecutionReport>(frame) {
                 Ok(report) => {
-                    if let Some(ev) = convert_execution_report(report) {
-                        buf.push(ev);
-                    }
+                    buf.extend(convert_execution_report(report).into_iter().flatten());
                 }
                 Err(e) => {
                     warn!(error = %e, "BinanceSpot: undeserializable executionReport, dropping")
@@ -2029,8 +2109,8 @@ fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -
             // balanceUpdate events are for deposits/withdrawals;
             // outboundAccountPosition covers balance changes from trades.
             // deposit/withdrawal balance changes are not forwarded to the consumer.
-            // The crypto repo wrapper should call fetch_balances or account_snapshot
-            // periodically to reconcile balances after external transfers.
+            // A caller should call fetch_balances or account_snapshot periodically to
+            // reconcile balances after external transfers.
             // No log here: this is the per-frame receive hot path.
             false
         }
@@ -2050,7 +2130,29 @@ fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -
     }
 }
 
-/// Convert a Binance executionReport to a rustrade AccountEvent.
+/// Whether a `TRADE` report's order status says the order is still live at the exchange, and may
+/// therefore be written into engine state as an `Open` snapshot.
+///
+/// A `TRADE` report carries the order's status (`X`) alongside the execution. Only
+/// `PARTIALLY_FILLED` and `FILLED` say the order reached this execution while working; every other
+/// status means some other report owns the order's current state. Writing an `Open` snapshot from
+/// one of those would resurrect an order the engine has already retired, leaving a resting order
+/// that does not exist at the exchange -- a fill that arrives after its order's terminal report is
+/// exactly the ordering this guards against.
+fn trade_order_is_live(status: &str) -> bool {
+    matches!(status, "PARTIALLY_FILLED" | "FILLED")
+}
+
+/// Convert a Binance `executionReport` into rustrade AccountEvents.
+///
+/// Returns up to two events, in the order they must be applied. A `TRADE` report genuinely
+/// carries two facts -- the execution print (`l`/`L`) and the order's new cumulative filled
+/// quantity (`z`) -- so it maps to both a `Trade` and an `OrderSnapshot`. Bounded at two, unlike
+/// `convert_account_position`, whose per-asset fan-out is unbounded and so pushes into a buffer.
+///
+/// The `Trade` is always first. A fully-filled snapshot retires its order, and routing a fill
+/// against an order that has already been retired is a strictly harder problem than routing it
+/// against a live one; emitting the execution first keeps the easy ordering.
 ///
 /// ExecutionReport field mapping (from Binance API docs):
 /// - s: symbol, c: clientOrderId, S: side, o: order type, f: time in force
@@ -2063,19 +2165,19 @@ fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -
 #[allow(clippy::cognitive_complexity)]
 fn convert_execution_report(
     report: binance_sdk::spot::websocket_api::ExecutionReport,
-) -> Option<UnindexedAccountEvent> {
+) -> [Option<UnindexedAccountEvent>; 2] {
     let exec_type = match report.x.as_deref() {
         Some(t) => t,
         None => {
             warn!("BinanceSpot executionReport missing execution type (x), dropping");
-            return None;
+            return [None, None];
         }
     };
     let symbol = match report.s.as_deref() {
         Some(s) => InstrumentNameExchange::new(s),
         None => {
             warn!("BinanceSpot executionReport missing symbol (s), dropping");
-            return None;
+            return [None, None];
         }
     };
     // check order_id first — if missing we drop the event, so avoid
@@ -2084,7 +2186,7 @@ fn convert_execution_report(
         Some(id) => OrderId(format_smolstr!("{id}")),
         None => {
             warn!(%symbol, "BinanceSpot executionReport missing orderId (i), dropping");
-            return None;
+            return [None, None];
         }
     };
     let cid = match report.c.as_deref() {
@@ -2105,21 +2207,24 @@ fn convert_execution_report(
     };
 
     match exec_type {
-        "NEW" => convert_new_order(&report, symbol, cid, order_id, time_exchange),
+        "NEW" => [
+            convert_new_order(&report, symbol, cid, order_id, time_exchange),
+            None,
+        ],
         "TRADE" => {
             // Partial or full fill
             let trade_id = match report.t {
                 Some(id) => TradeId(format_smolstr!("{id}")),
                 None => {
                     warn!(%symbol, "BinanceSpot TRADE event missing trade ID (t), dropping");
-                    return None;
+                    return [None, None];
                 }
             };
             let side = match report.s_uppercase.as_deref().and_then(parse_side) {
                 Some(s) => s,
                 None => {
                     warn!(%symbol, "BinanceSpot TRADE event missing/unknown side (S), dropping");
-                    return None;
+                    return [None, None];
                 }
             };
             let last_price = match report.l_uppercase.as_deref() {
@@ -2127,12 +2232,12 @@ fn convert_execution_report(
                     Ok(v) => v,
                     Err(e) => {
                         warn!(%symbol, error = %e, raw = s, "BinanceSpot TRADE event unparseable last price (L), dropping fill");
-                        return None;
+                        return [None, None];
                     }
                 },
                 None => {
                     warn!(%symbol, "BinanceSpot TRADE event missing last price (L), dropping fill");
-                    return None;
+                    return [None, None];
                 }
             };
             let last_qty = match report.l.as_deref() {
@@ -2140,12 +2245,12 @@ fn convert_execution_report(
                     Ok(v) => v,
                     Err(e) => {
                         warn!(%symbol, error = %e, raw = s, "BinanceSpot TRADE event unparseable last qty (l), dropping fill");
-                        return None;
+                        return [None, None];
                     }
                 },
                 None => {
                     warn!(%symbol, "BinanceSpot TRADE event missing last qty (l), dropping fill");
-                    return None;
+                    return [None, None];
                 }
             };
             // Commission parse failure: log and default to 0 rather than dropping the fill.
@@ -2166,22 +2271,44 @@ fn convert_execution_report(
                 .map(AssetNameExchange::from)
                 .unwrap_or_else(|| AssetNameExchange::from("UNKNOWN"));
 
+            // Field `z` is the order's cumulative filled quantity as of this execution, which is
+            // what advances the order; `l` above is this execution alone.
+            let order_filled_quantity = report.z.as_deref().and_then(|s| Decimal::from_str(s).ok());
+
             let trade = Trade::new(
                 trade_id,
-                order_id,
-                symbol,
+                order_id.clone(),
+                symbol.clone(),
                 StrategyId::unknown(), // Binance doesn't carry strategy IDs
                 time_exchange,
                 side,
                 last_price,
                 last_qty,
+                order_filled_quantity,
                 AssetFees::new(fee_asset, commission, None),
             );
+            let trade_event =
+                UnindexedAccountEvent::new(ExchangeId::BinanceSpot, AccountEventKind::Trade(trade));
 
-            Some(UnindexedAccountEvent::new(
-                ExchangeId::BinanceSpot,
-                AccountEventKind::Trade(trade),
-            ))
+            // The execution alone does not move the order: `filled_quantity` is only ever carried
+            // into engine state by an order snapshot, so without this second event a partially
+            // filled order reads as having nothing filled until REST reconciliation refreshes it.
+            // `convert_new_order` reads field `z` (cumulative filled quantity), which is exactly
+            // what a TRADE report carries, so the same builder serves both arms.
+            let order_status = report.x_uppercase.as_deref().unwrap_or_default();
+            let snapshot_event = if trade_order_is_live(order_status) {
+                convert_new_order(&report, symbol, cid, order_id, time_exchange)
+            } else {
+                trace!(
+                    %symbol,
+                    status = order_status,
+                    "BinanceSpot TRADE for an order the exchange no longer reports as working — \
+                     emitting the execution without an order snapshot"
+                );
+                None
+            };
+
+            [Some(trade_event), snapshot_event]
         }
         "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH" => {
             let filled_qty = report
@@ -2200,10 +2327,13 @@ fn convert_execution_report(
                 state: Ok(cancelled),
             };
 
-            Some(UnindexedAccountEvent::new(
-                ExchangeId::BinanceSpot,
-                AccountEventKind::OrderCancelled(response),
-            ))
+            [
+                Some(UnindexedAccountEvent::new(
+                    ExchangeId::BinanceSpot,
+                    AccountEventKind::OrderCancelled(response),
+                )),
+                None,
+            ]
         }
         "REJECTED" => {
             // order rejected by the matching engine after initial acceptance
@@ -2221,10 +2351,13 @@ fn convert_execution_report(
                 ))),
             };
 
-            Some(UnindexedAccountEvent::new(
-                ExchangeId::BinanceSpot,
-                AccountEventKind::OrderCancelled(response),
-            ))
+            [
+                Some(UnindexedAccountEvent::new(
+                    ExchangeId::BinanceSpot,
+                    AccountEventKind::OrderCancelled(response),
+                )),
+                None,
+            ]
         }
         "REPLACE" => {
             // REPLACE is emitted when an order is replaced via the cancel-replace
@@ -2243,16 +2376,19 @@ fn convert_execution_report(
                 key: OrderKey::new(ExchangeId::BinanceSpot, symbol, StrategyId::unknown(), cid),
                 state: Ok(cancelled),
             };
-            Some(UnindexedAccountEvent::new(
-                ExchangeId::BinanceSpot,
-                AccountEventKind::OrderCancelled(response),
-            ))
+            [
+                Some(UnindexedAccountEvent::new(
+                    ExchangeId::BinanceSpot,
+                    AccountEventKind::OrderCancelled(response),
+                )),
+                None,
+            ]
         }
         _ => {
             // PENDING_NEW and PENDING_CANCEL are transient states; the final
             // state (NEW/CANCELED/etc.) follows shortly after.
             trace!(exec_type, "BinanceSpot ignoring execution type");
-            None
+            [None, None]
         }
     }
 }
@@ -2470,6 +2606,7 @@ fn convert_order_kind_tif(
 mod tests {
     use super::*;
     use crate::client::binance::shared::*;
+    use crate::client::dedup::{DedupEventKind, DedupKey};
     use crate::order::TrailingOffsetType;
     use binance_sdk::common::errors::WebsocketError;
     use smol_str::SmolStr;
@@ -2931,9 +3068,138 @@ mod tests {
         let key2 = DedupKey {
             instrument: SmolStr::from("BTCUSDT"),
             id: SmolStr::from("12345"),
-            kind: DedupEventKind::New,
+            kind: DedupEventKind::OrderState {
+                filled_quantity: Decimal::ZERO,
+            },
         };
         assert!(!is_duplicate(&cache, key2));
+    }
+
+    /// Two order-state snapshots for one order differ only by cumulative filled quantity, and
+    /// must not be deduplicated against each other -- otherwise the acknowledgement (`z = 0`)
+    /// swallows every fill snapshot that follows it.
+    #[test]
+    fn dedup_distinguishes_order_states_and_still_collapses_a_replay() {
+        let cache = new_dedup_cache();
+        let state = |filled: &str| DedupKey {
+            instrument: SmolStr::from("BTCUSDT"),
+            id: SmolStr::from("12345"),
+            kind: DedupEventKind::OrderState {
+                filled_quantity: Decimal::from_str(filled).unwrap(),
+            },
+        };
+
+        // Acknowledgement, then two fills on the same order: three distinct states.
+        assert!(!is_duplicate(&cache, state("0")), "ack is new");
+        assert!(
+            !is_duplicate(&cache, state("1")),
+            "first fill is not the ack"
+        );
+        assert!(
+            !is_duplicate(&cache, state("2")),
+            "second fill is not the first"
+        );
+
+        // A re-delivered snapshot still collides, which is what keeps a replayed
+        // acknowledgement from resurrecting an order that has since retired.
+        assert!(
+            is_duplicate(&cache, state("0")),
+            "replayed ack is a duplicate"
+        );
+        assert!(
+            is_duplicate(&cache, state("2")),
+            "replayed fill is a duplicate"
+        );
+
+        // Decimal hashes normalised, so the venue's chosen representation does not split a key.
+        assert!(
+            is_duplicate(&cache, state("2.00")),
+            "2.00 must be the same key as 2"
+        );
+    }
+
+    /// Drive frames through the same two stages the live WebSocket callback does: convert, then
+    /// apply the dedup gate. Returns what a consumer would actually receive.
+    ///
+    /// Every other test in this file calls `convert_execution_report` directly. That is the wrong
+    /// altitude to prove a fill reaches anyone: the converter can be perfectly correct while the
+    /// gate downstream of it discards what the converter produced.
+    fn drive_ws_pipeline(frames: &[&str]) -> Vec<UnindexedAccountEvent> {
+        use crate::client::dedup::dedup_key_from_event;
+
+        let cache = new_dedup_cache();
+        let mut delivered = Vec::new();
+        let mut buf = Vec::new();
+        for frame in frames {
+            let _ = convert_user_data_events(frame, &mut buf);
+            for ev in buf.drain(..) {
+                if let Some(key) = dedup_key_from_event(&ev)
+                    && is_duplicate(&cache, key)
+                {
+                    continue;
+                }
+                delivered.push(ev);
+            }
+        }
+        delivered
+    }
+
+    const WS_NEW: &str = r#"{"e":"executionReport","s":"BTCUSDT","i":12345,"c":"client-1",
+        "x":"NEW","X":"NEW","S":"BUY","o":"LIMIT","f":"GTC","q":"2","p":"100","z":"0",
+        "T":1700000000000}"#;
+
+    const WS_PARTIAL_FILL: &str = r#"{"e":"executionReport","s":"BTCUSDT","i":12345,"c":"client-1",
+        "x":"TRADE","X":"PARTIALLY_FILLED","S":"BUY","o":"LIMIT","f":"GTC","q":"2","p":"100",
+        "z":"1","l":"1","L":"100","t":555,"n":"0.1","N":"USDT","T":1700000001000}"#;
+
+    /// A fill's order snapshot must survive the dedup gate that sits between the converter and the
+    /// consumer.
+    ///
+    /// The acknowledgement and the fill describe one order id, so a key built from the id alone
+    /// makes the second look like a replay of the first. `Open::filled_quantity` then never leaves
+    /// the `0` the acknowledgement carried, which is the defect the converter change was meant to
+    /// fix -- fixed in the converter, undone one stage later.
+    #[test]
+    fn ws_fill_snapshot_survives_the_dedup_gate() {
+        use crate::order::state::ActiveOrderState;
+
+        let delivered = drive_ws_pipeline(&[WS_NEW, WS_PARTIAL_FILL]);
+
+        assert_eq!(
+            delivered.len(),
+            3,
+            "expected the ack snapshot, then the fill's execution and its snapshot, got: {delivered:?}"
+        );
+
+        let snapshots: Vec<Decimal> = delivered
+            .iter()
+            .filter_map(|ev| match &ev.kind {
+                AccountEventKind::OrderSnapshot(snap) => match &snap.0.state {
+                    OrderState::Active(ActiveOrderState::Open(open)) => Some(open.filled_quantity),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            snapshots,
+            vec![Decimal::ZERO, Decimal::ONE],
+            "the fill's snapshot must reach the consumer carrying the advanced filled quantity"
+        );
+    }
+
+    /// The gate must still collapse a genuinely re-delivered frame, because a replayed
+    /// acknowledgement for a retired order is re-inserted as a live resting order by the engine.
+    #[test]
+    fn ws_replayed_frame_is_still_deduplicated() {
+        let delivered = drive_ws_pipeline(&[WS_NEW, WS_PARTIAL_FILL, WS_NEW, WS_PARTIAL_FILL]);
+
+        assert_eq!(
+            delivered.len(),
+            3,
+            "re-delivering both frames must add nothing, got: {delivered:?}"
+        );
     }
 
     #[test]
@@ -3061,6 +3327,7 @@ mod tests {
             Side::Buy,
             Decimal::ZERO,
             Decimal::ZERO,
+            None,
             AssetFees::new(
                 AssetNameExchange::from("USDT"),
                 Decimal::ZERO,
@@ -3090,6 +3357,7 @@ mod tests {
             Side::Buy,
             Decimal::ZERO,
             Decimal::ZERO,
+            None,
             AssetFees::new(
                 AssetNameExchange::from("USDT"),
                 Decimal::ZERO,
@@ -3284,6 +3552,19 @@ mod tests {
         }
     }
 
+    /// The one event produced by a report that maps to a single `AccountEvent`.
+    ///
+    /// Asserts the second slot is empty, so a test written for a single-event report fails
+    /// loudly if that report ever starts producing two.
+    fn sole_event(events: [Option<UnindexedAccountEvent>; 2]) -> Option<UnindexedAccountEvent> {
+        let [first, second] = events;
+        assert!(
+            second.is_none(),
+            "expected a single event, got a second: {second:?}"
+        );
+        first
+    }
+
     #[test]
     fn test_convert_execution_report_new() {
         let report = binance_sdk::spot::websocket_api::ExecutionReport {
@@ -3297,7 +3578,8 @@ mod tests {
             ..make_base_report()
         };
 
-        let event = convert_execution_report(report).expect("NEW event should produce Some");
+        let event =
+            sole_event(convert_execution_report(report)).expect("NEW event should produce Some");
         assert_eq!(event.exchange, ExchangeId::BinanceSpot);
         match &event.kind {
             AccountEventKind::OrderSnapshot(snap) => {
@@ -3315,6 +3597,8 @@ mod tests {
 
     #[test]
     fn test_convert_execution_report_trade() {
+        // No `X` (order status): the report says nothing about whether the order is still
+        // working, so only the execution is emitted.
         let report = binance_sdk::spot::websocket_api::ExecutionReport {
             x: Some("TRADE".to_string()),
             s_uppercase: Some("BUY".to_string()),
@@ -3325,7 +3609,8 @@ mod tests {
             ..make_base_report()
         };
 
-        let event = convert_execution_report(report).expect("TRADE event should produce Some");
+        let event =
+            sole_event(convert_execution_report(report)).expect("TRADE event should produce Some");
         assert_eq!(event.exchange, ExchangeId::BinanceSpot);
         match &event.kind {
             AccountEventKind::Trade(trade) => {
@@ -3337,6 +3622,128 @@ mod tests {
                 assert_eq!(trade.instrument.name().as_str(), "BTCUSDT");
             }
             other => panic!("TRADE should yield Trade, got {other:?}"),
+        }
+    }
+
+    /// The `(Trade, OrderSnapshot)` pair a fill report must produce, in that order.
+    fn trade_events(
+        events: [Option<UnindexedAccountEvent>; 2],
+    ) -> (
+        Trade<AssetNameExchange, InstrumentNameExchange>,
+        crate::order::Order<
+            ExchangeId,
+            InstrumentNameExchange,
+            OrderState<AssetNameExchange, InstrumentNameExchange>,
+        >,
+    ) {
+        let [first, second] = events;
+        let first = first.expect("a fill report must produce an execution");
+        let second = second.expect("a fill report must produce an order snapshot");
+        let AccountEventKind::Trade(trade) = first.kind else {
+            panic!("first event must be the Trade, got {:?}", first.kind);
+        };
+        let AccountEventKind::OrderSnapshot(snap) = second.kind else {
+            panic!(
+                "second event must be the OrderSnapshot, got {:?}",
+                second.kind
+            );
+        };
+        (trade, snap.0)
+    }
+
+    /// A `PARTIALLY_FILLED` report carries the order's cumulative filled quantity in `z`. The
+    /// execution alone never reaches `Open::filled_quantity`, so without the snapshot a half-done
+    /// order reads as having nothing filled until REST reconciliation refreshes it.
+    #[test]
+    fn a_partially_filled_report_carries_the_cumulative_filled_quantity() {
+        let report = binance_sdk::spot::websocket_api::ExecutionReport {
+            x: Some("TRADE".to_string()),
+            x_uppercase: Some("PARTIALLY_FILLED".to_string()),
+            s_uppercase: Some("BUY".to_string()),
+            o: Some("LIMIT".to_string()),
+            p: Some("50000.00".to_string()),
+            q: Some("0.01".to_string()),
+            f: Some("GTC".to_string()),
+            t: Some(9999),
+            l_uppercase: Some("50000.00".to_string()),
+            l: Some("0.004".to_string()),
+            z: Some("0.004".to_string()),
+            ..make_base_report()
+        };
+
+        let (trade, order) = trade_events(convert_execution_report(report));
+        assert_eq!(trade.quantity, Decimal::from_str("0.004").unwrap());
+
+        let OrderState::Active(crate::order::state::ActiveOrderState::Open(open)) = order.state
+        else {
+            panic!("expected an Open snapshot, got {:?}", order.state);
+        };
+        assert_eq!(open.filled_quantity, Decimal::from_str("0.004").unwrap());
+        assert_eq!(
+            open.quantity_remaining(order.quantity),
+            Decimal::from_str("0.006").unwrap()
+        );
+    }
+
+    /// A `FILLED` report reports nothing left to fill, which is how the engine learns the order
+    /// is done rather than leaving it as a resting order that no longer exists at the venue.
+    #[test]
+    fn a_filled_report_reports_nothing_left_to_fill() {
+        let report = binance_sdk::spot::websocket_api::ExecutionReport {
+            x: Some("TRADE".to_string()),
+            x_uppercase: Some("FILLED".to_string()),
+            s_uppercase: Some("BUY".to_string()),
+            o: Some("LIMIT".to_string()),
+            p: Some("50000.00".to_string()),
+            q: Some("0.01".to_string()),
+            f: Some("GTC".to_string()),
+            t: Some(10_000),
+            l_uppercase: Some("50000.00".to_string()),
+            l: Some("0.006".to_string()),
+            z: Some("0.01".to_string()),
+            ..make_base_report()
+        };
+
+        let (_trade, order) = trade_events(convert_execution_report(report));
+        let OrderState::Active(crate::order::state::ActiveOrderState::Open(open)) = order.state
+        else {
+            panic!("expected an Open snapshot, got {:?}", order.state);
+        };
+        assert!(
+            open.quantity_remaining(order.quantity).is_zero(),
+            "a completed order must report nothing left to fill so the engine retires it"
+        );
+    }
+
+    /// A fill whose order the exchange no longer reports as working must not be written back into
+    /// engine state as an `Open` order. The execution still counts -- it moved the position --
+    /// but resurrecting the order would leave a resting order that does not exist at the venue.
+    #[test]
+    fn a_trade_for_an_order_no_longer_working_emits_the_execution_without_a_snapshot() {
+        for status in ["CANCELED", "EXPIRED", "REJECTED", "PENDING_CANCEL", "NEW"] {
+            let report = binance_sdk::spot::websocket_api::ExecutionReport {
+                x: Some("TRADE".to_string()),
+                x_uppercase: Some(status.to_string()),
+                s_uppercase: Some("BUY".to_string()),
+                o: Some("LIMIT".to_string()),
+                p: Some("50000.00".to_string()),
+                q: Some("0.01".to_string()),
+                f: Some("GTC".to_string()),
+                t: Some(9999),
+                l_uppercase: Some("50000.00".to_string()),
+                l: Some("0.004".to_string()),
+                z: Some("0.004".to_string()),
+                ..make_base_report()
+            };
+            let [trade, snapshot] = convert_execution_report(report);
+            assert!(
+                matches!(trade.map(|e| e.kind), Some(AccountEventKind::Trade(_))),
+                "the execution must still be reported for status {status}"
+            );
+            assert!(
+                snapshot.is_none(),
+                "status {status} must not produce an order snapshot"
+            );
         }
     }
 
@@ -3352,7 +3759,7 @@ mod tests {
             ..make_base_report()
         };
         assert!(
-            convert_execution_report(report).is_none(),
+            sole_event(convert_execution_report(report)).is_none(),
             "missing last price (L) should return None"
         );
     }
@@ -3369,7 +3776,7 @@ mod tests {
             ..make_base_report()
         };
         assert!(
-            convert_execution_report(report).is_none(),
+            sole_event(convert_execution_report(report)).is_none(),
             "missing last qty (l) should return None"
         );
     }
@@ -3381,7 +3788,8 @@ mod tests {
             ..make_base_report()
         };
 
-        let event = convert_execution_report(report).expect("CANCELED should produce Some");
+        let event =
+            sole_event(convert_execution_report(report)).expect("CANCELED should produce Some");
         assert!(
             matches!(event.kind, AccountEventKind::OrderCancelled(ref r) if r.state.is_ok()),
             "CANCELED should yield OrderCancelled with Ok state"
@@ -3394,7 +3802,8 @@ mod tests {
             x: Some("EXPIRED".to_string()),
             ..make_base_report()
         };
-        let event = convert_execution_report(report).expect("EXPIRED should produce Some");
+        let event =
+            sole_event(convert_execution_report(report)).expect("EXPIRED should produce Some");
         assert!(
             matches!(event.kind, AccountEventKind::OrderCancelled(ref r) if r.state.is_ok()),
             "EXPIRED should yield OrderCancelled with Ok state"
@@ -3407,7 +3816,8 @@ mod tests {
             x: Some("EXPIRED_IN_MATCH".to_string()),
             ..make_base_report()
         };
-        let event = convert_execution_report(report).expect("EXPIRED_IN_MATCH should produce Some");
+        let event = sole_event(convert_execution_report(report))
+            .expect("EXPIRED_IN_MATCH should produce Some");
         assert!(
             matches!(event.kind, AccountEventKind::OrderCancelled(ref r) if r.state.is_ok()),
             "EXPIRED_IN_MATCH should yield OrderCancelled with Ok state"
@@ -3422,7 +3832,8 @@ mod tests {
             ..make_base_report()
         };
 
-        let event = convert_execution_report(report).expect("REJECTED should produce Some");
+        let event =
+            sole_event(convert_execution_report(report)).expect("REJECTED should produce Some");
         assert!(
             matches!(event.kind, AccountEventKind::OrderCancelled(ref r) if r.state.is_err()),
             "REJECTED should yield OrderCancelled with Err state"
@@ -3437,7 +3848,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            convert_execution_report(report).is_none(),
+            sole_event(convert_execution_report(report)).is_none(),
             "missing execution type should return None"
         );
     }
@@ -3450,7 +3861,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            convert_execution_report(report).is_none(),
+            sole_event(convert_execution_report(report)).is_none(),
             "missing symbol should return None"
         );
     }
@@ -3465,7 +3876,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            convert_execution_report(report).is_none(),
+            sole_event(convert_execution_report(report)).is_none(),
             "missing orderId should return None"
         );
     }
@@ -3479,7 +3890,7 @@ mod tests {
             ..make_base_report()
         };
         assert!(
-            convert_execution_report(report).is_none(),
+            sole_event(convert_execution_report(report)).is_none(),
             "TRADE event missing tradeId should return None"
         );
     }
@@ -3492,7 +3903,8 @@ mod tests {
         };
         // REPLACE describes the cancelled original order (field `i` = original order ID).
         // The replacement order arrives as a subsequent NEW execution report.
-        let event = convert_execution_report(report).expect("REPLACE should produce Some");
+        let event =
+            sole_event(convert_execution_report(report)).expect("REPLACE should produce Some");
         assert!(
             matches!(event.kind, AccountEventKind::OrderCancelled(ref r) if r.state.is_ok()),
             "REPLACE should yield OrderCancelled with Ok state"
@@ -3718,8 +4130,8 @@ mod tests {
     // convert_open_order tests
     // ---------------------------------------------------------------------------
 
-    fn make_base_open_order() -> binance_sdk::spot::rest_api::AllOrdersResponseInner {
-        binance_sdk::spot::rest_api::AllOrdersResponseInner {
+    fn make_base_open_order() -> binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
+        binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
             order_id: Some(12345),
             client_order_id: Some("cid-abc".to_string()),
             side: Some("BUY".to_string()),
@@ -3731,6 +4143,67 @@ mod tests {
             time: Some(1_700_000_000_000),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn test_convert_open_order_all_orders_response_converts_identically() {
+        // `convert_open_order` is generic over `SpotOrderFields`; the live open-orders path feeds
+        // it `GetOpenOrdersResponseInner` (what every other test here uses) while `allOrders`
+        // would feed it `AllOrdersResponseInner`. Pin that the second impl reads the same fields,
+        // so the two endpoint structs cannot drift apart unnoticed.
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+        let all_orders = binance_sdk::spot::rest_api::AllOrdersResponseInner {
+            order_id: Some(12345),
+            client_order_id: Some("cid-abc".to_string()),
+            side: Some("BUY".to_string()),
+            r#type: Some("LIMIT".to_string()),
+            price: Some("50000.00".to_string()),
+            orig_qty: Some("0.01".to_string()),
+            executed_qty: Some("0.0".to_string()),
+            time_in_force: Some("GTC".to_string()),
+            time: Some(1_700_000_000_000),
+            ..Default::default()
+        };
+        let from_all_orders =
+            convert_open_order(&all_orders, &instrument).expect("valid order should convert");
+        let from_open_orders = convert_open_order(&make_base_open_order(), &instrument)
+            .expect("valid order should convert");
+        assert_eq!(from_all_orders, from_open_orders);
+    }
+
+    /// A REST order snapshot is stamped with when the order last changed, not when it was created.
+    ///
+    /// The engine discards an `Open` snapshot older than the state it already tracks, so a
+    /// snapshot carrying `time` is thrown away as soon as a WebSocket fill has advanced the
+    /// tracked order past creation -- the exact order a reconciliation fetch is meant to repair.
+    #[test]
+    fn test_convert_open_order_prefers_update_time_over_creation_time() {
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+
+        let updated = binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
+            update_time: Some(1_700_000_005_000),
+            ..make_base_open_order()
+        };
+        let order = convert_open_order(&updated, &instrument).expect("valid order should convert");
+        assert_eq!(
+            order.state.time_exchange,
+            Utc.timestamp_millis_opt(1_700_000_005_000)
+                .single()
+                .unwrap(),
+            "update_time must win over time"
+        );
+
+        // Falls back to `time` when the venue omits `update_time`, rather than to `now` -- which
+        // would be worse than creation time, since it is not a venue-reported instant at all.
+        let order = convert_open_order(&make_base_open_order(), &instrument)
+            .expect("valid order should convert");
+        assert_eq!(
+            order.state.time_exchange,
+            Utc.timestamp_millis_opt(1_700_000_000_000)
+                .single()
+                .unwrap(),
+            "absent update_time falls back to time"
+        );
     }
 
     #[test]
@@ -3749,7 +4222,7 @@ mod tests {
     #[test]
     fn test_convert_open_order_owned_symbol_recovers_instrument() {
         // The no-symbol "return all" path derives the instrument from each order's own `symbol`.
-        let o = binance_sdk::spot::rest_api::AllOrdersResponseInner {
+        let o = binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
             symbol: Some("ETHUSDT".to_string()),
             ..make_base_open_order()
         };
@@ -3769,7 +4242,7 @@ mod tests {
     #[test]
     fn test_convert_open_order_missing_order_id_returns_none() {
         let instrument = InstrumentNameExchange::new("BTCUSDT");
-        let o = binance_sdk::spot::rest_api::AllOrdersResponseInner {
+        let o = binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
             order_id: None,
             ..make_base_open_order()
         };
@@ -3782,7 +4255,7 @@ mod tests {
     #[test]
     fn test_convert_open_order_missing_side_returns_none() {
         let instrument = InstrumentNameExchange::new("BTCUSDT");
-        let o = binance_sdk::spot::rest_api::AllOrdersResponseInner {
+        let o = binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
             side: None,
             ..make_base_open_order()
         };
@@ -3795,7 +4268,7 @@ mod tests {
     #[test]
     fn test_convert_open_order_missing_type_returns_none() {
         let instrument = InstrumentNameExchange::new("BTCUSDT");
-        let o = binance_sdk::spot::rest_api::AllOrdersResponseInner {
+        let o = binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
             r#type: None,
             ..make_base_open_order()
         };
@@ -3808,7 +4281,7 @@ mod tests {
     #[test]
     fn test_convert_open_order_executed_qty_none_defaults_to_zero() {
         let instrument = InstrumentNameExchange::new("BTCUSDT");
-        let o = binance_sdk::spot::rest_api::AllOrdersResponseInner {
+        let o = binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
             executed_qty: None,
             ..make_base_open_order()
         };
@@ -3824,7 +4297,7 @@ mod tests {
     #[test]
     fn test_convert_open_order_executed_qty_unparseable_defaults_to_zero() {
         let instrument = InstrumentNameExchange::new("BTCUSDT");
-        let o = binance_sdk::spot::rest_api::AllOrdersResponseInner {
+        let o = binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
             executed_qty: Some("bad-value".to_string()),
             ..make_base_open_order()
         };
@@ -3930,7 +4403,8 @@ mod tests {
             r: Some("INSUFFICIENT_FUNDS".to_string()),
             ..make_base_report()
         };
-        let event = convert_execution_report(report).expect("REJECTED report should produce Some");
+        let event = sole_event(convert_execution_report(report))
+            .expect("REJECTED report should produce Some");
         assert!(
             matches!(&event.kind, AccountEventKind::OrderCancelled(r) if r.state.is_err()),
             "prerequisite: event is OrderCancelled with Err"

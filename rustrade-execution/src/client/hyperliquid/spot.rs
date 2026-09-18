@@ -39,9 +39,11 @@
 use super::common::{
     CancelOnDropStream, cid_to_cloid, instrument_to_spot_coin, is_spot_coin, map_tif,
     millis_to_datetime, parse_decimal, parse_side, round_to_5_sig_figs, spot_coin_to_instrument,
+    user_fills,
 };
 use super::config::HyperliquidConfig;
 use super::error::{map_order_error, map_sdk_error};
+use crate::client::dedup::{dedup_key_from_event, is_duplicate, new_dedup_cache};
 use crate::{
     AccountEvent, AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot,
     UnindexedAccountEvent, UnindexedAccountSnapshot,
@@ -66,8 +68,10 @@ use futures::{StreamExt, stream::BoxStream};
 use hyperliquid_rust_sdk::{BaseUrl, ExchangeClient, InfoClient, Message, Subscription};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
-    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
-    instrument::name::InstrumentNameExchange,
+    Side,
+    asset::name::AssetNameExchange,
+    exchange::ExchangeId,
+    instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use rustrade_integration::collection::snapshot::Snapshot;
 use smol_str::{SmolStr, format_smolstr};
@@ -80,7 +84,7 @@ use std::{
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Hyperliquid spot trading execution client.
 ///
@@ -149,6 +153,10 @@ impl HyperliquidSpotClient {
 
 impl ExecutionClient for HyperliquidSpotClient {
     const EXCHANGE: ExchangeId = ExchangeId::HyperliquidSpot;
+
+    // Spot only — the perpetual counterpart is `HyperliquidClient`.
+    const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant] =
+        &[InstrumentKindDiscriminant::Spot];
 
     type Config = HyperliquidConfig;
     type AccountStream = BoxStream<'static, UnindexedAccountEvent>;
@@ -362,6 +370,11 @@ impl ExecutionClient for HyperliquidSpotClient {
         // terminal sends `StreamTerminated`, avoiding a double-emit.
         let terminated = Arc::new(AtomicBool::new(false));
 
+        // Scoped to this stream rather than to the client: a fresh `account_stream` opens a fresh
+        // subscription, whose snapshot the new consumer has not seen. It must outlive a reconnect,
+        // which it does -- the SDK reconnects underneath this task, not around it.
+        let fills_dedup = new_dedup_cache();
+
         // Spawn task to process fills (filtered to spot only)
         let fills_event_tx = event_tx.clone();
         let fills_cancel = cancel_token.clone();
@@ -395,14 +408,33 @@ impl ExecutionClient for HyperliquidSpotClient {
                         };
                         match msg {
                             Message::UserFills(fills) => {
+                                // Hyperliquid opens a `userFills` subscription with a snapshot of
+                                // recent fills, and the SDK resubscribes on every reconnect. Each
+                                // reconnect therefore redelivers fills already sent. A trade is a
+                                // delta the consumer accumulates, so redelivering one double-counts
+                                // filled quantity and fees -- hence the dedup cache.
+                                //
+                                // Order updates on the sibling task are deliberately NOT deduped:
+                                // they are absolute state, so a replayed one is idempotent, while
+                                // dropping one could strand the consumer on stale state.
                                 for fill in fills.data.fills {
                                     // Filter: only spot coins
                                     if !is_spot_coin(&fill.coin) {
                                         continue;
                                     }
-                                    if let Some(event) = fill_to_account_event(&fill)
-                                        && fills_event_tx.send(event).is_err()
+                                    let Some(event) = fill_to_account_event(&fill) else {
+                                        continue;
+                                    };
+                                    if let Some(key) = dedup_key_from_event(&event)
+                                        && is_duplicate(&fills_dedup, key)
                                     {
+                                        trace!(
+                                            tid = fill.tid,
+                                            "Hyperliquid spot dedup: skipping fill already delivered"
+                                        );
+                                        continue;
+                                    }
+                                    if fills_event_tx.send(event).is_err() {
                                         debug!("Spot fills event channel closed");
                                         return;
                                     }
@@ -1043,11 +1075,7 @@ impl ExecutionClient for HyperliquidSpotClient {
     ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError> {
         let address = self.wallet_h160();
 
-        let fills = self
-            .info_client
-            .user_fills(address)
-            .await
-            .map_err(map_sdk_error)?;
+        let fills = user_fills(&self.info_client, address).await?;
 
         // Safety: .max(0) ensures the value is non-negative before casting to u64.
         #[allow(clippy::cast_sign_loss)]
@@ -1098,16 +1126,21 @@ impl ExecutionClient for HyperliquidSpotClient {
                 continue;
             };
 
-            // REST `UserFillsResponse` does not expose `fee_token`. Infer the fee
-            // asset from side: spot BUY pays fee in base asset, SELL pays in quote.
-            let fee_asset = if matches!(side, Side::Buy) {
-                base_asset
-            } else {
-                quote_asset
-            };
+            // Prefer what the venue says the fee was charged in. The side-based rule below is
+            // only a guess — spot buys usually pay in base and sells in quote, but a fee can be
+            // charged in a third asset — and it is reachable only if `feeToken` is absent, which
+            // has not been observed.
+            let fee_asset = fill
+                .fee_token
+                .as_deref()
+                .unwrap_or(if matches!(side, Side::Buy) {
+                    base_asset
+                } else {
+                    quote_asset
+                });
 
             result.push(Trade {
-                id: TradeId(SmolStr::new(&fill.hash)),
+                id: TradeId(format_smolstr!("{}", fill.tid)),
                 order_id: OrderId(format_smolstr!("{}", fill.oid)),
                 instrument,
                 strategy: StrategyId::unknown(),
@@ -1115,12 +1148,19 @@ impl ExecutionClient for HyperliquidSpotClient {
                 side,
                 price,
                 quantity,
+                // `TradeInfo` carries no cumulative filled quantity; Hyperliquid reports order
+                // state as its own `OrderUpdate` message.
+                order_filled_quantity: None,
                 fees: AssetFees {
                     asset: AssetNameExchange::from(fee_asset),
                     fees: fee,
                     // Only set quote-equivalent when the fee is actually denominated in
                     // the quote asset. The downstream indexer recomputes for base-asset fees.
-                    fees_quote: if fee_asset == quote_asset {
+                    //
+                    // Case-insensitive, matching the stream path: `fee_asset` is now the venue's
+                    // own `feeToken` rather than a substring of `coin`, so it is no longer equal
+                    // to `quote_asset` byte-for-byte by construction.
+                    fees_quote: if fee_asset.eq_ignore_ascii_case(quote_asset) {
                         Some(fee)
                     } else {
                         None
@@ -1172,7 +1212,7 @@ fn fill_to_account_event(fill: &hyperliquid_rust_sdk::TradeInfo) -> Option<Unind
     let fee_asset = fill.fee_token.as_str();
 
     let trade = Trade {
-        id: TradeId(SmolStr::new(&fill.hash)),
+        id: TradeId(format_smolstr!("{}", fill.tid)),
         order_id,
         instrument,
         strategy: StrategyId::unknown(),
@@ -1180,6 +1220,9 @@ fn fill_to_account_event(fill: &hyperliquid_rust_sdk::TradeInfo) -> Option<Unind
         side,
         price,
         quantity,
+        // `TradeInfo` carries no cumulative filled quantity, so the order's state must be learned
+        // from an `OrderUpdate` -- which Hyperliquid sends as its own message.
+        order_filled_quantity: None,
         fees: AssetFees {
             asset: AssetNameExchange::from(fee_asset),
             fees: fee,
@@ -1303,6 +1346,10 @@ mod tests {
         match event.kind {
             AccountEventKind::Trade(trade) => {
                 assert_eq!(trade.instrument.as_ref(), "PURR-USDC-SPOT");
+                assert_eq!(
+                    trade.id.0, "99999",
+                    "the id is the fill's tid, not its hash"
+                );
                 assert_eq!(trade.side, Side::Buy);
                 assert_eq!(trade.price, dec!(0.05));
                 assert_eq!(trade.quantity, dec!(1000));
@@ -1311,6 +1358,50 @@ mod tests {
             }
             _ => panic!("Expected Trade event"),
         }
+    }
+
+    /// Build a spot `TradeInfo` sharing one transaction hash with its siblings.
+    fn spot_sweep_fill(tid: u64, px: &str) -> hyperliquid_rust_sdk::TradeInfo {
+        let json = format!(
+            r#"{{
+                "coin": "PURR/USDC", "side": "B", "px": "{px}", "sz": "1000",
+                "time": 1714100000000, "hash": "0xonesweep", "startPosition": "0",
+                "dir": "Open Long", "closedPnl": "0", "oid": 4242, "cloid": null,
+                "crossed": true, "fee": "0.025", "feeToken": "USDC", "tid": {tid}
+            }}"#
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn a_spot_trade_id_identifies_the_fill_not_the_transaction() {
+        let first = fill_to_account_event(&spot_sweep_fill(111, "0.05")).unwrap();
+        let second = fill_to_account_event(&spot_sweep_fill(222, "0.051")).unwrap();
+
+        let (AccountEventKind::Trade(first), AccountEventKind::Trade(second)) =
+            (first.kind, second.kind)
+        else {
+            panic!("Expected Trade events");
+        };
+
+        assert_eq!(first.order_id, second.order_id, "one order produced both");
+        assert_ne!(first.id, second.id, "but they are distinct fills");
+    }
+
+    #[test]
+    fn a_replayed_spot_fill_is_delivered_once() {
+        let cache = new_dedup_cache();
+        let event = fill_to_account_event(&spot_sweep_fill(111, "0.05")).unwrap();
+        let replay = fill_to_account_event(&spot_sweep_fill(111, "0.05")).unwrap();
+
+        assert!(!is_duplicate(&cache, dedup_key_from_event(&event).unwrap()));
+        assert!(is_duplicate(&cache, dedup_key_from_event(&replay).unwrap()));
+        // And the sibling fill of the same sweep still gets through.
+        let sibling = fill_to_account_event(&spot_sweep_fill(222, "0.051")).unwrap();
+        assert!(!is_duplicate(
+            &cache,
+            dedup_key_from_event(&sibling).unwrap()
+        ));
     }
 
     #[test]

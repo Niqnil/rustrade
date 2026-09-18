@@ -56,9 +56,23 @@ pub mod databento;
 #[cfg(feature = "massive")]
 pub mod massive;
 
+// No `///` here, unlike its siblings: that file carries its own `//!` documentation, and supplying
+// both makes rustdoc resolve the file's inner links in THIS module's scope rather than the child's,
+// so every one of them renders as dead text. Its summary and the redistribution warning open that
+// file's first paragraph instead.
+#[cfg(feature = "lse")]
+pub mod lse;
+
 /// Defines the generic [`ExchangeSub`] containing a market and channel combination used by an
 /// exchange [`Connector`] to build [`WsMessage`] subscription payloads.
 pub mod subscription;
+
+/// Internal HTTP helpers shared by the REST-based exchange integrations (Massive, IBKR Flex,
+/// Binance).
+///
+/// Not feature-gated: the Binance surface is always compiled and uses every helper here, so all
+/// three REST clients bound their error-path body reads identically.
+pub(crate) mod http;
 
 /// Default [`Duration`] the [`Connector::SubValidator`] will wait to receive all success responses to actioned
 /// `Subscription` requests.

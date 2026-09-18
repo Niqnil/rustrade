@@ -24,7 +24,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout sources
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
@@ -34,13 +34,29 @@ jobs:
       - name: Run cargo fmt
         run: cargo fmt --all -- --check
 
+  tier2-pins:
+    name: tier-2 pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      # Only `cargo metadata --no-deps` is run, which reads the workspace manifests without
+      # resolving or building anything -- no toolchain components and no network are needed.
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+
+      - name: Check tier-2 pins match the record
+        run: ./.github/scripts/check-tier2-pins.sh
+
   check:
     name: cargo check
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Checkout sources
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install mold linker
         uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444  # v1
@@ -50,21 +66,48 @@ jobs:
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
         with:
           shared-key: "rustrade-ci-check"
 
       - name: Run cargo check
         run: cargo check --locked --workspace --all-targets --all-features
 
+      # Every other job runs --all-features, so a missing `#[cfg(feature = ...)]` on an optional
+      # integration would ship green. These pin the claim that the integrations are genuinely
+      # optional: the default build must not require them.
+      - name: Run cargo check (no default features)
+        run: |
+          cargo check --locked -p rustrade-data --no-default-features
+          cargo check --locked -p rustrade-execution --no-default-features
+
   test:
     name: cargo test
     needs: [fmt, check]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # This job debug-builds the whole workspace with `--all-features` (ethers, aws-lc-sys, ring and
+    # every exchange SDK) and then runs both `--lib --bins --tests` and the doc-tests against that
+    # one build. Observed wall-clock on a warm cache is 11m35s-14m20s, so a 15-minute budget left
+    # as little as 40 seconds of headroom. Any `Cargo.lock` change invalidates the cache, and a
+    # cold build then runs past the limit: the job is cancelled, and a cancellation reports as a
+    # red required check that is indistinguishable from a genuine test failure at a glance. That
+    # blocks otherwise-good dependency PRs and costs a full re-run to diagnose.
+    #
+    # 25 minutes keeps a real hang bounded while leaving room for a cold cache. Revisit if the
+    # warm-cache figure climbs far enough to erode the margin again.
+    timeout-minutes: 25
     steps:
       - name: Checkout sources
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      # The `--all-features` debug build + link of the whole workspace (ethers,
+      # aws-lc-sys, ring, the exchange SDKs, ...) can exhaust the runner's disk
+      # ("No space left on device" during the mold link step). Reclaim ~12 GB of
+      # preinstalled toolchains we never use instead of adding a third-party action.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
 
       - name: Install mold linker
         uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444  # v1
@@ -74,13 +117,22 @@ jobs:
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
         with:
           shared-key: "rustrade-ci-test"
 
       - name: Run cargo test
-        # Exclude examples to avoid mold linker hitting .debug_str section size limits
-        run: cargo test --locked --workspace --all-features --lib --bins --tests
+        # `--examples` links the example binaries rather than only type-checking them.
+        # That is viable because `.cargo/config.toml` sets `-C split-debuginfo=unpacked`;
+        # without it the multi-exchange examples carry enough `.debug_str` to overflow a
+        # 32-bit relocation and the link fails.
+        run: cargo test --locked --workspace --all-features --lib --bins --tests --examples
+
+      # The target list above excludes doc-tests, so without this step a rustdoc example
+      # that no longer compiles ships green. Separate from the step above so a failure here is
+      # attributable at a glance; it reuses that step's build.
+      - name: Run doc-tests
+        run: cargo test --locked --workspace --all-features --doc
 
   clippy:
     name: cargo clippy
@@ -89,7 +141,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout sources
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install mold linker  # Required for proc-macro linking on cache miss
         uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444  # v1
@@ -101,12 +153,46 @@ jobs:
         with:
           components: clippy
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
         with:
           shared-key: "rustrade-ci-check"
 
       - name: Run cargo clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious -D clippy::style -W clippy::complexity -D clippy::perf
+
+  docs:
+    name: cargo doc
+    needs: [fmt, check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Install mold linker  # Required for proc-macro linking on cache miss
+        uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444  # v1
+        with:
+          mold-version: ${{ env.MOLD_VERSION }}
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
+        with:
+          shared-key: "rustrade-ci-check"
+
+      # Nothing else compiles rustdoc's link graph, so a doc link that stops resolving ships green
+      # and renders as dead text on docs.rs -- which is how six of them accumulated before this job
+      # existed. All three lints are warn-by-default, so denying them here is what makes them a gate.
+      # `--all-features` is load-bearing: `rustrade-execution` has `default = []` with every client
+      # feature-gated, so a bare `cargo doc` would document none of that code and pass vacuously.
+      - name: Check rustdoc links
+        env:
+          RUSTDOCFLAGS: >-
+            -D rustdoc::broken_intra_doc_links
+            -D rustdoc::private_intra_doc_links
+            -D rustdoc::redundant_explicit_links
+        run: cargo doc --locked --workspace --all-features --no-deps
 
   audit:
     name: cargo audit
@@ -114,13 +200,15 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout sources
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
 
-      - name: Generate Cargo.lock
-        run: cargo generate-lockfile
+      # NOTE: deliberately no `cargo generate-lockfile` step. `Cargo.lock` is committed, and
+      # re-resolving it here would audit a graph that is not the one this repository ships --
+      # exactly the question `deny.toml`'s RUSTSEC-2026-0097 exit criterion asks ("once `cargo
+      # audit` against `Cargo.lock` stops reporting it"), which a re-resolved graph cannot answer.
 
       # Advisory ignores synced with deny.toml (canonical source for justifications)
       - name: Run cargo audit
@@ -128,7 +216,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           # Synced with deny.toml [advisories.ignore] - see that file for full justifications
-          ignore: RUSTSEC-2026-0002,RUSTSEC-2026-0097,RUSTSEC-2025-0057,RUSTSEC-2024-0384,RUSTSEC-2025-0009,RUSTSEC-2025-0010,RUSTSEC-2025-0134,RUSTSEC-2026-0098,RUSTSEC-2026-0099,RUSTSEC-2026-0104
+          ignore: RUSTSEC-2024-0436,RUSTSEC-2026-0235,RUSTSEC-2025-0057,RUSTSEC-2024-0384,RUSTSEC-2025-0009,RUSTSEC-2025-0010,RUSTSEC-2025-0134,RUSTSEC-2026-0098,RUSTSEC-2026-0099,RUSTSEC-2026-0104,RUSTSEC-2026-0258
 
   deny:
     name: cargo deny
@@ -136,7 +224,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout sources
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Run cargo deny
-        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe  # v2.0.20
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25  # v2.1.1

@@ -37,7 +37,7 @@ async fn main() {
         let candle = candle.expect("spot fetch failed");
         if count < 3 {
             info!(
-                "  {} | O:{} H:{} L:{} C:{} V:{} trades:{}",
+                "  {} | O:{} H:{} L:{} C:{} V:{:?} trades:{:?}",
                 candle.close_time,
                 candle.open,
                 candle.high,
@@ -69,7 +69,7 @@ async fn main() {
     info!("Received {} futures 1s candles", candles.len());
     for candle in candles.iter().take(3) {
         info!(
-            "  {} | C:{} V:{} trades:{}",
+            "  {} | C:{} V:{:?} trades:{:?}",
             candle.close_time, candle.close, candle.volume, candle.trade_count,
         );
     }

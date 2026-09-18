@@ -313,6 +313,7 @@ impl AccountEventIndexer {
             UnindexedApiError::OrderRejected(reason) => ApiError::OrderRejected(reason),
             UnindexedApiError::OrderAlreadyCancelled => ApiError::OrderAlreadyCancelled,
             UnindexedApiError::OrderAlreadyFullyFilled => ApiError::OrderAlreadyFullyFilled,
+            UnindexedApiError::OrderAlreadyExpired => ApiError::OrderAlreadyExpired,
         })
     }
 
@@ -393,6 +394,7 @@ impl AccountEventIndexer {
             side,
             price: trade_price,
             quantity,
+            order_filled_quantity,
             fees,
         } = trade;
 
@@ -426,6 +428,7 @@ impl AccountEventIndexer {
             side,
             price: trade_price,
             quantity,
+            order_filled_quantity,
             fees: AssetFees {
                 asset: fee_asset_index,
                 fees: fees.fees,

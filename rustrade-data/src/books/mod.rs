@@ -227,12 +227,11 @@ impl OrderBook {
     /// Calculate the volume weighted mid-price (micro-price), weighing the best bid and ask prices
     /// with their associated amount.
     ///
-    /// See Docs: <https://www.quantstart.com/articles/high-frequency-trading-ii-limit-order-book>
+    /// `None` when the book is empty, and — for a two-sided book — when both best levels carry a
+    /// zero amount, because the weighting is undefined there. See [`volume_weighted_mid_price`].
     pub fn volume_weighed_mid_price(&self) -> Option<Decimal> {
         match (self.bids.best(), self.asks.best()) {
-            (Some(best_bid), Some(best_ask)) => {
-                Some(volume_weighted_mid_price(*best_bid, *best_ask))
-            }
+            (Some(best_bid), Some(best_ask)) => volume_weighted_mid_price(*best_bid, *best_ask),
             (Some(best_bid), None) => Some(best_bid.price),
             (None, Some(best_ask)) => Some(best_ask.price),
             (None, None) => None,
@@ -421,10 +420,20 @@ pub fn mid_price(best_bid_price: Decimal, best_ask_price: Decimal) -> Decimal {
 /// Calculate the volume weighted mid-price (micro-price), weighing the best bid and ask prices
 /// with their associated amount.
 ///
+/// Returns `None` when the two amounts sum to zero, which is not an edge case to be assumed away: a
+/// feed that publishes prices without sizes (a bulk export, an FX quote tape) yields exactly that
+/// book, and the weighting is undefined for it. `Decimal`'s `Div` **panics** on a zero divisor, so
+/// returning `Option` is what keeps a size-less book from taking down the caller. Use
+/// [`mid_price`] when a price is needed regardless of size.
+///
 /// See Docs: <https://www.quantstart.com/articles/high-frequency-trading-ii-limit-order-book>
-pub fn volume_weighted_mid_price(best_bid: Level, best_ask: Level) -> Decimal {
-    ((best_bid.price * best_ask.amount) + (best_ask.price * best_bid.amount))
-        / (best_bid.amount + best_ask.amount)
+pub fn volume_weighted_mid_price(best_bid: Level, best_ask: Level) -> Option<Decimal> {
+    let total_amount = best_bid.amount + best_ask.amount;
+    if total_amount.is_zero() {
+        return None;
+    }
+
+    Some(((best_bid.price * best_ask.amount) + (best_ask.price * best_bid.amount)) / total_amount)
 }
 
 #[cfg(test)]
@@ -550,6 +559,26 @@ mod tests {
                     },
                     expected: None,
                 },
+                TestCase {
+                    // TC5: two-sided book with NO sizes -- what a prices-only feed publishes. The
+                    // weighting is undefined; `Decimal` division would panic on the zero divisor.
+                    input: OrderBookL1 {
+                        last_update_time: Default::default(),
+                        best_bid: Some(Level::new(100, 0)),
+                        best_ask: Some(Level::new(200, 0)),
+                    },
+                    expected: None,
+                },
+                TestCase {
+                    // TC6: one side sized, the other not -- still weightable, and the sized side
+                    // takes the whole weight.
+                    input: OrderBookL1 {
+                        last_update_time: Default::default(),
+                        best_bid: Some(Level::new(100, 0)),
+                        best_ask: Some(Level::new(200, 50)),
+                    },
+                    expected: Some(dec!(100)),
+                },
             ];
 
             for (index, test) in tests.into_iter().enumerate() {
@@ -559,6 +588,20 @@ mod tests {
                     "TC{index} failed"
                 )
             }
+        }
+
+        #[test]
+        fn test_zero_size_book_falls_back_to_plain_mid() {
+            // The pairing the engine's price resolution relies on: a prices-only book has no
+            // volume-weighted mid, but its plain mid is well defined.
+            let book = OrderBookL1 {
+                last_update_time: Default::default(),
+                best_bid: Some(Level::new(100, 0)),
+                best_ask: Some(Level::new(200, 0)),
+            };
+
+            assert_eq!(book.volume_weighed_mid_price(), None);
+            assert_eq!(book.mid_price(), Some(dec!(150)));
         }
     }
 

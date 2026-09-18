@@ -56,7 +56,10 @@ fn gateio_market(instrument: &MarketDataInstrument) -> GateioMarket {
 
     GateioMarket(
         match kind {
-            Spot | Perpetual => format_smolstr!("{base}_{quote}"),
+            // `Cfd` is unreachable -- Gateio lists no CFDs, so `exchange_supports_instrument_kind`
+            // denies the subscription first. `Identifier` is infallible, so the arm exists only to
+            // keep this match total, and takes the identically shaped spot form.
+            Spot | Perpetual | Cfd => format_smolstr!("{base}_{quote}"),
             Future(contract) => {
                 format_smolstr!(
                     "{base}_{quote}_QUARTERLY_{}",

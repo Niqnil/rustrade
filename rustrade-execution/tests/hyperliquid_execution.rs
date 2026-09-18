@@ -350,6 +350,7 @@ async fn test_place_and_cancel_limit_order() {
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {
@@ -455,6 +456,7 @@ async fn test_stop_order_requires_uuid_cid() {
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {
@@ -523,6 +525,7 @@ async fn test_place_and_cancel_stop_order() {
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {
@@ -632,6 +635,7 @@ async fn test_place_and_cancel_take_profit_order() {
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {
@@ -717,6 +721,7 @@ async fn test_trailing_stop_unsupported() {
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {
@@ -843,6 +848,7 @@ async fn test_account_stream_with_order() {
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
+        market: None,
     };
 
     let open_request = rustrade_execution::order::OrderEvent {

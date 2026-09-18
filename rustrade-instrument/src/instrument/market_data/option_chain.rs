@@ -320,7 +320,9 @@ mod tests {
     fn display_format() {
         let descriptor = sample_descriptor();
         let display = format!("{}", descriptor);
-        assert!(display.contains("Ibkr"));
+        // `ExchangeId`'s `Display` is its canonical `as_str` spelling, not the variant name -- the
+        // same string a user writes in a configuration file.
+        assert!(display.contains("ibkr"), "{display}");
         assert!(display.contains("2 expirations"));
         assert!(display.contains("3 strikes"));
         assert!(display.contains("100"));

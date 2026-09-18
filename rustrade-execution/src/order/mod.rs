@@ -14,7 +14,9 @@ use rustrade_instrument::{
     instrument::{InstrumentIndex, name::InstrumentNameExchange},
 };
 use serde::{Deserialize, Serialize};
-use state::{ActiveOrderState, Cancelled, InactiveOrderState, Open, OpenInFlight, OrderState};
+use state::{
+    ActiveOrderState, Cancelled, Expired, InactiveOrderState, Open, OpenInFlight, OrderState,
+};
 
 /// `Order` related identifiers.
 pub mod id;
@@ -71,6 +73,50 @@ pub struct OrderKey<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex
     pub instrument: InstrumentKey,
     pub strategy: StrategyId,
     pub cid: ClientOrderId,
+}
+
+impl<ExchangeKey, InstrumentKey> OrderKey<ExchangeKey, &InstrumentKey>
+where
+    InstrumentKey: Clone,
+{
+    /// Clones the borrowed instrument key, producing a key that outlives what it was read from.
+    ///
+    /// An index that maps an [`InstrumentIndex`] back to an exchange-native name hands out a
+    /// borrow of the name it owns. Anything that stores the key, sends it to another task, or
+    /// hands it to a venue needs it owned, and every such site would otherwise write out this
+    /// same four-field rebuild.
+    pub fn into_owned_instrument(self) -> OrderKey<ExchangeKey, InstrumentKey> {
+        let Self {
+            exchange,
+            instrument,
+            strategy,
+            cid,
+        } = self;
+
+        OrderKey {
+            exchange,
+            instrument: instrument.clone(),
+            strategy,
+            cid,
+        }
+    }
+}
+
+impl<State, ExchangeKey, InstrumentKey> OrderEvent<State, ExchangeKey, &InstrumentKey>
+where
+    InstrumentKey: Clone,
+{
+    /// Clones the borrowed instrument key, producing an event that outlives what it was read from.
+    ///
+    /// See [`OrderKey::into_owned_instrument`]; the state travels untouched.
+    pub fn into_owned_instrument(self) -> OrderEvent<State, ExchangeKey, InstrumentKey> {
+        let Self { key, state } = self;
+
+        OrderEvent {
+            key: key.into_owned_instrument(),
+            state,
+        }
+    }
 }
 
 #[derive(
@@ -258,6 +304,7 @@ where
                     time_in_force,
                     position_id: _,
                     reduce_only: _, // used by adapters (e.g., Alpaca) to derive position_intent
+                    market: _,      // decision-time provenance; not part of the resulting Order
                 },
         } = value;
 
@@ -347,6 +394,32 @@ impl<ExchangeKey, AssetKey, InstrumentKey> From<Order<ExchangeKey, InstrumentKey
             kind,
             time_in_force,
             state: OrderState::Inactive(InactiveOrderState::Cancelled(state)),
+        }
+    }
+}
+
+impl<ExchangeKey, AssetKey, InstrumentKey> From<Order<ExchangeKey, InstrumentKey, Expired>>
+    for Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>
+{
+    fn from(value: Order<ExchangeKey, InstrumentKey, Expired>) -> Self {
+        let Order {
+            key,
+            side,
+            price,
+            quantity,
+            kind,
+            time_in_force,
+            state,
+        } = value;
+
+        Self {
+            key,
+            side,
+            price,
+            quantity,
+            kind,
+            time_in_force,
+            state: OrderState::Inactive(InactiveOrderState::Expired(state)),
         }
     }
 }

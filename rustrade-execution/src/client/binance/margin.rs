@@ -72,17 +72,20 @@ use binance_sdk::{
     margin_trading::{
         MarginTradingRestApi,
         rest_api::{
-            MarginAccountCancelOrderParams, MarginAccountNewOrderNewOrderRespTypeEnum,
-            MarginAccountNewOrderParams, MarginAccountNewOrderSideEnum,
-            MarginAccountNewOrderTimeInForceEnum, QueryCrossMarginAccountDetailsParams,
+            MarginAccountCancelOrderIsIsolatedEnum, MarginAccountCancelOrderParams,
+            MarginAccountNewOrderIsIsolatedEnum, MarginAccountNewOrderNewOrderRespTypeEnum,
+            MarginAccountNewOrderParams, MarginAccountNewOrderSideEffectTypeEnum,
+            MarginAccountNewOrderSideEnum, MarginAccountNewOrderTimeInForceEnum,
+            MarginAccountNewOrderTypeEnum, QueryCrossMarginAccountDetailsParams,
             QueryCrossMarginAccountDetailsResponseUserAssetsInner,
             QueryIsolatedMarginAccountInfoParams,
-            QueryIsolatedMarginAccountInfoResponseAssetsInner, QueryMarginAccountsOpenOrdersParams,
-            QueryMarginAccountsOpenOrdersResponseInner, QueryMarginAccountsTradeListParams,
-            QueryMarginAccountsTradeListResponseInner, RestApi,
+            QueryIsolatedMarginAccountInfoResponseAssetsInner,
+            QueryMarginAccountsOpenOrdersIsIsolatedEnum, QueryMarginAccountsOpenOrdersParams,
+            QueryMarginAccountsOpenOrdersResponseInner, QueryMarginAccountsTradeListIsIsolatedEnum,
+            QueryMarginAccountsTradeListParams, QueryMarginAccountsTradeListResponseInner, RestApi,
         },
         websocket_streams::{
-            Executionreport, MarginLevelStatusChange, Outboundaccountposition, UserLiabilityChange,
+            ExecutionReport, MarginLevelStatusChange, OutboundAccountPosition, UserLiabilityChange,
         },
     },
 };
@@ -90,8 +93,10 @@ use chrono::{DateTime, TimeZone, Utc};
 use futures::stream::BoxStream;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
-    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
-    instrument::name::InstrumentNameExchange,
+    Side,
+    asset::name::AssetNameExchange,
+    exchange::ExchangeId,
+    instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use serde::{Deserialize, Serialize};
 use smol_str::{SmolStr, format_smolstr};
@@ -148,6 +153,20 @@ impl MarginSideEffect {
         match self {
             MarginSideEffect::AutoBorrowRepay => "AUTO_BORROW_REPAY",
             MarginSideEffect::NoBorrow => "NO_SIDE_EFFECT",
+        }
+    }
+
+    /// This policy as the margin SDK's `sideEffectType` parameter enum.
+    ///
+    /// The SDK also exposes `MARGIN_BUY` and `AUTO_REPAY` (the pre-`AUTO_BORROW_REPAY` split
+    /// primitives); rustrade deliberately models only the two composite policies, so those
+    /// variants are unreachable from here.
+    fn as_sdk_enum(self) -> MarginAccountNewOrderSideEffectTypeEnum {
+        match self {
+            MarginSideEffect::AutoBorrowRepay => {
+                MarginAccountNewOrderSideEffectTypeEnum::AutoBorrowRepay
+            }
+            MarginSideEffect::NoBorrow => MarginAccountNewOrderSideEffectTypeEnum::NoSideEffect,
         }
     }
 }
@@ -521,6 +540,11 @@ impl BinanceMargin {
 
 impl ExecutionClient for BinanceMargin {
     const EXCHANGE: ExchangeId = ExchangeId::BinanceMargin;
+
+    // Margin is leverage applied to spot pairs, not a distinct instrument kind: a cross or
+    // isolated margin order is still an order on a `Spot` symbol.
+    const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant] =
+        &[InstrumentKindDiscriminant::Spot];
     type Config = BinanceMarginConfig;
     type AccountStream = BoxStream<'static, UnindexedAccountEvent>;
 
@@ -1101,6 +1125,12 @@ impl ExecutionClient for BinanceMargin {
     /// [`ExecutionClient::fetch_open_orders`] after each reconnect to reconcile order state — only
     /// TRADE fills are recovered, not order-lifecycle events.
     ///
+    /// That reconciliation is also the only way a recovered fill reaches the order. A live fill
+    /// carries the order's cumulative filled quantity in [`Trade::order_filled_quantity`]
+    /// (`executionReport`'s `z`) and advances the order by itself; a fill recovered from REST
+    /// `myTrades` carries no cumulative, so `order_filled_quantity` is `None` and
+    /// `filled_quantity` stays where it stood before the gap.
+    ///
     /// # Isolated mode (multiplexed `userListenToken`)
     /// Under `is_isolated = true` a **separate** manager drives the stream (the cross path above is
     /// left untouched). It acquires one per-symbol `userListenToken` for each
@@ -1210,7 +1240,7 @@ impl ExecutionClient for BinanceMargin {
                 Some(live),
             ))
         } else {
-            // --- Cross: the live-validated account-wide manager (TG17, unchanged) ---
+            // --- Cross: the live-validated account-wide manager (unchanged by isolated) ---
             let instruments = instruments.to_vec();
             // All current Binance margin symbols are ≤22 bytes (within SmolStr's 23-byte inline
             // limit), making clone() a stack memcpy with no heap allocation. Guard this implicit
@@ -1288,7 +1318,7 @@ fn build_listen_token_query(
 /// Wire shape of the `POST /sapi/v1/userListenToken` response.
 #[derive(Deserialize)]
 struct UserListenTokenResponse {
-    // Phase 0 observed `token` on the live endpoint; accept `listenToken` defensively too.
+    // The live endpoint was observed returning `token`; accept `listenToken` defensively too.
     #[serde(alias = "listenToken")]
     token: String,
     #[serde(rename = "expirationTime")]
@@ -1397,7 +1427,7 @@ async fn connect_margin_ws(
 ///
 /// `userDataStream.subscribe.listenToken` is unbound in the SDK, so it is sent via the generic
 /// `send_message` with the literal method string. The frame is **unsigned with no API key** — the
-/// token is the sole auth (verified live in Phase 0); `WebsocketMessageSendOptions::new()` yields
+/// token is the sole auth (verified live); `WebsocketMessageSendOptions::new()` yields
 /// exactly that (no `.signed()`/`.with_api_key()`, no session logon).
 async fn subscribe_listen_token(ws: &Arc<WsApiBase>, token: &str) -> anyhow::Result<()> {
     // The SDK's `send_message` takes an owned `BTreeMap<String, Value>`, so the single-entry map and
@@ -1470,7 +1500,7 @@ async fn subscribe_listen_token_capture(
 /// `BalanceStreamUpdate`s (the `subscriptionId` is unused — cross is account-wide). This is the
 /// `handle_position` passed to [`convert_margin_user_data_events_with`] / the cross manager.
 fn cross_account_position_handler(
-    position: Outboundaccountposition,
+    position: OutboundAccountPosition,
     _subscription_id: Option<i64>,
     buf: &mut Vec<UnindexedAccountEvent>,
 ) {
@@ -1486,7 +1516,7 @@ fn convert_margin_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEv
     convert_margin_user_data_events_with(frame, buf, &mut cross_account_position_handler)
 }
 
-/// Frame discrimination for the WS-API user-data delivery (Phase 0 finding).
+/// Frame discrimination for the WS-API user-data delivery, as observed live.
 ///
 /// Each text frame is either an RPC response (`{ "id", "status", "result", … }` — e.g. the
 /// subscribe ack) or a pushed user-data event wrapped as `{ "subscriptionId", "event": { "e", … } }`.
@@ -1503,7 +1533,7 @@ fn convert_margin_user_data_events_with(
     frame: &str,
     buf: &mut Vec<UnindexedAccountEvent>,
     handle_position: &mut impl FnMut(
-        Outboundaccountposition,
+        OutboundAccountPosition,
         Option<i64>,
         &mut Vec<UnindexedAccountEvent>,
     ),
@@ -1564,7 +1594,7 @@ fn convert_margin_user_data_events_with(
         "executionReport" => {
             // Single typed pass straight from the raw inner slice — no intermediate DOM, and only
             // the matched branch deserializes its payload.
-            match serde_json::from_str::<Executionreport>(event_raw) {
+            match serde_json::from_str::<ExecutionReport>(event_raw) {
                 Ok(report) => {
                     if let Some(ev) = convert_margin_execution_report(report) {
                         buf.push(ev);
@@ -1577,7 +1607,7 @@ fn convert_margin_user_data_events_with(
             false
         }
         "outboundAccountPosition" => {
-            match serde_json::from_str::<Outboundaccountposition>(event_raw) {
+            match serde_json::from_str::<OutboundAccountPosition>(event_raw) {
                 // Balance arm is the one cross/isolated divergence — delegate to the handler.
                 Ok(position) => handle_position(position, subscription_id, buf),
                 Err(e) => {
@@ -1654,12 +1684,12 @@ fn convert_margin_user_data_events_with(
 
 /// Convert a margin `executionReport` to a rustrade AccountEvent.
 ///
-/// Field-by-field adapter (the margin `Executionreport` is a distinct nominal type from spot's,
+/// Field-by-field adapter (the margin `ExecutionReport` is a distinct nominal type from spot's,
 /// fields identical). Mapping: s=symbol, c=clientOrderId, S=side, o=type, f=TIF, q=qty, p=price,
 /// x=execType, X=orderStatus, i=orderId, l=lastQty, L=lastPrice, n=commission, N=commissionAsset,
 /// T=transactTime, t=tradeId, z=cumQty.
 #[allow(clippy::cognitive_complexity)] // matches all exec types with per-variant validation (as spot)
-fn convert_margin_execution_report(report: Executionreport) -> Option<UnindexedAccountEvent> {
+fn convert_margin_execution_report(report: ExecutionReport) -> Option<UnindexedAccountEvent> {
     let exec_type = match report.x.as_deref() {
         Some(t) => t,
         None => {
@@ -1752,6 +1782,10 @@ fn convert_margin_execution_report(report: Executionreport) -> Option<UnindexedA
                 .map(AssetNameExchange::from)
                 .unwrap_or_else(|| AssetNameExchange::from("UNKNOWN"));
 
+            // Field `z` is the order's cumulative filled quantity as of this execution, which is
+            // what advances the order; `l` above is this execution alone.
+            let order_filled_quantity = report.z.as_deref().and_then(|s| Decimal::from_str(s).ok());
+
             let trade = Trade::new(
                 trade_id,
                 order_id,
@@ -1761,6 +1795,7 @@ fn convert_margin_execution_report(report: Executionreport) -> Option<UnindexedA
                 side,
                 last_price,
                 last_qty,
+                order_filled_quantity,
                 AssetFees::new(fee_asset, commission, None),
             );
             Some(UnindexedAccountEvent::new(
@@ -1838,7 +1873,7 @@ fn convert_margin_execution_report(report: Executionreport) -> Option<UnindexedA
 
 /// Convert a margin NEW execution report into an `OrderSnapshot` event.
 fn convert_margin_new_order(
-    report: &Executionreport,
+    report: &ExecutionReport,
     symbol: InstrumentNameExchange,
     cid: ClientOrderId,
     order_id: OrderId,
@@ -1938,7 +1973,7 @@ fn convert_margin_new_order(
 /// structurally cannot clobber the `margin` debt established by a REST `BalanceSnapshot`
 /// (Design decision #4).
 fn convert_margin_account_position(
-    position: Outboundaccountposition,
+    position: OutboundAccountPosition,
     buf: &mut Vec<UnindexedAccountEvent>,
 ) {
     let time_exchange = position
@@ -1990,7 +2025,7 @@ fn convert_margin_account_position(
 /// base/quote is unknown; or either side is absent/unparseable in the frame. The engine does not
 /// store this variant (`_ => None` wildcard); the wrapper consumes it off the account-event feed.
 fn route_isolated_account_position(
-    position: Outboundaccountposition,
+    position: OutboundAccountPosition,
     subscription_id: Option<i64>,
     sub_map: &Mutex<HashMap<i64, InstrumentNameExchange>>,
     base_quote: &HashMap<InstrumentNameExchange, (AssetNameExchange, AssetNameExchange)>,
@@ -2095,7 +2130,7 @@ fn register_user_data_listener(
     heartbeat_flag: Arc<AtomicBool>,
     signal_tx: oneshot::Sender<()>,
     mut handle_position: impl FnMut(
-        Outboundaccountposition,
+        OutboundAccountPosition,
         Option<i64>,
         &mut Vec<UnindexedAccountEvent>,
     ) + Send
@@ -2109,7 +2144,7 @@ fn register_user_data_listener(
     let mut event_buf = Vec::with_capacity(32);
 
     // Safety — non-atomic Option::take() in the callback is safe: binance-sdk drives one spawned
-    // task per subscription, invoking the FnMut sequentially (verified =50.0.0; re-verify on SDK
+    // task per subscription, invoking the FnMut sequentially (verified =69.1.0; re-verify on SDK
     // upgrade). Same contract spot relies on.
     ws.common.events.subscribe(move |event| {
         let Some(ref sender) = event_tx else { return };
@@ -2174,6 +2209,10 @@ fn register_user_data_listener(
 ///
 /// Only TRADE fills are recovered — order-lifecycle events (NEW/CANCELED) require a
 /// `fetch_open_orders` reconciliation by the caller. Mirrors `BinanceSpot::recover_fills`.
+///
+/// The recovered trades carry no `order_filled_quantity`: `myTrades` reports executions only,
+/// with no cumulative and no order status, so a recovered fill advances the position but not
+/// the order. Only that same reconciliation closes the gap.
 async fn recover_margin_fills(
     rest: &Arc<RestApi>,
     rate_limiter: &Arc<RateLimitTracker>,
@@ -2911,7 +2950,7 @@ async fn fetch_margin_open_orders_for_instrument(
 > {
     // Convert once before the retry closure to avoid a String allocation on every retry.
     let symbol_str = instrument.name().to_string();
-    let isolated = isolated_str(is_isolated);
+    let isolated = QueryMarginAccountsOpenOrdersIsIsolatedEnum::from_flag(is_isolated);
     let response = rest_call_with_retry(&rest, &rate_limiter, |rest| {
         let sym = symbol_str.clone();
         let isolated = isolated.clone();
@@ -2950,7 +2989,7 @@ async fn fetch_margin_all_open_orders(
     rate_limiter: Arc<RateLimitTracker>,
     is_isolated: bool,
 ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError> {
-    let isolated = isolated_str(is_isolated);
+    let isolated = QueryMarginAccountsOpenOrdersIsIsolatedEnum::from_flag(is_isolated);
     let response = rest_call_with_retry(&rest, &rate_limiter, |rest| {
         let isolated = isolated.clone();
         Box::pin(async move {
@@ -2993,7 +3032,7 @@ async fn paginate_margin_my_trades(
 ) -> Result<Vec<QueryMarginAccountsTradeListResponseInner>, UnindexedClientError> {
     // Convert once before the retry closure to avoid a String allocation on every retry.
     let symbol_str = instrument.name().to_string();
-    let isolated = isolated_str(is_isolated);
+    let isolated = QueryMarginAccountsTradeListIsIsolatedEnum::from_flag(is_isolated);
     // The const_assert! in shared bounds BINANCE_MAX_TRADES <= i32::MAX, which trivially fits in
     // i64, so this cast is always lossless. clippy::cast_possible_wrap fires only because usize is
     // the same width as i64 on 64-bit targets (a hypothetical >64-bit usize could wrap); the bound
@@ -3534,6 +3573,8 @@ fn convert_margin_trade(
         side,
         price,
         quantity,
+        // `myTrades` reports executions only -- no cumulative, no order status.
+        None,
         AssetFees::new(fee_asset, commission, None),
     ))
 }
@@ -3551,14 +3592,43 @@ enum BuildOrderError {
     Build(String),
 }
 
-/// The Binance `isIsolated` query/param wire string for the configured margin mode.
+/// Construct a margin endpoint's `isIsolated` parameter enum from the configured margin mode.
 ///
-/// `true` → `"TRUE"` (isolated, per-pair sub-accounts); `false` → `"FALSE"` (cross, account-wide).
-/// Threaded through every margin order/cancel/query call so the mode is config-driven from a single
-/// source rather than hardcoded per-call.
-fn isolated_str(is_isolated: bool) -> String {
-    if is_isolated { "TRUE" } else { "FALSE" }.to_string()
+/// The SDK generates a *separate* two-variant `isIsolated` enum per endpoint, all with identical
+/// `True`/`False` variants serialising to `"TRUE"`/`"FALSE"`. This trait keeps the one
+/// `bool` → wire-value mapping defined (and unit-tested) in a single place, as the former
+/// `isolated_str` helper did, rather than repeating a ternary at each call site.
+///
+/// `true` → `True` (`"TRUE"`, isolated, per-pair sub-accounts); `false` → `False` (`"FALSE"`,
+/// cross, account-wide). Threaded through every margin order/cancel/query call so the mode is
+/// config-driven from a single source rather than hardcoded per-call.
+trait IsolatedFlag {
+    /// The endpoint's `isIsolated` variant for `is_isolated`.
+    fn from_flag(is_isolated: bool) -> Self;
 }
+
+/// Implement [`IsolatedFlag`] for each endpoint's `isIsolated` enum.
+///
+/// Every one of these SDK enums is the same two-variant shape, so a macro keeps the impls honest:
+/// adding an endpoint is one line here rather than a copy-pasted block that can silently invert.
+macro_rules! impl_isolated_flag {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl IsolatedFlag for $t {
+                fn from_flag(is_isolated: bool) -> Self {
+                    if is_isolated { Self::True } else { Self::False }
+                }
+            }
+        )*
+    };
+}
+
+impl_isolated_flag!(
+    MarginAccountNewOrderIsIsolatedEnum,
+    MarginAccountCancelOrderIsIsolatedEnum,
+    QueryMarginAccountsOpenOrdersIsIsolatedEnum,
+    QueryMarginAccountsTradeListIsIsolatedEnum,
+);
 
 /// Build the margin cancel-order params (pure; no I/O).
 ///
@@ -3573,8 +3643,9 @@ fn build_cancel_order_params(
     cid: &ClientOrderId,
     is_isolated: bool,
 ) -> Result<MarginAccountCancelOrderParams, String> {
-    let mut builder =
-        MarginAccountCancelOrderParams::builder(symbol).is_isolated(isolated_str(is_isolated));
+    let mut builder = MarginAccountCancelOrderParams::builder(symbol).is_isolated(
+        MarginAccountCancelOrderIsIsolatedEnum::from_flag(is_isolated),
+    );
 
     match id {
         Some(order_id) => match order_id.0.parse::<i64>() {
@@ -3622,16 +3693,12 @@ fn build_new_order_params(
         convert_order_kind_tif_margin(kind, time_in_force).ok_or(BuildOrderError::Unsupported)?;
 
     // isIsolated is config-driven: "TRUE" for isolated, "FALSE" for cross.
-    let mut builder = MarginAccountNewOrderParams::builder(
-        symbol,
-        binance_side,
-        binance_type.as_binance_str().to_string(),
-    )
-    .quantity(quantity)
-    .is_isolated(isolated_str(is_isolated))
-    .side_effect_type(side_effect.as_binance_str().to_string())
-    .new_client_order_id(new_client_order_id)
-    .new_order_resp_type(MarginAccountNewOrderNewOrderRespTypeEnum::Full);
+    let mut builder = MarginAccountNewOrderParams::builder(symbol, binance_side, binance_type)
+        .quantity(quantity)
+        .is_isolated(MarginAccountNewOrderIsIsolatedEnum::from_flag(is_isolated))
+        .side_effect_type(side_effect.as_sdk_enum())
+        .new_client_order_id(new_client_order_id)
+        .new_order_resp_type(MarginAccountNewOrderNewOrderRespTypeEnum::Full);
 
     // auto_repay_at_cancel only coheres under AutoBorrowRepay: a NoBorrow client never borrows,
     // so there is no loan to repay when an order is cancelled.
@@ -3669,18 +3736,17 @@ fn build_new_order_params(
 /// Map a rustrade [`OrderKind`] + [`TimeInForce`] to the margin SDK's order `type`/`timeInForce`.
 ///
 /// Reuses the shared [`classify_order_kind_tif`] decision logic, mapping only the venue-neutral
-/// result onto margin's SDK output types — the `r#type` stays a [`BinanceOrderType`] (the caller
-/// emits its [`as_binance_str`](BinanceOrderType::as_binance_str) wire string into the SDK's
-/// `String` field) and the TIF becomes a [`MarginAccountNewOrderTimeInForceEnum`].
+/// result onto margin's SDK output types — a [`MarginAccountNewOrderTypeEnum`] and a
+/// [`MarginAccountNewOrderTimeInForceEnum`]. Mirrors spot's own `convert_order_kind_tif` adapter.
 ///
 /// Returns `None` for unsupported combinations. Trailing-stop kinds are rejected here (the margin
-/// SDK has no `trailingDelta` binding — Design decision #3), unlike spot which maps them to a
-/// `STOP_LOSS` with `trailingDelta`.
+/// SDK has no `trailingDelta` binding), unlike spot which maps them to a `STOP_LOSS` with
+/// `trailingDelta`.
 fn convert_order_kind_tif_margin(
     kind: OrderKind,
     tif: TimeInForce,
 ) -> Option<(
-    BinanceOrderType,
+    MarginAccountNewOrderTypeEnum,
     Option<MarginAccountNewOrderTimeInForceEnum>,
 )> {
     if matches!(
@@ -3695,12 +3761,21 @@ fn convert_order_kind_tif_margin(
     }
 
     let (binance_type, binance_tif) = classify_order_kind_tif(kind, tif)?;
+    let margin_type = match binance_type {
+        BinanceOrderType::Market => MarginAccountNewOrderTypeEnum::Market,
+        BinanceOrderType::Limit => MarginAccountNewOrderTypeEnum::Limit,
+        BinanceOrderType::LimitMaker => MarginAccountNewOrderTypeEnum::LimitMaker,
+        BinanceOrderType::StopLoss => MarginAccountNewOrderTypeEnum::StopLoss,
+        BinanceOrderType::StopLossLimit => MarginAccountNewOrderTypeEnum::StopLossLimit,
+        BinanceOrderType::TakeProfit => MarginAccountNewOrderTypeEnum::TakeProfit,
+        BinanceOrderType::TakeProfitLimit => MarginAccountNewOrderTypeEnum::TakeProfitLimit,
+    };
     let margin_tif = binance_tif.map(|t| match t {
         BinanceTimeInForce::Gtc => MarginAccountNewOrderTimeInForceEnum::Gtc,
         BinanceTimeInForce::Ioc => MarginAccountNewOrderTimeInForceEnum::Ioc,
         BinanceTimeInForce::Fok => MarginAccountNewOrderTimeInForceEnum::Fok,
     });
-    Some((binance_type, margin_tif))
+    Some((margin_type, margin_tif))
 }
 
 /// Volume-weighted average fill price from a margin order response's cumulative quote quantity.
@@ -3871,9 +3946,41 @@ mod tests {
     }
 
     #[test]
-    fn isolated_str_maps_mode() {
-        assert_eq!(isolated_str(false), "FALSE");
-        assert_eq!(isolated_str(true), "TRUE");
+    fn isolated_flag_maps_mode() {
+        // One assertion per endpoint enum: the SDK generates a separate `isIsolated` type for
+        // each, so an inverted arm in any single impl would otherwise go unnoticed.
+        assert_eq!(
+            MarginAccountNewOrderIsIsolatedEnum::from_flag(true).as_str(),
+            "TRUE"
+        );
+        assert_eq!(
+            MarginAccountNewOrderIsIsolatedEnum::from_flag(false).as_str(),
+            "FALSE"
+        );
+        assert_eq!(
+            MarginAccountCancelOrderIsIsolatedEnum::from_flag(true).as_str(),
+            "TRUE"
+        );
+        assert_eq!(
+            MarginAccountCancelOrderIsIsolatedEnum::from_flag(false).as_str(),
+            "FALSE"
+        );
+        assert_eq!(
+            QueryMarginAccountsOpenOrdersIsIsolatedEnum::from_flag(true).as_str(),
+            "TRUE"
+        );
+        assert_eq!(
+            QueryMarginAccountsOpenOrdersIsIsolatedEnum::from_flag(false).as_str(),
+            "FALSE"
+        );
+        assert_eq!(
+            QueryMarginAccountsTradeListIsIsolatedEnum::from_flag(true).as_str(),
+            "TRUE"
+        );
+        assert_eq!(
+            QueryMarginAccountsTradeListIsIsolatedEnum::from_flag(false).as_str(),
+            "FALSE"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3890,7 +3997,7 @@ mod tests {
         )
         .expect("build");
         assert_eq!(p.symbol, "BTCUSDT");
-        assert_eq!(p.is_isolated.as_deref(), Some("FALSE"));
+        assert_eq!(p.is_isolated.as_ref().map(|i| i.as_str()), Some("FALSE"));
         assert_eq!(p.order_id, Some(12345));
         assert_eq!(p.orig_client_order_id, None);
     }
@@ -3904,7 +4011,7 @@ mod tests {
             true,
         )
         .expect("build");
-        assert_eq!(p.is_isolated.as_deref(), Some("TRUE"));
+        assert_eq!(p.is_isolated.as_ref().map(|i| i.as_str()), Some("TRUE"));
         assert_eq!(p.order_id, Some(12345));
     }
 
@@ -3978,7 +4085,7 @@ mod tests {
 
         assert_eq!(p.symbol, "BTCUSDT");
         assert_eq!(p.side.as_str(), "BUY");
-        assert_eq!(p.r#type, "LIMIT");
+        assert_eq!(p.r#type.as_str(), "LIMIT");
         assert_eq!(p.quantity, Some(Decimal::from(2)));
         assert_eq!(p.price, Some(Decimal::from(50_000)));
         assert_eq!(p.stop_price, None);
@@ -4006,7 +4113,10 @@ mod tests {
             false,
         )
         .expect("build");
-        assert_eq!(cross.is_isolated.as_deref(), Some("FALSE"));
+        assert_eq!(
+            cross.is_isolated.as_ref().map(|i| i.as_str()),
+            Some("FALSE")
+        );
         assert_eq!(cross.side.as_str(), "SELL");
 
         // Isolated (is_isolated = true) → "TRUE".
@@ -4022,7 +4132,10 @@ mod tests {
             true,
         )
         .expect("build");
-        assert_eq!(isolated.is_isolated.as_deref(), Some("TRUE"));
+        assert_eq!(
+            isolated.is_isolated.as_ref().map(|i| i.as_str()),
+            Some("TRUE")
+        );
     }
 
     #[test]
@@ -4036,7 +4149,10 @@ mod tests {
             MarginSideEffect::AutoBorrowRepay,
         )
         .expect("build");
-        assert_eq!(auto.side_effect_type.as_deref(), Some("AUTO_BORROW_REPAY"));
+        assert_eq!(
+            auto.side_effect_type.as_ref().map(|s| s.as_str()),
+            Some("AUTO_BORROW_REPAY")
+        );
         assert_eq!(auto.auto_repay_at_cancel, Some(true));
 
         // NoBorrow → NO_SIDE_EFFECT and NO auto_repay_at_cancel (no loan to repay).
@@ -4049,7 +4165,7 @@ mod tests {
         )
         .expect("build");
         assert_eq!(
-            no_borrow.side_effect_type.as_deref(),
+            no_borrow.side_effect_type.as_ref().map(|s| s.as_str()),
             Some("NO_SIDE_EFFECT")
         );
         assert_eq!(no_borrow.auto_repay_at_cancel, None);
@@ -4065,7 +4181,7 @@ mod tests {
             MarginSideEffect::AutoBorrowRepay,
         )
         .expect("build");
-        assert_eq!(p.r#type, "MARKET");
+        assert_eq!(p.r#type.as_str(), "MARKET");
         assert_eq!(p.price, None);
         assert_eq!(p.stop_price, None);
         assert!(p.time_in_force.is_none());
@@ -4081,7 +4197,7 @@ mod tests {
             MarginSideEffect::AutoBorrowRepay,
         )
         .expect("build");
-        assert_eq!(p.r#type, "LIMIT_MAKER");
+        assert_eq!(p.r#type.as_str(), "LIMIT_MAKER");
         // LIMIT_MAKER carries no timeInForce (post-only is the type, not a TIF).
         assert!(p.time_in_force.is_none());
     }
@@ -4100,7 +4216,7 @@ mod tests {
             MarginSideEffect::AutoBorrowRepay,
         )
         .expect("build");
-        assert_eq!(stop.r#type, "STOP_LOSS");
+        assert_eq!(stop.r#type.as_str(), "STOP_LOSS");
         assert_eq!(stop.stop_price, Some(trigger));
         assert_eq!(stop.price, None);
 
@@ -4114,7 +4230,7 @@ mod tests {
             MarginSideEffect::AutoBorrowRepay,
         )
         .expect("build");
-        assert_eq!(stop_limit.r#type, "STOP_LOSS_LIMIT");
+        assert_eq!(stop_limit.r#type.as_str(), "STOP_LOSS_LIMIT");
         assert_eq!(stop_limit.stop_price, Some(trigger));
         assert_eq!(stop_limit.price, Some(Decimal::from(47_900)));
         assert_eq!(
@@ -4132,7 +4248,7 @@ mod tests {
             MarginSideEffect::AutoBorrowRepay,
         )
         .expect("build");
-        assert_eq!(take_profit.r#type, "TAKE_PROFIT");
+        assert_eq!(take_profit.r#type.as_str(), "TAKE_PROFIT");
         assert_eq!(take_profit.stop_price, Some(trigger));
     }
 
@@ -4680,7 +4796,7 @@ mod tests {
 
     // -- User-data stream: frame discrimination + event conversion -----------------------------
 
-    /// Wrap an inner user-data `event` object in the WS-API push envelope (Phase 0 shape),
+    /// Wrap an inner user-data `event` object in the WS-API push envelope observed live,
     /// serialized to the on-wire JSON string the converter parses.
     fn push(event: serde_json::Value) -> String {
         serde_json::json!({ "subscriptionId": 1, "event": event }).to_string()
@@ -4856,7 +4972,7 @@ mod tests {
     fn isolated_handler(
         sub_map: Arc<Mutex<HashMap<i64, InstrumentNameExchange>>>,
         base_quote: Arc<HashMap<InstrumentNameExchange, (AssetNameExchange, AssetNameExchange)>>,
-    ) -> impl FnMut(Outboundaccountposition, Option<i64>, &mut Vec<UnindexedAccountEvent>) {
+    ) -> impl FnMut(OutboundAccountPosition, Option<i64>, &mut Vec<UnindexedAccountEvent>) {
         move |position, subscription_id, buf| {
             route_isolated_account_position(position, subscription_id, &sub_map, &base_quote, buf);
         }
@@ -4875,7 +4991,7 @@ mod tests {
 
     #[test]
     fn listen_token_query_cross_vs_isolated() {
-        // Cross → no params (the signed POST sends an empty query, exactly as TG17).
+        // Cross → no params (the signed POST sends an empty query, as it did before isolated).
         assert!(build_listen_token_query(None).is_empty());
 
         // Isolated → isIsolated=TRUE & symbol=<sym> (the per-symbol scoping).

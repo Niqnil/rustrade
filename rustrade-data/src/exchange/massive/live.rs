@@ -75,7 +75,7 @@
 //! ```
 
 use super::error::MassiveError;
-use super::transformer::{WsMessage, parse_ws_message};
+use super::transformer::{AggregateProvenance, WsAggregateMsg, WsMessage, parse_ws_message};
 use crate::event::{DataKind, MarketEvent};
 use chrono::{DateTime, Utc};
 use futures::{SinkExt, Stream, StreamExt};
@@ -740,28 +740,53 @@ impl<K: Clone + Send + 'static> MassiveLive<K> {
                     kind: DataKind::OrderBookL1(l1),
                 })
             }
+            // The forex variants are split out deliberately: their `v` counts quote updates rather
+            // than trades, because spot FX has no consolidated tape for Massive to aggregate. See
+            // `AggregateProvenance`.
             WsMessage::AggSecondStocks(agg)
             | WsMessage::AggMinuteStocks(agg)
             | WsMessage::AggSecondCrypto(agg)
-            | WsMessage::AggMinuteCrypto(agg)
-            | WsMessage::AggSecondForex(agg)
-            | WsMessage::AggMinuteForex(agg) => {
-                let instrument = instruments.get(&agg.symbol)?.clone();
-                let (time_exchange, candle) = agg.into_candle();
-
-                Some(MarketEvent {
-                    time_exchange,
-                    time_received,
+            | WsMessage::AggMinuteCrypto(agg) => Self::aggregate_to_event(
+                agg,
+                AggregateProvenance::TradeTape,
+                instruments,
+                exchange,
+                time_received,
+            ),
+            WsMessage::AggSecondForex(agg) | WsMessage::AggMinuteForex(agg) => {
+                Self::aggregate_to_event(
+                    agg,
+                    AggregateProvenance::QuoteTape,
+                    instruments,
                     exchange,
-                    instrument,
-                    kind: DataKind::Candle(candle),
-                })
+                    time_received,
+                )
             }
             WsMessage::Status(_) => {
                 // Status messages are handled during auth/subscribe, not emitted as events
                 None
             }
         }
+    }
+
+    /// Shared tail of the aggregate arms, differing only in what the market's `v` means.
+    fn aggregate_to_event(
+        agg: WsAggregateMsg,
+        provenance: AggregateProvenance,
+        instruments: &HashMap<String, K>,
+        exchange: ExchangeId,
+        time_received: DateTime<Utc>,
+    ) -> Option<MarketEvent<K, DataKind>> {
+        let instrument = instruments.get(&agg.symbol)?.clone();
+        let (time_exchange, candle) = agg.into_candle(provenance);
+
+        Some(MarketEvent {
+            time_exchange,
+            time_received,
+            exchange,
+            instrument,
+            kind: DataKind::Candle(candle),
+        })
     }
 }
 

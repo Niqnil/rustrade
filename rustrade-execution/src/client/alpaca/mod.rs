@@ -30,6 +30,10 @@
 // - Only FILL activities are recovered after reconnect; order lifecycle events
 //   (new, cancelled, expired) are not — callers must call fetch_open_orders after
 //   each reconnect to reconcile open-order state.
+// - A fill frame whose order status is neither partially_filled nor filled emits the
+//   execution but no order snapshot, so a fill arriving after its order's terminal frame
+//   cannot resurrect a retired order as a resting one. That order's filled quantity is
+//   settled instead by the terminal frame's own filled_qty, or by fetch_open_orders.
 
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
@@ -62,8 +66,10 @@ use itertools::Itertools as _;
 use lru::LruCache;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
-    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
-    instrument::name::InstrumentNameExchange,
+    Side,
+    asset::name::AssetNameExchange,
+    exchange::ExchangeId,
+    instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use rustrade_integration::protocol::websocket::{WebSocket, WsMessage};
 use serde::{Deserialize, Serialize};
@@ -301,8 +307,10 @@ impl ExponentialBackoff {
 /// WS fills: `convert_trade_update` sets `trade_id = order.id + ":" + order.filled_qty`
 /// (cumulative from the order update payload).
 ///
-/// REST fills: `recover_fills` accumulates per-execution qty per order and overrides
-/// `trade.id` to the same format before inserting into the cache.
+/// REST fills: `recover_fills` reads the activity's own `cum_qty` -- the same figure the WS path
+/// reads -- and overrides `trade.id` to the same format before inserting into the cache. Where
+/// Alpaca omits `cum_qty` it falls back to accumulating per-execution qty within the batch, which
+/// is correct only for an order whose fills lie wholly inside the recovery window.
 ///
 /// Using cumulative qty (not per-execution qty) means two equal-size partial fills
 /// on the same order produce distinct keys (`order:1` and `order:2`), preventing
@@ -570,6 +578,9 @@ struct AlpacaOrderResponse {
     trail_percent: Option<String>,
     trail_price: Option<String>,
     created_at: String,
+    /// When the order last changed state. Nullable in Alpaca's schema, so callers fall back to
+    /// `created_at` via [`order_state_time`].
+    updated_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -581,6 +592,14 @@ struct AlpacaActivity {
     price: String,
     qty: String,
     transaction_time: String,
+    /// The order's cumulative filled quantity as of this execution, as Alpaca reported it --
+    /// the same figure the WebSocket path reads from `order.filled_qty`.
+    ///
+    /// Alpaca's schema lists this on trade activities without qualifying by fill type -- unlike
+    /// `leaves_qty`, which it documents as partial-fill-specific. It is parsed as optional
+    /// regardless, so an omission degrades to the fallback below rather than discarding the
+    /// whole activity.
+    cum_qty: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1120,6 +1139,17 @@ async fn rest_delete_with_retry(
 
 impl ExecutionClient for AlpacaClient {
     const EXCHANGE: ExchangeId = ExchangeId::AlpacaBroker;
+
+    // Equities and crypto are both `Spot` here — Alpaca settles each as an outright holding, and
+    // the client separates them only by symbol shape. `Option` is genuinely routed: the
+    // `position_intent` Alpaca requires on options orders is derived from that same shape test,
+    // which is `is_options_or_equity_symbol` — a not-a-crypto-pair check (`!symbol.contains('/')`),
+    // not OCC format validation. Equities take the branch too, harmlessly: `position_intent` is
+    // accepted on an equity order.
+    const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant] = &[
+        InstrumentKindDiscriminant::Spot,
+        InstrumentKindDiscriminant::Option,
+    ];
     type Config = AlpacaConfig;
     type AccountStream = BoxStream<'static, UnindexedAccountEvent>;
 
@@ -1223,10 +1253,17 @@ impl ExecutionClient for AlpacaClient {
     ///
     /// After a reconnect, missed fills are recovered from the REST activities endpoint
     /// using `direction=asc` to match the chronological order in which the WS stream
-    /// advanced `filled_qty`. The dedup key `"{order_id}:{cum_qty}"` is synthesised
-    /// by accumulating per-execution qty in that order. If Alpaca returns activities
-    /// out of chronological order (e.g. at pagination boundaries), dedup keys will
-    /// diverge and fills may be dropped or duplicated for that order.
+    /// advanced `filled_qty`. The dedup key `"{order_id}:{cum_qty}"` is taken from the
+    /// activity's own `cum_qty`, so it matches the WS path by construction and does not
+    /// depend on the order in which activities arrive.
+    ///
+    /// Only where Alpaca omits `cum_qty` does the key fall back to accumulating per-execution
+    /// qty within the batch. That fallback counts from zero per order, so it is correct only for
+    /// an order whose fills lie wholly inside the recovery window, and it is sensitive to
+    /// activities arriving out of chronological order (e.g. at pagination boundaries).
+    ///
+    /// A recovered fill also carries the order's cumulative filled quantity, so it advances the
+    /// order's `filled_quantity` without waiting for a `fetch_open_orders` reconciliation.
     ///
     /// # Lifecycle event deduplication
     ///
@@ -1444,7 +1481,7 @@ impl ExecutionClient for AlpacaClient {
         let page = paginate_activities(&http, &self.rate_limiter, base, &after_str).await?;
 
         // Propagate truncation as an error so callers can detect incomplete results.
-        // The crypto repo can match on `Truncated` and alert operators.
+        // A caller can match on `Truncated` and alert rather than act on a partial page.
         if page.truncated {
             return Err(UnindexedClientError::Truncated {
                 limit: MAX_ACTIVITY_PAGES,
@@ -1683,7 +1720,7 @@ impl AlpacaClient {
         match result {
             Ok(resp) => {
                 let exchange_order_id = OrderId(SmolStr::new(&resp.id));
-                let time_exchange = parse_timestamp(&resp.created_at).unwrap_or_else(Utc::now);
+                let time_exchange = order_state_time(&resp);
                 let filled_qty = Decimal::from_str(&resp.filled_qty).unwrap_or(Decimal::ZERO);
 
                 let state = if filled_qty >= request.quantity {
@@ -1888,7 +1925,7 @@ impl AlpacaClient {
         match result {
             Ok(resp) => {
                 let exchange_order_id = OrderId(SmolStr::new(&resp.id));
-                let time_exchange = parse_timestamp(&resp.created_at).unwrap_or_else(Utc::now);
+                let time_exchange = order_state_time(&resp);
                 let filled_qty = Decimal::from_str(&resp.filled_qty).unwrap_or(Decimal::ZERO);
 
                 let state = if filled_qty >= quantity {
@@ -2612,7 +2649,7 @@ fn process_ws_text(
                 }
             }
 
-            if let Some(event) = convert_trade_update(update) {
+            for event in convert_trade_update(update).into_iter().flatten() {
                 // Consumer dropped errors are benign; connection_manager will detect
                 // tx.closed() on the next select! poll and exit cleanly.
                 let _ = tx.send(event);
@@ -2715,18 +2752,22 @@ async fn recover_fills(
     let mut recovered = 0u32;
     let mut duplicates = 0u32;
 
-    // Track cumulative filled qty per order so that the synthesised TradeId matches
-    // the WS path: both produce "{order_id}:{cumulative_filled_qty}". This prevents
-    // same-size partial fill collisions (e.g. two 1-lot fills on a 2-lot order)
-    // and ensures cross-source dedup works correctly after reconnect.
+    // Fallback only. The dedup key is "{order_id}:{cumulative_filled_qty}" on both paths, and the
+    // cumulative is now taken from the activity's own `cum_qty` -- the same figure the WS path
+    // reads from `order.filled_qty` -- so the two agree by construction rather than by
+    // reconstruction.
     //
-    // Activities are fetched with direction=asc so they arrive in chronological order.
-    // Cumulative accumulation here must match the WS path's order.filled_qty progression.
-    // If Alpaca violates this ordering guarantee, dedup keys will diverge and fills
-    // may be dropped or duplicated.
-    // Borrow `activities` so &str keys into order_id strings remain valid for the
-    // entire loop. Consuming iteration would drop each activity at end of its iteration,
-    // invalidating keys that still need to be looked up by later fills on the same order.
+    // This counter is what the key falls back to when `cum_qty` is absent, which reproduces the
+    // previous behaviour exactly. That behaviour is correct only for an order whose fills lie
+    // entirely inside the recovery window: it counts from zero per order within the batch, so an
+    // order that had already partly filled before the window yields keys offset by the amount it
+    // filled earlier, and those keys match nothing the WS path ever emitted. Preferring `cum_qty`
+    // is what removes that failure mode.
+    //
+    // Activities are fetched with direction=asc, so accumulation here follows execution order.
+    // Borrow `activities` so &str keys into order_id strings remain valid for the entire loop:
+    // consuming iteration would drop each activity at the end of its iteration, invalidating keys
+    // that later fills on the same order still need to look up.
     let mut cumulative_qty: FnvHashMap<&str, Decimal> = FnvHashMap::default();
 
     for activity in &activities {
@@ -2770,10 +2811,20 @@ async fn recover_fills(
         // fill_dedup_key_from_event produces the same key for both sources.
         // Normalise the cumulative Decimal to strip trailing zeros so the string
         // representation matches the WS path (e.g. "1" == "1.00" after normalize).
+        //
+        // `order_filled_quantity` holds the venue's own cumulative, parsed by
+        // `convert_activity_to_trade`; `cumulative` is the intra-batch fallback described above.
+        //
+        // The counter is advanced for every activity, including those that carry `cum_qty` and so
+        // never consult it. That is deliberate: it keeps the fallback usable for a later activity
+        // on the same order that omits the field. A batch mixing both therefore interleaves two
+        // key schemes, and the fallback keys in it remain offset by whatever the order filled
+        // before the window -- the field's presence rescues an activity, not an order.
+        let key_cumulative = trade.order_filled_quantity.unwrap_or(cumulative);
         trade.id = TradeId(format_smolstr!(
             "{}:{}",
             activity.order_id,
-            cumulative.normalize()
+            key_cumulative.normalize()
         ));
 
         let event =
@@ -2977,7 +3028,7 @@ fn convert_open_order(
         o.trail_price.as_deref(),
     )?;
     let time_in_force = parse_time_in_force(&o.time_in_force);
-    let time_exchange = parse_timestamp(&o.created_at).unwrap_or_else(Utc::now);
+    let time_exchange = order_state_time(o);
 
     Some(Order {
         key: OrderKey::new(
@@ -3006,6 +3057,9 @@ fn convert_activity_to_trade(
     let side = parse_side(&a.side)?;
     let price = Decimal::from_str(&a.price).ok()?;
     let quantity = Decimal::from_str(&a.qty).ok()?;
+    // `None` when Alpaca omitted the field or sent something unparseable, which is the honest
+    // report: the venue did not tell us where the order stands, rather than "nothing is filled".
+    let order_filled_quantity = a.cum_qty.as_deref().and_then(|s| Decimal::from_str(s).ok());
     let time_exchange = parse_timestamp(&a.transaction_time).unwrap_or_else(|| {
         warn!(id = %a.id, "Alpaca activity: unparseable transaction_time, using now");
         Utc::now()
@@ -3024,6 +3078,7 @@ fn convert_activity_to_trade(
         side,
         price,
         quantity,
+        order_filled_quantity,
         AssetFees::new(
             AssetNameExchange::from("USD"),
             Decimal::ZERO,
@@ -3032,8 +3087,83 @@ fn convert_activity_to_trade(
     ))
 }
 
-/// Convert a WebSocket trade_update event into a rustrade AccountEvent.
-fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccountEvent> {
+/// Build an `OrderSnapshot` event from the order payload embedded in a `trade_updates` frame.
+///
+/// Shared by the acknowledgement arm and the fill arms of [`convert_trade_update`], so that a
+/// fill reports the order's new cumulative `filled_quantity` the same way an acknowledgement
+/// reports its initial one.
+///
+/// Returns `None` for a notional order (placed by dollar value, `qty` is null). Emitting a
+/// snapshot with `quantity == 0` would read as an order with nothing left to fill and retire it,
+/// so such orders are left untracked -- consistent with `convert_open_order` on the REST path.
+fn ws_order_snapshot(
+    order: &AlpacaOrderWs<'_>,
+    instrument: InstrumentNameExchange,
+    cid: ClientOrderId,
+    order_id: OrderId,
+    time_exchange: DateTime<Utc>,
+) -> Option<UnindexedAccountEvent> {
+    let side = parse_side(&order.side)?;
+    let quantity = Decimal::from_str(order.qty.unwrap_or("0")).unwrap_or(Decimal::ZERO);
+    if quantity.is_zero() {
+        trace!(order_id = %order.id, "Alpaca WS: skipping notional order snapshot (qty=None)");
+        return None;
+    }
+    let price = order.limit_price.and_then(|s| Decimal::from_str(s).ok());
+    let filled_qty = Decimal::from_str(order.filled_qty.unwrap_or("0")).unwrap_or(Decimal::ZERO);
+    let kind = parse_order_kind(
+        &order.order_type,
+        order.stop_price,
+        order.trail_percent,
+        order.trail_price,
+    )?;
+    let time_in_force = parse_time_in_force(&order.time_in_force);
+
+    let order_snapshot = crate::order::Order {
+        key: OrderKey::new(
+            ExchangeId::AlpacaBroker,
+            instrument,
+            StrategyId::unknown(),
+            cid,
+        ),
+        side,
+        price,
+        quantity,
+        kind,
+        time_in_force,
+        state: OrderState::active(Open::new(order_id, time_exchange, filled_qty)),
+    };
+    Some(UnindexedAccountEvent::new(
+        ExchangeId::AlpacaBroker,
+        AccountEventKind::OrderSnapshot(rustrade_integration::collection::snapshot::Snapshot(
+            order_snapshot,
+        )),
+    ))
+}
+
+/// Whether a fill frame's order payload describes an order that is still live at the exchange,
+/// and may therefore be written into engine state as an `Open` snapshot.
+///
+/// A fill frame carries the order's status alongside the execution. Only `partially_filled` and
+/// `filled` say the order reached this execution while working; every other status means some
+/// other frame owns the order's current state. Writing an `Open` snapshot from one of those would
+/// resurrect an order the engine has already retired, leaving a resting order that does not exist
+/// at the exchange -- a fill that arrives after its order's terminal frame is exactly the ordering
+/// this guards against.
+fn ws_fill_order_is_live(status: &str) -> bool {
+    matches!(status, "partially_filled" | "filled")
+}
+
+/// Convert a WebSocket trade_update event into rustrade AccountEvents.
+///
+/// Returns up to two events, in the order they must be applied. A fill frame genuinely carries
+/// two facts -- the execution print and the order's new cumulative filled quantity -- so it maps
+/// to both a `Trade` and an `OrderSnapshot`.
+///
+/// The `Trade` is always first. A fully-filled snapshot retires its order, and routing a fill
+/// against an order that has already been retired is a strictly harder problem than routing it
+/// against a live one; emitting the execution first keeps the easy ordering.
+fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccountEvent>; 2] {
     // Early exit for unrecognised event types before incurring allocations for
     // instrument/order_id/cid — those are wasted for unknown events.
     let event_str = update.event.as_str();
@@ -3051,7 +3181,7 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
             | "rejected"
     ) {
         trace!(event = %event_str, "Alpaca WS: ignoring trade_updates event type");
-        return None;
+        return [None, None];
     }
 
     let order = &update.order;
@@ -3066,9 +3196,13 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
     match event_str {
         "fill" | "partial_fill" => {
             // Use event-level price/qty for the per-execution trade.
-            let price = update.price.and_then(|s| Decimal::from_str(s).ok())?;
-            let quantity = update.qty.and_then(|s| Decimal::from_str(s).ok())?;
-            let side = parse_side(&order.side)?;
+            let (Some(price), Some(quantity), Some(side)) = (
+                update.price.and_then(|s| Decimal::from_str(s).ok()),
+                update.qty.and_then(|s| Decimal::from_str(s).ok()),
+                parse_side(&order.side),
+            ) else {
+                return [None, None];
+            };
             let time_exchange = update
                 .timestamp
                 .and_then(parse_timestamp)
@@ -3101,72 +3235,55 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
             // fee info is not available in WebSocket updates.
             let trade = Trade::new(
                 trade_id,
-                order_id,
-                instrument,
+                order_id.clone(),
+                instrument.clone(),
                 StrategyId::unknown(),
                 time_exchange,
                 side,
                 price,
                 quantity,
+                // The venue's own cumulative for this order, as of this execution.
+                Some(cum_qty),
                 AssetFees::new(
                     AssetNameExchange::from("USD"),
                     Decimal::ZERO,
                     Some(Decimal::ZERO),
                 ),
             );
-            Some(UnindexedAccountEvent::new(
+            let trade_event = UnindexedAccountEvent::new(
                 ExchangeId::AlpacaBroker,
                 AccountEventKind::Trade(trade),
-            ))
+            );
+
+            // The execution alone does not move the order: `filled_quantity` is only ever carried
+            // into engine state by an order snapshot, so without this second event a partially
+            // filled order reads as having nothing filled until REST reconciliation refreshes it.
+            let snapshot_event = if ws_fill_order_is_live(&order.status) {
+                ws_order_snapshot(order, instrument, cid, order_id, time_exchange)
+            } else {
+                trace!(
+                    order_id = %order.id,
+                    status = %order.status,
+                    "Alpaca WS: fill for an order the exchange no longer reports as working — \
+                     emitting the execution without an order snapshot"
+                );
+                None
+            };
+
+            [Some(trade_event), snapshot_event]
         }
 
         "new" | "accepted" | "pending_new" => {
             // Order acknowledged by Alpaca — emit an OrderSnapshot.
-            let side = parse_side(&order.side)?;
-            let quantity = Decimal::from_str(order.qty.unwrap_or("0")).unwrap_or(Decimal::ZERO);
-            // Notional orders (placed by dollar value) have qty=null, yielding quantity=0.
-            // Emitting an OrderSnapshot with quantity=0 would corrupt OMS state — skip,
-            // consistent with convert_open_order which also returns None for zero-qty orders.
-            if quantity.is_zero() {
-                trace!(order_id = %order.id, "Alpaca WS: skipping notional order snapshot (qty=None)");
-                return None;
-            }
-            let price = order.limit_price.and_then(|s| Decimal::from_str(s).ok());
-            let filled_qty =
-                Decimal::from_str(order.filled_qty.unwrap_or("0")).unwrap_or(Decimal::ZERO);
-            let kind = parse_order_kind(
-                &order.order_type,
-                order.stop_price,
-                order.trail_percent,
-                order.trail_price,
-            )?;
-            let time_in_force = parse_time_in_force(&order.time_in_force);
             let time_exchange = update
                 .timestamp
                 .and_then(parse_timestamp)
                 .unwrap_or_else(Utc::now);
 
-            let open_state = Open::new(order_id, time_exchange, filled_qty);
-            let order_snapshot = crate::order::Order {
-                key: OrderKey::new(
-                    ExchangeId::AlpacaBroker,
-                    instrument,
-                    StrategyId::unknown(),
-                    cid,
-                ),
-                side,
-                price,
-                quantity,
-                kind,
-                time_in_force,
-                state: OrderState::active(open_state),
-            };
-            Some(UnindexedAccountEvent::new(
-                ExchangeId::AlpacaBroker,
-                AccountEventKind::OrderSnapshot(
-                    rustrade_integration::collection::snapshot::Snapshot(order_snapshot),
-                ),
-            ))
+            [
+                ws_order_snapshot(order, instrument, cid, order_id, time_exchange),
+                None,
+            ]
         }
 
         "canceled" | "expired" | "replaced" | "done_for_day" => {
@@ -3193,10 +3310,13 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
                 ),
                 state: Ok(cancelled),
             };
-            Some(UnindexedAccountEvent::new(
-                ExchangeId::AlpacaBroker,
-                AccountEventKind::OrderCancelled(response),
-            ))
+            [
+                Some(UnindexedAccountEvent::new(
+                    ExchangeId::AlpacaBroker,
+                    AccountEventKind::OrderCancelled(response),
+                )),
+                None,
+            ]
         }
 
         "rejected" => {
@@ -3211,10 +3331,13 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> Option<UnindexedAccoun
                     format!("order rejected: status={}", order.status),
                 ))),
             };
-            Some(UnindexedAccountEvent::new(
-                ExchangeId::AlpacaBroker,
-                AccountEventKind::OrderCancelled(response),
-            ))
+            [
+                Some(UnindexedAccountEvent::new(
+                    ExchangeId::AlpacaBroker,
+                    AccountEventKind::OrderCancelled(response),
+                )),
+                None,
+            ]
         }
 
         // All recognised event types are handled above; the early-return guard at the
@@ -3290,6 +3413,24 @@ fn parse_time_in_force(s: &str) -> TimeInForce {
             TimeInForce::GoodUntilEndOfDay
         }
     }
+}
+
+/// When the exchange last reported this order's state.
+///
+/// [`Open::time_exchange`] orders an order's states, and the engine discards a snapshot older
+/// than the state it already tracks. `created_at` does not order them: it is the same value for
+/// every snapshot of one order, so a snapshot stamped with it is indistinguishable from the
+/// acknowledgement and is discarded the moment anything has advanced the tracked order past it.
+/// `updated_at` moves with each state change, which is what that comparison needs.
+///
+/// Falls back to `created_at` when the venue omits `updated_at`, and to now when neither parses.
+fn order_state_time(order: &AlpacaOrderResponse) -> DateTime<Utc> {
+    order
+        .updated_at
+        .as_deref()
+        .and_then(parse_timestamp)
+        .or_else(|| parse_timestamp(&order.created_at))
+        .unwrap_or_else(Utc::now)
 }
 
 fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
@@ -4139,6 +4280,48 @@ mod tests {
         }
     }
 
+    /// The one event produced by a frame that maps to a single `AccountEvent`.
+    ///
+    /// Asserts the second slot is empty, so a test written for a single-event frame fails
+    /// loudly if that frame ever starts producing two.
+    fn sole_event(events: [Option<UnindexedAccountEvent>; 2]) -> Option<UnindexedAccountEvent> {
+        let [first, second] = events;
+        assert!(
+            second.is_none(),
+            "expected a single event, got a second: {second:?}"
+        );
+        first
+    }
+
+    /// The `(Trade, OrderSnapshot)` pair a fill frame must produce, in that order.
+    fn fill_events(
+        events: [Option<UnindexedAccountEvent>; 2],
+    ) -> (
+        Trade<AssetNameExchange, InstrumentNameExchange>,
+        crate::order::Order<
+            ExchangeId,
+            InstrumentNameExchange,
+            OrderState<AssetNameExchange, InstrumentNameExchange>,
+        >,
+    ) {
+        let [first, second] = events;
+        let first = first.expect("a fill frame must produce an execution");
+        let second = second.expect("a fill frame must produce an order snapshot");
+        let AccountEventKind::Trade(trade) = first.kind else {
+            panic!("first event must be the Trade, got {:?}", first.kind);
+        };
+        let AccountEventKind::OrderSnapshot(rustrade_integration::collection::snapshot::Snapshot(
+            order,
+        )) = second.kind
+        else {
+            panic!(
+                "second event must be the OrderSnapshot, got {:?}",
+                second.kind
+            );
+        };
+        (trade, order)
+    }
+
     #[test]
     fn test_convert_trade_update_fill_produces_trade_with_dedup_key() {
         let update = AlpacaTradeUpdate {
@@ -4148,14 +4331,20 @@ mod tests {
             qty: Some("1"),
             timestamp: Some("2025-04-18T14:30:00Z"),
         };
-        let event = convert_trade_update(update).expect("fill should produce an event");
-        let AccountEventKind::Trade(trade) = event.kind else {
-            panic!("expected Trade, got {:?}", event.kind);
-        };
+        let (trade, order) = fill_events(convert_trade_update(update));
         // Trade ID must be "{order_id}:{cumulative_filled_qty}" for dedup to match REST path.
         assert_eq!(trade.id.0.as_str(), "ord-1:1");
         assert_eq!(trade.price, Decimal::from_str("150.00").unwrap());
         assert_eq!(trade.quantity, Decimal::from_str("1").unwrap());
+
+        // The execution print alone leaves the order reading as untouched. The snapshot carries
+        // the cumulative filled quantity, which is the only way it reaches engine state.
+        let OrderState::Active(crate::order::state::ActiveOrderState::Open(open)) = order.state
+        else {
+            panic!("expected an Open snapshot, got {:?}", order.state);
+        };
+        assert_eq!(open.filled_quantity, Decimal::from_str("1").unwrap());
+        assert_eq!(open.id.0.as_str(), "ord-1");
     }
 
     #[test]
@@ -4167,8 +4356,107 @@ mod tests {
             qty: Some("0.5"),
             timestamp: None,
         };
-        let event = convert_trade_update(update).expect("partial_fill should produce an event");
-        assert!(matches!(event.kind, AccountEventKind::Trade(_)));
+        let (trade, order) = fill_events(convert_trade_update(update));
+        assert_eq!(trade.quantity, Decimal::from_str("0.5").unwrap());
+
+        // make_order_ws reports qty=2, so 0.5 cumulative leaves 1.5 working: the order stays
+        // Open, and a consumer reading quantity_remaining now sees 1.5 rather than 2.
+        let OrderState::Active(crate::order::state::ActiveOrderState::Open(open)) = order.state
+        else {
+            panic!("expected an Open snapshot, got {:?}", order.state);
+        };
+        assert_eq!(open.filled_quantity, Decimal::from_str("0.5").unwrap());
+        assert_eq!(
+            open.quantity_remaining(order.quantity),
+            Decimal::from_str("1.5").unwrap()
+        );
+    }
+
+    /// A `fill` that completes the order reports nothing left to fill, which is how the engine
+    /// learns the order is done. Without the snapshot the order would sit in engine state as a
+    /// resting order with `filled_quantity` 0 until REST reconciliation refreshed it.
+    #[test]
+    fn a_full_fill_snapshot_reports_nothing_left_to_fill() {
+        let update = AlpacaTradeUpdate {
+            event: SmolStr::new("fill"),
+            // make_order_ws reports qty=2; a cumulative filled of 2 completes it.
+            order: AlpacaOrderWs {
+                status: SmolStr::new("filled"),
+                ..make_order_ws("ord-full", "SPY", "buy", "2")
+            },
+            price: Some("150.00"),
+            qty: Some("1"),
+            timestamp: Some("2025-04-18T14:30:00Z"),
+        };
+        let (_trade, order) = fill_events(convert_trade_update(update));
+        let OrderState::Active(crate::order::state::ActiveOrderState::Open(open)) = order.state
+        else {
+            panic!("expected an Open snapshot, got {:?}", order.state);
+        };
+        assert_eq!(open.filled_quantity, Decimal::from_str("2").unwrap());
+        assert!(
+            open.quantity_remaining(order.quantity).is_zero(),
+            "a completed order must report nothing left to fill so the engine retires it"
+        );
+    }
+
+    /// A fill whose order the exchange no longer reports as working must not be written back into
+    /// engine state as an `Open` order. The execution still counts -- it moved the position --
+    /// but resurrecting the order would leave a resting order that does not exist at the venue.
+    #[test]
+    fn a_fill_for_an_order_no_longer_working_emits_the_execution_without_a_snapshot() {
+        for status in [
+            "canceled",
+            "expired",
+            "rejected",
+            "done_for_day",
+            "pending_cancel",
+        ] {
+            let update = AlpacaTradeUpdate {
+                event: SmolStr::new("partial_fill"),
+                order: AlpacaOrderWs {
+                    status: SmolStr::new(status),
+                    ..make_order_ws("ord-late", "SPY", "buy", "1")
+                },
+                price: Some("150.00"),
+                qty: Some("1"),
+                timestamp: None,
+            };
+            let [trade, snapshot] = convert_trade_update(update);
+            assert!(
+                matches!(trade.map(|e| e.kind), Some(AccountEventKind::Trade(_))),
+                "the execution must still be reported for status {status}"
+            );
+            assert!(
+                snapshot.is_none(),
+                "status {status} must not produce an order snapshot"
+            );
+        }
+    }
+
+    /// A notional order (placed by dollar value) carries no `qty`, so there is no quantity to
+    /// report a remaining amount against. The execution is still reported; the order is not.
+    #[test]
+    fn a_notional_order_fill_emits_the_execution_without_a_snapshot() {
+        let update = AlpacaTradeUpdate {
+            event: SmolStr::new("partial_fill"),
+            order: AlpacaOrderWs {
+                qty: None,
+                ..make_order_ws("ord-notional-ws", "SPY", "buy", "1")
+            },
+            price: Some("150.00"),
+            qty: Some("1"),
+            timestamp: None,
+        };
+        let [trade, snapshot] = convert_trade_update(update);
+        assert!(matches!(
+            trade.map(|e| e.kind),
+            Some(AccountEventKind::Trade(_))
+        ));
+        assert!(
+            snapshot.is_none(),
+            "a notional order has no quantity to snapshot against"
+        );
     }
 
     #[test]
@@ -4194,7 +4482,8 @@ mod tests {
             qty: None,
             timestamp: Some("2025-04-18T14:30:00Z"),
         };
-        let event = convert_trade_update(update).expect("new event should produce an event");
+        let event =
+            sole_event(convert_trade_update(update)).expect("new event should produce an event");
         assert!(matches!(event.kind, AccountEventKind::OrderSnapshot(_)));
     }
 
@@ -4207,7 +4496,8 @@ mod tests {
             qty: None,
             timestamp: Some("2025-04-18T14:30:00Z"),
         };
-        let event = convert_trade_update(update).expect("canceled should produce an event");
+        let event =
+            sole_event(convert_trade_update(update)).expect("canceled should produce an event");
         let AccountEventKind::OrderCancelled(response) = event.kind else {
             panic!("expected OrderCancelled, got {:?}", event.kind);
         };
@@ -4223,7 +4513,8 @@ mod tests {
             qty: None,
             timestamp: None,
         };
-        let event = convert_trade_update(update).expect("rejected should produce an event");
+        let event =
+            sole_event(convert_trade_update(update)).expect("rejected should produce an event");
         let AccountEventKind::OrderCancelled(response) = event.kind else {
             panic!("expected OrderCancelled, got {:?}", event.kind);
         };
@@ -4248,6 +4539,7 @@ mod tests {
             trail_percent: None,
             trail_price: None,
             created_at: "2025-04-18T14:30:00Z".to_string(),
+            updated_at: None,
         };
         assert!(convert_open_order(&order).is_none());
     }
@@ -4265,6 +4557,7 @@ mod tests {
             price: "not-a-number".to_string(),
             qty: "1".to_string(),
             transaction_time: "2025-04-18T14:30:00Z".to_string(),
+            cum_qty: Some("1".to_string()),
         };
         assert!(convert_activity_to_trade(&activity).is_none());
     }
@@ -4308,6 +4601,36 @@ mod tests {
         assert_eq!(balances[0].asset.name().as_str(), "btc");
     }
 
+    /// `updated_at` orders an order's states; `created_at` is constant across all of them.
+    #[test]
+    fn order_state_time_prefers_updated_at() {
+        let mut resp = make_order_response("ord-1", "SPY");
+        resp.created_at = "2025-04-18T14:30:00Z".to_string();
+        resp.updated_at = Some("2025-04-18T15:45:00Z".to_string());
+        assert_eq!(
+            order_state_time(&resp),
+            parse_timestamp("2025-04-18T15:45:00Z").unwrap(),
+            "updated_at must win over created_at"
+        );
+
+        // Alpaca's schema makes updated_at nullable, so creation time is the fallback.
+        resp.updated_at = None;
+        assert_eq!(
+            order_state_time(&resp),
+            parse_timestamp("2025-04-18T14:30:00Z").unwrap(),
+            "absent updated_at falls back to created_at"
+        );
+
+        // An unparseable updated_at must not silently become `now`, which would order this state
+        // ahead of every later one.
+        resp.updated_at = Some("not-a-timestamp".to_string());
+        assert_eq!(
+            order_state_time(&resp),
+            parse_timestamp("2025-04-18T14:30:00Z").unwrap(),
+            "unparseable updated_at falls back to created_at"
+        );
+    }
+
     fn make_order_response(id: &str, symbol: &str) -> AlpacaOrderResponse {
         AlpacaOrderResponse {
             id: id.to_string(),
@@ -4323,6 +4646,7 @@ mod tests {
             trail_percent: None,
             trail_price: None,
             created_at: "2025-04-18T14:30:00Z".to_string(),
+            updated_at: None,
         }
     }
 
@@ -4395,7 +4719,8 @@ mod tests {
                     qty: Some("1"),
                     timestamp: None,
                 };
-                let event = convert_trade_update(update)?;
+                let [event, _snapshot] = convert_trade_update(update);
+                let event = event?;
                 fill_dedup_key_from_event(&event).cloned()
             })
             .collect();
@@ -4437,8 +4762,10 @@ mod tests {
         // Early path: extract key before full event construction
         let early_key = early_dedup_key(&update);
 
-        // Full path: construct event then extract key
-        let event = convert_trade_update(update).expect("fill should produce an event");
+        // Full path: construct event then extract key. A fill frame also carries the order
+        // snapshot; the dedup key lives on the execution, which is always the first slot.
+        let [event, _snapshot] = convert_trade_update(update);
+        let event = event.expect("fill should produce an execution");
         let full_key =
             fill_dedup_key_from_event(&event).expect("fill event should have a dedup key");
 
@@ -5068,6 +5395,7 @@ mod tests {
                     time_in_force: TimeInForce::ImmediateOrCancel,
                     position_id: None,
                     reduce_only: true, // This should map to SellToClose
+                    market: None,
                 },
             };
 
@@ -5166,6 +5494,7 @@ mod tests {
                     time_in_force: TimeInForce::ImmediateOrCancel,
                     position_id: None,
                     reduce_only: false, // This should map to BuyToOpen
+                    market: None,
                 },
             };
 
@@ -5187,6 +5516,192 @@ mod tests {
                 body.get("position_intent").and_then(|v| v.as_str()),
                 Some("buy_to_open"),
                 "reduce_only=false + Side::Buy should produce position_intent=buy_to_open, got: {body}"
+            );
+        }
+
+        // -----------------------------------------------------------------------
+        // recover_fills — what a recovered fill reports, and how it is keyed
+        // -----------------------------------------------------------------------
+        //
+        // These drive `recover_fills` itself rather than re-deriving its arithmetic in the test.
+        // A key that is correct in isolation is worth nothing if the function does not produce it.
+
+        /// One FILL activity as Alpaca serves it. `cum_qty` is omitted entirely when `None`, which
+        /// is how the pre-existing fallback path is reached.
+        fn activity_json(
+            id: &str,
+            order_id: &str,
+            qty: &str,
+            cum_qty: Option<&str>,
+        ) -> serde_json::Value {
+            let mut v = serde_json::json!({
+                "id": id,
+                "order_id": order_id,
+                "symbol": "SPY",
+                "side": "buy",
+                "price": "100.00",
+                "qty": qty,
+                "transaction_time": "2025-04-18T14:30:00Z"
+            });
+            if let Some(c) = cum_qty {
+                v["cum_qty"] = serde_json::Value::String(c.to_string());
+            }
+            v
+        }
+
+        /// Serve `activities` from a mock and run `recover_fills` against it, returning every
+        /// event it forwarded.
+        async fn drive_recover_fills_with(
+            activities: Vec<serde_json::Value>,
+            dedup: SharedDedupCache,
+        ) -> Vec<UnindexedAccountEvent> {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::Value::Array(activities)),
+                )
+                .mount(&server)
+                .await;
+
+            let http = reqwest::Client::new();
+            let rl = RateLimitTracker::new();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            recover_fills(
+                &http,
+                &rl,
+                &[],
+                &server.uri(),
+                "2025-01-01T00:00:00Z",
+                &tx,
+                &dedup,
+            )
+            .await;
+            drop(tx);
+
+            let mut out = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                out.push(event);
+            }
+            out
+        }
+
+        async fn drive_recover_fills(
+            activities: Vec<serde_json::Value>,
+        ) -> Vec<UnindexedAccountEvent> {
+            drive_recover_fills_with(activities, new_dedup_cache()).await
+        }
+
+        fn trade_of(
+            event: &UnindexedAccountEvent,
+        ) -> &Trade<AssetNameExchange, InstrumentNameExchange> {
+            match &event.kind {
+                AccountEventKind::Trade(t) => t,
+                other => panic!("expected a Trade event, got {other:?}"),
+            }
+        }
+
+        /// A recovered fill reports where it left the order, so it advances `filled_quantity`
+        /// without waiting for a `fetch_open_orders` reconciliation that the caller may never make.
+        #[tokio::test]
+        async fn a_recovered_fill_reports_the_cumulative_alpaca_sent() {
+            let events = drive_recover_fills(vec![
+                activity_json("act-1", "ord-1", "2", Some("2")),
+                activity_json("act-2", "ord-1", "3", Some("5")),
+            ])
+            .await;
+
+            let reported: Vec<_> = events
+                .iter()
+                .map(|e| trade_of(e).order_filled_quantity)
+                .collect();
+            assert_eq!(
+                reported,
+                vec![
+                    Some(Decimal::from_str("2").unwrap()),
+                    Some(Decimal::from_str("5").unwrap())
+                ]
+            );
+        }
+
+        /// The dedup key comes from the venue's own cumulative, not from counting executions
+        /// within the recovery batch.
+        ///
+        /// An order that had already partly filled *before* the recovery window is the case that
+        /// separates the two, and it is the case the previous implementation got wrong: counting
+        /// from zero inside the batch yields a key the WebSocket path never emitted for that fill.
+        #[tokio::test]
+        async fn the_dedup_key_uses_the_venue_cumulative_not_an_intra_batch_count() {
+            // Three lots filled before the window; the recovered 2-lot fill takes the order to 5.
+            let events =
+                drive_recover_fills(vec![activity_json("act-1", "ord-1", "2", Some("5"))]).await;
+
+            assert_eq!(
+                trade_of(&events[0]).id.0.as_str(),
+                "ord-1:5",
+                "counting executions within the batch would key this as ord-1:2"
+            );
+        }
+
+        /// The property the key exists for: one fill delivered twice, by two different paths, is
+        /// one fill. Before the cumulative was carried this held only for an order whose fills lay
+        /// wholly inside the recovery window -- precisely the orders least in need of recovery.
+        #[tokio::test]
+        async fn a_fill_already_delivered_over_websocket_is_not_recovered_twice() {
+            let dedup = new_dedup_cache();
+
+            // The same execution as it arrived over WebSocket: 2 lots, leaving the order at 5.
+            let update = AlpacaTradeUpdate {
+                event: SmolStr::new("partial_fill"),
+                order: super::make_order_ws("ord-1", "SPY", "buy", "5"),
+                price: Some("100.00"),
+                qty: Some("2"),
+                timestamp: None,
+            };
+            let [ws_event, _snapshot] = convert_trade_update(update);
+            let ws_event = ws_event.expect("a partial_fill converts to a Trade");
+            let ws_key = fill_dedup_key_from_event(&ws_event)
+                .expect("a Trade carries a dedup key")
+                .clone();
+            assert!(
+                !is_duplicate(&dedup, &ws_key),
+                "precondition: first sighting"
+            );
+
+            let events = drive_recover_fills_with(
+                vec![activity_json("act-1", "ord-1", "2", Some("5"))],
+                dedup,
+            )
+            .await;
+
+            assert!(
+                events.is_empty(),
+                "a fill already delivered over WebSocket must not be re-delivered by recovery, \
+                 got {events:?}"
+            );
+        }
+
+        /// With `cum_qty` absent the key falls back to counting within the batch -- exactly what
+        /// shipped before -- and the fill reports no cumulative rather than a fabricated one.
+        #[tokio::test]
+        async fn without_a_reported_cumulative_the_previous_behaviour_is_preserved() {
+            let events = drive_recover_fills(vec![
+                activity_json("act-1", "ord-1", "2", None),
+                activity_json("act-2", "ord-1", "3", None),
+            ])
+            .await;
+
+            let keys: Vec<_> = events
+                .iter()
+                .map(|e| trade_of(e).id.0.as_str().to_owned())
+                .collect();
+            assert_eq!(keys, vec!["ord-1:2", "ord-1:5"], "intra-batch accumulation");
+
+            assert!(
+                events
+                    .iter()
+                    .all(|e| trade_of(e).order_filled_quantity.is_none()),
+                "a venue that reported no cumulative must not have one invented for it"
             );
         }
     }

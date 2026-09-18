@@ -15,6 +15,10 @@
     missing_debug_implementations,
     rust_2018_idioms
 )]
+// Inherited from the barter-rs upstream: the generic, trait-heavy public API legitimately produces
+// complex nested types and many-argument constructors, and `type_alias_bounds` fires on
+// documentation-bearing alias bounds kept intentionally. Denying these adds churn without improving
+// the API.
 #![allow(clippy::type_complexity, clippy::too_many_arguments, type_alias_bounds)]
 
 //! # Barter-Integration
@@ -77,6 +81,12 @@ pub mod stream;
 /// `ReconnectingSocket` extension and utilities.
 #[cfg(feature = "socket")]
 pub mod socket;
+
+/// PULL-based corporate-action sourcing: the [`StockSplitSource`](corporate_action::StockSplitSource)
+/// trait + [`CorporateActionFilter`](corporate_action::CorporateActionFilter), re-exporting the
+/// `CorporateAction` descriptor from `rustrade-instrument`.
+#[cfg(feature = "corporate-action")]
+pub mod corporate_action;
 
 /// [`Validator`]s are capable of determining if their internal state is satisfactory to fulfill
 /// some use case defined by the implementor.

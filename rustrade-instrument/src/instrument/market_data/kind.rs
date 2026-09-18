@@ -14,6 +14,18 @@ pub enum MarketDataInstrumentKind {
     Perpetual,
     Future(MarketDataFutureContract),
     Option(MarketDataOptionContract),
+    /// Contract-for-difference.
+    ///
+    /// A unit variant, unlike its [`InstrumentKind::Cfd`](crate::instrument::kind::InstrumentKind)
+    /// counterpart: a CFD has no expiry or strike to bind a subscription on, and the market-data
+    /// twin needs neither `contract_size` nor `settlement_asset` (both are execution-side
+    /// concerns). Shaped like `Perpetual` for exactly that reason.
+    ///
+    /// Kept distinct from `Spot` rather than folded into it, because a single connector can serve
+    /// both a spot instrument and a CFD on the same `(exchange, base, quote)` — IBKR's `secType`
+    /// `STK` vs `CFD` being the concrete case. Folded, subscription binding would resolve to
+    /// whichever of the two iterated first.
+    Cfd,
 }
 
 impl Display for MarketDataInstrumentKind {
@@ -24,6 +36,7 @@ impl Display for MarketDataInstrumentKind {
             match self {
                 MarketDataInstrumentKind::Spot => "spot".to_string(),
                 MarketDataInstrumentKind::Perpetual => "perpetual".to_string(),
+                MarketDataInstrumentKind::Cfd => "cfd".to_string(),
                 MarketDataInstrumentKind::Future(contract) =>
                     format!("future_{}-UTC", contract.expiry.date_naive()),
                 MarketDataInstrumentKind::Option(contract) => format!(

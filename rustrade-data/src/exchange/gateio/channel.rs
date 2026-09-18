@@ -38,7 +38,13 @@ where
 {
     fn id(&self) -> GateioChannel {
         match self.instrument.kind() {
-            MarketDataInstrumentKind::Spot => GateioChannel::SPOT_TRADES,
+            // Gateio lists no CFDs, so `Cfd` is unreachable here: `exchange_supports_instrument_kind`
+            // denies it before a `Subscription` can be validated. `Identifier` is infallible, so the
+            // arm exists to keep this match total, and shares `Spot`'s channel as the nearest
+            // (identically shaped) wire form.
+            MarketDataInstrumentKind::Spot | MarketDataInstrumentKind::Cfd => {
+                GateioChannel::SPOT_TRADES
+            }
             MarketDataInstrumentKind::Future { .. } | MarketDataInstrumentKind::Perpetual => {
                 GateioChannel::FUTURE_TRADES
             }

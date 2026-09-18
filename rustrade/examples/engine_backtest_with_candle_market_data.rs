@@ -13,17 +13,22 @@
 //!    boundary with the library's shared [`close_time_from_open`] helper and use it
 //!    for both `Candle::close_time` and the wrapping `MarketEvent::time_exchange`.
 //!
-//! 2. **Candles need a custom [`InstrumentDataState`].** The built-in
+//! 2. **How to write a custom [`InstrumentDataState`]** — which candles no longer
+//!    *require*. The built-in
 //!    [`DefaultInstrumentMarketData`](rustrade::engine::state::instrument::data::DefaultInstrumentMarketData)
-//!    only tracks trades + L1 and ignores `DataKind::Candle`, so a candle-driven
-//!    engine must supply its own state. [`CandleInstrumentData`] below is a minimal
-//!    one that exposes the latest candle close as the instrument price.
+//!    now consumes `DataKind::Candle` itself, so a candle-driven engine needs no
+//!    custom state at all; see `engine_backtest_with_lse_candles.rs` for that path.
+//!    [`CandleInstrumentData`] below is kept as a minimal illustration of the trait,
+//!    for strategies that must hold more than the built-in state does — a rolling
+//!    window, an indicator, or a bar count.
 
 use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
 use rustrade::{
     backtest::{
-        BacktestArgsConstant, BacktestArgsDynamic, backtest,
+        BacktestArgsConstant, BacktestArgsDynamic,
+        aux_events::NoAuxEvents,
+        backtest,
         market_data::{BacktestMarketData, MarketDataInMemory},
     },
     engine::{
@@ -100,6 +105,7 @@ async fn main() {
         market_data,
         summary_interval: Daily,
         engine_state,
+        aux_events: NoAuxEvents,
     });
 
     // DefaultStrategy/DefaultRiskManager are no-ops — this example demonstrates the
@@ -112,7 +118,7 @@ async fn main() {
         risk: DefaultRiskManager::<EngineState<DefaultGlobalData, CandleInstrumentData>>::default(),
     };
 
-    let summary = backtest(args_constant, args_dynamic).await.unwrap();
+    let summary = backtest(args_constant, args_dynamic).await.unwrap().summary;
 
     println!("\nBacktest complete (BacktestId = {})", summary.id);
     summary.trading_summary.print_summary();
@@ -143,8 +149,8 @@ fn candle_market_data() -> Vec<MarketStreamEvent<InstrumentIndex, DataKind>> {
                 high: close + Decimal::from(20),
                 low: close - Decimal::from(20),
                 close,
-                volume: Decimal::from(5),
-                trade_count: 100,
+                volume: Some(Decimal::from(5)),
+                trade_count: Some(100),
             };
 
             MarketStreamEvent::Item(MarketEvent {

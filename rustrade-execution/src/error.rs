@@ -266,6 +266,18 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// Not transient — do not retry. The order no longer exists to cancel.
     #[error("order already fully filled")]
     OrderAlreadyFullyFilled,
+
+    /// Cancel request failed because the order had already expired.
+    ///
+    /// This is a state conflict — the order's own deadline retired it before the cancel arrived,
+    /// so the desired end state (order no longer working) has already been achieved. Distinct from
+    /// [`OrderAlreadyCancelled`](Self::OrderAlreadyCancelled) because nobody asked for it: a
+    /// time-in-force such as [`GoodTillDate`](crate::order::TimeInForce::GoodTillDate) retired it
+    /// unprompted, and a caller reconciling its local state needs to know which of the two happened.
+    ///
+    /// Not transient — do not retry. The order no longer exists to cancel.
+    #[error("order already expired")]
+    OrderAlreadyExpired,
 }
 
 /// Represents all errors that can be generated when cancelling or opening orders.

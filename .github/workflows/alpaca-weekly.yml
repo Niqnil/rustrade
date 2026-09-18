@@ -6,6 +6,19 @@ on:
     - cron: "0 15 * * 3"
   workflow_dispatch:
 
+concurrency:
+  # Deliberately the same group as `alpaca-integration.yml`: both run against the ONE Alpaca paper
+  # account, so they must exclude each other, not merely exclude themselves. Two overlapping runs
+  # contend for it -- one hits "connection limit exceeded" on the market-data stream while the other
+  # trips "cannot open a long buy while a short sell order is open" on a resting order it did not
+  # place. This workflow previously declared no concurrency at all, so a scheduled run could land on
+  # top of any push or PR run.
+  #
+  # `cancel-in-progress: false` matters as much as the shared group: cancelling a run mid-test can
+  # leave a resting order behind that poisons the next one.
+  group: alpaca-paper-account
+  cancel-in-progress: false
+
 env:
   MOLD_VERSION: "2.35.1"
   ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
@@ -19,7 +32,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout sources
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install mold linker
         uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444  # v1
@@ -29,19 +42,19 @@ jobs:
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
         with:
           shared-key: "rustrade-ci-test"
 
       - name: Execution tests
         id: exec-tests
         continue-on-error: true
-        run: cargo test --locked -p rustrade-execution --test alpaca_integration -- --ignored
+        run: cargo test --locked -p rustrade-execution --features alpaca --test alpaca_integration -- --ignored
 
       - name: Market data tests (includes IEX, skip SIP/OPRA)
         id: data-tests
         continue-on-error: true
-        run: cargo test --locked -p rustrade-data --test alpaca_data -- --ignored --skip sip --skip opra
+        run: cargo test --locked -p rustrade-data --features alpaca --test alpaca_data -- --ignored --skip sip --skip opra
 
       - name: Check test results
         if: steps.exec-tests.outcome == 'failure' || steps.data-tests.outcome == 'failure'

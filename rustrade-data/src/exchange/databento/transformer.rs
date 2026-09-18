@@ -202,7 +202,8 @@ fn ohlcv_conversion_error(message: String) -> DataError {
 /// # `trade_count`
 ///
 /// [`OhlcvMsg`] carries no trade-count field, so [`Candle::trade_count`] is set to
-/// `0` rather than fabricated.
+/// `None` ("unknown") rather than fabricating a `0` that a consumer could not
+/// distinguish from a genuine zero-trade bar.
 ///
 /// # Errors
 ///
@@ -259,9 +260,10 @@ pub fn dbn_ohlcv_to_candle(
             high: Decimal::new(msg.high, 9),
             low: Decimal::new(msg.low, 9),
             close: Decimal::new(msg.close, 9),
-            volume: Decimal::from(msg.volume),
-            // OhlcvMsg has no trade-count field; report 0 rather than fabricate (G21.2).
-            trade_count: 0,
+            volume: Some(Decimal::from(msg.volume)),
+            // OhlcvMsg has no trade-count field; report `None` (unknown) rather
+            // than fabricate a zero indistinguishable from a real zero-trade bar.
+            trade_count: None,
         },
     ))
 }
@@ -284,8 +286,8 @@ pub fn dbn_ohlcv_to_candle(
 ///
 /// # Errors
 ///
-/// Returns [`DataError::UnsupportedInterval`] for the 12 intervals Databento does
-/// not serve.
+/// Returns [`DataError::UnsupportedInterval`] for the 15 intervals Databento does
+/// not serve (its OHLCV schemas are `1s`/`1m`/`1h`/`1d` only).
 pub fn ensure_databento_ohlcv_supports(
     exchange: ExchangeId,
     interval: CandleInterval,
@@ -295,7 +297,10 @@ pub fn ensure_databento_ohlcv_supports(
         CandleInterval::Min1 => Ok(Schema::Ohlcv1M),
         CandleInterval::Hour1 => Ok(Schema::Ohlcv1H),
         CandleInterval::Day1 => Ok(Schema::Ohlcv1D),
-        CandleInterval::Min3
+        CandleInterval::Sec5
+        | CandleInterval::Sec15
+        | CandleInterval::Sec30
+        | CandleInterval::Min3
         | CandleInterval::Min5
         | CandleInterval::Min15
         | CandleInterval::Min30
@@ -461,7 +466,7 @@ mod tests {
         assert!(l1.best_ask.is_none());
     }
 
-    // --- OHLCV / candle transforms (TG21) ---
+    // --- OHLCV / candle transforms ---
 
     /// Build an `OhlcvMsg` with the given open-instant (`ts_event`) and OHLCV
     /// values in DBN fixed-point (1e-9) / integer-volume units.
@@ -504,9 +509,9 @@ mod tests {
         assert_eq!(candle.low, dec!(44800.0));
         assert_eq!(candle.close, dec!(45250.0));
         // Volume is an integer count, not fixed-point.
-        assert_eq!(candle.volume, dec!(1234));
-        // OhlcvMsg carries no trade-count (G21.2).
-        assert_eq!(candle.trade_count, 0);
+        assert_eq!(candle.volume, Some(dec!(1234)));
+        // OhlcvMsg carries no trade-count: reported as `None` (unknown), not `0`.
+        assert_eq!(candle.trade_count, None);
     }
 
     #[test]

@@ -4,7 +4,11 @@ use crate::execution::{
     request::{ExecutionRequest, RequestFuture},
 };
 use derive_more::Constructor;
-use futures::{Stream, StreamExt, future::Either, stream::FuturesUnordered};
+use futures::{
+    FutureExt, Stream, StreamExt,
+    future::Either,
+    stream::{BoxStream, FuturesUnordered},
+};
 use rustrade_data::streams::{
     consumer::StreamKey,
     reconnect::stream::{ReconnectingStream, ReconnectionBackoffPolicy, init_reconnecting_stream},
@@ -32,9 +36,8 @@ use rustrade_instrument::{
 use rustrade_integration::{
     channel::{Tx, UnboundedTx, mpsc_unbounded},
     collection::snapshot::Snapshot,
-    stream::util::merge::merge,
 };
-use std::sync::Arc;
+use std::{fmt::Debug, sync::Arc};
 use tracing::{error, info, warn};
 
 /// Per-exchange execution manager that actions order requests from the Engine and forwards back
@@ -44,7 +47,7 @@ use tracing::{error, info, warn};
 /// - Transforming the requests to use the associated exchange's asset and instrument names.
 /// - Issues the request via it's associated exchange [`ExecutionClient`],
 /// - Tracks requests and returns timeouts to the Engine where necessary.
-#[derive(Debug, Constructor)]
+#[derive(Constructor)]
 pub struct ExecutionManager<RequestStream, Client> {
     /// `Stream` of incoming Engine [`ExecutionRequest`]s.
     pub request_stream: RequestStream,
@@ -62,17 +65,58 @@ pub struct ExecutionManager<RequestStream, Client> {
     ///
     /// For example, `InstrumentNameExchange` -> `InstrumentIndex`.
     pub indexer: AccountEventIndexer,
+
+    /// Reconnecting exchange AccountStream (snapshot + updates), owned by this manager.
+    ///
+    /// Held here rather than handed to the caller so that [`run`](Self::run) can *sequence* it
+    /// against the execution responses: the manager forwards both into `response_tx`, and on
+    /// shutdown drains this stream before dropping that sender. A manager that does not hold the
+    /// account stream cannot do that — it has no access to the thing it must drain first.
+    pub account_stream:
+        BoxStream<'static, AccountStreamEvent<ExchangeIndex, AssetIndex, InstrumentIndex>>,
+}
+
+/// Manual because [`BoxStream`] is not [`Debug`]; every other field is forwarded.
+impl<RequestStream, Client> Debug for ExecutionManager<RequestStream, Client>
+where
+    RequestStream: Debug,
+    Client: Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutionManager")
+            .field("request_stream", &self.request_stream)
+            .field("request_timeout", &self.request_timeout)
+            .field("response_tx", &self.response_tx)
+            .field("client", &self.client)
+            .field("indexer", &self.indexer)
+            .field("account_stream", &"BoxStream<AccountStreamEvent>")
+            .finish()
+    }
 }
 
 impl<RequestStream, Client> ExecutionManager<RequestStream, Client>
 where
-    RequestStream: Stream<Item = ExecutionRequest<ExchangeIndex, InstrumentIndex>> + Unpin,
-    Client: ExecutionClient + Send + Sync,
+    // `'static` because the manager owns its AccountStream as a `BoxStream<'static, _>`, built
+    // from these parameters -- and because it is spawned as a task, which requires it regardless.
+    RequestStream:
+        Stream<Item = ExecutionRequest<ExchangeIndex, InstrumentIndex>> + Unpin + 'static,
+    Client: ExecutionClient + Send + Sync + 'static,
     Client::AccountStream: Send,
 {
-    /// Initialises a new `ExecutionManager` and it's associated AccountStream.
+    /// Initialises a new `ExecutionManager` and the `Stream` of events it will emit.
     ///
-    /// The first item of the AccountStream will be a full account snapshot.
+    /// The returned `Stream` carries **everything** the manager produces: the exchange
+    /// AccountStream (whose first item is a full account snapshot) *and* the responses to the
+    /// [`ExecutionRequest`]s it actions. Both are forwarded by [`run`](Self::run) through a single
+    /// channel, so the returned `Stream` ends exactly when the manager has finished — which is what
+    /// makes a drained shutdown observable to the caller.
+    ///
+    /// # Why the AccountStream is not returned separately
+    /// It used to be merged with the response channel by the caller, which ended the combined
+    /// `Stream` as soon as *either* side finished and left the manager unable to sequence the two.
+    /// A response resolving the last in-flight request could then tear the run down while the trade
+    /// that opens the position was still unread on the account side, truncating both the trade and
+    /// the balance ledger non-deterministically.
     pub async fn init(
         request_stream: RequestStream,
         request_timeout: std::time::Duration,
@@ -129,9 +173,8 @@ where
         // Construct channel to communicate ExecutionRequest responses (ie/ AccountEvents) to Engine
         let (response_tx, response_rx) = mpsc_unbounded();
 
-        // Construct merged IndexedAccountStream (execution responses + account notifications)
-        let merged_account_stream = merge(
-            response_rx.into_stream(),
+        // Boxed so the manager can poll it inline in `run`'s `select!` -- see `account_stream`.
+        let account_stream = Box::pin(
             account_stream
                 .with_reconnect_backoff::<_, ExecutionError>(reconnect_policy, stream_key)
                 .with_reconnection_events(indexer.map.exchange.value),
@@ -144,8 +187,9 @@ where
                 response_tx,
                 client,
                 indexer,
+                account_stream,
             ),
-            merged_account_stream,
+            response_rx.into_stream(),
         ))
     }
 
@@ -216,13 +260,54 @@ where
         )
     }
 
-    /// Run the `ExecutionManager`, processing execution requests and forwarding back responses via
-    /// the AccountStream.
+    /// Run the `ExecutionManager`, processing execution requests and forwarding both their
+    /// responses and the exchange AccountStream into this manager's event channel.
+    ///
+    /// # Two ways to stop
+    /// [`ExecutionRequest::Shutdown`] breaks out at once, abandoning anything in flight — the
+    /// abrupt stop a live system wants.
+    ///
+    /// [`ExecutionRequest::Drain`] (or the request `Stream` ending) instead stops the manager
+    /// *accepting* new requests, then:
+    ///
+    /// 1. every already in-flight open and cancel is awaited to completion, each response
+    ///    forwarded — these are bounded by `request_timeout`, so this cannot hang;
+    /// 2. the account tail — every event the exchange has already made available — is drained;
+    /// 3. only then does the loop end, dropping `response_tx` and ending the `Stream` returned by
+    ///    [`init`](Self::init).
+    ///
+    /// That last drop is what a caller observes as "this manager is finished", so performing it
+    /// after the drain rather than before is what stops a shutdown from truncating the ledgers.
     pub async fn run(mut self) {
         let mut in_flight_cancels = FuturesUnordered::new();
         let mut in_flight_opens = FuturesUnordered::new();
 
+        // Set once a Shutdown (or a closed request Stream) has been observed. New requests are no
+        // longer accepted, but the loop keeps running until nothing is outstanding.
+        let mut draining = false;
+
+        // Set if the AccountStream ever ends. It reconnects indefinitely, so in practice this only
+        // happens once the manager itself has torn the client down.
+        let mut account_stream_done = false;
+
         loop {
+            if draining && in_flight_cancels.is_empty() && in_flight_opens.is_empty() {
+                // Every response this manager owed has been forwarded. Anything the exchange sent
+                // alongside those responses is already queued on the account side, so take it
+                // before the channel closes.
+                if !account_stream_done {
+                    // Borrows `account_stream` and `response_tx` as disjoint fields: the in-flight
+                    // `FuturesUnordered` still hold a borrow of `self.client` until end of scope,
+                    // so a `&mut self` method would not compile here even though both are empty.
+                    Self::drain_ready_account_events(
+                        &mut self.account_stream,
+                        &self.response_tx,
+                        self.indexer.map.exchange.value,
+                    );
+                }
+                break;
+            }
+
             let next_cancel_response = if in_flight_cancels.is_empty() {
                 Either::Left(std::future::pending())
             } else {
@@ -236,10 +321,29 @@ where
             };
 
             tokio::select! {
+                // Process exchange AccountStream events (balances, trades, order updates)
+                event = self.account_stream.next(), if !account_stream_done => match event {
+                    Some(event) => {
+                        if self.response_tx.send(event).is_err() {
+                            break;
+                        }
+                    }
+                    None => {
+                        account_stream_done = true;
+                    }
+                },
+
                 // Process Engine ExecutionRequests
-                request = self.request_stream.next() => match request {
-                    Some(ExecutionRequest::Shutdown) | None => {
+                request = self.request_stream.next(), if !draining => match request {
+                    // Abrupt stop: whatever is in flight is abandoned, as the variant documents.
+                    Some(ExecutionRequest::Shutdown) => {
                         break;
+                    }
+                    // Graceful stop. A closed request Stream is treated the same way: the Engine is
+                    // gone, but anything already owed is still worth forwarding, and doing so is
+                    // bounded by `request_timeout`.
+                    Some(ExecutionRequest::Drain) | None => {
+                        draining = true;
                     }
                     Some(ExecutionRequest::Cancel(request)) => {
                         // Panic since the system is set up incorrectly, so it's foolish to continue
@@ -345,6 +449,58 @@ where
             exchange = %self.indexer.map.exchange.value,
             "ExecutionManager shutting down"
         )
+    }
+
+    /// Forward every AccountStream event that is **already available**, then return.
+    ///
+    /// This is the shutdown tail. It polls the account stream only while it is `Ready`, so it
+    /// terminates without a timer and without waiting on the exchange — it cannot hang, and it
+    /// cannot make a shutdown slower than the events already queued for it.
+    ///
+    /// # Why "already available" is the right stopping point
+    /// A simulated exchange emits an order's account events *before* it resolves that order's
+    /// response. By the time the last in-flight response has been forwarded, every event those
+    /// orders produced is therefore sitting in the account channel, ready. Draining to `Pending`
+    /// collects exactly that tail and nothing more.
+    ///
+    /// A live exchange is not bound by that ordering and may still owe events. Waiting for them is
+    /// deliberately not attempted: there is no point at which a venue can be said to owe nothing,
+    /// so a manager that waited would be waiting on an unbounded condition. Live shutdowns use
+    /// [`Shutdown::Immediate`](crate::shutdown::Shutdown::Immediate) and accept that.
+    ///
+    /// Returns the number of events forwarded, for logging.
+    fn drain_ready_account_events(
+        account_stream: &mut BoxStream<
+            'static,
+            AccountStreamEvent<ExchangeIndex, AssetIndex, InstrumentIndex>,
+        >,
+        response_tx: &UnboundedTx<AccountStreamEvent<ExchangeIndex, AssetIndex, InstrumentIndex>>,
+        exchange: ExchangeId,
+    ) -> usize {
+        let mut drained = 0;
+
+        while let Some(event) = account_stream.next().now_or_never() {
+            let Some(event) = event else {
+                // AccountStream ended.
+                break;
+            };
+
+            drained += 1;
+
+            if response_tx.send(event).is_err() {
+                break;
+            }
+        }
+
+        if drained > 0 {
+            info!(
+                %exchange,
+                drained,
+                "ExecutionManager drained AccountStream tail before shutting down"
+            );
+        }
+
+        drained
     }
 
     fn process_cancel_response(

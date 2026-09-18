@@ -138,7 +138,10 @@ impl AssetStates {
 /// When used in the context of [`AssetStates`], this state is for an exchange asset, but it could
 /// be used for a "global" asset that aggregates data for similar named assets on multiple
 /// exchanges.
-#[derive(Debug, Clone, PartialEq, PartialOrd, Deserialize, Serialize, Constructor)]
+///
+/// Does not implement `PartialOrd`: `balance` holds a [`Timed`] value, whose whole-struct
+/// ordering is intentionally not provided (see [`Timed`] docs).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Constructor)]
 pub struct AssetState {
     /// `Asset` name data that details the internal and exchange names.
     pub asset: Asset,

@@ -100,7 +100,7 @@ impl HyperliquidHistoricalData {
     /// # Errors
     ///
     /// Returns [`DataError::UnsupportedInterval`] if the requested interval is not
-    /// supported by Hyperliquid (`Sec1`/`Hour6` — the shared [`CandleInterval`] is
+    /// supported by Hyperliquid (any sub-minute interval, and `Hour6` — the shared [`CandleInterval`] is
     /// a venue-agnostic union, so this guard is required: the typed-path validator
     /// checks instrument kind only, not interval). Returns `DataError::Socket` if
     /// the API request fails or a candle's `close_time` cannot be computed
@@ -214,7 +214,8 @@ impl HistoricalRequest {
 ///
 /// The shared [`CandleInterval`] is the venue-agnostic union across all
 /// exchanges, so each venue must guard the intervals it does not support before
-/// they reach the API (Hyperliquid 400s on `Sec1`/`Hour6`). The typed-path
+/// they reach the API (Hyperliquid 400s on every sub-minute interval and on
+/// `Hour6`). The typed-path
 /// validator checks instrument kind only, never the interval, so this guard is
 /// the sole gate.
 ///
@@ -223,10 +224,15 @@ impl HistoricalRequest {
 /// whether Hyperliquid supports it rather than silently passing it to the API.
 fn ensure_hyperliquid_supports(interval: CandleInterval) -> Result<(), DataError> {
     match interval {
-        CandleInterval::Sec1 | CandleInterval::Hour6 => Err(DataError::UnsupportedInterval {
-            // 1s/6h are unsupported across the whole Hyperliquid candleSnapshot
-            // API (perp and spot alike); this client is coin-keyed, not
-            // venue-keyed, so `HyperliquidPerp` is a representative venue label.
+        CandleInterval::Sec1
+        | CandleInterval::Sec5
+        | CandleInterval::Sec15
+        | CandleInterval::Sec30
+        | CandleInterval::Hour6 => Err(DataError::UnsupportedInterval {
+            // Hyperliquid's candleSnapshot menu starts at 1m — every sub-minute
+            // resolution is unsupported, as is 6h — across the whole API (perp and
+            // spot alike); this client is coin-keyed, not venue-keyed, so
+            // `HyperliquidPerp` is a representative venue label.
             exchange: ExchangeId::HyperliquidPerp,
             interval,
         }),
@@ -302,8 +308,9 @@ fn sdk_candle_to_candle(
         high,
         low,
         close,
-        volume,
-        trade_count: sdk.num_trades,
+        // Hyperliquid candles carry real consolidated volume and trade count.
+        volume: Some(volume),
+        trade_count: Some(sdk.num_trades),
     })
 }
 
@@ -313,10 +320,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ensure_hyperliquid_supports_rejects_sec1_and_hour6() {
-        // `Sec1`/`Hour6` exist on the shared union but Hyperliquid cannot serve
-        // them — the guard must reject them with a typed error.
-        for interval in [CandleInterval::Sec1, CandleInterval::Hour6] {
+    fn ensure_hyperliquid_supports_rejects_sub_minute_and_hour6() {
+        // Sub-minute resolutions and `Hour6` exist on the shared union but
+        // Hyperliquid cannot serve them — the guard must reject them with a typed error.
+        for interval in [
+            CandleInterval::Sec1,
+            CandleInterval::Sec5,
+            CandleInterval::Sec15,
+            CandleInterval::Sec30,
+            CandleInterval::Hour6,
+        ] {
             let err = ensure_hyperliquid_supports(interval).unwrap_err();
             assert!(
                 matches!(err, DataError::UnsupportedInterval { interval: i, .. } if i == interval),
@@ -327,9 +340,16 @@ mod tests {
 
     #[test]
     fn ensure_hyperliquid_supports_accepts_the_rest() {
-        // Every variant except the two Hyperliquid cannot serve must be accepted.
+        // Every variant except the ones Hyperliquid cannot serve must be accepted.
         for interval in CandleInterval::ALL {
-            let supported = !matches!(interval, CandleInterval::Sec1 | CandleInterval::Hour6);
+            let supported = !matches!(
+                interval,
+                CandleInterval::Sec1
+                    | CandleInterval::Sec5
+                    | CandleInterval::Sec15
+                    | CandleInterval::Sec30
+                    | CandleInterval::Hour6
+            );
             assert_eq!(
                 ensure_hyperliquid_supports(interval).is_ok(),
                 supported,
@@ -383,8 +403,8 @@ mod tests {
         assert_eq!(candle.high, dec!(45500.0));
         assert_eq!(candle.low, dec!(44800.0));
         assert_eq!(candle.close, dec!(45250.0));
-        assert_eq!(candle.volume, dec!(1234.56));
-        assert_eq!(candle.trade_count, 5000);
+        assert_eq!(candle.volume, Some(dec!(1234.56)));
+        assert_eq!(candle.trade_count, Some(5000));
     }
 
     #[test]
