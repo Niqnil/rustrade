@@ -901,7 +901,7 @@ async fn test_contract_resolution() {
 }
 
 // ============================================================================
-// Option Greeks Calculator Tests (Phase 5A) — Tier 1: US Real-Time (FREE)
+// Option Greeks Calculator Tests — Tier 1: US Real-Time (FREE)
 // ============================================================================
 // Note: These are calculator functions, not data fetches. They don't require
 // OPRA subscription — they compute Greeks from user-provided inputs.
@@ -1170,7 +1170,7 @@ async fn test_fetch_option_chain() {
 }
 
 // ============================================================================
-// Real-Time Option Greeks Streaming Tests (Phase 5B) — Tier 3: OPRA (PAID)
+// Real-Time Option Greeks Streaming Tests — Tier 3: OPRA (PAID)
 // ============================================================================
 
 #[serial]

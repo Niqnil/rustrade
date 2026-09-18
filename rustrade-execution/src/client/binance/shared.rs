@@ -331,7 +331,6 @@ pub(crate) fn parse_order_kind(t: &str) -> Option<OrderKind> {
         // Mapping to Limit is imprecise (treats them as resting limit orders)
         // but preserves visibility into open orders. Dropping them (like the
         // pure stop variants above) would lose order tracking entirely.
-        // Acceptable for Phase 1: the crypto repo wrapper doesn't place stop orders.
         "LIMIT" | "LIMIT_MAKER" | "STOP_LOSS_LIMIT" | "TAKE_PROFIT_LIMIT" => Some(OrderKind::Limit),
         _ => {
             warn!(order_type = t, "unsupported Binance order type");
