@@ -83,6 +83,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING: `Trade` carries the order's cumulative filled quantity** (`rustrade-execution`). A
+  fill states two things — that an execution happened, and what it left the order at — and a
+  consumer that tracks order state needs both. Until now only the first crossed the API boundary,
+  so an order could be advanced only by a separate order snapshot. Where a venue sends no such
+  message, or sends one the consumer never receives, the order stood still while its position moved.
+
+  `Trade` gains `order_filled_quantity: Option<Decimal>`, placed after `quantity` — which remains
+  the size of *this* execution. `Trade::new` therefore takes one more argument. The field is
+  `#[serde(default)]`, so trades serialised before it existed still deserialise, as `None`.
+
+  `InstrumentState::update_from_trade` now advances the order the fill was against to that figure,
+  retiring it once nothing remains. Three properties make this safe to drive from a fill stream:
+
+  - **Idempotent.** The order advances to `max(current, reported)` and is never incremented, so a
+    re-delivered fill, or two arriving out of order, cannot double-count. Accumulating each
+    execution's size would.
+  - **Cannot resurrect.** It only ever updates an order already tracked as `Open` with that exact
+    exchange id. A fill arriving after its order retired is inert — unlike an order snapshot, which
+    reaches an arm that inserts, and which is why that path needs a liveness gate at the client.
+  - **Nothing is fabricated.** A venue that does not report a cumulative sends `None`, and the order
+    is left for a snapshot or a reconciliation fetch. `None` is not a claim that nothing is filled.
+
+  `Option` is the point rather than an accommodation: whether a venue tells you this is now a visible
+  fact in the data instead of an invisible difference between code paths. Reported by Binance Spot
+  and Margin over WebSocket (`z`), by Alpaca over WebSocket (`order.filled_qty`) and by Interactive
+  Brokers (`cumulative_quantity`, previously discarded); not by Hyperliquid's `userFills`, nor by
+  either venue's REST trade history. The simulated venue reports it, so a backtest and a live
+  session now agree about what is still working.
+
+  Migration: pass `None` at any call site building a `Trade` that is not a venue-reported execution
+  — the engine's own position-flip and expiry-settlement trades do exactly that.
+
 - **Account-event deduplication moved to `client::dedup`** (`rustrade-execution`), shared by the
   Binance and Hyperliquid clients instead of living inside `client::binance::shared`. Crate-internal
   only — nothing public moved, and Binance call sites are unchanged via a re-export. The cache's

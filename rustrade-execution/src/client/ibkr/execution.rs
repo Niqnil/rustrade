@@ -167,6 +167,12 @@ fn build_trade(
         side,
         price,
         quantity,
+        // IB reports the order's running total on every execution, so the order advances from the
+        // fill itself rather than waiting on the next `OrderStatus`.
+        order_filled_quantity: Some(parse_decimal_or_warn(
+            exec.cumulative_quantity,
+            "exec.cumulative_quantity",
+        )),
         fees: AssetFees {
             asset: AssetNameExchange::from(commission.currency.as_str()),
             fees: commission_amount,

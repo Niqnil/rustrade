@@ -1776,6 +1776,10 @@ fn convert_margin_execution_report(report: ExecutionReport) -> Option<UnindexedA
                 .map(AssetNameExchange::from)
                 .unwrap_or_else(|| AssetNameExchange::from("UNKNOWN"));
 
+            // Field `z` is the order's cumulative filled quantity as of this execution, which is
+            // what advances the order; `l` above is this execution alone.
+            let order_filled_quantity = report.z.as_deref().and_then(|s| Decimal::from_str(s).ok());
+
             let trade = Trade::new(
                 trade_id,
                 order_id,
@@ -1785,6 +1789,7 @@ fn convert_margin_execution_report(report: ExecutionReport) -> Option<UnindexedA
                 side,
                 last_price,
                 last_qty,
+                order_filled_quantity,
                 AssetFees::new(fee_asset, commission, None),
             );
             Some(UnindexedAccountEvent::new(
@@ -3558,6 +3563,8 @@ fn convert_margin_trade(
         side,
         price,
         quantity,
+        // `myTrades` reports executions only -- no cumulative, no order status.
+        None,
         AssetFees::new(fee_asset, commission, None),
     ))
 }

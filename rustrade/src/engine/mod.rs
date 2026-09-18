@@ -700,6 +700,9 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 strategy: rustrade_execution::order::id::StrategyId::ENGINE_EXPIRY,
                 time_exchange: engine_time,
                 side: closing_side,
+                // Engine-generated settlement, not a venue execution: there is no order for it
+                // to advance.
+                order_filled_quantity: None,
                 price: settlement_price,
                 quantity: closing_quantity,
                 fees: AssetFees {

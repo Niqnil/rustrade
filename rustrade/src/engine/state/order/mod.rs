@@ -3,9 +3,10 @@ use crate::engine::state::order::{
 };
 use derive_more::Constructor;
 use fnv::FnvHashMap;
+use rust_decimal::Decimal;
 use rustrade_execution::order::{
     Order,
-    id::ClientOrderId,
+    id::{ClientOrderId, OrderId},
     request::{OrderRequestCancel, OrderRequestOpen, OrderResponseCancel},
     state::{ActiveOrderState, CancelInFlight, OrderState},
 };
@@ -74,6 +75,75 @@ impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
                 ActiveOrderState::OpenInFlight(_) | ActiveOrderState::CancelInFlight(_)
             )
         })
+    }
+
+    /// Advance a tracked order's cumulative filled quantity to what one of its fills reported,
+    /// untracking the order once nothing is left to fill.
+    ///
+    /// Returns `true` if the order was untracked, so the caller can prune the routing that
+    /// referred to it -- the same obligation a terminal
+    /// [`OrderManager::update_from_order_snapshot`] carries.
+    ///
+    /// # Why a cumulative rather than an increment
+    ///
+    /// `filled_quantity` is advanced to `max(current, reported)`, never incremented. A venue can
+    /// re-deliver a fill, and two fills can arrive out of order; adding each execution's size to a
+    /// running total double-counts under either. Taking the greater of the two is unconditionally
+    /// idempotent, which is what lets this be driven from the fill stream at all.
+    ///
+    /// # What it will not do
+    ///
+    /// Nothing happens unless the order is already tracked and `Open` with this exact exchange
+    /// [`OrderId`]. A fill for an untracked order cannot insert one, so this cannot resurrect an
+    /// order that has retired -- unlike an order snapshot, which reaches a vacant-entry arm that
+    /// inserts. A fill arriving after its order retired is therefore safe to apply here, and is
+    /// simply ignored.
+    pub fn update_from_fill(
+        &mut self,
+        cid: &ClientOrderId,
+        order_id: &OrderId,
+        filled_quantity: Decimal,
+    ) -> bool
+    where
+        InstrumentKey: Debug,
+    {
+        let Some(order) = self.0.get_mut(cid) else {
+            return false;
+        };
+        let quantity = order.quantity;
+        let ActiveOrderState::Open(open) = &mut order.state else {
+            return false;
+        };
+        // A `ClientOrderId` identifies the order this engine sent; the exchange id identifies what
+        // the venue filled. Requiring both to agree keeps a fill off an order that merely shares
+        // the slot -- a replaced order, or a reused client id.
+        if open.id != *order_id {
+            return false;
+        }
+        if filled_quantity <= open.filled_quantity {
+            // Stale or re-delivered: the order already reflects at least this much.
+            return false;
+        }
+
+        open.filled_quantity = filled_quantity;
+
+        // `<= 0` rather than `is_zero`: a venue that reports a cumulative above the quantity this
+        // engine recorded -- an over-fill, or an order amended at the venue -- has still finished
+        // with it, and a negative remainder must retire the order rather than leave it resting
+        // forever.
+        if open.quantity_remaining(quantity) <= Decimal::ZERO {
+            debug!(
+                instrument = ?order.key.instrument,
+                strategy = %order.key.strategy,
+                cid = %cid,
+                %order_id,
+                "OrderManager removing an Open order a fill reports as fully filled"
+            );
+            self.0.remove(cid);
+            return true;
+        }
+
+        false
     }
 }
 

@@ -359,6 +359,7 @@ fn seed_long_position_event(
                 // Zero fees keep `price_entry_average` clean; the asset only needs to be a valid
                 // index (fees don't affect the split-scaled fields asserted below).
                 quantity,
+                order_filled_quantity: None,
                 fees: AssetFees::new(AssetIndex(0), dec!(0), Some(dec!(0))),
             }),
         })),

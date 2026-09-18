@@ -386,6 +386,7 @@ pub mod test_utils {
             side,
             price: price.try_into().unwrap(),
             quantity: quantity.try_into().unwrap(),
+            order_filled_quantity: None,
             fees: AssetFees {
                 asset: QuoteAsset,
                 fees: fees.try_into().unwrap(),
