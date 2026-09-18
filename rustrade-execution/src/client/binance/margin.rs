@@ -38,8 +38,9 @@ use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
     RateLimitTracker, SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, classify_order_kind_tif,
-    classify_rest_order_error, connectivity_error, dedup_key_from_event, is_duplicate,
-    new_dedup_cache, parse_order_kind, parse_side, parse_time_in_force, rest_call_with_retry,
+    classify_rest_order_error, connectivity_error, convert_open_order,
+    convert_open_order_owned_symbol, dedup_key_from_event, is_duplicate, new_dedup_cache,
+    parse_order_kind, parse_side, parse_time_in_force, rest_call_with_retry,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, InstrumentBalanceUpdate,
@@ -81,8 +82,8 @@ use binance_sdk::{
             QueryIsolatedMarginAccountInfoParams,
             QueryIsolatedMarginAccountInfoResponseAssetsInner,
             QueryMarginAccountsOpenOrdersIsIsolatedEnum, QueryMarginAccountsOpenOrdersParams,
-            QueryMarginAccountsOpenOrdersResponseInner, QueryMarginAccountsTradeListIsIsolatedEnum,
-            QueryMarginAccountsTradeListParams, QueryMarginAccountsTradeListResponseInner, RestApi,
+            QueryMarginAccountsTradeListIsIsolatedEnum, QueryMarginAccountsTradeListParams,
+            QueryMarginAccountsTradeListResponseInner, RestApi,
         },
         websocket_streams::{
             ExecutionReport, MarginLevelStatusChange, OutboundAccountPosition, UserLiabilityChange,
@@ -467,7 +468,7 @@ impl BinanceMargin {
     }
 
     /// Isolated-margin `account_snapshot`: per-pair balances + risk attached per-instrument, with
-    /// the asset-keyed top-level `balances` left empty (Design decision #2). Open orders and
+    /// the asset-keyed top-level `balances` left empty. Open orders and
     /// isolated balances cover the same effective isolated set so they cannot diverge.
     async fn isolated_account_snapshot(
         &self,
@@ -933,7 +934,7 @@ impl ExecutionClient for BinanceMargin {
     /// **Isolated**: returns an empty `Vec`. Isolated balances are per-`(pair, asset)` and the
     /// asset-keyed return type cannot carry them without collision — they are surfaced per-instrument
     /// via [`account_snapshot`](Self::account_snapshot)'s [`InstrumentAccountSnapshot::isolated`]
-    /// instead (Design decision #2).
+    /// instead.
     async fn fetch_balances(
         &self,
         assets: &[AssetNameExchange],
@@ -970,7 +971,7 @@ impl ExecutionClient for BinanceMargin {
     ///
     /// **Isolated**: per-symbol on the venue — always iterates the effective isolated set (empty
     /// `instruments` → configured `isolated_symbols`; out-of-set instruments skipped with a warning);
-    /// never issues a no-symbol isolated call (Design decision #4).
+    /// never issues a no-symbol isolated call.
     async fn fetch_open_orders(
         &self,
         instruments: &[InstrumentNameExchange],
@@ -979,7 +980,7 @@ impl ExecutionClient for BinanceMargin {
 
         // Isolated: per-symbol on the venue — always iterate the effective set (never a no-symbol
         // isolated call, which would error). The empty-`instruments` sentinel resolves to the
-        // configured isolated_symbols (Design decision #4).
+        // configured isolated_symbols.
         if self.config.is_isolated {
             let effective = self.effective_isolated_set(instruments);
             let capacity = effective.len();
@@ -1111,7 +1112,7 @@ impl ExecutionClient for BinanceMargin {
     /// re-subscribed before its ~24h expiry — there is **no** listen-key keepalive (that API is
     /// retired).
     ///
-    /// # Debt cold-start (Design decision #4)
+    /// # Debt cold-start
     /// This method does **not** seed balances. Margin debt (`borrowed`/`interest`) is correct only
     /// if the caller invokes [`ExecutionClient::account_snapshot`] at startup (the `BalanceSnapshot`
     /// that populates `margin`). WS thereafter keeps `free`/`locked` live via `BalanceStreamUpdate`
@@ -1196,7 +1197,7 @@ impl ExecutionClient for BinanceMargin {
 
             // (0) Build the invariant `instrument → (base, quote)` map from the isolated account
             // info. Authoritative base/quote split for routing the symbol-less
-            // `outboundAccountPosition` frames (Design decision #5); built once, reused across
+            // `outboundAccountPosition` frames; built once, reused across
             // reconnects (a pair's base/quote never change). A REST failure here is a hard Err
             // before anything spawns.
             let assets = fetch_isolated_margin_account_info(
@@ -1623,7 +1624,7 @@ fn convert_margin_user_data_events_with(
             false
         }
         "userLiabilityChange" => {
-            // Observable, NOT accumulated into balance state (Design decision #4): borrow/repay is a
+            // Observable, NOT accumulated into balance state: borrow/repay is a
             // delta, and folding it in would be the position tracking the library refuses. Surfaced
             // via logs; consumers needing exact live debt refresh via account_snapshot. Always
             // deserialized (rare borrow/repay path, not per-frame) so a parse failure — exchange
@@ -1684,8 +1685,11 @@ fn convert_margin_user_data_events_with(
 
 /// Convert a margin `executionReport` to a rustrade AccountEvent.
 ///
-/// Field-by-field adapter (the margin `ExecutionReport` is a distinct nominal type from spot's,
-/// fields identical). Mapping: s=symbol, c=clientOrderId, S=side, o=type, f=TIF, q=qty, p=price,
+/// Field-by-field adapter. The margin `ExecutionReport` is a distinct nominal type from spot's,
+/// and the two are *not* interchangeable: spot declares fields margin does not, and several
+/// fields shared by name differ in type. Every field this conversion reads is identical in both,
+/// which is what lets the mapping below stand for either. Mapping: s=symbol, c=clientOrderId,
+/// S=side, o=type, f=TIF, q=qty, p=price,
 /// x=execType, X=orderStatus, i=orderId, l=lastQty, L=lastPrice, n=commission, N=commissionAsset,
 /// T=transactTime, t=tradeId, z=cumQty.
 #[allow(clippy::cognitive_complexity)] // matches all exec types with per-variant validation (as spot)
@@ -1970,8 +1974,7 @@ fn convert_margin_new_order(
 /// Convert a margin `outboundAccountPosition` to `BalanceStreamUpdate` events (one per asset).
 ///
 /// The WS message is a `free`/`locked` partial (no debt), so it emits `BalanceStreamUpdate` — which
-/// structurally cannot clobber the `margin` debt established by a REST `BalanceSnapshot`
-/// (Design decision #4).
+/// structurally cannot clobber the `margin` debt established by a REST `BalanceSnapshot`.
 fn convert_margin_account_position(
     position: OutboundAccountPosition,
     buf: &mut Vec<UnindexedAccountEvent>,
@@ -2549,7 +2552,7 @@ async fn margin_connection_manager(
 /// account-info response.
 ///
 /// The authoritative base/quote split for routing symbol-less `outboundAccountPosition` frames
-/// (Design decision #5 / [`route_isolated_account_position`]) — base/quote never change for a pair,
+/// ([`route_isolated_account_position`]) — base/quote never change for a pair,
 /// so this is built once at stream start and reused across reconnects. Entries missing a symbol or
 /// either asset name are skipped (their balance frames then drop with a `warn!` at routing time).
 fn build_base_quote_map(
@@ -2582,7 +2585,7 @@ fn build_base_quote_map(
 /// Acquire one per-symbol isolated `userListenToken` for every configured symbol, bounded-concurrent.
 ///
 /// Fans out at 8-wide (mirroring `recover_margin_fills`) through the shared rate-limit/backoff
-/// machinery — ~1s at the v1 N≤100 ceiling vs ~5–10s sequential (Design decision #5). Each token is
+/// machinery — ~1s at the v1 N≤100 ceiling vs ~5–10s sequential. Each token is
 /// a weight-1 signed POST; the bound stays well inside SAPI weight limits. Errors if any acquisition
 /// fails (the caller treats a partial set as a startup/reconnect failure).
 ///
@@ -2972,7 +2975,7 @@ async fn fetch_margin_open_orders_for_instrument(
 
     let orders = orders_data
         .into_iter()
-        .filter_map(|o| convert_margin_open_order(&o, &instrument))
+        .filter_map(|o| convert_open_order(&o, ExchangeId::BinanceMargin, &instrument))
         .collect();
 
     Ok((instrument, orders))
@@ -3009,7 +3012,7 @@ async fn fetch_margin_all_open_orders(
 
     let orders = orders_data
         .into_iter()
-        .filter_map(|o| convert_margin_open_order_owned_symbol(&o))
+        .filter_map(|o| convert_open_order_owned_symbol(&o, ExchangeId::BinanceMargin))
         .collect();
 
     Ok(orders)
@@ -3386,115 +3389,6 @@ async fn fetch_isolated_margin_account_info(
     .await
 }
 
-/// Convert a margin open-order response into rustrade's `Open` state order.
-///
-/// Field-for-field identical to spot's `convert_open_order` but typed to the margin SDK response
-/// and stamped with [`ExchangeId::BinanceMargin`]. Reuses the shared wire-string parsers
-/// (`parse_side`/`parse_order_kind`/`parse_time_in_force`); see the duplication rationale in the
-/// module's design notes (two clients is below the abstraction threshold).
-fn convert_margin_open_order(
-    o: &QueryMarginAccountsOpenOrdersResponseInner,
-    instrument: &InstrumentNameExchange,
-) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
-    let order_id_raw = match o.order_id {
-        Some(id) => id,
-        None => {
-            warn!(%instrument, "BinanceMargin open order missing orderId");
-            return None;
-        }
-    };
-    let order_id = OrderId(format_smolstr!("{order_id_raw}"));
-    if o.client_order_id.is_none() {
-        warn!(%instrument, order_id = %order_id_raw, "BinanceMargin open order missing clientOrderId, using orderId as fallback — order may not reconcile with engine state");
-    }
-    let cid = ClientOrderId::new(
-        o.client_order_id
-            .as_deref()
-            .unwrap_or(&format_smolstr!("{order_id_raw}")),
-    );
-    let side = match o.side.as_deref() {
-        // parse_side already logs a warning on unknown values
-        Some(s) => parse_side(s)?,
-        None => {
-            warn!(%instrument, order_id = %order_id_raw, "BinanceMargin open order missing side");
-            return None;
-        }
-    };
-    let price = o.price.as_deref().and_then(|s| Decimal::from_str(s).ok());
-    let quantity = match o
-        .orig_qty
-        .as_deref()
-        .and_then(|s| Decimal::from_str(s).ok())
-    {
-        Some(v) => v,
-        None => {
-            warn!(%instrument, order_id = %order_id_raw, "BinanceMargin open order missing/unparseable origQty");
-            return None;
-        }
-    };
-    let filled_qty = match o.executed_qty.as_deref() {
-        Some(s) => match Decimal::from_str(s) {
-            Ok(v) => v,
-            Err(_) => {
-                warn!(%instrument, order_id = %order_id_raw, executed_qty = s, "BinanceMargin open order unparseable executedQty, defaulting to 0");
-                Decimal::ZERO
-            }
-        },
-        None => Decimal::ZERO,
-    };
-    let kind = match o.r#type.as_deref() {
-        // parse_order_kind already logs a warning on unknown values
-        Some(t) => parse_order_kind(t)?,
-        None => {
-            warn!(%instrument, order_id = %order_id_raw, "BinanceMargin open order missing type");
-            return None;
-        }
-    };
-    let time_in_force = parse_time_in_force(o.time_in_force.as_deref().unwrap_or("GTC"));
-    let time_exchange = match o.time.and_then(|ms| Utc.timestamp_millis_opt(ms).single()) {
-        Some(ts) => ts,
-        None => {
-            warn!(%instrument, order_id = %order_id_raw, "BinanceMargin open order missing/unparseable time, using now");
-            Utc::now()
-        }
-    };
-
-    Some(Order {
-        key: OrderKey::new(
-            ExchangeId::BinanceMargin,
-            instrument.clone(),
-            // Binance doesn't carry strategy IDs in any response field.
-            // Callers must reconcile orders by ClientOrderId or OrderId — never StrategyId.
-            StrategyId::unknown(),
-            cid,
-        ),
-        side,
-        price,
-        quantity,
-        kind,
-        time_in_force,
-        state: Open::new(order_id, time_exchange, filled_qty),
-    })
-}
-
-/// Convert a margin open-order response whose instrument is recovered from its own `symbol` field,
-/// rather than supplied by the caller. Used by the no-symbol "return all" path
-/// ([`fetch_margin_all_open_orders`]), where each order may belong to a different instrument.
-/// Drops (with a warning) any order missing `symbol`; otherwise delegates to
-/// [`convert_margin_open_order`].
-fn convert_margin_open_order_owned_symbol(
-    o: &QueryMarginAccountsOpenOrdersResponseInner,
-) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
-    let instrument = match o.symbol.as_deref() {
-        Some(s) => InstrumentNameExchange::new(s),
-        None => {
-            warn!("BinanceMargin open order missing symbol in return-all query, dropping order");
-            return None;
-        }
-    };
-    convert_margin_open_order(o, &instrument)
-}
-
 /// Convert a margin trade-list response into a rustrade [`Trade`].
 ///
 /// Field-for-field identical to spot's `convert_my_trade` but typed to the margin SDK response and
@@ -3806,6 +3700,7 @@ fn margin_avg_price(cummulative_quote_qty: Option<&str>, filled_qty: Decimal) ->
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use binance_sdk::margin_trading::rest_api::QueryMarginAccountsOpenOrdersResponseInner;
 
     #[test]
     fn margin_side_effect_default_is_auto_borrow_repay() {
@@ -4699,8 +4594,12 @@ mod tests {
     #[test]
     fn margin_open_order_converts() {
         let inst = InstrumentNameExchange::new("BTCUSDT");
-        let order =
-            convert_margin_open_order(&open_order(Some(42), "BUY"), &inst).expect("convert");
+        let order = convert_open_order(
+            &open_order(Some(42), "BUY"),
+            ExchangeId::BinanceMargin,
+            &inst,
+        )
+        .expect("convert");
         assert_eq!(order.key.exchange, ExchangeId::BinanceMargin);
         assert_eq!(order.state.id.0.as_str(), "42");
         assert_eq!(order.key.cid.0.as_str(), "cid-9");
@@ -4714,7 +4613,50 @@ mod tests {
     #[test]
     fn margin_open_order_missing_order_id_is_dropped() {
         let inst = InstrumentNameExchange::new("BTCUSDT");
-        assert!(convert_margin_open_order(&open_order(None, "BUY"), &inst).is_none());
+        assert!(
+            convert_open_order(&open_order(None, "BUY"), ExchangeId::BinanceMargin, &inst)
+                .is_none()
+        );
+    }
+
+    /// A margin REST snapshot must be stamped with when the order last *changed*, not when it was
+    /// created. The engine orders an order's states by `Open::time_exchange` and discards any
+    /// snapshot older than the state it already tracks, so a creation stamp -- identical across
+    /// every snapshot of one order -- is discarded the moment anything advances that order past
+    /// creation. That is exactly the partially-filled order a reconciliation fetch exists to repair.
+    #[test]
+    fn margin_open_order_prefers_update_time_over_creation_time() {
+        let inst = InstrumentNameExchange::new("BTCUSDT");
+
+        let mut updated = open_order(Some(42), "BUY");
+        updated.update_time = Some(1_700_000_005_000);
+        let order =
+            convert_open_order(&updated, ExchangeId::BinanceMargin, &inst).expect("convert");
+        assert_eq!(
+            order.state.time_exchange,
+            Utc.timestamp_millis_opt(1_700_000_005_000)
+                .single()
+                .unwrap(),
+            "update_time must win over time"
+        );
+    }
+
+    /// Falls back to `time` when the venue omits `update_time`, rather than to `now` -- which would
+    /// be worse than creation time, since it is not a venue-reported instant at all.
+    #[test]
+    fn margin_open_order_falls_back_to_creation_time_when_update_time_absent() {
+        let inst = InstrumentNameExchange::new("BTCUSDT");
+
+        let base = open_order(Some(42), "BUY");
+        assert!(base.update_time.is_none(), "fixture must omit update_time");
+        let order = convert_open_order(&base, ExchangeId::BinanceMargin, &inst).expect("convert");
+        assert_eq!(
+            order.state.time_exchange,
+            Utc.timestamp_millis_opt(1_700_000_000_000)
+                .single()
+                .unwrap(),
+            "absent update_time falls back to time"
+        );
     }
 
     #[test]
@@ -4722,7 +4664,8 @@ mod tests {
         // The no-symbol "return all" path derives the instrument from each order's own `symbol`.
         let mut o = open_order(Some(42), "SELL");
         o.symbol = Some("ETHUSDT".to_string());
-        let order = convert_margin_open_order_owned_symbol(&o).expect("convert");
+        let order =
+            convert_open_order_owned_symbol(&o, ExchangeId::BinanceMargin).expect("convert");
         assert_eq!(order.key.instrument.name().as_str(), "ETHUSDT");
         assert_eq!(order.key.exchange, ExchangeId::BinanceMargin);
         assert_eq!(order.side, Side::Sell);
@@ -4733,7 +4676,7 @@ mod tests {
         // open_order() leaves `symbol` unset — the return-all path must drop it rather than guess.
         let o = open_order(Some(42), "BUY");
         assert!(o.symbol.is_none());
-        assert!(convert_margin_open_order_owned_symbol(&o).is_none());
+        assert!(convert_open_order_owned_symbol(&o, ExchangeId::BinanceMargin).is_none());
     }
 
     fn trade(id: Option<i64>, is_buyer: Option<bool>) -> QueryMarginAccountsTradeListResponseInner {
@@ -4920,7 +4863,7 @@ mod tests {
     #[test]
     fn margin_ws_margin_specific_events_are_observable_only() {
         // userLiabilityChange / marginLevelStatusChange are logged, NOT forwarded as account events
-        // and NOT signalled as reconnects (Design decision #4: observable, not accumulated).
+        // and NOT signalled as reconnects: observable, not accumulated.
         let mut buf = Vec::new();
         let liability = push(serde_json::json!({
             "e": "userLiabilityChange", "a": "USDT", "t": "BORROW", "p": "100", "i": "0.01",

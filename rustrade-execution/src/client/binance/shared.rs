@@ -6,15 +6,22 @@
 //!
 //! Nothing here is spot- or margin-specific: the parsers operate on rustrade's own types
 //! (`OrderKind`, `TimeInForce`, `Side`) or on Binance's stable wire strings, so both clients
-//! reuse them unchanged. The SDK-typed converters (which differ between spot's WS-API enums and
-//! margin's REST params) deliberately stay in their respective modules.
+//! reuse them unchanged. The REST order-response converter joins them via
+//! [`BinanceOrderFields`], which names the field subset that conversion reads -- provably
+//! identical across every Binance order-response type, even though the structs around it are not.
+//! The remaining SDK-typed converters, which differ between spot's WS-API enums and margin's REST
+//! params, deliberately stay in their respective modules.
 //!
 //! Event deduplication lives in [`crate::client::dedup`], shared with the other clients that
 //! need it, and is re-exported here so Binance call sites keep a single import site.
 
 use crate::{
     error::{ApiError, ConnectivityError, OrderError, UnindexedClientError},
-    order::{OrderKind, TimeInForce, TrailingOffsetType},
+    order::{
+        Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
+        id::{ClientOrderId, OrderId, StrategyId},
+        state::Open,
+    },
 };
 
 // Deduplication moved to `client::dedup` when Hyperliquid needed the same machinery; re-exported
@@ -23,11 +30,16 @@ pub(crate) use crate::client::dedup::{
     SharedDedupCache, dedup_key_from_event, is_duplicate, new_dedup_cache,
 };
 use binance_sdk::common::errors::{ConnectorError, WebsocketError};
+use chrono::{TimeZone, Utc};
+use rust_decimal::Decimal;
 use rustrade_instrument::{
-    Side, asset::name::AssetNameExchange, instrument::name::InstrumentNameExchange,
+    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
+    instrument::name::InstrumentNameExchange,
 };
+use smol_str::format_smolstr;
 use std::{
     pin::Pin,
+    str::FromStr,
     sync::Arc,
     task::{Context, Poll},
     time::Duration,
@@ -354,6 +366,180 @@ pub(crate) fn parse_time_in_force(tif: &str) -> TimeInForce {
             TimeInForce::GoodUntilCancelled { post_only: false }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Order-response conversion (REST open-order / all-order endpoints)
+// ---------------------------------------------------------------------------
+
+/// The subset of a Binance order-response struct that [`convert_open_order`] reads.
+///
+/// binance-sdk generates a *distinct* response type per endpoint, with no shared trait:
+/// `AllOrdersResponseInner` and `GetOpenOrdersResponseInner` on spot,
+/// `QueryMarginAccountsOpenOrdersResponseInner` on margin. Those structs are emphatically not
+/// interchangeable -- the spot family carries substantially more fields than the margin one, and
+/// several fields share a name while differing in type -- but the eleven named here are identical
+/// in name and type across all of them.
+///
+/// Naming that read subset is what makes a single converter safe to share. The dependency surface
+/// is explicit, so an SDK change to any *other* field cannot silently alter order parsing, and a
+/// correction to the conversion reaches every Binance client at once instead of one of them.
+pub(crate) trait BinanceOrderFields {
+    fn order_id(&self) -> Option<i64>;
+    fn client_order_id(&self) -> Option<&str>;
+    fn side(&self) -> Option<&str>;
+    fn price(&self) -> Option<&str>;
+    fn orig_qty(&self) -> Option<&str>;
+    fn executed_qty(&self) -> Option<&str>;
+    fn order_type(&self) -> Option<&str>;
+    fn time_in_force(&self) -> Option<&str>;
+    fn time(&self) -> Option<i64>;
+    /// When the order last changed state, as opposed to [`BinanceOrderFields::time`], which is when
+    /// it was created. Every endpoint implemented below carries it.
+    fn update_time(&self) -> Option<i64>;
+    fn symbol(&self) -> Option<&str>;
+}
+
+/// Implement [`BinanceOrderFields`] for SDK response types that share these field names.
+///
+/// Every struct listed below declares these eleven fields with the same types, so the accessors
+/// are identical; a macro keeps them from drifting apart under hand-editing.
+macro_rules! impl_binance_order_fields {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl BinanceOrderFields for $t {
+                fn order_id(&self) -> Option<i64> { self.order_id }
+                fn client_order_id(&self) -> Option<&str> { self.client_order_id.as_deref() }
+                fn side(&self) -> Option<&str> { self.side.as_deref() }
+                fn price(&self) -> Option<&str> { self.price.as_deref() }
+                fn orig_qty(&self) -> Option<&str> { self.orig_qty.as_deref() }
+                fn executed_qty(&self) -> Option<&str> { self.executed_qty.as_deref() }
+                fn order_type(&self) -> Option<&str> { self.r#type.as_deref() }
+                fn time_in_force(&self) -> Option<&str> { self.time_in_force.as_deref() }
+                fn time(&self) -> Option<i64> { self.time }
+                fn update_time(&self) -> Option<i64> { self.update_time }
+                fn symbol(&self) -> Option<&str> { self.symbol.as_deref() }
+            }
+        )*
+    };
+}
+
+impl_binance_order_fields!(
+    binance_sdk::spot::rest_api::AllOrdersResponseInner,
+    binance_sdk::spot::rest_api::GetOpenOrdersResponseInner,
+    binance_sdk::margin_trading::rest_api::QueryMarginAccountsOpenOrdersResponseInner,
+);
+
+/// Convert a Binance open order into rustrade's `Open` state order.
+///
+/// `exchange` stamps the resulting [`OrderKey`] and every diagnostic below, so one
+/// implementation serves each Binance client without a venue name baked into its warnings.
+pub(crate) fn convert_open_order<T: BinanceOrderFields>(
+    o: &T,
+    exchange: ExchangeId,
+    instrument: &InstrumentNameExchange,
+) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
+    let order_id_raw = match o.order_id() {
+        Some(id) => id,
+        None => {
+            warn!(%exchange, %instrument, "Binance open order missing orderId");
+            return None;
+        }
+    };
+    let order_id = OrderId(format_smolstr!("{}", order_id_raw));
+    if o.client_order_id().is_none() {
+        warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance open order missing clientOrderId, using orderId as fallback — order may not reconcile with engine state");
+    }
+    let cid = ClientOrderId::new(
+        o.client_order_id()
+            .unwrap_or(&format_smolstr!("{}", order_id_raw)),
+    );
+    let side = match o.side() {
+        // parse_side already logs a warning on unknown values
+        Some(s) => parse_side(s)?,
+        None => {
+            warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance open order missing side");
+            return None;
+        }
+    };
+    let price = o.price().and_then(|s| Decimal::from_str(s).ok());
+    let quantity = match o.orig_qty().and_then(|s| Decimal::from_str(s).ok()) {
+        Some(v) => v,
+        None => {
+            warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance open order missing/unparseable origQty");
+            return None;
+        }
+    };
+    let filled_qty = match o.executed_qty() {
+        Some(s) => match Decimal::from_str(s) {
+            Ok(v) => v,
+            Err(_) => {
+                warn!(%exchange, %instrument, order_id = %order_id_raw, executed_qty = s, "Binance open order unparseable executedQty, defaulting to 0");
+                Decimal::ZERO
+            }
+        },
+        None => Decimal::ZERO,
+    };
+    let kind = match o.order_type() {
+        // parse_order_kind already logs a warning on unknown values
+        Some(t) => parse_order_kind(t)?,
+        None => {
+            warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance open order missing type");
+            return None;
+        }
+    };
+    let time_in_force = parse_time_in_force(o.time_in_force().unwrap_or("GTC"));
+    // `update_time` over `time`: `Open::time_exchange` orders an order's states, and the engine
+    // discards a snapshot older than the state it already tracks. `time` is the creation stamp and
+    // is identical across every snapshot of one order, so a snapshot carrying it is discarded the
+    // moment a WebSocket fill has advanced the tracked order past creation -- which is exactly the
+    // partially-filled order this fetch exists to reconcile.
+    let time_exchange = match o
+        .update_time()
+        .or_else(|| o.time())
+        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+    {
+        Some(ts) => ts,
+        None => {
+            warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance open order missing/unparseable time, using now");
+            Utc::now()
+        }
+    };
+
+    Some(Order {
+        key: OrderKey::new(
+            exchange,
+            instrument.clone(),
+            // Binance doesn't carry strategy IDs in any response field.
+            // Callers must reconcile orders by ClientOrderId or OrderId — never StrategyId.
+            StrategyId::unknown(),
+            cid,
+        ),
+        side,
+        price,
+        quantity,
+        kind,
+        time_in_force,
+        state: Open::new(order_id, time_exchange, filled_qty),
+    })
+}
+
+/// Convert an open-order response whose instrument is recovered from its own `symbol` field,
+/// rather than supplied by the caller. Used by the no-symbol "return all" path
+/// (each client's no-symbol "return all" fetch), where each order may belong to a different instrument. Drops
+/// (with a warning) any order missing `symbol`; otherwise delegates to [`convert_open_order`].
+pub(crate) fn convert_open_order_owned_symbol<T: BinanceOrderFields>(
+    o: &T,
+    exchange: ExchangeId,
+) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
+    let instrument = match o.symbol() {
+        Some(s) => InstrumentNameExchange::new(s),
+        None => {
+            warn!(%exchange, "Binance open order missing symbol in return-all query, dropping order");
+            return None;
+        }
+    };
+    convert_open_order(o, exchange, &instrument)
 }
 
 // ---------------------------------------------------------------------------
