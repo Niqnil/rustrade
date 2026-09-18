@@ -29,6 +29,24 @@
 //!   secrets configured", so a mistyped key would report green forever.
 //! - Key present but the assertion fails → **FAIL** (the real signal).
 //!
+//! # Why every test here is `#[serial]`
+//!
+//! The vault caps *concurrent* requests — its own `/vault/usage` reports
+//! `vault_concurrency: 2` — and `LseVaultClient` never retries a `429` by design, mapping it
+//! straight to `LseError::RateLimited`. Rust's harness runs the tests in a file in parallel, so
+//! running these four unserialised puts more than two requests in flight and whichever test loses
+//! the race panics on its `expect`.
+//!
+//! That is worse than an ordinary flake, because the failure it produces is *indistinguishable
+//! from the drift this canary exists to detect*: three tests pass and a fourth reports
+//! `RateLimited { retry_after: Some(1s) }`, which reads like a provider-side change and is not
+//! one. A drift detector that cries wolf is one people learn to ignore.
+//!
+//! Serialising holds this binary to a single in-flight request, strictly under the cap: the
+//! paging inside `collect_candles` drives its stream sequentially, so one test never exceeds one
+//! request on its own. Note the race is latency-sensitive and does not reproduce on a low-latency
+//! link — it was observed in CI, not locally.
+//!
 //! # Running
 //!
 //! ```bash
@@ -44,6 +62,7 @@
 use chrono::{DateTime, Duration, Utc};
 use rustrade_data::exchange::lse::vault::LseVaultClient;
 use rustrade_data::subscription::candle::{Candle, CandleInterval};
+use serial_test::serial;
 
 const KEY_ENV: &str = "LSE_API_KEY";
 
@@ -114,6 +133,7 @@ fn range(days: i64) -> (DateTime<Utc>, DateTime<Utc>) {
 
 #[tokio::test]
 #[ignore = "spends the shared provider allowance; run on demand"]
+#[serial]
 async fn daily_candles_arrive_at_daily_spacing() {
     let Some(client) = client() else { return };
     let (start, end) = range(30);
@@ -137,6 +157,7 @@ async fn daily_candles_arrive_at_daily_spacing() {
 
 #[tokio::test]
 #[ignore = "spends the shared provider allowance; run on demand"]
+#[serial]
 async fn hourly_candles_arrive_at_hourly_spacing() {
     let Some(client) = client() else { return };
     let (start, end) = range(3);
@@ -153,6 +174,7 @@ async fn hourly_candles_arrive_at_hourly_spacing() {
 
 #[tokio::test]
 #[ignore = "spends the shared provider allowance; run on demand"]
+#[serial]
 async fn equity_candles_carry_a_volume() {
     let Some(client) = client() else { return };
     let (start, end) = range(30);
@@ -176,6 +198,7 @@ async fn equity_candles_carry_a_volume() {
 
 #[tokio::test]
 #[ignore = "spends the shared provider allowance; run on demand"]
+#[serial]
 async fn usage_reports_every_allowance_dimension() {
     let Some(client) = client() else { return };
 
