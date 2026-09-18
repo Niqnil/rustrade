@@ -626,6 +626,17 @@ impl ExecutionClient for BinanceSpot {
     /// Callers MUST also call [`ExecutionClient::fetch_open_orders`] after each
     /// reconnect to reconcile open-order state — order lifecycle events (NEW, CANCELED)
     /// are not recovered after a WS disconnect, only TRADE fills are.
+    ///
+    /// # A recovered fill does not advance the order
+    ///
+    /// A fill that arrives live over the WebSocket carries the order's cumulative filled
+    /// quantity in [`Trade::order_filled_quantity`] (`executionReport`'s `z`), so it advances
+    /// the order by itself. A fill recovered after a disconnect does not: it comes from REST
+    /// `myTrades`, which reports executions only and carries no cumulative, so
+    /// `order_filled_quantity` is `None` and the order's `filled_quantity` stands still.
+    /// The `fetch_open_orders` reconciliation above is therefore not merely for NEW and
+    /// CANCELED — without it, an order that filled across a disconnect keeps whatever
+    /// `filled_quantity` it held before the gap.
     async fn account_stream(
         &self,
         // _assets is intentionally ignored — Binance pushes outboundAccountPosition
@@ -1610,6 +1621,10 @@ async fn connection_manager(
 /// Fetches trades since `disconnect_time` via REST and sends them through the dedup
 /// cache. Trades already seen (from before the disconnect) are filtered out; only
 /// genuinely missed fills reach the consumer.
+///
+/// The recovered trades carry no `order_filled_quantity`: `myTrades` reports executions
+/// only, with no cumulative and no order status, so a recovered fill advances the position
+/// but not the order. Only a `fetch_open_orders` reconciliation closes that gap.
 // `.iter().cloned()` is required: Rust async closures cannot satisfy the HRTB
 // `for<'a> FnMut(&'a InstrumentNameExchange) -> impl Future + 'static` needed by
 // the iterator machinery, even when the clone is moved inside the closure body.
