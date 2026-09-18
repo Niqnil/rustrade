@@ -110,6 +110,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A WebSocket partial fill now advances `Open::filled_quantity`** (`rustrade-execution`,
+  Alpaca and Binance Spot). Both clients mapped one venue frame to at most one `AccountEvent`, and
+  `filled_quantity` is only ever carried into engine state by an order snapshot. The fill arms
+  emitted the execution and nothing else, so `filled_quantity` was written only when the order was
+  first acknowledged — where it is `0`. Between acknowledgement and the next REST reconciliation, a
+  half-executed order read as having its full original quantity still working, and anything sizing,
+  netting or risk-checking off `quantity_remaining()` over-counted by the amount already filled.
+
+  A fill frame genuinely carries two facts — the execution print and the order's new cumulative
+  filled quantity — so it now maps to both a `Trade` and an `OrderSnapshot`. The execution is always
+  emitted first: a fully-filled snapshot retires its order, and routing a fill against an order that
+  has already been retired is a strictly harder problem than routing it against a live one.
+
+  This also settles a completed order. A `fill` (not just a `partial_fill`) reports nothing left to
+  fill, which is how the engine learns the order is done; previously neither client's WS path ever
+  moved an order out of `Open`, leaving a resting order that no longer existed at the venue until
+  REST reconciliation removed it.
+
+  A fill is written back as an `Open` snapshot only when the frame's own order status says the order
+  was still working — `partially_filled`/`filled` on Alpaca, `PARTIALLY_FILLED`/`FILLED` in Binance's
+  `X` field. A fill arriving after its order's terminal frame therefore still reports its execution,
+  but cannot resurrect a retired order as a resting one. IBKR and Hyperliquid were never affected:
+  both venues send order state and executions as separate messages, so each already mapped to its own
+  event.
+
+  The two internal converters return `[Option<UnindexedAccountEvent>; 2]` rather than
+  `Option<UnindexedAccountEvent>`. Both are private; no public API changed.
+
 - **A Hedging fill arriving after its order retired now reaches the position the strategy chose**
   (`rustrade`). In `OmsMode::Hedging`, routing-table lifetime was coupled to membership of
   `InstrumentState::orders`: retiring an order pruned the `exchange_id → ClientOrderId → PositionId`
