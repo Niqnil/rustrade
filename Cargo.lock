@@ -4453,7 +4453,7 @@ dependencies = [
 
 [[package]]
 name = "rustrade"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -4483,7 +4483,7 @@ dependencies = [
 
 [[package]]
 name = "rustrade-data"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-stream",
  "chrono",
@@ -4528,7 +4528,7 @@ dependencies = [
 
 [[package]]
 name = "rustrade-execution"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "binance-sdk",
@@ -4567,7 +4567,7 @@ dependencies = [
 
 [[package]]
 name = "rustrade-instrument"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "derive_more 2.1.1",
@@ -4584,7 +4584,7 @@ dependencies = [
 
 [[package]]
 name = "rustrade-integration"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -4617,7 +4617,7 @@ dependencies = [
 
 [[package]]
 name = "rustrade-macro"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "convert_case 0.12.0",
  "proc-macro2",

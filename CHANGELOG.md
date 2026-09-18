@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-18
+
 ### Added
 
 - **An unroutable Hedging fill is now counted, not only logged** (`rustrade`). In
@@ -81,301 +83,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reaches it: capping a maker honestly needs the volume that actually printed through its limit,
   which this venue's feed does not carry.
 
-### Changed
-
-- **BREAKING: `Trade` carries the order's cumulative filled quantity** (`rustrade-execution`). A
-  fill states two things — that an execution happened, and what it left the order at — and a
-  consumer that tracks order state needs both. Until now only the first crossed the API boundary,
-  so an order could be advanced only by a separate order snapshot. Where a venue sends no such
-  message, or sends one the consumer never receives, the order stood still while its position moved.
-
-  `Trade` gains `order_filled_quantity: Option<Decimal>`, placed after `quantity` — which remains
-  the size of *this* execution. `Trade::new` therefore takes one more argument. The field is
-  `#[serde(default)]`, so trades serialised before it existed still deserialise, as `None`.
-
-  `InstrumentState::update_from_trade` now advances the order the fill was against to that figure,
-  retiring it once nothing remains. Three properties make this safe to drive from a fill stream:
-
-  - **Idempotent.** The order advances to `max(current, reported)` and is never incremented, so a
-    re-delivered fill, or two arriving out of order, cannot double-count. Accumulating each
-    execution's size would.
-  - **Cannot resurrect.** It only ever updates an order already tracked as `Open` with that exact
-    exchange id. A fill arriving after its order retired is inert — unlike an order snapshot, which
-    reaches an arm that inserts, and which is why that path needs a liveness gate at the client.
-  - **Nothing is fabricated.** A venue that does not report a cumulative sends `None`, and the order
-    is left for a snapshot or a reconciliation fetch. `None` is not a claim that nothing is filled.
-
-  `Option` is the point rather than an accommodation: whether a venue tells you this is now a visible
-  fact in the data instead of an invisible difference between code paths. Reported by Binance Spot
-  and Margin over WebSocket (`z`), by Alpaca over WebSocket (`order.filled_qty`) and by Interactive
-  Brokers (`cumulative_quantity`, previously discarded); not by Hyperliquid's `userFills`, nor by
-  either venue's REST trade history. The simulated venue reports it, so a backtest and a live
-  session now agree about what is still working.
-
-  Migration: pass `None` at any call site building a `Trade` that is not a venue-reported execution
-  — the engine's own position-flip and expiry-settlement trades do exactly that.
-
-- **Account-event deduplication moved to `client::dedup`** (`rustrade-execution`), shared by the
-  Binance and Hyperliquid clients instead of living inside `client::binance::shared`. Crate-internal
-  only — nothing public moved, and Binance call sites are unchanged via a re-export. The cache's
-  documentation is now venue-neutral, and says why the key carries the instrument: venue ids are
-  routinely per-symbol rather than global.
-
-- **`SimulatedVenue` mints trade ids from a sequence of their own** (`rustrade-execution`). They
-  were derived from the order's id, which was unique only while one order produced at most one
-  fill — no longer true now that an order can fill in part on arrival and again when its remainder
-  is crossed, where the two trades would have collided. `Trade::order_id` is still how a trade says
-  which order it belongs to.
-
-  `TradeId` also gains the documentation it never had, and a `Display` impl for parity with the
-  other id types. Note what it now states: **uniqueness is the venue's to define and is often
-  narrower than global** (Binance's are per symbol), and the derived `Ord` is lexicographic byte
-  order carrying no chronological meaning — order trades by `Trade::time_exchange`.
-
-- **`AccountState::debit_filled` is replaced by `AccountState::commit`** (`rustrade-execution`),
-  taking a `Debit` that names the asset once and splits an arrival into what it settled and what it
-  holds. **Breaking.** One arrival is now one fallible ledger operation and one balance
-  restatement, including the arrival that both settles a fill and holds against a resting
-  remainder. Settling and then reserving as two calls could commit the first and be refused the
-  second, leaving the venue's ledger permanently short with no event to say so; asking for the whole
-  requirement up front makes that state unreachable rather than merely avoided.
-
-### Fixed
-
-- **BREAKING: an Alpaca subscription is now confirmed symbol by symbol, not by counting replies**
-  (`rustrade-data`). Alpaca answers a multi-symbol subscribe with a single frame listing the
-  symbols it actually registered. The client used the standard validator, which succeeds once it
-  has seen the expected *number* of non-error replies — and `expected_responses` was 1. A
-  confirmation naming one of two requested symbols was therefore indistinguishable from one naming
-  both, and the caller was handed a stream silently subscribed to less than it asked for. The same
-  gap let `[{"T":"success", ...}]`, which names no symbols at all, satisfy the subscribe.
-
-  `AlpacaWebSocketSubValidator` replaces the counting validator: every requested subscription must
-  be named in a confirmation before `init()` returns, and anything still outstanding when the
-  timeout expires fails the subscribe and is reported by name.
-
-  **This can surface as a subscribe error where one previously succeeded** — that is the point, but
-  it is a behaviour change for anyone who was unknowingly running a partial subscription. The
-  `Connector::SubValidator` associated type for the Alpaca connectors changes accordingly, and the
-  `expected_responses` override is gone, since coverage rather than a count now decides.
-
-  Note this does **not** mean a confirmed symbol will produce data promptly. Alpaca's crypto feed
-  publishes a quote on top-of-book change, and the delay before a symbol first ticks is large and
-  variable — 1s, 15s, 96s and 132s for four symbols confirmed on one connection in a single 300s
-  window. Absence of data is not evidence of a failed subscription.
-
-- **An Alpaca fill recovered after a disconnect now reports where it left the order**
-  (`rustrade-execution`). Recovery reads the account-activities endpoint, whose FILL activities
-  carry the order's cumulative filled quantity as `cum_qty`. The client discarded that field, so a
-  recovered fill advanced the position and left the order untouched — precisely the orders a
-  reconnect exists to repair. It is now parsed into `Trade::order_filled_quantity`, so the order
-  advances from the fill itself, with no extra API call and no reconciliation fetch.
-
-  **This also corrects a dedup mis-keying between the two paths.** Both key a fill as
-  `"{order_id}:{cumulative}"`, but only the WebSocket path used the venue's own cumulative;
-  recovery reconstructed one by counting executions from zero *within the recovery batch*. For an
-  order that had already partly filled before the window, the two paths therefore produced
-  different keys for the same execution, and it could be delivered twice. The key is now taken from
-  `cum_qty`, so it agrees with the WebSocket path by construction rather than by reconstruction.
-  Where Alpaca omits the field the previous counting behaviour is kept unchanged, including its
-  limitations.
-
-  Binance Spot and Margin recovery is unaffected and unchanged: REST `myTrades` reports executions
-  only, with no cumulative, so a recovered fill there still reports `None` rather than a figure
-  invented from a second endpoint. Both clients now say so at the call site, and
-  `Trade::order_filled_quantity` documents which producers report it.
-
-- **A Binance Spot fill's order snapshot now reaches the consumer** (`rustrade-execution`). The
-  account stream deduplicates events before forwarding them, and an order snapshot's dedup key was
-  the order's exchange id alone. An order's acknowledgement and every fill against it carry that one
-  id, so the acknowledgement — which reports nothing filled — suppressed each fill snapshot behind
-  it and `Open::filled_quantity` never moved. The defect fixed below was therefore corrected in the
-  converter and undone one stage later, on Binance Spot only; Alpaca derives dedup keys from
-  executions alone and was unaffected.
-
-  The key now carries the order's cumulative filled quantity, so successive states of one order stay
-  distinct while a genuinely re-delivered frame still collapses. That suppression is load-bearing
-  rather than an optimisation: a replayed acknowledgement for an order that has since retired is a
-  partially-filled snapshot for an untracked order, which the engine inserts as a live resting order.
-
-  Every test covering the change below drives the converter directly, which is upstream of the gate
-  that discarded its output. The new tests drive a frame through convert-then-deduplicate — the seam
-  where this failed.
-
-- **A REST order snapshot is stamped with when the order last changed, not when it was created**
-  (`rustrade-execution`, Alpaca and Binance Spot). The engine orders an order's states by
-  `Open::time_exchange` and discards a snapshot older than the state it already tracks. Both clients
-  stamped a fetched order with its creation time, which is identical across every snapshot of that
-  order — so once a WebSocket fill had advanced the tracked order, a reconciliation fetch was thrown
-  away as stale, silently, for exactly the partially-filled orders it exists to repair. Reconciling
-  order state after a reconnect is a documented caller obligation on both clients, and it had stopped
-  discharging anything.
-
-  Both clients now prefer the venue's last-update field (Binance `updateTime`, Alpaca `updated_at`),
-  falling back to creation time only where the venue omits it. `Open::time_exchange` and
-  `Open::filled_quantity` now document what a producer must put in them.
-
-- **A WebSocket partial fill now advances `Open::filled_quantity`** (`rustrade-execution`,
-  Alpaca and Binance Spot). Both clients mapped one venue frame to at most one `AccountEvent`, and
-  `filled_quantity` is only ever carried into engine state by an order snapshot. The fill arms
-  emitted the execution and nothing else, so `filled_quantity` was written only when the order was
-  first acknowledged — where it is `0`. Between acknowledgement and the next REST reconciliation, a
-  half-executed order read as having its full original quantity still working, and anything sizing,
-  netting or risk-checking off `quantity_remaining()` over-counted by the amount already filled.
-
-  A fill frame genuinely carries two facts — the execution print and the order's new cumulative
-  filled quantity — so it now maps to both a `Trade` and an `OrderSnapshot`. The execution is always
-  emitted first: a fully-filled snapshot retires its order, and routing a fill against an order that
-  has already been retired is a strictly harder problem than routing it against a live one.
-
-  This also settles a completed order. A `fill` (not just a `partial_fill`) reports nothing left to
-  fill, which is how the engine learns the order is done; previously neither client's WS path ever
-  moved an order out of `Open`, leaving a resting order that no longer existed at the venue until
-  REST reconciliation removed it.
-
-  A fill is written back as an `Open` snapshot only when the frame's own order status says the order
-  was still working — `partially_filled`/`filled` on Alpaca, `PARTIALLY_FILLED`/`FILLED` in Binance's
-  `X` field. A fill arriving after its order's terminal frame therefore still reports its execution,
-  but cannot resurrect a retired order as a resting one. IBKR and Hyperliquid were never affected:
-  both venues send order state and executions as separate messages, so each already mapped to its own
-  event.
-
-  The two internal converters return `[Option<UnindexedAccountEvent>; 2]` rather than
-  `Option<UnindexedAccountEvent>`. Both are private; no public API changed.
-
-- **A Hedging fill arriving after its order retired now reaches the position the strategy chose**
-  (`rustrade`). In `OmsMode::Hedging`, routing-table lifetime was coupled to membership of
-  `InstrumentState::orders`: retiring an order pruned the `exchange_id → ClientOrderId → PositionId`
-  chain that a fill arriving *after* its terminal snapshot needs, so the fill opened a position under
-  its raw exchange `OrderId` and that order's PnL was split across two slots with nothing to rejoin
-  them. `update_from_order_snapshot` compensated — but by restoring those entries into the same live
-  maps, so the next retirement pruned them again. The window held **one** order per instrument, and
-  only for an order retired as `Open`-with-nothing-left or `FullyFilled`. A **cancelled** order got no
-  compensation at all, so an IOC's fill reported after the cancel that closed it never routed — which
-  is the case `Cancelled::filled_quantity` exists for.
-
-  `cleanup_routing_tables` now **demotes** that chain into a new `InstrumentState::retired_routing`
-  instead of dropping it, and `update_from_trade` consults it once both live lookups have missed. The
-  window spans `MAX_RETIRED_ROUTING` (64) retirements per instrument, evicting oldest first; a fill
-  beyond that bound falls back exactly as before.
-
-  Only a chain that resolves end to end is demoted, and that is what keeps the corporate-action split
-  path out of it. That path prunes `position_ids` **by value** while leaving the order resting, so the
-  join finds no `PositionId`, nothing is kept, and a late fill there still reaches the fallback —
-  deliberately, because routing it would reopen a position a reverse split floored to zero. The
-  one-order compensation is retained rather than replaced: an order that fills fully on ack has no
-  `exchange_id_to_cid` entry at the moment `cleanup_routing_tables` runs, so there is nothing to
-  demote, and the entries it restores are what the *next* retirement demotes.
-
-  Two consequences beyond the split itself are also closed. Because both live lookups missed, the fill
-  reached the no-order-matched arm and was counted under `TearSheet::fills_unmatched` — conflating it
-  with a genuinely external fill, for which one position per order is a defensible reading, and
-  leaving the split-position banner silent on a real split. And before falling back, that arm buffers
-  a fill into `pending_fills` whenever any *other* order is `OpenInFlight`; a buffered fill is only
-  released by an ack for an order still tracked in `orders`, so a fill for an already-retired order
-  was never replayed and never dropped, growing that `Vec` for the rest of the run. The retired map is
-  consulted before the buffer, so neither happens.
-
-  `retired_routing` is `#[serde(default)]` so existing snapshots load, stays empty under
-  `OmsMode::Netting` where one position key makes the failure unreachable, and is cleared alongside
-  the other routing tables on contract expiry in both the live handler and the audit replica.
-
-- **Hyperliquid trade ids identify the fill rather than the transaction** (`rustrade-execution`).
-  A `Trade`'s id came from `fill.hash`, which is the L1 transaction hash. One aggressive order
-  sweeping several resting orders produces several fills under a single hash, so those fills all
-  arrived carrying the same `TradeId`. Anything reconciling on it — which is what a caller does with
-  `fetch_trades` after a reconnect — treated a multi-level sweep as one fill and dropped the rest,
-  understating both filled quantity and fees. The id is now the venue's `tid`, which is per-fill.
-
-  On the REST path this required parsing `userFills` into this client's own `UserFill` rather than
-  `hyperliquid_rust_sdk`'s `UserFillsResponse`, which models neither `tid` nor `feeToken` and — with
-  no `deny_unknown_fields` — discards both silently. The request goes through the SDK's own HTTP
-  client, so base URL, TLS and error mapping are unchanged. A response without `tid` now fails
-  loudly instead of falling back to the hash, because a silent fallback restores the defect
-  invisibly.
-
-  Hyperliquid documents `tid` as unique per fill but qualified by coin rather than globally, so
-  callers reconciling across instruments should qualify it the same way.
-
-- **Hyperliquid spot fills report the fee asset the venue charged** (`rustrade-execution`). The REST
-  path inferred it from the side — base for a buy, quote for a sell — because the SDK's response
-  type does not expose `feeToken`. It is available now that this client parses the response itself,
-  and the inference survives only as a fallback. The stream path already used `feeToken` and is
-  unchanged. The quote-equivalence test alongside it became case-insensitive, matching the stream:
-  the fee asset is no longer a substring of `coin` and so is no longer byte-equal to the quote asset
-  by construction.
-
-- **Hyperliquid deduplicates fills on the account stream** (`rustrade-execution`). The `userFills`
-  subscription opens with a snapshot of recent fills and the SDK resubscribes on reconnect, so every
-  reconnect redelivered fills already sent. A trade is a delta the consumer accumulates, so each
-  redelivery double-counted filled quantity and fees. The module documentation claimed
-  deduplication was "SDK-managed; no custom dedup cache needed", which was never true.
-
-  Order updates are deliberately not deduplicated: they assert absolute state, so a replayed one is
-  idempotent while a dropped one could strand a consumer on stale state. `fetch_trades` does not
-  deduplicate either — it answers the window it was asked for.
-
-  This had to land with the id fix rather than after it. Keyed on the old hash-derived id, the cache
-  would have discarded the second and subsequent fills of every sweep.
-
-- **A replaced resting order no longer leaks the balance held against it** (`rustrade-execution`).
-  Re-opening a `ClientOrderId` that was already resting replaced the order under it, and
-  `OpenOrders::insert` returns the displaced order's reservation precisely because it is still held
-  against the account — but `SimulatedVenue` discarded it. Nothing else would ever release it, so
-  `free` stayed down and `Balance::used` overstated by that amount for the rest of the run,
-  silently. It is now released, and `OpenOrders::insert` is `#[must_use]` so it cannot be dropped
-  again without a warning.
-
-- **A resting order that arrived part-filled no longer settles and prints its whole quantity**
-  (`rustrade-execution`). `SimulatedVenue`'s matching built its settlement, its `Trade` and its
-  terminal snapshot from an order's full `quantity`, ignoring the `Open::filled_quantity` the order
-  carried. An order that reached the book with part of its quantity already done — which a
-  configured `initial_state` copied out of a live account may seed — therefore paid for that part a
-  second time in the balance ledger, and printed a trade larger than the quantity that was left to
-  trade. It now settles and prints the remainder alone.
-
-  A fill that completes such an order also reports no `avg_price`. This venue struck one of the
-  fills behind the order's total and never saw the other, so its own limit is that fill's price
-  rather than the mean of both — `Filled::avg_price` is optional for exactly that, and a consumer
-  needing the mean has both trades to compute it from. An order that reached the book with nothing
-  done still reports the price it filled at, unchanged.
-
-  Resting holds the same invariant from the other side: an order is booked reserving against its
-  unfilled remainder and carrying what it has already done, so what is held and what is later
-  settled are the same quantity at the same price. Both are the whole quantity for every order this
-  venue books itself, which fills nothing before it rests — so no existing result moves.
-
-### Changed
-
-- **A market-driven simulated venue prices a market order from its own book**
-  (`rustrade-execution`, `rustrade`). ⚠️ **Behaviour change, and it moves backtest results at a
-  non-zero `latency_ms`.** A `SimulatedVenue` in `VenueRegime::MarketDriven` — the regime `SimRunner`
-  drives — now prices every fill from the market its driver feeds it, as a live venue prices from
-  its own book. It previously used `RequestOpen::market`, the snapshot the sender stamped at
-  decision time.
-
-  Combined with booking each request at the instant it arrives, this is what makes `to_venue`
-  price-relevant: an order pays the market it reaches, not the market it was decided against. While
-  a market order was priced from its request, `latency_ms` changed only *when* a result was
-  delivered and never *what* it was, so a backtest could raise it to any value and report identical
-  fills. `RequestOpen::market` is now decision-time provenance alone on this path, which is what it
-  is documented to be, and the gap between it and the fill is implementation shortfall — a quantity
-  that was identically zero while the two were the same snapshot.
-
-  `VenueRegime::RequestPriced` is unchanged and still prices from the request, so `MockExchange` and
-  `MockExecution` results do not move. **Nor does anything at `latency_ms: 0`**, where the two
-  snapshots are the same instant's.
-
-  A `MarketDriven` venue that has never been fed an instrument now **rejects** a market order in it
-  as unpriceable rather than falling back to the requester's snapshot. Falling back would make the
-  fill depend on which of the two happened to hold a price.
-
-  **The committed tear sheet moved by one number**: closing USDT on the 40-order fixture, by
-  0.0029 on 1312.42 spent — 0.022bp, the price drift over one 50ms outbound leg. Nothing else in the
-  artifact changed, because the fixture opens positions and never closes them, so no realised PnL
-  or return statistic depends on the fill price.
-
-### Added
 
 - **A simulated request is booked when it reaches its venue, not when the `Engine` sends it**
   (`rustrade`). `SimRunner` queues each `ExecutionRequest` at `time + to_venue` alongside the
@@ -1138,6 +845,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   driver for the simulated venue would have needed another.
 
 ### Changed
+
+- **BREAKING: `Trade` carries the order's cumulative filled quantity** (`rustrade-execution`). A
+  fill states two things — that an execution happened, and what it left the order at — and a
+  consumer that tracks order state needs both. Until now only the first crossed the API boundary,
+  so an order could be advanced only by a separate order snapshot. Where a venue sends no such
+  message, or sends one the consumer never receives, the order stood still while its position moved.
+
+  `Trade` gains `order_filled_quantity: Option<Decimal>`, placed after `quantity` — which remains
+  the size of *this* execution. `Trade::new` therefore takes one more argument. The field is
+  `#[serde(default)]`, so trades serialised before it existed still deserialise, as `None`.
+
+  `InstrumentState::update_from_trade` now advances the order the fill was against to that figure,
+  retiring it once nothing remains. Three properties make this safe to drive from a fill stream:
+
+  - **Idempotent.** The order advances to `max(current, reported)` and is never incremented, so a
+    re-delivered fill, or two arriving out of order, cannot double-count. Accumulating each
+    execution's size would.
+  - **Cannot resurrect.** It only ever updates an order already tracked as `Open` with that exact
+    exchange id. A fill arriving after its order retired is inert — unlike an order snapshot, which
+    reaches an arm that inserts, and which is why that path needs a liveness gate at the client.
+  - **Nothing is fabricated.** A venue that does not report a cumulative sends `None`, and the order
+    is left for a snapshot or a reconciliation fetch. `None` is not a claim that nothing is filled.
+
+  `Option` is the point rather than an accommodation: whether a venue tells you this is now a visible
+  fact in the data instead of an invisible difference between code paths. Reported by Binance Spot
+  and Margin over WebSocket (`z`), by Alpaca over WebSocket (`order.filled_qty`) and by Interactive
+  Brokers (`cumulative_quantity`, previously discarded); not by Hyperliquid's `userFills`, nor by
+  either venue's REST trade history. The simulated venue reports it, so a backtest and a live
+  session now agree about what is still working.
+
+  Migration: pass `None` at any call site building a `Trade` that is not a venue-reported execution
+  — the engine's own position-flip and expiry-settlement trades do exactly that.
+
+- **Account-event deduplication moved to `client::dedup`** (`rustrade-execution`), shared by the
+  Binance and Hyperliquid clients instead of living inside `client::binance::shared`. Crate-internal
+  only — nothing public moved, and Binance call sites are unchanged via a re-export. The cache's
+  documentation is now venue-neutral, and says why the key carries the instrument: venue ids are
+  routinely per-symbol rather than global.
+
+- **`SimulatedVenue` mints trade ids from a sequence of their own** (`rustrade-execution`). They
+  were derived from the order's id, which was unique only while one order produced at most one
+  fill — no longer true now that an order can fill in part on arrival and again when its remainder
+  is crossed, where the two trades would have collided. `Trade::order_id` is still how a trade says
+  which order it belongs to.
+
+  `TradeId` also gains the documentation it never had, and a `Display` impl for parity with the
+  other id types. Note what it now states: **uniqueness is the venue's to define and is often
+  narrower than global** (Binance's are per symbol), and the derived `Ord` is lexicographic byte
+  order carrying no chronological meaning — order trades by `Trade::time_exchange`.
+
+- **`AccountState::debit_filled` is replaced by `AccountState::commit`** (`rustrade-execution`),
+  taking a `Debit` that names the asset once and splits an arrival into what it settled and what it
+  holds. **Breaking.** One arrival is now one fallible ledger operation and one balance
+  restatement, including the arrival that both settles a fill and holds against a resting
+  remainder. Settling and then reserving as two calls could commit the first and be refused the
+  second, leaving the venue's ledger permanently short with no event to say so; asking for the whole
+  requirement up front makes that state unreachable rather than merely avoided.
+
+
+- **A market-driven simulated venue prices a market order from its own book**
+  (`rustrade-execution`, `rustrade`). ⚠️ **Behaviour change, and it moves backtest results at a
+  non-zero `latency_ms`.** A `SimulatedVenue` in `VenueRegime::MarketDriven` — the regime `SimRunner`
+  drives — now prices every fill from the market its driver feeds it, as a live venue prices from
+  its own book. It previously used `RequestOpen::market`, the snapshot the sender stamped at
+  decision time.
+
+  Combined with booking each request at the instant it arrives, this is what makes `to_venue`
+  price-relevant: an order pays the market it reaches, not the market it was decided against. While
+  a market order was priced from its request, `latency_ms` changed only *when* a result was
+  delivered and never *what* it was, so a backtest could raise it to any value and report identical
+  fills. `RequestOpen::market` is now decision-time provenance alone on this path, which is what it
+  is documented to be, and the gap between it and the fill is implementation shortfall — a quantity
+  that was identically zero while the two were the same snapshot.
+
+  `VenueRegime::RequestPriced` is unchanged and still prices from the request, so `MockExchange` and
+  `MockExecution` results do not move. **Nor does anything at `latency_ms: 0`**, where the two
+  snapshots are the same instant's.
+
+  A `MarketDriven` venue that has never been fed an instrument now **rejects** a market order in it
+  as unpriceable rather than falling back to the requester's snapshot. Falling back would make the
+  fill depend on which of the two happened to hold a price.
+
+  **The committed tear sheet moved by one number**: closing USDT on the 40-order fixture, by
+  0.0029 on 1312.42 spent — 0.022bp, the price drift over one 50ms outbound leg. Nothing else in the
+  artifact changed, because the fixture opens positions and never closes them, so no realised PnL
+  or return statistic depends on the fill price.
+
 
 - **BREAKING**: **`FillModel::fill_price` takes a single `FillContext`, and a fill model no longer
   sees the order's limit price** (`rustrade-execution`).
@@ -2096,6 +1890,210 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lexicographic field-order) derived orderings with it.
 
 ### Fixed
+
+- **BREAKING: an Alpaca subscription is now confirmed symbol by symbol, not by counting replies**
+  (`rustrade-data`). Alpaca answers a multi-symbol subscribe with a single frame listing the
+  symbols it actually registered. The client used the standard validator, which succeeds once it
+  has seen the expected *number* of non-error replies — and `expected_responses` was 1. A
+  confirmation naming one of two requested symbols was therefore indistinguishable from one naming
+  both, and the caller was handed a stream silently subscribed to less than it asked for. The same
+  gap let `[{"T":"success", ...}]`, which names no symbols at all, satisfy the subscribe.
+
+  `AlpacaWebSocketSubValidator` replaces the counting validator: every requested subscription must
+  be named in a confirmation before `init()` returns, and anything still outstanding when the
+  timeout expires fails the subscribe and is reported by name.
+
+  **This can surface as a subscribe error where one previously succeeded** — that is the point, but
+  it is a behaviour change for anyone who was unknowingly running a partial subscription. The
+  `Connector::SubValidator` associated type for the Alpaca connectors changes accordingly, and the
+  `expected_responses` override is gone, since coverage rather than a count now decides.
+
+  Note this does **not** mean a confirmed symbol will produce data promptly. Alpaca's crypto feed
+  publishes a quote on top-of-book change, and the delay before a symbol first ticks is large and
+  variable — 1s, 15s, 96s and 132s for four symbols confirmed on one connection in a single 300s
+  window. Absence of data is not evidence of a failed subscription.
+
+- **An Alpaca fill recovered after a disconnect now reports where it left the order**
+  (`rustrade-execution`). Recovery reads the account-activities endpoint, whose FILL activities
+  carry the order's cumulative filled quantity as `cum_qty`. The client discarded that field, so a
+  recovered fill advanced the position and left the order untouched — precisely the orders a
+  reconnect exists to repair. It is now parsed into `Trade::order_filled_quantity`, so the order
+  advances from the fill itself, with no extra API call and no reconciliation fetch.
+
+  **This also corrects a dedup mis-keying between the two paths.** Both key a fill as
+  `"{order_id}:{cumulative}"`, but only the WebSocket path used the venue's own cumulative;
+  recovery reconstructed one by counting executions from zero *within the recovery batch*. For an
+  order that had already partly filled before the window, the two paths therefore produced
+  different keys for the same execution, and it could be delivered twice. The key is now taken from
+  `cum_qty`, so it agrees with the WebSocket path by construction rather than by reconstruction.
+  Where Alpaca omits the field the previous counting behaviour is kept unchanged, including its
+  limitations.
+
+  Binance Spot and Margin recovery is unaffected and unchanged: REST `myTrades` reports executions
+  only, with no cumulative, so a recovered fill there still reports `None` rather than a figure
+  invented from a second endpoint. Both clients now say so at the call site, and
+  `Trade::order_filled_quantity` documents which producers report it.
+
+- **A Binance Spot fill's order snapshot now reaches the consumer** (`rustrade-execution`). The
+  account stream deduplicates events before forwarding them, and an order snapshot's dedup key was
+  the order's exchange id alone. An order's acknowledgement and every fill against it carry that one
+  id, so the acknowledgement — which reports nothing filled — suppressed each fill snapshot behind
+  it and `Open::filled_quantity` never moved. The defect fixed below was therefore corrected in the
+  converter and undone one stage later, on Binance Spot only; Alpaca derives dedup keys from
+  executions alone and was unaffected.
+
+  The key now carries the order's cumulative filled quantity, so successive states of one order stay
+  distinct while a genuinely re-delivered frame still collapses. That suppression is load-bearing
+  rather than an optimisation: a replayed acknowledgement for an order that has since retired is a
+  partially-filled snapshot for an untracked order, which the engine inserts as a live resting order.
+
+  Every test covering the change below drives the converter directly, which is upstream of the gate
+  that discarded its output. The new tests drive a frame through convert-then-deduplicate — the seam
+  where this failed.
+
+- **A REST order snapshot is stamped with when the order last changed, not when it was created**
+  (`rustrade-execution`, Alpaca and Binance Spot). The engine orders an order's states by
+  `Open::time_exchange` and discards a snapshot older than the state it already tracks. Both clients
+  stamped a fetched order with its creation time, which is identical across every snapshot of that
+  order — so once a WebSocket fill had advanced the tracked order, a reconciliation fetch was thrown
+  away as stale, silently, for exactly the partially-filled orders it exists to repair. Reconciling
+  order state after a reconnect is a documented caller obligation on both clients, and it had stopped
+  discharging anything.
+
+  Both clients now prefer the venue's last-update field (Binance `updateTime`, Alpaca `updated_at`),
+  falling back to creation time only where the venue omits it. `Open::time_exchange` and
+  `Open::filled_quantity` now document what a producer must put in them.
+
+- **A WebSocket partial fill now advances `Open::filled_quantity`** (`rustrade-execution`,
+  Alpaca and Binance Spot). Both clients mapped one venue frame to at most one `AccountEvent`, and
+  `filled_quantity` is only ever carried into engine state by an order snapshot. The fill arms
+  emitted the execution and nothing else, so `filled_quantity` was written only when the order was
+  first acknowledged — where it is `0`. Between acknowledgement and the next REST reconciliation, a
+  half-executed order read as having its full original quantity still working, and anything sizing,
+  netting or risk-checking off `quantity_remaining()` over-counted by the amount already filled.
+
+  A fill frame genuinely carries two facts — the execution print and the order's new cumulative
+  filled quantity — so it now maps to both a `Trade` and an `OrderSnapshot`. The execution is always
+  emitted first: a fully-filled snapshot retires its order, and routing a fill against an order that
+  has already been retired is a strictly harder problem than routing it against a live one.
+
+  This also settles a completed order. A `fill` (not just a `partial_fill`) reports nothing left to
+  fill, which is how the engine learns the order is done; previously neither client's WS path ever
+  moved an order out of `Open`, leaving a resting order that no longer existed at the venue until
+  REST reconciliation removed it.
+
+  A fill is written back as an `Open` snapshot only when the frame's own order status says the order
+  was still working — `partially_filled`/`filled` on Alpaca, `PARTIALLY_FILLED`/`FILLED` in Binance's
+  `X` field. A fill arriving after its order's terminal frame therefore still reports its execution,
+  but cannot resurrect a retired order as a resting one. IBKR and Hyperliquid were never affected:
+  both venues send order state and executions as separate messages, so each already mapped to its own
+  event.
+
+  The two internal converters return `[Option<UnindexedAccountEvent>; 2]` rather than
+  `Option<UnindexedAccountEvent>`. Both are private; no public API changed.
+
+- **A Hedging fill arriving after its order retired now reaches the position the strategy chose**
+  (`rustrade`). In `OmsMode::Hedging`, routing-table lifetime was coupled to membership of
+  `InstrumentState::orders`: retiring an order pruned the `exchange_id → ClientOrderId → PositionId`
+  chain that a fill arriving *after* its terminal snapshot needs, so the fill opened a position under
+  its raw exchange `OrderId` and that order's PnL was split across two slots with nothing to rejoin
+  them. `update_from_order_snapshot` compensated — but by restoring those entries into the same live
+  maps, so the next retirement pruned them again. The window held **one** order per instrument, and
+  only for an order retired as `Open`-with-nothing-left or `FullyFilled`. A **cancelled** order got no
+  compensation at all, so an IOC's fill reported after the cancel that closed it never routed — which
+  is the case `Cancelled::filled_quantity` exists for.
+
+  `cleanup_routing_tables` now **demotes** that chain into a new `InstrumentState::retired_routing`
+  instead of dropping it, and `update_from_trade` consults it once both live lookups have missed. The
+  window spans `MAX_RETIRED_ROUTING` (64) retirements per instrument, evicting oldest first; a fill
+  beyond that bound falls back exactly as before.
+
+  Only a chain that resolves end to end is demoted, and that is what keeps the corporate-action split
+  path out of it. That path prunes `position_ids` **by value** while leaving the order resting, so the
+  join finds no `PositionId`, nothing is kept, and a late fill there still reaches the fallback —
+  deliberately, because routing it would reopen a position a reverse split floored to zero. The
+  one-order compensation is retained rather than replaced: an order that fills fully on ack has no
+  `exchange_id_to_cid` entry at the moment `cleanup_routing_tables` runs, so there is nothing to
+  demote, and the entries it restores are what the *next* retirement demotes.
+
+  Two consequences beyond the split itself are also closed. Because both live lookups missed, the fill
+  reached the no-order-matched arm and was counted under `TearSheet::fills_unmatched` — conflating it
+  with a genuinely external fill, for which one position per order is a defensible reading, and
+  leaving the split-position banner silent on a real split. And before falling back, that arm buffers
+  a fill into `pending_fills` whenever any *other* order is `OpenInFlight`; a buffered fill is only
+  released by an ack for an order still tracked in `orders`, so a fill for an already-retired order
+  was never replayed and never dropped, growing that `Vec` for the rest of the run. The retired map is
+  consulted before the buffer, so neither happens.
+
+  `retired_routing` is `#[serde(default)]` so existing snapshots load, stays empty under
+  `OmsMode::Netting` where one position key makes the failure unreachable, and is cleared alongside
+  the other routing tables on contract expiry in both the live handler and the audit replica.
+
+- **Hyperliquid trade ids identify the fill rather than the transaction** (`rustrade-execution`).
+  A `Trade`'s id came from `fill.hash`, which is the L1 transaction hash. One aggressive order
+  sweeping several resting orders produces several fills under a single hash, so those fills all
+  arrived carrying the same `TradeId`. Anything reconciling on it — which is what a caller does with
+  `fetch_trades` after a reconnect — treated a multi-level sweep as one fill and dropped the rest,
+  understating both filled quantity and fees. The id is now the venue's `tid`, which is per-fill.
+
+  On the REST path this required parsing `userFills` into this client's own `UserFill` rather than
+  `hyperliquid_rust_sdk`'s `UserFillsResponse`, which models neither `tid` nor `feeToken` and — with
+  no `deny_unknown_fields` — discards both silently. The request goes through the SDK's own HTTP
+  client, so base URL, TLS and error mapping are unchanged. A response without `tid` now fails
+  loudly instead of falling back to the hash, because a silent fallback restores the defect
+  invisibly.
+
+  Hyperliquid documents `tid` as unique per fill but qualified by coin rather than globally, so
+  callers reconciling across instruments should qualify it the same way.
+
+- **Hyperliquid spot fills report the fee asset the venue charged** (`rustrade-execution`). The REST
+  path inferred it from the side — base for a buy, quote for a sell — because the SDK's response
+  type does not expose `feeToken`. It is available now that this client parses the response itself,
+  and the inference survives only as a fallback. The stream path already used `feeToken` and is
+  unchanged. The quote-equivalence test alongside it became case-insensitive, matching the stream:
+  the fee asset is no longer a substring of `coin` and so is no longer byte-equal to the quote asset
+  by construction.
+
+- **Hyperliquid deduplicates fills on the account stream** (`rustrade-execution`). The `userFills`
+  subscription opens with a snapshot of recent fills and the SDK resubscribes on reconnect, so every
+  reconnect redelivered fills already sent. A trade is a delta the consumer accumulates, so each
+  redelivery double-counted filled quantity and fees. The module documentation claimed
+  deduplication was "SDK-managed; no custom dedup cache needed", which was never true.
+
+  Order updates are deliberately not deduplicated: they assert absolute state, so a replayed one is
+  idempotent while a dropped one could strand a consumer on stale state. `fetch_trades` does not
+  deduplicate either — it answers the window it was asked for.
+
+  This had to land with the id fix rather than after it. Keyed on the old hash-derived id, the cache
+  would have discarded the second and subsequent fills of every sweep.
+
+- **A replaced resting order no longer leaks the balance held against it** (`rustrade-execution`).
+  Re-opening a `ClientOrderId` that was already resting replaced the order under it, and
+  `OpenOrders::insert` returns the displaced order's reservation precisely because it is still held
+  against the account — but `SimulatedVenue` discarded it. Nothing else would ever release it, so
+  `free` stayed down and `Balance::used` overstated by that amount for the rest of the run,
+  silently. It is now released, and `OpenOrders::insert` is `#[must_use]` so it cannot be dropped
+  again without a warning.
+
+- **A resting order that arrived part-filled no longer settles and prints its whole quantity**
+  (`rustrade-execution`). `SimulatedVenue`'s matching built its settlement, its `Trade` and its
+  terminal snapshot from an order's full `quantity`, ignoring the `Open::filled_quantity` the order
+  carried. An order that reached the book with part of its quantity already done — which a
+  configured `initial_state` copied out of a live account may seed — therefore paid for that part a
+  second time in the balance ledger, and printed a trade larger than the quantity that was left to
+  trade. It now settles and prints the remainder alone.
+
+  A fill that completes such an order also reports no `avg_price`. This venue struck one of the
+  fills behind the order's total and never saw the other, so its own limit is that fill's price
+  rather than the mean of both — `Filled::avg_price` is optional for exactly that, and a consumer
+  needing the mean has both trades to compute it from. An order that reached the book with nothing
+  done still reports the price it filled at, unchanged.
+
+  Resting holds the same invariant from the other side: an order is booked reserving against its
+  unfilled remainder and carrying what it has already done, so what is held and what is later
+  settled are the same quantity at the same price. Both are the whole quantity for every order this
+  venue books itself, which fills nothing before it rests — so no existing result moves.
+
 
 - **An order reported as fully filled by an `Open` snapshot is no longer tracked as active**
   (`rustrade`). `OrderManager`'s `Open` → `Open` transition overwrote the tracked state without
