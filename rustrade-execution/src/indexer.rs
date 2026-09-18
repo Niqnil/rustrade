@@ -394,6 +394,7 @@ impl AccountEventIndexer {
             side,
             price: trade_price,
             quantity,
+            order_filled_quantity,
             fees,
         } = trade;
 
@@ -427,6 +428,7 @@ impl AccountEventIndexer {
             side,
             price: trade_price,
             quantity,
+            order_filled_quantity,
             fees: AssetFees {
                 asset: fee_asset_index,
                 fees: fees.fees,

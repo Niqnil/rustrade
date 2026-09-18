@@ -3044,6 +3044,9 @@ fn convert_activity_to_trade(
         side,
         price,
         quantity,
+        // The account-activities response does carry the order's cumulative filled quantity, but
+        // this client does not parse it. Until it does, a recovered fill cannot advance the order.
+        None,
         AssetFees::new(
             AssetNameExchange::from("USD"),
             Decimal::ZERO,
@@ -3207,6 +3210,8 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
                 side,
                 price,
                 quantity,
+                // The venue's own cumulative for this order, as of this execution.
+                Some(cum_qty),
                 AssetFees::new(
                     AssetNameExchange::from("USD"),
                     Decimal::ZERO,

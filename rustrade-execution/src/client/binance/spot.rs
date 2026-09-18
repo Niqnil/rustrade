@@ -2028,6 +2028,8 @@ fn convert_my_trade(
         side,
         price,
         quantity,
+        // `myTrades` reports executions only -- no cumulative, no order status.
+        None,
         AssetFees::new(fee_asset, commission, None),
     ))
 }
@@ -2254,6 +2256,10 @@ fn convert_execution_report(
                 .map(AssetNameExchange::from)
                 .unwrap_or_else(|| AssetNameExchange::from("UNKNOWN"));
 
+            // Field `z` is the order's cumulative filled quantity as of this execution, which is
+            // what advances the order; `l` above is this execution alone.
+            let order_filled_quantity = report.z.as_deref().and_then(|s| Decimal::from_str(s).ok());
+
             let trade = Trade::new(
                 trade_id,
                 order_id.clone(),
@@ -2263,6 +2269,7 @@ fn convert_execution_report(
                 side,
                 last_price,
                 last_qty,
+                order_filled_quantity,
                 AssetFees::new(fee_asset, commission, None),
             );
             let trade_event =
@@ -3305,6 +3312,7 @@ mod tests {
             Side::Buy,
             Decimal::ZERO,
             Decimal::ZERO,
+            None,
             AssetFees::new(
                 AssetNameExchange::from("USDT"),
                 Decimal::ZERO,
@@ -3334,6 +3342,7 @@ mod tests {
             Side::Buy,
             Decimal::ZERO,
             Decimal::ZERO,
+            None,
             AssetFees::new(
                 AssetNameExchange::from("USDT"),
                 Decimal::ZERO,

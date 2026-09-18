@@ -342,6 +342,7 @@ impl<AssetKey: Debug + Clone, InstrumentKey> PositionManager<AssetKey, Instrumen
 ///     side: Side::Buy,
 ///     price: dec!(50_000.0),
 ///     quantity: dec!(0.1),
+///     order_filled_quantity: None,
 ///     fees: AssetFees::quote_fees(dec!(5.0))
 /// });
 /// assert_eq!(position.side, Side::Buy);
@@ -357,6 +358,7 @@ impl<AssetKey: Debug + Clone, InstrumentKey> PositionManager<AssetKey, Instrumen
 ///     side: Side::Sell,
 ///     price: dec!(60_000.0),
 ///     quantity: dec!(0.05),
+///     order_filled_quantity: None,
 ///     fees: AssetFees::quote_fees(dec!(2.5))
 /// });
 ///
@@ -390,6 +392,7 @@ impl<AssetKey: Debug + Clone, InstrumentKey> PositionManager<AssetKey, Instrumen
 ///     side: Side::Sell,
 ///     price: dec!(50_000.0),
 ///     quantity: dec!(0.1),
+///     order_filled_quantity: None,
 ///     fees: AssetFees::quote_fees(dec!(5.0))
 /// });
 /// assert_eq!(position.side, Side::Sell);
@@ -405,6 +408,7 @@ impl<AssetKey: Debug + Clone, InstrumentKey> PositionManager<AssetKey, Instrumen
 ///     side: Side::Buy,
 ///     price: dec!(40_000.0),
 ///     quantity: dec!(0.2),
+///     order_filled_quantity: None,
 ///     fees: AssetFees::quote_fees(dec!(10.0))
 /// });
 ///
@@ -623,6 +627,10 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
                     side: trade.side,
                     price: trade.price,
                     quantity: next_position_quantity,
+                    // Synthetic: this is a slice of `trade` opening the next position, not a
+                    // second execution the venue reported. Carrying the cumulative forward would
+                    // apply the same order advance twice.
+                    order_filled_quantity: None,
                     fees: AssetFees {
                         asset: trade.fees.asset.clone(),
                         fees: next_position_fee_enter,

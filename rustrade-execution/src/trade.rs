@@ -63,7 +63,38 @@ pub struct Trade<AssetKey, InstrumentKey> {
     pub time_exchange: DateTime<Utc>,
     pub side: Side,
     pub price: Decimal,
+    /// The size of *this* execution.
     pub quantity: Decimal,
+    /// The order's cumulative filled quantity as of this execution, as the venue reported it --
+    /// **not** the size of this execution, which is [`Trade::quantity`].
+    ///
+    /// A fill carries two facts: that an execution happened, and what it left the order at. A
+    /// consumer that tracks order state needs both, and they arrive together or not at all. Where
+    /// the venue supplies the second, carrying it here lets the order be advanced from the fill
+    /// itself rather than from a separate message that may never come.
+    ///
+    /// Advancing from a cumulative is idempotent: re-applying the same fill, or applying two out
+    /// of order, cannot double-count, because the receiver takes the greater of what it holds and
+    /// what is reported rather than adding to a running total.
+    ///
+    /// `None` means the venue's fill payload does not carry it, and the order's state must be
+    /// learned some other way -- an order snapshot, or a reconciliation fetch. It is not a claim
+    /// that nothing is filled. Known producers, as of writing:
+    ///
+    /// | Source | Reports it |
+    /// |---|---|
+    /// | Binance Spot / Margin WebSocket `executionReport` | yes (`z`) |
+    /// | Binance Spot `myTrades` REST | no |
+    /// | Alpaca WebSocket `trade_updates` | yes (`order.filled_qty`) |
+    /// | Alpaca account-activities REST | no |
+    /// | Interactive Brokers `ExecutionData` | yes (`cumulative_quantity`) |
+    /// | Hyperliquid `userFills` | no |
+    /// | `SimulatedVenue` | yes |
+    ///
+    /// `#[serde(default)]` so trades serialised before this field existed still deserialise, as
+    /// `None`.
+    #[serde(default)]
+    pub order_filled_quantity: Option<Decimal>,
     pub fees: AssetFees<AssetKey>,
 }
 

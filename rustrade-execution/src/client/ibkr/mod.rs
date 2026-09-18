@@ -1932,6 +1932,10 @@ impl ExecutionClient for IbkrClient {
                     side,
                     price: parse_decimal_or_warn(exec.price, "exec.price"),
                     quantity: parse_decimal_or_warn(exec.shares, "exec.shares"),
+                    order_filled_quantity: Some(parse_decimal_or_warn(
+                        exec.cumulative_quantity,
+                        "exec.cumulative_quantity",
+                    )),
                     // IBKR executions API lacks commission data (available via CommissionReport callback).
                     // "UNKNOWN" placeholder will fail indexing - use unindexed or correlate with WS.
                     fees: AssetFees::new(AssetNameExchange::from("UNKNOWN"), Decimal::ZERO, None),

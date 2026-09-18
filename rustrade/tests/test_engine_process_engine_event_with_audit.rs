@@ -1258,6 +1258,7 @@ fn account_event_trade(
             side,
             price: Decimal::try_from(price).unwrap(),
             quantity: Decimal::try_from(quantity).unwrap(),
+            order_filled_quantity: None,
             fees: asset_fees(
                 instrument,
                 Decimal::try_from(price * quantity * QUOTE_FEES_PERCENT).unwrap(),
@@ -1386,6 +1387,7 @@ fn open_option_position(engine: &mut TestEngine, quantity: Decimal, price: Decim
             price,
             quantity,
             // Option instrument quote is USD = AssetIndex(1) in option engine
+            order_filled_quantity: None,
             fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
         }),
     }));
@@ -1705,6 +1707,7 @@ fn open_position_via_trade(
             side,
             price,
             quantity,
+            order_filled_quantity: None,
             fees: asset_fees(instrument, dec!(0)),
         }),
     }));
@@ -2286,6 +2289,7 @@ fn open_option_position_via_trade(
             side,
             price,
             quantity,
+            order_filled_quantity: None,
             fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
         }),
     }));
@@ -3306,6 +3310,7 @@ fn option_trade_event(
             side,
             price,
             quantity,
+            order_filled_quantity: None,
             fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
         }),
     }))
@@ -3584,6 +3589,7 @@ fn open_option_position_side(
             price,
             quantity,
             // Put option instrument quote is USD = AssetIndex(1)
+            order_filled_quantity: None,
             fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
         }),
     }));
@@ -3828,6 +3834,7 @@ fn send_fill(engine: &mut TestEngine, exchange_order_id: OrderId, side: Side, pr
             quantity: dec!(1),
             // BTCUSDT (instrument 0) quote = usdt = AssetIndex(2). Fee is zero here regardless, but
             // use the correct quote asset for the instrument this helper always fills (index 0).
+            order_filled_quantity: None,
             fees: asset_fees(0, Decimal::ZERO),
         }),
     }));
@@ -4543,6 +4550,7 @@ fn test_fee_model_per_contract_augments_trade_fees() {
             price: dec!(1_000),
             quantity: dec!(1),
             // Option engine: quote is USD = AssetIndex(1). Exchange reports zero commission.
+            order_filled_quantity: None,
             fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
         }),
     }));
@@ -5341,6 +5349,7 @@ fn open_position_on(
             price,
             quantity,
             // Quote asset of every instrument in the ambiguous fixture is usd = AssetIndex(1).
+            order_filled_quantity: None,
             fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
         }),
     }));

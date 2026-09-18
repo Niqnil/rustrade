@@ -1399,6 +1399,47 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                 .retain(|cid, v| *v != position_id || self.orders.0.contains_key(cid));
         }
 
+        // Step 5: Advance the order this fill was against.
+        //
+        // Deliberately last. Advancing may retire the order, and every step above needs it still
+        // tracked: the routing resolved in step 1 reads it, and step 4's join asks whether its CID
+        // is still present. The same ordering an execution and its order snapshot are emitted in --
+        // the execution first -- for the same reason.
+        //
+        // Only a venue that reports the order's cumulative alongside the execution reaches this;
+        // `None` means the venue does not, and the order's state must still be learned from a
+        // snapshot or a reconciliation fetch.
+        if let Some(reported) = trade.order_filled_quantity {
+            // O(1) through the reverse index, which is maintained in both OMS modes. The scan is
+            // the same fallback step 1 uses: an order acknowledged but not yet indexed, or one
+            // whose index entry a prune removed.
+            let cid = self
+                .exchange_id_to_cid
+                .get(&trade.order_id)
+                .cloned()
+                .or_else(|| {
+                    self.orders
+                        .0
+                        .iter()
+                        .find_map(|(cid, order)| match &order.state {
+                            ActiveOrderState::Open(open) if open.id == trade.order_id => {
+                                Some(cid.clone())
+                            }
+                            _ => None,
+                        })
+                });
+
+            if let Some(cid) = cid
+                && self
+                    .orders
+                    .update_from_fill(&cid, &trade.order_id, reported)
+            {
+                // The order was untracked, so the routing that pointed at it is now stale. This is
+                // the same obligation a terminal order snapshot discharges.
+                self.cleanup_routing_tables();
+            }
+        }
+
         exited
     }
 
@@ -1625,12 +1666,195 @@ mod tests {
 
     /// A fill reported against exchange `order_id`, with zero fees so an assertion reads the
     /// routing outcome rather than the fee model.
+    /// The cumulative filled quantity the engine currently tracks for `cid`, or `None` if the
+    /// order is no longer tracked.
+    fn tracked_filled(
+        state: &InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex>,
+        cid: &ClientOrderId,
+    ) -> Option<Decimal> {
+        match &state.orders.0.get(cid)?.state {
+            ActiveOrderState::Open(open) => Some(open.filled_quantity),
+            _ => None,
+        }
+    }
+
+    /// A venue that reports the order's cumulative on the fill advances the order from the fill
+    /// alone, with no order snapshot involved. Both OMS modes: `Netting` resolves its position
+    /// without ever looking the order up, so the advance has to be independent of that lookup.
+    #[test]
+    fn a_fill_reporting_its_cumulative_advances_the_order() {
+        for mode in [OmsMode::Netting, OmsMode::Hedging] {
+            let mut state = instrument_state(mode);
+            let cid = ClientOrderId::new("cid-1");
+            let exchange_id = OrderId::new("ex-1");
+            let position_id = PositionId::new("pos-1");
+            rest_order_at_exchange(&mut state, &cid, &exchange_id, Some(&position_id));
+
+            assert_eq!(
+                tracked_filled(&state, &cid),
+                Some(Decimal::ZERO),
+                "{mode:?}"
+            );
+
+            state.update_from_trade(&fill_reporting(
+                exchange_id.clone(),
+                Side::Buy,
+                dec!(3),
+                dec!(3),
+            ));
+            assert_eq!(tracked_filled(&state, &cid), Some(dec!(3)), "{mode:?}");
+
+            // The second fill reports the running total, not its own size.
+            state.update_from_trade(&fill_reporting(
+                exchange_id.clone(),
+                Side::Buy,
+                dec!(4),
+                dec!(7),
+            ));
+            assert_eq!(tracked_filled(&state, &cid), Some(dec!(7)), "{mode:?}");
+        }
+    }
+
+    /// Advancing to a cumulative is idempotent. A re-delivered fill, or two arriving out of
+    /// order, must not move the order backwards or double-count -- which is the whole reason the
+    /// venue's running total is carried rather than each execution's size accumulated.
+    #[test]
+    fn a_redelivered_or_out_of_order_fill_cannot_move_the_order_backwards() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let cid = ClientOrderId::new("cid-1");
+        let exchange_id = OrderId::new("ex-1");
+        let position_id = PositionId::new("pos-1");
+        rest_order_at_exchange(&mut state, &cid, &exchange_id, Some(&position_id));
+
+        let fill = fill_reporting(exchange_id.clone(), Side::Buy, dec!(5), dec!(5));
+        state.update_from_trade(&fill);
+        assert_eq!(tracked_filled(&state, &cid), Some(dec!(5)));
+
+        state.update_from_trade(&fill);
+        assert_eq!(
+            tracked_filled(&state, &cid),
+            Some(dec!(5)),
+            "re-delivering the same fill must not advance the order"
+        );
+
+        state.update_from_trade(&fill_reporting(
+            exchange_id.clone(),
+            Side::Buy,
+            dec!(2),
+            dec!(2),
+        ));
+        assert_eq!(
+            tracked_filled(&state, &cid),
+            Some(dec!(5)),
+            "a fill reporting an older cumulative must not move the order backwards"
+        );
+    }
+
+    /// A fill that leaves nothing to fill retires the order, exactly as a snapshot reporting the
+    /// same thing does. Previously only a snapshot could, so a venue that sent neither left a
+    /// resting order behind that no longer existed at the exchange.
+    #[test]
+    fn a_fill_completing_the_order_retires_it() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let cid = ClientOrderId::new("cid-1");
+        let exchange_id = OrderId::new("ex-1");
+        let position_id = PositionId::new("pos-1");
+        rest_order_at_exchange(&mut state, &cid, &exchange_id, Some(&position_id));
+
+        // The test order's quantity is 10.
+        state.update_from_trade(&fill_reporting(
+            exchange_id.clone(),
+            Side::Buy,
+            dec!(10),
+            dec!(10),
+        ));
+
+        assert!(
+            !state.orders.0.contains_key(&cid),
+            "an order with nothing left to fill must not stay tracked"
+        );
+        assert!(
+            !state.position_ids.contains_key(&cid),
+            "retiring the order must prune the routing that referred to it"
+        );
+    }
+
+    /// A fill can advance an order but never create one, so a fill arriving after its order
+    /// retired is inert. An order *snapshot* in the same position reaches a vacant-entry arm that
+    /// inserts, which is why that path needs a liveness gate at the client and this one does not.
+    #[test]
+    fn a_fill_for_a_retired_order_cannot_resurrect_it() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let cid = ClientOrderId::new("cid-1");
+        let exchange_id = OrderId::new("ex-1");
+        let position_id = PositionId::new("pos-1");
+        rest_order_at_exchange(&mut state, &cid, &exchange_id, Some(&position_id));
+
+        state.update_from_trade(&fill_reporting(
+            exchange_id.clone(),
+            Side::Buy,
+            dec!(10),
+            dec!(10),
+        ));
+        assert!(!state.orders.0.contains_key(&cid), "precondition: retired");
+
+        state.update_from_trade(&fill_reporting(
+            exchange_id.clone(),
+            Side::Buy,
+            dec!(10),
+            dec!(10),
+        ));
+        assert!(
+            !state.orders.0.contains_key(&cid),
+            "a fill must not re-insert an order that has retired"
+        );
+    }
+
+    /// `None` means the venue did not report a cumulative -- not that nothing is filled. The
+    /// order is left for a snapshot or a reconciliation fetch to update, exactly as before.
+    #[test]
+    fn a_fill_without_a_reported_cumulative_leaves_the_order_untouched() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let cid = ClientOrderId::new("cid-1");
+        let exchange_id = OrderId::new("ex-1");
+        let position_id = PositionId::new("pos-1");
+        rest_order_at_exchange(&mut state, &cid, &exchange_id, Some(&position_id));
+
+        state.update_from_trade(&fill(exchange_id.clone(), Side::Buy, dec!(4)));
+
+        assert_eq!(
+            tracked_filled(&state, &cid),
+            Some(Decimal::ZERO),
+            "a fill carrying no cumulative must not be read as one"
+        );
+    }
+
     fn fill(
         order_id: OrderId,
         side: Side,
         quantity: Decimal,
     ) -> Trade<AssetIndex, InstrumentIndex> {
+        fill_inner(order_id, side, quantity, None)
+    }
+
+    /// A fill whose venue also reported the order's cumulative filled quantity.
+    fn fill_reporting(
+        order_id: OrderId,
+        side: Side,
+        quantity: Decimal,
+        cumulative: Decimal,
+    ) -> Trade<AssetIndex, InstrumentIndex> {
+        fill_inner(order_id, side, quantity, Some(cumulative))
+    }
+
+    fn fill_inner(
+        order_id: OrderId,
+        side: Side,
+        quantity: Decimal,
+        order_filled_quantity: Option<Decimal>,
+    ) -> Trade<AssetIndex, InstrumentIndex> {
         Trade {
+            order_filled_quantity,
             id: TradeId::new("trade"),
             order_id,
             instrument: InstrumentIndex(0),

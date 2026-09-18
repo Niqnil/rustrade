@@ -637,6 +637,9 @@ impl SimulatedVenue {
                 side: order.side,
                 price: limit,
                 quantity: remaining,
+                // This fill exhausts the resting order, so its cumulative is everything it had
+                // already done plus what is settled here.
+                order_filled_quantity: Some(order.state.filled_quantity + remaining),
                 fees: settlement.fees,
             };
 
@@ -1344,6 +1347,9 @@ impl SimulatedVenue {
             side,
             price: fill_price,
             quantity: filled_quantity,
+            // An arriving order that aggresses has no prior executions, so this fill is its
+            // whole cumulative.
+            order_filled_quantity: Some(filled_quantity),
             fees: fill.fees,
         };
 

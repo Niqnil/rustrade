@@ -1219,6 +1219,9 @@ impl ExecutionClient for HyperliquidClient {
                 side,
                 price,
                 quantity,
+                // `TradeInfo` carries no cumulative filled quantity; Hyperliquid reports order
+                // state as its own `OrderUpdate` message.
+                order_filled_quantity: None,
                 fees: AssetFees {
                     asset: AssetNameExchange::from("USDC"),
                     fees: fee,
@@ -1250,6 +1253,9 @@ fn fill_to_account_event(fill: &hyperliquid_rust_sdk::TradeInfo) -> Option<Unind
         side,
         price,
         quantity,
+        // `TradeInfo` carries no cumulative filled quantity, so the order's state must be learned
+        // from an `OrderUpdate` -- which Hyperliquid sends as its own message.
+        order_filled_quantity: None,
         fees: AssetFees {
             asset: AssetNameExchange::from("USDC"),
             fees: fee,
