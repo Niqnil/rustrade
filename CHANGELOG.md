@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The London Strategic Edge vault canary no longer races the provider's concurrency cap**
+  (`rustrade-data`, `lse` feature). The vault permits two concurrent requests and
+  `LseVaultClient` never retries a `429` by design, so running the canary's four tests in
+  parallel — the harness default — could put three requests in flight and fail whichever test
+  lost the race with `LseError::RateLimited`. The failure was indistinguishable from the
+  provider-side drift the canary exists to detect. The tests are now `#[serial]`, matching the
+  Alpaca and Massive live tests, which holds the binary to one in-flight request. Test-only; no
+  library behaviour changes.
+
 ## [0.6.0] - 2026-09-18
 
 ### Added
