@@ -6,22 +6,27 @@
 //!
 //! Nothing here is spot- or margin-specific: the parsers operate on rustrade's own types
 //! (`OrderKind`, `TimeInForce`, `Side`) or on Binance's stable wire strings, so both clients
-//! reuse them unchanged. The REST order-response converter joins them via
-//! [`BinanceOrderFields`], which names the field subset that conversion reads -- provably
-//! identical across every Binance order-response type, even though the structs around it are not.
-//! The remaining SDK-typed converters, which differ between spot's WS-API enums and margin's REST
-//! params, deliberately stay in their respective modules.
+//! reuse them unchanged. The two event converters join them the same way, each naming the field
+//! subset it reads as a trait -- [`BinanceOrderFields`] for the REST order-response endpoints,
+//! [`BinanceExecutionReportFields`] for the WebSocket user-data `executionReport`. Those subsets
+//! are provably identical across every SDK type implementing them, even though the structs around
+//! them are not, which is what makes one converter safe to share and keeps a venue name out of
+//! both. The remaining SDK-typed converters, which differ between spot's WS-API enums and
+//! margin's REST params, deliberately stay in their respective modules.
 //!
 //! Event deduplication lives in [`crate::client::dedup`], shared with the other clients that
 //! need it, and is re-exported here so Binance call sites keep a single import site.
 
 use crate::{
-    error::{ApiError, ConnectivityError, OrderError, UnindexedClientError},
+    AccountEventKind, UnindexedAccountEvent,
+    error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
     order::{
         Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
         id::{ClientOrderId, OrderId, StrategyId},
-        state::Open,
+        request::UnindexedOrderResponseCancel,
+        state::{Cancelled, Open, OrderState},
     },
+    trade::{AssetFees, Trade, TradeId},
 };
 
 // Deduplication moved to `client::dedup` when Hyperliquid needed the same machinery; re-exported
@@ -30,7 +35,7 @@ pub(crate) use crate::client::dedup::{
     SharedDedupCache, dedup_key_from_event, is_duplicate, new_dedup_cache,
 };
 use binance_sdk::common::errors::{ConnectorError, WebsocketError};
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
     Side, asset::name::AssetNameExchange, exchange::ExchangeId,
@@ -44,7 +49,7 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 // ---------------------------------------------------------------------------
 // AbortOnDropStream — ensures connection_manager task is cleaned up
@@ -540,6 +545,466 @@ pub(crate) fn convert_open_order_owned_symbol<T: BinanceOrderFields>(
         }
     };
     convert_open_order(o, exchange, &instrument)
+}
+
+// ---------------------------------------------------------------------------
+// executionReport conversion (WebSocket user-data stream)
+// ---------------------------------------------------------------------------
+
+/// The subset of a Binance `executionReport` that [`convert_execution_report`] reads.
+///
+/// As with [`BinanceOrderFields`], binance-sdk generates a distinct nominal type per stream
+/// family and gives them no shared trait: `spot::websocket_api::ExecutionReport` and
+/// `margin_trading::websocket_streams::ExecutionReport`. The two are not interchangeable -- spot
+/// declares 55 fields to margin's 50, and eight fields sharing a name differ in type
+/// (`Option<i64>` on spot against `Option<String>` on margin). None of those eight is named here;
+/// the eighteen below are identical in name and type across both.
+///
+/// Naming that read subset is what makes a single converter safe to share, and keeps the
+/// dependency on the SDK explicit: a change to any *other* field cannot silently alter execution
+/// handling, and a correction to the conversion reaches every Binance client at once.
+///
+/// Accessors borrow rather than consume, so one report can serve both events a `TRADE` produces.
+pub(crate) trait BinanceExecutionReportFields {
+    /// Binance field `x`: what happened (`NEW`, `TRADE`, `CANCELED`, ...).
+    fn execution_type(&self) -> Option<&str>;
+    /// Binance field `X`: the order's status *after* this execution, which is not the same
+    /// question as `execution_type` -- a `TRADE` may leave the order `PARTIALLY_FILLED`,
+    /// `FILLED`, or already retired by a report that overtook it.
+    fn order_status(&self) -> Option<&str>;
+    /// Binance field `s`.
+    fn symbol(&self) -> Option<&str>;
+    /// Binance field `S`.
+    fn side(&self) -> Option<&str>;
+    /// Binance field `i`: the venue's order id.
+    fn order_id(&self) -> Option<i64>;
+    /// Binance field `c`.
+    fn client_order_id(&self) -> Option<&str>;
+    /// Binance field `T`: transaction time, in milliseconds.
+    fn transaction_time(&self) -> Option<i64>;
+    /// Binance field `t`: the execution's own id, present only on a `TRADE`.
+    fn trade_id(&self) -> Option<i64>;
+    /// Binance field `L`: the price of this execution alone.
+    fn last_executed_price(&self) -> Option<&str>;
+    /// Binance field `l`: the quantity of this execution alone.
+    fn last_executed_quantity(&self) -> Option<&str>;
+    /// Binance field `n`.
+    fn commission_amount(&self) -> Option<&str>;
+    /// Binance field `N`: the asset the commission was charged in, which need not be either leg
+    /// of the traded pair.
+    fn commission_asset(&self) -> Option<&str>;
+    /// Binance field `z`: the *order's* cumulative filled quantity as of this execution, as
+    /// opposed to `last_executed_quantity`, which is this execution alone.
+    fn cumulative_filled_quantity(&self) -> Option<&str>;
+    /// Binance field `r`.
+    fn reject_reason(&self) -> Option<&str>;
+    /// Binance field `o`.
+    fn order_type(&self) -> Option<&str>;
+    /// Binance field `p`: the order's limit price, `"0"` on order kinds that carry none.
+    fn price(&self) -> Option<&str>;
+    /// Binance field `q`: the order's total quantity, as opposed to any executed portion of it.
+    fn order_quantity(&self) -> Option<&str>;
+    /// Binance field `f`.
+    fn time_in_force(&self) -> Option<&str>;
+}
+
+/// Implement [`BinanceExecutionReportFields`] for SDK types that share these field names.
+///
+/// Every struct listed below declares these eighteen fields with the same types, so the accessors
+/// are identical; a macro keeps them from drifting apart under hand-editing.
+macro_rules! impl_binance_execution_report_fields {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl BinanceExecutionReportFields for $t {
+                fn execution_type(&self) -> Option<&str> { self.x.as_deref() }
+                fn order_status(&self) -> Option<&str> { self.x_uppercase.as_deref() }
+                fn symbol(&self) -> Option<&str> { self.s.as_deref() }
+                fn side(&self) -> Option<&str> { self.s_uppercase.as_deref() }
+                fn order_id(&self) -> Option<i64> { self.i }
+                fn client_order_id(&self) -> Option<&str> { self.c.as_deref() }
+                fn transaction_time(&self) -> Option<i64> { self.t_uppercase }
+                fn trade_id(&self) -> Option<i64> { self.t }
+                fn last_executed_price(&self) -> Option<&str> { self.l_uppercase.as_deref() }
+                fn last_executed_quantity(&self) -> Option<&str> { self.l.as_deref() }
+                fn commission_amount(&self) -> Option<&str> { self.n.as_deref() }
+                fn commission_asset(&self) -> Option<&str> { self.n_uppercase.as_deref() }
+                fn cumulative_filled_quantity(&self) -> Option<&str> { self.z.as_deref() }
+                fn reject_reason(&self) -> Option<&str> { self.r.as_deref() }
+                fn order_type(&self) -> Option<&str> { self.o.as_deref() }
+                fn price(&self) -> Option<&str> { self.p.as_deref() }
+                fn order_quantity(&self) -> Option<&str> { self.q.as_deref() }
+                fn time_in_force(&self) -> Option<&str> { self.f.as_deref() }
+            }
+        )*
+    };
+}
+
+impl_binance_execution_report_fields!(
+    binance_sdk::spot::websocket_api::ExecutionReport,
+    binance_sdk::margin_trading::websocket_streams::ExecutionReport,
+);
+
+/// Whether a `TRADE` report's order status says the order is still live at the exchange, and may
+/// therefore be written into engine state as an `Open` snapshot.
+///
+/// A `TRADE` report carries the order's status (`X`) alongside the execution. Only
+/// `PARTIALLY_FILLED` and `FILLED` say the order reached this execution while working; every other
+/// status means some other report owns the order's current state. Writing an `Open` snapshot from
+/// one of those would resurrect an order the engine has already retired, leaving a resting order
+/// that does not exist at the exchange -- a fill that arrives after its order's terminal report is
+/// exactly the ordering this guards against.
+fn trade_order_is_live(status: &str) -> bool {
+    matches!(status, "PARTIALLY_FILLED" | "FILLED")
+}
+
+/// Convert a Binance `executionReport` into rustrade account events, appended to `buf`.
+///
+/// A `TRADE` report genuinely carries two facts -- the execution print (`l`/`L`) and the order's
+/// new cumulative filled quantity (`z`) -- so it appends both a `Trade` and an `OrderSnapshot`.
+/// Every other execution type appends at most one event, and an unusable report appends none.
+///
+/// The `Trade` is always first. A fully-filled snapshot retires its order, and routing a fill
+/// against an order that has already been retired is a strictly harder problem than routing it
+/// against a live one; appending the execution first keeps the easy ordering.
+///
+/// `exchange` stamps every event and every diagnostic below, so one implementation serves each
+/// Binance client without a venue name baked into its warnings.
+// Inherent complexity: one arm per Binance execution type (TRADE, NEW, CANCELED, EXPIRED,
+// REJECTED, REPLACE), each validating the fields its own variant needs.
+#[allow(clippy::cognitive_complexity)]
+pub(crate) fn convert_execution_report<T: BinanceExecutionReportFields>(
+    report: &T,
+    exchange: ExchangeId,
+    buf: &mut Vec<UnindexedAccountEvent>,
+) {
+    let Some(exec_type) = report.execution_type() else {
+        warn!(%exchange, "Binance executionReport missing execution type (x), dropping");
+        return;
+    };
+    let Some(symbol) = report.symbol().map(InstrumentNameExchange::new) else {
+        warn!(%exchange, "Binance executionReport missing symbol (s), dropping");
+        return;
+    };
+    // Check order_id first -- if it is missing the event is dropped, so avoid constructing cid.
+    let Some(order_id_raw) = report.order_id() else {
+        warn!(%exchange, %symbol, "Binance executionReport missing orderId (i), dropping");
+        return;
+    };
+    let order_id = OrderId(format_smolstr!("{order_id_raw}"));
+    let cid = match report.client_order_id() {
+        Some(c) => ClientOrderId::new(c),
+        None => ClientOrderId::new(order_id.0.as_str()),
+    };
+
+    let time_exchange = match report
+        .transaction_time()
+        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+    {
+        Some(t) => t,
+        None => {
+            warn!(%exchange, %symbol, "Binance executionReport missing/unparseable transaction time (T), using now");
+            Utc::now()
+        }
+    };
+
+    match exec_type {
+        "NEW" => {
+            buf.extend(convert_order_snapshot(
+                report,
+                exchange,
+                symbol,
+                cid,
+                order_id,
+                time_exchange,
+            ));
+        }
+        "TRADE" => {
+            // Partial or full fill.
+            let Some(trade_id) = report.trade_id() else {
+                warn!(%exchange, %symbol, "Binance TRADE event missing trade ID (t), dropping");
+                return;
+            };
+            let trade_id = TradeId(format_smolstr!("{trade_id}"));
+            // parse_side already logs a warning on unknown values.
+            let Some(side) = report.side().and_then(parse_side) else {
+                warn!(%exchange, %symbol, "Binance TRADE event missing/unknown side (S), dropping");
+                return;
+            };
+            let last_price = match report.last_executed_price() {
+                Some(s) => match Decimal::from_str(s) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(%exchange, %symbol, error = %e, raw = s, "Binance TRADE event unparseable last price (L), dropping fill");
+                        return;
+                    }
+                },
+                None => {
+                    warn!(%exchange, %symbol, "Binance TRADE event missing last price (L), dropping fill");
+                    return;
+                }
+            };
+            let last_qty = match report.last_executed_quantity() {
+                Some(s) => match Decimal::from_str(s) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(%exchange, %symbol, error = %e, raw = s, "Binance TRADE event unparseable last qty (l), dropping fill");
+                        return;
+                    }
+                },
+                None => {
+                    warn!(%exchange, %symbol, "Binance TRADE event missing last qty (l), dropping fill");
+                    return;
+                }
+            };
+            // Commission parse failure: log and default to 0 rather than dropping the fill.
+            let commission = match Decimal::from_str(report.commission_amount().unwrap_or("0")) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(%exchange, %symbol, error = %e, "Binance TRADE event unparseable commission (n), defaulting to 0");
+                    Decimal::ZERO
+                }
+            };
+            // Use the venue's own commission asset (N: e.g. BNB, USDT, BTC). fees_quote is None
+            // here; the indexer computes it if the fee is in the quote or base asset. The
+            // "UNKNOWN" fallback (rare: the API omits N) will fail indexing.
+            let fee_asset = report
+                .commission_asset()
+                .map(AssetNameExchange::from)
+                .unwrap_or_else(|| AssetNameExchange::from("UNKNOWN"));
+            // `z` is the order's cumulative filled quantity as of this execution, which is what
+            // advances the order; `last_qty` above is this execution alone.
+            let order_filled_quantity = report
+                .cumulative_filled_quantity()
+                .and_then(|s| Decimal::from_str(s).ok());
+
+            let trade = Trade::new(
+                trade_id,
+                order_id.clone(),
+                symbol.clone(),
+                StrategyId::unknown(), // Binance doesn't carry strategy IDs
+                time_exchange,
+                side,
+                last_price,
+                last_qty,
+                order_filled_quantity,
+                AssetFees::new(fee_asset, commission, None),
+            );
+            buf.push(UnindexedAccountEvent::new(
+                exchange,
+                AccountEventKind::Trade(trade),
+            ));
+
+            // The execution alone does not move the order: `filled_quantity` is only ever carried
+            // into engine state by an order snapshot, so without this second event a partially
+            // filled order reads as having nothing filled until REST reconciliation refreshes it.
+            // `convert_order_snapshot` reads field `z` (cumulative filled quantity), which is
+            // exactly what a TRADE report carries, so the same builder serves both arms.
+            let order_status = report.order_status().unwrap_or_default();
+            if trade_order_is_live(order_status) {
+                buf.extend(convert_order_snapshot(
+                    report,
+                    exchange,
+                    symbol,
+                    cid,
+                    order_id,
+                    time_exchange,
+                ));
+            } else {
+                trace!(
+                    %exchange,
+                    %symbol,
+                    status = order_status,
+                    "Binance TRADE for an order the exchange no longer reports as working — \
+                     emitting the execution without an order snapshot"
+                );
+            }
+        }
+        "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH" => {
+            buf.push(cancelled_event(
+                report,
+                exchange,
+                symbol,
+                cid,
+                order_id,
+                time_exchange,
+            ));
+        }
+        "REJECTED" => {
+            // Rejected by the matching engine after initial acceptance (e.g. insufficient funds
+            // discovered post-validation). Mapped to OrderCancelled with an error state so the
+            // engine removes this order.
+            let reject_reason = report.reject_reason().unwrap_or("unknown");
+            warn!(
+                %exchange, %symbol, %order_id, reason = reject_reason,
+                "Binance order REJECTED by matching engine"
+            );
+            let response = UnindexedOrderResponseCancel {
+                key: OrderKey::new(exchange, symbol, StrategyId::unknown(), cid),
+                state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
+                    reject_reason.to_string(),
+                ))),
+            };
+            buf.push(UnindexedAccountEvent::new(
+                exchange,
+                AccountEventKind::OrderCancelled(response),
+            ));
+        }
+        "REPLACE" => {
+            // REPLACE is emitted when an order is replaced via the cancel-replace endpoint. The
+            // report describes the CANCELLED original order: field `i` is the original order id
+            // (already extracted as `order_id` above). The replacement arrives as a subsequent
+            // NEW report with its own order id. Emitting OrderCancelled for the original is what
+            // removes it from the engine's open-order book.
+            buf.push(cancelled_event(
+                report,
+                exchange,
+                symbol,
+                cid,
+                order_id,
+                time_exchange,
+            ));
+        }
+        _ => {
+            // PENDING_NEW and PENDING_CANCEL are transient; the terminal state
+            // (NEW/CANCELED/...) follows shortly after.
+            trace!(%exchange, exec_type, "Binance ignoring execution type");
+        }
+    }
+}
+
+/// Build the `OrderCancelled` event shared by the `CANCELED`/`EXPIRED`/`REPLACE` arms.
+///
+/// All of them report an order leaving the book with whatever it had filled (`z`) at that point,
+/// and differ only in why -- which the caller has already established by matching on `x`.
+fn cancelled_event<T: BinanceExecutionReportFields>(
+    report: &T,
+    exchange: ExchangeId,
+    symbol: InstrumentNameExchange,
+    cid: ClientOrderId,
+    order_id: OrderId,
+    time_exchange: DateTime<Utc>,
+) -> UnindexedAccountEvent {
+    let filled_qty = report
+        .cumulative_filled_quantity()
+        .and_then(|s| Decimal::from_str(s).ok())
+        .unwrap_or(Decimal::ZERO);
+    let response = UnindexedOrderResponseCancel {
+        key: OrderKey::new(exchange, symbol, StrategyId::unknown(), cid),
+        state: Ok(Cancelled::new(order_id, time_exchange, filled_qty)),
+    };
+    UnindexedAccountEvent::new(exchange, AccountEventKind::OrderCancelled(response))
+}
+
+/// Build the `OrderSnapshot` event for a report that leaves the order resting at the exchange.
+///
+/// Serves both the `NEW` arm and the live half of the `TRADE` arm: the fields describing the
+/// order -- side, kind, price, quantity, TIF and cumulative filled quantity -- are carried
+/// identically by both, so one builder covers the acknowledgement and every fill that follows it.
+///
+/// Returns `None` when a field the snapshot cannot be built without is missing or unparseable;
+/// each such case is warned about individually.
+fn convert_order_snapshot<T: BinanceExecutionReportFields>(
+    report: &T,
+    exchange: ExchangeId,
+    symbol: InstrumentNameExchange,
+    cid: ClientOrderId,
+    order_id: OrderId,
+    time_exchange: DateTime<Utc>,
+) -> Option<UnindexedAccountEvent> {
+    // parse_side already logs a warning on unknown values.
+    let Some(side) = report.side().and_then(parse_side) else {
+        warn!(%exchange, %symbol, "Binance order report missing/unknown side (S), dropping snapshot");
+        return None;
+    };
+    // parse_order_kind already logs a warning on unknown values.
+    let kind = parse_order_kind(report.order_type().unwrap_or("LIMIT"))?;
+    let price: Option<Decimal> = match (report.price(), &kind) {
+        (Some(p), _) => match Decimal::from_str(p) {
+            Ok(v) if !v.is_zero() => Some(v),
+            Ok(_) => {
+                // Binance sends "0" / "0.00" as the price field for Market/Stop/TrailingStop
+                // orders. Trace only when a zero arrives on an order kind that should carry a
+                // limit price, so the surprising case is observable.
+                if matches!(
+                    kind,
+                    OrderKind::Limit
+                        | OrderKind::StopLimit { .. }
+                        | OrderKind::TakeProfitLimit { .. }
+                        | OrderKind::TrailingStopLimit { .. }
+                ) {
+                    trace!(%exchange, %symbol, %kind, "Binance order report has zero price (p) on limit-type order, treating as no limit price");
+                }
+                None
+            }
+            Err(e) => {
+                warn!(%exchange, %symbol, price = p, error = %e, "Binance order report unparseable price (p), dropping snapshot");
+                return None;
+            }
+        },
+        (
+            None,
+            OrderKind::Market
+            | OrderKind::Stop { .. }
+            | OrderKind::TakeProfit { .. }
+            | OrderKind::TrailingStop { .. },
+        ) => {
+            // Market, Stop and TakeProfit orders carry no limit price.
+            None
+        }
+        (
+            None,
+            OrderKind::Limit
+            | OrderKind::StopLimit { .. }
+            | OrderKind::TakeProfitLimit { .. }
+            | OrderKind::TrailingStopLimit { .. },
+        ) => {
+            warn!(%exchange, %symbol, "Binance limit-type order report missing price (p), dropping snapshot");
+            return None;
+        }
+    };
+    let quantity = match report.order_quantity() {
+        Some(q) => match Decimal::from_str(q) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(%exchange, %symbol, qty = q, error = %e, "Binance order report unparseable quantity (q), dropping snapshot");
+                return None;
+            }
+        },
+        None => {
+            warn!(%exchange, %symbol, "Binance order report missing quantity (q), dropping snapshot");
+            return None;
+        }
+    };
+    let time_in_force = parse_time_in_force(report.time_in_force().unwrap_or("GTC"));
+    // Field `z`: the order's cumulative filled quantity. Usually 0 on a NEW, but read it there
+    // too in case of an immediate partial fill on an aggressive order; on a TRADE it is the whole
+    // point of the snapshot.
+    let filled_qty = report
+        .cumulative_filled_quantity()
+        .and_then(|s| Decimal::from_str(s).ok())
+        .unwrap_or(Decimal::ZERO);
+
+    let order = Order {
+        key: OrderKey::new(
+            exchange,
+            symbol,
+            StrategyId::unknown(), // Binance doesn't carry strategy IDs
+            cid,
+        ),
+        side,
+        price,
+        quantity,
+        kind,
+        time_in_force,
+        state: OrderState::active(Open::new(order_id, time_exchange, filled_qty)),
+    };
+
+    Some(UnindexedAccountEvent::new(
+        exchange,
+        AccountEventKind::OrderSnapshot(rustrade_integration::collection::snapshot::Snapshot::new(
+            order,
+        )),
+    ))
 }
 
 // ---------------------------------------------------------------------------

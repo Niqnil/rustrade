@@ -35,10 +35,9 @@ use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
     RateLimitTracker, SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, classify_order_kind_tif,
-    connectivity_error, convert_open_order, convert_open_order_owned_symbol, dedup_key_from_event,
-    is_api_rejection_error, is_duplicate, is_rate_limit_error, new_dedup_cache,
-    parse_binance_api_error, parse_order_kind, parse_side, parse_time_in_force,
-    rest_call_with_retry,
+    connectivity_error, convert_execution_report, convert_open_order,
+    convert_open_order_owned_symbol, dedup_key_from_event, is_api_rejection_error, is_duplicate,
+    is_rate_limit_error, new_dedup_cache, parse_binance_api_error, rest_call_with_retry,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
@@ -52,7 +51,7 @@ use crate::{
     },
     order::{
         Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
-        id::{ClientOrderId, OrderId, StrategyId},
+        id::{OrderId, StrategyId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
     },
@@ -1927,7 +1926,7 @@ fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -
             // matched branch deserializes its payload. The SDK struct ignores the unknown `e` tag.
             match serde_json::from_str::<binance_sdk::spot::websocket_api::ExecutionReport>(frame) {
                 Ok(report) => {
-                    buf.extend(convert_execution_report(report).into_iter().flatten());
+                    convert_execution_report(&report, ExchangeId::BinanceSpot, buf);
                 }
                 Err(e) => {
                     warn!(error = %e, "BinanceSpot: undeserializable executionReport, dropping")
@@ -1969,374 +1968,6 @@ fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -
             false
         }
     }
-}
-
-/// Whether a `TRADE` report's order status says the order is still live at the exchange, and may
-/// therefore be written into engine state as an `Open` snapshot.
-///
-/// A `TRADE` report carries the order's status (`X`) alongside the execution. Only
-/// `PARTIALLY_FILLED` and `FILLED` say the order reached this execution while working; every other
-/// status means some other report owns the order's current state. Writing an `Open` snapshot from
-/// one of those would resurrect an order the engine has already retired, leaving a resting order
-/// that does not exist at the exchange -- a fill that arrives after its order's terminal report is
-/// exactly the ordering this guards against.
-fn trade_order_is_live(status: &str) -> bool {
-    matches!(status, "PARTIALLY_FILLED" | "FILLED")
-}
-
-/// Convert a Binance `executionReport` into rustrade AccountEvents.
-///
-/// Returns up to two events, in the order they must be applied. A `TRADE` report genuinely
-/// carries two facts -- the execution print (`l`/`L`) and the order's new cumulative filled
-/// quantity (`z`) -- so it maps to both a `Trade` and an `OrderSnapshot`. Bounded at two, unlike
-/// `convert_account_position`, whose per-asset fan-out is unbounded and so pushes into a buffer.
-///
-/// The `Trade` is always first. A fully-filled snapshot retires its order, and routing a fill
-/// against an order that has already been retired is a strictly harder problem than routing it
-/// against a live one; emitting the execution first keeps the easy ordering.
-///
-/// ExecutionReport field mapping (from Binance API docs):
-/// - s: symbol, c: clientOrderId, S: side, o: order type, f: time in force
-/// - q: quantity, p: price, x: execution type, X: order status
-/// - i: orderId, l: last filled qty, L: last filled price
-/// - n: commission, N: commission asset, T: transaction time, t: tradeId
-/// - z: cumulative filled qty
-// inherent complexity from matching all Binance execution types (TRADE, NEW,
-// CANCELED, EXPIRED, REJECTED, REPLACE) with field validation per variant.
-#[allow(clippy::cognitive_complexity)]
-fn convert_execution_report(
-    report: binance_sdk::spot::websocket_api::ExecutionReport,
-) -> [Option<UnindexedAccountEvent>; 2] {
-    let exec_type = match report.x.as_deref() {
-        Some(t) => t,
-        None => {
-            warn!("BinanceSpot executionReport missing execution type (x), dropping");
-            return [None, None];
-        }
-    };
-    let symbol = match report.s.as_deref() {
-        Some(s) => InstrumentNameExchange::new(s),
-        None => {
-            warn!("BinanceSpot executionReport missing symbol (s), dropping");
-            return [None, None];
-        }
-    };
-    // check order_id first — if missing we drop the event, so avoid
-    // constructing cid unnecessarily.
-    let order_id = match report.i {
-        Some(id) => OrderId(format_smolstr!("{id}")),
-        None => {
-            warn!(%symbol, "BinanceSpot executionReport missing orderId (i), dropping");
-            return [None, None];
-        }
-    };
-    let cid = match report.c.as_deref() {
-        Some(c) => ClientOrderId::new(c),
-        None => ClientOrderId::new(order_id.0.as_str()),
-    };
-
-    // binance-sdk renames single-letter fields: `t_uppercase` = Binance JSON field `T`
-    let time_exchange = match report
-        .t_uppercase
-        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
-    {
-        Some(t) => t,
-        None => {
-            warn!(%symbol, "BinanceSpot executionReport missing/unparseable transaction time (T), using now");
-            Utc::now()
-        }
-    };
-
-    match exec_type {
-        "NEW" => [
-            convert_new_order(&report, symbol, cid, order_id, time_exchange),
-            None,
-        ],
-        "TRADE" => {
-            // Partial or full fill
-            let trade_id = match report.t {
-                Some(id) => TradeId(format_smolstr!("{id}")),
-                None => {
-                    warn!(%symbol, "BinanceSpot TRADE event missing trade ID (t), dropping");
-                    return [None, None];
-                }
-            };
-            let side = match report.s_uppercase.as_deref().and_then(parse_side) {
-                Some(s) => s,
-                None => {
-                    warn!(%symbol, "BinanceSpot TRADE event missing/unknown side (S), dropping");
-                    return [None, None];
-                }
-            };
-            let last_price = match report.l_uppercase.as_deref() {
-                Some(s) => match Decimal::from_str(s) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(%symbol, error = %e, raw = s, "BinanceSpot TRADE event unparseable last price (L), dropping fill");
-                        return [None, None];
-                    }
-                },
-                None => {
-                    warn!(%symbol, "BinanceSpot TRADE event missing last price (L), dropping fill");
-                    return [None, None];
-                }
-            };
-            let last_qty = match report.l.as_deref() {
-                Some(s) => match Decimal::from_str(s) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(%symbol, error = %e, raw = s, "BinanceSpot TRADE event unparseable last qty (l), dropping fill");
-                        return [None, None];
-                    }
-                },
-                None => {
-                    warn!(%symbol, "BinanceSpot TRADE event missing last qty (l), dropping fill");
-                    return [None, None];
-                }
-            };
-            // Commission parse failure: log and default to 0 rather than dropping the fill.
-            let commission = match Decimal::from_str(report.n.as_deref().unwrap_or("0")) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(%symbol, error = %e, "BinanceSpot TRADE event unparseable commission (n), defaulting to 0");
-                    Decimal::ZERO
-                }
-            };
-
-            // Use actual commission asset from Binance (N field: e.g., BNB, USDT, BTC).
-            // fees_quote is None here; indexer computes if fee is in quote/base asset.
-            // "UNKNOWN" fallback (rare: API omits N field) will fail indexing.
-            let fee_asset = report
-                .n_uppercase
-                .as_deref()
-                .map(AssetNameExchange::from)
-                .unwrap_or_else(|| AssetNameExchange::from("UNKNOWN"));
-
-            // Field `z` is the order's cumulative filled quantity as of this execution, which is
-            // what advances the order; `l` above is this execution alone.
-            let order_filled_quantity = report.z.as_deref().and_then(|s| Decimal::from_str(s).ok());
-
-            let trade = Trade::new(
-                trade_id,
-                order_id.clone(),
-                symbol.clone(),
-                StrategyId::unknown(), // Binance doesn't carry strategy IDs
-                time_exchange,
-                side,
-                last_price,
-                last_qty,
-                order_filled_quantity,
-                AssetFees::new(fee_asset, commission, None),
-            );
-            let trade_event =
-                UnindexedAccountEvent::new(ExchangeId::BinanceSpot, AccountEventKind::Trade(trade));
-
-            // The execution alone does not move the order: `filled_quantity` is only ever carried
-            // into engine state by an order snapshot, so without this second event a partially
-            // filled order reads as having nothing filled until REST reconciliation refreshes it.
-            // `convert_new_order` reads field `z` (cumulative filled quantity), which is exactly
-            // what a TRADE report carries, so the same builder serves both arms.
-            let order_status = report.x_uppercase.as_deref().unwrap_or_default();
-            let snapshot_event = if trade_order_is_live(order_status) {
-                convert_new_order(&report, symbol, cid, order_id, time_exchange)
-            } else {
-                trace!(
-                    %symbol,
-                    status = order_status,
-                    "BinanceSpot TRADE for an order the exchange no longer reports as working — \
-                     emitting the execution without an order snapshot"
-                );
-                None
-            };
-
-            [Some(trade_event), snapshot_event]
-        }
-        "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH" => {
-            let filled_qty = report
-                .z
-                .as_deref()
-                .and_then(|s| Decimal::from_str(s).ok())
-                .unwrap_or(Decimal::ZERO);
-            let cancelled = Cancelled::new(order_id, time_exchange, filled_qty);
-            let response = UnindexedOrderResponseCancel {
-                key: OrderKey::new(
-                    ExchangeId::BinanceSpot,
-                    symbol,
-                    StrategyId::unknown(), // Binance doesn't carry strategy IDs
-                    cid,
-                ),
-                state: Ok(cancelled),
-            };
-
-            [
-                Some(UnindexedAccountEvent::new(
-                    ExchangeId::BinanceSpot,
-                    AccountEventKind::OrderCancelled(response),
-                )),
-                None,
-            ]
-        }
-        "REJECTED" => {
-            // order rejected by the matching engine after initial acceptance
-            // (e.g., insufficient funds discovered post-validation). Map to
-            // OrderCancelled with an error state so the engine removes this order.
-            let reject_reason = report.r.unwrap_or_else(|| "unknown".to_string());
-            warn!(
-                %symbol, %order_id, reason = %reject_reason,
-                "BinanceSpot order REJECTED by matching engine"
-            );
-            let response = UnindexedOrderResponseCancel {
-                key: OrderKey::new(ExchangeId::BinanceSpot, symbol, StrategyId::unknown(), cid),
-                state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
-                    reject_reason,
-                ))),
-            };
-
-            [
-                Some(UnindexedAccountEvent::new(
-                    ExchangeId::BinanceSpot,
-                    AccountEventKind::OrderCancelled(response),
-                )),
-                None,
-            ]
-        }
-        "REPLACE" => {
-            // REPLACE is emitted when an order is replaced via the cancel-replace
-            // endpoint. The execution report describes the CANCELLED original order:
-            // field `i` = original order ID (already extracted as `order_id` above).
-            // The replacement order arrives as a subsequent NEW execution report with
-            // its own order ID. We emit OrderCancelled for the original order so the
-            // engine removes it from its open-order book.
-            let filled_qty = report
-                .z
-                .as_deref()
-                .and_then(|s| Decimal::from_str(s).ok())
-                .unwrap_or(Decimal::ZERO);
-            let cancelled = Cancelled::new(order_id, time_exchange, filled_qty);
-            let response = UnindexedOrderResponseCancel {
-                key: OrderKey::new(ExchangeId::BinanceSpot, symbol, StrategyId::unknown(), cid),
-                state: Ok(cancelled),
-            };
-            [
-                Some(UnindexedAccountEvent::new(
-                    ExchangeId::BinanceSpot,
-                    AccountEventKind::OrderCancelled(response),
-                )),
-                None,
-            ]
-        }
-        _ => {
-            // PENDING_NEW and PENDING_CANCEL are transient states; the final
-            // state (NEW/CANCELED/etc.) follows shortly after.
-            trace!(exec_type, "BinanceSpot ignoring execution type");
-            [None, None]
-        }
-    }
-}
-
-/// Convert a Binance NEW execution report into an OrderSnapshot event.
-fn convert_new_order(
-    report: &binance_sdk::spot::websocket_api::ExecutionReport,
-    symbol: InstrumentNameExchange,
-    cid: ClientOrderId,
-    order_id: OrderId,
-    time_exchange: DateTime<Utc>,
-) -> Option<UnindexedAccountEvent> {
-    let side = match report.s_uppercase.as_deref().and_then(parse_side) {
-        Some(s) => s,
-        None => {
-            warn!(%symbol, "BinanceSpot NEW event missing/unknown side (S), dropping");
-            return None;
-        }
-    };
-    let kind = parse_order_kind(report.o.as_deref().unwrap_or("LIMIT"))?;
-    let price: Option<Decimal> = match (report.p.as_deref(), &kind) {
-        (Some(p), _) => match Decimal::from_str(p) {
-            Ok(v) if !v.is_zero() => Some(v),
-            Ok(_) => {
-                // Binance sends "0" / "0.00" as the price field for Market/Stop/TrailingStop
-                // orders. Trace only when a zero arrives on an order kind that should carry
-                // a limit price, so the surprising case is observable.
-                if matches!(
-                    kind,
-                    OrderKind::Limit
-                        | OrderKind::StopLimit { .. }
-                        | OrderKind::TakeProfitLimit { .. }
-                        | OrderKind::TrailingStopLimit { .. }
-                ) {
-                    trace!(%symbol, %kind, "BinanceSpot NEW event has zero price (p) on limit-type order, treating as no limit price");
-                }
-                None
-            }
-            Err(e) => {
-                warn!(%symbol, price = p, error = %e, "BinanceSpot NEW event unparseable price (p), dropping");
-                return None;
-            }
-        },
-        (
-            None,
-            OrderKind::Market
-            | OrderKind::Stop { .. }
-            | OrderKind::TakeProfit { .. }
-            | OrderKind::TrailingStop { .. },
-        ) => {
-            // Market, Stop, and TakeProfit orders don't have a limit price
-            None
-        }
-        (
-            None,
-            OrderKind::Limit
-            | OrderKind::StopLimit { .. }
-            | OrderKind::TakeProfitLimit { .. }
-            | OrderKind::TrailingStopLimit { .. },
-        ) => {
-            warn!(%symbol, "BinanceSpot NEW limit-type order missing price (p), dropping");
-            return None;
-        }
-    };
-    let quantity = match report.q.as_deref() {
-        Some(q) => match Decimal::from_str(q) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(%symbol, qty = q, error = %e, "BinanceSpot NEW event unparseable quantity (q), dropping");
-                return None;
-            }
-        },
-        None => {
-            warn!(%symbol, "BinanceSpot NEW order missing quantity (q), dropping");
-            return None;
-        }
-    };
-    let time_in_force = parse_time_in_force(report.f.as_deref().unwrap_or("GTC"));
-    // Binance field z: cumulative filled quantity; usually 0 for NEW events
-    // but read it in case of immediate partial fill on aggressive orders.
-    let filled_qty = report
-        .z
-        .as_deref()
-        .and_then(|s| Decimal::from_str(s).ok())
-        .unwrap_or(Decimal::ZERO);
-
-    let order = Order {
-        key: OrderKey::new(
-            ExchangeId::BinanceSpot,
-            symbol,
-            StrategyId::unknown(), // Binance doesn't carry strategy IDs
-            cid,
-        ),
-        side,
-        price,
-        quantity,
-        kind,
-        time_in_force,
-        state: OrderState::active(Open::new(order_id, time_exchange, filled_qty)),
-    };
-
-    Some(UnindexedAccountEvent::new(
-        ExchangeId::BinanceSpot,
-        AccountEventKind::OrderSnapshot(rustrade_integration::collection::snapshot::Snapshot::new(
-            order,
-        )),
-    ))
 }
 
 /// Convert a Binance outboundAccountPosition to balance stream-update events.
@@ -2448,7 +2079,7 @@ mod tests {
     use super::*;
     use crate::client::binance::shared::*;
     use crate::client::dedup::{DedupEventKind, DedupKey};
-    use crate::order::TrailingOffsetType;
+    use crate::order::{TrailingOffsetType, id::ClientOrderId};
     use binance_sdk::common::errors::WebsocketError;
     use smol_str::SmolStr;
 
@@ -3393,17 +3024,25 @@ mod tests {
         }
     }
 
+    /// Run the shared converter over one report and collect what it appends.
+    fn convert(
+        report: binance_sdk::spot::websocket_api::ExecutionReport,
+    ) -> Vec<UnindexedAccountEvent> {
+        let mut buf = Vec::new();
+        convert_execution_report(&report, ExchangeId::BinanceSpot, &mut buf);
+        buf
+    }
+
     /// The one event produced by a report that maps to a single `AccountEvent`.
     ///
-    /// Asserts the second slot is empty, so a test written for a single-event report fails
-    /// loudly if that report ever starts producing two.
-    fn sole_event(events: [Option<UnindexedAccountEvent>; 2]) -> Option<UnindexedAccountEvent> {
-        let [first, second] = events;
+    /// Asserts nothing followed it, so a test written for a single-event report fails loudly if
+    /// that report ever starts producing two.
+    fn sole_event(mut events: Vec<UnindexedAccountEvent>) -> Option<UnindexedAccountEvent> {
         assert!(
-            second.is_none(),
-            "expected a single event, got a second: {second:?}"
+            events.len() <= 1,
+            "expected at most a single event, got: {events:?}"
         );
-        first
+        events.pop()
     }
 
     #[test]
@@ -3419,8 +3058,7 @@ mod tests {
             ..make_base_report()
         };
 
-        let event =
-            sole_event(convert_execution_report(report)).expect("NEW event should produce Some");
+        let event = sole_event(convert(report)).expect("NEW event should produce Some");
         assert_eq!(event.exchange, ExchangeId::BinanceSpot);
         match &event.kind {
             AccountEventKind::OrderSnapshot(snap) => {
@@ -3450,8 +3088,7 @@ mod tests {
             ..make_base_report()
         };
 
-        let event =
-            sole_event(convert_execution_report(report)).expect("TRADE event should produce Some");
+        let event = sole_event(convert(report)).expect("TRADE event should produce Some");
         assert_eq!(event.exchange, ExchangeId::BinanceSpot);
         match &event.kind {
             AccountEventKind::Trade(trade) => {
@@ -3468,7 +3105,7 @@ mod tests {
 
     /// The `(Trade, OrderSnapshot)` pair a fill report must produce, in that order.
     fn trade_events(
-        events: [Option<UnindexedAccountEvent>; 2],
+        events: Vec<UnindexedAccountEvent>,
     ) -> (
         Trade<AssetNameExchange, InstrumentNameExchange>,
         crate::order::Order<
@@ -3477,9 +3114,9 @@ mod tests {
             OrderState<AssetNameExchange, InstrumentNameExchange>,
         >,
     ) {
-        let [first, second] = events;
-        let first = first.expect("a fill report must produce an execution");
-        let second = second.expect("a fill report must produce an order snapshot");
+        let [first, second]: [UnindexedAccountEvent; 2] = events
+            .try_into()
+            .expect("a fill report must produce an execution and an order snapshot");
         let AccountEventKind::Trade(trade) = first.kind else {
             panic!("first event must be the Trade, got {:?}", first.kind);
         };
@@ -3512,7 +3149,7 @@ mod tests {
             ..make_base_report()
         };
 
-        let (trade, order) = trade_events(convert_execution_report(report));
+        let (trade, order) = trade_events(convert(report));
         assert_eq!(trade.quantity, Decimal::from_str("0.004").unwrap());
 
         let OrderState::Active(crate::order::state::ActiveOrderState::Open(open)) = order.state
@@ -3545,7 +3182,7 @@ mod tests {
             ..make_base_report()
         };
 
-        let (_trade, order) = trade_events(convert_execution_report(report));
+        let (_trade, order) = trade_events(convert(report));
         let OrderState::Active(crate::order::state::ActiveOrderState::Open(open)) = order.state
         else {
             panic!("expected an Open snapshot, got {:?}", order.state);
@@ -3576,14 +3213,15 @@ mod tests {
                 z: Some("0.004".to_string()),
                 ..make_base_report()
             };
-            let [trade, snapshot] = convert_execution_report(report);
-            assert!(
-                matches!(trade.map(|e| e.kind), Some(AccountEventKind::Trade(_))),
-                "the execution must still be reported for status {status}"
+            let events = convert(report);
+            assert_eq!(
+                events.len(),
+                1,
+                "status {status} must produce the execution alone, got: {events:?}"
             );
             assert!(
-                snapshot.is_none(),
-                "status {status} must not produce an order snapshot"
+                matches!(events[0].kind, AccountEventKind::Trade(_)),
+                "the execution must still be reported for status {status}"
             );
         }
     }
@@ -3600,7 +3238,7 @@ mod tests {
             ..make_base_report()
         };
         assert!(
-            sole_event(convert_execution_report(report)).is_none(),
+            sole_event(convert(report)).is_none(),
             "missing last price (L) should return None"
         );
     }
@@ -3617,7 +3255,7 @@ mod tests {
             ..make_base_report()
         };
         assert!(
-            sole_event(convert_execution_report(report)).is_none(),
+            sole_event(convert(report)).is_none(),
             "missing last qty (l) should return None"
         );
     }
@@ -3629,8 +3267,7 @@ mod tests {
             ..make_base_report()
         };
 
-        let event =
-            sole_event(convert_execution_report(report)).expect("CANCELED should produce Some");
+        let event = sole_event(convert(report)).expect("CANCELED should produce Some");
         assert!(
             matches!(event.kind, AccountEventKind::OrderCancelled(ref r) if r.state.is_ok()),
             "CANCELED should yield OrderCancelled with Ok state"
@@ -3643,8 +3280,7 @@ mod tests {
             x: Some("EXPIRED".to_string()),
             ..make_base_report()
         };
-        let event =
-            sole_event(convert_execution_report(report)).expect("EXPIRED should produce Some");
+        let event = sole_event(convert(report)).expect("EXPIRED should produce Some");
         assert!(
             matches!(event.kind, AccountEventKind::OrderCancelled(ref r) if r.state.is_ok()),
             "EXPIRED should yield OrderCancelled with Ok state"
@@ -3657,8 +3293,7 @@ mod tests {
             x: Some("EXPIRED_IN_MATCH".to_string()),
             ..make_base_report()
         };
-        let event = sole_event(convert_execution_report(report))
-            .expect("EXPIRED_IN_MATCH should produce Some");
+        let event = sole_event(convert(report)).expect("EXPIRED_IN_MATCH should produce Some");
         assert!(
             matches!(event.kind, AccountEventKind::OrderCancelled(ref r) if r.state.is_ok()),
             "EXPIRED_IN_MATCH should yield OrderCancelled with Ok state"
@@ -3673,8 +3308,7 @@ mod tests {
             ..make_base_report()
         };
 
-        let event =
-            sole_event(convert_execution_report(report)).expect("REJECTED should produce Some");
+        let event = sole_event(convert(report)).expect("REJECTED should produce Some");
         assert!(
             matches!(event.kind, AccountEventKind::OrderCancelled(ref r) if r.state.is_err()),
             "REJECTED should yield OrderCancelled with Err state"
@@ -3689,7 +3323,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            sole_event(convert_execution_report(report)).is_none(),
+            sole_event(convert(report)).is_none(),
             "missing execution type should return None"
         );
     }
@@ -3702,7 +3336,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            sole_event(convert_execution_report(report)).is_none(),
+            sole_event(convert(report)).is_none(),
             "missing symbol should return None"
         );
     }
@@ -3717,7 +3351,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            sole_event(convert_execution_report(report)).is_none(),
+            sole_event(convert(report)).is_none(),
             "missing orderId should return None"
         );
     }
@@ -3731,7 +3365,7 @@ mod tests {
             ..make_base_report()
         };
         assert!(
-            sole_event(convert_execution_report(report)).is_none(),
+            sole_event(convert(report)).is_none(),
             "TRADE event missing tradeId should return None"
         );
     }
@@ -3744,8 +3378,7 @@ mod tests {
         };
         // REPLACE describes the cancelled original order (field `i` = original order ID).
         // The replacement order arrives as a subsequent NEW execution report.
-        let event =
-            sole_event(convert_execution_report(report)).expect("REPLACE should produce Some");
+        let event = sole_event(convert(report)).expect("REPLACE should produce Some");
         assert!(
             matches!(event.kind, AccountEventKind::OrderCancelled(ref r) if r.state.is_ok()),
             "REPLACE should yield OrderCancelled with Ok state"
@@ -4258,8 +3891,7 @@ mod tests {
             r: Some("INSUFFICIENT_FUNDS".to_string()),
             ..make_base_report()
         };
-        let event = sole_event(convert_execution_report(report))
-            .expect("REJECTED report should produce Some");
+        let event = sole_event(convert(report)).expect("REJECTED report should produce Some");
         assert!(
             matches!(&event.kind, AccountEventKind::OrderCancelled(r) if r.state.is_err()),
             "prerequisite: event is OrderCancelled with Err"
