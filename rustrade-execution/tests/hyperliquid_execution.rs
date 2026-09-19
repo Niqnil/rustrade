@@ -40,7 +40,7 @@ use rustrade_execution::{
     },
     order::{
         OrderKey, OrderKind, TimeInForce,
-        id::{ClientOrderId, StrategyId},
+        id::{ClientOrderId, StrategyId, VenueOrderId},
         request::RequestOpen,
         state::{ActiveOrderState, OrderState},
     },
@@ -545,15 +545,15 @@ async fn test_place_and_cancel_stop_order() {
             println!("  Client Order ID (UUID): {}", response.key.cid);
             println!("  Order ID: {}", open_state.id);
 
-            // Note: Exchange may return numeric OID (Resting) or UUID (WaitingForTrigger)
-            // depending on the trigger order type. Both should work for cancellation.
-            let is_uuid_format = open_state.id.0.contains('-');
+            // A resting trigger order comes back with an oid of the venue's own; one still
+            // waiting to trigger comes back with nothing, addressable only by the cloid we sent.
+            // Both cancel, by different endpoints -- which the variant states outright rather than
+            // leaving the shape of a string to imply.
             println!(
-                "  Order ID format: {}",
-                if is_uuid_format {
-                    "UUID (cloid)"
-                } else {
-                    "numeric (OID)"
+                "  Addressable by: {}",
+                match &open_state.id {
+                    VenueOrderId::Assigned(_) => "venue oid",
+                    VenueOrderId::ClientAssigned => "client id (cloid)",
                 }
             );
 
@@ -936,7 +936,9 @@ async fn test_cancel_nonexistent_order() {
     let cancel_request = rustrade_execution::order::OrderEvent {
         key: cancel_key,
         state: rustrade_execution::order::request::RequestCancel {
-            id: Some(rustrade_execution::order::id::OrderId::new("999999999")),
+            id: Some(VenueOrderId::Assigned(
+                rustrade_execution::order::id::OrderId::new("999999999"),
+            )),
         },
     };
 

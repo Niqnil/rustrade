@@ -79,7 +79,7 @@ use crate::{
             BracketOrderRequest as UnifiedBracketOrderRequest,
             BracketOrderResult as UnifiedBracketOrderResult,
         },
-        id::{ClientOrderId, OrderId, StrategyId},
+        id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         request::{
             OrderRequestCancel, OrderRequestOpen, OrderResponseCancel, UnindexedOrderResponseCancel,
         },
@@ -885,7 +885,10 @@ impl IbkrClient {
                         kind: OrderKind::Limit,
                         time_in_force: request.time_in_force,
                         state: OrderState::active(Open::new(
-                            OrderId::new(format_smolstr!("{}", parent_ib_id)),
+                            VenueOrderId::Assigned(OrderId::new(format_smolstr!(
+                                "{}",
+                                parent_ib_id
+                            ))),
                             now,
                             parent_filled_dec,
                         )),
@@ -903,7 +906,7 @@ impl IbkrClient {
                         kind: OrderKind::Limit,
                         time_in_force: request.time_in_force,
                         state: OrderState::active(Open::new(
-                            OrderId::new(format_smolstr!("{}", tp_ib_id)),
+                            VenueOrderId::Assigned(OrderId::new(format_smolstr!("{}", tp_ib_id))),
                             now,
                             tp_filled_dec,
                         )),
@@ -923,7 +926,7 @@ impl IbkrClient {
                         },
                         time_in_force: request.time_in_force,
                         state: OrderState::active(Open::new(
-                            OrderId::new(format_smolstr!("{}", sl_ib_id)),
+                            VenueOrderId::Assigned(OrderId::new(format_smolstr!("{}", sl_ib_id))),
                             now,
                             sl_filled_dec,
                         )),
@@ -1618,7 +1621,7 @@ impl ExecutionClient for IbkrClient {
                     kind,
                     time_in_force: tif,
                     state: OrderState::active(Open::new(
-                        OrderId::new(format_smolstr!("{}", order_id)),
+                        VenueOrderId::Assigned(OrderId::new(format_smolstr!("{}", order_id))),
                         Utc::now(),
                         filled,
                     )),
@@ -1640,7 +1643,7 @@ impl ExecutionClient for IbkrClient {
                     kind,
                     time_in_force: tif,
                     state: OrderState::active(Open::new(
-                        OrderId::new(format_smolstr!("{}", ib_order_id)),
+                        VenueOrderId::Assigned(OrderId::new(format_smolstr!("{}", ib_order_id))),
                         Utc::now(),
                         Decimal::ZERO,
                     )),
@@ -1823,7 +1826,10 @@ impl ExecutionClient for IbkrClient {
                     // IB's open orders endpoint doesn't return TIF; default to GTC
                     time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
                     state: Open::new(
-                        OrderId::new(format_smolstr!("{}", order_data.order_id)),
+                        VenueOrderId::Assigned(OrderId::new(format_smolstr!(
+                            "{}",
+                            order_data.order_id
+                        ))),
                         Utc::now(),
                         Decimal::ZERO, // M-5: filled_qty unavailable from open orders endpoint
                     ),
@@ -2038,9 +2044,11 @@ fn make_order_from_status(
         | OrderStatusKind::PendingSubmit
         | OrderStatusKind::ApiPending
         | OrderStatusKind::PendingCancel
-        | OrderStatusKind::ApiCancelled => {
-            OrderState::active(Open::new(order_id, Utc::now(), filled_qty))
-        }
+        | OrderStatusKind::ApiCancelled => OrderState::active(Open::new(
+            VenueOrderId::Assigned(order_id),
+            Utc::now(),
+            filled_qty,
+        )),
         // A status string ibapi does not model. Upstream declines to classify
         // it — `is_active()` and `is_terminal()` are both false — and so do we:
         // report it active/Open so the order-id mapping is retained and the
@@ -2056,7 +2064,11 @@ fn make_order_from_status(
                 "unmodelled IBKR order status; treating as live, account \
                  stream is authoritative"
             );
-            OrderState::active(Open::new(order_id, Utc::now(), filled_qty))
+            OrderState::active(Open::new(
+                VenueOrderId::Assigned(order_id),
+                Utc::now(),
+                filled_qty,
+            ))
         }
     };
 

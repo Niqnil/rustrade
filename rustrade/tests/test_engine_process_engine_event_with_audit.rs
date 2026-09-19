@@ -53,7 +53,7 @@ use rustrade_execution::{
     balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate},
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
-        id::{ClientOrderId, OrderId, PositionId, StrategyId},
+        id::{ClientOrderId, OrderId, PositionId, StrategyId, VenueOrderId},
         request::{OrderRequestCancel, OrderRequestOpen, OrderResponseCancel, RequestOpen},
         state::{ActiveOrderState, Cancelled, Filled, Open, OrderState},
     },
@@ -426,7 +426,7 @@ fn test_engine_process_engine_event_with_audit() {
             kind: OrderKind::Market,
             time_in_force: TimeInForce::ImmediateOrCancel,
             state: OrderState::active(Open {
-                id: gen_order_id(0),
+                id: VenueOrderId::Assigned(gen_order_id(0)),
                 time_exchange: time_plus_days(STARTING_TIMESTAMP, 3),
                 filled_quantity: dec!(1),
             }),
@@ -619,7 +619,7 @@ fn test_engine_process_engine_event_with_audit() {
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: true },
             state: ActiveOrderState::Open(Open {
-                id: gen_order_id(1),
+                id: VenueOrderId::Assigned(gen_order_id(1)),
                 time_exchange: time_plus_days(STARTING_TIMESTAMP, 4),
                 filled_quantity: dec!(0),
             }),
@@ -1164,7 +1164,7 @@ fn account_event_order_response(
             kind: OrderKind::Market,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: true },
             state: OrderState::active(Open {
-                id: gen_order_id(instrument),
+                id: VenueOrderId::Assigned(gen_order_id(instrument)),
                 time_exchange: time_plus_days(STARTING_TIMESTAMP, time_plus),
                 filled_quantity: Decimal::try_from(filled).unwrap(),
             }),
@@ -3810,7 +3810,7 @@ fn send_order_ack(
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
             state: OrderState::active(Open {
-                id: exchange_order_id,
+                id: VenueOrderId::Assigned(exchange_order_id),
                 time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
                 filled_quantity: dec!(0),
             }),
@@ -3995,7 +3995,7 @@ fn send_fully_filled_open_snapshot(
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
             // filled_quantity == quantity: the order is finished, said without a distinct state.
             state: OrderState::active(Open {
-                id: exchange_order_id,
+                id: VenueOrderId::Assigned(exchange_order_id),
                 time_exchange: time_plus_days(STARTING_TIMESTAMP, 2),
                 filled_quantity: dec!(1),
             }),
