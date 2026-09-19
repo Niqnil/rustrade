@@ -66,7 +66,7 @@ use crate::{
     },
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
-        id::{ClientOrderId, OrderId, StrategyId},
+        id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
     },
@@ -745,7 +745,11 @@ impl ExecutionClient for BinanceMargin {
                 avg_price,
             ))
         } else {
-            OrderState::active(Open::new(exchange_order_id, time_exchange, filled_qty))
+            OrderState::active(Open::new(
+                VenueOrderId::Assigned(exchange_order_id),
+                time_exchange,
+                filled_qty,
+            ))
         };
 
         Some(Order {
@@ -782,7 +786,7 @@ impl ExecutionClient for BinanceMargin {
 
         let params = match build_cancel_order_params(
             instrument.name().to_string(),
-            request.state.id.as_ref(),
+            request.state.id.as_ref().and_then(VenueOrderId::assigned),
             &request.key.cid,
             self.config.is_isolated,
         ) {
@@ -4322,7 +4326,10 @@ mod tests {
         )
         .expect("convert");
         assert_eq!(order.key.exchange, ExchangeId::BinanceMargin);
-        assert_eq!(order.state.id.0.as_str(), "42");
+        assert_eq!(
+            order.state.id.assigned().map(|id| id.0.as_str()),
+            Some("42")
+        );
         assert_eq!(order.key.cid.0.as_str(), "cid-9");
         assert_eq!(order.side, Side::Buy);
         assert_eq!(order.price, Some(Decimal::from(50_000)));
@@ -4520,7 +4527,7 @@ mod tests {
                 );
                 match &snap.0.state {
                     OrderState::Active(ActiveOrderState::Open(open)) => {
-                        assert_eq!(open.id.0.as_str(), "12345");
+                        assert_eq!(open.id.assigned().map(|id| id.0.as_str()), Some("12345"));
                         assert_eq!(
                             open.filled_quantity,
                             Decimal::new(5, 1),

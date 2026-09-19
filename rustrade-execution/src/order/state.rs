@@ -1,4 +1,7 @@
-use crate::{error::OrderError, order::id::OrderId};
+use crate::{
+    error::OrderError,
+    order::id::{OrderId, VenueOrderId},
+};
 use chrono::{DateTime, Utc};
 use derive_more::{Constructor, From};
 use rust_decimal::Decimal;
@@ -107,7 +110,13 @@ pub struct OpenInFlight;
     Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
 )]
 pub struct Open {
-    pub id: OrderId,
+    /// How the venue addresses this order.
+    ///
+    /// [`VenueOrderId::ClientAssigned`] when the venue acknowledged the order without assigning an
+    /// identifier of its own. A consumer deciding whether two `Open` values describe the same
+    /// venue order must go through [`VenueOrderId::assigned`] rather than comparing this field
+    /// directly, because two `ClientAssigned` values are equal without being evidence of anything.
+    pub id: VenueOrderId,
     /// When the exchange last reported this state -- **not** when the order was created.
     ///
     /// ## Producer obligation

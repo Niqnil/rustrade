@@ -1012,7 +1012,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         let ack_exchange_id: Option<OrderId> =
             if currently_open_in_flight || (currently_open && update_retires_order) {
                 match &order.0.state {
-                    OrderState::Active(ActiveOrderState::Open(open)) => Some(open.id.clone()),
+                    OrderState::Active(ActiveOrderState::Open(open)) => open.id.assigned().cloned(),
                     OrderState::Inactive(InactiveOrderState::FullyFilled(filled)) => {
                         Some(filled.id.clone())
                     }
@@ -1238,14 +1238,15 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                             .0
                             .iter()
                             .find_map(|(cid, order)| match &order.state {
-                                ActiveOrderState::Open(open) if open.id == trade.order_id => {
+                                ActiveOrderState::Open(open)
+                                    if open.id.assigned() == Some(&trade.order_id) =>
+                                {
                                     Some(self.position_ids.get(cid).cloned())
                                 }
                                 ActiveOrderState::CancelInFlight(cf)
-                                    if cf
-                                        .order
-                                        .as_ref()
-                                        .is_some_and(|o| o.id == trade.order_id) =>
+                                    if cf.order.as_ref().is_some_and(|o| {
+                                        o.id.assigned() == Some(&trade.order_id)
+                                    }) =>
                                 {
                                     Some(self.position_ids.get(cid).cloned())
                                 }
@@ -1422,7 +1423,9 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                         .0
                         .iter()
                         .find_map(|(cid, order)| match &order.state {
-                            ActiveOrderState::Open(open) if open.id == trade.order_id => {
+                            ActiveOrderState::Open(open)
+                                if open.id.assigned() == Some(&trade.order_id) =>
+                            {
                                 Some(cid.clone())
                             }
                             _ => None,
@@ -1607,7 +1610,7 @@ mod tests {
     use rustrade_execution::{
         order::{
             OrderKind, TimeInForce,
-            id::{ClientOrderId, OrderId, PositionId, StrategyId},
+            id::{ClientOrderId, OrderId, PositionId, StrategyId, VenueOrderId},
             state::{CancelInFlight, Cancelled, Open, OpenInFlight},
         },
         trade::{AssetFees, Trade, TradeId},
@@ -1897,7 +1900,11 @@ mod tests {
 
         state.update_from_order_snapshot(Snapshot(&order(
             cid.clone(),
-            OrderState::active(Open::new(exchange_id.clone(), TIME, Decimal::ZERO)),
+            OrderState::active(Open::new(
+                VenueOrderId::Assigned(exchange_id.clone()),
+                TIME,
+                Decimal::ZERO,
+            )),
         )));
     }
 
@@ -1971,7 +1978,11 @@ mod tests {
         state.update_from_order_snapshot(Snapshot(&order(
             cid.clone(),
             OrderState::active(CancelInFlight {
-                order: Some(Open::new(exchange_id.clone(), TIME, Decimal::ZERO)),
+                order: Some(Open::new(
+                    VenueOrderId::Assigned(exchange_id.clone()),
+                    TIME,
+                    Decimal::ZERO,
+                )),
             }),
         )));
 
@@ -2083,7 +2094,11 @@ mod tests {
         // The ack arrives and carries the exchange OrderId, settling the mapping.
         state.update_from_order_snapshot(Snapshot(&order(
             cid.clone(),
-            OrderState::active(Open::new(exchange_id.clone(), TIME, dec!(4))),
+            OrderState::active(Open::new(
+                VenueOrderId::Assigned(exchange_id.clone()),
+                TIME,
+                dec!(4),
+            )),
         )));
 
         assert!(
@@ -2334,7 +2349,11 @@ mod tests {
     ) {
         state.update_from_order_snapshot(Snapshot(&order(
             cid.clone(),
-            OrderState::active(Open::new(exchange_id.clone(), TIME, dec!(10))),
+            OrderState::active(Open::new(
+                VenueOrderId::Assigned(exchange_id.clone()),
+                TIME,
+                dec!(10),
+            )),
         )));
     }
 

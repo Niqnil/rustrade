@@ -103,7 +103,7 @@ use crate::{
     },
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
-        id::{ClientOrderId, OrderId, StrategyId},
+        id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
     },
@@ -366,7 +366,7 @@ impl ExecutionClient for HyperliquidClient {
                 kind: OrderKind::Limit,
                 time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
                 state: crate::order::state::OrderState::active(Open {
-                    id: OrderId(order_id),
+                    id: VenueOrderId::Assigned(OrderId(order_id)),
                     time_exchange,
                     filled_quantity: Decimal::ZERO,
                 }),
@@ -664,11 +664,34 @@ impl ExecutionClient for HyperliquidClient {
 
         let coin = instrument_to_perp_coin(request.key.instrument);
 
-        // Get order ID from request
-        let order_id = match &request.state.id {
-            Some(id) => id,
-            None => {
-                warn!("Cancel request missing order ID");
+        enum CancelMethod {
+            ByOid(u64),
+            ByCloid(Uuid),
+        }
+
+        // How the venue addresses the order decides which endpoint cancels it. This reads the
+        // identifier's kind rather than inferring it from the string's shape: an oid and a cloid
+        // are different identifiers that happen to both be text, and telling them apart by parsing
+        // means a cloid which parses as a number gets cancelled as somebody else's oid.
+        let cancel_method = match &request.state.id {
+            Some(VenueOrderId::Assigned(id)) => {
+                id.0.parse::<u64>()
+                    .map(CancelMethod::ByOid)
+                    .map_err(|_| "venue order id is not a numeric Hyperliquid oid")
+            }
+            // The venue accepted the order without assigning an oid, so the only handle on it is
+            // the client id sent with it -- and `cancel_by_cloid` requires that to be a UUID. The
+            // UUID guard at placement is what keeps this arm reachable.
+            Some(VenueOrderId::ClientAssigned) => Uuid::parse_str(&request.key.cid.0)
+                .map(CancelMethod::ByCloid)
+                .map_err(|_| "order is addressable only by its client id, which is not a UUID"),
+            None => Err("order is still in flight; the venue has acknowledged nothing to cancel"),
+        };
+
+        let cancel_method = match cancel_method {
+            Ok(method) => method,
+            Err(reason) => {
+                warn!(%reason, cid = %request.key.cid, "Cannot determine how to cancel order");
                 return Some(OrderResponseCancel {
                     key: OrderKey {
                         exchange: ExchangeId::HyperliquidPerp,
@@ -677,41 +700,17 @@ impl ExecutionClient for HyperliquidClient {
                         cid: request.key.cid.clone(),
                     },
                     state: Err(UnindexedOrderError::Rejected(
-                        crate::error::ApiError::OrderRejected("Missing order ID".to_string()),
+                        crate::error::ApiError::OrderRejected(reason.to_string()),
                     )),
                 });
             }
         };
 
-        // Try to determine cancel method:
-        // 1. If order_id parses as u64, use cancel() with OID (regular limit orders)
-        // 2. If order_id parses as UUID, use cancel_by_cloid() (trigger orders)
-        // 3. Otherwise, reject with clear error
-        enum CancelMethod {
-            ByOid(u64),
-            ByCloid(Uuid),
-        }
-
-        let cancel_method = if let Ok(oid) = order_id.0.parse::<u64>() {
-            CancelMethod::ByOid(oid)
-        } else if let Ok(uuid) = Uuid::parse_str(&order_id.0) {
-            CancelMethod::ByCloid(uuid)
-        } else {
-            warn!(?order_id, "Order ID is neither u64 (OID) nor UUID (cloid)");
-            return Some(OrderResponseCancel {
-                key: OrderKey {
-                    exchange: ExchangeId::HyperliquidPerp,
-                    instrument: request.key.instrument.clone(),
-                    strategy: request.key.strategy.clone(),
-                    cid: request.key.cid.clone(),
-                },
-                state: Err(UnindexedOrderError::Rejected(
-                    crate::error::ApiError::OrderRejected(
-                        "Invalid order ID: must be numeric OID or UUID (for trigger orders)"
-                            .to_string(),
-                    ),
-                )),
-            });
+        // Terminal states keep a plain `OrderId`: nothing compares them for identity, so an order
+        // the venue never named records the client id it was addressed by instead.
+        let cancelled_id = match &request.state.id {
+            Some(venue_id) => venue_id.or_client_id(&request.key.cid),
+            None => OrderId(request.key.cid.0.clone()),
         };
 
         let response = match cancel_method {
@@ -757,7 +756,7 @@ impl ExecutionClient for HyperliquidClient {
                         cid: request.key.cid.clone(),
                     },
                     state: Ok(Cancelled::new(
-                        order_id.clone(),
+                        cancelled_id.clone(),
                         Utc::now(),
                         Decimal::ZERO, // Cancel response doesn't include filled quantity
                     )),
@@ -967,7 +966,7 @@ impl ExecutionClient for HyperliquidClient {
                     Some(ExchangeDataStatus::Resting(resting)) => {
                         debug!(oid = resting.oid, "Order resting");
                         OrderState::active(Open {
-                            id: OrderId(format_smolstr!("{}", resting.oid)),
+                            id: VenueOrderId::Assigned(OrderId(format_smolstr!("{}", resting.oid))),
                             time_exchange: Utc::now(),
                             filled_quantity: Decimal::ZERO,
                         })
@@ -1001,7 +1000,7 @@ impl ExecutionClient for HyperliquidClient {
                         if cloid_is_some {
                             debug!(cloid = %request.key.cid.0, "Order waiting (cloid trackable)");
                             OrderState::active(Open {
-                                id: OrderId(request.key.cid.0.clone()),
+                                id: VenueOrderId::ClientAssigned,
                                 time_exchange: Utc::now(),
                                 filled_quantity: Decimal::ZERO,
                             })
@@ -1147,7 +1146,7 @@ impl ExecutionClient for HyperliquidClient {
                 kind: OrderKind::Limit,
                 time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
                 state: Open {
-                    id: OrderId(order_id),
+                    id: VenueOrderId::Assigned(OrderId(order_id)),
                     time_exchange,
                     filled_quantity: Decimal::ZERO,
                 },
@@ -1294,7 +1293,7 @@ fn order_update_to_account_event(
             let current_sz = parse_decimal(&order.sz, "order.sz")?;
             let filled_quantity = (orig_sz - current_sz).max(Decimal::ZERO);
             crate::order::state::OrderState::active(Open {
-                id: OrderId(order_id_smol),
+                id: VenueOrderId::Assigned(OrderId(order_id_smol)),
                 time_exchange,
                 filled_quantity,
             })

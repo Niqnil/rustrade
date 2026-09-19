@@ -51,7 +51,7 @@ use crate::{
     },
     order::{
         Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
-        id::{OrderId, StrategyId},
+        id::{OrderId, StrategyId, VenueOrderId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
     },
@@ -768,7 +768,7 @@ impl ExecutionClient for BinanceSpot {
             OrderCancelParams::builder(request.key.instrument.name().to_string());
 
         // Use exchange order ID if available and parseable, otherwise use client order ID
-        if let Some(ref order_id) = request.state.id {
+        if let Some(order_id) = request.state.id.as_ref().and_then(VenueOrderId::assigned) {
             if let Ok(id) = order_id.0.parse::<i64>() {
                 params_builder = params_builder.order_id(id);
             } else {
@@ -1100,7 +1100,11 @@ impl ExecutionClient for BinanceSpot {
                         ))
                     } else {
                         // Order is resting on the order book
-                        OrderState::active(Open::new(exchange_order_id, time_exchange, filled_qty))
+                        OrderState::active(Open::new(
+                            VenueOrderId::Assigned(exchange_order_id),
+                            time_exchange,
+                            filled_qty,
+                        ))
                     };
 
                     Some(Order {

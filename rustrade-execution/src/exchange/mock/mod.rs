@@ -372,7 +372,7 @@ pub(crate) mod fixtures {
         market::MarketSnapshot,
         order::{
             Order, OrderEvent, OrderKey, OrderKind, TimeInForce, UnindexedOrder,
-            id::{ClientOrderId, OrderId, StrategyId},
+            id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
             request::{OrderRequestOpen, RequestOpen},
             state::{Open, OrderState},
         },
@@ -497,7 +497,7 @@ pub(crate) mod fixtures {
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodTillDate { expiry },
             state: OrderState::active(Open::new(
-                OrderId::new(cid),
+                VenueOrderId::Assigned(OrderId::new(cid)),
                 opened,
                 rust_decimal::Decimal::ZERO,
             )),

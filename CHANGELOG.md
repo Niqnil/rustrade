@@ -7,7 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: `Open::id` and `RequestCancel::id` now carry a `VenueOrderId`, which distinguishes an
+  order the venue named from one it did not** (`rustrade-execution`). Both fields previously held a
+  plain `OrderId`, and that field had come to mean two different things. A venue that accepts an
+  order without assigning an identifier of its own — Hyperliquid, for one resting but not yet
+  triggered — leaves it addressable only by the client id sent with it, and the Hyperliquid client
+  stored that client id in the venue-id field. Nothing marked which kind an `OrderId` held, so the
+  cancel path recovered the distinction by parsing: numeric meant a venue oid, UUID-shaped meant a
+  client id. Two identifiers told apart by the shape of their text is not a distinction a caller can
+  rely on.
+
+  `VenueOrderId::Assigned(OrderId)` and `VenueOrderId::ClientAssigned` now state it outright.
+  `VenueOrderId::assigned` yields the venue's identifier or `None`; `is_same_order_as` and
+  `contradicts` answer identity without treating two absent identifiers as a match, which plain `==`
+  on the old field could not avoid. `RequestCancel::id` is `Option<VenueOrderId>`, keeping three
+  cases apart that would otherwise collapse into two: nothing acknowledged yet, cancel by venue
+  identifier, and cancel by client id. Hyperliquid's cancel now reads the variant instead of parsing.
+
+  Migration: construct `Open` with `VenueOrderId::Assigned(order_id)` where a venue assigned one,
+  and `VenueOrderId::ClientAssigned` where it did not; `From<OrderId>` is available for the common
+  case. Replace `open.id == some_order_id` with `open.id.assigned() == Some(&some_order_id)`, and any
+  "is this the same order" test with `is_same_order_as` or `contradicts`. `Open` serialises
+  differently as a result, so persisted order state from an earlier version will not load. The
+  terminal states — `Cancelled`, `Filled` and `Expired` — keep a plain `OrderId`: they are records
+  of an order that has ended rather than handles for addressing one, and nothing compares them for
+  identity.
+
 ### Fixed
+
+- **An order snapshot is no longer applied to a tracked order it does not belong to** (`rustrade`).
+  `OrderManager::update_from_order_snapshot` resolves a snapshot to a tracked order by
+  `ClientOrderId` and nothing else, so two exchange orders sharing one client id occupy the same
+  slot. `Orders::update_from_fill` had long refused a fill whose venue identifier disagreed with the
+  order it would advance; the snapshot path, which writes the order's price, quantity, kind, time in
+  force and cumulative fill and can retire it outright, had no equivalent check. The three arms that
+  merge an incoming `Open` into a state the venue has already named now refuse an update that names
+  a different venue order, and report it. The test is for contradiction rather than inequality: an
+  order the venue has not yet named carries nothing to disagree with, and must still be able to
+  adopt the identifier a later snapshot brings — refusing that would strand such an order on its
+  placeholder for the rest of its life, never learning its venue identifier and never learning its
+  fills.
 
 - **A Binance Margin fill now advances its order** (`rustrade-execution`, `binance` feature). A
   Binance `executionReport` of type `TRADE` carries two facts: the execution print (`l`/`L`) and

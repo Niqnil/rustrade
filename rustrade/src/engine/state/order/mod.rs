@@ -93,11 +93,15 @@ impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
     ///
     /// # What it will not do
     ///
-    /// Nothing happens unless the order is already tracked and `Open` with this exact exchange
+    /// Nothing happens unless the order is already tracked and `Open` under this exact venue
     /// [`OrderId`]. A fill for an untracked order cannot insert one, so this cannot resurrect an
     /// order that has retired -- unlike an order snapshot, which reaches a vacant-entry arm that
     /// inserts. A fill arriving after its order retired is therefore safe to apply here, and is
     /// simply ignored.
+    ///
+    /// An order the venue has not named -- `VenueOrderId::ClientAssigned` -- is never advanced
+    /// here, because a fill is reported against a venue id and that order has none to match.
+    /// Such an order is advanced by its order snapshots instead.
     pub fn update_from_fill(
         &mut self,
         cid: &ClientOrderId,
@@ -114,10 +118,14 @@ impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
         let ActiveOrderState::Open(open) = &mut order.state else {
             return false;
         };
-        // A `ClientOrderId` identifies the order this engine sent; the exchange id identifies what
-        // the venue filled. Requiring both to agree keeps a fill off an order that merely shares
-        // the slot -- a replaced order, or a reused client id.
-        if open.id != *order_id {
+        // A `ClientOrderId` identifies the order this engine sent; the venue's own id identifies
+        // what it filled. Requiring both to agree keeps a fill off an order that merely shares the
+        // slot -- a replaced order, or a reused client id.
+        //
+        // An order the venue never named has no id to agree with, so it cannot be advanced from
+        // the fill stream at all. Reading two absent ids as a match is precisely the confusion
+        // this comparison exists to prevent, so the absence is compared, not skipped.
+        if open.id.assigned() != Some(order_id) {
             return false;
         }
         if filled_quantity <= open.filled_quantity {
@@ -284,6 +292,28 @@ where
                 );
             }
             (ActiveOrderState::Open(current), ActiveOrderState::Open(open)) => {
+                // This order was reached by `ClientOrderId` alone. If both states name a venue
+                // order and the two disagree, one client id is covering two distinct exchange
+                // orders, and applying the update would overwrite a live order's price, quantity
+                // and cumulative fill -- or retire it outright -- on the strength of a different
+                // order's state.
+                //
+                // `contradicts` rejects only on positive evidence. An order the venue has not
+                // named carries nothing to compare, and two such orders are not shown to be the
+                // same order by both lacking an identifier.
+                if current.id.contradicts(&open.id) {
+                    error!(
+                        exchange = ?snapshot.key.exchange,
+                        instrument = ?snapshot.key.instrument,
+                        strategy = %snapshot.key.strategy,
+                        cid = %snapshot.key.cid,
+                        tracked_id = %current.id,
+                        update_id = %open.id,
+                        "OrderManager received an Open snapshot naming a different exchange order than the one tracked under this ClientOrderId - ignoring"
+                    );
+                    return;
+                }
+
                 if current.time_exchange <= open.time_exchange {
                     // A venue may report a completed fill as an Open snapshot with nothing left to
                     // fill, rather than as a distinct terminal state. That order is finished, so
@@ -336,11 +366,19 @@ where
                     "OrderManager transitioned an Open order to CancelInFlight"
                 );
 
-                // Ensure next CancelInFlight.Open is populated and the most recent
+                // Ensure next CancelInFlight.Open is populated and the most recent.
+                //
+                // A carried `Open` naming a different venue order is dropped rather than adopted,
+                // on the reasoning in the `Open` -> `Open` arm. The transition itself still
+                // happens: a cancel is in flight either way, and falling back to the tracked
+                // `Open` keeps this order's own state rather than a foreign one's.
                 let latest_open = update
                     .order
                     .take()
-                    .filter(|update| current.time_exchange <= update.time_exchange)
+                    .filter(|update| {
+                        !current.id.contradicts(&update.id)
+                            && current.time_exchange <= update.time_exchange
+                    })
                     .unwrap_or_else(|| current.clone());
 
                 current_entry.get_mut().state = ActiveOrderState::CancelInFlight(CancelInFlight {
@@ -358,6 +396,23 @@ where
                 );
             }
             (ActiveOrderState::CancelInFlight(current), ActiveOrderState::Open(update)) => {
+                // Reached by `ClientOrderId` alone; see the `Open` -> `Open` arm.
+                if current
+                    .order
+                    .as_ref()
+                    .is_some_and(|held| held.id.contradicts(&update.id))
+                {
+                    error!(
+                        exchange = ?snapshot.key.exchange,
+                        instrument = ?snapshot.key.instrument,
+                        strategy = %snapshot.key.strategy,
+                        cid = %snapshot.key.cid,
+                        update_id = %update.id,
+                        "OrderManager received an Open snapshot naming a different exchange order than the tracked CancelInFlight - ignoring"
+                    );
+                    return;
+                }
+
                 debug!(
                     exchange = ?snapshot.key.exchange,
                     instrument = ?snapshot.key.instrument,
@@ -524,7 +579,7 @@ mod tests {
         error::{ConnectivityError, OrderError},
         order::{
             Order, OrderKey, OrderKind, TimeInForce,
-            id::{ClientOrderId, OrderId, StrategyId},
+            id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
             request::{RequestCancel, RequestOpen},
             state::{
                 ActiveOrderState, CancelInFlight, Cancelled, Expired, Filled, Open, OpenInFlight,
@@ -680,7 +735,7 @@ mod tests {
 
     fn open(time_exchange: DateTime<Utc>) -> Open {
         Open {
-            id: OrderId(SmolStr::default()),
+            id: VenueOrderId::Assigned(OrderId(SmolStr::default())),
             time_exchange,
             filled_quantity: Default::default(),
         }
@@ -689,9 +744,27 @@ mod tests {
     /// An `Open` whose cumulative fill is the point rather than incidental.
     fn open_filled(time_exchange: DateTime<Utc>, filled_quantity: Decimal) -> Open {
         Open {
-            id: OrderId(SmolStr::default()),
+            id: VenueOrderId::Assigned(OrderId(SmolStr::default())),
             time_exchange,
             filled_quantity,
+        }
+    }
+
+    /// An `Open` the venue has named, for the cases where *which* order it names is the point.
+    fn open_assigned(id: &str, time_exchange: DateTime<Utc>) -> Open {
+        Open {
+            id: VenueOrderId::Assigned(OrderId::new(id)),
+            time_exchange,
+            filled_quantity: Default::default(),
+        }
+    }
+
+    /// An `Open` the venue accepted without naming -- addressable only by its client id.
+    fn open_client_assigned(time_exchange: DateTime<Utc>) -> Open {
+        Open {
+            id: VenueOrderId::ClientAssigned,
+            time_exchange,
+            filled_quantity: Default::default(),
         }
     }
 
@@ -1201,6 +1274,191 @@ mod tests {
                 ActiveOrderState::Open(open_filled(time_filled, filled_on_stream)),
             )]),
             "a snapshot stamped with creation time was applied over a later one"
+        );
+    }
+
+    /// A snapshot resolves to a tracked order by `ClientOrderId` alone, so two exchange orders
+    /// sharing one client id land in the same slot. Where both name a venue order and the two
+    /// disagree, applying the update would write one order's price, quantity and cumulative fill
+    /// over another's -- or retire an order that is still resting at the venue.
+    #[test]
+    fn a_snapshot_naming_a_different_exchange_order_is_refused() {
+        let time_base = DateTime::<Utc>::MIN_UTC;
+        let cid = ClientOrderId::default();
+
+        let mut state = orders([order(
+            cid.clone(),
+            ActiveOrderState::Open(open_assigned("A", time_base)),
+        )]);
+
+        // Newer, so the staleness gate would admit it. It is refused on identity alone.
+        let foreign: Snapshot<Order<ExchangeId, u64, OrderState<u64, u64>>> = Snapshot(order(
+            cid.clone(),
+            OrderState::active(open_assigned("B", time_plus_secs(time_base, 1))),
+        ));
+        state.update_from_order_snapshot(foreign.as_ref());
+
+        assert_eq!(
+            state,
+            orders([order(
+                cid,
+                ActiveOrderState::Open(open_assigned("A", time_base)),
+            )]),
+            "a snapshot for exchange order B was applied to tracked order A"
+        );
+    }
+
+    /// The other half of that guard, and the reason it tests for contradiction rather than
+    /// inequality.
+    ///
+    /// A venue may accept an order without assigning an identifier -- Hyperliquid does this for one
+    /// that is resting but has not yet triggered -- and name it only later. Refusing that later
+    /// snapshot would leave the order on its placeholder for the rest of its life, never learning
+    /// the venue's identifier and never learning its fills: a worse failure than the one the guard
+    /// exists to prevent.
+    #[test]
+    fn an_order_the_venue_has_not_named_adopts_the_id_a_later_snapshot_brings() {
+        let time_base = DateTime::<Utc>::MIN_UTC;
+        let time_named = time_plus_secs(time_base, 1);
+        let cid = ClientOrderId::default();
+
+        let mut state = orders([order(
+            cid.clone(),
+            ActiveOrderState::Open(open_client_assigned(time_base)),
+        )]);
+
+        let named: Snapshot<Order<ExchangeId, u64, OrderState<u64, u64>>> = Snapshot(order(
+            cid.clone(),
+            OrderState::active(open_assigned("A", time_named)),
+        ));
+        state.update_from_order_snapshot(named.as_ref());
+
+        assert_eq!(
+            state,
+            orders([order(
+                cid,
+                ActiveOrderState::Open(open_assigned("A", time_named)),
+            )]),
+            "an order the venue had not yet named failed to adopt the id a later snapshot brought"
+        );
+    }
+
+    /// A `CancelInFlight` reached either way round refuses a foreign `Open` too, but not
+    /// identically: arriving *as* a cancel the transition still happens, because a cancel is in
+    /// flight whatever the carried `Open` says, and the tracked `Open` is kept instead.
+    #[test]
+    fn a_cancel_in_flight_does_not_adopt_an_open_naming_a_different_exchange_order() {
+        let time_base = DateTime::<Utc>::MIN_UTC;
+        let cid = ClientOrderId::default();
+
+        let mut state = orders([order(
+            cid.clone(),
+            ActiveOrderState::Open(open_assigned("A", time_base)),
+        )]);
+
+        let cancelling: Snapshot<Order<ExchangeId, u64, OrderState<u64, u64>>> = Snapshot(order(
+            cid.clone(),
+            OrderState::active(CancelInFlight {
+                order: Some(open_assigned("B", time_plus_secs(time_base, 1))),
+            }),
+        ));
+        state.update_from_order_snapshot(cancelling.as_ref());
+
+        assert_eq!(
+            state,
+            orders([order(
+                cid.clone(),
+                ActiveOrderState::CancelInFlight(CancelInFlight {
+                    order: Some(open_assigned("A", time_base)),
+                }),
+            )]),
+            "a CancelInFlight transition adopted an Open naming a different exchange order"
+        );
+
+        // Arriving as an `Open` for an existing `CancelInFlight`, adoption is the arm's only
+        // effect, so the snapshot is refused outright.
+        let foreign: Snapshot<Order<ExchangeId, u64, OrderState<u64, u64>>> = Snapshot(order(
+            cid.clone(),
+            OrderState::active(open_assigned("B", time_plus_secs(time_base, 2))),
+        ));
+        state.update_from_order_snapshot(foreign.as_ref());
+
+        assert_eq!(
+            state,
+            orders([order(
+                cid,
+                ActiveOrderState::CancelInFlight(CancelInFlight {
+                    order: Some(open_assigned("A", time_base)),
+                }),
+            )]),
+            "a tracked CancelInFlight adopted an Open naming a different exchange order"
+        );
+    }
+
+    /// `update_from_fill` matches on the venue's identifier as well as the client id, so a fill
+    /// reaches only the order the venue named in it.
+    #[test]
+    fn a_fill_only_advances_the_order_the_venue_named_in_it() {
+        let time_base = DateTime::<Utc>::MIN_UTC;
+        let cid = ClientOrderId::default();
+
+        // `order` builds `quantity: dec!(1)`.
+        let mut state = orders([order(
+            cid.clone(),
+            ActiveOrderState::Open(open_assigned("A", time_base)),
+        )]);
+
+        // A fill for a different venue order leaves this one untouched.
+        assert!(!state.update_from_fill(&cid, &OrderId::new("B"), dec!(0.5)));
+        assert_eq!(
+            state,
+            orders([order(
+                cid.clone(),
+                ActiveOrderState::Open(open_assigned("A", time_base)),
+            )])
+        );
+
+        // The matching one advances the cumulative, and reports `false`: the order is still live,
+        // so the caller has no routing to prune.
+        assert!(!state.update_from_fill(&cid, &OrderId::new("A"), dec!(0.5)));
+        assert_eq!(
+            state,
+            orders([order(
+                cid.clone(),
+                ActiveOrderState::Open(Open {
+                    id: VenueOrderId::Assigned(OrderId::new("A")),
+                    time_exchange: time_base,
+                    filled_quantity: dec!(0.5),
+                }),
+            )])
+        );
+
+        // Nothing left to fill: the order is untracked and the caller is told so.
+        assert!(state.update_from_fill(&cid, &OrderId::new("A"), dec!(1)));
+        assert_eq!(state, Orders::default());
+    }
+
+    /// A fill is reported against a venue identifier, so an order that has none cannot be matched
+    /// to one. Reading two absent identifiers as agreement would attach any fill under this client
+    /// id to this order.
+    #[test]
+    fn a_fill_cannot_advance_an_order_the_venue_has_not_named() {
+        let time_base = DateTime::<Utc>::MIN_UTC;
+        let cid = ClientOrderId::default();
+
+        let mut state = orders([order(
+            cid.clone(),
+            ActiveOrderState::Open(open_client_assigned(time_base)),
+        )]);
+
+        assert!(!state.update_from_fill(&cid, &OrderId::new("A"), dec!(0.5)));
+        assert_eq!(
+            state,
+            orders([order(
+                cid,
+                ActiveOrderState::Open(open_client_assigned(time_base)),
+            )]),
+            "a fill advanced an order the venue has not named"
         );
     }
 

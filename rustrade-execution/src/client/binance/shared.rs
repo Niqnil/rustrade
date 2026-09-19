@@ -22,7 +22,7 @@ use crate::{
     error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
     order::{
         Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
-        id::{ClientOrderId, OrderId, StrategyId},
+        id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         request::UnindexedOrderResponseCancel,
         state::{Cancelled, Open, OrderState},
     },
@@ -525,7 +525,7 @@ pub(crate) fn convert_open_order<T: BinanceOrderFields>(
         quantity,
         kind,
         time_in_force,
-        state: Open::new(order_id, time_exchange, filled_qty),
+        state: Open::new(VenueOrderId::Assigned(order_id), time_exchange, filled_qty),
     })
 }
 
@@ -996,7 +996,11 @@ fn convert_order_snapshot<T: BinanceExecutionReportFields>(
         quantity,
         kind,
         time_in_force,
-        state: OrderState::active(Open::new(order_id, time_exchange, filled_qty)),
+        state: OrderState::active(Open::new(
+            VenueOrderId::Assigned(order_id),
+            time_exchange,
+            filled_qty,
+        )),
     };
 
     Some(UnindexedAccountEvent::new(

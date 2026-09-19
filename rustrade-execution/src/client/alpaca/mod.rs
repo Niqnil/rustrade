@@ -51,7 +51,7 @@ use crate::{
             BracketOrderRequest as UnifiedBracketOrderRequest,
             BracketOrderResult as UnifiedBracketOrderResult,
         },
-        id::{ClientOrderId, OrderId, StrategyId},
+        id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
     },
@@ -1342,7 +1342,7 @@ impl ExecutionClient for AlpacaClient {
         // Require the exchange order ID — Alpaca's DELETE endpoint uses the UUID.
         // If only clientOrderId is available, the caller should first resolve it
         // via fetch_open_orders.
-        let order_id: SmolStr = match &request.state.id {
+        let order_id: SmolStr = match request.state.id.as_ref().and_then(VenueOrderId::assigned) {
             Some(id) => id.0.clone(),
             None => {
                 warn!(
@@ -1731,7 +1731,11 @@ impl AlpacaClient {
                         None,
                     ))
                 } else {
-                    OrderState::active(Open::new(exchange_order_id, time_exchange, filled_qty))
+                    OrderState::active(Open::new(
+                        VenueOrderId::Assigned(exchange_order_id),
+                        time_exchange,
+                        filled_qty,
+                    ))
                 };
 
                 AlpacaBracketOrderResult {
@@ -1938,7 +1942,11 @@ impl AlpacaClient {
                     ))
                 } else {
                     // Order is resting on the order book (partially filled or unfilled)
-                    OrderState::active(Open::new(exchange_order_id, time_exchange, filled_qty))
+                    OrderState::active(Open::new(
+                        VenueOrderId::Assigned(exchange_order_id),
+                        time_exchange,
+                        filled_qty,
+                    ))
                 };
 
                 Some(Order {
@@ -3043,7 +3051,7 @@ fn convert_open_order(
         quantity,
         kind,
         time_in_force,
-        state: Open::new(order_id, time_exchange, filled_qty),
+        state: Open::new(VenueOrderId::Assigned(order_id), time_exchange, filled_qty),
     })
 }
 
@@ -3131,7 +3139,11 @@ fn ws_order_snapshot(
         quantity,
         kind,
         time_in_force,
-        state: OrderState::active(Open::new(order_id, time_exchange, filled_qty)),
+        state: OrderState::active(Open::new(
+            VenueOrderId::Assigned(order_id),
+            time_exchange,
+            filled_qty,
+        )),
     };
     Some(UnindexedAccountEvent::new(
         ExchangeId::AlpacaBroker,
@@ -4344,7 +4356,7 @@ mod tests {
             panic!("expected an Open snapshot, got {:?}", order.state);
         };
         assert_eq!(open.filled_quantity, Decimal::from_str("1").unwrap());
-        assert_eq!(open.id.0.as_str(), "ord-1");
+        assert_eq!(open.id.assigned().map(|id| id.0.as_str()), Some("ord-1"));
     }
 
     #[test]
