@@ -184,8 +184,27 @@ We use a **two-PR flow** so `develop` and `main` stay in sync — the version bu
    - Rename `[Unreleased]` → `[x.y.z] - YYYY-MM-DD` and add a fresh empty `[Unreleased]`.
 3. Open the release-prep PR targeting **`develop`**; merge after CI is green.
 4. Open the release PR **`develop` → `main`**; merge after CI is green.
-5. Tag the release: `git tag vx.y.z && git push origin vx.y.z`.
+5. Tag the **merge commit on `main`** — not `develop`'s tip. Step 4 leaves you on `develop`, so a
+   bare `git tag vx.y.z` would tag the wrong commit. Name the commit explicitly:
+
+   ```bash
+   git fetch origin
+   git log -1 origin/main   # confirm this is the release merge commit
+   git tag vx.y.z origin/main
+   git push origin vx.y.z
+   ```
 6. The publish workflow runs automatically on the tag.
+
+   **A failed publish does not need a version bump.** Every publish step is guarded by a
+   `cargo search` check for the exact version, so crates already on crates.io are skipped and a
+   re-run resumes where it stopped. `publish.yml` has no `workflow_dispatch` trigger, so a retry
+   means deleting and re-pushing the same tag:
+
+   ```bash
+   git push origin :refs/tags/vx.y.z
+   git tag -d vx.y.z
+   # fix the cause, then re-tag and re-push as in step 5
+   ```
 
 ## What NOT to Contribute
 
