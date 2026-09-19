@@ -686,6 +686,15 @@ mod tests {
         }
     }
 
+    /// An `Open` whose cumulative fill is the point rather than incidental.
+    fn open_filled(time_exchange: DateTime<Utc>, filled_quantity: Decimal) -> Open {
+        Open {
+            id: OrderId(SmolStr::default()),
+            time_exchange,
+            filled_quantity,
+        }
+    }
+
     fn request_cancel(cid: ClientOrderId) -> OrderRequestCancel<ExchangeId, u64> {
         OrderRequestCancel {
             key: OrderKey {
@@ -786,11 +795,7 @@ mod tests {
                 state: Orders::default(),
                 input: Snapshot(order(
                     cid.clone(),
-                    OrderState::active(Open {
-                        id: OrderId(SmolStr::default()),
-                        time_exchange: time_base,
-                        filled_quantity: dec!(1),
-                    }),
+                    OrderState::active(open_filled(time_base, dec!(1))),
                 )),
                 expected: Orders::default(),
             },
@@ -910,11 +915,7 @@ mod tests {
                 )]),
                 input: Snapshot(order(
                     cid.clone(),
-                    OrderState::active(Open {
-                        id: OrderId(SmolStr::default()),
-                        time_exchange: time_base,
-                        filled_quantity: dec!(1),
-                    }),
+                    OrderState::active(open_filled(time_base, dec!(1))),
                 )),
                 expected: Orders::default(),
             },
@@ -967,11 +968,7 @@ mod tests {
                 state: orders([order(cid.clone(), ActiveOrderState::Open(open(time_base)))]),
                 input: Snapshot(order(
                     cid.clone(),
-                    OrderState::active(Open {
-                        id: OrderId(SmolStr::default()),
-                        time_exchange: time_plus_secs(time_base, 1),
-                        filled_quantity: dec!(1),
-                    }),
+                    OrderState::active(open_filled(time_plus_secs(time_base, 1), dec!(1))),
                 )),
                 expected: Orders::default(),
             },
@@ -986,11 +983,7 @@ mod tests {
                 )]),
                 input: Snapshot(order(
                     cid.clone(),
-                    OrderState::active(Open {
-                        id: OrderId(SmolStr::default()),
-                        time_exchange: time_base,
-                        filled_quantity: dec!(1),
-                    }),
+                    OrderState::active(open_filled(time_base, dec!(1))),
                 )),
                 expected: orders([order(
                     cid.clone(),
@@ -1146,6 +1139,69 @@ mod tests {
             test.state.update_from_order_snapshot(test.input.as_ref());
             assert_eq!(test.state, test.expected, "TC failed: {}", test.name)
         }
+    }
+
+    /// What it costs a consumer when a producer stamps `Open::time_exchange` with the order's
+    /// creation time instead of its last update.
+    ///
+    /// `Open`'s producer contract requires the venue's last-update field, because creation time is
+    /// identical across every snapshot of one order. A snapshot carrying it cannot be ordered
+    /// against the states that followed, so the staleness gate discards it -- and the cumulative
+    /// fill it carried goes with it. The gate is right to: it cannot tell a genuinely old snapshot
+    /// from a mis-stamped fresh one, and letting the older stamp win would let an out-of-sequence
+    /// snapshot rewind an order that is still live.
+    ///
+    /// The loss lands exactly where a reconciliation fetch is meant to help -- a partially filled
+    /// order, where the discarded snapshot held the only accurate cumulative. Asserting it here
+    /// keeps the behaviour visible, and makes any change to the gate's ordering key a deliberate
+    /// one rather than a silent flip.
+    ///
+    /// Note that the fill has to reach the order *as a snapshot* for this to arise.
+    /// `Orders::update_from_fill` writes `filled_quantity` alone and never `time_exchange`, so it
+    /// cannot move an order past its own creation stamp.
+    #[test]
+    fn a_creation_time_stamped_snapshot_is_discarded_once_a_fill_has_advanced_the_order() {
+        let time_created = DateTime::<Utc>::MIN_UTC;
+        let time_filled = time_plus_secs(time_created, 1);
+        let cid = ClientOrderId::default();
+
+        // `order` builds `quantity: dec!(1)`. Both cumulatives stay under it, so the order remains
+        // live throughout and the full-fill collapse stays out of what is being measured.
+        let filled_on_stream = dec!(0.3);
+        let filled_at_venue = dec!(0.6);
+
+        // The order rests at the exchange, acknowledged at the moment it was created.
+        let mut state = orders([order(
+            cid.clone(),
+            ActiveOrderState::Open(open(time_created)),
+        )]);
+
+        // A partial fill arrives on the stream paired with a snapshot, stamped when the exchange
+        // matched it. The order now sits later than its own creation time.
+        let fill: Snapshot<Order<ExchangeId, u64, OrderState<u64, u64>>> = Snapshot(order(
+            cid.clone(),
+            OrderState::active(open_filled(time_filled, filled_on_stream)),
+        ));
+        state.update_from_order_snapshot(fill.as_ref());
+
+        // A reconciliation fetch returns the same order with the venue's true cumulative, stamped
+        // with creation time -- older than what the stream already applied.
+        let recovered: Snapshot<Order<ExchangeId, u64, OrderState<u64, u64>>> = Snapshot(order(
+            cid.clone(),
+            OrderState::active(open_filled(time_created, filled_at_venue)),
+        ));
+        state.update_from_order_snapshot(recovered.as_ref());
+
+        // The stream's view survives, cumulative and all. The expected state also pins that the
+        // first snapshot *was* applied, so the test cannot pass by ignoring both.
+        assert_eq!(
+            state,
+            orders([order(
+                cid,
+                ActiveOrderState::Open(open_filled(time_filled, filled_on_stream)),
+            )]),
+            "a snapshot stamped with creation time was applied over a later one"
+        );
     }
 
     #[test]
