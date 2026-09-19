@@ -33,14 +33,27 @@
 //! `MarginTradingRestApi::production`. A `testnet: true` config is therefore inert for margin and
 //! always resolves to production endpoints; the constructor logs a warning so this is observable
 //! rather than silent. See [`BinanceMarginConfig::testnet`].
+//!
+//! ## Known limitations
+//! - `balanceUpdate` events (deposits/withdrawals) are not forwarded. Callers reconcile balances
+//!   after external transfers via [`ExecutionClient::fetch_balances`] or
+//!   [`ExecutionClient::account_snapshot`].
+//! - `userLiabilityChange` is surfaced at INFO but never folded into balance state: borrow/repay
+//!   is a delta, and accumulating it would be the position tracking this library leaves to its
+//!   consumers.
+//! - A `TRADE` report whose order status (`X`) is neither `PARTIALLY_FILLED` nor `FILLED` emits
+//!   the execution but no order snapshot, so a fill arriving after its order's terminal report
+//!   cannot resurrect a retired order as a resting one. That order's filled quantity is settled
+//!   instead by the terminal report's own `z`, or by
+//!   [`ExecutionClient::fetch_open_orders`].
 
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
     RateLimitTracker, SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, classify_order_kind_tif,
-    classify_rest_order_error, connectivity_error, convert_open_order,
+    classify_rest_order_error, connectivity_error, convert_execution_report, convert_open_order,
     convert_open_order_owned_symbol, dedup_key_from_event, is_duplicate, new_dedup_cache,
-    parse_order_kind, parse_side, parse_time_in_force, rest_call_with_retry,
+    rest_call_with_retry,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, InstrumentBalanceUpdate,
@@ -50,7 +63,6 @@ use crate::{
     emit_stream_terminated,
     error::{
         ApiError, ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
-        UnindexedOrderError,
     },
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
@@ -1596,11 +1608,7 @@ fn convert_margin_user_data_events_with(
             // Single typed pass straight from the raw inner slice — no intermediate DOM, and only
             // the matched branch deserializes its payload.
             match serde_json::from_str::<ExecutionReport>(event_raw) {
-                Ok(report) => {
-                    if let Some(ev) = convert_margin_execution_report(report) {
-                        buf.push(ev);
-                    }
-                }
+                Ok(report) => convert_execution_report(&report, ExchangeId::BinanceMargin, buf),
                 Err(e) => {
                     warn!(error = %e, "BinanceMargin: undeserializable executionReport, dropping")
                 }
@@ -1681,294 +1689,6 @@ fn convert_margin_user_data_events_with(
             false
         }
     }
-}
-
-/// Convert a margin `executionReport` to a rustrade AccountEvent.
-///
-/// Field-by-field adapter. The margin `ExecutionReport` is a distinct nominal type from spot's,
-/// and the two are *not* interchangeable: spot declares fields margin does not, and several
-/// fields shared by name differ in type. Every field this conversion reads is identical in both,
-/// which is what lets the mapping below stand for either. Mapping: s=symbol, c=clientOrderId,
-/// S=side, o=type, f=TIF, q=qty, p=price,
-/// x=execType, X=orderStatus, i=orderId, l=lastQty, L=lastPrice, n=commission, N=commissionAsset,
-/// T=transactTime, t=tradeId, z=cumQty.
-#[allow(clippy::cognitive_complexity)] // matches all exec types with per-variant validation (as spot)
-fn convert_margin_execution_report(report: ExecutionReport) -> Option<UnindexedAccountEvent> {
-    let exec_type = match report.x.as_deref() {
-        Some(t) => t,
-        None => {
-            warn!("BinanceMargin executionReport missing execution type (x), dropping");
-            return None;
-        }
-    };
-    let symbol = match report.s.as_deref() {
-        Some(s) => InstrumentNameExchange::new(s),
-        None => {
-            warn!("BinanceMargin executionReport missing symbol (s), dropping");
-            return None;
-        }
-    };
-    let order_id = match report.i {
-        Some(id) => OrderId(format_smolstr!("{id}")),
-        None => {
-            warn!(%symbol, "BinanceMargin executionReport missing orderId (i), dropping");
-            return None;
-        }
-    };
-    let cid = match report.c.as_deref() {
-        Some(c) => ClientOrderId::new(c),
-        None => ClientOrderId::new(order_id.0.as_str()),
-    };
-    let time_exchange = match report
-        .t_uppercase
-        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
-    {
-        Some(t) => t,
-        None => {
-            warn!(%symbol, "BinanceMargin executionReport missing/unparseable transaction time (T), using now");
-            Utc::now()
-        }
-    };
-
-    match exec_type {
-        "NEW" => convert_margin_new_order(&report, symbol, cid, order_id, time_exchange),
-        "TRADE" => {
-            let trade_id = match report.t {
-                Some(id) => TradeId(format_smolstr!("{id}")),
-                None => {
-                    warn!(%symbol, "BinanceMargin TRADE event missing trade ID (t), dropping");
-                    return None;
-                }
-            };
-            let side = match report.s_uppercase.as_deref().and_then(parse_side) {
-                Some(s) => s,
-                None => {
-                    warn!(%symbol, "BinanceMargin TRADE event missing/unknown side (S), dropping");
-                    return None;
-                }
-            };
-            let last_price = match report.l_uppercase.as_deref() {
-                Some(s) => match Decimal::from_str(s) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(%symbol, error = %e, raw = s, "BinanceMargin TRADE event unparseable last price (L), dropping fill");
-                        return None;
-                    }
-                },
-                None => {
-                    warn!(%symbol, "BinanceMargin TRADE event missing last price (L), dropping fill");
-                    return None;
-                }
-            };
-            let last_qty = match report.l.as_deref() {
-                Some(s) => match Decimal::from_str(s) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(%symbol, error = %e, raw = s, "BinanceMargin TRADE event unparseable last qty (l), dropping fill");
-                        return None;
-                    }
-                },
-                None => {
-                    warn!(%symbol, "BinanceMargin TRADE event missing last qty (l), dropping fill");
-                    return None;
-                }
-            };
-            let commission = match Decimal::from_str(report.n.as_deref().unwrap_or("0")) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(%symbol, error = %e, "BinanceMargin TRADE event unparseable commission (n), defaulting to 0");
-                    Decimal::ZERO
-                }
-            };
-            let fee_asset = report
-                .n_uppercase
-                .as_deref()
-                .map(AssetNameExchange::from)
-                .unwrap_or_else(|| AssetNameExchange::from("UNKNOWN"));
-
-            // Field `z` is the order's cumulative filled quantity as of this execution, which is
-            // what advances the order; `l` above is this execution alone.
-            let order_filled_quantity = report.z.as_deref().and_then(|s| Decimal::from_str(s).ok());
-
-            let trade = Trade::new(
-                trade_id,
-                order_id,
-                symbol,
-                StrategyId::unknown(), // Binance doesn't carry strategy IDs
-                time_exchange,
-                side,
-                last_price,
-                last_qty,
-                order_filled_quantity,
-                AssetFees::new(fee_asset, commission, None),
-            );
-            Some(UnindexedAccountEvent::new(
-                ExchangeId::BinanceMargin,
-                AccountEventKind::Trade(trade),
-            ))
-        }
-        "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH" => {
-            let filled_qty = report
-                .z
-                .as_deref()
-                .and_then(|s| Decimal::from_str(s).ok())
-                .unwrap_or(Decimal::ZERO);
-            let response = UnindexedOrderResponseCancel {
-                key: OrderKey::new(
-                    ExchangeId::BinanceMargin,
-                    symbol,
-                    StrategyId::unknown(),
-                    cid,
-                ),
-                state: Ok(Cancelled::new(order_id, time_exchange, filled_qty)),
-            };
-            Some(UnindexedAccountEvent::new(
-                ExchangeId::BinanceMargin,
-                AccountEventKind::OrderCancelled(response),
-            ))
-        }
-        "REJECTED" => {
-            let reject_reason = report.r.unwrap_or_else(|| "unknown".to_string());
-            warn!(%symbol, %order_id, reason = %reject_reason, "BinanceMargin order REJECTED by matching engine");
-            let response = UnindexedOrderResponseCancel {
-                key: OrderKey::new(
-                    ExchangeId::BinanceMargin,
-                    symbol,
-                    StrategyId::unknown(),
-                    cid,
-                ),
-                state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
-                    reject_reason,
-                ))),
-            };
-            Some(UnindexedAccountEvent::new(
-                ExchangeId::BinanceMargin,
-                AccountEventKind::OrderCancelled(response),
-            ))
-        }
-        "REPLACE" => {
-            // Describes the CANCELLED original order; the replacement arrives as a later NEW report.
-            let filled_qty = report
-                .z
-                .as_deref()
-                .and_then(|s| Decimal::from_str(s).ok())
-                .unwrap_or(Decimal::ZERO);
-            let response = UnindexedOrderResponseCancel {
-                key: OrderKey::new(
-                    ExchangeId::BinanceMargin,
-                    symbol,
-                    StrategyId::unknown(),
-                    cid,
-                ),
-                state: Ok(Cancelled::new(order_id, time_exchange, filled_qty)),
-            };
-            Some(UnindexedAccountEvent::new(
-                ExchangeId::BinanceMargin,
-                AccountEventKind::OrderCancelled(response),
-            ))
-        }
-        _ => {
-            // PENDING_NEW / PENDING_CANCEL are transient; the terminal state follows shortly.
-            trace!(exec_type, "BinanceMargin ignoring execution type");
-            None
-        }
-    }
-}
-
-/// Convert a margin NEW execution report into an `OrderSnapshot` event.
-fn convert_margin_new_order(
-    report: &ExecutionReport,
-    symbol: InstrumentNameExchange,
-    cid: ClientOrderId,
-    order_id: OrderId,
-    time_exchange: DateTime<Utc>,
-) -> Option<UnindexedAccountEvent> {
-    let side = match report.s_uppercase.as_deref().and_then(parse_side) {
-        Some(s) => s,
-        None => {
-            warn!(%symbol, "BinanceMargin NEW event missing/unknown side (S), dropping");
-            return None;
-        }
-    };
-    let kind = parse_order_kind(report.o.as_deref().unwrap_or("LIMIT"))?;
-    let price: Option<Decimal> = match (report.p.as_deref(), &kind) {
-        (Some(p), _) => match Decimal::from_str(p) {
-            Ok(v) if !v.is_zero() => Some(v),
-            Ok(_) => {
-                if matches!(
-                    kind,
-                    OrderKind::Limit
-                        | OrderKind::StopLimit { .. }
-                        | OrderKind::TakeProfitLimit { .. }
-                        | OrderKind::TrailingStopLimit { .. }
-                ) {
-                    trace!(%symbol, %kind, "BinanceMargin NEW event has zero price (p) on limit-type order, treating as no limit price");
-                }
-                None
-            }
-            Err(e) => {
-                warn!(%symbol, price = p, error = %e, "BinanceMargin NEW event unparseable price (p), dropping");
-                return None;
-            }
-        },
-        (
-            None,
-            OrderKind::Market
-            | OrderKind::Stop { .. }
-            | OrderKind::TakeProfit { .. }
-            | OrderKind::TrailingStop { .. },
-        ) => None,
-        (
-            None,
-            OrderKind::Limit
-            | OrderKind::StopLimit { .. }
-            | OrderKind::TakeProfitLimit { .. }
-            | OrderKind::TrailingStopLimit { .. },
-        ) => {
-            warn!(%symbol, "BinanceMargin NEW limit-type order missing price (p), dropping");
-            return None;
-        }
-    };
-    let quantity = match report.q.as_deref() {
-        Some(q) => match Decimal::from_str(q) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(%symbol, qty = q, error = %e, "BinanceMargin NEW event unparseable quantity (q), dropping");
-                return None;
-            }
-        },
-        None => {
-            warn!(%symbol, "BinanceMargin NEW order missing quantity (q), dropping");
-            return None;
-        }
-    };
-    let time_in_force = parse_time_in_force(report.f.as_deref().unwrap_or("GTC"));
-    let filled_qty = report
-        .z
-        .as_deref()
-        .and_then(|s| Decimal::from_str(s).ok())
-        .unwrap_or(Decimal::ZERO);
-
-    let order = Order {
-        key: OrderKey::new(
-            ExchangeId::BinanceMargin,
-            symbol,
-            StrategyId::unknown(),
-            cid,
-        ),
-        side,
-        price,
-        quantity,
-        kind,
-        time_in_force,
-        state: OrderState::active(Open::new(order_id, time_exchange, filled_qty)),
-    };
-    Some(UnindexedAccountEvent::new(
-        ExchangeId::BinanceMargin,
-        AccountEventKind::OrderSnapshot(rustrade_integration::collection::snapshot::Snapshot::new(
-            order,
-        )),
-    ))
 }
 
 /// Convert a margin `outboundAccountPosition` to `BalanceStreamUpdate` events (one per asset).
@@ -3700,6 +3420,7 @@ fn margin_avg_price(cummulative_quote_qty: Option<&str>, filled_qty: Decimal) ->
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use crate::order::state::ActiveOrderState;
     use binance_sdk::margin_trading::rest_api::QueryMarginAccountsOpenOrdersResponseInner;
 
     #[test]
@@ -4754,17 +4475,29 @@ mod tests {
         assert!(buf.is_empty());
     }
 
+    /// A partial fill carries two facts, and both must reach the consumer: the execution print
+    /// (`l`/`L`) and the order's new cumulative filled quantity (`z`).
+    ///
+    /// The execution alone never moves the order -- `Orders::update_from_fill` writes only
+    /// `filled_quantity` and needs the order already tracked -- so without the paired snapshot a
+    /// partially filled margin order reads as having nothing filled until REST reconciliation
+    /// refreshes it.
     #[test]
-    fn margin_ws_execution_report_trade_maps_to_trade() {
+    fn margin_ws_execution_report_trade_maps_to_trade_and_order_snapshot() {
         let frame = push(serde_json::json!({
             "e": "executionReport", "s": "BTCUSDT", "S": "BUY", "o": "LIMIT",
             "x": "TRADE", "X": "PARTIALLY_FILLED", "i": 12_345_i64, "c": "cid-1",
             "t": 99_i64, "l": "0.5", "L": "48000", "z": "0.5",
+            "p": "48000", "q": "2", "f": "GTC",
             "n": "0.001", "N": "BNB", "T": 1_700_000_000_000_i64,
         }));
         let mut buf = Vec::new();
         assert!(!convert_margin_user_data_events(&frame, &mut buf));
-        assert_eq!(buf.len(), 1);
+        assert_eq!(
+            buf.len(),
+            2,
+            "a fill must produce the execution and the order snapshot, got: {buf:?}"
+        );
         assert_eq!(buf[0].exchange, ExchangeId::BinanceMargin);
         match &buf[0].kind {
             AccountEventKind::Trade(t) => {
@@ -4776,6 +4509,60 @@ mod tests {
                 assert_eq!(t.fees.fees, Decimal::new(1, 3));
             }
             other => panic!("expected Trade, got {other:?}"),
+        }
+        assert_eq!(buf[1].exchange, ExchangeId::BinanceMargin);
+        match &buf[1].kind {
+            AccountEventKind::OrderSnapshot(snap) => {
+                assert_eq!(
+                    snap.0.quantity,
+                    Decimal::from(2),
+                    "the order's total quantity"
+                );
+                match &snap.0.state {
+                    OrderState::Active(ActiveOrderState::Open(open)) => {
+                        assert_eq!(open.id.0.as_str(), "12345");
+                        assert_eq!(
+                            open.filled_quantity,
+                            Decimal::new(5, 1),
+                            "the snapshot must carry the order's cumulative filled quantity (z)"
+                        );
+                        assert_eq!(
+                            open.time_exchange.timestamp_millis(),
+                            1_700_000_000_000,
+                            "stamped with the execution's transaction time (T), which is what \
+                             gives the engine's staleness gate an ordering key"
+                        );
+                    }
+                    other => panic!("expected an Open order, got {other:?}"),
+                }
+            }
+            other => panic!("expected OrderSnapshot, got {other:?}"),
+        }
+    }
+
+    /// The mirror of the case above: a `TRADE` whose order status says the order is no longer
+    /// working must emit the execution *without* a snapshot, or it resurrects an order the
+    /// engine has already retired as a resting one.
+    #[test]
+    fn margin_trade_for_an_order_no_longer_working_emits_no_snapshot() {
+        for status in ["CANCELED", "EXPIRED", "REJECTED", "PENDING_CANCEL", "NEW"] {
+            let frame = push(serde_json::json!({
+                "e": "executionReport", "s": "BTCUSDT", "S": "BUY", "o": "LIMIT",
+                "x": "TRADE", "X": status, "i": 12_345_i64, "c": "cid-1",
+                "t": 99_i64, "l": "0.5", "L": "48000", "z": "0.5",
+                "p": "48000", "q": "2", "f": "GTC", "T": 1_700_000_000_000_i64,
+            }));
+            let mut buf = Vec::new();
+            assert!(!convert_margin_user_data_events(&frame, &mut buf));
+            assert_eq!(
+                buf.len(),
+                1,
+                "status {status} must produce the execution alone, got: {buf:?}"
+            );
+            assert!(
+                matches!(buf[0].kind, AccountEventKind::Trade(_)),
+                "the execution must still be reported for status {status}"
+            );
         }
     }
 
@@ -4885,20 +4672,153 @@ mod tests {
         let frame = push(serde_json::json!({
             "e": "executionReport", "s": "BTCUSDT", "S": "BUY", "o": "LIMIT",
             "x": "TRADE", "X": "FILLED", "i": 1_i64, "c": "cid", "t": 4_242_i64,
-            "l": "1", "L": "100", "z": "1", "n": "0", "N": "USDT", "T": 1_700_000_000_000_i64,
+            "l": "1", "L": "100", "z": "1", "p": "100", "q": "1", "f": "GTC",
+            "n": "0", "N": "USDT", "T": 1_700_000_000_000_i64,
         }));
         let mut buf = Vec::new();
         convert_margin_user_data_events(&frame, &mut buf);
-        let event = buf.pop().expect("a Trade event");
+        // Index rather than pop: a fill appends the execution *then* its order snapshot, and
+        // popping would take the snapshot and silently test the wrong event's key.
+        let event = buf.first().expect("a Trade event");
+        assert!(
+            matches!(event.kind, AccountEventKind::Trade(_)),
+            "the execution is the first of the two events a fill produces"
+        );
 
         let cache = new_dedup_cache();
         // DedupKey isn't Clone; re-derive it from the same event (deterministic) for the 2nd check.
-        let first = dedup_key_from_event(&event).expect("Trade events have a dedup key");
+        let first = dedup_key_from_event(event).expect("Trade events have a dedup key");
         assert!(!is_duplicate(&cache, first), "first sighting is fresh");
-        let second = dedup_key_from_event(&event).expect("Trade events have a dedup key");
+        let second = dedup_key_from_event(event).expect("Trade events have a dedup key");
         assert!(
             is_duplicate(&cache, second),
             "second sighting is a duplicate"
+        );
+    }
+
+    /// Drive frames through the same two stages the live WebSocket callback does: convert, then
+    /// apply the dedup gate. Returns what a consumer would actually receive.
+    ///
+    /// Every other user-data test in this file calls the converter directly. That is the wrong
+    /// altitude to prove a fill reaches anyone: the converter can be perfectly correct while the
+    /// gate downstream of it discards what the converter produced. Margin's gate is structurally
+    /// identical to spot's, so it needs the same end-to-end coverage.
+    fn drive_ws_pipeline(frames: &[&str]) -> Vec<UnindexedAccountEvent> {
+        let cache = new_dedup_cache();
+        let mut delivered = Vec::new();
+        let mut buf = Vec::new();
+        for frame in frames {
+            let _ = convert_margin_user_data_events(frame, &mut buf);
+            for ev in buf.drain(..) {
+                if let Some(key) = dedup_key_from_event(&ev)
+                    && is_duplicate(&cache, key)
+                {
+                    continue;
+                }
+                delivered.push(ev);
+            }
+        }
+        delivered
+    }
+
+    fn ws_new(cumulative_filled: &str) -> String {
+        push(serde_json::json!({
+            "e": "executionReport", "s": "BTCUSDT", "S": "BUY", "o": "LIMIT",
+            "x": "NEW", "X": "NEW", "i": 12_345_i64, "c": "client-1",
+            "q": "2", "p": "100", "f": "GTC", "z": cumulative_filled,
+            "T": 1_700_000_000_000_i64,
+        }))
+    }
+
+    fn ws_partial_fill(cumulative_filled: &str) -> String {
+        push(serde_json::json!({
+            "e": "executionReport", "s": "BTCUSDT", "S": "BUY", "o": "LIMIT",
+            "x": "TRADE", "X": "PARTIALLY_FILLED", "i": 12_345_i64, "c": "client-1",
+            "q": "2", "p": "100", "f": "GTC", "z": cumulative_filled,
+            "l": "1", "L": "100", "t": 555_i64, "n": "0.1", "N": "USDT",
+            "T": 1_700_000_001_000_i64,
+        }))
+    }
+
+    fn open_filled_quantities(events: &[UnindexedAccountEvent]) -> Vec<Decimal> {
+        events
+            .iter()
+            .filter_map(|ev| match &ev.kind {
+                AccountEventKind::OrderSnapshot(snap) => match &snap.0.state {
+                    OrderState::Active(ActiveOrderState::Open(open)) => Some(open.filled_quantity),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A fill's order snapshot must survive the dedup gate that sits between the converter and
+    /// the consumer.
+    ///
+    /// The acknowledgement and the fill describe one order id, so a key built from the id alone
+    /// would make the second look like a replay of the first. `Open::filled_quantity` would then
+    /// never leave the `0` the acknowledgement carried -- the defect fixed in the converter,
+    /// undone one stage later.
+    #[test]
+    fn margin_ws_fill_snapshot_survives_the_dedup_gate() {
+        let delivered = drive_ws_pipeline(&[&ws_new("0"), &ws_partial_fill("1")]);
+
+        assert_eq!(
+            delivered.len(),
+            3,
+            "expected the ack snapshot, then the fill's execution and its snapshot, got: {delivered:?}"
+        );
+        assert_eq!(
+            open_filled_quantities(&delivered),
+            vec![Decimal::ZERO, Decimal::ONE],
+            "the fill's snapshot must reach the consumer carrying the advanced filled quantity"
+        );
+    }
+
+    /// The gate must still collapse a genuinely re-delivered frame, because a replayed
+    /// acknowledgement for a retired order is re-inserted as a live resting order by the engine.
+    #[test]
+    fn margin_ws_replayed_frame_is_still_deduplicated() {
+        let delivered = drive_ws_pipeline(&[
+            &ws_new("0"),
+            &ws_partial_fill("1"),
+            &ws_new("0"),
+            &ws_partial_fill("1"),
+        ]);
+
+        assert_eq!(
+            delivered.len(),
+            3,
+            "re-delivering both frames must add nothing, got: {delivered:?}"
+        );
+    }
+
+    /// An acknowledgement that already carries a partial fill, followed by the `TRADE` reporting
+    /// that same fill, describes one order state twice -- so the gate collapses the second
+    /// snapshot. That is correct, not a loss: the dedup key includes `filled_quantity`, the two
+    /// snapshots agree on it, and the execution itself carries a distinct trade id and is
+    /// delivered either way.
+    #[test]
+    fn margin_ws_an_ack_and_its_fill_reporting_one_state_deliver_that_state_once() {
+        let delivered = drive_ws_pipeline(&[&ws_new("1"), &ws_partial_fill("1")]);
+
+        assert_eq!(
+            delivered.len(),
+            2,
+            "the ack snapshot and the execution, with the fill's duplicate snapshot collapsed, \
+             got: {delivered:?}"
+        );
+        assert!(
+            delivered
+                .iter()
+                .any(|ev| matches!(ev.kind, AccountEventKind::Trade(_))),
+            "the execution must reach the consumer regardless"
+        );
+        assert_eq!(
+            open_filled_quantities(&delivered),
+            vec![Decimal::ONE],
+            "one snapshot, carrying the state both reports agree on"
         );
     }
 
@@ -5113,7 +5033,8 @@ mod tests {
             serde_json::json!({
                 "e": "executionReport", "s": "BTCUSDT", "S": "BUY", "o": "LIMIT",
                 "x": "TRADE", "X": "FILLED", "i": 1_i64, "c": "cid", "t": 5_i64,
-                "l": "1", "L": "100", "z": "1", "n": "0", "N": "USDT", "T": 1_700_000_000_000_i64,
+                "l": "1", "L": "100", "z": "1", "p": "100", "q": "1", "f": "GTC",
+                "n": "0", "N": "USDT", "T": 1_700_000_000_000_i64,
             }),
         );
         let mut buf = Vec::new();
@@ -5122,10 +5043,16 @@ mod tests {
             &mut buf,
             &mut handler
         ));
-        assert_eq!(buf.len(), 1);
+        assert_eq!(buf.len(), 2, "the execution and its order snapshot");
         match &buf[0].kind {
             AccountEventKind::Trade(t) => assert_eq!(t.instrument.name().as_str(), "BTCUSDT"),
             other => panic!("expected Trade, got {other:?}"),
+        }
+        match &buf[1].kind {
+            AccountEventKind::OrderSnapshot(snap) => {
+                assert_eq!(snap.0.key.instrument.name().as_str(), "BTCUSDT");
+            }
+            other => panic!("expected OrderSnapshot, got {other:?}"),
         }
     }
 }

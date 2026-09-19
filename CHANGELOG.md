@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Binance Margin fill now advances its order** (`rustrade-execution`, `binance` feature). A
+  Binance `executionReport` of type `TRADE` carries two facts: the execution print (`l`/`L`) and
+  the order's new cumulative filled quantity (`z`). The margin client emitted only the first, and
+  an execution on its own never moves an order — `Orders::update_from_fill` writes
+  `Open::filled_quantity` and does nothing at all when the order is not already tracked, which is
+  the case for an order placed out of band, after an engine restart mid-order, or for a fill
+  arriving inside the documented subscribe/listener race. A margin `TRADE` now emits the paired
+  `OrderSnapshot` alongside the `Trade`, as Binance Spot has since 0.6.0, unless the report's own
+  order status (`X`) says the order is no longer working — emitting one then would resurrect an
+  order the engine has already retired. The snapshot is stamped with the execution's transaction
+  time (`T`), which is also what gives the engine's staleness gate an ordering key on the margin
+  WebSocket path.
+
+- **Binance Spot and Margin now share one `executionReport` converter** (`rustrade-execution`,
+  `binance` feature). The margin client carried a hand-maintained copy of spot's WebSocket
+  user-data converter, and the fix above is the third correction to reach spot and not margin. The
+  new `BinanceExecutionReportFields` trait names the eighteen fields the conversion reads — they
+  are identical in name and type across `spot::websocket_api::ExecutionReport` and
+  `margin_trading::websocket_streams::ExecutionReport`, even though the structs around them are
+  not (55 fields against 50, with eight sharing a name while differing in type) — and a single
+  converter parameterised by `ExchangeId` now serves both clients. This mirrors
+  `BinanceOrderFields` on the REST path. No public API changes; diagnostics from this path now
+  carry the venue as a structured `exchange` field rather than a hard-coded message prefix.
+
 - **A Binance Margin REST order snapshot is now stamped with when the order last changed, not when
   it was created** (`rustrade-execution`, `binance` feature). The engine orders an order's states by
   `Open::time_exchange` and discards any snapshot no newer than the state it already tracks. Margin
