@@ -35,7 +35,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of an order that has ended rather than handles for addressing one, and nothing compares them for
   identity.
 
+- **Successive `Open` states for one order are now ordered by cumulative fill as well as by
+  `Open::time_exchange`** (`rustrade`, `rustrade-execution`). The new `Open::is_superseded_by`
+  replaces the bare timestamp comparison that `OrderManager::update_from_order_snapshot` used at
+  its three merge points. Cumulative fill is append-only for a single venue order, which makes it
+  a stronger ordering signal than a timestamp the venue may not supply: an update reporting
+  strictly less filled than the tracked state is refused however it is stamped, and one reporting
+  strictly more is admitted however it is stamped.
+
+  Two behaviours change as a result. A snapshot stamped earlier than the tracked state but
+  reporting more filled is now applied rather than discarded — this is what lets a reconciliation
+  fetch pinned to an order's creation time deliver the cumulative it alone holds. And a snapshot
+  reporting an order fully filled now retires it even when stamped earlier, because an order the
+  venue has once reported complete cannot become live again. Consumers that relied on the tracked
+  `time_exchange` never moving backwards should note that adopting an earlier-stamped update
+  carries its stamp with it; the state is taken as the venue reported it rather than recombined.
+
 ### Fixed
+
+- **An out-of-sequence order snapshot can no longer rewind an order's state at a venue that
+  reports no timestamp of its own** (`rustrade`). IBKR's `orderStatus` callback carries no
+  timestamp field, so the client stamps `Utc::now()` as it processes each one. Those stamps record
+  arrival rather than the venue's own sequence and rise monotonically, so ordering on the stamp
+  alone admitted every snapshot and left the venue with last-writer-wins: a snapshot that overtook
+  a newer one in flight silently overwrote newer state with older, including the order's cumulative
+  filled quantity. Ordering now also rests on that cumulative, which is append-only for one venue
+  order, so the overtaken snapshot is recognised as out of sequence and refused. This is a
+  venue-independent change to engine state, not an IBKR one; IBKR is where the absence of a usable
+  timestamp made it load-bearing.
 
 - **An order snapshot is no longer applied to a tracked order it does not belong to** (`rustrade`).
   `OrderManager::update_from_order_snapshot` resolves a snapshot to a tracked order by
