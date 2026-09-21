@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`LseCatalogEntry`, the London Strategic Edge catalog record, with
+  `LseVaultClient::fetch_catalog`** (`rustrade-data`, feature `lse`). The provider's index of
+  everything it publishes — 22,966 entries at the last measurement — as a provider-shaped type in
+  the same spirit as `AlpacaStockSplit`, not a provider-agnostic abstraction. Nothing is wired into
+  the engine: reference series never stream.
+
+  `LseCatalogEntry::class` separates price datasets from reference series using the provider's own
+  `frequency`/`category` pair. The rule is not a heuristic — across all 22,966 entries it classifies
+  every row with none left over (15,537 reference / 7,429 price) — so a dataset the provider adds
+  later classifies itself with no list here to update.
+
+  Three field choices are measurements rather than taste. `ticks` is `u64` because the largest
+  observed count is 96.5% of `u32::MAX` on a tape that is still growing. `frequency` stays the
+  provider's own string because the vocabulary is dirty — ten spellings including both `biannually`
+  and `bi-annually`, both `quarterly` and `quarter` — so a closed enum over the obvious six values
+  would have silently mishandled seven rows; the label also fails to predict observed spacing, so it
+  must not be read as a cadence contract. `first_tick`/`last_tick` are parsed on demand rather than
+  at decode, so one malformed timestamp surfaces on its own entry instead of failing a whole fetch.
+
+  `LseCatalogEntry::price_dataset` resolves to an `LseDataset` where one exists and returns `None`
+  otherwise. `None` does not mean "reference data": `options` is a price dataset with no
+  `LseDataset` variant, and it accounts for 3,186 of the 7,429 price entries, so callers pair this
+  with `class` rather than reading `None` as a classification. `LseDataset::from_catalog_str`'s
+  documented `UnknownDataset` contract is left exactly as it was.
+
+  ⚠️ Catalog contents are provider data and may not be redistributed or committed as fixtures. See
+  <https://londonstrategicedge.com/terms>.
+
 ### Changed
 
 - **BREAKING: `Open::id` and `RequestCancel::id` now carry a `VenueOrderId`, which distinguishes an
