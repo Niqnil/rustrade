@@ -130,6 +130,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Alpaca and Massive live tests, which holds the binary to one in-flight request. Test-only; no
   library behaviour changes.
 
+- **The London Strategic Edge WebSocket canary no longer reports green on a throttled stream**
+  (`rustrade-data`, `lse` feature). It asserted that every subscribed symbol delivers a tick, that
+  each tick's decoded instant is plausible, and that no frame failed to decode — none of which a
+  throttled connection violates. A session serving a couple of percent of its normal tick rate,
+  with the socket up and no error frame, satisfies all three: every symbol still delivers, and
+  every timestamp on what arrives is genuinely fresh. A new test counts ticks over a fixed window
+  on the continuously-traded crypto tape and fails below a floor set more than an order of
+  magnitude beneath the slowest rate ever measured on that feed.
+
+  The floor is held against crypto alone, and the canary's documentation now says so outright. On
+  a venue that keeps market hours the same low count is produced by a shut market and by a
+  throttled feed alike, so a floor there would fail for a closure and would end up muted, taking
+  the signal with it. A passing run therefore reports that the crypto tape is flowing and says
+  nothing about throughput on the equities, ETF, FX and CFD venues, which stay covered only
+  against a subscription that never ticks and a frame that cannot be read. Test-only; no library
+  behaviour changes.
+
 ## [0.6.0] - 2026-09-18
 
 ### Added

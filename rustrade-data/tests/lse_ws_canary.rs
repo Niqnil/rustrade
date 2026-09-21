@@ -11,13 +11,18 @@
 //!
 //! # ⚠️ What it deliberately does NOT assert
 //!
-//! **No counts.** The published symbol list moved from 7,940 to 8,516 entries inside a week, and
-//! the subscription cap is a plan attribute the provider may revise. A canary that pinned either
-//! would fail for a reason that is not a defect, and would then be muted — which costs more than it
-//! ever caught. Support is asserted structurally instead: the guards either work against the real
-//! list or they do not.
+//! **No provider-side inventory counts.** The published symbol list moved from 7,940 to 8,516
+//! entries inside a week, and the subscription cap is a plan attribute the provider may revise. A
+//! canary that pinned either would fail for a reason that is not a defect, and would then be muted
+//! — which costs more than it ever caught. Support is asserted structurally instead: the guards
+//! either work against the real list or they do not.
 //!
-//! # The four signals it does assert
+//! Signal 5 counts *ticks over a window*, which is a different quantity: it is a property of the
+//! feed this connection is being served rather than of the provider's published inventory, and it
+//! is held to a floor set more than an order of magnitude below every rate ever measured here,
+//! rather than pinned to a figure.
+//!
+//! # The five signals it does assert
 //!
 //! 1. **Every subscribed symbol actually ticks.** This surface's quietest failure is a subscription
 //!    that is *confirmed and then silent* — the provider answers `subscribed` for a symbol it does
@@ -43,6 +48,14 @@
 //!    stays away long enough that a resubscribe ignoring the watermark would be unmistakable, and
 //!    reconnects: the resumed stream must begin at the watermark rather than at the reconnect, and
 //!    never before it.
+//! 5. **The crypto tape delivers at a rate, not merely at all.** A subscription can be confirmed,
+//!    tick, decode cleanly and still carry a small fraction of the feed. Whole sessions have been
+//!    reported running at a couple of percent of normal throughput with the socket up, no error
+//!    frame and no close code — and signals 1 and 2 are both satisfied by such a stream, because
+//!    every symbol does deliver *a* tick and every `ts` on it is genuinely fresh. Throughput is
+//!    the only thing separating it from a healthy connection, so it is the only thing that can
+//!    detect it. It is asserted as a floor rather than a band, because a fast feed is not a
+//!    defect, and only against crypto; see the note below on what that leaves uncovered.
 //!
 //! # Skip vs. fail contract
 //!
@@ -83,6 +96,25 @@
 //! So decode failures are counted, and the count is asserted zero **before** any silence is
 //! interpreted. Silence is only allowed to mean a closed venue once it is known that nothing
 //! arrived and failed to be read.
+//!
+//! # ⚠️ The rate floor covers ONE venue — a green run is not "the stream is healthy"
+//!
+//! Signal 5 is asserted against crypto alone, and that is a limit chosen rather than one
+//! overlooked. A rate floor needs a denominator that means something, and on a venue keeping
+//! market hours the same low count is produced by a shut market and by a throttled feed alike. A
+//! floor there would fail for a closure — the failure-for-a-non-defect this file's own reasoning
+//! rules out — and would then be muted, taking the signal with it. Crypto never closes, so it is
+//! the one venue where a low count has exactly one explanation.
+//!
+//! The consequence has to be said plainly, because it is the misreading the floor exists to
+//! prevent: **a green run here says the crypto tape is flowing, and says nothing whatever about
+//! throughput on the equities, ETF, FX and CFD venues.** Those are covered by signals 1–4 only. On
+//! them this file still catches a subscription that never ticks and a frame it cannot read, and
+//! still cannot catch one delivering a fraction of the feed — which is, as it happens, where
+//! degraded throughput has actually been reported, rather than on crypto. Covering that surface
+//! needs a different instrument: a comparison against a second source over the same window, or a
+//! measurement taken during known trading hours. It does not need a looser floor here, which would
+//! only trade the one venue this file can speak for against a figure it cannot defend on any.
 //!
 //! # Running
 //!
@@ -133,6 +165,26 @@ const KEY_ENV: &str = "LSE_API_KEY";
 /// Generous against the measured rates — one busy crypto symbol replayed six figures of ticks per
 /// hour — so a timeout here means silence, not slowness.
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// How long the rate signal counts ticks for, once the first one has arrived.
+///
+/// Long enough that what it measures is a rate rather than a coin toss — at the slowest throughput
+/// ever recorded on this feed the window carries several hundred ticks — and short enough to sit
+/// inside the same run as everything else here. The clock starts at the first tick rather than at
+/// the subscribe, so connection and handshake latency are not charged to the provider's throughput.
+const RATE_WINDOW: Duration = Duration::from_secs(30);
+
+/// The slowest aggregate rate a healthy **continuously-traded** subscription may deliver at.
+///
+/// `BTC/USD` and `ETH/USD` together delivered 170, 225 and 293 ticks a second on three consecutive
+/// measurements, and `BTC/USD` alone has sustained 21–58 a second on every earlier probe of this
+/// feed. This floor therefore sits more than an order of magnitude beneath the slowest healthy
+/// rate yet recorded, and two beneath the pair as actually subscribed here. It is set that far
+/// down deliberately. The throttling it exists to catch has been reported at a couple of percent
+/// of normal throughput, so any figure between the two separates them, and the lower it sits the
+/// less it can fail for a genuinely quiet minute. A floor nearer normal would buy no additional
+/// detection and would spend this canary's credibility to get it.
+const MIN_TICKS_PER_SECOND: usize = 1;
 
 /// How far behind now a tick may be stamped on a **continuously-traded** venue.
 ///
@@ -322,6 +374,64 @@ where
     (pending, newest)
 }
 
+/// Count the ticks delivered over [`RATE_WINDOW`], starting the clock at the first one.
+///
+/// Returns the count and the number of reconnects that intervened, or `None` if no tick arrived at
+/// all within [`DELIVERY_TIMEOUT`] — a distinction the caller needs, because "nothing in 45 s" and
+/// "a handful in 30 s" have the same verdict but not the same diagnosis.
+///
+/// The tick that starts the clock is counted: the window runs from the instant it arrived, so it
+/// sits on the opening boundary rather than before it. Reconnects are returned rather than merely
+/// logged because a reconnect mid-window costs both time and ticks, and is the likeliest innocent
+/// explanation of a count below the floor.
+async fn count_ticks_over_rate_window<S>(mut stream: S) -> Option<(usize, usize)>
+where
+    S: Stream<Item = Event<ExchangeId, MarketEvent<MarketDataInstrument, PublicTrade>>> + Unpin,
+{
+    let mut reconnects = 0usize;
+
+    // Phase one: wait for the first tick, which opens the window. Nothing is counted here, so a
+    // slow connect cannot depress the rate measured below.
+    let opened = tokio::time::timeout(DELIVERY_TIMEOUT, async {
+        loop {
+            match stream.next().await {
+                Some(Event::Item(_)) => return,
+                Some(Event::Reconnecting(origin)) => {
+                    reconnects += 1;
+                    println!("CANARY: {origin} is reconnecting before the rate window opened");
+                }
+                None => panic!("the market stream terminated before delivering a single tick"),
+            }
+        }
+    })
+    .await;
+
+    if opened.is_err() {
+        return None;
+    }
+
+    // Phase two: count everything that arrives over exactly the window. The timeout ends it, so
+    // the interval is the window by construction rather than by arithmetic on arrival instants —
+    // which matters, because a stream that goes silent partway through must still be measured over
+    // the whole window rather than over the part of it that had ticks in it.
+    let mut ticks = 1usize;
+    let _ = tokio::time::timeout(RATE_WINDOW, async {
+        loop {
+            match stream.next().await {
+                Some(Event::Item(_)) => ticks += 1,
+                Some(Event::Reconnecting(origin)) => {
+                    reconnects += 1;
+                    println!("CANARY: {origin} is reconnecting mid-window");
+                }
+                None => panic!("the market stream terminated before the rate window elapsed"),
+            }
+        }
+    })
+    .await;
+
+    Some((ticks, reconnects))
+}
+
 #[tokio::test]
 #[ignore = "opens a live connection and spends the shared provider allowance; run on demand"]
 async fn every_subscribed_crypto_symbol_delivers_a_live_tick() {
@@ -369,6 +479,105 @@ async fn every_subscribed_crypto_symbol_delivers_a_live_tick() {
          that did arrive decoded - on a continuously-traded venue that is the confirmed-then-silent \
          failure this integration's pre-subscribe guard exists to prevent, which means the guard's \
          symbol list no longer reflects what the provider actually serves",
+    );
+}
+
+/// A confirmed, ticking, cleanly-decoding subscription can still be carrying a fraction of the
+/// feed, and only throughput separates it from a healthy one.
+///
+/// # What this catches that the test above cannot
+///
+/// [`every_subscribed_crypto_symbol_delivers_a_live_tick`] stops the moment each symbol has
+/// delivered once, which is the right shape for the failure it covers and blind to this one: at a
+/// fiftieth of normal throughput every symbol still delivers inside the window, every `ts` on
+/// what arrives is genuinely fresh, and every frame decodes. That connection passes all three of
+/// the signals above while carrying almost nothing, and it does so with the socket up, no error
+/// frame and no close code, so there is nothing else in band to notice it by.
+///
+/// # Why a floor, why crypto, and why this far down
+///
+/// The upper end is not a defect — a busy tape is the healthy case — so the only defensible bound
+/// is a lower one. It is held against crypto because crypto never closes, which is what makes a
+/// low count mean one thing here and two things on any venue that keeps hours; the module header
+/// sets out what that leaves uncovered, and it is not a small thing. The floor itself sits far
+/// below normal on purpose: see [`MIN_TICKS_PER_SECOND`] for the measurements it is placed
+/// against. Separating normal from degraded needs only a figure somewhere between them, and every
+/// step closer to normal is bought with flakiness that would eventually get this muted.
+///
+/// # ⚠️ The rate is asserted aggregate, not per symbol
+///
+/// Per-symbol floors would need a per-symbol denominator, and the two symbols here differ in
+/// liquidity by enough that the thinner one would set the flakiest bound in the file while adding
+/// nothing: the throttling reported on this feed suppressed a whole connection rather than one
+/// subscription on it. Aggregate keeps the bound on the quantity that actually moved.
+#[tokio::test]
+#[ignore = "opens a live connection and spends the shared provider allowance; run on demand"]
+async fn the_crypto_tape_delivers_at_a_rate_rather_than_a_trickle() {
+    let Some(subscriber) = subscriber() else {
+        return;
+    };
+
+    let expected = [spot("btc"), spot("eth")];
+
+    let streams = Streams::<PublicTrades>::builder()
+        .subscribe(
+            subscriber,
+            expected.clone().map(|instrument| {
+                Subscription::<LseCrypto, MarketDataInstrument, PublicTrades>::new(
+                    LseCrypto::default(),
+                    instrument,
+                    PublicTrades,
+                )
+            }),
+        )
+        .init()
+        .await
+        .expect("subscribing to continuously-traded crypto symbols should succeed");
+
+    // Counted as well as printed for the reason given on `decode_failures`, and it bites harder
+    // here than anywhere else in this file: the handler filters an undecodable frame out of the
+    // stream, so a partial shape change presents below as exactly what this test is measuring — a
+    // reduced tick count. Without the assertion that follows, a decoder broken on some fraction of
+    // frames would be reported as the provider throttling us.
+    let (failures, on_error) = decode_failures();
+    let stream = streams.select_all().with_error_handler(on_error);
+
+    let counted = count_ticks_over_rate_window(Box::pin(stream)).await;
+
+    // Before the count below is read as throttling, and that ordering is the whole point of the
+    // paragraph above.
+    assert_every_frame_decoded(&failures);
+
+    let Some((ticks, reconnects)) = counted else {
+        panic!(
+            "no tick arrived in {DELIVERY_TIMEOUT:?} on a continuously-traded venue, and every \
+             frame that did arrive decoded - a rate of zero is below any floor, but the diagnosis \
+             is the confirmed-then-silent subscription rather than a throttled one"
+        );
+    };
+
+    let floor = MIN_TICKS_PER_SECOND * RATE_WINDOW.as_secs() as usize;
+    let per_second = ticks as f64 / RATE_WINDOW.as_secs_f64();
+    // Display rather than Debug: the failure message below is what this test produces, and a
+    // two-element Debug dump of the instruments buries the numbers that matter in it.
+    let symbols = expected
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    assert!(
+        ticks >= floor,
+        "{ticks} tick(s) in {RATE_WINDOW:?} ({per_second:.2}/s) across {symbols}, below the \
+         floor of {floor} ({MIN_TICKS_PER_SECOND}/s), with {reconnects} reconnect(s) and every \
+         frame decoding - the socket is up and serving a fraction of the feed. If the reconnect \
+         count is non-zero this may be that rather than the provider; rerun before reading it as \
+         throttling",
+    );
+
+    println!(
+        "CANARY_OK: {ticks} tick(s) in {RATE_WINDOW:?} ({per_second:.2}/s, floor \
+         {MIN_TICKS_PER_SECOND}/s), {reconnects} reconnect(s)",
     );
 }
 
