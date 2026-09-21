@@ -154,6 +154,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Alpaca and Massive live tests, which holds the binary to one in-flight request. Test-only; no
   library behaviour changes.
 
+- **The London Strategic Edge WebSocket canary could not be run as a file, and now runs weekly**
+  (`rustrade-data`, `lse` feature). The provider permits **one** WebSocket connection per API key
+  and answers a second with `TOO_MANY_CONNECTIONS`. Rust's harness runs a file's tests in
+  parallel and four of these five open a socket, so running the file exactly as its own
+  documentation prescribes failed four tests inside their `expect`, before any assertion — while
+  the one that won the race passed. The tests are now `#[serial]`, matching the vault canary and
+  the Massive WebSocket tests, which holds the binary to one socket at a time; the full file now
+  passes in about seventy seconds.
+
+  The canary was also wired into the weekly live-API workflow, which until now ran only the vault
+  and export canaries — so this surface had never been scheduled at all, independently of that
+  workflow's own reachability. The job's timeout rises to thirty minutes, since serialised tests
+  sum their timeouts rather than overlapping them.
+
 - **The London Strategic Edge WebSocket canary no longer reports green on a throttled stream**
   (`rustrade-data`, `lse` feature). It asserted that every subscribed symbol delivers a tick, that
   each tick's decoded instant is plausible, and that no frame failed to decode — none of which a

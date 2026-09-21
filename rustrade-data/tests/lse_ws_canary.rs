@@ -72,6 +72,25 @@
 //! part of the invocation rather than a debugging nicety, and why nothing this file *decides* is
 //! left to a printed line: what must not pass silently is asserted.
 //!
+//! # Why every test here is `#[serial]`
+//!
+//! The provider permits **one** WebSocket connection per API key, and says so plainly when it
+//! refuses a second: `TOO_MANY_CONNECTIONS: Max 1 concurrent websocket connection(s) for this API
+//! key; 1 already open from this same address.` Four of the five tests below open a socket, and
+//! Rust's harness runs the tests in a file in parallel, so unserialised they contend for the one
+//! slot: whichever connects first proceeds and the rest fail inside their `expect`, before
+//! asserting anything at all.
+//!
+//! That failure is worse than an ordinary flake, for the reason the vault canary gives about its
+//! own cap: it presents as four red tests on the surface this file exists to watch, it is not a
+//! provider-side change, and it reads exactly like one. A drift detector that cries wolf is one
+//! people learn to ignore.
+//!
+//! Serialising holds the binary to a single socket at a time — which the resume test already
+//! assumed, since it drops one connection before opening the next. It is also what makes signal 5
+//! well defined: a rate is only meaningful as a measurement of the whole of what this key is being
+//! served, and one connection per key is what guarantees that is what it counts.
+//!
 //! # ⚠️ A closed venue is not a silent one — measured
 //!
 //! One test covers the only venue that reaches the space-separated timestamp spelling, and that
@@ -125,6 +144,10 @@
 //!
 //! Marked `#[ignore]` so a default test run never opens a connection or spends the shared
 //! allowance.
+//!
+//! ⚠️ If a run reports `TOO_MANY_CONNECTIONS` despite the serialisation above, a socket from an
+//! interrupted earlier run is still open against the same key. The provider closes it on its own
+//! timeout; wait rather than re-running immediately.
 
 #![cfg(feature = "lse")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
@@ -149,6 +172,7 @@ use rustrade_instrument::{
     exchange::ExchangeId,
     instrument::market_data::{MarketDataInstrument, kind::MarketDataInstrumentKind},
 };
+use serial_test::serial;
 use std::{
     sync::{
         Arc,
@@ -176,13 +200,17 @@ const RATE_WINDOW: Duration = Duration::from_secs(30);
 
 /// The slowest aggregate rate a healthy **continuously-traded** subscription may deliver at.
 ///
-/// `BTC/USD` and `ETH/USD` together delivered 170, 225 and 293 ticks a second on three consecutive
+/// `BTC/USD` and `ETH/USD` together delivered 51, 170, 225 and 293 ticks a second across four
 /// measurements, and `BTC/USD` alone has sustained 21–58 a second on every earlier probe of this
-/// feed. This floor therefore sits more than an order of magnitude beneath the slowest healthy
-/// rate yet recorded, and two beneath the pair as actually subscribed here. It is set that far
-/// down deliberately. The throttling it exists to catch has been reported at a couple of percent
-/// of normal throughput, so any figure between the two separates them, and the lower it sits the
-/// less it can fail for a genuinely quiet minute. A floor nearer normal would buy no additional
+/// feed. **Note the spread**: the same pair, measured the same way within the hour, varied by
+/// nearly six times. That is the argument for this floor rather than a proportional one — a bound
+/// set at some fraction of "normal" has no stable figure to take a fraction of, and would be
+/// calibrated against whichever hour it was written in.
+///
+/// One a second sits beneath the slowest of those by more than an order of magnitude, so it is
+/// clear of the variation rather than tracking it. The throttling it exists to catch has been
+/// reported at a couple of percent of normal throughput, which lands well below even the quietest
+/// figure above, so the two are cleanly separated. A floor nearer normal would buy no additional
 /// detection and would spend this canary's credibility to get it.
 const MIN_TICKS_PER_SECOND: usize = 1;
 
@@ -434,6 +462,7 @@ where
 
 #[tokio::test]
 #[ignore = "opens a live connection and spends the shared provider allowance; run on demand"]
+#[serial]
 async fn every_subscribed_crypto_symbol_delivers_a_live_tick() {
     let Some(subscriber) = subscriber() else {
         return;
@@ -512,6 +541,7 @@ async fn every_subscribed_crypto_symbol_delivers_a_live_tick() {
 /// subscription on it. Aggregate keeps the bound on the quantity that actually moved.
 #[tokio::test]
 #[ignore = "opens a live connection and spends the shared provider allowance; run on demand"]
+#[serial]
 async fn the_crypto_tape_delivers_at_a_rate_rather_than_a_trickle() {
     let Some(subscriber) = subscriber() else {
         return;
@@ -586,6 +616,7 @@ async fn the_crypto_tape_delivers_at_a_rate_rather_than_a_trickle() {
 /// crypto, and [`DateTime::parse_from_rfc3339`] rejects the former outright.
 #[tokio::test]
 #[ignore = "opens a live connection and spends the shared provider allowance; run on demand"]
+#[serial]
 async fn a_cfd_tick_decodes_to_a_plausible_instant() {
     let Some(subscriber) = subscriber() else {
         return;
@@ -652,6 +683,7 @@ async fn a_cfd_tick_decodes_to_a_plausible_instant() {
 /// here is what proves the list is still both present and honoured.
 #[tokio::test]
 #[ignore = "opens a live connection; run on demand"]
+#[serial]
 async fn a_symbol_the_provider_does_not_offer_is_rejected_before_subscribing() {
     let Some(subscriber) = subscriber() else {
         return;
@@ -763,6 +795,7 @@ where
 /// `the_epoch_form_round_trips_an_instant_to_the_microsecond` is for.
 #[tokio::test]
 #[ignore = "opens two live connections and pauses between them; run on demand"]
+#[serial]
 async fn a_resumed_reconnect_replays_from_the_watermark_rather_than_from_now() {
     let Some(subscriber) = subscriber() else {
         return;
