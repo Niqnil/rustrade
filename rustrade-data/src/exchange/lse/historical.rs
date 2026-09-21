@@ -147,10 +147,29 @@ impl LseVaultClient {
     /// and the flat OHLC is the only signal. Do not infer "no bar means the market was closed": see
     /// the [module's data characteristics](super#data-characteristics).
     ///
-    /// # Volume
+    /// # Volume — ⚠️ not a figure to size on without reconciling it
     /// FX candles carry **no volume**: the vault omits the field, which surfaces as
     /// [`volume: None`](Candle::volume) rather than a zero. `trade_count` is `None` for every
     /// dataset — the vault reports none.
+    ///
+    /// Where volume *is* published it is unreliable in both directions, and by margins large
+    /// enough to invert a result rather than blur it: a majority of sampled one-minute equity bars
+    /// report `0` in minutes the tick tape shows real trades, and ETF bars have been reported
+    /// carrying three to four orders of magnitude too much — one `QQQ` minute published at some
+    /// 5,700× that session's entire consolidated volume. Equity totals over the same period ran
+    /// well under the consolidated tape. Every one of those bars is structurally valid, so neither
+    /// this method nor any shape check on its output can tell them from correct ones. See the
+    /// [module's data characteristics](super#data-characteristics) for the measurements and their
+    /// provenance. Reconcile against a second source before trusting a volume-derived quantity.
+    ///
+    /// # Coverage — a range the symbol does not cover is not an error
+    /// The provider publishes a first tick and a coverage span per symbol per dataset, and the two
+    /// vary widely: an ETF has been reported carrying three months of spot history where equities
+    /// reach back two decades. Those fields live in the catalog on the discovery host, which this
+    /// integration does not wrap, so this method cannot check `start` against them. A range
+    /// beginning before a symbol's coverage yields the bars that exist and nothing to say the
+    /// remainder was never published — indistinguishable here from a genuinely quiet period.
+    /// Establish a symbol's depth from the catalog before choosing a range to backfill.
     ///
     /// # Arguments
     /// * `symbol` - Display symbol, e.g. `"EUR/USD"` or `"AAPL"`.
