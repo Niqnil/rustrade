@@ -7,7 +7,7 @@ name: "LSE Weekly"
 # the export endpoint permits five jobs an hour, and the point is detecting provider-side drift,
 # which does not correlate with our commits.
 #
-# Both canaries SKIP (and pass) when `LSE_API_KEY` is unset, so a fork or an unconfigured repo
+# Every canary SKIPs (and passes) when `LSE_API_KEY` is unset, so a fork or an unconfigured repo
 # stays green. That makes an unset secret indistinguishable from a passing run *in the test*, which
 # is why the guard job below fails loudly instead.
 
@@ -44,7 +44,10 @@ jobs:
     name: LSE live-API canaries
     needs: secret-present
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # The WebSocket canary adds up to five minutes on top of the build and the two REST canaries:
+    # its five tests are serialised against the provider's one-connection-per-key cap, and their
+    # timeouts sum rather than overlap.
+    timeout-minutes: 30
     env:
       LSE_API_KEY: ${{ secrets.LSE_API_KEY }}
     steps:
@@ -76,7 +79,21 @@ jobs:
         continue-on-error: true
         run: cargo test --locked --test lse_export_canary --features lse-parquet -- --ignored --nocapture
 
-      # Both run even if the first fails, so one report covers both surfaces.
+      # Last because it is the slowest, and because it is the one step that holds a socket open.
+      # The provider permits ONE WebSocket connection per API key -- it answers a second with
+      # `TOO_MANY_CONNECTIONS` -- so nothing else may connect while this runs. Steps inside a job
+      # are sequential, which is what makes that safe here; adding a parallel job that uses the
+      # same key would break it, and the failure would look like provider drift rather than like
+      # a scheduling mistake. The tests are `#[serial]` for the same cap within the binary.
+      - name: WebSocket canary (delivery, timestamps, tick rate, resume)
+        id: ws-canary
+        continue-on-error: true
+        run: cargo test --locked --test lse_ws_canary --features lse -- --ignored --nocapture
+
+      # All three run even if an earlier one fails, so one report covers every surface.
       - name: Check canary results
-        if: steps.vault-canary.outcome == 'failure' || steps.export-canary.outcome == 'failure'
+        if: >-
+          steps.vault-canary.outcome == 'failure' ||
+          steps.export-canary.outcome == 'failure' ||
+          steps.ws-canary.outcome == 'failure'
         run: exit 1
