@@ -34,6 +34,30 @@
 //!   too large. A literal `0` is passed through as `Some(0)`; rewriting it to `None` would be this
 //!   library inventing a fact, and `None` is reserved for a column the provider does not publish.
 //!   Validate before trading on it.
+//! - **⚠️ Candle volume has additionally been reported wrong by three to four orders of magnitude
+//!   since 2026-04-27, in opposite directions on ETFs and on equities.** Unlike the rest of this
+//!   list, which is measured here, this is a third-party report on the provider's public issue
+//!   tracker — repeated across symbols and dates, and unanswered. **ETFs over-report**: a `QQQ`
+//!   one-minute bar was published at 189,272,655,373 against a consolidated **daily** figure of
+//!   33,118,600 for the same session — roughly 5,700× the whole day inside one minute — on
+//!   `QQQ`, `SPY`, `IWM`, `SMH`, `XLE`, `XLF`, `TLT`, every trading day sampled over two months.
+//!   **Equities under-report**: `AAPL`, `MSFT` and `NVDA` daily totals ran at 24–45% of the
+//!   consolidated tape, against 65–80% before the same date, which is the ordinary
+//!   primary-venue-versus-consolidated gap. Splits and liquidity stress were both ruled out by
+//!   the reporter. This integration decodes those figures faithfully, and a shape check passes on
+//!   them: the bars are structurally valid and semantically wrong, so nothing in band distinguishes
+//!   them from correct ones. **Reconcile volume against a second source before sizing anything on
+//!   it**, and treat a volume-derived signal — VWAP, a liquidity filter, a participation-rate
+//!   model — as unusable on this feed until you have.
+//! - **⚠️ History depth varies per dataset and is far shallower than the headline suggests on
+//!   some of them.** `QQQ` in the `etf` dataset was reported carrying a first tick of 2026-04-27
+//!   and 0.2 years of coverage — roughly three months of spot — while options on the same ticker
+//!   reach back to 2014 and equities are stated to reach 2004. Depth is a per-symbol,
+//!   per-dataset property, discoverable from the `first_tick` and `years` fields the provider's
+//!   catalog publishes for each entry. **That catalog is on the discovery host and is not wrapped
+//!   by this integration**, so nothing here can check a requested range against it: a backtest
+//!   asking for years that a symbol does not have receives the bars that exist and no indication
+//!   that the rest were never published. Check depth per symbol before choosing a range.
 //! - **Non-trading days are emitted as FLAT bars, not omitted — daily series are not sparse.**
 //!   Every sampled Saturday and the US Independence Day observance returned a bar with
 //!   `open == high == low == close`; Sundays are absent. A backtest therefore sees a tradeable

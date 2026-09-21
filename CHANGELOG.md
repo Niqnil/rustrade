@@ -51,6 +51,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `time_exchange` never moving backwards should note that adopting an earlier-stamped update
   carries its stamp with it; the state is taken as the venue reported it rather than recombined.
 
+- **The London Strategic Edge candle path now documents two limitations it had been passing on in
+  silence** (`rustrade-data`, `rustrade`; `lse` feature; documentation only, no behaviour change).
+
+  **Volume can be wrong by three to four orders of magnitude, in opposite directions.** The module
+  documentation already recorded that a majority of sampled one-minute equity bars report `0` in
+  minutes that demonstrably had trades. Since 2026-04-27 ETF bars have additionally been reported
+  over-stating volume enormously — one `QQQ` minute published at roughly 5,700× that session's
+  entire consolidated volume, repeated across `SPY`, `IWM`, `SMH`, `XLE`, `XLF` and `TLT` on every
+  trading day sampled over two months — while equity daily totals ran at 24–45% of the
+  consolidated tape against 65–80% before the same date. Those bars are structurally valid, so
+  neither `fetch_candles` nor any shape check on its output can distinguish them from correct
+  ones. `fetch_candles`, the module documentation and both candle examples now say so, and say
+  that a volume-derived quantity must be reconciled against a second source before it is trusted.
+
+  **History depth varies per symbol and per dataset, and a range exceeding it is not an error.**
+  Equities are stated to reach back to 2004, while an ETF has been reported carrying a first tick
+  of 2026-04-27 — about three months of spot. The provider publishes a first tick and a coverage
+  span for every catalog entry, but the catalog is on its discovery host and this integration does
+  not wrap it, so nothing here can check a requested range against it. A fetch starting before a
+  symbol's coverage returns the bars that exist and nothing to indicate the remainder was never
+  published, which in a backtest presents as a successful run over a shorter period than the one
+  asked for. Both the API documentation and the backtest example now state this and direct callers
+  to establish depth per symbol first.
+
 ### Fixed
 
 - **An out-of-sequence order snapshot can no longer rewind an order's state at a venue that
