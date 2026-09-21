@@ -314,15 +314,18 @@ where
                     return;
                 }
 
-                if current.time_exchange <= open.time_exchange {
+                if current.is_superseded_by(&open) {
                     // A venue may report a completed fill as an Open snapshot with nothing left to
                     // fill, rather than as a distinct terminal state. That order is finished, so
                     // it stops being tracked -- exactly as the OpenInFlight -> Open arm above
                     // already does. Retaining it would leave the strategy reading a resting order
                     // that no longer exists on the exchange.
                     //
-                    // Nested inside the staleness gate deliberately: an out-of-sequence snapshot
-                    // claiming a full fill must not retire an order that is still live.
+                    // Nested inside the ordering gate deliberately, so a snapshot that does not
+                    // supersede the tracked state cannot retire it. Note that an earlier-stamped
+                    // snapshot claiming a full fill does reach here: it reports a cumulative above
+                    // a live order's, which is exactly the evidence the fill key tests for, and
+                    // an order the venue has once reported complete cannot become live again.
                     if open.quantity_remaining(update.quantity).is_zero() {
                         debug!(
                             exchange = ?snapshot.key.exchange,
@@ -376,8 +379,7 @@ where
                     .order
                     .take()
                     .filter(|update| {
-                        !current.id.contradicts(&update.id)
-                            && current.time_exchange <= update.time_exchange
+                        !current.id.contradicts(&update.id) && current.is_superseded_by(update)
                     })
                     .unwrap_or_else(|| current.clone());
 
@@ -422,11 +424,11 @@ where
                     "OrderManager received an Open order snapshot for a CancelInFlight - updating CancelInFlight.Open"
                 );
 
-                // Check if the update Open is more recent
+                // Check if the update Open supersedes the one the cancel carries.
                 let update_open_is_latest = current
                     .order
                     .as_ref()
-                    .is_none_or(|current| current.time_exchange <= update.time_exchange);
+                    .is_none_or(|current| current.is_superseded_by(&update));
 
                 if update_open_is_latest {
                     current_entry.get_mut().state =
@@ -1046,10 +1048,19 @@ mod tests {
                 expected: Orders::default(),
             },
             TestCase {
-                // The staleness gate outranks the full-fill collapse. An out-of-sequence snapshot
-                // claiming completion must not retire an order that is still live -- otherwise the
-                // engine forgets a resting order the exchange still holds.
-                name: "tracked Open, Snapshot is active Open fully filled but older, so ignore",
+                // The cumulative-fill key outranks the stamp, and here that retires the order.
+                //
+                // The snapshot is stamped earlier than the tracked state, but reports the order
+                // fully filled while the tracked state has nothing filled at all. Cumulative fill
+                // is append-only for one venue order, so a snapshot reporting it complete is
+                // reporting something that cannot later become untrue -- the order is finished
+                // whatever its stamp says, and retaining it would leave the strategy reading a
+                // resting order the exchange no longer holds.
+                //
+                // Note this is reachable for *every* older full-fill claim against a live order:
+                // "fully filled" means the cumulative reached `quantity`, and a live order's is
+                // below it, so the fill key always admits such a snapshot.
+                name: "tracked Open, Snapshot is active Open fully filled and older, so remove",
                 state: orders([order(
                     cid.clone(),
                     ActiveOrderState::Open(open(time_plus_secs(time_base, 1))),
@@ -1058,10 +1069,7 @@ mod tests {
                     cid.clone(),
                     OrderState::active(open_filled(time_base, dec!(1))),
                 )),
-                expected: orders([order(
-                    cid.clone(),
-                    ActiveOrderState::Open(open(time_plus_secs(time_base, 1))),
-                )]),
+                expected: Orders::default(),
             },
             TestCase {
                 name: "tracked Open, Snapshot is active Open with older time, so ignore",
@@ -1214,26 +1222,24 @@ mod tests {
         }
     }
 
-    /// What it costs a consumer when a producer stamps `Open::time_exchange` with the order's
-    /// creation time instead of its last update.
+    /// What a producer's creation-stamped `Open::time_exchange` costs a consumer, and how far the
+    /// cumulative-fill ordering key repairs it.
     ///
     /// `Open`'s producer contract requires the venue's last-update field, because creation time is
-    /// identical across every snapshot of one order. A snapshot carrying it cannot be ordered
-    /// against the states that followed, so the staleness gate discards it -- and the cumulative
-    /// fill it carried goes with it. The gate is right to: it cannot tell a genuinely old snapshot
-    /// from a mis-stamped fresh one, and letting the older stamp win would let an out-of-sequence
-    /// snapshot rewind an order that is still live.
+    /// identical across every snapshot of one order. Ordering on the stamp alone therefore cannot
+    /// place such a snapshot after the states that followed it, and the cumulative fill it carries
+    /// is lost with it -- exactly where a reconciliation fetch is meant to help, a partially filled
+    /// order whose discarded snapshot held the only accurate cumulative.
     ///
-    /// The loss lands exactly where a reconciliation fetch is meant to help -- a partially filled
-    /// order, where the discarded snapshot held the only accurate cumulative. Asserting it here
-    /// keeps the behaviour visible, and makes any change to the gate's ordering key a deliberate
-    /// one rather than a silent flip.
+    /// `Open::is_superseded_by`'s second key recovers this case: the reconciliation snapshot
+    /// reports strictly more filled, which is evidence of a later state whatever the stamps say,
+    /// so it lands despite being stamped earlier.
     ///
     /// Note that the fill has to reach the order *as a snapshot* for this to arise.
     /// `Orders::update_from_fill` writes `filled_quantity` alone and never `time_exchange`, so it
     /// cannot move an order past its own creation stamp.
     #[test]
-    fn a_creation_time_stamped_snapshot_is_discarded_once_a_fill_has_advanced_the_order() {
+    fn a_creation_time_stamped_snapshot_lands_once_it_reports_more_filled() {
         let time_created = DateTime::<Utc>::MIN_UTC;
         let time_filled = time_plus_secs(time_created, 1);
         let cid = ClientOrderId::default();
@@ -1265,15 +1271,106 @@ mod tests {
         ));
         state.update_from_order_snapshot(recovered.as_ref());
 
-        // The stream's view survives, cumulative and all. The expected state also pins that the
-        // first snapshot *was* applied, so the test cannot pass by ignoring both.
+        // The venue's cumulative wins. The adopted state carries the reconciliation snapshot's own
+        // stamp, which is the earlier of the two -- the documented consequence of taking a venue's
+        // reported state as a unit rather than splicing the newer stamp onto it.
         assert_eq!(
             state,
             orders([order(
                 cid,
-                ActiveOrderState::Open(open_filled(time_filled, filled_on_stream)),
+                ActiveOrderState::Open(open_filled(time_created, filled_at_venue)),
             )]),
-            "a snapshot stamped with creation time was applied over a later one"
+            "a snapshot reporting more filled was discarded for being stamped earlier"
+        );
+    }
+
+    /// The limit of that repair, and why the producer obligation on `Open::time_exchange` still
+    /// stands.
+    ///
+    /// The cumulative-fill key is evidence only where the cumulative actually moves. Two snapshots
+    /// reporting the same fill are ordered on the stamp alone, so a creation-stamped one is still
+    /// discarded -- and an order resting unfilled reports the same cumulative on every snapshot,
+    /// which is the whole of its life before the first execution.
+    #[test]
+    fn a_creation_time_stamped_snapshot_is_still_discarded_when_it_reports_no_more_filled() {
+        let time_created = DateTime::<Utc>::MIN_UTC;
+        let time_filled = time_plus_secs(time_created, 1);
+        let cid = ClientOrderId::default();
+        let filled = dec!(0.3);
+
+        let mut state = orders([order(
+            cid.clone(),
+            ActiveOrderState::Open(open(time_created)),
+        )]);
+
+        let fill: Snapshot<Order<ExchangeId, u64, OrderState<u64, u64>>> = Snapshot(order(
+            cid.clone(),
+            OrderState::active(open_filled(time_filled, filled)),
+        ));
+        state.update_from_order_snapshot(fill.as_ref());
+
+        // Same cumulative, creation stamp. Neither key admits it, so it is discarded -- exactly as
+        // before the fill key existed.
+        let stale: Snapshot<Order<ExchangeId, u64, OrderState<u64, u64>>> = Snapshot(order(
+            cid.clone(),
+            OrderState::active(open_filled(time_created, filled)),
+        ));
+        state.update_from_order_snapshot(stale.as_ref());
+
+        assert_eq!(
+            state,
+            orders([order(
+                cid,
+                ActiveOrderState::Open(open_filled(time_filled, filled)),
+            )]),
+            "a creation-stamped snapshot reporting no more filled was applied over a later one"
+        );
+    }
+
+    /// The shape a venue takes on when it reports no timestamp of its own.
+    ///
+    /// IBKR's `orderStatus` callback carries no timestamp field, so the client stamps
+    /// `Utc::now()` as it processes each one. Those stamps record *arrival*, not the venue's
+    /// sequence, and they rise monotonically -- which means ordering on the stamp alone admits
+    /// every snapshot and leaves the venue with last-writer-wins rather than ordering.
+    ///
+    /// So a snapshot that overtook a newer one in flight arrives carrying the later stamp and the
+    /// earlier state, and the stamp cannot tell it apart from genuine progress. Cumulative fill
+    /// can: it is append-only for one venue order, so a snapshot reporting less of it than the
+    /// tracked state is out of sequence no matter how it is stamped.
+    ///
+    /// Without that, the second snapshot here would rewind the order's cumulative from the
+    /// venue's 0.6 to a stale 0.3.
+    #[test]
+    fn a_receipt_stamped_snapshot_cannot_rewind_the_cumulative_it_arrives_after() {
+        let time_base = DateTime::<Utc>::MIN_UTC;
+        let cid = ClientOrderId::default();
+
+        let mut state = orders([order(cid.clone(), ActiveOrderState::Open(open(time_base)))]);
+
+        // Processed first, so stamped first. Carries the venue's true cumulative.
+        let arrived_first: Snapshot<Order<ExchangeId, u64, OrderState<u64, u64>>> =
+            Snapshot(order(
+                cid.clone(),
+                OrderState::active(open_filled(time_plus_secs(time_base, 1), dec!(0.6))),
+            ));
+        state.update_from_order_snapshot(arrived_first.as_ref());
+
+        // Processed second, so stamped later -- but it describes an earlier state of the order.
+        // Only the cumulative gives it away.
+        let overtaken: Snapshot<Order<ExchangeId, u64, OrderState<u64, u64>>> = Snapshot(order(
+            cid.clone(),
+            OrderState::active(open_filled(time_plus_secs(time_base, 2), dec!(0.3))),
+        ));
+        state.update_from_order_snapshot(overtaken.as_ref());
+
+        assert_eq!(
+            state,
+            orders([order(
+                cid,
+                ActiveOrderState::Open(open_filled(time_plus_secs(time_base, 1), dec!(0.6))),
+            )]),
+            "an out-of-sequence snapshot rewound the order's cumulative fill"
         );
     }
 

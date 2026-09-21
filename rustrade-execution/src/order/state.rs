@@ -104,8 +104,10 @@ pub struct OpenInFlight;
 /// An order the exchange reports as working, in the state the exchange last reported it.
 ///
 /// Successive `Open` values for one order describe that order over time -- an acknowledgement,
-/// then each partial fill -- so consumers order them by [`Open::time_exchange`] and discard one
-/// older than the state they already hold. Producers must stamp it accordingly; see that field.
+/// then each partial fill -- so consumers keep the later of two and discard the other. Use
+/// [`Open::is_superseded_by`] to decide which is which; it does not rest on
+/// [`Open::time_exchange`] alone, because not every venue supplies a usable one. Producers must
+/// still stamp that field correctly where they can; see it for the obligation.
 #[derive(
     Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
 )]
@@ -136,6 +138,61 @@ pub struct Open {
 impl Open {
     pub fn quantity_remaining(&self, initial_quantity: Decimal) -> Decimal {
         initial_quantity - self.filled_quantity
+    }
+
+    /// Whether `update` describes a later state of this order than `self` does, and so should
+    /// replace it.
+    ///
+    /// Ordering rests on two properties of a single venue order:
+    ///
+    /// 1. **[`Open::time_exchange`]** is non-decreasing, where the venue supplies a usable one.
+    /// 2. **[`Open::filled_quantity`]** is non-decreasing *always* -- cumulative fill is
+    ///    append-only, because an execution against an order cannot be un-executed.
+    ///
+    /// The second is the stronger property, and it is used in both directions. An update
+    /// reporting strictly **less** filled is out of sequence whatever its stamp says, so it is
+    /// refused outright. Otherwise an update is taken as later when it is stamped no earlier
+    /// **or** when it reports strictly more filled.
+    ///
+    /// Each direction carries a different class of venue:
+    ///
+    /// - Refusing a lower cumulative is what orders a venue whose stamps are *locally* applied.
+    ///   IBKR's `orderStatus` callback carries no timestamp field at all, so its client stamps
+    ///   `Utc::now()` on receipt; those rise in arrival order, which makes the stamp admit every
+    ///   snapshot and degrades ordering to last-writer-wins. The fill invariant still rejects a
+    ///   snapshot that overtook a newer one in flight.
+    /// - Admitting a higher cumulative is what rescues a venue whose stamps are *too old* -- a
+    ///   reconciliation fetch pinned to the order's creation time, whose snapshot would otherwise
+    ///   be discarded along with the only accurate cumulative it carried.
+    ///
+    /// # Caller obligation
+    ///
+    /// Both values must already be known to describe the *same* venue order. This orders states,
+    /// it does not establish identity -- check that first with [`VenueOrderId::contradicts`], or
+    /// a snapshot belonging to a different order will be ordered against this one as though it
+    /// were a later state of it.
+    ///
+    /// # Known limitations
+    ///
+    /// Two snapshots reporting the same cumulative fill are ordered on the stamp alone, so a
+    /// venue that supplies no usable one is unordered across them. That covers an order's whole
+    /// life before its first execution, which is why the producer obligation on
+    /// [`Open::time_exchange`] still stands.
+    ///
+    /// A venue that *reduces* a reported cumulative -- busting or correcting an execution -- has
+    /// its correction refused, since a decrease is indistinguishable from out-of-sequence
+    /// delivery. The order is left on the higher cumulative until a later snapshot moves it.
+    ///
+    /// A caller replacing `self` with `update` wholesale adopts `update`'s `time_exchange` too,
+    /// which may be the earlier of the two. That is deliberate: an `Open` is one state the venue
+    /// reported, and carrying the newer stamp onto the other's quantities would synthesise a
+    /// state the venue never reported.
+    pub fn is_superseded_by(&self, update: &Self) -> bool {
+        if update.filled_quantity < self.filled_quantity {
+            return false;
+        }
+
+        self.time_exchange <= update.time_exchange || update.filled_quantity > self.filled_quantity
     }
 }
 
@@ -207,4 +264,62 @@ pub struct Expired {
     pub time_exchange: DateTime<Utc>,
     /// Quantity filled before the order expired.
     pub filled_quantity: Decimal,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeDelta;
+    use rust_decimal_macros::dec;
+
+    /// An `Open` for one venue order, `secs` after an arbitrary epoch, reporting `filled`.
+    fn open(secs: i64, filled: Decimal) -> Open {
+        Open {
+            id: VenueOrderId::Assigned(OrderId::new("1")),
+            time_exchange: DateTime::<Utc>::MIN_UTC + TimeDelta::seconds(secs),
+            filled_quantity: filled,
+        }
+    }
+
+    #[test]
+    fn a_later_stamp_supersedes() {
+        assert!(open(0, dec!(0)).is_superseded_by(&open(1, dec!(0))));
+    }
+
+    /// Deliberately `<=`. Venues report at a coarser resolution than they act, so two states of
+    /// one order routinely share a stamp; the later-arriving one is taken as the later state.
+    #[test]
+    fn an_equal_stamp_supersedes() {
+        assert!(open(1, dec!(0)).is_superseded_by(&open(1, dec!(0))));
+    }
+
+    #[test]
+    fn an_earlier_stamp_alone_does_not_supersede() {
+        assert!(!open(1, dec!(0)).is_superseded_by(&open(0, dec!(0))));
+    }
+
+    /// The creation-stamped reconciliation snapshot. Its stamp cannot place it after the states
+    /// that followed the order's acknowledgement, but the cumulative it carries is evidence
+    /// enough on its own.
+    #[test]
+    fn more_filled_supersedes_an_earlier_stamp() {
+        assert!(open(1, dec!(0.3)).is_superseded_by(&open(0, dec!(0.6))));
+    }
+
+    /// The case the stamp cannot catch at a venue that stamps locally on receipt: a snapshot that
+    /// overtook a newer one in flight carries the later stamp and the earlier state. Cumulative
+    /// fill is append-only, so reporting less of it is proof the snapshot is out of sequence.
+    #[test]
+    fn less_filled_is_refused_despite_a_later_stamp() {
+        assert!(!open(0, dec!(0.6)).is_superseded_by(&open(1, dec!(0.3))));
+    }
+
+    /// Both keys together are still weaker than a correct stamp: where the cumulative does not
+    /// move, ordering falls back to the stamp alone. This is the whole of an order's life before
+    /// its first execution.
+    #[test]
+    fn an_unmoved_cumulative_leaves_ordering_to_the_stamp() {
+        assert!(!open(1, dec!(0.3)).is_superseded_by(&open(0, dec!(0.3))));
+        assert!(open(0, dec!(0.3)).is_superseded_by(&open(1, dec!(0.3))));
+    }
 }
