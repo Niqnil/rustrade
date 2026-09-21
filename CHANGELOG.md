@@ -75,6 +75,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   asked for. Both the API documentation and the backtest example now state this and direct callers
   to establish depth per symbol first.
 
+- **The London Strategic Edge HTTP plumbing now lives in one internal transport shared by the
+  provider's hosts** (`rustrade-data`; `lse` feature; internal refactor, no public API or behaviour
+  change). The auth header, the `User-Agent` their CDN requires, the timeouts, the no-redirect
+  policy that keeps the key off a server-named host, the concurrency-and-pacing gate and the
+  status-to-error mapping were all defined inside `LseVaultClient`. The provider serves reference
+  data from a second host that needs every one of them, so they moved to an `LseHttpCore` that
+  takes its base URL from whichever client wraps it; `LseVaultClient` keeps its own base URL and
+  page limit and is otherwise a thin wrapper.
+
+  `LseVaultClient`'s public surface, its `Debug` output and its rationing semantics are unchanged —
+  a core is still one ration pool shared by clones, so two clients still ration independently. The
+  `User-Agent` requirement is now documented as measured on both hosts rather than on the vault
+  alone: each answers a request carrying the default agent of a common HTTP client with `403`
+  `error code: 1010` at the edge, before it reaches the API. The one observable difference is a
+  `debug`-level log line, which reads `lse response received` in place of `vault response
+  received` now that it is emitted for either host.
+
+  Reading `LSE_API_KEY` is now shared too. The REST clients and the WebSocket connector had
+  separate copies of the variable name and of the redaction that keeps a mis-encoded key out of
+  the error message — `VarError`'s non-UTF-8 arm embeds the raw value, so interpolating it would
+  put essentially the whole key into a string callers log. They now read through one helper and
+  wrap its failure in their own error type, so that redaction has a single definition and cannot
+  drift between the two surfaces. The messages themselves are unchanged.
+
 ### Fixed
 
 - **An out-of-sequence order snapshot can no longer rewind an order's state at a venue that
