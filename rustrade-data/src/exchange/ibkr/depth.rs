@@ -29,7 +29,11 @@ const IB_DEPTH_OP_DELETE: i32 = 2;
 ///
 /// Its sibling 316 ("HALTED") is terminal: the subscription ends with an error
 /// and the caller re-subscribes, which the stream's error arm already handles.
-pub(super) const IB_MARKET_DEPTH_RESET_CODE: i32 = 317;
+///
+/// Public because [`DepthAggregator`] is: a caller driving the aggregator from
+/// their own subscription loop must match this code and call
+/// [`DepthAggregator::on_venue_reset`]. The stream in this module already does.
+pub const IB_MARKET_DEPTH_RESET_CODE: i32 = 317;
 
 /// Aggregates IB market depth updates into OrderBook snapshots.
 ///

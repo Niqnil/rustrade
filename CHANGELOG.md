@@ -152,6 +152,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a robustness one. It is unit-tested; confirming it end to end needs a live level-2 subscription
   that receives a reset, which CI does not run.
 
+  `IB_MARKET_DEPTH_RESET_CODE` is exported alongside it: `DepthAggregator` is public, so a caller
+  driving one from their own subscription loop needs the code that triggers `on_venue_reset`.
+  `ibapi` names no constant for it, exposing only membership in `DATA_ADVISORY_CODES`.
+
 
 - **An out-of-sequence order snapshot can no longer rewind an order's state at a venue that
   reports no timestamp of its own** (`rustrade`). IBKR's `orderStatus` callback carries no
