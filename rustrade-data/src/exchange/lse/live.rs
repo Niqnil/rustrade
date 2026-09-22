@@ -4,6 +4,7 @@ use super::{
     market::LseDataset,
     resume::{LseResumeKey, LseResumeState, epoch_seconds, subscription_id},
 };
+use crate::exchange::lse::transport::api_key_from_env;
 use crate::{
     Identifier,
     exchange::Connector,
@@ -25,11 +26,8 @@ use rustrade_integration::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use smol_str::SmolStr;
-use std::{collections::HashMap, env, fmt, sync::Arc, time::Duration};
+use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
 use tracing::{debug, warn};
-
-/// The environment variable [`LseCredentials::from_env`] reads.
-const API_KEY_ENV: &str = "LSE_API_KEY";
 
 /// How long to wait for the `authenticated` frame.
 ///
@@ -66,18 +64,10 @@ impl LseCredentials {
     ///
     /// # Errors
     /// Returns [`SocketError::Subscribe`] if the variable is unset or does not hold valid UTF-8.
-    /// The message names the variable and never its value — `VarError`'s own `Display` embeds the
-    /// raw `OsString` on the non-UTF-8 arm, which would put essentially the whole key into a string
-    /// callers log.
+    /// The message names the variable and never its value; the REST clients read the same variable
+    /// through the same helper, so the redaction cannot drift between the two surfaces.
     pub fn from_env() -> Result<Self, SocketError> {
-        let api_key = env::var(API_KEY_ENV).map_err(|error| {
-            SocketError::Subscribe(match error {
-                env::VarError::NotPresent => format!("{API_KEY_ENV} is not set"),
-                env::VarError::NotUnicode(_) => {
-                    format!("{API_KEY_ENV} is set but is not valid UTF-8")
-                }
-            })
-        })?;
+        let api_key = api_key_from_env().map_err(SocketError::Subscribe)?;
 
         Ok(Self::new(api_key))
     }

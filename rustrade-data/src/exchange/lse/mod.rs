@@ -122,6 +122,8 @@ pub mod quota;
 
 pub mod quote;
 
+pub mod reference;
+
 pub mod resume;
 
 pub mod stream;
@@ -133,6 +135,10 @@ pub mod tick;
 pub mod trade;
 
 pub mod transformer;
+
+/// HTTP plumbing shared by the provider's two hosts. Internal: the host clients
+/// ([`vault::LseVaultClient`]) are the public surface.
+pub(crate) mod transport;
 
 pub mod vault;
 
@@ -164,6 +170,13 @@ use url::Url;
 /// least eight concurrent authenticated connections on one key when measured; the binding
 /// constraint is the per-connection subscription cap, not the connection count.
 pub const WEBSOCKET_URL: &str = "wss://data-ws.londonstrategicedge.com";
+
+/// Format of every naive timestamp the provider serves over REST.
+///
+/// Used by the candle rows' `ts` and by the catalog's `first_tick` / `last_tick`, which share one
+/// spelling (`2024-01-02 09:09:00.000000`). `%.f` makes the fractional part optional, so a response
+/// that drops the microseconds still parses. The value carries no timezone and is UTC.
+pub(crate) const PROVIDER_TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.f";
 
 /// The London Strategic Edge live market data connector.
 ///
