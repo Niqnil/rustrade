@@ -34,7 +34,14 @@ pub enum LseDataset {
 }
 
 impl LseDataset {
-    /// Every price dataset, in catalog order.
+    /// Every price dataset that has a variant here, in catalog order.
+    ///
+    /// ⚠️ **Not every price dataset the catalog publishes.** The catalog carries eleven price
+    /// dataset names; `options` is the eleventh and has no variant, because the surfaces below
+    /// ([`exchange_id`](Self::exchange_id), [`market_data_kind`](Self::market_data_kind),
+    /// [`ws_category`](Self::ws_category)) have no honest answer for an option contract. It was
+    /// 3,186 of the 7,429 price-classified catalog entries when last measured, so a caller
+    /// enumerating this to cover "all price data" will silently miss them.
     pub const ALL: [Self; 10] = [
         Self::Stocks,
         Self::Etf,
@@ -67,8 +74,10 @@ impl LseDataset {
     /// Parses a catalog dataset name.
     ///
     /// # Errors
-    /// Returns [`LseError::UnknownDataset`] for anything that is not a price dataset — including
-    /// the provider's reference datasets, which are not instruments.
+    /// Returns [`LseError::UnknownDataset`] for any name without a variant in [`ALL`](Self::ALL).
+    /// That is **every** reference dataset — they are not instruments, and this is the contract, not
+    /// a gap — and also `options`, which *is* a price dataset but has no variant. So the error does
+    /// not classify the name: it reports only that this type cannot model it.
     pub fn from_catalog_str(dataset: &str) -> Result<Self, LseError> {
         Self::ALL
             .into_iter()

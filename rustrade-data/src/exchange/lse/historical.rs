@@ -27,6 +27,7 @@
 //! Candles retrieved here are **not redistributable**. See the [module documentation](super) and
 //! <https://londonstrategicedge.com/terms>.
 
+use crate::exchange::lse::PROVIDER_TIMESTAMP_FORMAT;
 use crate::exchange::lse::error::LseError;
 use crate::exchange::lse::market::candle_interval_str;
 use crate::exchange::lse::vault::LseVaultClient;
@@ -39,12 +40,6 @@ use futures::{Stream, StreamExt};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use tracing::debug;
-
-/// Format of the `ts` field in a candle row (`2024-01-02 09:09:00.000000`).
-///
-/// `%.f` makes the fractional part optional, so a response that drops the microseconds still
-/// parses. The value carries no timezone and is UTC.
-const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.f";
 
 /// Format accepted by the `start` / `end` query parameters.
 ///
@@ -71,7 +66,7 @@ const CURSOR_STEP_SECS: i64 = 1;
 /// does not break decoding.
 #[derive(Debug, Deserialize)]
 struct LseCandleRow {
-    /// Bar **open** time, UTC. See [`TIMESTAMP_FORMAT`].
+    /// Bar **open** time, UTC. See [`PROVIDER_TIMESTAMP_FORMAT`].
     ts: String,
     open: Decimal,
     high: Decimal,
@@ -85,7 +80,7 @@ struct LseCandleRow {
 impl LseCandleRow {
     /// Parse the row's `ts` as the bar's open instant.
     fn open_time(&self) -> Result<DateTime<Utc>, LseError> {
-        NaiveDateTime::parse_from_str(&self.ts, TIMESTAMP_FORMAT)
+        NaiveDateTime::parse_from_str(&self.ts, PROVIDER_TIMESTAMP_FORMAT)
             .map(|naive| naive.and_utc())
             .map_err(|error| LseError::Deserialize {
                 message: format!("invalid candle timestamp {:?}: {error}", self.ts),
