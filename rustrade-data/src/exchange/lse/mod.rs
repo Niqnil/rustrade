@@ -136,6 +136,10 @@ pub mod trade;
 
 pub mod transformer;
 
+/// HTTP plumbing shared by the provider's two hosts. Internal: the host clients
+/// ([`vault::LseVaultClient`]) are the public surface.
+pub(crate) mod transport;
+
 pub mod vault;
 
 use self::{
