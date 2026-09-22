@@ -93,7 +93,7 @@ ibapi=4.0.1  # 2026-09-14 | Financial protocol, community-maintained, no officia
 # `place_order` subscription observes for a held order, and only a live out-of-RTH placement can
 # confirm the `OrderStatus(PreSubmitted)` actually arrives where this bump implies it will. Do that
 # before relying on 4.0.1 in production.
-binance-sdk=69.2.3  # 2026-09-14 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
+binance-sdk=70.1.0  # 2026-09-14 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
 #   1. common::websocket::WebsocketApi::send_message      — signature + WebsocketMessageSendOptions signing fields (margin WS subscribe send)
 #   2. ws.common.events.subscribe (WebsocketEventEmitter) — receive/event-callback path (margin WS event delivery)
 #   3. common::utils::send_request                        — signature + HMAC signing + X-MBX-APIKEY header (hand-rolled `userListenToken` POST; SDK binds no endpoint for it)
@@ -196,6 +196,66 @@ binance-sdk=69.2.3  # 2026-09-14 | Exchange SDK, signing/IO. PINNED: margin user
 # STOCKS_REST_API_PROD_URL and a new WS host `wss://nbstream.binance.com/equity`) — we enable only
 # `spot` and `margin_trading`, so none of it is compiled. No consumer-side API churn: this bump needs
 # no code change, unlike 60.0.0 -> 69.1.0.
+#
+# Re-verified against the vendored =70.1.0 source on 2026-09-22 (69.2.3 -> 70.1.0). A MAJOR bump,
+# and the cheapest one this entry has ever recorded: THE ENTIRE `src/` DELTA IS TWO MODULES WE DO
+# NOT COMPILE. `diff -rq` over src/ returns 15 entries, all under
+# derivatives_trading_portfolio_margin/ and derivatives_trading_usds_futures/, both
+# #[cfg(feature)]-gated at lib.rs:29-30 and :33-34 and neither in our `spot` + `margin_trading`
+# selection. `src/common/`, `src/spot/`, `src/margin_trading/` and `src/lib.rs` are ALL
+# BYTE-IDENTICAL (diff -rq empty on each).
+# All 3 internals therefore hold BY CONSTRUCTION: `common/websocket.rs` md5 is again
+# 38b5990bb85497fdbcec39984732509b -- the same hash recorded at 60.0.0, 69.1.0 and 69.2.3, now ten
+# majors unchanged -- and `common/utils.rs` (1541c46b7c5ba4f5f7ef57286c99695d) did not move either,
+# so unlike 69.2.3 not even one file in common/ differs. Quoted from the 70.1.0 source anyway:
+#   1. `send_message(&self, method: &str, payload: BTreeMap<String, Value>,
+#      options: WebsocketMessageSendOptions) -> Result<SendWebsocketMessageResult<R>, WebsocketError>`
+#      (websocket.rs:1630); WebsocketMessageSendOptions (websocket.rs:1404-1409) still carries exactly
+#      with_api_key / is_signed / is_session_logon / is_session_logout. Both margin WS call sites
+#      (margin.rs:1457, margin.rs:1497) still type-check and both still pass
+#      `WebsocketMessageSendOptions::new()`, i.e. unsigned with no API key.
+#   2. `WebsocketEventEmitter::subscribe` (websocket.rs:125) still opens an unbounded channel (:129)
+#      and spawns exactly ONE task (:137) draining it via a sequential
+#      `while let Some(event) = rx.recv().await { callback(event) }` (:138-140). No FuturesUnordered,
+#      no per-event spawn, no concurrent dispatch. That is the contract the non-atomic `Option::take()`
+#      in the margin `account_stream` callback (margin.rs:1876) relies on for soundness.
+#   3. `send_request(configuration, endpoint, method, query_params, body_params, time_unit, is_signed)`
+#      -- 7-arg shape unchanged (utils.rs:951-959). `is_signed` still injects `timestamp` (:967-968),
+#      signs via `configuration.signature_gen.get_signature(...)` (:979-980), appends `signature` to
+#      the query string (:997) and sets `X-MBX-APIKEY` (:1034). The hand-rolled
+#      `POST /sapi/v1/userListenToken` (margin.rs:1369) is still signed as intended.
+#
+# What made it MAJOR, and why it costs us nothing: a pure removal in a module we do not enable.
+# `derivatives_trading_portfolio_margin/rest_api/apis/trade_api.rs` loses 1724 lines and gains 0 --
+# seven UM conditional-order endpoints plus their 7 model files and 7 example stanzas. Secondarily
+# `derivatives_trading_usds_futures` `modify_order` moved `reduce_only` from `Option<String>` to
+# `Option<ModifyOrderReduceOnlyEnum>`, the same typed-enum pattern recorded at 60.0.0 -> 69.1.0.
+# Everything else in those two modules is doc-comment rewording. CONSUMER-SIDE API CHURN: NONE.
+# rustrade imports only from common/ and margin_trading/ and spot/, all byte-identical, so this bump
+# needs no code change. Our `binance_conditional_orders` test is our own spot stop-order test and
+# touches no SDK conditional-order API.
+#
+# Security: PASS, and unchanged rather than merely equivalent. Real `unsafe` constructs: 10 in BOTH
+# versions, identical sites -- utils.rs:1492-1542, all `std::env::set_var`/`remove_var` below the
+# `#[cfg(test)]`. (A bare `\bunsafe\b` grep reports 17 -> 17; the 7 extra are the word inside the
+# plain-query validator's error strings, the same over-count caveat this file records for `dbn`.)
+# Zero transmute / from_raw / extern "C" / asm! in both. build.rs identical
+# (md5 32353f57fa3d951fe6be1ce5c5edb33c). NETWORK: the URL set across src/ differs by ONE LINE, a
+# doc-comment FAQ link at derivatives_trading_portfolio_margin/rest_api/mod.rs:4807 -- zero new
+# domains, zero removed. Env reads, filesystem sites (the caller's own PEM at utils.rs:158, two gzip
+# decoders) and credential handling are byte-identical, so the redacting `Debug` on every
+# secret-bearing struct and the zero `Serialize` in config.rs carry forward unchanged, as do BOTH
+# standing caveats: the `BINANCE_CONNECTOR_RUST_USER_AGENT` crafted-value panic (utils.rs:437 ->
+# HeaderValue parse) and the DEBUG-level log of the full signed WS request at websocket.rs:1665.
+# No process spawn, no obfuscation. No RUSTSEC advisory for binance-sdk (advisory-db b50980a).
+#
+# Dependency surface: `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]` AND the whole
+# `[features]` table are byte-for-byte identical to 69.2.3 (30 features, unchanged -- `stocks` from
+# the last bump is still there and still not enabled). No MSRV change (neither declares
+# `rust-version`; edition 2024 both). The PR is 2 files and 3 changed lines -- version, checksum,
+# manifest -- and adds or removes ZERO packages from our Cargo.lock; binance-sdk's own 32-entry dep
+# list there is untouched. The crate's VENDORED Cargo.lock drops `tinyvec_macros`, which is
+# irrelevant: Cargo ignores a dependency's own lockfile and ours shows no delta.
 quick-xml  # 2026-07-08 | New direct dep (XML parsing of broker Flex statements). Reviewed @ 0.41.0: #![forbid(unsafe_code)] crate-wide, zero net-new transitive deps (serde+memchr only, both already in tree), no RUSTSEC advisories, de-facto-standard parser. Not pinned — any version bump still needs review.
 #   Re-reviewed @ 0.42.0 (2026-09-16), the review this entry's "any version bump still needs
 #   review" mandates. All four properties recorded at 0.41.0 re-verified and still hold:
