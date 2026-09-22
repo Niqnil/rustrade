@@ -154,6 +154,63 @@ pub enum LseError {
         last_date: NaiveDate,
     },
 
+    /// The requested country is not one the economic calendar publishes.
+    ///
+    /// Raised before the request is sent, for the same reason as
+    /// [`UnknownBondYieldCountry`](Self::UnknownBondYieldCountry): the endpoint answers an unknown
+    /// country with `200` and `count: 0`, indistinguishable from a quiet window.
+    ///
+    /// `normalised` is what `requested` became before the lookup. The calendar keys the United
+    /// Kingdom `UK` rather than `GB`, exactly as `/bond-yields` does — but the two vocabularies are
+    /// **not** the same set: the calendar's 108 codes also include `EA` and `EU`, which are not
+    /// countries. Both forms are reported so a caller can see which one was actually looked up.
+    #[error(
+        "unknown economic-calendar country {requested:?} (looked up as {normalised:?}): the          provider does not publish it - consult the stats handle for the countries it does"
+    )]
+    UnknownCalendarCountry {
+        requested: String,
+        normalised: String,
+    },
+
+    /// The requested impact rating is not one the economic calendar publishes.
+    ///
+    /// Measured: `impact=Critical` answers `200` with `count: 0` rather than an error, so this is
+    /// raised before the request is sent.
+    ///
+    /// `available` is carried in full because the vocabulary is closed and short — exactly
+    /// `["High", "Low", "Medium", "None"]`. ⚠️ `"None"` in that list is a literal rating, not an
+    /// absent value.
+    #[error("unknown economic-calendar impact {requested:?}: the provider publishes {available:?}")]
+    UnknownCalendarImpact {
+        requested: String,
+        available: Vec<String>,
+    },
+
+    /// The requested range lies entirely outside the calendar's published coverage.
+    ///
+    /// ⚠️ **A global bound, not a per-country one**, which makes this weaker than
+    /// [`BondYieldRangeOutsideCoverage`](Self::BondYieldRangeOutsideCoverage).
+    /// `/economic-calendar/stats` publishes no per-country coverage at all, so a window *inside*
+    /// this range may still legitimately return nothing — 88 of the 108 countries hold fewer than
+    /// 100 events. That case is deliberately **not** an error: the library has no way to
+    /// distinguish it from a quiet period, and inventing an error for it would mean inventing
+    /// knowledge the provider does not publish.
+    ///
+    /// 🔴 `latest` has been 2026-03-24 across measurements two months apart — the feed is frozen,
+    /// so **every** forward-looking window lands here.
+    ///
+    /// Raised only when the requested range and the published one are **disjoint**. A partial
+    /// overlap is not an error: it returns the events that exist, which is what was asked for.
+    #[error(
+        "economic-calendar range {start}..={end} lies outside the published coverage          ({earliest}..={latest})"
+    )]
+    CalendarRangeOutsideCoverage {
+        start: NaiveDate,
+        end: NaiveDate,
+        earliest: NaiveDate,
+        latest: NaiveDate,
+    },
+
     /// The requested resolution is not one the provider serves.
     ///
     /// [`CandleInterval`] is the venue-agnostic union of every resolution any connector in this
@@ -624,7 +681,10 @@ impl LseError {
             | Self::QuoteAssetMismatch { .. }
             | Self::UnknownBondYieldCountry { .. }
             | Self::UnknownBondYieldMaturity { .. }
-            | Self::BondYieldRangeOutsideCoverage { .. } => LseErrorKind::InvalidInput,
+            | Self::BondYieldRangeOutsideCoverage { .. }
+            | Self::UnknownCalendarCountry { .. }
+            | Self::UnknownCalendarImpact { .. }
+            | Self::CalendarRangeOutsideCoverage { .. } => LseErrorKind::InvalidInput,
 
             // Everything the provider sent that could not be read as what it claims to be. An
             // integrity or job mismatch belongs here rather than under `Api`: the request was
