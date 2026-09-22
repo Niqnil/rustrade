@@ -7,8 +7,9 @@
 //! an [`LseError`].
 //!
 //! [`LseHttpCore`] holds exactly that common part. The host-specific clients —
-//! [`LseVaultClient`](super::vault::LseVaultClient) for the vault data plane — wrap one and add
-//! their own endpoints and their own configuration on top.
+//! [`LseVaultClient`](super::vault::LseVaultClient) for the vault data plane and
+//! [`LseDataApiClient`](super::data_api::LseDataApiClient) for the reference host — wrap one and
+//! add their own endpoints and their own configuration on top.
 //!
 //! # ⚠️ One core is one ration pool
 //!

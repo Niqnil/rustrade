@@ -1,6 +1,6 @@
 use crate::exchange::lse::quota::QuotaStatus;
 use crate::subscription::candle::CandleInterval;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -87,6 +87,72 @@ pub enum LseError {
     /// The request is malformed in a way the caller must fix, detected before it is sent.
     #[error("invalid input: {message}")]
     InvalidInput { message: String },
+
+    /// The requested country is not one the provider publishes bond yields for.
+    ///
+    /// Raised before the request is sent, because `/bond-yields` performs **no validation of its
+    /// own**: a country it does not know answers `200` with `count: 0`, which is byte-for-byte
+    /// indistinguishable from an unknown maturity and from a range that is simply empty. Measured:
+    /// `country=ZZ` and `country=GB` both return `200 count=0`, against `country=UK` returning rows.
+    ///
+    /// `normalised` is what `requested` became before the lookup — the provider keys the United
+    /// Kingdom `UK`, **not** the ISO-3166 `GB` its own `country_iso2` column name implies, and that
+    /// is the only divergence among its 34 codes. Both forms are reported so a caller can see which
+    /// one was actually looked up.
+    #[error(
+        "unknown bond-yield country {requested:?} (looked up as {normalised:?}): the provider does          not publish it - consult the stats handle for the countries it does"
+    )]
+    UnknownBondYieldCountry {
+        requested: String,
+        normalised: String,
+    },
+
+    /// The requested maturity is not one the provider publishes for that country.
+    ///
+    /// Raised before the request is sent, for the same reason as
+    /// [`UnknownBondYieldCountry`](Self::UnknownBondYieldCountry): measured, `maturity=99Y` answers
+    /// `200` with `count: 0` rather than an error.
+    ///
+    /// `available` is the country's published tenor list, carried in full because it is short
+    /// (fifteen at the widest measured) and because a tenor is a **provider label**, not a
+    /// duration — `5Y` and `5Y TIPS` are distinct series that report the same `maturity_days`, so
+    /// there is nothing a caller can compute the right spelling from.
+    #[error(
+        "unknown bond-yield maturity {requested:?} for country {country}: the provider publishes          {available:?}"
+    )]
+    UnknownBondYieldMaturity {
+        country: String,
+        requested: String,
+        available: Vec<String>,
+    },
+
+    /// The requested range lies entirely outside the published coverage of that series.
+    ///
+    /// The third cause of a `200 count=0`, and the one that membership alone cannot catch: a
+    /// `(country, maturity)` pair can exist and still hold nothing in the window asked for.
+    /// Measured on `US 10Y TIPS` and `TR 2Y`, both of which return zero rows for 2023-2024 and both
+    /// of which report a `first_date` of 2025-07-07 — correct behaviour from the provider, and
+    /// silent.
+    ///
+    /// Raised only when the requested range and the published one are **disjoint**. A partial
+    /// overlap is not an error: it returns the rows that exist, which is what was asked for.
+    #[error(
+        "bond-yield range {start}..={end} lies outside the published coverage of {country}{} \
+         ({first_date}..={last_date})",
+        match .maturity {
+            Some(maturity) => format!(" {maturity}"),
+            None => String::new(),
+        }
+    )]
+    BondYieldRangeOutsideCoverage {
+        country: String,
+        /// `None` when the query named no maturity, so the bound is the country's own coverage.
+        maturity: Option<String>,
+        start: NaiveDate,
+        end: NaiveDate,
+        first_date: NaiveDate,
+        last_date: NaiveDate,
+    },
 
     /// The requested resolution is not one the provider serves.
     ///
@@ -555,7 +621,10 @@ impl LseError {
             | Self::UnknownDataset(_)
             | Self::AmbiguousSlug { .. }
             | Self::UnknownInstrument { .. }
-            | Self::QuoteAssetMismatch { .. } => LseErrorKind::InvalidInput,
+            | Self::QuoteAssetMismatch { .. }
+            | Self::UnknownBondYieldCountry { .. }
+            | Self::UnknownBondYieldMaturity { .. }
+            | Self::BondYieldRangeOutsideCoverage { .. } => LseErrorKind::InvalidInput,
 
             // Everything the provider sent that could not be read as what it claims to be. An
             // integrity or job mismatch belongs here rather than under `Api`: the request was
