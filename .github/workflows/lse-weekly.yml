@@ -44,7 +44,7 @@ jobs:
     name: LSE live-API canaries
     needs: secret-present
     runs-on: ubuntu-latest
-    # The WebSocket canary adds up to five minutes on top of the build and the three REST canaries:
+    # The WebSocket canary adds up to five minutes on top of the build and the four REST canaries:
     # its five tests are serialised against the provider's one-connection-per-key cap, and their
     # timeouts sum rather than overlap.
     timeout-minutes: 30
@@ -80,6 +80,15 @@ jobs:
         continue-on-error: true
         run: cargo test --locked --test lse_bond_yield_canary --features lse -- --ignored --nocapture
 
+      # Same host again, and quota-free. 🔴 Its assertions are deliberately STRUCTURAL: the feed
+      # stopped publishing on 2026-03-24, so a freshness check would fail every week for a reason
+      # nobody can fix. It RECORDS `total_events`/`latest` in the log instead, which is what makes
+      # a revival visible without a revival failing the build.
+      - name: Economic-calendar canary (vocabulary, event encoding, country OR, pagination)
+        id: calendar-canary
+        continue-on-error: true
+        run: cargo test --locked --test lse_economic_calendar_canary --features lse -- --ignored --nocapture
+
       # Spends one of five hourly export jobs.
       - name: Export canary (job lifecycle, download, Parquet schema)
         id: export-canary
@@ -97,11 +106,12 @@ jobs:
         continue-on-error: true
         run: cargo test --locked --test lse_ws_canary --features lse -- --ignored --nocapture
 
-      # All four run even if an earlier one fails, so one report covers every surface.
+      # All five run even if an earlier one fails, so one report covers every surface.
       - name: Check canary results
         if: >-
           steps.vault-canary.outcome == 'failure' ||
           steps.bond-yield-canary.outcome == 'failure' ||
+          steps.calendar-canary.outcome == 'failure' ||
           steps.export-canary.outcome == 'failure' ||
           steps.ws-canary.outcome == 'failure'
         run: exit 1

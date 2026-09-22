@@ -16,7 +16,7 @@
 # cannot land while leaving this record behind. CI cannot verify that the re-verification a
 # pinned entry mandates was actually performed — only that this file was not left untouched.
 
-ibapi=4.0.1  # 2026-09-14 | Financial protocol, community-maintained, no official SDK. Reviewed 3.2.0->3.3.0, all four properties recorded at 3.2.0 re-verified and still hold: zero unsafe (also no transmute/from_raw/extern "C"/asm!; holds by inspection, not by lint — upstream has no #![forbid(unsafe_code)]), no build.rs, dependency tree byte-identical vs 3.2.0 (both Cargo.toml and Cargo.lock differ by the version line alone; 9 direct deps under our `default-features = false, features = ["sync"]` selection, unchanged), still only a caller-supplied TWS socket (reconnect reuses the caller's address — no fallback host, no telemetry) + the opt-in local recorder dir (IBAPI_RECORDING_DIR; recorder.rs byte-identical). Env set unchanged (IBAPI_RECORDING_DIR, IBAPI_TIMEZONE_ALIASES); no process spawn, no obfuscation; published from git b140b312d1136d240f3b5651a89f4778e01aa222.
+ibapi=4.1.0  # 2026-09-14 | Financial protocol, community-maintained, no official SDK. Reviewed 3.2.0->3.3.0, all four properties recorded at 3.2.0 re-verified and still hold: zero unsafe (also no transmute/from_raw/extern "C"/asm!; holds by inspection, not by lint — upstream has no #![forbid(unsafe_code)]), no build.rs, dependency tree byte-identical vs 3.2.0 (both Cargo.toml and Cargo.lock differ by the version line alone; 9 direct deps under our `default-features = false, features = ["sync"]` selection, unchanged), still only a caller-supplied TWS socket (reconnect reuses the caller's address — no fallback host, no telemetry) + the opt-in local recorder dir (IBAPI_RECORDING_DIR; recorder.rs byte-identical). Env set unchanged (IBAPI_RECORDING_DIR, IBAPI_TIMEZONE_ALIASES); no process spawn, no obfuscation; published from git b140b312d1136d240f3b5651a89f4778e01aa222.
 #   New in 3.3.0, reviewed: `src/config` — despite the name it reads NO local files and NO env vars. It wraps two TWS wire messages (ReqConfig=108/UpdateConfig=109) over the already-open socket, whose protobuf types already existed in 3.2.0. Version-gated, #[must_use] builder, not reachable during connect/handshake.
 #   NOTE (capability, not vulnerability): `update_config()` can write the gateway's own safety settings — read_only_api, the bypass_* order precautions, trusted_ips, allow_localhost_only, socket_port, master_client_id. rustrade does not call it and does not re-export it; keep it out of the wrapper surface unless there is a deliberate reason.
 #   Upstream BREAKING in a minor release: the `fundamental` module was removed (IBKR retired reqFundamentalData in TWS API 10.47). rustrade never used it — verified no reference to fundamental_data / FundamentalData / FundamentalReportType / TickType::FundamentalRatios.
@@ -93,6 +93,125 @@ ibapi=4.0.1  # 2026-09-14 | Financial protocol, community-maintained, no officia
 # `place_order` subscription observes for a held order, and only a live out-of-RTH placement can
 # confirm the `OrderStatus(PreSubmitted)` actually arrives where this bump implies it will. Do that
 # before relying on 4.0.1 in production.
+#
+# Re-verified against the vendored =4.1.0 source on 2026-09-22 (4.0.1 -> 4.1.0). Published from git
+# 2dfc49bef73d12f0a3363ea91256d86a77cb9b6f (4.0.1 was b05574806d153b1ca304d9d2905c9ca3015727eb).
+# The maintainer's author email changed domain (wsbsolutions.com -> wsblabs.com); same name, same
+# crates.io publisher, recorded because it is the only identity-adjacent delta in the manifest.
+#
+# ORDER WIRE FORMAT: unchanged, and more strongly than at 4.0.1. `src/orders/common/encoders.rs` is
+# BYTE-IDENTICAL, md5 049bed6ba1d842eedeb81ec639852583 -- the same hash this entry recorded at 4.0.1
+# and 3.3.0. ALL 16 encoder files in the crate are byte-identical. There is no encoder delta to
+# enumerate. Nothing this crate sends to TWS changed shape.
+#
+# The four standing properties all still hold:
+#   1. ZERO unsafe -- 0 constructs in `src/` in both versions, no transmute/from_raw/extern "C"/asm!.
+#      The one new `forget(` grep hit is tokio's safe `SemaphorePermit::forget` at
+#      connection/async_tests.rs:390 -- async AND #[cfg(test)], doubly not ours. Still by inspection,
+#      not by lint: upstream has no #![forbid(unsafe_code)].
+#   2. NO build.rs -- still absent; `build = false` explicit at Cargo.toml:16.
+#   3. DEPENDENCY TREE -- `[dependencies]` byte-for-byte identical under our
+#      `default-features = false, features = ["sync"]` selection: md5 4b001df77c55c0bf51077d4b661d6ee5
+#      over everything from `[dependencies.` onward, identical in both. `[features]` and the 139
+#      `[[example]]` targets identical. THE ENTIRE MANIFEST DELTA IS TWO LINES: version and author
+#      email. No dev-dependency delta this time, unlike 4.0.1. The serde-xml-rs (0.5.1) / xml-rs
+#      (0.8.28) note is UNCHANGED and still accurate: build-deps of time-tz 2.0.0, itself a
+#      non-optional dep of ibapi.
+#   4. NETWORK SURFACE -- still only the caller-supplied TWS socket. URL host set identical and
+#      entirely doc links; the sole textual URL delta in the tree is a trailing `.` after a
+#      tick_types.html link. No new hosts, no process spawn, no telemetry, no obfuscation.
+#
+# ENV SURFACE UNCHANGED -- the same three, same sites: IBAPI_RECORDING_DIR (recorder.rs:34),
+# IBAPI_TIMEZONE_ALIASES (common/timezone/mod.rs:148), IBAPI_RAW_CAPTURE_DIR (raw_capture.rs:93). No
+# new tap of the unredacted-capture class. The 4.0.1 note on IBAPI_RAW_CAPTURE_DIR carrying account
+# ids, positions and orders in the clear stands as written.
+#
+# NOTICE RECLASSIFICATION, re-audited because this entry mandates it -- and this time it DOES reach a
+# live path.
+#   `is_warning_message` is BYTE-IDENTICAL (messages.rs:1102-1106 -> 1108-1112). What moved is the
+#   constant it reads: WARNING_CODE_RANGE 2100..=2169 -> 2100..=2199, because IB kept adding warnings
+#   above the published ceiling (2176, 2187) and each was a hard error.
+#   `classify_error` (routing.rs:215) swapped its predicate from the deleted `is_warning_error` to
+#   `messages::is_informational_code` (messages.rs:1119), now the single owner of the precedence chain.
+#   The routing-informational set changed STRICTLY ADDITIVELY:
+#     4.0.1: is_warning_message U {2188,10089,10090,10167} U {202}
+#     4.1.0: {202} U {317,2188,10089,10090,10091,10167} U is_warning_message(now ..=2199)
+#            U {1100,1101,1102,1300}
+#   i.e. +317, +10091, +2170..=2199, +the system codes. NOTHING was removed -- no frame that was
+#   informational in 4.0.1 becomes an error in 4.1.0. `Notice::category()` also moved
+#   DATA_ADVISORY_CODES ahead of the warning and order-rejection bands; that reorder is
+#   ROUTING-NEUTRAL (the set is a union either way) and only changes the reported variant for 317
+#   (OrderRejection -> DataAdvisory) and 2188 (Warning -> DataAdvisory).
+#   a. OUR ORDER HANDLING IS UNAFFECTED. INFORMATIONAL_ORDER_CODES = &[399] at
+#      rustrade-execution/src/client/ibkr/mod.rs, and 399 is in neither the new advisory list nor the
+#      system list, so BOTH forms classify exactly as in 4.0.1: with a `Warning:` line -> warning ->
+#      non-terminal Notice dropped by timeout_iter_data, subscription stays open; without one -> falls
+#      to ORDER_REJECTION_CODE_RANGE -> Err(Error::Notice), still matched against the list. That
+#      rustdoc has been updated to record the re-verification and to carve 202/317 out of its
+#      "whole 200..=399 range" sentence, which was no longer exact.
+#   b. MARKET DEPTH 317 -- the one live-path change that reached us, and it was a LOSS OF
+#      OBSERVABILITY. FIXED IN THIS PR rather than deferred. rustrade-data/src/exchange/ibkr/mod.rs
+#      iterated `sub.iter_data()`, which DROPS notices. Under 4.0.1 a 317 ("Market depth data has been
+#      RESET") was an OrderRejection -> Err -> the loop logged, sent DataError::Socket and broke, so
+#      the consumer resubscribed and rebuilt the book. Under 4.1.0 it is a DataAdvisory ->
+#      informational -> Notice -> silently dropped, and DepthAggregator would have kept applying rows
+#      to a book it never cleared while TWS had discarded its own. ibapi's behaviour is the CORRECT
+#      one and it documents the consumer contract at market_data/realtime/mod.rs:253-259 ("drop every
+#      row held and rebuild from the updates that follow"); rustrade did not implement it, so 4.0.1
+#      was fail-loud only by accident. The loop now iterates `sub.iter()` and matches
+#      SubscriptionItem::Notice, calling the new `DepthAggregator::on_venue_reset` on code 317 --
+#      which empties both sides, ADVANCES the sequence (reusing `clear()` would have renumbered to 0
+#      and a consumer ordering by sequence would have read the emptied book as older than the stale
+#      one it replaces) and returns the emptied snapshot so it is forwarded at once. Non-317 notices
+#      are logged at warn!, preserving what iter_data() did. Its sibling 316 (HALTED) stays terminal
+#      and is still handled by the error arm.
+#   c. SYSTEM CODES 1100/1101/1102/1300 no longer fail in-flight one-shots (this reverses part of
+#      3.2.1's rework). DOES NOT REACH US, and the reason is structural:
+#      ErrorDisposition::NoticeAndFailOneShots calls only `shared_channels.fail_one_shot_channels(...)`
+#      (transport/sync.rs:452, identical to 4.0.1's :401) -- the shared-channel registry, never
+#      request-id-bound subscriptions. rustrade has 0 call sites for all nine shared one-shots this
+#      entry has listed since 3.3.0 (re-verified: each 0). `contract_details`, which we DO call, is
+#      request-id-bound and was never on that path.
+#
+# CONSUMER-SIDE API CHURN: none forced by the compiler. `OrderUpdate` gained `OrderBound(OrderBound)`
+# and the changelog says exhaustive matches must handle it; our match in
+# rustrade-execution/src/client/ibkr/mod.rs ends with `_ => None`, so it compiles unchanged.
+# `DATA_ADVISORY_CODES: [i32;4]` became `&[i32]` -- we never reference it (0 hits, as for
+# WARNING_CODE_RANGE, NoticeCategory, SYSTEM_MESSAGE_CODES and the notice stream). The `Orders`
+# decoder dropped a dead CommissionsReport arm that would have decoded a commission frame as an open
+# order; our open_orders propagates any Err via `?`, so this removes a spurious failure path.
+#
+# FIXES ON PATHS WE COMPILE, recorded because they are the reason to take this bump:
+#   - New ShutdownSignal (transport/sync/shutdown.rs, std Mutex+Condvar, poison-tolerant via
+#     unwrap_or_else(PoisonError::into_inner), no panic path). Client::drop / disconnect() no longer
+#     block until the reconnect backoff exhausts -- forever under reconnect_forever. We call
+#     disconnect().
+#   - HistoricalDataEnd parsing (market_data/historical/common/decoders/mod.rs:74-100): the old
+#     `rsplit_once(' ')` took only the LAST word as the zone, so "China Standard Time" resolved as
+#     "Time", failed to parse and ended the subscription; the zone-less UTC form `YYYYMMDD-HH:MM:SS`
+#     also failed. Both now parse. We use historical streams heavily.
+#   - ORDER-ID GENERATOR, and a wrapper gap this exposes rather than creates: `set`/`reset` became
+#     `raise` (fetch_max, client/id_generator.rs:46-53) and a successful reconnect now re-seeds the
+#     generator from the handshake's NextValidId, fixing error 103 after a gateway restart. WE DO NOT
+#     BENEFIT: connect_sync takes `client.next_order_id()` ONCE into its own Arc<Mutex<i32>> and
+#     allocates from that thereafter, never consulting ibapi's generator again. Pre-existing, NOT a
+#     regression -- but 4.1.0 is the first version where deferring to ibapi's generator would be
+#     correct, so the wrapper counter could now be retired.
+#   - TRANSPORT_RECONNECT_CODE (-8) is broadcast to the notice fan-out after reconnect cleanup; we do
+#     not consume the notice stream, so it is a no-op here. NOTICE_STREAM_LAG_CODE (-7) is
+#     #[cfg(feature = "async")] and is not compiled for us at all.
+#
+# LOCKFILE: 4 changed lines, all in the ibapi package block (version + checksum). ZERO packages added,
+# ZERO removed, measured by counting +/- `name =` lines in the PR diff.
+# RUSTSEC not verified offline -- no local advisory-db; CI's cargo-deny job covers it.
+#
+# NOT VERIFIABLE OFF-GATEWAY, unchanged in force from 4.0.1: the ibkr integration tests are all
+# #[ignore]d (20 in rustrade-data/tests/ibkr_integration.rs) and CI does not run them. NOTHING has
+# exercised 4.1.0's handshake, its shutdown-aware reconnect backoff, the order-id re-seed, the widened
+# 2100..=2199 warning band, the 317/10091 advisory routing or the new HistoricalDataEnd parser against
+# a real gateway. THE 317 FIX IN (b) IS UNIT-TESTED ONLY -- `on_venue_reset` has three tests, but no
+# test drives a real 317 notice through the subscription loop, because that needs a live level-2
+# subscription that receives a book reset. Do that before relying on 4.1.0 in production.
 binance-sdk=70.1.0  # 2026-09-14 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
 #   1. common::websocket::WebsocketApi::send_message      — signature + WebsocketMessageSendOptions signing fields (margin WS subscribe send)
 #   2. ws.common.events.subscribe (WebsocketEventEmitter) — receive/event-callback path (margin WS event delivery)
