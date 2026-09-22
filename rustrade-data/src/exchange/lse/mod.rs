@@ -101,6 +101,8 @@ pub mod backtest;
 
 pub mod bond_yield;
 
+pub mod calendar;
+
 /// The WebSocket channel a subscription maps to.
 pub mod channel;
 

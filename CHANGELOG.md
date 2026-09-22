@@ -9,6 +9,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`LseCalendarEvent` and the economic-calendar fetch, with
+  `LseDataApiClient::fetch_economic_calendar` and `fetch_economic_calendar_stats`**
+  (`rustrade-data`, feature `lse`). The provider's archive of scheduled macroeconomic releases —
+  124,896 events across 108 country codes, each carrying the consensus estimate, the previous
+  figure and the actual outcome. Added to the existing `LseDataApiClient` rather than a new client,
+  since it is the same host as `/bond-yields`.
+
+  🔴 **The feed stopped on 2026-03-24, and that is documented as a limitation rather than a
+  footnote.** It was measured frozen to the unit two months of wall-clock apart — `total_events`
+  124,896 and `latest` 2026-03-24 on both readings — and confirmed from the other side: any window
+  after that date returns `200` with zero events across all 108 countries. The forward-looking use
+  case an economic calendar exists for is therefore **not served at all**. What remains is a genuine
+  historical archive spanning 2014-12-31 to 2026-03-24, with an `estimate` on 74,843 events, which
+  is useful for backtesting and event studies and is what this models. The module rustdoc says so
+  first, and `LseCalendarStats::latest` is the live figure rather than a constant so a caller can
+  detect a revival.
+
+  Like `/bond-yields`, the endpoint validates nothing: an unknown country, an unknown impact rating,
+  a reversed range and a window past the freeze all answer an identical `200 count=0`. So
+  `fetch_economic_calendar` takes an `LseCalendarStats` as a **required** argument. But the
+  validation it can offer is genuinely weaker, and the difference is documented rather than papered
+  over: `/economic-calendar/stats` publishes **no per-country coverage**, only a flat global
+  `earliest`/`latest`, while coverage is wildly uneven — 88 of 108 countries hold fewer than 100
+  events and `UK` holds 56. An empty result inside the global range is therefore a legitimate answer
+  and deliberately **not** an error, because inventing one would mean inventing knowledge the
+  provider does not publish.
+
+  Two silent wire traps are closed by construction. A repeated `country` key makes the provider keep
+  only the **last** value — `country=US&country=UK` returns the 56 UK events and drops 36,421 US
+  ones, with no error — so `LseCalendarQuery` joins with commas, which is a genuine OR, and nothing
+  in the API can express the broken form. And `format` defaults to **CSV**, so every request sends
+  `format=json` explicitly.
+
+  Field choices are measurements. `event_date` is a `DateTime<Utc>` rather than the `NaiveDate`
+  `/bond-yields` uses — the opposite call from its sibling, because every event carries a real time
+  of day and 348 distinct ones occur, so a date would destroy intraday ordering. Numerics are
+  `Option<Decimal>` via `rust_decimal::serde::str_option`: every numeric arrives as a JSON string,
+  all ~462,000 non-null values parse, and negatives are abundant on `change` and
+  `change_percentage`. Absence is always `null` and never `""` — the empty-string count is zero for
+  every one of the eleven fields across the whole corpus. `impact` is a closed `LseCalendarImpact`
+  enum in which **`None` is a literal provider rating carried by 592 events, not an absent value**,
+  which is why the field is not an `Option`.
+
+  `UK`-not-`GB` carries over from `/bond-yields`, so `normalise_country` applies the same single
+  documented alias — but the vocabularies are **not** the same set: the calendar's 108 codes include
+  `EA` and `EU`, which are not countries.
+
+  A live canary (`lse_economic_calendar_canary`) is wired into `lse-weekly.yml` as a fourth REST
+  canary. Its assertions are structural so they hold on a frozen feed, and it **records**
+  `total_events`/`latest` in the log rather than asserting them — a revival is the outcome we want
+  and must not fail the build.
+
+  ⚠️ Calendar events are provider data and may not be redistributed or committed as fixtures. See
+  <https://londonstrategicedge.com/terms>.
+
 - **`LseDataApiClient` and the London Strategic Edge bond-yield endpoints** (`rustrade-data`,
   feature `lse`). Daily open/high/low/close sovereign yields for 34 countries — 716,820
   observations at the last measurement — via `fetch_bond_yield_stats` and `fetch_bond_yields`.

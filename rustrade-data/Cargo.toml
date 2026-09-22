@@ -200,7 +200,15 @@ name = "lse_vault"
 required-features = ["lse"]
 
 [[test]]
+name = "lse_economic_calendar"
+required-features = ["lse"]
+
+[[test]]
 name = "lse_bond_yield_canary"
+required-features = ["lse"]
+
+[[test]]
+name = "lse_economic_calendar_canary"
 required-features = ["lse"]
 
 [[test]]
