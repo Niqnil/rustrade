@@ -99,8 +99,12 @@
 /// Replay historical candles for N instruments as one time-ordered market stream.
 pub mod backtest;
 
+pub mod bond_yield;
+
 /// The WebSocket channel a subscription maps to.
 pub mod channel;
+
+pub mod data_api;
 
 /// Errors produced by the London Strategic Edge integration.
 pub mod error;
@@ -137,7 +141,7 @@ pub mod trade;
 pub mod transformer;
 
 /// HTTP plumbing shared by the provider's two hosts. Internal: the host clients
-/// ([`vault::LseVaultClient`]) are the public surface.
+/// ([`vault::LseVaultClient`] and [`data_api::LseDataApiClient`]) are the public surface.
 pub(crate) mod transport;
 
 pub mod vault;

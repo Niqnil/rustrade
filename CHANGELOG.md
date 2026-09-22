@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`LseDataApiClient` and the London Strategic Edge bond-yield endpoints** (`rustrade-data`,
+  feature `lse`). Daily open/high/low/close sovereign yields for 34 countries — 716,820
+  observations at the last measurement — via `fetch_bond_yield_stats` and `fetch_bond_yields`.
+  These live on the provider's *second* host, `data-api.londonstrategicedge.com`, because a
+  bond-yield symbol has no candle data on the vault at all (`GET /vault/candles?symbol=UK5Y`
+  answers `404`). `LseDataApiClient` is a second thin wrapper over the transport introduced
+  alongside it, so both hosts share auth, agent, timeouts, redirect policy, rationing and error
+  mapping.
+
+  **The stats handle is a required argument to `fetch_bond_yields`, not an option**, because the
+  endpoint performs no validation of its own. Measured: an unknown country (`ZZ`), the ISO-3166
+  spelling of a country the provider keys differently (`GB`), and a nonsense tenor (`99Y`) each
+  answer `200` with `count: 0` — an envelope identical to a genuinely quiet window. Making
+  validation unskippable in the type system is the only way a wrong query fails loudly rather than
+  returning an empty `Vec`.
+
+  Validation checks the requested window against the **tenor's own** coverage, not merely that the
+  `(country, maturity)` pair exists. Membership alone is insufficient: `US 10Y TIPS` and `TR 2Y`
+  both exist and both return nothing for 2023–2024, because neither was published before
+  2025-07-07. Three typed errors distinguish the three causes a zero-row response otherwise
+  conflates — `LseError::UnknownBondYieldCountry`, `UnknownBondYieldMaturity` (carrying the
+  country's published tenor list) and `BondYieldRangeOutsideCoverage` (carrying the window that
+  does exist).
+
+  ⚠️ **The provider keys the United Kingdom `UK`, not `GB`**, despite naming the column
+  `country_iso2`; `GB` is absent from all 34 keys, while the vault's catalog spells the same
+  country `GB`. It is the only divergence in the set. `LseBondYieldStats::normalise_country` maps
+  it, and every entry point applies the mapping before the request is sent.
+
+  ⚠️ **A tenor is a provider label, not a duration.** Each US TIPS tenor reports the same
+  `maturity_days` as its nominal twin (`5Y` and `5Y TIPS` both `1825`), so keying a series on
+  `(country, maturity_days)` silently merges a real yield with an inflation-linked one. `maturity`
+  identifies the series; `maturity_days` is a derived hint.
+
+  Every field of a row arrives as a JSON **string**, numerics included, so prices decode with
+  `rust_decimal::serde::str` — the `rust_decimal::serde::float` helper used by `AlpacaStockSplit`
+  expects a JSON number and fails here. The response is **not paged**: a request for one tenor's
+  full published history returned all 10,004 rows in a single response, matching what the stats
+  endpoint reports, so the fetch returns a `Vec` rather than inventing pagination for a surface
+  that has none. The envelope's own `count` is checked against the rows delivered, which is the
+  signal a silently introduced page cap would produce.
+
+  A live canary (`lse_bond_yield_canary`, `#[ignore]`d, wired into the weekly drift workflow)
+  asserts each of those premises against the real API rather than against a fixture.
+
+  ⚠️ Bond-yield rows are provider data and may not be redistributed or committed as fixtures. See
+  <https://londonstrategicedge.com/terms>.
+
 - **`LseCatalogEntry`, the London Strategic Edge catalog record, with
   `LseVaultClient::fetch_catalog`** (`rustrade-data`, feature `lse`). The provider's index of
   everything it publishes — 22,966 entries at the last measurement — as a provider-shaped type in
