@@ -97,7 +97,7 @@ hex = { workspace = true, optional = true }
 # which is why the other codecs are not enabled pre-emptively. Adding e.g. `snap` here is a
 # one-line fix if that day comes; carrying the dependency for a switch that has not happened is
 # supply-chain surface a public library should not spend up front.
-parquet = { version = "59.1.0", default-features = false, features = ["zstd"], optional = true }
+parquet = { version = "60.0.0", default-features = false, features = ["zstd"], optional = true }
 
 # Protocol
 url = { workspace = true }
@@ -192,7 +192,15 @@ name = "lse_export"
 required-features = ["lse"]
 
 [[test]]
+name = "lse_bond_yield"
+required-features = ["lse"]
+
+[[test]]
 name = "lse_vault"
+required-features = ["lse"]
+
+[[test]]
+name = "lse_bond_yield_canary"
 required-features = ["lse"]
 
 [[test]]

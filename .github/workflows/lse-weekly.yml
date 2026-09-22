@@ -44,7 +44,7 @@ jobs:
     name: LSE live-API canaries
     needs: secret-present
     runs-on: ubuntu-latest
-    # The WebSocket canary adds up to five minutes on top of the build and the two REST canaries:
+    # The WebSocket canary adds up to five minutes on top of the build and the three REST canaries:
     # its five tests are serialised against the provider's one-connection-per-key cap, and their
     # timeouts sum rather than overlap.
     timeout-minutes: 30
@@ -73,6 +73,13 @@ jobs:
         continue-on-error: true
         run: cargo test --locked --test lse_vault_canary --features lse -- --ignored --nocapture
 
+      # Also quota-free, and on the provider's OTHER host: a failure here is isolated from the
+      # vault entirely, so it distinguishes a data-api change from an account-wide one.
+      - name: Bond-yield canary (stats, country vocabulary, row encoding, pagination)
+        id: bond-yield-canary
+        continue-on-error: true
+        run: cargo test --locked --test lse_bond_yield_canary --features lse -- --ignored --nocapture
+
       # Spends one of five hourly export jobs.
       - name: Export canary (job lifecycle, download, Parquet schema)
         id: export-canary
@@ -90,10 +97,11 @@ jobs:
         continue-on-error: true
         run: cargo test --locked --test lse_ws_canary --features lse -- --ignored --nocapture
 
-      # All three run even if an earlier one fails, so one report covers every surface.
+      # All four run even if an earlier one fails, so one report covers every surface.
       - name: Check canary results
         if: >-
           steps.vault-canary.outcome == 'failure' ||
+          steps.bond-yield-canary.outcome == 'failure' ||
           steps.export-canary.outcome == 'failure' ||
           steps.ws-canary.outcome == 'failure'
         run: exit 1

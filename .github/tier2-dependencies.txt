@@ -287,6 +287,75 @@ parquet  # 2026-07-28 | New direct dep (Parquet decode of provider bulk exports)
 #   duplicate. Recorded rather than edited in place, because the original sentence was accurate
 #   on 2026-07-28 and the value of this file is what was actually reviewed and when. The next
 #   parquet bump should re-measure rather than assume either state.
+#   UPDATE 2026-09-22 (#350, 59.3.0 -> 60.0.0, MAJOR): re-verified per this entry's standing
+#   requirement. ARROW IS STILL OPTIONAL. All seven arrow-* deps carry `optional = true`
+#   (Cargo.toml:381-383 et al.) and are reachable only through the `arrow` (:39-47), `cli` (:53)
+#   and `variant_experimental` (:88) features; `zstd = ["dep:zstd"]` (:93) pulls zstd -> zstd-safe
+#   -> zstd-sys and nothing else. `default` (:61) still lists `arrow`, so our
+#   `default-features = false` remains the thing that keeps it out. The whole [features] table is
+#   unchanged but for `variant_experimental` dropping `parquet-variant-json`. Corroborated in the
+#   lockfile: `grep '^name = "arrow' Cargo.lock` still returns nothing, and parquet's lock entry
+#   is exactly ahash, bytes, chrono, half, hashbrown 0.17.0, num-bigint 0.5.1, num-integer,
+#   num-traits, seq-macro, twox-hash, zstd -- 11 deps, not 12: `paste`'s removal at 59.2.0 took it
+#   from 12 to 11 and this entry's "12 direct deps" has been stale since. LOCK DELTA, measured:
+#   ZERO packages added, ZERO removed. The only edge that moves is parquet's zstd, 0.13.3 ->
+#   0.14.0 (zstd-safe 7.2.4 -> 8.0.0, same single zstd-sys 2.1.0). Both zstd majors were already
+#   in the tree -- 0.14.0 arrives independently via compression-codecs 0.4.41 <- async-compression
+#   0.4.46 <- databento/dbn, and 0.13.3 stays for those same two -- so the zstd major count is
+#   unchanged at 3 (0.11.2 via zip) and `bans.multiple-versions` sees nothing new. AHASH
+#   RE-MEASURED rather than assumed, as the 2026-09-16 UPDATE asked: one ahash in Cargo.lock,
+#   0.8.12 (:33-35), parquet its only consumer; rkyv and ahash 0.7.8 remain gone. The wasm32 story
+#   is byte-identical -- `cfg(not(wasm32))` -> runtime-rng (:657-660), `cfg(wasm32)` ->
+#   compile-time-rng (:662-665), zero diff -- so const-random/const-random-macro stay lockfile-only
+#   and the compile-time-RNG warning above still applies to any wasm32 consumer. MSRV: parquet's
+#   `rust-version` rises 1.85 -> 1.88 (Cargo.toml:14), below this workspace's 1.95, so not
+#   blocking; the cause is visible in source -- new `src/util/prefix.rs` and the bloom filter now
+#   use `slice::as_chunks`, stabilised in 1.88. UNSAFE re-counted over the modules our feature set
+#   compiles: still 19, same six files, same per-file split (data_type.rs 10, util/bit_util.rs 3,
+#   bloom_filter/mod.rs 2, encodings/rle.rs 2, byte_stream_split_decoder.rs 1,
+#   column/chunker/cdc.rs 1). Sharpening the old figure: the cdc.rs site sits inside
+#   `#[cfg(test)] mod tests` and calls arrow's `ArrayData::new_unchecked`, so the compiled count is
+#   18 production + 1 we never build. No new sites; three rewrites are clippy modernisation with
+#   identical semantics (`x as *const T as *const u8` -> `.cast::<u8>()` / `ptr::from_ref`). The
+#   five new source files (encodings/alp.rs, alp_decoder.rs, alp_encoder.rs, util/prefix.rs,
+#   file/metadata/page_index.rs) contain zero unsafe, and 60.0.0 adds `#[cfg_attr(miri, ignore)]`
+#   to the slow bloom-filter/bit-packing tests, i.e. the rest of that surface runs under miri
+#   upstream. Still no build.rs (`build = false`, :18); still no network or process spawn in the
+#   library; the only `env!` is the compile-time CARGO_PKG_VERSION in file/properties.rs:54 and the
+#   only runtime `env::var` is still src/bin/parquet-fromcsv.rs:436, a CLI binary we do not build.
+#   New targets -- example `custom_page_index`, test `ieee754_nan_interop`, benches `alp`,
+#   `bit_packing`, `writer_page_windows` -- are all arrow/cli/experimental-gated and unreachable
+#   for us; the nine binaries are the same nine. No OSV/RUSTSEC advisories for parquet 60.0.0,
+#   zstd 0.14.0 or zstd-safe 8.0.0; `paste` is still absent from Cargo.lock; licence still
+#   Apache-2.0.
+#   WHY IT IS MAJOR, and why it still needed no code from us: 23 upstream breaking changes, of
+#   which the ones touching the arrow-free path are "parquet: Remove deprecated functions", the
+#   PageIndex restructure, "introduce FILE logical type", "PARQUET-2249: IEEE 754 total order" and
+#   the MSRV bump. Removed and checked against our tree, all unused here:
+#   `BasicTypeInfo::logical_type()` (we were already on `logical_type_ref()` --
+#   lse/parquet.rs:339,364,397), `ColumnOrder::get_sort_order`,
+#   `WriterProperties::{max_row_group_size,set_max_row_group_size}`,
+#   `ParquetMetaData::{column_index,offset_index,set_*,take_*}`, the `ParquetColumnIndex` /
+#   `ParquetOffsetIndex` type aliases, and `SerializedRowGroupReader::new`'s offset-index parameter
+#   (we reach row groups through `FileReader::get_row_group`, lse/parquet.rs:577,659). Everything
+#   we do import is unchanged: file/reader.rs's public item list is byte-identical,
+#   `read_records(max_records, def, rep, values) -> Result<(usize,usize,usize)>` keeps its
+#   signature (column/reader.rs:204-210), errors.rs's variants are identical, and
+#   file/statistics.rs is additive only (`nan_count_opt`, `with_nan_count`) with
+#   `Statistics::Double(ValueStatistics<f64>)` and `min_opt`/`max_opt` intact. `LogicalType` gains
+#   variant 19, `File`; all three of our matches over it carry catch-alls, so it is inert.
+#   ONE BEHAVIOURAL CHANGE inside a function we call, recorded so the next bump knows the shape:
+#   `read_records` now runs `check_partial_record_fits` (column/reader.rs:590-598) and errors
+#   instead of over-flushing when a page's repetition levels disagree with its record count. It is
+#   reachable only at max_rep_level > 0, and lse/parquet.rs:293 rejects anything but flat
+#   primitives, so it cannot fire for us -- hardening, not a regression. CI proves the shape
+#   empirically: `cargo test --workspace --all-features --lib --bins --tests --examples` is green,
+#   and `--all-features` turns on `lse-parquet`, so tests/lse_parquet.rs (SerializedFileWriter
+#   round-trip through read_export) and examples/lse_export.rs both built and ran against 60.0.0.
+#   What CI does NOT re-prove is the 370,531-row real-artifact decode above: lse_export_canary.rs
+#   is #[ignore]d and needs artifacts on disk. Run it manually when the decoder or this dep moves.
+#   HOUSEKEEPING, unrelated to this bump: deny.toml still carries the RUSTSEC-2024-0436 `paste`
+#   ignore, described as "Transitive via parquet 59.1.0 (latest)". Dead since 59.2.0.
 databento  # 2026-09-13 | Direct dep (historical + live market data). Meets the criteria above on three counts — network/IO, credential handling (API key via `DATABENTO_API_KEY`), and financial data — but was never listed when it was introduced; this entry closes that gap rather than recording a new dependency. Reviewed @ 0.61.0, Apache-2.0, databento/databento-rs — a first-party vendor SDK, not community-maintained, which is the opposite of the ibapi risk profile above. No build.rs. Zero `unsafe` in the `databento` crate itself. The unsafe lives one level down in `dbn` (0.69.0, Apache-2.0, no build.rs, same vendor), where a grep over src reports 133 occurrences — that count includes `unsafe impl`, `unsafe fn`, blocks and comments alike, so it over-counts distinct sites. They cluster exactly where a zero-copy wire-format decoder puts them: record_ref.rs (25), decode/dbn/fsm.rs (17), record_buf.rs (16), record/conv.rs (8), plus the sync/async encode paths. Idiomatic for the crate class, same justification parquet's 19 sites get. A further 21 occurrences in dbn's python/record.rs are NOT compiled: they sit behind dbn's opt-in `python` feature, and `pyo3` is absent from Cargo.lock — re-check if the feature set ever changes. That surface is not merely theoretical, and this is the reason to keep reading dbn's changelog and not only databento's: 0.61.0 fixes an unsound `AsRef<[u8]>` for `RecordBuf` that could yield a slice longer than the backing buffer, and a metadata count bug that made decoding read into the start of records. Treat dbn bumps as soundness-relevant. 16 direct deps (async-compression, bon, chrono, dbn, futures, hex, reqwest, serde, serde_json, sha2, thiserror, time, tokio, tokio-util, tracing, zstd), all already in the tree. Not pinned — any version bump still needs review.
 
 # Net-new lockfile entries NOT attributable to a tier-2 crate above, recorded so the
