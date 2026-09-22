@@ -368,6 +368,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against a subscription that never ticks and a frame that cannot be read. Test-only; no library
   behaviour changes.
 
+### Security
+
+- **The dead `RUSTSEC-2024-0436` (`paste`) suppression has been dropped from `deny.toml` and the
+  CI audit job's ignore list.** `paste` left the graph when `parquet` moved to 59.2.0; it appears
+  zero times in `Cargo.lock`, so the entry has been suppressing an advisory for a crate the build
+  no longer contains. Its justification had gone stale on both counts — it still read *"Transitive
+  via parquet 59.1.0 (latest)"* while the manifest is on 60.0.0.
+
+  Removing it is bookkeeping, not a behaviour change: an ignore for an absent crate can never fire,
+  so no advisory becomes newly visible and no gate becomes newly strict. It is removed because a
+  suppression list is only readable as a list of accepted risks if every line on it is a risk that
+  still exists. The two lists stay synchronised at ten ids each, which is the property the CI job's
+  *"Synced with deny.toml"* comment asserts.
+
+  The neighbouring `rkyv` (`RUSTSEC-2026-0235`) entry is deliberately kept: unlike `paste` it is
+  still in `Cargo.lock`, as an unenabled optional dependency of `rust_decimal` that the build never
+  compiles but the feature-agnostic lockfile still records.
+
 ## [0.6.0] - 2026-09-18
 
 ### Added

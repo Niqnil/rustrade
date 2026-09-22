@@ -27,11 +27,6 @@ all-features = true
 # the full release distance. Check the version in Cargo.lock on the branch you care about before
 # treating an alert as live.
 ignore = [
-    # paste is a build-time proc-macro (no code shipped into the binary), archived upstream with
-    # no vulnerability and no safe upgrade. Transitive via parquet 59.1.0 (latest) -> rustrade-data
-    # `lse-parquet`. Revisit if arrow-rs migrates to `pastey`.
-    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; build-time proc-macro, transitive via parquet; no upgrade available" },
-
     # rkyv is an *unenabled optional* dependency of rust_decimal (gated behind its `rkyv` feature,
     # which nothing here enables). It is in Cargo.lock only because the lockfile is feature-agnostic
     # and records every optional dep; `cargo tree -i rkyv --workspace --all-features --target all`
