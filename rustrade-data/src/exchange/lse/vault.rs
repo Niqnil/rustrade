@@ -45,7 +45,8 @@ const DEFAULT_PAGE_LIMIT: NonZeroU32 = NonZeroU32::new(5000).unwrap();
 ///
 /// Wraps the internal transport shared with the provider's other host, pointed at the vault, and
 /// adds the vault's own configuration and endpoints: [`usage`](Self::usage) here, paged candles in
-/// [`historical`](super::historical), bulk export in [`export`](super::export).
+/// [`historical`](super::historical), the catalog in [`reference`](super::reference), bulk export
+/// in [`export`](super::export).
 ///
 /// # Request rationing is per client, not per call
 /// Every request this client issues — candle page, export submit, status poll, artifact download —
