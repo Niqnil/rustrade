@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`LseCatalogEntry`, the London Strategic Edge catalog record, with
+  `LseVaultClient::fetch_catalog`** (`rustrade-data`, feature `lse`). The provider's index of
+  everything it publishes — 22,966 entries at the last measurement — as a provider-shaped type in
+  the same spirit as `AlpacaStockSplit`, not a provider-agnostic abstraction. Nothing is wired into
+  the engine: reference series never stream.
+
+  `LseCatalogEntry::class` separates price datasets from reference series using the provider's own
+  `frequency`/`category` pair. The rule is not a heuristic — across all 22,966 entries it classifies
+  every row with none left over (15,537 reference / 7,429 price) — so a dataset the provider adds
+  later classifies itself with no list here to update.
+
+  Three field choices are measurements rather than taste. `ticks` is `u64` because the largest
+  observed count is 96.5% of `u32::MAX` on a tape that is still growing. `frequency` stays the
+  provider's own string because the vocabulary is dirty — ten spellings including both `biannually`
+  and `bi-annually`, both `quarterly` and `quarter` — so a closed enum over the obvious six values
+  would have silently mishandled seven rows; the label also fails to predict observed spacing, so it
+  must not be read as a cadence contract. `first_tick`/`last_tick` are parsed on demand rather than
+  at decode, so one malformed timestamp surfaces on its own entry instead of failing a whole fetch.
+
+  `LseCatalogEntry::price_dataset` resolves to an `LseDataset` where one exists and returns `None`
+  otherwise. `None` does not mean "reference data": `options` is a price dataset with no
+  `LseDataset` variant, and it accounts for 3,186 of the 7,429 price entries, so callers pair this
+  with `class` rather than reading `None` as a classification. `LseDataset::from_catalog_str`'s
+  documented `UnknownDataset` contract is left exactly as it was.
+
+  ⚠️ Catalog contents are provider data and may not be redistributed or committed as fixtures. See
+  <https://londonstrategicedge.com/terms>.
+
 ### Changed
 
 - **BREAKING: `Open::id` and `RequestCancel::id` now carry a `VenueOrderId`, which distinguishes an
@@ -74,6 +104,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   published, which in a backtest presents as a successful run over a shorter period than the one
   asked for. Both the API documentation and the backtest example now state this and direct callers
   to establish depth per symbol first.
+
+- **The London Strategic Edge HTTP plumbing now lives in one internal transport shared by the
+  provider's hosts** (`rustrade-data`; `lse` feature; internal refactor, no public API or behaviour
+  change). The auth header, the `User-Agent` their CDN requires, the timeouts, the no-redirect
+  policy that keeps the key off a server-named host, the concurrency-and-pacing gate and the
+  status-to-error mapping were all defined inside `LseVaultClient`. The provider serves reference
+  data from a second host that needs every one of them, so they moved to an `LseHttpCore` that
+  takes its base URL from whichever client wraps it; `LseVaultClient` keeps its own base URL and
+  page limit and is otherwise a thin wrapper.
+
+  `LseVaultClient`'s public surface, its `Debug` output and its rationing semantics are unchanged —
+  a core is still one ration pool shared by clones, so two clients still ration independently. The
+  `User-Agent` requirement is now documented as measured on both hosts rather than on the vault
+  alone: each answers a request carrying the default agent of a common HTTP client with `403`
+  `error code: 1010` at the edge, before it reaches the API. The one observable difference is a
+  `debug`-level log line, which reads `lse response received` in place of `vault response
+  received` now that it is emitted for either host.
+
+  Reading `LSE_API_KEY` is now shared too. The REST clients and the WebSocket connector had
+  separate copies of the variable name and of the redaction that keeps a mis-encoded key out of
+  the error message — `VarError`'s non-UTF-8 arm embeds the raw value, so interpolating it would
+  put essentially the whole key into a string callers log. They now read through one helper and
+  wrap its failure in their own error type, so that redaction has a single definition and cannot
+  drift between the two surfaces. The messages themselves are unchanged.
 
 ### Fixed
 
