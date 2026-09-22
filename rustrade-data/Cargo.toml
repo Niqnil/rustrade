@@ -192,7 +192,15 @@ name = "lse_export"
 required-features = ["lse"]
 
 [[test]]
+name = "lse_bond_yield"
+required-features = ["lse"]
+
+[[test]]
 name = "lse_vault"
+required-features = ["lse"]
+
+[[test]]
+name = "lse_bond_yield_canary"
 required-features = ["lse"]
 
 [[test]]
