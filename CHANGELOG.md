@@ -131,6 +131,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An IBKR market-depth RESET no longer leaves a silently stale order book** (`rustrade-data`,
+  feature `ibkr`). IB sends notice 317, *"Market depth data has been RESET"*, when TWS discards the
+  book on its side; every level held locally is stale from that moment. `ibapi` 4.1.0 reclassified
+  317 from an error to a data advisory, which is the correct reading — but the depth loop consumed
+  the subscription through `iter_data()`, and that iterator drops notices. The reset therefore
+  became invisible, and `DepthAggregator` went on applying updates to a book the venue had already
+  thrown away. Before 4.1.0 the same notice ended the stream, so the book was rebuilt by accident
+  rather than by design.
+
+  The loop now reads the subscription through `iter()` and handles the notice. `DepthAggregator`
+  gains `on_venue_reset`, which empties both sides and returns the emptied snapshot so it is
+  forwarded immediately rather than after the next depth row — the window in between is exactly
+  when a consumer would still be holding levels that no longer exist. It advances the sequence
+  counter instead of resetting it, which `clear` does and which would have been wrong here: a
+  consumer ordering by sequence reads a book renumbered to 0 as older than the stale one it
+  replaces, and keeps the stale one. Notice 316 (*"HALTED"*) remains terminal and is unchanged.
+
+  A book that looks live and is not is worse than no book, so this is a correctness fix rather than
+  a robustness one. It is unit-tested; confirming it end to end needs a live level-2 subscription
+  that receives a reset, which CI does not run.
+
+
 - **An out-of-sequence order snapshot can no longer rewind an order's state at a venue that
   reports no timestamp of its own** (`rustrade`). IBKR's `orderStatus` callback carries no
   timestamp field, so the client stamps `Utc::now()` as it processes each one. Those stamps record

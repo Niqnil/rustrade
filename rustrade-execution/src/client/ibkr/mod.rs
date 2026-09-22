@@ -222,8 +222,9 @@ const PLACEMENT_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_
 
 /// IBKR "Order Message" codes that are informational rather than rejections.
 ///
-/// ibapi classifies the whole `200..=399` range as order rejections
-/// (`ORDER_REJECTION_CODE_RANGE`), but IBKR uses code 399 as a generic order
+/// ibapi classifies the `200..=399` range as order rejections
+/// (`ORDER_REJECTION_CODE_RANGE`) — bar 202 and, since 4.1.0, 317, both of
+/// which are resolved ahead of the range — but IBKR uses code 399 as a generic order
 /// message — e.g. *"Your order will not be placed at the exchange until
 /// 09:30:00 US/Eastern"* — for an order that is in fact **accepted and held**
 /// (it proceeds to `PreSubmitted`). We therefore report the order as
@@ -246,6 +247,12 @@ const PLACEMENT_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_
 ///   stream, because the notice had already closed the subscription.
 /// - **399 without one** — still `Err(Error::Notice)`, still closes the
 ///   subscription, and is still matched against this list.
+///
+/// Re-verified against ibapi 4.1.0, which reworked this classification: the
+/// warning band widened to `2100..=2199`, `classify_error`'s predicate became
+/// `is_informational_code`, and 317 joined the data advisories. The change is
+/// strictly additive and 399 is in neither the advisory nor the system list, so
+/// both forms above route exactly as described.
 ///
 /// The list stays load-bearing for the second form. It documents the known gap
 /// between ibapi's range heuristic and IBKR's actual protocol semantics; if
