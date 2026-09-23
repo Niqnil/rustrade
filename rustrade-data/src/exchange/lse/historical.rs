@@ -103,7 +103,6 @@ impl VaultCandleRow for LseCandleRow {
 }
 
 impl LseCandleRow {
-
     /// Convert into the library [`Candle`] model, given the period-end boundary.
     ///
     /// `trade_count` is unconditionally `None`: the vault reports no trade count for any dataset.

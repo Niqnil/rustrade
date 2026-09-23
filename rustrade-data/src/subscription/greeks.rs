@@ -60,6 +60,7 @@ impl OptionGreeks {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
 
@@ -106,10 +107,11 @@ mod tests {
     fn option_greeks_serialised_before_rho_existed_still_deserialise() {
         // Persisted greeks written before the field was added carry no `rho` key at all; they must
         // still decode, as an explicit unknown rather than a zero.
-        let greeks: OptionGreeks =
-            serde_json::from_str(r#"{"delta":0.5,"gamma":null,"theta":null,"vega":null,
-                "implied_volatility":null,"theoretical_price":null,"underlying_price":null}"#)
-                .unwrap();
+        let greeks: OptionGreeks = serde_json::from_str(
+            r#"{"delta":0.5,"gamma":null,"theta":null,"vega":null,
+                "implied_volatility":null,"theoretical_price":null,"underlying_price":null}"#,
+        )
+        .unwrap();
         assert_eq!(greeks.rho, None);
         assert_eq!(greeks.delta, Some(0.5));
     }

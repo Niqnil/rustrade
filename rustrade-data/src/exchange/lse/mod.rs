@@ -89,6 +89,9 @@
 //! - **London (`.L`) listings are quoted in PENCE**, and the catalog reports no unit. They are
 //!   quoted in GBX, an asset distinct from GBP; see
 //!   [`market::quote_asset`].
+//! - **Option greeks are print-triggered, not continuous**: they arrive only with a trade, so a
+//!   contract's greeks are as stale as its last print and an unheld, untraded contract is never
+//!   marked. See [`options`].
 //! - **Dataset slugs are not instrument identities** and do not uniquely identify a series; see
 //!   [`market::slug`].
 
@@ -116,6 +119,8 @@ pub mod export;
 pub mod historical;
 
 pub mod live;
+
+pub mod options;
 
 /// London Strategic Edge symbology: datasets, underlying assets, quote currencies and slugs.
 pub mod market;
