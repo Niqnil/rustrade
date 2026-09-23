@@ -160,6 +160,56 @@ async fn a_full_window_is_halved_and_reread_rather_than_emitted_truncated() {
 }
 
 #[tokio::test]
+async fn an_odd_span_is_halved_in_whole_seconds() {
+    let server = MockServer::start().await;
+
+    // Found against the live API: halving five seconds exactly gives 2.5, and the next window then
+    // starts mid-second -- a bound the endpoint cannot express.
+    mount_window(
+        &server,
+        "2024-01-02 15:00:00",
+        "2024-01-02 15:00:05",
+        &[
+            print_row(3, "2024-01-02 15:00:04.070000", "TEST"),
+            print_row(2, "2024-01-02 15:00:03.070000", "TEST"),
+        ],
+    )
+    .await;
+    mount_window(
+        &server,
+        "2024-01-02 15:00:00",
+        "2024-01-02 15:00:02",
+        &[print_row(1, "2024-01-02 15:00:01.070000", "TEST")],
+    )
+    .await;
+    mount_window(
+        &server,
+        "2024-01-02 15:00:02",
+        "2024-01-02 15:00:04",
+        &[print_row(2, "2024-01-02 15:00:03.070000", "TEST")],
+    )
+    .await;
+    mount_window(
+        &server,
+        "2024-01-02 15:00:04",
+        "2024-01-02 15:00:05",
+        &[print_row(3, "2024-01-02 15:00:04.070000", "TEST")],
+    )
+    .await;
+
+    let client = client(&server).with_page_limit(NonZeroU32::new(2).unwrap());
+    let results = collect(
+        &client,
+        Some("TEST"),
+        "2024-01-02T15:00:00Z",
+        "2024-01-02T15:00:05Z",
+    )
+    .await;
+
+    assert_eq!(ids(results), vec![1, 2, 3]);
+}
+
+#[tokio::test]
 async fn a_sparse_window_lets_the_next_one_grow() {
     let server = MockServer::start().await;
 

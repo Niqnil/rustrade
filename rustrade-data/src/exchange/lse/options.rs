@@ -50,6 +50,7 @@
 //! - **Exercise style is not reported**, so none is claimed: most listed US equity options are
 //!   American, but index options are European, and guessing would be this library inventing a fact.
 
+use crate::event::{DataKind, MarketEvent};
 use crate::exchange::lse::PROVIDER_TIMESTAMP_FORMAT;
 use crate::exchange::lse::error::LseError;
 use crate::exchange::lse::historical::{VaultCandleRow, parse_candle_open};
@@ -63,7 +64,7 @@ use async_stream::try_stream;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeDelta, Timelike, Utc};
 use futures::{Stream, StreamExt};
 use rust_decimal::Decimal;
-use rustrade_instrument::instrument::kind::option::OptionKind;
+use rustrade_instrument::{exchange::ExchangeId, instrument::kind::option::OptionKind};
 use serde::{Deserialize, Serialize};
 use smol_str::{SmolStr, ToSmolStr};
 use tracing::debug;
@@ -153,6 +154,24 @@ impl LseOptionPrint {
             amount: Decimal::from(self.volume),
             side: None,
         }
+    }
+
+    /// This print as the market events an engine consumes: its trade, then its greeks.
+    ///
+    /// Both are stamped with the print's [`time`](Self::time) as `time_exchange` **and**
+    /// `time_received` — a historical fetch has no receipt instant of its own — on
+    /// [`ExchangeId::LseOptions`]. The greeks event is emitted even when every greek is `None`; a
+    /// consumer such as the engine's option state decides whether an empty update means anything.
+    #[must_use]
+    pub fn into_market_events<InstrumentKey: Clone>(
+        self,
+        instrument: InstrumentKey,
+    ) -> [MarketEvent<InstrumentKey, DataKind>; 2] {
+        let trade = self.public_trade();
+        [
+            option_event(self.time, instrument.clone(), DataKind::Trade(trade)),
+            option_event(self.time, instrument, DataKind::OptionGreeks(self.greeks)),
+        ]
     }
 }
 
@@ -274,6 +293,40 @@ struct OptionCandleRow {
 impl VaultCandleRow for OptionCandleRow {
     fn open_time(&self) -> Result<DateTime<Utc>, LseError> {
         parse_candle_open(&self.minute)
+    }
+}
+
+impl LseOptionCandle {
+    /// This candle as the market events an engine consumes: the bar, then its averaged greeks.
+    ///
+    /// Both are stamped with the bar's [`close_time`](Candle::close_time) — the instant its
+    /// contents, the averages included, became knowable — as `time_exchange` and `time_received`,
+    /// on [`ExchangeId::LseOptions`]. Stamping any earlier would hand an engine the minute's outcome
+    /// before the minute has ended.
+    #[must_use]
+    pub fn into_market_events<InstrumentKey: Clone>(
+        self,
+        instrument: InstrumentKey,
+    ) -> [MarketEvent<InstrumentKey, DataKind>; 2] {
+        let time = self.candle.close_time;
+        [
+            option_event(time, instrument.clone(), DataKind::Candle(self.candle)),
+            option_event(time, instrument, DataKind::OptionGreeks(self.greeks)),
+        ]
+    }
+}
+
+fn option_event<InstrumentKey>(
+    time: DateTime<Utc>,
+    instrument: InstrumentKey,
+    kind: DataKind,
+) -> MarketEvent<InstrumentKey, DataKind> {
+    MarketEvent {
+        time_exchange: time,
+        time_received: time,
+        exchange: ExchangeId::LseOptions,
+        instrument,
+        kind,
     }
 }
 
@@ -464,7 +517,9 @@ impl LseVaultClient {
                             rows: rows.len(),
                         })?;
                     }
-                    window = (span / 2).max(MIN_FLOW_WINDOW);
+                    // Halved in WHOLE seconds: every bound sent must be one the endpoint can express,
+                    // and an odd span halved exactly would put the next window's start mid-second.
+                    window = TimeDelta::seconds(span.num_seconds() / 2).max(MIN_FLOW_WINDOW);
                     continue;
                 }
 
@@ -648,6 +703,35 @@ mod tests {
         assert_eq!(candle.greeks.delta, Some(-0.4));
         assert_eq!(candle.greeks.rho, Some(-0.001));
         assert_eq!(candle.greeks.underlying_price, Some(10.25));
+    }
+
+    #[test]
+    fn a_print_becomes_a_trade_then_its_greeks_stamped_at_the_print() {
+        let row: FlowRow = serde_json::from_str(FLOW_ROW).unwrap();
+        let time = row.time().unwrap();
+        let [trade, greeks] = row.into_print(time).into_market_events(0usize);
+
+        for event in [&trade, &greeks] {
+            assert_eq!(event.exchange, ExchangeId::LseOptions);
+            assert_eq!(event.time_exchange, time);
+            assert_eq!(event.time_received, time);
+        }
+        assert!(matches!(trade.kind, DataKind::Trade(_)));
+        assert!(matches!(greeks.kind, DataKind::OptionGreeks(ref g) if g.rho == Some(0.003)));
+    }
+
+    #[test]
+    fn an_option_candle_is_stamped_at_its_close_so_the_minute_is_never_seen_early() {
+        let json = r#"{"ticker":"TEST240105P00010000","underlying":"TEST","strike":10,
+            "expiry":"2024-01-05","contract_type":"put","minute":"2024-01-02 15:00:00",
+            "open":1.0,"high":2.0,"low":0.5,"close":1.5,"volume":40,"premium":6000,"print_count":9}"#;
+        let row: OptionCandleRow = serde_json::from_str(json).unwrap();
+        let close = row.open_time().unwrap() + TimeDelta::minutes(1);
+        let [bar, greeks] = row.into_option_candle(close).into_market_events(0usize);
+
+        assert_eq!(bar.time_exchange, close);
+        assert_eq!(greeks.time_exchange, close);
+        assert!(matches!(bar.kind, DataKind::Candle(c) if c.close_time == close));
     }
 
     #[test]
