@@ -23,12 +23,31 @@ use std::fmt;
 ///  "price":42000.5,"bid":42000.5,"ask":42001.0,"volume":0.00155}
 /// ```
 ///
-/// # ⚠️ The tick is a QUOTE, not a print
+/// # ⚠️ The tick is a QUOTE, not a print — except on the options channel
 /// `price` equals `bid` exactly — measured on 3,966 of 3,966 sampled ticks spanning every dataset
 /// family, plus every sample taken on the provider's other price endpoint. Anything decoded from
 /// this frame as a trade is therefore a bid-side quote wearing a trade's shape, and is not evidence
 /// that a transaction occurred at that price or at all. See the trade transformer for what ships
 /// anyway and why.
+///
+/// # Option contract ticks differ in four ways
+/// Option contracts tick on this same frame, under their OSI symbol (`SPY260930C00700000`):
+///
+/// - **`bid` and `ask` are `null` on every one**, while an equity tick on the same connection in
+///   the same second carries both. It is a property of the channel, not of market hours, so an
+///   option contract has no quote here at all — [`bid`](Self::bid) and [`ask`](Self::ask) are
+///   optional for this reason alone.
+/// - **The tick is a real print.** Over one identical window every option tick matched a row of the
+///   provider's REST option-print tape exactly on `(price, volume)`, and vice versa. The quote
+///   caveat above does not apply to it.
+/// - **`ts` is whole-second.** Dozens of prints share one value, so an option tick's instant is
+///   neither a unique key nor an ordering: arrival order is the only sequencing, and it was never
+///   observed out of order.
+/// - **An extra `name` key** carries a human-readable contract label. It is present on every live
+///   option tick, so it marks the channel and says nothing about replay — only [`replay`] does
+///   that. It is not decoded.
+///
+/// [`replay`]: Self::replay
 ///
 /// # ⚠️ `volume` is real on some datasets and fabricated on others
 /// Crypto and equity ticks carry a genuine per-tick size: summing it over three whole minutes of
@@ -114,16 +133,21 @@ pub struct LseTick {
     #[serde(rename = "ts", deserialize_with = "de_timestamp")]
     pub time_exchange: DateTime<Utc>,
 
-    /// The tick price. Equal to [`bid`](Self::bid) on every sample taken; see the type-level note,
+    /// The tick price. Equal to [`bid`](Self::bid) on every non-option sample taken, and the traded
+    /// premium on an option contract; see the type-level note,
     /// which also covers the ~15-significant-digit ceiling this and the three fields below decode
     /// under.
     pub price: Decimal,
 
-    /// The bid.
-    pub bid: Decimal,
+    /// The bid. `None` on every option contract tick, which the provider publishes as `null`;
+    /// present on every other dataset sampled.
+    #[serde(default)]
+    pub bid: Option<Decimal>,
 
-    /// The ask.
-    pub ask: Decimal,
+    /// The ask. `None` on every option contract tick, which the provider publishes as `null`;
+    /// present on every other dataset sampled.
+    #[serde(default)]
+    pub ask: Option<Decimal>,
 
     /// The size traded at this tick — genuine on crypto and equities, fabricated on FX and
     /// commodities. See the type-level note.
@@ -484,6 +508,37 @@ mod tests {
     #[test]
     fn replay_defaults_to_false_when_the_key_is_absent() {
         let tick: LseTick = serde_json::from_str(LIVE_T_SEPARATED).unwrap();
+        assert!(!tick.replay);
+    }
+
+    /// An option contract tick, synthetic but in the shape the options channel publishes: `bid`
+    /// and `ask` present as `null`, a whole-second `ts`, an integer `volume` and a `name` label.
+    const OPTION_TICK: &str = r#"{"type":"tick","symbol":"TEST261231C00010500",
+        "ts":"2026-01-02T15:00:00+00:00","price":1.25,"bid":null,"ask":null,"volume":3,
+        "name":"TEST $10.50 Call Dec 31"}"#;
+
+    /// Both sides are null on every option tick. Required fields would fail the whole frame, and
+    /// every print on the channel with it.
+    #[test]
+    fn an_option_tick_decodes_with_no_quote() {
+        let tick: LseTick = serde_json::from_str(OPTION_TICK).unwrap();
+
+        assert_eq!(tick.subscription_id.as_ref(), "tick|TEST261231C00010500");
+        assert_eq!(tick.price, dec!(1.25));
+        assert_eq!(tick.volume, dec!(3));
+        assert_eq!(tick.bid, None);
+        assert_eq!(tick.ask, None);
+        assert_eq!(
+            tick.time_exchange,
+            "2026-01-02T15:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+    }
+
+    /// `name` rides on every live option tick. It marks the channel, so reading it as a replay
+    /// marker would classify every live option print as replayed.
+    #[test]
+    fn an_option_ticks_name_does_not_mark_it_as_replayed() {
+        let tick: LseTick = serde_json::from_str(OPTION_TICK).unwrap();
         assert!(!tick.replay);
     }
 
