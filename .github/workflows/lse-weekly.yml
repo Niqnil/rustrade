@@ -89,6 +89,14 @@ jobs:
         continue-on-error: true
         run: cargo test --locked --test lse_economic_calendar_canary --features lse -- --ignored --nocapture
 
+      # Vault again, quota-free. Reads a window days old, so the Monday-morning schedule -- with
+      # the US market closed -- is not a reason for it to be empty; an empty tape means the feed
+      # stopped, and the canary fails on that rather than passing on nothing.
+      - name: Options canary (print tape liveness, adaptive walk, option candles)
+        id: options-canary
+        continue-on-error: true
+        run: cargo test --locked --test lse_options_canary --features lse -- --ignored --nocapture
+
       # Spends one of five hourly export jobs.
       - name: Export canary (job lifecycle, download, Parquet schema)
         id: export-canary
@@ -106,12 +114,13 @@ jobs:
         continue-on-error: true
         run: cargo test --locked --test lse_ws_canary --features lse -- --ignored --nocapture
 
-      # All five run even if an earlier one fails, so one report covers every surface.
+      # All six run even if an earlier one fails, so one report covers every surface.
       - name: Check canary results
         if: >-
           steps.vault-canary.outcome == 'failure' ||
           steps.bond-yield-canary.outcome == 'failure' ||
           steps.calendar-canary.outcome == 'failure' ||
+          steps.options-canary.outcome == 'failure' ||
           steps.export-canary.outcome == 'failure' ||
           steps.ws-canary.outcome == 'failure'
         run: exit 1

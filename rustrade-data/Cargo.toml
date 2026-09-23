@@ -263,6 +263,10 @@ name = "lse_candles"
 required-features = ["lse"]
 
 [[example]]
+name = "lse_options"
+required-features = ["lse"]
+
+[[example]]
 name = "lse_export"
 required-features = ["lse-parquet"]
 

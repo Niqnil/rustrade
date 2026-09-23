@@ -9,6 +9,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **London Strategic Edge option prints and option candles, with
+  `LseVaultClient::fetch_option_flow` / `collect_option_flow` and `fetch_option_candles` /
+  `collect_option_candles`** (`rustrade-data`, feature `lse`). US equity and ETF options: every
+  executed print as an `LseOptionPrint` carrying its contract (`ticker`, `underlying`, `kind`,
+  `strike`, `expiry`), price, size in contracts, notional premium and the greeks computed at that
+  print, including `rho`; and one-minute premium bars as an `LseOptionCandle`, with the print count
+  as `trade_count` and greeks **averaged over the minute** rather than sampled at its close. Both
+  convert into the engine's `DataKind` events via `into_market_events` on the new
+  `ExchangeId::LseOptions`: a print is stamped at the print, a candle at its close so the minute's
+  outcome is never visible before it ends.
+
+  **The flow fetch is oldest-first, which the endpoint is not.** `/options/flow` answers
+  newest-first, truncates silently at a 5,000-row cap, ignores `offset`, and accepts only
+  whole-second bounds, so a range can only be read in windows small enough to come back whole. The
+  fetch walks forward in adaptive windows — a full page is treated as a truncated one, halved and
+  re-read; a sparse one lets the next window grow — and emits each window in order, holding at most
+  one page in memory. A single second too dense for one page is a typed
+  `LseError::OptionFlowWindowSaturated` rather than a short tape. Because a full page is the only
+  sign of truncation, each fetch first reads the provider's own `max_rows_per_request` from
+  `usage()` and treats the smaller of that and `with_page_limit` as a full page — so a page limit
+  raised past the provider's cap cannot hide a truncated window. The live canary checks that the
+  walk, forced to halve repeatedly, reproduces a single-page read print for print, and that the cap
+  `usage()` reports is the one `/options/flow` actually enforces.
+
+  **Recent data is refused, not returned short.** The provider's ingestion lag is variable and
+  episodic: a closed window was measured returning zero rows thirty seconds after closing, and
+  another holding a fifth of its final count across two consecutive reads, both with a `200`. A
+  partial window holds steady, so no amount of polling detects it. A range ending within
+  `OPTION_FLOW_SETTLE_MARGIN` (60 s) of now is therefore `LseError::InvalidInput`.
+
+  The endpoint silently ignores parameters it does not recognise — a `ticker` filter returns every
+  contract — so there is no per-contract flow fetch (select from the result), and a row outside its
+  requested window or underlying fails that window with `LseError::UnexpectedOptionFlowRow` before
+  any of it is yielded. Option candles reuse the vault candle pager, whose range semantics the
+  options endpoint was measured to share.
+
+  ⚠️ **Greeks on this feed are print-triggered.** They arrive only with a trade, so a contract's
+  greeks are as old as its last print and an unheld, untraded contract has none. The provider's
+  chain snapshot endpoint, the only continuous alternative, serves stale stored fields and is
+  deliberately not wrapped. There are no quotes on these paths, and timestamps are whole-second
+  batch stamps: key on the print `id`. Strikes can be fractional on adjusted contracts, so they are
+  `Decimal`. Exercise style is not reported and none is claimed.
+
+  A live canary (`lse_options_canary`) is wired into `lse-weekly.yml`. It reads a window days old
+  and fails on an empty tape, so a stopped feed cannot pass on nothing.
+
+  ⚠️ Option data is provider data and may not be redistributed or committed as fixtures. See
+  <https://londonstrategicedge.com/terms>.
+
+- **`OptionInstrumentMarketData`** (`rustrade`): an `InstrumentDataState` for option contracts that
+  wraps `DefaultInstrumentMarketData` and holds the contract's most recent `OptionGreeks` with the
+  instant they were stamped. Greeks never contribute a price; marking is delegated unchanged. Nothing
+  ages the held value out, and the rustdoc says so: check its stamp against the engine clock before
+  treating it as a current risk figure. An update carrying no greek does not overwrite a real one.
+
+- **`OptionGreeks::rho`** (`rustrade-data`). `OptionGreeks` is `#[non_exhaustive]`, so the field is
+  additive, and greeks serialised before it existed still deserialise, as `None`. Alpaca published
+  rho already and discarded it for want of a field; it is now mapped through. IBKR and Massive
+  publish none and report `None`. `has_any_greek` now counts `rho`.
+
+- **`ExchangeId::LseOptions`** (`rustrade-instrument`), appended at the end of the enum so no
+  existing index is renumbered. It supports the `Option` instrument kind and, for now, **no
+  subscription kind**: the provider's WebSocket delivers option prints under a
+  subscribe-by-underlying handshake this integration does not yet implement.
+  *Note:* `ExchangeId` is not `#[non_exhaustive]`, so downstream exhaustive `match`es need a new arm.
+
 - **`LseCalendarEvent` and the economic-calendar fetch, with
   `LseDataApiClient::fetch_economic_calendar` and `fetch_economic_calendar_stats`**
   (`rustrade-data`, feature `lse`). The provider's archive of scheduled macroeconomic releases —

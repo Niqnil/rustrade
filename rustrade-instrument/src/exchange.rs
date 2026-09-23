@@ -133,6 +133,8 @@ pub enum ExchangeId {
     LseFutures,
     /// London Strategic Edge CFDs (index, commodity, interest rates, currency index, volatility)
     LseCfd,
+    /// London Strategic Edge US equity & ETF options (prints and print-time greeks; no quotes)
+    LseOptions,
     // ---------------------------------------------------------------------------------------
     // NOTE: append new variants HERE, at the end. See `# Index stability` on this enum.
     // ---------------------------------------------------------------------------------------
@@ -203,6 +205,7 @@ impl ExchangeId {
             ExchangeId::LseEquities => "lse_equities",
             ExchangeId::LseFutures => "lse_futures",
             ExchangeId::LseCfd => "lse_cfd",
+            ExchangeId::LseOptions => "lse_options",
         }
     }
 }
@@ -235,6 +238,7 @@ mod tests {
             (ExchangeId::LseEquities, "lse_equities"),
             (ExchangeId::LseFutures, "lse_futures"),
             (ExchangeId::LseCfd, "lse_cfd"),
+            (ExchangeId::LseOptions, "lse_options"),
         ] {
             assert_eq!(exchange.as_str(), expected);
             assert_eq!(
@@ -265,6 +269,7 @@ mod tests {
             ExchangeId::LseEquities,
             ExchangeId::LseFutures,
             ExchangeId::LseCfd,
+            ExchangeId::LseOptions,
         ];
 
         for pair in tail.windows(2) {

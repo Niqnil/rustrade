@@ -338,6 +338,29 @@ pub enum LseError {
         actual: chrono::TimeDelta,
     },
 
+    /// A single second of the option print tape holds more prints than one page can carry.
+    ///
+    /// The flow endpoint truncates silently at its row cap and accepts only whole-second bounds, so
+    /// a one-second window that still comes back full cannot be narrowed further, and the prints
+    /// beyond the cap cannot be read at all. Terminal rather than returned short: the alternative is
+    /// a tape missing prints with nothing to say so.
+    #[error(
+        "the option print tape holds at least {rows} prints in the one second from {window_start}, \
+         more than one page can carry"
+    )]
+    OptionFlowWindowSaturated {
+        window_start: DateTime<Utc>,
+        rows: usize,
+    },
+
+    /// An option print came back outside the window or underlying it was requested for.
+    ///
+    /// Means the provider ignored a request parameter, which it is known to do silently — the flow
+    /// endpoint answers a `ticker` filter by returning every contract. Raised before any print of
+    /// the offending window is yielded.
+    #[error("option print {id} does not match its request: {message}")]
+    UnexpectedOptionFlowRow { id: u64, message: String },
+
     /// The shared allowance is exhausted.
     ///
     /// Carries the allowance state at the point of rejection so the caller can decide how to pace.
@@ -669,7 +692,10 @@ impl LseError {
             Self::RateLimited { .. } | Self::QuotaExceeded { .. } => LseErrorKind::RateLimit,
             Self::Http(_) => LseErrorKind::Network,
             Self::ExportTimeout { .. } => LseErrorKind::Timeout,
-            Self::Api { .. } | Self::ExportFailed { .. } => LseErrorKind::Api,
+            // The request was valid and the provider cannot serve it whole; retrying changes nothing.
+            Self::Api { .. }
+            | Self::ExportFailed { .. }
+            | Self::OptionFlowWindowSaturated { .. } => LseErrorKind::Api,
             Self::Io { .. } => LseErrorKind::Io,
 
             // The caller's request or registry, not the provider's answer.
@@ -695,6 +721,7 @@ impl LseError {
             | Self::UnexpectedCandleRange { .. }
             | Self::NonMonotonicCandlePage { .. }
             | Self::UnexpectedCandleResolution { .. }
+            | Self::UnexpectedOptionFlowRow { .. }
             | Self::IntegrityMismatch { .. }
             | Self::ExportJobMismatch { .. }
             | Self::UnsupportedSchema { .. }
