@@ -226,7 +226,7 @@ pub fn exchange_supports_instrument_kind(
             Spot,
         ) => false,
         (LseFx | LseCrypto | LseEquities, Spot) => true,
-        (LseCfd | LseFutures, Spot) => false,
+        (LseCfd | LseFutures | LseOptions, Spot) => false,
         // NOTE: this default is OPEN -- an exchange that serves no spot market claims spot support
         // unless it is denied above, with no compile error to prompt the edit. It is left open
         // deliberately: closing it means writing an explicit arm for every existing variant and
@@ -247,7 +247,7 @@ pub fn exchange_supports_instrument_kind(
         (_, Perpetual) => false,
 
         // Option
-        (GateioOptions | Okx, Option { .. }) => true,
+        (GateioOptions | Okx | LseOptions, Option { .. }) => true,
         (_, Option { .. }) => false,
 
         // Cfd
@@ -348,6 +348,11 @@ pub fn exchange_supports_instrument_kind_sub_kind(
         // answer. The full reasoning lives on the trade decoder in the `lse` module.
         (LseFx | LseCrypto | LseEquities, Spot, PublicTrades | OrderBooksL1) => true,
         (LseCfd | LseFutures, Cfd, PublicTrades | OrderBooksL1) => true,
+        // Options reach users over the REST vault only, for now. The WebSocket does carry option
+        // prints, but under a subscribe-by-underlying handshake that this integration does not yet
+        // speak, so no subscription kind is honestly servable. Explicit rather than left to the
+        // default below so the eventual edit has one obvious place to land.
+        (LseOptions, _, _) => false,
         // No `Candles` arm exists for any London Strategic Edge venue, deliberately: the provider's
         // WebSocket carries no candle channel at all -- the tick above is its only data frame, so
         // there is nothing to subscribe to. Its candles are served exclusively over the REST vault,
@@ -414,7 +419,15 @@ mod tests {
 
     mod supports {
         use super::*;
-        use rustrade_instrument::exchange::ExchangeId;
+        use chrono::{DateTime, Utc};
+        use rust_decimal::Decimal;
+        use rustrade_instrument::{
+            exchange::ExchangeId,
+            instrument::{
+                kind::option::{OptionExercise, OptionKind},
+                market_data::kind::MarketDataOptionContract,
+            },
+        };
 
         /// The London Strategic Edge datasets, paired with the single
         /// [`MarketDataInstrumentKind`] each one serves.
@@ -450,6 +463,53 @@ mod tests {
                         "{exchange:?} should not support {denied:?}"
                     );
                 }
+            }
+        }
+
+        fn option_kind() -> MarketDataInstrumentKind {
+            MarketDataInstrumentKind::Option(MarketDataOptionContract {
+                kind: OptionKind::Call,
+                exercise: OptionExercise::American,
+                expiry: DateTime::<Utc>::MAX_UTC,
+                strike: Decimal::ONE,
+            })
+        }
+
+        #[test]
+        fn test_lse_options_supports_only_the_option_kind() {
+            assert!(exchange_supports_instrument_kind(
+                ExchangeId::LseOptions,
+                &option_kind()
+            ));
+            for denied in [
+                MarketDataInstrumentKind::Spot,
+                MarketDataInstrumentKind::Cfd,
+                MarketDataInstrumentKind::Perpetual,
+            ] {
+                assert!(
+                    !exchange_supports_instrument_kind(ExchangeId::LseOptions, &denied),
+                    "LseOptions should not support {denied:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn test_lse_options_serves_no_subscription_kind_yet() {
+            // Pins the explicit `(LseOptions, _, _) => false` arm: nothing streams until the
+            // subscribe-by-underlying handshake is implemented.
+            for sub_kind in [
+                SubKind::PublicTrades,
+                SubKind::OrderBooksL1,
+                SubKind::OrderBooksL2,
+            ] {
+                assert!(
+                    !exchange_supports_instrument_kind_sub_kind(
+                        &ExchangeId::LseOptions,
+                        &option_kind(),
+                        sub_kind
+                    ),
+                    "LseOptions should not yet serve {sub_kind}"
+                );
             }
         }
 
