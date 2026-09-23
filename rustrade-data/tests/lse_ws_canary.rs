@@ -22,7 +22,7 @@
 //! is held to a floor set more than an order of magnitude below every rate ever measured here,
 //! rather than pinned to a figure.
 //!
-//! # The five signals it does assert
+//! # The six signals it does assert
 //!
 //! 1. **Every subscribed symbol actually ticks.** This surface's quietest failure is a subscription
 //!    that is *confirmed and then silent* — the provider answers `subscribed` for a symbol it does
@@ -56,6 +56,14 @@
 //!    the only thing separating it from a healthy connection, so it is the only thing that can
 //!    detect it. It is asserted as a floor rather than a band, because a fast feed is not a
 //!    defect, and only against crypto; see the note below on what that leaves uncovered.
+//! 6. **Option contracts spell, subscribe and print as this integration expects.** Every contract
+//!    on a slice of the provider's own REST print tape must rebuild, through the connector, to the
+//!    exact ticker the provider printed it under; the busiest of them must subscribe (one
+//!    underlying, confirmed once); and, **while the US options session is open**, at least one must
+//!    print over the socket, with nothing from the rest of the chain surfacing as an error. Whether
+//!    the session is open is read from the REST tape rather than a clock, which knows nothing of
+//!    holidays: a settled minute holding prints is an open market. Outside the session — which
+//!    includes the weekly run — the print half reports `CANARY_SKIP`.
 //!
 //! # Skip vs. fail contract
 //!
@@ -152,14 +160,20 @@
 #![cfg(feature = "lse")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Utc};
 use futures_util::{Stream, StreamExt};
 use rustrade_data::{
-    MarketStream, NoInitialSnapshots,
+    Identifier, MarketStream, NoInitialSnapshots,
     error::DataError,
     event::MarketEvent,
     exchange::lse::{
-        LseCfd, LseCrypto, live::LseSubscriber, resume::LseResumeState, stream::LseStream,
+        LseCfd, LseCrypto, LseOptions,
+        live::LseSubscriber,
+        market::LseMarket,
+        options::{LseOptionContract, LseOptionPrint},
+        resume::LseResumeState,
+        stream::LseStream,
+        vault::LseVaultClient,
     },
     streams::{
         Streams,
@@ -170,11 +184,18 @@ use rustrade_data::{
 };
 use rustrade_instrument::{
     exchange::ExchangeId,
-    instrument::market_data::{MarketDataInstrument, kind::MarketDataInstrumentKind},
+    instrument::{
+        kind::option::OptionExercise,
+        market_data::{
+            MarketDataInstrument,
+            kind::{MarketDataInstrumentKind, MarketDataOptionContract},
+        },
+    },
 };
 use rustrade_integration::error::SocketError;
 use serial_test::serial;
 use std::{
+    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -933,4 +954,233 @@ async fn a_resumed_reconnect_replays_from_the_watermark_rather_than_from_now() {
             .filter(|event| event.time_exchange == watermark)
             .count(),
     );
+}
+
+/// The underlying the options signal subscribes, and whose tape decides whether the session is open.
+///
+/// The busiest the provider carries, so a settled minute of it is empty only when the market is shut.
+const OPTIONS_UNDERLYING: &str = "SPY";
+
+/// How many of the underlying's busiest contracts to register.
+///
+/// Enough that one printing inside [`DELIVERY_TIMEOUT`] is near-certain in session, and all on one
+/// underlying, so one subscription slot.
+const OPTION_CONTRACTS: usize = 10;
+
+/// How far before now the open-market probe window ends.
+///
+/// Past the vault's settle margin, which refuses a range ending closer to now than that because the
+/// provider can serve one incomplete, with a margin on top for clock skew.
+const OPEN_PROBE_END: ChronoDuration = ChronoDuration::seconds(90);
+
+/// 15:00 UTC is inside the US options session on both sides of the DST change, so a minute there
+/// on a recent weekday supplies contracts to spell and subscribe when the market is shut now.
+const CLOSED_PROBE_TIME: chrono::NaiveTime = chrono::NaiveTime::from_hms_opt(15, 0, 0).unwrap();
+
+/// The instrument a caller would register for `contract`.
+///
+/// Exercise style plays no part in the OSI symbol, and the provider does not report it; American is
+/// what a caller registering a listed equity option would say.
+fn option_instrument(contract: &LseOptionContract) -> MarketDataInstrument {
+    MarketDataInstrument::from((
+        contract.underlying.as_str(),
+        "usd",
+        MarketDataInstrumentKind::Option(MarketDataOptionContract {
+            kind: contract.kind,
+            exercise: OptionExercise::American,
+            expiry: contract
+                .expiry
+                .and_hms_opt(20, 0, 0)
+                .expect("20:00 is a valid time")
+                .and_utc(),
+            strike: contract.strike,
+        }),
+    ))
+}
+
+/// A slice of the provider's own print tape, and whether it shows the session open *now*.
+///
+/// A settled minute ending just before now holding prints means the market is open. An empty one
+/// means it is shut — or that ingestion is lagging, which the provider does episodically — and either
+/// way the print signal cannot be judged, so contracts are taken from a recent session instead.
+async fn option_tape(vault: &LseVaultClient) -> (Vec<LseOptionPrint>, bool) {
+    let end = Utc::now() - OPEN_PROBE_END;
+    let recent = vault
+        .collect_option_flow(
+            Some(OPTIONS_UNDERLYING),
+            end - ChronoDuration::minutes(1),
+            end,
+        )
+        .await
+        .expect("option flow fetch");
+
+    if !recent.is_empty() {
+        return (recent, true);
+    }
+
+    let today = Utc::now().date_naive();
+    for days_back in 1..=7 {
+        let day = today - ChronoDuration::days(days_back);
+        if matches!(day.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun) {
+            continue;
+        }
+
+        let start = day.and_time(CLOSED_PROBE_TIME).and_utc();
+        let prints = vault
+            .collect_option_flow(
+                Some(OPTIONS_UNDERLYING),
+                start,
+                start + ChronoDuration::minutes(1),
+            )
+            .await
+            .expect("option flow fetch");
+
+        if !prints.is_empty() {
+            return (prints, false);
+        }
+    }
+
+    panic!(
+        "no {OPTIONS_UNDERLYING} option prints now or at {CLOSED_PROBE_TIME} UTC on any weekday in \
+         the last week - the print tape the contracts are chosen from appears to have stopped"
+    );
+}
+
+/// Signal 6. The spelling half holds at any hour; the delivery half only in session.
+#[tokio::test]
+#[ignore = "opens a live connection and spends the shared provider allowance; run on demand"]
+#[serial]
+async fn option_contracts_spell_subscribe_and_print_as_expected() {
+    let Some(subscriber) = subscriber() else {
+        return;
+    };
+    let vault = LseVaultClient::from_env()
+        .unwrap_or_else(|error| panic!("{KEY_ENV} is set but unusable: {error}"));
+
+    let (tape, open) = option_tape(&vault).await;
+
+    // Spelling: every contract on the tape, rebuilt from its parts, must name the provider's ticker.
+    // A wrong spelling is the quietest failure this dataset has: the contract is accepted, its prints
+    // arrive under the real ticker, and the stream counts them as someone else's and drops them.
+    let mut prints_per_contract = HashMap::<&LseOptionContract, usize>::new();
+    for print in &tape {
+        *prints_per_contract.entry(&print.contract).or_default() += 1;
+    }
+
+    let misspelt = prints_per_contract
+        .keys()
+        .filter_map(|contract| {
+            let subscription = Subscription::<LseOptions, MarketDataInstrument, PublicTrades>::new(
+                LseOptions::default(),
+                option_instrument(contract),
+                PublicTrades,
+            );
+            let spelt: LseMarket = subscription.id();
+
+            (spelt.as_ref() != contract.ticker.as_str())
+                .then(|| format!("{} spelt {spelt}", contract.ticker))
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        misspelt.is_empty(),
+        "{} of {} contracts rebuild to a symbol other than the provider's own ticker: {misspelt:?} - \
+         a subscription to any of them would be confirmed and then never deliver",
+        misspelt.len(),
+        prints_per_contract.len(),
+    );
+    println!(
+        "CANARY_OK: all {} contracts on the tape spell back to the provider's ticker",
+        prints_per_contract.len()
+    );
+
+    // Subscription: the busiest contracts, which all share one underlying and so one slot.
+    let mut busiest = prints_per_contract.into_iter().collect::<Vec<_>>();
+    busiest.sort_by(|(a, a_prints), (b, b_prints)| {
+        b_prints.cmp(a_prints).then_with(|| a.ticker.cmp(&b.ticker))
+    });
+    let expected = busiest
+        .into_iter()
+        .take(OPTION_CONTRACTS)
+        .map(|(contract, _)| option_instrument(contract))
+        .collect::<Vec<_>>();
+
+    let streams = Streams::<PublicTrades>::builder()
+        .subscribe(
+            subscriber,
+            expected.iter().cloned().map(|instrument| {
+                Subscription::<LseOptions, MarketDataInstrument, PublicTrades>::new(
+                    LseOptions::default(),
+                    instrument,
+                    PublicTrades,
+                )
+            }),
+        )
+        .init()
+        .await
+        .expect(
+            "subscribing option contracts on one underlying should be confirmed once - a failure \
+             here with a validation timeout means the confirmation frame changed shape",
+        );
+    println!(
+        "CANARY_OK: {} contracts on {OPTIONS_UNDERLYING} subscribed and confirmed",
+        expected.len()
+    );
+
+    // Delivery. Every error reaching the handler is counted, which here covers more than a decode:
+    // the rest of the chain arrives too, and must be dropped as counted rather than raised.
+    let (failures, on_error) = decode_failures();
+    let mut stream = Box::pin(streams.select_all().with_error_handler(on_error));
+
+    let deadline = Instant::now() + DELIVERY_TIMEOUT;
+    let delivered = tokio::time::timeout_at(deadline, async {
+        loop {
+            match stream.next().await {
+                Some(Event::Item(event)) => return Some(event),
+                Some(Event::Reconnecting(origin)) => {
+                    println!("CANARY: {origin} is reconnecting mid-test");
+                }
+                None => return None,
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+
+    // Before silence is read as a closed market, for the reason given on `decode_failures` - and on
+    // this dataset it also proves the unregistered chain is being dropped rather than raised.
+    assert_every_frame_decoded(&failures);
+
+    match (delivered, open) {
+        (Some(event), _) => {
+            assert!(
+                expected.contains(&event.instrument),
+                "{} was delivered but never registered - the stream should drop the rest of the \
+                 chain",
+                event.instrument,
+            );
+            assert_stamped_plausibly(&event.instrument, event.time_exchange, MAX_TICK_AGE);
+            assert!(
+                event.kind.price > rust_decimal::Decimal::ZERO
+                    && event.kind.amount > rust_decimal::Decimal::ZERO,
+                "an option print must carry a positive premium and size: {event:?}",
+            );
+            println!(
+                "CANARY_OK: {} printed {} x {} at {}",
+                event.instrument, event.kind.amount, event.kind.price, event.time_exchange,
+            );
+        }
+        (None, true) => panic!(
+            "the REST tape shows the session open, yet none of the {OPTION_CONTRACTS} busiest \
+             contracts printed over the socket in {DELIVERY_TIMEOUT:?}, and every frame decoded - \
+             the options channel is confirmed but silent, or delivering under symbols the \
+             connector does not spell"
+        ),
+        (None, false) => println!(
+            "CANARY_SKIP: the US options session is shut, so option delivery was NOT exercised; \
+             spelling and subscription were. Rerun during the session (13:30-20:00 UTC in US \
+             summer time, 14:30-21:00 in winter)."
+        ),
+    }
 }

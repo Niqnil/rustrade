@@ -109,7 +109,7 @@ jobs:
       # are sequential, which is what makes that safe here; adding a parallel job that uses the
       # same key would break it, and the failure would look like provider drift rather than like
       # a scheduling mistake. The tests are `#[serial]` for the same cap within the binary.
-      - name: WebSocket canary (delivery, timestamps, tick rate, resume)
+      - name: WebSocket canary (delivery, timestamps, tick rate, resume, option contracts)
         id: ws-canary
         continue-on-error: true
         run: cargo test --locked --test lse_ws_canary --features lse -- --ignored --nocapture
