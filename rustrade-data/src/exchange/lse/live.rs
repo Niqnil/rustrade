@@ -18,6 +18,7 @@ use crate::{
     subscription::{Subscription, SubscriptionKind, SubscriptionMeta},
 };
 use chrono::{DateTime, Utc};
+use fnv::FnvHashSet;
 use futures::{SinkExt, StreamExt};
 use rustrade_instrument::exchange::ExchangeId;
 use rustrade_integration::{
@@ -416,8 +417,9 @@ pub(super) fn option_underlyings(
 /// is keyed the same way — so sending a payload per *subscription* would over-count against the
 /// cap and leave the validator waiting for a confirmation that never comes.
 ///
-/// The linear scan is deliberate: the batch is bounded by the connection's subscription cap, which
-/// was sixteen when measured, and at that size it beats building a hash set.
+/// The batch is not bounded by the subscription cap: on the options dataset each entry is a
+/// *contract*, and one underlying can carry thousands of them into a single slot. Hence the
+/// seen-set rather than a linear scan, which would make a large option batch quadratic.
 fn requested_markets<Exchange, Instrument, Kind>(
     subscriptions: &[Subscription<Exchange, Instrument, Kind>],
 ) -> Vec<SmolStr>
@@ -425,13 +427,15 @@ where
     Exchange: Connector,
     Subscription<Exchange, Instrument, Kind>: Identifier<Exchange::Market>,
 {
+    let mut seen =
+        FnvHashSet::<SmolStr>::with_capacity_and_hasher(subscriptions.len(), Default::default());
     let mut markets = Vec::<SmolStr>::with_capacity(subscriptions.len());
 
     for subscription in subscriptions {
         let market = Identifier::<Exchange::Market>::id(subscription);
         let symbol = SmolStr::new(market.as_ref());
 
-        if !markets.contains(&symbol) {
+        if seen.insert(symbol.clone()) {
             markets.push(symbol);
         }
     }
