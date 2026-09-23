@@ -39,7 +39,9 @@ pub trait Subscriber: Clone + Send + Sync {
     /// [`MarketStream`](crate::MarketStream) initialisation accepts. A subscriber whose streams
     /// share one connection instead hands out a per-stream view of it, and pairs with a
     /// [`MarketStream`](crate::MarketStream) of its own that knows how to read that view.
-    type Transport;
+    ///
+    /// `Send`, because a stream's transport is moved into the task that drives it.
+    type Transport: Send;
 
     fn subscribe<Exchange, Instrument, Kind>(
         &self,
@@ -63,6 +65,9 @@ pub struct Subscribed<InstrumentKey, Transport = WebSocket> {
     /// Frames that arrived during validation without being a confirmation, in arrival order —
     /// typically the first events of an already-confirmed subscription. They are the stream's first
     /// input and must be processed before anything read from `transport`.
+    ///
+    /// Raw WebSocket frames whatever the transport: a shared connection relays the frames it reads,
+    /// so every stream parses its input the same way.
     pub buffered_websocket_events: Vec<WsMessage>,
 }
 

@@ -41,7 +41,8 @@
 //! - Define what exchange market data you want to stream using the [`Subscription`] type.
 //! - Pass [`Subscription`]s to the [`StreamBuilder::subscribe`](streams::builder::StreamBuilder::subscribe) or [`DynamicStreams::init`](streams::builder::dynamic::DynamicStreams::init) methods.
 //! - Each call to the [`StreamBuilder::subscribe`](streams::builder::StreamBuilder::subscribe) (or each batch passed to the [`DynamicStreams::init`](streams::builder::dynamic::DynamicStreams::init))
-//!   method opens a new WebSocket connection to the exchange - giving you full control.
+//!   method opens a new WebSocket connection to the exchange - giving you full control - unless its
+//!   subscriber shares one connection among its clones (see [`Subscriber::Transport`]).
 //!
 //! ## Examples
 //! For a comprehensive collection of examples, see the /examples directory.

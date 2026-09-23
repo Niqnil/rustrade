@@ -208,8 +208,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **BREAKING: `Subscriber` gains an associated `Transport` type, and `Subscribed` is generic over it**
-  (`rustrade-data`). `Subscribed<InstrumentKey, Transport = WebSocket>` names what a successful
+- **BREAKING: `Subscriber` gains an associated `Transport: Send` type, and `Subscribed` is generic
+  over it** (`rustrade-data`). `Subscribed<InstrumentKey, Transport = WebSocket>` names what a successful
   subscribe hands the stream, and its `websocket` field is renamed `transport`. Every in-tree
   subscriber sets `type Transport = WebSocket`, so behaviour is unchanged; the standard
   `ExchangeWsStream` initialisation is bounded on `Subscriber<Transport = WebSocket>`. This is the
