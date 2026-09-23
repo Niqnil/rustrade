@@ -440,11 +440,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The `lse_market_data` example no longer opens three connections on a key that holds one**
   (`rustrade-data`, feature `lse`). It subscribed two datasets and a second subscription kind, each
-  on a connection of its own, and a free key allows one concurrent connection, so the second and
-  third were refused with `TOO_MANY_CONNECTIONS`. It now makes a single subscription. The
-  `WEBSOCKET_URL` rustdoc, which claimed eight concurrent connections were served, now states the
-  one-connection limit and its consequence: a key streams one dataset and one subscription kind at a
-  time.
+  on a connection of its own. A free key allows one concurrent connection, so the second and third
+  were refused with `TOO_MANY_CONNECTIONS`. The same three batches now share one connection. The
+  `WEBSOCKET_URL` rustdoc claimed eight concurrent connections were served. It now states the
+  one-connection limit, and how every stream opened by a subscriber and its clones shares that
+  connection.
 
 - **The Alpaca account snapshot no longer leaves out an open order silently, and declares its
   order lists complete** (#369, `rustrade-execution`). The snapshot and `fetch_open_orders` dropped
