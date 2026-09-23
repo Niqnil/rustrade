@@ -38,7 +38,7 @@ use async_stream::try_stream;
 use chrono::{DateTime, Duration as TimeDelta, NaiveDateTime, Utc};
 use futures::{Stream, StreamExt};
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use tracing::debug;
 
 /// Format accepted by the `start` / `end` query parameters.
@@ -77,15 +77,32 @@ struct LseCandleRow {
     volume: Option<Decimal>,
 }
 
-impl LseCandleRow {
-    /// Parse the row's `ts` as the bar's open instant.
+/// A vault row describing one candle, identified by the instant its bar opens.
+///
+/// Implemented by every row type [`candle_rows`](LseVaultClient::candle_rows) pages over, so the
+/// cursor arithmetic and the structural page checks are written once for every vault candle
+/// endpoint rather than once per row shape.
+pub(super) trait VaultCandleRow: DeserializeOwned {
+    /// Parse the row's timestamp as the bar's open instant.
+    fn open_time(&self) -> Result<DateTime<Utc>, LseError>;
+}
+
+/// Parse a vault candle label, which carries the bar's **open** in UTC with no zone suffix.
+pub(super) fn parse_candle_open(label: &str) -> Result<DateTime<Utc>, LseError> {
+    NaiveDateTime::parse_from_str(label, PROVIDER_TIMESTAMP_FORMAT)
+        .map(|naive| naive.and_utc())
+        .map_err(|error| LseError::Deserialize {
+            message: format!("invalid candle timestamp {label:?}: {error}"),
+        })
+}
+
+impl VaultCandleRow for LseCandleRow {
     fn open_time(&self) -> Result<DateTime<Utc>, LseError> {
-        NaiveDateTime::parse_from_str(&self.ts, PROVIDER_TIMESTAMP_FORMAT)
-            .map(|naive| naive.and_utc())
-            .map_err(|error| LseError::Deserialize {
-                message: format!("invalid candle timestamp {:?}: {error}", self.ts),
-            })
+        parse_candle_open(&self.ts)
     }
+}
+
+impl LseCandleRow {
 
     /// Convert into the library [`Candle`] model, given the period-end boundary.
     ///
@@ -208,6 +225,56 @@ impl LseVaultClient {
         end: DateTime<Utc>,
     ) -> impl Stream<Item = Result<Candle, LseError>> + 'a {
         try_stream! {
+            // Rejected up front so the caller gets a typed answer instead of a relayed 400.
+            let timeframe = candle_interval_str(interval)
+                .ok_or(LseError::UnsupportedInterval { interval })?;
+
+            let rows = self.candle_rows::<LseCandleRow>(
+                "candles",
+                symbol,
+                vec![
+                    ("symbol", symbol.to_owned()),
+                    // ⚠️ `timeframe`, NOT `resolution`. An unknown parameter is ignored silently
+                    // and the vault defaults to 1-minute bars, returning a byte-identical shape.
+                    ("timeframe", timeframe.to_owned()),
+                ],
+                interval,
+                start,
+                end,
+            );
+            futures::pin_mut!(rows);
+
+            while let Some(row) = rows.next().await {
+                let (row, close_time) = row?;
+                yield row.into_candle(close_time);
+            }
+        }
+    }
+
+    /// The paging core shared by every vault candle endpoint.
+    ///
+    /// Yields each row whose close falls in `[start, end]`, paired with that close, under exactly
+    /// the range, ordering, resolution and request-count contract documented on
+    /// [`fetch_candles`](Self::fetch_candles) — every error described there originates here.
+    ///
+    /// `path` is the vault endpoint and `selector` the query parameters naming what to fetch; the
+    /// range and page-size parameters are appended per page. `symbol` labels the typed errors only.
+    ///
+    /// Relies on the endpoint sharing the vault's measured range semantics: `start` inclusive and
+    /// `end` exclusive, both on the bar's **open**, at second precision.
+    pub(super) fn candle_rows<'a, R>(
+        &'a self,
+        path: &'static str,
+        symbol: &'a str,
+        selector: Vec<(&'static str, String)>,
+        interval: CandleInterval,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> impl Stream<Item = Result<(R, DateTime<Utc>), LseError>> + 'a
+    where
+        R: VaultCandleRow + 'a,
+    {
+        try_stream! {
             // An inverted range is a caller error, not an empty result: the vault would answer 200
             // with a confusing selection rather than complaining.
             if start > end {
@@ -215,10 +282,6 @@ impl LseVaultClient {
                     message: format!("start ({start}) must not be after end ({end})"),
                 })?;
             }
-
-            // Rejected up front so the caller gets a typed answer instead of a relayed 400.
-            let timeframe = candle_interval_str(interval)
-                .ok_or(LseError::UnsupportedInterval { interval })?;
 
             let step = interval.to_step();
 
@@ -248,19 +311,16 @@ impl LseVaultClient {
                 // every clone of this client. Spacing pages from inside this loop would only ever
                 // pace *this* fetch, so N concurrent fetches would issue N requests per interval —
                 // see `LseVaultClient::with_pace`.
-                let query = [
-                    ("symbol", symbol.to_owned()),
-                    // ⚠️ `timeframe`, NOT `resolution`. An unknown parameter is ignored silently
-                    // and the vault defaults to 1-minute bars, returning a byte-identical shape.
-                    ("timeframe", timeframe.to_owned()),
+                let mut query = selector.clone();
+                query.extend([
                     ("start", cursor.format(CURSOR_FORMAT).to_string()),
                     ("end", range_end.format(CURSOR_FORMAT).to_string()),
                     ("limit", self.page_limit().to_string()),
-                ];
+                ]);
 
-                let rows: Vec<LseCandleRow> = self.get_json("candles", &query).await?;
+                let rows: Vec<R> = self.get_json(path, &query).await?;
                 page += 1;
-                debug!(symbol, %cursor, rows = rows.len(), page, "vault candle page received");
+                debug!(path, symbol, %cursor, rows = rows.len(), page, "vault candle page received");
 
                 // The only reliable end-of-data signal; see the request-count note above.
                 if rows.is_empty() {
@@ -356,7 +416,7 @@ impl LseVaultClient {
                         continue;
                     }
 
-                    yield row.into_candle(close_time);
+                    yield (row, close_time);
                 }
 
                 if reached_end {
