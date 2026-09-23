@@ -43,6 +43,8 @@ impl OptionGreeks {
             gamma: computation.gamma,
             theta: computation.theta,
             vega: computation.vega,
+            // `OptionComputation` carries no rho.
+            rho: None,
             implied_volatility: computation.implied_volatility,
             theoretical_price: computation.option_price,
             underlying_price: computation.underlying_price,

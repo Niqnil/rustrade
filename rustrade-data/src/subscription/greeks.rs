@@ -1,7 +1,7 @@
 //! Option Greeks subscription type.
 //!
 //! This module defines the [`OptionGreeks`](crate::subscription::greeks::OptionGreeks) data type for option analytics
-//! (delta, gamma, theta, vega, implied volatility).
+//! (delta, gamma, theta, vega, rho, implied volatility).
 //!
 //! Unlike other subscription types in this module, Greeks are typically
 //! computed by the exchange/broker from live market data rather than being
@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 /// - `gamma`: Rate of change of delta with respect to underlying price
 /// - `theta`: Rate of change of option price with respect to time (per day)
 /// - `vega`: Rate of change of option price with respect to volatility
+/// - `rho`: Rate of change of option price with respect to the risk-free interest rate. `None`
+///   wherever the source does not publish it, which today includes IBKR and Massive
 /// - `implied_volatility`: Market-implied volatility
 /// - `theoretical_price`: Model price computed by the exchange/broker
 /// - `underlying_price`: Current underlying price used in computation
@@ -35,14 +37,15 @@ pub struct OptionGreeks {
     pub gamma: Option<f64>,
     pub theta: Option<f64>,
     pub vega: Option<f64>,
+    pub rho: Option<f64>,
     pub implied_volatility: Option<f64>,
     pub theoretical_price: Option<f64>,
     pub underlying_price: Option<f64>,
 }
 
 impl OptionGreeks {
-    /// Returns true if at least one first-order Greek (delta, gamma, theta,
-    /// vega, or implied volatility) is present.
+    /// Returns true if at least one Greek (delta, gamma, theta, vega, rho, or
+    /// implied volatility) is present.
     ///
     /// Does NOT consider `theoretical_price` or `underlying_price` — a tick
     /// containing only those fields is treated as having no Greek data.
@@ -51,6 +54,7 @@ impl OptionGreeks {
             || self.gamma.is_some()
             || self.theta.is_some()
             || self.vega.is_some()
+            || self.rho.is_some()
             || self.implied_volatility.is_some()
     }
 }
@@ -81,11 +85,33 @@ mod tests {
             gamma: Some(0.02),
             theta: Some(-0.05),
             vega: Some(0.15),
+            rho: Some(0.01),
             implied_volatility: Some(0.25),
             theoretical_price: Some(5.50),
             underlying_price: Some(150.0),
         };
         assert!(greeks.has_any_greek());
+    }
+
+    #[test]
+    fn option_greeks_rho_only_has_any_greek() {
+        let greeks = OptionGreeks {
+            rho: Some(0.01),
+            ..Default::default()
+        };
+        assert!(greeks.has_any_greek());
+    }
+
+    #[test]
+    fn option_greeks_serialised_before_rho_existed_still_deserialise() {
+        // Persisted greeks written before the field was added carry no `rho` key at all; they must
+        // still decode, as an explicit unknown rather than a zero.
+        let greeks: OptionGreeks =
+            serde_json::from_str(r#"{"delta":0.5,"gamma":null,"theta":null,"vega":null,
+                "implied_volatility":null,"theoretical_price":null,"underlying_price":null}"#)
+                .unwrap();
+        assert_eq!(greeks.rho, None);
+        assert_eq!(greeks.delta, Some(0.5));
     }
 
     #[test]
