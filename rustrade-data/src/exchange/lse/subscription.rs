@@ -25,11 +25,14 @@ use smol_str::SmolStr;
 /// slots it can never get back.
 ///
 /// # Why replay frames are deliberately not modelled here
-/// The subscription validator counts every frame that deserialises into this type and validates
-/// `Ok` as one more subscription confirmed. A `replay_started` frame modelled as a success would
-/// inflate that count and end validation before the last real confirmation arrived. It is decoded
-/// on the stream instead, and reaches the transformer through the buffered-events path — the same
-/// route ticks that arrive mid-validation take. For the same reason this enum has no catch-all
+/// A validator counts every frame that deserialises into this type and validates `Ok` as one more
+/// subscription confirmed — the connector's declared
+/// [`SubValidator`](crate::exchange::Connector::SubValidator) does. The shared
+/// [`connection`](super::connection) decodes a frame as this type only when its `type` names an
+/// answer, but the type must stay safe for any validator to count. A `replay_started` frame
+/// modelled as a success would inflate that count and end validation before the last real
+/// confirmation arrived. It is decoded on the stream instead, and reaches the transformer as stream
+/// data — the same route ticks take. For the same reason this enum has no catch-all
 /// variant: one would swallow ticks into the success count.
 #[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -37,7 +40,7 @@ pub enum LseSubResponse {
     /// A subscription was accepted, and the connection now holds `count` of its `max` slots.
     ///
     /// **No field is required to deserialise**, `symbol` included. All three are reported by the
-    /// provider and modelled for the reader, but nothing acts on any of them: the validator counts
+    /// provider and modelled for the reader, but nothing acts on any of them: a validator counts
     /// confirmations rather than matching them to symbols, and the cap is enforced before a
     /// subscribe is sent, against the `authenticated` frame. Requiring a field nothing reads would
     /// let a rename or an omission upstream turn an arriving confirmation into a ten-second

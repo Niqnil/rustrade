@@ -190,10 +190,13 @@ pub enum LseMessage {
     /// # Why it is modelled on the stream rather than caught during the handshake
     /// The provider answers `subscribe` *before* it announces the window — measured on both a
     /// crypto and an FX symbol, the order is `subscribed`, then `replay_started`, then the replayed
-    /// ticks. The subscription validator stops reading the socket the moment the last confirmation
-    /// arrives, so a single-symbol resumed subscription never has a `replay_started` to inspect at
-    /// handshake time, and a batch never has one for its last symbol. Reading it here instead makes
-    /// the check independent of frame ordering and of batch size.
+    /// ticks. A subscribe handshake is complete the moment its last confirmation arrives, so a
+    /// single-symbol resumed subscription never has a `replay_started` to inspect at handshake
+    /// time, and a batch never has one for its last symbol. Reading it here instead makes the check
+    /// independent of frame ordering and of batch size.
+    ///
+    /// The shared connection routes it only to the streams a replay window was opened for — see
+    /// [`connection`](super::connection).
     ReplayStarted {
         /// The subscription the window belongs to, built from `symbol` exactly as a tick's is.
         #[serde(rename = "symbol", deserialize_with = "de_tick_subscription_id")]
@@ -204,15 +207,18 @@ pub enum LseMessage {
         from: DateTime<Utc>,
     },
 
-    /// A rejection raised *after* the handshake completed.
+    /// A rejection raised outside a subscribe handshake.
     ///
-    /// # Why the handshake cannot catch these
-    /// The subscription validator stops reading the socket the moment the last confirmation
-    /// arrives, so every rejection the provider raises afterwards lands here instead — a later
-    /// `LIMIT_REACHED`, an `INVALID_START` on a resumed symbol, a credential that expired
-    /// mid-connection. Collapsed into [`Other`](Self::Other) it would be discarded in silence,
-    /// which is the one thing a rejection must never be: the provider does **not** name the symbol
-    /// it rejected, so the only outward sign is a subscription that stops ticking.
+    /// # Why no stream normally sees one
+    /// The provider does **not** name the symbol it rejected, so a rejection arriving outside a
+    /// handshake — a later `LIMIT_REACHED`, a credential that expired mid-connection — cannot be
+    /// routed to the stream it concerns. The shared [`connection`](super::connection) logs it once
+    /// instead, and one arriving *during* a handshake fails that handshake.
+    ///
+    /// It is still decoded rather than collapsed into [`Other`](Self::Other), so a rejection that
+    /// reaches a stream by any other route is reported rather than discarded in silence — the one
+    /// thing a rejection must never be, since the only outward sign of one is a subscription that
+    /// stops ticking.
     ///
     /// Both fields are optional for the same reason they are on the handshake's own rejection: a
     /// frame missing one must still decode, because failing the parse on an error frame would take

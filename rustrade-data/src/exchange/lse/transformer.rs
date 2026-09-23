@@ -83,6 +83,23 @@ struct UnregisteredTally {
     contracts: FnvHashSet<SubscriptionId>,
 }
 
+/// What a stream needs to resume: the shared watermarks, the kind they are filed under, and the
+/// replay windows the connection opened for it.
+#[derive(Debug)]
+pub(super) struct ResumeContext {
+    pub(super) state: Arc<LseResumeState>,
+
+    /// [`SubscriptionKind::as_str`] of the stream — see [`LseResumeKey`].
+    pub(super) kind: &'static str,
+
+    /// Each subscription a replay window was opened for, and the instant it opens at.
+    ///
+    /// Only these expect a replay. A subscription the connection already held when the stream
+    /// attached was never re-sent, so the provider replays nothing for it, and expecting one would
+    /// read every live tick as a replay that fell short.
+    pub(super) starts: FnvHashMap<SubscriptionId, DateTime<Utc>>,
+}
+
 /// Per-connection resume bookkeeping: the shared watermark, and what this connection still owes
 /// the replay window.
 #[derive(Debug)]
@@ -99,8 +116,8 @@ struct ResumeTracker {
     /// value to call [`SubscriptionKind::as_str`] on.
     kind: &'static str,
 
-    /// Keyed by subscription alone: the snapshot is filtered to this stream's dataset and kind on
-    /// construction, so both are constant across every entry here.
+    /// Keyed by subscription alone: the dataset and the kind are this stream's, so both are
+    /// constant across every entry here.
     pending: FnvHashMap<SubscriptionId, PendingDrop>,
 }
 
@@ -109,6 +126,18 @@ struct ResumeTracker {
 struct PendingDrop {
     time_exchange: DateTime<Utc>,
     remaining: usize,
+
+    /// Whether the window was opened *before* this stream's own watermark.
+    ///
+    /// A symbol has one replay window per connection, opened at the earliest watermark among the
+    /// streams holding it, so a stream that had delivered further receives ticks it already
+    /// delivered before reaching its own watermark. Those are dropped silently, until the first
+    /// tick past the watermark closes the window. Where the window opened exactly at the watermark,
+    /// an older tick contradicts the inclusive `start` and is reported instead.
+    opened_earlier: bool,
+
+    /// Whether a tick past the watermark has arrived, closing the replay window for good.
+    passed: bool,
 
     /// Whether the out-of-contract-ordering warning has already fired for this subscription.
     ///
@@ -144,14 +173,14 @@ where
     /// is partitioned by dataset *and* kind — see [`LseResumeKey`] — and this type's `Kind`
     /// parameter has no value to derive the latter from. The dataset comes from `Exchange::ID`.
     ///
-    /// The drop counters are **snapshotted** here rather than consulted per tick, so the shared
-    /// lock is taken once per connection to read them. Recording still takes it once per emitted
-    /// tick; the critical section there is a hash lookup and a field update.
+    /// The drop counters are read here, once per resumed subscription, rather than consulted per
+    /// tick. Recording still takes the shared lock once per emitted tick; the critical section
+    /// there is a hash lookup and a field update.
     pub(super) async fn new(
         instrument_map: Map<InstrumentKey>,
         initial_snapshots: &[MarketEvent<InstrumentKey, Kind::Event>],
         ws_sink_tx: mpsc::UnboundedSender<WsMessage>,
-        resume: Option<(Arc<LseResumeState>, &'static str)>,
+        resume: Option<ResumeContext>,
     ) -> Result<Self, DataError> {
         let unregistered = subscribes_per_underlying(Exchange::ID).then(|| {
             UnregisteredContracts::new(Exchange::ID, instrument_map.0.keys().cloned().collect())
@@ -160,17 +189,25 @@ where
         let inner =
             StatelessTransformer::init(instrument_map, initial_snapshots, ws_sink_tx).await?;
 
-        let resume = resume.map(|(state, kind)| ResumeTracker {
-            pending: state
-                .snapshot()
-                .into_iter()
-                .filter(|(key, _)| key.exchange() == Exchange::ID && key.kind() == kind)
-                .map(|(key, watermark)| (key.into_subscription(), PendingDrop::from(watermark)))
-                .collect(),
-            state,
-            exchange: Exchange::ID,
-            kind,
-        });
+        let resume = resume.map(
+            |ResumeContext {
+                 state,
+                 kind,
+                 starts,
+             }| ResumeTracker {
+                pending: starts
+                    .into_iter()
+                    .filter_map(|(subscription, start)| {
+                        let key = LseResumeKey::new(Exchange::ID, subscription.clone(), kind);
+                        let watermark = state.watermark(&key)?;
+                        Some((subscription, PendingDrop::new(watermark, start)))
+                    })
+                    .collect(),
+                state,
+                exchange: Exchange::ID,
+                kind,
+            },
+        );
 
         Ok(Self {
             inner,
@@ -180,11 +217,15 @@ where
     }
 }
 
-impl From<LseWatermark> for PendingDrop {
-    fn from(watermark: LseWatermark) -> Self {
+impl PendingDrop {
+    /// What remains to skip of a window opened at `start` for a stream last delivered at
+    /// `watermark`.
+    fn new(watermark: LseWatermark, start: DateTime<Utc>) -> Self {
         Self {
             time_exchange: watermark.time_exchange,
             remaining: watermark.count_at_time,
+            opened_earlier: start < watermark.time_exchange,
+            passed: false,
             warned_older: false,
             clamped: false,
         }
@@ -254,12 +295,11 @@ where
             return vec![];
         }
 
-        // A rejection raised *after* the handshake completed -- a later `LIMIT_REACHED`, an
-        // `INVALID_START` on a resumed symbol, an expired credential. The handshake validator
-        // cannot see these: it has already stopped reading. Nothing downstream can act on one
-        // either, since the provider does not name the symbol it rejected, so the frame yields no
-        // market event -- but the stream simply stops producing events for whatever was dropped,
-        // and a rejection is the last thing that may reach the consumer as silence.
+        // A rejection. The shared connection consumes these rather than routing them -- one names
+        // no symbol, so there is no stream to route it to -- but one arriving here by any other
+        // route must still be reported: nothing downstream can act on it, and the stream simply
+        // stops producing events for whatever was dropped, so a rejection is the last thing that
+        // may reach the consumer as silence.
         if let LseMessage::Error { code, message } = &input {
             warn!(
                 exchange = %Exchange::ID,
@@ -374,6 +414,7 @@ impl ResumeTracker {
                 // beat its own `replay_started`. Zeroing the count closes the drop window just as
                 // removal did: `Ordering::Equal` with nothing remaining emits.
                 pending.remaining = 0;
+                pending.passed = true;
 
                 // The replay held fewer events at the watermark's instant than were delivered from
                 // it. Positional skipping assumes the replay reproduces what went out live -- an
@@ -408,6 +449,9 @@ impl ResumeTracker {
 
                 false
             }
+            // Older than the watermark, inside a window the connection opened earlier than it on
+            // another stream's behalf: this stream delivered it before the connection was lost.
+            Ordering::Less if pending.opened_earlier && !pending.passed => true,
             // Older than the watermark. `start` is inclusive, so the provider should never send
             // this; emitting is the safe answer, since dropping would discard a real event on the
             // strength of an assumption that has already been contradicted.
@@ -617,15 +661,121 @@ mod tests {
         .unwrap()
     }
 
+    /// A stream on a connection of its own: any window opens exactly at its own watermark.
     async fn subject(resume: Option<Arc<LseResumeState>>) -> Subject {
+        let starts = resume
+            .as_ref()
+            .and_then(|state| state.watermark(&key()))
+            .map(|watermark| (id(), watermark.time_exchange));
+
+        subject_with(resume, starts).await
+    }
+
+    /// A stream whose window for [`id`] the connection opened at `start`, or never opened.
+    async fn subject_with(
+        resume: Option<Arc<LseResumeState>>,
+        start: Option<(SubscriptionId, DateTime<Utc>)>,
+    ) -> Subject {
         let map = Map([(id(), 1_u8)]
             .into_iter()
             .collect::<FnvHashMap<SubscriptionId, u8>>());
         let (tx, _rx) = mpsc::unbounded_channel();
 
-        Subject::new(map, &[], tx, resume.map(|state| (state, KIND)))
-            .await
-            .unwrap()
+        let resume = resume.map(|state| ResumeContext {
+            state,
+            kind: KIND,
+            starts: start.into_iter().collect(),
+        });
+
+        Subject::new(map, &[], tx, resume).await.unwrap()
+    }
+
+    /// A symbol has one replay window per connection, opened at the earliest watermark among the
+    /// streams holding it. A stream that had delivered further drops what it already delivered —
+    /// silently, and exactly — and emits everything past its own watermark.
+    #[tokio::test]
+    async fn a_window_opened_before_the_watermark_drops_what_this_stream_already_delivered() {
+        let state = Arc::new(LseResumeState::new());
+
+        let mut first = subject(Some(Arc::clone(&state))).await;
+        first.transform(tick("2026-01-02T09:00:00.000001Z", "1.0"));
+        first.transform(tick("2026-01-02T09:00:00.000002Z", "2.0"));
+        first.transform(tick("2026-01-02T09:00:00.000002Z", "3.0"));
+
+        // Another stream on the connection resumes from further back.
+        let mut second = subject_with(
+            Some(Arc::clone(&state)),
+            Some((id(), at("2026-01-02T09:00:00Z"))),
+        )
+        .await;
+
+        for (ts, price) in [
+            ("2026-01-02T09:00:00.000000Z", "0.5"),
+            ("2026-01-02T09:00:00.000001Z", "1.0"),
+            ("2026-01-02T09:00:00.000002Z", "2.0"),
+            ("2026-01-02T09:00:00.000002Z", "3.0"),
+        ] {
+            assert!(
+                second.transform(replayed_tick(ts, price)).is_empty(),
+                "{ts} was delivered before the connection was lost"
+            );
+        }
+
+        assert_eq!(
+            second
+                .transform(replayed_tick("2026-01-02T09:00:00.000003Z", "4.0"))
+                .len(),
+            1,
+            "the first tick past this stream's own watermark is new"
+        );
+    }
+
+    /// The silent drop covers the replay window only. Once a tick passes the watermark, an older
+    /// one is the monotonicity contradiction it always was: emitted, not swallowed.
+    #[tokio::test]
+    async fn an_older_tick_after_the_window_closes_is_emitted_even_when_it_opened_earlier() {
+        let state = Arc::new(LseResumeState::new());
+
+        let mut first = subject(Some(Arc::clone(&state))).await;
+        first.transform(tick("2026-01-02T09:00:00.000002Z", "1.0"));
+
+        let mut second = subject_with(
+            Some(Arc::clone(&state)),
+            Some((id(), at("2026-01-02T09:00:00Z"))),
+        )
+        .await;
+        assert_eq!(
+            second
+                .transform(tick("2026-01-02T09:00:00.000003Z", "2.0"))
+                .len(),
+            1
+        );
+        assert_eq!(
+            second
+                .transform(tick("2026-01-02T09:00:00.000001Z", "0.5"))
+                .len(),
+            1,
+            "the window is closed; an older tick must be emitted, not dropped"
+        );
+    }
+
+    /// A stream joining a symbol the connection already streams is given no replay, so it must not
+    /// expect one: nothing is skipped at its watermark, and nothing is reported as a shortfall.
+    #[tokio::test]
+    async fn a_subscription_with_no_window_opened_skips_nothing() {
+        let state = Arc::new(LseResumeState::new());
+
+        let mut first = subject(Some(Arc::clone(&state))).await;
+        first.transform(tick("2026-01-02T09:00:00.000001Z", "1.0"));
+
+        let mut joined = subject_with(Some(Arc::clone(&state)), None).await;
+        assert!(joined.resume.as_ref().unwrap().pending.is_empty());
+        assert_eq!(
+            joined
+                .transform(tick("2026-01-02T09:00:00.000001Z", "1.0"))
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
