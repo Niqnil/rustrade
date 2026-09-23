@@ -2,9 +2,12 @@
 //!
 //! Decoding is delegated wholesale to [`StatelessTransformer`] — one provider frame maps to one
 //! event and nothing about it needs state. What this type adds is the consuming half of
-//! [`resume`](super::resume): skipping the events a reconnect's replay re-delivers.
+//! [`resume`](super::resume): skipping the events a reconnect's replay re-delivers; and, on the
+//! options dataset, the count of prints for contracts nobody registered.
 
 use super::{
+    live::subscribes_per_underlying,
+    osi,
     resume::{LseResumeKey, LseResumeState, LseWatermark},
     tick::LseMessage,
 };
@@ -17,15 +20,27 @@ use crate::{
     transformer::{ExchangeTransformer, stateless::StatelessTransformer},
 };
 use chrono::{DateTime, Utc};
-use fnv::FnvHashMap;
+use fnv::{FnvHashMap, FnvHashSet};
 use rustrade_instrument::exchange::ExchangeId;
 use rustrade_integration::{
     Transformer, protocol::websocket::WsMessage, subscription::SubscriptionId,
 };
 use serde::Deserialize;
-use std::{cmp::Ordering, sync::Arc};
+use smol_str::SmolStr;
+use std::{
+    cmp::Ordering,
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{info, warn};
+
+/// How often the options dataset reports the prints it dropped for unregistered contracts.
+///
+/// A minute keeps a busy connection to one line per underlying per minute — at one registered
+/// contract on a busy index ETF, that line stands in for thousands of dropped prints.
+pub const UNREGISTERED_REPORT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Transformer for every London Strategic Edge subscription kind.
 ///
@@ -36,6 +51,36 @@ use tracing::warn;
 pub struct LseTransformer<Exchange, InstrumentKey, Kind> {
     inner: StatelessTransformer<Exchange, InstrumentKey, Kind, LseMessage>,
     resume: Option<ResumeTracker>,
+
+    /// Present on the options dataset only, where most of what arrives was never registered.
+    unregistered: Option<UnregisteredContracts>,
+}
+
+/// The options dataset's count of prints for contracts nobody registered.
+///
+/// # Why a count and not an error per print
+/// One subscribe delivers an underlying's whole chain, so a stream registering a handful of
+/// contracts receives prints for thousands it did not — measured at around 45 a second on one busy
+/// underlying. Resolved like any other frame, each would become an "unidentifiable" error, drowning
+/// every real one. They are expected, so they are dropped; but silently dropping them would hide
+/// the one case that is a mistake — a registered contract spelled differently from the one that
+/// trades, whose prints would all land here — so they are counted per underlying and reported
+/// every [`UNREGISTERED_REPORT_INTERVAL`].
+#[derive(Debug)]
+struct UnregisteredContracts {
+    exchange: ExchangeId,
+    registered: FnvHashSet<SubscriptionId>,
+
+    /// Ordered so the report lists underlyings in the same order every time.
+    tally: BTreeMap<SmolStr, UnregisteredTally>,
+    window_start: Instant,
+}
+
+/// What one underlying delivered for unregistered contracts since the last report.
+#[derive(Debug, Default)]
+struct UnregisteredTally {
+    prints: u64,
+    contracts: FnvHashSet<SubscriptionId>,
 }
 
 /// Per-connection resume bookkeeping: the shared watermark, and what this connection still owes
@@ -108,6 +153,10 @@ where
         ws_sink_tx: mpsc::UnboundedSender<WsMessage>,
         resume: Option<(Arc<LseResumeState>, &'static str)>,
     ) -> Result<Self, DataError> {
+        let unregistered = subscribes_per_underlying(Exchange::ID).then(|| {
+            UnregisteredContracts::new(Exchange::ID, instrument_map.0.keys().cloned().collect())
+        });
+
         let inner =
             StatelessTransformer::init(instrument_map, initial_snapshots, ws_sink_tx).await?;
 
@@ -123,7 +172,11 @@ where
             kind,
         });
 
-        Ok(Self { inner, resume })
+        Ok(Self {
+            inner,
+            resume,
+            unregistered,
+        })
     }
 }
 
@@ -217,6 +270,20 @@ where
             );
 
             return vec![];
+        }
+
+        // A print for an option contract nobody registered: counted, not converted into an error.
+        // The report is checked on every option tick, registered or not, so it keeps its cadence
+        // however few unregistered prints arrive.
+        if let Some(unregistered) = self.unregistered.as_mut()
+            && let LseMessage::Tick(tick) = &input
+        {
+            let dropped = unregistered.absorb(&tick.subscription_id);
+            unregistered.report_if_due(Instant::now());
+
+            if dropped {
+                return vec![];
+            }
         }
 
         // Nothing to track when the caller did not opt in, and a control frame carries no instant
@@ -439,6 +506,68 @@ impl ResumeTracker {
             &LseResumeKey::new(self.exchange, subscription_id, self.kind),
             time_exchange,
         );
+    }
+}
+
+impl UnregisteredContracts {
+    fn new(exchange: ExchangeId, registered: FnvHashSet<SubscriptionId>) -> Self {
+        Self {
+            exchange,
+            registered,
+            tally: BTreeMap::new(),
+            window_start: Instant::now(),
+        }
+    }
+
+    /// Count a print if nobody registered its contract. `true` means it was counted and must be
+    /// dropped; `false` means it is registered and passes through.
+    fn absorb(&mut self, subscription_id: &SubscriptionId) -> bool {
+        if self.registered.contains(subscription_id) {
+            return false;
+        }
+
+        // A subscription identifier is `channel|market`. Every symbol on this channel is an OSI
+        // contract, so the root is always found; were one not, it is tallied under itself rather
+        // than lost.
+        let market = subscription_id
+            .0
+            .split_once('|')
+            .map_or(subscription_id.0.as_str(), |(_, market)| market);
+        let underlying = osi::root(market).unwrap_or(market);
+
+        // Looked up before inserting so the common case -- an underlying already tallied this
+        // window -- builds no owned key.
+        let tally = match self.tally.get_mut(underlying) {
+            Some(tally) => tally,
+            None => self.tally.entry(SmolStr::new(underlying)).or_default(),
+        };
+        tally.prints += 1;
+        tally.contracts.insert(subscription_id.clone());
+
+        true
+    }
+
+    /// Report what was counted and start a new window, if the current one has run its course.
+    fn report_if_due(&mut self, now: Instant) {
+        let window = now.saturating_duration_since(self.window_start);
+        if window < UNREGISTERED_REPORT_INTERVAL {
+            return;
+        }
+
+        for (underlying, tally) in std::mem::take(&mut self.tally) {
+            info!(
+                exchange = %self.exchange,
+                %underlying,
+                prints = tally.prints,
+                contracts = tally.contracts.len(),
+                window_secs = window.as_secs(),
+                "London Strategic Edge delivered option prints for contracts nobody registered, \
+                 and dropped them; register a contract to receive it, and if one you registered is \
+                 silent, check its spelling against these",
+            );
+        }
+
+        self.window_start = now;
     }
 }
 
@@ -875,6 +1004,123 @@ mod tests {
 
     /// The frame is the only evidence a requested window was clamped, and it reaches the stream
     /// rather than the handshake. It must yield no market event of its own.
+    mod unregistered_contracts {
+        use super::*;
+        use crate::exchange::lse::LseOptions;
+
+        type OptionsSubject = LseTransformer<LseOptions, u8, PublicTrades>;
+
+        const REGISTERED: &str = "SPY260930C00700000";
+
+        fn option_tick(symbol: &str) -> LseMessage {
+            serde_json::from_str(&format!(
+                r#"{{"type":"tick","symbol":"{symbol}","ts":"2026-01-02T15:00:00+00:00",
+                    "price":1.25,"bid":null,"ask":null,"volume":3,"name":"label"}}"#
+            ))
+            .unwrap()
+        }
+
+        async fn options_subject() -> OptionsSubject {
+            let map = Map([(
+                super::super::super::resume::subscription_id(REGISTERED),
+                1_u8,
+            )]
+            .into_iter()
+            .collect::<FnvHashMap<SubscriptionId, u8>>());
+            let (tx, _rx) = mpsc::unbounded_channel();
+
+            OptionsSubject::new(map, &[], tx, None).await.unwrap()
+        }
+
+        fn tally(subject: &OptionsSubject) -> Vec<(String, u64, usize)> {
+            subject
+                .unregistered
+                .as_ref()
+                .unwrap()
+                .tally
+                .iter()
+                .map(|(underlying, tally)| {
+                    (underlying.to_string(), tally.prints, tally.contracts.len())
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn a_registered_contract_is_emitted() {
+            let mut subject = options_subject().await;
+
+            let output = subject.transform(option_tick(REGISTERED));
+            assert_eq!(output.len(), 1);
+            assert!(output[0].is_ok());
+            assert!(tally(&subject).is_empty());
+        }
+
+        /// The chain delivers thousands of contracts nobody asked for. Each one surfaced as an
+        /// error would bury every real error on the stream.
+        #[tokio::test]
+        async fn an_unregistered_contract_is_counted_rather_than_raised() {
+            let mut subject = options_subject().await;
+
+            assert!(
+                subject
+                    .transform(option_tick("SPY260930C00701000"))
+                    .is_empty()
+            );
+            assert!(
+                subject
+                    .transform(option_tick("SPY260930C00701000"))
+                    .is_empty()
+            );
+            assert!(
+                subject
+                    .transform(option_tick("SPY260930P00650000"))
+                    .is_empty()
+            );
+            assert!(
+                subject
+                    .transform(option_tick("QQQ260930C00500000"))
+                    .is_empty()
+            );
+
+            assert_eq!(
+                tally(&subject),
+                [("QQQ".to_owned(), 1, 1), ("SPY".to_owned(), 3, 2)]
+            );
+        }
+
+        #[tokio::test]
+        async fn the_count_is_kept_until_the_interval_has_run() {
+            let mut subject = options_subject().await;
+            subject.transform(option_tick("SPY260930C00701000"));
+
+            let unregistered = subject.unregistered.as_mut().unwrap();
+            let opened = unregistered.window_start;
+
+            unregistered.report_if_due(opened + UNREGISTERED_REPORT_INTERVAL / 2);
+            assert_eq!(tally(&subject).len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_report_starts_a_new_window() {
+            let mut subject = options_subject().await;
+            subject.transform(option_tick("SPY260930C00701000"));
+
+            let unregistered = subject.unregistered.as_mut().unwrap();
+            let due = unregistered.window_start + UNREGISTERED_REPORT_INTERVAL;
+
+            unregistered.report_if_due(due);
+            assert!(tally(&subject).is_empty());
+            assert_eq!(subject.unregistered.as_ref().unwrap().window_start, due);
+        }
+
+        /// Only the options dataset fans out, so only it counts. Elsewhere an unregistered symbol
+        /// is a genuine mismatch and stays an error.
+        #[tokio::test]
+        async fn other_datasets_keep_no_count() {
+            assert!(subject(None).await.unregistered.is_none());
+        }
+    }
+
     #[tokio::test]
     async fn a_replay_boundary_is_consumed_without_emitting_an_event() {
         let state = Arc::new(LseResumeState::new());

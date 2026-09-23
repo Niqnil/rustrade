@@ -1,4 +1,4 @@
-use super::Lse;
+use super::{Lse, osi};
 use crate::exchange::lse::error::LseError;
 use crate::subscription::candle::CandleInterval;
 use crate::{Identifier, instrument::MarketInstrumentData, subscription::Subscription};
@@ -483,15 +483,26 @@ pub fn supports_candle_interval(interval: CandleInterval) -> bool {
 
 /// How a dataset spells the display symbol the WebSocket subscribes on.
 ///
-/// The provider uses two spellings and each dataset uses exactly one, which is what the per-dataset
-/// [`ExchangeId`] split buys at this boundary: the shape is known statically from the connector
-/// type, so no runtime discriminator is needed to reconstruct a symbol.
+/// The provider uses three spellings and each dataset uses exactly one, which is what the
+/// per-dataset [`ExchangeId`] split buys at this boundary: the shape is known statically from the
+/// connector type, so no runtime discriminator is needed to reconstruct a symbol.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum LseSymbolShape {
     /// `BASE/QUOTE` — FX, crypto and CFDs: `EUR/USD`, `BTC/USD`, `SPX500/USD`, `VIX/USD`.
     Pair,
     /// A bare ticker, venue suffix included — equities and futures: `AAPL`, `BP.L`, `ES.F`.
     Bare,
+    /// An unpadded OSI option contract symbol — option contracts: `SPY260930C00700000`.
+    ///
+    /// Built from the base asset as the root and the instrument's
+    /// [`MarketDataInstrumentKind::Option`] contract; the quote asset plays no part. The expiry is
+    /// read as a UTC date, so an instant on the New York evening names the next day's contract.
+    ///
+    /// An instrument that is not an option, or whose strike OSI cannot carry (more than three
+    /// decimal places, not positive, or 100,000 or more), has no OSI symbol. It is given a
+    /// descriptive non-OSI one instead, which the subscriber rejects by name before anything is
+    /// sent.
+    OptionContract,
 }
 
 /// A London Strategic Edge WebSocket server, and the symbol spelling its dataset uses.
@@ -503,6 +514,14 @@ pub trait LseServer: crate::exchange::ExchangeServer {
     /// The spelling this dataset's display symbols take.
     const SYMBOL_SHAPE: LseSymbolShape;
 }
+
+/// A London Strategic Edge server whose ticks carry a bid and an ask.
+///
+/// Every dataset but options. The options channel publishes both sides as `null` on every tick, so
+/// an [`OrderBooksL1`](crate::subscription::book::OrderBooksL1) stream on it would never produce a
+/// quote; this bound makes subscribing to one a compile error rather than a silent stream of empty
+/// books.
+pub trait LseQuoteServer: LseServer {}
 
 /// A London Strategic Edge display symbol, as the WebSocket expects it.
 ///
@@ -535,6 +554,7 @@ fn market_symbol(
     shape: LseSymbolShape,
     base: &AssetNameInternal,
     quote: &AssetNameInternal,
+    kind: &MarketDataInstrumentKind,
 ) -> LseMarket {
     match shape {
         LseSymbolShape::Pair => LseMarket(format_smolstr!(
@@ -543,6 +563,22 @@ fn market_symbol(
             quote.name().to_uppercase_smolstr()
         )),
         LseSymbolShape::Bare => LseMarket(base.name().to_uppercase_smolstr()),
+        LseSymbolShape::OptionContract => {
+            let spelled = match kind {
+                MarketDataInstrumentKind::Option(contract) => osi::symbol(base.name(), contract),
+                _ => None,
+            };
+
+            // `Identifier::id` is infallible, so an instrument with no OSI spelling cannot fail
+            // here. It gets a symbol that says why instead, which cannot parse as OSI, so the
+            // subscriber's guard rejects the batch naming it before a single subscribe is sent.
+            LseMarket(spelled.unwrap_or_else(|| {
+                format_smolstr!(
+                    "{} (no OSI symbol for {kind})",
+                    base.name().to_uppercase_smolstr()
+                )
+            }))
+        }
     }
 }
 
@@ -555,6 +591,7 @@ where
             Server::SYMBOL_SHAPE,
             &self.instrument.base,
             &self.instrument.quote,
+            &self.instrument.kind,
         )
     }
 }
@@ -569,6 +606,7 @@ where
             Server::SYMBOL_SHAPE,
             &self.instrument.value.base,
             &self.instrument.value.quote,
+            &self.instrument.value.kind,
         )
     }
 }
@@ -913,9 +951,16 @@ mod tests {
     mod market_symbol_reconstruction {
         use super::*;
         use crate::exchange::lse::{
-            LseCfd, LseServerCfd, LseServerCrypto, LseServerEquities, LseServerFutures, LseServerFx,
+            LseCfd, LseServerCfd, LseServerCrypto, LseServerEquities, LseServerFutures,
+            LseServerFx, LseServerOptions,
         };
         use crate::subscription::trade::PublicTrades;
+        use rust_decimal::Decimal;
+        use rust_decimal_macros::dec;
+        use rustrade_instrument::instrument::{
+            kind::option::{OptionExercise, OptionKind},
+            market_data::kind::MarketDataOptionContract,
+        };
 
         /// Build a subscription for `Server` and resolve it to the symbol it would subscribe on.
         ///
@@ -1003,6 +1048,7 @@ mod tests {
                     Server::SYMBOL_SHAPE,
                     &AssetNameInternal::new(split.base.name().clone()),
                     &AssetNameInternal::new(split.quote.name().clone()),
+                    &MarketDataInstrumentKind::Spot,
                 );
 
                 assert_eq!(
@@ -1020,6 +1066,46 @@ mod tests {
             round_trips::<LseServerEquities>("AAPL");
             round_trips::<LseServerEquities>("BP.L");
             round_trips::<LseServerFutures>("ES.F");
+        }
+
+        fn option(kind: OptionKind, strike: Decimal) -> MarketDataInstrumentKind {
+            MarketDataInstrumentKind::Option(MarketDataOptionContract {
+                kind,
+                exercise: OptionExercise::American,
+                expiry: "2026-09-30T20:00:00Z".parse().unwrap(),
+                strike,
+            })
+        }
+
+        /// An option contract is spelled from the base asset as its root; the quote plays no part.
+        #[test]
+        fn an_option_contract_reconstructs_its_osi_symbol() {
+            assert_eq!(
+                market_of::<LseServerOptions>("spy", "usd", option(OptionKind::Call, dec!(700)))
+                    .as_ref(),
+                "SPY260930C00700000"
+            );
+            assert_eq!(
+                market_of::<LseServerOptions>("f", "usd", option(OptionKind::Put, dec!(2.67)))
+                    .as_ref(),
+                "F260930P00002670"
+            );
+        }
+
+        /// No OSI spelling exists for these, and `Identifier::id` cannot fail. What comes back must
+        /// be something the subscriber's OSI guard rejects, and must say why when it is quoted in
+        /// that rejection.
+        #[test]
+        fn an_instrument_with_no_osi_spelling_gets_a_symbol_the_guard_rejects() {
+            for kind in [
+                MarketDataInstrumentKind::Spot,
+                option(OptionKind::Call, dec!(700.1234)),
+            ] {
+                let market = market_of::<LseServerOptions>("spy", "usd", kind);
+
+                assert_eq!(osi::root(market.as_ref()), None, "{market}");
+                assert!(market.as_ref().contains("no OSI symbol"), "{market}");
+            }
         }
 
         /// An exchange-side name is the provider's own symbol, so it is used as given rather than

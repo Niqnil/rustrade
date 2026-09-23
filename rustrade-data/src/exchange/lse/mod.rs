@@ -125,6 +125,8 @@ pub mod options;
 /// London Strategic Edge symbology: datasets, underlying assets, quote currencies and slugs.
 pub mod market;
 
+pub(crate) mod osi;
+
 #[cfg(feature = "lse-parquet")]
 pub mod parquet;
 
@@ -155,8 +157,10 @@ pub mod vault;
 
 use self::{
     channel::LseChannel,
-    live::{LseSubscriber, subscribe_message},
-    market::{LseMarket, LseServer, LseSymbolShape},
+    live::{
+        LseSubscriber, subscribe_message, subscribe_options_message, subscribes_per_underlying,
+    },
+    market::{LseMarket, LseQuoteServer, LseServer, LseSymbolShape},
     stream::LseStream,
     subscription::LseSubResponse,
 };
@@ -165,11 +169,12 @@ use crate::{
     exchange::{Connector, ExchangeServer, ExchangeSub, StreamSelector},
     instrument::InstrumentData,
     subscriber::validator::WebSocketSubValidator,
-    subscription::{book::OrderBooksL1, trade::PublicTrades},
+    subscription::{Map, book::OrderBooksL1, trade::PublicTrades},
 };
 use rustrade_instrument::exchange::ExchangeId;
 use rustrade_integration::protocol::websocket::WsMessage;
 use serde::{Deserialize, Serialize};
+use smol_str::SmolStr;
 use std::{fmt::Debug, marker::PhantomData};
 use url::Url;
 
@@ -192,7 +197,7 @@ pub(crate) const PROVIDER_TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.f";
 /// The London Strategic Edge live market data connector.
 ///
 /// Use the per-dataset aliases — [`LseFx`], [`LseCrypto`], [`LseEquities`], [`LseFutures`],
-/// [`LseCfd`] — rather than naming the server type directly.
+/// [`LseCfd`], [`LseOptions`] — rather than naming the server type directly.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
 pub struct Lse<Server>(PhantomData<Server>);
 
@@ -211,6 +216,39 @@ pub type LseFutures = Lse<LseServerFutures>;
 /// Indices, commodities, interest rates, currency indices and volatility, all as CFDs:
 /// `SPX500/USD`, `XAU/USD`, `USB10Y/USD`, `DXY/USD`, `VIX/USD`.
 pub type LseCfd = Lse<LseServerCfd>;
+
+/// US equity and ETF option contracts, one [`Subscription`](crate::subscription::Subscription)
+/// per contract: `SPY260930C00700000`.
+///
+/// Serves [`PublicTrades`] only — every option tick is a genuine print, and none carries a quote.
+///
+/// # How a batch is subscribed
+/// The provider streams options **per underlying**, not per contract: one subscribe covers an
+/// underlying's whole chain, thousands of contracts, on a single one of the connection's
+/// subscription slots. Contracts sharing an underlying therefore collapse into one subscribe, and
+/// the connection holds as many underlyings as it has slots — 100 when last measured — however
+/// many contracts are registered.
+///
+/// # ⚠️ Only registered contracts are delivered; the rest of the chain is counted and dropped
+/// Every contract on a subscribed underlying ticks, whether registered or not. Prints for contracts
+/// nobody registered are dropped without an error each, and reported instead as a periodic
+/// per-underlying `info` count. The set of contracts that trade does not level off over a session —
+/// it was still growing after five minutes with no plateau in sight — so a contract that starts
+/// trading mid-session is missed unless it was registered up front. The provider's REST print tape
+/// in [`options`] carries every contract, greeks included.
+///
+/// # ⚠️ A contract the provider does not list is silent, not rejected
+/// The provider confirms an underlying without listing its contracts, so a registered contract that
+/// does not exist — a wrong expiry, a strike off the chain — is accepted and never ticks. An
+/// underlying with no options at all *is* rejected, by name.
+///
+/// # No resumption
+/// A reconnect does not replay the gap. Whether the provider honours a replay window on this
+/// channel has not been established, so none is requested, and a subscriber configured with
+/// [`LseSubscriber::with_resume`] resumes its other datasets but not this one.
+///
+/// Expiry and strike conventions are those of [`LseSymbolShape::OptionContract`].
+pub type LseOptions = Lse<LseServerOptions>;
 
 /// Spot FX server.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
@@ -231,6 +269,10 @@ pub struct LseServerFutures;
 /// CFD server — indices, commodities, interest rates, currency indices and volatility.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
 pub struct LseServerCfd;
+
+/// Option contract server.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
+pub struct LseServerOptions;
 
 macro_rules! impl_lse_server {
     ($server:ty, $id:expr, $shape:expr) => {
@@ -264,6 +306,18 @@ impl_lse_server!(
     LseSymbolShape::Bare
 );
 impl_lse_server!(LseServerCfd, ExchangeId::LseCfd, LseSymbolShape::Pair);
+impl_lse_server!(
+    LseServerOptions,
+    ExchangeId::LseOptions,
+    LseSymbolShape::OptionContract
+);
+
+// Every server but options: the options channel publishes no quote. See `LseQuoteServer`.
+impl LseQuoteServer for LseServerFx {}
+impl LseQuoteServer for LseServerCrypto {}
+impl LseQuoteServer for LseServerEquities {}
+impl LseQuoteServer for LseServerFutures {}
+impl LseQuoteServer for LseServerCfd {}
 
 impl<Server> Connector for Lse<Server>
 where
@@ -292,11 +346,59 @@ where
     /// payload's *shape*. They do differ in what they are given: this receives one entry per
     /// subscription, while the subscriber sends one per *distinct* symbol, because a repeated
     /// symbol is one slot and one confirmation on this provider.
+    ///
+    /// On [`LseOptions`] it sends one payload per distinct underlying, as the subscriber does. A
+    /// contract with no OSI symbol has no underlying to name and is left out; the live route
+    /// rejects the batch over it instead, which this infallible signature cannot.
     fn requests(exchange_subs: Vec<ExchangeSub<Self::Channel, Self::Market>>) -> Vec<WsMessage> {
-        exchange_subs
-            .iter()
-            .map(|exchange_sub| subscribe_message(exchange_sub.market.as_ref(), None))
+        if !subscribes_per_underlying(Self::ID) {
+            return exchange_subs
+                .iter()
+                .map(|exchange_sub| subscribe_message(exchange_sub.market.as_ref(), None))
+                .collect();
+        }
+
+        let mut underlyings = Vec::<&str>::new();
+        for exchange_sub in &exchange_subs {
+            if let Some(root) = osi::root(exchange_sub.market.as_ref())
+                && !underlyings.contains(&root)
+            {
+                underlyings.push(root);
+            }
+        }
+
+        underlyings
+            .into_iter()
+            .map(subscribe_options_message)
             .collect()
+    }
+
+    /// One confirmation per distinct symbol — or, on [`LseOptions`], per distinct underlying.
+    ///
+    /// The instrument map holds one entry per registered contract, but the provider confirms an
+    /// underlying once however many of its contracts are registered, so counting entries would
+    /// leave the validator waiting out its timeout for confirmations that never come.
+    fn expected_responses<InstrumentKey>(map: &Map<InstrumentKey>) -> usize {
+        if !subscribes_per_underlying(Self::ID) {
+            return map.0.len();
+        }
+
+        let mut underlyings = Vec::<SmolStr>::new();
+        for subscription_id in map.0.keys() {
+            // A subscription identifier is `channel|market`; the market is the contract symbol.
+            let root = subscription_id
+                .0
+                .split_once('|')
+                .and_then(|(_, market)| osi::root(market));
+
+            if let Some(root) = root
+                && !underlyings.iter().any(|underlying| underlying == root)
+            {
+                underlyings.push(SmolStr::new(root));
+            }
+        }
+
+        underlyings.len()
     }
 }
 
@@ -305,8 +407,9 @@ where
 // the transformer is instantiated with. Neither needs an initial snapshot: the feed is a tick
 // stream with no book to synchronise against.
 //
-// One blanket impl per kind covers all five servers, rather than five impls each. The servers
-// differ in venue and symbol shape, never in framing.
+// One blanket impl per kind covers every server, rather than an impl per server each. The servers
+// differ in venue and symbol shape, never in framing -- save that the options channel carries no
+// quote, which is why the L1 impl is bounded on `LseQuoteServer`.
 
 impl<Instrument, Server> StreamSelector<Instrument, PublicTrades> for Lse<Server>
 where
@@ -320,7 +423,7 @@ where
 impl<Instrument, Server> StreamSelector<Instrument, OrderBooksL1> for Lse<Server>
 where
     Instrument: InstrumentData,
-    Server: LseServer + Debug + Send + Sync,
+    Server: LseQuoteServer + Debug + Send + Sync,
 {
     type SnapFetcher = NoInitialSnapshots;
     type Stream = LseStream<Self, Instrument::Key, OrderBooksL1>;
@@ -363,6 +466,7 @@ where
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use crate::Identifier;
 
     /// The connector is hand-serialised rather than derived, so nothing else pins that the two
     /// halves agree — a `Subscription` carrying one would otherwise fail to round-trip through a
@@ -376,6 +480,70 @@ mod tests {
             serde_json::from_str::<LseCrypto>(&json).unwrap(),
             LseCrypto::default()
         );
+    }
+
+    fn map(markets: &[&str]) -> Map<u8> {
+        markets
+            .iter()
+            .zip(0_u8..)
+            .map(|(market, key)| (ExchangeSub::from((LseChannel::Tick, *market)).id(), key))
+            .collect()
+    }
+
+    /// The provider confirms an underlying once however many of its contracts are registered.
+    /// Counting contracts would leave the validator waiting out its timeout.
+    #[test]
+    fn options_expect_one_confirmation_per_underlying() {
+        let contracts = map(&[
+            "SPY260930C00700000",
+            "SPY260930P00650000",
+            "QQQ260930C00500000",
+        ]);
+
+        assert_eq!(LseOptions::expected_responses(&contracts), 2);
+    }
+
+    #[test]
+    fn other_datasets_expect_one_confirmation_per_symbol() {
+        let symbols = map(&["BTC/USD", "ETH/USD"]);
+        assert_eq!(LseCrypto::expected_responses(&symbols), 2);
+    }
+
+    #[test]
+    fn options_requests_name_each_underlying_once() {
+        let exchange_subs = [
+            "SPY260930C00700000",
+            "SPY260930P00650000",
+            "QQQ260930C00500000",
+        ]
+        .into_iter()
+        .map(|market| ExchangeSub::from((LseChannel::Tick, LseMarket(market.into()))))
+        .collect();
+
+        let payloads: Vec<serde_json::Value> = LseOptions::requests(exchange_subs)
+            .into_iter()
+            .map(|message| match message {
+                WsMessage::Text(text) => serde_json::from_str(text.as_str()).unwrap(),
+                other => panic!("expected a text payload, not {other:?}"),
+            })
+            .collect();
+
+        assert_eq!(
+            payloads,
+            [
+                serde_json::json!({"action": "subscribe_options", "underlying": "SPY"}),
+                serde_json::json!({"action": "subscribe_options", "underlying": "QQQ"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_options_server_spells_option_contracts() {
+        assert_eq!(
+            LseServerOptions::SYMBOL_SHAPE,
+            LseSymbolShape::OptionContract
+        );
+        assert_eq!(LseServerOptions::ID, ExchangeId::LseOptions);
     }
 
     /// Every dataset connector is a distinct type over one endpoint, so deserialising a config that

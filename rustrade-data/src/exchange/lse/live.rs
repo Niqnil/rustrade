@@ -2,6 +2,7 @@
 
 use super::{
     market::LseDataset,
+    osi,
     resume::{LseResumeKey, LseResumeState, epoch_seconds, subscription_id},
 };
 use crate::exchange::lse::transport::api_key_from_env;
@@ -231,9 +232,19 @@ impl Subscriber for LseSubscriber {
     /// partial recovery. Failing the whole batch before sending is the only outcome that does not
     /// leave the caller guessing which subscriptions survived.
     ///
+    /// # Option contracts subscribe per underlying
+    /// On [`LseOptions`](super::LseOptions) one subscribe covers an underlying's whole chain, so the
+    /// batch is reduced to its distinct underlyings: that is what is sent, what the cap counts, and
+    /// what the provider confirms. Every contract must spell an OSI symbol, checked before
+    /// connecting. The offered-symbol check does not apply: the handshake's list does not hold every
+    /// underlying that has options (index roots are absent from it), and an underlying with no
+    /// options is rejected by the provider **by name** rather than confirmed.
+    ///
     /// # Errors
     /// Returns [`SocketError::Subscribe`] if the key is rejected, the handshake times out, the
-    /// batch exceeds the connection's subscription cap, or any requested symbol is not offered.
+    /// batch exceeds the connection's subscription cap, any requested symbol is not offered, or —
+    /// on the options dataset — any contract has no OSI symbol or names an underlying with no
+    /// options.
     async fn subscribe<Exchange, Instrument, Kind>(
         &self,
         subscriptions: &[Subscription<Exchange, Instrument, Kind>],
@@ -251,6 +262,11 @@ impl Subscriber for LseSubscriber {
 
         let markets = requested_markets::<Exchange, Instrument, Kind>(subscriptions);
 
+        // Checked before connecting: a contract with no OSI symbol needs no socket to reject.
+        let underlyings = subscribes_per_underlying(exchange)
+            .then(|| option_underlyings(exchange, &markets))
+            .transpose()?;
+
         let mut websocket = connect(url).await?;
         let authenticated = authenticate(&mut websocket, &self.credentials).await?;
         debug!(
@@ -260,8 +276,15 @@ impl Subscriber for LseSubscriber {
             "authenticated to London Strategic Edge WebSocket",
         );
 
-        check_subscription_cap(exchange, &markets, authenticated.max_subscriptions)?;
-        check_symbols_are_offered(exchange, &markets, &authenticated)?;
+        match &underlyings {
+            Some(underlyings) => {
+                check_subscription_cap(exchange, underlyings, authenticated.max_subscriptions)?;
+            }
+            None => {
+                check_subscription_cap(exchange, &markets, authenticated.max_subscriptions)?;
+                check_symbols_are_offered(exchange, &markets, &authenticated)?;
+            }
+        }
 
         // Only the instrument map is taken from the standard mapper. The subscribe payloads are
         // built here instead, because this subscriber is where a per-symbol replay window can be
@@ -279,9 +302,22 @@ impl Subscriber for LseSubscriber {
             .first()
             .map(|subscription| subscription.kind.as_str());
 
-        for market in &markets {
-            let start = kind.and_then(|kind| self.resume_start(exchange, market, kind));
-            let message = subscribe_message(market, start);
+        // Option underlyings never carry a replay window -- see `LseOptions`.
+        let messages: Vec<WsMessage> = match &underlyings {
+            Some(underlyings) => underlyings
+                .iter()
+                .map(|underlying| subscribe_options_message(underlying))
+                .collect(),
+            None => markets
+                .iter()
+                .map(|market| {
+                    let start = kind.and_then(|kind| self.resume_start(exchange, market, kind));
+                    subscribe_message(market, start)
+                })
+                .collect(),
+        };
+
+        for message in messages {
             debug!(%exchange, payload = ?message, "sending London Strategic Edge subscription");
             websocket
                 .send(message)
@@ -325,6 +361,55 @@ pub(super) fn subscribe_message(symbol: &str, start: Option<DateTime<Utc>>) -> W
     WsMessage::text(payload.to_string())
 }
 
+/// Build the subscribe payload for every option contract on `underlying`.
+///
+/// Carries no replay window: whether the provider honours one on this channel is unestablished.
+pub(super) fn subscribe_options_message(underlying: &str) -> WsMessage {
+    WsMessage::text(json!({ "action": "subscribe_options", "underlying": underlying }).to_string())
+}
+
+/// Whether `exchange` subscribes per option underlying rather than per symbol.
+///
+/// The one place that decision is made. The subscriber, the confirmation count, the transformer and
+/// the stream all ask it, so they cannot disagree about which dataset fans out.
+pub(super) fn subscribes_per_underlying(exchange: ExchangeId) -> bool {
+    exchange == ExchangeId::LseOptions
+}
+
+/// The distinct underlyings a batch of option contracts subscribes to, in the order requested.
+///
+/// # Errors
+/// Returns [`SocketError::Subscribe`] naming every requested symbol that is not an OSI contract
+/// symbol — an instrument that is not an option, or whose strike OSI cannot carry.
+pub(super) fn option_underlyings(
+    exchange: ExchangeId,
+    markets: &[SmolStr],
+) -> Result<Vec<SmolStr>, SocketError> {
+    let mut underlyings = Vec::<SmolStr>::new();
+    let mut unspellable = Vec::new();
+
+    for market in markets {
+        match osi::root(market) {
+            Some(root) => {
+                if !underlyings.iter().any(|underlying| underlying == root) {
+                    underlyings.push(SmolStr::new(root));
+                }
+            }
+            None => unspellable.push(market.as_str()),
+        }
+    }
+
+    if !unspellable.is_empty() {
+        return Err(SocketError::Subscribe(format!(
+            "{exchange} subscribes option contracts by OSI symbol (root, YYMMDD, C or P, strike in \
+             thousandths as eight digits), and {unspellable:?} have none - each must be an option \
+             instrument whose strike has at most three decimal places and is below 100,000",
+        )));
+    }
+
+    Ok(underlyings)
+}
+
 /// The distinct symbols a batch will subscribe to, in the order they were requested.
 ///
 /// Two subscriptions naming one symbol are one slot and one confirmation, and the instrument map
@@ -356,6 +441,9 @@ where
 
 /// Reject a batch larger than the connection may hold.
 ///
+/// `markets` is what each subscribe names, and so what each slot holds: a distinct symbol, or on
+/// the options dataset a distinct underlying.
+///
 /// # Errors
 /// Returns [`SocketError::Subscribe`] if `markets` exceeds `max_subscriptions`.
 fn check_subscription_cap(
@@ -376,10 +464,16 @@ fn check_subscription_cap(
 
     let cap = usize::try_from(max).unwrap_or(usize::MAX);
     if markets.len() > cap {
+        let unit = if subscribes_per_underlying(exchange) {
+            "option underlyings"
+        } else {
+            "symbols"
+        };
+
         return Err(SocketError::Subscribe(format!(
-            "{} symbols requested on {exchange} but this connection holds at most {cap} - the \
-             provider's rejection does not name the symbols it refuses, so there is no partial \
-             subscription to recover and the batch is rejected before it is sent",
+            "{} {unit} requested on {exchange} but this connection holds at most {cap} - the \
+             provider's rejection does not name the subscriptions it refuses, so there is no \
+             partial subscription to recover and the batch is rejected before it is sent",
             markets.len(),
         )));
     }
@@ -824,6 +918,77 @@ mod tests {
             requested_markets(&subscriptions),
             markets(&["EUR/USD", "GBP/USD"])
         );
+    }
+
+    #[test]
+    fn an_options_subscribe_payload_names_the_underlying_and_nothing_else() {
+        let WsMessage::Text(payload) = subscribe_options_message("SPY") else {
+            panic!("expected a text payload");
+        };
+        let payload: serde_json::Value = serde_json::from_str(payload.as_str()).unwrap();
+
+        assert_eq!(
+            payload,
+            json!({"action": "subscribe_options", "underlying": "SPY"})
+        );
+    }
+
+    #[test]
+    fn only_the_options_dataset_subscribes_per_underlying() {
+        assert!(subscribes_per_underlying(ExchangeId::LseOptions));
+
+        for exchange in [
+            ExchangeId::LseFx,
+            ExchangeId::LseCrypto,
+            ExchangeId::LseEquities,
+            ExchangeId::LseFutures,
+            ExchangeId::LseCfd,
+        ] {
+            assert!(!subscribes_per_underlying(exchange), "{exchange}");
+        }
+    }
+
+    /// One subscribe covers a whole chain and is confirmed once, however often it is sent, so the
+    /// contracts of one underlying must collapse into a single subscription.
+    #[test]
+    fn contracts_sharing_an_underlying_collapse_into_one_subscription() {
+        let requested = markets(&[
+            "SPY260930C00700000",
+            "QQQ260930P00500000",
+            "SPY260930P00650000",
+            "SPY261016C00700000",
+        ]);
+
+        assert_eq!(
+            option_underlyings(ExchangeId::LseOptions, &requested).unwrap(),
+            markets(&["SPY", "QQQ"])
+        );
+    }
+
+    /// Checked before connecting, and every offender is named — not only the first.
+    #[test]
+    fn a_contract_with_no_osi_symbol_fails_the_batch_naming_it() {
+        let requested = markets(&["SPY260930C00700000", "SPY", "SPY (no OSI symbol for spot)"]);
+
+        let error = option_underlyings(ExchangeId::LseOptions, &requested)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(r#""SPY""#), "{error}");
+        assert!(error.contains("no OSI symbol for spot"), "{error}");
+        assert!(!error.contains("SPY260930C00700000"), "{error}");
+    }
+
+    /// On the options dataset a slot holds an underlying, so that is what an over-cap rejection
+    /// must count.
+    #[test]
+    fn an_over_cap_options_batch_is_reported_in_underlyings() {
+        let requested = markets(&["SPY", "QQQ", "AAPL"]);
+        let error = check_subscription_cap(ExchangeId::LseOptions, &requested, Some(2))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("3 option underlyings"), "{error}");
+        assert!(error.contains("at most 2"), "{error}");
     }
 
     #[test]
