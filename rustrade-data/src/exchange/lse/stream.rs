@@ -96,7 +96,7 @@ where
             Identifier<Exchange::Channel> + Identifier<Exchange::Market>,
     {
         let Subscribed {
-            websocket,
+            transport: websocket,
             map: instrument_map,
             buffered_websocket_events,
         } = subscriber.subscribe(subscriptions).await?;

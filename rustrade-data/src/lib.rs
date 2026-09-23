@@ -165,7 +165,7 @@ use rustrade_integration::{
     error::SocketError,
     protocol::{
         StreamParser,
-        websocket::{WsError, WsMessage, WsSink, WsStream},
+        websocket::{WebSocket, WsError, WsMessage, WsSink, WsStream},
     },
 };
 
@@ -220,8 +220,7 @@ pub mod books;
 /// [`futures_usd`](exchange::binance::futures::l2::BinanceFuturesUsdOrderBooksL2Transformer).
 pub mod transformer;
 
-/// Convenient type alias for an [`ExchangeStream`] utilizing a tungstenite
-/// [`WebSocket`](rustrade_integration::protocol::websocket::WebSocket).
+/// Convenient type alias for an [`ExchangeStream`] utilizing a tungstenite [`WebSocket`].
 pub type ExchangeWsStream<Parser, Transformer> = ExchangeStream<Parser, WsStream, Transformer>;
 
 /// Defines a generic identification type for the implementor.
@@ -274,6 +273,9 @@ impl<Exchange, Instrument, Kind, Transformer, Parser> MarketStream<Exchange, Ins
     for ExchangeWsStream<Parser, Transformer>
 where
     Exchange: Connector + Send + Sync,
+    // This initialisation splits and reads a socket of the stream's own, so it serves only a
+    // subscriber that hands one out; see `Subscriber::Transport`.
+    Exchange::Subscriber: Subscriber<Transport = WebSocket>,
     Instrument: InstrumentData,
     Kind: SubscriptionKind + Send + Sync,
     Transformer: ExchangeTransformer<Exchange, Instrument::Key, Kind> + Send,
@@ -291,7 +293,7 @@ where
     {
         // Connect & subscribe
         let Subscribed {
-            websocket,
+            transport: websocket,
             map: instrument_map,
             buffered_websocket_events,
         } = subscriber.subscribe(subscriptions).await?;

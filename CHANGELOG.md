@@ -208,6 +208,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING: `Subscriber` gains an associated `Transport` type, and `Subscribed` is generic over it**
+  (`rustrade-data`). `Subscribed<InstrumentKey, Transport = WebSocket>` names what a successful
+  subscribe hands the stream, and its `websocket` field is renamed `transport`. Every in-tree
+  subscriber sets `type Transport = WebSocket`, so behaviour is unchanged; the standard
+  `ExchangeWsStream` initialisation is bounded on `Subscriber<Transport = WebSocket>`. This is the
+  seam that lets a subscriber whose streams share one connection hand each stream a view of it
+  rather than a socket of its own, for providers that allow a key a single connection. To migrate a
+  custom `Subscriber`, add `type Transport = WebSocket;` and construct `Subscribed` with
+  `transport:` in place of `websocket:`.
+
 - **BREAKING: `Open::id` and `RequestCancel::id` now carry a `VenueOrderId`, which distinguishes an
   order the venue named from one it did not** (`rustrade-execution`). Both fields previously held a
   plain `OrderId`, and that field had come to mean two different things. A venue that accepts an

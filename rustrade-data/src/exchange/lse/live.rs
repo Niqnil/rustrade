@@ -206,6 +206,7 @@ impl LseSubscriber {
 
 impl Subscriber for LseSubscriber {
     type SubMapper = WebSocketSubMapper;
+    type Transport = WebSocket;
 
     /// Connect, authenticate, check the batch, then subscribe.
     ///
@@ -236,7 +237,7 @@ impl Subscriber for LseSubscriber {
     async fn subscribe<Exchange, Instrument, Kind>(
         &self,
         subscriptions: &[Subscription<Exchange, Instrument, Kind>],
-    ) -> Result<Subscribed<Instrument::Key>, SocketError>
+    ) -> Result<Subscribed<Instrument::Key, Self::Transport>, SocketError>
     where
         Exchange: Connector + Send + Sync,
         Kind: SubscriptionKind + Send + Sync,
@@ -297,7 +298,7 @@ impl Subscriber for LseSubscriber {
 
         debug!(%exchange, "London Strategic Edge subscriptions confirmed");
         Ok(Subscribed {
-            websocket,
+            transport: websocket,
             map,
             buffered_websocket_events,
         })

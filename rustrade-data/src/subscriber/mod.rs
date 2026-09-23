@@ -33,10 +33,18 @@ pub mod validator;
 pub trait Subscriber: Clone + Send + Sync {
     type SubMapper: SubscriptionMapper;
 
+    /// What a successful subscribe hands the stream to read from.
+    ///
+    /// A [`WebSocket`] of its own for almost every exchange, and the only transport the standard
+    /// [`MarketStream`](crate::MarketStream) initialisation accepts. A subscriber whose streams
+    /// share one connection instead hands out a per-stream view of it, and pairs with a
+    /// [`MarketStream`](crate::MarketStream) of its own that knows how to read that view.
+    type Transport;
+
     fn subscribe<Exchange, Instrument, Kind>(
         &self,
         subscriptions: &[Subscription<Exchange, Instrument, Kind>],
-    ) -> impl Future<Output = Result<Subscribed<Instrument::Key>, SocketError>> + Send
+    ) -> impl Future<Output = Result<Subscribed<Instrument::Key, Self::Transport>, SocketError>> + Send
     where
         Exchange: Connector + Send + Sync,
         Kind: SubscriptionKind + Send + Sync,
@@ -45,10 +53,16 @@ pub trait Subscriber: Clone + Send + Sync {
             Identifier<Exchange::Channel> + Identifier<Exchange::Market>;
 }
 
+/// The outcome of a successful [`Subscriber::subscribe`].
 #[derive(Debug)]
-pub struct Subscribed<InstrumentKey> {
-    pub websocket: WebSocket,
+pub struct Subscribed<InstrumentKey, Transport = WebSocket> {
+    /// The connection, or view of one, that the subscribed events arrive on.
+    pub transport: Transport,
+    /// Each confirmed subscription's identifier, mapped to its instrument key.
     pub map: Map<InstrumentKey>,
+    /// Frames that arrived during validation without being a confirmation, in arrival order —
+    /// typically the first events of an already-confirmed subscription. They are the stream's first
+    /// input and must be processed before anything read from `transport`.
     pub buffered_websocket_events: Vec<WsMessage>,
 }
 
@@ -62,11 +76,12 @@ pub struct WebSocketSubscriber;
 
 impl Subscriber for WebSocketSubscriber {
     type SubMapper = WebSocketSubMapper;
+    type Transport = WebSocket;
 
     async fn subscribe<Exchange, Instrument, Kind>(
         &self,
         subscriptions: &[Subscription<Exchange, Instrument, Kind>],
-    ) -> Result<Subscribed<Instrument::Key>, SocketError>
+    ) -> Result<Subscribed<Instrument::Key, Self::Transport>, SocketError>
     where
         Exchange: Connector + Send + Sync,
         Kind: SubscriptionKind + Send + Sync,
@@ -108,7 +123,7 @@ impl Subscriber for WebSocketSubscriber {
 
         debug!(%exchange, "successfully initialised WebSocket stream with confirmed Subscriptions");
         Ok(Subscribed {
-            websocket,
+            transport: websocket,
             map,
             buffered_websocket_events,
         })
