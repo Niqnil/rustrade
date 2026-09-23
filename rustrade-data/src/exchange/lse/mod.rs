@@ -242,6 +242,12 @@ pub type LseCfd = Lse<LseServerCfd>;
 /// does not exist — a wrong expiry, a strike off the chain — is accepted and never ticks. An
 /// underlying with no options at all *is* rejected, by name.
 ///
+/// # ⚠️ One connection per key
+/// Each dataset connector streams over its own connection, and the provider allows a key exactly
+/// one — its handshake says so, and a second is refused with `TOO_MANY_CONNECTIONS`. A stream
+/// subscribing options alongside another London Strategic Edge dataset therefore needs a second
+/// connection that a single key cannot open.
+///
 /// # No resumption
 /// A reconnect does not replay the gap. Whether the provider honours a replay window on this
 /// channel has not been established, so none is requested, and a subscriber configured with

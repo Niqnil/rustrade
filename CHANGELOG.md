@@ -58,6 +58,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ⚠️ Option data is provider data and may not be redistributed or committed as fixtures. See
   <https://londonstrategicedge.com/terms>.
 
+- **Live London Strategic Edge option prints over the WebSocket, with the `LseOptions` connector**
+  (`rustrade-data`, feature `lse`). Register option contracts as ordinary `PublicTrades`
+  subscriptions, one per contract. The connector spells each as the unpadded OSI symbol the
+  provider ticks under (`SPY260930C00700000`), reading the expiry as a UTC date. The provider
+  streams options per underlying, so contracts that share an underlying collapse into one
+  `subscribe_options`, and the connection's subscription cap (100 when measured) counts
+  underlyings, not contracts. Every option tick is a genuine print; none carries a quote, so
+  `PublicTrades` is the only kind.
+
+  **The whole chain arrives, and only registered contracts are delivered.** One subscribe streams
+  every contract on the underlying, around 45 prints a second on a busy one. Unregistered prints are
+  dropped and reported as a per-underlying `info` count every minute, rather than raised one error
+  at a time. The set of contracts that trade keeps growing through a session, so a contract that
+  starts trading mid-session is missed unless registered up front; the REST print tape carries them
+  all.
+
+  Guards run before anything is sent. A contract with no OSI spelling (not an option, or a strike
+  with more than three decimal places) fails the batch before a connection is opened. An underlying
+  with no options is rejected by the provider by name. A registered contract that does not exist is
+  confirmed and stays silent, because the provider does not list its contracts. Options do not
+  resume: whether the provider honours a replay window on this channel is unmeasured, so none is
+  requested.
+
+  The WebSocket canary now covers option contracts. Every contract on a slice of the provider's own
+  print tape must rebuild to its exact ticker, and the busiest must subscribe. In session, at least
+  one must print. Outside the session, which includes the weekly run, the print check reports
+  `CANARY_SKIP`. New example: `lse_options_stream`.
+
+  ⚠️ Live option prints are provider data and may not be redistributed. See
+  <https://londonstrategicedge.com/terms>.
+
 - **`OptionInstrumentMarketData`** (`rustrade`): an `InstrumentDataState` for option contracts that
   wraps `DefaultInstrumentMarketData` and holds the contract's most recent `OptionGreeks` with the
   instant they were stamped. Greeks never contribute a price; marking is delegated unchanged. Nothing
@@ -207,6 +238,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   <https://londonstrategicedge.com/terms>.
 
 ### Changed
+
+- **BREAKING: `LseTick::bid` and `LseTick::ask` are now `Option<Decimal>`** (`rustrade-data`,
+  feature `lse`). Option contracts tick on the same WebSocket frame and publish both sides as
+  `null` on every tick, which failed the decode outright. The L1 decoder treats a null side as
+  absent, as it already treated a zero one.
+
+- **BREAKING: London Strategic Edge `OrderBooksL1` streams require the new `LseQuoteServer` marker
+  trait, and `LseSymbolShape` gains an `OptionContract` variant** (`rustrade-data`, feature `lse`).
+  The five quoting datasets implement the trait. The options dataset does not, because it
+  publishes no quote, so an L1 subscription on it is a compile error rather than a stream of empty
+  books. A server type declared outside this crate must implement `LseQuoteServer` to keep serving
+  `OrderBooksL1`.
 
 - **BREAKING: connectivity state is read-only outside `rustrade`** (`ConnectivityStates`,
   `ConnectivityState`). `ConnectivityStates::update_from_account_reconnecting` is crate-private. So
