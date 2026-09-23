@@ -92,7 +92,11 @@ async fn main() {
             );
         }
     }
-    info!(total, contracts = per_contract.len(), "SPY print tape complete");
+    info!(
+        total,
+        contracts = per_contract.len(),
+        "SPY print tape complete"
+    );
 
     let Some((ticker, count)) = per_contract.into_iter().max_by_key(|(_, count)| *count) else {
         info!("no prints in the window - a US market holiday?");

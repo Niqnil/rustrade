@@ -184,7 +184,8 @@ impl LseVaultClient {
     /// [`max_rows_per_request`](QuotaStatus::max_rows_per_request); raise it only against a key whose
     /// [`usage`](Self::usage) reports a higher one. Requesting **more** than your key allows is not
     /// an error — the vault caps the page silently, and pagination handles a short page — so an
-    /// over-large value costs nothing but degrades into more, smaller pages. Requesting fewer than
+    /// over-large value costs nothing but degrades into more, smaller pages. The option print walk,
+    /// which cannot page past a short page, bounds this by the cap [`usage`](Self::usage) reports. Requesting fewer than
     /// the cap is a legitimate way to bound per-page memory or response latency.
     ///
     /// # Why `NonZeroU32`, where [`with_concurrency`](Self::with_concurrency) clamps

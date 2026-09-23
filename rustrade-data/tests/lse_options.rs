@@ -29,6 +29,22 @@ fn client(server: &MockServer) -> LseVaultClient {
         .with_pace(Duration::ZERO)
 }
 
+/// A mock server whose `/vault/usage` reports `max_rows` as the provider's row cap. The flow walk
+/// reads it once per fetch to learn what a full -- and therefore possibly truncated -- page is.
+async fn server_with_usage(max_rows: u32) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/vault/usage"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            r#"{{"bytes_used_month":0,"bytes_cap_month":1,"bytes_used_week":0,"bytes_cap_week":1,
+                "exports_this_hour":0,"exports_cap_hour":5,"historical_data_months":-1,
+                "calls_per_minute":200,"max_rows_per_request":{max_rows},"vault_concurrency":2}}"#
+        )))
+        .mount(&server)
+        .await;
+    server
+}
+
 fn utc(raw: &str) -> DateTime<Utc> {
     raw.parse().unwrap()
 }
@@ -73,7 +89,7 @@ fn ids(results: Vec<Result<LseOptionPrint, LseError>>) -> Vec<u64> {
 
 #[tokio::test]
 async fn walks_forward_and_yields_each_window_oldest_first() {
-    let server = MockServer::start().await;
+    let server = server_with_usage(5000).await;
 
     // The provider serves newest-first within a window.
     mount_window(
@@ -109,7 +125,7 @@ async fn walks_forward_and_yields_each_window_oldest_first() {
 
 #[tokio::test]
 async fn a_full_window_is_halved_and_reread_rather_than_emitted_truncated() {
-    let server = MockServer::start().await;
+    let server = server_with_usage(5000).await;
 
     // At a page limit of 4, four rows means the window may have been cut: the cap drops the OLDEST
     // rows, so none of this page may be yielded.
@@ -161,7 +177,7 @@ async fn a_full_window_is_halved_and_reread_rather_than_emitted_truncated() {
 
 #[tokio::test]
 async fn an_odd_span_is_halved_in_whole_seconds() {
-    let server = MockServer::start().await;
+    let server = server_with_usage(5000).await;
 
     // Found against the live API: halving five seconds exactly gives 2.5, and the next window then
     // starts mid-second -- a bound the endpoint cannot express.
@@ -210,8 +226,88 @@ async fn an_odd_span_is_halved_in_whole_seconds() {
 }
 
 #[tokio::test]
+async fn a_full_page_is_measured_against_the_reported_cap_not_the_page_limit() {
+    // The client asks for 5,000 rows, but the provider reports -- and enforces -- two. Two rows
+    // back is therefore a full page, possibly truncated, and must be halved rather than emitted.
+    let server = server_with_usage(2).await;
+
+    Mock::given(method("GET"))
+        .and(path("/vault/options/flow"))
+        .and(query_param("start", "2024-01-02 15:00:00"))
+        .and(query_param("end", "2024-01-02 15:00:04"))
+        // The request asks only for what a page can hold.
+        .and(query_param("limit", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "[{},{}]",
+            print_row(3, "2024-01-02 15:00:03.070000", "TEST"),
+            print_row(2, "2024-01-02 15:00:02.070000", "TEST"),
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_window(
+        &server,
+        "2024-01-02 15:00:00",
+        "2024-01-02 15:00:02",
+        &[print_row(1, "2024-01-02 15:00:01.070000", "TEST")],
+    )
+    .await;
+    mount_window(
+        &server,
+        "2024-01-02 15:00:02",
+        "2024-01-02 15:00:04",
+        &[
+            print_row(3, "2024-01-02 15:00:03.070000", "TEST"),
+            print_row(2, "2024-01-02 15:00:02.070000", "TEST"),
+        ],
+    )
+    .await;
+    // That window is full again, so it too is halved.
+    mount_window(
+        &server,
+        "2024-01-02 15:00:02",
+        "2024-01-02 15:00:03",
+        &[print_row(2, "2024-01-02 15:00:02.070000", "TEST")],
+    )
+    .await;
+    mount_window(
+        &server,
+        "2024-01-02 15:00:03",
+        "2024-01-02 15:00:04",
+        &[print_row(3, "2024-01-02 15:00:03.070000", "TEST")],
+    )
+    .await;
+
+    let results = collect(
+        &client(&server),
+        Some("TEST"),
+        "2024-01-02T15:00:00Z",
+        "2024-01-02T15:00:04Z",
+    )
+    .await;
+
+    assert_eq!(ids(results), vec![1, 2, 3]);
+}
+
+#[tokio::test]
+async fn a_reported_cap_of_zero_is_an_error_not_an_endless_walk() {
+    let server = server_with_usage(0).await;
+
+    let results = collect(
+        &client(&server),
+        Some("TEST"),
+        "2024-01-02T15:00:00Z",
+        "2024-01-02T15:01:00Z",
+    )
+    .await;
+
+    assert_eq!(results.len(), 1);
+    assert!(matches!(results[0], Err(LseError::Deserialize { .. })));
+}
+
+#[tokio::test]
 async fn a_sparse_window_lets_the_next_one_grow() {
-    let server = MockServer::start().await;
+    let server = server_with_usage(5000).await;
 
     mount_window(&server, "2024-01-02 15:00:00", "2024-01-02 15:01:00", &[]).await;
     // Doubled from sixty seconds after an empty window.
@@ -238,7 +334,7 @@ async fn a_sparse_window_lets_the_next_one_grow() {
 
 #[tokio::test]
 async fn a_saturated_second_is_a_typed_error_not_a_short_tape() {
-    let server = MockServer::start().await;
+    let server = server_with_usage(5000).await;
 
     mount_window(
         &server,
@@ -269,7 +365,7 @@ async fn a_saturated_second_is_a_typed_error_not_a_short_tape() {
 
 #[tokio::test]
 async fn sub_second_bounds_are_widened_to_whole_seconds_and_trimmed_back() {
-    let server = MockServer::start().await;
+    let server = server_with_usage(5000).await;
 
     mount_window(
         &server,
@@ -318,7 +414,7 @@ async fn a_range_ending_inside_the_settle_margin_is_refused_without_a_request() 
 
 #[tokio::test]
 async fn an_inverted_range_is_invalid_input() {
-    let server = MockServer::start().await;
+    let server = server_with_usage(5000).await;
 
     let results = collect(
         &client(&server),
@@ -333,7 +429,7 @@ async fn an_inverted_range_is_invalid_input() {
 
 #[tokio::test]
 async fn a_row_outside_its_window_fails_the_window_before_any_of_it_is_yielded() {
-    let server = MockServer::start().await;
+    let server = server_with_usage(5000).await;
 
     mount_window(
         &server,
@@ -365,7 +461,7 @@ async fn a_row_outside_its_window_fails_the_window_before_any_of_it_is_yielded()
 
 #[tokio::test]
 async fn a_row_for_another_underlying_is_rejected_but_case_is_not_a_mismatch() {
-    let server = MockServer::start().await;
+    let server = server_with_usage(5000).await;
 
     mount_window(
         &server,
@@ -395,7 +491,7 @@ async fn a_row_for_another_underlying_is_rejected_but_case_is_not_a_mismatch() {
 
 #[tokio::test]
 async fn no_underlying_sends_no_underlying_filter() {
-    let server = MockServer::start().await;
+    let server = server_with_usage(5000).await;
 
     Mock::given(method("GET"))
         .and(path("/vault/options/flow"))
@@ -422,7 +518,7 @@ async fn no_underlying_sends_no_underlying_filter() {
 
 #[tokio::test]
 async fn a_print_decodes_its_contract_and_greeks() {
-    let server = MockServer::start().await;
+    let server = server_with_usage(5000).await;
 
     mount_window(
         &server,
@@ -465,7 +561,7 @@ fn candle_row(minute: &str) -> String {
 
 #[tokio::test]
 async fn option_candles_page_on_the_shared_vault_contract_keyed_by_ticker() {
-    let server = MockServer::start().await;
+    let server = server_with_usage(5000).await;
 
     // The lower bound widens one minute so the bar closing exactly on `start` is included, and the
     // exclusive upper bound sits one second past the last bar's open -- the vault candle contract.

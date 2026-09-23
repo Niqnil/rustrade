@@ -22,6 +22,11 @@
 //!   which forces the walk to halve repeatedly, must return exactly the prints one page returns.
 //!   That is the property the walk's correctness rests on — that a full page means a truncated one,
 //!   and that narrowing the window recovers what was cut.
+//! - **The reported row cap is the enforced one**: a whole-tape minute requested with a limit above
+//!   the `max_rows_per_request` that `usage` reports must come back with exactly that many rows.
+//!   The walk learns what a full page is from that figure, so were the endpoint to enforce a lower
+//!   cap than it reports, truncated windows would read as complete — this is the check that makes
+//!   such a divergence visible.
 //! - **Greeks arrive with prints** — at least one print carries one. A tape that silently stopped
 //!   carrying them would otherwise decode cleanly to all-`None`.
 //! - **Candles exist for a contract that printed**, carrying a print count.
@@ -211,6 +216,53 @@ async fn the_adaptive_walk_recovers_exactly_what_one_page_returns() {
     assert_eq!(
         walked_ids, whole_ids,
         "the adaptive walk did not reproduce the single-page read"
+    );
+}
+
+#[tokio::test]
+#[ignore = "spends the shared provider allowance; run on demand"]
+#[serial]
+async fn the_reported_row_cap_is_the_one_the_print_tape_enforces() {
+    let Some(client) = client() else { return };
+    let (start, _) = recent_session(&client).await;
+    let reported = client.usage().await.expect("usage").max_rows_per_request;
+
+    // Raw, because the fetch deliberately never asks for more than the reported cap. Every
+    // underlying for a whole minute of the session is far more than one page.
+    let key = std::env::var(KEY_ENV).expect("key checked above");
+    let format = "%Y-%m-%d %H:%M:%S";
+    let rows: Vec<serde_json::Value> = reqwest::Client::new()
+        .get("https://api.londonstrategicedge.com/vault/options/flow")
+        .header("x-api-key", key)
+        // The provider's edge rejects a request carrying no user agent.
+        .header("user-agent", "rustrade-data-canary")
+        .query(&[
+            ("start", start.format(format).to_string()),
+            (
+                "end",
+                (start + Duration::minutes(1)).format(format).to_string(),
+            ),
+            ("limit", (reported * 2).to_string()),
+        ])
+        .send()
+        .await
+        .expect("raw flow request")
+        .error_for_status()
+        .expect("raw flow status")
+        .json()
+        .await
+        .expect("raw flow body");
+
+    println!(
+        "reported cap {reported}; asked for {}, received {}",
+        reported * 2,
+        rows.len()
+    );
+    assert_eq!(
+        rows.len(),
+        usize::try_from(reported).unwrap(),
+        "the print tape enforces a different row cap than usage reports; the flow walk's \
+         truncation check rests on them agreeing"
     );
 }
 

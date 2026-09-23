@@ -435,6 +435,17 @@ impl LseVaultClient {
     /// emitted oldest-first, so memory holds at most one page. The extra requests fall only on
     /// windows that hit the cap.
     ///
+    /// A full page is the only sign of truncation, so the fetch first reads the provider's own
+    /// [`max_rows_per_request`](super::quota::QuotaStatus::max_rows_per_request) from
+    /// [`usage`](Self::usage) — one extra request per fetch — and treats the smaller of that and
+    /// [`with_page_limit`](Self::with_page_limit) as a full page. A page limit set above the
+    /// provider's cap therefore cannot hide a truncated window.
+    ///
+    /// # Known limitation
+    /// The walk trusts the reported cap to be the one `/options/flow` enforces. They agreed when
+    /// measured, and the live options canary asserts they still do; were the provider to enforce a
+    /// lower cap than it reports, a truncated window would read as complete.
+    ///
     /// # Arguments
     /// * `underlying` - Restrict to one underlying (case-insensitive), or `None` for every
     ///   underlying the provider carries. The endpoint cannot filter by contract — it silently
@@ -455,7 +466,7 @@ impl LseVaultClient {
     ///   print's time. Prints sharing that time are then yielded again; de-duplicate on
     ///   [`id`](LseOptionPrint::id).
     /// - Otherwise [`LseError::Api`] / [`Http`](LseError::Http) /
-    ///   [`Deserialize`](LseError::Deserialize).
+    ///   [`Deserialize`](LseError::Deserialize) — the last also when the reported row cap is zero.
     #[must_use = "fetch_option_flow returns a lazy Stream that does nothing unless polled"]
     pub fn fetch_option_flow<'a>(
         &'a self,
@@ -482,7 +493,23 @@ impl LseVaultClient {
                 })?;
             }
 
-            let cap = usize::try_from(self.page_limit().get()).unwrap_or(usize::MAX);
+            // A full page is the only truncation signal, so the walk must know the size a full page
+            // has. The provider caps silently, and `page_limit` is only what this client ASKS for: a
+            // caller may raise it past the cap, and the provider may lower the cap under the
+            // default. Either way a truncated window would come back shorter than `page_limit`,
+            // read as complete, and silently lose its oldest prints. The provider's own figure is
+            // read once per fetch -- it is a static request-shaping limit, not a running total --
+            // and the smaller of the two is what a full page means here.
+            let reported = self.usage().await?.max_rows_per_request;
+            if reported == 0 {
+                Err(LseError::Deserialize {
+                    message: "usage reports max_rows_per_request = 0, which leaves no page size a \
+                              truncated option-flow window could be recognised by"
+                        .to_owned(),
+                })?;
+            }
+            let limit = self.page_limit().get().min(reported);
+            let cap = usize::try_from(limit).unwrap_or(usize::MAX);
             let range_end = ceil_to_second(end);
             let mut cursor = floor_to_second(start);
             let mut window = INITIAL_FLOW_WINDOW;
@@ -495,7 +522,7 @@ impl LseVaultClient {
                 let mut query = vec![
                     ("start", cursor.format(WINDOW_FORMAT).to_string()),
                     ("end", window_end.format(WINDOW_FORMAT).to_string()),
-                    ("limit", self.page_limit().to_string()),
+                    ("limit", limit.to_string()),
                 ];
                 if let Some(underlying) = underlying {
                     query.push(("underlying", underlying.to_owned()));

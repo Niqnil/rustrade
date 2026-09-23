@@ -26,8 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fetch walks forward in adaptive windows — a full page is treated as a truncated one, halved and
   re-read; a sparse one lets the next window grow — and emits each window in order, holding at most
   one page in memory. A single second too dense for one page is a typed
-  `LseError::OptionFlowWindowSaturated` rather than a short tape. The live canary checks that the
-  walk, forced to halve repeatedly, reproduces a single-page read print for print.
+  `LseError::OptionFlowWindowSaturated` rather than a short tape. Because a full page is the only
+  sign of truncation, each fetch first reads the provider's own `max_rows_per_request` from
+  `usage()` and treats the smaller of that and `with_page_limit` as a full page — so a page limit
+  raised past the provider's cap cannot hide a truncated window. The live canary checks that the
+  walk, forced to halve repeatedly, reproduces a single-page read print for print, and that the cap
+  `usage()` reports is the one `/options/flow` actually enforces.
 
   **Recent data is refused, not returned short.** The provider's ingestion lag is variable and
   episodic: a closed window was measured returning zero rows thirty seconds after closing, and
