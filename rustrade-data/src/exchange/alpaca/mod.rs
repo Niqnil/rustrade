@@ -347,11 +347,12 @@ impl AlpacaSubscriber {
 
 impl crate::subscriber::Subscriber for AlpacaSubscriber {
     type SubMapper = crate::subscriber::mapper::WebSocketSubMapper;
+    type Transport = rustrade_integration::protocol::websocket::WebSocket;
 
     async fn subscribe<Exchange, Instrument, Kind>(
         &self,
         subscriptions: &[crate::subscription::Subscription<Exchange, Instrument, Kind>],
-    ) -> Result<crate::subscriber::Subscribed<Instrument::Key>, SocketError>
+    ) -> Result<crate::subscriber::Subscribed<Instrument::Key, Self::Transport>, SocketError>
     where
         Exchange: Connector + Send + Sync,
         Kind: crate::subscription::SubscriptionKind + Send + Sync,
@@ -391,7 +392,7 @@ impl crate::subscriber::Subscriber for AlpacaSubscriber {
 
         debug!(%exchange, "Alpaca subscriptions confirmed");
         Ok(crate::subscriber::Subscribed {
-            websocket,
+            transport: websocket,
             map,
             buffered_websocket_events,
         })

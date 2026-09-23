@@ -70,9 +70,15 @@ where
     }
 
     /// Add a collection of [`Subscription`]s to the [`StreamBuilder`] that will be actioned on
-    /// a distinct [`WebSocket`](rustrade_integration::protocol::websocket::WebSocket) connection.
+    /// a connection the `subscriber` provides.
     ///
-    /// The `subscriber` handles the WebSocket connection and authentication.
+    /// For almost every exchange that is a distinct
+    /// [`WebSocket`](rustrade_integration::protocol::websocket::WebSocket) per call. A subscriber
+    /// whose clones share one connection — for a provider that allows a key a single connection —
+    /// instead serves each call over a view of it; see
+    /// [`Subscriber::Transport`](crate::subscriber::Subscriber::Transport).
+    ///
+    /// The `subscriber` handles the connection and authentication.
     /// For unauthenticated exchanges, use [`WebSocketSubscriber`](crate::subscriber::WebSocketSubscriber).
     /// For authenticated exchanges like Alpaca, use the exchange-specific subscriber with credentials.
     ///
