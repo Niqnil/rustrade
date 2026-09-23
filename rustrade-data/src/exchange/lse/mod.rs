@@ -181,10 +181,19 @@ use url::Url;
 /// The WebSocket endpoint.
 ///
 /// One host serves every dataset. The per-dataset connector split below is about provenance in
-/// `MarketEvent.exchange` and per-dataset support declarations, not about distinct endpoints — so
-/// subscribing across datasets opens several connections to this one host. The provider served at
-/// least eight concurrent authenticated connections on one key when measured; the binding
-/// constraint is the per-connection subscription cap, not the connection count.
+/// `MarketEvent.exchange` and per-dataset support declarations, not about distinct endpoints.
+///
+/// # ⚠️ One connection per key
+/// A free key — the `registered` tier, the only one measured — holds exactly one concurrent
+/// connection: its handshake reports `max_connections: 1`, and a second is refused with
+/// `TOO_MANY_CONNECTIONS`. Each batch of
+/// subscriptions streams over a connection of its own, so a key can serve **one** batch at a time:
+/// one dataset, one subscription kind, one `subscribe` call. Another dataset, or
+/// [`OrderBooksL1`] alongside [`PublicTrades`] on the same symbols, needs a second connection the
+/// key cannot open.
+///
+/// That one connection holds 100 subscriptions when last measured (the handshake reports the live
+/// figure): a symbol per slot, or on [`LseOptions`] an underlying per slot.
 pub const WEBSOCKET_URL: &str = "wss://data-ws.londonstrategicedge.com";
 
 /// Format of every naive timestamp the provider serves over REST.
@@ -243,10 +252,8 @@ pub type LseCfd = Lse<LseServerCfd>;
 /// underlying with no options at all *is* rejected, by name.
 ///
 /// # ⚠️ One connection per key
-/// Each dataset connector streams over its own connection, and the provider allows a key exactly
-/// one — its handshake says so, and a second is refused with `TOO_MANY_CONNECTIONS`. A stream
-/// subscribing options alongside another London Strategic Edge dataset therefore needs a second
-/// connection that a single key cannot open.
+/// A key holds one connection, and this dataset's batch needs one of its own, so options cannot
+/// stream alongside another London Strategic Edge dataset on the same key. See [`WEBSOCKET_URL`].
 ///
 /// # No resumption
 /// A reconnect does not replay the gap. Whether the provider honours a replay window on this
