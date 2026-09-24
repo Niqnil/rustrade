@@ -46,7 +46,19 @@ impl ConnectivityStates {
         &mut self,
         exchange: &ExchangeId,
     ) -> Result<(), UntrackedExchange> {
-        let Some(state) = self.exchanges.get_mut(exchange) else {
+        self.update_from_account_reconnecting_indexed(exchange)
+            .map(drop)
+    }
+
+    /// [`Self::update_from_account_reconnecting`], returning the [`ExchangeIndex`] the exchange
+    /// resolved to, for a caller with more to update on that exchange. The index is the entry's
+    /// position in [`Self::exchanges`], which is built in `ExchangeIndex` order, as
+    /// [`Self::connectivity_index_mut`] already relies on.
+    pub(crate) fn update_from_account_reconnecting_indexed(
+        &mut self,
+        exchange: &ExchangeId,
+    ) -> Result<ExchangeIndex, UntrackedExchange> {
+        let Some((index, _, state)) = self.exchanges.get_full_mut(exchange) else {
             // `warn!` here, unlike the `debug!` on the market *event* path: a disconnect notice
             // arrives once per disconnect, so there is no volume to bound — and the routine,
             // tracked-venue case two lines below logs at this same level. Logging the anomaly more
@@ -83,7 +95,7 @@ impl ConnectivityStates {
 
         self.re_derive_global();
 
-        Ok(())
+        Ok(ExchangeIndex(index))
     }
 
     /// Updates from an exchange AccountStream event, setting the `ConnectivityState` account

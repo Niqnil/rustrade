@@ -467,6 +467,7 @@ pub(crate) mod fixtures {
                 instruments: vec![InstrumentAccountSnapshot {
                     instrument: instrument_name(),
                     orders: vec![order],
+                    orders_complete: true,
                     position: None,
                     isolated: None,
                 }],

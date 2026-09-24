@@ -929,6 +929,10 @@ impl SimulatedVenue {
             .map(|(instrument, orders)| InstrumentAccountSnapshot {
                 instrument,
                 orders: orders.into_iter().collect(),
+                // Read from the venue's own book, so every open order is here under the id it was
+                // placed with. Cancelled and expired orders are listed too, which only adds to what
+                // a consumer can see.
+                orders_complete: true,
                 position: None,
                 isolated: None,
             })
@@ -3169,6 +3173,7 @@ mod tests {
         config.initial_state.instruments = vec![InstrumentAccountSnapshot {
             instrument: instrument_name(),
             orders: CIDS.into_iter().map(resting).collect(),
+            orders_complete: true,
             position: None,
             isolated: None,
         }];

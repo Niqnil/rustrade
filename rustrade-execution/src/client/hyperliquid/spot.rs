@@ -37,9 +37,9 @@
 //! - UUID requirement: Trigger orders MUST use [`crate::order::id::ClientOrderId::uuid()`]
 
 use super::common::{
-    CancelOnDropStream, cid_to_cloid, instrument_to_spot_coin, is_spot_coin, map_tif,
-    millis_to_datetime, parse_decimal, parse_side, round_to_5_sig_figs, spot_coin_to_instrument,
-    user_fills,
+    CancelOnDropStream, HYPERLIQUID_OPEN_ORDERS_COMPLETE, cid_to_cloid, instrument_to_spot_coin,
+    is_spot_coin, map_tif, millis_to_datetime, parse_decimal, parse_side, round_to_5_sig_figs,
+    spot_coin_to_instrument, user_fills,
 };
 use super::config::HyperliquidConfig;
 use super::error::{map_order_error, map_sdk_error};
@@ -311,6 +311,7 @@ impl ExecutionClient for HyperliquidSpotClient {
             .map(|(instrument, orders)| InstrumentAccountSnapshot {
                 instrument,
                 orders,
+                orders_complete: HYPERLIQUID_OPEN_ORDERS_COMPLETE,
                 position: None, // Spot has no positions
                 isolated: None,
             })

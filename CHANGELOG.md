@@ -208,6 +208,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING: `InstrumentAccountSnapshot` gains `orders_complete`, a client's statement that its
+  `orders` list is every order open at the venue for that instrument** (`rustrade-execution`). A
+  snapshot's list could previously miss an open order without saying so: Alpaca drops a notional
+  order on conversion, IBKR's list is always empty, and Hyperliquid reports each order under its
+  venue `oid` rather than the id it was placed with. So nothing could read an order's absence as
+  meaning it was gone. `orders_complete: true` now states that it can, which the engine relies on
+  to retire vanished orders (see Fixed). The field is `#[serde(default)]` false, the answer that
+  claims nothing, and `ExecutionClient::account_snapshot` now documents what a client must
+  guarantee before setting it. Binance Spot and Margin set it per symbol, only when every
+  `openOrders` row converted under its own `clientOrderId`; the mock venue sets it always. Alpaca,
+  Hyperliquid and IBKR set it `false` until the gaps above are closed (#368, #369, #371). To migrate, pass the new
+  argument to `InstrumentAccountSnapshot::new` after `orders`, or add the field to a struct literal;
+  `false` keeps the previous behaviour.
+
+  `InstrumentState` gains `orders_open_at_resync` (`#[serde(default)]`), and
+  `EngineState::update_from_account_reconnecting` now handles an account stream's reconnect notice.
+  The engine and the audit replica both call it in place of
+  `ConnectivityStates::update_from_account_reconnecting`, which it wraps. A consumer that drives
+  `EngineState` directly should do the same.
+
 - **BREAKING: `Subscriber` gains an associated `Transport: Send` type, and `Subscribed` is generic
   over it** (`rustrade-data`). `Subscribed<InstrumentKey, Transport = WebSocket>` names what a successful
   subscribe hands the stream, and its `websocket` field is renamed `transport`. Every in-tree
@@ -309,6 +329,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drift between the two surfaces. The messages themselves are unchanged.
 
 ### Fixed
+
+- **The engine retires an order that a complete account snapshot no longer lists** (`rustrade`).
+  A snapshot applied only the orders it listed, and `ExecutionManager` re-reads one on every
+  account-stream reconnect. So an order that filled, was cancelled or expired while the stream was
+  down stayed active in `Orders` indefinitely, and a strategy could go on treating it as working
+  liquidity. The snapshot a reconnect produces now retires each tracked `Open` order that its
+  instrument's list leaves out, when the client declares that list complete, and logs each
+  retirement at `warn`. Absence cannot say how an order ended, so the order's fill is left to the
+  fill path, and a late fill still routes to its position.
+
+  Only an order that was already `Open` when the reconnect began is eligible. The venue is re-read
+  while order requests are still being answered, so an order accepted just after the read can
+  reach the engine as `Open` before the snapshot that cannot list it; the engine records which
+  orders were `Open` at the reconnect notice and leaves every other order alone. An order in flight
+  is never retired, since its request's answer settles it, and neither is anything in a snapshot
+  that does not declare its list complete, including the one that starts a run. An order is retired
+  only when its venue order id proves it is the order recorded, so a client id reused for a new
+  order before the snapshot arrives keeps the new order, and so does an order the venue never
+  assigned an id. Each order kept that way is logged at `warn` too, since it may be gone. (#364)
 
 - **A Binance fill recovered after a disconnect now advances its order** (`rustrade-execution`,
   feature `binance`; Spot and Margin). Recovery reads missed fills from REST `myTrades`, which

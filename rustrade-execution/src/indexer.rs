@@ -104,6 +104,7 @@ impl AccountEventIndexer {
                 let InstrumentAccountSnapshot {
                     instrument,
                     orders,
+                    orders_complete,
                     position,
                     isolated,
                 } = snapshot;
@@ -125,6 +126,7 @@ impl AccountEventIndexer {
                 Ok(InstrumentAccountSnapshot {
                     instrument,
                     orders,
+                    orders_complete,
                     position,
                     isolated,
                 })

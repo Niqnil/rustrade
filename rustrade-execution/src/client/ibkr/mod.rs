@@ -1181,6 +1181,8 @@ impl ExecutionClient for IbkrClient {
                 snapshots.push(InstrumentAccountSnapshot {
                     instrument,
                     orders: Vec::new(),
+                    // Nothing is read, so absence says nothing: see the limitation above and #371.
+                    orders_complete: false,
                     position: None,
                     isolated: None,
                 });

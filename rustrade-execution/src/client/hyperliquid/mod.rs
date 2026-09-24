@@ -112,8 +112,9 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use common::{
-    CancelOnDropStream, cid_to_cloid, instrument_to_perp_coin, map_tif, millis_to_datetime,
-    parse_decimal, parse_side, perp_coin_to_instrument, round_to_5_sig_figs, user_fills,
+    CancelOnDropStream, HYPERLIQUID_OPEN_ORDERS_COMPLETE, cid_to_cloid, instrument_to_perp_coin,
+    map_tif, millis_to_datetime, parse_decimal, parse_side, perp_coin_to_instrument,
+    round_to_5_sig_figs, user_fills,
 };
 pub use config::{HyperliquidConfig, HyperliquidConfigError};
 use error::{map_order_error, map_sdk_error};
@@ -423,6 +424,7 @@ impl ExecutionClient for HyperliquidClient {
             instrument_snapshots.push(InstrumentAccountSnapshot {
                 instrument,
                 orders,
+                orders_complete: HYPERLIQUID_OPEN_ORDERS_COMPLETE,
                 position,
                 isolated: None,
             });
@@ -433,6 +435,7 @@ impl ExecutionClient for HyperliquidClient {
             instrument_snapshots.push(InstrumentAccountSnapshot {
                 instrument,
                 orders,
+                orders_complete: HYPERLIQUID_OPEN_ORDERS_COMPLETE,
                 position: None,
                 isolated: None,
             });
