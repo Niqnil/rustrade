@@ -183,16 +183,15 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
         &mut self,
         exchange: &ExchangeId,
     ) -> Result<(), UntrackedExchange> {
-        self.connectivity
-            .update_from_account_reconnecting(exchange)?;
+        let index = self
+            .connectivity
+            .update_from_account_reconnecting_indexed(exchange)?;
 
-        // `ConnectivityStates::exchanges` is built in `ExchangeIndex` order, which is how every
-        // indexed account event already finds its exchange's state.
-        if let Some(index) = self.connectivity.exchanges.get_index_of(exchange) {
-            let filter = InstrumentFilter::exchanges([ExchangeIndex(index)]);
-            for instrument in self.instruments.instruments_mut(&filter) {
-                instrument.begin_account_resync();
-            }
+        for instrument in self
+            .instruments
+            .instruments_mut(&InstrumentFilter::exchanges([index]))
+        {
+            instrument.begin_account_resync();
         }
 
         Ok(())
