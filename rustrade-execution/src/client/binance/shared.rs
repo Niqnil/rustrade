@@ -383,7 +383,7 @@ pub(crate) fn parse_time_in_force(tif: &str) -> TimeInForce {
 /// `AllOrdersResponseInner` and `GetOpenOrdersResponseInner` on spot,
 /// `QueryMarginAccountsOpenOrdersResponseInner` on margin. Those structs are emphatically not
 /// interchangeable -- the spot family carries substantially more fields than the margin one, and
-/// several fields share a name while differing in type -- but the eleven named here are identical
+/// several fields share a name while differing in type -- but the twelve named here are identical
 /// in name and type across all of them.
 ///
 /// Naming that read subset is what makes a single converter safe to share. The dependency surface
@@ -403,11 +403,15 @@ pub(crate) trait BinanceOrderFields {
     /// it was created. Every endpoint implemented below carries it.
     fn update_time(&self) -> Option<i64>;
     fn symbol(&self) -> Option<&str>;
+    /// The order's status. `openOrders` serves only live orders, but `allOrders` also serves
+    /// cancelled, expired and filled ones through the same accessors, so [`convert_open_order`]
+    /// reads it rather than trusting the endpoint.
+    fn status(&self) -> Option<&str>;
 }
 
 /// Implement [`BinanceOrderFields`] for SDK response types that share these field names.
 ///
-/// Every struct listed below declares these eleven fields with the same types, so the accessors
+/// Every struct listed below declares these twelve fields with the same types, so the accessors
 /// are identical; a macro keeps them from drifting apart under hand-editing.
 macro_rules! impl_binance_order_fields {
     ($($t:ty),* $(,)?) => {
@@ -424,6 +428,7 @@ macro_rules! impl_binance_order_fields {
                 fn time(&self) -> Option<i64> { self.time }
                 fn update_time(&self) -> Option<i64> { self.update_time }
                 fn symbol(&self) -> Option<&str> { self.symbol.as_deref() }
+                fn status(&self) -> Option<&str> { self.status.as_deref() }
             }
         )*
     };
@@ -434,6 +439,151 @@ impl_binance_order_fields!(
     binance_sdk::spot::rest_api::GetOpenOrdersResponseInner,
     binance_sdk::margin_trading::rest_api::QueryMarginAccountsOpenOrdersResponseInner,
 );
+
+/// Whether a REST order response's status says the order is resting at the exchange, and may
+/// therefore become an `Open` order.
+///
+/// `NEW` and `PARTIALLY_FILLED` are working orders. `PENDING_NEW` is an order-list leg that waits
+/// for its working order to fill; it is at the exchange and `openOrders` returns it, so it is live
+/// too. Every other status is terminal (`FILLED`, `CANCELED`, `REJECTED`, `EXPIRED`,
+/// `EXPIRED_IN_MATCH`), unused (`PENDING_CANCEL`), or unknown to this version.
+///
+/// This is an allow-list for the same reason [`trade_order_is_live`] is one: an `Open` snapshot of
+/// an order that is no longer live resurrects it. A cancelled order that had partly filled would
+/// rest in engine state with quantity remaining, and nothing at the exchange would ever fill or
+/// cancel it.
+fn rest_order_is_open(status: &str) -> bool {
+    matches!(status, "NEW" | "PARTIALLY_FILLED" | "PENDING_NEW")
+}
+
+/// Convert a Binance open order into rustrade's `Open` state order.
+///
+/// Returns `None`, with a warning, for an order whose status is not live (see
+/// [`rest_order_is_open`]) or is missing, whichever endpoint served it. `openOrders` serves only
+/// live orders, so there this never fires in practice. An `allOrders` row for a finished order
+/// cannot be expressed as `Open` at all; reading that endpoint needs a conversion to
+/// [`OrderState`], which this is not.
+///
+/// `exchange` stamps the resulting [`OrderKey`] and every diagnostic below, so one
+/// implementation serves each Binance client without a venue name baked into its warnings.
+pub(crate) fn convert_open_order<T: BinanceOrderFields>(
+    o: &T,
+    exchange: ExchangeId,
+    instrument: &InstrumentNameExchange,
+) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
+    let order_id_raw = match o.order_id() {
+        Some(id) => id,
+        None => {
+            warn!(%exchange, %instrument, "Binance open order missing orderId");
+            return None;
+        }
+    };
+    match o.status() {
+        Some(status) if rest_order_is_open(status) => {}
+        Some(status) => {
+            warn!(%exchange, %instrument, order_id = %order_id_raw, status, "Binance order is not live, not converting it to an open order");
+            return None;
+        }
+        None => {
+            warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance open order missing status");
+            return None;
+        }
+    }
+    let order_id = OrderId(format_smolstr!("{}", order_id_raw));
+    if o.client_order_id().is_none() {
+        warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance open order missing clientOrderId, using orderId as fallback — order may not reconcile with engine state");
+    }
+    let cid = ClientOrderId::new(
+        o.client_order_id()
+            .unwrap_or(&format_smolstr!("{}", order_id_raw)),
+    );
+    let side = match o.side() {
+        // parse_side already logs a warning on unknown values
+        Some(s) => parse_side(s)?,
+        None => {
+            warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance open order missing side");
+            return None;
+        }
+    };
+    let price = o.price().and_then(|s| Decimal::from_str(s).ok());
+    let quantity = match o.orig_qty().and_then(|s| Decimal::from_str(s).ok()) {
+        Some(v) => v,
+        None => {
+            warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance open order missing/unparseable origQty");
+            return None;
+        }
+    };
+    let filled_qty = match o.executed_qty() {
+        Some(s) => match Decimal::from_str(s) {
+            Ok(v) => v,
+            Err(_) => {
+                warn!(%exchange, %instrument, order_id = %order_id_raw, executed_qty = s, "Binance open order unparseable executedQty, defaulting to 0");
+                Decimal::ZERO
+            }
+        },
+        None => Decimal::ZERO,
+    };
+    let kind = match o.order_type() {
+        // parse_order_kind already logs a warning on unknown values
+        Some(t) => parse_order_kind(t)?,
+        None => {
+            warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance open order missing type");
+            return None;
+        }
+    };
+    let time_in_force = parse_time_in_force(o.time_in_force().unwrap_or("GTC"));
+    // `update_time` over `time`: `Open::time_exchange` orders an order's states, and the engine
+    // discards a snapshot older than the state it already tracks. `time` is the creation stamp and
+    // is identical across every snapshot of one order, so a snapshot carrying it is discarded the
+    // moment a WebSocket fill has advanced the tracked order past creation -- which is exactly the
+    // partially-filled order this fetch exists to reconcile.
+    let time_exchange = match o
+        .update_time()
+        .or_else(|| o.time())
+        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+    {
+        Some(ts) => ts,
+        None => {
+            warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance open order missing/unparseable time, using now");
+            Utc::now()
+        }
+    };
+
+    Some(Order {
+        key: OrderKey::new(
+            exchange,
+            instrument.clone(),
+            // Binance doesn't carry strategy IDs in any response field.
+            // Callers must reconcile orders by ClientOrderId or OrderId — never StrategyId.
+            StrategyId::unknown(),
+            cid,
+        ),
+        side,
+        price,
+        quantity,
+        kind,
+        time_in_force,
+        state: Open::new(VenueOrderId::Assigned(order_id), time_exchange, filled_qty),
+    })
+}
+
+/// Convert an open-order response whose instrument is recovered from its own `symbol` field,
+/// rather than supplied by the caller. Used by the no-symbol "return all" path
+/// (each client's no-symbol "return all" fetch), where each order may belong to a different instrument. Drops
+/// (with a warning) any order missing `symbol`; otherwise delegates to [`convert_open_order`].
+pub(crate) fn convert_open_order_owned_symbol<T: BinanceOrderFields>(
+    o: &T,
+    exchange: ExchangeId,
+) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
+    let instrument = match o.symbol() {
+        Some(s) => InstrumentNameExchange::new(s),
+        None => {
+            warn!(%exchange, "Binance open order missing symbol in return-all query, dropping order");
+            return None;
+        }
+    };
+    convert_open_order(o, exchange, &instrument)
+}
 
 // ---------------------------------------------------------------------------
 // Recovered fills: the order's cumulative filled quantity
@@ -610,118 +760,6 @@ pub(crate) fn order_running_totals<T: BinanceExecutionFields>(
             })
             .collect(),
     )
-}
-
-/// Convert a Binance open order into rustrade's `Open` state order.
-///
-/// `exchange` stamps the resulting [`OrderKey`] and every diagnostic below, so one
-/// implementation serves each Binance client without a venue name baked into its warnings.
-pub(crate) fn convert_open_order<T: BinanceOrderFields>(
-    o: &T,
-    exchange: ExchangeId,
-    instrument: &InstrumentNameExchange,
-) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
-    let order_id_raw = match o.order_id() {
-        Some(id) => id,
-        None => {
-            warn!(%exchange, %instrument, "Binance open order missing orderId");
-            return None;
-        }
-    };
-    let order_id = OrderId(format_smolstr!("{}", order_id_raw));
-    if o.client_order_id().is_none() {
-        warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance open order missing clientOrderId, using orderId as fallback — order may not reconcile with engine state");
-    }
-    let cid = ClientOrderId::new(
-        o.client_order_id()
-            .unwrap_or(&format_smolstr!("{}", order_id_raw)),
-    );
-    let side = match o.side() {
-        // parse_side already logs a warning on unknown values
-        Some(s) => parse_side(s)?,
-        None => {
-            warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance open order missing side");
-            return None;
-        }
-    };
-    let price = o.price().and_then(|s| Decimal::from_str(s).ok());
-    let quantity = match o.orig_qty().and_then(|s| Decimal::from_str(s).ok()) {
-        Some(v) => v,
-        None => {
-            warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance open order missing/unparseable origQty");
-            return None;
-        }
-    };
-    let filled_qty = match o.executed_qty() {
-        Some(s) => match Decimal::from_str(s) {
-            Ok(v) => v,
-            Err(_) => {
-                warn!(%exchange, %instrument, order_id = %order_id_raw, executed_qty = s, "Binance open order unparseable executedQty, defaulting to 0");
-                Decimal::ZERO
-            }
-        },
-        None => Decimal::ZERO,
-    };
-    let kind = match o.order_type() {
-        // parse_order_kind already logs a warning on unknown values
-        Some(t) => parse_order_kind(t)?,
-        None => {
-            warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance open order missing type");
-            return None;
-        }
-    };
-    let time_in_force = parse_time_in_force(o.time_in_force().unwrap_or("GTC"));
-    // `update_time` over `time`: `Open::time_exchange` orders an order's states, and the engine
-    // discards a snapshot older than the state it already tracks. `time` is the creation stamp and
-    // is identical across every snapshot of one order, so a snapshot carrying it is discarded the
-    // moment a WebSocket fill has advanced the tracked order past creation -- which is exactly the
-    // partially-filled order this fetch exists to reconcile.
-    let time_exchange = match o
-        .update_time()
-        .or_else(|| o.time())
-        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
-    {
-        Some(ts) => ts,
-        None => {
-            warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance open order missing/unparseable time, using now");
-            Utc::now()
-        }
-    };
-
-    Some(Order {
-        key: OrderKey::new(
-            exchange,
-            instrument.clone(),
-            // Binance doesn't carry strategy IDs in any response field.
-            // Callers must reconcile orders by ClientOrderId or OrderId — never StrategyId.
-            StrategyId::unknown(),
-            cid,
-        ),
-        side,
-        price,
-        quantity,
-        kind,
-        time_in_force,
-        state: Open::new(VenueOrderId::Assigned(order_id), time_exchange, filled_qty),
-    })
-}
-
-/// Convert an open-order response whose instrument is recovered from its own `symbol` field,
-/// rather than supplied by the caller. Used by the no-symbol "return all" path
-/// (each client's no-symbol "return all" fetch), where each order may belong to a different instrument. Drops
-/// (with a warning) any order missing `symbol`; otherwise delegates to [`convert_open_order`].
-pub(crate) fn convert_open_order_owned_symbol<T: BinanceOrderFields>(
-    o: &T,
-    exchange: ExchangeId,
-) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
-    let instrument = match o.symbol() {
-        Some(s) => InstrumentNameExchange::new(s),
-        None => {
-            warn!(%exchange, "Binance open order missing symbol in return-all query, dropping order");
-            return None;
-        }
-    };
-    convert_open_order(o, exchange, &instrument)
 }
 
 // ---------------------------------------------------------------------------

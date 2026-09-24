@@ -326,6 +326,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already carried the cumulative (activity `cum_qty`). Order cancellations during an outage are
   still not recovered; see #364 for the engine side of reconciling them.
 
+- **A Binance REST order that is no longer live can no longer become an `Open` order**
+  (`rustrade-execution`, feature `binance`; Spot and Margin). The shared open-order converter read
+  every field but the order's status, so it treated any row it was given as resting. The two
+  `openOrders` call sites only ever serve live orders, but the converter also accepts Spot
+  `allOrders` rows, where a cancelled order that had partly filled would have converted to `Open`
+  with quantity remaining and rested in engine state indefinitely. The converter now admits only
+  `NEW`, `PARTIALLY_FILLED` and `PENDING_NEW` (an order-list leg waiting on its working order), and
+  drops any other or missing status with a `warn`, matching the guard the `executionReport` path
+  already applies. (#329)
+
 - **An IBKR market-depth RESET no longer leaves a silently stale order book** (`rustrade-data`,
   feature `ibkr`). IB sends notice 317, *"Market depth data has been RESET"*, when TWS discards the
   book on its side; every level held locally is stale from that moment. `ibapi` 4.1.0 reclassified
