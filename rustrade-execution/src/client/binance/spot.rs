@@ -34,10 +34,11 @@
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
-    RateLimitTracker, SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, classify_order_kind_tif,
-    connectivity_error, convert_execution_report, convert_open_order,
-    convert_open_order_owned_symbol, dedup_key_from_event, is_api_rejection_error, is_duplicate,
-    is_rate_limit_error, new_dedup_cache, parse_binance_api_error, rest_call_with_retry,
+    MyTradesFrom, ORDER_EXECUTIONS_BUDGET, RateLimitTracker, SIGNAL_RECOVERY_LOOKBACK_MS,
+    SharedDedupCache, classify_order_kind_tif, connectivity_error, convert_execution_report,
+    convert_open_order, convert_open_order_owned_symbol, dedup_key_from_event,
+    is_api_rejection_error, is_duplicate, is_rate_limit_error, new_dedup_cache,
+    parse_binance_api_error, recovered_order_totals, rest_call_with_retry,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
@@ -445,18 +446,20 @@ async fn fetch_all_open_orders(
     Ok(orders)
 }
 
-/// Paginate `GET /api/v3/myTrades` for a single instrument since `start_time_ms`.
+/// Paginate `GET /api/v3/myTrades` for a single instrument, from `from`.
 ///
-/// Uses cursor-based pagination: first page queries by `start_time`; subsequent pages
-/// use `from_id = last_id + 1` (Binance ignores `start_time` when `from_id` is set).
-/// Trade IDs are monotonically increasing per symbol, so this produces a gapless result.
+/// Uses cursor-based pagination: the first page queries by `start_time`, or by `order_id` for a
+/// single order's executions; subsequent pages use `from_id = last_id + 1` (Binance ignores
+/// `start_time` when `from_id` is set), keeping `order_id` alongside it, a combination Binance
+/// documents as supported. Trade IDs are monotonically increasing per symbol, so this produces a
+/// gapless result.
 ///
 /// Returns raw response items. Callers decide how to handle `Err` (propagate vs. log-skip).
 async fn paginate_my_trades(
     rest: &Arc<RestApi>,
     rate_limiter: &Arc<RateLimitTracker>,
     instrument: &InstrumentNameExchange,
-    start_time_ms: i64,
+    from: MyTradesFrom,
 ) -> Result<Vec<binance_sdk::spot::rest_api::MyTradesResponseInner>, UnindexedClientError> {
     // Convert once before the retry closure to avoid a String allocation on every retry.
     let symbol_str = instrument.name().to_string();
@@ -470,16 +473,19 @@ async fn paginate_my_trades(
         let fid = cursor; // Option<i64> is Copy
         let response = rest_call_with_retry(rest, rate_limiter, |rest| {
             let sym = symbol_str.clone();
-            let stm = start_time_ms;
             Box::pin(async move {
                 // const_assert! above guarantees BINANCE_MAX_TRADES fits in i32
                 #[allow(clippy::cast_possible_truncation)]
                 let builder = MyTradesParams::builder(sym).limit(BINANCE_MAX_TRADES as i32);
-                let params = if let Some(id) = fid {
-                    builder.from_id(id).build()?
-                } else {
-                    builder.start_time(stm).build()?
-                };
+                let params = match (from, fid) {
+                    (MyTradesFrom::Time(start_time_ms), None) => builder.start_time(start_time_ms),
+                    (MyTradesFrom::Time(_), Some(id)) => builder.from_id(id),
+                    (MyTradesFrom::Order(order_id), None) => builder.order_id(order_id),
+                    (MyTradesFrom::Order(order_id), Some(id)) => {
+                        builder.order_id(order_id).from_id(id)
+                    }
+                }
+                .build()?;
                 rest.my_trades(params).await
             })
         })
@@ -627,16 +633,20 @@ impl ExecutionClient for BinanceSpot {
     /// reconnect to reconcile open-order state — order lifecycle events (NEW, CANCELED)
     /// are not recovered after a WS disconnect, only TRADE fills are.
     ///
-    /// # A recovered fill does not advance the order
+    /// # A recovered fill advances the order too
     ///
     /// A fill that arrives live over the WebSocket carries the order's cumulative filled
     /// quantity in [`Trade::order_filled_quantity`] (`executionReport`'s `z`), so it advances
-    /// the order by itself. A fill recovered after a disconnect does not: it comes from REST
-    /// `myTrades`, which reports executions only and carries no cumulative, so
-    /// `order_filled_quantity` is `None` and the order's `filled_quantity` stands still.
-    /// The `fetch_open_orders` reconciliation above is therefore not merely for NEW and
-    /// CANCELED — without it, an order that filled across a disconnect keeps whatever
-    /// `filled_quantity` it held before the gap.
+    /// the order by itself. A fill recovered after a disconnect comes from REST `myTrades`,
+    /// which reports executions only, so recovery rebuilds the same figure by reading each
+    /// recovered order's executions from its first: one extra request per order (another per
+    /// further 1,000 executions), up to four orders at a time per instrument.
+    ///
+    /// Those lookups have their own time budget inside the recovery timeout, so they can never
+    /// cost a fill. A fill whose order was not looked up in time, or whose lookup failed, goes
+    /// out with `order_filled_quantity: None`, logged at `warn`. It then advances the position
+    /// but not the order, which keeps whatever `filled_quantity` it held before the gap until
+    /// the order's state is learned some other way.
     async fn account_stream(
         &self,
         // _assets is intentionally ignored — Binance pushes outboundAccountPosition
@@ -1277,7 +1287,13 @@ impl ExecutionClient for BinanceSpot {
             let rest = self.rest.clone();
             let rate_limiter = self.rate_limiter.clone();
             async move {
-                let pages = paginate_my_trades(&rest, &rate_limiter, &inst, start_time_ms).await?;
+                let pages = paginate_my_trades(
+                    &rest,
+                    &rate_limiter,
+                    &inst,
+                    MyTradesFrom::Time(start_time_ms),
+                )
+                .await?;
                 Ok::<_, UnindexedClientError>((inst, pages))
             }
         }))
@@ -1626,9 +1642,9 @@ async fn connection_manager(
 /// cache. Trades already seen (from before the disconnect) are filtered out; only
 /// genuinely missed fills reach the consumer.
 ///
-/// The recovered trades carry no `order_filled_quantity`: `myTrades` reports executions
-/// only, with no cumulative and no order status, so a recovered fill advances the position
-/// but not the order. Only a `fetch_open_orders` reconciliation closes that gap.
+/// `myTrades` reports executions only, with no cumulative, so each recovered trade's
+/// `order_filled_quantity` is rebuilt from its order's executions by
+/// [`recovered_order_totals`]. A trade whose order could not be looked up keeps `None`.
 // `.iter().cloned()` is required: Rust async closures cannot satisfy the HRTB
 // `for<'a> FnMut(&'a InstrumentNameExchange) -> impl Future + 'static` needed by
 // the iterator machinery, even when the clone is moved inside the closure body.
@@ -1656,6 +1672,7 @@ async fn recover_fills(
     );
 
     let start_time_ms = disconnect_time.timestamp_millis();
+    let order_executions_deadline = tokio::time::Instant::now() + ORDER_EXECUTIONS_BUDGET;
     let mut recovered = 0u32;
     let mut duplicates = 0u32;
     let mut failed_instruments = 0u32;
@@ -1670,16 +1687,32 @@ async fn recover_fills(
         let rest = rest.clone();
         let rl = rate_limiter.clone();
         async move {
-            let raw = match paginate_my_trades(&rest, &rl, &inst, start_time_ms).await {
+            let raw = match paginate_my_trades(&rest, &rl, &inst, MyTradesFrom::Time(start_time_ms))
+                .await
+            {
                 Ok(pages) => pages,
                 Err(e) => {
                     warn!(%e, %inst, "BinanceSpot fill recovery: REST request failed");
                     return None;
                 }
             };
+            // `myTrades` carries no cumulative, so each recovered fill's is rebuilt from its
+            // order's executions; without it the fill advances the position but not the order.
+            let totals = recovered_order_totals(
+                ExchangeId::BinanceSpot,
+                &inst,
+                &raw,
+                order_executions_deadline,
+                |order_id| paginate_my_trades(&rest, &rl, &inst, MyTradesFrom::Order(order_id)),
+            )
+            .await;
             let trades: Vec<_> = raw
-                .into_iter()
-                .filter_map(|t| convert_my_trade(&t, &inst))
+                .iter()
+                .filter_map(|t| {
+                    let mut trade = convert_my_trade(t, &inst)?;
+                    trade.order_filled_quantity = t.id.and_then(|id| totals.get(&id).copied());
+                    Some(trade)
+                })
                 .collect();
             Some(trades)
         }

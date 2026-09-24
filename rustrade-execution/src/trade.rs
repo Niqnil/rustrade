@@ -84,8 +84,8 @@ pub struct Trade<AssetKey, InstrumentKey> {
     /// | Source | Reports it |
     /// |---|---|
     /// | Binance Spot / Margin WebSocket `executionReport` | yes (`z`) |
-    /// | Binance Spot `myTrades` REST | no |
-    /// | Binance Margin `myTrades` REST | no |
+    /// | Binance Spot / Margin fill recovery after a disconnect | yes, rebuilt from the order's executions; `None` where that lookup failed or ran out of time |
+    /// | Binance Spot / Margin `fetch_trades` (`myTrades` REST) | no |
     /// | Alpaca WebSocket `trade_updates` | yes (`order.filled_qty`) |
     /// | Alpaca account-activities REST | yes (`cum_qty`) |
     /// | Interactive Brokers `ExecutionData` | yes (`cumulative_quantity`) |
