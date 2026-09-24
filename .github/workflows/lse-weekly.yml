@@ -13,9 +13,21 @@ name: "LSE Weekly"
 
 on:
   schedule:
-    # Monday 07:00 UTC - before the London session, so a drift report lands before it matters.
-    - cron: "0 7 * * 1"
+    # Tuesday 15:00 UTC - inside the US options session all year (13:30-20:00 UTC in US summer
+    # time, 14:30-21:00 in winter), which the WebSocket canary's option-print check needs: outside
+    # it that check reports `CANARY_SKIP`, so a schedule outside the session never exercises live
+    # option delivery at all. Tuesday rather than Monday because most US market holidays fall on
+    # a Monday; a holiday is read from the print tape and skips, it does not fail.
+    - cron: "0 15 * * 2"
   workflow_dispatch:
+
+concurrency:
+  # The provider permits ONE WebSocket connection per API key. A manual run started while another
+  # run holds the socket would fail its WebSocket canary on `TOO_MANY_CONNECTIONS`, which reads as
+  # provider drift rather than as two runs overlapping. A second run waits for the first rather
+  # than cancelling it: a canary cut off mid-export still spends one of the five hourly jobs.
+  group: lse-api-key
+  cancel-in-progress: false
 
 env:
   MOLD_VERSION: "2.35.1"
@@ -89,9 +101,9 @@ jobs:
         continue-on-error: true
         run: cargo test --locked --test lse_economic_calendar_canary --features lse -- --ignored --nocapture
 
-      # Vault again, quota-free. Reads a window days old, so the Monday-morning schedule -- with
-      # the US market closed -- is not a reason for it to be empty; an empty tape means the feed
-      # stopped, and the canary fails on that rather than passing on nothing.
+      # Vault again, quota-free. Reads a window days old, so neither the time of day nor a closed
+      # US market is a reason for it to be empty; an empty tape means the feed stopped, and the
+      # canary fails on that rather than passing on nothing.
       - name: Options canary (print tape liveness, adaptive walk, option candles)
         id: options-canary
         continue-on-error: true

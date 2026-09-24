@@ -66,8 +66,8 @@
 //!    underlying, confirmed once); and, **while the US options session is open**, at least one must
 //!    print over the socket, with nothing from the rest of the chain surfacing as an error. Whether
 //!    the session is open is read from the REST tape rather than a clock, which knows nothing of
-//!    holidays: a settled minute holding prints is an open market. Outside the session — which
-//!    includes the weekly run — the print half reports `CANARY_SKIP`.
+//!    holidays: a settled minute holding prints is an open market. Outside the session the print
+//!    half reports `CANARY_SKIP`, which is why `lse-weekly.yml` is scheduled inside it.
 //!
 //! # Skip vs. fail contract
 //!

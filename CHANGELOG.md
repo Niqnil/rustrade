@@ -83,8 +83,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The WebSocket canary now covers option contracts. Every contract on a slice of the provider's own
   print tape must rebuild to its exact ticker, and the busiest must subscribe. In session, at least
-  one must print. Outside the session, which includes the weekly run, the print check reports
-  `CANARY_SKIP`. New example: `lse_options_stream`.
+  one must print. Outside the session the print check reports `CANARY_SKIP`, so `lse-weekly.yml`
+  now runs inside it, on Tuesday at 15:00 UTC instead of Monday at 07:00, and queues a second run
+  rather than letting two hold the key's one connection. New example: `lse_options_stream`.
 
   ⚠️ Live option prints are provider data and may not be redistributed. See
   <https://londonstrategicedge.com/terms>.
