@@ -9,6 +9,10 @@
 //! data (<https://londonstrategicedge.com/terms>), so no recorded frame may be committed here and
 //! every other test is necessarily synthetic.
 //!
+//! The restriction reaches this file's output too. `lse-weekly.yml` runs it with `--nocapture` in a
+//! public repository, so whatever a passing run prints is published in the workflow log. That is
+//! why the `CANARY_OK` lines carry symbols, timestamps and counts, and never a price or a size.
+//!
 //! # ⚠️ What it deliberately does NOT assert
 //!
 //! **No provider-side inventory counts.** The published symbol list moved from 7,940 to 8,516
@@ -1164,11 +1168,13 @@ async fn option_contracts_spell_subscribe_and_print_as_expected() {
             assert!(
                 event.kind.price > rust_decimal::Decimal::ZERO
                     && event.kind.amount > rust_decimal::Decimal::ZERO,
-                "an option print must carry a positive premium and size: {event:?}",
+                "{} printed without a positive premium and size",
+                event.instrument,
             );
+            // No premium or size: the log is public (see the module docs).
             println!(
-                "CANARY_OK: {} printed {} x {} at {}",
-                event.instrument, event.kind.amount, event.kind.price, event.time_exchange,
+                "CANARY_OK: {} printed at {}",
+                event.instrument, event.time_exchange,
             );
         }
         (None, true) => panic!(
