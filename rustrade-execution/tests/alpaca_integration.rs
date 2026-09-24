@@ -98,7 +98,8 @@ fn btc_instrument() -> InstrumentNameExchange {
     "BTC/USD".into()
 }
 
-/// Wait until the venue lists no open order on `instrument`, panicking after 15 seconds.
+/// Wait until [`ExecutionClient::fetch_open_orders`] lists nothing on `instrument`, panicking once
+/// 15 seconds have passed.
 ///
 /// Alpaca answers a cancel once it has accepted the request, while the order may still be
 /// `pending_cancel` and live. The order tests run one after another on the same symbols, so an
@@ -107,6 +108,12 @@ fn btc_instrument() -> InstrumentNameExchange {
 /// buy order is open". Every test that cancels waits here, so it leaves the instrument as it
 /// found it. Waiting on the instrument rather than on the one order also covers a bracket's
 /// legs, whose ids the placement does not return.
+///
+/// The list is Alpaca's `status=open`, which its documentation does not define status by status.
+/// This relies on `pending_cancel`, which is not a final status, being included. If it were not,
+/// the wait would end early and the refusals above would recur, not some new failure. The list
+/// also leaves out what `fetch_open_orders` cannot convert, notional orders among them, and
+/// these tests place none.
 async fn await_no_open_orders(client: &AlpacaClient, instrument: &InstrumentNameExchange) {
     const POLL: Duration = Duration::from_millis(250);
     const DEADLINE: Duration = Duration::from_secs(15);
@@ -119,10 +126,10 @@ async fn await_no_open_orders(client: &AlpacaClient, instrument: &InstrumentName
             println!("{instrument}: no open orders after {:?}", started.elapsed());
             return;
         }
-        if started.elapsed() >= DEADLINE {
-            panic!(
-                "{instrument} still lists open orders {DEADLINE:?} after the cancel: {listed:?}"
-            );
+        // A rate-limited fetch can wait out its own backoff, so report the time actually taken.
+        let waited = started.elapsed();
+        if waited >= DEADLINE {
+            panic!("{instrument} still lists open orders {waited:?} after the cancel: {listed:?}");
         }
         tokio::time::sleep(POLL).await;
     }
