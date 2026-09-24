@@ -1146,7 +1146,8 @@ impl ExecutionClient for BinanceMargin {
     /// A recovered fill advances the order too. A live fill carries the order's cumulative filled
     /// quantity in [`Trade::order_filled_quantity`] (`executionReport`'s `z`); REST `myTrades`
     /// carries none, so recovery rebuilds the same figure by reading each recovered order's
-    /// executions from its first, at one extra request per order. Those lookups have their own
+    /// executions from its first: one extra request per order (another per further 1,000
+    /// executions), up to four orders at a time per instrument. Those lookups have their own
     /// time budget inside the recovery timeout, so they can never cost a fill: a fill whose order
     /// was not looked up in time, or whose lookup failed, goes out with `order_filled_quantity:
     /// None`, logged at `warn`, and advances the position but not the order.

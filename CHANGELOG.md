@@ -315,9 +315,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports executions only, so a recovered `Trade` carried no `order_filled_quantity`. It moved the
   position and left the order's `filled_quantity` where it stood before the gap, while the same
   fill arriving live over the WebSocket advanced it. Recovery now reads each recovered order's
-  executions from its first (`myTrades` by `orderId`, one extra request per order) and sets the
-  cumulative as of each fill, the same figure the WebSocket reports as `z`. An order that fills
-  completely during an outage is therefore retired by its recovered fills.
+  executions from its first (`myTrades` by `orderId`, one extra request per order, up to four
+  orders at a time per instrument) and sets the cumulative as of each fill, the same figure the
+  WebSocket reports as `z`. An order that fills completely during an outage is therefore retired
+  by its recovered fills.
 
   The lookups have their own budget, half of the 30-second recovery timeout, so they never cost a
   fill. A fill whose order was not looked up in time, or whose lookup failed or came back unusable,

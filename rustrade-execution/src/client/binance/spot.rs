@@ -639,7 +639,8 @@ impl ExecutionClient for BinanceSpot {
     /// quantity in [`Trade::order_filled_quantity`] (`executionReport`'s `z`), so it advances
     /// the order by itself. A fill recovered after a disconnect comes from REST `myTrades`,
     /// which reports executions only, so recovery rebuilds the same figure by reading each
-    /// recovered order's executions from its first, at one extra request per order.
+    /// recovered order's executions from its first: one extra request per order (another per
+    /// further 1,000 executions), up to four orders at a time per instrument.
     ///
     /// Those lookups have their own time budget inside the recovery timeout, so they can never
     /// cost a fill. A fill whose order was not looked up in time, or whose lookup failed, goes

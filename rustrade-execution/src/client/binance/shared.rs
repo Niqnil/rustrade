@@ -445,6 +445,11 @@ pub(crate) enum MyTradesFrom {
     /// Every execution on the instrument at or after this time, in epoch milliseconds.
     Time(i64),
     /// Every execution of this one order, from its first.
+    ///
+    /// Queried by `orderId` alone, Binance returns an order's oldest executions first, in
+    /// ascending trade id, even when the order has more executions than `limit`; later pages
+    /// continue with `fromId`. Observed on the Spot testnet (2026-09-24, a five-execution order
+    /// read with `limit=2`); Margin serves the same parameters and is assumed to match.
     Order(i64),
 }
 
@@ -484,6 +489,13 @@ impl_binance_execution_fields!(
 pub(crate) const ORDER_EXECUTIONS_BUDGET: Duration =
     Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS / 2);
 
+/// How many orders' executions one instrument's recovery reads at once.
+///
+/// Recovery already runs up to eight instruments at once, so this allows 32 lookups in flight.
+/// Each is weight 5 (Spot, `myTrades` with `orderId`) or 10 (Margin) against a limit of several
+/// thousand a minute, and [`rest_call_with_retry`] backs off when Binance signals the limit.
+pub(crate) const ORDER_EXECUTIONS_IN_FLIGHT: usize = 4;
+
 /// The cumulative filled quantity of each recovered execution's order, as of that execution,
 /// keyed by trade id.
 ///
@@ -491,7 +503,7 @@ pub(crate) const ORDER_EXECUTIONS_BUDGET: Duration =
 /// order on its own. For each order among `recovered`, this walks that order's executions from its
 /// first with `fetch` and sums them in trade-id order. That is the figure the WebSocket reports as
 /// `z` on the same execution, so a recovered fill and a live one carry the same
-/// [`Trade::order_filled_quantity`].
+/// [`Trade::order_filled_quantity`]. Up to [`ORDER_EXECUTIONS_IN_FLIGHT`] orders are read at once.
 ///
 /// An order is left out, and its recovered fills keep `None`, when its walk fails, when the walk
 /// is unusable (see [`order_running_totals`]), or once `deadline` passes. Each case is logged.
@@ -509,31 +521,44 @@ where
     F: Fn(i64) -> Fut,
     Fut: Future<Output = Result<Vec<T>, UnindexedClientError>>,
 {
+    use futures::StreamExt as _;
+
     let mut order_ids: Vec<i64> = recovered.iter().filter_map(|t| t.order_id()).collect();
     order_ids.sort_unstable();
     order_ids.dedup();
 
+    let fetch = &fetch;
+    let mut lookups = futures::stream::iter(order_ids.iter().copied())
+        .map(|order_id| async move { (order_id, fetch(order_id).await) })
+        .buffer_unordered(ORDER_EXECUTIONS_IN_FLIGHT);
+
     let mut totals = fnv::FnvHashMap::default();
-    for (looked_up, &order_id) in order_ids.iter().enumerate() {
-        let executions = match tokio::time::timeout_at(deadline, fetch(order_id)).await {
-            Ok(Ok(executions)) => executions,
-            Ok(Err(error)) => {
+    let mut settled = 0;
+    loop {
+        let (order_id, walk) = match tokio::time::timeout_at(deadline, lookups.next()).await {
+            Ok(Some(lookup)) => lookup,
+            Ok(None) => break,
+            Err(_elapsed) => {
+                warn!(
+                    %exchange, %instrument,
+                    orders_left = order_ids.len() - settled,
+                    budget = ?ORDER_EXECUTIONS_BUDGET,
+                    "fill recovery ran out of time reading orders' executions; the remaining \
+                     orders' recovered fills carry no cumulative filled quantity"
+                );
+                break;
+            }
+        };
+        settled += 1;
+        let executions = match walk {
+            Ok(executions) => executions,
+            Err(error) => {
                 warn!(
                     %exchange, %instrument, order_id, %error,
                     "fill recovery could not read the order's executions; its recovered fills \
                      carry no cumulative filled quantity"
                 );
                 continue;
-            }
-            Err(_elapsed) => {
-                warn!(
-                    %exchange, %instrument,
-                    orders_left = order_ids.len() - looked_up,
-                    budget = ?ORDER_EXECUTIONS_BUDGET,
-                    "fill recovery ran out of time reading orders' executions; the remaining \
-                     orders' recovered fills carry no cumulative filled quantity"
-                );
-                break;
             }
         };
         match order_running_totals(order_id, &executions) {
@@ -1681,9 +1706,9 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn lookups_stop_at_the_deadline_rather_than_holding_the_fills() {
-        // Order 1's walk never answers; order 2 is never reached. Recovery must return what it
-        // has at the deadline, so the fills still go out inside the overall recovery timeout.
+    async fn lookups_stop_at_the_deadline_keeping_the_walks_that_answered() {
+        // Order 1's walk never answers; order 2's does. Recovery must return what it has at the
+        // deadline, so the fills still go out inside the overall recovery timeout.
         let recovered = [execution(20, 1, "1"), execution(21, 2, "1")];
         let started = tokio::time::Instant::now();
         let deadline = started + Duration::from_secs(5);
@@ -1702,8 +1727,39 @@ mod tests {
         )
         .await;
 
-        assert!(totals.is_empty(), "{totals:?}");
+        assert_eq!(totals.get(&20), None);
+        assert_eq!(totals.get(&21), Some(&Decimal::ONE));
         assert_eq!(tokio::time::Instant::now(), deadline);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lookups_run_side_by_side_up_to_the_in_flight_bound() {
+        // Each walk takes 4 s against a 5 s budget: one at a time, only the first would finish.
+        // Side by side, the first ORDER_EXECUTIONS_IN_FLIGHT finish together at 4 s, and the one
+        // over the bound starts only then, so the deadline cuts it.
+        let recovered: Vec<Execution> = (1_i64..)
+            .take(ORDER_EXECUTIONS_IN_FLIGHT + 1)
+            .map(|order_id| execution(100 + order_id, order_id, "1"))
+            .collect();
+        let over_bound = recovered.last().and_then(|t| t.id);
+
+        let totals = recovered_order_totals(
+            ExchangeId::BinanceSpot,
+            &btcusdt(),
+            &recovered,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            |order_id| async move {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                Ok(vec![execution(100 + order_id, order_id, "1")])
+            },
+        )
+        .await;
+
+        assert_eq!(totals.len(), ORDER_EXECUTIONS_IN_FLIGHT, "{totals:?}");
+        assert!(
+            over_bound.is_some_and(|id| !totals.contains_key(&id)),
+            "{totals:?}"
+        );
     }
 
     fn classify(
