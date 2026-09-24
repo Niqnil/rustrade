@@ -185,7 +185,7 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     ) -> Result<(), UntrackedExchange> {
         let index = self
             .connectivity
-            .update_from_account_reconnecting_indexed(exchange)?;
+            .update_from_account_reconnecting(exchange)?;
 
         for instrument in self
             .instruments

@@ -29,7 +29,13 @@ impl ConnectivityStates {
     /// Updates from an exchange AccountStream disconnection.
     ///
     /// Sets the account `ConnectivityState` for the provided `ExchangeId`
-    /// to [`Health::Reconnecting`], then re-derives [`Self::global`].
+    /// to [`Health::Reconnecting`], then re-derives [`Self::global`]. Returns the [`ExchangeIndex`]
+    /// the exchange resolved to, for the caller's own updates on that exchange. The index is the
+    /// entry's position in [`Self::exchanges`], which is built in `ExchangeIndex` order, as
+    /// [`Self::connectivity_index_mut`] already relies on.
+    ///
+    /// Crate-private: a reconnect must also arm every instrument on the exchange for the account
+    /// resync, which [`EngineState::update_from_account_reconnecting`] does and this does not.
     ///
     /// # A venue whose role declares no account
     /// Reaching this for a [`VenueRole::DataOnly`] venue means the role is wrong or the event is
@@ -42,19 +48,9 @@ impl ConnectivityStates {
     /// # Errors
     /// Returns [`UntrackedExchange`] if the `ExchangeId` has no `ConnectivityState`, having mutated
     /// nothing — including [`Self::global`].
-    pub fn update_from_account_reconnecting(
-        &mut self,
-        exchange: &ExchangeId,
-    ) -> Result<(), UntrackedExchange> {
-        self.update_from_account_reconnecting_indexed(exchange)
-            .map(drop)
-    }
-
-    /// [`Self::update_from_account_reconnecting`], returning the [`ExchangeIndex`] the exchange
-    /// resolved to, for a caller with more to update on that exchange. The index is the entry's
-    /// position in [`Self::exchanges`], which is built in `ExchangeIndex` order, as
-    /// [`Self::connectivity_index_mut`] already relies on.
-    pub(crate) fn update_from_account_reconnecting_indexed(
+    ///
+    /// [`EngineState::update_from_account_reconnecting`]: crate::engine::state::EngineState::update_from_account_reconnecting
+    pub(crate) fn update_from_account_reconnecting(
         &mut self,
         exchange: &ExchangeId,
     ) -> Result<ExchangeIndex, UntrackedExchange> {
@@ -1121,7 +1117,7 @@ mod tests {
             match dimension {
                 // `DATA` is `DataOnly`: it has no account connection to lose.
                 ConnectivityDimension::Account => {
-                    states.update_from_account_reconnecting(&DATA).unwrap()
+                    states.update_from_account_reconnecting(&DATA).unwrap();
                 }
                 // `EXECUTION` is `ExecutionOnly`: it has no market data subscription to lose.
                 ConnectivityDimension::MarketData => {

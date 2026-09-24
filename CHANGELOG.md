@@ -208,6 +208,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING: `ConnectivityStates::update_from_account_reconnecting` is crate-private**
+  (`rustrade`). It marks the exchange's account connection as reconnecting, but it does not arm the
+  exchange's instruments for the account resync the way `EngineState::update_from_account_reconnecting`
+  does, and `EngineState::connectivity` is public. A direct call therefore skipped recording which
+  orders the next complete snapshot may retire. To migrate, call
+  `EngineState::update_from_account_reconnecting`.
+
 - **BREAKING: the Hyperliquid clients refuse an order whose client id is not a UUID in
   `ClientOrderId::uuid()` form** (`rustrade-execution`, `HyperliquidClient` and
   `HyperliquidSpotClient`). Hyperliquid names an order by the 16-byte `cloid` it was placed with,
