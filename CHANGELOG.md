@@ -101,9 +101,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   publish none and report `None`. `has_any_greek` now counts `rho`.
 
 - **`ExchangeId::LseOptions`** (`rustrade-instrument`), appended at the end of the enum so no
-  existing index is renumbered. It supports the `Option` instrument kind and, for now, **no
-  subscription kind**: the provider's WebSocket delivers option prints under a
-  subscribe-by-underlying handshake this integration does not yet implement.
+  existing index is renumbered. It supports the `Option` instrument kind and one subscription
+  kind, `PublicTrades`, served over the WebSocket by the `LseOptions` connector.
   *Note:* `ExchangeId` is not `#[non_exhaustive]`, so downstream exhaustive `match`es need a new arm.
 
 - **`LseCalendarEvent` and the economic-calendar fetch, with
