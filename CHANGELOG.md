@@ -350,8 +350,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   order it is, which is now listed rather than missing. Every other instrument's list is declared
   complete, so the engine retires an Alpaca order that ended while the account stream was down.
   That holds because the open-order list is unpaged: a response at Alpaca's 500-order cap already
-  fails the snapshot with `TruncatedSnapshot`. It also holds because every order this client
-  places is listed under the client order id it was placed with.
+  fails the snapshot with `TruncatedSnapshot`. It also holds because every order is listed under
+  the client order id the order stream reports it under: the one it was placed with, or the one
+  Alpaca assigns to a bracket's take-profit and stop-loss legs.
 
 - **Hyperliquid reports each order under the client id it was placed with** (#368,
   `rustrade-execution`). The account snapshot and `fetch_open_orders` reported every open order

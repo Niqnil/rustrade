@@ -364,18 +364,16 @@ async fn test_place_and_cancel_limit_order() {
     }
 }
 
-/// The account snapshot lists an open order under the client id it was placed with, and declares
-/// the instrument's list complete; once the order is cancelled, the complete list no longer shows
-/// it. Together these are what let the engine retire an order that ended while the account stream
-/// was down.
-#[tokio::test]
-#[ignore]
-#[serial]
-async fn test_snapshot_lists_the_order_under_its_client_id_and_complete() {
-    init_logging();
-
+/// Place `request` on `instrument`, then check the account snapshot lists it under the client id
+/// it was placed with and declares the instrument's list complete; once the order is cancelled,
+/// the complete list must no longer show it. Together these are what let the engine retire an
+/// order that ended while the account stream was down. The instrument is requested by the name
+/// the order is placed under, so this also checks Alpaca reports that name back unchanged.
+async fn assert_snapshot_lists_the_order_then_drops_it(
+    instrument: InstrumentNameExchange,
+    request: RequestOpen,
+) {
     let client = AlpacaClient::new(test_config());
-    let instrument = spy_instrument();
     let instruments = [instrument.clone()];
     let cid = ClientOrderId::new(format!(
         "test-listed-{}",
@@ -391,40 +389,34 @@ async fn test_snapshot_lists_the_order_under_its_client_id_and_complete() {
     let response = client
         .open_order(rustrade_execution::order::OrderEvent {
             key: key.clone(),
-            state: RequestOpen {
-                side: Side::Buy,
-                price: Some(dec!(1.00)),
-                quantity: dec!(1),
-                kind: OrderKind::Limit,
-                time_in_force: TimeInForce::GoodUntilEndOfDay,
-                position_id: None,
-                reduce_only: false,
-                market: None,
-            },
+            state: request,
         })
         .await
         .expect("Expected order response");
     let OrderState::Active(ActiveOrderState::Open(open)) = &response.state else {
-        panic!("Limit order at $1.00 did not rest: {:?}", response.state);
+        panic!(
+            "{instrument} limit order did not rest: {:?}",
+            response.state
+        );
     };
 
     let listed = client
         .account_snapshot(&[], &instruments)
         .await
         .expect("account_snapshot failed");
-    let spy = listed
+    let snapshot = listed
         .instruments
         .iter()
         .find(|snapshot| snapshot.instrument == instrument)
         .expect("a requested instrument always has an entry");
     assert!(
-        spy.orders_complete,
-        "SPY's order list is not declared complete"
+        snapshot.orders_complete,
+        "{instrument}'s order list is not declared complete"
     );
     assert!(
-        spy.orders.iter().any(|order| order.key.cid == cid),
-        "the resting order is not listed under its client id {cid}: {:?}",
-        spy.orders
+        snapshot.orders.iter().any(|order| order.key.cid == cid),
+        "the resting {instrument} order is not listed under its client id {cid}: {:?}",
+        snapshot.orders
     );
 
     let cancelled = client
@@ -447,20 +439,63 @@ async fn test_snapshot_lists_the_order_under_its_client_id_and_complete() {
         .account_snapshot(&[], &instruments)
         .await
         .expect("account_snapshot failed");
-    let spy = listed
+    let snapshot = listed
         .instruments
         .iter()
         .find(|snapshot| snapshot.instrument == instrument)
         .expect("a requested instrument always has an entry");
     assert!(
-        spy.orders_complete,
-        "SPY's order list is not declared complete"
+        snapshot.orders_complete,
+        "{instrument}'s order list is not declared complete"
     );
     assert!(
-        spy.orders.iter().all(|order| order.key.cid != cid),
-        "the cancelled order is still listed: {:?}",
-        spy.orders
+        snapshot.orders.iter().all(|order| order.key.cid != cid),
+        "the cancelled {instrument} order is still listed: {:?}",
+        snapshot.orders
     );
+}
+
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_snapshot_lists_an_equity_order_under_its_client_id_and_complete() {
+    init_logging();
+    assert_snapshot_lists_the_order_then_drops_it(
+        spy_instrument(),
+        RequestOpen {
+            side: Side::Buy,
+            price: Some(dec!(1.00)),
+            quantity: dec!(1),
+            kind: OrderKind::Limit,
+            time_in_force: TimeInForce::GoodUntilEndOfDay,
+            position_id: None,
+            reduce_only: false,
+            market: None,
+        },
+    )
+    .await;
+}
+
+/// Alpaca names a crypto pair with a slash (`BTC/USD`), unlike an equity ticker.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_snapshot_lists_a_crypto_order_under_its_client_id_and_complete() {
+    init_logging();
+    assert_snapshot_lists_the_order_then_drops_it(
+        btc_instrument(),
+        RequestOpen {
+            side: Side::Buy,
+            price: Some(dec!(1000.00)),
+            quantity: dec!(0.01),
+            kind: OrderKind::Limit,
+            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+            position_id: None,
+            reduce_only: false,
+            market: None,
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
