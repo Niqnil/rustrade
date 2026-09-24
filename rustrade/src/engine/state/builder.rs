@@ -85,7 +85,7 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
     /// trades a *different* instrument on another: the pricing venue would otherwise be assigned
     /// [`VenueRole::Both`](crate::engine::state::connectivity::VenueRole::Both), wait forever on an
     /// account connection nothing will ever establish, and hold
-    /// [`ConnectivityStates::global`](crate::engine::state::connectivity::ConnectivityStates::global)
+    /// [`ConnectivityStates::global()`](crate::engine::state::connectivity::ConnectivityStates::global())
     /// at [`Health::Reconnecting`](crate::engine::state::connectivity::Health::Reconnecting) for the
     /// life of the run.
     ///
@@ -321,12 +321,12 @@ mod tests {
             .build();
 
         assert_eq!(
-            declared.connectivity.connectivity(&DATA).role,
+            declared.connectivity.connectivity(&DATA).role(),
             VenueRole::DataOnly,
             "the declared set is what says nothing executes on the pricing venue"
         );
         assert_eq!(
-            declared.connectivity.connectivity(&EXECUTION).role,
+            declared.connectivity.connectivity(&EXECUTION).role(),
             VenueRole::Both
         );
 
@@ -336,7 +336,7 @@ mod tests {
             EngineState::builder(&instruments, (), |_| ()).build();
 
         assert_eq!(
-            approximated.connectivity.connectivity(&DATA).role,
+            approximated.connectivity.connectivity(&DATA).role(),
             VenueRole::Both
         );
     }

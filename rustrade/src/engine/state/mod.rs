@@ -363,8 +363,10 @@ impl<GlobalData, InstrumentData> From<&EngineState<GlobalData, InstrumentData>>
         } = value;
 
         // Upper bound: venues without an account are skipped below.
-        let mut snapshots =
-            FnvHashMap::with_capacity_and_hasher(connectivity.exchanges.len(), Default::default());
+        let mut snapshots = FnvHashMap::with_capacity_and_hasher(
+            connectivity.exchanges().len(),
+            Default::default(),
+        );
 
         // Insert UnindexedAccountSnapshot for each exchange that holds an account.
         //
@@ -372,8 +374,8 @@ impl<GlobalData, InstrumentData> From<&EngineState<GlobalData, InstrumentData>>
         // into `connectivity.exchanges`, so numbering only the surviving venues would shift every
         // index past the first skipped one and silently attribute one exchange's instruments to
         // another.
-        for (index, (exchange, state)) in connectivity.exchanges.iter().enumerate() {
-            if !state.role.has_account() {
+        for (index, (exchange, state)) in connectivity.exchanges().iter().enumerate() {
+            if !state.role().has_account() {
                 continue;
             }
 

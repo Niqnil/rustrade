@@ -1727,7 +1727,7 @@ pub enum EngineOutput<
     /// see [`UntrackedExchange`] for the full rationale and for exactly what was left untouched.
     ///
     /// **No state was mutated**, including
-    /// [`ConnectivityStates::global`](crate::engine::state::connectivity::ConnectivityStates::global).
+    /// [`ConnectivityStates::global()`](crate::engine::state::connectivity::ConnectivityStates::global()).
     /// A consumer folding
     /// observables into a mutation tally must not count this variant — the same treatment as
     /// [`CorporateActionAlreadyProcessed`](Self::CorporateActionAlreadyProcessed).

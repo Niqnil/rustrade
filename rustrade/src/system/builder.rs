@@ -523,10 +523,13 @@ mod tests {
         let connectivity = &system.engine.state.connectivity;
 
         assert_eq!(
-            connectivity.connectivity(&DATA).role,
+            connectivity.connectivity(&DATA).role(),
             VenueRole::DataOnly,
             "no execution client was registered for the pricing venue, so it holds no account"
         );
-        assert_eq!(connectivity.connectivity(&EXECUTION).role, VenueRole::Both);
+        assert_eq!(
+            connectivity.connectivity(&EXECUTION).role(),
+            VenueRole::Both
+        );
     }
 }
