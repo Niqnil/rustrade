@@ -330,6 +330,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The London Strategic Edge canaries no longer print provider data when they fail**
+  (`rustrade-data` tests). `lse-weekly.yml` runs them with `--nocapture` in a public repository,
+  so their failure messages are published in the workflow log. Three put provider data there:
+  - the bond-yield canary's OHLC checks printed a row's yields;
+  - the economic-calendar canary's checks debug-printed a whole event, readings included;
+  - the WebSocket canary's stream-error line printed a decode failure's raw frame.
+
+  Each now names the row, event or field that failed and nothing else. The frame cut is pinned by
+  an ordinary test, so a change to the error's wording fails CI rather than leaking a frame. LSE
+  data may not be redistributed; see <https://londonstrategicedge.com/terms>.
+
 - **The engine retires an order that a complete account snapshot no longer lists** (`rustrade`).
   A snapshot applied only the orders it listed, and `ExecutionManager` re-reads one on every
   account-stream reconnect. So an order that filled, was cancelled or expired while the stream was

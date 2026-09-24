@@ -268,23 +268,39 @@ async fn events_decode_with_their_string_encoded_numerics_and_intraday_timestamp
             .unwrap_or_else(|error| panic!("event_date: {error}"));
         times_of_day.insert(time.format("%H:%M:%S").to_string());
 
+        // The messages name the event by country, name and date, never with `{event:?}`: they
+        // reach a public GitHub Actions log, and an event's readings are this provider's data,
+        // which may not be redistributed (see the module header).
         assert!(
             !event.country.is_empty(),
-            "event with no country: {event:?}"
+            "event with no country: {} at {}",
+            event.event,
+            event.event_date
         );
-        assert!(!event.event.is_empty(), "event with no name: {event:?}");
+        assert!(
+            !event.event.is_empty(),
+            "event with no name: {} at {}",
+            event.country,
+            event.event_date
+        );
 
         // 🔴 Absence is spelled `null`, never an empty string. An empty string here would decode
         // into `Some("")` and quietly defeat every `is_none()` check a caller writes.
         assert_ne!(
             event.currency.as_deref(),
             Some(""),
-            "currency arrived as an empty string rather than null: {event:?}"
+            "currency arrived as an empty string rather than null: {} {} at {}",
+            event.country,
+            event.event,
+            event.event_date
         );
         assert_ne!(
             event.unit.as_deref(),
             Some(""),
-            "unit arrived as an empty string rather than null: {event:?}"
+            "unit arrived as an empty string rather than null: {} {} at {}",
+            event.country,
+            event.event,
+            event.event_date
         );
     }
 

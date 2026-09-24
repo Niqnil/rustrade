@@ -297,16 +297,28 @@ async fn rows_decode_with_their_string_encoded_numerics() {
             .unwrap_or_else(|error| panic!("row maturity_days: {error}"));
 
         // The OHLC relationship is the cheapest check that the four legs were not transposed.
+        //
+        // The messages name the row, never its yields: they reach a public GitHub Actions log,
+        // and a row's values are this provider's data, which may not be redistributed (see the
+        // module header). Which relationship broke, and on which row, is the whole diagnostic.
         assert!(
             row.high >= row.low,
-            "{} {}: high {} below low {}",
+            "{} {}: high below low",
             row.symbol,
-            row.date,
-            row.high,
-            row.low
+            row.date
         );
-        assert!(row.high >= row.open && row.high >= row.close, "{row:?}");
-        assert!(row.low <= row.open && row.low <= row.close, "{row:?}");
+        assert!(
+            row.high >= row.open && row.high >= row.close,
+            "{} {}: high below open or close",
+            row.symbol,
+            row.date
+        );
+        assert!(
+            row.low <= row.open && row.low <= row.close,
+            "{} {}: low above open or close",
+            row.symbol,
+            row.date
+        );
         assert_eq!(row.maturity, maturity.tenor, "wrong tenor returned");
         assert_eq!(row.country_iso2, country.code, "wrong country returned");
     }
