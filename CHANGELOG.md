@@ -243,8 +243,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `InstrumentState` gains `orders_open_at_resync` (`#[serde(default)]`), and
   `EngineState::update_from_account_reconnecting` now handles an account stream's reconnect notice.
   The engine and the audit replica both call it in place of
-  `ConnectivityStates::update_from_account_reconnecting`, which it wraps. A consumer that drives
-  `EngineState` directly should do the same.
+  `ConnectivityStates::update_from_account_reconnecting`, which it wraps and which is now
+  crate-private (see the entry above).
 
 - **BREAKING: `Subscriber` gains an associated `Transport: Send` type, and `Subscribed` is generic
   over it** (`rustrade-data`). `Subscribed<InstrumentKey, Transport = WebSocket>` names what a successful
