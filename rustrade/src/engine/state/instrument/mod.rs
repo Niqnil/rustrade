@@ -799,7 +799,9 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// ([`InstrumentAccountSnapshot::orders_complete`]), an order it does not list is no longer
     /// open at the venue: it filled, was cancelled or expired while the account stream was down.
     /// Such an order is retired, with a `warn!` naming it, provided it is in
-    /// [`Self::orders_open_at_resync`] and is still `Open`. Absence cannot say how the order ended,
+    /// [`Self::orders_open_at_resync`] and is still `Open` as the venue order recorded there
+    /// ([`Orders::remove_open`]). An `Open` order that fails only the last test is kept with a
+    /// `warn!` of its own, since it may be a new order or may be gone. Absence cannot say how the order ended,
     /// so its `filled_quantity` is not touched; fills reach the position through the fill path,
     /// and a late one still routes through [`Self::retired_routing`].
     ///
@@ -849,6 +851,24 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                         "InstrumentState retiring an Open order that a complete account snapshot \
                          no longer lists - it filled, was cancelled or expired while the account \
                          stream was down"
+                    );
+                } else if let Some(order) = self
+                    .orders
+                    .0
+                    .get(cid)
+                    .filter(|order| matches!(order.state, ActiveOrderState::Open(_)))
+                {
+                    // Kept, but possibly gone: say so rather than leave a stale order unremarked.
+                    warn!(
+                        instrument = ?order.key.instrument,
+                        strategy = %order.key.strategy,
+                        %cid,
+                        recorded = %id,
+                        state = ?order.state,
+                        "InstrumentState keeping an Open order that a complete account snapshot \
+                         does not list - its venue order id does not prove it is the order \
+                         recorded when the account stream reconnected (a reused client id, or an \
+                         order the venue never named)"
                     );
                 }
             }
@@ -2852,6 +2872,33 @@ mod tests {
                 Decimal::ZERO,
             )))
         );
+    }
+
+    /// An order the venue never named cannot be shown to be the one recorded, so even a complete
+    /// snapshot that leaves it out keeps it.
+    #[test]
+    fn an_order_the_venue_never_named_survives_a_complete_snapshot_that_leaves_it_out() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let cid = ClientOrderId::new("cid-unnamed");
+        state.update_from_order_snapshot(Snapshot(&order(
+            cid.clone(),
+            OrderState::active(OpenInFlight),
+        )));
+        let resting =
+            ActiveOrderState::Open(Open::new(VenueOrderId::ClientAssigned, TIME, Decimal::ZERO));
+        state.update_from_order_snapshot(Snapshot(&order(
+            cid.clone(),
+            OrderState::Active(resting.clone()),
+        )));
+
+        state.begin_account_resync();
+        state.update_from_account_snapshot(&account_snapshot(Vec::new(), true));
+
+        assert_eq!(
+            state.orders.0.get(&cid).map(|order| &order.state),
+            Some(&resting)
+        );
+        assert!(state.orders_open_at_resync.is_empty());
     }
 
     /// The snapshot that starts a run has no resync before it, so it retires nothing.

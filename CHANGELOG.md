@@ -347,7 +347,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that does not declare its list complete, including the one that starts a run. An order is retired
   only when its venue order id proves it is the order recorded, so a client id reused for a new
   order before the snapshot arrives keeps the new order, and so does an order the venue never
-  assigned an id. (#364)
+  assigned an id. Each order kept that way is logged at `warn` too, since it may be gone. (#364)
 
 - **A Binance fill recovered after a disconnect now advances its order** (`rustrade-execution`,
   feature `binance`; Spot and Margin). Recovery reads missed fills from REST `myTrades`, which
