@@ -18,12 +18,12 @@ impl ClientOrderId<SmolStr> {
 
     /// Construct a `ClientOrderId` containing a UUID v4 string.
     ///
-    /// Produces lowercase hyphenated format (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`, 36 chars),
-    /// the format required by Hyperliquid's `cancel_by_cloid()` endpoint.
+    /// Produces lowercase hyphenated format (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`, 36 chars).
     ///
-    /// Required for Hyperliquid trigger orders (Stop, TakeProfit, etc.), which must use
-    /// UUID-format client order IDs for `cancel_by_cloid()` to work. Regular orders can
-    /// use [`Self::random`] for better performance (stack-allocated, no heap).
+    /// Required for every Hyperliquid order, of any kind. The venue stores the id as a 16-byte
+    /// cloid and reports each order back under it, and only this spelling of a UUID converts
+    /// back to the same id. The Hyperliquid clients refuse an order under any other id,
+    /// including [`Self::random`], which suits other venues (stack-allocated, no heap).
     #[cfg(feature = "hyperliquid")]
     pub fn uuid() -> Self {
         Self(SmolStr::new(uuid::Uuid::new_v4().to_string()))

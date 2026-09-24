@@ -58,6 +58,23 @@
 //! and its results reach the caller rather than the stream. A caller feeding both into one consumer
 //! should expect overlap and reconcile on the trade id.
 //!
+//! # Client order ids
+//!
+//! **Every order must be placed under a client id in
+//! [`ClientOrderId::uuid()`](crate::order::id::ClientOrderId::uuid) form**: a UUID, lowercase and
+//! hyphenated. Any other id is refused at placement with [`OrderError::Rejected`], before anything
+//! is sent.
+//!
+//! Hyperliquid tracks an order by its venue `oid` and by an optional 16-byte `cloid`, and reports
+//! the `cloid` back on every order record, REST and WebSocket alike. This client sends the client
+//! id as the `cloid` and turns the one reported back into the same id, so every account snapshot,
+//! open-order listing and order update names an order by the id it was placed with. Only that
+//! form of UUID comes back unchanged, which is why nothing else is accepted.
+//!
+//! An order placed some other way, such as the web app, has no `cloid` and is reported under its
+//! `oid`. It cannot be one of this client's orders, which is what lets an account snapshot declare
+//! its order list complete (see [`InstrumentAccountSnapshot::orders_complete`]).
+//!
 //! # Conditional Orders (Stop, TakeProfit)
 //!
 //! Hyperliquid supports conditional (trigger) orders via the `ClientOrder::Trigger` variant.
@@ -70,16 +87,10 @@
 //!
 //! **Unsupported**: `TrailingStop`, `TrailingStopLimit` (Hyperliquid does not support trailing stops)
 //!
-//! **UUID requirement**: Trigger orders MUST use [`ClientOrderId::uuid()`] for the client order ID.
-//! The SDK's `cancel_by_cloid()` requires a valid UUID. Non-UUID client IDs will be rejected
-//! at order placement with a clear error message.
-//!
-//! **SDK limitations** (hyperliquid_rust_sdk 0.6.x):
-//! - `fetch_open_orders`: Returns `OpenOrdersResponse` which lacks trigger fields (`is_trigger`,
-//!   `trigger_px`). All orders appear as `OrderKind::Limit`.
-//! - `account_stream` (WebSocket): `OrderUpdate` uses `BasicOrder` which also lacks trigger fields.
-//!   Downstream consumers should correlate orders by `cloid` and track `OrderKind` from the
-//!   placement response.
+//! **SDK limitations** (hyperliquid_rust_sdk 0.6.x): neither the open orders this client reads
+//! nor `OrderUpdate` carry an order's trigger fields or time in force, so orders from both are
+//! reported as `OrderKind::Limit`, `GoodUntilCancelled`. Track `OrderKind` from the placement
+//! request.
 //!
 //! # Limitations
 //!
@@ -103,18 +114,18 @@ use crate::{
     },
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
-        id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
+        id::{OrderId, StrategyId, VenueOrderId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
+        state::{Filled, Open, OrderState, UnindexedOrderState},
     },
     position::Position,
     trade::{AssetFees, Trade, TradeId},
 };
 use chrono::{DateTime, Utc};
 use common::{
-    CancelOnDropStream, HYPERLIQUID_OPEN_ORDERS_COMPLETE, cid_to_cloid, instrument_to_perp_coin,
-    map_tif, millis_to_datetime, parse_decimal, parse_side, perp_coin_to_instrument,
-    round_to_5_sig_figs, user_fills,
+    CLOID_REQUIRED, CancelOnDropStream, OpenOrderListing, cid_to_cloid, instrument_to_perp_coin,
+    map_tif, millis_to_datetime, open_order_to_order, open_orders, parse_decimal, parse_side,
+    perp_coin_to_instrument, round_to_5_sig_figs, user_fills,
 };
 pub use config::{HyperliquidConfig, HyperliquidConfigError};
 use error::{map_order_error, map_sdk_error};
@@ -128,8 +139,7 @@ use rustrade_instrument::{
     exchange::ExchangeId,
     instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
-use rustrade_integration::collection::snapshot::Snapshot;
-use smol_str::{SmolStr, format_smolstr};
+use smol_str::format_smolstr;
 use std::{
     collections::HashSet,
     sync::{
@@ -284,12 +294,7 @@ impl ExecutionClient for HyperliquidClient {
                     .await
                     .map_err(map_sdk_error)
             },
-            async {
-                self.info_client
-                    .open_orders(address)
-                    .await
-                    .map_err(map_sdk_error)
-            }
+            open_orders(&self.info_client, address)
         )?;
 
         let now = Utc::now();
@@ -322,62 +327,12 @@ impl ExecutionClient for HyperliquidClient {
             Some(set)
         };
 
-        // Group open orders by instrument
-        let mut orders_by_instrument: std::collections::HashMap<InstrumentNameExchange, Vec<_>> =
-            std::collections::HashMap::with_capacity(open_orders.len());
-
-        for order in &open_orders {
-            let instrument = perp_coin_to_instrument(&order.coin);
-            if instrument_filter
-                .as_ref()
-                .is_some_and(|f| !f.contains(&instrument))
-            {
-                continue;
-            }
-
-            let Some(side) = parse_side(&order.side) else {
-                continue;
-            };
-            let Some(price) = parse_decimal(&order.limit_px, "limit_px") else {
-                continue;
-            };
-            let Some(quantity) = parse_decimal(&order.sz, "sz") else {
-                continue;
-            };
-            let Some(time_exchange) = millis_to_datetime(order.timestamp) else {
-                warn!(
-                    oid = order.oid,
-                    timestamp = order.timestamp,
-                    "Invalid order timestamp, skipping"
-                );
-                continue;
-            };
-
-            let order_id = format_smolstr!("{}", order.oid);
-            let order_snapshot = Order {
-                key: OrderKey {
-                    exchange: ExchangeId::HyperliquidPerp,
-                    instrument: instrument.clone(),
-                    strategy: StrategyId::unknown(),
-                    cid: ClientOrderId::new(order_id.clone()),
-                },
-                side,
-                price: Some(price),
-                quantity,
-                kind: OrderKind::Limit,
-                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                state: crate::order::state::OrderState::active(Open {
-                    id: VenueOrderId::Assigned(OrderId(order_id)),
-                    time_exchange,
-                    filled_quantity: Decimal::ZERO,
-                }),
-            };
-
-            orders_by_instrument
-                .entry(instrument)
-                .or_default()
-                .push(order_snapshot);
-        }
+        let mut listing = OpenOrderListing::new(
+            &open_orders,
+            ExchangeId::HyperliquidPerp,
+            instruments,
+            |coin| Some(perp_coin_to_instrument(coin)),
+        );
 
         // Build positions from asset_positions
         let mut instrument_snapshots = Vec::new();
@@ -419,27 +374,24 @@ impl ExecutionClient for HyperliquidClient {
                 ))
             };
 
-            let orders = orders_by_instrument.remove(&instrument).unwrap_or_default();
+            let (orders, orders_complete) = match listing.remove(&instrument) {
+                Some(listed) => (listed.orders, listed.orders_complete),
+                // The listing has an entry for every requested instrument, so this is an
+                // unfiltered read with no open order on the instrument.
+                None => (Vec::new(), true),
+            };
 
             instrument_snapshots.push(InstrumentAccountSnapshot {
                 instrument,
                 orders,
-                orders_complete: HYPERLIQUID_OPEN_ORDERS_COMPLETE,
+                orders_complete,
                 position,
                 isolated: None,
             });
         }
 
-        // Add any instruments that have orders but no position
-        for (instrument, orders) in orders_by_instrument {
-            instrument_snapshots.push(InstrumentAccountSnapshot {
-                instrument,
-                orders,
-                orders_complete: HYPERLIQUID_OPEN_ORDERS_COMPLETE,
-                position: None,
-                isolated: None,
-            });
-        }
+        // Every other instrument listed: open orders but no position, or requested with neither.
+        instrument_snapshots.extend(listing.into_snapshots());
 
         Ok(AccountSnapshot {
             exchange: ExchangeId::HyperliquidPerp,
@@ -683,11 +635,11 @@ impl ExecutionClient for HyperliquidClient {
                     .map_err(|_| "venue order id is not a numeric Hyperliquid oid")
             }
             // The venue accepted the order without assigning an oid, so the only handle on it is
-            // the client id sent with it -- and `cancel_by_cloid` requires that to be a UUID. The
-            // UUID guard at placement is what keeps this arm reachable.
-            Some(VenueOrderId::ClientAssigned) => Uuid::parse_str(&request.key.cid.0)
+            // the cloid it was placed with -- which placement derives from the client id the same
+            // way, and refuses the order if it cannot.
+            Some(VenueOrderId::ClientAssigned) => cid_to_cloid(&request.key.cid)
                 .map(CancelMethod::ByCloid)
-                .map_err(|_| "order is addressable only by its client id, which is not a UUID"),
+                .ok_or("order is addressable only by its client id, which is not a canonical UUID"),
             None => Err("order is still in flight; the venue has acknowledged nothing to cancel"),
         };
 
@@ -723,7 +675,7 @@ impl ExecutionClient for HyperliquidClient {
                 self.exchange_client.cancel(cancel_request, None).await
             }
             CancelMethod::ByCloid(cloid) => {
-                debug!(%cloid, "Cancelling by cloid (trigger order)");
+                debug!(%cloid, "Cancelling by cloid (no oid assigned)");
                 let cancel_request = ClientCancelRequestCloid { asset: coin, cloid };
                 self.exchange_client
                     .cancel_by_cloid(cancel_request, None)
@@ -851,22 +803,11 @@ impl ExecutionClient for HyperliquidClient {
             | OrderKind::TakeProfitLimit { .. } => {}
         }
 
-        let cloid = cid_to_cloid(&request.key.cid);
-        let cloid_is_some = cloid.is_some();
-        let is_trigger_order = matches!(
-            request.state.kind,
-            OrderKind::Stop { .. }
-                | OrderKind::StopLimit { .. }
-                | OrderKind::TakeProfit { .. }
-                | OrderKind::TakeProfitLimit { .. }
-        );
-        if is_trigger_order && cloid.is_none() {
-            return Some(make_rejected(
-                "Trigger orders require UUID-format client order ID (use ClientOrderId::uuid()). \
-                 Non-UUID IDs cannot be cancelled via cancel_by_cloid()."
-                    .to_string(),
-            ));
-        }
+        // The venue reports every order under its cloid, so an order placed without one could
+        // not be matched to the id the caller tracks it by. See the module docs.
+        let Some(cloid) = cid_to_cloid(&request.key.cid) else {
+            return Some(make_rejected(CLOID_REQUIRED.to_string()));
+        };
 
         let limit_px = match request.state.kind {
             // Market triggers: SDK uses trigger_px as limit_px
@@ -932,7 +873,7 @@ impl ExecutionClient for HyperliquidClient {
             reduce_only: request.state.reduce_only,
             limit_px,
             sz,
-            cloid,
+            cloid: Some(cloid),
             order_type,
         };
 
@@ -995,27 +936,15 @@ impl ExecutionClient for HyperliquidClient {
                     Some(
                         ExchangeDataStatus::WaitingForFill | ExchangeDataStatus::WaitingForTrigger,
                     ) => {
-                        // Use cid as OrderId only if it's a valid UUID (required for
-                        // cancel_by_cloid). Trigger orders pass the UUID guard above;
-                        // limit IOC/FOK orders may have non-UUID cids — those become
-                        // untrackable, so reject with an observable failure rather than
-                        // returning an OrderId that cancel cannot parse.
-                        if cloid_is_some {
-                            debug!(cloid = %request.key.cid.0, "Order waiting (cloid trackable)");
-                            OrderState::active(Open {
-                                id: VenueOrderId::ClientAssigned,
-                                time_exchange: Utc::now(),
-                                filled_quantity: Decimal::ZERO,
-                            })
-                        } else {
-                            warn!("Order accepted but cid is not UUID — untrackable");
-                            OrderState::inactive(OrderError::Rejected(
-                                crate::error::ApiError::OrderRejected(
-                                    "order accepted but cid is not UUID; cannot track for cancel"
-                                        .to_string(),
-                                ),
-                            ))
-                        }
+                        // The venue answered without an oid, so the order's only handle is the
+                        // cloid it was placed with. A standalone trigger order is answered
+                        // `resting` with an oid; these statuses belong to grouped orders.
+                        debug!(cid = %request.key.cid, "Order waiting under its cloid");
+                        OrderState::active(Open {
+                            id: VenueOrderId::ClientAssigned,
+                            time_exchange: Utc::now(),
+                            filled_quantity: Decimal::ZERO,
+                        })
                     }
                     Some(ExchangeDataStatus::Success) | None => {
                         // Generic success without order ID — SDK didn't return structured data.
@@ -1092,11 +1021,7 @@ impl ExecutionClient for HyperliquidClient {
     ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError> {
         let address = self.wallet_h160();
 
-        let open_orders = self
-            .info_client
-            .open_orders(address)
-            .await
-            .map_err(map_sdk_error)?;
+        let open_orders = open_orders(&self.info_client, address).await?;
 
         let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
             None
@@ -1106,57 +1031,19 @@ impl ExecutionClient for HyperliquidClient {
             Some(set)
         };
 
-        let mut result = Vec::new();
-        for order in open_orders {
-            let instrument = perp_coin_to_instrument(&order.coin);
-
-            if instrument_filter
-                .as_ref()
-                .is_some_and(|f| !f.contains(&instrument))
-            {
-                continue;
-            }
-
-            let Some(side) = parse_side(&order.side) else {
-                continue;
-            };
-            let Some(price) = parse_decimal(&order.limit_px, "limit_px") else {
-                continue;
-            };
-            let Some(quantity) = parse_decimal(&order.sz, "sz") else {
-                continue;
-            };
-            let Some(time_exchange) = millis_to_datetime(order.timestamp) else {
-                warn!(
-                    oid = order.oid,
-                    timestamp = order.timestamp,
-                    "Invalid order timestamp, skipping"
-                );
-                continue;
-            };
-
-            let order_id = format_smolstr!("{}", order.oid);
-            result.push(Order {
-                key: OrderKey {
-                    exchange: ExchangeId::HyperliquidPerp,
-                    instrument,
-                    strategy: StrategyId::unknown(),
-                    cid: ClientOrderId::new(order_id.clone()),
-                },
-                side,
-                price: Some(price),
-                quantity,
-                kind: OrderKind::Limit,
-                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                state: Open {
-                    id: VenueOrderId::Assigned(OrderId(order_id)),
-                    time_exchange,
-                    filled_quantity: Decimal::ZERO,
-                },
-            });
-        }
-
-        Ok(result)
+        Ok(open_orders
+            .iter()
+            .filter_map(|order| {
+                let instrument = perp_coin_to_instrument(&order.coin);
+                if instrument_filter
+                    .as_ref()
+                    .is_some_and(|f| !f.contains(&instrument))
+                {
+                    return None;
+                }
+                open_order_to_order(order, ExchangeId::HyperliquidPerp, instrument)
+            })
+            .collect())
     }
 
     async fn fetch_trades(
@@ -1275,74 +1162,11 @@ fn fill_to_account_event(fill: &hyperliquid_rust_sdk::TradeInfo) -> Option<Unind
 fn order_update_to_account_event(
     update: &hyperliquid_rust_sdk::OrderUpdate,
 ) -> Option<UnindexedAccountEvent> {
-    let order = &update.order;
-    let side = parse_side(&order.side)?;
-    let price = parse_decimal(&order.limit_px, "order.limit_px")?;
-    let orig_sz = parse_decimal(&order.orig_sz, "order.orig_sz")?;
-    let time_exchange = millis_to_datetime(update.status_timestamp)?;
-    let instrument = perp_coin_to_instrument(&order.coin);
-
-    // Use cloid (client order ID) if available, fall back to OID
-    let order_id_smol = format_smolstr!("{}", order.oid);
-    let cid = order
-        .cloid
-        .as_deref()
-        .map(|c| ClientOrderId::new(SmolStr::new(c)))
-        .unwrap_or_else(|| ClientOrderId::new(order_id_smol.clone()));
-
-    // Determine order state from status
-    let state = match update.status.as_str() {
-        "open" | "resting" => {
-            let current_sz = parse_decimal(&order.sz, "order.sz")?;
-            let filled_quantity = (orig_sz - current_sz).max(Decimal::ZERO);
-            crate::order::state::OrderState::active(Open {
-                id: VenueOrderId::Assigned(OrderId(order_id_smol)),
-                time_exchange,
-                filled_quantity,
-            })
-        }
-        "filled" => crate::order::state::OrderState::fully_filled(Filled::new(
-            OrderId(order_id_smol),
-            time_exchange,
-            orig_sz, // Fully filled means filled_quantity == orig_sz
-            None,    // OrderUpdate doesn't include avg_price
-        )),
-        "canceled" | "cancelled" => {
-            let current_sz = parse_decimal(&order.sz, "order.sz")?;
-            let filled_quantity = (orig_sz - current_sz).max(Decimal::ZERO);
-            crate::order::state::OrderState::inactive(Cancelled::new(
-                OrderId(order_id_smol),
-                time_exchange,
-                filled_quantity,
-            ))
-        }
-        status => {
-            warn!(%status, "Unknown order status");
-            return None;
-        }
-    };
-
-    // SDK's OrderUpdate doesn't include original order type or TIF, so we default
-    // to Limit/GTC. This is a known limitation — IOC/FOK orders will be misrepresented.
-    let order_snapshot = Order {
-        key: OrderKey {
-            exchange: ExchangeId::HyperliquidPerp,
-            instrument,
-            strategy: StrategyId::unknown(),
-            cid,
-        },
-        side,
-        price: Some(price),
-        quantity: orig_sz,
-        kind: OrderKind::Limit,
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        state,
-    };
-
-    Some(AccountEvent::new(
+    common::order_update_to_account_event(
+        update,
         ExchangeId::HyperliquidPerp,
-        AccountEventKind::OrderSnapshot(Snapshot(order_snapshot)),
-    ))
+        perp_coin_to_instrument(&update.order.coin),
+    )
 }
 
 #[cfg(test)]
@@ -1351,6 +1175,7 @@ fn order_update_to_account_event(
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+    use rustrade_integration::collection::snapshot::Snapshot;
 
     #[test]
     fn test_fill_to_account_event() {

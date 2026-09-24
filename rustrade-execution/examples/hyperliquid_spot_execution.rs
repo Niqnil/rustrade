@@ -141,10 +141,8 @@ async fn main() {
 
     // Spot instrument format: "BTC-USDC-SPOT" (converts to "BTC/USDC" for API)
     let btc_spot: InstrumentNameExchange = "BTC-USDC-SPOT".into();
-    let order_cid = ClientOrderId::new(format!(
-        "spot-example-{}",
-        chrono::Utc::now().timestamp_millis()
-    ));
+    // Hyperliquid accepts only client ids in `ClientOrderId::uuid()` form.
+    let order_cid = ClientOrderId::uuid();
     let strategy = StrategyId::new("demo-spot-strategy");
 
     let order_key = OrderKey {

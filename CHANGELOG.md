@@ -208,6 +208,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING: the Hyperliquid clients refuse an order whose client id is not a UUID in
+  `ClientOrderId::uuid()` form** (`rustrade-execution`, `HyperliquidClient` and
+  `HyperliquidSpotClient`). Hyperliquid names an order by the 16-byte `cloid` it was placed with,
+  and only a lowercase, hyphenated UUID comes back from it as the same id; an order placed under any
+  other id could never be matched to its own updates. Previously only trigger orders required a
+  UUID, and other orders were sent without a `cloid`. `open_order` now answers such a request with
+  `OrderError::Rejected` before anything is sent, whatever the order kind. `common::cid_to_cloid`
+  returns `None` for every other spelling of a UUID, uppercase or unhyphenated included. To
+  migrate, generate Hyperliquid client ids with `ClientOrderId::uuid()`.
+
 - **BREAKING: `InstrumentAccountSnapshot` gains `orders_complete`, a client's statement that its
   `orders` list is every order open at the venue for that instrument** (`rustrade-execution`). A
   snapshot's list could previously miss an open order without saying so: Alpaca drops a notional
@@ -217,8 +227,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to retire vanished orders (see Fixed). The field is `#[serde(default)]` false, the answer that
   claims nothing, and `ExecutionClient::account_snapshot` now documents what a client must
   guarantee before setting it. Binance Spot and Margin set it per symbol, only when every
-  `openOrders` row converted under its own `clientOrderId`; the mock venue sets it always. Alpaca,
-  Hyperliquid and IBKR set it `false` until the gaps above are closed (#368, #369, #371). To migrate, pass the new
+  `openOrders` row converted under its own `clientOrderId`; the mock venue sets it always, and
+  Hyperliquid per instrument (see the entry below). Alpaca and IBKR set it `false` until the gaps
+  above are closed (#369, #371). To migrate, pass the new
   argument to `InstrumentAccountSnapshot::new` after `orders`, or add the field to a struct literal;
   `false` keeps the previous behaviour.
 
@@ -329,6 +340,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drift between the two surfaces. The messages themselves are unchanged.
 
 ### Fixed
+
+- **Hyperliquid reports each order under the client id it was placed with** (#368,
+  `rustrade-execution`). The account snapshot and `fetch_open_orders` reported every open order
+  under its venue `oid`, because the SDK's type for the `openOrders` response drops the `cloid`
+  the venue sends. Order updates on the account stream reported the `cloid` as the venue echoes it,
+  `0x` and 32 hex digits, which is not the id the order was placed with either. So no order state
+  reached the order the engine tracked: each snapshot inserted a duplicate of every open order,
+  keyed by its `oid` and owned by `StrategyId::unknown()`, while the tracked order was never
+  advanced by a partial fill or retired when cancelled. Both paths now turn the `cloid` back into
+  the id the order was placed with; an order placed without one, such as from the web app, is
+  still reported under its `oid`. Open orders now also carry their filled quantity, from the
+  `origSz` the SDK type dropped.
+
+  With every order identifiable, the account snapshot declares its order list complete
+  (`orders_complete`), so the engine retires an order that ended while the account stream was
+  down. The snapshot now has an entry for every requested instrument, open orders or not, so that
+  covers the instrument whose last order ended. An order that does not convert is logged at `warn`
+  and leaves its instrument's list incomplete, rather than being left out silently.
+
+- **Hyperliquid order updates that end an order for a stated reason now end it**
+  (`rustrade-execution`). Only `open`, `filled` and `canceled` were recognised. Every other status
+  Hyperliquid sends, such as `marginCanceled`, `selfTradeCanceled`, `reduceOnlyCanceled`,
+  `scheduledCancel` and the `…Rejected` family, was logged and dropped, leaving the order tracked
+  as open. A status ending in `Canceled` now cancels the order, one ending in `Rejected` rejects
+  it, and `triggered` keeps a trigger order open until its own ending arrives.
 
 - **The London Strategic Edge canaries no longer print provider data when they fail**
   (`rustrade-data` tests). `lse-weekly.yml` runs them with `--nocapture` in a public repository,

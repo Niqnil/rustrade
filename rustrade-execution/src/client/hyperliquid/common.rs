@@ -6,27 +6,29 @@
 //! Error mapping is in the `error` module.
 
 use crate::client::hyperliquid::error::map_sdk_error;
-use crate::error::UnindexedClientError;
-use crate::order::{TimeInForce, id::ClientOrderId};
+use crate::error::{ApiError, OrderError, UnindexedClientError};
+use crate::order::{
+    Order, OrderKey, OrderKind, TimeInForce, UnindexedOrderSnapshot,
+    id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
+    state::{Cancelled, Filled, Open, OrderState},
+};
+use crate::{InstrumentAccountSnapshot, UnindexedAccountEvent};
 use chrono::{DateTime, TimeZone, Utc};
 use futures::Stream;
 use rust_decimal::Decimal;
-use rustrade_instrument::{Side, instrument::name::InstrumentNameExchange};
+use rustrade_instrument::{
+    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
+    instrument::name::InstrumentNameExchange,
+};
+use serde::de::DeserializeOwned;
 use smol_str::format_smolstr;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::task::{Context, Poll};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::warn;
 use uuid::Uuid;
-
-/// Whether an account snapshot's `orders` is every open order under the id it was placed with.
-///
-/// Not yet: the REST open-orders response the snapshot reads has no `cloid`, so each order is
-/// reported under its venue `oid` and cannot be matched to the `ClientOrderId` it was placed with.
-/// Declaring the list complete would have the engine retire every tracked order as absent. See
-/// #368.
-pub(super) const HYPERLIQUID_OPEN_ORDERS_COMPLETE: bool = false;
 
 /// Stream wrapper that cancels background tasks when dropped.
 ///
@@ -123,9 +125,70 @@ pub async fn user_fills(
     info_client: &hyperliquid_rust_sdk::InfoClient,
     address: ethers::types::H160,
 ) -> Result<Vec<UserFill>, UnindexedClientError> {
+    user_info(info_client, "userFills", address).await
+}
+
+/// One order from the `openOrders` info endpoint, as the venue actually returns it.
+///
+/// # Why this exists rather than `hyperliquid_rust_sdk::OpenOrdersResponse`
+///
+/// The SDK's type does not model `cloid`, the client order id the order was placed with, nor
+/// `origSz`. The venue sends both, although its documentation lists neither. Without `cloid` an
+/// order can only be reported under its venue `oid`, which is not the id the engine tracks it by.
+///
+/// Drop this in favour of the SDK type if it ever models `cloid`.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenOrder {
+    pub coin: String,
+    pub side: String,
+    pub limit_px: String,
+    /// Quantity still to fill.
+    pub sz: String,
+    pub oid: u64,
+    pub timestamp: u64,
+
+    /// Quantity the order was placed for.
+    ///
+    /// Optional because the endpoint's documentation does not list it. Without it the order's
+    /// filled quantity is unknown, and it is reported as its remaining quantity with nothing
+    /// filled.
+    #[serde(default)]
+    pub orig_sz: Option<String>,
+
+    /// The client order id the order was placed with, as `0x` and 32 hex digits (see
+    /// [`cloid_to_cid`]). Absent for an order placed without one.
+    #[serde(default)]
+    pub cloid: Option<String>,
+}
+
+/// Fetch every open order for `address`, parsed into [`OpenOrder`] rather than the SDK's lossy
+/// type, which drops the `cloid`.
+///
+/// # Errors
+///
+/// Returns a transport error if the POST fails, or a parse error if the response does not match
+/// [`OpenOrder`].
+pub async fn open_orders(
+    info_client: &hyperliquid_rust_sdk::InfoClient,
+    address: ethers::types::H160,
+) -> Result<Vec<OpenOrder>, UnindexedClientError> {
+    user_info(info_client, "openOrders", address).await
+}
+
+/// POST the info request `{"type": kind, "user": address}` and parse the response as `T`.
+///
+/// Issued through the SDK's own [`HttpClient`](hyperliquid_rust_sdk::InfoClient::http_client), so
+/// base URL, TLS configuration and error type are exactly those of every other info request this
+/// client makes — only the response type differs.
+async fn user_info<T: DeserializeOwned>(
+    info_client: &hyperliquid_rust_sdk::InfoClient,
+    kind: &str,
+    address: ethers::types::H160,
+) -> Result<T, UnindexedClientError> {
     // `{:?}` on H160 renders the checksummed 0x-prefixed form the endpoint expects. `Display`
     // abbreviates the middle of the address ("0x1234…5678"), so it must not be used here.
-    let body = format!(r#"{{"type":"userFills","user":"{address:?}"}}"#);
+    let body = format!(r#"{{"type":"{kind}","user":"{address:?}"}}"#);
 
     let raw = info_client
         .http_client
@@ -136,8 +199,250 @@ pub async fn user_fills(
     // `Internal` rather than a connectivity error: a response that does not parse is a schema
     // change or a venue-side regression, not a transient fault, and retrying will not fix it.
     serde_json::from_str(&raw).map_err(|e| {
-        UnindexedClientError::Internal(format!("Hyperliquid userFills response did not parse: {e}"))
+        UnindexedClientError::Internal(format!("Hyperliquid {kind} response did not parse: {e}"))
     })
+}
+
+/// Convert one [`OpenOrder`] into an `Open` order on `instrument`, keyed as [`record_cid`] says.
+///
+/// `None`, with a `warn!`, when a field does not parse. The caller then cannot say the order is
+/// not open, so it must not declare its list complete.
+pub(super) fn open_order_to_order(
+    row: &OpenOrder,
+    exchange: ExchangeId,
+    instrument: InstrumentNameExchange,
+) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
+    let parsed = (|| {
+        let cid = record_cid(row.cloid.as_deref(), row.oid)?;
+        let side = parse_side(&row.side)?;
+        let price = parse_decimal(&row.limit_px, "limitPx")?;
+        let remaining = parse_decimal(&row.sz, "sz")?;
+        let quantity = match &row.orig_sz {
+            Some(orig_sz) => parse_decimal(orig_sz, "origSz")?,
+            None => remaining,
+        };
+        let time_exchange = millis_to_datetime(row.timestamp)?;
+        Some((cid, side, price, quantity, remaining, time_exchange))
+    })();
+
+    let Some((cid, side, price, quantity, remaining, time_exchange)) = parsed else {
+        warn!(
+            %exchange,
+            %instrument,
+            oid = row.oid,
+            order = ?row,
+            "Hyperliquid open order did not convert - leaving it out, so this instrument's order \
+             list is not complete"
+        );
+        return None;
+    };
+
+    Some(Order {
+        key: OrderKey {
+            exchange,
+            instrument,
+            strategy: StrategyId::unknown(),
+            cid,
+        },
+        side,
+        price: Some(price),
+        quantity,
+        // Neither the kind nor the time in force is in this response.
+        kind: OrderKind::Limit,
+        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+        state: Open {
+            id: VenueOrderId::Assigned(OrderId(format_smolstr!("{}", row.oid))),
+            time_exchange,
+            filled_quantity: (quantity - remaining).max(Decimal::ZERO),
+        },
+    })
+}
+
+type UnindexedInstrumentAccountSnapshot =
+    InstrumentAccountSnapshot<ExchangeId, AssetNameExchange, InstrumentNameExchange>;
+
+/// The open orders of an account snapshot, one entry per instrument.
+pub(super) struct OpenOrderListing(
+    HashMap<InstrumentNameExchange, UnindexedInstrumentAccountSnapshot>,
+);
+
+impl OpenOrderListing {
+    /// List `rows` by instrument, keeping only the rows `to_instrument` maps to an instrument in
+    /// `requested` (every instrument when `requested` is empty).
+    ///
+    /// Each entry declares its orders complete unless one of its rows failed to convert. That
+    /// holds because the endpoint returns every open order, unpaged, and because [`record_cid`]
+    /// reports each order placed through this client under the id it was placed with.
+    ///
+    /// Every requested instrument gets an entry, open orders or not. An entry is what lets the
+    /// engine judge an order that is no longer listed to be gone, and the instrument whose last
+    /// order was cancelled while the account stream was down is exactly the one with nothing
+    /// left to list. With `requested` empty there is nothing to enumerate, so only instruments
+    /// with open orders get one.
+    pub(super) fn new(
+        rows: &[OpenOrder],
+        exchange: ExchangeId,
+        requested: &[InstrumentNameExchange],
+        to_instrument: impl Fn(&str) -> Option<InstrumentNameExchange>,
+    ) -> Self {
+        fn entry<'a>(
+            listing: &'a mut HashMap<InstrumentNameExchange, UnindexedInstrumentAccountSnapshot>,
+            instrument: &InstrumentNameExchange,
+        ) -> &'a mut UnindexedInstrumentAccountSnapshot {
+            listing
+                .entry(instrument.clone())
+                .or_insert_with(|| InstrumentAccountSnapshot {
+                    instrument: instrument.clone(),
+                    orders: Vec::new(),
+                    orders_complete: true,
+                    position: None,
+                    isolated: None,
+                })
+        }
+
+        let requested_set = requested.iter().collect::<HashSet<_>>();
+        let mut listing = HashMap::with_capacity(requested.len());
+
+        for instrument in requested {
+            entry(&mut listing, instrument);
+        }
+
+        for row in rows {
+            let Some(instrument) = to_instrument(&row.coin) else {
+                continue;
+            };
+            if !requested_set.is_empty() && !requested_set.contains(&instrument) {
+                continue;
+            }
+            let order = open_order_to_order(row, exchange, instrument.clone());
+            let snapshot = entry(&mut listing, &instrument);
+            match order {
+                Some(order) => snapshot.orders.push(order.into()),
+                None => snapshot.orders_complete = false,
+            }
+        }
+
+        Self(listing)
+    }
+
+    /// Take the entry for `instrument`, if it has one.
+    pub(super) fn remove(
+        &mut self,
+        instrument: &InstrumentNameExchange,
+    ) -> Option<UnindexedInstrumentAccountSnapshot> {
+        self.0.remove(instrument)
+    }
+
+    /// Every remaining entry.
+    pub(super) fn into_snapshots(self) -> impl Iterator<Item = UnindexedInstrumentAccountSnapshot> {
+        self.0.into_values()
+    }
+}
+
+/// What a Hyperliquid order status says about the order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrderStatus {
+    Open,
+    Filled,
+    Cancelled,
+    Rejected,
+}
+
+impl OrderStatus {
+    /// Classify an `orderUpdates` / `orderStatus` status string.
+    ///
+    /// Beyond `open`, `filled`, `canceled` and `rejected`, Hyperliquid names the reason for each
+    /// other way an order ends: `marginCanceled`, `selfTradeCanceled`, `reduceOnlyCanceled`,
+    /// `tickRejected`, `badAloPxRejected` and a dozen more. They are classified by their suffix
+    /// so that a reason added later still ends the order, rather than leaving it tracked as open
+    /// for good. `scheduledCancel` is the one ending that breaks the pattern.
+    ///
+    /// `triggered` is a trigger order whose condition was met. It is still working, and ends
+    /// with a later status of its own.
+    fn classify(status: &str) -> Option<Self> {
+        match status {
+            "open" | "triggered" => Some(Self::Open),
+            "filled" => Some(Self::Filled),
+            "canceled" | "scheduledCancel" => Some(Self::Cancelled),
+            "rejected" => Some(Self::Rejected),
+            status if status.ends_with("Canceled") => Some(Self::Cancelled),
+            status if status.ends_with("Rejected") => Some(Self::Rejected),
+            _ => None,
+        }
+    }
+}
+
+/// Convert an `orderUpdates` message into an order snapshot event on `instrument`, keyed as
+/// [`record_cid`] says.
+///
+/// `None`, with a `warn!` naming the cause where the parse helpers do not, when a field does not
+/// parse or the status is not one [`OrderStatus::classify`] recognises.
+pub(super) fn order_update_to_account_event(
+    update: &hyperliquid_rust_sdk::OrderUpdate,
+    exchange: ExchangeId,
+    instrument: InstrumentNameExchange,
+) -> Option<UnindexedAccountEvent> {
+    let order = &update.order;
+    let Some(status) = OrderStatus::classify(&update.status) else {
+        warn!(%exchange, status = %update.status, oid = order.oid, "Unknown Hyperliquid order status - ignoring the update");
+        return None;
+    };
+    let cid = record_cid(order.cloid.as_deref(), order.oid)?;
+    let side = parse_side(&order.side)?;
+    let price = parse_decimal(&order.limit_px, "order.limitPx")?;
+    let orig_sz = parse_decimal(&order.orig_sz, "order.origSz")?;
+    let Some(time_exchange) = millis_to_datetime(update.status_timestamp) else {
+        warn!(%exchange, oid = order.oid, status_timestamp = update.status_timestamp, "Invalid Hyperliquid order update timestamp - ignoring the update");
+        return None;
+    };
+    let order_id = OrderId(format_smolstr!("{}", order.oid));
+    let filled_quantity = || {
+        parse_decimal(&order.sz, "order.sz")
+            .map(|remaining| (orig_sz - remaining).max(Decimal::ZERO))
+    };
+
+    let state = match status {
+        OrderStatus::Open => OrderState::active(Open {
+            id: VenueOrderId::Assigned(order_id),
+            time_exchange,
+            filled_quantity: filled_quantity()?,
+        }),
+        OrderStatus::Filled => OrderState::fully_filled(Filled::new(
+            order_id,
+            time_exchange,
+            orig_sz,
+            None, // The update does not carry the average price.
+        )),
+        OrderStatus::Cancelled => {
+            OrderState::inactive(Cancelled::new(order_id, time_exchange, filled_quantity()?))
+        }
+        OrderStatus::Rejected => OrderState::inactive(OrderError::Rejected(
+            ApiError::OrderRejected(update.status.clone()),
+        )),
+    };
+
+    // The update carries neither the order's kind nor its time in force.
+    let snapshot: UnindexedOrderSnapshot = Order {
+        key: OrderKey {
+            exchange,
+            instrument,
+            strategy: StrategyId::unknown(),
+            cid,
+        },
+        side,
+        price: Some(price),
+        quantity: orig_sz,
+        kind: OrderKind::Limit,
+        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+        state,
+    };
+
+    Some(crate::AccountEvent::new(
+        exchange,
+        crate::AccountEventKind::OrderSnapshot(
+            rustrade_integration::collection::snapshot::Snapshot(snapshot),
+        ),
+    ))
 }
 
 pub fn parse_decimal(value: &str, field: &str) -> Option<Decimal> {
@@ -227,16 +532,55 @@ pub fn map_tif(tif: &TimeInForce) -> &'static str {
     }
 }
 
-/// Convert a ClientOrderId to SDK cloid format (UUID) if valid.
+/// Why an order is refused when its client id cannot be a cloid ([`cid_to_cloid`]).
+pub(super) const CLOID_REQUIRED: &str = "Hyperliquid requires the client order id to be a UUID in \
+     canonical form, as ClientOrderId::uuid() makes: the venue reports each order under that id, \
+     and an order under any other id could not be matched to its own updates";
+
+/// The cloid to place an order under `cid` with, or `None` if `cid` cannot be one.
 ///
-/// Returns `Some(Uuid)` if the cid is a valid UUID, `None` otherwise.
-/// Non-UUID CIDs are logged at debug level since they're common in tests/examples.
+/// Hyperliquid stores a cloid as 16 bytes and reports it back as `0x` and 32 lowercase hex
+/// digits, which [`cloid_to_cid`] turns back into a client id. Only a `cid` that is the canonical
+/// text of a UUID — lowercase and hyphenated, as [`ClientOrderId::uuid`] makes — comes back
+/// unchanged. Any other spelling of a UUID would come back as a different id, under which the
+/// order's own updates could not find it, so it is refused along with every id that is not a UUID.
 pub fn cid_to_cloid(cid: &ClientOrderId) -> Option<Uuid> {
-    match Uuid::parse_str(cid.0.as_str()) {
-        Ok(uuid) => Some(uuid),
-        Err(_) => {
-            debug!(cid = %cid.0, "CID is not a valid UUID, cloid will be None");
-            None
+    let uuid = Uuid::try_parse(cid.0.as_str()).ok()?;
+    let mut canonical = Uuid::encode_buffer();
+    (uuid.hyphenated().encode_lower(&mut canonical) == cid.0.as_str()).then_some(uuid)
+}
+
+/// The client id an order placed with `cloid` was placed under: the inverse of [`cid_to_cloid`].
+///
+/// `cloid` is the venue's form, `0x` and 32 hex digits. `None` for anything else.
+pub fn cloid_to_cid(cloid: &str) -> Option<ClientOrderId> {
+    let hex = cloid.strip_prefix("0x")?;
+    if hex.len() != 32 {
+        return None;
+    }
+    // The 32-digit length check rules out the other spellings `try_parse` accepts.
+    let uuid = Uuid::try_parse(hex).ok()?;
+    Some(ClientOrderId::new(format_smolstr!("{}", uuid.hyphenated())))
+}
+
+/// The client id to report a venue order record under, given the record's `cloid` and `oid`.
+///
+/// Every order this client places carries a cloid ([`cid_to_cloid`]), so a record with one is
+/// reported under the id the order was placed with. A record without one was placed some other
+/// way, such as the web app, and has no client id at all. It is reported under its venue `oid`,
+/// the only identifier it has, which is stable across reads so the order is tracked once.
+///
+/// `None`, with a `warn!`, for a cloid that is not in the venue's form. The record's order is
+/// then unidentified, and must be left out rather than reported under a guess.
+pub(super) fn record_cid(cloid: Option<&str>, oid: u64) -> Option<ClientOrderId> {
+    match cloid {
+        None => Some(ClientOrderId::new(format_smolstr!("{oid}"))),
+        Some(cloid) => {
+            let cid = cloid_to_cid(cloid);
+            if cid.is_none() {
+                warn!(%cloid, oid, "Hyperliquid order carries a cloid that is not 0x and 32 hex digits");
+            }
+            cid
         }
     }
 }
@@ -432,8 +776,9 @@ mod tests {
 #[cfg(test)]
 // Test code: panics on bad input are acceptable
 #[allow(clippy::unwrap_used)]
-mod user_fills_tests {
+mod info_tests {
     use super::*;
+    use rust_decimal_macros::dec;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -576,5 +921,321 @@ mod user_fills_tests {
         // The mock only answers a body carrying the full address, so reaching `Ok` is the
         // assertion.
         assert!(user_fills(&client, address).await.unwrap().is_empty());
+    }
+
+    // ---- client order ids -------------------------------------------------------------------
+
+    const CID: &str = "85b60bff-64d5-49ec-95af-6268d7d1df63";
+    /// `CID` as the venue reports it back: `0x` and the 32 lowercase hex digits.
+    const CLOID: &str = "0x85b60bff64d549ec95af6268d7d1df63";
+
+    #[test]
+    fn only_the_canonical_uuid_form_can_be_a_cloid() {
+        let cloid = cid_to_cloid(&ClientOrderId::new(CID)).unwrap();
+        assert_eq!(cloid.to_string(), CID);
+
+        // Every other spelling of the same UUID would come back as `CID`, not as itself.
+        for other in [
+            "85B60BFF-64D5-49EC-95AF-6268D7D1DF63",
+            "85b60bff64d549ec95af6268d7d1df63",
+            "{85b60bff-64d5-49ec-95af-6268d7d1df63}",
+            "urn:uuid:85b60bff-64d5-49ec-95af-6268d7d1df63",
+            "example-1714100000000",
+            "",
+        ] {
+            assert_eq!(cid_to_cloid(&ClientOrderId::new(other)), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn a_generated_uuid_client_id_is_always_a_cloid() {
+        for _ in 0..32 {
+            let cid = ClientOrderId::uuid();
+            assert!(cid_to_cloid(&cid).is_some(), "{cid}");
+        }
+    }
+
+    #[test]
+    fn the_reported_cloid_is_the_client_id_the_order_was_placed_under() {
+        assert_eq!(cloid_to_cid(CLOID), Some(ClientOrderId::new(CID)));
+
+        // The round trip through the form the SDK sends, for a fresh id.
+        let cid = ClientOrderId::uuid();
+        let sent = format!("0x{}", cid_to_cloid(&cid).unwrap().simple());
+        assert_eq!(cloid_to_cid(&sent), Some(cid));
+    }
+
+    #[test]
+    fn a_cloid_not_in_the_venue_form_names_no_client_id() {
+        for malformed in [
+            CID,
+            "85b60bff64d549ec95af6268d7d1df63",
+            "0x85b60bff64d549ec95af6268d7d1df",
+            "0x85b60bff64d549ec95af6268d7d1df6300",
+            "0x85b60bff-64d5-49ec-95af-6268d7d1df63",
+            "0xzzb60bff64d549ec95af6268d7d1df63",
+            "0x",
+        ] {
+            assert_eq!(cloid_to_cid(malformed), None, "{malformed}");
+        }
+    }
+
+    #[test]
+    fn a_record_without_a_cloid_is_reported_under_its_oid() {
+        assert_eq!(record_cid(None, 42), Some(ClientOrderId::new("42")));
+        assert_eq!(record_cid(Some(CLOID), 42), Some(ClientOrderId::new(CID)));
+        assert_eq!(record_cid(Some("0x1234"), 42), None);
+    }
+
+    // ---- order statuses -----------------------------------------------------------------------
+
+    #[test]
+    fn every_documented_order_status_is_classified() {
+        use OrderStatus::*;
+        for (status, expected) in [
+            ("open", Open),
+            ("triggered", Open),
+            ("filled", Filled),
+            ("canceled", Cancelled),
+            ("marginCanceled", Cancelled),
+            ("vaultWithdrawalCanceled", Cancelled),
+            ("openInterestCapCanceled", Cancelled),
+            ("selfTradeCanceled", Cancelled),
+            ("reduceOnlyCanceled", Cancelled),
+            ("siblingFilledCanceled", Cancelled),
+            ("delistedCanceled", Cancelled),
+            ("liquidatedCanceled", Cancelled),
+            ("scheduledCancel", Cancelled),
+            ("rejected", Rejected),
+            ("tickRejected", Rejected),
+            ("minTradeNtlRejected", Rejected),
+            ("perpMarginRejected", Rejected),
+            ("reduceOnlyRejected", Rejected),
+            ("badAloPxRejected", Rejected),
+            ("iocCancelRejected", Rejected),
+            ("badTriggerPxRejected", Rejected),
+            ("marketOrderNoLiquidityRejected", Rejected),
+            ("positionIncreaseAtOpenInterestCapRejected", Rejected),
+            ("positionFlipAtOpenInterestCapRejected", Rejected),
+            ("tooAggressiveAtOpenInterestCapRejected", Rejected),
+            ("openInterestIncreaseRejected", Rejected),
+            ("insufficientSpotBalanceRejected", Rejected),
+            ("oracleRejected", Rejected),
+            ("perpMaxPositionRejected", Rejected),
+        ] {
+            assert_eq!(OrderStatus::classify(status), Some(expected), "{status}");
+        }
+        assert_eq!(OrderStatus::classify("unknown_status"), None);
+    }
+
+    fn order_update(status: &str, cloid: &str, sz: &str) -> hyperliquid_rust_sdk::OrderUpdate {
+        serde_json::from_str(&format!(
+            r#"{{"order": {{"coin": "ETH", "side": "B", "limitPx": "1605.0", "sz": "{sz}",
+                 "oid": 7001, "timestamp": 1714100000000, "origSz": "0.0075", "cloid": {cloid}}},
+               "status": "{status}", "statusTimestamp": 1714100001000}}"#
+        ))
+        .unwrap()
+    }
+
+    fn snapshot_of(event: UnindexedAccountEvent) -> UnindexedOrderSnapshot {
+        match event.kind {
+            crate::AccountEventKind::OrderSnapshot(snapshot) => snapshot.0,
+            other => panic!("expected an order snapshot, got {other:?}"),
+        }
+    }
+
+    fn eth() -> InstrumentNameExchange {
+        InstrumentNameExchange::from("ETH-USD-PERP")
+    }
+
+    #[test]
+    fn an_order_update_names_the_order_by_the_id_it_was_placed_under() {
+        let update = order_update("open", &format!(r#""{CLOID}""#), "0.005");
+        let order = snapshot_of(
+            order_update_to_account_event(&update, ExchangeId::HyperliquidPerp, eth()).unwrap(),
+        );
+
+        assert_eq!(order.key.cid, ClientOrderId::new(CID));
+        assert_eq!(order.quantity, dec!(0.0075));
+        match order.state {
+            OrderState::Active(crate::order::state::ActiveOrderState::Open(open)) => {
+                assert_eq!(open.id, VenueOrderId::Assigned(OrderId::new("7001")));
+                assert_eq!(open.filled_quantity, dec!(0.0025));
+            }
+            other => panic!("expected Open, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_order_update_without_a_cloid_is_named_by_its_oid() {
+        let update = order_update("open", "null", "0.0075");
+        let order = snapshot_of(
+            order_update_to_account_event(&update, ExchangeId::HyperliquidPerp, eth()).unwrap(),
+        );
+        assert_eq!(order.key.cid, ClientOrderId::new("7001"));
+    }
+
+    #[test]
+    fn an_order_update_with_a_malformed_cloid_is_dropped() {
+        let update = order_update("open", r#""0x1234""#, "0.0075");
+        assert!(
+            order_update_to_account_event(&update, ExchangeId::HyperliquidPerp, eth()).is_none()
+        );
+    }
+
+    #[test]
+    fn a_cancellation_for_any_reason_ends_the_order() {
+        let update = order_update("selfTradeCanceled", &format!(r#""{CLOID}""#), "0.005");
+        let order = snapshot_of(
+            order_update_to_account_event(&update, ExchangeId::HyperliquidPerp, eth()).unwrap(),
+        );
+        match order.state {
+            OrderState::Inactive(crate::order::state::InactiveOrderState::Cancelled(cancelled)) => {
+                assert_eq!(cancelled.filled_quantity, dec!(0.0025));
+            }
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_rejection_ends_the_order_and_names_the_reason() {
+        let update = order_update("badAloPxRejected", &format!(r#""{CLOID}""#), "0.0075");
+        let order = snapshot_of(
+            order_update_to_account_event(&update, ExchangeId::HyperliquidPerp, eth()).unwrap(),
+        );
+        match order.state {
+            OrderState::Inactive(crate::order::state::InactiveOrderState::OpenFailed(
+                OrderError::Rejected(ApiError::OrderRejected(reason)),
+            )) => assert_eq!(reason, "badAloPxRejected"),
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
+
+    // ---- open orders --------------------------------------------------------------------------
+
+    /// The shape `openOrders` was observed to return: `origSz` and `cloid` included, although the
+    /// endpoint's documentation lists neither. Values are synthetic.
+    const OPEN_ORDERS: &str = r#"[
+        {"coin":"ETH","side":"B","limitPx":"1605.0","sz":"0.005","oid":7001,
+         "timestamp":1714100000000,"origSz":"0.0075","cloid":"0x85b60bff64d549ec95af6268d7d1df63"},
+        {"coin":"ETH","side":"A","limitPx":"1700.0","sz":"0.01","oid":7002,
+         "timestamp":1714100000000,"origSz":"0.01"},
+        {"coin":"BTC","side":"A","limitPx":"50000.0","sz":"0.001","oid":7003,
+         "timestamp":1714100000000}
+    ]"#;
+
+    #[tokio::test]
+    async fn open_orders_carry_the_cloid_and_original_size_the_sdk_type_drops() {
+        let (_server, client) = serve(OPEN_ORDERS.to_string()).await;
+
+        let rows = open_orders(&client, ethers::types::H160::zero())
+            .await
+            .unwrap();
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].cloid.as_deref(), Some(CLOID));
+        assert_eq!(rows[0].orig_sz.as_deref(), Some("0.0075"));
+        assert_eq!(rows[1].cloid, None);
+        assert_eq!(rows[2].orig_sz, None);
+    }
+
+    fn rows() -> Vec<OpenOrder> {
+        serde_json::from_str(OPEN_ORDERS).unwrap()
+    }
+
+    fn perp(coin: &str) -> Option<InstrumentNameExchange> {
+        Some(perp_coin_to_instrument(coin))
+    }
+
+    #[test]
+    fn an_open_order_is_listed_under_its_client_id_with_its_fill_so_far() {
+        let order = open_order_to_order(&rows()[0], ExchangeId::HyperliquidPerp, eth()).unwrap();
+
+        assert_eq!(order.key.cid, ClientOrderId::new(CID));
+        assert_eq!(order.quantity, dec!(0.0075));
+        assert_eq!(order.state.filled_quantity, dec!(0.0025));
+        assert_eq!(order.state.id, VenueOrderId::Assigned(OrderId::new("7001")));
+    }
+
+    #[test]
+    fn an_open_order_without_its_original_size_is_its_remainder_with_nothing_filled() {
+        let row = &rows()[2];
+        let btc = InstrumentNameExchange::from("BTC-USD-PERP");
+        let order = open_order_to_order(row, ExchangeId::HyperliquidPerp, btc).unwrap();
+
+        assert_eq!(order.key.cid, ClientOrderId::new("7003"));
+        assert_eq!(order.quantity, dec!(0.001));
+        assert_eq!(order.state.filled_quantity, Decimal::ZERO);
+    }
+
+    #[test]
+    fn every_requested_instrument_is_listed_complete_even_with_nothing_open() {
+        let sol = InstrumentNameExchange::from("SOL-USD-PERP");
+        let mut listing = OpenOrderListing::new(
+            &rows(),
+            ExchangeId::HyperliquidPerp,
+            &[eth(), sol.clone()],
+            perp,
+        );
+
+        let eth_entry = listing.remove(&eth()).unwrap();
+        assert!(eth_entry.orders_complete);
+        assert_eq!(eth_entry.orders.len(), 2);
+
+        // Nothing open: the entry is what lets an order that ended offline be seen to be gone.
+        let sol_entry = listing.remove(&sol).unwrap();
+        assert!(sol_entry.orders_complete);
+        assert!(sol_entry.orders.is_empty());
+
+        // BTC was not requested.
+        assert_eq!(listing.into_snapshots().count(), 0);
+    }
+
+    #[test]
+    fn an_unfiltered_listing_covers_every_instrument_with_open_orders() {
+        let listing = OpenOrderListing::new(&rows(), ExchangeId::HyperliquidPerp, &[], perp);
+        let mut instruments = listing
+            .into_snapshots()
+            .map(|entry| entry.instrument.to_string())
+            .collect::<Vec<_>>();
+        instruments.sort();
+        assert_eq!(instruments, ["BTC-USD-PERP", "ETH-USD-PERP"]);
+    }
+
+    #[test]
+    fn an_order_that_does_not_convert_leaves_only_its_instrument_incomplete() {
+        let mut rows = rows();
+        rows[1].side = "?".to_string();
+        let btc = InstrumentNameExchange::from("BTC-USD-PERP");
+        let mut listing = OpenOrderListing::new(
+            &rows,
+            ExchangeId::HyperliquidPerp,
+            &[eth(), btc.clone()],
+            perp,
+        );
+
+        let eth_entry = listing.remove(&eth()).unwrap();
+        assert!(!eth_entry.orders_complete);
+        assert_eq!(eth_entry.orders.len(), 1);
+        assert!(listing.remove(&btc).unwrap().orders_complete);
+    }
+
+    #[test]
+    fn an_order_with_a_malformed_cloid_leaves_its_instrument_incomplete() {
+        let mut rows = rows();
+        rows[0].cloid = Some("0x1234".to_string());
+        let mut listing = OpenOrderListing::new(&rows, ExchangeId::HyperliquidPerp, &[eth()], perp);
+
+        let eth_entry = listing.remove(&eth()).unwrap();
+        assert!(!eth_entry.orders_complete);
+        assert_eq!(eth_entry.orders.len(), 1);
+    }
+
+    #[test]
+    fn coins_the_client_does_not_trade_are_left_out() {
+        let listing = OpenOrderListing::new(&rows(), ExchangeId::HyperliquidSpot, &[], |coin| {
+            is_spot_coin(coin).then(|| spot_coin_to_instrument(coin))
+        });
+        assert_eq!(listing.into_snapshots().count(), 0);
     }
 }
