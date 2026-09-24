@@ -20,6 +20,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+/// Whether an account snapshot's `orders` is every open order under the id it was placed with.
+///
+/// Not yet: the REST open-orders response the snapshot reads has no `cloid`, so each order is
+/// reported under its venue `oid` and cannot be matched to the `ClientOrderId` it was placed with.
+/// Declaring the list complete would have the engine retire every tracked order as absent. See
+/// #368.
+pub(super) const HYPERLIQUID_OPEN_ORDERS_COMPLETE: bool = false;
+
 /// Stream wrapper that cancels background tasks when dropped.
 ///
 /// Ensures spawned WebSocket processing tasks are cleaned up when the consumer

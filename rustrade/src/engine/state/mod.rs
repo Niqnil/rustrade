@@ -166,6 +166,38 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
         EngineStateBuilder::new(instruments, global, instrument_data_init)
     }
 
+    /// Updates the internal state from an exchange's AccountStream reporting that it is
+    /// reconnecting.
+    ///
+    /// Marks the exchange's account connectivity as reconnecting, then has every instrument on it
+    /// record the orders it holds `Open`
+    /// ([`InstrumentState::begin_account_resync`](instrument::InstrumentState::begin_account_resync)).
+    /// The account snapshot the reconnect produces may retire only those orders, which is what
+    /// keeps an order accepted while the venue was being re-read from being mistaken for one that
+    /// has gone.
+    ///
+    /// # Errors
+    /// Returns [`UntrackedExchange`] if the exchange has no
+    /// `ConnectivityState`, having mutated nothing.
+    pub fn update_from_account_reconnecting(
+        &mut self,
+        exchange: &ExchangeId,
+    ) -> Result<(), UntrackedExchange> {
+        self.connectivity
+            .update_from_account_reconnecting(exchange)?;
+
+        // `ConnectivityStates::exchanges` is built in `ExchangeIndex` order, which is how every
+        // indexed account event already finds its exchange's state.
+        if let Some(index) = self.connectivity.exchanges.get_index_of(exchange) {
+            let filter = InstrumentFilter::exchanges([ExchangeIndex(index)]);
+            for instrument in self.instruments.instruments_mut(&filter) {
+                instrument.begin_account_resync();
+            }
+        }
+
+        Ok(())
+    }
+
     /// Updates the internal state from an `AccountEvent`.
     ///
     /// If the `AccountEvent` results in a new [`PositionExited`], that is returned.

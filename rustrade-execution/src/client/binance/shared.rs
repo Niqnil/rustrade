@@ -567,6 +567,40 @@ pub(crate) fn convert_open_order<T: BinanceOrderFields>(
     })
 }
 
+/// One symbol's `openOrders` rows after conversion.
+#[derive(Debug)]
+pub(crate) struct OpenOrderListing {
+    pub(crate) orders: Vec<Order<ExchangeId, InstrumentNameExchange, Open>>,
+    /// Whether `orders` shows every row the venue listed under the `clientOrderId` it was placed
+    /// with. This is the `orders_complete` an account snapshot built from the listing may claim.
+    pub(crate) complete: bool,
+}
+
+/// Convert one symbol's `openOrders` rows with [`convert_open_order`], recording whether the
+/// result can stand for the whole listing.
+///
+/// A row the converter drops may be a live order, and a row without a `clientOrderId` is kept under
+/// its `orderId`, where the order it was placed as cannot be found. Either leaves the listing
+/// unable to say that an order missing from it is gone, so either makes it incomplete. A dropped
+/// row that really was finished makes it incomplete too; `openOrders` does not serve those, and
+/// erring towards "incomplete" costs only a reconciliation.
+pub(crate) fn convert_open_order_listing<T: BinanceOrderFields>(
+    rows: &[T],
+    exchange: ExchangeId,
+    instrument: &InstrumentNameExchange,
+) -> OpenOrderListing {
+    let mut complete = true;
+    let orders = rows
+        .iter()
+        .filter_map(|row| {
+            let order = convert_open_order(row, exchange, instrument);
+            complete &= order.is_some() && row.client_order_id().is_some();
+            order
+        })
+        .collect();
+    OpenOrderListing { orders, complete }
+}
+
 /// Convert an open-order response whose instrument is recovered from its own `symbol` field,
 /// rather than supplied by the caller. Used by the no-symbol "return all" path
 /// (each client's no-symbol "return all" fetch), where each order may belong to a different instrument. Drops

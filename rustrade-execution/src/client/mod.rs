@@ -27,9 +27,15 @@
 //!
 //! # Known Limitations
 //!
-//! All connectors have a gap between reconnection and fill recovery: **order lifecycle
-//! events** (NEW, CANCELED, EXPIRED) during disconnect are NOT recovered. Callers must
-//! call [`ExecutionClient::fetch_open_orders`] after reconnect to reconcile state.
+//! No connector recovers the **order lifecycle events** (NEW, CANCELED, EXPIRED) it missed while
+//! disconnected; only fills are recovered (#370).
+//!
+//! The engine closes part of that gap from the account snapshot each reconnect produces: an order a
+//! complete list no longer shows is retired (see [`ExecutionClient::account_snapshot`]). That covers
+//! the connectors whose snapshot declares its orders complete — Binance Spot and Margin, and the
+//! mock venue — but not Alpaca (#369), Hyperliquid (#368) or IBKR (#371), and it cannot tell how
+//! an order ended. A caller that needs more reconciles against
+//! [`ExecutionClient::fetch_open_orders`] after a reconnect.
 
 use crate::{
     UnindexedAccountEvent, UnindexedAccountSnapshot,
@@ -117,6 +123,21 @@ where
 
     fn new(config: Self::Config) -> Self;
 
+    /// Reads the account's balances, and its open orders and positions for `instruments`, from the
+    /// venue.
+    ///
+    /// Besides startup, the engine's `ExecutionManager` calls this again on every account-stream
+    /// reconnect, and emits the result ahead of the new stream's updates. It is how the engine
+    /// catches up on what changed while the stream was down.
+    ///
+    /// # Order completeness
+    ///
+    /// Each [`InstrumentAccountSnapshot`](crate::InstrumentAccountSnapshot) states through
+    /// `orders_complete` whether its `orders` list is every order open at the venue for that
+    /// instrument. Set it only when it is true: the engine retires a tracked order that a complete
+    /// list omits, so a list that can miss an open order (a capped page, an order dropped on
+    /// conversion, an order reported under an id other than the one it was placed with) must say
+    /// `false`. `false` is always safe; it only forgoes that reconciliation.
     fn account_snapshot(
         &self,
         assets: &[AssetNameExchange],

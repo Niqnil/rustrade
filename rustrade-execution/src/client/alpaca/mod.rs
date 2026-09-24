@@ -2001,6 +2001,13 @@ impl AlpacaClient {
 /// Alpaca's API caps at 500; accounts exceeding this have an incomplete snapshot.
 const MAX_OPEN_ORDERS: usize = 500;
 
+/// Whether an account snapshot's `orders` is every order open on the venue.
+///
+/// Not yet: [`convert_open_order`] drops a notional order (one placed by dollar value, whose `qty`
+/// is `null`), so an instrument can hold an open order its list does not show. Declaring the list
+/// complete would have the engine retire such an order as absent. See #369.
+const ALPACA_OPEN_ORDERS_COMPLETE: bool = false;
+
 /// Fetch all open orders from Alpaca, optionally filtered by symbol.
 ///
 /// # Errors
@@ -2987,7 +2994,13 @@ fn build_instrument_snapshots(
         by_symbol
             .into_iter()
             .map(|(sym, orders)| {
-                InstrumentAccountSnapshot::new(InstrumentNameExchange::new(sym), orders, None, None)
+                InstrumentAccountSnapshot::new(
+                    InstrumentNameExchange::new(sym),
+                    orders,
+                    ALPACA_OPEN_ORDERS_COMPLETE,
+                    None,
+                    None,
+                )
             })
             .collect()
     } else {
@@ -2999,7 +3012,13 @@ fn build_instrument_snapshots(
                 let orders = by_symbol
                     .swap_remove(inst.name().as_str())
                     .unwrap_or_default();
-                InstrumentAccountSnapshot::new(inst.clone(), orders, None, None)
+                InstrumentAccountSnapshot::new(
+                    inst.clone(),
+                    orders,
+                    ALPACA_OPEN_ORDERS_COMPLETE,
+                    None,
+                    None,
+                )
             })
             .collect()
     }
@@ -4694,6 +4713,22 @@ mod tests {
             .find(|s| s.instrument.name().as_str() == "SPY")
             .expect("SPY snapshot must be present even with no orders");
         assert!(spy.orders.is_empty());
+    }
+
+    /// Alpaca drops a notional open order on conversion, so no instrument's list can claim to be
+    /// every open order: the engine would retire that order as absent.
+    #[test]
+    fn test_build_instrument_snapshots_never_declares_orders_complete() {
+        let instruments = [
+            InstrumentNameExchange::new("AAPL"),
+            InstrumentNameExchange::new("SPY"),
+        ];
+        for requested in [&instruments[..], &[]] {
+            let orders = vec![make_order_response("o1", "AAPL")];
+            let snapshots = build_instrument_snapshots(orders, requested);
+            assert!(!snapshots.is_empty());
+            assert!(snapshots.iter().all(|snapshot| !snapshot.orders_complete));
+        }
     }
 
     #[test]

@@ -385,11 +385,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 // An untracked exchange skips `on_disconnect` as well as the state update: the
                 // strategy has no link to that venue to react to, and the engine's own health is
                 // unaffected by one it never tracked.
-                match self
-                    .state
-                    .connectivity
-                    .update_from_account_reconnecting(exchange)
-                {
+                match self.state.update_from_account_reconnecting(exchange) {
                     Ok(()) => UpdateFromAccountOutput::OnDisconnect(Strategy::on_disconnect(
                         self, *exchange,
                     )),

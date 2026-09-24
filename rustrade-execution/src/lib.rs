@@ -284,6 +284,8 @@ fn none_option<T>() -> Option<T> {
     None
 }
 
+/// One instrument's slice of an [`AccountSnapshot`]: its orders, and its position or isolated
+/// balances where the venue has them.
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize, Constructor,
 )]
@@ -293,8 +295,28 @@ pub struct InstrumentAccountSnapshot<
     InstrumentKey = InstrumentIndex,
 > {
     pub instrument: InstrumentKey,
+    /// Orders the venue reported for this instrument, keyed by the `ClientOrderId` the order was
+    /// placed with where the venue reports it.
+    ///
+    /// Whether this is **every** order open at the venue is stated by
+    /// [`orders_complete`](Self::orders_complete), not implied by the list.
     #[serde(default = "Vec::new")]
     pub orders: Vec<OrderSnapshot<ExchangeKey, AssetKey, InstrumentKey>>,
+    /// `true` only when [`orders`](Self::orders) lists every order open at the venue for this
+    /// instrument when it was read, each under the `ClientOrderId` it was placed with.
+    ///
+    /// A consumer may then read an order's **absence** as "no longer open": it filled, was
+    /// cancelled or expired. The engine does exactly that, retiring a tracked order a complete
+    /// list omits. A wrong `true` therefore retires live orders, so a client sets it only when
+    /// nothing can be missing:
+    /// - the read covered every open order, with no page cap or partial result;
+    /// - no open order was dropped on conversion;
+    /// - each order carries the id it was placed with, so a tracked order can be found in it.
+    ///
+    /// `false` claims nothing about absent orders, and is the default for a snapshot that does not
+    /// say.
+    #[serde(default)]
+    pub orders_complete: bool,
     /// Open position for derivative instruments (perpetuals, futures, margin).
     /// `None` for spot instruments where position is implicit in balances.
     #[serde(default, skip_serializing_if = "Option::is_none")]

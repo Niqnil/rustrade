@@ -34,11 +34,11 @@
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
-    MyTradesFrom, ORDER_EXECUTIONS_BUDGET, RateLimitTracker, SIGNAL_RECOVERY_LOOKBACK_MS,
-    SharedDedupCache, classify_order_kind_tif, connectivity_error, convert_execution_report,
-    convert_open_order, convert_open_order_owned_symbol, dedup_key_from_event,
-    is_api_rejection_error, is_duplicate, is_rate_limit_error, new_dedup_cache,
-    parse_binance_api_error, recovered_order_totals, rest_call_with_retry,
+    MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, RateLimitTracker,
+    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, classify_order_kind_tif, connectivity_error,
+    convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
+    dedup_key_from_event, is_api_rejection_error, is_duplicate, is_rate_limit_error,
+    new_dedup_cache, parse_binance_api_error, recovered_order_totals, rest_call_with_retry,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
@@ -384,13 +384,7 @@ async fn fetch_open_orders_for_instrument(
     rest: Arc<RestApi>,
     rate_limiter: Arc<RateLimitTracker>,
     instrument: InstrumentNameExchange,
-) -> Result<
-    (
-        InstrumentNameExchange,
-        Vec<Order<ExchangeId, InstrumentNameExchange, Open>>,
-    ),
-    UnindexedClientError,
-> {
+) -> Result<(InstrumentNameExchange, OpenOrderListing), UnindexedClientError> {
     // Convert once before the retry closure to avoid a String allocation on every retry.
     let symbol_str = instrument.name().to_string();
     let response = rest_call_with_retry(&rest, &rate_limiter, |rest| {
@@ -408,12 +402,9 @@ async fn fetch_open_orders_for_instrument(
         .await
         .map_err(|e| connectivity_error(e.into()))?;
 
-    let orders = orders_data
-        .into_iter()
-        .filter_map(|o| convert_open_order(&o, ExchangeId::BinanceSpot, &instrument))
-        .collect();
+    let listing = convert_open_order_listing(&orders_data, ExchangeId::BinanceSpot, &instrument);
 
-    Ok((instrument, orders))
+    Ok((instrument, listing))
 }
 
 /// Fetch *all* open orders in a single no-symbol `GET /api/v3/openOrders` call. Backs the
@@ -590,8 +581,9 @@ impl ExecutionClient for BinanceSpot {
             }))
             .buffer_unordered(8)
             .map(|result| {
-                let (inst, orders) = result?;
-                let wrapped = orders
+                let (inst, listing) = result?;
+                let wrapped = listing
+                    .orders
                     .into_iter()
                     .map(|o| Order {
                         key: o.key,
@@ -604,7 +596,11 @@ impl ExecutionClient for BinanceSpot {
                     })
                     .collect();
                 Ok::<_, UnindexedClientError>(InstrumentAccountSnapshot::new(
-                    inst, wrapped, None, None,
+                    inst,
+                    wrapped,
+                    listing.complete,
+                    None,
+                    None,
                 ))
             })
             .try_collect()
@@ -1247,8 +1243,8 @@ impl ExecutionClient for BinanceSpot {
             )
         }))
             .buffer_unordered(8)
-            .try_fold(Vec::with_capacity(instruments.len()), |mut acc: Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, (_, orders)| async move {
-                acc.extend(orders);
+            .try_fold(Vec::with_capacity(instruments.len()), |mut acc: Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, (_, listing)| async move {
+                acc.extend(listing.orders);
                 Ok(acc)
             })
             .await
@@ -3741,6 +3737,61 @@ mod tests {
                 "{status}"
             );
         }
+    }
+
+    /// A listing is complete only while it shows every row under the id its order was placed with.
+    ///
+    /// The engine retires an order a complete snapshot leaves out, so a row that is dropped, or kept
+    /// under its `orderId` alone, must make the listing incomplete: either can hide a live order.
+    #[test]
+    fn test_convert_open_order_listing_is_complete_only_when_every_row_survives_under_its_cid() {
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+        let second = || binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
+            order_id: Some(67890),
+            client_order_id: Some("cid-def".to_string()),
+            ..make_base_open_order()
+        };
+
+        let listing = convert_open_order_listing(
+            &[make_base_open_order(), second()],
+            ExchangeId::BinanceSpot,
+            &instrument,
+        );
+        assert_eq!(listing.orders.len(), 2);
+        assert!(listing.complete);
+
+        let empty = convert_open_order_listing::<
+            binance_sdk::spot::rest_api::GetOpenOrdersResponseInner,
+        >(&[], ExchangeId::BinanceSpot, &instrument);
+        assert!(empty.orders.is_empty());
+        assert!(empty.complete, "no open orders is a complete answer");
+
+        let dropped = binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
+            side: None,
+            ..second()
+        };
+        let listing = convert_open_order_listing(
+            &[make_base_open_order(), dropped],
+            ExchangeId::BinanceSpot,
+            &instrument,
+        );
+        assert_eq!(listing.orders.len(), 1);
+        assert!(!listing.complete, "a dropped row may be a live order");
+
+        let without_cid = binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
+            client_order_id: None,
+            ..second()
+        };
+        let listing = convert_open_order_listing(
+            &[make_base_open_order(), without_cid],
+            ExchangeId::BinanceSpot,
+            &instrument,
+        );
+        assert_eq!(listing.orders.len(), 2, "the row is still converted");
+        assert!(
+            !listing.complete,
+            "an order kept under its orderId cannot be found under the cid it was placed with"
+        );
     }
 
     #[test]

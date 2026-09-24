@@ -21,7 +21,7 @@ use rustrade_execution::{
     FeeModel, FeeModelConfig, InstrumentAccountSnapshot, Liquidity,
     order::{
         Order, OrderKey,
-        id::{ClientOrderId, OrderId, PositionId},
+        id::{ClientOrderId, OrderId, PositionId, VenueOrderId},
         request::OrderResponseCancel,
         state::{ActiveOrderState, InactiveOrderState, OrderState},
     },
@@ -667,6 +667,34 @@ pub struct InstrumentState<
     /// as it did before this field existed.
     #[serde(default = "FnvIndexMap::default")]
     pub retired_routing: FnvIndexMap<OrderId, PositionId>,
+
+    /// The orders that were `Open` when this instrument's account stream last began to
+    /// resynchronise, each with the venue order it was: the only orders the next account snapshot
+    /// may retire by leaving them out.
+    ///
+    /// Recorded by [`Self::begin_account_resync`] and consumed by
+    /// [`Self::update_from_account_snapshot`]. Empty until the first resync, so the snapshot that
+    /// starts a run retires nothing. A snapshot that does not cover this instrument never reaches
+    /// it, so the record then waits for the next resync, which replaces it. That is safe: every
+    /// order in it was accepted before any later re-read of the venue.
+    ///
+    /// The venue order is kept so that a client id reused for a new order before the snapshot
+    /// arrives does not retire the new order in the old one's place.
+    ///
+    /// # Why only these
+    ///
+    /// A snapshot is read from the venue while order requests are still being answered, so an
+    /// order the venue accepts just after the read can have its `Open` response reach the engine
+    /// before the snapshot does. That order is live, yet the snapshot cannot list it. An order
+    /// that was already `Open` when the resync began was accepted before the read began, so a
+    /// complete snapshot that leaves it out is evidence that it is gone. The comparison needs no
+    /// clock, only the order in which the engine received events.
+    ///
+    /// That rests on the account stream delivering its reconnect notice before it starts
+    /// re-reading the venue, which `ExecutionManager` does. A consumer feeding the engine account
+    /// events some other way must do the same.
+    #[serde(default)]
+    pub orders_open_at_resync: FnvHashMap<ClientOrderId, VenueOrderId>,
 }
 
 impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
@@ -760,8 +788,28 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
 
     /// Updates the instrument state using an account snapshot from the exchange.
     ///
-    /// This updates active orders for the instrument, using timestamps where relevant to ensure
-    /// the most recent order state is applied.
+    /// Each order the snapshot lists is applied as an order snapshot, using timestamps where
+    /// relevant so the most recent order state wins.
+    ///
+    /// # Orders the snapshot leaves out
+    ///
+    /// When the snapshot declares its order list complete
+    /// ([`InstrumentAccountSnapshot::orders_complete`]), an order it does not list is no longer
+    /// open at the venue: it filled, was cancelled or expired while the account stream was down.
+    /// Such an order is retired, with a `warn!` naming it, provided it is in
+    /// [`Self::orders_open_at_resync`] and is still `Open`. Absence cannot say how the order ended,
+    /// so its `filled_quantity` is not touched; fills reach the position through the fill path,
+    /// and a late one still routes through [`Self::retired_routing`].
+    ///
+    /// Left alone whatever the snapshot says:
+    /// - an order in flight (`OpenInFlight`, `CancelInFlight`): its request is still being
+    ///   answered, and the answer settles it;
+    /// - an order that became `Open` after the resync began, which the snapshot may predate;
+    /// - every order, when the list is not declared complete.
+    ///
+    /// The resync record is consumed either way, so each resync gives one snapshot the chance to
+    /// retire orders. (A snapshot that does not cover the instrument does not call this; see
+    /// [`Self::orders_open_at_resync`].)
     pub fn update_from_account_snapshot(
         &mut self,
         snapshot: &InstrumentAccountSnapshot<ExchangeKey, AssetKey, InstrumentKey>,
@@ -777,7 +825,58 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             // reconciliation at startup does not emit PositionExit output events.
             let _ = self.update_from_order_snapshot(Snapshot(order));
         }
+
+        let open_at_resync = std::mem::take(&mut self.orders_open_at_resync);
+        if snapshot.orders_complete && !open_at_resync.is_empty() {
+            let listed = snapshot
+                .orders
+                .iter()
+                .map(|order| &order.key.cid)
+                .collect::<FnvHashSet<_>>();
+
+            for (cid, id) in open_at_resync
+                .iter()
+                .filter(|(cid, _)| !listed.contains(cid))
+            {
+                if let Some(order) = self.orders.remove_open(cid, id) {
+                    warn!(
+                        instrument = ?order.key.instrument,
+                        strategy = %order.key.strategy,
+                        %cid,
+                        state = ?order.state,
+                        "InstrumentState retiring an Open order that a complete account snapshot \
+                         no longer lists - it filled, was cancelled or expired while the account \
+                         stream was down"
+                    );
+                }
+            }
+        }
+
         self.cleanup_routing_tables();
+    }
+
+    /// Records the orders that are `Open` as the account stream begins to resynchronise, making
+    /// them the ones the next complete account snapshot may retire by leaving them out.
+    ///
+    /// Call it when the account stream reports that it is reconnecting, before the snapshot that
+    /// the reconnect produces is applied. [`EngineState::update_from_account_reconnecting`] does
+    /// this for each instrument on the exchange. See [`Self::orders_open_at_resync`] for why only
+    /// these orders.
+    ///
+    /// A second call before a snapshot replaces the record: every order `Open` at the later call
+    /// was accepted before any re-read that follows it.
+    ///
+    /// [`EngineState::update_from_account_reconnecting`]: crate::engine::state::EngineState::update_from_account_reconnecting
+    pub fn begin_account_resync(&mut self) {
+        self.orders_open_at_resync = self
+            .orders
+            .0
+            .iter()
+            .filter_map(|(cid, order)| match &order.state {
+                ActiveOrderState::Open(open) => Some((cid.clone(), open.id.clone())),
+                _ => None,
+            })
+            .collect();
     }
 
     /// Drop stale entries from `position_ids` and `exchange_id_to_cid` whose
@@ -1514,6 +1613,7 @@ where
         pending_fills: _,
         exchange_id_to_cid: _,
         retired_routing: _,
+        orders_open_at_resync: _,
     } = state;
 
     InstrumentAccountSnapshot {
@@ -1550,6 +1650,9 @@ where
                 })
             })
             .collect(),
+        // The engine's own record, not a read of the venue: it leaves out orders in flight, and
+        // may still hold orders the venue has finished.
+        orders_complete: false,
         position: None,
         isolated: None,
     }
@@ -1594,6 +1697,7 @@ where
                         pending_fills: Vec::new(),
                         exchange_id_to_cid: FnvHashMap::default(),
                         retired_routing: FnvIndexMap::default(),
+                        orders_open_at_resync: FnvHashMap::default(),
                     },
                 )
             })
@@ -2603,5 +2707,213 @@ mod tests {
 
         state.update_from_trade(&fill(oid, Side::Buy, dec!(4)));
         assert_eq!(open_position_ids(&state), vec![PositionId::NETTING]);
+    }
+
+    // --- Retiring orders a complete account snapshot no longer lists --------------------------
+
+    /// An account snapshot for the harness instrument listing `orders`, declared complete or not.
+    fn account_snapshot(
+        orders: Vec<Order<ExchangeIndex, InstrumentIndex, OrderState<AssetIndex, InstrumentIndex>>>,
+        orders_complete: bool,
+    ) -> InstrumentAccountSnapshot<ExchangeIndex, AssetIndex, InstrumentIndex> {
+        InstrumentAccountSnapshot {
+            instrument: InstrumentIndex(0),
+            orders,
+            orders_complete,
+            position: None,
+            isolated: None,
+        }
+    }
+
+    /// `cid` as the venue lists it: `Open` under `exchange_id`, nothing filled.
+    fn listed(
+        cid: &ClientOrderId,
+        exchange_id: &OrderId,
+    ) -> Order<ExchangeIndex, InstrumentIndex, OrderState<AssetIndex, InstrumentIndex>> {
+        order(
+            cid.clone(),
+            OrderState::active(Open::new(
+                VenueOrderId::Assigned(exchange_id.clone()),
+                TIME,
+                Decimal::ZERO,
+            )),
+        )
+    }
+
+    #[test]
+    fn a_complete_snapshot_retires_an_open_order_it_no_longer_lists() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let (gone, gone_oid, gone_pos) = (
+            ClientOrderId::new("cid-gone"),
+            OrderId::new("oid-gone"),
+            PositionId::new("position-gone"),
+        );
+        let (kept, kept_oid) = (ClientOrderId::new("cid-kept"), OrderId::new("oid-kept"));
+        rest_order_at_exchange(&mut state, &gone, &gone_oid, Some(&gone_pos));
+        rest_order_at_exchange(&mut state, &kept, &kept_oid, None);
+
+        state.begin_account_resync();
+        state.update_from_account_snapshot(&account_snapshot(vec![listed(&kept, &kept_oid)], true));
+
+        assert!(!state.orders.0.contains_key(&gone));
+        assert!(state.orders.0.contains_key(&kept));
+        assert_eq!(
+            state.retired_routing.get(&gone_oid),
+            Some(&gone_pos),
+            "a fill recovered after the retirement must still reach the order's position"
+        );
+        assert!(
+            state.orders_open_at_resync.is_empty(),
+            "the record is consumed"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_not_declared_complete_retires_nothing() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let (cid, oid) = (ClientOrderId::new("cid-1"), OrderId::new("oid-1"));
+        rest_order_at_exchange(&mut state, &cid, &oid, None);
+
+        state.begin_account_resync();
+        state.update_from_account_snapshot(&account_snapshot(Vec::new(), false));
+
+        assert!(state.orders.0.contains_key(&cid));
+        assert!(
+            state.orders_open_at_resync.is_empty(),
+            "the record is consumed"
+        );
+    }
+
+    /// The race the resync record exists for: the venue accepts an order just after the snapshot
+    /// read it, and the order's `Open` response reaches the engine before the snapshot does.
+    #[test]
+    fn an_order_opened_after_the_resync_began_survives_a_snapshot_that_cannot_list_it() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let (cid, oid) = (ClientOrderId::new("cid-new"), OrderId::new("oid-new"));
+
+        state.begin_account_resync();
+        rest_order_at_exchange(&mut state, &cid, &oid, None);
+        state.update_from_account_snapshot(&account_snapshot(Vec::new(), true));
+
+        assert!(state.orders.0.contains_key(&cid));
+    }
+
+    #[test]
+    fn orders_in_flight_survive_a_complete_snapshot_that_leaves_them_out() {
+        let mut state = instrument_state(OmsMode::Netting);
+
+        // In flight before the resync began: never recorded.
+        let opening = ClientOrderId::new("cid-opening");
+        state.update_from_order_snapshot(Snapshot(&order(
+            opening.clone(),
+            OrderState::active(OpenInFlight),
+        )));
+
+        // `Open` when the resync began, with a cancel sent before the snapshot arrives: recorded,
+        // but no longer `Open`, and the cancel's answer settles it.
+        let (cancelling, cancelling_oid) = (
+            ClientOrderId::new("cid-cancelling"),
+            OrderId::new("oid-cancelling"),
+        );
+        rest_order_at_exchange(&mut state, &cancelling, &cancelling_oid, None);
+
+        state.begin_account_resync();
+        state.update_from_order_snapshot(Snapshot(&order(
+            cancelling.clone(),
+            OrderState::active(CancelInFlight { order: None }),
+        )));
+        state.update_from_account_snapshot(&account_snapshot(Vec::new(), true));
+
+        assert!(state.orders.0.contains_key(&opening));
+        assert!(state.orders.0.contains_key(&cancelling));
+    }
+
+    /// A client id reused for a new order between the resync and the snapshot names a different
+    /// venue order than the one recorded, so the new order is not retired in the old one's place.
+    #[test]
+    fn a_reused_client_id_does_not_retire_the_new_order() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let cid = ClientOrderId::new("cid-reused");
+        let (old_oid, new_oid) = (OrderId::new("oid-old"), OrderId::new("oid-new"));
+        rest_order_at_exchange(&mut state, &cid, &old_oid, None);
+
+        state.begin_account_resync();
+        cancel_order(&mut state, &cid, &old_oid);
+        rest_order_at_exchange(&mut state, &cid, &new_oid, None);
+        state.update_from_account_snapshot(&account_snapshot(Vec::new(), true));
+
+        assert_eq!(
+            state.orders.0.get(&cid).map(|order| &order.state),
+            Some(&ActiveOrderState::Open(Open::new(
+                VenueOrderId::Assigned(new_oid),
+                TIME,
+                Decimal::ZERO,
+            )))
+        );
+    }
+
+    /// The snapshot that starts a run has no resync before it, so it retires nothing.
+    #[test]
+    fn a_complete_snapshot_without_a_resync_retires_nothing() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let (cid, oid) = (ClientOrderId::new("cid-1"), OrderId::new("oid-1"));
+        rest_order_at_exchange(&mut state, &cid, &oid, None);
+
+        state.update_from_account_snapshot(&account_snapshot(Vec::new(), true));
+
+        assert!(state.orders.0.contains_key(&cid));
+    }
+
+    #[test]
+    fn a_resync_gives_only_the_next_snapshot_the_chance_to_retire() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let (cid, oid) = (ClientOrderId::new("cid-1"), OrderId::new("oid-1"));
+        rest_order_at_exchange(&mut state, &cid, &oid, None);
+
+        state.begin_account_resync();
+        state.update_from_account_snapshot(&account_snapshot(vec![listed(&cid, &oid)], true));
+        state.update_from_account_snapshot(&account_snapshot(Vec::new(), true));
+
+        assert!(state.orders.0.contains_key(&cid));
+    }
+
+    /// The engine arms the record on every instrument of the reconnecting exchange, and on no
+    /// other.
+    #[test]
+    fn an_account_reconnect_records_open_orders_on_that_exchange_only() {
+        const OTHER: ExchangeId = ExchangeId::Kraken;
+        let instruments = IndexedInstruments::new([
+            test_instrument(EXCHANGE, "btc", "usdt"),
+            test_instrument(OTHER, "eth", "usdt"),
+        ]);
+        let mut engine: EngineState<(), ()> =
+            EngineState::builder(&instruments, (), |_| ()).build();
+        let cid = ClientOrderId::new("cid-1");
+        for (index, instrument) in engine.instruments.0.values_mut().enumerate() {
+            let mut resting = listed(&cid, &OrderId::new("oid-1"));
+            resting.key.exchange = ExchangeIndex(index);
+            resting.key.instrument = InstrumentIndex(index);
+            instrument.update_from_order_snapshot(Snapshot(&resting));
+        }
+
+        engine
+            .update_from_account_reconnecting(&EXCHANGE)
+            .expect("the harness exchange is tracked");
+
+        let recorded = |exchange: ExchangeId| {
+            engine
+                .instruments
+                .0
+                .values()
+                .find(|state| {
+                    engine.connectivity.exchanges.get_index_of(&exchange)
+                        == Some(state.instrument.exchange.index())
+                })
+                .expect("one instrument per exchange")
+                .orders_open_at_resync
+                .contains_key(&cid)
+        };
+        assert!(recorded(EXCHANGE));
+        assert!(!recorded(OTHER));
     }
 }

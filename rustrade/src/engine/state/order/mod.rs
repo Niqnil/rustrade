@@ -6,7 +6,7 @@ use fnv::FnvHashMap;
 use rust_decimal::Decimal;
 use rustrade_execution::order::{
     Order,
-    id::{ClientOrderId, OrderId},
+    id::{ClientOrderId, OrderId, VenueOrderId},
     request::{OrderRequestCancel, OrderRequestOpen, OrderResponseCancel},
     state::{ActiveOrderState, CancelInFlight, OrderState},
 };
@@ -75,6 +75,25 @@ impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
                 ActiveOrderState::OpenInFlight(_) | ActiveOrderState::CancelInFlight(_)
             )
         })
+    }
+
+    /// Stop tracking the order under `cid` if it is `Open` as the venue order `id`, returning it.
+    ///
+    /// Kept, with `None` returned, when:
+    /// - the order is in flight, because its request is still being answered;
+    /// - it names a different venue order than `id` ([`VenueOrderId::contradicts`]), because the
+    ///   client id has been reused for a new order that `id` does not describe.
+    ///
+    /// The caller owes the same routing prune as for any other retirement.
+    pub fn remove_open(
+        &mut self,
+        cid: &ClientOrderId,
+        id: &VenueOrderId,
+    ) -> Option<Order<ExchangeKey, InstrumentKey, ActiveOrderState>> {
+        match &self.0.get(cid)?.state {
+            ActiveOrderState::Open(open) if !open.id.contradicts(id) => self.0.remove(cid),
+            _ => None,
+        }
     }
 
     /// Advance a tracked order's cumulative filled quantity to what one of its fills reported,
@@ -617,6 +636,59 @@ mod tests {
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
             state,
         }
+    }
+
+    #[test]
+    fn remove_open_retires_only_an_open_order_that_is_the_venue_order_named() {
+        let assigned = |id: &str| VenueOrderId::Assigned(OrderId::new(id));
+        let open = |cid: &str, id: &str| {
+            order(
+                ClientOrderId::new(cid),
+                ActiveOrderState::Open(Open::new(
+                    assigned(id),
+                    DateTime::<Utc>::MIN_UTC,
+                    Decimal::ZERO,
+                )),
+            )
+        };
+        let mut manager = orders([
+            open("open", "oid-open"),
+            open("reused", "oid-new"),
+            order(
+                ClientOrderId::new("opening"),
+                ActiveOrderState::OpenInFlight(OpenInFlight),
+            ),
+            order_cancel_in_flight(ClientOrderId::new("cancelling")),
+        ]);
+
+        assert!(
+            manager
+                .remove_open(&ClientOrderId::new("open"), &assigned("oid-open"))
+                .is_some()
+        );
+        assert!(
+            manager
+                .remove_open(&ClientOrderId::new("reused"), &assigned("oid-old"))
+                .is_none(),
+            "the client id now names a different venue order"
+        );
+        for in_flight in ["opening", "cancelling"] {
+            assert!(
+                manager
+                    .remove_open(&ClientOrderId::new(in_flight), &assigned("oid"))
+                    .is_none(),
+                "{in_flight}"
+            );
+        }
+        assert!(
+            manager
+                .remove_open(&ClientOrderId::new("untracked"), &assigned("oid"))
+                .is_none()
+        );
+
+        let mut remaining = manager.0.into_keys().map(|cid| cid.0).collect::<Vec<_>>();
+        remaining.sort();
+        assert_eq!(remaining, ["cancelling", "opening", "reused"]);
     }
 
     fn order_cancel_in_flight(cid: ClientOrderId) -> Order<ExchangeId, u64, ActiveOrderState> {

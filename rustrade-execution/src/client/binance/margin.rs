@@ -50,11 +50,11 @@
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
-    MyTradesFrom, ORDER_EXECUTIONS_BUDGET, RateLimitTracker, SIGNAL_RECOVERY_LOOKBACK_MS,
-    SharedDedupCache, classify_order_kind_tif, classify_rest_order_error, connectivity_error,
-    convert_execution_report, convert_open_order, convert_open_order_owned_symbol,
-    dedup_key_from_event, is_duplicate, new_dedup_cache, recovered_order_totals,
-    rest_call_with_retry,
+    MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, RateLimitTracker,
+    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, classify_order_kind_tif,
+    classify_rest_order_error, connectivity_error, convert_execution_report,
+    convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event,
+    is_duplicate, new_dedup_cache, recovered_order_totals, rest_call_with_retry,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, InstrumentBalanceUpdate,
@@ -523,8 +523,12 @@ impl BinanceMargin {
             }))
             .buffer_unordered(8)
             .map(|result| {
-                let (inst, orders) = result?;
-                let wrapped = orders.into_iter().map(active_order_snapshot).collect();
+                let (inst, listing) = result?;
+                let wrapped = listing
+                    .orders
+                    .into_iter()
+                    .map(active_order_snapshot)
+                    .collect();
                 let isolated = balances_by_symbol.remove(&inst);
                 if isolated.is_none() {
                     // The same effective set drives both balances and open orders, so a miss here
@@ -536,7 +540,11 @@ impl BinanceMargin {
                     );
                 }
                 Ok::<_, UnindexedClientError>(InstrumentAccountSnapshot::new(
-                    inst, wrapped, None, isolated,
+                    inst,
+                    wrapped,
+                    listing.complete,
+                    None,
+                    isolated,
                 ))
             })
             .try_collect()
@@ -927,10 +935,18 @@ impl ExecutionClient for BinanceMargin {
             }))
             .buffer_unordered(8)
             .map(|result| {
-                let (inst, orders) = result?;
-                let wrapped = orders.into_iter().map(active_order_snapshot).collect();
+                let (inst, listing) = result?;
+                let wrapped = listing
+                    .orders
+                    .into_iter()
+                    .map(active_order_snapshot)
+                    .collect();
                 Ok::<_, UnindexedClientError>(InstrumentAccountSnapshot::new(
-                    inst, wrapped, None, None,
+                    inst,
+                    wrapped,
+                    listing.complete,
+                    None,
+                    None,
                 ))
             })
             .try_collect()
@@ -1013,8 +1029,8 @@ impl ExecutionClient for BinanceMargin {
             .try_fold(
                 Vec::with_capacity(capacity),
                 |mut acc: Vec<Order<ExchangeId, InstrumentNameExchange, Open>>,
-                 (_, orders)| async move {
-                    acc.extend(orders);
+                 (_, listing)| async move {
+                    acc.extend(listing.orders);
                     Ok(acc)
                 },
             )
@@ -1042,8 +1058,8 @@ impl ExecutionClient for BinanceMargin {
         .buffer_unordered(8)
         .try_fold(
             Vec::with_capacity(instruments.len()),
-            |mut acc: Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, (_, orders)| async move {
-                acc.extend(orders);
+            |mut acc: Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, (_, listing)| async move {
+                acc.extend(listing.orders);
                 Ok(acc)
             },
         )
@@ -2703,13 +2719,7 @@ async fn fetch_margin_open_orders_for_instrument(
     rate_limiter: Arc<RateLimitTracker>,
     instrument: InstrumentNameExchange,
     is_isolated: bool,
-) -> Result<
-    (
-        InstrumentNameExchange,
-        Vec<Order<ExchangeId, InstrumentNameExchange, Open>>,
-    ),
-    UnindexedClientError,
-> {
+) -> Result<(InstrumentNameExchange, OpenOrderListing), UnindexedClientError> {
     // Convert once before the retry closure to avoid a String allocation on every retry.
     let symbol_str = instrument.name().to_string();
     let isolated = QueryMarginAccountsOpenOrdersIsIsolatedEnum::from_flag(is_isolated);
@@ -2732,12 +2742,9 @@ async fn fetch_margin_open_orders_for_instrument(
         .await
         .map_err(|e| connectivity_error(e.into()))?;
 
-    let orders = orders_data
-        .into_iter()
-        .filter_map(|o| convert_open_order(&o, ExchangeId::BinanceMargin, &instrument))
-        .collect();
+    let listing = convert_open_order_listing(&orders_data, ExchangeId::BinanceMargin, &instrument);
 
-    Ok((instrument, orders))
+    Ok((instrument, listing))
 }
 
 /// Fetch *all* open margin orders in a single no-symbol `query_margin_accounts_open_orders`
@@ -3463,6 +3470,7 @@ fn margin_avg_price(cummulative_quote_qty: Option<&str>, filled_qty: Decimal) ->
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use crate::client::binance::shared::convert_open_order;
     use crate::order::state::ActiveOrderState;
     use binance_sdk::margin_trading::rest_api::QueryMarginAccountsOpenOrdersResponseInner;
 
