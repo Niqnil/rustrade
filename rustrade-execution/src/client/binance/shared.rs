@@ -435,6 +435,158 @@ impl_binance_order_fields!(
     binance_sdk::margin_trading::rest_api::QueryMarginAccountsOpenOrdersResponseInner,
 );
 
+// ---------------------------------------------------------------------------
+// Recovered fills: the order's cumulative filled quantity
+// ---------------------------------------------------------------------------
+
+/// Where a `myTrades` walk starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MyTradesFrom {
+    /// Every execution on the instrument at or after this time, in epoch milliseconds.
+    Time(i64),
+    /// Every execution of this one order, from its first.
+    Order(i64),
+}
+
+/// The fields of a `myTrades` execution that fill recovery reads to rebuild an order's
+/// cumulative filled quantity. Spot and margin serve different types that share these three.
+pub(crate) trait BinanceExecutionFields {
+    /// The trade id, which Binance assigns in increasing order per symbol.
+    fn id(&self) -> Option<i64>;
+    fn order_id(&self) -> Option<i64>;
+    /// The size of this execution.
+    fn qty(&self) -> Option<&str>;
+}
+
+macro_rules! impl_binance_execution_fields {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl BinanceExecutionFields for $t {
+                fn id(&self) -> Option<i64> { self.id }
+                fn order_id(&self) -> Option<i64> { self.order_id }
+                fn qty(&self) -> Option<&str> { self.qty.as_deref() }
+            }
+        )*
+    };
+}
+
+impl_binance_execution_fields!(
+    binance_sdk::spot::rest_api::MyTradesResponseInner,
+    binance_sdk::margin_trading::rest_api::QueryMarginAccountsTradeListResponseInner,
+);
+
+/// How long fill recovery may spend reading recovered orders' executions, from the moment it
+/// starts.
+///
+/// Half of [`FILL_RECOVERY_TIMEOUT_SECS`], which bounds the whole recovery and drops every fill
+/// not yet sent when it expires. The lookups only enrich fills; they must never cost one. Past
+/// this budget the remaining fills go out without a cumulative, as they did before it existed.
+pub(crate) const ORDER_EXECUTIONS_BUDGET: Duration =
+    Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS / 2);
+
+/// The cumulative filled quantity of each recovered execution's order, as of that execution,
+/// keyed by trade id.
+///
+/// `myTrades` reports executions only, with no cumulative, so a recovered fill cannot advance its
+/// order on its own. For each order among `recovered`, this walks that order's executions from its
+/// first with `fetch` and sums them in trade-id order. That is the figure the WebSocket reports as
+/// `z` on the same execution, so a recovered fill and a live one carry the same
+/// [`Trade::order_filled_quantity`].
+///
+/// An order is left out, and its recovered fills keep `None`, when its walk fails, when the walk
+/// is unusable (see [`order_running_totals`]), or once `deadline` passes. Each case is logged.
+/// `None` is what every recovered fill carried before this existed, and the order's state must
+/// then be learned some other way.
+pub(crate) async fn recovered_order_totals<T, F, Fut>(
+    exchange: ExchangeId,
+    instrument: &InstrumentNameExchange,
+    recovered: &[T],
+    deadline: tokio::time::Instant,
+    fetch: F,
+) -> fnv::FnvHashMap<i64, Decimal>
+where
+    T: BinanceExecutionFields,
+    F: Fn(i64) -> Fut,
+    Fut: Future<Output = Result<Vec<T>, UnindexedClientError>>,
+{
+    let mut order_ids: Vec<i64> = recovered.iter().filter_map(|t| t.order_id()).collect();
+    order_ids.sort_unstable();
+    order_ids.dedup();
+
+    let mut totals = fnv::FnvHashMap::default();
+    for (looked_up, &order_id) in order_ids.iter().enumerate() {
+        let executions = match tokio::time::timeout_at(deadline, fetch(order_id)).await {
+            Ok(Ok(executions)) => executions,
+            Ok(Err(error)) => {
+                warn!(
+                    %exchange, %instrument, order_id, %error,
+                    "fill recovery could not read the order's executions; its recovered fills \
+                     carry no cumulative filled quantity"
+                );
+                continue;
+            }
+            Err(_elapsed) => {
+                warn!(
+                    %exchange, %instrument,
+                    orders_left = order_ids.len() - looked_up,
+                    budget = ?ORDER_EXECUTIONS_BUDGET,
+                    "fill recovery ran out of time reading orders' executions; the remaining \
+                     orders' recovered fills carry no cumulative filled quantity"
+                );
+                break;
+            }
+        };
+        match order_running_totals(order_id, &executions) {
+            Some(running) => totals.extend(running),
+            None => warn!(
+                %exchange, %instrument, order_id, executions = executions.len(),
+                "fill recovery read an order's executions it cannot sum (a missing id or size, \
+                 or another order's execution); its recovered fills carry no cumulative filled \
+                 quantity"
+            ),
+        }
+    }
+    totals
+}
+
+/// `(trade id, cumulative filled quantity as of that execution)` for every execution of one
+/// order, or `None` if the walk cannot be trusted to sum.
+///
+/// A running total is only right if every execution is counted exactly once, in order. So the
+/// walk is refused whole, rather than summed around a gap, when an execution has no id or no
+/// parseable size, or belongs to a different order: the last would mean the venue ignored the
+/// `orderId` filter, and summing another order's fills would report a quantity this order never
+/// filled. An execution repeated across pages is counted once.
+pub(crate) fn order_running_totals<T: BinanceExecutionFields>(
+    order_id: i64,
+    executions: &[T],
+) -> Option<Vec<(i64, Decimal)>> {
+    let mut sized = executions
+        .iter()
+        .map(|execution| {
+            if execution.order_id() != Some(order_id) {
+                return None;
+            }
+            let qty = Decimal::from_str(execution.qty()?).ok()?;
+            Some((execution.id()?, qty))
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    sized.sort_unstable_by_key(|&(id, _)| id);
+    sized.dedup_by_key(|&mut (id, _)| id);
+
+    let mut cumulative = Decimal::ZERO;
+    Some(
+        sized
+            .into_iter()
+            .map(|(id, qty)| {
+                cumulative += qty;
+                (id, cumulative)
+            })
+            .collect(),
+    )
+}
+
 /// Convert a Binance open order into rustrade's `Open` state order.
 ///
 /// `exchange` stamps the resulting [`OrderKey`] and every diagnostic below, so one
@@ -1401,6 +1553,158 @@ pub(crate) fn classify_rest_order_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `myTrades` execution reduced to the three fields recovery reads.
+    #[derive(Debug, Clone, Copy)]
+    struct Execution {
+        id: Option<i64>,
+        order_id: Option<i64>,
+        qty: Option<&'static str>,
+    }
+
+    impl BinanceExecutionFields for Execution {
+        fn id(&self) -> Option<i64> {
+            self.id
+        }
+        fn order_id(&self) -> Option<i64> {
+            self.order_id
+        }
+        fn qty(&self) -> Option<&str> {
+            self.qty
+        }
+    }
+
+    fn execution(id: i64, order_id: i64, qty: &'static str) -> Execution {
+        Execution {
+            id: Some(id),
+            order_id: Some(order_id),
+            qty: Some(qty),
+        }
+    }
+
+    fn btcusdt() -> InstrumentNameExchange {
+        InstrumentNameExchange::new("BTCUSDT")
+    }
+
+    #[test]
+    fn running_totals_accumulate_in_trade_id_order_counting_a_repeat_once() {
+        // Out of order, and trade 12 twice, as an overlapping page would serve it.
+        let executions = [
+            execution(12, 7, "0.5"),
+            execution(10, 7, "1"),
+            execution(12, 7, "0.5"),
+            execution(15, 7, "2"),
+        ];
+
+        assert_eq!(
+            order_running_totals(7, &executions),
+            Some(vec![
+                (10, Decimal::ONE),
+                (12, Decimal::new(15, 1)),
+                (15, Decimal::new(35, 1)),
+            ])
+        );
+    }
+
+    #[test]
+    fn running_totals_refuse_a_walk_holding_another_orders_execution() {
+        // The venue ignoring `orderId` would serve the symbol's other orders; summing them would
+        // report a quantity this order never filled.
+        let executions = [execution(10, 7, "1"), execution(11, 8, "5")];
+
+        assert_eq!(order_running_totals(7, &executions), None);
+    }
+
+    #[test]
+    fn running_totals_refuse_a_walk_with_an_unreadable_execution() {
+        let unsized_execution = Execution {
+            qty: None,
+            ..execution(11, 7, "0")
+        };
+        let unparseable = execution(11, 7, "abc");
+        let unidentified = Execution {
+            id: None,
+            ..execution(11, 7, "1")
+        };
+
+        for broken in [unsized_execution, unparseable, unidentified] {
+            assert_eq!(
+                order_running_totals(7, &[execution(10, 7, "1"), broken]),
+                None,
+                "{broken:?}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_recovered_fill_counts_what_its_order_filled_before_the_window() {
+        // Only trade 12 fell inside the recovery window; trade 10 filled before the disconnect.
+        let recovered = [execution(12, 7, "2")];
+        let order_walk = vec![execution(10, 7, "1"), execution(12, 7, "2")];
+
+        let totals = recovered_order_totals(
+            ExchangeId::BinanceSpot,
+            &btcusdt(),
+            &recovered,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            |order_id| {
+                assert_eq!(order_id, 7);
+                let walk = order_walk.clone();
+                async move { Ok(walk) }
+            },
+        )
+        .await;
+
+        assert_eq!(totals.get(&12), Some(&Decimal::new(3, 0)));
+    }
+
+    #[tokio::test]
+    async fn an_order_whose_walk_fails_is_left_out_and_the_others_are_not() {
+        let recovered = [execution(20, 1, "1"), execution(21, 2, "1")];
+
+        let totals = recovered_order_totals(
+            ExchangeId::BinanceMargin,
+            &btcusdt(),
+            &recovered,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            |order_id| async move {
+                match order_id {
+                    1 => Err(connectivity_error(anyhow::anyhow!("connection reset"))),
+                    _ => Ok(vec![execution(21, 2, "1")]),
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(totals.get(&20), None);
+        assert_eq!(totals.get(&21), Some(&Decimal::ONE));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lookups_stop_at_the_deadline_rather_than_holding_the_fills() {
+        // Order 1's walk never answers; order 2 is never reached. Recovery must return what it
+        // has at the deadline, so the fills still go out inside the overall recovery timeout.
+        let recovered = [execution(20, 1, "1"), execution(21, 2, "1")];
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_secs(5);
+
+        let totals = recovered_order_totals(
+            ExchangeId::BinanceSpot,
+            &btcusdt(),
+            &recovered,
+            deadline,
+            |order_id| async move {
+                if order_id == 1 {
+                    std::future::pending::<()>().await;
+                }
+                Ok(vec![execution(21, 2, "1")])
+            },
+        )
+        .await;
+
+        assert!(totals.is_empty(), "{totals:?}");
+        assert_eq!(tokio::time::Instant::now(), deadline);
+    }
 
     fn classify(
         msg: &str,

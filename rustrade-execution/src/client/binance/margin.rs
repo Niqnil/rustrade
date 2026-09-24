@@ -50,9 +50,10 @@
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
-    RateLimitTracker, SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, classify_order_kind_tif,
-    classify_rest_order_error, connectivity_error, convert_execution_report, convert_open_order,
-    convert_open_order_owned_symbol, dedup_key_from_event, is_duplicate, new_dedup_cache,
+    MyTradesFrom, ORDER_EXECUTIONS_BUDGET, RateLimitTracker, SIGNAL_RECOVERY_LOOKBACK_MS,
+    SharedDedupCache, classify_order_kind_tif, classify_rest_order_error, connectivity_error,
+    convert_execution_report, convert_open_order, convert_open_order_owned_symbol,
+    dedup_key_from_event, is_duplicate, new_dedup_cache, recovered_order_totals,
     rest_call_with_retry,
 };
 use crate::{
@@ -1098,7 +1099,7 @@ impl ExecutionClient for BinanceMargin {
                     &rest,
                     &rate_limiter,
                     &inst,
-                    start_time_ms,
+                    MyTradesFrom::Time(start_time_ms),
                     is_isolated,
                 )
                 .await?;
@@ -1142,11 +1143,13 @@ impl ExecutionClient for BinanceMargin {
     /// [`ExecutionClient::fetch_open_orders`] after each reconnect to reconcile order state — only
     /// TRADE fills are recovered, not order-lifecycle events.
     ///
-    /// That reconciliation is also the only way a recovered fill reaches the order. A live fill
-    /// carries the order's cumulative filled quantity in [`Trade::order_filled_quantity`]
-    /// (`executionReport`'s `z`) and advances the order by itself; a fill recovered from REST
-    /// `myTrades` carries no cumulative, so `order_filled_quantity` is `None` and
-    /// `filled_quantity` stays where it stood before the gap.
+    /// A recovered fill advances the order too. A live fill carries the order's cumulative filled
+    /// quantity in [`Trade::order_filled_quantity`] (`executionReport`'s `z`); REST `myTrades`
+    /// carries none, so recovery rebuilds the same figure by reading each recovered order's
+    /// executions from its first, at one extra request per order. Those lookups have their own
+    /// time budget inside the recovery timeout, so they can never cost a fill: a fill whose order
+    /// was not looked up in time, or whose lookup failed, goes out with `order_filled_quantity:
+    /// None`, logged at `warn`, and advances the position but not the order.
     ///
     /// # Isolated mode (multiplexed `userListenToken`)
     /// Under `is_isolated = true` a **separate** manager drives the stream (the cross path above is
@@ -1937,9 +1940,9 @@ fn register_user_data_listener(
 /// Only TRADE fills are recovered — order-lifecycle events (NEW/CANCELED) require a
 /// `fetch_open_orders` reconciliation by the caller. Mirrors `BinanceSpot::recover_fills`.
 ///
-/// The recovered trades carry no `order_filled_quantity`: `myTrades` reports executions only,
-/// with no cumulative and no order status, so a recovered fill advances the position but not
-/// the order. Only that same reconciliation closes the gap.
+/// `myTrades` reports executions only, with no cumulative, so each recovered trade's
+/// `order_filled_quantity` is rebuilt from its order's executions by
+/// [`recovered_order_totals`]. A trade whose order could not be looked up keeps `None`.
 async fn recover_margin_fills(
     rest: &Arc<RestApi>,
     rate_limiter: &Arc<RateLimitTracker>,
@@ -1962,6 +1965,7 @@ async fn recover_margin_fills(
     );
 
     let start_time_ms = disconnect_time.timestamp_millis();
+    let order_executions_deadline = tokio::time::Instant::now() + ORDER_EXECUTIONS_BUDGET;
     let mut recovered = 0u32;
     let mut duplicates = 0u32;
     let mut failed_instruments = 0u32;
@@ -1970,18 +1974,48 @@ async fn recover_margin_fills(
         let rest = rest.clone();
         let rl = rate_limiter.clone();
         async move {
-            match paginate_margin_my_trades(&rest, &rl, &inst, start_time_ms, is_isolated).await {
-                Ok(pages) => Some(
-                    pages
-                        .iter()
-                        .filter_map(|t| convert_margin_trade(t, &inst))
-                        .collect::<Vec<_>>(),
-                ),
+            let raw = match paginate_margin_my_trades(
+                &rest,
+                &rl,
+                &inst,
+                MyTradesFrom::Time(start_time_ms),
+                is_isolated,
+            )
+            .await
+            {
+                Ok(pages) => pages,
                 Err(e) => {
                     warn!(%e, %inst, "BinanceMargin fill recovery: REST request failed");
-                    None
+                    return None;
                 }
-            }
+            };
+            // `myTrades` carries no cumulative, so each recovered fill's is rebuilt from its
+            // order's executions; without it the fill advances the position but not the order.
+            let totals = recovered_order_totals(
+                ExchangeId::BinanceMargin,
+                &inst,
+                &raw,
+                order_executions_deadline,
+                |order_id| {
+                    paginate_margin_my_trades(
+                        &rest,
+                        &rl,
+                        &inst,
+                        MyTradesFrom::Order(order_id),
+                        is_isolated,
+                    )
+                },
+            )
+            .await;
+            Some(
+                raw.iter()
+                    .filter_map(|t| {
+                        let mut trade = convert_margin_trade(t, &inst)?;
+                        trade.order_filled_quantity = t.id.and_then(|id| totals.get(&id).copied());
+                        Some(trade)
+                    })
+                    .collect::<Vec<_>>(),
+            )
         }
     }))
     .buffer_unordered(8);
@@ -2742,10 +2776,11 @@ async fn fetch_margin_all_open_orders(
     Ok(orders)
 }
 
-/// Paginate the margin trade list for a single instrument since `start_time_ms`
-/// (`isIsolated` config-driven). Mirrors `BinanceSpot::paginate_my_trades`: cursor-based,
-/// first page by `start_time`, subsequent pages by `from_id = last_id + 1` (Binance ignores
-/// `start_time` once `from_id` is set), producing a gapless result.
+/// Paginate the margin trade list for a single instrument from `from` (`isIsolated`
+/// config-driven). Mirrors `BinanceSpot::paginate_my_trades`: cursor-based, first page by
+/// `start_time` or, for one order's executions, by `order_id`; subsequent pages by
+/// `from_id = last_id + 1` (Binance ignores `start_time` once `from_id` is set), keeping
+/// `order_id` alongside it. Produces a gapless result.
 ///
 /// **Isolated correctness:** this also backs reconnect fill-recovery (`recover_margin_fills`), so a
 /// missed `isIsolated` flip would silently query *cross* trades on an isolated client — hence the
@@ -2754,7 +2789,7 @@ async fn paginate_margin_my_trades(
     rest: &Arc<RestApi>,
     rate_limiter: &Arc<RateLimitTracker>,
     instrument: &InstrumentNameExchange,
-    start_time_ms: i64,
+    from: MyTradesFrom,
     is_isolated: bool,
 ) -> Result<Vec<QueryMarginAccountsTradeListResponseInner>, UnindexedClientError> {
     // Convert once before the retry closure to avoid a String allocation on every retry.
@@ -2773,16 +2808,19 @@ async fn paginate_margin_my_trades(
         let response = rest_call_with_retry(rest, rate_limiter, |rest| {
             let sym = symbol_str.clone();
             let isolated = isolated.clone();
-            let stm = start_time_ms;
             Box::pin(async move {
                 let builder = QueryMarginAccountsTradeListParams::builder(sym)
                     .is_isolated(isolated)
                     .limit(limit);
-                let params = if let Some(id) = fid {
-                    builder.from_id(id).build()?
-                } else {
-                    builder.start_time(stm).build()?
-                };
+                let params = match (from, fid) {
+                    (MyTradesFrom::Time(start_time_ms), None) => builder.start_time(start_time_ms),
+                    (MyTradesFrom::Time(_), Some(id)) => builder.from_id(id),
+                    (MyTradesFrom::Order(order_id), None) => builder.order_id(order_id),
+                    (MyTradesFrom::Order(order_id), Some(id)) => {
+                        builder.order_id(order_id).from_id(id)
+                    }
+                }
+                .build()?;
                 rest.query_margin_accounts_trade_list(params).await
             })
         })
