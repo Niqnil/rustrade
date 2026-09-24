@@ -43,9 +43,11 @@
 //! - **Timestamps are whole-second.** Dozens of prints share one; arrival order is the sequence.
 //! - **A contract that starts trading mid-session is missed** unless registered up front. The
 //!   REST print tape carries every contract.
-//! - **One connection per key.** Options stream over their own connection, so a `Streams` builder
-//!   subscribing options alongside another London Strategic Edge dataset needs a second, which a
-//!   free key is refused.
+//! - **One connection per key, shared.** Options stream over the same connection as every other
+//!   London Strategic Edge dataset, so contracts can be subscribed alongside equities or crypto by
+//!   handing each `subscribe` a clone of one subscriber. A separately built subscriber for the
+//!   same key would need a second connection, which a free key is refused.
+//! - **No resumption.** A reconnect leaves a gap: the provider replays nothing on this channel.
 
 use chrono::{Datelike, Duration, NaiveTime, Utc, Weekday};
 use futures::StreamExt;
