@@ -3652,6 +3652,7 @@ mod tests {
             executed_qty: Some("0.0".to_string()),
             time_in_force: Some("GTC".to_string()),
             time: Some(1_700_000_000_000),
+            status: Some("NEW".to_string()),
             ..Default::default()
         }
     }
@@ -3661,7 +3662,9 @@ mod tests {
         // `convert_open_order` is generic over `BinanceOrderFields`; the live open-orders path feeds
         // it `GetOpenOrdersResponseInner` (what every other test here uses) while `allOrders`
         // would feed it `AllOrdersResponseInner`. Pin that the second impl reads the same fields,
-        // so the two endpoint structs cannot drift apart unnoticed.
+        // so the two endpoint structs cannot drift apart unnoticed. This guards field drift only:
+        // an `allOrders` row for a finished order must not convert, which
+        // `test_convert_open_order_refuses_an_all_orders_row_that_is_not_live` pins.
         let instrument = InstrumentNameExchange::new("BTCUSDT");
         let all_orders = binance_sdk::spot::rest_api::AllOrdersResponseInner {
             order_id: Some(12345),
@@ -3673,6 +3676,7 @@ mod tests {
             executed_qty: Some("0.0".to_string()),
             time_in_force: Some("GTC".to_string()),
             time: Some(1_700_000_000_000),
+            status: Some("NEW".to_string()),
             ..Default::default()
         };
         let from_all_orders = convert_open_order(&all_orders, ExchangeId::BinanceSpot, &instrument)
@@ -3684,6 +3688,69 @@ mod tests {
         )
         .expect("valid order should convert");
         assert_eq!(from_all_orders, from_open_orders);
+    }
+
+    /// An `allOrders` row for an order that is no longer live must not become an `Open` order.
+    ///
+    /// The case that matters is a cancelled order that had partly filled: as `Open` it would rest
+    /// in engine state with quantity remaining, and nothing at the exchange would ever fill or
+    /// cancel it.
+    #[test]
+    fn test_convert_open_order_refuses_an_all_orders_row_that_is_not_live() {
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+        for status in [
+            "CANCELED",
+            "FILLED",
+            "EXPIRED",
+            "EXPIRED_IN_MATCH",
+            "REJECTED",
+            "PENDING_CANCEL",
+            "SOME_FUTURE_STATUS",
+        ] {
+            let row = binance_sdk::spot::rest_api::AllOrdersResponseInner {
+                order_id: Some(12345),
+                client_order_id: Some("cid-abc".to_string()),
+                side: Some("BUY".to_string()),
+                r#type: Some("LIMIT".to_string()),
+                price: Some("50000.00".to_string()),
+                orig_qty: Some("0.01".to_string()),
+                executed_qty: Some("0.004".to_string()),
+                time_in_force: Some("GTC".to_string()),
+                time: Some(1_700_000_000_000),
+                status: Some(status.to_string()),
+                ..Default::default()
+            };
+            assert_eq!(
+                convert_open_order(&row, ExchangeId::BinanceSpot, &instrument),
+                None,
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_convert_open_order_admits_every_live_status() {
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+        for status in ["NEW", "PARTIALLY_FILLED", "PENDING_NEW"] {
+            let o = binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
+                status: Some(status.to_string()),
+                ..make_base_open_order()
+            };
+            assert!(
+                convert_open_order(&o, ExchangeId::BinanceSpot, &instrument).is_some(),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_convert_open_order_missing_status_returns_none() {
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+        let o = binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
+            status: None,
+            ..make_base_open_order()
+        };
+        assert!(convert_open_order(&o, ExchangeId::BinanceSpot, &instrument).is_none());
     }
 
     /// A REST order snapshot is stamped with when the order last changed, not when it was created.

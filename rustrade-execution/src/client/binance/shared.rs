@@ -383,7 +383,7 @@ pub(crate) fn parse_time_in_force(tif: &str) -> TimeInForce {
 /// `AllOrdersResponseInner` and `GetOpenOrdersResponseInner` on spot,
 /// `QueryMarginAccountsOpenOrdersResponseInner` on margin. Those structs are emphatically not
 /// interchangeable -- the spot family carries substantially more fields than the margin one, and
-/// several fields share a name while differing in type -- but the eleven named here are identical
+/// several fields share a name while differing in type -- but the twelve named here are identical
 /// in name and type across all of them.
 ///
 /// Naming that read subset is what makes a single converter safe to share. The dependency surface
@@ -403,11 +403,15 @@ pub(crate) trait BinanceOrderFields {
     /// it was created. Every endpoint implemented below carries it.
     fn update_time(&self) -> Option<i64>;
     fn symbol(&self) -> Option<&str>;
+    /// The order's status. `openOrders` serves only live orders, but `allOrders` also serves
+    /// cancelled, expired and filled ones through the same accessors, so [`convert_open_order`]
+    /// reads it rather than trusting the endpoint.
+    fn status(&self) -> Option<&str>;
 }
 
 /// Implement [`BinanceOrderFields`] for SDK response types that share these field names.
 ///
-/// Every struct listed below declares these eleven fields with the same types, so the accessors
+/// Every struct listed below declares these twelve fields with the same types, so the accessors
 /// are identical; a macro keeps them from drifting apart under hand-editing.
 macro_rules! impl_binance_order_fields {
     ($($t:ty),* $(,)?) => {
@@ -424,6 +428,7 @@ macro_rules! impl_binance_order_fields {
                 fn time(&self) -> Option<i64> { self.time }
                 fn update_time(&self) -> Option<i64> { self.update_time }
                 fn symbol(&self) -> Option<&str> { self.symbol.as_deref() }
+                fn status(&self) -> Option<&str> { self.status.as_deref() }
             }
         )*
     };
@@ -612,7 +617,29 @@ pub(crate) fn order_running_totals<T: BinanceExecutionFields>(
     )
 }
 
+/// Whether a REST order response's status says the order is resting at the exchange, and may
+/// therefore become an `Open` order.
+///
+/// `NEW` and `PARTIALLY_FILLED` are working orders. `PENDING_NEW` is an order-list leg that waits
+/// for its working order to fill; it is at the exchange and `openOrders` returns it, so it is live
+/// too. Every other status is terminal (`FILLED`, `CANCELED`, `REJECTED`, `EXPIRED`,
+/// `EXPIRED_IN_MATCH`), unused (`PENDING_CANCEL`), or unknown to this version.
+///
+/// This is an allow-list for the same reason [`trade_order_is_live`] is one: an `Open` snapshot of
+/// an order that is no longer live resurrects it. A cancelled order that had partly filled would
+/// rest in engine state with quantity remaining, and nothing at the exchange would ever fill or
+/// cancel it.
+fn rest_order_is_open(status: &str) -> bool {
+    matches!(status, "NEW" | "PARTIALLY_FILLED" | "PENDING_NEW")
+}
+
 /// Convert a Binance open order into rustrade's `Open` state order.
+///
+/// Returns `None`, with a warning, for an order whose status is not live (see
+/// [`rest_order_is_open`]) or is missing, whichever endpoint served it. `openOrders` serves only
+/// live orders, so there this never fires in practice. An `allOrders` row for a finished order
+/// cannot be expressed as `Open` at all; reading that endpoint needs a conversion to
+/// [`OrderState`], which this is not.
 ///
 /// `exchange` stamps the resulting [`OrderKey`] and every diagnostic below, so one
 /// implementation serves each Binance client without a venue name baked into its warnings.
@@ -628,6 +655,17 @@ pub(crate) fn convert_open_order<T: BinanceOrderFields>(
             return None;
         }
     };
+    match o.status() {
+        Some(status) if rest_order_is_open(status) => {}
+        Some(status) => {
+            warn!(%exchange, %instrument, order_id = %order_id_raw, status, "Binance order is not live, not converting it to an open order");
+            return None;
+        }
+        None => {
+            warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance open order missing status");
+            return None;
+        }
+    }
     let order_id = OrderId(format_smolstr!("{}", order_id_raw));
     if o.client_order_id().is_none() {
         warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance open order missing clientOrderId, using orderId as fallback — order may not reconcile with engine state");

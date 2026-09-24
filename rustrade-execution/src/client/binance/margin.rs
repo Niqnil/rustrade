@@ -4352,6 +4352,7 @@ mod tests {
         o.r#type = Some("LIMIT".to_string());
         o.time_in_force = Some("GTC".to_string());
         o.time = Some(1_700_000_000_000);
+        o.status = Some("PARTIALLY_FILLED".to_string());
         o
     }
 
@@ -4375,6 +4376,16 @@ mod tests {
         assert_eq!(order.quantity, Decimal::from(2));
         assert_eq!(order.state.filled_quantity, Decimal::new(5, 1));
         assert_eq!(order.kind, OrderKind::Limit);
+    }
+
+    /// Margin shares the converter, so it shares the guard: a cancelled order that had partly
+    /// filled must not come back as `Open`.
+    #[test]
+    fn margin_open_order_that_is_not_live_is_dropped() {
+        let inst = InstrumentNameExchange::new("BTCUSDT");
+        let mut o = open_order(Some(42), "BUY");
+        o.status = Some("CANCELED".to_string());
+        assert!(convert_open_order(&o, ExchangeId::BinanceMargin, &inst).is_none());
     }
 
     #[test]
