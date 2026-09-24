@@ -98,6 +98,36 @@ fn btc_instrument() -> InstrumentNameExchange {
     "BTC/USD".into()
 }
 
+/// Wait until the venue lists no open order on `instrument`, panicking after 15 seconds.
+///
+/// Alpaca answers a cancel once it has accepted the request, while the order may still be
+/// `pending_cancel` and live. The order tests run one after another on the same symbols, so an
+/// order still live when its test ends can get the next test's order refused: a sell against a
+/// buy still open is "potential wash trade detected" or "cannot open a short sell while a long
+/// buy order is open". Every test that cancels waits here, so it leaves the instrument as it
+/// found it. Waiting on the instrument rather than on the one order also covers a bracket's
+/// legs, whose ids the placement does not return.
+async fn await_no_open_orders(client: &AlpacaClient, instrument: &InstrumentNameExchange) {
+    const POLL: Duration = Duration::from_millis(250);
+    const DEADLINE: Duration = Duration::from_secs(15);
+
+    let instruments = [instrument.clone()];
+    let started = tokio::time::Instant::now();
+    loop {
+        let listed = client.fetch_open_orders(&instruments).await;
+        if matches!(&listed, Ok(orders) if orders.is_empty()) {
+            println!("{instrument}: no open orders after {:?}", started.elapsed());
+            return;
+        }
+        if started.elapsed() >= DEADLINE {
+            panic!(
+                "{instrument} still lists open orders {DEADLINE:?} after the cancel: {listed:?}"
+            );
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 // ============================================================================
 // Connection Tests
 // ============================================================================
@@ -312,6 +342,8 @@ async fn test_place_and_cancel_limit_order() {
                     panic!("Cancel rejected: {:?}", e);
                 }
             }
+
+            await_no_open_orders(&client, &instrument).await;
         }
         OrderState::Inactive(InactiveOrderState::FullyFilled(_)) => {
             panic!("Unexpected full fill at $1.00 - market moved unexpectedly");
@@ -400,6 +432,8 @@ async fn test_place_crypto_limit_order() {
                 Ok(_) => println!("Crypto order canceled successfully!"),
                 Err(e) => panic!("Cancel rejected: {:?}", e),
             }
+
+            await_no_open_orders(&client, &instrument).await;
         }
         OrderState::Inactive(e) => {
             panic!("Crypto order rejected: {:?}", e);
@@ -589,6 +623,7 @@ async fn test_account_stream_with_order() {
                 state: rustrade_execution::order::request::RequestCancel { id: Some(oid) },
             })
             .await;
+        await_no_open_orders(&client, &instrument).await;
         println!("Cleanup complete");
     }
 }
@@ -685,6 +720,8 @@ async fn test_place_and_cancel_stop_order() {
                     panic!("Cancel rejected: {:?}", e);
                 }
             }
+
+            await_no_open_orders(&client, &instrument).await;
         }
         OrderState::Inactive(e) => {
             panic!("Stop order rejected: {:?}", e);
@@ -783,6 +820,8 @@ async fn test_place_and_cancel_trailing_stop_order() {
                     panic!("Cancel rejected: {:?}", e);
                 }
             }
+
+            await_no_open_orders(&client, &instrument).await;
         }
         OrderState::Inactive(e) => {
             panic!("Trailing stop order rejected: {:?}", e);
@@ -899,6 +938,8 @@ async fn test_place_and_cancel_bracket_order_with_stop() {
                     panic!("Cancel rejected: {:?}", e);
                 }
             }
+
+            await_no_open_orders(&client, &instrument).await;
         }
         OrderState::Inactive(e) => {
             panic!("Bracket order rejected: {:?}", e);
@@ -983,6 +1024,8 @@ async fn test_place_and_cancel_bracket_order_with_stop_limit() {
                     panic!("Cancel rejected: {:?}", e);
                 }
             }
+
+            await_no_open_orders(&client, &instrument).await;
         }
         OrderState::Inactive(e) => {
             panic!("Bracket order (stop-limit) rejected: {:?}", e);
