@@ -56,8 +56,8 @@ jobs:
     name: LSE live-API canaries
     needs: secret-present
     runs-on: ubuntu-latest
-    # The WebSocket canary adds up to five minutes on top of the build and the four REST canaries:
-    # its five tests are serialised against the provider's one-connection-per-key cap, and their
+    # The WebSocket canary adds up to six minutes on top of the build and the five REST canaries:
+    # its seven tests are serialised against the provider's one-connection-per-key cap, and their
     # timeouts sum rather than overlap.
     timeout-minutes: 30
     env:
@@ -121,7 +121,7 @@ jobs:
       # are sequential, which is what makes that safe here; adding a parallel job that uses the
       # same key would break it, and the failure would look like provider drift rather than like
       # a scheduling mistake. The tests are `#[serial]` for the same cap within the binary.
-      - name: WebSocket canary (delivery, timestamps, tick rate, resume, option contracts)
+      - name: WebSocket canary (delivery, timestamps, tick rate, resume, option contracts, shared connection)
         id: ws-canary
         continue-on-error: true
         run: cargo test --locked --test lse_ws_canary --features lse -- --ignored --nocapture

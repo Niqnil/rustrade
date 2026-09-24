@@ -116,6 +116,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     only to streams that asked for a window on that symbol.
   - A separately built subscriber for the same key still opens its own connection, and the
     provider's refusal is left visible.
+  - The WebSocket canary gains a shared-connection signal. Clones of one subscriber stream three
+    crypto batches across both kinds, re-reading symbols the connection already holds, and every
+    stream must deliver.
 
   ⚠️ Data streamed over the connection is provider data and may not be redistributed. See
   <https://londonstrategicedge.com/terms>.
