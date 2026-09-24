@@ -543,7 +543,7 @@ impl ExecutionClient for HyperliquidSpotClient {
                 self.exchange_client.cancel(cancel_request, None).await
             }
             CancelMethod::ByCloid(cloid) => {
-                debug!(%cloid, "Cancelling spot order by cloid (trigger order)");
+                debug!(%cloid, "Cancelling spot order by cloid (no oid assigned)");
                 let cancel_request = ClientCancelRequestCloid { asset: coin, cloid };
                 self.exchange_client
                     .cancel_by_cloid(cancel_request, None)

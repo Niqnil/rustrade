@@ -317,15 +317,7 @@ impl OpenOrderListing {
             let order = open_order_to_order(row, exchange, instrument.clone());
             let snapshot = entry(&mut listing, &instrument);
             match order {
-                Some(order) => snapshot.orders.push(Order {
-                    key: order.key,
-                    side: order.side,
-                    price: order.price,
-                    quantity: order.quantity,
-                    kind: order.kind,
-                    time_in_force: order.time_in_force,
-                    state: OrderState::active(order.state),
-                }),
+                Some(order) => snapshot.orders.push(order.into()),
                 None => snapshot.orders_complete = false,
             }
         }
