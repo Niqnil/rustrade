@@ -42,7 +42,7 @@ use rustrade_execution::{
         OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, StrategyId, VenueOrderId},
         request::RequestOpen,
-        state::{ActiveOrderState, OrderState},
+        state::{ActiveOrderState, InactiveOrderState, OrderState},
     },
 };
 use rustrade_instrument::{
@@ -331,7 +331,7 @@ async fn test_place_and_cancel_limit_order() {
 
     let instrument = btc_instrument();
     let strategy = StrategyId::new("test-strategy");
-    let order_cid = ClientOrderId::new(format!("test-{}", chrono::Utc::now().timestamp_millis()));
+    let order_cid = ClientOrderId::uuid();
 
     let order_key = OrderKey {
         exchange: ExchangeId::HyperliquidPerp,
@@ -830,7 +830,7 @@ async fn test_account_stream_with_order() {
     // Place an order to trigger stream events
     let instrument = eth_instrument();
     let strategy = StrategyId::new("stream-test");
-    let order_cid = ClientOrderId::new(format!("stream-{}", chrono::Utc::now().timestamp_millis()));
+    let order_cid = ClientOrderId::uuid();
 
     let order_key = OrderKey {
         exchange: ExchangeId::HyperliquidPerp,
@@ -906,6 +906,142 @@ async fn test_account_stream_with_order() {
         let _ = client.cancel_order(cancel_request).await;
         println!("Cleanup: order cancelled");
     }
+}
+
+/// An order is reported under the client id it was placed with, by every path that reports it: the
+/// account snapshot, the open-order listing, and the order updates on the account stream.
+///
+/// The venue stores the client id as a 16-byte `cloid` and echoes it back as `0x` and 32 hex
+/// digits; anything that reported that string, or the venue `oid`, would fail here.
+#[tokio::test]
+#[ignore]
+async fn test_order_is_reported_under_its_client_id() {
+    init_logging();
+
+    let config = test_config();
+    assert!(config.testnet, "This test MUST run on testnet only!");
+
+    let client = HyperliquidClient::connect(config)
+        .await
+        .expect("Failed to connect");
+
+    let mut stream = client
+        .account_stream(&[], &[])
+        .await
+        .expect("account_stream failed");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let instrument = eth_instrument();
+    let order_cid = ClientOrderId::uuid();
+    let key = OrderKey {
+        exchange: ExchangeId::HyperliquidPerp,
+        instrument: &instrument,
+        strategy: StrategyId::new("cid-test"),
+        cid: order_cid.clone(),
+    };
+
+    // Post-only, far below the market, so it rests; $16 notional clears the $10 minimum.
+    let response = client
+        .open_order(rustrade_execution::order::OrderEvent {
+            key: key.clone(),
+            state: RequestOpen {
+                side: Side::Buy,
+                price: Some(dec!(1600.0)),
+                quantity: dec!(0.01),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilCancelled { post_only: true },
+                position_id: None,
+                reduce_only: false,
+                market: None,
+            },
+        })
+        .await
+        .expect("Expected order response");
+    let venue_id = match &response.state {
+        OrderState::Active(ActiveOrderState::Open(open)) => open.id.clone(),
+        other => panic!("Order did not rest: {other:?}"),
+    };
+    assert!(
+        matches!(venue_id, VenueOrderId::Assigned(_)),
+        "a resting order is named by its oid"
+    );
+
+    let snapshot = client
+        .account_snapshot(&[], std::slice::from_ref(&instrument))
+        .await
+        .expect("account_snapshot failed");
+    let entry = snapshot
+        .instruments
+        .iter()
+        .find(|entry| entry.instrument == instrument)
+        .expect("the requested instrument has an entry");
+    assert!(entry.orders_complete, "the listing should be complete");
+    let listed = entry
+        .orders
+        .iter()
+        .find(|order| order.key.cid == order_cid)
+        .unwrap_or_else(|| panic!("snapshot does not list {order_cid}: {:?}", entry.orders));
+    match &listed.state {
+        OrderState::Active(ActiveOrderState::Open(open)) => assert_eq!(open.id, venue_id),
+        other => panic!("listed order is not Open: {other:?}"),
+    }
+
+    let open_orders = client
+        .fetch_open_orders(std::slice::from_ref(&instrument))
+        .await
+        .expect("fetch_open_orders failed");
+    assert!(
+        open_orders.iter().any(|order| order.key.cid == order_cid),
+        "fetch_open_orders does not list {order_cid}"
+    );
+
+    let cancel = client
+        .cancel_order(rustrade_execution::order::OrderEvent {
+            key: key.clone(),
+            state: rustrade_execution::order::request::RequestCancel { id: Some(venue_id) },
+        })
+        .await
+        .expect("Expected cancel response");
+    assert!(cancel.state.is_ok(), "cancel failed: {:?}", cancel.state);
+
+    // Both updates -- resting, then cancelled -- must name the order by its client id.
+    let (mut saw_open, mut saw_cancelled) = (false, false);
+    let _ = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = stream.next().await {
+            if let rustrade_execution::AccountEventKind::OrderSnapshot(snapshot) = event.kind {
+                let order = snapshot.0;
+                if order.key.cid != order_cid {
+                    continue;
+                }
+                match order.state {
+                    OrderState::Active(ActiveOrderState::Open(_)) => saw_open = true,
+                    OrderState::Inactive(InactiveOrderState::Cancelled(_)) => saw_cancelled = true,
+                    _ => {}
+                }
+                if saw_open && saw_cancelled {
+                    break;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(saw_open, "no Open update under {order_cid}");
+    assert!(saw_cancelled, "no Cancelled update under {order_cid}");
+
+    let snapshot = client
+        .account_snapshot(&[], std::slice::from_ref(&instrument))
+        .await
+        .expect("account_snapshot failed");
+    let entry = snapshot
+        .instruments
+        .iter()
+        .find(|entry| entry.instrument == instrument)
+        .expect("a requested instrument is listed even with nothing open");
+    assert!(entry.orders_complete);
+    assert!(
+        entry.orders.iter().all(|order| order.key.cid != order_cid),
+        "the cancelled order is still listed"
+    );
 }
 
 // ============================================================================

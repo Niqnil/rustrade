@@ -258,10 +258,7 @@ async fn test_spot_place_and_cancel_limit_order() {
 
     let instrument = hype_spot_instrument();
     let strategy = StrategyId::new("test-spot-strategy");
-    let order_cid = ClientOrderId::new(format!(
-        "spot-test-{}",
-        chrono::Utc::now().timestamp_millis()
-    ));
+    let order_cid = ClientOrderId::uuid();
 
     let order_key = OrderKey {
         exchange: ExchangeId::HyperliquidSpot,
@@ -357,7 +354,7 @@ async fn test_spot_minimum_notional_validation() {
 
     let instrument = hype_spot_instrument();
     let strategy = StrategyId::new("test-min-notional");
-    let order_cid = ClientOrderId::new(format!("min-{}", chrono::Utc::now().timestamp_millis()));
+    let order_cid = ClientOrderId::uuid();
 
     let order_key = OrderKey {
         exchange: ExchangeId::HyperliquidSpot,
@@ -486,7 +483,7 @@ async fn test_spot_account_stream_with_order() {
     // Place an order to trigger stream events
     let instrument = hype_spot_instrument();
     let strategy = StrategyId::new("stream-test");
-    let order_cid = ClientOrderId::new(format!("stream-{}", chrono::Utc::now().timestamp_millis()));
+    let order_cid = ClientOrderId::uuid();
 
     let order_key = OrderKey {
         exchange: ExchangeId::HyperliquidSpot,

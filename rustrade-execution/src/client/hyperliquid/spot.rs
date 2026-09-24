@@ -34,19 +34,24 @@
 //! The same constraints apply to spot:
 //! - Supported: `Stop`, `StopLimit`, `TakeProfit`, `TakeProfitLimit`
 //! - Unsupported: `TrailingStop`, `TrailingStopLimit`, `Market`
-//! - UUID requirement: Trigger orders MUST use [`crate::order::id::ClientOrderId::uuid()`]
+//!
+//! # Client order ids
+//!
+//! As for perpetuals, every order must be placed under a client id in
+//! [`ClientOrderId::uuid()`](crate::order::id::ClientOrderId::uuid) form. See the
+//! [`super`] module documentation for why.
 
 use super::common::{
-    CancelOnDropStream, HYPERLIQUID_OPEN_ORDERS_COMPLETE, cid_to_cloid, instrument_to_spot_coin,
-    is_spot_coin, map_tif, millis_to_datetime, parse_decimal, parse_side, round_to_5_sig_figs,
-    spot_coin_to_instrument, user_fills,
+    CLOID_REQUIRED, CancelOnDropStream, OpenOrderListing, cid_to_cloid, instrument_to_spot_coin,
+    is_spot_coin, map_tif, millis_to_datetime, open_order_to_order, open_orders, parse_decimal,
+    parse_side, round_to_5_sig_figs, spot_coin_to_instrument, user_fills,
 };
 use super::config::HyperliquidConfig;
 use super::error::{map_order_error, map_sdk_error};
 use crate::client::dedup::{dedup_key_from_event, is_duplicate, new_dedup_cache};
 use crate::{
-    AccountEvent, AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot,
-    UnindexedAccountEvent, UnindexedAccountSnapshot,
+    AccountEvent, AccountEventKind, AccountSnapshot, UnindexedAccountEvent,
+    UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance},
     client::ExecutionClient,
     emit_stream_terminated,
@@ -56,9 +61,9 @@ use crate::{
     },
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
-        id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
+        id::{OrderId, StrategyId, VenueOrderId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
+        state::{Filled, Open, OrderState, UnindexedOrderState},
     },
     trade::{AssetFees, Trade, TradeId},
 };
@@ -73,8 +78,7 @@ use rustrade_instrument::{
     exchange::ExchangeId,
     instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
-use rustrade_integration::collection::snapshot::Snapshot;
-use smol_str::{SmolStr, format_smolstr};
+use smol_str::format_smolstr;
 use std::{
     collections::HashSet,
     sync::{
@@ -223,99 +227,21 @@ impl ExecutionClient for HyperliquidSpotClient {
                     .await
                     .map_err(map_sdk_error)
             },
-            async {
-                self.info_client
-                    .open_orders(address)
-                    .await
-                    .map_err(map_sdk_error)
-            }
+            open_orders(&self.info_client, address)
         )?;
 
         let now = Utc::now();
         let balances = parse_token_balances(&token_balances.balances, now);
 
-        // Build instrument filter if provided
-        let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
-            None
-        } else {
-            let mut set = HashSet::with_capacity(instruments.len());
-            set.extend(instruments.iter().cloned());
-            Some(set)
-        };
-
-        // Group open orders by instrument (filter to spot orders only)
-        let mut orders_by_instrument: std::collections::HashMap<InstrumentNameExchange, Vec<_>> =
-            std::collections::HashMap::new();
-
-        for order in &open_orders {
-            // Filter: only spot coins (contain '/')
-            if !is_spot_coin(&order.coin) {
-                continue;
-            }
-
-            let instrument = spot_coin_to_instrument(&order.coin);
-            if instrument_filter
-                .as_ref()
-                .is_some_and(|f| !f.contains(&instrument))
-            {
-                continue;
-            }
-
-            let Some(side) = parse_side(&order.side) else {
-                continue;
-            };
-            let Some(price) = parse_decimal(&order.limit_px, "limit_px") else {
-                continue;
-            };
-            let Some(quantity) = parse_decimal(&order.sz, "sz") else {
-                continue;
-            };
-            let Some(time_exchange) = millis_to_datetime(order.timestamp) else {
-                warn!(
-                    oid = order.oid,
-                    timestamp = order.timestamp,
-                    "Invalid order timestamp, skipping"
-                );
-                continue;
-            };
-
-            let order_id = format_smolstr!("{}", order.oid);
-            let order_snapshot = Order {
-                key: OrderKey {
-                    exchange: ExchangeId::HyperliquidSpot,
-                    instrument: instrument.clone(),
-                    strategy: StrategyId::unknown(),
-                    cid: ClientOrderId::new(order_id.clone()),
-                },
-                side,
-                price: Some(price),
-                quantity,
-                kind: OrderKind::Limit,
-                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                state: crate::order::state::OrderState::active(Open {
-                    id: VenueOrderId::Assigned(OrderId(order_id)),
-                    time_exchange,
-                    filled_quantity: Decimal::ZERO,
-                }),
-            };
-
-            orders_by_instrument
-                .entry(instrument)
-                .or_default()
-                .push(order_snapshot);
-        }
-
-        // Build instrument snapshots from orders (spot has no positions)
-        let instrument_snapshots: Vec<_> = orders_by_instrument
-            .into_iter()
-            .map(|(instrument, orders)| InstrumentAccountSnapshot {
-                instrument,
-                orders,
-                orders_complete: HYPERLIQUID_OPEN_ORDERS_COMPLETE,
-                position: None, // Spot has no positions
-                isolated: None,
-            })
-            .collect();
+        // Spot has no positions, so the open orders are the whole of each instrument's entry.
+        let instrument_snapshots = OpenOrderListing::new(
+            &open_orders,
+            ExchangeId::HyperliquidSpot,
+            instruments,
+            |coin| is_spot_coin(coin).then(|| spot_coin_to_instrument(coin)),
+        )
+        .into_snapshots()
+        .collect();
 
         Ok(AccountSnapshot {
             exchange: ExchangeId::HyperliquidSpot,
@@ -577,11 +503,11 @@ impl ExecutionClient for HyperliquidSpotClient {
                     .map_err(|_| "venue order id is not a numeric Hyperliquid oid")
             }
             // The venue accepted the order without assigning an oid, so the only handle on it is
-            // the client id sent with it -- and `cancel_by_cloid` requires that to be a UUID. The
-            // UUID guard at placement is what keeps this arm reachable.
-            Some(VenueOrderId::ClientAssigned) => Uuid::parse_str(&request.key.cid.0)
+            // the cloid it was placed with -- which placement derives from the client id the same
+            // way, and refuses the order if it cannot.
+            Some(VenueOrderId::ClientAssigned) => cid_to_cloid(&request.key.cid)
                 .map(CancelMethod::ByCloid)
-                .map_err(|_| "order is addressable only by its client id, which is not a UUID"),
+                .ok_or("order is addressable only by its client id, which is not a canonical UUID"),
             None => Err("order is still in flight; the venue has acknowledged nothing to cancel"),
         };
 
@@ -757,22 +683,11 @@ impl ExecutionClient for HyperliquidSpotClient {
             | OrderKind::TakeProfitLimit { .. } => {}
         }
 
-        let cloid = cid_to_cloid(&request.key.cid);
-        let cloid_is_some = cloid.is_some();
-        let is_trigger_order = matches!(
-            request.state.kind,
-            OrderKind::Stop { .. }
-                | OrderKind::StopLimit { .. }
-                | OrderKind::TakeProfit { .. }
-                | OrderKind::TakeProfitLimit { .. }
-        );
-        if is_trigger_order && cloid.is_none() {
-            return Some(make_rejected(
-                "Trigger orders require UUID-format client order ID (use ClientOrderId::uuid()). \
-                 Non-UUID IDs cannot be cancelled via cancel_by_cloid()."
-                    .to_string(),
-            ));
-        }
+        // The venue reports every order under its cloid, so an order placed without one could
+        // not be matched to the id the caller tracks it by. See the module docs.
+        let Some(cloid) = cid_to_cloid(&request.key.cid) else {
+            return Some(make_rejected(CLOID_REQUIRED.to_string()));
+        };
 
         let limit_px = match request.state.kind {
             // Market triggers: SDK uses trigger_px as limit_px
@@ -857,7 +772,7 @@ impl ExecutionClient for HyperliquidSpotClient {
             reduce_only: request.state.reduce_only,
             limit_px,
             sz,
-            cloid,
+            cloid: Some(cloid),
             order_type,
         };
 
@@ -919,27 +834,15 @@ impl ExecutionClient for HyperliquidSpotClient {
                     Some(
                         ExchangeDataStatus::WaitingForFill | ExchangeDataStatus::WaitingForTrigger,
                     ) => {
-                        // Use cid as OrderId only if it's a valid UUID (required for
-                        // cancel_by_cloid). Trigger orders pass the UUID guard above;
-                        // limit IOC/FOK orders may have non-UUID cids — those become
-                        // untrackable, so reject with an observable failure rather than
-                        // returning an OrderId that cancel cannot parse.
-                        if cloid_is_some {
-                            debug!(cloid = %request.key.cid.0, "Spot order waiting (cloid trackable)");
-                            OrderState::active(Open {
-                                id: VenueOrderId::ClientAssigned,
-                                time_exchange: Utc::now(),
-                                filled_quantity: Decimal::ZERO,
-                            })
-                        } else {
-                            warn!("Spot order accepted but cid is not UUID — untrackable");
-                            OrderState::inactive(OrderError::Rejected(
-                                crate::error::ApiError::OrderRejected(
-                                    "order accepted but cid is not UUID; cannot track for cancel"
-                                        .to_string(),
-                                ),
-                            ))
-                        }
+                        // The venue answered without an oid, so the order's only handle is the
+                        // cloid it was placed with. A standalone trigger order is answered
+                        // `resting` with an oid; these statuses belong to grouped orders.
+                        debug!(cid = %request.key.cid, "Spot order waiting under its cloid");
+                        OrderState::active(Open {
+                            id: VenueOrderId::ClientAssigned,
+                            time_exchange: Utc::now(),
+                            filled_quantity: Decimal::ZERO,
+                        })
                     }
                     Some(ExchangeDataStatus::Success) | None => {
                         warn!("Spot order accepted but no order ID returned");
@@ -997,11 +900,7 @@ impl ExecutionClient for HyperliquidSpotClient {
     ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError> {
         let address = self.wallet_h160();
 
-        let open_orders = self
-            .info_client
-            .open_orders(address)
-            .await
-            .map_err(map_sdk_error)?;
+        let open_orders = open_orders(&self.info_client, address).await?;
 
         let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
             None
@@ -1011,62 +910,22 @@ impl ExecutionClient for HyperliquidSpotClient {
             Some(set)
         };
 
-        let mut result = Vec::new();
-        for order in open_orders {
-            // Filter: only spot coins
-            if !is_spot_coin(&order.coin) {
-                continue;
-            }
-
-            let instrument = spot_coin_to_instrument(&order.coin);
-
-            if instrument_filter
-                .as_ref()
-                .is_some_and(|f| !f.contains(&instrument))
-            {
-                continue;
-            }
-
-            let Some(side) = parse_side(&order.side) else {
-                continue;
-            };
-            let Some(price) = parse_decimal(&order.limit_px, "limit_px") else {
-                continue;
-            };
-            let Some(quantity) = parse_decimal(&order.sz, "sz") else {
-                continue;
-            };
-            let Some(time_exchange) = millis_to_datetime(order.timestamp) else {
-                warn!(
-                    oid = order.oid,
-                    timestamp = order.timestamp,
-                    "Invalid order timestamp, skipping"
-                );
-                continue;
-            };
-
-            let order_id = format_smolstr!("{}", order.oid);
-            result.push(Order {
-                key: OrderKey {
-                    exchange: ExchangeId::HyperliquidSpot,
-                    instrument,
-                    strategy: StrategyId::unknown(),
-                    cid: ClientOrderId::new(order_id.clone()),
-                },
-                side,
-                price: Some(price),
-                quantity,
-                kind: OrderKind::Limit,
-                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                state: Open {
-                    id: VenueOrderId::Assigned(OrderId(order_id)),
-                    time_exchange,
-                    filled_quantity: Decimal::ZERO,
-                },
-            });
-        }
-
-        Ok(result)
+        Ok(open_orders
+            .iter()
+            .filter_map(|order| {
+                if !is_spot_coin(&order.coin) {
+                    return None;
+                }
+                let instrument = spot_coin_to_instrument(&order.coin);
+                if instrument_filter
+                    .as_ref()
+                    .is_some_and(|f| !f.contains(&instrument))
+                {
+                    return None;
+                }
+                open_order_to_order(order, ExchangeId::HyperliquidSpot, instrument)
+            })
+            .collect())
     }
 
     async fn fetch_trades(
@@ -1247,70 +1106,11 @@ fn fill_to_account_event(fill: &hyperliquid_rust_sdk::TradeInfo) -> Option<Unind
 fn order_update_to_account_event(
     update: &hyperliquid_rust_sdk::OrderUpdate,
 ) -> Option<UnindexedAccountEvent> {
-    let order = &update.order;
-    let side = parse_side(&order.side)?;
-    let price = parse_decimal(&order.limit_px, "order.limit_px")?;
-    let orig_sz = parse_decimal(&order.orig_sz, "order.orig_sz")?;
-    let time_exchange = millis_to_datetime(update.status_timestamp)?;
-    let instrument = spot_coin_to_instrument(&order.coin);
-
-    let order_id_smol = format_smolstr!("{}", order.oid);
-    let cid = order
-        .cloid
-        .as_deref()
-        .map(|c| ClientOrderId::new(SmolStr::new(c)))
-        .unwrap_or_else(|| ClientOrderId::new(order_id_smol.clone()));
-
-    let state = match update.status.as_str() {
-        "open" | "resting" => {
-            let current_sz = parse_decimal(&order.sz, "order.sz")?;
-            let filled_quantity = (orig_sz - current_sz).max(Decimal::ZERO);
-            crate::order::state::OrderState::active(Open {
-                id: VenueOrderId::Assigned(OrderId(order_id_smol)),
-                time_exchange,
-                filled_quantity,
-            })
-        }
-        "filled" => crate::order::state::OrderState::fully_filled(Filled::new(
-            OrderId(order_id_smol),
-            time_exchange,
-            orig_sz,
-            None,
-        )),
-        "canceled" | "cancelled" => {
-            let current_sz = parse_decimal(&order.sz, "order.sz")?;
-            let filled_quantity = (orig_sz - current_sz).max(Decimal::ZERO);
-            crate::order::state::OrderState::inactive(Cancelled::new(
-                OrderId(order_id_smol),
-                time_exchange,
-                filled_quantity,
-            ))
-        }
-        status => {
-            warn!(%status, "Unknown order status");
-            return None;
-        }
-    };
-
-    let order_snapshot = Order {
-        key: OrderKey {
-            exchange: ExchangeId::HyperliquidSpot,
-            instrument,
-            strategy: StrategyId::unknown(),
-            cid,
-        },
-        side,
-        price: Some(price),
-        quantity: orig_sz,
-        kind: OrderKind::Limit,
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        state,
-    };
-
-    Some(AccountEvent::new(
+    super::common::order_update_to_account_event(
+        update,
         ExchangeId::HyperliquidSpot,
-        AccountEventKind::OrderSnapshot(Snapshot(order_snapshot)),
-    ))
+        spot_coin_to_instrument(&update.order.coin),
+    )
 }
 
 #[cfg(test)]
@@ -1319,6 +1119,7 @@ fn order_update_to_account_event(
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+    use rustrade_integration::collection::snapshot::Snapshot;
 
     #[test]
     fn test_fill_to_account_event_spot() {

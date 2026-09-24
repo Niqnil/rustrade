@@ -149,8 +149,8 @@ async fn main() {
     info!("=== Placing Limit Order ===");
 
     let btc_perp: InstrumentNameExchange = "BTC-USD-PERP".into();
-    let order_cid =
-        ClientOrderId::new(format!("example-{}", chrono::Utc::now().timestamp_millis()));
+    // Hyperliquid accepts only client ids in `ClientOrderId::uuid()` form.
+    let order_cid = ClientOrderId::uuid();
     let strategy = StrategyId::new("demo-strategy");
 
     let order_key = OrderKey {
