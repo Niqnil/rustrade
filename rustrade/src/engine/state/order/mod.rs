@@ -81,8 +81,10 @@ impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
     ///
     /// Kept, with `None` returned, when:
     /// - the order is in flight, because its request is still being answered;
-    /// - it names a different venue order than `id` ([`VenueOrderId::contradicts`]), because the
-    ///   client id has been reused for a new order that `id` does not describe.
+    /// - it cannot be shown to be the venue order `id` ([`VenueOrderId::is_same_order_as`]). The
+    ///   client id may have been reused for a new order that `id` does not describe, and without
+    ///   a venue identifier on both sides nothing tells the two apart, so an order the venue never
+    ///   named is always kept.
     ///
     /// The caller owes the same routing prune as for any other retirement.
     pub fn remove_open(
@@ -91,7 +93,7 @@ impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
         id: &VenueOrderId,
     ) -> Option<Order<ExchangeKey, InstrumentKey, ActiveOrderState>> {
         match &self.0.get(cid)?.state {
-            ActiveOrderState::Open(open) if !open.id.contradicts(id) => self.0.remove(cid),
+            ActiveOrderState::Open(open) if open.id.is_same_order_as(id) => self.0.remove(cid),
             _ => None,
         }
     }
@@ -641,19 +643,18 @@ mod tests {
     #[test]
     fn remove_open_retires_only_an_open_order_that_is_the_venue_order_named() {
         let assigned = |id: &str| VenueOrderId::Assigned(OrderId::new(id));
-        let open = |cid: &str, id: &str| {
+        let open_as = |cid: &str, id: VenueOrderId| {
             order(
                 ClientOrderId::new(cid),
-                ActiveOrderState::Open(Open::new(
-                    assigned(id),
-                    DateTime::<Utc>::MIN_UTC,
-                    Decimal::ZERO,
-                )),
+                ActiveOrderState::Open(Open::new(id, DateTime::<Utc>::MIN_UTC, Decimal::ZERO)),
             )
         };
+        let open = |cid: &str, id: &str| open_as(cid, assigned(id));
         let mut manager = orders([
             open("open", "oid-open"),
             open("reused", "oid-new"),
+            open_as("unnamed", VenueOrderId::ClientAssigned),
+            open("named-now", "oid-now"),
             order(
                 ClientOrderId::new("opening"),
                 ActiveOrderState::OpenInFlight(OpenInFlight),
@@ -672,6 +673,16 @@ mod tests {
                 .is_none(),
             "the client id now names a different venue order"
         );
+        for (cid, id) in [
+            ("unnamed", VenueOrderId::ClientAssigned),
+            ("unnamed", assigned("oid-old")),
+            ("named-now", VenueOrderId::ClientAssigned),
+        ] {
+            assert!(
+                manager.remove_open(&ClientOrderId::new(cid), &id).is_none(),
+                "{cid} vs {id}: nothing proves the tracked order is the one named"
+            );
+        }
         for in_flight in ["opening", "cancelling"] {
             assert!(
                 manager
@@ -688,7 +699,10 @@ mod tests {
 
         let mut remaining = manager.0.into_keys().map(|cid| cid.0).collect::<Vec<_>>();
         remaining.sort();
-        assert_eq!(remaining, ["cancelling", "opening", "reused"]);
+        assert_eq!(
+            remaining,
+            ["cancelling", "named-now", "opening", "reused", "unnamed"]
+        );
     }
 
     fn order_cancel_in_flight(cid: ClientOrderId) -> Order<ExchangeId, u64, ActiveOrderState> {

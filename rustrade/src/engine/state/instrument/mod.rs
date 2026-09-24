@@ -679,7 +679,9 @@ pub struct InstrumentState<
     /// order in it was accepted before any later re-read of the venue.
     ///
     /// The venue order is kept so that a client id reused for a new order before the snapshot
-    /// arrives does not retire the new order in the old one's place.
+    /// arrives does not retire the new order in the old one's place. Only a venue identifier can
+    /// prove the tracked order is the one recorded, so an order the venue never named
+    /// ([`VenueOrderId::ClientAssigned`]) is never retired this way.
     ///
     /// # Why only these
     ///

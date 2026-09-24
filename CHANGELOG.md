@@ -344,9 +344,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reach the engine as `Open` before the snapshot that cannot list it; the engine records which
   orders were `Open` at the reconnect notice and leaves every other order alone. An order in flight
   is never retired, since its request's answer settles it, and neither is anything in a snapshot
-  that does not declare its list complete, including the one that starts a run. A client id reused
-  for a new order before the snapshot arrives names a different venue order than the one recorded,
-  so the new order is kept. (#364)
+  that does not declare its list complete, including the one that starts a run. An order is retired
+  only when its venue order id proves it is the order recorded, so a client id reused for a new
+  order before the snapshot arrives keeps the new order, and so does an order the venue never
+  assigned an id. (#364)
 
 - **A Binance fill recovered after a disconnect now advances its order** (`rustrade-execution`,
   feature `binance`; Spot and Margin). Recovery reads missed fills from REST `myTrades`, which
