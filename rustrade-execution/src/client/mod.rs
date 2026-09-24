@@ -33,8 +33,8 @@
 //! The engine closes part of that gap from the account snapshot each reconnect produces: an order a
 //! complete list no longer shows is retired (see [`ExecutionClient::account_snapshot`]). That covers
 //! the connectors whose snapshot declares its orders complete — Binance Spot and Margin,
-//! Hyperliquid, and the mock venue — but not Alpaca (#369) or IBKR (#371), and it cannot tell how
-//! an order ended. A caller that needs more reconciles against
+//! Hyperliquid, Alpaca, and the mock venue — but not IBKR (#371), and it cannot tell how an order
+//! ended. A caller that needs more reconciles against
 //! [`ExecutionClient::fetch_open_orders`] after a reconnect.
 
 use crate::{

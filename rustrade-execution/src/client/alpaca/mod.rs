@@ -46,7 +46,7 @@ use crate::{
         UnindexedOrderError,
     },
     order::{
-        Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
+        Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType, UnindexedOrderSnapshot,
         bracket::{
             BracketOrderRequest as UnifiedBracketOrderRequest,
             BracketOrderResult as UnifiedBracketOrderResult,
@@ -2001,13 +2001,6 @@ impl AlpacaClient {
 /// Alpaca's API caps at 500; accounts exceeding this have an incomplete snapshot.
 const MAX_OPEN_ORDERS: usize = 500;
 
-/// Whether an account snapshot's `orders` is every order open on the venue.
-///
-/// Not yet: [`convert_open_order`] drops a notional order (one placed by dollar value, whose `qty`
-/// is `null`), so an instrument can hold an open order its list does not show. Declaring the list
-/// complete would have the engine retire such an order as absent. See #369.
-const ALPACA_OPEN_ORDERS_COMPLETE: bool = false;
-
 /// Fetch all open orders from Alpaca, optionally filtered by symbol.
 ///
 /// # Errors
@@ -2966,42 +2959,46 @@ fn convert_positions_to_balances(
 /// When `instruments` is non-empty, a snapshot is returned for every requested instrument
 /// (possibly with an empty orders list). When empty, only instruments with open orders
 /// are returned.
+///
+/// Each snapshot declares its orders complete unless [`convert_open_order`] left one of its
+/// orders out. That holds because `orders` is every open order, unpaged: a response at Alpaca's
+/// cap fails the whole snapshot in [`fetch_raw_open_orders`] rather than arriving here short. And
+/// every order this client places is listed under the client order id it was placed with.
 fn build_instrument_snapshots(
     orders: Vec<AlpacaOrderResponse>,
     instruments: &[InstrumentNameExchange],
 ) -> Vec<InstrumentAccountSnapshot<ExchangeId, AssetNameExchange, InstrumentNameExchange>> {
+    /// One instrument's converted orders, and whether none was left out.
+    struct Listing {
+        orders: Vec<UnindexedOrderSnapshot>,
+        complete: bool,
+    }
+
     // Build ordered map from symbol → snapshot to preserve deterministic ordering.
-    let mut by_symbol: IndexMap<SmolStr, Vec<_>> = IndexMap::new();
+    let mut by_symbol: IndexMap<SmolStr, Listing> = IndexMap::new();
 
     for order in orders {
-        let sym = SmolStr::new(&order.symbol);
-        if let Some(converted) = convert_open_order(&order) {
-            let wrapped = crate::order::Order {
-                key: converted.key,
-                side: converted.side,
-                price: converted.price,
-                quantity: converted.quantity,
-                kind: converted.kind,
-                time_in_force: converted.time_in_force,
-                state: OrderState::active(converted.state),
-            };
-            by_symbol.entry(sym).or_default().push(wrapped);
+        let listing = by_symbol
+            .entry(SmolStr::new(&order.symbol))
+            .or_insert_with(|| Listing {
+                orders: Vec::new(),
+                complete: true,
+            });
+        match convert_open_order(&order) {
+            Some(converted) => listing.orders.push(converted.into()),
+            None => listing.complete = false,
         }
     }
+
+    let snapshot = |instrument, listing: Listing| {
+        InstrumentAccountSnapshot::new(instrument, listing.orders, listing.complete, None, None)
+    };
 
     // If instruments is empty, return all; otherwise filter to requested set.
     if instruments.is_empty() {
         by_symbol
             .into_iter()
-            .map(|(sym, orders)| {
-                InstrumentAccountSnapshot::new(
-                    InstrumentNameExchange::new(sym),
-                    orders,
-                    ALPACA_OPEN_ORDERS_COMPLETE,
-                    None,
-                    None,
-                )
-            })
+            .map(|(sym, listing)| snapshot(InstrumentNameExchange::new(sym), listing))
             .collect()
     } else {
         instruments
@@ -3009,23 +3006,44 @@ fn build_instrument_snapshots(
             .map(|inst| {
                 // swap_remove is O(1); output order is determined by the `instruments`
                 // slice, not by the internal IndexMap order of `by_symbol`.
-                let orders = by_symbol
+                let listing = by_symbol
                     .swap_remove(inst.name().as_str())
-                    .unwrap_or_default();
-                InstrumentAccountSnapshot::new(
-                    inst.clone(),
-                    orders,
-                    ALPACA_OPEN_ORDERS_COMPLETE,
-                    None,
-                    None,
-                )
+                    .unwrap_or(Listing {
+                        orders: Vec::new(),
+                        complete: true,
+                    });
+                snapshot(inst.clone(), listing)
             })
             .collect()
     }
 }
 
-/// Convert an Alpaca REST order into rustrade's Open state order.
+/// Convert an Alpaca REST open order into rustrade's Open state order.
+///
+/// `None`, with a `warn!`, for an order it cannot represent: a notional order (placed by dollar
+/// value, so its `qty` is null), which this client never places but the Alpaca dashboard can, or
+/// one whose side, quantity or kind does not parse. A list missing that order is not every open
+/// order, so [`build_instrument_snapshots`] must not declare it complete.
 fn convert_open_order(
+    o: &AlpacaOrderResponse,
+) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
+    let converted = convert_representable_open_order(o);
+    if converted.is_none() {
+        warn!(
+            order_id = %o.id,
+            symbol = %o.symbol,
+            qty = ?o.qty,
+            side = %o.side,
+            order_type = %o.order_type,
+            "Alpaca open order cannot be represented - leaving it out, so its instrument's order \
+             list is not complete"
+        );
+    }
+    converted
+}
+
+/// [`convert_open_order`] without the `warn!`.
+fn convert_representable_open_order(
     o: &AlpacaOrderResponse,
 ) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
     let order_id = OrderId(SmolStr::new(&o.id));
@@ -3039,7 +3057,8 @@ fn convert_open_order(
     let side = parse_side(&o.side)?;
     let quantity = Decimal::from_str(o.qty.as_deref().unwrap_or("0")).ok()?;
     // Notional orders (placed by dollar value, qty=null) have no representable quantity.
-    // Skip them rather than recording a zero-quantity order that would corrupt reconciliation.
+    // Leave them out rather than recording a zero-quantity order that would corrupt
+    // reconciliation.
     if quantity.is_zero() {
         return None;
     }
@@ -4715,10 +4734,33 @@ mod tests {
         assert!(spy.orders.is_empty());
     }
 
-    /// Alpaca drops a notional open order on conversion, so no instrument's list can claim to be
-    /// every open order: the engine would retire that order as absent.
+    /// A notional order: placed by dollar value, so Alpaca reports no `qty`.
+    fn make_notional_order_response(id: &str, symbol: &str) -> AlpacaOrderResponse {
+        AlpacaOrderResponse {
+            qty: None,
+            ..make_order_response(id, symbol)
+        }
+    }
+
+    fn snapshot_for<'a>(
+        snapshots: &'a [InstrumentAccountSnapshot<
+            ExchangeId,
+            AssetNameExchange,
+            InstrumentNameExchange,
+        >],
+        symbol: &str,
+    ) -> &'a InstrumentAccountSnapshot<ExchangeId, AssetNameExchange, InstrumentNameExchange> {
+        snapshots
+            .iter()
+            .find(|snapshot| snapshot.instrument.name().as_str() == symbol)
+            .unwrap_or_else(|| panic!("no snapshot for {symbol}"))
+    }
+
+    /// Every open order converted, so each list is every order open on the venue, including a
+    /// requested instrument with none: that entry is what lets the engine see an order that ended
+    /// while the stream was down is gone.
     #[test]
-    fn test_build_instrument_snapshots_never_declares_orders_complete() {
+    fn test_build_instrument_snapshots_declares_complete_lists_complete() {
         let instruments = [
             InstrumentNameExchange::new("AAPL"),
             InstrumentNameExchange::new("SPY"),
@@ -4727,8 +4769,42 @@ mod tests {
             let orders = vec![make_order_response("o1", "AAPL")];
             let snapshots = build_instrument_snapshots(orders, requested);
             assert!(!snapshots.is_empty());
-            assert!(snapshots.iter().all(|snapshot| !snapshot.orders_complete));
+            assert!(snapshots.iter().all(|snapshot| snapshot.orders_complete));
         }
+    }
+
+    /// A notional order cannot be represented, so its instrument's list is not every open order
+    /// and must not say so: the engine would retire that order as absent. Other instruments are
+    /// unaffected.
+    #[test]
+    fn test_build_instrument_snapshots_notional_order_leaves_only_its_instrument_incomplete() {
+        let orders = vec![
+            make_order_response("o1", "AAPL"),
+            make_order_response("o2", "SPY"),
+            make_notional_order_response("o3", "SPY"),
+        ];
+        let instruments = [
+            InstrumentNameExchange::new("AAPL"),
+            InstrumentNameExchange::new("SPY"),
+        ];
+        let snapshots = build_instrument_snapshots(orders, &instruments);
+
+        assert!(snapshot_for(&snapshots, "AAPL").orders_complete);
+        let spy = snapshot_for(&snapshots, "SPY");
+        assert!(!spy.orders_complete);
+        assert_eq!(spy.orders.len(), 1);
+    }
+
+    /// Unfiltered, an instrument whose only open order cannot be represented still gets an entry,
+    /// one that says its list is not complete.
+    #[test]
+    fn test_build_instrument_snapshots_unfiltered_lists_an_instrument_with_only_a_notional_order() {
+        let orders = vec![make_notional_order_response("o1", "SPY")];
+        let snapshots = build_instrument_snapshots(orders, &[]);
+
+        let spy = snapshot_for(&snapshots, "SPY");
+        assert!(!spy.orders_complete);
+        assert!(spy.orders.is_empty());
     }
 
     #[test]

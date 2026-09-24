@@ -228,8 +228,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   claims nothing, and `ExecutionClient::account_snapshot` now documents what a client must
   guarantee before setting it. Binance Spot and Margin set it per symbol, only when every
   `openOrders` row converted under its own `clientOrderId`; the mock venue sets it always, and
-  Hyperliquid per instrument (see the entry below). Alpaca and IBKR set it `false` until the gaps
-  above are closed (#369, #371). To migrate, pass the new
+  Hyperliquid and Alpaca per instrument (see the entries below). IBKR sets it `false` until its
+  gap above is closed (#371). To migrate, pass the new
   argument to `InstrumentAccountSnapshot::new` after `orders`, or add the field to a struct literal;
   `false` keeps the previous behaviour.
 
@@ -340,6 +340,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drift between the two surfaces. The messages themselves are unchanged.
 
 ### Fixed
+
+- **The Alpaca account snapshot no longer leaves out an open order silently, and declares its
+  order lists complete** (#369, `rustrade-execution`). The snapshot and `fetch_open_orders` dropped
+  an open order they could not represent without a trace. That is a notional order, placed by
+  dollar value so its `qty` is null, which this client never places but the Alpaca dashboard can,
+  or one whose side, quantity or kind does not parse. Such an order is now logged at `warn`. Its
+  instrument's `orders_complete` is `false`, and so is the entry of an instrument whose only open
+  order it is, which is now listed rather than missing. Every other instrument's list is declared
+  complete, so the engine retires an Alpaca order that ended while the account stream was down.
+  That holds because the open-order list is unpaged: a response at Alpaca's 500-order cap already
+  fails the snapshot with `TruncatedSnapshot`. It also holds because every order this client
+  places is listed under the client order id it was placed with.
 
 - **Hyperliquid reports each order under the client id it was placed with** (#368,
   `rustrade-execution`). The account snapshot and `fetch_open_orders` reported every open order
