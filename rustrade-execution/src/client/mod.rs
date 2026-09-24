@@ -191,15 +191,16 @@ where
     ///
     /// Binance, Hyperliquid and the mock venue answer once the order is cancelled. Alpaca answers
     /// once it has accepted the cancel, and IBKR once the cancel is submitted. The
-    /// [connector comparison](crate::client#connector-comparison) lists the same.
+    /// [connector comparison](crate::client#connector-comparison) lists the same for each
+    /// connector; the mock venue is not one, so it has no row there.
     ///
     /// # `filled_quantity` and `time_exchange`
     ///
-    /// `Cancelled::filled_quantity` is what the venue reported filled when it answered, where the
-    /// answer says: Binance and the mock venue. Alpaca, IBKR and Hyperliquid answer without it and
-    /// report zero, which does not mean nothing filled. The fill total comes from the account
-    /// stream, or from [`Self::fetch_trades`]. Likewise `time_exchange` is the venue's time where
-    /// the answer carries one, and the local time the answer arrived otherwise.
+    /// `Cancelled::filled_quantity` is the quantity the venue reported filled where the answer
+    /// carries one, which Binance's and the mock venue's do. Alpaca, IBKR and Hyperliquid answer
+    /// without it and report zero, which does not mean nothing filled. The fill total comes from
+    /// the account stream, or from [`Self::fetch_trades`]. Likewise `time_exchange` is the venue's
+    /// time where the answer carries one, and the local time the answer arrived otherwise.
     fn cancel_order(
         &self,
         request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
