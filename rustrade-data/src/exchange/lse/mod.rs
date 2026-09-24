@@ -256,9 +256,11 @@ pub type LseCfd = Lse<LseServerCfd>;
 /// stream alongside another London Strategic Edge dataset on the same key. See [`WEBSOCKET_URL`].
 ///
 /// # No resumption
-/// A reconnect does not replay the gap. Whether the provider honours a replay window on this
-/// channel has not been established, so none is requested, and a subscriber configured with
-/// [`LseSubscriber::with_resume`] resumes its other datasets but not this one.
+/// A reconnect does not replay the gap: the provider has no replay window on this channel. An
+/// options subscribe that names a `start` is confirmed as usual and draws no error, yet no replay
+/// opens and nothing older than the subscribe is served — measured in session, beside a plain
+/// subscribe on the same connection that did replay. None is therefore requested, and a subscriber configured with [`LseSubscriber::with_resume`] resumes its other
+/// datasets but not this one.
 ///
 /// Expiry and strike conventions are those of [`LseSymbolShape::OptionContract`].
 pub type LseOptions = Lse<LseServerOptions>;

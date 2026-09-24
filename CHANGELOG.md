@@ -78,8 +78,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with more than three decimal places) fails the batch before a connection is opened. An underlying
   with no options is rejected by the provider by name. A registered contract that does not exist is
   confirmed and stays silent, because the provider does not list its contracts. Options do not
-  resume: whether the provider honours a replay window on this channel is unmeasured, so none is
-  requested.
+  resume: the provider accepts a `start` on an options subscribe but silently replays nothing, so
+  none is requested.
 
   The WebSocket canary now covers option contracts. Every contract on a slice of the provider's own
   print tape must rebuild to its exact ticker, and the busiest must subscribe. In session, at least
