@@ -208,6 +208,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING: connectivity state is read-only outside `rustrade`** (`ConnectivityStates`,
+  `ConnectivityState`). `ConnectivityStates::update_from_account_reconnecting` is crate-private. So
+  are the fields `ConnectivityStates::{global, exchanges}` and `ConnectivityState::{market_data,
+  account, role}`, and the `connectivity_mut` and `connectivity_index_mut` accessors.
+  `EngineState::connectivity` is public. A caller could therefore mark an exchange's account
+  connection as reconnecting without arming its instruments for the account resync, which only
+  `EngineState::update_from_account_reconnecting` does. The next complete snapshot then could not
+  retire an order that ended while the stream was down. A direct field write also left the cached
+  `global` health out of step with the venues it summarises. To migrate:
+  - Read through the new getters of the same names: `global()`, `exchanges()`, `market_data()`,
+    `account()` and `role()`.
+  - Report an account disconnect through `EngineState::update_from_account_reconnecting`.
+  - Build a `ConnectivityState` with `ConnectivityState::new`.
+
 - **BREAKING: the Hyperliquid clients refuse an order whose client id is not a UUID in
   `ClientOrderId::uuid()` form** (`rustrade-execution`, `HyperliquidClient` and
   `HyperliquidSpotClient`). Hyperliquid names an order by the 16-byte `cloid` it was placed with,
@@ -236,8 +250,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `InstrumentState` gains `orders_open_at_resync` (`#[serde(default)]`), and
   `EngineState::update_from_account_reconnecting` now handles an account stream's reconnect notice.
   The engine and the audit replica both call it in place of
-  `ConnectivityStates::update_from_account_reconnecting`, which it wraps. A consumer that drives
-  `EngineState` directly should do the same.
+  `ConnectivityStates::update_from_account_reconnecting`, which it wraps and which is now
+  crate-private (see the entry above).
 
 - **BREAKING: `Subscriber` gains an associated `Transport: Send` type, and `Subscribed` is generic
   over it** (`rustrade-data`). `Subscribed<InstrumentKey, Transport = WebSocket>` names what a successful

@@ -133,21 +133,21 @@ fn test_engine_process_engine_event_with_audit() {
 
     let mut engine = build_engine(TradingState::Disabled, execution_tx);
     assert_eq!(engine.meta.sequence, Sequence(0));
-    assert_eq!(engine.state.connectivity.global, Health::Reconnecting);
+    assert_eq!(engine.state.connectivity.global(), Health::Reconnecting);
 
     // Simulate AccountSnapshot from ExecutionManager::init
     let event = account_event_snapshot(&engine.state.assets);
     let audit = process_with_audit(&mut engine, event.clone());
     assert_eq!(audit.context.sequence, Sequence(0));
     assert_eq!(audit.event, EngineAudit::process(event));
-    assert_eq!(engine.state.connectivity.global, Health::Reconnecting);
+    assert_eq!(engine.state.connectivity.global(), Health::Reconnecting);
 
     // Process 1st MarketEvent for btc_usdt
     let event = market_event_trade(1, 0, dec!(10_000));
     let audit = process_with_audit(&mut engine, event.clone());
     assert_eq!(audit.context.sequence, Sequence(1));
     assert_eq!(audit.event, EngineAudit::process(event));
-    assert_eq!(engine.state.connectivity.global, Health::Healthy);
+    assert_eq!(engine.state.connectivity.global(), Health::Healthy);
 
     // Process 1st MarketEvent for eth_btc
     let event = market_event_trade(1, 1, dec!(0.1));
@@ -513,13 +513,13 @@ fn test_engine_process_engine_event_with_audit() {
         audit.event,
         EngineAudit::process_with_output(event, EngineOutput::MarketDisconnect(OnDisconnectOutput))
     );
-    assert_eq!(engine.state.connectivity.global, Health::Reconnecting);
+    assert_eq!(engine.state.connectivity.global(), Health::Reconnecting);
     assert_eq!(
         engine
             .state
             .connectivity
             .connectivity(&ExchangeId::BinanceSpot)
-            .market_data,
+            .market_data(),
         Health::Reconnecting
     );
     assert_eq!(
@@ -527,7 +527,7 @@ fn test_engine_process_engine_event_with_audit() {
             .state
             .connectivity
             .connectivity(&ExchangeId::BinanceSpot)
-            .account,
+            .account(),
         Health::Healthy
     );
 
@@ -6134,7 +6134,7 @@ fn test_untracked_exchange_replica_parity_across_all_three_paths() {
             .state
             .connectivity
             .connectivity(&ExchangeId::BinanceSpot)
-            .market_data,
+            .market_data(),
         Health::Healthy,
         "the tracked event must actually mutate, or the parity asserts below are vacuous"
     );
@@ -6240,7 +6240,11 @@ fn test_untracked_exchange_reconnecting_is_reported_without_disconnect_or_mutati
         "an untracked exchange must not mutate connectivity state"
     );
     assert!(
-        !engine.state.connectivity.exchanges.contains_key(&UNTRACKED),
+        !engine
+            .state
+            .connectivity
+            .exchanges()
+            .contains_key(&UNTRACKED),
         "an untracked exchange must not become tracked by reporting it"
     );
 }

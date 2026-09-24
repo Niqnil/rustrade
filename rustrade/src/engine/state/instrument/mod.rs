@@ -2955,7 +2955,7 @@ mod tests {
                 .0
                 .values()
                 .find(|state| {
-                    engine.connectivity.exchanges.get_index_of(&exchange)
+                    engine.connectivity.exchanges().get_index_of(&exchange)
                         == Some(state.instrument.exchange.index())
                 })
                 .expect("one instrument per exchange")
