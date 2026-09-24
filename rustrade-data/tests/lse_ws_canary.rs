@@ -172,6 +172,7 @@ use rustrade_instrument::{
     exchange::ExchangeId,
     instrument::market_data::{MarketDataInstrument, kind::MarketDataInstrumentKind},
 };
+use rustrade_integration::error::SocketError;
 use serial_test::serial;
 use std::{
     sync::{
@@ -330,10 +331,47 @@ fn decode_failures() -> (Arc<AtomicUsize>, impl Fn(DataError)) {
 
     let handler = move |error: DataError| {
         counter.fetch_add(1, Ordering::Relaxed);
-        println!("CANARY: market stream error: {error:?}");
+        println!("CANARY: market stream error: {}", without_payload(&error));
     };
 
     (failures, handler)
+}
+
+/// `error` with any frame it quotes cut off.
+///
+/// A decode failure's message ends `for payload: <the raw frame>`, and this line reaches a public
+/// GitHub Actions log, where one live frame is this provider's data, which may not be
+/// redistributed (see the module header). The parser's own message comes first and is kept: it
+/// names the field that no longer decodes, which is the diagnostic, and quotes at most one value.
+///
+/// The cut matches `SocketError`'s wording, so
+/// `a_decode_failure_is_reported_without_its_frame` pins it on every CI run: if that wording
+/// changes, the test fails rather than the frame reaching the log.
+fn without_payload(error: &DataError) -> String {
+    let message = error.to_string();
+    match message
+        .find(" for payload: ")
+        .or_else(|| message.find(" for binary payload: "))
+    {
+        Some(end) => format!("{} [frame withheld]", &message[..end]),
+        None => message,
+    }
+}
+
+/// Not a canary: no network and no key, so it runs with the ordinary test suite.
+#[test]
+fn a_decode_failure_is_reported_without_its_frame() {
+    let payload = r#"{"symbol":"BTC/USD","price":"not-a-number"}"#;
+    let error = DataError::from(SocketError::Deserialise {
+        error: serde_json::from_str::<u64>(payload).unwrap_err(),
+        payload: payload.to_owned(),
+    });
+
+    let reported = without_payload(&error);
+
+    assert!(!reported.contains("BTC/USD"), "{reported}");
+    assert!(reported.contains("Deserialising JSON error"), "{reported}");
+    assert!(reported.ends_with("[frame withheld]"), "{reported}");
 }
 
 /// Fail if any frame failed to decode, whatever else the stream did.
