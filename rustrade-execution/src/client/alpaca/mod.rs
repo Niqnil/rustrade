@@ -1328,6 +1328,20 @@ impl ExecutionClient for AlpacaClient {
         Ok(futures::StreamExt::boxed(guarded))
     }
 
+    /// Cancel an order.
+    ///
+    /// # Async cancel semantics
+    ///
+    /// Returns `Ok(Cancelled)` once Alpaca has **accepted** the cancel, not once the order is
+    /// cancelled: `DELETE /v2/orders/{id}` answers 204 when the cancel request is accepted and the
+    /// order will be cancelled. Until it is, the order can be `pending_cancel`, still live, and can
+    /// still fill. The account stream reports how it ended, and any fill.
+    ///
+    /// The 204 has no body, so `filled_quantity` is zero whatever the order filled, and
+    /// `time_exchange` is the local time the answer arrived.
+    ///
+    /// Needs the venue order id. A request without one is refused, since Alpaca cancels by that
+    /// id only; resolve it through [`ExecutionClient::fetch_open_orders`].
     async fn cancel_order(
         &self,
         request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,

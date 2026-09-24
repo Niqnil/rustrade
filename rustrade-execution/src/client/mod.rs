@@ -2,12 +2,15 @@
 //!
 //! # Connector Comparison
 //!
-//! | Connector | Reconnect | Dedup | Fill Recovery | Heartbeat |
-//! |-----------|-----------|-------|---------------|-----------|
-//! | [`binance`] | Auto (1s→30s backoff) | 10k LRU | REST after reconnect | 30s |
-//! | [`alpaca`] | Auto (1s→30s backoff) | 2k LRU | REST after reconnect | 35s |
-//! | [`ibkr`] | Caller responsibility | N/A | Caller responsibility | N/A |
-//! | [`hyperliquid`] | SDK-managed | 10k LRU, fills only | Caller responsibility | SDK-managed |
+//! | Connector | Reconnect | Dedup | Fill Recovery | Heartbeat | Cancel answers once |
+//! |-----------|-----------|-------|---------------|-----------|---------------------|
+//! | [`binance`] | Auto (1s→30s backoff) | 10k LRU | REST after reconnect | 30s | cancelled |
+//! | [`alpaca`] | Auto (1s→30s backoff) | 2k LRU | REST after reconnect | 35s | accepted |
+//! | [`ibkr`] | Caller responsibility | N/A | Caller responsibility | N/A | submitted |
+//! | [`hyperliquid`] | SDK-managed | 10k LRU, fills only | Caller responsibility | SDK-managed | cancelled |
+//!
+//! The last column is when [`ExecutionClient::cancel_order`] answers `Ok`. Only for "cancelled" has
+//! the order ended by then; see that method.
 //!
 //! # Resilience Philosophy
 //!
@@ -167,6 +170,36 @@ where
         instruments: &[InstrumentNameExchange],
     ) -> impl Future<Output = Result<Self::AccountStream, UnindexedClientError>> + Send;
 
+    /// Cancel an order at the venue.
+    ///
+    /// # Return value
+    ///
+    /// - `Some` with `Ok(Cancelled)`: the venue took the cancel. Whether the order has *ended* by
+    ///   then depends on the venue; see below.
+    /// - `Some` with `Err`: the venue refused the cancel, or it could not be sent or answered. The
+    ///   order may still be open, or may have ended some other way, such as by filling. The account
+    ///   stream reports which.
+    /// - `None`: nothing to report, so the engine's `ExecutionManager` emits nothing for the
+    ///   request. No client in this crate returns it.
+    ///
+    /// # A taken cancel is not always an ended order
+    ///
+    /// Some venues answer a cancel before carrying it out. Until they do, the order is live and can
+    /// still fill. From those venues `Ok(Cancelled)` means only that the cancel was accepted, and
+    /// the account stream reports how the order actually ended, including any fill in between. The
+    /// engine stops tracking an order on `Ok(Cancelled)` from any venue.
+    ///
+    /// Binance, Hyperliquid and the mock venue answer once the order is cancelled. Alpaca answers
+    /// once it has accepted the cancel, and IBKR once the cancel is submitted. The
+    /// [connector comparison](crate::client#connector-comparison) lists the same.
+    ///
+    /// # `filled_quantity` and `time_exchange`
+    ///
+    /// `Cancelled::filled_quantity` is what the venue reported filled when it answered, where the
+    /// answer says: Binance and the mock venue. Alpaca, IBKR and Hyperliquid answer without it and
+    /// report zero, which does not mean nothing filled. The fill total comes from the account
+    /// stream, or from [`Self::fetch_trades`]. Likewise `time_exchange` is the venue's time where
+    /// the answer carries one, and the local time the answer arrived otherwise.
     fn cancel_order(
         &self,
         request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
