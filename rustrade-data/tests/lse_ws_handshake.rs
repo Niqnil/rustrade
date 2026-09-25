@@ -52,23 +52,22 @@ use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use rustrade_data::{
-    Identifier, MarketStream, NoInitialSnapshots,
+    MarketStream, NoInitialSnapshots,
     error::DataError,
     event::MarketEvent,
     exchange::{
         ExchangeServer,
         lse::{
             Lse,
-            channel::LseChannel,
             live::{LseCredentials, LseSubscriber},
-            market::{LseMarket, LseQuoteServer, LseServer, LseSymbolShape},
+            mapper::LseSubMapper,
+            market::{LseQuoteServer, LseServer, LseSymbolShape},
             resume::LseResumeState,
             stream::LseStream,
         },
-        subscription::ExchangeSub,
     },
-    subscriber::Subscriber,
-    subscription::{Subscription, book::OrderBooksL1, trade::PublicTrades},
+    subscriber::{Subscriber, mapper::SubscriptionMapper},
+    subscription::{Subscription, SubscriptionMeta, book::OrderBooksL1, trade::PublicTrades},
 };
 use rustrade_instrument::{
     exchange::ExchangeId,
@@ -412,7 +411,8 @@ fn subscription(base: &str) -> Subscription<HarnessLse, MarketDataInstrument, Pu
 /// Derived the way the connector derives it, rather than spelled out, so this pins the resume
 /// behaviour and not the identifier's format.
 fn subscription_id(base: &str) -> SubscriptionId {
-    ExchangeSub::<LseChannel, LseMarket>::new(&subscription(base)).id()
+    let SubscriptionMeta { instrument_map, .. } = LseSubMapper::map(&[subscription(base)]);
+    instrument_map.0.into_keys().next().unwrap()
 }
 
 fn subscriber() -> LseSubscriber {
@@ -948,6 +948,38 @@ async fn only_registered_contracts_reach_the_options_stream() {
     assert_eq!(event.exchange, ExchangeId::LseOptions);
     assert_eq!(event.kind.price, dec!(1.25));
     assert_eq!(event.kind.amount, dec!(3));
+}
+
+/// A root of four or more characters used to take the identifier past the inline limit, and it is
+/// the same identifier the instrument map files the contract under. The unregistered print on the
+/// same root ahead of it must still be dropped, and the registered one must still resolve.
+#[tokio::test]
+#[serial]
+async fn a_contract_on_a_long_root_reaches_the_options_stream() {
+    let registered = contract("googl", OptionKind::Call, dec!(700));
+    let script = Script {
+        frames_after_confirmation: vec![
+            option_tick_frame("GOOGL260930C00701000"),
+            option_tick_frame("GOOGL260930C00700000"),
+        ],
+        ..Script::default()
+    };
+    let _harness = Harness::start(script).await;
+
+    let mut stream =
+        <LseStream<_, _, _> as MarketStream<
+            OptionsHarnessLse,
+            MarketDataInstrument,
+            PublicTrades,
+        >>::init::<NoInitialSnapshots>(&subscriber(), std::slice::from_ref(&registered))
+        .await
+        .unwrap();
+
+    let event = next_event(&mut stream).await;
+
+    assert_eq!(event.instrument, registered.instrument);
+    assert_eq!(event.exchange, ExchangeId::LseOptions);
+    assert_eq!(event.kind.price, dec!(1.25));
 }
 
 // ---------------------------------------------------------------------------------------------

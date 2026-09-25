@@ -1,7 +1,7 @@
 //! The London Strategic Edge WebSocket tick frame, and the three timestamp spellings it arrives in.
 
-use super::channel::LseChannel;
-use crate::{Identifier, exchange::ExchangeSub};
+use super::mapper::subscription_id;
+use crate::Identifier;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rustrade_integration::subscription::SubscriptionId;
@@ -267,17 +267,13 @@ impl Identifier<Option<SubscriptionId>> for LseMessage {
 /// way fails at runtime on a frame that is entirely legal. `SmolStr` accepts either spelling and
 /// holds up to 23 bytes inline, so the symbol itself is not allocated.
 ///
-/// # Allocation
-/// The identifier built from the symbol prefixes it with `tick|`, five bytes more. An option
-/// contract's symbol is its root plus fifteen characters, so on a root of four or more characters
-/// (`AAPL`, `GOOGL`) the identifier exceeds the inline limit and is allocated on the heap, once per
-/// tick. On a three-character root (`SPY`, `QQQ`) it fits exactly.
+/// The identifier is the symbol, so it is not allocated either — every symbol this feed publishes
+/// fits inline. See [`subscription_id`].
 fn de_tick_subscription_id<'de, D>(deserializer: D) -> Result<SubscriptionId, D::Error>
 where
     D: Deserializer<'de>,
 {
-    SmolStr::deserialize(deserializer)
-        .map(|symbol| ExchangeSub::from((LseChannel::Tick, symbol.as_str())).id())
+    SmolStr::deserialize(deserializer).map(|symbol| subscription_id(&symbol))
 }
 
 /// Deserialise a WebSocket timestamp from any of the three spellings the provider uses.
@@ -535,7 +531,7 @@ mod tests {
     fn an_option_tick_decodes_with_no_quote() {
         let tick: LseTick = serde_json::from_str(OPTION_TICK).unwrap();
 
-        assert_eq!(tick.subscription_id.as_ref(), "tick|TEST261231C00010500");
+        assert_eq!(tick.subscription_id.as_ref(), "TEST261231C00010500");
         assert_eq!(tick.price, dec!(1.25));
         assert_eq!(tick.volume, dec!(3));
         assert_eq!(tick.bid, None);
@@ -554,10 +550,21 @@ mod tests {
         assert!(!tick.replay);
     }
 
+    /// The decoder builds the identifier on every tick, so it must fit inline for the longest
+    /// symbol the feed publishes: an OSI contract on a six-character root.
+    #[test]
+    fn a_long_root_option_ticks_identifier_is_not_allocated() {
+        let frame = OPTION_TICK.replace("TEST261231C00010500", "GOOGLX261231C00010500");
+        let tick: LseTick = serde_json::from_str(&frame).unwrap();
+
+        assert_eq!(tick.subscription_id.as_ref(), "GOOGLX261231C00010500");
+        assert!(!tick.subscription_id.0.is_heap_allocated());
+    }
+
     #[test]
     fn the_subscription_id_is_built_from_the_symbol() {
         let tick: LseTick = serde_json::from_str(LIVE_T_SEPARATED).unwrap();
-        assert_eq!(tick.subscription_id.as_ref(), "tick|BTC/USD");
+        assert_eq!(tick.subscription_id.as_ref(), "BTC/USD");
     }
 
     /// A timestamp carrying no offset is ambiguous, and guessing at it would silently misdate the
@@ -592,7 +599,7 @@ mod tests {
         let message: LseMessage = serde_json::from_str(LIVE_T_SEPARATED).unwrap();
         assert_eq!(
             message.id(),
-            Some(SubscriptionId::from("tick|BTC/USD")),
+            Some(SubscriptionId::from("BTC/USD")),
             "a tick must resolve to the subscription it was registered under"
         );
     }
@@ -676,7 +683,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(escaped.id(), Some(SubscriptionId::from("tick|BTC/USD")));
+        assert_eq!(escaped.id(), Some(SubscriptionId::from("BTC/USD")));
 
         // The replay boundary decodes its symbol through the same function, and a clamp that went
         // undetected because the boundary frame failed to parse would be silent.
@@ -688,7 +695,7 @@ mod tests {
         assert_eq!(
             boundary,
             LseMessage::ReplayStarted {
-                subscription_id: SubscriptionId::from("tick|BTC/USD"),
+                subscription_id: SubscriptionId::from("BTC/USD"),
                 from: "2026-01-02T09:37:24Z".parse::<DateTime<Utc>>().unwrap(),
             }
         );
@@ -709,7 +716,7 @@ mod tests {
             assert_eq!(
                 message,
                 LseMessage::ReplayStarted {
-                    subscription_id: SubscriptionId::from("tick|BTC/USD"),
+                    subscription_id: SubscriptionId::from("BTC/USD"),
                     from: "2026-01-02T09:39:31.716622Z"
                         .parse::<DateTime<Utc>>()
                         .unwrap(),

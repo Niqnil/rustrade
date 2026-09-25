@@ -284,6 +284,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   books. A server type declared outside this crate must implement `LseQuoteServer` to keep serving
   `OrderBooksL1`.
 
+- **BREAKING: a London Strategic Edge tick is filed under its bare symbol, so no tick allocates
+  its key** (`rustrade-data`, feature `lse`). The `SubscriptionId` was `tick|<symbol>`. An option
+  contract's symbol is its root plus fifteen characters, so on a root of four or more characters
+  (`AAPL`, `GOOGL`) the key passed `SmolStr`'s 23 inline bytes and was heap-allocated on every
+  print, including the unregistered prints the stream drops. The channel prefix carried nothing,
+  because the provider has one channel. Without it the longest key is 21 bytes. `LseSubscriber`
+  now maps subscriptions with the new `LseSubMapper` instead of `WebSocketSubMapper`, and the
+  instrument map in its `Subscribed` answer is keyed by the bare symbol. `ExchangeSub::id` still
+  spells `tick|<symbol>` for this connector, and no tick arrives under that key.
+
 - **BREAKING: connectivity state is read-only outside `rustrade`** (`ConnectivityStates`,
   `ConnectivityState`). `ConnectivityStates::update_from_account_reconnecting` is crate-private. So
   are the fields `ConnectivityStates::{global, exchanges}` and `ConnectivityState::{market_data,

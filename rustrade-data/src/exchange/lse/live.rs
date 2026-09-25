@@ -2,6 +2,7 @@
 
 use super::{
     connection::{AttachRequest, LseAttachment, LseConnection},
+    mapper::LseSubMapper,
     market::LseDataset,
     osi,
     resume::{LseResumeState, epoch_seconds},
@@ -11,10 +12,7 @@ use crate::{
     Identifier,
     exchange::Connector,
     instrument::InstrumentData,
-    subscriber::{
-        Subscribed, Subscriber,
-        mapper::{SubscriptionMapper, WebSocketSubMapper},
-    },
+    subscriber::{Subscribed, Subscriber, mapper::SubscriptionMapper},
     subscription::{Subscription, SubscriptionKind, SubscriptionMeta},
 };
 use chrono::{DateTime, Utc};
@@ -198,7 +196,7 @@ impl LseSubscriber {
 }
 
 impl Subscriber for LseSubscriber {
-    type SubMapper = WebSocketSubMapper;
+    type SubMapper = LseSubMapper;
     type Transport = LseAttachment;
 
     /// Attach the batch to this subscriber's shared connection — connecting and authenticating
@@ -280,7 +278,7 @@ impl Subscriber for LseSubscriber {
             .then(|| option_underlyings(exchange, &markets))
             .transpose()?;
 
-        // Only the instrument map is taken from the standard mapper. The subscribe payloads are
+        // Only the instrument map is taken from the mapper. The subscribe payloads are
         // built by the connection instead, because it alone knows what the socket already holds
         // and which replay window each symbol needs -- `Connector::requests` is a static function
         // with access to neither. Both routes build their payloads with `subscribe_message`, so
