@@ -23,7 +23,9 @@
 //!   no other stream holds.
 //! - **One subscribe handshake at a time.** Attaches are serialised, so a rejection naming no
 //!   symbol (`LIMIT_REACHED`, `INVALID_START`) belongs to the attach in flight and fails it. One
-//!   arriving outside a handshake is logged once, by the connection.
+//!   arriving outside a handshake is logged once, by the connection. A detach waits for the
+//!   handshake in flight too, so a dropped stream's symbols stay subscribed until that handshake
+//!   ends; frames keep flowing to every attached stream meanwhile.
 //! - **Every guard is per attach, and the cap is per connection.** The offered-symbol check runs
 //!   against each attach's own batch, before anything is sent; the subscription cap is checked
 //!   against everything the connection would then hold, because every stream sharing it draws on
@@ -88,7 +90,7 @@ use tokio::{
     sync::{mpsc, oneshot},
     time::Instant,
 };
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 use url::Url;
 
 /// How long the connection holds frames for a stream that has not re-attached after a reconnect.
@@ -171,10 +173,27 @@ impl LseConnection {
         }
 
         let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(Actor::new(self.credentials.clone(), rx, tx.downgrade()).run());
+        let actor = tokio::spawn(Actor::new(self.credentials.clone(), rx, tx.downgrade()).run());
+        tokio::spawn(report_panic(actor));
         *commands = Some(tx.clone());
 
         tx
+    }
+}
+
+/// Log a panic of the connection actor, which its streams would otherwise see only as a lost socket.
+///
+/// Every stream sharing the connection ends when the actor does, and the next attach spawns a new
+/// one, so the panic is not propagated anywhere; this is the one place it is reported.
+async fn report_panic(actor: tokio::task::JoinHandle<()>) {
+    if let Err(error) = actor.await
+        && error.is_panic()
+    {
+        error!(
+            %error,
+            "the London Strategic Edge connection task panicked; every stream sharing the \
+             connection ends, and the next to re-attach starts a new connection",
+        );
     }
 }
 
@@ -225,6 +244,12 @@ enum Command {
 ///
 /// Dropping it detaches the stream: every symbol no other stream holds is unsubscribed, and the
 /// socket closes once nothing remains attached.
+///
+/// # Keep it drained
+/// The queue behind it is unbounded. The connection reads the one socket for every stream sharing
+/// it, so it never waits for a slow one — that would stall the rest — and a stream it serves is
+/// not back-pressured the way a socket of its own would be. Frames for a stream that stops being
+/// polled accumulate in memory until it is polled again or dropped.
 ///
 /// See [`connection`](self) for how the connection is shared.
 #[derive(Debug)]

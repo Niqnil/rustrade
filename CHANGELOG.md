@@ -346,8 +346,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was refused. Clones now share one connection, and building one subscriber and cloning it is the
   intended way to stream several batches on a key. `LseSubscriber::subscribe` now rejects an empty
   batch, where it used to open a connection that never ticked. Its `Subscribed` never carries
-  buffered events, because frames go straight to the attachment. See the shared-connection entry
-  under Added.
+  buffered events, because frames go straight to the attachment. A stream that stops being polled
+  no longer back-pressures the socket, which the other streams need read; its frames queue in
+  memory until it is polled again or dropped. See the shared-connection entry under Added.
 
 - **BREAKING: `Open::id` and `RequestCancel::id` now carry a `VenueOrderId`, which distinguishes an
   order the venue named from one it did not** (`rustrade-execution`). Both fields previously held a
