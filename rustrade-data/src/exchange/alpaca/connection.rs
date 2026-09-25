@@ -52,7 +52,6 @@ use super::{
     channel::AlpacaChannel,
     channel_message,
     subscription::{AlpacaSubResponse, AlpacaSubResponseInner},
-    validator::covered,
 };
 use fnv::{FnvHashMap, FnvHashSet};
 use futures::{SinkExt, Stream, StreamExt};
@@ -1299,7 +1298,7 @@ fn answer(raw: &RawValue) -> Result<FnvHashSet<Slot>, SocketError> {
     Ok(response
         .0
         .iter()
-        .flat_map(covered)
+        .flat_map(AlpacaSubResponseInner::covered)
         .map(|(channel, symbol)| Slot {
             channel,
             symbol: symbol.clone(),

@@ -313,7 +313,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Symbol spelling moves to a new public `AlpacaServer` trait, with a per-feed `AlpacaSymbolShape`,
   and the `Identifier<AlpacaMarket>` impls become blanket impls over it. The shipped feeds implement
   it and spell every symbol as before. A server type declared outside this crate can now serve
-  `Alpaca<Server>` by implementing it.
+  `Alpaca<Server>` by implementing it. `AlpacaWebSocketSubValidator` and the `alpaca::validator`
+  module are removed: the subscriber confirms each subscribe on its shared connection, by coverage
+  as before, so the Alpaca connectors' `Connector::SubValidator` is the generic
+  `WebSocketSubValidator`, which it never calls.
 
 - **BREAKING: `DynamicStreams::init` bounds its instrument type on the new `DynamicInstrument`
   trait, and fails without connecting anything when a group cannot be routed** (`rustrade-data`).

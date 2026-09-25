@@ -82,13 +82,14 @@ use self::{
     stream::AlpacaStream,
     subscription::AlpacaSubResponse,
     trade::AlpacaTradeTransformer,
-    validator::AlpacaWebSocketSubValidator,
 };
 use crate::{
     Identifier, NoInitialSnapshots,
     exchange::{Connector, ExchangeServer, ExchangeSub, StreamSelector},
     instrument::InstrumentData,
-    subscriber::{Subscribed, Subscriber, mapper::SubscriptionMapper},
+    subscriber::{
+        Subscribed, Subscriber, mapper::SubscriptionMapper, validator::WebSocketSubValidator,
+    },
     subscription::{
         Subscription, SubscriptionKind, SubscriptionMeta, quote::Quotes, trade::PublicTrades,
     },
@@ -117,7 +118,6 @@ pub mod rest;
 pub mod stream;
 pub mod subscription;
 pub mod trade;
-pub mod validator;
 
 // `StockSplitSource` adapter for `AlpacaRestClient` (no public items of its own — just the impl).
 mod corporate_action;
@@ -197,7 +197,8 @@ where
     type Channel = AlpacaChannel;
     type Market = AlpacaMarket;
     type Subscriber = AlpacaSubscriber;
-    type SubValidator = AlpacaWebSocketSubValidator;
+    // Never called: `AlpacaSubscriber` confirms each subscribe on the connection it shares.
+    type SubValidator = WebSocketSubValidator;
     type SubResponse = AlpacaSubResponse;
 
     fn url() -> Result<Url, url::ParseError> {
