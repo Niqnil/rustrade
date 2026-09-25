@@ -130,13 +130,13 @@ impl DynamicSubscribers {
 /// every combination.
 ///
 /// # Only this crate's instrument types implement it
-/// It is sealed: it cannot be implemented directly, and a type qualifies only by satisfying the
-/// identifier bound of every connector `DynamicStreams` routes to — an
+/// It is sealed: its supertrait lives in a private module, so no crate but this one can name it
+/// or implement it. This crate implements that supertrait once, as a blanket impl requiring an
 /// `Identifier<ExchangeMarket>` impl for a `Subscription` over the type, per connector and kind.
-/// The coherence rules forbid a downstream crate from writing those impls for a type of its own,
-/// because `Identifier`, `Subscription` and every market type belong to this crate. So the set of
-/// qualifying types is exactly the three above, in every build, whichever features any crate in
-/// the build enables. A custom instrument type streams through the typed
+/// A downstream crate cannot write those impls for a type of its own either: the coherence rules
+/// leave them to the crate that owns `Identifier`, `Subscription` and the market types, which is
+/// this one. So the set of qualifying types is exactly the three above, in every build, whichever
+/// features any crate in the build enables. A custom instrument type streams through the typed
 /// [`Streams`](crate::streams::Streams) builder instead, for a connector whose identifier it can
 /// provide: [`LseInstrument`] is implementable for a downstream type, for example.
 pub trait DynamicInstrument: Route {}
