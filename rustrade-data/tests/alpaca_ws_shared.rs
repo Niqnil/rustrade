@@ -702,7 +702,12 @@ async fn an_unconfirmed_subscribe_times_out_and_releases_what_it_sent() {
     let failed = trade_stream(&subscriber, &[trades("tsla")])
         .await
         .unwrap_err();
-    assert!(failed.to_string().contains("timeout"), "{failed}");
+    let message = failed.to_string();
+    assert!(message.contains("timeout"), "{message}");
+    assert!(
+        message.contains("trades TSLA"),
+        "names what went unconfirmed: {message}"
+    );
 
     provider
         .until("the unsubscribe", |provider| provider.sent_on(1).len() == 3)

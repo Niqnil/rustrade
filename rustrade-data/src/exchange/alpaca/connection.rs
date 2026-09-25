@@ -372,6 +372,31 @@ impl Index {
         self.trades.clear();
         self.quotes.clear();
     }
+
+    /// A frame of only the `elements` `id` holds, in their original order and spelling.
+    fn share(&self, id: AttachId, elements: &[Element<'_>]) -> String {
+        // Sized for every element, so it never grows: bounded by the frame it is cut from.
+        let capacity = elements
+            .iter()
+            .map(|element| element.raw.get().len() + 1)
+            .sum::<usize>()
+            + 1;
+        let mut share = String::with_capacity(capacity);
+
+        share.push('[');
+        for element in elements.iter().filter(|element| {
+            self.holders(element.channel, &element.symbol)
+                .is_some_and(|holders| holders.contains(&id))
+        }) {
+            if share.len() > 1 {
+                share.push(',');
+            }
+            share.push_str(element.raw.get());
+        }
+        share.push(']');
+
+        share
+    }
 }
 
 /// One data element of a frame, as routing reads it.
@@ -533,7 +558,8 @@ impl Registry {
     /// every kind — receives `frame` itself. Any other receives a frame of only its own elements,
     /// in their original order and spelling.
     fn route(&mut self, frame: &WsMessage, total: usize, elements: &[Element<'_>]) {
-        let mut shares = FnvHashMap::<AttachId, Vec<&str>>::default();
+        // Counted before anything is copied, so a stream owning the whole frame costs no copy.
+        let mut counts = FnvHashMap::<AttachId, usize>::default();
 
         for element in elements {
             let Some(holders) = self.index.holders(element.channel, &element.symbol) else {
@@ -547,19 +573,19 @@ impl Registry {
             };
 
             for id in holders {
-                shares.entry(*id).or_default().push(element.raw.get());
+                *counts.entry(*id).or_default() += 1;
             }
         }
 
-        for (id, share) in shares {
+        for (id, count) in counts {
             let Some(registration) = self.registrations.get_mut(&id) else {
                 continue;
             };
 
-            let frame = if share.len() == total {
+            let frame = if count == total {
                 frame.clone()
             } else {
-                WsMessage::text(format!("[{}]", share.join(",")))
+                WsMessage::text(self.index.share(id, elements))
             };
 
             registration.deliver(id, frame);
@@ -672,6 +698,39 @@ impl Awaiting<'_> {
             Self::Subscribed(slots) => slots.iter().all(|slot| state.contains(slot)),
             Self::Released(slots) => !slots.iter().any(|slot| state.contains(slot)),
         }
+    }
+
+    /// Why a handshake that saw `state` last, if any state at all, timed out: the pairs it still
+    /// waits on, in request order.
+    fn timed_out(&self, timeout: Duration, state: Option<&FnvHashSet<Slot>>) -> String {
+        let reported = |slot: &Slot| state.is_some_and(|state| state.contains(slot));
+        let (outstanding, asked) = match self {
+            Self::Subscribed(slots) => (
+                slots
+                    .iter()
+                    .filter(|slot| !reported(slot))
+                    .collect::<Vec<_>>(),
+                "subscribed",
+            ),
+            Self::Released(slots) => (
+                slots
+                    .iter()
+                    .filter(|slot| reported(slot))
+                    .collect::<Vec<_>>(),
+                "unsubscribed",
+            ),
+        };
+
+        let outstanding = outstanding
+            .iter()
+            .map(|slot| format!("{} {}", slot.channel.as_ref(), slot.symbol))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        format!(
+            "subscription validation timeout reached: {timeout:?}; Alpaca never reported as \
+             {asked}: {outstanding}"
+        )
     }
 }
 
@@ -845,16 +904,16 @@ impl Actor {
         timeout: Duration,
     ) -> Result<(), Refusal> {
         let deadline = Instant::now() + timeout;
+        // The latest state Alpaca reported, so a timeout can name what it never reported.
+        let mut last = None;
 
         loop {
-            let frame = tokio::time::timeout_at(deadline, next_frame(&mut self.socket))
-                .await
-                .map_err(|_| {
-                    Refusal::Failed(SocketError::Subscribe(format!(
-                        "subscription validation timeout reached: {timeout:?}; Alpaca never \
-                         confirmed the subscription state asked for"
-                    )))
-                })?;
+            let Ok(frame) = tokio::time::timeout_at(deadline, next_frame(&mut self.socket)).await
+            else {
+                return Err(Refusal::Failed(SocketError::Subscribe(
+                    awaiting.timed_out(timeout, last.as_ref()),
+                )));
+            };
 
             match self.read(frame) {
                 Read::Done(answers) => {
@@ -863,7 +922,8 @@ impl Actor {
                             Ok(state) if awaiting.is_answered_by(&state) => return Ok(()),
                             // The whole state, not yet the one asked for.
                             Ok(state) => {
-                                debug!(held = state.len(), "Alpaca subscription state")
+                                debug!(held = state.len(), "Alpaca subscription state");
+                                last = Some(state);
                             }
                             Err(error) => return Err(Refusal::Refused(error)),
                         }
@@ -1077,13 +1137,15 @@ fn report_unawaited(answer: Result<FnvHashSet<Slot>, SocketError>) {
     }
 }
 
-/// Add to a refusal what the stream cannot see: the cap it hit is shared.
+/// Add to a refusal for the subscription cap what the stream cannot see: the cap is shared.
 fn shared_cap_context(error: SocketError) -> SocketError {
     match error {
-        SocketError::Subscribe(message) => SocketError::Subscribe(format!(
-            "{message} (the connection and its subscription cap are shared by every stream this \
-             subscriber and its clones open on the feed)"
-        )),
+        SocketError::Subscribe(message) if message.contains("symbol limit exceeded") => {
+            SocketError::Subscribe(format!(
+                "{message} (the connection and its subscription cap are shared by every stream \
+                 this subscriber and its clones open on the feed)"
+            ))
+        }
         other => other,
     }
 }
@@ -1430,6 +1492,53 @@ mod tests {
         deliver(&mut registry, &success);
 
         assert!(received(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn a_market_data_message_with_no_symbol_is_dropped_and_the_rest_routed() {
+        let mut registry = Registry::default();
+        let (_, mut rx) = attach(&mut registry, &[(TRADES, "AAPL")]);
+
+        let anonymous = json!({"T": "t", "i": 1, "p": 1.0});
+        deliver(&mut registry, &frame(&[anonymous, trade("AAPL")]));
+
+        assert_eq!(received(&mut rx), [vec![trade("AAPL")]]);
+    }
+
+    #[test]
+    fn only_a_cap_refusal_is_told_the_cap_is_shared() {
+        let refusal = |msg: &str| {
+            let frame = frame(&[json!({"T": "error", "code": 405, "msg": msg})]);
+            shared_cap_context(only(answers(&frame)).unwrap_err()).to_string()
+        };
+
+        assert!(refusal("symbol limit exceeded").contains("shared by every stream"));
+        assert!(!refusal("invalid syntax").contains("shared by every stream"));
+    }
+
+    #[test]
+    fn a_timed_out_handshake_names_what_alpaca_never_reported() {
+        let slots = [slot(TRADES, "AAPL"), slot(QUOTES, "MSFT")];
+        let state = FnvHashSet::from_iter([slot(TRADES, "AAPL")]);
+        let timeout = Duration::from_secs(1);
+
+        let subscribing = Awaiting::Subscribed(&slots).timed_out(timeout, Some(&state));
+        assert!(
+            subscribing.ends_with("subscribed: quotes MSFT"),
+            "{subscribing}"
+        );
+
+        let nothing_reported = Awaiting::Subscribed(&slots).timed_out(timeout, None);
+        assert!(
+            nothing_reported.ends_with("trades AAPL, quotes MSFT"),
+            "{nothing_reported}"
+        );
+
+        let releasing = Awaiting::Released(&slots).timed_out(timeout, Some(&state));
+        assert!(
+            releasing.ends_with("unsubscribed: trades AAPL"),
+            "{releasing}"
+        );
     }
 
     #[test]

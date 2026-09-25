@@ -61,11 +61,12 @@
 //!
 //! # Subscription confirmation
 //!
-//! Alpaca answers a subscribe with one frame naming the symbols it registered. Initialisation
-//! does not return until **every** requested symbol has been named; if any is still outstanding
-//! when the subscription timeout expires, the subscribe fails and names what was missing. A
-//! partial subscription is therefore an error rather than a quietly reduced stream. See
-//! [`AlpacaWebSocketSubValidator`](crate::exchange::alpaca::validator::AlpacaWebSocketSubValidator).
+//! Alpaca answers a subscribe with one frame naming every symbol the connection holds.
+//! Initialisation does not return until **every** requested symbol has been named; if any is
+//! still outstanding when the subscription timeout expires, the subscribe fails and names what was
+//! missing. A partial subscription is therefore an error rather than a quietly reduced stream. The
+//! [`AlpacaSubscriber`](crate::exchange::alpaca::AlpacaSubscriber) confirms each subscribe on the
+//! connection it shares.
 //!
 //! **A confirmed symbol is not a promise of prompt data.** Alpaca's crypto feed publishes a quote
 //! when top-of-book changes, so the delay before a given symbol first ticks is large and highly
@@ -217,8 +218,8 @@ where
         )]
     }
 
-    // `expected_responses` is deliberately left at its default. `AlpacaWebSocketSubValidator`
-    // succeeds on coverage of the requested subscriptions rather than on a response count, so
+    // `expected_responses` is deliberately left at its default. `AlpacaSubscriber` confirms a
+    // subscribe on coverage of the requested subscriptions rather than on a response count, so
     // no count it could return would be consulted.
 }
 

@@ -164,6 +164,10 @@ name = "alpaca_pagination"
 required-features = ["alpaca"]
 
 [[test]]
+name = "alpaca_ws_shared"
+required-features = ["alpaca"]
+
+[[test]]
 name = "databento_integration"
 required-features = ["databento"]
 
