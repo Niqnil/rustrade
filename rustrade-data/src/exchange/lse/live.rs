@@ -189,6 +189,12 @@ impl LseSubscriber {
         self
     }
 
+    /// How many handles share this subscriber's connection: this subscriber and each clone of it.
+    #[cfg(test)]
+    pub(crate) fn connection_handles(&self) -> usize {
+        Arc::strong_count(&self.connection)
+    }
+
     /// The resume state this subscriber shares with the streams it opens, if any.
     pub(super) fn resume_state(&self) -> Option<Arc<LseResumeState>> {
         self.resume.clone()
