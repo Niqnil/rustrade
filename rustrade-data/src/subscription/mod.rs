@@ -348,11 +348,11 @@ pub fn exchange_supports_instrument_kind_sub_kind(
         // answer. The full reasoning lives on the trade decoder in the `lse` module.
         (LseFx | LseCrypto | LseEquities, Spot, PublicTrades | OrderBooksL1) => true,
         (LseCfd | LseFutures, Cfd, PublicTrades | OrderBooksL1) => true,
-        // Options reach users over the REST vault only, for now. The WebSocket does carry option
-        // prints, but under a subscribe-by-underlying handshake that this integration does not yet
-        // speak, so no subscription kind is honestly servable. Explicit rather than left to the
-        // default below so the eventual edit has one obvious place to land.
-        (LseOptions, _, _) => false,
+        // Option contracts tick on the same frame, subscribed per underlying, but with `bid` and
+        // `ask` null on every one -- there is no quote to serve, so `PublicTrades` is the only
+        // kind. Unlike the venues above, these trades ARE prints: they reconcile one-for-one
+        // against the provider's REST option-print tape.
+        (LseOptions, Option { .. }, PublicTrades) => true,
         // No `Candles` arm exists for any London Strategic Edge venue, deliberately: the provider's
         // WebSocket carries no candle channel at all -- the tick above is its only data frame, so
         // there is nothing to subscribe to. Its candles are served exclusively over the REST vault,
@@ -494,13 +494,18 @@ mod tests {
         }
 
         #[test]
-        fn test_lse_options_serves_no_subscription_kind_yet() {
-            // Pins the explicit `(LseOptions, _, _) => false` arm: nothing streams until the
-            // subscribe-by-underlying handshake is implemented.
+        fn test_lse_options_serves_public_trades_only() {
+            assert!(exchange_supports_instrument_kind_sub_kind(
+                &ExchangeId::LseOptions,
+                &option_kind(),
+                SubKind::PublicTrades
+            ));
+
+            // Every option tick publishes `bid` and `ask` as null, so there is no quote to serve.
             for sub_kind in [
-                SubKind::PublicTrades,
                 SubKind::OrderBooksL1,
                 SubKind::OrderBooksL2,
+                SubKind::OrderBooksL3,
             ] {
                 assert!(
                     !exchange_supports_instrument_kind_sub_kind(
@@ -508,9 +513,18 @@ mod tests {
                         &option_kind(),
                         sub_kind
                     ),
-                    "LseOptions should not yet serve {sub_kind}"
+                    "LseOptions should not serve {sub_kind}"
                 );
             }
+
+            assert!(
+                !exchange_supports_instrument_kind_sub_kind(
+                    &ExchangeId::LseOptions,
+                    &MarketDataInstrumentKind::Spot,
+                    SubKind::PublicTrades
+                ),
+                "LseOptions serves option contracts only"
+            );
         }
 
         #[test]

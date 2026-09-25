@@ -49,6 +49,8 @@
 
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use rustrade_data::{
     Identifier, MarketStream, NoInitialSnapshots,
     error::DataError,
@@ -73,7 +75,13 @@ use rustrade_data::{
 };
 use rustrade_instrument::{
     exchange::ExchangeId,
-    instrument::market_data::{MarketDataInstrument, kind::MarketDataInstrumentKind},
+    instrument::{
+        kind::option::{OptionExercise, OptionKind},
+        market_data::{
+            MarketDataInstrument,
+            kind::{MarketDataInstrumentKind, MarketDataOptionContract},
+        },
+    },
 };
 use rustrade_integration::subscription::SubscriptionId;
 use serde_json::{Value, json};
@@ -119,6 +127,28 @@ impl LseServer for HarnessServer {
 
 type HarnessLse = Lse<HarnessServer>;
 
+/// The options dataset, pointed at the harness.
+///
+/// Declared as the shipped options server is — the options identifier and the OSI spelling — so the
+/// per-underlying subscribe, the per-underlying confirmation count and the unregistered-contract
+/// count all run exactly as they do against the provider.
+#[derive(Copy, Clone, Debug, Default)]
+struct OptionsHarnessServer;
+
+impl ExchangeServer for OptionsHarnessServer {
+    const ID: ExchangeId = ExchangeId::LseOptions;
+
+    fn websocket_url() -> &'static str {
+        HarnessServer::websocket_url()
+    }
+}
+
+impl LseServer for OptionsHarnessServer {
+    const SYMBOL_SHAPE: LseSymbolShape = LseSymbolShape::OptionContract;
+}
+
+type OptionsHarnessLse = Lse<OptionsHarnessServer>;
+
 /// How the synthetic server answers.
 struct Script {
     /// The frame sent in reply to `auth`.
@@ -137,6 +167,10 @@ struct Script {
     /// These reach the stream itself rather than the handshake, which is what lets a test drive a
     /// market event out of the far end instead of stopping at `subscribe`.
     frames_after_confirmation: Vec<Value>,
+
+    /// Option underlyings answered with the provider's `INVALID_UNDERLYING` rejection rather than
+    /// a confirmation.
+    underlyings_without_options: Vec<&'static str>,
 }
 
 impl Default for Script {
@@ -146,6 +180,7 @@ impl Default for Script {
             close_without_answering: false,
             frames_before_confirmation: Vec::new(),
             frames_after_confirmation: Vec::new(),
+            underlyings_without_options: Vec::new(),
         }
     }
 }
@@ -267,6 +302,32 @@ async fn serve(stream: TcpStream, script: Script, subscribes: Arc<Mutex<Vec<Valu
             continue;
         };
 
+        // What answers a subscribe: a confirmation in the shape the action calls for, or the
+        // rejection an underlying with no options receives.
+        let answer = match payload["action"].as_str() {
+            Some("subscribe") => Some(json!({
+                "type": "subscribed", "symbol": payload["symbol"], "max": 16,
+            })),
+            Some("subscribe_options") => {
+                let underlying = payload["underlying"].as_str().unwrap_or_default();
+
+                Some(
+                    if script.underlyings_without_options.contains(&underlying) {
+                        json!({
+                            "type": "error", "code": "INVALID_UNDERLYING",
+                            "message": format!("No options available for {underlying}"),
+                        })
+                    } else {
+                        json!({
+                            "type": "options_subscribed", "underlying": underlying,
+                            "contracts": 1000, "max": 100,
+                        })
+                    },
+                )
+            }
+            _ => None,
+        };
+
         match payload["action"].as_str() {
             Some("auth") => {
                 if script.close_without_answering {
@@ -281,8 +342,7 @@ async fn serve(stream: TcpStream, script: Script, subscribes: Arc<Mutex<Vec<Valu
                     return;
                 }
             }
-            Some("subscribe") => {
-                let symbol = payload["symbol"].as_str().unwrap_or_default().to_owned();
+            Some("subscribe" | "subscribe_options") => {
                 let count = {
                     let mut recorded = subscribes.lock().unwrap();
                     recorded.push(payload.clone());
@@ -299,9 +359,10 @@ async fn serve(stream: TcpStream, script: Script, subscribes: Arc<Mutex<Vec<Valu
                     }
                 }
 
-                let confirmation = json!({
-                    "type": "subscribed", "symbol": symbol, "count": count, "max": 16,
-                });
+                let mut confirmation = answer.unwrap_or_default();
+                if confirmation["type"] != "error" {
+                    confirmation["count"] = json!(count);
+                }
                 if websocket
                     .send(Message::text(confirmation.to_string()))
                     .await
@@ -679,4 +740,186 @@ async fn a_replayed_tick_buffered_during_validation_is_skipped_on_a_resumed_reco
         "the first event out of a resumed stream was the replayed duplicate, so the resume state \
          did not reach the transformer before the buffered events were processed",
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Option contracts: subscribed per underlying, confirmed per underlying, delivered per contract.
+// ---------------------------------------------------------------------------------------------
+
+/// A subscription to one option contract on `root`, expiring 30 Sep 2026.
+fn contract(
+    root: &str,
+    kind: OptionKind,
+    strike: Decimal,
+) -> Subscription<OptionsHarnessLse, MarketDataInstrument, PublicTrades> {
+    Subscription::from((
+        OptionsHarnessLse::default(),
+        root,
+        "usd",
+        MarketDataInstrumentKind::Option(MarketDataOptionContract {
+            kind,
+            exercise: OptionExercise::American,
+            expiry: "2026-09-30T20:00:00Z".parse().unwrap(),
+            strike,
+        }),
+        PublicTrades,
+    ))
+}
+
+/// An option contract tick as the options channel spells it: no quote, a whole-second instant and
+/// a contract label.
+fn option_tick_frame(symbol: &str) -> Value {
+    json!({
+        "type": "tick", "symbol": symbol, "ts": "2026-09-30T15:00:00+00:00",
+        "price": 1.25, "bid": null, "ask": null, "volume": 3, "name": "a contract label",
+    })
+}
+
+/// Three contracts over two underlyings are two subscribes and two confirmations. The validator
+/// finishing at all is the proof it expected two: expecting three — one per contract — it would wait
+/// out its timeout for a confirmation the provider never sends, and fail.
+#[tokio::test]
+#[serial]
+async fn an_options_batch_subscribes_and_is_confirmed_once_per_underlying() {
+    let harness = Harness::start(Script::default()).await;
+
+    let subscriptions = [
+        contract("spy", OptionKind::Call, dec!(700)),
+        contract("qqq", OptionKind::Put, dec!(500)),
+        contract("spy", OptionKind::Put, dec!(650)),
+    ];
+    let subscribed = subscriber().subscribe(&subscriptions).await.unwrap();
+    let instruments = subscribed.map.0.len();
+
+    drop(subscribed);
+    let sent = harness.drained().await;
+
+    assert_eq!(
+        sent,
+        [
+            json!({"action": "subscribe_options", "underlying": "SPY"}),
+            json!({"action": "subscribe_options", "underlying": "QQQ"}),
+        ]
+    );
+    assert_eq!(instruments, 3, "every contract is its own instrument");
+}
+
+/// Options do not resume, so a subscriber configured to must still subscribe the options channel
+/// plainly and deliver from it — the resume state is withheld from the options stream rather than
+/// failing it, and no replay window reaches the wire.
+#[tokio::test]
+#[serial]
+async fn a_resuming_subscriber_streams_options_without_a_replay_window() {
+    let registered = contract("spy", OptionKind::Call, dec!(700));
+    let script = Script {
+        frames_after_confirmation: vec![option_tick_frame("SPY260930C00700000")],
+        ..Script::default()
+    };
+    let harness = Harness::start(script).await;
+
+    let subscriber = subscriber().with_resume(Arc::new(LseResumeState::new()));
+    let mut stream =
+        <LseStream<_, _, _> as MarketStream<
+            OptionsHarnessLse,
+            MarketDataInstrument,
+            PublicTrades,
+        >>::init::<NoInitialSnapshots>(&subscriber, std::slice::from_ref(&registered))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        next_event(&mut stream).await.instrument,
+        registered.instrument
+    );
+
+    drop(stream);
+    assert_eq!(
+        harness.drained().await,
+        [json!({"action": "subscribe_options", "underlying": "SPY"})]
+    );
+}
+
+/// An instrument with no OSI spelling is refused before a connection is even opened.
+#[tokio::test]
+#[serial]
+async fn a_contract_with_no_osi_symbol_is_refused_before_connecting() {
+    let harness = Harness::start(Script::default()).await;
+
+    let not_an_option = Subscription::from((
+        OptionsHarnessLse::default(),
+        "spy",
+        "usd",
+        MarketDataInstrumentKind::Spot,
+        PublicTrades,
+    ));
+    let error = subscriber()
+        .subscribe(&[contract("spy", OptionKind::Call, dec!(700)), not_an_option])
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("no OSI symbol"), "{error}");
+
+    // No connection was ever opened, so the server is still waiting to accept one and nothing can be
+    // in flight: the sample is complete, and the task is stopped rather than awaited.
+    assert!(harness.subscribes().is_empty());
+    harness.served.abort();
+}
+
+/// Unlike an unknown symbol, which the provider confirms, an underlying with no options is rejected
+/// by name — so the provider's own rejection is the guard, and it must fail the batch.
+#[tokio::test]
+#[serial]
+async fn an_underlying_with_no_options_fails_the_batch_naming_it() {
+    let script = Script {
+        underlyings_without_options: vec!["NOPE"],
+        ..Script::default()
+    };
+    let harness = Harness::start(script).await;
+
+    let error = subscriber()
+        .subscribe(&[
+            contract("spy", OptionKind::Call, dec!(700)),
+            contract("nope", OptionKind::Call, dec!(10)),
+        ])
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("INVALID_UNDERLYING"), "{error}");
+    assert!(error.contains("NOPE"), "{error}");
+    drop(harness.drained().await);
+}
+
+/// The whole chain arrives, and only the registered contract may come out of the stream. The
+/// unregistered print ahead of it must be dropped as counted rather than surface as an error —
+/// `next_event` fails on an error, so the first event being the registered print proves both.
+#[tokio::test]
+#[serial]
+async fn only_registered_contracts_reach_the_options_stream() {
+    let registered = contract("spy", OptionKind::Call, dec!(700));
+    let script = Script {
+        frames_after_confirmation: vec![
+            option_tick_frame("SPY260930C00701000"),
+            option_tick_frame("SPY260930C00700000"),
+        ],
+        ..Script::default()
+    };
+    let _harness = Harness::start(script).await;
+
+    let mut stream =
+        <LseStream<_, _, _> as MarketStream<
+            OptionsHarnessLse,
+            MarketDataInstrument,
+            PublicTrades,
+        >>::init::<NoInitialSnapshots>(&subscriber(), std::slice::from_ref(&registered))
+        .await
+        .unwrap();
+
+    let event = next_event(&mut stream).await;
+
+    assert_eq!(event.instrument, registered.instrument);
+    assert_eq!(event.exchange, ExchangeId::LseOptions);
+    assert_eq!(event.kind.price, dec!(1.25));
+    assert_eq!(event.kind.amount, dec!(3));
 }

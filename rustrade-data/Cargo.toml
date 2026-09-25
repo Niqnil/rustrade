@@ -267,6 +267,10 @@ name = "lse_options"
 required-features = ["lse"]
 
 [[example]]
+name = "lse_options_stream"
+required-features = ["lse"]
+
+[[example]]
 name = "lse_export"
 required-features = ["lse-parquet"]
 

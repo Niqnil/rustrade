@@ -24,15 +24,20 @@
 //! ```
 //!
 //! Demonstrates:
-//! - **One frame serving two subscription kinds.** The provider publishes a single data frame
-//!   carrying a price, a bid, an ask and a size, so the same tick decodes as a `PublicTrade` or as
-//!   an `OrderBookL1` depending only on which kind was subscribed.
-//! - **Per-dataset provenance.** Each dataset family is its own connector, so `MarketEvent.exchange`
-//!   says which one an event came from — worth having, because two of the five fabricate `volume`.
-//! - **Opt-in resumption across a reconnect**, with one state shared across every stream.
+//! - **Live ticks decoded as `PublicTrade`s** on one dataset, over the key's one connection.
+//! - **Opt-in resumption across a reconnect.**
 //!
 //! # Properties worth knowing before you build on this
 //!
+//! - **A free key holds exactly one connection, and each `subscribe` call opens one.** The
+//!   provider's handshake says so, and a second connection is refused with `TOO_MANY_CONNECTIONS`. That
+//!   includes another dataset, and the other subscription kind on the same symbols, so this example
+//!   makes one `subscribe` call and nothing else may hold the key while it runs.
+//! - **One frame serves two subscription kinds.** The provider publishes a single data frame
+//!   carrying a price, a bid, an ask and a size, so the same tick decodes as a `PublicTrade` or as
+//!   an `OrderBookL1` depending only on which kind was subscribed.
+//! - **Each dataset family is its own connector**, so `MarketEvent.exchange` says which one an event
+//!   came from — worth having, because two of the five fabricate `volume`.
 //! - **The tick is a QUOTE, not a print.** Its `price` equals its `bid` on every sample taken —
 //!   3,966 of 3,966 ticks across every dataset family. A `PublicTrade` decoded from it is a
 //!   bid-side quote wearing a trade's shape, and its arrival is not evidence that a transaction
@@ -41,31 +46,27 @@
 //!   separating them. `LseCrypto` and `LseEquities` carry a genuine per-tick size that reconciles
 //!   exactly against the provider's own one-minute candles. **`LseFx` and `LseCfd` carry a
 //!   hard-coded `1.0`** — a placeholder that aggregates into a legitimate-looking total, so
-//!   volume-weighted prices and size filters there are meaningless rather than imprecise. Watch the
-//!   `EUR/USD` line below print `1` forever while `BTC/USD` varies.
+//!   volume-weighted prices and size filters there are meaningless rather than imprecise.
 //! - **Identical consecutive ticks are genuine and are never de-duplicated.** Barely a third of a
 //!   sampled run was unique on `(ts, price, bid, ask, volume)`, yet removing the repeats destroyed
 //!   volume that otherwise reconciles exactly. Do not add a filter.
-//! - **Both book levels carry a zero size.** The feed publishes bid and ask *prices* only.
-//! - **Each `subscribe` call opens its own connection, and a connection accepts 16 symbols.** A
-//!   batch that exceeds the cap, or that names a symbol the key cannot subscribe to, is rejected
-//!   before anything reaches the wire — so a typo costs no subscription slot and never presents as
-//!   a symbol that is confirmed and then silently never ticks.
+//! - **An `OrderBookL1` carries a zero size on both levels.** The feed publishes bid and ask
+//!   *prices* only.
+//! - **A connection holds 100 subscriptions** (as last measured; the handshake reports the live
+//!   figure). A batch that exceeds the cap, or that names a symbol the key cannot subscribe to, is
+//!   rejected before anything reaches the wire — so a typo costs no subscription slot and never
+//!   presents as a symbol that is confirmed and then silently never ticks.
 
 use futures::StreamExt;
 use rustrade_data::{
-    event::DataKind,
-    exchange::lse::{LseCrypto, LseFx, live::LseSubscriber, resume::LseResumeState},
+    exchange::lse::{LseCrypto, live::LseSubscriber, resume::LseResumeState},
     streams::{
         Streams,
-        consumer::MarketStreamResult,
         reconnect::{Event, stream::ReconnectingStream},
     },
-    subscription::{book::OrderBooksL1, trade::PublicTrades},
+    subscription::trade::PublicTrades,
 };
-use rustrade_instrument::instrument::market_data::{
-    MarketDataInstrument, kind::MarketDataInstrumentKind,
-};
+use rustrade_instrument::instrument::market_data::kind::MarketDataInstrumentKind;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -76,74 +77,35 @@ async fn main() {
     let subscriber = LseSubscriber::from_env()
         .expect("set LSE_API_KEY - get a free key at https://londonstrategicedge.com/data");
 
-    // Resumption is opt-in, and one state serves every stream below — including the top-of-book
-    // connection, which carries the *same* crypto symbols as the crypto trade connection.
-    // Watermarks are filed per subscription *and* kind, so those two advance independently and
-    // neither can set the other's resume point; nothing about sharing needs thinking about here.
-    //
-    // On a first connection there is nothing to resume from, so nothing replays here. The state
-    // matters after a drop: the reconnect re-subscribes from the last event each stream actually
-    // delivered instead of leaving a gap.
+    // Resumption is opt-in. On a first connection there is nothing to resume from, so nothing
+    // replays here. The state matters after a drop: the reconnect re-subscribes from the last event
+    // each subscription actually delivered instead of leaving a gap.
     let resume = Arc::new(LseResumeState::new());
 
-    let streams: Streams<MarketStreamResult<MarketDataInstrument, DataKind>> =
-        Streams::builder_multi()
-            .add(
-                Streams::<PublicTrades>::builder()
-                    .subscribe(
-                        subscriber.clone().with_resume(Arc::clone(&resume)),
-                        [
-                            (
-                                LseCrypto::default(),
-                                "btc",
-                                "usd",
-                                MarketDataInstrumentKind::Spot,
-                                PublicTrades,
-                            ),
-                            (
-                                LseCrypto::default(),
-                                "eth",
-                                "usd",
-                                MarketDataInstrumentKind::Spot,
-                                PublicTrades,
-                            ),
-                        ],
-                    )
-                    // A second dataset family, on its own connection: same frame, same decoder,
-                    // different `MarketEvent.exchange` — and a `volume` the provider invents.
-                    .subscribe(
-                        subscriber.clone().with_resume(Arc::clone(&resume)),
-                        [(
-                            LseFx::default(),
-                            "eur",
-                            "usd",
-                            MarketDataInstrumentKind::Spot,
-                            PublicTrades,
-                        )],
-                    ),
-            )
-            .add(Streams::<OrderBooksL1>::builder().subscribe(
-                subscriber.with_resume(resume),
-                [
-                    (
-                        LseCrypto::default(),
-                        "btc",
-                        "usd",
-                        MarketDataInstrumentKind::Spot,
-                        OrderBooksL1,
-                    ),
-                    (
-                        LseCrypto::default(),
-                        "eth",
-                        "usd",
-                        MarketDataInstrumentKind::Spot,
-                        OrderBooksL1,
-                    ),
-                ],
-            ))
-            .init()
-            .await
-            .unwrap();
+    // One `subscribe` call, because it opens a connection and the key holds only one.
+    let streams = Streams::<PublicTrades>::builder()
+        .subscribe(
+            subscriber.with_resume(resume),
+            [
+                (
+                    LseCrypto::default(),
+                    "btc",
+                    "usd",
+                    MarketDataInstrumentKind::Spot,
+                    PublicTrades,
+                ),
+                (
+                    LseCrypto::default(),
+                    "eth",
+                    "usd",
+                    MarketDataInstrumentKind::Spot,
+                    PublicTrades,
+                ),
+            ],
+        )
+        .init()
+        .await
+        .unwrap();
 
     let mut joined_stream = streams
         .select_all()
@@ -160,32 +122,17 @@ async fn main() {
             Event::Item(event) => event,
         };
 
-        match &event.kind {
-            DataKind::Trade(trade) => info!(
-                exchange = %event.exchange,
-                instrument = %event.instrument,
-                time_exchange = %event.time_exchange,
-                price = %trade.price,
-                // Genuine on LseCrypto, a hard-coded 1.0 on LseFx. Same field, same type, no signal.
-                amount = %trade.amount,
-                // Always empty, and always `None`: the feed publishes neither a trade identifier
-                // nor an aggressor side, and neither is inferable from a quote.
-                side = ?trade.side,
-                "tick as trade"
-            ),
-            DataKind::OrderBookL1(l1) => info!(
-                exchange = %event.exchange,
-                instrument = %event.instrument,
-                time_exchange = %event.time_exchange,
-                best_bid = ?l1.best_bid.as_ref().map(|level| level.price),
-                best_ask = ?l1.best_ask.as_ref().map(|level| level.price),
-                // Both zero: the feed publishes no resting size. Do not read them as quantity.
-                "tick as top-of-book"
-            ),
-            // Unreachable: this provider's WebSocket serves no other kind. There is no candle
-            // channel at all — its candles are a REST-only product.
-            other => warn!(kind = other.kind_name(), "unexpected DataKind"),
-        }
+        info!(
+            exchange = %event.exchange,
+            instrument = %event.instrument,
+            time_exchange = %event.time_exchange,
+            price = %event.kind.price,
+            // Genuine on LseCrypto; a hard-coded 1.0 on LseFx and LseCfd. Same field, no signal.
+            amount = %event.kind.amount,
+            // Always `None`: the feed publishes no aggressor side, and a quote implies none.
+            side = ?event.kind.side,
+            "tick as trade"
+        );
     }
 }
 

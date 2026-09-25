@@ -5,7 +5,10 @@
 //! static function with no access to the subscriber, so a stream that wants resumption has to
 //! assemble the pieces itself.
 
-use super::{live::LseSubscriber, transformer::LseTransformer};
+use super::{
+    live::{LseSubscriber, subscribes_per_underlying},
+    transformer::LseTransformer,
+};
 use crate::{
     Identifier, MarketStream, SnapshotFetcher, distribute_messages_to_exchange,
     error::DataError,
@@ -27,6 +30,7 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::sync::mpsc;
+use tracing::warn;
 
 /// The market stream every London Strategic Edge subscription kind is served over.
 ///
@@ -127,11 +131,26 @@ where
         // transformer reads it there; the kind has no type-level value to read, and every
         // subscription in one batch shares a `Kind`, so the first names it for all of them. An
         // empty batch has nothing to resume, which is what the `zip` yields.
-        let resume = subscriber.resume_state().zip(
-            subscriptions
-                .first()
-                .map(|subscription| subscription.kind.as_str()),
-        );
+        //
+        // Option contracts never resume -- see `LseOptions` -- so the state is withheld from their
+        // transformer too. Held, it would skip live prints at the watermark's instant as though a
+        // replay had re-sent them, when no replay was asked for.
+        let resume = if subscribes_per_underlying(Exchange::ID) {
+            if subscriber.resume_state().is_some() {
+                warn!(
+                    exchange = %Exchange::ID,
+                    "London Strategic Edge option contracts do not resume; this stream will not \
+                     replay what a reconnect missed",
+                );
+            }
+            None
+        } else {
+            subscriber.resume_state().zip(
+                subscriptions
+                    .first()
+                    .map(|subscription| subscription.kind.as_str()),
+            )
+        };
 
         let mut transformer =
             LseTransformer::new(instrument_map, &initial_snapshots, ws_sink_tx, resume).await?;
