@@ -18,6 +18,17 @@ pub enum AlpacaChannel {
     Quotes,
 }
 
+impl AlpacaChannel {
+    /// The channel [`AsRef<str>`] spells as `name`, if any.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "trades" => Some(Self::Trades),
+            "quotes" => Some(Self::Quotes),
+            _ => None,
+        }
+    }
+}
+
 impl AsRef<str> for AlpacaChannel {
     fn as_ref(&self) -> &str {
         match self {
@@ -51,5 +62,13 @@ mod tests {
     fn test_channel_as_ref() {
         assert_eq!(AlpacaChannel::Trades.as_ref(), "trades");
         assert_eq!(AlpacaChannel::Quotes.as_ref(), "quotes");
+    }
+
+    #[test]
+    fn every_channel_round_trips_through_its_name() {
+        for channel in [AlpacaChannel::Trades, AlpacaChannel::Quotes] {
+            assert_eq!(AlpacaChannel::from_name(channel.as_ref()), Some(channel));
+        }
+        assert_eq!(AlpacaChannel::from_name("bars"), None);
     }
 }
