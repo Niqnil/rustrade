@@ -693,36 +693,36 @@ enum Awaiting<'a> {
 }
 
 impl Awaiting<'_> {
-    fn is_answered_by(&self, state: &FnvHashSet<Slot>) -> bool {
+    fn slots(&self) -> &[Slot] {
         match self {
-            Self::Subscribed(slots) => slots.iter().all(|slot| state.contains(slot)),
-            Self::Released(slots) => !slots.iter().any(|slot| state.contains(slot)),
+            Self::Subscribed(slots) | Self::Released(slots) => slots,
         }
     }
 
+    /// Whether `state` reports `slot` the way this handshake asks for.
+    fn settles(&self, state: &FnvHashSet<Slot>, slot: &Slot) -> bool {
+        match self {
+            Self::Subscribed(_) => state.contains(slot),
+            Self::Released(_) => !state.contains(slot),
+        }
+    }
+
+    fn is_answered_by(&self, state: &FnvHashSet<Slot>) -> bool {
+        self.slots().iter().all(|slot| self.settles(state, slot))
+    }
+
     /// Why a handshake that saw `state` last, if any state at all, timed out: the pairs it still
-    /// waits on, in request order.
+    /// waits on, in request order. With no state reported, that is every pair.
     fn timed_out(&self, timeout: Duration, state: Option<&FnvHashSet<Slot>>) -> String {
-        let reported = |slot: &Slot| state.is_some_and(|state| state.contains(slot));
-        let (outstanding, asked) = match self {
-            Self::Subscribed(slots) => (
-                slots
-                    .iter()
-                    .filter(|slot| !reported(slot))
-                    .collect::<Vec<_>>(),
-                "subscribed",
-            ),
-            Self::Released(slots) => (
-                slots
-                    .iter()
-                    .filter(|slot| reported(slot))
-                    .collect::<Vec<_>>(),
-                "unsubscribed",
-            ),
+        let asked = match self {
+            Self::Subscribed(_) => "subscribed",
+            Self::Released(_) => "unsubscribed",
         };
 
-        let outstanding = outstanding
+        let outstanding = self
+            .slots()
             .iter()
+            .filter(|slot| state.is_none_or(|state| !self.settles(state, slot)))
             .map(|slot| format!("{} {}", slot.channel.as_ref(), slot.symbol))
             .collect::<Vec<_>>()
             .join(", ");
@@ -1538,6 +1538,12 @@ mod tests {
         assert!(
             releasing.ends_with("unsubscribed: trades AAPL"),
             "{releasing}"
+        );
+
+        let nothing_released = Awaiting::Released(&slots).timed_out(timeout, None);
+        assert!(
+            nothing_released.ends_with("unsubscribed: trades AAPL, quotes MSFT"),
+            "{nothing_released}"
         );
     }
 
