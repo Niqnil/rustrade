@@ -91,22 +91,6 @@ impl LseResumeKey {
             kind,
         }
     }
-
-    /// The dataset this key partitions on.
-    pub(super) fn exchange(&self) -> ExchangeId {
-        self.exchange
-    }
-
-    /// The kind this key partitions on.
-    pub(super) fn kind(&self) -> &'static str {
-        self.kind
-    }
-
-    /// Consume the key for the subscription half, which is what a transformer keys its own
-    /// per-connection bookkeeping on once it has filtered the snapshot to its own kind.
-    pub(super) fn into_subscription(self) -> SubscriptionId {
-        self.subscription
-    }
 }
 
 /// Resume state shared between a [`LseSubscriber`](super::live::LseSubscriber) and the transformer
@@ -168,13 +152,12 @@ impl LseResumeKey {
 /// ```
 #[derive(Debug, Default)]
 pub struct LseResumeState {
-    // A plain `Mutex` rather than an `RwLock`. Within one reconnect chain the two accessors never
-    // overlap at all -- the chain polls the outer stream (where the subscriber reads) only once the
-    // inner stream (where the transformer writes) has fully drained. Across chains they do: this
-    // state is documented as shareable between concurrently-spawned per-batch streams, and those
-    // contend. A `Mutex` is still the right choice for that: the critical section is a hash lookup
-    // and a field update with no allocation, which an `RwLock` would only make more expensive to
-    // acquire. The lock is never held across an `await`.
+    // A plain `Mutex` rather than an `RwLock`. Writes dominate: every stream sharing this state
+    // records once per emitted tick, while reads happen once per resumed symbol per reconnect --
+    // in the shared connection, choosing each symbol's replay window, and in each transformer as
+    // it is built. The critical section is a hash lookup and a field update with no allocation,
+    // which an `RwLock` would only make more expensive to acquire. The lock is never held across
+    // an `await`.
     marks: Mutex<FnvHashMap<LseResumeKey, MarkState>>,
 }
 
@@ -278,17 +261,6 @@ impl LseResumeState {
     /// The watermark filed under `key`, if anything has been emitted for it.
     pub(super) fn watermark(&self, key: &LseResumeKey) -> Option<LseWatermark> {
         self.lock().get(key).map(|state| state.watermark)
-    }
-
-    /// Every watermark recorded so far, across every dataset and kind.
-    ///
-    /// Taken as a snapshot so a transformer can carry its own drop counters without holding the
-    /// lock, or consulting it, per tick. The caller filters to its own dataset and kind.
-    pub(super) fn snapshot(&self) -> FnvHashMap<LseResumeKey, LseWatermark> {
-        self.lock()
-            .iter()
-            .map(|(key, state)| (key.clone(), state.watermark))
-            .collect()
     }
 
     // A poisoned lock means some other thread panicked mid-update. The data behind it is a
@@ -470,8 +442,7 @@ mod tests {
             LseResumeKey::new(ExchangeId::LseFutures, bare.clone(), PublicTrades.as_str());
 
         assert_eq!(
-            equities.clone().into_subscription(),
-            futures.clone().into_subscription(),
+            equities.subscription, futures.subscription,
             "this test is only meaningful while both datasets file under one identifier",
         );
 

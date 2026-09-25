@@ -90,6 +90,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ⚠️ Live option prints are provider data and may not be redistributed. See
   <https://londonstrategicedge.com/terms>.
 
+- **Every London Strategic Edge stream on one key now shares one WebSocket**
+  (`rustrade-data`, feature `lse`), in the new `lse::connection` module. The provider allows a key
+  one connection and refuses a second with `TOO_MANY_CONNECTIONS`, so until now a key could stream
+  one `subscribe` batch at a time: one dataset, one kind. Streams opened by one `LseSubscriber` and
+  its clones now share a socket owned by a connection task. That covers every dataset, both kinds
+  and option chains, across any number of `subscribe` calls. Each stream receives the raw frames
+  for its own symbols as an `LseAttachment`. The task reads only the routing key of each frame, so
+  each stream's parse is still the only full one.
+  - A symbol or underlying the socket already holds is not subscribed again, and one symbol held by
+    several streams costs one slot. When the last stream holding a symbol detaches, the task
+    unsubscribes it. When the last stream detaches, the socket closes.
+  - The subscription cap belongs to the connection. A batch is checked against everything the
+    connection would then hold, before anything is sent, and the error says the cap is shared. If
+    the provider rejects a subscribe anyway, that batch fails and what it sent is unsubscribed
+    again.
+  - When the socket drops, every stream on it ends. The first stream to re-attach reconnects and
+    re-subscribes everything the lost socket held. Frames for streams that have not re-attached
+    yet are held for `REATTACH_GRACE` (30 s), then discarded with a warning. They are also
+    discarded, with a warning, if the new socket is lost before those streams re-attach; a stream
+    that resumes asks for them again on the next reconnect.
+  - With resumption on, each resumed symbol gets one replay window, opened at the earliest
+    watermark among the streams holding it: the provider ignores `start` on a symbol it already
+    streams. Each stream silently drops replayed ticks it had already delivered. Replayed frames go
+    only to streams that asked for a window on that symbol.
+  - A separately built subscriber for the same key still opens its own connection, and the
+    provider's refusal is left visible.
+  - The WebSocket canary gains a shared-connection signal. Clones of one subscriber stream three
+    crypto batches across both kinds, re-reading symbols the connection already holds, and every
+    stream must deliver.
+
+  ⚠️ Data streamed over the connection is provider data and may not be redistributed. See
+  <https://londonstrategicedge.com/terms>.
+
 - **`OptionInstrumentMarketData`** (`rustrade`): an `InstrumentDataState` for option contracts that
   wraps `DefaultInstrumentMarketData` and holds the contract's most recent `OptionGreeks` with the
   instant they were stamped. Greeks never contribute a price; marking is delegated unchanged. Nothing
@@ -306,6 +339,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   custom `Subscriber`, add `type Transport = WebSocket;` and construct `Subscribed` with
   `transport:` in place of `websocket:`.
 
+- **BREAKING: `LseSubscriber` hands its streams an `LseAttachment` rather than a socket, and its
+  clones share one connection** (`rustrade-data`, feature `lse`). `LseSubscriber::Transport` is
+  `LseAttachment`. `LseStream` now reads from the attachment and no longer drives a socket of its
+  own. Clones used to open a connection each, and a key allows one, so every clone past the first
+  was refused. Clones now share one connection, and building one subscriber and cloning it is the
+  intended way to stream several batches on a key. `LseSubscriber::subscribe` now rejects an empty
+  batch, where it used to open a connection that never ticked. Its `Subscribed` never carries
+  buffered events, because frames go straight to the attachment. A stream that stops being polled
+  no longer back-pressures the socket, which must keep being read for the other streams; its frames
+  queue in memory until it is polled again or dropped. See the shared-connection entry under Added.
+
 - **BREAKING: `Open::id` and `RequestCancel::id` now carry a `VenueOrderId`, which distinguishes an
   order the venue named from one it did not** (`rustrade-execution`). Both fields previously held a
   plain `OrderId`, and that field had come to mean two different things. A venue that accepts an
@@ -400,11 +444,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The `lse_market_data` example no longer opens three connections on a key that holds one**
   (`rustrade-data`, feature `lse`). It subscribed two datasets and a second subscription kind, each
-  on a connection of its own, and a free key allows one concurrent connection, so the second and
-  third were refused with `TOO_MANY_CONNECTIONS`. It now makes a single subscription. The
-  `WEBSOCKET_URL` rustdoc, which claimed eight concurrent connections were served, now states the
-  one-connection limit and its consequence: a key streams one dataset and one subscription kind at a
-  time.
+  on a connection of its own. A free key allows one concurrent connection, so the second and third
+  were refused with `TOO_MANY_CONNECTIONS`. The same three batches now share one connection. The
+  `WEBSOCKET_URL` rustdoc claimed eight concurrent connections were served. It now states the
+  one-connection limit, and how every stream opened by a subscriber and its clones shares that
+  connection.
 
 - **The Alpaca account snapshot no longer leaves out an open order silently, and declares its
   order lists complete** (#369, `rustrade-execution`). The snapshot and `fetch_open_orders` dropped

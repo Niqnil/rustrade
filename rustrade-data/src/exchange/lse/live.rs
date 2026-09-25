@@ -1,9 +1,10 @@
 //! Live WebSocket subscription: authentication, the pre-subscribe guards, and the subscribe flow.
 
 use super::{
+    connection::{AttachRequest, LseAttachment, LseConnection},
     market::LseDataset,
     osi,
-    resume::{LseResumeKey, LseResumeState, epoch_seconds, subscription_id},
+    resume::{LseResumeState, epoch_seconds},
 };
 use crate::exchange::lse::transport::api_key_from_env;
 use crate::{
@@ -13,22 +14,21 @@ use crate::{
     subscriber::{
         Subscribed, Subscriber,
         mapper::{SubscriptionMapper, WebSocketSubMapper},
-        validator::SubscriptionValidator,
     },
     subscription::{Subscription, SubscriptionKind, SubscriptionMeta},
 };
 use chrono::{DateTime, Utc};
-use fnv::FnvHashSet;
+use fnv::{FnvHashMap, FnvHashSet};
 use futures::{SinkExt, StreamExt};
 use rustrade_instrument::exchange::ExchangeId;
 use rustrade_integration::{
     error::SocketError,
-    protocol::websocket::{WebSocket, WsMessage, connect},
+    protocol::websocket::{WebSocket, WsMessage},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use smol_str::SmolStr;
-use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 use tracing::{debug, warn};
 
 /// How long to wait for the `authenticated` frame.
@@ -85,6 +85,19 @@ impl LseCredentials {
 /// enumerates every symbol the key may subscribe to. That list is the only defence against this
 /// surface's quietest failure — see [`Self::subscribe`].
 ///
+/// # ⚠️ One connection per key: clone the subscriber, do not build a second one
+/// The provider allows a key **one** WebSocket, so every stream this subscriber and its clones open
+/// shares one socket — whatever the dataset, the kind or the option underlying, and across every
+/// `subscribe` call. [`StreamBuilder::subscribe`](crate::streams::builder::StreamBuilder::subscribe)
+/// clones the subscriber it is given, so passing one subscriber, or clones of it, to every call is
+/// all sharing takes. See [`connection`](super::connection) for how the socket is shared, how a
+/// reconnect is coordinated across the streams on it, and what the shared subscription cap means
+/// for a batch.
+///
+/// A subscriber built separately — a second [`LseSubscriber::new`] or [`LseSubscriber::from_env`]
+/// for the same key — opens a socket of its own, and the provider refuses it with
+/// `TOO_MANY_CONNECTIONS`.
+///
 /// # Example
 /// ```ignore
 /// use rustrade_data::exchange::lse::{LseCrypto, live::LseSubscriber};
@@ -103,15 +116,17 @@ impl LseCredentials {
 /// ```
 #[derive(Clone, Debug)]
 pub struct LseSubscriber {
-    credentials: LseCredentials,
+    connection: Arc<LseConnection>,
     resume: Option<Arc<LseResumeState>>,
 }
 
 impl LseSubscriber {
     /// Construct a subscriber with the provided credentials, without resumption.
+    ///
+    /// Each call opens a connection of its own when first used; clone the result to share it.
     pub fn new(credentials: LseCredentials) -> Self {
         Self {
-            credentials,
+            connection: Arc::new(LseConnection::new(credentials)),
             resume: None,
         }
     }
@@ -158,6 +173,17 @@ impl LseSubscriber {
     /// resume instant, so it is unlikely rather than impossible, and it is reported by a `warn!`
     /// naming the subscription and the instant rather than passing silently.
     ///
+    /// # Streams sharing a symbol share its replay window
+    /// Streams on one connection that hold one symbol — two kinds, or two datasets spelling it
+    /// alike — hold one provider subscription to it, and the provider opens one replay window per
+    /// subscription. A reconnect therefore opens each symbol's window at the **earliest** watermark
+    /// among the streams holding it, and every stream drops, silently, the replayed ticks before its
+    /// own watermark: it delivered them before the connection was lost. Replayed ticks reach only
+    /// the streams that resume that symbol. See [`connection`](super::connection).
+    ///
+    /// A clone made *before* this call shares the connection but not the state. That is supported —
+    /// each stream resumes from its own subscriber's state — but it is rarely what was meant.
+    ///
     /// Covers reconnects, not process restarts; see [`LseResumeState`].
     #[must_use]
     pub fn with_resume(mut self, state: Arc<LseResumeState>) -> Self {
@@ -169,56 +195,22 @@ impl LseSubscriber {
     pub(super) fn resume_state(&self) -> Option<Arc<LseResumeState>> {
         self.resume.clone()
     }
-
-    /// The instant a subscription to `market` should ask the provider to replay from.
-    ///
-    /// `None` — subscribe live, with no replay window — when the caller did not opt in, or when
-    /// nothing has been delivered for this symbol yet. The two are deliberately indistinguishable
-    /// here: a symbol added to a batch after a reconnect has no history to resume from and must
-    /// not be handed one.
-    ///
-    /// `exchange` and `kind` are the other two axes the watermark is filed under. Reading one
-    /// without them would resume this subscription from whatever another dataset or another kind
-    /// last delivered for the same symbol, which is a window that skips events this stream never
-    /// saw.
-    ///
-    /// # The watermark's instant is sent unmodified, and that is load-bearing
-    /// `start` is **inclusive**, so the provider replays every event carrying it and the
-    /// transformer skips the prefix already delivered. Nudging the instant forward here to exclude
-    /// them instead would drop every event at that instant the previous connection had not yet
-    /// reached — and on a dataset where a single instant carried 141 ticks, that is not a rounding
-    /// error. Rounding it *down* to a coarser resolution would be the mirror failure: the provider
-    /// filters at microsecond resolution, so a millisecond-floored `start` would re-serve a whole
-    /// millisecond of already-delivered, timestamp-distinct events on the datasets that carry
-    /// microseconds.
-    fn resume_start(
-        &self,
-        exchange: ExchangeId,
-        market: &str,
-        kind: &'static str,
-    ) -> Option<DateTime<Utc>> {
-        self.resume
-            .as_ref()
-            .and_then(|state| {
-                state.watermark(&LseResumeKey::new(exchange, subscription_id(market), kind))
-            })
-            .map(|watermark| watermark.time_exchange)
-    }
 }
 
 impl Subscriber for LseSubscriber {
     type SubMapper = WebSocketSubMapper;
-    type Transport = WebSocket;
+    type Transport = LseAttachment;
 
-    /// Connect, authenticate, check the batch, then subscribe.
+    /// Attach the batch to this subscriber's shared connection — connecting and authenticating
+    /// first if nothing is attached yet — check it, then subscribe whatever the connection does not
+    /// already hold.
     ///
     /// # ⚠️ Every guard runs before the first subscribe leaves the client, deliberately
     /// This surface confirms a subscription to a symbol it has never heard of: it answers
-    /// `subscribed`, never errors, never ticks, **and permanently consumes one of the connection's
-    /// slots**. A slot spent that way cannot be reclaimed without reconnecting, and the standard
-    /// subscription validator counts the confirmation as a success. So the requested symbols are
-    /// checked against the list the `authenticated` frame supplies *first*, and a batch that fails
-    /// costs nothing.
+    /// `subscribed`, never errors, never ticks, **and holds one of the connection's slots** until
+    /// it is unsubscribed — which nothing would prompt, since a confirmation is all the client ever
+    /// sees. So the requested symbols are checked against the list the `authenticated` frame
+    /// supplies *first*, and a batch that fails costs nothing.
     ///
     /// Two checks run over that list:
     /// - **Membership is enforced.** A symbol the provider does not offer fails the batch.
@@ -233,6 +225,15 @@ impl Subscriber for LseSubscriber {
     /// partial recovery. Failing the whole batch before sending is the only outcome that does not
     /// leave the caller guessing which subscriptions survived.
     ///
+    /// # ⚠️ The cap is the connection's, not the batch's
+    /// Every stream sharing the connection draws on one subscription cap, so a batch is checked
+    /// against what the connection would hold with it: the symbols and underlyings already held by
+    /// other streams count, and a symbol one of them already holds costs nothing more. A batch that
+    /// fits on its own can therefore be refused here.
+    ///
+    /// Should the provider reject a subscribe anyway, the batch fails and whatever it sent is
+    /// unsubscribed again, so a failed batch still holds no slot.
+    ///
     /// # Option contracts subscribe per underlying
     /// On [`LseOptions`](super::LseOptions) one subscribe covers an underlying's whole chain, so the
     /// batch is reduced to its distinct underlyings: that is what is sent, what the cap counts, and
@@ -242,10 +243,10 @@ impl Subscriber for LseSubscriber {
     /// options is rejected by the provider **by name** rather than confirmed.
     ///
     /// # Errors
-    /// Returns [`SocketError::Subscribe`] if the key is rejected, the handshake times out, the
-    /// batch exceeds the connection's subscription cap, any requested symbol is not offered, or —
-    /// on the options dataset — any contract has no OSI symbol or names an underlying with no
-    /// options.
+    /// Returns [`SocketError::Subscribe`] if the batch is empty, the key is rejected, the handshake
+    /// times out, the batch would take the connection over its subscription cap, any requested
+    /// symbol is not offered, or — on the options dataset — any contract has no OSI symbol or names
+    /// an underlying with no options.
     async fn subscribe<Exchange, Instrument, Kind>(
         &self,
         subscriptions: &[Subscription<Exchange, Instrument, Kind>],
@@ -261,83 +262,54 @@ impl Subscriber for LseSubscriber {
         let url = Exchange::url()?;
         debug!(%exchange, %url, ?subscriptions, "subscribing to London Strategic Edge WebSocket");
 
+        // Every subscription in a batch shares one `Kind`, and a watermark is filed under the
+        // dataset and the kind it was delivered for -- see `LseResumeKey`.
+        let Some(kind) = subscriptions
+            .first()
+            .map(|subscription| subscription.kind.as_str())
+        else {
+            return Err(SocketError::Subscribe(format!(
+                "no subscriptions were given to subscribe to on {exchange}"
+            )));
+        };
+
         let markets = requested_markets::<Exchange, Instrument, Kind>(subscriptions);
 
-        // Checked before connecting: a contract with no OSI symbol needs no socket to reject.
+        // Checked before attaching: a contract with no OSI symbol needs no socket to reject.
         let underlyings = subscribes_per_underlying(exchange)
             .then(|| option_underlyings(exchange, &markets))
             .transpose()?;
 
-        let mut websocket = connect(url).await?;
-        let authenticated = authenticate(&mut websocket, &self.credentials).await?;
-        debug!(
-            %exchange,
-            tier = ?authenticated.tier,
-            offered = authenticated.symbols.len(),
-            "authenticated to London Strategic Edge WebSocket",
-        );
-
-        match &underlyings {
-            Some(underlyings) => {
-                check_subscription_cap(exchange, underlyings, authenticated.max_subscriptions)?;
-            }
-            None => {
-                check_subscription_cap(exchange, &markets, authenticated.max_subscriptions)?;
-                check_symbols_are_offered(exchange, &markets, &authenticated)?;
-            }
-        }
-
         // Only the instrument map is taken from the standard mapper. The subscribe payloads are
-        // built here instead, because this subscriber is where a per-symbol replay window can be
-        // attached -- `Connector::requests` is a static function with no access to it. Both routes
-        // build their payloads with `subscribe_message`, so they cannot drift apart.
+        // built by the connection instead, because it alone knows what the socket already holds
+        // and which replay window each symbol needs -- `Connector::requests` is a static function
+        // with access to neither. Both routes build their payloads with `subscribe_message`, so
+        // they cannot drift apart.
         let SubscriptionMeta {
             instrument_map,
             ws_subscriptions: _,
         } = Self::SubMapper::map::<Exchange, Instrument, Kind>(subscriptions);
 
-        // Every subscription in a batch shares one `Kind`, and a watermark is filed under the
-        // dataset and the kind it was delivered for -- see `LseResumeKey`. `markets` is empty when
-        // `subscriptions` is, so the loop below never runs without one.
-        let kind = subscriptions
-            .first()
-            .map(|subscription| subscription.kind.as_str());
+        let transport = self
+            .connection
+            .attach(AttachRequest {
+                exchange,
+                url,
+                kind,
+                markets,
+                underlyings,
+                timeout: Exchange::subscription_timeout(),
+                resume: self.resume.clone(),
+            })
+            .await?;
 
-        // Option underlyings never carry a replay window -- see `LseOptions`.
-        let messages: Vec<WsMessage> = match &underlyings {
-            Some(underlyings) => underlyings
-                .iter()
-                .map(|underlying| subscribe_options_message(underlying))
-                .collect(),
-            None => markets
-                .iter()
-                .map(|market| {
-                    let start = kind.and_then(|kind| self.resume_start(exchange, market, kind));
-                    subscribe_message(market, start)
-                })
-                .collect(),
-        };
-
-        for message in messages {
-            debug!(%exchange, payload = ?message, "sending London Strategic Edge subscription");
-            websocket
-                .send(message)
-                .await
-                .map_err(|error| SocketError::WebSocket(Box::new(error)))?;
-        }
-
-        let (map, buffered_websocket_events) = Exchange::SubValidator::validate::<
-            Exchange,
-            Instrument::Key,
-            Kind,
-        >(instrument_map, &mut websocket)
-        .await?;
-
-        debug!(%exchange, "London Strategic Edge subscriptions confirmed");
+        debug!(%exchange, "attached to the London Strategic Edge connection");
         Ok(Subscribed {
-            transport: websocket,
-            map,
-            buffered_websocket_events,
+            transport,
+            map: instrument_map,
+            // The connection routes every frame for the batch into `transport` from the moment it
+            // is registered, so nothing is read ahead of it.
+            buffered_websocket_events: Vec::new(),
         })
     }
 }
@@ -369,6 +341,22 @@ pub(super) fn subscribe_options_message(underlying: &str) -> WsMessage {
     WsMessage::text(json!({ "action": "subscribe_options", "underlying": underlying }).to_string())
 }
 
+/// Build the payload releasing one symbol's subscription and its slot.
+///
+/// Answered by an `unsubscribed` frame, and ticks stop at once.
+pub(super) fn unsubscribe_message(symbol: &str) -> WsMessage {
+    WsMessage::text(json!({ "action": "unsubscribe", "symbol": symbol }).to_string())
+}
+
+/// Build the payload releasing an underlying's option chain and its slot.
+///
+/// Answered by an `options_unsubscribed` frame.
+pub(super) fn unsubscribe_options_message(underlying: &str) -> WsMessage {
+    WsMessage::text(
+        json!({ "action": "unsubscribe_options", "underlying": underlying }).to_string(),
+    )
+}
+
 /// Whether `exchange` subscribes per option underlying rather than per symbol.
 ///
 /// The one place that decision is made. The subscriber, the confirmation count, the transformer and
@@ -386,13 +374,14 @@ pub(super) fn option_underlyings(
     exchange: ExchangeId,
     markets: &[SmolStr],
 ) -> Result<Vec<SmolStr>, SocketError> {
+    let mut seen = FnvHashSet::default();
     let mut underlyings = Vec::<SmolStr>::new();
     let mut unspellable = Vec::new();
 
     for market in markets {
         match osi::root(market) {
             Some(root) => {
-                if !underlyings.iter().any(|underlying| underlying == root) {
+                if seen.insert(root) {
                     underlyings.push(SmolStr::new(root));
                 }
             }
@@ -416,7 +405,7 @@ pub(super) fn option_underlyings(
 ///
 /// Two subscriptions naming one symbol are one slot and one confirmation, and the instrument map
 /// is keyed the same way — so sending a payload per *subscription* would over-count against the
-/// cap and leave the validator waiting for a confirmation that never comes.
+/// cap and leave the handshake waiting for a confirmation that never comes.
 ///
 /// The batch is not bounded by the subscription cap: on the options dataset each entry is a
 /// *contract*, and one underlying can carry thousands of them into a single slot. Hence the
@@ -444,16 +433,18 @@ where
     markets
 }
 
-/// Reject a batch larger than the connection may hold.
+/// Reject a batch that would take the connection past what it may hold.
 ///
-/// `markets` is what each subscribe names, and so what each slot holds: a distinct symbol, or on
-/// the options dataset a distinct underlying.
+/// `added` counts the slots the batch needs that the connection does not hold yet — distinct
+/// symbols, or on the options dataset distinct underlyings — and `held` the slots other streams on
+/// the connection already hold. The cap is the connection's, so both count against it.
 ///
 /// # Errors
-/// Returns [`SocketError::Subscribe`] if `markets` exceeds `max_subscriptions`.
-fn check_subscription_cap(
+/// Returns [`SocketError::Subscribe`] if `held + added` exceeds `max_subscriptions`.
+pub(super) fn check_subscription_cap(
     exchange: ExchangeId,
-    markets: &[SmolStr],
+    added: usize,
+    held: usize,
     max_subscriptions: Option<u32>,
 ) -> Result<(), SocketError> {
     let Some(max) = max_subscriptions else {
@@ -468,7 +459,7 @@ fn check_subscription_cap(
     };
 
     let cap = usize::try_from(max).unwrap_or(usize::MAX);
-    if markets.len() > cap {
+    if held.saturating_add(added) > cap {
         let unit = if subscribes_per_underlying(exchange) {
             "option underlyings"
         } else {
@@ -476,14 +467,34 @@ fn check_subscription_cap(
         };
 
         return Err(SocketError::Subscribe(format!(
-            "{} {unit} requested on {exchange} but this connection holds at most {cap} - the \
-             provider's rejection does not name the subscriptions it refuses, so there is no \
-             partial subscription to recover and the batch is rejected before it is sent",
-            markets.len(),
+            "{added} {unit} requested on {exchange} beyond the {held} subscriptions this \
+             connection already holds, but it holds at most {cap} - the cap is shared by every \
+             stream opened by this subscriber and its clones, and the provider's rejection does \
+             not name the subscriptions it refuses, so there is no partial subscription to recover \
+             and the batch is rejected before it is sent",
         )));
     }
 
     Ok(())
+}
+
+/// The handshake's symbol list, indexed once per connection for the per-batch guard.
+///
+/// The list ran to over eight thousand entries when measured, and every batch attached to a
+/// connection is checked against it.
+#[derive(Debug, Default)]
+pub(super) struct OfferedSymbols(FnvHashMap<SmolStr, Option<SmolStr>>);
+
+impl OfferedSymbols {
+    /// Index the `authenticated` frame's symbols by spelling, keeping each one's category.
+    pub(super) fn new(symbols: Vec<LseSymbol>) -> Self {
+        Self(
+            symbols
+                .into_iter()
+                .map(|entry| (entry.symbol, entry.category))
+                .collect(),
+        )
+    }
 }
 
 /// Check every requested symbol against the list the handshake published.
@@ -491,12 +502,12 @@ fn check_subscription_cap(
 /// # Errors
 /// Returns [`SocketError::Subscribe`] if a symbol is not offered, or if one is offered under a
 /// category that contradicts the dataset being subscribed on.
-fn check_symbols_are_offered(
+pub(super) fn check_symbols_are_offered(
     exchange: ExchangeId,
     markets: &[SmolStr],
-    authenticated: &LseAuthenticated,
+    offered: &OfferedSymbols,
 ) -> Result<(), SocketError> {
-    if authenticated.symbols.is_empty() {
+    if offered.0.is_empty() {
         warn!(
             %exchange,
             "London Strategic Edge published no symbol list; a typo'd symbol will be confirmed and \
@@ -505,21 +516,16 @@ fn check_symbols_are_offered(
         return Ok(());
     }
 
-    let offered: HashMap<&str, Option<&str>> = authenticated
-        .symbols
-        .iter()
-        .map(|entry| (entry.symbol.as_str(), entry.category.as_deref()))
-        .collect();
     let expected = expected_categories(exchange);
 
     let mut unknown = Vec::new();
     let mut miscategorised = Vec::new();
 
     for market in markets {
-        match offered.get(market.as_str()) {
+        match offered.0.get(market.as_str()) {
             None => unknown.push(market.as_str()),
             Some(category) => {
-                if let Some(category) = *category
+                if let Some(category) = category.as_deref()
                     && !expected.is_empty()
                     && !expected.contains(&category)
                     && is_published_category(category)
@@ -583,7 +589,7 @@ fn is_published_category(category: &str) -> bool {
 }
 
 /// Authenticate, and return the frame the provider answers with.
-async fn authenticate(
+pub(super) async fn authenticate(
     websocket: &mut WebSocket,
     credentials: &LseCredentials,
 ) -> Result<LseAuthenticated, SocketError> {
@@ -732,9 +738,7 @@ pub struct LseSymbol {
 mod tests {
     use super::*;
     use crate::exchange::lse::LseFx;
-    // `SubscriptionKind` is already in scope through `use super::*`, which is what `as_str` below
-    // resolves through.
-    use crate::subscription::{book::OrderBooksL1, trade::PublicTrades};
+    use crate::subscription::trade::PublicTrades;
     use rustrade_instrument::instrument::market_data::MarketDataInstrument;
     use rustrade_instrument::instrument::market_data::kind::MarketDataInstrumentKind;
 
@@ -807,97 +811,6 @@ mod tests {
             .unwrap_or_else(|| panic!("start must be a JSON number, not {:?}", payload["start"]));
         let drift = seconds * 1_000_000.0 - micros_as_f64(start);
         assert!(drift.abs() < 0.5, "start drifted {drift} microseconds");
-    }
-
-    /// A subscription that has delivered nothing has nothing to resume from, and must be sent the
-    /// same payload a first-ever subscribe sends.
-    #[test]
-    fn a_subscriber_without_resume_asks_for_no_replay_window() {
-        let subscriber = LseSubscriber::new(LseCredentials::new("key"));
-
-        assert_eq!(
-            subscriber.resume_start(ExchangeId::LseCrypto, "BTC/USD", PublicTrades.as_str()),
-            None
-        );
-    }
-
-    /// A reconnect re-subscribes every symbol in the batch, including ones added since the last
-    /// connection. Only those with a watermark may carry a window.
-    #[test]
-    fn a_resuming_subscriber_asks_for_a_window_only_where_it_has_delivered() {
-        let state = Arc::new(LseResumeState::new());
-        state.record(
-            &LseResumeKey::new(
-                ExchangeId::LseCrypto,
-                subscription_id("BTC/USD"),
-                PublicTrades.as_str(),
-            ),
-            at("2026-08-14T10:16:55.161234Z"),
-        );
-
-        let subscriber = LseSubscriber::new(LseCredentials::new("key")).with_resume(state);
-
-        assert_eq!(
-            subscriber.resume_start(ExchangeId::LseCrypto, "BTC/USD", PublicTrades.as_str()),
-            Some(at("2026-08-14T10:16:55.161234Z")),
-        );
-        assert_eq!(
-            subscriber.resume_start(ExchangeId::LseCrypto, "ETH/USD", PublicTrades.as_str()),
-            None
-        );
-    }
-
-    /// The provider has one channel, so both kinds tick under one wire identifier. A window is
-    /// asked for on the strength of what *this* kind delivered, never what another one did — the
-    /// trailing stream would otherwise resume past events it never saw.
-    #[test]
-    fn a_window_is_asked_for_per_kind_rather_than_per_symbol() {
-        let state = Arc::new(LseResumeState::new());
-        state.record(
-            &LseResumeKey::new(
-                ExchangeId::LseCrypto,
-                subscription_id("BTC/USD"),
-                PublicTrades.as_str(),
-            ),
-            at("2026-08-14T10:16:55.161234Z"),
-        );
-
-        let subscriber = LseSubscriber::new(LseCredentials::new("key")).with_resume(state);
-
-        assert_eq!(
-            subscriber.resume_start(ExchangeId::LseCrypto, "BTC/USD", OrderBooksL1.as_str()),
-            None,
-            "a kind that has delivered nothing must subscribe live, not from another kind's mark",
-        );
-    }
-
-    /// The five dataset connectors share one endpoint and one identifier construction, and the
-    /// `Bare` symbol shape rebuilds a symbol from the base asset alone — so one ticker on two of
-    /// them produces one wire identifier. A window read across that boundary would resume this
-    /// dataset from what a different one delivered.
-    #[test]
-    fn a_window_is_asked_for_per_dataset_rather_than_per_symbol() {
-        let state = Arc::new(LseResumeState::new());
-        state.record(
-            &LseResumeKey::new(
-                ExchangeId::LseEquities,
-                subscription_id("AAPL"),
-                PublicTrades.as_str(),
-            ),
-            at("2026-08-14T10:16:55.161234Z"),
-        );
-
-        let subscriber = LseSubscriber::new(LseCredentials::new("key")).with_resume(state);
-
-        assert_eq!(
-            subscriber.resume_start(ExchangeId::LseEquities, "AAPL", PublicTrades.as_str()),
-            Some(at("2026-08-14T10:16:55.161234Z")),
-        );
-        assert_eq!(
-            subscriber.resume_start(ExchangeId::LseFutures, "AAPL", PublicTrades.as_str()),
-            None,
-            "a dataset that has delivered nothing must subscribe live, not from another's mark",
-        );
     }
 
     /// Two subscriptions naming one symbol are one slot and one confirmation. Sending two payloads
@@ -988,7 +901,7 @@ mod tests {
     #[test]
     fn an_over_cap_options_batch_is_reported_in_underlyings() {
         let requested = markets(&["SPY", "QQQ", "AAPL"]);
-        let error = check_subscription_cap(ExchangeId::LseOptions, &requested, Some(2))
+        let error = check_subscription_cap(ExchangeId::LseOptions, requested.len(), 0, Some(2))
             .unwrap_err()
             .to_string();
 
@@ -996,16 +909,30 @@ mod tests {
         assert!(error.contains("at most 2"), "{error}");
     }
 
+    /// The cap is the connection's: slots other streams on it already hold count, so a batch that
+    /// fits on its own is refused when the connection it joins is nearly full.
+    #[test]
+    fn slots_held_by_other_streams_count_against_the_cap() {
+        let error = check_subscription_cap(ExchangeId::LseFx, 2, 15, Some(16))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("2 symbols"), "{error}");
+        assert!(error.contains("already holds"), "{error}");
+        assert!(error.contains("shared by every stream"), "{error}");
+        assert!(check_subscription_cap(ExchangeId::LseFx, 1, 15, Some(16)).is_ok());
+    }
+
     #[test]
     fn a_batch_within_the_cap_is_accepted() {
         let requested = markets(&["EUR/USD", "GBP/USD"]);
-        assert!(check_subscription_cap(ExchangeId::LseFx, &requested, Some(2)).is_ok());
+        assert!(check_subscription_cap(ExchangeId::LseFx, requested.len(), 0, Some(2)).is_ok());
     }
 
     #[test]
     fn a_batch_over_the_cap_is_rejected_before_it_is_sent() {
         let requested = markets(&["EUR/USD", "GBP/USD", "XAU/USD"]);
-        let error = check_subscription_cap(ExchangeId::LseFx, &requested, Some(2))
+        let error = check_subscription_cap(ExchangeId::LseFx, requested.len(), 0, Some(2))
             .unwrap_err()
             .to_string();
 
@@ -1017,7 +944,7 @@ mod tests {
     #[test]
     fn an_unreported_cap_does_not_reject_the_batch() {
         let requested = markets(&["EUR/USD"]);
-        assert!(check_subscription_cap(ExchangeId::LseFx, &requested, None).is_ok());
+        assert!(check_subscription_cap(ExchangeId::LseFx, requested.len(), 0, None).is_ok());
     }
 
     #[test]
@@ -1025,7 +952,14 @@ mod tests {
         let frame = authenticated(&[("EUR/USD", Some("Forex"))], Some(16));
         let requested = markets(&["EUR/USD"]);
 
-        assert!(check_symbols_are_offered(ExchangeId::LseFx, &requested, &frame).is_ok());
+        assert!(
+            check_symbols_are_offered(
+                ExchangeId::LseFx,
+                &requested,
+                &OfferedSymbols::new(frame.symbols)
+            )
+            .is_ok()
+        );
     }
 
     /// The failure this guard exists for: the provider confirms a symbol it does not offer, never
@@ -1035,9 +969,13 @@ mod tests {
         let frame = authenticated(&[("EUR/USD", Some("Forex"))], Some(16));
         let requested = markets(&["EUR/USD", "NOPE_XYZ"]);
 
-        let error = check_symbols_are_offered(ExchangeId::LseFx, &requested, &frame)
-            .unwrap_err()
-            .to_string();
+        let error = check_symbols_are_offered(
+            ExchangeId::LseFx,
+            &requested,
+            &OfferedSymbols::new(frame.symbols),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("NOPE_XYZ"), "{error}");
     }
 
@@ -1054,7 +992,14 @@ mod tests {
         let frame = authenticated(&[], Some(16));
         let requested = markets(&["NOPE_XYZ"]);
 
-        assert!(check_symbols_are_offered(ExchangeId::LseFx, &requested, &frame).is_ok());
+        assert!(
+            check_symbols_are_offered(
+                ExchangeId::LseFx,
+                &requested,
+                &OfferedSymbols::new(frame.symbols)
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1062,9 +1007,13 @@ mod tests {
         let frame = authenticated(&[("AAPL", Some("Stocks"))], Some(16));
         let requested = markets(&["AAPL"]);
 
-        let error = check_symbols_are_offered(ExchangeId::LseFx, &requested, &frame)
-            .unwrap_err()
-            .to_string();
+        let error = check_symbols_are_offered(
+            ExchangeId::LseFx,
+            &requested,
+            &OfferedSymbols::new(frame.symbols),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("AAPL is Stocks"), "{error}");
     }
 
@@ -1088,7 +1037,14 @@ mod tests {
         let frame = authenticated(&[("EUR/USD", Some("FX Majors"))], Some(16));
         let requested = markets(&["EUR/USD"]);
 
-        assert!(check_symbols_are_offered(ExchangeId::LseFx, &requested, &frame).is_ok());
+        assert!(
+            check_symbols_are_offered(
+                ExchangeId::LseFx,
+                &requested,
+                &OfferedSymbols::new(frame.symbols)
+            )
+            .is_ok()
+        );
     }
 
     /// Roughly half the published entries carry no category, so absence must never be a mismatch.
@@ -1097,7 +1053,14 @@ mod tests {
         let frame = authenticated(&[("EUR/USD", None)], Some(16));
         let requested = markets(&["EUR/USD"]);
 
-        assert!(check_symbols_are_offered(ExchangeId::LseFx, &requested, &frame).is_ok());
+        assert!(
+            check_symbols_are_offered(
+                ExchangeId::LseFx,
+                &requested,
+                &OfferedSymbols::new(frame.symbols)
+            )
+            .is_ok()
+        );
     }
 
     /// Datasets the provider publishes no category for must not reject the categories it does
@@ -1109,7 +1072,14 @@ mod tests {
         let frame = authenticated(&[("ES.F", Some("Anything"))], Some(16));
         let requested = markets(&["ES.F"]);
 
-        assert!(check_symbols_are_offered(ExchangeId::LseFutures, &requested, &frame).is_ok());
+        assert!(
+            check_symbols_are_offered(
+                ExchangeId::LseFutures,
+                &requested,
+                &OfferedSymbols::new(frame.symbols)
+            )
+            .is_ok()
+        );
     }
 
     /// Five datasets stand behind `LseCfd` and the provider labels two of them, so its expectation
@@ -1128,7 +1098,14 @@ mod tests {
         let frame = authenticated(&[("VIX/USD", Some("Volatility"))], Some(16));
         let requested = markets(&["VIX/USD"]);
 
-        assert!(check_symbols_are_offered(ExchangeId::LseCfd, &requested, &frame).is_ok());
+        assert!(
+            check_symbols_are_offered(
+                ExchangeId::LseCfd,
+                &requested,
+                &OfferedSymbols::new(frame.symbols)
+            )
+            .is_ok()
+        );
     }
 
     /// The other half of the same rule: a label we recognise as belonging elsewhere still fails,
@@ -1138,9 +1115,13 @@ mod tests {
         let frame = authenticated(&[("AAPL", Some("Stocks"))], Some(16));
         let requested = markets(&["AAPL"]);
 
-        let error = check_symbols_are_offered(ExchangeId::LseCfd, &requested, &frame)
-            .unwrap_err()
-            .to_string();
+        let error = check_symbols_are_offered(
+            ExchangeId::LseCfd,
+            &requested,
+            &OfferedSymbols::new(frame.symbols),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("AAPL is Stocks"), "{error}");
     }
 
@@ -1154,7 +1135,14 @@ mod tests {
         let frame = authenticated(&[("AAPL", Some("Stocks")), ("SPY", Some("ETFs"))], Some(16));
         let requested = markets(&["AAPL", "SPY"]);
 
-        assert!(check_symbols_are_offered(ExchangeId::LseEquities, &requested, &frame).is_ok());
+        assert!(
+            check_symbols_are_offered(
+                ExchangeId::LseEquities,
+                &requested,
+                &OfferedSymbols::new(frame.symbols)
+            )
+            .is_ok()
+        );
     }
 
     /// The server opens with a `welcome` frame before the key is ever sent, so treating any frame

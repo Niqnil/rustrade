@@ -26,7 +26,7 @@
 //! is held to a floor set more than an order of magnitude below every rate ever measured here,
 //! rather than pinned to a figure.
 //!
-//! # The six signals it does assert
+//! # The seven signals it does assert
 //!
 //! 1. **Every subscribed symbol actually ticks.** This surface's quietest failure is a subscription
 //!    that is *confirmed and then silent* — the provider answers `subscribed` for a symbol it does
@@ -68,6 +68,10 @@
 //!    the session is open is read from the REST tape rather than a clock, which knows nothing of
 //!    holidays: a settled minute holding prints is an open market. Outside the session the print
 //!    half reports `CANARY_SKIP`, which is why `lse-weekly.yml` is scheduled inside it.
+//! 7. **One connection serves several batches and both kinds.** Clones of one subscriber share a
+//!    socket, and every stream on it must deliver: a batch the provider confirmed and then stopped
+//!    serving on a shared socket, or a frame no longer carrying the key the connection routes by,
+//!    would leave every synthetic test green and a shared stream silent.
 //!
 //! # Skip vs. fail contract
 //!
@@ -88,10 +92,10 @@
 //!
 //! The provider permits **one** WebSocket connection per API key, and says so plainly when it
 //! refuses a second: `TOO_MANY_CONNECTIONS: Max 1 concurrent websocket connection(s) for this API
-//! key; 1 already open from this same address.` Four of the five tests below open a socket, and
-//! Rust's harness runs the tests in a file in parallel, so unserialised they contend for the one
-//! slot: whichever connects first proceeds and the rest fail inside their `expect`, before
-//! asserting anything at all.
+//! key; 1 already open from this same address.` Every test below opens a socket, each through a
+//! subscriber of its own, and Rust's harness runs the tests in a file in parallel, so unserialised
+//! they contend for the one slot: whichever connects first proceeds and the rest fail inside their
+//! `expect`, before asserting anything at all.
 //!
 //! That failure is worse than an ordinary flake, for the reason the vault canary gives about its
 //! own cap: it presents as four red tests on the surface this file exists to watch, it is not a
@@ -169,7 +173,7 @@ use futures_util::{Stream, StreamExt};
 use rustrade_data::{
     Identifier, MarketStream, NoInitialSnapshots,
     error::DataError,
-    event::MarketEvent,
+    event::{DataKind, MarketEvent},
     exchange::lse::{
         LseCfd, LseCrypto, LseOptions,
         live::LseSubscriber,
@@ -181,10 +185,15 @@ use rustrade_data::{
     },
     streams::{
         Streams,
+        consumer::MarketStreamResult,
         reconnect::{Event, stream::ReconnectingStream},
     },
     subscriber::Subscriber,
-    subscription::{Subscription, trade::PublicTrade, trade::PublicTrades},
+    subscription::{
+        Subscription,
+        book::OrderBooksL1,
+        trade::{PublicTrade, PublicTrades},
+    },
 };
 use rustrade_instrument::{
     exchange::ExchangeId,
@@ -1189,4 +1198,131 @@ async fn option_contracts_spell_subscribe_and_print_as_expected() {
              summer time, 14:30-21:00 in winter)."
         ),
     }
+}
+
+/// Signal 7. Several batches and both kinds from clones of one subscriber, all over one socket.
+///
+/// # What only the provider can answer
+///
+/// `lse_ws_handshake.rs` proves the connection task routes, de-duplicates and fans out correctly,
+/// against a server this repository wrote. What that cannot notice is the provider changing the
+/// premises underneath it: that one socket serves several subscribe batches at once, that a symbol
+/// subscribed once ticks for every kind reading it, and that the frames still carry the routing key
+/// the task sorts them by. Any of those failing leaves the handshake green and a shared stream
+/// silent, so each stream here must deliver on its own.
+///
+/// # ⚠️ What it deliberately does NOT assert
+///
+/// **That the streams share exactly one socket.** That is a property of this crate's code, not of
+/// the provider, and `lse_ws_handshake.rs` asserts it exactly, on every CI run, by counting the
+/// connections its synthetic provider accepts. Proving it again here would mean opening a second
+/// socket to watch the provider refuse it, which tests the provider's connection policy rather than
+/// any premise this integration rests on: a provider that lifted the cap would fail this for a
+/// non-defect, which is the failure this file's own reasoning rules out. While the cap stands, a
+/// batch that opened a socket of its own would fail `init` here with `TOO_MANY_CONNECTIONS` anyway.
+///
+/// # Why this shape
+///
+/// Three batches, crypto only, so a scheduled run with every other market shut still exercises it.
+/// The two trade batches are separate `subscribe` calls, so they are separate attaches to the
+/// connection. The quote batch re-reads both symbols the trade batches already hold: on the wire
+/// that is two slots and no further subscribe, and each frame must reach both kinds.
+#[tokio::test]
+#[ignore = "opens a live connection and spends the shared provider allowance; run on demand"]
+#[serial]
+async fn clones_of_one_subscriber_share_one_socket_across_batches_and_kinds() {
+    let Some(subscriber) = subscriber() else {
+        return;
+    };
+
+    let symbols = [spot("btc"), spot("eth")];
+    let trades = |instrument: &MarketDataInstrument| {
+        Subscription::<LseCrypto, MarketDataInstrument, PublicTrades>::new(
+            LseCrypto::default(),
+            instrument.clone(),
+            PublicTrades,
+        )
+    };
+
+    let streams: Streams<MarketStreamResult<MarketDataInstrument, DataKind>> =
+        Streams::builder_multi()
+            .add(
+                Streams::<PublicTrades>::builder()
+                    .subscribe(subscriber.clone(), [trades(&symbols[0])])
+                    .subscribe(subscriber.clone(), [trades(&symbols[1])]),
+            )
+            .add(Streams::<OrderBooksL1>::builder().subscribe(
+                subscriber,
+                symbols.clone().map(|instrument| {
+                    Subscription::<LseCrypto, MarketDataInstrument, OrderBooksL1>::new(
+                        LseCrypto::default(),
+                        instrument,
+                        OrderBooksL1,
+                    )
+                }),
+            ))
+            .init()
+            .await
+            .expect(
+                "every batch from clones of one subscriber should attach to one shared connection - \
+                 a TOO_MANY_CONNECTIONS here means a batch opened a socket of its own",
+            );
+
+    // Decode failures are counted as well as printed: the handler filters them out of the stream,
+    // so an undecodable frame arrives below as nothing at all.
+    let (failures, on_error) = decode_failures();
+    let mut stream = Box::pin(streams.select_all().with_error_handler(on_error));
+
+    // One entry per stream the connection must feed: a kind and a symbol. A symbol held by both
+    // kinds is one subscription on the wire and two entries here, which is the point.
+    let mut pending = ["public_trade", "l1"]
+        .into_iter()
+        .flat_map(|kind| symbols.iter().map(move |symbol| (kind, symbol.clone())))
+        .collect::<Vec<_>>();
+    let expected = pending.len();
+    let mut reconnects = 0usize;
+
+    let deadline = Instant::now() + DELIVERY_TIMEOUT;
+    let _ = tokio::time::timeout_at(deadline, async {
+        while !pending.is_empty() {
+            match stream.next().await {
+                Some(Event::Item(event)) => {
+                    assert_stamped_plausibly(&event.instrument, event.time_exchange, MAX_TICK_AGE);
+
+                    let kind = event.kind.kind_name();
+                    if let Some(index) = pending
+                        .iter()
+                        .position(|(k, symbol)| *k == kind && *symbol == event.instrument)
+                    {
+                        let (kind, symbol) = pending.swap_remove(index);
+                        println!("CANARY_OK: {symbol} delivered {kind} over the shared connection");
+                    }
+                }
+                // Counted, not asserted: a reconnect is the likeliest innocent cause of a timeout,
+                // and the report below needs it to be read correctly.
+                Some(Event::Reconnecting(origin)) => {
+                    reconnects += 1;
+                    println!("CANARY: {origin} is reconnecting mid-test");
+                }
+                None => panic!("the market stream terminated before every stream delivered"),
+            }
+        }
+    })
+    .await;
+
+    // Before the silence below is read as a routing failure, for the reason given on
+    // `decode_failures`.
+    assert_every_frame_decoded(&failures);
+
+    assert!(
+        pending.is_empty(),
+        "{pending:?} delivered nothing in {DELIVERY_TIMEOUT:?} on a continuously-traded venue, with \
+         {reconnects} reconnect(s) and every frame decoding - the shared connection confirmed these \
+         streams and then never routed them a frame",
+    );
+
+    println!(
+        "CANARY_OK: {expected} streams across 3 batches and 2 kinds delivered over one connection, \
+         {reconnects} reconnect(s)",
+    );
 }

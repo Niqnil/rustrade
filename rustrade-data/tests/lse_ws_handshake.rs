@@ -61,17 +61,14 @@ use rustrade_data::{
             Lse,
             channel::LseChannel,
             live::{LseCredentials, LseSubscriber},
-            market::{LseMarket, LseServer, LseSymbolShape},
+            market::{LseMarket, LseQuoteServer, LseServer, LseSymbolShape},
             resume::LseResumeState,
             stream::LseStream,
         },
         subscription::ExchangeSub,
     },
     subscriber::Subscriber,
-    subscription::{
-        Subscription,
-        trade::{PublicTrade, PublicTrades},
-    },
+    subscription::{Subscription, book::OrderBooksL1, trade::PublicTrades},
 };
 use rustrade_instrument::{
     exchange::ExchangeId,
@@ -86,8 +83,17 @@ use rustrade_instrument::{
 use rustrade_integration::subscription::SubscriptionId;
 use serde_json::{Value, json};
 use serial_test::serial;
-use std::sync::{Arc, Mutex};
-use tokio::net::{TcpListener, TcpStream};
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::mpsc,
+};
 use tokio_tungstenite::tungstenite::Message;
 
 /// The endpoint the connector under test resolves to, set by whichever harness is running.
@@ -124,6 +130,8 @@ impl ExchangeServer for HarnessServer {
 impl LseServer for HarnessServer {
     const SYMBOL_SHAPE: LseSymbolShape = LseSymbolShape::Pair;
 }
+
+impl LseQuoteServer for HarnessServer {}
 
 type HarnessLse = Lse<HarnessServer>;
 
@@ -585,13 +593,13 @@ async fn a_connection_closed_during_authentication_is_reported() {
     assert!(harness.drained().await.is_empty());
 }
 
-/// Ticks and replay boundaries arrive while *other* symbols in the batch are still being confirmed,
-/// and neither deserialises as a subscription response. They must survive as buffered events: the
-/// clamp check reads the replay boundary out of that buffer, and the stream replays the ticks from
-/// it. A frame dropped here is market data lost before the stream ever starts.
+/// Ticks arrive while *other* symbols in the batch are still being confirmed, and must reach the
+/// stream: a frame dropped here is market data lost before the stream ever starts. A replay's
+/// boundary frame arriving alongside must not, when nothing asked this stream for a replay — it
+/// belongs to whichever stream on the connection did.
 #[tokio::test]
 #[serial]
-async fn frames_arriving_during_validation_are_buffered_rather_than_dropped() {
+async fn frames_arriving_during_the_handshake_reach_the_stream_rather_than_being_dropped() {
     let script = Script {
         frames_before_confirmation: vec![
             json!({"type": "replay_started", "symbol": "BTC/USD",
@@ -604,34 +612,53 @@ async fn frames_arriving_during_validation_are_buffered_rather_than_dropped() {
     };
     let harness = Harness::start(script).await;
 
-    let subscribed = subscriber()
+    let mut subscribed = subscriber()
         .subscribe(&[subscription("btc")])
         .await
         .unwrap();
 
-    // Collected before the connection is released, because dropping `Subscribed` takes the
-    // buffered events with it.
-    let buffered = subscribed
-        .buffered_websocket_events
-        .iter()
-        .map(|message| match message {
-            rustrade_integration::protocol::websocket::WsMessage::Text(text) => {
-                serde_json::from_str::<Value>(text.as_str()).unwrap()
-            }
-            other => panic!("unexpected buffered frame: {other:?}"),
-        })
-        .collect::<Vec<_>>();
+    // The connection routes a batch's frames into its transport from the moment the batch is
+    // registered, so nothing is left to buffer.
+    assert!(subscribed.buffered_websocket_events.is_empty());
+
+    let mut received = Vec::new();
+    while let Ok(Some(frame)) =
+        tokio::time::timeout(Duration::from_millis(200), subscribed.transport.next()).await
+    {
+        let rustrade_integration::protocol::websocket::WsMessage::Text(text) = frame.unwrap()
+        else {
+            panic!("expected a text frame");
+        };
+        received.push(serde_json::from_str::<Value>(text.as_str()).unwrap());
+    }
 
     drop(subscribed);
     assert_eq!(symbols(&harness.drained().await), vec!["BTC/USD"]);
 
+    assert_eq!(received.len(), 1, "{received:?}");
+    assert_eq!(received[0]["type"], "tick");
+}
+
+/// The live half of the same path: a tick sent before the confirmation reaches the stream.
+#[tokio::test]
+#[serial]
+async fn a_live_tick_sent_before_the_confirmation_reaches_the_stream() {
+    const INSTANT: &str = "2026-08-14T10:16:55.161234+00:00";
+
+    let harness = Harness::start(Script {
+        frames_before_confirmation: vec![tick_frame("BTC/USD", INSTANT, 42000.5, false)],
+        ..Script::default()
+    })
+    .await;
+
+    let mut opened = stream(&subscriber(), &[subscription("btc")]).await;
     assert_eq!(
-        buffered.len(),
-        2,
-        "both frames should have been buffered: {buffered:?}",
+        next_event(&mut opened).await.time_exchange,
+        INSTANT.parse::<DateTime<Utc>>().unwrap(),
     );
-    assert_eq!(buffered[0]["type"], "replay_started");
-    assert_eq!(buffered[1]["type"], "tick");
+
+    drop(opened);
+    drop(harness.drained().await);
 }
 
 /// A tick frame as the provider spells it, live or replayed.
@@ -662,11 +689,10 @@ async fn stream(
 }
 
 /// The next market event, or a failure naming which of the three ways it did not arrive.
-async fn next_event<S>(stream: &mut S) -> MarketEvent<MarketDataInstrument, PublicTrade>
+async fn next_event<S, Event>(stream: &mut S) -> MarketEvent<MarketDataInstrument, Event>
 where
-    S: futures_util::Stream<
-            Item = Result<MarketEvent<MarketDataInstrument, PublicTrade>, DataError>,
-        > + Unpin,
+    S: futures_util::Stream<Item = Result<MarketEvent<MarketDataInstrument, Event>, DataError>>
+        + Unpin,
 {
     tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
         .await
@@ -922,4 +948,619 @@ async fn only_registered_contracts_reach_the_options_stream() {
     assert_eq!(event.exchange, ExchangeId::LseOptions);
     assert_eq!(event.kind.price, dec!(1.25));
     assert_eq!(event.kind.amount, dec!(3));
+}
+
+// ---------------------------------------------------------------------------------------------
+// One connection per key: every stream a subscriber and its clones open shares one socket.
+// ---------------------------------------------------------------------------------------------
+
+/// What a test tells the connection it is serving.
+enum Control {
+    Send(Value),
+    /// Drop the socket without a close frame, as a network failure would.
+    Drop,
+}
+
+/// A synthetic provider that stays up across connections and is driven by the test.
+///
+/// The scripted [`Harness`] serves one connection and answers from a script, which suits a single
+/// handshake. Sharing is about what happens *between* handshakes — a second stream joining, one
+/// leaving, the socket failing under all of them — so this one serves every connection the client
+/// opens, logs every payload but `auth` against the connection it arrived on, and sends frames when
+/// the test says to.
+struct Provider {
+    log: Arc<Mutex<Vec<(usize, Value)>>>,
+    connections: Arc<AtomicUsize>,
+    closed: Arc<AtomicUsize>,
+    control: Arc<Mutex<Option<mpsc::UnboundedSender<Control>>>>,
+    accepting: tokio::task::JoinHandle<()>,
+}
+
+impl Provider {
+    async fn start(
+        auth_reply: Value,
+        underlyings_without_options: &'static [&'static str],
+    ) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url: &'static str =
+            Box::leak(format!("ws://{}", listener.local_addr().unwrap()).into_boxed_str());
+        *HARNESS_URL.lock().unwrap() = Some(url);
+
+        let log = Arc::<Mutex<Vec<(usize, Value)>>>::default();
+        let connections = Arc::<AtomicUsize>::default();
+        let closed = Arc::<AtomicUsize>::default();
+        let control = Arc::<Mutex<Option<mpsc::UnboundedSender<Control>>>>::default();
+
+        let shared = (
+            Arc::clone(&log),
+            Arc::clone(&connections),
+            Arc::clone(&closed),
+            Arc::clone(&control),
+        );
+
+        let accepting = tokio::spawn(async move {
+            let (log, connections, closed, control) = shared;
+            while let Ok((stream, _)) = listener.accept().await {
+                let number = connections.fetch_add(1, Ordering::SeqCst) + 1;
+                let (tx, rx) = mpsc::unbounded_channel();
+                *control.lock().unwrap() = Some(tx);
+
+                tokio::spawn(serve_connection(
+                    stream,
+                    number,
+                    auth_reply.clone(),
+                    underlyings_without_options,
+                    Arc::clone(&log),
+                    rx,
+                    Arc::clone(&closed),
+                ));
+            }
+        });
+
+        Self {
+            log,
+            connections,
+            closed,
+            control,
+            accepting,
+        }
+    }
+
+    /// Send `frame` on the newest connection.
+    fn push(&self, frame: Value) {
+        self.control().send(Control::Send(frame)).unwrap();
+    }
+
+    fn drop_connection(&self) {
+        self.control().send(Control::Drop).unwrap();
+    }
+
+    fn control(&self) -> mpsc::UnboundedSender<Control> {
+        self.control
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("no connection has been opened yet")
+    }
+
+    fn connections(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
+    }
+
+    /// The payloads received on connection `number`, in arrival order.
+    fn sent_on(&self, number: usize) -> Vec<Value> {
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(on, _)| *on == number)
+            .map(|(_, payload)| payload.clone())
+            .collect()
+    }
+
+    /// Wait until `done` holds, failing with `what` after five seconds.
+    ///
+    /// The client acts on its own task, so an effect it has promised — an unsubscribe, a closed
+    /// socket — is observed by waiting for it rather than by sampling once.
+    async fn until(&self, what: &str, done: impl Fn(&Self) -> bool) {
+        let waited = tokio::time::timeout(Duration::from_secs(5), async {
+            while !done(self) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        assert!(
+            waited.is_ok(),
+            "timed out waiting for {what}: {:?}",
+            self.log
+        );
+    }
+
+    /// Wait for every connection opened so far to have closed. Only then is a log complete.
+    async fn all_closed(&self) {
+        self.until("every connection to close", |provider| {
+            provider.closed.load(Ordering::SeqCst) == provider.connections()
+        })
+        .await;
+    }
+}
+
+impl Drop for Provider {
+    fn drop(&mut self) {
+        self.accepting.abort();
+    }
+}
+
+async fn serve_connection(
+    stream: TcpStream,
+    number: usize,
+    auth_reply: Value,
+    underlyings_without_options: &'static [&'static str],
+    log: Arc<Mutex<Vec<(usize, Value)>>>,
+    mut control: mpsc::UnboundedReceiver<Control>,
+    closed: Arc<AtomicUsize>,
+) {
+    let Ok(mut websocket) = tokio_tungstenite::accept_async(stream).await else {
+        closed.fetch_add(1, Ordering::SeqCst);
+        return;
+    };
+
+    let welcome = json!({"type": "welcome", "message": "connected"});
+    let _ = websocket.send(Message::text(welcome.to_string())).await;
+
+    loop {
+        let payload = tokio::select! {
+            command = control.recv() => match command {
+                Some(Control::Send(frame)) => {
+                    if websocket.send(Message::text(frame.to_string())).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                Some(Control::Drop) | None => break,
+            },
+            message = websocket.next() => match message {
+                Some(Ok(Message::Text(text))) => match serde_json::from_str::<Value>(text.as_str()) {
+                    Ok(payload) => payload,
+                    Err(_) => continue,
+                },
+                Some(Ok(_)) => continue,
+                Some(Err(_)) | None => break,
+            },
+        };
+
+        let action = payload["action"].as_str().unwrap_or_default().to_owned();
+        if action != "auth" {
+            log.lock().unwrap().push((number, payload.clone()));
+        }
+
+        let answer = match action.as_str() {
+            "auth" => auth_reply.clone(),
+            "subscribe" => json!({"type": "subscribed", "symbol": payload["symbol"], "max": 16}),
+            "subscribe_options" => {
+                let underlying = payload["underlying"].as_str().unwrap_or_default();
+                if underlyings_without_options.contains(&underlying) {
+                    json!({"type": "error", "code": "INVALID_UNDERLYING",
+                           "message": format!("No options available for {underlying}")})
+                } else {
+                    json!({"type": "options_subscribed", "underlying": underlying, "max": 100})
+                }
+            }
+            "unsubscribe" => json!({"type": "unsubscribed", "symbol": payload["symbol"]}),
+            "unsubscribe_options" => {
+                json!({"type": "options_unsubscribed", "underlying": payload["underlying"]})
+            }
+            _ => continue,
+        };
+
+        if websocket
+            .send(Message::text(answer.to_string()))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+
+    closed.fetch_add(1, Ordering::SeqCst);
+}
+
+fn offering(symbols: &[&str], max_subscriptions: u32) -> Value {
+    let symbols = symbols
+        .iter()
+        .map(|symbol| (*symbol, None))
+        .collect::<Vec<_>>();
+
+    authenticated(&symbols, max_subscriptions)
+}
+
+fn books(base: &str) -> Subscription<HarnessLse, MarketDataInstrument, OrderBooksL1> {
+    Subscription::from((
+        HarnessLse::default(),
+        base,
+        "usd",
+        MarketDataInstrumentKind::Spot,
+        OrderBooksL1,
+    ))
+}
+
+async fn books_stream(
+    subscriber: &LseSubscriber,
+    subscriptions: &[Subscription<HarnessLse, MarketDataInstrument, OrderBooksL1>],
+) -> LseStream<HarnessLse, MarketDataInstrument, OrderBooksL1> {
+    <LseStream<_, _, _> as MarketStream<HarnessLse, MarketDataInstrument, OrderBooksL1>>::init::<
+        NoInitialSnapshots,
+    >(subscriber, subscriptions)
+    .await
+    .unwrap()
+}
+
+/// Wait for `stream` to end, which it must do without yielding anything first.
+async fn ended<S>(stream: &mut S)
+where
+    S: futures_util::Stream + Unpin,
+    S::Item: std::fmt::Debug,
+{
+    let next = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the stream did not end when its connection was lost");
+
+    assert!(next.is_none(), "expected the stream to end, got {next:?}");
+}
+
+fn at(spelling: &str) -> DateTime<Utc> {
+    spelling.parse::<DateTime<Utc>>().unwrap()
+}
+
+/// The instant a subscribe's `start` names, to the microsecond it is sent at.
+fn start_of(payload: &Value) -> Option<DateTime<Utc>> {
+    let seconds = payload.get("start")?.as_f64()?;
+    // The payload carries microseconds, and a float of present-day epoch seconds holds them.
+    #[allow(clippy::cast_possible_truncation)]
+    let micros = (seconds * 1_000_000.0).round() as i64;
+
+    DateTime::from_timestamp_micros(micros)
+}
+
+/// The failure the whole connection design exists for: the provider allows a key one socket, so two
+/// streams on one key must share one — authenticated once, and each symbol subscribed once however
+/// many streams hold it.
+#[tokio::test]
+#[serial]
+async fn clones_share_one_connection_and_one_subscription_per_symbol() {
+    let provider = Provider::start(offering(&["BTC/USD", "ETH/USD"], 16), &[]).await;
+    let subscriber = subscriber();
+
+    let mut bitcoin = stream(&subscriber.clone(), &[subscription("btc")]).await;
+    let mut both = stream(&subscriber, &[subscription("btc"), subscription("eth")]).await;
+
+    assert_eq!(provider.connections(), 1);
+    assert_eq!(
+        symbols(&provider.sent_on(1)),
+        ["BTC/USD", "ETH/USD"],
+        "a symbol already on the connection must not be subscribed again",
+    );
+
+    provider.push(tick_frame("ETH/USD", "2026-08-14T10:00:00Z", 3000.0, false));
+    provider.push(tick_frame(
+        "BTC/USD",
+        "2026-08-14T10:00:01Z",
+        60000.0,
+        false,
+    ));
+
+    let first = next_event(&mut bitcoin).await;
+    assert_eq!(first.instrument, subscription("btc").instrument);
+
+    assert_eq!(
+        next_event(&mut both).await.instrument,
+        subscription("eth").instrument
+    );
+    assert_eq!(
+        next_event(&mut both).await.instrument,
+        subscription("btc").instrument
+    );
+}
+
+/// Every stream on the connection draws on one cap. A batch that would fit on a connection of its
+/// own is refused when others already hold the slots — before anything is sent, and saying why.
+#[tokio::test]
+#[serial]
+async fn the_cap_counts_what_other_streams_on_the_connection_hold() {
+    let provider = Provider::start(offering(&["BTC/USD", "ETH/USD", "SOL/USD"], 2), &[]).await;
+    let subscriber = subscriber();
+
+    let held = stream(&subscriber, &[subscription("btc"), subscription("eth")]).await;
+
+    let error = subscriber
+        .clone()
+        .subscribe(&[subscription("sol")])
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("already holds"), "{error}");
+    assert!(error.contains("shared by every stream"), "{error}");
+
+    drop(held);
+    provider.all_closed().await;
+    assert_eq!(symbols(&provider.sent_on(1)), ["BTC/USD", "ETH/USD"]);
+}
+
+/// Detaching frees exactly what no other stream holds, and the last one out closes the socket —
+/// the connection's lifetime is its streams', so a key is never left holding a socket idle.
+#[tokio::test]
+#[serial]
+async fn a_detach_releases_only_what_no_other_stream_holds_and_the_last_closes_the_socket() {
+    let provider = Provider::start(offering(&["BTC/USD", "ETH/USD"], 16), &[]).await;
+    let subscriber = subscriber();
+
+    let bitcoin = stream(&subscriber, &[subscription("btc")]).await;
+    let both = stream(&subscriber, &[subscription("btc"), subscription("eth")]).await;
+
+    drop(both);
+    provider
+        .until("ETH/USD to be released", |provider| {
+            provider
+                .sent_on(1)
+                .iter()
+                .any(|payload| payload["action"] == "unsubscribe")
+        })
+        .await;
+
+    drop(bitcoin);
+    provider.all_closed().await;
+
+    let released = provider
+        .sent_on(1)
+        .into_iter()
+        .filter(|payload| payload["action"] == "unsubscribe")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        released,
+        [json!({"action": "unsubscribe", "symbol": "ETH/USD"})]
+    );
+}
+
+/// The reconnect, end to end, over a symbol two streams hold at different watermarks.
+///
+/// The provider replays nothing for a repeated subscribe, so the symbol gets one window, opened at
+/// the earlier watermark. The stream that had delivered further must drop what it already
+/// delivered, silently and exactly; the one behind must receive what it missed. Both streams end
+/// with the socket, and one reconnect serves them both — the second to re-attach receives the frames
+/// held for it in the meantime.
+#[tokio::test]
+#[serial]
+async fn one_reconnect_resumes_every_stream_from_its_own_watermark() {
+    const T1: &str = "2026-08-14T10:16:55.161234+00:00";
+    const T2: &str = "2026-08-14T10:16:55.161235+00:00";
+    const T3: &str = "2026-08-14T10:16:55.161236+00:00";
+
+    let provider = Provider::start(offering(&["BTC/USD"], 16), &[]).await;
+    let subscriber = subscriber().with_resume(Arc::new(LseResumeState::new()));
+
+    // Both kinds deliver T1. Then the books stream leaves, the trades stream delivers T2 alone,
+    // and the books stream comes back: its watermark is T1, the trades stream's is T2.
+    let mut trades = stream(&subscriber, &[subscription("btc")]).await;
+    let mut quotes = books_stream(&subscriber, &[books("btc")]).await;
+
+    provider.push(tick_frame("BTC/USD", T1, 1.0, false));
+    assert_eq!(next_event(&mut trades).await.time_exchange, at(T1));
+    assert_eq!(next_event(&mut quotes).await.time_exchange, at(T1));
+
+    drop(quotes);
+    provider.push(tick_frame("BTC/USD", T2, 2.0, false));
+    assert_eq!(next_event(&mut trades).await.time_exchange, at(T2));
+
+    let mut quotes = books_stream(&subscriber, &[books("btc")]).await;
+
+    // The socket fails under both.
+    provider.drop_connection();
+    ended(&mut trades).await;
+    ended(&mut quotes).await;
+    drop((trades, quotes));
+
+    // The trades stream re-attaches first and reconnects for both.
+    let mut trades = stream(&subscriber, &[subscription("btc")]).await;
+    assert_eq!(provider.connections(), 2);
+
+    let resubscribed = provider.sent_on(2);
+    assert_eq!(symbols(&resubscribed), ["BTC/USD"], "{resubscribed:?}");
+    assert_eq!(
+        start_of(&resubscribed[0]),
+        Some(at(T1)),
+        "the window must open at the earliest watermark any stream holding the symbol needs",
+    );
+
+    // The replay, then the first live tick -- before the books stream has re-attached.
+    provider.push(tick_frame("BTC/USD", T1, 1.0, true));
+    provider.push(tick_frame("BTC/USD", T2, 2.0, true));
+    provider.push(tick_frame("BTC/USD", T3, 3.0, false));
+
+    assert_eq!(
+        next_event(&mut trades).await.time_exchange,
+        at(T3),
+        "the trades stream delivered T1 and T2 already, and must drop both",
+    );
+
+    let mut quotes = books_stream(&subscriber, &[books("btc")]).await;
+    assert_eq!(provider.connections(), 2, "a re-attach must not reconnect");
+    assert_eq!(
+        next_event(&mut quotes).await.time_exchange,
+        at(T2),
+        "the books stream delivered T1 only; T2 is its gap and must be replayed to it",
+    );
+    assert_eq!(next_event(&mut quotes).await.time_exchange, at(T3));
+}
+
+/// The socket is lost again while the frames held for a stream that has not re-attached are still
+/// waiting. Those frames are discarded, but the stream's registration is not: the next reconnect
+/// re-subscribes it, and because it never delivered what was held, its watermark still asks for it
+/// and the replay recovers it. The stream that did receive those frames drops their replay.
+#[tokio::test]
+#[serial]
+async fn a_second_loss_before_a_stream_re_attaches_is_recovered_by_the_next_reconnect() {
+    const T1: &str = "2026-08-14T10:16:55.161234+00:00";
+    const T2: &str = "2026-08-14T10:16:55.161235+00:00";
+    const T3: &str = "2026-08-14T10:16:55.161236+00:00";
+
+    let provider = Provider::start(offering(&["BTC/USD"], 16), &[]).await;
+    let subscriber = subscriber().with_resume(Arc::new(LseResumeState::new()));
+
+    let mut trades = stream(&subscriber, &[subscription("btc")]).await;
+    let mut quotes = books_stream(&subscriber, &[books("btc")]).await;
+
+    provider.push(tick_frame("BTC/USD", T1, 1.0, false));
+    assert_eq!(next_event(&mut trades).await.time_exchange, at(T1));
+    assert_eq!(next_event(&mut quotes).await.time_exchange, at(T1));
+
+    provider.drop_connection();
+    ended(&mut trades).await;
+    ended(&mut quotes).await;
+    drop((trades, quotes));
+
+    // Only the trades stream re-attaches, so T2 is held for the books stream -- routing hands a
+    // frame to every holder at once, so it is held by the time the trades stream has it.
+    let mut trades = stream(&subscriber, &[subscription("btc")]).await;
+    provider.push(tick_frame("BTC/USD", T2, 2.0, false));
+    assert_eq!(next_event(&mut trades).await.time_exchange, at(T2));
+
+    provider.drop_connection();
+    ended(&mut trades).await;
+    drop(trades);
+
+    // This time the books stream reconnects for both, from the earlier of the two watermarks.
+    let mut quotes = books_stream(&subscriber, &[books("btc")]).await;
+    assert_eq!(provider.connections(), 3);
+    assert_eq!(start_of(&provider.sent_on(3)[0]), Some(at(T1)));
+
+    provider.push(tick_frame("BTC/USD", T2, 2.0, true));
+    provider.push(tick_frame("BTC/USD", T3, 3.0, false));
+
+    assert_eq!(
+        next_event(&mut quotes).await.time_exchange,
+        at(T2),
+        "the frame discarded with the lost reconnect must be recovered by the replay",
+    );
+    assert_eq!(next_event(&mut quotes).await.time_exchange, at(T3));
+
+    let mut trades = stream(&subscriber, &[subscription("btc")]).await;
+    assert_eq!(provider.connections(), 3, "a re-attach must not reconnect");
+    assert_eq!(
+        next_event(&mut trades).await.time_exchange,
+        at(T3),
+        "the trades stream delivered T2 already, and must drop its replay",
+    );
+}
+
+/// A stream holding a resumed symbol without resuming it itself must get the live frames and none
+/// of the replay — the replay is another stream's gap, and to this one it is a burst of duplicates.
+#[tokio::test]
+#[serial]
+async fn a_replay_reaches_only_the_streams_that_asked_for_one() {
+    const T1: &str = "2026-08-14T10:16:55.161234+00:00";
+    const T2: &str = "2026-08-14T10:16:55.161235+00:00";
+
+    let provider = Provider::start(offering(&["BTC/USD", "ETH/USD"], 16), &[]).await;
+    let plain = subscriber();
+    let resumed = plain.clone().with_resume(Arc::new(LseResumeState::new()));
+
+    let mut resuming = stream(&resumed, &[subscription("btc")]).await;
+    let mut live = stream(&plain, &[subscription("btc"), subscription("eth")]).await;
+
+    provider.push(tick_frame("BTC/USD", T1, 1.0, false));
+    assert_eq!(next_event(&mut resuming).await.time_exchange, at(T1));
+    assert_eq!(next_event(&mut live).await.time_exchange, at(T1));
+
+    provider.drop_connection();
+    ended(&mut resuming).await;
+    ended(&mut live).await;
+    drop((resuming, live));
+
+    let mut resuming = stream(&resumed, &[subscription("btc")]).await;
+    provider.push(tick_frame("BTC/USD", T1, 1.0, true));
+    provider.push(tick_frame("BTC/USD", T2, 2.0, false));
+
+    let mut live = stream(&plain, &[subscription("btc"), subscription("eth")]).await;
+
+    assert_eq!(next_event(&mut resuming).await.time_exchange, at(T2));
+    assert_eq!(
+        next_event(&mut live).await.time_exchange,
+        at(T2),
+        "the replayed T1 reached a stream that asked for no replay",
+    );
+}
+
+/// A rejection names no symbol, but attaches are serialised, so it belongs to the attach in flight:
+/// that attach fails, what it sent is released so a failed batch holds no slot, and every other
+/// stream on the connection carries on.
+#[tokio::test]
+#[serial]
+async fn a_rejected_attach_releases_what_it_sent_and_leaves_the_connection_up() {
+    let provider = Provider::start(offering(&["BTC/USD"], 16), &["NOPE"]).await;
+    let subscriber = subscriber();
+
+    let mut bitcoin = stream(&subscriber, &[subscription("btc")]).await;
+
+    let error = subscriber
+        .subscribe(&[
+            contract("spy", OptionKind::Call, dec!(700)),
+            contract("nope", OptionKind::Call, dec!(10)),
+        ])
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("INVALID_UNDERLYING"), "{error}");
+    assert!(error.contains("shared by every stream"), "{error}");
+
+    provider
+        .until("SPY to be released", |provider| {
+            provider
+                .sent_on(1)
+                .contains(&json!({"action": "unsubscribe_options", "underlying": "SPY"}))
+        })
+        .await;
+
+    provider.push(tick_frame("BTC/USD", "2026-08-14T10:00:00Z", 1.0, false));
+    assert_eq!(
+        next_event(&mut bitcoin).await.instrument,
+        subscription("btc").instrument
+    );
+    assert_eq!(provider.connections(), 1);
+}
+
+/// Option chains and plain symbols share the socket and its cap, and each frame reaches the stream
+/// that registered it: a contract by its underlying, a symbol by its spelling.
+#[tokio::test]
+#[serial]
+async fn option_and_plain_streams_share_one_connection() {
+    let provider = Provider::start(offering(&["BTC/USD"], 16), &[]).await;
+    let subscriber = subscriber();
+    let registered = contract("spy", OptionKind::Call, dec!(700));
+
+    let mut bitcoin = stream(&subscriber, &[subscription("btc")]).await;
+    let mut options =
+        <LseStream<_, _, _> as MarketStream<
+            OptionsHarnessLse,
+            MarketDataInstrument,
+            PublicTrades,
+        >>::init::<NoInitialSnapshots>(&subscriber, std::slice::from_ref(&registered))
+        .await
+        .unwrap();
+
+    assert_eq!(provider.connections(), 1);
+
+    provider.push(option_tick_frame("SPY260930C00700000"));
+    provider.push(tick_frame("BTC/USD", "2026-08-14T10:00:00Z", 1.0, false));
+
+    assert_eq!(
+        next_event(&mut options).await.instrument,
+        registered.instrument
+    );
+    assert_eq!(
+        next_event(&mut bitcoin).await.instrument,
+        subscription("btc").instrument
+    );
 }

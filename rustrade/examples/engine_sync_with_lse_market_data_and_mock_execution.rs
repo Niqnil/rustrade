@@ -204,8 +204,8 @@ async fn init_lse_market_stream(
     instruments: &IndexedInstruments,
 ) -> Result<impl Stream<Item = MarketStreamEvent<InstrumentIndex, DataKind>> + use<>, DataError> {
     // The subscriber holds the credential and performs the authenticating handshake. It is cloned
-    // into each connection, and again into every reconnect attempt, so one instance serves all of
-    // them.
+    // into each stream, and again into every reconnect attempt, and every clone shares its one
+    // connection -- the provider allows a key only one.
     let subscriber = LseSubscriber::from_env()
         .expect("set LSE_API_KEY - get a free key at https://londonstrategicedge.com/data");
 
@@ -244,8 +244,9 @@ async fn init_lse_market_stream(
         })
         .collect::<Vec<_>>();
 
-    // One connection per kind, each capped at 16 symbols by the provider. Both decode the same tick
-    // frame — the kind decides what it becomes, not what is asked for on the wire.
+    // Both kinds share the key's one connection and its subscription cap, and a symbol subscribed as
+    // both costs one slot. Both decode the same tick frame — the kind decides what it becomes, not
+    // what is asked for on the wire.
     let streams: Streams<MarketStreamResult<InstrumentIndex, DataKind>> = Streams::builder_multi()
         .add(Streams::<PublicTrades>::builder().subscribe(subscriber.clone(), trades))
         .add(Streams::<OrderBooksL1>::builder().subscribe(subscriber, quotes))

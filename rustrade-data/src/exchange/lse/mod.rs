@@ -109,6 +109,8 @@ pub mod calendar;
 /// The WebSocket channel a subscription maps to.
 pub mod channel;
 
+pub mod connection;
+
 pub mod data_api;
 
 /// Errors produced by the London Strategic Edge integration.
@@ -183,17 +185,18 @@ use url::Url;
 /// One host serves every dataset. The per-dataset connector split below is about provenance in
 /// `MarketEvent.exchange` and per-dataset support declarations, not about distinct endpoints.
 ///
-/// # ⚠️ One connection per key
+/// # ⚠️ One connection per key, shared by every stream a subscriber and its clones open
 /// A free key — the `registered` tier, the only one measured — holds exactly one concurrent
 /// connection: its handshake reports `max_connections: 1`, and a second is refused with
-/// `TOO_MANY_CONNECTIONS`. Each batch of
-/// subscriptions streams over a connection of its own, so a key can serve **one** batch at a time:
-/// one dataset, one subscription kind, one `subscribe` call. Another dataset, or
-/// [`OrderBooksL1`] alongside [`PublicTrades`] on the same symbols, needs a second connection the
-/// key cannot open.
+/// `TOO_MANY_CONNECTIONS`. That one connection serves every dataset, both subscription kinds and
+/// option underlyings, so every stream opened by one [`LseSubscriber`] and its clones shares it —
+/// across any number of `subscribe` calls. A subscriber built separately for the same key opens a
+/// connection of its own and is refused. See [`connection`] for how the connection is shared.
 ///
 /// That one connection holds 100 subscriptions when last measured (the handshake reports the live
-/// figure): a symbol per slot, or on [`LseOptions`] an underlying per slot.
+/// figure), shared by every stream on it: a symbol per slot, or on [`LseOptions`] an underlying per
+/// slot. A symbol held by several streams — [`OrderBooksL1`] alongside [`PublicTrades`], say —
+/// costs one.
 pub const WEBSOCKET_URL: &str = "wss://data-ws.londonstrategicedge.com";
 
 /// Format of every naive timestamp the provider serves over REST.
@@ -251,9 +254,10 @@ pub type LseCfd = Lse<LseServerCfd>;
 /// does not exist — a wrong expiry, a strike off the chain — is accepted and never ticks. An
 /// underlying with no options at all *is* rejected, by name.
 ///
-/// # ⚠️ One connection per key
-/// A key holds one connection, and this dataset's batch needs one of its own, so options cannot
-/// stream alongside another London Strategic Edge dataset on the same key. See [`WEBSOCKET_URL`].
+/// # One connection per key, shared
+/// Option chains stream over the same connection as every other London Strategic Edge dataset, and
+/// draw on its one subscription cap: each underlying takes a slot, as each plain symbol does. See
+/// [`WEBSOCKET_URL`].
 ///
 /// # No resumption
 /// A reconnect does not replay the gap: the provider has no replay window on this channel. An
