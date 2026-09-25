@@ -126,7 +126,19 @@ impl DynamicSubscribers {
 /// connector and kind.
 ///
 /// Which connectors it covers depends on the cargo features enabled: with `lse` it also requires
-/// [`LseInstrument`], with `hyperliquid` [`HyperliquidInstrument`].
+/// [`LseInstrument`], with `hyperliquid` [`HyperliquidInstrument`]. The three types above satisfy
+/// every combination.
+///
+/// # Only this crate's instrument types implement it
+/// It is sealed: it cannot be implemented directly, and a type qualifies only by satisfying the
+/// identifier bound of every connector `DynamicStreams` routes to — an
+/// `Identifier<ExchangeMarket>` impl for a `Subscription` over the type, per connector and kind.
+/// The coherence rules forbid a downstream crate from writing those impls for a type of its own,
+/// because `Identifier`, `Subscription` and every market type belong to this crate. So the set of
+/// qualifying types is exactly the three above, in every build, whichever features any crate in
+/// the build enables. A custom instrument type streams through the typed
+/// [`Streams`](crate::streams::Streams) builder instead, for a connector whose identifier it can
+/// provide: [`LseInstrument`] is implementable for a downstream type, for example.
 pub trait DynamicInstrument: Route {}
 
 impl<Instrument> DynamicInstrument for Instrument where Instrument: Route {}
@@ -211,8 +223,13 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
     ///
     /// Every group is then initialised concurrently. If any fails, the call waits for the rest to
     /// finish initialising, stops every stream that succeeded, and returns the first error — so a
-    /// failed call leaves nothing running. A stopped London Strategic Edge stream releases its
-    /// share of the connection as it is dropped, which closes the socket once none remains.
+    /// failed call leaves no stream running: each is dropped before the call returns.
+    ///
+    /// A dropped London Strategic Edge stream asks its connection to release its share, and the
+    /// connection does so asynchronously, closing the socket once no stream remains. A retry
+    /// through the same subscriber, or a clone of it, reuses that connection whatever state it is
+    /// in. A retry through a subscriber built separately for the same key may still be refused
+    /// with `TOO_MANY_CONNECTIONS` until the socket has closed.
     ///
     /// ## Examples
     /// Please see rustrade-data-rs/examples/dynamic_multi_stream_multi_exchange.rs for a
@@ -236,7 +253,7 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
 
         let groups = route_batches(batches, &txs, subscribers)?;
 
-        settle(join_all(groups).await)?;
+        settle(join_all(groups).await).await?;
 
         Ok(Self {
             trades: rxs
@@ -498,14 +515,17 @@ where
 /// error.
 ///
 /// Stopping them is what makes a failed initialisation leave nothing running: a forwarder owns its
-/// stream, and a stream on a shared connection holds its share of it for as long as it lives.
-fn settle(results: Vec<Result<JoinHandle<()>, DataError>>) -> Result<(), DataError> {
+/// stream, and a stream on a shared connection holds its share of it for as long as it lives. Each
+/// aborted forwarder is awaited, because an abort only schedules the cancellation: awaiting it is
+/// what guarantees the stream has been dropped by the time this returns.
+async fn settle(results: Vec<Result<JoinHandle<()>, DataError>>) -> Result<(), DataError> {
     let (forwarders, errors): (Vec<_>, Vec<_>) = results.into_iter().partition_result();
 
     match errors.into_iter().next() {
         None => Ok(()),
         Some(error) => {
             forwarders.iter().for_each(JoinHandle::abort);
+            join_all(forwarders).await;
             Err(error)
         }
     }
@@ -1006,7 +1026,7 @@ mod tests {
         }
 
         // Built outside the task, so it is dropped with it whether or not the task ever ran.
-        let (dropped_tx, dropped) = tokio::sync::oneshot::channel();
+        let (dropped_tx, mut dropped) = tokio::sync::oneshot::channel();
         let guard = OnDrop(Some(dropped_tx));
         let forwarder = tokio::spawn(async move {
             let _guard = guard;
@@ -1019,6 +1039,7 @@ mod tests {
                 exchange: ExchangeId::LseFx,
             }),
         ])
+        .await
         .unwrap_err();
 
         assert_eq!(
@@ -1027,11 +1048,9 @@ mod tests {
                 exchange: ExchangeId::LseFx
             }
         );
-        // The forwarder's task is dropped, and with it the stream it owned.
-        tokio::time::timeout(std::time::Duration::from_secs(5), dropped)
-            .await
-            .unwrap()
-            .unwrap();
+        // The forwarder's task, and with it the stream it owned, was dropped before `settle`
+        // returned: nothing further needs to run for the drop to have happened.
+        assert_eq!(dropped.try_recv(), Ok(()));
     }
 
     #[tokio::test]
@@ -1039,7 +1058,7 @@ mod tests {
         let forwarder = tokio::spawn(std::future::pending::<()>());
         let abort = forwarder.abort_handle();
 
-        settle(vec![Ok(forwarder)]).unwrap();
+        settle(vec![Ok(forwarder)]).await.unwrap();
         tokio::task::yield_now().await;
 
         assert!(!abort.is_finished());
