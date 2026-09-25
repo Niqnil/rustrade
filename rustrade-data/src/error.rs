@@ -72,6 +72,25 @@ pub enum DataError {
         sub_kind: SubKind,
     },
 
+    /// A dynamic subscription names a venue whose subscriber must be built by the caller — usually
+    /// because it carries credentials — and none was supplied. See
+    /// [`DynamicSubscribers`](crate::streams::builder::dynamic::DynamicSubscribers).
+    #[error(
+        "dynamic Subscription for exchange {exchange} needs a subscriber, and none was supplied \
+         through DynamicSubscribers"
+    )]
+    SubscriberRequired { exchange: ExchangeId },
+
+    /// The venue serves the subscription, but this build was compiled without the cargo feature
+    /// that carries its integration.
+    #[error(
+        "exchange {exchange} needs the `{feature}` cargo feature, which this build does not enable"
+    )]
+    FeatureDisabled {
+        exchange: ExchangeId,
+        feature: String,
+    },
+
     #[error("exchange {exchange} does not support candle interval: {interval}")]
     UnsupportedInterval {
         exchange: ExchangeId,

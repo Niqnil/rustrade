@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`DynamicStreams` serves London Strategic Edge and Hyperliquid perpetuals, through the new
+  `DynamicStreams::init_with` and `DynamicSubscribers`** (`rustrade-data`). The support matrix
+  accepted `Lse*` and `HyperliquidPerp` subscriptions, then `DynamicStreams::init` refused every one
+  with `DataError::Unsupported`, because it had no route to either connector. Both are routed now.
+  London Strategic Edge needs an API key, and it allows a key a single WebSocket, so its subscriber
+  is built by the caller and passed in with `DynamicSubscribers::default().with_lse(subscriber)`.
+  Every `Lse*` group takes a clone of that one subscriber, whatever its dataset, kind or batch, so
+  they all share one connection. A resuming subscriber resumes every one of them. `init` keeps its
+  signature and is `init_with` with no subscribers. `init_indexed_multi_exchange_market_stream_with`
+  is the indexed counterpart. Two new `DataError` variants cover the cases that used to be reported
+  as `Unsupported`: `SubscriberRequired`, for a venue with no subscriber supplied, and
+  `FeatureDisabled`, for a venue whose cargo feature (`lse`, `hyperliquid`) the build lacks. A test
+  routes every pair the matrix accepts, so the two cannot drift apart again.
+
+  ⚠️ London Strategic Edge data may not be redistributed. See
+  <https://londonstrategicedge.com/terms>.
+
 - **London Strategic Edge option prints and option candles, with
   `LseVaultClient::fetch_option_flow` / `collect_option_flow` and `fetch_option_candles` /
   `collect_option_candles`** (`rustrade-data`, feature `lse`). US equity and ETF options: every
@@ -271,6 +288,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   <https://londonstrategicedge.com/terms>.
 
 ### Changed
+
+- **BREAKING: `DynamicStreams::init` bounds its instrument type on the new `DynamicInstrument`
+  trait, and fails without connecting anything when a group cannot be routed** (`rustrade-data`).
+  The per-connector `Identifier` bounds that `init` listed now sit behind that one trait. It is
+  implemented for `MarketDataInstrument`, `Keyed<_, MarketDataInstrument>` and
+  `MarketInstrumentData<_>`, so callers passing those types change nothing. A generic caller
+  restates `Instrument: DynamicInstrument` instead of the list. `init` now routes every group of
+  every batch before it connects any. Before, an unroutable group failed the call only after the
+  groups beside it had connected. If a group fails to initialise, `init` now stops every stream that
+  did start before it returns the error, where it used to leave them running with no receiver.
+  On London Strategic Edge, one of those streams would have kept the key's only connection.
+
+- **BREAKING: the London Strategic Edge and Hyperliquid perpetual market identifiers are blanket
+  impls over the new `LseInstrument` and `HyperliquidInstrument` traits** (`rustrade-data`,
+  features `lse` and `hyperliquid`). They replace three impls each, one per instrument type, and
+  spell every symbol as before. An instrument type declared outside this crate identifies its market
+  by implementing the trait.
 
 - **BREAKING: `LseTick::bid` and `LseTick::ask` are now `Option<Decimal>`** (`rustrade-data`,
   feature `lse`). Option contracts tick on the same WebSocket frame and publish both sides as

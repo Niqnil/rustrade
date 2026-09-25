@@ -582,32 +582,40 @@ fn market_symbol(
     }
 }
 
-impl<Server, Kind> Identifier<LseMarket> for Subscription<Lse<Server>, MarketDataInstrument, Kind>
+/// An instrument representation a London Strategic Edge subscription can spell as a display symbol.
+///
+/// Implemented for every instrument type this crate subscribes with: [`MarketDataInstrument`],
+/// [`Keyed`] over it, and [`MarketInstrumentData`]. Every [`Subscription`] to an [`Lse`] dataset over
+/// an implementor identifies its [`LseMarket`] through it, so one blanket `Identifier` impl covers
+/// every dataset and every representation.
+///
+/// It is also what lets [`DynamicStreams`](crate::streams::builder::dynamic::DynamicStreams) route
+/// to this integration: a bound on the instrument type alone implies the identifier for every
+/// dataset, where the alternative is one bound per dataset and kind.
+pub trait LseInstrument {
+    /// The display symbol this instrument subscribes to on a dataset spelling symbols as `shape`.
+    fn lse_market(&self, shape: LseSymbolShape) -> LseMarket;
+}
+
+impl<Server, Instrument, Kind> Identifier<LseMarket> for Subscription<Lse<Server>, Instrument, Kind>
 where
     Server: LseServer,
+    Instrument: LseInstrument,
 {
     fn id(&self) -> LseMarket {
-        market_symbol(
-            Server::SYMBOL_SHAPE,
-            &self.instrument.base,
-            &self.instrument.quote,
-            &self.instrument.kind,
-        )
+        self.instrument.lse_market(Server::SYMBOL_SHAPE)
     }
 }
 
-impl<Server, InstrumentKey, Kind> Identifier<LseMarket>
-    for Subscription<Lse<Server>, Keyed<InstrumentKey, MarketDataInstrument>, Kind>
-where
-    Server: LseServer,
-{
-    fn id(&self) -> LseMarket {
-        market_symbol(
-            Server::SYMBOL_SHAPE,
-            &self.instrument.value.base,
-            &self.instrument.value.quote,
-            &self.instrument.value.kind,
-        )
+impl LseInstrument for MarketDataInstrument {
+    fn lse_market(&self, shape: LseSymbolShape) -> LseMarket {
+        market_symbol(shape, &self.base, &self.quote, &self.kind)
+    }
+}
+
+impl<InstrumentKey> LseInstrument for Keyed<InstrumentKey, MarketDataInstrument> {
+    fn lse_market(&self, shape: LseSymbolShape) -> LseMarket {
+        self.value.lse_market(shape)
     }
 }
 
@@ -620,11 +628,9 @@ where
 /// under a key the map does not hold and deliver nothing — the silent failure the reconstruction
 /// path already avoids, and there is no reason for this path to keep it. On a correctly spelled
 /// exchange name the call is a no-op.
-impl<Server, InstrumentKey, Kind> Identifier<LseMarket>
-    for Subscription<Lse<Server>, MarketInstrumentData<InstrumentKey>, Kind>
-{
-    fn id(&self) -> LseMarket {
-        LseMarket(self.instrument.name_exchange.name().to_uppercase_smolstr())
+impl<InstrumentKey> LseInstrument for MarketInstrumentData<InstrumentKey> {
+    fn lse_market(&self, _shape: LseSymbolShape) -> LseMarket {
+        LseMarket(self.name_exchange.name().to_uppercase_smolstr())
     }
 }
 

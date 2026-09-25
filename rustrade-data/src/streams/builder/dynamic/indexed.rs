@@ -3,7 +3,7 @@ use crate::{
     event::DataKind,
     instrument::MarketInstrumentData,
     streams::{
-        builder::dynamic::DynamicStreams,
+        builder::dynamic::{DynamicStreams, DynamicSubscribers},
         consumer::{MarketStreamEvent, MarketStreamResult},
         reconnect::stream::ReconnectingStream,
     },
@@ -21,10 +21,29 @@ use tracing::warn;
 
 /// Initialise an indexed [`DynamicStreams`] using batches of indexed [`Subscription`] batches.
 ///
+/// Equivalent to [`init_indexed_multi_exchange_market_stream_with`] with no
+/// [`DynamicSubscribers`]: an instrument on a venue that needs a subscriber from the caller fails
+/// with [`DataError::SubscriberRequired`].
+pub async fn init_indexed_multi_exchange_market_stream(
+    instruments: &IndexedInstruments,
+    sub_kinds: &[SubKind],
+) -> Result<impl Stream<Item = MarketStreamEvent<InstrumentIndex, DataKind>> + use<>, DataError> {
+    init_indexed_multi_exchange_market_stream_with(
+        &DynamicSubscribers::default(),
+        instruments,
+        sub_kinds,
+    )
+    .await
+}
+
+/// Initialise an indexed [`DynamicStreams`] using batches of indexed [`Subscription`] batches, and
+/// the subscribers for venues that cannot be served without one.
+///
 /// This function:
 /// 1. Generates indexed market data Subscriptions from all Instrument-SubKind combinations found
 ///    in the provided `IndexedInstruments` and `SubKind` slice.
-/// 2. Initialise an indexed [`DynamicStreams`] .
+/// 2. Initialise an indexed [`DynamicStreams`] via [`DynamicStreams::init_with`], which states how
+///    `subscribers` are shared and what fails the call.
 /// 3. Combines all market streams into a single `Stream` via
 ///    [`select_all`](futures_util::stream::select_all::select_all)
 /// 4. Handles recoverable errors by logging them at `warn` level.
@@ -34,7 +53,8 @@ use tracing::warn;
 ///
 /// See [`index_market_data_subscription_batches`] for how unindexed `Subscriptions` can be
 /// indexed using an [`IndexedInstruments`] collection.
-pub async fn init_indexed_multi_exchange_market_stream(
+pub async fn init_indexed_multi_exchange_market_stream_with(
+    subscribers: &DynamicSubscribers,
     instruments: &IndexedInstruments,
     sub_kinds: &[SubKind],
 ) -> Result<impl Stream<Item = MarketStreamEvent<InstrumentIndex, DataKind>> + use<>, DataError> {
@@ -42,7 +62,7 @@ pub async fn init_indexed_multi_exchange_market_stream(
     let subscriptions = generate_indexed_market_data_subscription_batches(instruments, sub_kinds);
 
     // Initialise an indexed MarketStream via DynamicStreams
-    let stream = DynamicStreams::init(subscriptions)
+    let stream = DynamicStreams::init_with(subscribers, subscriptions)
         .await?
         .select_all::<MarketStreamResult<InstrumentIndex, DataKind>>()
         .with_error_handler(|error| warn!(?error, "MarketStream generated error"));
