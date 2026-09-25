@@ -570,14 +570,11 @@ impl UnregisteredContracts {
             return false;
         }
 
-        // A subscription identifier is `channel|market`. Every symbol on this channel is an OSI
+        // A subscription identifier is the symbol, and every symbol on this channel is an OSI
         // contract, so the root is always found; were one not, it is tallied under itself rather
         // than lost.
-        let market = subscription_id
-            .0
-            .split_once('|')
-            .map_or(subscription_id.0.as_str(), |(_, market)| market);
-        let underlying = osi::root(market).unwrap_or(market);
+        let symbol = subscription_id.as_ref();
+        let underlying = osi::root(symbol).unwrap_or(symbol);
 
         // Looked up before inserting so the common case -- an underlying already tallied this
         // window -- builds no owned key.
@@ -636,7 +633,7 @@ mod tests {
     const KIND: &str = "public_trades";
 
     fn id() -> SubscriptionId {
-        super::super::resume::subscription_id("BTC/USD")
+        super::super::mapper::subscription_id("BTC/USD")
     }
 
     fn key() -> LseResumeKey {
@@ -1173,7 +1170,7 @@ mod tests {
 
         async fn options_subject() -> OptionsSubject {
             let map = Map([(
-                super::super::super::resume::subscription_id(REGISTERED),
+                super::super::super::mapper::subscription_id(REGISTERED),
                 1_u8,
             )]
             .into_iter()

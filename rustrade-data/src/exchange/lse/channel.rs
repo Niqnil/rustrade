@@ -13,10 +13,12 @@ use crate::{
 /// (`{"action":"subscribe","symbol":"EUR/USD"}`), so both supported subscription kinds are decoded
 /// from the same frame.
 ///
-/// The variant therefore exists to supply the channel half of a
-/// [`SubscriptionId`](rustrade_integration::subscription::SubscriptionId), not to select anything
-/// on the wire. Both kinds map to it, and each stream carries its own instrument map, so the shared
-/// identifier is unambiguous within a stream.
+/// The variant therefore exists because a [`Connector`](crate::exchange::Connector) must name a
+/// channel, not to select anything on the wire. It is not part of the
+/// [`SubscriptionId`](rustrade_integration::subscription::SubscriptionId) either: a tick is filed
+/// under its bare symbol, since a channel that never varies would only lengthen the identifier —
+/// see [`LseSubMapper`](super::mapper::LseSubMapper). Both kinds therefore share one identifier per
+/// symbol, which is unambiguous because each stream carries its own instrument map.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub enum LseChannel {
     /// The tick frame — a price, a bid, an ask and a size for one symbol.

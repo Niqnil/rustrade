@@ -122,6 +122,8 @@ pub mod historical;
 
 pub mod live;
 
+pub mod mapper;
+
 pub mod options;
 
 /// London Strategic Edge symbology: datasets, underlying assets, quote currencies and slugs.
@@ -404,13 +406,8 @@ where
 
         let mut underlyings = Vec::<SmolStr>::new();
         for subscription_id in map.0.keys() {
-            // A subscription identifier is `channel|market`; the market is the contract symbol.
-            let root = subscription_id
-                .0
-                .split_once('|')
-                .and_then(|(_, market)| osi::root(market));
-
-            if let Some(root) = root
+            // A subscription identifier is the contract symbol -- see `mapper::subscription_id`.
+            if let Some(root) = osi::root(subscription_id.as_ref())
                 && !underlyings.iter().any(|underlying| underlying == root)
             {
                 underlyings.push(SmolStr::new(root));
@@ -485,7 +482,6 @@ where
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
-    use crate::Identifier;
 
     /// The connector is hand-serialised rather than derived, so nothing else pins that the two
     /// halves agree — a `Subscription` carrying one would otherwise fail to round-trip through a
@@ -505,7 +501,7 @@ mod tests {
         markets
             .iter()
             .zip(0_u8..)
-            .map(|(market, key)| (ExchangeSub::from((LseChannel::Tick, *market)).id(), key))
+            .map(|(market, key)| (mapper::subscription_id(market), key))
             .collect()
     }
 

@@ -5,8 +5,6 @@
 //! module holds the state that survives a reconnect; [`transformer`](super::transformer) applies
 //! it, and [`live`](super::live) sends it.
 
-use super::channel::LseChannel;
-use crate::{Identifier, exchange::ExchangeSub};
 use chrono::{DateTime, Utc};
 use fnv::FnvHashMap;
 use rustrade_instrument::exchange::ExchangeId;
@@ -42,7 +40,7 @@ pub(super) struct LseWatermark {
 ///
 /// # Why the subscription alone is not enough
 /// The provider publishes one data frame from one host, so a subscribe names a symbol and nothing
-/// else. Every stream therefore files its ticks under a wire identifier — `tick|BTC/USD` — that
+/// else. Every stream therefore files its ticks under a wire identifier — the symbol, `BTC/USD` — that
 /// says nothing about which stream produced it. Two axes collapse onto it:
 ///
 /// - **Kind.** Both supported kinds are decodings of the same frame, so one instrument subscribed
@@ -271,14 +269,6 @@ impl LseResumeState {
     }
 }
 
-/// The [`SubscriptionId`] the provider's ticks for `symbol` arrive under.
-///
-/// Shared with the tick decoder's own construction of the same identifier so the subscriber and
-/// the stream cannot disagree about which subscription a watermark belongs to.
-pub(super) fn subscription_id(symbol: &str) -> SubscriptionId {
-    ExchangeSub::from((LseChannel::Tick, symbol)).id()
-}
-
 /// Render an instant as the epoch-seconds number the provider's `start` parameter expects.
 ///
 /// # Why a float, and why microseconds
@@ -303,7 +293,7 @@ pub(super) fn epoch_seconds(time: DateTime<Utc>) -> f64 {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
-    use super::*;
+    use super::{super::mapper::subscription_id, *};
     use crate::subscription::{SubscriptionKind, book::OrderBooksL1, trade::PublicTrades};
 
     fn at(spelling: &str) -> DateTime<Utc> {

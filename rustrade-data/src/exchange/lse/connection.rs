@@ -63,8 +63,9 @@ use super::{
         check_symbols_are_offered, subscribe_message, subscribe_options_message,
         unsubscribe_message, unsubscribe_options_message,
     },
+    mapper::subscription_id,
     osi,
-    resume::{LseResumeKey, LseResumeState, subscription_id},
+    resume::{LseResumeKey, LseResumeState},
     subscription::LseSubResponse,
 };
 use chrono::{DateTime, Utc};
