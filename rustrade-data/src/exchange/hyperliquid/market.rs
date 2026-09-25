@@ -13,17 +13,36 @@ use smol_str::{SmolStr, StrExt, format_smolstr};
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Deserialize, Serialize)]
 pub struct HyperliquidMarket(pub SmolStr);
 
-impl<Kind> Identifier<HyperliquidMarket> for Subscription<Hyperliquid, MarketDataInstrument, Kind> {
+/// An instrument representation a Hyperliquid perpetual subscription can name as a market.
+///
+/// Implemented for every instrument type this crate subscribes with: [`MarketDataInstrument`],
+/// [`Keyed`] over it, and [`MarketInstrumentData`]. One blanket `Identifier` impl covers them all,
+/// which is also what lets
+/// [`DynamicStreams`](crate::streams::builder::dynamic::DynamicStreams) route to this integration
+/// through a single bound on the instrument type.
+pub trait HyperliquidInstrument {
+    /// The perpetual market this instrument subscribes to.
+    fn hyperliquid_market(&self) -> HyperliquidMarket;
+}
+
+impl<Instrument, Kind> Identifier<HyperliquidMarket> for Subscription<Hyperliquid, Instrument, Kind>
+where
+    Instrument: HyperliquidInstrument,
+{
     fn id(&self) -> HyperliquidMarket {
-        hyperliquid_market(&self.instrument.base)
+        self.instrument.hyperliquid_market()
     }
 }
 
-impl<InstrumentKey, Kind> Identifier<HyperliquidMarket>
-    for Subscription<Hyperliquid, Keyed<InstrumentKey, MarketDataInstrument>, Kind>
-{
-    fn id(&self) -> HyperliquidMarket {
-        hyperliquid_market(&self.instrument.value.base)
+impl HyperliquidInstrument for MarketDataInstrument {
+    fn hyperliquid_market(&self) -> HyperliquidMarket {
+        hyperliquid_market(&self.base)
+    }
+}
+
+impl<InstrumentKey> HyperliquidInstrument for Keyed<InstrumentKey, MarketDataInstrument> {
+    fn hyperliquid_market(&self) -> HyperliquidMarket {
+        self.value.hyperliquid_market()
     }
 }
 
@@ -31,11 +50,9 @@ fn hyperliquid_market(base: &AssetNameInternal) -> HyperliquidMarket {
     HyperliquidMarket(base.name().to_uppercase_smolstr())
 }
 
-impl<InstrumentKey, Kind> Identifier<HyperliquidMarket>
-    for Subscription<Hyperliquid, MarketInstrumentData<InstrumentKey>, Kind>
-{
-    fn id(&self) -> HyperliquidMarket {
-        HyperliquidMarket(self.instrument.name_exchange.name().clone())
+impl<InstrumentKey> HyperliquidInstrument for MarketInstrumentData<InstrumentKey> {
+    fn hyperliquid_market(&self) -> HyperliquidMarket {
+        HyperliquidMarket(self.name_exchange.name().clone())
     }
 }
 
