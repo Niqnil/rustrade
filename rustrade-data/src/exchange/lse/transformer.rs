@@ -562,8 +562,9 @@ impl UnregisteredContracts {
                 contracts = tally.contracts.len(),
                 window_secs = window.as_secs(),
                 "London Strategic Edge delivered option prints for contracts nobody registered, \
-                 and dropped them; register a contract to receive it, and if one you registered is \
-                 silent, check its spelling against these",
+                 and dropped them; register a contract to receive it, and if one you registered on \
+                 this underlying is silent, check its OSI spelling, since a misspelled contract's \
+                 prints are counted here",
             );
         }
 

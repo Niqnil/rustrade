@@ -259,7 +259,13 @@ impl Identifier<Option<SubscriptionId>> for LseMessage {
 /// enough that several encoders do it by default. A borrowed `&str` cannot be produced from an
 /// escaped string, because unescaping needs somewhere to write the result, so a decoder typed that
 /// way fails at runtime on a frame that is entirely legal. `SmolStr` accepts either spelling and
-/// keeps a symbol of this length inline, so nothing is allocated for the ordinary case.
+/// holds up to 23 bytes inline, so the symbol itself is not allocated.
+///
+/// # Allocation
+/// The identifier built from the symbol prefixes it with `tick|`, five bytes more. An option
+/// contract's symbol is its root plus fifteen characters, so on a root of four or more characters
+/// (`AAPL`, `GOOGL`) the identifier exceeds the inline limit and is allocated on the heap, once per
+/// tick. On a three-character root (`SPY`, `QQQ`) it fits exactly.
 fn de_tick_subscription_id<'de, D>(deserializer: D) -> Result<SubscriptionId, D::Error>
 where
     D: Deserializer<'de>,

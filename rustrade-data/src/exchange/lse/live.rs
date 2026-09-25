@@ -404,7 +404,8 @@ pub(super) fn option_underlyings(
         return Err(SocketError::Subscribe(format!(
             "{exchange} subscribes option contracts by OSI symbol (root, YYMMDD, C or P, strike in \
              thousandths as eight digits), and {unspellable:?} have none - each must be an option \
-             instrument whose strike has at most three decimal places and is below 100,000",
+             instrument whose strike is positive, has at most three decimal places and is below \
+             100,000",
         )));
     }
 
