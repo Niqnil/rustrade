@@ -19,6 +19,7 @@ use rustrade_integration::{
     subscription::SubscriptionId,
 };
 use serde::{Deserialize, Serialize};
+use smol_str::SmolStr;
 use std::collections::HashSet;
 use tracing::debug;
 
@@ -142,29 +143,36 @@ impl SubscriptionValidator for AlpacaWebSocketSubValidator {
 
 /// Remove from `awaiting` every [`SubscriptionId`] this message confirms.
 ///
-/// Only [`AlpacaSubResponseInner::Subscription`] names symbols. `Success` and `Error` confirm
-/// nothing -- `Error` never reaches here, having already failed
+/// `Error` never reaches here, having already failed
 /// [`AlpacaSubResponse::validate`](rustrade_integration::Validator::validate).
 fn confirm(awaiting: &mut HashSet<SubscriptionId>, inner: &AlpacaSubResponseInner) {
-    let AlpacaSubResponseInner::Subscription {
-        trades,
-        quotes,
-        bars: _,
-    } = inner
-    else {
-        return;
+    for (channel, market) in covered(inner) {
+        awaiting.remove(&ExchangeSub::from((channel, market.as_str())).id());
+    }
+}
+
+/// Every `(channel, symbol)` pair a message reports the connection holding.
+///
+/// Only [`AlpacaSubResponseInner::Subscription`] names symbols; `Success` and `Error` cover
+/// nothing. The report is the connection's whole state, not only what the last request added.
+pub(super) fn covered(
+    inner: &AlpacaSubResponseInner,
+) -> impl Iterator<Item = (AlpacaChannel, &SmolStr)> {
+    let (trades, quotes): (&[SmolStr], &[SmolStr]) = match inner {
+        // `bars` is deliberately ignored: AlpacaChannel models only trades and quotes, so no
+        // Subscription is ever keyed against a bars channel and nothing could match it.
+        AlpacaSubResponseInner::Subscription {
+            trades,
+            quotes,
+            bars: _,
+        } => (trades, quotes),
+        AlpacaSubResponseInner::Error { .. } | AlpacaSubResponseInner::Success { .. } => (&[], &[]),
     };
 
-    // `bars` is deliberately ignored: AlpacaChannel models only trades and quotes, so no
-    // Subscription is ever keyed against a bars channel and nothing could match it.
-    for (channel, markets) in [
-        (AlpacaChannel::Trades, trades),
-        (AlpacaChannel::Quotes, quotes),
-    ] {
-        for market in markets {
-            awaiting.remove(&ExchangeSub::from((channel, market.as_str())).id());
-        }
-    }
+    let trades = trades.iter().map(|market| (AlpacaChannel::Trades, market));
+    let quotes = quotes.iter().map(|market| (AlpacaChannel::Quotes, market));
+
+    trades.chain(quotes)
 }
 
 /// Render the outstanding [`SubscriptionId`]s in a stable order, so a failure names the same
@@ -179,7 +187,6 @@ fn display_awaiting(awaiting: &HashSet<SubscriptionId>) -> String {
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
-    use smol_str::SmolStr;
 
     fn id(channel: AlpacaChannel, market: &str) -> SubscriptionId {
         ExchangeSub::from((channel, market)).id()

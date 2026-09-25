@@ -289,6 +289,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING: an `AlpacaSubscriber` and its clones share one connection per feed, so one feed can
+  stream trades and quotes at once** (`rustrade-data`, feature `alpaca`). Alpaca allows an account
+  one market data connection per feed (crypto, IEX and SIP each count separately), and refuses a
+  second with `connection limit exceeded`. The subscriber used to open a socket per `subscribe`
+  call, and each call carries one kind, so trades and quotes on one feed could not both be
+  streamed. Now every stream a subscriber and its clones open on a feed attaches to one socket.
+  Each `(channel, symbol)` pair is subscribed once however many streams hold it, and unsubscribed
+  when the last of them is dropped. The socket closes when no stream is left. Alpaca's frames mix
+  symbols and kinds, so the connection splits each frame and hands every stream only its own
+  messages. A stream therefore never decodes another stream's message as an error. When the
+  socket is lost, every stream on it ends and they reconnect together on one new socket. Alpaca
+  replays nothing, so what it sent while no socket was open is lost. A subscribe that would take
+  the connection past Alpaca's pair cap fails and says the cap is shared. The cap is plan-dependent,
+  30 on the free IEX plan as last measured. **Pass clones of one subscriber to every stream on an
+  account**: a subscriber built separately opens its own connection, which Alpaca refuses while
+  another is open on the feed. The error now says so. Breaking changes: `AlpacaSubscriber`'s
+  `Subscriber::Transport` is the new `AlpacaAttachment`; `AlpacaWsStream` is replaced by
+  `AlpacaStream`, the type both `StreamSelector` impls now name; and cloning a subscriber is no
+  longer equivalent to building another, because clones share its connections. **An attachment's queue
+  is unbounded**: the connection reads one socket for every stream on it and never waits for a
+  slow one, so a stream that stops being polled buffers in memory rather than applying back-pressure.
+  Symbol spelling moves to a new public `AlpacaServer` trait, with a per-feed `AlpacaSymbolShape`,
+  and the `Identifier<AlpacaMarket>` impls become blanket impls over it. The shipped feeds implement
+  it and spell every symbol as before. A server type declared outside this crate can now serve
+  `Alpaca<Server>` by implementing it.
+
 - **BREAKING: `DynamicStreams::init` bounds its instrument type on the new `DynamicInstrument`
   trait, and fails without connecting anything when a group cannot be routed** (`rustrade-data`).
   The per-connector `Identifier` bounds that `init` listed now sit behind that one trait. It is

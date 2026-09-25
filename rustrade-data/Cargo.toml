@@ -21,7 +21,7 @@ hyperliquid = ["dep:hyperliquid_rust_sdk"]
 # extra effect is to flip every `Decimal`'s default serialization workspace-wide to a lossy f64
 # number (Cargo unifies features across the build). Keeping it field-level preserves the
 # deterministic, lossless string wire format for all other `Decimal` values.
-alpaca = ["rust_decimal/serde-with-float"]
+alpaca = ["rust_decimal/serde-with-float", "serde_json/raw_value"]
 databento = ["dep:databento"]
 # London Strategic Edge. No extra dependencies today; the feature exists so the integration is
 # opt-in from the start, matching every other provider in this crate.
