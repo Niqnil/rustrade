@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`DynamicStreams` serves Alpaca market data, through `DynamicSubscribers::with_alpaca`**
+  (`rustrade-data`, feature `alpaca`). The support matrix now accepts trades and top of book on
+  `AlpacaCrypto`, `AlpacaIex` and `AlpacaSip`, and `DynamicStreams::init_with` routes them. Alpaca
+  allows an account one market data connection per feed, so the caller builds the subscriber and
+  passes it in with `DynamicSubscribers::default().with_alpaca(subscriber)`. Every Alpaca group
+  takes a clone of it, whatever its feed, kind or batch, so each feed's groups share one socket. The
+  top of book is Alpaca's quote, delivered as `OrderBookL1` through a new
+  `StreamSelector<_, OrderBooksL1>` for the Alpaca connectors, which reads the same `quotes`
+  channel as `Quotes`. The engine's market data carries a top of book rather than a quote, so
+  `SubKind::Quotes` stays with the typed `Streams` builder and `DynamicStreams` refuses it. A side
+  Alpaca quotes at a zero price has no quote, and the book leaves it `None`. IEX quotes are IEX's
+  own top of book rather than the NBBO. `AlpacaSip` is routed on the code path it shares with IEX
+  and has never been run against the real feed, which needs a paid subscription.
+  `AlpacaQuoteTransformer` gains a `Kind` parameter, defaulting to `Quotes`, for the event it
+  produces.
+
 - **`DynamicStreams` serves London Strategic Edge and Hyperliquid perpetuals, through the new
   `DynamicStreams::init_with` and `DynamicSubscribers`** (`rustrade-data`). The support matrix
   accepted `Lse*` and `HyperliquidPerp` subscriptions, then `DynamicStreams::init` refused every one

@@ -57,7 +57,13 @@
 //! # Supported Streams
 //!
 //! - [`PublicTrades`](crate::subscription::trade::PublicTrades): Real-time trades
-//! - [`Quotes`](crate::subscription::quote::Quotes): Real-time quotes (NBBO for equities, bid/ask for crypto)
+//! - [`Quotes`](crate::subscription::quote::Quotes): Real-time quotes — IEX's own top of book on
+//!   the IEX feed, the NBBO on SIP, Alpaca's crypto venue on crypto
+//! - [`OrderBooksL1`](crate::subscription::book::OrderBooksL1): the same quotes as a top of book,
+//!   read from the same `quotes` channel. This is the kind
+//!   [`DynamicStreams`](crate::streams::builder::dynamic::DynamicStreams) serves, since the engine's
+//!   market data carries a top of book rather than a quote. A side Alpaca publishes at a zero price
+//!   has no quote and is `None`.
 //!
 //! # Subscription confirmation
 //!
@@ -91,7 +97,8 @@ use crate::{
         Subscribed, Subscriber, mapper::SubscriptionMapper, validator::WebSocketSubValidator,
     },
     subscription::{
-        Subscription, SubscriptionKind, SubscriptionMeta, quote::Quotes, trade::PublicTrades,
+        Subscription, SubscriptionKind, SubscriptionMeta, book::OrderBooksL1, quote::Quotes,
+        trade::PublicTrades,
     },
 };
 use fnv::FnvHashSet;
@@ -242,6 +249,17 @@ where
     type Stream = AlpacaStream<AlpacaQuoteTransformer<Self, Instrument::Key>>;
 }
 
+/// The same quotes as [`Quotes`], as a top of book. See the `OrderBookL1` conversion in
+/// [`quote`] for how a quote maps onto one.
+impl<Instrument, Server> StreamSelector<Instrument, OrderBooksL1> for Alpaca<Server>
+where
+    Instrument: InstrumentData,
+    Server: ExchangeServer + Debug + Send + Sync,
+{
+    type SnapFetcher = NoInitialSnapshots;
+    type Stream = AlpacaStream<AlpacaQuoteTransformer<Self, Instrument::Key, OrderBooksL1>>;
+}
+
 impl<'de, Server> Deserialize<'de> for Alpaca<Server>
 where
     Server: ExchangeServer,
@@ -377,6 +395,12 @@ impl AlpacaSubscriber {
     /// See [`AlpacaCredentials::from_env`](crate::exchange::alpaca::AlpacaCredentials::from_env) for the variables read and error conditions.
     pub fn from_env() -> Result<Self, SocketError> {
         Ok(Self::new(AlpacaCredentials::from_env()?))
+    }
+
+    /// How many handles share this subscriber's connections: this subscriber and each clone of it.
+    #[cfg(test)]
+    pub(crate) fn connection_handles(&self) -> usize {
+        Arc::strong_count(&self.connections)
     }
 }
 

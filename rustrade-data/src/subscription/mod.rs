@@ -325,6 +325,16 @@ pub fn exchange_supports_instrument_kind_sub_kind(
         (Okx, Spot | Future { .. } | Perpetual | Option { .. }, PublicTrades) => true,
         (HyperliquidPerp, Perpetual, PublicTrades | OrderBooksL2) => true,
 
+        // Alpaca's top of book is its quote: `OrderBooksL1` reads the `quotes` channel, which the
+        // typed `Quotes` kind also serves. `Quotes` itself has no arm because `DynamicStreams`, the
+        // one caller of this matrix, carries no quote channel, and the engine's market data no quote
+        // event. IEX quotes are IEX's own top of book rather than the NBBO; SIP quotes are the NBBO.
+        //
+        // ⚠️ `AlpacaSip` is declared on the strength of the code path, which it shares with IEX, and
+        // has never been run against the real feed: it needs a paid subscription. See
+        // `exchange::alpaca`.
+        (AlpacaCrypto | AlpacaIex | AlpacaSip, Spot, PublicTrades | OrderBooksL1) => true,
+
         // London Strategic Edge serves both kinds from ONE frame: its WebSocket publishes a single
         // tick carrying `price`, `bid`, `ask` and `volume` together, so a dataset that serves one
         // of these kinds necessarily serves the other. The two arms differ only in instrument kind,
