@@ -176,15 +176,18 @@ impl<P: Protocol> Actor<P> {
         let exchange = request.exchange;
         let timeout = request.timeout;
 
-        // Request order first, so a batch reaches the wire in the order it was asked for.
-        let mut seen = FnvHashSet::default();
-        let sending = request
-            .slots
-            .iter()
-            .chain(fresh.then(|| self.registry.slots()).into_iter().flatten())
-            .filter(|slot| !socket.subscribed.contains(*slot) && seen.insert(*slot))
-            .cloned()
-            .collect::<Vec<_>>();
+        // Request order first, so a batch reaches the wire in the order it was asked for. Scoped so
+        // no borrowed slot is held across the handshake's awaits, which would demand `Sync` of it.
+        let sending = {
+            let mut seen = FnvHashSet::default();
+            request
+                .slots
+                .iter()
+                .chain(fresh.then(|| self.registry.slots()).into_iter().flatten())
+                .filter(|slot| !socket.subscribed.contains(*slot) && seen.insert(*slot))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
 
         let (tx, rx) = mpsc::unbounded_channel();
         let id = self.registry.insert_live(request, tx);
@@ -426,7 +429,7 @@ impl<P: Protocol> Actor<P> {
         if self.socket.take().is_some() {
             warn!(
                 cause,
-                endpoint = ?self.endpoint,
+                endpoint = self.endpoint.as_ref().map(tracing::field::display),
                 streams = self.registry.len(),
                 "{} connection lost; every stream sharing it ends, and the first to re-attach \
                  reconnects for all of them",
@@ -467,7 +470,11 @@ impl<P: Protocol> Actor<P> {
 
     async fn close(&mut self) {
         if let Some(mut socket) = self.socket.take() {
-            debug!(endpoint = ?self.endpoint, "closing {} connection", P::NAME);
+            debug!(
+                endpoint = self.endpoint.as_ref().map(tracing::field::display),
+                "closing {} connection",
+                P::NAME
+            );
             // Best effort: the connection is being discarded either way.
             let _ = socket.websocket.close(None).await;
         }

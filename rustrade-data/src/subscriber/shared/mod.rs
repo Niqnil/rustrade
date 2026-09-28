@@ -117,13 +117,13 @@ pub(crate) trait Protocol: Debug + Sized + Send + 'static {
     type Credentials: Clone + Debug + Send + Sync + 'static;
 
     /// One subscription on the socket: what the provider counts against its cap.
-    type Slot: Clone + Eq + Hash + Debug + Send + Sync + 'static;
+    type Slot: Clone + Eq + Hash + Debug + Send + 'static;
 
     /// What a stream's batch carries beyond its exchange, kind and slots.
     type Batch: Batch;
 
     /// What authentication reported about the socket.
-    type Session: Send + Sync;
+    type Session: Send;
 
     /// A subscribe or unsubscribe answer, as a handshake reads it.
     type Answer: Debug + Send;

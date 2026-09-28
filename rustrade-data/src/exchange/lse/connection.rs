@@ -345,9 +345,11 @@ impl Protocol for Lse {
         let starts = plan_starts(registry, sending);
 
         let joined = joined_without_replay(registry, id, sending);
-        if !joined.is_empty() {
+        if !joined.is_empty()
+            && let Some(registration) = registry.get(id)
+        {
             warn!(
-                exchange = ?registry.get(id).map(|registration| registration.exchange),
+                exchange = %registration.exchange,
                 symbols = ?joined,
                 "London Strategic Edge symbols this stream resumes were already streaming on the \
                  shared connection, and the provider replays nothing for a symbol it already \
