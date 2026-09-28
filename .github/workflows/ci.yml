@@ -121,29 +121,21 @@ jobs:
         with:
           shared-key: "rustrade-ci-test"
 
-      # This job has been intermittently killed with exit 143 (SIGTERM) during the final parallel
-      # compile-and-link of the `rustrade` crate, with no other diagnostic. Sample memory and the
-      # largest processes every 5 s so a kill can be attributed, or memory ruled out. The sampler
-      # runs in the background for the rest of the job; the runner reaps it at job end.
-      - name: Start memory sampler
-        run: |
-          nproc
-          free -m
-          swapon --show
-          # shellcheck disable=SC2016 # single-quoted on purpose: the inner shell expands each sample
-          nohup bash -c 'while true; do
-            echo "=== $(date -u +%H:%M:%S)"
-            free -m | awk "NR==2 {print \"used_mb=\" \$3, \"avail_mb=\" \$7} NR==3 {print \"swap_used_mb=\" \$3}"
-            ps -eo rss=,comm= --sort=-rss | head -5 | awk "{printf \"  %6d MB %s\n\", \$1/1024, \$2}"
-            sleep 5
-          done' > "$RUNNER_TEMP/mem.log" 2>&1 &
-
       - name: Run cargo test
         # `--examples` links the example binaries rather than only type-checking them.
         # That is viable because `.cargo/config.toml` sets `-C split-debuginfo=unpacked`;
         # without it the multi-exchange examples carry enough `.debug_str` to overflow a
         # 32-bit relocation and the link fails.
-        run: cargo test --locked --workspace --all-features --lib --bins --tests --examples
+        #
+        # This step has been intermittently killed with exit 143 (SIGTERM) during the final
+        # parallel compile-and-link of the `rustrade` crate. The kill ends the whole job, skipping
+        # every later step including `if: always()` ones, so the sampler runs inside this step and
+        # prints as it goes: whatever it saw before the kill is already in the log.
+        run: |
+          .github/scripts/sample-memory.sh 5 "$RUNNER_TEMP/mem.log" &
+          sampler=$!
+          trap 'kill "$sampler"' EXIT
+          cargo test --locked --workspace --all-features --lib --bins --tests --examples
 
       # The target list above excludes doc-tests, so without this step a rustdoc example
       # that no longer compiles ships green. Separate from the step above so a failure here is
@@ -151,28 +143,18 @@ jobs:
       - name: Run doc-tests
         run: cargo test --locked --workspace --all-features --doc
 
-      # Always record the peak, so the headroom on green runs is visible as well as the cause on
-      # red ones. The kernel log names any OOM kill; systemd-oomd acts on memory pressure without
-      # one, so its journal is checked too.
-      - name: Memory report
+      # Put the build's peak in the job summary, so the headroom on runs that survive is on record
+      # alongside the kills. A killed run never reaches this step; its samples are in the log above.
+      - name: Memory peak
         if: always()
         run: |
-          log="$RUNNER_TEMP/mem.log"
-          # The step shell runs with `-e -o pipefail`: a missing or empty log must not end the step
-          # before the kernel log is read.
-          peak=$(grep -o 'used_mb=[0-9]*' "$log" 2>/dev/null | cut -d= -f2 | sort -n | tail -1 || true)
-          low=$(grep -o 'avail_mb=[0-9]*' "$log" 2>/dev/null | cut -d= -f2 | sort -n | head -1 || true)
-          echo "Peak used: ${peak:-?} MB, lowest available: ${low:-?} MB of $(free -m | awk 'NR==2 {print $2}') MB" \
+          record="$RUNNER_TEMP/mem.log"
+          # `|| true`: the step shell runs with `-e -o pipefail`, and a failure before the sampler
+          # started leaves no record.
+          peak=$(grep -o 'used=[0-9]*' "$record" 2>/dev/null | cut -d= -f2 | sort -n | tail -1 || true)
+          low=$(grep -o 'avail=[0-9]*' "$record" 2>/dev/null | cut -d= -f2 | sort -n | head -1 || true)
+          echo "Build memory: peak used ${peak:-?} MB, lowest available ${low:-?} MB, of $(free -m | awk 'NR==2 {print $2}') MB" \
             | tee -a "$GITHUB_STEP_SUMMARY"
-          echo "::group::Last 2 minutes of samples"
-          tail -n 168 "$log" || echo "no samples"
-          echo "::endgroup::"
-          echo "::group::Kernel OOM messages"
-          sudo dmesg -T | grep -iE 'out of memory|oom|killed process' || echo "none"
-          echo "::endgroup::"
-          echo "::group::systemd-oomd"
-          sudo journalctl -u systemd-oomd --no-pager 2>/dev/null | tail -n 20 || echo "unavailable"
-          echo "::endgroup::"
 
   clippy:
     name: cargo clippy
