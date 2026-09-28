@@ -777,6 +777,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **The Binance execution clients now document that `binance-sdk` logs request credentials at
+  `DEBUG`** (`rustrade-execution`, feature `binance`). The SDK's WebSocket API client logs every
+  request it sends at `DEBUG`, after signing. For `BinanceSpot` that is every order placement and
+  cancellation and the user-data subscription, each carrying the account's API key and the
+  request's signature. For `BinanceMargin` it is the user-data subscription, carrying the listen
+  token. The API secret and private key are never logged. This library installs no subscriber, so
+  the fix belongs in the application's filter. The `binance` module rustdoc now explains the
+  exposure and gives an `EnvFilter` recipe: seed a `binance_sdk=info` directive before the user's
+  own, so a bare `RUST_LOG=debug` cannot lift it while an explicit `binance_sdk=debug` still can.
+
 - **The dead `RUSTSEC-2024-0436` (`paste`) suppression has been dropped from `deny.toml` and the
   CI audit job's ignore list.** `paste` left the graph when `parquet` moved to 59.2.0; it appears
   zero times in `Cargo.lock`, so the entry has been suppressing an advisory for a crate the build
