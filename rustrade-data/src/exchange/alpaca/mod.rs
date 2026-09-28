@@ -435,11 +435,15 @@ impl Subscriber for AlpacaSubscriber {
         debug!(%exchange, %url, ?subscriptions, "subscribing to Alpaca WebSocket");
 
         let slots = requested_slots(exchange, subscriptions)?;
-        if slots.is_empty() {
+        // Every subscription in a batch shares one `Kind`, and a batch has a pair per subscription.
+        let Some(kind) = subscriptions
+            .first()
+            .map(|subscription| subscription.kind.as_str())
+        else {
             return Err(SocketError::Subscribe(format!(
                 "no subscriptions were given to subscribe to on {exchange}"
             )));
-        }
+        };
 
         // Only the instrument map is taken from the mapper. The subscribe payload is built by the
         // connection instead, because it alone knows what the socket already holds.
@@ -453,6 +457,7 @@ impl Subscriber for AlpacaSubscriber {
             .attach(AttachRequest {
                 exchange,
                 url,
+                kind,
                 slots,
                 timeout: Exchange::subscription_timeout(),
             })

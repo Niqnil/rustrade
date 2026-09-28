@@ -25,6 +25,11 @@ pub mod mapper;
 /// validate actioned [`Subscription`]s were successful.
 pub mod validator;
 
+/// One connection shared by every stream a subscriber and its clones open, for providers that cap
+/// how many connections a key may hold.
+#[cfg(any(feature = "alpaca", feature = "lse"))]
+pub(crate) mod shared;
+
 /// Defines how to connect to a socket and subscribe to market data streams.
 ///
 /// Subscribers may carry state such as authentication credentials.
