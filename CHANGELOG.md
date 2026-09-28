@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`DynamicStreams` serves Alpaca market data, through `DynamicSubscribers::with_alpaca`**
+  (`rustrade-data`, feature `alpaca`). The support matrix now accepts trades and top of book on
+  `AlpacaCrypto`, `AlpacaIex` and `AlpacaSip`, and `DynamicStreams::init_with` routes them. Alpaca
+  allows an account one market data connection per feed, so the caller builds the subscriber and
+  passes it in with `DynamicSubscribers::default().with_alpaca(subscriber)`. Every Alpaca group
+  takes a clone of it, whatever its feed, kind or batch, so each feed's groups share one socket. The
+  top of book is Alpaca's quote, delivered as `OrderBookL1` through a new
+  `StreamSelector<_, OrderBooksL1>` for the Alpaca connectors, which reads the same `quotes`
+  channel as `Quotes`. The engine's market data carries a top of book rather than a quote, so
+  `SubKind::Quotes` stays with the typed `Streams` builder and `DynamicStreams` refuses it. A side
+  Alpaca quotes at a zero price has no quote, and the book leaves it `None`. IEX quotes are IEX's
+  own top of book rather than the NBBO. `AlpacaSip` is routed on the code path it shares with IEX
+  and has never been run against the real feed, which needs a paid subscription.
+  `AlpacaQuoteTransformer` gains a `Kind` parameter, defaulting to `Quotes`, for the event it
+  produces.
+
 - **`DynamicStreams` serves London Strategic Edge and Hyperliquid perpetuals, through the new
   `DynamicStreams::init_with` and `DynamicSubscribers`** (`rustrade-data`). The support matrix
   accepted `Lse*` and `HyperliquidPerp` subscriptions, then `DynamicStreams::init` refused every one
@@ -358,6 +374,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   impls over the new `LseInstrument` and `HyperliquidInstrument` traits** (`rustrade-data`,
   features `lse` and `hyperliquid`). They replace three impls each, one per instrument type, and
   spell every symbol as before. An instrument type declared outside this crate identifies its market
+  by implementing the trait.
+
+- **BREAKING: the Alpaca market identifier is one blanket impl over the new `AlpacaInstrument`
+  trait, and an exchange-named Alpaca instrument's symbol is uppercased** (`rustrade-data`, feature
+  `alpaca`). The trait replaces the three impls, one per instrument type, that the `AlpacaServer`
+  blanket impls still needed. A `MarketInstrumentData` instrument's `name_exchange` used to be sent
+  as given. Alpaca spells its symbols in uppercase and confirms a subscribe only once its answer
+  names each requested symbol exactly, so a lowercase name timed out unconfirmed. It is now
+  uppercased, as the symbol reconstructed from a `MarketDataInstrument` always was. Every other
+  symbol is spelled as before. An instrument type declared outside this crate identifies its market
   by implementing the trait.
 
 - **BREAKING: `LseTick::bid` and `LseTick::ask` are now `Option<Decimal>`** (`rustrade-data`,

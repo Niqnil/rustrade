@@ -5,6 +5,8 @@
 //! needs — fails the whole initialisation with nothing opened.
 
 use super::DynamicSubscribers;
+#[cfg(feature = "alpaca")]
+use crate::exchange::alpaca::{AlpacaCrypto, AlpacaIex, AlpacaSip, AlpacaSubscriber};
 #[cfg(feature = "hyperliquid")]
 use crate::exchange::hyperliquid::Hyperliquid;
 #[cfg(feature = "lse")]
@@ -109,6 +111,7 @@ where
         + Send
         + Sync
         + 'static
+        + super::DynamicAlpacaInstrument
         + super::DynamicLseInstrument
         + super::DynamicHyperliquidInstrument,
     Instrument::Key: Debug + Clone + PartialEq + Send + Sync + 'static,
@@ -149,8 +152,8 @@ where
     ) -> Result<GroupFuture, DataError> {
         use SubKind::{OrderBooksL1 as L1, OrderBooksL2 as L2, PublicTrades as Trades};
 
-        // Only the London Strategic Edge arms take a subscriber from the caller.
-        #[cfg(not(feature = "lse"))]
+        // Only the Alpaca and London Strategic Edge arms take a subscriber from the caller.
+        #[cfg(not(any(feature = "alpaca", feature = "lse")))]
         let _ = subscribers;
 
         let subs = subscriptions;
@@ -345,6 +348,65 @@ where
                 return Err(feature_disabled(exchange, "hyperliquid"));
             }
 
+            // Every Alpaca group takes a clone of the ONE subscriber supplied, so the groups on each
+            // feed share its connection to it: Alpaca allows an account one per feed.
+            #[cfg(feature = "alpaca")]
+            (ExchangeId::AlpacaCrypto, Trades) => group(
+                alpaca(subscribers, exchange)?,
+                AlpacaCrypto::default(),
+                PublicTrades,
+                subs,
+                tx(&txs.trades, exchange),
+            ),
+            // Alpaca's top of book is its quote, read from the `quotes` channel.
+            #[cfg(feature = "alpaca")]
+            (ExchangeId::AlpacaCrypto, L1) => group(
+                alpaca(subscribers, exchange)?,
+                AlpacaCrypto::default(),
+                OrderBooksL1,
+                subs,
+                tx(&txs.l1s, exchange),
+            ),
+            #[cfg(feature = "alpaca")]
+            (ExchangeId::AlpacaIex, Trades) => group(
+                alpaca(subscribers, exchange)?,
+                AlpacaIex::default(),
+                PublicTrades,
+                subs,
+                tx(&txs.trades, exchange),
+            ),
+            #[cfg(feature = "alpaca")]
+            (ExchangeId::AlpacaIex, L1) => group(
+                alpaca(subscribers, exchange)?,
+                AlpacaIex::default(),
+                OrderBooksL1,
+                subs,
+                tx(&txs.l1s, exchange),
+            ),
+            #[cfg(feature = "alpaca")]
+            (ExchangeId::AlpacaSip, Trades) => group(
+                alpaca(subscribers, exchange)?,
+                AlpacaSip::default(),
+                PublicTrades,
+                subs,
+                tx(&txs.trades, exchange),
+            ),
+            #[cfg(feature = "alpaca")]
+            (ExchangeId::AlpacaSip, L1) => group(
+                alpaca(subscribers, exchange)?,
+                AlpacaSip::default(),
+                OrderBooksL1,
+                subs,
+                tx(&txs.l1s, exchange),
+            ),
+            #[cfg(not(feature = "alpaca"))]
+            (
+                ExchangeId::AlpacaCrypto | ExchangeId::AlpacaIex | ExchangeId::AlpacaSip,
+                Trades | L1,
+            ) => {
+                return Err(feature_disabled(exchange, "alpaca"));
+            }
+
             // Every London Strategic Edge group takes a clone of the ONE subscriber supplied, so
             // they all share its connection: the provider allows a key a single socket.
             #[cfg(feature = "lse")]
@@ -489,6 +551,18 @@ fn tx<Tx: Clone>(txs: &FnvHashMap<ExchangeId, Tx>, exchange: ExchangeId) -> Tx {
     txs.get(&exchange).unwrap().clone()
 }
 
+/// A clone of the Alpaca subscriber, sharing its connection to each feed.
+#[cfg(feature = "alpaca")]
+fn alpaca(
+    subscribers: &DynamicSubscribers,
+    exchange: ExchangeId,
+) -> Result<AlpacaSubscriber, DataError> {
+    subscribers
+        .alpaca
+        .clone()
+        .ok_or(DataError::SubscriberRequired { exchange })
+}
+
 /// A clone of the London Strategic Edge subscriber, sharing its connection.
 #[cfg(feature = "lse")]
 fn lse(subscribers: &DynamicSubscribers, exchange: ExchangeId) -> Result<LseSubscriber, DataError> {
@@ -498,7 +572,11 @@ fn lse(subscribers: &DynamicSubscribers, exchange: ExchangeId) -> Result<LseSubs
         .ok_or(DataError::SubscriberRequired { exchange })
 }
 
-#[cfg(any(not(feature = "lse"), not(feature = "hyperliquid")))]
+#[cfg(any(
+    not(feature = "alpaca"),
+    not(feature = "lse"),
+    not(feature = "hyperliquid")
+))]
 fn feature_disabled(exchange: ExchangeId, feature: &str) -> DataError {
     DataError::FeatureDisabled {
         exchange,

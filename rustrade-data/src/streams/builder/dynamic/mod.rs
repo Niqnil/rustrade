@@ -1,3 +1,5 @@
+#[cfg(feature = "alpaca")]
+use crate::exchange::alpaca::{AlpacaSubscriber, market::AlpacaInstrument};
 #[cfg(feature = "hyperliquid")]
 use crate::exchange::hyperliquid::market::HyperliquidInstrument;
 #[cfg(feature = "lse")]
@@ -59,6 +61,7 @@ pub struct DynamicStreams<InstrumentKey> {
 /// supplied fails with [`DataError::SubscriberRequired`].
 ///
 /// Venues that need one:
+/// - **Alpaca** (`alpaca` feature): `AlpacaCrypto`, `AlpacaIex` and `AlpacaSip`.
 /// - **London Strategic Edge** (`lse` feature): every `Lse*` dataset.
 ///
 /// # Example
@@ -83,11 +86,37 @@ pub struct DynamicStreams<InstrumentKey> {
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct DynamicSubscribers {
+    #[cfg(feature = "alpaca")]
+    alpaca: Option<AlpacaSubscriber>,
     #[cfg(feature = "lse")]
     lse: Option<LseSubscriber>,
 }
 
 impl DynamicSubscribers {
+    /// Serve every Alpaca subscription — any feed, either kind — from clones of `subscriber`.
+    ///
+    /// Alpaca allows an account one market data connection per feed and refuses a second on the
+    /// same feed with `connection limit exceeded`. Clones of one subscriber share one connection per
+    /// feed, so every `Alpaca*` group of every batch on a feed attaches to the same socket, and the
+    /// crypto, IEX and SIP feeds each get one of their own. Any other stream the caller opens on the
+    /// same account should take a clone of this subscriber too, rather than one built separately.
+    ///
+    /// Quotes arrive as [`OrderBookL1`]: `SubKind::OrderBooksL1` reads Alpaca's `quotes` channel,
+    /// and a side quoted at a zero price is `None`. `SubKind::Quotes` is not served here; the
+    /// typed [`Streams`](crate::streams::Streams) builder serves it. A confirmed crypto
+    /// subscription may stay silent for minutes: Alpaca publishes a crypto quote only when the top
+    /// of book changes. See [`exchange::alpaca`](crate::exchange::alpaca).
+    ///
+    /// The `(channel, symbol)` pairs every stream on a feed holds count together against Alpaca's
+    /// per-connection cap — 30 on the free IEX plan, as last measured. Trades and L1 on one symbol
+    /// are two pairs.
+    #[cfg(feature = "alpaca")]
+    #[must_use]
+    pub fn with_alpaca(mut self, subscriber: AlpacaSubscriber) -> Self {
+        self.alpaca = Some(subscriber);
+        self
+    }
+
     /// Serve every London Strategic Edge subscription — any dataset, either kind — from clones of
     /// `subscriber`.
     ///
@@ -125,9 +154,9 @@ impl DynamicSubscribers {
 /// bounds, so a caller generic over the instrument states this one bound rather than one per
 /// connector and kind.
 ///
-/// Which connectors it covers depends on the cargo features enabled: with `lse` it also requires
-/// [`LseInstrument`], with `hyperliquid` [`HyperliquidInstrument`]. The three types above satisfy
-/// every combination.
+/// Which connectors it covers depends on the cargo features enabled: with `alpaca` it also
+/// requires [`AlpacaInstrument`], with `lse` [`LseInstrument`], with `hyperliquid`
+/// [`HyperliquidInstrument`]. The three types above satisfy every combination.
 ///
 /// # Only this crate's instrument types implement it
 /// It is sealed: its supertrait lives in a private module, so no crate but this one can name it
@@ -142,6 +171,21 @@ impl DynamicSubscribers {
 pub trait DynamicInstrument: Route {}
 
 impl<Instrument> DynamicInstrument for Instrument where Instrument: Route {}
+
+/// Requires [`AlpacaInstrument`] when the `alpaca` feature is enabled, and nothing otherwise. See
+/// [`DynamicLseInstrument`] for why this is a trait.
+#[cfg(feature = "alpaca")]
+pub trait DynamicAlpacaInstrument: AlpacaInstrument {}
+
+#[cfg(feature = "alpaca")]
+impl<Instrument> DynamicAlpacaInstrument for Instrument where Instrument: AlpacaInstrument {}
+
+/// Requires `AlpacaInstrument` when the `alpaca` feature is enabled, and nothing otherwise.
+#[cfg(not(feature = "alpaca"))]
+pub trait DynamicAlpacaInstrument {}
+
+#[cfg(not(feature = "alpaca"))]
+impl<Instrument> DynamicAlpacaInstrument for Instrument {}
 
 /// Requires [`LseInstrument`] when the `lse` feature is enabled, and nothing otherwise.
 ///
@@ -209,8 +253,9 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
     ///
     /// # Streams sharing a connection
     /// A venue supplied through `subscribers` receives a clone of that subscriber for every group,
-    /// whichever batch it came from. Where clones share a connection — London Strategic Edge —
-    /// every group on that venue shares it, across datasets and kinds.
+    /// whichever batch it came from. Where clones share a connection, every group on that venue
+    /// shares it: across datasets and kinds on London Strategic Edge, and across kinds on each
+    /// Alpaca feed.
     ///
     /// # Errors
     /// Nothing is connected until every group has been routed, so these fail the call with no
@@ -225,11 +270,12 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
     /// finish initialising, stops every stream that succeeded, and returns the first error — so a
     /// failed call leaves no stream running: each is dropped before the call returns.
     ///
-    /// A dropped London Strategic Edge stream asks its connection to release its share, and the
-    /// connection does so asynchronously, closing the socket once no stream remains. A retry
-    /// through the same subscriber, or a clone of it, reuses that connection whatever state it is
-    /// in. A retry through a subscriber built separately for the same key may still be refused
-    /// with `TOO_MANY_CONNECTIONS` until the socket has closed.
+    /// A dropped London Strategic Edge or Alpaca stream asks its connection to release its share,
+    /// and the connection does so asynchronously, closing the socket once no stream remains. A
+    /// retry through the same subscriber, or a clone of it, reuses that connection whatever state
+    /// it is in. A retry through a subscriber built separately for the same account may still be
+    /// refused — `TOO_MANY_CONNECTIONS` on London Strategic Edge, `connection limit exceeded` on
+    /// Alpaca — until the socket has closed.
     ///
     /// ## Examples
     /// Please see rustrade-data-rs/examples/dynamic_multi_stream_multi_exchange.rs for a
@@ -840,17 +886,30 @@ mod tests {
 
     /// Subscribers for every venue that needs one in this build.
     fn every_subscriber() -> DynamicSubscribers {
+        let subscribers = DynamicSubscribers::default();
+
+        #[cfg(feature = "alpaca")]
+        let subscribers = subscribers.with_alpaca(alpaca_subscriber());
+
         #[cfg(feature = "lse")]
-        return DynamicSubscribers::default().with_lse(LseSubscriber::new(
+        let subscribers = subscribers.with_lse(LseSubscriber::new(
             crate::exchange::lse::live::LseCredentials::new("test-key"),
         ));
 
-        #[cfg(not(feature = "lse"))]
-        DynamicSubscribers::default()
+        subscribers
+    }
+
+    #[cfg(feature = "alpaca")]
+    fn alpaca_subscriber() -> AlpacaSubscriber {
+        AlpacaSubscriber::new(crate::exchange::alpaca::AlpacaCredentials::new(
+            "test-key",
+            "test-secret",
+        ))
     }
 
     fn feature_enabled(feature: &str) -> bool {
         match feature {
+            "alpaca" => cfg!(feature = "alpaca"),
             "lse" => cfg!(feature = "lse"),
             "hyperliquid" => cfg!(feature = "hyperliquid"),
             other => panic!("no dynamic route is gated on the `{other}` feature"),
@@ -916,6 +975,116 @@ mod tests {
 
         assert!(
             matches!(&error, DataError::Socket(message) if message.contains("lse_options")),
+            "{error:?}"
+        );
+    }
+
+    #[cfg(feature = "alpaca")]
+    #[test]
+    fn one_alpaca_batch_across_feeds_and_kinds_shares_one_subscriber() {
+        let subscriber = alpaca_subscriber();
+        let subscribers = DynamicSubscribers::default().with_alpaca(subscriber.clone());
+        let before = subscriber.connection_handles();
+
+        let groups = route(
+            vec![vec![
+                subscription(
+                    ExchangeId::AlpacaCrypto,
+                    MarketDataInstrumentKind::Spot,
+                    SubKind::PublicTrades,
+                ),
+                subscription(
+                    ExchangeId::AlpacaCrypto,
+                    MarketDataInstrumentKind::Spot,
+                    SubKind::OrderBooksL1,
+                ),
+                subscription(
+                    ExchangeId::AlpacaIex,
+                    MarketDataInstrumentKind::Spot,
+                    SubKind::PublicTrades,
+                ),
+                subscription(
+                    ExchangeId::AlpacaIex,
+                    MarketDataInstrumentKind::Spot,
+                    SubKind::OrderBooksL1,
+                ),
+            ]],
+            &subscribers,
+        )
+        .unwrap();
+
+        // One group per (feed, kind), each holding a clone of the one subscriber: a group given a
+        // subscriber of its own would open a second socket to its feed, which Alpaca refuses.
+        assert_eq!(groups.len(), 4);
+        assert_eq!(subscriber.connection_handles(), before + groups.len());
+
+        drop(groups);
+        assert_eq!(subscriber.connection_handles(), before);
+    }
+
+    #[cfg(feature = "alpaca")]
+    #[test]
+    fn an_alpaca_subscription_without_a_subscriber_fails_the_call_before_any_group_connects() {
+        let error = route(
+            vec![
+                vec![subscription(
+                    ExchangeId::BinanceSpot,
+                    MarketDataInstrumentKind::Spot,
+                    SubKind::PublicTrades,
+                )],
+                vec![subscription(
+                    ExchangeId::AlpacaIex,
+                    MarketDataInstrumentKind::Spot,
+                    SubKind::OrderBooksL1,
+                )],
+            ],
+            &DynamicSubscribers::default(),
+        )
+        .err()
+        .unwrap();
+
+        assert_eq!(
+            error,
+            DataError::SubscriberRequired {
+                exchange: ExchangeId::AlpacaIex
+            }
+        );
+    }
+
+    #[cfg(not(feature = "alpaca"))]
+    #[test]
+    fn an_alpaca_subscription_without_the_feature_names_the_feature() {
+        let error = route(
+            vec![vec![subscription(
+                ExchangeId::AlpacaCrypto,
+                MarketDataInstrumentKind::Spot,
+                SubKind::PublicTrades,
+            )]],
+            &DynamicSubscribers::default(),
+        )
+        .err()
+        .unwrap();
+
+        assert_eq!(
+            error,
+            DataError::FeatureDisabled {
+                exchange: ExchangeId::AlpacaCrypto,
+                feature: "alpaca".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn alpaca_quotes_are_refused_before_routing_because_dynamic_streams_carry_no_quote() {
+        let error = validate_batches([[subscription(
+            ExchangeId::AlpacaCrypto,
+            MarketDataInstrumentKind::Spot,
+            SubKind::Quotes,
+        )]])
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, DataError::Socket(message) if message.contains("alpaca_crypto")),
             "{error:?}"
         );
     }

@@ -1,7 +1,7 @@
 use super::Alpaca;
 use crate::{
     Identifier,
-    subscription::{Subscription, quote::Quotes, trade::PublicTrades},
+    subscription::{Subscription, book::OrderBooksL1, quote::Quotes, trade::PublicTrades},
 };
 
 /// Alpaca WebSocket channel types.
@@ -48,6 +48,16 @@ impl<Server, Instrument> Identifier<AlpacaChannel>
 
 impl<Server, Instrument> Identifier<AlpacaChannel>
     for Subscription<Alpaca<Server>, Instrument, Quotes>
+{
+    fn id(&self) -> AlpacaChannel {
+        AlpacaChannel::Quotes
+    }
+}
+
+/// Alpaca's top of book is its quote, so an L1 stream reads the `quotes` channel. It shares the
+/// `(channel, symbol)` pair with any [`Quotes`] stream on the same symbol and feed.
+impl<Server, Instrument> Identifier<AlpacaChannel>
+    for Subscription<Alpaca<Server>, Instrument, OrderBooksL1>
 {
     fn id(&self) -> AlpacaChannel {
         AlpacaChannel::Quotes
