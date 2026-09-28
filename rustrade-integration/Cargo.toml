@@ -32,6 +32,7 @@ stream = ["dep:tokio-stream", "dep:pin-project", "dep:futures", "dep:rustrade-in
 [dev-dependencies]
 tokio-test = { workspace = true }
 sha2 = { workspace = true }
+wiremock = { workspace = true }
 
 [dependencies]
 # Rustrade Ecosystem

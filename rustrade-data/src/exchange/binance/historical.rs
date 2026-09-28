@@ -1009,4 +1009,60 @@ mod tests {
         }
         server.join().expect("mock server panicked");
     }
+
+    // --- Transport ---------------------------------------------------------------------------
+
+    /// `page([BASE_MS])` -- one spot row -- gzip-compressed with a zeroed mtime so the bytes are
+    /// reproducible: `python3 -c 'import gzip; print(gzip.compress(PAGE, mtime=0))'`.
+    const GZIPPED_ONE_ROW_PAGE: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x8b, 0x8e, 0x36, 0x34, 0x37,
+        0x40, 0x00, 0x1d, 0x25, 0x43, 0x25, 0x1d, 0x25, 0x23, 0x20, 0x36, 0xd0, 0x33, 0x05, 0x92,
+        0x86, 0x10, 0xd2, 0x40, 0x49, 0x07, 0xa6, 0xcc, 0xd4, 0x12, 0x08, 0x80, 0xd2, 0x40, 0x91,
+        0xd8, 0x58, 0x00, 0x10, 0x0a, 0xf6, 0x91, 0x3e, 0x00, 0x00, 0x00,
+    ];
+
+    #[tokio::test]
+    async fn the_default_spot_client_negotiates_and_decodes_gzip() {
+        // `spot()` builds its own `reqwest::Client`, so this pins the workspace's reqwest `gzip`
+        // feature for every consumer that does not inject one via `with_client`. A kline page
+        // compresses roughly 6-8x, which is the point of asking.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/klines"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .insert_header("content-type", "application/json")
+                    .set_body_bytes(GZIPPED_ONE_ROW_PAGE),
+            )
+            .mount(&server)
+            .await;
+
+        let candles = BinanceHistoricalClient::spot()
+            .with_base_url(server.uri())
+            .with_pace(Duration::ZERO)
+            .collect_candles(
+                "BTCUSDT",
+                CandleInterval::Min1,
+                ms(BASE_MS + MIN_MS),
+                ms(BASE_MS + 2 * MIN_MS),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(candles.len(), 1);
+        assert_eq!(candles[0].close_time, ms(BASE_MS + MIN_MS));
+        let requests = server.received_requests().await.unwrap();
+        let accept_encoding = requests[0]
+            .headers
+            .get("accept-encoding")
+            .and_then(|value| value.to_str().ok());
+        assert!(
+            accept_encoding.is_some_and(|value| value.contains("gzip")),
+            "expected gzip in Accept-Encoding, sent {accept_encoding:?}"
+        );
+    }
 }
