@@ -96,6 +96,14 @@ jobs:
     # 25 minutes keeps a real hang bounded while leaving room for a cold cache. Revisit if the
     # warm-cache figure climbs far enough to erode the margin again.
     timeout-minutes: 25
+    # With full debug info, the `rustrade-data` library alone compiles at up to 13 GB in one
+    # rustc process on this 16 GB runner, almost all of it debug info. That left the job within
+    # ~0.7 GB of the runner's memory and got it intermittently killed with exit 143 (#385).
+    # Line tables keep file:line in backtraces and cut that compile to ~1.1 GB (measured locally).
+    # This is a profile setting, not a rustflag, so `.cargo/config.toml`'s mold and
+    # `split-debuginfo` flags still apply. The underlying cost, which consumers pay too, is #387.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - name: Checkout sources
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
