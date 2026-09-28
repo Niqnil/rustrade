@@ -139,10 +139,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the provider rejects a subscribe anyway, that batch fails and what it sent is unsubscribed
     again.
   - When the socket drops, every stream on it ends. The first stream to re-attach reconnects and
-    re-subscribes everything the lost socket held. Frames for streams that have not re-attached
-    yet are held for `REATTACH_GRACE` (30 s), then discarded with a warning. They are also
-    discarded, with a warning, if the new socket is lost before those streams re-attach; a stream
-    that resumes asks for them again on the next reconnect.
+    re-subscribes everything the lost socket held. A stream keeps its place for `REATTACH_GRACE`
+    (30 s) from the loss. Frames for streams that have not re-attached yet are held until then,
+    and discarded with a warning if they still have not. They are also discarded, with a warning,
+    if the new socket is lost before those streams re-attach; a stream that resumes asks for them
+    again on the next reconnect. A stream dropped while no socket was open is forgotten at the
+    same deadline, so no later reconnect re-subscribes its symbols. A reconnect that fails does
+    not extend the deadline.
   - With resumption on, each resumed symbol gets one replay window, opened at the earliest
     watermark among the streams holding it: the provider ignores `start` on a symbol it already
     streams. Each stream silently drops replayed ticks it had already delivered. Replayed frames go
@@ -341,7 +344,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   symbols and kinds, so the connection splits each frame and hands every stream only its own
   messages. A stream therefore never decodes another stream's message as an error. When the
   socket is lost, every stream on it ends and they reconnect together on one new socket. Alpaca
-  replays nothing, so what it sent while no socket was open is lost. A subscribe that would take
+  replays nothing, so what it sent while no socket was open is lost. A stream that has not
+  re-attached within `REATTACH_GRACE` (30 s) of the loss, including one dropped while no socket was
+  open, is forgotten and its pairs released, so it cannot push every later reconnect over the pair
+  cap. A subscribe that would take
   the connection past Alpaca's pair cap fails and says the cap is shared. The cap is plan-dependent,
   30 on the free IEX plan as last measured. **Pass clones of one subscriber to every stream on an
   account**: a subscriber built separately opens its own connection, which Alpaca refuses while
