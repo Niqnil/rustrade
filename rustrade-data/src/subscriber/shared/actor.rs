@@ -22,6 +22,26 @@ struct Socket<P: Protocol> {
     session: P::Session,
     /// The slots subscribed on this socket and confirmed.
     subscribed: FnvHashSet<P::Slot>,
+    /// When to ping next, for a provider that is pinged.
+    keepalive: Option<Keepalive>,
+}
+
+/// Where a pinged socket is in its keepalive.
+struct Keepalive {
+    interval: Duration,
+    next: Instant,
+    /// Whether a ping went out with nothing read since.
+    unanswered: bool,
+}
+
+impl Keepalive {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            next: Instant::now() + interval,
+            unanswered: false,
+        }
+    }
 }
 
 pub(super) struct Actor<P: Protocol> {
@@ -40,6 +60,7 @@ enum Event<P: Protocol> {
     Command(Option<Command<P>>),
     Frame(Option<Result<WsMessage, WsError>>),
     Expiry,
+    Keepalive,
 }
 
 /// What reading one frame amounted to.
@@ -77,11 +98,17 @@ impl<P: Protocol> Actor<P> {
     pub(super) async fn run(mut self) {
         loop {
             let expiry = self.registry.next_expiry();
+            let ping = self
+                .socket
+                .as_ref()
+                .and_then(|socket| socket.keepalive.as_ref())
+                .map(|keepalive| keepalive.next);
 
             let event = tokio::select! {
                 command = self.commands.recv() => Event::Command(command),
                 frame = next_frame(&mut self.socket) => Event::Frame(frame),
                 () = sleep_until(expiry) => Event::Expiry,
+                () = sleep_until(ping) => Event::Keepalive,
             };
 
             match event {
@@ -101,6 +128,7 @@ impl<P: Protocol> Actor<P> {
                     }
                 }
                 Event::Expiry => self.expire().await,
+                Event::Keepalive => self.keepalive().await,
             }
         }
 
@@ -274,16 +302,27 @@ impl<P: Protocol> Actor<P> {
 
             match self.read(frame) {
                 Read::Done(answers) => {
+                    // Every confirmation in the frame is observed before any refusal in it is
+                    // acted on, wherever in the frame the provider put it: the refusal can then
+                    // say what was left unconfirmed, and a refusal sharing a frame with the answer
+                    // that would settle the handshake is not lost to it.
+                    let mut refusal = None;
                     for answer in answers {
                         match answer {
-                            Ok(answer) => {
-                                handshake.observe(answer);
-                                if handshake.is_settled() {
-                                    return Ok(());
+                            Ok(answer) => handshake.observe(answer),
+                            Err(error) => {
+                                if let Some(earlier) = refusal.replace(error) {
+                                    report_unawaited::<P>(Err(earlier));
                                 }
                             }
-                            Err(error) => return Err(Refusal::Refused(error)),
                         }
+                    }
+
+                    if let Some(error) = refusal {
+                        return Err(Refusal::Refused(handshake.refusal(error)));
+                    }
+                    if handshake.is_settled() {
+                        return Ok(());
                     }
                 }
                 Read::Lost(cause) => {
@@ -390,6 +429,7 @@ impl<P: Protocol> Actor<P> {
             websocket,
             session,
             subscribed: FnvHashSet::default(),
+            keepalive: P::KEEPALIVE.map(Keepalive::new),
         });
 
         Ok(())
@@ -410,6 +450,33 @@ impl<P: Protocol> Actor<P> {
         Ok(())
     }
 
+    /// Ping the provider, or lose the socket if it delivered nothing since the last ping.
+    async fn keepalive(&mut self) {
+        let Some(keepalive) = self
+            .socket
+            .as_mut()
+            .and_then(|socket| socket.keepalive.as_mut())
+        else {
+            return;
+        };
+
+        if keepalive.unanswered {
+            let cause = format!(
+                "nothing received from {} within {:?} of a ping",
+                P::NAME,
+                keepalive.interval
+            );
+            self.lose(&cause);
+            return;
+        }
+
+        keepalive.unanswered = true;
+        keepalive.next = Instant::now() + keepalive.interval;
+
+        // A failed send loses the socket, which is all there is to do about it.
+        let _ = self.send(WsMessage::Ping(Default::default())).await;
+    }
+
     /// Classify one read, routing whatever it carries for the streams.
     fn read(&mut self, frame: Option<Result<WsMessage, WsError>>) -> Read<P::Answer> {
         let message = match frame {
@@ -417,6 +484,16 @@ impl<P: Protocol> Actor<P> {
             Some(Err(error)) => return self.lose(&error.to_string()),
             None => return self.lose("the socket ended"),
         };
+
+        // Anything read, not only the pong, shows the socket alive: a pong can queue behind a
+        // burst of frames.
+        if let Some(keepalive) = self
+            .socket
+            .as_mut()
+            .and_then(|socket| socket.keepalive.as_mut())
+        {
+            keepalive.unanswered = false;
+        }
 
         match P::read(&mut self.registry, &message) {
             Frame::Answers(answers) => Read::Done(answers),
@@ -530,5 +607,271 @@ async fn sleep_until(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => future::pending().await,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
+mod tests {
+    use super::*;
+    use crate::subscriber::shared::{Connections, Frame};
+    use futures::FutureExt;
+    use rustrade_instrument::exchange::ExchangeId;
+    use rustrade_integration::protocol::websocket::connect;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::WebSocketStream;
+
+    const KEEPALIVE: Duration = Duration::from_millis(100);
+
+    /// Serve one WebSocket on a local port, handing the accepted socket to `serve`.
+    async fn server<F, Fut>(serve: F) -> Url
+    where
+        F: FnOnce(WebSocketStream<tokio::net::TcpStream>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            serve(websocket).await;
+        });
+
+        url
+    }
+
+    fn request<P: Protocol<Slot = &'static str, Batch = ()>>(url: Url) -> AttachRequest<P> {
+        AttachRequest {
+            exchange: ExchangeId::Other,
+            url,
+            kind: "public_trades",
+            slots: vec!["AAPL", "MSFT"],
+            timeout: Duration::from_secs(5),
+            batch: (),
+        }
+    }
+
+    /// A pinged provider whose subscribes need no answer.
+    #[derive(Debug)]
+    struct Pinged;
+
+    struct Settled;
+
+    impl Handshake<()> for Settled {
+        fn is_settled(&self) -> bool {
+            true
+        }
+
+        fn observe(&mut self, (): ()) {}
+
+        fn timed_out(&self, _: Duration) -> String {
+            String::new()
+        }
+    }
+
+    impl Protocol for Pinged {
+        const NAME: &'static str = "Pinged";
+        const CONNECTION_PER_ENDPOINT: bool = false;
+        const REFUSAL_IS_ATOMIC: bool = false;
+        const KEEPALIVE: Option<Duration> = Some(KEEPALIVE);
+
+        type Credentials = ();
+        type Slot = &'static str;
+        type Batch = ();
+        type Session = ();
+        type Answer = ();
+        type Handshake = Settled;
+
+        async fn connect(_: &(), url: &Url) -> Result<(WebSocket, ()), SocketError> {
+            Ok((connect(url.clone()).await?, ()))
+        }
+
+        fn subscribe(
+            _: &mut Registry<Self>,
+            _: AttachId,
+            _: &[&'static str],
+        ) -> (Vec<WsMessage>, Settled) {
+            (Vec::new(), Settled)
+        }
+
+        fn release(_: &[&'static str]) -> (Vec<WsMessage>, Option<Settled>) {
+            (Vec::new(), None)
+        }
+
+        fn read(_: &mut Registry<Self>, _: &WsMessage) -> Frame<()> {
+            Frame::Answers(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_socket_that_answers_its_pings_is_kept() {
+        // Reading is what answers a ping: tungstenite queues the pong as the ping is read.
+        let url =
+            server(
+                |mut websocket| async move { while let Some(Ok(_)) = websocket.next().await {} },
+            )
+            .await;
+
+        let connections = Connections::<Pinged>::new(());
+        let mut attachment = connections.attach(request(url)).await.unwrap();
+
+        let ended = tokio::time::timeout(KEEPALIVE * 6, attachment.next()).await;
+        assert!(ended.is_err(), "the attachment ended: {ended:?}");
+    }
+
+    #[tokio::test]
+    async fn a_socket_silent_after_a_ping_is_lost() {
+        // Never reads, so never answers a ping, and holds the socket open meanwhile.
+        let url = server(|websocket| async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(websocket);
+        })
+        .await;
+
+        let connections = Connections::<Pinged>::new(());
+        let mut attachment = connections.attach(request(url)).await.unwrap();
+
+        // Lost at the second ping at the latest, after two intervals.
+        let ended = tokio::time::timeout(KEEPALIVE * 4, attachment.next())
+            .await
+            .expect("a socket that never answered a ping was not lost");
+        assert!(
+            ended.is_none(),
+            "expected the attachment to end, got {ended:?}"
+        );
+    }
+
+    /// A provider answering a subscribe with a frame of one character per slot: `y` a
+    /// confirmation, anything else a refusal naming nothing.
+    #[derive(Debug)]
+    struct Answered;
+
+    struct Counted {
+        expected: usize,
+        confirmed: usize,
+    }
+
+    impl Handshake<()> for Counted {
+        fn is_settled(&self) -> bool {
+            self.confirmed >= self.expected
+        }
+
+        fn observe(&mut self, (): ()) {
+            self.confirmed += 1;
+        }
+
+        fn timed_out(&self, _: Duration) -> String {
+            "timed out".to_owned()
+        }
+
+        fn refusal(&self, error: SocketError) -> SocketError {
+            SocketError::Subscribe(format!(
+                "{error}; {} of {} confirmed",
+                self.confirmed, self.expected
+            ))
+        }
+    }
+
+    impl Protocol for Answered {
+        const NAME: &'static str = "Answered";
+        const CONNECTION_PER_ENDPOINT: bool = false;
+        const REFUSAL_IS_ATOMIC: bool = false;
+
+        type Credentials = ();
+        type Slot = &'static str;
+        type Batch = ();
+        type Session = ();
+        type Answer = ();
+        type Handshake = Counted;
+
+        async fn connect(_: &(), url: &Url) -> Result<(WebSocket, ()), SocketError> {
+            Ok((connect(url.clone()).await?, ()))
+        }
+
+        fn subscribe(
+            _: &mut Registry<Self>,
+            _: AttachId,
+            sending: &[&'static str],
+        ) -> (Vec<WsMessage>, Counted) {
+            (
+                vec![WsMessage::text(sending.join(","))],
+                Counted {
+                    expected: sending.len(),
+                    confirmed: 0,
+                },
+            )
+        }
+
+        fn release(_: &[&'static str]) -> (Vec<WsMessage>, Option<Counted>) {
+            (Vec::new(), None)
+        }
+
+        fn read(_: &mut Registry<Self>, message: &WsMessage) -> Frame<()> {
+            let WsMessage::Text(text) = message else {
+                return Frame::Answers(Vec::new());
+            };
+
+            Frame::Answers(
+                text.chars()
+                    .map(|answer| match answer {
+                        'y' => Ok(()),
+                        _ => Err(SocketError::Subscribe("refused".to_owned())),
+                    })
+                    .collect(),
+            )
+        }
+    }
+
+    /// Answer the one subscribe with `answers`, then hold the socket open.
+    async fn answering(answers: &'static str) -> Url {
+        server(move |mut websocket| async move {
+            websocket.next().await.unwrap().unwrap();
+            websocket.send(WsMessage::text(answers)).await.unwrap();
+            while let Some(Ok(_)) = websocket.next().await {}
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_refusal_ahead_of_the_confirmations_in_its_frame_counts_them() {
+        let connections = Connections::<Answered>::new(());
+
+        let error = connections
+            .attach(request(answering("ny").await))
+            .await
+            .expect_err("a refused subscribe attached");
+
+        assert!(
+            error.to_string().contains("refused; 1 of 2 confirmed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_sharing_a_frame_with_the_settling_answer_is_not_lost() {
+        let connections = Connections::<Answered>::new(());
+
+        let error = connections
+            .attach(request(answering("yyn").await))
+            .await
+            .expect_err("a refused subscribe attached");
+
+        assert!(
+            error.to_string().contains("refused; 2 of 2 confirmed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmations_alone_settle_the_handshake() {
+        let connections = Connections::<Answered>::new(());
+
+        let mut attachment = connections
+            .attach(request(answering("yy").await))
+            .await
+            .unwrap();
+
+        assert!(attachment.next().now_or_never().is_none());
     }
 }
