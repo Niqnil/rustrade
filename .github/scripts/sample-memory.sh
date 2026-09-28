@@ -36,7 +36,12 @@ while true; do
   mem=$(free -m | awk 'NR==2 {printf "used=%sM avail=%sM", $3, $7} NR==3 {printf " swap=%sM", $3}')
   # Share of the last 10 s in which every task was stalled on memory: what systemd-oomd acts on.
   psi=$(awk '/^full/ {sub("avg10=", "", $2); print $2}' /proc/pressure/memory 2>/dev/null)
-  top=$(ps -eo rss=,comm= --sort=-rss | head -5 | awk '{printf "%s%s %dM", sep, $2, $1 / 1024; sep = ", "}')
+  # Every compiler process is `rustc`, so name each by the crate it is building, as `rustc:<crate>`.
+  top=$(ps -eo rss=,args= --sort=-rss | head -5 | awk '{
+    name = $2; sub(".*/", "", name)
+    for (i = 3; i < NF; i++) if ($i == "--crate-name") { name = name ":" $(i + 1); break }
+    printf "%s%s %dM", sep, name, $1 / 1024; sep = ", "
+  }')
   echo "[mem $(date -u +%H:%M:%S)] $mem psi_full=${psi:-?}% | $top" | tee -a "$record"
   journal_since_last kernel --dmesg | grep -iE 'out of memory|oom|killed process' | sed 's/^/[kernel] /'
   journal_since_last oomd --unit=systemd-oomd | sed 's/^/[oomd] /'
