@@ -306,6 +306,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   crates were already compiled for other dependencies. `binance-sdk`, which decodes gzip itself, is
   on a separate reqwest major and is unaffected.
 
+- **Massive WebSocket clients connect to `socket.massive.com`** (`rustrade-data`, feature
+  `massive`). `MassiveLive` still defaulted every market (stocks, crypto, forex, options) to the
+  legacy `socket.polygon.io` host, while the REST client already used `api.massive.com`. A live
+  probe of the new host found the greeting, authentication, subscribe acknowledgement and tick
+  schema identical to the old one. The legacy host is still reachable through
+  `MassiveLive::with_ws_url`, which takes the full URL including the market path. No API change.
+
 - **BREAKING: an `AlpacaSubscriber` and its clones share one connection per feed, so one feed can
   stream trades and quotes at once** (`rustrade-data`, feature `alpaca`). Alpaca allows an account
   one market data connection per feed (crypto, IEX and SIP each count separately), and refuses a
