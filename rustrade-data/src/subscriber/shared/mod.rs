@@ -45,6 +45,10 @@
 )]
 
 mod actor;
+// Only the providers that pack several messages into one frame use it, and it needs
+// `serde_json/raw_value`, which only their features enable.
+#[cfg(any(feature = "alpaca", feature = "massive"))]
+pub(crate) mod elements;
 mod registry;
 
 pub(crate) use registry::{Registration, Registry};
