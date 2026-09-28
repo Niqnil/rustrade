@@ -1031,6 +1031,10 @@ impl LseVaultClient {
         // `downloaded` in decoded bytes while a `Range` addresses the *encoded* representation
         // (RFC 9110 §14.1.2), so a resume would ask for the wrong offset of a stream it cannot
         // decode from the middle. reqwest does not drop gzip for `Range` requests on its own.
+        // This relies on the server honouring the request: the client decodes any response that
+        // arrives gzip-encoded regardless of what was asked for. A server that ignored it would
+        // still verify on a full transfer, and on a resume fail loudly with a decode error rather
+        // than write a corrupt file.
         let mut builder = self
             .http()
             .get(&url)

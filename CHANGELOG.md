@@ -293,13 +293,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workspace now enables reqwest's `gzip` feature, so every `reqwest::Client` the crates build sends
   `Accept-Encoding: gzip` and decompresses gzip-encoded bodies before the caller sees them. That
   covers `rustrade-integration`'s `RestClient::new`, `BinanceHistoricalClient::spot()`/`futures()`,
-  and the Massive, Alpaca, IBKR Flex and London Strategic Edge REST clients. Nothing changes at a
-  call site. Market data REST responses compress well: an hour of Massive one-second aggregates was
-  measured at 380 KB before and 60–82 KB after, with the median fetch going from 1.56 s to 1.13 s;
-  a 1,000-candle page of Binance one-second klines went from 158 KB to 20–28 KB. Decoding costs
-  about 0.6 ms per response. The London Strategic Edge export download is the one exception:
-  it asks for `Accept-Encoding: identity`, because it resumes with `Range` and verifies a SHA-256
-  over the artifact as stored, and a byte range addresses the encoded body, not the decoded one.
+  the Massive, IBKR Flex and London Strategic Edge REST clients, and both Alpaca clients: market
+  data in `rustrade-data` and trading in `rustrade-execution`. Nothing changes at a call site.
+  Market data REST responses compress well: an hour of Massive one-second aggregates was measured
+  at 380 KB before and 60–82 KB after, with the median fetch going from 1.56 s to 1.13 s; a
+  1,000-candle page of Binance one-second klines went from 158 KB to 20–28 KB. Decoding costs about
+  0.6 ms per response. The London Strategic Edge export download is the one exception: it asks
+  for `Accept-Encoding: identity`, because it resumes with `Range` and verifies a SHA-256 over the
+  artifact as stored, and a byte range addresses the encoded body, not the decoded one.
   Cargo feature unification also turns gzip on for any reqwest 0.13 client a downstream crate builds
   in the same build, including one passed in through a `with_client` method; build it with
   `ClientBuilder::gzip(false)` to opt out. No new crates enter the dependency graph: the compression
