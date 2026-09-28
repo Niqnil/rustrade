@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Print one line of memory state every INTERVAL seconds until killed, and follow the kernel and
-# systemd-oomd logs for out-of-memory kills as they happen.
+# Print one line of memory state every INTERVAL seconds until killed, along with any new
+# out-of-memory lines in the kernel log or the systemd-oomd journal.
 #
 #   sample-memory.sh [INTERVAL] [RECORD]
 #
@@ -18,20 +18,19 @@ set -uo pipefail
 
 interval=${1:-5}
 record=${2:-/dev/null}
-
-# Stop the log followers with the sampler, or they outlive the step that started them.
-trap 'kill $(jobs -p) 2>/dev/null' EXIT
-trap 'exit 0' TERM INT
+cursors=$(mktemp -d)
 
 echo "[mem] cpus=$(nproc) $(free -m | awk 'NR==2 {print "total=" $2 "M"} NR==3 {print "swap_total=" $2 "M"}' | paste -sd' ')"
 
-# `-n`: never prompt for a password. Hosted runners have passwordless sudo; elsewhere the followers
-# print nothing rather than block.
-sudo -n dmesg --follow 2>/dev/null \
-  | grep --line-buffered -iE 'out of memory|oom|killed process' \
-  | sed -u 's/^/[kernel] /' &
-sudo -n journalctl --follow --lines=0 --unit=systemd-oomd --output=short-iso 2>/dev/null \
-  | sed -u 's/^/[oomd] /' &
+# Print the journal entries added since the previous call. Polled once per sample rather than
+# followed, because a `--follow` process runs as root and outlives any kill this script can send,
+# holding the step's output open. `sudo -n` never prompts: hosted runners have passwordless sudo,
+# and elsewhere this prints nothing. The first call also reports anything from earlier in the boot.
+journal_since_last() {
+  local name=$1
+  shift
+  sudo -n journalctl --quiet --no-pager --output=short-iso --cursor-file="$cursors/$name" "$@" 2>/dev/null
+}
 
 while true; do
   mem=$(free -m | awk 'NR==2 {printf "used=%sM avail=%sM", $3, $7} NR==3 {printf " swap=%sM", $3}')
@@ -39,7 +38,8 @@ while true; do
   psi=$(awk '/^full/ {sub("avg10=", "", $2); print $2}' /proc/pressure/memory 2>/dev/null)
   top=$(ps -eo rss=,comm= --sort=-rss | head -5 | awk '{printf "%s%s %dM", sep, $2, $1 / 1024; sep = ", "}')
   echo "[mem $(date -u +%H:%M:%S)] $mem psi_full=${psi:-?}% | $top" | tee -a "$record"
-  # Wait in the background so a TERM is handled at once rather than after the sleep.
-  sleep "$interval" &
-  wait $!
+  journal_since_last kernel --dmesg | grep -iE 'out of memory|oom|killed process' | sed 's/^/[kernel] /'
+  journal_since_last oomd --unit=systemd-oomd | sed 's/^/[oomd] /'
+  # Detached from the step's output, so a sleep left running by a kill cannot hold the log open.
+  sleep "$interval" >/dev/null 2>&1
 done
