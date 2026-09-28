@@ -22,6 +22,16 @@
 //!
 //! Auth message is sent immediately after WebSocket connection, before subscriptions.
 //!
+//! # One connection per feed
+//!
+//! Alpaca allows an account one market data connection per feed and refuses a second with
+//! `connection limit exceeded`. Every stream an
+//! [`AlpacaSubscriber`](crate::exchange::alpaca::AlpacaSubscriber) and its clones open on a feed
+//! shares one socket to it, so trades and quotes — any number of symbols, over any number of
+//! `subscribe` calls — can stream together. Pass clones of one subscriber to every stream on the
+//! account; see [`AlpacaSubscriber`](crate::exchange::alpaca::AlpacaSubscriber) and
+//! [`connection`](crate::exchange::alpaca::connection) for the details.
+//!
 //! # Example
 //!
 //! ```ignore
@@ -51,11 +61,12 @@
 //!
 //! # Subscription confirmation
 //!
-//! Alpaca answers a subscribe with one frame naming the symbols it registered. Initialisation
-//! does not return until **every** requested symbol has been named; if any is still outstanding
-//! when the subscription timeout expires, the subscribe fails and names what was missing. A
-//! partial subscription is therefore an error rather than a quietly reduced stream. See
-//! [`AlpacaWebSocketSubValidator`](crate::exchange::alpaca::validator::AlpacaWebSocketSubValidator).
+//! Alpaca answers a subscribe with one frame naming every symbol the connection holds.
+//! Initialisation does not return until **every** requested symbol has been named; if any is
+//! still outstanding when the subscription timeout expires, the subscribe fails and names what was
+//! missing. A partial subscription is therefore an error rather than a quietly reduced stream. The
+//! [`AlpacaSubscriber`](crate::exchange::alpaca::AlpacaSubscriber) confirms each subscribe on the
+//! connection it shares.
 //!
 //! **A confirmed symbol is not a promise of prompt data.** Alpaca's crypto feed publishes a quote
 //! when top-of-book changes, so the delay before a given symbol first ticks is large and highly
@@ -64,38 +75,49 @@
 //! first event as a readiness signal for any particular instrument.
 
 use self::{
-    channel::AlpacaChannel, market::AlpacaMarket, quote::AlpacaQuoteTransformer,
-    subscription::AlpacaSubResponse, trade::AlpacaTradeTransformer,
-    validator::AlpacaWebSocketSubValidator,
+    channel::AlpacaChannel,
+    connection::{AlpacaAttachment, AlpacaConnections, AttachRequest, Slot},
+    market::AlpacaMarket,
+    quote::AlpacaQuoteTransformer,
+    stream::AlpacaStream,
+    subscription::AlpacaSubResponse,
+    trade::AlpacaTradeTransformer,
 };
 use crate::{
-    ExchangeWsStream, NoInitialSnapshots,
+    Identifier, NoInitialSnapshots,
     exchange::{Connector, ExchangeServer, ExchangeSub, StreamSelector},
     instrument::InstrumentData,
-    subscriber::{mapper::SubscriptionMapper, validator::SubscriptionValidator},
-    subscription::{quote::Quotes, trade::PublicTrades},
+    subscriber::{
+        Subscribed, Subscriber, mapper::SubscriptionMapper, validator::WebSocketSubValidator,
+    },
+    subscription::{
+        Subscription, SubscriptionKind, SubscriptionMeta, quote::Quotes, trade::PublicTrades,
+    },
 };
+use fnv::FnvHashSet;
 use futures::{SinkExt, StreamExt};
 use rustrade_instrument::exchange::ExchangeId;
 use rustrade_integration::{
     error::SocketError,
-    protocol::websocket::{WebSocket, WebSocketSerdeParser, WsMessage, connect},
+    protocol::websocket::{WebSocket, WsMessage},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{env, fmt, fmt::Debug, marker::PhantomData, time::Duration};
+use smol_str::SmolStr;
+use std::{env, fmt, fmt::Debug, marker::PhantomData, sync::Arc, time::Duration};
 use tracing::debug;
 use url::Url;
 
 pub mod channel;
+pub mod connection;
 pub mod market;
 pub mod options;
 pub mod quote;
 pub mod reference;
 pub mod rest;
+pub mod stream;
 pub mod subscription;
 pub mod trade;
-pub mod validator;
 
 // `StockSplitSource` adapter for `AlpacaRestClient` (no public items of its own — just the impl).
 mod corporate_action;
@@ -116,9 +138,6 @@ pub const WEBSOCKET_URL_SIP: &str = "wss://stream.data.alpaca.markets/v2/sip";
 
 /// Crypto WebSocket URL.
 pub const WEBSOCKET_URL_CRYPTO: &str = "wss://stream.data.alpaca.markets/v1beta3/crypto/us";
-
-/// Type alias for Alpaca WebSocket stream.
-pub type AlpacaWsStream<Transformer> = ExchangeWsStream<WebSocketSerdeParser, Transformer>;
 
 /// Alpaca IEX equities connector (free feed).
 pub type AlpacaIex = Alpaca<AlpacaServerIex>;
@@ -178,37 +197,30 @@ where
     type Channel = AlpacaChannel;
     type Market = AlpacaMarket;
     type Subscriber = AlpacaSubscriber;
-    type SubValidator = AlpacaWebSocketSubValidator;
+    // Never called: `AlpacaSubscriber` confirms each subscribe on the connection it shares.
+    type SubValidator = WebSocketSubValidator;
     type SubResponse = AlpacaSubResponse;
 
     fn url() -> Result<Url, url::ParseError> {
         Url::parse(Server::websocket_url())
     }
 
+    /// The payload a socket of its own would be subscribed with.
+    ///
+    /// [`AlpacaSubscriber`] subscribes through its shared connection instead, which alone knows
+    /// what the socket already holds; both build their payloads with the same function, so they
+    /// cannot disagree about its shape.
     fn requests(exchange_subs: Vec<ExchangeSub<Self::Channel, Self::Market>>) -> Vec<WsMessage> {
-        let mut trades: Vec<&str> = Vec::new();
-        let mut quotes: Vec<&str> = Vec::new();
-
-        for sub in &exchange_subs {
-            match sub.channel {
-                AlpacaChannel::Trades => trades.push(sub.market.as_ref()),
-                AlpacaChannel::Quotes => quotes.push(sub.market.as_ref()),
-            }
-        }
-
-        let mut payload = json!({"action": "subscribe"});
-        if !trades.is_empty() {
-            payload["trades"] = json!(trades);
-        }
-        if !quotes.is_empty() {
-            payload["quotes"] = json!(quotes);
-        }
-
-        vec![WsMessage::text(payload.to_string())]
+        vec![channel_message(
+            "subscribe",
+            exchange_subs
+                .iter()
+                .map(|sub| (sub.channel, sub.market.as_ref())),
+        )]
     }
 
-    // `expected_responses` is deliberately left at its default. `AlpacaWebSocketSubValidator`
-    // succeeds on coverage of the requested subscriptions rather than on a response count, so
+    // `expected_responses` is deliberately left at its default. `AlpacaSubscriber` confirms a
+    // subscribe on coverage of the requested subscriptions rather than on a response count, so
     // no count it could return would be consulted.
 }
 
@@ -218,7 +230,7 @@ where
     Server: ExchangeServer + Debug + Send + Sync,
 {
     type SnapFetcher = NoInitialSnapshots;
-    type Stream = AlpacaWsStream<AlpacaTradeTransformer<Self, Instrument::Key>>;
+    type Stream = AlpacaStream<AlpacaTradeTransformer<Self, Instrument::Key>>;
 }
 
 impl<Instrument, Server> StreamSelector<Instrument, Quotes> for Alpaca<Server>
@@ -227,7 +239,7 @@ where
     Server: ExchangeServer + Debug + Send + Sync,
 {
     type SnapFetcher = NoInitialSnapshots;
-    type Stream = AlpacaWsStream<AlpacaQuoteTransformer<Self, Instrument::Key>>;
+    type Stream = AlpacaStream<AlpacaQuoteTransformer<Self, Instrument::Key>>;
 }
 
 impl<'de, Server> Deserialize<'de> for Alpaca<Server>
@@ -309,9 +321,29 @@ impl AlpacaCredentials {
     }
 }
 
-/// Alpaca WebSocket subscriber with authentication.
+/// Alpaca market data subscriber: authenticates, and shares one connection per feed among every
+/// stream it and its clones open.
 ///
-/// Handles the auth → subscribe flow required by Alpaca market data streams.
+/// # One connection per feed, shared by clones
+/// Alpaca allows an account one market data connection per feed — crypto, IEX and SIP count
+/// separately — and refuses a second on the same feed with `connection limit exceeded`. So every
+/// stream this subscriber opens on a feed attaches to one socket to it: trades and quotes, any
+/// number of symbols, in as many `subscribe` calls as the caller likes. **Pass clones of one
+/// subscriber** to every stream on the account. A subscriber built separately opens a connection
+/// of its own, and Alpaca refuses it once another is open on that feed. Streams on different feeds
+/// run side by side, one socket each.
+///
+/// Each `(channel, symbol)` pair is subscribed once however many streams hold it, and unsubscribed
+/// when the last stream holding it is dropped; the socket closes once none remains. Alpaca caps the
+/// pairs one connection holds — 30 on the free IEX plan, as last measured — and a subscribe that
+/// would pass the cap fails naming it. The cap counts what every stream on the feed holds.
+///
+/// If the connection is lost, every stream on it ends together and reconnects through the usual
+/// reconnect wrapper, sharing one new connection. Alpaca replays nothing, so what it published
+/// while no socket was open is not recovered.
+///
+/// See [`connection`] for how frames reach each stream, and [`AlpacaAttachment`] for why a stream
+/// must be kept drained.
 ///
 /// # Example
 ///
@@ -319,21 +351,24 @@ impl AlpacaCredentials {
 /// use rustrade_data::exchange::alpaca::{AlpacaCredentials, AlpacaSubscriber};
 ///
 /// // Load credentials at construction time (fails fast if env vars missing)
-/// let credentials = AlpacaCredentials::from_env()?;
-/// let subscriber = AlpacaSubscriber::new(credentials);
+/// let subscriber = AlpacaSubscriber::from_env()?;
 ///
 /// // Or with explicit credentials
 /// let subscriber = AlpacaSubscriber::new(AlpacaCredentials::new("key", "secret"));
 /// ```
 #[derive(Clone, Debug)]
 pub struct AlpacaSubscriber {
-    credentials: AlpacaCredentials,
+    connections: Arc<AlpacaConnections>,
 }
 
 impl AlpacaSubscriber {
     /// Create a new subscriber with the provided credentials.
+    ///
+    /// The subscriber opens no connection until a stream subscribes.
     pub fn new(credentials: AlpacaCredentials) -> Self {
-        Self { credentials }
+        Self {
+            connections: Arc::new(AlpacaConnections::new(credentials)),
+        }
     }
 
     /// Create a new subscriber using credentials from environment variables.
@@ -345,58 +380,129 @@ impl AlpacaSubscriber {
     }
 }
 
-impl crate::subscriber::Subscriber for AlpacaSubscriber {
+impl Subscriber for AlpacaSubscriber {
     type SubMapper = crate::subscriber::mapper::WebSocketSubMapper;
-    type Transport = rustrade_integration::protocol::websocket::WebSocket;
+    type Transport = AlpacaAttachment;
 
+    /// Attach the batch to its feed's shared connection, subscribing whatever the connection does
+    /// not already hold.
+    ///
+    /// Returns once Alpaca reports holding every requested `(channel, symbol)` pair. A pair
+    /// another stream already holds is not sent again, and needs no answer.
+    ///
+    /// # Errors
+    /// Returns [`SocketError::Subscribe`] if the batch is empty, authentication is refused — by
+    /// the credentials, or because another connection holds the feed — Alpaca refuses the
+    /// subscribe (the connection's pair cap among the reasons), or the subscription timeout passes
+    /// before every pair is confirmed.
     async fn subscribe<Exchange, Instrument, Kind>(
         &self,
-        subscriptions: &[crate::subscription::Subscription<Exchange, Instrument, Kind>],
-    ) -> Result<crate::subscriber::Subscribed<Instrument::Key, Self::Transport>, SocketError>
+        subscriptions: &[Subscription<Exchange, Instrument, Kind>],
+    ) -> Result<Subscribed<Instrument::Key, Self::Transport>, SocketError>
     where
         Exchange: Connector + Send + Sync,
-        Kind: crate::subscription::SubscriptionKind + Send + Sync,
+        Kind: SubscriptionKind + Send + Sync,
         Instrument: InstrumentData,
-        crate::subscription::Subscription<Exchange, Instrument, Kind>:
-            crate::Identifier<Exchange::Channel> + crate::Identifier<Exchange::Market>,
+        Subscription<Exchange, Instrument, Kind>:
+            Identifier<Exchange::Channel> + Identifier<Exchange::Market>,
     {
         let exchange = Exchange::ID;
         let url = Exchange::url()?;
         debug!(%exchange, %url, ?subscriptions, "subscribing to Alpaca WebSocket");
 
-        let mut websocket = connect(url).await?;
-        debug!(%exchange, "connected to Alpaca WebSocket, sending auth");
-
-        alpaca_authenticate(&mut websocket, &self.credentials).await?;
-        debug!(%exchange, "Alpaca auth successful");
-
-        let crate::subscription::SubscriptionMeta {
-            instrument_map,
-            ws_subscriptions,
-        } = Self::SubMapper::map::<Exchange, Instrument, Kind>(subscriptions);
-
-        for subscription in ws_subscriptions {
-            debug!(%exchange, payload = ?subscription, "sending Alpaca subscription");
-            websocket
-                .send(subscription)
-                .await
-                .map_err(|error| SocketError::WebSocket(Box::new(error)))?;
+        let slots = requested_slots(exchange, subscriptions)?;
+        if slots.is_empty() {
+            return Err(SocketError::Subscribe(format!(
+                "no subscriptions were given to subscribe to on {exchange}"
+            )));
         }
 
-        let (map, buffered_websocket_events) = Exchange::SubValidator::validate::<
-            Exchange,
-            Instrument::Key,
-            Kind,
-        >(instrument_map, &mut websocket)
-        .await?;
+        // Only the instrument map is taken from the mapper. The subscribe payload is built by the
+        // connection instead, because it alone knows what the socket already holds.
+        let SubscriptionMeta {
+            instrument_map,
+            ws_subscriptions: _,
+        } = Self::SubMapper::map::<Exchange, Instrument, Kind>(subscriptions);
 
-        debug!(%exchange, "Alpaca subscriptions confirmed");
-        Ok(crate::subscriber::Subscribed {
-            transport: websocket,
-            map,
-            buffered_websocket_events,
+        let transport = self
+            .connections
+            .attach(AttachRequest {
+                exchange,
+                url,
+                slots,
+                timeout: Exchange::subscription_timeout(),
+            })
+            .await?;
+
+        debug!(%exchange, "attached to the Alpaca connection");
+        Ok(Subscribed {
+            transport,
+            map: instrument_map,
+            // The connection routes every frame for the batch into `transport` from the moment it
+            // is registered, so nothing is read ahead of it.
+            buffered_websocket_events: Vec::new(),
         })
     }
+}
+
+/// The distinct `(channel, symbol)` pairs a batch requests, in request order.
+fn requested_slots<Exchange, Instrument, Kind>(
+    exchange: ExchangeId,
+    subscriptions: &[Subscription<Exchange, Instrument, Kind>],
+) -> Result<Vec<Slot>, SocketError>
+where
+    Exchange: Connector,
+    Subscription<Exchange, Instrument, Kind>:
+        Identifier<Exchange::Channel> + Identifier<Exchange::Market>,
+{
+    let mut seen = FnvHashSet::default();
+    let mut slots = Vec::with_capacity(subscriptions.len());
+
+    for subscription in subscriptions {
+        let sub = ExchangeSub::<Exchange::Channel, Exchange::Market>::new(subscription);
+        let Some(channel) = AlpacaChannel::from_name(sub.channel.as_ref()) else {
+            return Err(SocketError::Subscribe(format!(
+                "{exchange} has no Alpaca channel named {}",
+                sub.channel.as_ref()
+            )));
+        };
+
+        let slot = Slot {
+            channel,
+            symbol: SmolStr::new(sub.market.as_ref()),
+        };
+        if seen.insert(slot.clone()) {
+            slots.push(slot);
+        }
+    }
+
+    Ok(slots)
+}
+
+/// Build a `subscribe` or `unsubscribe` payload for `pairs`, grouped by channel.
+fn channel_message<'a>(
+    action: &str,
+    pairs: impl IntoIterator<Item = (AlpacaChannel, &'a str)>,
+) -> WsMessage {
+    let mut trades: Vec<&str> = Vec::new();
+    let mut quotes: Vec<&str> = Vec::new();
+
+    for (channel, symbol) in pairs {
+        match channel {
+            AlpacaChannel::Trades => trades.push(symbol),
+            AlpacaChannel::Quotes => quotes.push(symbol),
+        }
+    }
+
+    let mut payload = json!({"action": action});
+    if !trades.is_empty() {
+        payload["trades"] = json!(trades);
+    }
+    if !quotes.is_empty() {
+        payload["quotes"] = json!(quotes);
+    }
+
+    WsMessage::text(payload.to_string())
 }
 
 /// Authenticate to Alpaca WebSocket using the provided credentials.

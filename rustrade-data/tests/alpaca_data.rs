@@ -42,9 +42,11 @@
 //!
 //! Crypto streams (BTC/USD, etc.) are available 24/7 and are the primary validation.
 //!
-//! - WebSocket tests are marked `#[serial]` to prevent connection conflicts. Alpaca rejects
-//!   concurrent data-stream connections with "auth failed: connection limit exceeded", so
-//!   running them in parallel fails every connection but the one that wins the race.
+//! - WebSocket tests are marked `#[serial]` to prevent connection conflicts. Alpaca allows one
+//!   data-stream connection per feed and rejects another with "auth failed: connection limit
+//!   exceeded". Clones of one `AlpacaSubscriber` share that connection, but each test builds its
+//!   own subscriber, so running them in parallel fails every connection but the one that wins the
+//!   race.
 
 #![cfg(feature = "alpaca")]
 // Test code: unwrap/expect panics are the correct failure mode for test assertions
@@ -114,9 +116,9 @@ async fn test_crypto_trade_stream_connection() {
 /// before the first BTC/USD trade is large and variable: within one half-hour window (2026-09-19)
 /// it measured under 60s, ~136s, ~175s, and none at all in ~189s. No deadline separates "not
 /// subscribed" from "not yet traded", so requiring a trade made the test fail on market activity.
-/// The subscription itself is asserted deterministically by `init()`: the Alpaca validator holds
-/// it open until the venue names every requested symbol, as `test_crypto_trade_stream_connection`
-/// also relies on.
+/// The subscription itself is asserted deterministically by `init()`: the subscriber holds it open
+/// until the venue names every requested symbol, as `test_crypto_trade_stream_connection` also
+/// relies on.
 #[tokio::test]
 #[ignore]
 #[serial]
@@ -287,7 +289,7 @@ async fn test_crypto_quote_stream_receives_data() {
 /// than library behaviour.
 ///
 /// What carries the subscription assertion instead is
-/// [`AlpacaWebSocketSubValidator`](rustrade_data::exchange::alpaca::validator::AlpacaWebSocketSubValidator):
+/// [`AlpacaSubscriber`]'s subscribe:
 /// `init()` now succeeds only once Alpaca has confirmed every requested symbol *by name*, so the
 /// `streams.is_ok()` assertion below is the multi-instrument check this test previously
 /// approximated by waiting for data -- and it is deterministic.
@@ -323,7 +325,7 @@ async fn test_crypto_multiple_symbols() {
         .init()
         .await;
 
-    // Alpaca confirms the symbols it registered, and the validator holds `init()` open until every
+    // Alpaca confirms the symbols it holds, and the subscriber holds `init()` open until every
     // requested one is named. Reaching here therefore means both were subscribed -- a partial
     // subscription fails above, reporting which symbol was missing.
     assert!(
@@ -367,6 +369,84 @@ async fn test_crypto_multiple_symbols() {
     // Deliberately not asserted: which symbols ticked is market activity. Logged so a run that
     // saw nothing is still legible, and so the first-tick delays above can be re-measured.
     tracing::info!(events, ?seen, "crypto multi-symbol quote window closed");
+}
+
+/// Trades and quotes from one feed at once, through clones of one subscriber.
+///
+/// Alpaca allows one connection per feed, and each kind is its own `subscribe`, so this needs the
+/// two streams to share a socket: opened on separate sockets, the second `init()` fails with
+/// `connection limit exceeded`. Both `init()`s succeeding is therefore the assertion.
+///
+/// The window that follows cannot require data -- see `test_crypto_multiple_symbols` for how long
+/// a crypto symbol can stay quiet -- but any event it does see must be well formed. The shared
+/// connection splits frames that mix trades and quotes between the two streams, and a message
+/// routed to the wrong one would surface here as an error.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_crypto_trades_and_quotes_share_one_connection() {
+    init_logging();
+
+    let subscriber = AlpacaSubscriber::from_env().unwrap();
+
+    let trades = Streams::<PublicTrades>::builder()
+        .subscribe(
+            subscriber.clone(),
+            [(
+                AlpacaCrypto::default(),
+                "btc",
+                "usd",
+                MarketDataInstrumentKind::Spot,
+                PublicTrades,
+            )],
+        )
+        .init()
+        .await
+        .expect("trades on the crypto feed");
+
+    let quotes = Streams::<Quotes>::builder()
+        .subscribe(
+            subscriber,
+            [(
+                AlpacaCrypto::default(),
+                "btc",
+                "usd",
+                MarketDataInstrumentKind::Spot,
+                Quotes,
+            )],
+        )
+        .init()
+        .await
+        .expect("quotes on the crypto feed, on the connection the trades already hold");
+
+    let mut trades = trades.select_all();
+    let mut quotes = quotes.select_all();
+
+    let (mut trade_events, mut quote_events) = (0usize, 0usize);
+    let deadline = tokio::time::sleep(Duration::from_secs(20));
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            () = &mut deadline => break,
+            Some(event) = trades.next() => match event {
+                Event::Item(Ok(_)) => trade_events += 1,
+                Event::Item(Err(error)) => panic!("trade stream error: {error:?}"),
+                Event::Reconnecting(exchange) => panic!("trade stream reconnecting: {exchange}"),
+            },
+            Some(event) = quotes.next() => match event {
+                Event::Item(Ok(_)) => quote_events += 1,
+                Event::Item(Err(error)) => panic!("quote stream error: {error:?}"),
+                Event::Reconnecting(exchange) => panic!("quote stream reconnecting: {exchange}"),
+            },
+        }
+    }
+
+    tracing::info!(
+        trade_events,
+        quote_events,
+        "crypto trades and quotes shared one connection"
+    );
 }
 
 // ============================================================================
