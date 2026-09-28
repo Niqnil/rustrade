@@ -360,6 +360,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spell every symbol as before. An instrument type declared outside this crate identifies its market
   by implementing the trait.
 
+- **BREAKING: the Alpaca market identifier is one blanket impl over the new `AlpacaInstrument`
+  trait, and an exchange-named Alpaca instrument's symbol is uppercased** (`rustrade-data`, feature
+  `alpaca`). The trait replaces the three impls, one per instrument type, that the `AlpacaServer`
+  blanket impls still needed. A `MarketInstrumentData` instrument's `name_exchange` used to be sent
+  as given. Alpaca spells its symbols in uppercase and confirms a subscribe only once its answer
+  names each requested symbol exactly, so a lowercase name timed out unconfirmed. It is now
+  uppercased, as the symbol reconstructed from a `MarketDataInstrument` always was. Every other
+  symbol is spelled as before. An instrument type declared outside this crate identifies its market
+  by implementing the trait.
+
 - **BREAKING: `LseTick::bid` and `LseTick::ask` are now `Option<Decimal>`** (`rustrade-data`,
   feature `lse`). Option contracts tick on the same WebSocket frame and publish both sides as
   `null` on every tick, which failed the decode outright. The L1 decoder treats a null side as
