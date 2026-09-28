@@ -710,6 +710,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "58a6d0db8759036a783bc7c3f7a07f8cef3bf9470eb1db3bc86e8bcd1c5d0fe8"
 dependencies = [
  "compression-core",
+ "flate2",
+ "memchr",
  "zstd 0.14.0",
  "zstd-safe 8.0.0",
 ]
@@ -4613,6 +4615,7 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tracing",
  "url",
+ "wiremock",
 ]
 
 [[package]]
@@ -5783,13 +5786,18 @@ version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4e6559d53cc268e5031cd8429d05415bc4cb4aefc4aa5d6cc35fbf5b924a1f8"
 dependencies = [
+ "async-compression",
  "bitflags 2.11.0",
  "bytes",
+ "futures-core",
  "futures-util",
  "http 1.5.0",
  "http-body 1.0.1",
+ "http-body-util",
  "iri-string",
  "pin-project-lite",
+ "tokio",
+ "tokio-util",
  "tower",
  "tower-layer",
  "tower-service",

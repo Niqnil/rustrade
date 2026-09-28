@@ -114,13 +114,14 @@ pub enum Market {
 impl Market {
     /// Get the WebSocket endpoint URL for this market.
     ///
-    /// Massive operates on Polygon.io infrastructure; endpoints are unchanged from Polygon.
+    /// Massive is the rebranded Polygon.io, and the legacy `socket.polygon.io` host still serves
+    /// the same protocol. [`MassiveLive::with_ws_url`] points a client at it, or anywhere else.
     fn ws_url(&self) -> &'static str {
         match self {
-            Market::Stocks => "wss://socket.polygon.io/stocks",
-            Market::Crypto => "wss://socket.polygon.io/crypto",
-            Market::Forex => "wss://socket.polygon.io/forex",
-            Market::Options => "wss://socket.polygon.io/options",
+            Market::Stocks => "wss://socket.massive.com/stocks",
+            Market::Crypto => "wss://socket.massive.com/crypto",
+            Market::Forex => "wss://socket.massive.com/forex",
+            Market::Options => "wss://socket.massive.com/options",
         }
     }
 }
@@ -281,7 +282,10 @@ impl<K> MassiveLive<K> {
         Ok(Self::new(api_key, market, exchange, instruments))
     }
 
-    /// Override the WebSocket URL (useful for testing).
+    /// Override the WebSocket URL (useful for testing or the legacy `socket.polygon.io` host).
+    ///
+    /// The URL must include the market path, e.g. `wss://socket.polygon.io/crypto`: it replaces
+    /// the market's default endpoint outright.
     #[must_use]
     pub fn with_ws_url(mut self, url: impl Into<String>) -> Self {
         self.ws_url = url.into();
@@ -796,10 +800,10 @@ mod tests {
 
     #[test]
     fn test_market_ws_url() {
-        assert_eq!(Market::Stocks.ws_url(), "wss://socket.polygon.io/stocks");
-        assert_eq!(Market::Crypto.ws_url(), "wss://socket.polygon.io/crypto");
-        assert_eq!(Market::Forex.ws_url(), "wss://socket.polygon.io/forex");
-        assert_eq!(Market::Options.ws_url(), "wss://socket.polygon.io/options");
+        assert_eq!(Market::Stocks.ws_url(), "wss://socket.massive.com/stocks");
+        assert_eq!(Market::Crypto.ws_url(), "wss://socket.massive.com/crypto");
+        assert_eq!(Market::Forex.ws_url(), "wss://socket.massive.com/forex");
+        assert_eq!(Market::Options.ws_url(), "wss://socket.massive.com/options");
     }
 
     #[test]

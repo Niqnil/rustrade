@@ -289,6 +289,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **REST clients negotiate and transparently decode gzip** (workspace `reqwest` dependency). The
+  workspace now enables reqwest's `gzip` feature, so every `reqwest::Client` the crates build sends
+  `Accept-Encoding: gzip` and decompresses gzip-encoded bodies before the caller sees them. That
+  covers `rustrade-integration`'s `RestClient::new`, `BinanceHistoricalClient::spot()`/`futures()`,
+  the Massive, IBKR Flex and London Strategic Edge REST clients, and both Alpaca clients: market
+  data in `rustrade-data` and trading in `rustrade-execution`. Nothing changes at a call site.
+  Market data REST responses compress well: an hour of Massive one-second aggregates was measured
+  at 380 KB before and 60–82 KB after, with the median fetch going from 1.56 s to 1.13 s; a
+  1,000-candle page of Binance one-second klines went from 158 KB to 20–28 KB. Decoding costs about
+  0.6 ms per response. The London Strategic Edge export download is the one exception: it asks
+  for `Accept-Encoding: identity`, because it resumes with `Range` and verifies a SHA-256 over the
+  artifact as stored, and a byte range addresses the encoded body, not the decoded one.
+  Cargo feature unification also turns gzip on for any reqwest 0.13 client a downstream crate builds
+  in the same build, including one passed in through a `with_client` method; build it with
+  `ClientBuilder::gzip(false)` to opt out. No new crates enter the dependency graph: the compression
+  crates were already compiled for other dependencies. `binance-sdk`, which decodes gzip itself, is
+  on a separate reqwest major and is unaffected.
+
+- **Massive WebSocket clients connect to `socket.massive.com`** (`rustrade-data`, feature
+  `massive`). `MassiveLive` still defaulted every market (stocks, crypto, forex, options) to the
+  legacy `socket.polygon.io` host, while the REST client already used `api.massive.com`. A live
+  probe of the new host found the greeting, authentication, subscribe acknowledgement and tick
+  schema identical to the old one. The legacy host is still reachable through
+  `MassiveLive::with_ws_url`, which takes the full URL including the market path. No API change.
+
 - **BREAKING: an `AlpacaSubscriber` and its clones share one connection per feed, so one feed can
   stream trades and quotes at once** (`rustrade-data`, feature `alpaca`). Alpaca allows an account
   one market data connection per feed (crypto, IEX and SIP each count separately), and refuses a
@@ -752,6 +777,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behaviour changes.
 
 ### Security
+
+- **The Binance execution clients now document that `binance-sdk` logs request credentials at
+  `DEBUG`** (`rustrade-execution`, feature `binance`). The SDK's WebSocket API client logs every
+  request it sends at `DEBUG`, after signing. For `BinanceSpot` that is every order placement and
+  cancellation and the user-data subscription, each carrying the account's API key and the
+  request's signature. For `BinanceMargin` it is the user-data subscription, carrying the listen
+  token. The API secret and private key are never logged. This library installs no subscriber, so
+  the fix belongs in the application's filter. The `binance` module rustdoc now explains the
+  exposure and gives an `EnvFilter` recipe: seed a `binance_sdk=info` directive before the user's
+  own, so a bare `RUST_LOG=debug` cannot lift it while an explicit `binance_sdk=debug` still can.
 
 - **The dead `RUSTSEC-2024-0436` (`paste`) suppression has been dropped from `deny.toml` and the
   CI audit job's ignore list.** `paste` left the graph when `parquet` moved to 59.2.0; it appears

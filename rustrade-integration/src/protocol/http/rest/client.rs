@@ -144,3 +144,90 @@ impl<'a, Strategy, Parser> RestClient<'a, Strategy, Parser> {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+mod tests {
+    use super::*;
+    use crate::protocol::http::{HttpParser, public::PublicNoHeaders};
+    use reqwest::StatusCode;
+    use serde::Deserialize;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// `{"value":"decoded"}`, gzip-compressed with a zeroed mtime so the bytes are reproducible:
+    /// `python3 -c 'import gzip; print(gzip.compress(b"{\"value\":\"decoded\"}", mtime=0))'`.
+    const GZIPPED_BODY: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xab, 0x56, 0x2a, 0x4b, 0xcc,
+        0x29, 0x4d, 0x55, 0xb2, 0x52, 0x4a, 0x49, 0x4d, 0xce, 0x4f, 0x49, 0x4d, 0x51, 0xaa, 0x05,
+        0x00, 0xba, 0xf3, 0x5c, 0x77, 0x13, 0x00, 0x00, 0x00,
+    ];
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Payload {
+        value: String,
+    }
+
+    struct GetPayload;
+
+    impl RestRequest for GetPayload {
+        type Response = Payload;
+        type QueryParams = ();
+        type Body = ();
+
+        fn path(&self) -> Cow<'static, str> {
+            Cow::Borrowed("/payload")
+        }
+
+        fn method() -> reqwest::Method {
+            reqwest::Method::GET
+        }
+    }
+
+    struct JsonParser;
+
+    impl HttpParser for JsonParser {
+        type ApiError = serde_json::Value;
+        type OutputError = SocketError;
+
+        fn parse_api_error(&self, status: StatusCode, error: Self::ApiError) -> Self::OutputError {
+            SocketError::HttpResponse(status, error.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_default_client_negotiates_and_decodes_gzip() {
+        // Pins the workspace's reqwest `gzip` feature: without it the request advertises no
+        // encoding and the compressed body reaches the parser undecoded.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/payload"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .insert_header("content-type", "application/json")
+                    .set_body_bytes(GZIPPED_BODY),
+            )
+            .mount(&server)
+            .await;
+
+        let client = RestClient::new(server.uri(), PublicNoHeaders, JsonParser);
+        let (response, _) = client.execute(GetPayload).await.unwrap();
+
+        assert_eq!(
+            response,
+            Payload {
+                value: "decoded".to_owned()
+            }
+        );
+        let requests = server.received_requests().await.unwrap();
+        let accept_encoding = requests[0]
+            .headers
+            .get("accept-encoding")
+            .and_then(|value| value.to_str().ok());
+        assert!(
+            accept_encoding.is_some_and(|value| value.contains("gzip")),
+            "expected gzip in Accept-Encoding, sent {accept_encoding:?}"
+        );
+    }
+}
