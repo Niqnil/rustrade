@@ -16,6 +16,7 @@ use crate::{
     error::DataError,
     event::{MarketEvent, MarketIter},
     exchange::Connector,
+    subscriber::shared_stream::AttachedTransformer,
     subscription::{Map, SubscriptionKind},
     transformer::{ExchangeTransformer, stateless::StatelessTransformer},
 };
@@ -189,31 +190,61 @@ where
         let inner =
             StatelessTransformer::init(instrument_map, initial_snapshots, ws_sink_tx).await?;
 
-        let resume = resume.map(
-            |ResumeContext {
-                 state,
-                 kind,
-                 starts,
-             }| ResumeTracker {
-                pending: starts
-                    .into_iter()
-                    .filter_map(|(subscription, start)| {
-                        let key = LseResumeKey::new(Exchange::ID, subscription.clone(), kind);
-                        let watermark = state.watermark(&key)?;
-                        Some((subscription, PendingDrop::new(watermark, start)))
-                    })
-                    .collect(),
-                state,
-                exchange: Exchange::ID,
-                kind,
-            },
-        );
-
         Ok(Self {
             inner,
-            resume,
+            resume: resume.map(Self::tracker),
             unregistered,
         })
+    }
+}
+
+impl<Exchange, InstrumentKey, Kind> LseTransformer<Exchange, InstrumentKey, Kind>
+where
+    Exchange: Connector,
+{
+    /// The bookkeeping for resuming from `context`.
+    fn tracker(
+        ResumeContext {
+            state,
+            kind,
+            starts,
+        }: ResumeContext,
+    ) -> ResumeTracker {
+        ResumeTracker {
+            pending: starts
+                .into_iter()
+                .filter_map(|(subscription, start)| {
+                    let key = LseResumeKey::new(Exchange::ID, subscription.clone(), kind);
+                    let watermark = state.watermark(&key)?;
+                    Some((subscription, PendingDrop::new(watermark, start)))
+                })
+                .collect(),
+            state,
+            exchange: Exchange::ID,
+            kind,
+        }
+    }
+}
+
+/// What the shared connection hands a London Strategic Edge stream on attaching: what it needs to
+/// resume, if it resumes.
+///
+/// Built by the connection from the subscriber's resume state and the replay windows it opened for
+/// the stream, and handed to the stream's [`LseTransformer`] before any frame reaches it.
+#[derive(Debug, Default)]
+pub struct LseResume(pub(super) Option<ResumeContext>);
+
+/// Resume from what the connection handed over, if anything.
+///
+/// Replaces any resume state the transformer was built with: the connection's is the one that
+/// knows which replay windows it opened.
+impl<Exchange, InstrumentKey, Kind> AttachedTransformer<LseResume>
+    for LseTransformer<Exchange, InstrumentKey, Kind>
+where
+    Exchange: Connector,
+{
+    fn attached(&mut self, LseResume(resume): LseResume) {
+        self.resume = resume.map(Self::tracker);
     }
 }
 

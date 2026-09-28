@@ -30,6 +30,10 @@ pub mod validator;
 #[cfg(any(feature = "alpaca", feature = "lse"))]
 pub(crate) mod shared;
 
+/// The market stream of every provider whose streams share one connection.
+#[cfg(any(feature = "alpaca", feature = "lse"))]
+pub mod shared_stream;
+
 /// Defines how to connect to a socket and subscribe to market data streams.
 ///
 /// Subscribers may carry state such as authentication credentials.

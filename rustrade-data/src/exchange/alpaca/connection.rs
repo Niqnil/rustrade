@@ -64,6 +64,7 @@ use crate::subscriber::shared::{
     self, AttachId, Attachment, Connections, Frame, Handshake, Protocol, Registry,
     elements::{self, Element, Elements, excerpt},
 };
+use crate::subscriber::shared_stream::{SharedTransport, sealed};
 use fnv::FnvHashSet;
 use futures::Stream;
 use rustrade_instrument::exchange::ExchangeId;
@@ -339,6 +340,17 @@ impl Stream for AlpacaAttachment {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.0).poll_next(cx)
+    }
+}
+
+impl sealed::Sealed for AlpacaAttachment {}
+
+/// Alpaca hands a stream nothing on attaching.
+impl SharedTransport for AlpacaAttachment {
+    type Attached = ();
+
+    fn take_attached(&mut self) {
+        self.0.take_attached()
     }
 }
 
