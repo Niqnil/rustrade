@@ -93,13 +93,15 @@
 //! As a result:
 //!
 //! - [`ExecutionClient::fetch_open_orders`] can report orders that have since filled or
-//!   been cancelled as open. After each connection drop it fails three times, then lags
-//!   three calls behind. See that method.
+//!   been cancelled as open. Each connection drop makes three calls fail and adds three
+//!   calls of lag, which never clears. See that method.
 //! - [`ExecutionClient::account_snapshot`] fails twice after each connection drop, then
 //!   recovers.
-//! - This client never reads two of the three open-orders queues, so they keep a copy of
-//!   every order update for the life of the connection. `ibapi` logs a warning each time
-//!   one of them passes a multiple of 10,000 queued messages.
+//! - This client never reads two of the three open-orders queues, and reads the third
+//!   only when `fetch_open_orders` is called. They keep a copy of every order update
+//!   until read, so the two unread ones grow for the life of the client: `ibapi`'s own
+//!   reconnect does not clear them. `ibapi` logs a warning each time one of them passes a
+//!   multiple of 10,000 queued messages.
 //!
 //! [Account order events](ExecutionClient::account_stream) come through a separate
 //! channel and are unaffected.
@@ -269,7 +271,7 @@ static ACCOUNT_GROUP_ALL: std::sync::LazyLock<AccountGroup> =
 /// `PositionEnd` marker, so the read stops once this long passes without an
 /// update. It does not stop at `PositionEnd`: on `ibapi` 4.2.0 the positions
 /// queue is shared across calls (see the module's Known Issues), so after a
-/// connection drop it holds the replies to the calls that failed. Stopping at
+/// connection drop it may hold the replies to the calls that failed. Stopping at
 /// the first `PositionEnd` would return one of those replies and leave the rest
 /// for the next call, which would lag behind for good. Reading until quiet
 /// drains them.
@@ -2160,10 +2162,11 @@ impl ExecutionClient for IbkrClient {
     /// - Order updates received since the previous call are read as part of the
     ///   result. It can hold the same order more than once, and orders that have
     ///   since filled or been cancelled, reported as open.
-    /// - After each connection drop, the next three calls fail with
-    ///   [`UnindexedClientError::Internal`]. Each call after that returns the
-    ///   reply to the call three before it, and each further drop adds three
-    ///   more calls of lag. Retrying does not catch up.
+    /// - After the first connection drop, the next three calls fail with
+    ///   [`UnindexedClientError::Internal`], and every call after them returns
+    ///   the reply to the call three before it. Each later drop adds three more
+    ///   calls of lag, and three more failures, which come once the replies
+    ///   already queued have been read. Retrying does not catch up.
     ///
     /// Do not treat the result as authoritative open-order state on 4.2.0. The
     /// order events from [`ExecutionClient::account_stream`] are unaffected.

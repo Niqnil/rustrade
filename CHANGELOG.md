@@ -655,11 +655,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answers open-orders and positions requests from one queue per request type. Every call reads
   from it and nothing clears it between calls, so a call can read what was meant for another.
   Order updates received since the previous call are read as part of `fetch_open_orders`' result,
-  which can therefore report an order that has since filled or been cancelled as open. After each
-  connection drop, `fetch_open_orders` fails three times and then returns the reply to the call
-  three before it, for good. `account_snapshot` fails twice after a drop, then recovers. `ibapi`
-  also keeps a copy of every order update in two queues this client never reads, for the life of
-  the connection. The module, `fetch_open_orders`, `account_snapshot` and `account_stream` rustdoc
+  which can therefore report an order that has since filled or been cancelled as open. Each
+  connection drop makes three `fetch_open_orders` calls fail and adds three calls of lag that never
+  clears: after the first drop, every call returns the reply to the call three before it.
+  `account_snapshot` fails twice after a drop, then recovers. `ibapi` also keeps a copy of every
+  order update in two queues this client never reads, for the life of the client; its own reconnect
+  does not clear them. The module, `fetch_open_orders`, `account_snapshot` and `account_stream` rustdoc
   now say so. The comments claiming `ibapi` never routes `PositionEnd` are corrected: it arrives,
   but positions is a live subscription, and reading until quiet is what drains replies left over
   from failed calls. Fixed upstream after 4.2.0 by
