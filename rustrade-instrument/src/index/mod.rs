@@ -5,7 +5,7 @@ use crate::{
     index::{builder::IndexedInstrumentsBuilder, error::IndexError},
     instrument::{Instrument, InstrumentIndex, name::InstrumentNameInternal},
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeSeq};
 
 pub mod builder;
 
@@ -26,7 +26,16 @@ pub mod error;
 /// - `ExchangeIndex`: Unique index for each [`ExchangeId`] added during initialisation.
 /// - `InstrumentIndex`: Unique identifier for each [`Instrument`] added during initialisation.
 /// - `AssetIndex`: Unique identifier for each [`ExchangeAsset`] added during initialisation.
-#[derive(Debug, Clone, PartialEq, PartialOrd, Deserialize, Serialize)]
+///
+/// # Serialisation
+/// Serialises as the plain list of unindexed `Instrument<ExchangeId, Asset>`s it indexes, and
+/// deserialises from that list through [`Self::try_new`]. No index is ever read from a payload,
+/// so a deserialised collection upholds every invariant a built one does, and a payload that
+/// breaks one fails with the same [`IndexError`] `try_new` returns. Building sorts and
+/// de-duplicates, and every asset is derived from the instruments and unique by exchange and
+/// [`AssetNameInternal`], so a round trip reproduces the same indices.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Deserialize)]
+#[serde(try_from = "Vec<Instrument<ExchangeId, Asset>>")]
 pub struct IndexedInstruments {
     exchanges: Vec<Keyed<ExchangeIndex, ExchangeId>>,
     assets: Vec<Keyed<AssetIndex, ExchangeAsset<Asset>>>,
@@ -66,9 +75,11 @@ impl IndexedInstruments {
     ///
     /// # Errors
     /// Returns [`IndexError::DuplicateInstrumentNameInternal`] if two `Instrument`s share an
-    /// [`InstrumentNameInternal`], or [`IndexError::InvalidContractSize`] if an `Instrument`
-    /// carries a non-positive `contract_size` — see [`IndexedInstrumentsBuilder::try_build`] for
-    /// why both invariants exist.
+    /// [`InstrumentNameInternal`], [`IndexError::DuplicateAssetNameInternal`] if two distinct
+    /// assets on one exchange share an [`AssetNameInternal`], or
+    /// [`IndexError::InvalidContractSize`] if an `Instrument` carries a non-positive
+    /// `contract_size` — see [`IndexedInstrumentsBuilder::try_build`] for why each invariant
+    /// exists.
     pub fn try_new<Iter, I>(instruments: Iter) -> Result<Self, IndexError>
     where
         Iter: IntoIterator<Item = I>,
@@ -203,6 +214,54 @@ impl IndexedInstruments {
     }
 }
 
+impl IndexedInstruments {
+    /// The unindexed form of an indexed `instrument`, with each [`AssetIndex`] resolved
+    /// positionally against `self.assets`.
+    fn unindexed_instrument(
+        &self,
+        instrument: &Instrument<Keyed<ExchangeIndex, ExchangeId>, AssetIndex>,
+    ) -> Result<Instrument<ExchangeId, Asset>, IndexError> {
+        instrument
+            .clone()
+            .map_exchange_key(|exchange| exchange.value)
+            .map_asset_key_with_lookup(|index| {
+                self.assets
+                    .get(index.index())
+                    .filter(|keyed| keyed.key == *index)
+                    .map(|keyed| keyed.value.asset.clone())
+                    .ok_or_else(|| {
+                        IndexError::AssetIndex(format!(
+                            "AssetIndex: {index} of instrument {} is not present in indexed \
+                             instrument assets",
+                            instrument.name_internal
+                        ))
+                    })
+            })
+    }
+}
+
+impl Serialize for IndexedInstruments {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(self.instruments.len()))?;
+        for keyed in &self.instruments {
+            let instrument = self
+                .unindexed_instrument(&keyed.value)
+                .map_err(serde::ser::Error::custom)?;
+            seq.serialize_element(&instrument)?;
+        }
+        seq.end()
+    }
+}
+
+impl TryFrom<Vec<Instrument<ExchangeId, Asset>>> for IndexedInstruments {
+    type Error = IndexError;
+
+    /// Builds the collection through [`IndexedInstruments::try_new`].
+    fn try_from(instruments: Vec<Instrument<ExchangeId, Asset>>) -> Result<Self, Self::Error> {
+        Self::try_new(instruments)
+    }
+}
+
 impl<I> FromIterator<I> for IndexedInstruments
 where
     I: Into<Instrument<ExchangeId, Asset>>,
@@ -258,6 +317,7 @@ mod tests {
         },
         test_utils::{exchange_asset, instrument},
     };
+    use rust_decimal::Decimal;
 
     #[test]
     fn test_indexed_instruments_new() {
@@ -516,5 +576,140 @@ mod tests {
         assert_eq!(indexed.exchanges().len(), 2);
         assert_eq!(indexed.assets().len(), 4); // BTC and USDT on both exchanges
         assert_eq!(indexed.instruments().len(), 2);
+    }
+
+    /// A multi-exchange set exercising every key `map_exchange_key` and
+    /// `map_asset_key_with_lookup` touch: a data venue on an exchange no instrument executes on,
+    /// a perpetual settled in an asset its underlying does not name, and a spec whose quantity is
+    /// denominated in an asset only the spec names.
+    fn serde_fixture() -> Vec<Instrument<ExchangeId, Asset>> {
+        use crate::instrument::{
+            data_venue::DataVenue,
+            kind::perpetual::PerpetualContract,
+            spec::{
+                InstrumentSpec, InstrumentSpecNotional, InstrumentSpecPrice,
+                InstrumentSpecQuantity, OrderQuantityUnits,
+            },
+        };
+
+        let mut kraken_eth_usd = instrument(ExchangeId::Kraken, "eth", "usd");
+        kraken_eth_usd.spec = Some(InstrumentSpec::new(
+            InstrumentSpecPrice::new(Decimal::ONE, Decimal::ONE),
+            InstrumentSpecQuantity::new(
+                OrderQuantityUnits::Asset(Asset::new_from_exchange("eth_lot")),
+                Decimal::ONE,
+                Decimal::ONE,
+            ),
+            InstrumentSpecNotional::new(Decimal::ONE),
+        ));
+
+        vec![
+            kraken_eth_usd,
+            instrument(ExchangeId::BinanceSpot, "btc", "usdt"),
+            Instrument::spot(
+                ExchangeId::AlpacaBroker,
+                "alpaca_broker-aapl",
+                "AAPL",
+                Underlying::new(
+                    Asset::new_from_exchange("aapl"),
+                    Asset::new_from_exchange("usd"),
+                ),
+                None,
+            )
+            .with_data_venue(DataVenue::new_same_name(ExchangeId::LseEquities)),
+            Instrument::new(
+                ExchangeId::BinanceFuturesUsd,
+                "binance_futures_usd-btc_usdt-perp",
+                "BTCUSDT",
+                Underlying::new(
+                    Asset::new_from_exchange("btc"),
+                    Asset::new_from_exchange("usdt"),
+                ),
+                InstrumentQuoteAsset::UnderlyingQuote,
+                InstrumentKind::Perpetual(PerpetualContract {
+                    contract_size: Decimal::ONE,
+                    settlement_asset: Asset::new_from_exchange("usdc"),
+                }),
+                None,
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_serde_round_trip_reproduces_the_same_indices() {
+        let indexed = IndexedInstruments::new(serde_fixture());
+
+        let json = serde_json::to_string(&indexed).unwrap();
+        let restored: IndexedInstruments = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored, indexed);
+        // The spec-only asset is registered again on the way back in.
+        assert!(
+            restored
+                .find_asset_index(ExchangeId::Kraken, &AssetNameInternal::from("eth_lot"))
+                .is_ok()
+        );
+        // The data venue is indexed although no instrument executes on it.
+        assert!(
+            restored
+                .exchanges()
+                .iter()
+                .any(|keyed| keyed.value == ExchangeId::LseEquities)
+        );
+    }
+
+    #[test]
+    fn test_serialises_as_the_plain_instrument_list() {
+        let instruments = serde_fixture();
+        let indexed = IndexedInstruments::new(instruments.clone());
+
+        // Building sorts the instruments, so the list is written in index order.
+        let mut expected = instruments;
+        expected.sort();
+
+        assert_eq!(
+            serde_json::to_value(&indexed).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_deserialise_rejects_a_duplicate_name_internal() {
+        let mut instruments = vec![
+            instrument(ExchangeId::BinanceSpot, "btc", "usdt"),
+            instrument(ExchangeId::BinanceSpot, "eth", "usdt"),
+        ];
+        instruments[1].name_internal = instruments[0].name_internal.clone();
+        let json = serde_json::to_string(&instruments).unwrap();
+
+        let err = serde_json::from_str::<IndexedInstruments>(&json)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate InstrumentNameInternal"), "{err}");
+    }
+
+    #[test]
+    fn test_deserialise_rejects_a_non_positive_contract_size() {
+        let mut instruments = serde_fixture();
+        for instrument in &mut instruments {
+            if let InstrumentKind::Perpetual(contract) = &mut instrument.kind {
+                contract.contract_size = Decimal::ZERO;
+            }
+        }
+        let json = serde_json::to_string(&instruments).unwrap();
+
+        let err = serde_json::from_str::<IndexedInstruments>(&json)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("contract_size"), "{err}");
+    }
+
+    #[test]
+    fn test_deserialise_rejects_the_former_index_bearing_format() {
+        // The derive this replaced wrote the private index tables. That format can declare
+        // indices that disagree with their positions, so it no longer loads at all.
+        let json =
+            r#"{"exchanges":[{"key":0,"value":"binance_spot"}],"assets":[],"instruments":[]}"#;
+        assert!(serde_json::from_str::<IndexedInstruments>(json).is_err());
     }
 }

@@ -109,9 +109,11 @@ impl IndexedInstrumentsBuilder {
     ///
     /// # Panics
     /// Panics if two added `Instrument`s share an
-    /// [`InstrumentNameInternal`](crate::instrument::name::InstrumentNameInternal), or if any
-    /// added `Instrument` carries a non-positive `contract_size` — see [`Self::try_build`], which
-    /// returns both as an [`IndexError`] instead.
+    /// [`InstrumentNameInternal`](crate::instrument::name::InstrumentNameInternal), if two distinct
+    /// assets on one exchange share an
+    /// [`AssetNameInternal`](crate::asset::name::AssetNameInternal), or if any added `Instrument`
+    /// carries a non-positive `contract_size` — see [`Self::try_build`], which returns each as an
+    /// [`IndexError`] instead.
     pub fn build(self) -> IndexedInstruments {
         // Deliberate panic: `build` is the infallible convenience over `try_build`, and every
         // failure it can raise is a caller error that must not be silently tolerated (see
@@ -127,7 +129,9 @@ impl IndexedInstrumentsBuilder {
     ///
     /// # Errors
     /// Returns [`IndexError::DuplicateInstrumentNameInternal`] if two added `Instrument`s share an
-    /// [`InstrumentNameInternal`](crate::instrument::name::InstrumentNameInternal), or
+    /// [`InstrumentNameInternal`](crate::instrument::name::InstrumentNameInternal),
+    /// [`IndexError::DuplicateAssetNameInternal`] if two distinct assets on one exchange share an
+    /// [`AssetNameInternal`](crate::asset::name::AssetNameInternal), or
     /// [`IndexError::InvalidContractSize`] if any added `Instrument` carries a non-positive
     /// `contract_size`.
     ///
@@ -188,6 +192,27 @@ impl IndexedInstrumentsBuilder {
                     // `as_str`, not `Display`: the canonical snake_case spelling users write in
                     // configs, rather than the bare variant name.
                     instrument.exchange.as_str(),
+                )));
+            }
+        }
+
+        // Enforce the asset-side twin: `(exchange, name_internal)` must be unique across assets.
+        // The dedup above removes only fully equal assets, so two assets differing only in
+        // `name_exchange` survive it, and would take two `AssetIndex` slots that lookups keyed on
+        // `name_internal` cannot tell apart.
+        let mut asset_names = HashMap::with_capacity(self.assets.len());
+        for exchange_asset in &self.assets {
+            let key = (exchange_asset.exchange, &exchange_asset.asset.name_internal);
+            if let Some(previous) = asset_names.insert(key, exchange_asset) {
+                return Err(IndexError::DuplicateAssetNameInternal(format!(
+                    "{} on {} is shared by the distinct assets with name_exchange {} and {} - \
+                     every asset on an exchange requires a unique name_internal",
+                    exchange_asset.asset.name_internal,
+                    // `as_str`, not `Display`: the canonical snake_case spelling users write in
+                    // configs, rather than the bare variant name.
+                    exchange_asset.exchange.as_str(),
+                    previous.asset.name_exchange,
+                    exchange_asset.asset.name_exchange,
                 )));
             }
         }
@@ -471,6 +496,51 @@ mod tests {
         // tells the operator which of the two configured entries to change.
         assert!(message.contains("lse_equities"), "{message}");
         assert!(message.contains("binance_spot"), "{message}");
+    }
+
+    /// One exchange spelling a quote asset two ways, both normalising to `usdt`.
+    fn spot_quoted_in(base: &str, quote_name_exchange: &str) -> Instrument<ExchangeId, Asset> {
+        Instrument::spot(
+            ExchangeId::BinanceSpot,
+            format!("binance_spot-{base}_usdt"),
+            format!("{}USDT", base.to_uppercase()),
+            Underlying::new(
+                Asset::new_from_exchange(base),
+                Asset::new("usdt", quote_name_exchange),
+            ),
+            None,
+        )
+    }
+
+    #[test]
+    fn two_assets_sharing_a_name_internal_on_one_exchange_are_rejected() {
+        let error = IndexedInstrumentsBuilder::default()
+            .add_instrument(spot_quoted_in("btc", "USDT"))
+            .add_instrument(spot_quoted_in("eth", "usdt.e"))
+            .try_build()
+            .expect_err("an (exchange, name_internal) asset collision must be rejected");
+
+        let IndexError::DuplicateAssetNameInternal(message) = &error else {
+            panic!("unexpected error variant: {error:?}")
+        };
+        assert!(message.contains("usdt on binance_spot"), "{message}");
+        // Both spellings are named: they are the only thing telling the operator what collided.
+        assert!(message.contains("USDT"), "{message}");
+        assert!(message.contains("usdt.e"), "{message}");
+    }
+
+    #[test]
+    fn one_asset_name_internal_on_two_exchanges_is_not_a_collision() {
+        let mut coinbase = spot_quoted_in("eth", "usdt.e");
+        coinbase.exchange = ExchangeId::Coinbase;
+
+        let indexed = IndexedInstrumentsBuilder::default()
+            .add_instrument(spot_quoted_in("btc", "USDT"))
+            .add_instrument(coinbase)
+            .try_build()
+            .expect("an asset name is unique per exchange, not across exchanges");
+
+        assert_eq!(indexed.assets().len(), 4);
     }
 
     /// Builds a one-instrument collection whose only variable is the CFD multiplier.

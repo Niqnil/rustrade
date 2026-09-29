@@ -375,6 +375,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING (behaviour): building an `IndexedInstruments` rejects two distinct assets on one
+  exchange that share an `AssetNameInternal`** (`rustrade-instrument`). The new
+  `IndexError::DuplicateAssetNameInternal` covers two assets that differ only in `name_exchange`,
+  such as a venue spelling its quote asset `USDT` for one instrument and `usdt.e` for another.
+  Since `Asset::new_from_exchange`, and so `SystemConfig`, lowercases `name_exchange` into
+  `name_internal`, spellings that differ only in letter case (`USDT` and `usdt`) collide too.
+  `try_build` and `try_new` return it, and `build`, `new` and deserialisation fail on it. Such a
+  pair survived the de-duplication as two `AssetIndex` slots. Asset lookups and engine asset
+  state are keyed on `(exchange, name_internal)` but read by position, so the pair collapsed into
+  one entry, and every later index resolved to the wrong asset: balances were attributed to their
+  neighbour with no error. The same asset name on two exchanges is still fine.
+
+- **BREAKING: `IndexedInstruments` serialises as the plain list of instruments it indexes, and
+  deserialises by building from that list** (`rustrade-instrument`). It derived serde over its
+  private index tables, so a payload was loaded as written: it could skip every check
+  `try_new` makes (unique `name_internal`, positive `contract_size`), or declare indices that
+  disagree with their positions, so that every lookup resolved to the wrong entity. It now
+  writes a JSON array of `Instrument<ExchangeId, Asset>` and reads one through `try_new`, so a
+  payload that breaks an invariant fails with the same `IndexError`, and no index is ever read
+  from input. The old object format no longer loads, so previously serialised output must be
+  regenerated. `IndexedInstruments` also implements `TryFrom<Vec<Instrument<ExchangeId, Asset>>>`.
+
 - **BREAKING: `TradingSummary` and `TradingSummaryGenerator` serialise `assets` as a sequence of
   `(key, value)` pairs, and serialise to JSON** (`rustrade`). `assets` is keyed by
   `ExchangeAsset`, a struct, and JSON object keys must be strings, so `serde_json` refused any
