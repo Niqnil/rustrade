@@ -562,7 +562,7 @@ fn build_ohlcv_get_range(params: &DatabentoOhlcvParams, schema: Schema) -> GetRa
 /// this should *always* hold; a mismatch signals a `dbn` API contract violation
 /// (not caller error) and is surfaced as [`DataError`], never silently skipped.
 fn assert_ohlcv_rtype_matches(rtype: u8, schema: Schema) -> Result<(), DataError> {
-    if RType::try_into_schema(rtype) == Some(schema) {
+    if RType::try_into_schema(u16::from(rtype)) == Some(schema) {
         Ok(())
     } else {
         Err(decode_error(format!(
