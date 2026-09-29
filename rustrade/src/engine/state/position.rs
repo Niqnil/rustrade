@@ -1,12 +1,12 @@
 use chrono::{DateTime, Utc};
 use derive_more::Constructor;
-use indexmap::IndexMap;
 use rust_decimal::Decimal;
 pub use rustrade_execution::order::id::PositionId;
 use rustrade_execution::trade::{AssetFees, Trade, TradeId};
 use rustrade_instrument::{
     Side, asset::AssetIndex, corporate_action::SplitRatio, instrument::InstrumentIndex,
 };
+use rustrade_integration::collection::FnvIndexMap;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use thiserror::Error;
@@ -173,7 +173,7 @@ pub(crate) struct PreparedSplit {
 pub struct PositionManager<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     pub mode: OmsMode,
     /// All currently open positions keyed by `PositionId`.
-    pub positions: IndexMap<PositionId, Position<AssetKey, InstrumentKey>>,
+    pub positions: FnvIndexMap<PositionId, Position<AssetKey, InstrumentKey>>,
 }
 
 impl<AssetKey, InstrumentKey> Default for PositionManager<AssetKey, InstrumentKey> {
@@ -190,7 +190,7 @@ impl<AssetKey, InstrumentKey> PositionManager<AssetKey, InstrumentKey> {
         // reallocation on the first fill for the majority of use cases.
         Self {
             mode,
-            positions: IndexMap::with_capacity(1),
+            positions: FnvIndexMap::with_capacity_and_hasher(1, Default::default()),
         }
     }
 }

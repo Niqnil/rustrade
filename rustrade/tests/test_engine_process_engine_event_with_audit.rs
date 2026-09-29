@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics acceptable
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Days, TimeDelta, Utc};
 use fnv::FnvHashMap;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -40,7 +40,6 @@ use rustrade::{
         on_disconnect::OnDisconnectStrategy,
         on_trading_disabled::OnTradingDisabled,
     },
-    test_utils::time_plus_days,
 };
 use rustrade_data::{
     event::{DataKind, MarketEvent},
@@ -88,6 +87,10 @@ const STARTING_BALANCE_USDT: Balance = Balance::new(dec!(40_000.0), dec!(40_000.
 const STARTING_BALANCE_BTC: Balance = Balance::new(dec!(1.0), dec!(1.0));
 const STARTING_BALANCE_ETH: Balance = Balance::new(dec!(10.0), dec!(10.0));
 const QUOTE_FEES_PERCENT: f64 = 0.1; // 10%
+
+fn time_plus_days(base: DateTime<Utc>, plus: u64) -> DateTime<Utc> {
+    base.checked_add_days(Days::new(plus)).unwrap()
+}
 
 // Asset indices after alphabetical sorting: btc(0), eth(1), usdt(2)
 // For BTCUSDT (instrument 0): quote = usdt = AssetIndex(2)
