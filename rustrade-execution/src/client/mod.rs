@@ -371,9 +371,9 @@ pub trait BracketOrderClient: ExecutionClient {
     ///
     /// Either all orders are `Active(Open)` or all are `Inactive` (placement failed), with one
     /// exception: a leg of a failed placement whose fate at the venue is unknown (no status
-    /// arrived, or its rollback cancel could not be sent) is returned `Active(Open)`, so the
-    /// account stream can resolve it. Only IBKR returns such legs today; see its
-    /// `open_bracket_order`.
+    /// arrived, or it was accepted and its rollback cancel could not be sent) is returned
+    /// `Active(Open)`, so the account stream can resolve it. Only IBKR returns such legs today;
+    /// see its `open_bracket_order`.
     fn open_bracket_order(
         &self,
         request: BracketOrderRequest<ExchangeId, &InstrumentNameExchange>,

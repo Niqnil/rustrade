@@ -640,10 +640,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **BREAKING (behaviour): a failed IBKR bracket order returns legs of unknown fate as `Open`**
   (`rustrade-execution`, feature `ibkr`). `IbkrClient::open_bracket_order` still cancels every
-  sent leg when placement fails. But a leg that reported no status, or whose rollback cancel could
-  not be sent, may still be live or held at TWS. Such a leg now comes back `Open` with zero fill,
+  sent leg when placement fails. But a leg that reported no status, or was accepted and then its
+  rollback cancel could not be sent, may still be live or held at TWS. Such a leg now comes back `Open` with zero fill,
   and its order id stays tracked so the account stream reports how it ends, as for a no-status
-  single order. The other legs come back `Inactive` with the error, as before. Previously all
+  single order. The other legs, including any IB rejected, come back `Inactive` with the error,
+  as before. Previously all
   three legs were always `Inactive` and untracked, so later events for a leg that was in fact live
   were dropped. A failed bracket can therefore return a mix of `Open` and `Inactive` legs, and
   `BracketOrderClient::open_bracket_order`'s rustdoc now states this exception to its
