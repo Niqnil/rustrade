@@ -41,7 +41,9 @@ jobs:
     name: Publish crates
     needs: validate
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Above the worst case of six crates each spending cargo's own index wait plus the script's
+    # INDEX_TIMEOUT_SECS, so the script's timeout error fires before the job is killed
+    timeout-minutes: 45
     steps:
       - name: Checkout sources
         uses: actions/checkout@v7

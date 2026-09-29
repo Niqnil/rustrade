@@ -25,6 +25,12 @@
 # timeout it only warns and exits 0. So after every publish this script polls the index itself
 # until the exact version is listed, and fails if INDEX_TIMEOUT_SECS passes first. Every crate gets
 # the same barrier, including siblings with no edge between them, so reordering cannot remove one.
+# While polling, an index that cannot be read is retried until the deadline, because the upload has
+# already succeeded; before publishing, it stops the script, because neither answer can be assumed.
+#
+# Cache: the index is served through a CDN with `max-age=600`, which crates.io purges on publish.
+# Every lookup adds a throwaway query string, which the index ignores but which misses the CDN's
+# cached copy, so neither the check nor the poll can be answered by a stale copy if a purge is late.
 #
 # Environment:
 #   DRY_RUN=1            print the order and what would be published; publish nothing
@@ -59,24 +65,31 @@ index_path() {
     esac
 }
 
-# Succeeds if the index lists exactly `$2` for crate `$1`, fails if it does not, and exits the
-# script if the index cannot be read. A lookup error must never read as "not published" (the
-# publish would then fail confusingly) nor as "published" (a crate would be skipped silently).
-index_has_version() {
+# Looks up exactly version `$2` of crate `$1` and sets INDEX_STATE to `listed`, `absent`, or
+# `unreadable` with the reason in INDEX_ERROR. Unreadable is kept apart from absent so that a
+# lookup error never reads as "not published" (the publish would then fail confusingly) nor as
+# "published" (a crate would be skipped silently). Each caller decides what unreadable means.
+index_lookup() {
     local name="$1" version="$2" url status listed
     url="$INDEX_URL/$(index_path "$name")"
-    status="$(curl -sS --retry 3 --max-time 30 -o "$body" -w '%{http_code}' "$url")" \
-        || die "could not reach $url"
+    INDEX_STATE=unreadable
+    if ! status="$(curl -sS --retry 3 --max-time 30 -o "$body" -w '%{http_code}' \
+        "$url?nocache=$EPOCHSECONDS$RANDOM")"; then
+        INDEX_ERROR="could not reach $url"
+        return 0
+    fi
     case "$status" in
         200) ;;
-        404) return 1 ;; # the crate has never been published
-        *) die "$url answered HTTP $status" ;;
+        404) INDEX_STATE=absent; return 0 ;; # the crate has never been published
+        *) INDEX_ERROR="$url answered HTTP $status"; return 0 ;;
     esac
     # One JSON object per published version. A yanked version is still published and cannot be
     # uploaded again, so it counts.
-    listed="$(jq -rs --arg v "$version" 'any(.[]; .vers == $v)' "$body")" \
-        || die "could not parse the index file at $url"
-    [[ "$listed" == true ]]
+    if ! listed="$(jq -rs --arg v "$version" 'any(.[]; .vers == $v)' "$body")"; then
+        INDEX_ERROR="could not parse the index file at $url"
+        return 0
+    fi
+    if [[ "$listed" == true ]]; then INDEX_STATE=listed; else INDEX_STATE=absent; fi
 }
 
 metadata="$(cargo metadata --format-version=1 --no-deps)"
@@ -131,7 +144,10 @@ for name in "${order[@]}"; do
     ver="${version[$name]}"
     echo "::group::$name@$ver"
 
-    if index_has_version "$name" "$ver"; then
+    index_lookup "$name" "$ver"
+    [[ "$INDEX_STATE" != unreadable ]] || die "$INDEX_ERROR"
+
+    if [[ "$INDEX_STATE" == listed ]]; then
         echo "$name@$ver is already in the index, skipping"
     elif [[ "$DRY_RUN" == 1 ]]; then
         echo "DRY_RUN: would publish $name@$ver"
@@ -139,10 +155,14 @@ for name in "${order[@]}"; do
         cargo publish -p "$name" --no-verify
 
         deadline=$(( SECONDS + INDEX_TIMEOUT_SECS ))
-        until index_has_version "$name" "$ver"; do
+        while index_lookup "$name" "$ver"; [[ "$INDEX_STATE" != listed ]]; do
             (( SECONDS < deadline )) \
                 || die "$name@$ver was published but is not in the index after ${INDEX_TIMEOUT_SECS}s; re-run once it appears"
-            echo "waiting for $name@$ver to reach the index"
+            if [[ "$INDEX_STATE" == unreadable ]]; then
+                echo "::warning::$INDEX_ERROR; retrying"
+            else
+                echo "waiting for $name@$ver to reach the index"
+            fi
             sleep "$INDEX_POLL_SECS"
         done
         echo "$name@$ver is in the index"
