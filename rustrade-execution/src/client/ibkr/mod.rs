@@ -670,11 +670,11 @@ impl IbkrClient {
     /// prevents the dangerous scenario where take-profit fills but stop-loss
     /// remains open, potentially opening an unintended opposing position.
     ///
-    /// # All-or-Nothing Semantics
+    /// # Failure Semantics
     ///
     /// If any leg is rejected by IB (e.g., insufficient margin, invalid price),
     /// or cannot be sent, this method cancels every leg already sent and
-    /// returns the legs as `Inactive`.
+    /// returns the legs as `Inactive`, except for legs of unknown fate (below).
     ///
     /// The same all-legs cancellation applies if any leg fails to report a
     /// status within the placement timeout, or the transport drops while
@@ -690,9 +690,12 @@ impl IbkrClient {
     /// at TWS. Such a leg comes back `Open` with zero fill and keeps its
     /// order-id mapping, as a no-status single order does, so the account
     /// stream can report how it ends. The other legs come back `Inactive` with
-    /// the error. So a failed bracket can return a mix of `Open` and `Inactive`
-    /// legs, and every leg can be `Open` when none reported a status. Treat an
-    /// `Open` leg of a failed bracket as working until the account stream or
+    /// the error. A leg IB rejected is settled even if its cancel was refused.
+    /// So a failed bracket can return a mix of `Open` and `Inactive` legs, and
+    /// every leg can be `Open` when none reported a status: an all-`Open`
+    /// result is then indistinguishable from success, and the failure shows
+    /// only in the log and on the account stream. Treat an `Open` leg as
+    /// working until the account stream or
     /// [`ExecutionClient::fetch_open_orders`] says otherwise.
     ///
     /// # Cancellation Safety
@@ -887,19 +890,14 @@ impl IbkrClient {
                 (failed.into_iter().map(|(id, _)| id).collect(), suffix)
             };
 
-            // A later leg's send failed after earlier legs were written. Retrying
-            // is only safe when every rollback cancel went out; otherwise a leg
-            // may still be held at TWS, so the failure is not transient. The
-            // failing leg itself was refused, so it never reached TWS.
+            // A later leg's send failed after the legs in `sent` were written:
+            // roll them back. A leg whose cancel was refused may be held at TWS,
+            // so it is unresolved. The failing leg itself is treated as never
+            // having reached TWS, as in `send_error`.
             let leg_send_failure = |e: &ibapi::Error, message: String, sent: &[i32]| {
                 let (cancel_failed, rollback) = rollback(sent);
-                let error = if cancel_failed.is_empty() {
-                    send_error(e, message)
-                } else {
-                    OrderError::Rejected(ApiError::OrderRejected(format!("{message}{rollback}")))
-                };
                 BracketFailure {
-                    error,
+                    error: leg_send_error(e, message, &rollback),
                     unresolved: cancel_failed,
                 }
             };
@@ -1072,7 +1070,10 @@ impl IbkrClient {
                 &self.order_ids,
             ),
             Err(join_err) => {
-                // Clean up order ID mappings
+                // The placement task panicked, and which legs it sent was lost
+                // with it. Unlike `failed_bracket`, all three are released: a
+                // leg it did send is then untracked, but keeping unsent legs
+                // Open would report orders that do not exist.
                 self.order_ids.remove_by_ib_id(parent_ib_id);
                 self.order_ids.remove_by_ib_id(tp_ib_id);
                 self.order_ids.remove_by_ib_id(sl_ib_id);
@@ -1109,16 +1110,44 @@ struct BracketFailure {
 }
 
 /// The legs of a bracket that failed after all three were sent whose fate at
-/// TWS is unknown: those without a placement status (`None`), and those whose
-/// rollback cancel could not be sent.
+/// TWS is unknown: those without a placement status (`None`), and those that
+/// were accepted but whose rollback cancel could not be sent.
 ///
-/// A leg that reported a status and whose cancel went out is settled: rejected,
-/// or being cancelled.
-fn unresolved_legs<T>(legs: [(i32, &Option<T>); 3], cancel_failed: &[i32]) -> Vec<i32> {
+/// A rejected leg (`Some(Err)`) is settled whether or not its cancel went out:
+/// its terminal status was consumed by the placement subscription and will not
+/// be replayed, so keeping it `Open` would leave a phantom order. An accepted
+/// leg whose cancel went out is settled as being cancelled.
+fn unresolved_legs<T, E>(
+    legs: [(i32, &Option<Result<T, E>>); 3],
+    cancel_failed: &[i32],
+) -> Vec<i32> {
     legs.into_iter()
-        .filter(|(id, status)| status.is_none() || cancel_failed.contains(id))
+        .filter(|(id, status)| match status {
+            None => true,
+            Some(Ok(_)) => cancel_failed.contains(id),
+            Some(Err(_)) => false,
+        })
         .map(|(id, _)| id)
         .collect()
+}
+
+/// Classify a later bracket leg's send failure, after the legs sent before it
+/// were rolled back. `rollback` is the suffix naming the cancels that could
+/// not be sent, empty when every cancel went out.
+///
+/// Retrying is only safe when every rollback cancel went out, so only then does
+/// the failure keep [`send_error`]'s classification. Otherwise a leg may still
+/// be held at TWS, and the failure is a non-transient rejection naming it.
+fn leg_send_error(
+    e: &ibapi::Error,
+    message: String,
+    rollback: &str,
+) -> OrderError<AssetNameExchange, InstrumentNameExchange> {
+    if rollback.is_empty() {
+        send_error(e, message)
+    } else {
+        OrderError::Rejected(ApiError::OrderRejected(format!("{message}{rollback}")))
+    }
 }
 
 /// Build the result of a failed bracket placement, releasing the order-id
@@ -2612,8 +2641,43 @@ mod order_status_tests {
         );
     }
 
-    /// A leg is unresolved when it reported no status or its rollback cancel
-    /// was refused; a leg with a status whose cancel went out is settled.
+    /// A rejected leg is settled even when its rollback cancel was refused: its
+    /// terminal status will not be replayed, so keeping it Open would leave a
+    /// phantom order.
+    #[test]
+    fn rejected_leg_with_failed_cancel_is_settled() {
+        let accepted: Option<Result<f64, String>> = Some(Ok(0.0));
+        let rejected: Option<Result<f64, String>> = Some(Err("Cancelled".into()));
+
+        assert_eq!(
+            unresolved_legs([(1, &rejected), (2, &accepted), (3, &accepted)], &[1, 2, 3]),
+            vec![2, 3]
+        );
+    }
+
+    /// A later leg's send failure keeps `send_error`'s classification only when
+    /// every rollback cancel went out; otherwise it is a non-transient
+    /// rejection naming the cancels that failed.
+    #[test]
+    fn leg_send_error_is_transient_only_after_a_clean_rollback() {
+        let clean = leg_send_error(&ibapi::Error::ConnectionReset, "sl failed".into(), "");
+        assert!(matches!(clean, OrderError::Connectivity(_)));
+
+        let dirty = leg_send_error(
+            &ibapi::Error::ConnectionReset,
+            "sl failed".into(),
+            "; rollback cancel failed for order ids 10 (connection reset), which may be live",
+        );
+        match dirty {
+            OrderError::Rejected(ApiError::OrderRejected(message)) => {
+                assert!(message.starts_with("sl failed; rollback cancel failed"));
+            }
+            other => panic!("expected a non-transient rejection, got {other:?}"),
+        }
+    }
+
+    /// A leg is unresolved when it reported no status, or was accepted and its
+    /// rollback cancel was refused; a leg whose cancel went out is settled.
     #[test]
     fn unresolved_legs_are_no_status_or_failed_cancel() {
         let accepted: Option<Result<f64, String>> = Some(Ok(0.0));

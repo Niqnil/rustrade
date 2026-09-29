@@ -56,9 +56,9 @@ pub struct BracketOrderRequest {
 ///
 /// # Invariant
 ///
-/// Either all three orders are `Active(Open)` or all three are `Inactive`.
-/// Partial success (some active, some inactive) is prevented by the all-or-nothing
-/// error handling in `open_bracket_order`.
+/// Either all three orders are `Active(Open)` or all three are `Inactive`, except
+/// that a leg of a failed placement whose fate at TWS is unknown is `Active(Open)`.
+/// See [`IbkrClient::open_bracket_order`](super::IbkrClient::open_bracket_order).
 #[derive(Debug, Clone)]
 pub struct BracketOrderResult {
     /// Parent (entry) order.

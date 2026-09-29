@@ -97,8 +97,10 @@ pub type BracketOrderRequest<ExchangeKey = ExchangeId, InstrumentKey = Instrumen
 ///
 /// # Invariants
 ///
-/// - Either all orders are `Active(Open)` or all are `Inactive` (placement failed).
-///   Partial success is prevented by all-or-nothing error handling in implementations.
+/// - Either all orders are `Active(Open)` or all are `Inactive` (placement failed), except that
+///   a leg of a failed placement whose fate at the venue is unknown is `Active(Open)`, so the
+///   account stream can resolve it. See
+///   [`BracketOrderClient::open_bracket_order`](crate::client::BracketOrderClient::open_bracket_order).
 /// - Child legs are either both `Some` (exchange returns legs immediately, e.g. IBKR)
 ///   or both `None` (exchange creates legs server-side, e.g. Alpaca). Asymmetric leg
 ///   presence is not supported — no current exchange returns one leg but not the other,
