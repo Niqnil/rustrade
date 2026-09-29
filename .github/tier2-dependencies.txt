@@ -254,8 +254,11 @@ ibapi=4.2.0  # 2026-09-14 | Financial protocol, community-maintained, no officia
 #   - HOW THE WRAPPER NOW READS THIS (changed in the same PR): a transport error (ConnectionReset,
 #     ConnectionFailed, Shutdown, Io) while awaiting a placement's first status is `NoStatus` --
 #     the order may be live, so it is reported open and its id mapping kept -- not a rejection; a
-#     send refused before anything was written is OrderError::Connectivity; and bracket rollback
-#     cancels that cannot be sent are logged and named in the error instead of discarded.
+#     send refused with ConnectionReset/Io is OrderError::Connectivity (Shutdown/ConnectionFailed,
+#     reconnect given up, stay non-transient); and bracket rollback cancels that cannot be sent are
+#     logged and named in a non-transient error instead of discarded. NOTE `ensure_connected`
+#     refuses with ConnectionReset even after a permanent shutdown, so that case still reads as
+#     transient to us.
 #   - UPSTREAM-DOCUMENTED CAVEAT that reaches us: `reset()` notifies but does not drain the shared
 #     channels, and `all_open_orders` is not one-shot, so our fetch_open_orders issued right after a
 #     reconnect can read the stale ConnectionReset first and fail once.

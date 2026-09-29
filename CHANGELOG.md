@@ -625,16 +625,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **IBKR orders and account reads fail fast across a TWS disconnect, and reject malformed order
   frames** (`rustrade-execution`, feature `ibkr`; `ibapi` 4.1.0 → 4.2.0). While `ibapi`'s transport
   is reconnecting, `open_order` and `cancel_order` are refused at once instead of being written to
-  the socket being replaced. The refusal is reported as `OrderError::Connectivity`, which is
-  transient, rather than as a venue rejection: the request never reached TWS and can be retried.
-  A placement still waiting for its first status when the socket drops is no longer reported as
-  rejected either. TWS may already hold it, so it comes back open with its order id still tracked,
-  as when the status wait times out, and the account stream or `fetch_open_orders` resolves it. A
-  bracket order whose rollback cancels cannot be sent now names those order ids in its error, and
-  logs them, instead of discarding the failure. `fetch_open_orders` and `fetch_trades` now fail on
-  an order frame missing its action, or an order or execution frame missing a required part, where
-  `ibapi` used to hand back a default-built order that read as a buy; the account stream ends on
-  such a frame. Wire encoding of every order this crate builds is unchanged.
+  the socket being replaced. A single order or cancel refused this way never reached TWS, so it is
+  reported as `OrderError::Connectivity`, which is transient, rather than as a venue rejection;
+  once `ibapi` has given up reconnecting, the refusal is a non-transient rejection. A placement
+  still waiting for its first status when the socket drops is no longer reported as rejected
+  either. TWS may already hold it, so it comes back open with its order id still tracked, as when
+  the status wait times out, and `fetch_open_orders` can resolve it. A bracket order whose
+  rollback cancels cannot be sent now names those order ids in its error, logs them, and is
+  reported as a non-transient rejection, because a leg may still be held at TWS; before, the
+  failed cancels were discarded. `fetch_open_orders` and `fetch_trades` now fail on an order frame
+  missing its action, or an order or execution frame missing a required part, where `ibapi` used
+  to hand back a default-built order that read as a buy; the account stream ends on such a frame.
+  Wire encoding of every order this crate builds is unchanged.
 
 ### Removed
 

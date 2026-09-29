@@ -314,17 +314,27 @@ fn is_transport_loss(e: &ibapi::Error) -> bool {
 /// Classify the error from a send (`place_order` / `cancel_order`) that failed
 /// before TWS acknowledged anything, carrying `message` as the reason.
 ///
-/// Transport loss is a transient [`OrderError::Connectivity`]: the request did
-/// not reach TWS and may be retried once the connection is back. Anything else
-/// is a refusal, [`ApiError::OrderRejected`].
+/// A dropped or reconnecting transport (`ConnectionReset`, `Io`) is a transient
+/// [`OrderError::Connectivity`]: the request did not reach TWS and may be retried
+/// once the connection is back. `Shutdown` and `ConnectionFailed` mean ibapi has
+/// given up reconnecting, so they are non-transient, like any other refusal
+/// ([`ApiError::OrderRejected`]).
+///
+/// # Known limitation
+///
+/// ibapi refuses a send with `ConnectionReset` whenever the session is not
+/// connected, including after it has shut down for good, so a send refused on a
+/// dead client still reads as transient here. The client's streams ending is
+/// the signal that it will not come back.
 fn send_error<AssetKey, InstrumentKey>(
     e: &ibapi::Error,
     message: String,
 ) -> OrderError<AssetKey, InstrumentKey> {
-    if is_transport_loss(e) {
-        OrderError::Connectivity(ConnectivityError::Socket(message))
-    } else {
-        OrderError::Rejected(ApiError::OrderRejected(message))
+    match e {
+        ibapi::Error::ConnectionReset | ibapi::Error::Io(_) => {
+            OrderError::Connectivity(ConnectivityError::Socket(message))
+        }
+        _ => OrderError::Rejected(ApiError::OrderRejected(message)),
     }
 }
 
@@ -865,6 +875,20 @@ impl IbkrClient {
                 }
             };
 
+            // A later leg's send failed after earlier legs were written. Retrying
+            // is only safe when every rollback cancel went out; otherwise a leg
+            // may still be held at TWS, so the failure is not transient.
+            let leg_send_error = |e: &ibapi::Error,
+                                  message: String,
+                                  rollback: String|
+             -> OrderError<AssetNameExchange, InstrumentNameExchange> {
+                if rollback.is_empty() {
+                    send_error(e, message)
+                } else {
+                    OrderError::Rejected(ApiError::OrderRejected(format!("{message}{rollback}")))
+                }
+            };
+
             // Place parent (transmit=false, held until SL is sent)
             let parent_sub = match client.place_order(parent_ib_id, &contract, &ib_orders[0]) {
                 Ok(s) => s,
@@ -876,9 +900,10 @@ impl IbkrClient {
                 Ok(s) => s,
                 Err(e) => {
                     let rollback = rollback(&[parent_ib_id]);
-                    return Err(send_error(
+                    return Err(leg_send_error(
                         &e,
-                        format!("take_profit order failed: {e}{rollback}"),
+                        format!("take_profit order failed: {e}"),
+                        rollback,
                     ));
                 }
             };
@@ -888,7 +913,11 @@ impl IbkrClient {
                 Ok(s) => s,
                 Err(e) => {
                     let rollback = rollback(&[parent_ib_id, tp_ib_id]);
-                    return Err(send_error(&e, format!("stop_loss order failed: {e}{rollback}")));
+                    return Err(leg_send_error(
+                        &e,
+                        format!("stop_loss order failed: {e}"),
+                        rollback,
+                    ));
                 }
             };
 
@@ -927,8 +956,15 @@ impl IbkrClient {
                 (Some(Ok(parent)), Some(Ok(tp)), Some(Ok(sl))) => Ok((parent, tp, sl)),
                 (parent, tp, sl) => {
                     let rollback = rollback(&[parent_ib_id, tp_ib_id, sl_ib_id]);
+                    let show = |status: Option<Result<f64, String>>| match status {
+                        Some(status) => format!("{status:?}"),
+                        None => "no status (timed out or transport lost)".to_string(),
+                    };
                     Err(OrderError::Rejected(ApiError::OrderRejected(format!(
-                        "bracket order rejected: parent={parent:?}, tp={tp:?}, sl={sl:?}{rollback}"
+                        "bracket order rejected: parent={}, tp={}, sl={}{rollback}",
+                        show(parent),
+                        show(tp),
+                        show(sl)
                     ))))
                 }
             }
@@ -2385,8 +2421,8 @@ mod order_status_tests {
         ));
     }
 
-    /// A send refused because the transport is down never reached TWS: it is a
-    /// transient connectivity error, not a venue rejection.
+    /// A send refused because the transport is down or reconnecting never
+    /// reached TWS: it is a transient connectivity error, not a venue rejection.
     #[test]
     fn send_error_separates_transport_loss_from_refusal() {
         let refused: OrderError<AssetNameExchange, InstrumentNameExchange> =
@@ -2396,9 +2432,27 @@ mod order_status_tests {
         );
         assert!(refused.is_transient());
 
-        let rejected: OrderError<AssetNameExchange, InstrumentNameExchange> =
-            send_error(&ibapi::Error::Simple("no".into()), "no".into());
-        assert!(matches!(&rejected, OrderError::Rejected(ApiError::OrderRejected(m)) if m == "no"));
+        let io: OrderError<AssetNameExchange, InstrumentNameExchange> = send_error(
+            &ibapi::Error::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+            "io".into(),
+        );
+        assert!(io.is_transient());
+
+        // ibapi has given up reconnecting: retrying cannot succeed.
+        for e in [
+            ibapi::Error::Shutdown,
+            ibapi::Error::ConnectionFailed,
+            ibapi::Error::Simple("no".into()),
+        ] {
+            let label = e.to_string();
+            let rejected: OrderError<AssetNameExchange, InstrumentNameExchange> =
+                send_error(&e, "no".into());
+            assert!(
+                matches!(&rejected, OrderError::Rejected(ApiError::OrderRejected(m)) if m == "no"),
+                "{label} must be a non-transient refusal"
+            );
+            assert!(!rejected.is_transient(), "{label}");
+        }
     }
 
     /// Regression anchors: the statuses that were already decisive must keep
