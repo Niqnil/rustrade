@@ -58,12 +58,15 @@
 //! 2. **Permanent disconnect**: when `ibapi` gives up reconnecting, or fill recovery
 //!    fails repeatedly, `account_stream` ends with `StreamTerminated` within about a
 //!    second. Its reader thread then stays blocked until TWS sends another event, and
-//!    another `account_stream` call on the client fails until it exits. After recovery
-//!    fails, the client is still connected, so that is the next event. After a
-//!    shutdown, no event follows, so replace the client. Recovering from
-//!    that, by reconnecting with [`IbkrClient::connect_sync`] and choosing the client
-//!    ID, is the caller's decision. A new `IbkrClient` does not know the orders the old
-//!    one placed, so their later events are dropped.
+//!    another `account_stream` call on the client fails until the thread exits. After
+//!    recovery fails, the client is still connected, so the reader exits on the next
+//!    TWS event and `account_stream` works again. After a shutdown, no event follows,
+//!    so replace the client. Shutdown is detected only while a stream is open, so
+//!    `account_stream` on a client that has already shut down returns a stream that
+//!    never ends; see [`ExecutionClient::account_stream`]. Replacing the client, by
+//!    reconnecting with [`IbkrClient::connect_sync`] and choosing the client ID, is the
+//!    caller's decision. A new `IbkrClient` does not know the orders the old one
+//!    placed, so their later events are dropped.
 //! 3. **Stale state cleanup**: Periodically call [`IbkrClient::clear_stale_executions`],
 //!    [`IbkrClient::clear_stale_order_ids`], and [`IbkrClient::clear_stale_pending_cancels`]
 //!
@@ -355,6 +358,120 @@ fn resolve_execution(
         return None;
     };
     Some((instrument, client_id))
+}
+
+/// Forward `updates`, from `ibapi`'s order-update subscription, to `sink` as account events,
+/// until the subscription ends or the account stream does.
+///
+/// A closed stream is noticed on the next update, whether or not that update would be
+/// forwarded, so the thread running this releases `ibapi`'s single order-update slot as soon as
+/// TWS sends anything.
+fn forward_order_updates(
+    updates: impl IntoIterator<Item = Result<ibapi::orders::OrderUpdate, ibapi::Error>>,
+    sink: &recovery::EventSink,
+    contracts: &ContractRegistry,
+    order_ids: &OrderIdMap,
+    pending_cancels: &PendingCancels,
+    exec_buffer: &ExecutionBuffer,
+) {
+    use ibapi::orders::{OrderStatusKind, OrderUpdate};
+
+    for update in updates {
+        // Recovery ended the stream, or the consumer dropped it. Stop on this update rather than
+        // the next one that would be forwarded, which may never come.
+        if !sink.is_open() {
+            return;
+        }
+        let update = match update {
+            Ok(u) => u,
+            Err(e) => {
+                // ibapi's own reconnect does not surface here (see the
+                // recovery module), so an error on the subscription is terminal.
+                // Surface it in-band as StreamTerminated(Error) so the caller
+                // gets a programmatic signal rather than inferring EOF.
+                // (best-effort — a no-op if the consumer already dropped rx.)
+                error!(error = %e, "Order stream subscription error");
+                sink.terminate(StreamTerminationReason::Error(e.to_string()));
+                return;
+            }
+        };
+        let event = match update {
+            OrderUpdate::OrderStatus(status) => {
+                let ib_id = status.order_id;
+                // Use single-lock method for terminal status to avoid read+write.
+                // Only `Cancelled`/`Inactive` remove the mapping here: a `Filled`
+                // order's mapping is intentionally retained so late-arriving
+                // ExecutionData/CommissionReport events still resolve it (reaped
+                // later by `OrderIdMap::clear_stale`), so this is deliberately
+                // narrower than `OrderStatusKind::is_terminal()`.
+                let is_terminal = matches!(
+                    status.status,
+                    OrderStatusKind::Cancelled | OrderStatusKind::Inactive
+                );
+
+                let lookup_result = if is_terminal {
+                    order_ids.remove_and_get_context(ib_id)
+                } else {
+                    order_ids.get_client_id_and_context(ib_id)
+                };
+
+                if let Some((client_id, ctx)) = lookup_result {
+                    let order = make_order_from_status(&status, client_id, &ctx, pending_cancels);
+                    Some(UnindexedAccountEvent {
+                        exchange: ExchangeId::Ibkr,
+                        kind: AccountEventKind::OrderSnapshot(Snapshot::new(order)),
+                    })
+                } else {
+                    debug!(ib_order_id = ib_id, "OrderStatus for unknown order ID");
+                    None
+                }
+            }
+            OrderUpdate::ExecutionData(exec) => {
+                // ibapi copies an executions request's answers here too; they
+                // are not fills happening now, and recovery emits its own.
+                if recovery::is_replayed_execution(&exec) {
+                    trace!(
+                        exec_id = %exec.execution.execution_id,
+                        request_id = exec.request_id,
+                        "ExecutionData answering an executions request, skipping"
+                    );
+                    continue;
+                }
+                let Some((instrument, client_id)) = resolve_execution(&exec, contracts, order_ids)
+                else {
+                    continue;
+                };
+
+                exec_buffer.add_execution(exec, instrument, client_id);
+                None
+            }
+            OrderUpdate::CommissionReport(report) => {
+                if let Some(trade) = exec_buffer.complete_with_commission(&report)
+                    && !sink.send_trade(trade)
+                {
+                    return;
+                }
+                None
+            }
+            _ => None,
+        };
+
+        if let Some(e) = event
+            && !sink.send(e)
+        {
+            // The consumer dropped rx, or recovery ended the stream: either
+            // way nothing more may be sent.
+            return;
+        }
+    }
+
+    // The subscription iterator ended without an error (e.g. clean
+    // disconnect/unsubscribe, or ibapi giving up reconnecting). Still a
+    // terminal stream death — surface it in-band so the consumer doesn't have
+    // to infer it from channel EOF.
+    sink.terminate(StreamTerminationReason::Error(
+        "IBKR order-update stream ended".to_string(),
+    ));
 }
 
 /// The message a worker thread panicked with.
@@ -1487,8 +1604,10 @@ impl ExecutionClient for IbkrClient {
     ///
     /// **Important:** If IB is stalled (no events flowing), the reader thread blocks
     /// on the iterator. Dropping the stream signals termination, but the thread won't
-    /// observe it until the next IB event arrives. For graceful shutdown during
-    /// stalls, the caller should disconnect the IB connection.
+    /// observe it until the next IB event arrives. Disconnecting does not release
+    /// it either: `ibapi` does not end the order-update subscription when the
+    /// client shuts down (wboayue/rust-ibapi#871), so after a shutdown the thread
+    /// stays blocked until the process exits.
     ///
     /// # Reconnects and Fill Recovery
     ///
@@ -1609,106 +1728,14 @@ impl ExecutionClient for IbkrClient {
                 // afterward, so the panic handler below emits a terminal StreamTerminated
                 // (a panic is a terminal stream death like any other).
                 let result = catch_unwind(AssertUnwindSafe(|| {
-                    use ibapi::orders::{OrderStatusKind, OrderUpdate};
-
-                    for update in order_sub.iter_data() {
-                        let update = match update {
-                            Ok(u) => u,
-                            Err(e) => {
-                                // ibapi's own reconnect does not surface here (see the
-                                // recovery module), so an error on the subscription is terminal.
-                                // Surface it in-band as StreamTerminated(Error) so the caller
-                                // gets a programmatic signal rather than inferring EOF.
-                                // (best-effort — a no-op if the consumer already dropped rx.)
-                                error!(error = %e, "Order stream subscription error");
-                                sink.terminate(StreamTerminationReason::Error(e.to_string()));
-                                return;
-                            }
-                        };
-                        let event = match update {
-                            OrderUpdate::OrderStatus(status) => {
-                                let ib_id = status.order_id;
-                                // Use single-lock method for terminal status to avoid read+write.
-                                // Only `Cancelled`/`Inactive` remove the mapping here: a `Filled`
-                                // order's mapping is intentionally retained so late-arriving
-                                // ExecutionData/CommissionReport events still resolve it (reaped
-                                // later by `OrderIdMap::clear_stale`), so this is deliberately
-                                // narrower than `OrderStatusKind::is_terminal()`.
-                                let is_terminal = matches!(
-                                    status.status,
-                                    OrderStatusKind::Cancelled | OrderStatusKind::Inactive
-                                );
-
-                                let lookup_result = if is_terminal {
-                                    order_ids_clone.remove_and_get_context(ib_id)
-                                } else {
-                                    order_ids_clone.get_client_id_and_context(ib_id)
-                                };
-
-                                if let Some((client_id, ctx)) = lookup_result {
-                                    let order = make_order_from_status(
-                                        &status,
-                                        client_id,
-                                        &ctx,
-                                        &pending_cancels_clone,
-                                    );
-                                    Some(UnindexedAccountEvent {
-                                        exchange: ExchangeId::Ibkr,
-                                        kind: AccountEventKind::OrderSnapshot(Snapshot::new(order)),
-                                    })
-                                } else {
-                                    debug!(ib_order_id = ib_id, "OrderStatus for unknown order ID");
-                                    None
-                                }
-                            }
-                            OrderUpdate::ExecutionData(exec) => {
-                                // ibapi copies an executions request's answers here too; they
-                                // are not fills happening now, and recovery emits its own.
-                                if recovery::is_replayed_execution(&exec) {
-                                    trace!(
-                                        exec_id = %exec.execution.execution_id,
-                                        request_id = exec.request_id,
-                                        "ExecutionData answering an executions request, skipping"
-                                    );
-                                    continue;
-                                }
-                                let Some((instrument, client_id)) =
-                                    resolve_execution(&exec, &contracts_clone, &order_ids_clone)
-                                else {
-                                    continue;
-                                };
-
-                                exec_buffer_clone.add_execution(exec, instrument, client_id);
-                                None
-                            }
-                            OrderUpdate::CommissionReport(report) => {
-                                if let Some(trade) =
-                                    exec_buffer_clone.complete_with_commission(&report)
-                                    && !sink.send_trade(trade)
-                                {
-                                    return;
-                                }
-                                None
-                            }
-                            _ => None,
-                        };
-
-                        if let Some(e) = event
-                            && !sink.send(e)
-                        {
-                            // The consumer dropped rx, or recovery ended the stream: either
-                            // way nothing more may be sent.
-                            return;
-                        }
-                    }
-
-                    // The subscription iterator ended without an error (e.g. clean
-                    // disconnect/unsubscribe, or ibapi giving up reconnecting). Still a
-                    // terminal stream death — surface it in-band so the consumer doesn't have
-                    // to infer it from channel EOF.
-                    sink.terminate(StreamTerminationReason::Error(
-                        "IBKR order-update stream ended".to_string(),
-                    ));
+                    forward_order_updates(
+                        order_sub.iter_data(),
+                        &sink,
+                        &contracts_clone,
+                        &order_ids_clone,
+                        &pending_cancels_clone,
+                        &exec_buffer_clone,
+                    );
                 }));
 
                 if let Err(panic_info) = result {
@@ -2893,5 +2920,74 @@ mod order_status_tests {
         for ib_id in [10, 11, 12] {
             assert!(order_ids.get_client_id(ib_id).is_none());
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics are the correct failure mode
+mod order_reader_tests {
+    use super::*;
+    use crate::client::dedup::new_dedup_cache;
+    use ibapi::orders::{OrderStatus, OrderUpdate};
+    use std::cell::Cell;
+
+    /// Status updates for an order this client did not place, so none is forwarded.
+    fn unforwarded(n: usize) -> Vec<Result<OrderUpdate, ibapi::Error>> {
+        (0..n)
+            .map(|_| {
+                Ok(OrderUpdate::OrderStatus(OrderStatus {
+                    order_id: 999,
+                    ..OrderStatus::default()
+                }))
+            })
+            .collect()
+    }
+
+    /// Run the reader over `updates` and return how many of them it pulled.
+    fn run(sink: &recovery::EventSink, updates: Vec<Result<OrderUpdate, ibapi::Error>>) -> usize {
+        let pulled = Cell::new(0);
+        forward_order_updates(
+            updates
+                .into_iter()
+                .inspect(|_| pulled.set(pulled.get() + 1)),
+            sink,
+            &ContractRegistry::new(),
+            &OrderIdMap::new(),
+            &PendingCancels::new(),
+            &ExecutionBuffer::new(),
+        );
+        pulled.get()
+    }
+
+    #[test]
+    fn stops_on_the_first_update_after_the_stream_ends() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink = recovery::EventSink::new(tx, new_dedup_cache());
+        sink.terminate(StreamTerminationReason::Error("recovery failed".into()));
+
+        assert_eq!(run(&sink, unforwarded(3)), 1);
+    }
+
+    #[test]
+    fn stops_on_the_first_update_after_the_consumer_goes() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let sink = recovery::EventSink::new(tx, new_dedup_cache());
+        drop(rx);
+
+        assert_eq!(run(&sink, unforwarded(3)), 1);
+    }
+
+    #[test]
+    fn open_stream_reads_past_unforwarded_updates() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = recovery::EventSink::new(tx, new_dedup_cache());
+
+        assert_eq!(run(&sink, unforwarded(3)), 3);
+        // The subscription ended, so the stream says so.
+        assert!(matches!(
+            rx.try_recv().unwrap().kind,
+            AccountEventKind::StreamTerminated(StreamTerminationReason::Error(ref reason))
+                if reason == "IBKR order-update stream ended"
+        ));
     }
 }

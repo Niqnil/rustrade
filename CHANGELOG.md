@@ -686,6 +686,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answering an executions request, so each `fetch_trades` call could replay the day's fills onto a
   live stream. The stream now skips executions that answer a request.
 
+- **An ended IBKR account stream releases `ibapi`'s order-update slot on the next TWS event**
+  (`rustrade-execution`, feature `ibkr`). The stream can end because the consumer dropped it or
+  because fill recovery gave up. Afterwards, its reader thread noticed only when it next had
+  something to forward: a status update for an order this client placed, or a completed fill.
+  Until then it held `ibapi`'s single order-update subscription, so another `account_stream` call
+  on the client failed, possibly for a long time when this client had nothing in flight. The
+  reader now checks on every order-update event it receives, so the first event after the stream
+  ends releases the slot. The `account_stream` rustdoc also no longer suggests disconnecting to release a stalled
+  reader: `ibapi` does not end the subscription on shutdown (wboayue/rust-ibapi#871), so that does
+  not work.
+
 - **Massive WebSocket channels and symbols that `MassiveLive` got wrong in 0.6.0** (`rustrade-data`,
   feature `massive`). These are fixed by the connectors that replace it; if you consumed its
   output, check what you stored.
