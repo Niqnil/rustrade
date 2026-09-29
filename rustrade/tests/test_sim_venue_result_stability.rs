@@ -69,7 +69,7 @@ use rustrade::{
     },
     execution::request::ExecutionRequest,
     risk::DefaultRiskManager,
-    statistic::time::Daily,
+    statistic::{summary::TradingSummary, time::Daily},
     strategy::{
         algo::AlgoStrategy, close_positions::ClosePositionsStrategy,
         on_disconnect::OnDisconnectStrategy, on_trading_disabled::OnTradingDisabled,
@@ -386,10 +386,9 @@ fn first_difference(expected: &str, actual: &str) -> String {
 /// is only a claim until something checks it, and a claim a human re-reads off a log is checked once
 /// and then forgotten. Committing the expected tear sheet makes the criterion CI's problem.
 ///
-/// The artifact is `Debug`, not JSON: `TradingSummary::assets` is keyed by `ExchangeAsset`, a
-/// struct, and `serde_json` rejects non-string map keys, so `to_string` on a funded summary fails
-/// outright (tracked as issue #301). `Debug` is total, and stable for as long as `TradingSummary`'s
-/// own shape is.
+/// The artifact is `Debug`, which is total and stable for as long as `TradingSummary`'s own shape
+/// is. The test also checks that the funded summary survives a JSON round trip: its `assets` map is
+/// keyed by `ExchangeAsset`, a struct, so it serialises as a sequence of `(key, value)` pairs.
 ///
 /// # Regenerating
 ///
@@ -428,6 +427,17 @@ async fn sim_venue_backtest_summary_is_stable() {
             );
         }
     }
+
+    // A funded summary, `ExchangeAsset`-keyed `assets` included, serialises to JSON and reads back
+    // unchanged.
+    let json = serde_json::to_string(summary).expect("a funded summary must serialise to JSON");
+    let restored: TradingSummary<Daily> =
+        serde_json::from_str(&json).expect("a funded summary must deserialise from its own JSON");
+    assert_eq!(&restored, summary, "the JSON round trip must be lossless");
+    assert!(
+        !summary.assets.is_empty(),
+        "the round trip is only meaningful with a funded, struct-keyed assets map"
+    );
 
     // The fixture is only meaningful if it actually traded. A silent regression to zero fills would
     // otherwise make every later comparison vacuously "stable".
