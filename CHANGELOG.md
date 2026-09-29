@@ -381,6 +381,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is unchanged. Code that names the field's type, or builds a map to assign to it, uses
   `rustrade_integration::collection::FnvIndexMap`.
 
+- **BREAKING: `IndexedInstruments::find_instrument_index` reports a missing instrument as
+  `IndexError::InstrumentIndex`** (`rustrade-instrument`). It returned `IndexError::AssetIndex`,
+  with a message that said "Asset" and listed the assets, which the lookup never searches. Code
+  that matched `IndexError::AssetIndex` from this method matches `IndexError::InstrumentIndex`
+  instead. The message now names the exchange and instrument sought, and lists the instruments by
+  exchange and internal name.
+
 - **REST clients negotiate and transparently decode gzip** (workspace `reqwest` dependency). The
   workspace now enables reqwest's `gzip` feature, so every `reqwest::Client` the crates build sends
   `Accept-Encoding: gzip` and decompresses gzip-encoded bodies before the caller sees them. That
@@ -715,12 +722,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through `rustrade-integration`, over rustls, like every other connector.
 
 ### Fixed
-
-- **`IndexedInstruments::find_instrument_index` reports a missing instrument as
-  `IndexError::InstrumentIndex`** (`rustrade-instrument`). It returned `IndexError::AssetIndex`,
-  with a message that said "Asset" and listed the assets, which the lookup never searches. The
-  message now names the exchange and instrument sought, and lists the instruments by exchange and
-  internal name.
 
 - **The IBKR account stream recovers fills sent while `ibapi` was reconnecting** (#402,
   `rustrade-execution`, feature `ibkr`). `ibapi` reconnects its socket to TWS/Gateway by itself,
