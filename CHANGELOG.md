@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-29
+
 ### Added
 
 - **`collection::pair_seq`, a serde adapter for maps with non-string keys**
@@ -4629,43 +4631,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `DatabentoHistorical::fetch_quotes_stream()`: Stream quotes without collecting into memory
   - Avoids memory spikes for large historical queries (millions of records)
 
-### Changed
-
-- **BREAKING: Migrate from `async_trait` to native AFIT** ([#85](https://github.com/Niqnil/rustrade/issues/85))
-  - `Subscriber`, `SubscriptionValidator`, `ExchangeTransformer`, and `MarketStream` traits now use native async fn in trait (Rust 1.75+)
-  - Removed `async-trait` crate dependency
-  - Additional `Sync` bounds added to some generic parameters where required
-  - Return type changed from `Pin<Box<dyn Future + Send>>` to opaque `impl Future + Send`
-  - No code changes required for most downstream users unless explicitly naming future types
-
-- **Databento structured error types** ([#47](https://github.com/Niqnil/rustrade/issues/47))
-  - New `DatabentoErrorKind` enum: `Authentication`, `RateLimit`, `Network`, `Decode`, `Api`
-  - New `DataError::Databento { kind, context, message }` variant for programmatic error handling
-  - Enables proper retry logic: don't retry auth errors, backoff on rate limits, retry network errors
-  - All Databento errors now use structured types instead of `DataError::Socket(String)`
-
-- **Databento `Arc<K>` performance documentation** ([#45](https://github.com/Niqnil/rustrade/issues/45))
-  - Documented that instrument keys are cloned per record
-  - Recommended `Arc<K>` for high-frequency scenarios to avoid per-record heap allocations
-  - Added examples in rustdoc for `fetch_trades`, `fetch_quotes`, and `DatabentoLive`
-
-- **BREAKING: Stateful `Subscriber` trait for credential injection** ([#43](https://github.com/Niqnil/rustrade/issues/43))
-  - `Subscriber::subscribe` now takes `&self` instead of being a static method
-  - `Subscriber` trait requires `Clone + Send + Sync` bounds
-  - `StreamBuilder::subscribe()` now requires a subscriber instance as first argument:
-    - Unauthenticated: `.subscribe(WebSocketSubscriber, [...])`
-    - Authenticated (Alpaca): `.subscribe(AlpacaSubscriber::from_env()?, [...])`
-  - `init_market_stream()` now takes subscriber as second argument
-  - `AlpacaSubscriber` is now stateful with `AlpacaCredentials`:
-    - `AlpacaSubscriber::new(credentials)`: Create with explicit credentials
-    - `AlpacaSubscriber::from_env()`: Load from `ALPACA_API_KEY`/`ALPACA_SECRET_KEY`
-    - `AlpacaCredentials::new(key, secret)`: Create credentials explicitly
-    - `AlpacaCredentials::from_env()`: Load from environment
-  - Auth errors now fail at construction time (fast fail) instead of first reconnect
-  - Credentials are cloned into reconnect closure, available on every reconnect
-
-### Added
-
 - **BracketOrderClient supertrait**: Unified trait for bracket orders
   - `BracketOrderClient` trait extending `ExecutionClient` for exchanges supporting native bracket orders
   - `RequestOpenBracket` struct: Common request parameters (side, quantity, prices, TIF)
@@ -4738,6 +4703,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (distinct from market data feed identifiers)
 
 ### Changed
+
+- **BREAKING: Migrate from `async_trait` to native AFIT** ([#85](https://github.com/Niqnil/rustrade/issues/85))
+  - `Subscriber`, `SubscriptionValidator`, `ExchangeTransformer`, and `MarketStream` traits now use native async fn in trait (Rust 1.75+)
+  - Removed `async-trait` crate dependency
+  - Additional `Sync` bounds added to some generic parameters where required
+  - Return type changed from `Pin<Box<dyn Future + Send>>` to opaque `impl Future + Send`
+  - No code changes required for most downstream users unless explicitly naming future types
+
+- **Databento structured error types** ([#47](https://github.com/Niqnil/rustrade/issues/47))
+  - New `DatabentoErrorKind` enum: `Authentication`, `RateLimit`, `Network`, `Decode`, `Api`
+  - New `DataError::Databento { kind, context, message }` variant for programmatic error handling
+  - Enables proper retry logic: don't retry auth errors, backoff on rate limits, retry network errors
+  - All Databento errors now use structured types instead of `DataError::Socket(String)`
+
+- **Databento `Arc<K>` performance documentation** ([#45](https://github.com/Niqnil/rustrade/issues/45))
+  - Documented that instrument keys are cloned per record
+  - Recommended `Arc<K>` for high-frequency scenarios to avoid per-record heap allocations
+  - Added examples in rustdoc for `fetch_trades`, `fetch_quotes`, and `DatabentoLive`
+
+- **BREAKING: Stateful `Subscriber` trait for credential injection** ([#43](https://github.com/Niqnil/rustrade/issues/43))
+  - `Subscriber::subscribe` now takes `&self` instead of being a static method
+  - `Subscriber` trait requires `Clone + Send + Sync` bounds
+  - `StreamBuilder::subscribe()` now requires a subscriber instance as first argument:
+    - Unauthenticated: `.subscribe(WebSocketSubscriber, [...])`
+    - Authenticated (Alpaca): `.subscribe(AlpacaSubscriber::from_env()?, [...])`
+  - `init_market_stream()` now takes subscriber as second argument
+  - `AlpacaSubscriber` is now stateful with `AlpacaCredentials`:
+    - `AlpacaSubscriber::new(credentials)`: Create with explicit credentials
+    - `AlpacaSubscriber::from_env()`: Load from `ALPACA_API_KEY`/`ALPACA_SECRET_KEY`
+    - `AlpacaCredentials::new(key, secret)`: Create credentials explicitly
+    - `AlpacaCredentials::from_env()`: Load from environment
+  - Auth errors now fail at construction time (fast fail) instead of first reconnect
+  - Credentials are cloned into reconnect closure, available on every reconnect
 
 - **deps(ibkr)**: Bump `ibapi` from 2.11.4 to 2.12.0 — fixes TWS error surfacing on
   subscription channels ([rust-ibapi#567](https://github.com/wboayue/rust-ibapi/pull/567),
