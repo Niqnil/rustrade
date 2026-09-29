@@ -692,8 +692,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   something to forward: a status update for an order this client placed, or a completed fill.
   Until then it held `ibapi`'s single order-update subscription, so another `account_stream` call
   on the client failed, possibly for a long time when this client had nothing in flight. The
-  reader now checks on every order-update event it receives, which is what the rustdoc already
-  said. The `account_stream` rustdoc also no longer suggests disconnecting to release a stalled
+  reader now checks on every order-update event it receives, so the first event after the stream
+  ends releases the slot. The `account_stream` rustdoc also no longer suggests disconnecting to release a stalled
   reader: `ibapi` does not end the subscription on shutdown (wboayue/rust-ibapi#871), so that does
   not work.
 
