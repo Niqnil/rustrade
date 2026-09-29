@@ -16,7 +16,7 @@
 # cannot land while leaving this record behind. CI cannot verify that the re-verification a
 # pinned entry mandates was actually performed — only that this file was not left untouched.
 
-ibapi=4.1.0  # 2026-09-14 | Financial protocol, community-maintained, no official SDK. Reviewed 3.2.0->3.3.0, all four properties recorded at 3.2.0 re-verified and still hold: zero unsafe (also no transmute/from_raw/extern "C"/asm!; holds by inspection, not by lint — upstream has no #![forbid(unsafe_code)]), no build.rs, dependency tree byte-identical vs 3.2.0 (both Cargo.toml and Cargo.lock differ by the version line alone; 9 direct deps under our `default-features = false, features = ["sync"]` selection, unchanged), still only a caller-supplied TWS socket (reconnect reuses the caller's address — no fallback host, no telemetry) + the opt-in local recorder dir (IBAPI_RECORDING_DIR; recorder.rs byte-identical). Env set unchanged (IBAPI_RECORDING_DIR, IBAPI_TIMEZONE_ALIASES); no process spawn, no obfuscation; published from git b140b312d1136d240f3b5651a89f4778e01aa222.
+ibapi=4.2.0  # 2026-09-14 | Financial protocol, community-maintained, no official SDK. Reviewed 3.2.0->3.3.0, all four properties recorded at 3.2.0 re-verified and still hold: zero unsafe (also no transmute/from_raw/extern "C"/asm!; holds by inspection, not by lint — upstream has no #![forbid(unsafe_code)]), no build.rs, dependency tree byte-identical vs 3.2.0 (both Cargo.toml and Cargo.lock differ by the version line alone; 9 direct deps under our `default-features = false, features = ["sync"]` selection, unchanged), still only a caller-supplied TWS socket (reconnect reuses the caller's address — no fallback host, no telemetry) + the opt-in local recorder dir (IBAPI_RECORDING_DIR; recorder.rs byte-identical). Env set unchanged (IBAPI_RECORDING_DIR, IBAPI_TIMEZONE_ALIASES); no process spawn, no obfuscation; published from git b140b312d1136d240f3b5651a89f4778e01aa222.
 #   New in 3.3.0, reviewed: `src/config` — despite the name it reads NO local files and NO env vars. It wraps two TWS wire messages (ReqConfig=108/UpdateConfig=109) over the already-open socket, whose protobuf types already existed in 3.2.0. Version-gated, #[must_use] builder, not reachable during connect/handshake.
 #   NOTE (capability, not vulnerability): `update_config()` can write the gateway's own safety settings — read_only_api, the bypass_* order precautions, trusted_ips, allow_localhost_only, socket_port, master_client_id. rustrade does not call it and does not re-export it; keep it out of the wrapper surface unless there is a deliberate reason.
 #   Upstream BREAKING in a minor release: the `fundamental` module was removed (IBKR retired reqFundamentalData in TWS API 10.47). rustrade never used it — verified no reference to fundamental_data / FundamentalData / FundamentalReportType / TickType::FundamentalRatios.
@@ -212,6 +212,64 @@ ibapi=4.1.0  # 2026-09-14 | Financial protocol, community-maintained, no officia
 # a real gateway. THE 317 FIX IN (b) IS UNIT-TESTED ONLY -- `on_venue_reset` has three tests, but no
 # test drives a real 317 notice through the subscription loop, because that needs a live level-2
 # subscription that receives a book reset. Do that before relying on 4.1.0 in production.
+#
+# Re-verified against the =4.2.0 crates.io source on 2026-09-29 (4.1.0 -> 4.2.0). Published from git
+# 9c65a111beadca898f175d4e82d94a742989ba1d (4.1.0 = 2dfc49bef73d12f0a3363ea91256d86a77cb9b6f).
+#
+# Standing properties, all hold:
+#   1. ZERO unsafe -- 0 real constructs, and no transmute / from_raw / extern "C" / asm! in src/. Still
+#      by inspection: upstream has no #![forbid(unsafe_code)].
+#   2. NO build.rs.
+#   3. DEPENDENCY TREE -- Cargo.toml differs by the version line and ONE bound: `time` minimum
+#      0.3.36 -> 0.3.47 (upstream's RUSTSEC-2026-0009 floor). Our Cargo.lock already resolves `time`
+#      0.3.55, so nothing moves. `[features]` identical, no dev-dependency delta. The PR changes
+#      ibapi's version and checksum in Cargo.lock and nothing else: zero packages added or removed.
+#   4. NETWORK SURFACE -- still only the caller's TWS socket. The URL set in src/ gains one doc link
+#      (interactivebrokers.com trigger-methods page); zero new hosts. No process spawn, no telemetry,
+#      no obfuscation. Filesystem sites unchanged (raw_capture.rs, recorder.rs, both opt-in).
+#   5. ENV SURFACE unchanged: IBAPI_RAW_CAPTURE_DIR (transport/raw_capture.rs:93),
+#      IBAPI_RECORDING_DIR (transport/recorder.rs:34), IBAPI_TIMEZONE_ALIASES (common/timezone/mod.rs:148).
+#
+# ORDER WIRE FORMAT: unchanged for every order rustrade builds. `src/orders/common/encoders.rs` is
+# BYTE-IDENTICAL again (md5 049bed6ba1d842eedeb81ec639852583, same as 3.3.0 through 4.1.0). The whole
+# `src/proto/encoders.rs` delta is rule80_a / open_close now omitting an empty `Unknown("")` -- we set
+# neither. TimeInForce still encodes to the same wire strings ("GTC", "GTD", ...); only the Rust
+# variant names moved. `auction_strategy` is removed, but the proto encoder already dropped it.
+#
+# UPSTREAM BREAKING IN A MINOR RELEASE, the second time for this crate: `TimeInForce::GoodTilCanceled`
+# / `GoodTilDate` / `DayTilCanceled` renamed to `GoodTill*`, plus new `GoodTillCrossing` and
+# `Unknown(String)` variants. This is the only forced change: 2 library sites and 7 test sites in
+# rustrade-execution/src/client/ibkr/order.rs. Our match at order.rs:364 is on rustrade's own
+# TimeInForce, and we never read a decoded `tif`, so the new variants are not swallowed anywhere.
+#
+# BEHAVIOUR CHANGES ON PATHS WE COMPILE (sync transport, #816):
+#   - On a socket read failure the transport now marks the session down and fails in-flight requests,
+#     orders and shared channels with ConnectionReset BEFORE reconnecting (sync.rs:379-386), instead
+#     of after the reconnect backoff. Sends while down -- place_order, cancel_order -- are refused with
+#     ConnectionReset (`ensure_connected`, sync.rs:291) rather than written to the dead socket.
+#     `is_connected()` is false until the replayed handshake completes.
+#   - Strict decode: an order frame with a missing/empty `action`, or an absent contract / order /
+#     order_state / execution submessage, is Error::Parse instead of a default-constructed phantom
+#     (`action == Buy`). Our open_orders / executions propagate it via `?`; our account stream ends on it.
+#   - HOW THE WRAPPER NOW READS THIS (changed in the same PR): a transport error (ConnectionReset,
+#     ConnectionFailed, Shutdown, Io) while awaiting a placement's first status is `NoStatus` --
+#     the order may be live, so it is reported open and its id mapping kept -- not a rejection; a
+#     send refused with ConnectionReset/Io is OrderError::Connectivity (Shutdown/ConnectionFailed,
+#     reconnect given up, stay non-transient); and bracket rollback cancels that cannot be sent are
+#     logged and named in a non-transient error instead of discarded. NOTE `ensure_connected`
+#     refuses with ConnectionReset even after a permanent shutdown, so that case still reads as
+#     transient to us.
+#   - UPSTREAM-DOCUMENTED CAVEAT that reaches us: `reset()` notifies but does not drain the shared
+#     channels, and `all_open_orders` is not one-shot, so our fetch_open_orders issued right after a
+#     reconnect can read the stale ConnectionReset first and fail once.
+#   - PRE-EXISTING WRAPPER GAP this bump makes easier to see, NOT a regression: `reset()` does not touch
+#     `order_update_stream`, so across ibapi's internal reconnect our account_stream stays open and
+#     silently misses the lifecycle events of the outage -- contrary to the ibkr module docs, which say
+#     ibapi does not auto-reconnect and tell callers to watch for EOF. Not addressed by this bump.
+#
+# NOT VERIFIABLE OFF-GATEWAY, unchanged in force: the ibkr integration tests are all #[ignore]d and CI
+# does not run them. Nothing has exercised 4.2.0's connection-state gate, early reset or strict decode
+# against a real gateway. Do that before relying on 4.2.0 in production.
 binance-sdk=70.2.0  # 2026-09-14 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
 #   1. common::websocket::WebsocketApi::send_message      — signature + WebsocketMessageSendOptions signing fields (margin WS subscribe send)
 #   2. ws.common.events.subscribe (WebsocketEventEmitter) — receive/event-callback path (margin WS event delivery)
@@ -525,6 +583,39 @@ parquet  # 2026-07-28 | New direct dep (Parquet decode of provider bulk exports)
 #   dead since 59.2.0, still worded as "Transitive via parquet 59.1.0 (latest)" -- has since been
 #   dropped from both deny.toml and the CI audit job's ignore list.
 databento  # 2026-09-13 | Direct dep (historical + live market data). Meets the criteria above on three counts — network/IO, credential handling (API key via `DATABENTO_API_KEY`), and financial data — but was never listed when it was introduced; this entry closes that gap rather than recording a new dependency. Reviewed @ 0.61.0, Apache-2.0, databento/databento-rs — a first-party vendor SDK, not community-maintained, which is the opposite of the ibapi risk profile above. No build.rs. Zero `unsafe` in the `databento` crate itself. The unsafe lives one level down in `dbn` (0.69.0, Apache-2.0, no build.rs, same vendor), where a grep over src reports 133 occurrences — that count includes `unsafe impl`, `unsafe fn`, blocks and comments alike, so it over-counts distinct sites. They cluster exactly where a zero-copy wire-format decoder puts them: record_ref.rs (25), decode/dbn/fsm.rs (17), record_buf.rs (16), record/conv.rs (8), plus the sync/async encode paths. Idiomatic for the crate class, same justification parquet's 19 sites get. A further 21 occurrences in dbn's python/record.rs are NOT compiled: they sit behind dbn's opt-in `python` feature, and `pyo3` is absent from Cargo.lock — re-check if the feature set ever changes. That surface is not merely theoretical, and this is the reason to keep reading dbn's changelog and not only databento's: 0.61.0 fixes an unsound `AsRef<[u8]>` for `RecordBuf` that could yield a slice longer than the backing buffer, and a metadata count bug that made decoding read into the start of records. Treat dbn bumps as soundness-relevant. 16 direct deps (async-compression, bon, chrono, dbn, futures, hex, reqwest, serde, serde_json, sha2, thiserror, time, tokio, tokio-util, tracing, zstd), all already in the tree. Not pinned — any version bump still needs review.
+#   Re-verified @ 0.62.0 on 2026-09-29 (databento 0.61.0 -> 0.62.0, dbn + dbn-macros 0.69.0 -> 0.70.0),
+#   against the crates.io sources. Published from git: databento 0.62.0 = 0f4a7ea542fc5a5eac54e8f73d50d8888bf51910
+#   (0.61.0 = aadc91a4b024cc1a879737e4e30e89e95424aa56); dbn/dbn-macros 0.70.0 = aa012adc6502e01b01d7b5c7836742dde21e93d8
+#   (0.69.0 = a7d8ee93a5d5d0b7082d0ca15ab85c01e3cce550), the same monorepo commit for both.
+#   databento: the entire src/ delta is ONE import line in live/client.rs (`Record` dropped from the dbn use
+#   list), so no behaviour change. Still zero `unsafe`, no build.rs, and the same 16 direct deps (dependency
+#   names identical; only the dbn requirement moves 0.69 -> 0.70). No new hosts, env reads or credential
+#   handling -- nothing but the import changed.
+#   dbn: THIS is where the bump matters, as the note above predicted. The 0.70.0 changelog lists three
+#   soundness/correctness fixes: `RecordRefMut` accessors returned references outliving the borrow of self
+#   (two `&mut` to one record from safe code); mutation through `RecordRefMut` went via a read-only pointer or
+#   one not spanning the whole record (UB); and `process_all`/`process_many` returned an empty `Record` in
+#   place of `ReadMore` and dropped records decoded before an invalid one. All three read correctly in the
+#   source: `RecordRefMut::new` now takes `as_mut_ptr()`, `From<&mut R>` casts the whole record rather than
+#   its header, and `get_mut` takes `&mut self`. A new tests/soundness.rs covers them.
+#   `unsafe` count (same over-counting grep as above): 133 -> 135, 112 -> 114 excluding python/. The +2 are
+#   in decode/dbn/fsm.rs (17 -> 20; record_ref.rs 25 -> 24): `RecordRef::new` calls in the new batch decoder,
+#   `process_batch()`, which indexes offsets recorded only for records that passed the header length checks,
+#   and drops the batch before every buffer-mutating call (space/write_all/reset/reset_for_seek), so no
+#   offset outlives the bytes it points at. WE REACH THAT PATH: our `decode_record::<T>()` calls (historical.rs)
+#   go decode() -> decode_ref() -> process_batch(), in both the sync and async decoders. The live client does
+#   NOT: databento's live/client.rs:447 still drives `fsm.process()`, one record at a time.
+#   API break, not a format change: `Record::header()` is replaced by per-field methods, and
+#   `RType::try_into_schema` takes `u16` (it `u8::try_from`s internally, so a value above 255 is `None`, not
+#   wrapped). record.rs is BYTE-IDENTICAL, so `RecordHeader` -- and `hd.rtype: u8` -- is unchanged, and
+#   the one fix needed on our side is a lossless `u16::from(rtype)` in historical.rs. Unlisted in the changelog
+#   but not used by us: `Venue::Def` became `Venue::Cdef` ("DEF" -> "CDEF") and `Publisher::MainCgifDef`
+#   became `MainCgifCdef`.
+#   `python` feature still opt-in (`default = ["zstd"]`; databento enables dbn's `async` + `serde` only), and
+#   `pyo3` is still absent from Cargo.lock (0 hits). dbn's dependency list is unchanged apart from
+#   async-compression 0.4.43 -> 0.4.44 and the lockstep dbn-macros pin; neither crate has a build.rs, and
+#   neither reads env, spawns processes or opens network connections. The PR changes the databento, dbn and
+#   dbn-macros entries in Cargo.lock and nothing else: zero packages added or removed.
 
 # Net-new lockfile entries NOT attributable to a tier-2 crate above, recorded so the
 # "measured by diffing Cargo.lock" claim in the parquet entry stays true of the whole file:
