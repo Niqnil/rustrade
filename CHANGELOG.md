@@ -650,6 +650,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BracketOrderClient::open_bracket_order`'s rustdoc now states this exception to its
   all-or-nothing contract.
 
+- **The IBKR client now documents that `fetch_open_orders` is unreliable on `ibapi` 4.2.0**
+  (`rustrade-execution`, feature `ibkr`; documentation only, no behaviour change). `ibapi` 4.2.0
+  answers open-orders and positions requests from one queue per request type. Every call reads
+  from it and nothing clears it between calls, so a call can read what was meant for another.
+  Order updates received since the previous call are read as part of `fetch_open_orders`' result,
+  which can therefore report an order that has since filled or been cancelled as open. After each
+  connection drop, `fetch_open_orders` fails three times and then returns the reply to the call
+  three before it, for good. `account_snapshot` fails twice after a drop, then recovers. `ibapi`
+  also keeps a copy of every order update in two queues this client never reads, for the life of
+  the connection. The module, `fetch_open_orders`, `account_snapshot` and `account_stream` rustdoc
+  now say so. The comments claiming `ibapi` never routes `PositionEnd` are corrected: it arrives,
+  but positions is a live subscription, and reading until quiet is what drains replies left over
+  from failed calls. Fixed upstream after 4.2.0 by
+  [rust-ibapi#836](https://github.com/wboayue/rust-ibapi/pull/836). The fix reaches this client
+  with the first `ibapi` release that includes it.
+
 ### Removed
 
 - **BREAKING: `MassiveLive`, `ChannelType` and `massive::Market`** (`rustrade-data`, feature
