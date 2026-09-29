@@ -14,9 +14,9 @@ jobs:
     name: Validate release
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # The same `--all-features` debug build as ci.yml's `cargo test` job, so the same memory limit:
-    # with full debug info it runs the 16 GB runner out of memory during the final parallel
-    # compile of the `rustrade` crate and is killed with exit 143 (#385), which failed the v0.7.0
+    # The `cargo test` step is ci.yml's `--all-features` workspace test build less its examples, so
+    # it hits the same memory limit: with full debug info, its final parallel compile runs the
+    # 16 GB runner out of memory and the job is killed with exit 143 (#385). That failed the v0.7.0
     # validation. Line tables are what ci.yml builds with; see the note on that job.
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
