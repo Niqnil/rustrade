@@ -1,4 +1,5 @@
-//! Serde adapter that writes an [`IndexMap`] as a sequence of `(key, value)` pairs.
+//! Serde adapter that writes an [`IndexMap`](indexmap::IndexMap) as a sequence of `(key, value)`
+//! pairs.
 //!
 //! Use it with `#[serde(with = "rustrade_integration::collection::pair_seq")]` on a map field
 //! whose key is not a string, such as a struct key. JSON object keys must be strings, so
