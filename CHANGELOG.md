@@ -368,6 +368,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING (behaviour): building an `IndexedInstruments` rejects two distinct assets on one
+  exchange that share an `AssetNameInternal`** (`rustrade-instrument`). The new
+  `IndexError::DuplicateAssetNameInternal` covers two assets that differ only in `name_exchange`,
+  such as a venue spelling its quote asset `USDT` for one instrument and `usdt.e` for another.
+  `try_build` and `try_new` return it, and `build`, `new` and deserialisation fail on it. Such a
+  pair survived the de-duplication as two `AssetIndex` slots. Asset lookups and engine asset
+  state are keyed on `(exchange, name_internal)` but read by position, so the pair collapsed into
+  one entry, and every later index resolved to the wrong asset: balances were attributed to their
+  neighbour with no error. The same asset name on two exchanges is still fine.
+
 - **BREAKING: `IndexedInstruments` serialises as the plain list of instruments it indexes, and
   deserialises by building from that list** (`rustrade-instrument`). It derived serde over its
   private index tables, so a payload was loaded as written: it could skip every check

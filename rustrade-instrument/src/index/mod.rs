@@ -32,12 +32,8 @@ pub mod error;
 /// deserialises from that list through [`Self::try_new`]. No index is ever read from a payload,
 /// so a deserialised collection upholds every invariant a built one does, and a payload that
 /// breaks one fails with the same [`IndexError`] `try_new` returns. Building sorts and
-/// de-duplicates, so a round trip reproduces the same indices.
-///
-/// Each asset is written as the [`Asset`] its [`AssetIndex`] resolves to. Where two assets on one
-/// exchange share an [`AssetNameInternal`] but differ in `name_exchange`, every instrument already
-/// resolves to the first of them when built, so the list written is what the collection resolves
-/// to, not necessarily what it was built from.
+/// de-duplicates, and every asset is derived from the instruments and unique by exchange and
+/// [`AssetNameInternal`], so a round trip reproduces the same indices.
 #[derive(Debug, Clone, PartialEq, PartialOrd, Deserialize)]
 #[serde(try_from = "Vec<Instrument<ExchangeId, Asset>>")]
 pub struct IndexedInstruments {
@@ -79,9 +75,11 @@ impl IndexedInstruments {
     ///
     /// # Errors
     /// Returns [`IndexError::DuplicateInstrumentNameInternal`] if two `Instrument`s share an
-    /// [`InstrumentNameInternal`], or [`IndexError::InvalidContractSize`] if an `Instrument`
-    /// carries a non-positive `contract_size` — see [`IndexedInstrumentsBuilder::try_build`] for
-    /// why both invariants exist.
+    /// [`InstrumentNameInternal`], [`IndexError::DuplicateAssetNameInternal`] if two distinct
+    /// assets on one exchange share an [`AssetNameInternal`], or
+    /// [`IndexError::InvalidContractSize`] if an `Instrument` carries a non-positive
+    /// `contract_size` — see [`IndexedInstrumentsBuilder::try_build`] for why each invariant
+    /// exists.
     pub fn try_new<Iter, I>(instruments: Iter) -> Result<Self, IndexError>
     where
         Iter: IntoIterator<Item = I>,
