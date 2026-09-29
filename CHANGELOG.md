@@ -368,6 +368,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING: `IndexedInstruments` serialises as the plain list of instruments it indexes, and
+  deserialises by building from that list** (`rustrade-instrument`). It derived serde over its
+  private index tables, so a payload was loaded as written: it could skip every check
+  `try_new` makes (unique `name_internal`, positive `contract_size`), or declare indices that
+  disagree with their positions, so that every lookup resolved to the wrong entity. It now
+  writes a JSON array of `Instrument<ExchangeId, Asset>` and reads one through `try_new`, so a
+  payload that breaks an invariant fails with the same `IndexError`, and no index is ever read
+  from input. The old object format no longer loads. `IndexedInstruments` also implements
+  `TryFrom<Vec<Instrument<ExchangeId, Asset>>>`.
+
 - **REST clients negotiate and transparently decode gzip** (workspace `reqwest` dependency). The
   workspace now enables reqwest's `gzip` feature, so every `reqwest::Client` the crates build sends
   `Accept-Encoding: gzip` and decompresses gzip-encoded bodies before the caller sees them. That
