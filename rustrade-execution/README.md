@@ -35,9 +35,9 @@ Additional order types:
 ⚠️ Binance `TrailingStop` supports `BasisPoints` and `Percentage` offsets only;
 `Absolute` offsets are rejected as unsupported. ⚠️ Alpaca `TrailingStop` supports
 `Percentage` and `Absolute` offsets only; `BasisPoints` is rejected as unsupported.
-Hyperliquid requires every order, of any type, to carry a client order ID in
-`ClientOrderId::uuid()` form; an order with any other ID is rejected. `BinanceMargin` matches Binance spot except that both
-`TrailingStop` and `TrailingStopLimit` are rejected as unsupported (the SDK margin
-binding omits `trailingDelta`).
+Hyperliquid requires every order it accepts to carry a client order ID in
+`ClientOrderId::uuid()` form; an order with any other ID is rejected. `BinanceMargin`
+matches Binance spot except that both `TrailingStop` and `TrailingStopLimit` are
+rejected as unsupported (the SDK margin binding omits `trailingDelta`).
 
 See the [workspace README](../README.md) for documentation, examples, and contributing guidelines.

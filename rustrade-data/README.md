@@ -74,9 +74,9 @@ Integration library for streaming public market data from exchanges and data pro
 ## Build memory
 
 A debug build of this crate with all features needs several GB of memory in a single `rustc`
-process, almost all of it for debug info. Cargo applies your package's profile to its
-dependencies, so this cost reaches you too. If it matters, reduce this crate's debug info in your
-own `Cargo.toml`:
+process, almost all of it for debug info. Cargo applies your workspace's `dev` profile to
+dependencies too, so this cost reaches you. If it matters, reduce this crate's debug info in the
+`Cargo.toml` at your workspace root; Cargo ignores `[profile]` sections in any other manifest:
 
 ```toml
 [profile.dev.package.rustrade-data]
