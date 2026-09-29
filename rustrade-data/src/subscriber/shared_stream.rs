@@ -2,8 +2,9 @@
 //!
 //! Such a provider hands each stream a view of the shared connection rather than a socket of its
 //! own — see [`Subscriber::Transport`] — which the standard WebSocket initialisation, built to
-//! split and drive a socket, cannot read. [`SharedStream`] reads that view instead, and parses and
-//! transforms exactly as the standard stream does.
+//! split and drive a socket, cannot read.
+//! [`SharedStream`](crate::subscriber::shared_stream::SharedStream) reads that view instead, and
+//! parses and transforms exactly as the standard stream does.
 
 use crate::{
     Identifier, MarketStream, SnapshotFetcher,

@@ -665,7 +665,7 @@ fn classify(message: &WsMessage) -> Classified {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
     use crate::subscription::{SubscriptionKind, book::OrderBooksL1, trade::PublicTrades};
