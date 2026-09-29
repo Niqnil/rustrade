@@ -666,6 +666,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The IBKR account stream recovers fills sent while `ibapi` was reconnecting** (#402,
+  `rustrade-execution`, feature `ibkr`). `ibapi` reconnects its socket to TWS/Gateway by itself,
+  and `account_stream` stayed open across that without noticing. It ended with no error and
+  emitted no `StreamTerminated`, and everything TWS sent while the socket was down was lost
+  silently. The stream now watches `ibapi`'s notices and connection state. When delivery is
+  restored, after `ibapi`'s reconnect notice or TWS's 1101/1102 following a 1100, it asks TWS for
+  the day's executions and emits those from the gap as `Trade` events, with their commissions.
+  Trades pass through a 10k LRU dedup cache, so none is delivered twice. If recovery fails three
+  times for a reason other than another drop, the stream ends with `StreamTerminated` rather than
+  stay open with a gap. Order lifecycle events from the gap are still not recovered (#370), so
+  reconcile with `fetch_open_orders` after a reconnect. The module rustdoc said the client had
+  "no auto-reconnect" and that a drop would show on the account stream as an error or EOF. Both
+  were wrong, and the docs now describe `ibapi`'s reconnect and what remains the caller's job. A
+  side fix: `ibapi` copies every execution it receives to the account stream, including those
+  answering an executions request, so each `fetch_trades` call could replay the day's fills onto a
+  live stream. The stream now skips executions that answer a request.
+
 - **Massive WebSocket channels and symbols that `MassiveLive` got wrong in 0.6.0** (`rustrade-data`,
   feature `massive`). These are fixed by the connectors that replace it; if you consumed its
   output, check what you stored.
