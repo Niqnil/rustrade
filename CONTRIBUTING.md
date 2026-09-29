@@ -198,8 +198,10 @@ We use a **two-PR flow** so `develop` and `main` stay in sync — the version bu
    commit to `develop` and changes no file. It makes `main` an ancestor of `develop` again. Skip it
    and `develop` never holds `main`'s merge commits, so the next release PR shows as out of date,
    which `main`'s branch protection treats as a blocker. The push goes straight to `develop`, so it
-   needs a maintainer who can bypass that branch's protection. Git refuses it if `develop` gained a
-   commit after the release PR merged; in that case, open a PR from `main` into `develop` instead.
+   needs a maintainer who can bypass that branch's protection. GitHub rejects it if `develop` gained
+   a commit after the release PR merged. In that case, open a PR from `main` into `develop` instead,
+   and merge it as a merge commit too: a squash or rebase leaves `main`'s merge commit out of
+   `develop`'s history, and the next release PR is out of date again.
 5. Tag the **merge commit on `main`** — not `develop`'s tip. Step 4 leaves you on `develop`, so a
    bare `git tag vx.y.z` would tag the wrong commit. Name the commit explicitly:
 
