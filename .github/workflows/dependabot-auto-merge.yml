@@ -114,7 +114,7 @@ jobs:
                 ;;
             esac
             if [ "$(date +%s)" -ge "$deadline" ]; then
-              echo "::error::Not merged within 60 minutes, likely because its CI failed or the merge is blocked, so CI was not dispatched on develop. If it merges later, run ci.yml on develop by hand."
+              echo "::error::Not seen merged within 60 minutes (last state: $state), so CI was not dispatched on develop. OPEN usually means its CI failed or the merge is blocked; UNKNOWN means the PR could not be read. If it merges later, run ci.yml on develop by hand."
               exit 1
             fi
             sleep 30
