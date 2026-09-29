@@ -756,6 +756,10 @@ mod tests {
             LseFutures,
             LseCfd,
             LseOptions,
+            MassiveStocks,
+            MassiveCrypto,
+            MassiveForex,
+            MassiveOptions,
         ];
 
         // Exhaustive, so a new variant fails to compile here until it is added to the list too.
@@ -822,7 +826,11 @@ mod tests {
                 | LseEquities
                 | LseFutures
                 | LseCfd
-                | LseOptions => {}
+                | LseOptions
+                | MassiveStocks
+                | MassiveCrypto
+                | MassiveForex
+                | MassiveOptions => {}
             }
         }
 
