@@ -15,6 +15,10 @@
 //!    on ([`RecoveredFills`]).
 //! 3. It emits them through the stream's [`EventSink`], which drops every trade already delivered.
 //!
+//! The watcher also ends the stream when the client shuts down for good. `ibapi` never closes the
+//! order update stream, so the reader cannot see that happen, but it does close every notice
+//! stream.
+//!
 //! Only fills are recovered. An order that was cancelled, expired or rejected during the gap is
 //! not reported.
 
@@ -57,7 +61,8 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// dropped by the [`EventSink`].
 const RECOVERY_LOOKBACK: chrono::Duration = chrono::Duration::seconds(30);
 
-/// Upper bound on reading one recovery's executions from TWS.
+/// Upper bound on reading one recovery's executions from TWS. Read in slices of [`POLL_INTERVAL`],
+/// so a consumer that goes meanwhile is noticed within one.
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Recovery attempts that may fail, for a reason other than the transport dropping again, before
@@ -111,6 +116,8 @@ pub(super) struct GapTracker {
     last_connected: DateTime<Utc>,
     /// The estimated start of the earliest gap not yet recovered.
     gap_start: Option<DateTime<Utc>>,
+    /// A sample saw the transport disconnected, and no connected sample has followed yet.
+    transport_down: bool,
     /// Delivery was restored after `gap_start`, so recovery can run.
     recovery_due: bool,
     /// Consecutive recovery attempts that failed for a reason other than transport loss.
@@ -122,6 +129,7 @@ impl GapTracker {
         Self {
             last_connected: now,
             gap_start: None,
+            transport_down: false,
             recovery_due: false,
             failures: 0,
         }
@@ -130,11 +138,17 @@ impl GapTracker {
     /// Record one sample of the transport state.
     ///
     /// A disconnected sample opens a gap at the last connected sample, since the drop happened
-    /// somewhere between the two. A gap already open keeps its earlier start.
+    /// somewhere between the two. A gap already open keeps its earlier start. The first connected
+    /// sample after a disconnected one makes recovery due, so recovery does not hinge on the
+    /// reconnect notice alone.
     pub(super) fn observe_connection(&mut self, connected: bool, now: DateTime<Utc>) {
         if connected {
+            if std::mem::take(&mut self.transport_down) {
+                self.recovery_due = true;
+            }
             self.last_connected = now;
         } else {
+            self.transport_down = true;
             self.gap_start.get_or_insert(self.last_connected);
         }
     }
@@ -241,28 +255,20 @@ impl EventSink {
 }
 
 /// Why a recovery attempt failed.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub(super) enum RecoveryError {
-    Ibapi(ibapi::Error),
+    #[error("executions request failed: {0}")]
+    Ibapi(#[source] ibapi::Error),
+    #[error("executions request did not complete within {}s", RECOVERY_TIMEOUT.as_secs())]
     TimedOut,
+    /// The stream ended, or its consumer went, while recovery was reading.
+    #[error("account stream ended during recovery")]
+    StreamClosed,
 }
 
 impl RecoveryError {
     fn is_transport_loss(&self) -> bool {
         matches!(self, Self::Ibapi(e) if super::is_transport_loss(e))
-    }
-}
-
-impl std::fmt::Display for RecoveryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Ibapi(e) => write!(f, "executions request failed: {e}"),
-            Self::TimedOut => write!(
-                f,
-                "executions request did not complete within {}s",
-                RECOVERY_TIMEOUT.as_secs()
-            ),
-        }
     }
 }
 
@@ -276,6 +282,8 @@ pub(super) struct RecoveredFills<'a> {
     order_ids: &'a OrderIdMap,
     awaiting_commission: ExecutionBuffer,
     trades: Vec<Trade<AssetNameExchange, InstrumentNameExchange>>,
+    /// Executions kept although their timestamp did not parse.
+    unparseable: usize,
 }
 
 impl<'a> RecoveredFills<'a> {
@@ -290,23 +298,27 @@ impl<'a> RecoveredFills<'a> {
             order_ids,
             awaiting_commission: ExecutionBuffer::new(),
             trades: Vec::new(),
+            unparseable: 0,
         }
     }
 
     pub(super) fn push(&mut self, item: Executions) {
         match item {
             Executions::ExecutionData(execution) => {
-                let Some(time) = super::execution::parse_ib_timestamp(&execution.execution.time)
-                else {
-                    warn!(
-                        exec_id = %execution.execution.execution_id,
-                        time = %execution.execution.time,
-                        "Unparseable timestamp in recovered execution, skipping"
-                    );
-                    return;
-                };
-                if time < self.floor {
-                    return;
+                // An execution whose time does not parse (a DST-ambiguous local time, or a
+                // format change) is kept: dropping it could lose a fill from the gap, while
+                // keeping one the stream already delivered costs nothing past the dedup cache.
+                match super::execution::parse_ib_timestamp(&execution.execution.time) {
+                    Some(time) if time < self.floor => return,
+                    Some(_) => {}
+                    None => {
+                        debug!(
+                            exec_id = %execution.execution.execution_id,
+                            time = %execution.execution.time,
+                            "Unparseable timestamp in recovered execution, keeping it"
+                        );
+                        self.unparseable += 1;
+                    }
                 }
                 if let Some((instrument, client_id)) =
                     resolve_execution(&execution, self.contracts, self.order_ids)
@@ -329,6 +341,13 @@ impl<'a> RecoveredFills<'a> {
         self,
         pending: &ExecutionBuffer,
     ) -> Vec<Trade<AssetNameExchange, InstrumentNameExchange>> {
+        if self.unparseable > 0 {
+            warn!(
+                count = self.unparseable,
+                "Recovered IBKR executions with unparseable timestamps were kept regardless of \
+                 the recovery window"
+            );
+        }
         let moved = self.awaiting_commission.drain_into(pending);
         if moved > 0 {
             warn!(
@@ -348,6 +367,7 @@ fn recover_fills(
     contracts: &ContractRegistry,
     order_ids: &OrderIdMap,
     pending: &ExecutionBuffer,
+    sink: &EventSink,
 ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, RecoveryError> {
     // No server-side time filter: TWS reads `ExecutionFilter::time` in a zone of its own choosing.
     // A day's executions are few, and `RecoveredFills` applies the window.
@@ -358,20 +378,36 @@ fn recover_fills(
     let mut fills = RecoveredFills::new(floor, contracts, order_ids);
 
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match subscription.next_timeout(remaining) {
+        if !sink.is_open() {
+            return Err(RecoveryError::StreamClosed);
+        }
+        let slice = deadline
+            .saturating_duration_since(Instant::now())
+            .min(POLL_INTERVAL);
+        let waited = Instant::now();
+        match subscription.next_timeout(slice) {
             Some(Ok(SubscriptionItem::Data(item))) => fills.push(item),
             Some(Ok(SubscriptionItem::Notice(notice))) => {
                 debug!(%notice, "Notice during IBKR fill recovery");
             }
             Some(Err(e)) => return Err(RecoveryError::Ibapi(e)),
-            // `next_timeout` answers `None` both at the end marker and when time runs out.
+            // `next_timeout` answers `None` both at the end marker and when the slice runs out.
             None if Instant::now() >= deadline => return Err(RecoveryError::TimedOut),
-            None => break,
+            None if returned_early(waited.elapsed(), slice) => break,
+            None => {}
         }
     }
 
     Ok(fills.finish(pending))
+}
+
+/// Whether a blocking wait of `timeout` that produced nothing ended before its time.
+///
+/// `ibapi`'s timed receives answer `None` both when the time runs out and when there is nothing
+/// left to wait for: a subscription past its end marker, or a notice stream the client closed on
+/// shutdown. Only the second returns before the timeout.
+fn returned_early(elapsed: Duration, timeout: Duration) -> bool {
+    elapsed < timeout / 2
 }
 
 /// Everything the recovery watcher thread needs.
@@ -387,59 +423,90 @@ pub(super) struct RecoveryWatcher {
 impl RecoveryWatcher {
     /// Watch for gaps and recover their fills until the stream ends or its consumer goes.
     ///
-    /// If recovery keeps failing, the stream is terminated rather than left open with a gap
-    /// nobody knows about.
+    /// If recovery keeps failing, or the client shuts down for good, the stream is terminated
+    /// rather than left open with a gap nobody knows about.
     pub(super) fn run(self) {
         let mut tracker = GapTracker::new(Utc::now());
 
         while self.sink.is_open() {
-            let now = Utc::now();
             let connected = self.client.is_connected();
-            tracker.observe_connection(connected, now);
+            tracker.observe_connection(connected, Utc::now());
 
             while let Some(notice) = self.notices.try_next() {
-                if let Some(kind) = classify_notice(notice.code) {
-                    info!(code = notice.code, message = %notice.message, "IBKR connectivity notice");
-                    tracker.observe_notice(kind, now);
-                }
+                observe_notice(&mut tracker, &notice);
             }
 
-            if let Some(floor) = tracker.recovery_floor(connected) {
-                match recover_fills(
-                    &self.client,
-                    floor,
-                    &self.contracts,
-                    &self.order_ids,
-                    &self.pending,
-                ) {
-                    Ok(trades) => {
-                        info!(
-                            count = trades.len(),
-                            since = %floor,
-                            "Recovered IBKR fills after a gap in event delivery"
-                        );
-                        for trade in trades {
-                            if !self.sink.send_trade(trade) {
-                                return;
-                            }
-                        }
-                        tracker.recovered();
-                    }
-                    Err(e) => {
-                        warn!(error = %e, since = %floor, "IBKR fill recovery failed");
-                        if tracker.recovery_failed(e.is_transport_loss()) {
-                            error!(error = %e, "Giving up IBKR fill recovery; terminating the account stream");
-                            self.sink.terminate(StreamTerminationReason::Error(format!(
-                                "IBKR fill recovery after a gap in event delivery failed: {e}"
-                            )));
-                            return;
-                        }
-                    }
-                }
+            if let Some(floor) = tracker.recovery_floor(connected)
+                && !self.recover(&mut tracker, floor)
+            {
+                return;
             }
 
-            std::thread::sleep(POLL_INTERVAL);
+            // The poll interval's sleep. It ends early on a notice, or at once if `ibapi` closed
+            // the notice stream, which it does only when the client shuts down for good: the
+            // reconnect failed, or `IbkrClient::disconnect` was called. The order update stream
+            // is never closed, so without this the account stream would stay open and silent.
+            let waited = Instant::now();
+            match self.notices.next_timeout(POLL_INTERVAL) {
+                Some(notice) => observe_notice(&mut tracker, &notice),
+                None if returned_early(waited.elapsed(), POLL_INTERVAL) => {
+                    warn!("IBKR client shut down; terminating the account stream");
+                    self.sink.terminate(StreamTerminationReason::Error(
+                        "IBKR client shut down: ibapi gave up reconnecting to TWS/Gateway, or \
+                         the client was disconnected"
+                            .to_string(),
+                    ));
+                    return;
+                }
+                None => {}
+            }
         }
+    }
+
+    /// Recover the gap from `floor` on. Returns `false` once the watcher should stop.
+    fn recover(&self, tracker: &mut GapTracker, floor: DateTime<Utc>) -> bool {
+        match recover_fills(
+            &self.client,
+            floor,
+            &self.contracts,
+            &self.order_ids,
+            &self.pending,
+            &self.sink,
+        ) {
+            Ok(trades) => {
+                info!(
+                    count = trades.len(),
+                    since = %floor,
+                    "Recovered IBKR fills after a gap in event delivery"
+                );
+                for trade in trades {
+                    if !self.sink.send_trade(trade) {
+                        return false;
+                    }
+                }
+                tracker.recovered();
+                true
+            }
+            Err(RecoveryError::StreamClosed) => false,
+            Err(e) => {
+                warn!(error = %e, since = %floor, "IBKR fill recovery failed");
+                if tracker.recovery_failed(e.is_transport_loss()) {
+                    error!(error = %e, "Giving up IBKR fill recovery; terminating the account stream");
+                    self.sink.terminate(StreamTerminationReason::Error(format!(
+                        "IBKR fill recovery after a gap in event delivery failed: {e}"
+                    )));
+                    return false;
+                }
+                true
+            }
+        }
+    }
+}
+
+fn observe_notice(tracker: &mut GapTracker, notice: &ibapi::Notice) {
+    if let Some(kind) = classify_notice(notice.code) {
+        info!(code = notice.code, message = %notice.message, "IBKR connectivity notice");
+        tracker.observe_notice(kind, Utc::now());
     }
 }
 
@@ -478,6 +545,17 @@ mod tests {
     }
 
     #[test]
+    fn early_return_means_nothing_left_to_wait_for() {
+        let timeout = Duration::from_secs(1);
+        assert!(returned_early(Duration::ZERO, timeout));
+        assert!(returned_early(Duration::from_millis(100), timeout));
+        assert!(!returned_early(timeout, timeout));
+        // A timeout slightly late or slightly early by scheduling is still a timeout.
+        assert!(!returned_early(Duration::from_millis(990), timeout));
+        assert!(!returned_early(Duration::from_millis(1100), timeout));
+    }
+
+    #[test]
     fn replayed_execution_is_one_answering_a_request() {
         let with_request_id = |request_id| ExecutionData {
             request_id,
@@ -507,6 +585,19 @@ mod tests {
 
         tracker.observe_connection(true, at("2026-09-29T14:05:01Z"));
         tracker.observe_notice(ConnectivityNotice::Restored, at("2026-09-29T14:05:01Z"));
+
+        assert_eq!(
+            tracker.recovery_floor(true),
+            Some(at("2026-09-29T14:00:10Z") - RECOVERY_LOOKBACK)
+        );
+    }
+
+    #[test]
+    fn observed_reconnect_makes_recovery_due_without_a_notice() {
+        let mut tracker = GapTracker::new(at("2026-09-29T14:00:00Z"));
+        tracker.observe_connection(true, at("2026-09-29T14:00:10Z"));
+        tracker.observe_connection(false, at("2026-09-29T14:00:11Z"));
+        tracker.observe_connection(true, at("2026-09-29T14:00:40Z"));
 
         assert_eq!(
             tracker.recovery_floor(true),
@@ -756,9 +847,6 @@ mod tests {
             // In the window, but for an order this client does not track.
             execution("foreign", 99, "20260929 14:00:01 UTC"),
             commission("foreign"),
-            // Unparseable timestamp.
-            execution("garbled", IB_ORDER_ID, "not a time"),
-            commission("garbled"),
         ] {
             fills.push(item);
         }
@@ -769,6 +857,21 @@ mod tests {
         assert_eq!(trades[0].order_id.0.as_str(), "cid-7");
         assert_eq!(trades[0].fees.fees, Decimal::ONE);
         assert_eq!(pending.pending_count(), 0);
+    }
+
+    /// A time that does not parse cannot be placed against the window, and dropping the execution
+    /// could lose a fill from the gap, so it is kept.
+    #[test]
+    fn recovered_execution_with_unparseable_time_is_kept() {
+        let (contracts, order_ids) = tracked();
+        let pending = ExecutionBuffer::new();
+        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), &contracts, &order_ids);
+        fills.push(execution("garbled", IB_ORDER_ID, "not a time"));
+        fills.push(commission("garbled"));
+
+        let trades = fills.finish(&pending);
+        assert_eq!(trades.len(), 1, "{trades:?}");
+        assert_eq!(trades[0].id.0.as_str(), "garbled");
     }
 
     #[test]

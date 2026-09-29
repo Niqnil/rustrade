@@ -103,10 +103,15 @@ impl ExecutionBuffer {
     /// Fill recovery buffers what it reads in a buffer of its own, then hands over whatever is
     /// still waiting for a commission report, so a report that reaches the account stream later
     /// can complete it there.
-    pub(crate) fn drain_into(&self, target: &ExecutionBuffer) -> usize {
+    ///
+    /// Both buffers stay locked for the move, so a commission report the stream reads meanwhile
+    /// finds the execution in one of them. `target` is locked first. The stream locks only its own
+    /// buffer, so the order cannot deadlock against it.
+    pub(super) fn drain_into(&self, target: &ExecutionBuffer) -> usize {
+        let mut target = target.inner.lock();
         let drained = std::mem::take(&mut self.inner.lock().pending);
         let count = drained.len();
-        target.inner.lock().pending.extend(drained);
+        target.pending.extend(drained);
         count
     }
 
@@ -286,6 +291,33 @@ mod tests {
         assert!(ts.is_some());
         let dt = ts.unwrap();
         assert_eq!(dt.hour(), 10);
+    }
+
+    #[test]
+    fn drain_into_moves_everything_and_keeps_the_target() {
+        let execution = |exec_id: &str| ExecutionData {
+            execution: ibapi::orders::Execution {
+                execution_id: exec_id.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let add = |buffer: &ExecutionBuffer, exec_id: &str| {
+            buffer.add_execution(
+                execution(exec_id),
+                InstrumentNameExchange::new("AAPL"),
+                ClientOrderId::new("cid"),
+            );
+        };
+        let source = ExecutionBuffer::new();
+        let target = ExecutionBuffer::new();
+        add(&source, "a");
+        add(&source, "b");
+        add(&target, "c");
+
+        assert_eq!(source.drain_into(&target), 2);
+        assert_eq!(source.pending_count(), 0);
+        assert_eq!(target.pending_count(), 3);
     }
 
     #[test]

@@ -56,7 +56,9 @@
 //!    reconnect, call [`ExecutionClient::fetch_open_orders`] to reconcile open-order
 //!    state. The IBKR account snapshot carries no open orders (#371).
 //! 2. **Permanent disconnect**: when `ibapi` gives up reconnecting, or fill recovery
-//!    fails repeatedly, `account_stream` ends with `StreamTerminated`. Recovering from
+//!    fails repeatedly, `account_stream` ends with `StreamTerminated` within about a
+//!    second. Its reader thread then stays blocked until TWS sends another event, so
+//!    replace the client rather than call `account_stream` on it again. Recovering from
 //!    that, by reconnecting with [`IbkrClient::connect_sync`] and choosing the client
 //!    ID, is the caller's decision. A new `IbkrClient` does not know the orders the old
 //!    one placed, so their later events are dropped.
@@ -699,8 +701,8 @@ impl IbkrClient {
     /// is dropped. Calling `disconnect()` explicitly terminates the connection
     /// **immediately for all clones** sharing this client.
     ///
-    /// Any active `account_stream()` iterators will receive errors on their
-    /// next iteration attempt.
+    /// Any active `account_stream()` ends with `StreamTerminated` within about a
+    /// second.
     ///
     /// This is idempotent — calling it multiple times is safe.
     pub fn disconnect(&self) {
@@ -1475,9 +1477,11 @@ impl ExecutionClient for IbkrClient {
     ///
     /// Spawns two background threads: `ibkr-order-stream` reads the blocking IB
     /// subscription, and `ibkr-fill-recovery` watches for gaps in event delivery
-    /// (see below). Both terminate when:
-    /// - The returned `BoxStream` is dropped (channel closes)
-    /// - The IB subscription ends (disconnect)
+    /// (see below). The watcher exits within about a second of the returned
+    /// `BoxStream` being dropped or the stream ending. The reader exits when:
+    /// - The returned `BoxStream` is dropped (channel closes), or the stream has
+    ///   ended, and the next IB event arrives
+    /// - The IB subscription ends
     ///
     /// **Important:** If IB is stalled (no events flowing), the reader thread blocks
     /// on the iterator. Dropping the stream signals termination, but the thread won't
@@ -1501,12 +1505,22 @@ impl ExecutionClient for IbkrClient {
     /// [`ExecutionClient::fetch_open_orders`] after a reconnect. The log line
     /// `Recovered IBKR fills after a gap in event delivery` marks one.
     ///
-    /// If recovery fails three times for a reason other than the transport
-    /// dropping again, the stream ends with `StreamTerminated` rather than stay
-    /// open with a gap.
+    /// While TWS reports its link to IB's servers lost (1100), nothing marks the
+    /// gap on this stream until the link is restored and the recovered fills
+    /// arrive.
     ///
-    /// When `ibapi` gives up reconnecting, the subscription ends and so does the
-    /// stream, with `StreamTerminated`.
+    /// The stream ends with `StreamTerminated` when:
+    /// - recovery fails three times for a reason other than the transport
+    ///   dropping again, rather than stay open with a gap;
+    /// - the client shuts down for good, because `ibapi` gave up reconnecting or
+    ///   [`IbkrClient::disconnect`] was called. `ibapi` never ends the order
+    ///   update subscription itself, so this is detected from its notice stream,
+    ///   which it does close.
+    ///
+    /// After either, the reader thread stays blocked on the subscription, and
+    /// holds `ibapi`'s single order-update slot, until TWS sends another event.
+    /// Calling `account_stream` again on the same client fails meanwhile. After a
+    /// shutdown, TWS sends nothing more, so replace the client.
     ///
     /// # Duplicate Events
     ///

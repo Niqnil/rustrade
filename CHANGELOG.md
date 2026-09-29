@@ -675,7 +675,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the day's executions and emits those from the gap as `Trade` events, with their commissions.
   Trades pass through a 10k LRU dedup cache, so none is delivered twice. If recovery fails three
   times for a reason other than another drop, the stream ends with `StreamTerminated` rather than
-  stay open with a gap. Order lifecycle events from the gap are still not recovered (#370), so
+  stay open with a gap. It also ends with `StreamTerminated` when the client shuts down for good,
+  because `ibapi` gave up reconnecting or `IbkrClient::disconnect` was called. `ibapi` never ends
+  the order update subscription, so the stream used to stay open and silent then, and
+  `disconnect`'s rustdoc wrongly promised errors on it. Order lifecycle events from the gap are still not recovered (#370), so
   reconcile with `fetch_open_orders` after a reconnect. The module rustdoc said the client had
   "no auto-reconnect" and that a drop would show on the account stream as an error or EOF. Both
   were wrong, and the docs now describe `ibapi`'s reconnect and what remains the caller's job. A
