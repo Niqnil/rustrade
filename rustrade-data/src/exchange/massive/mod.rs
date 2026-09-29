@@ -404,7 +404,10 @@ where
 /// A Massive frame of status messages, as a subscribe is answered.
 ///
 /// [`MassiveSubscriber`] reads Massive's answers on the connection it shares, so this is
-/// consulted only by a caller validating a socket of its own.
+/// consulted only by a caller validating a socket of its own. Its [`Validator`] checks only that
+/// every status in the frame is a success. It does not confirm each subscription by name, so a
+/// subscription Massive left unanswered — as it does one to a channel the cluster does not
+/// publish — passes.
 #[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
 pub struct MassiveSubResponse(pub Vec<MassiveStatus>);
 
@@ -546,8 +549,9 @@ impl Subscriber for MassiveSubscriber {
     ///
     /// # Errors
     /// Returns [`SocketError::Subscribe`] — before connecting — if the batch is empty, asks for
-    /// candles at an interval other than one second or one minute, or on the options cluster
-    /// names an instrument that is not an option contract. Once connected, it returns one if
+    /// candles at an interval other than one second or one minute, names a market holding a comma
+    /// or whitespace (as an instrument the cluster cannot spell is written), or on the options
+    /// cluster names an instrument that is not an option contract. Once connected, it returns one if
     /// authentication is refused (a key without WebSocket access to the cluster among the
     /// reasons), Massive refuses a subscription, or the subscription timeout passes before every
     /// subscription is confirmed. Massive does not answer a subscription to a channel the cluster
@@ -636,12 +640,19 @@ where
             )));
         }
 
-        if exchange == ExchangeId::MassiveOptions
-            && !market::is_option_contract(sub.market.as_ref())
-        {
+        let spelled = sub.market.as_ref();
+        if exchange == ExchangeId::MassiveOptions && !market::is_option_contract(spelled) {
             return Err(SocketError::Subscribe(format!(
-                "{exchange} streams option contracts only, and {} is not one",
-                sub.market.as_ref()
+                "{exchange} streams option contracts only, and {spelled} is not one"
+            )));
+        }
+
+        // No market Massive spells holds whitespace or a comma. A comma would split the market
+        // into two subscriptions in the comma-joined `params`, and whitespace marks an instrument
+        // the cluster cannot spell, whichever cluster type is subscribing.
+        if spelled.is_empty() || spelled.contains(|c: char| c == ',' || c.is_whitespace()) {
+            return Err(SocketError::Subscribe(format!(
+                "{exchange} cannot subscribe to the market {spelled:?}"
             )));
         }
 
@@ -754,6 +765,33 @@ mod tests {
         .to_string();
 
         assert!(error.contains("option contracts only"), "{error}");
+    }
+
+    #[test]
+    fn a_market_no_cluster_spells_is_refused_whatever_the_cluster_id() {
+        // An options-spelling cluster of the caller's own, under another cluster's id.
+        let unspellable = requested_slots(
+            ExchangeId::MassiveStocks,
+            &[subscription::<MassiveServerOptions, _>(
+                "aapl", "usd", Quotes,
+            )],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(unspellable.contains("no OSI symbol"), "{unspellable}");
+
+        // A comma would smuggle a second subscription into the comma-joined `params`.
+        let smuggled = requested_slots(
+            ExchangeId::MassiveStocks,
+            &[subscription::<MassiveServerStocks, _>(
+                "aapl,t.msft",
+                "usd",
+                Quotes,
+            )],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(smuggled.contains("AAPL,T.MSFT"), "{smuggled}");
     }
 
     #[test]

@@ -270,6 +270,10 @@ impl MassiveKind for PublicTrades {
 }
 
 /// The quote as published. Forex quotes carry no sizes, so both amounts are zero there.
+///
+/// A [`Quote`] has no way to say a side is empty, so a side with nothing quoted on it — a zero
+/// price, or none — arrives as a zero price. Check both prices before using
+/// [`Quote::mid_price`] or [`Quote::spread`]; [`OrderBooksL1`] maps such a side to `None` instead.
 impl MassiveKind for Quotes {
     type Message = MassiveQuote;
 

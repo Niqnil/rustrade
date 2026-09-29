@@ -101,7 +101,9 @@ pub(super) fn is_option_contract(market: &str) -> bool {
 ///
 /// Implemented by the four shipped clusters. A cluster reached at another endpoint — Massive's
 /// legacy `socket.polygon.io` host, say — is a type of your own implementing this and
-/// [`ExchangeServer`] with the constants of the cluster it mirrors.
+/// [`ExchangeServer`] with the constants of the cluster it mirrors, [`ExchangeServer::ID`] among
+/// them: the subscriber refuses a non-contract instrument before connecting only on
+/// [`ExchangeId::MassiveOptions`](rustrade_instrument::exchange::ExchangeId::MassiveOptions).
 pub trait MassiveServer: ExchangeServer {
     /// How the cluster spells its markets.
     const SYMBOLS: MassiveSymbols;

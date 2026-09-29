@@ -19,7 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because Massive builds it from quote updates. Only crypto trades carry an aggressor side.
   Markets are spelled from the instrument as each cluster's messages spell them: `AAPL`,
   `BTC-USD`, `EUR/USD`, and `O:` plus the OSI symbol. The options connector refuses an instrument
-  that is not an option contract. It is untested, because it needs an options subscription.
+  that is not an option contract. It is untested, because it needs an options subscription. Every
+  connector refuses a market holding a comma or whitespace, which would otherwise split into
+  extra subscriptions. A `Quotes` side with nothing quoted on it is a zero price, and
+  `OrderBooksL1` makes it `None`.
 
   Massive allows a key a fixed number of connections per cluster, one on an individual plan, and
   past it **closes the older connection** with a `max_connections` status. So every stream a
