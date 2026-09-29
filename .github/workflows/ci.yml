@@ -9,6 +9,9 @@ on:
     paths-ignore:
       - "**.md"
     branches: ["main", "develop"]
+  # Dispatched by `dependabot-auto-merge.yml` once it has merged a PR: a merge made with
+  # GITHUB_TOKEN triggers no `push` run, but GITHUB_TOKEN may dispatch one.
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
