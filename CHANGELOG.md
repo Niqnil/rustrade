@@ -375,8 +375,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disagree with their positions, so that every lookup resolved to the wrong entity. It now
   writes a JSON array of `Instrument<ExchangeId, Asset>` and reads one through `try_new`, so a
   payload that breaks an invariant fails with the same `IndexError`, and no index is ever read
-  from input. The old object format no longer loads. `IndexedInstruments` also implements
-  `TryFrom<Vec<Instrument<ExchangeId, Asset>>>`.
+  from input. The old object format no longer loads, so previously serialised output must be
+  regenerated. `IndexedInstruments` also implements `TryFrom<Vec<Instrument<ExchangeId, Asset>>>`.
 
 - **REST clients negotiate and transparently decode gzip** (workspace `reqwest` dependency). The
   workspace now enables reqwest's `gzip` feature, so every `reqwest::Client` the crates build sends

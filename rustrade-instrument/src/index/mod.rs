@@ -568,12 +568,31 @@ mod tests {
 
     /// A multi-exchange set exercising every key `map_exchange_key` and
     /// `map_asset_key_with_lookup` touch: a data venue on an exchange no instrument executes on,
-    /// and a perpetual whose settlement asset is not its underlying base.
+    /// a perpetual settled in an asset its underlying does not name, and a spec whose quantity is
+    /// denominated in an asset only the spec names.
     fn serde_fixture() -> Vec<Instrument<ExchangeId, Asset>> {
-        use crate::instrument::{data_venue::DataVenue, kind::perpetual::PerpetualContract};
+        use crate::instrument::{
+            data_venue::DataVenue,
+            kind::perpetual::PerpetualContract,
+            spec::{
+                InstrumentSpec, InstrumentSpecNotional, InstrumentSpecPrice,
+                InstrumentSpecQuantity, OrderQuantityUnits,
+            },
+        };
+
+        let mut kraken_eth_usd = instrument(ExchangeId::Kraken, "eth", "usd");
+        kraken_eth_usd.spec = Some(InstrumentSpec::new(
+            InstrumentSpecPrice::new(Decimal::ONE, Decimal::ONE),
+            InstrumentSpecQuantity::new(
+                OrderQuantityUnits::Asset(Asset::new_from_exchange("eth_lot")),
+                Decimal::ONE,
+                Decimal::ONE,
+            ),
+            InstrumentSpecNotional::new(Decimal::ONE),
+        ));
 
         vec![
-            instrument(ExchangeId::Kraken, "eth", "usd"),
+            kraken_eth_usd,
             instrument(ExchangeId::BinanceSpot, "btc", "usdt"),
             Instrument::spot(
                 ExchangeId::AlpacaBroker,
@@ -612,6 +631,12 @@ mod tests {
         let restored: IndexedInstruments = serde_json::from_str(&json).unwrap();
 
         assert_eq!(restored, indexed);
+        // The spec-only asset is registered again on the way back in.
+        assert!(
+            restored
+                .find_asset_index(ExchangeId::Kraken, &AssetNameInternal::from("eth_lot"))
+                .is_ok()
+        );
         // The data venue is indexed although no instrument executes on it.
         assert!(
             restored
