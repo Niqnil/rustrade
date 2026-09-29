@@ -6,12 +6,16 @@ Execution client library for streaming private account data and executing orders
 
 | Exchange | Constructor | InstrumentKinds | Features |
 |:--------:|:-----------:|:---------------:|:--------:|
-| **Binance** | `BinanceClient::connect()` | Spot | Orders, Balances, Positions |
-| **BinanceMargin** | `BinanceMargin::new(config)` | Spot (cross/isolated margin) | Orders, Balances, Positions |
-| **Alpaca** | `AlpacaClient::connect()` | Spot (Equities, Crypto), Option | Orders, Balances, Positions, BracketOrders |
-| **Hyperliquid** | `HyperliquidClient::connect()` | Perpetual | Orders, Balances, Positions |
-| **HyperliquidSpot** | `HyperliquidSpotClient::connect()` | Spot | Orders, Balances, Positions |
-| **IBKR** | `IbkrClient::connect()` | Spot, Future, Option | Orders, Balances, Positions, BracketOrders |
+| **BinanceSpot** | `BinanceSpot::new(BinanceSpotConfig)` | Spot | Orders, Balances, Positions |
+| **BinanceMargin** | `BinanceMargin::new(BinanceMarginConfig)` | Spot (cross/isolated margin) | Orders, Balances, Positions |
+| **Alpaca** | `AlpacaClient::new(AlpacaConfig)` | Spot (Equities, Crypto), Option | Orders, Balances, Positions, BracketOrders |
+| **Hyperliquid** | `HyperliquidClient::connect(HyperliquidConfig)` | Perpetual | Orders, Balances, Positions |
+| **HyperliquidSpot** | `HyperliquidSpotClient::connect(HyperliquidConfig)` | Spot | Orders, Balances, Positions |
+| **IBKR** | `IbkrClient::connect_sync(IbkrConfig)` | Spot, Future, Option | Orders, Balances, Positions, BracketOrders |
+
+The `new` constructors are `ExecutionClient::new`. Each connector is behind a Cargo feature, and
+none is enabled by default: `alpaca`, `binance` (Spot and Margin), `hyperliquid` (perpetuals and
+spot), and `ibkr`. The mock client is always available.
 
 ## Order Types
 
@@ -25,13 +29,14 @@ Additional order types:
 | StopLimit | ✅ | ✅ | ✅ | ✅ |
 | TakeProfit | ❌ | ❌ | ✅ | ✅ |
 | TakeProfitLimit | ❌ | ❌ | ✅ | ✅ |
-| TrailingStop | ✅ | ✅ | ⚠️ | ❌ |
+| TrailingStop | ✅ | ⚠️ | ⚠️ | ❌ |
 | TrailingStopLimit | ✅ | ❌ | ❌ | ❌ |
 
 ⚠️ Binance `TrailingStop` supports `BasisPoints` and `Percentage` offsets only;
-`Absolute` offsets are rejected as unsupported. Hyperliquid trigger orders (Stop,
-StopLimit, TakeProfit, TakeProfitLimit) require a UUID-format client order ID
-(`ClientOrderId::uuid()`). `BinanceMargin` matches Binance spot except that both
+`Absolute` offsets are rejected as unsupported. ⚠️ Alpaca `TrailingStop` supports
+`Percentage` and `Absolute` offsets only; `BasisPoints` is rejected as unsupported.
+Hyperliquid requires every order, of any type, to carry a client order ID in
+`ClientOrderId::uuid()` form; an order with any other ID is rejected. `BinanceMargin` matches Binance spot except that both
 `TrailingStop` and `TrailingStopLimit` are rejected as unsupported (the SDK margin
 binding omits `trailingDelta`).
 

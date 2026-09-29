@@ -51,7 +51,7 @@ rustrade is a collection of Rust libraries for live-trading, paper-trading, and 
 | **Binance** | ✅ Spot, USD-M Futures | ✅ Spot, Margin (cross/isolated) | WebSocket + REST |
 | **Alpaca** | ✅ Equities (IEX/SIP), Crypto, Options | ✅ Equities, Options, Crypto | WebSocket + REST |
 | **Hyperliquid** | ✅ Perps, Spot | ✅ Perps, Spot | WebSocket + REST |
-| **Interactive Brokers** | ✅ All asset classes | ✅ All asset classes | TWS/Gateway API |
+| **Interactive Brokers** | ✅ Equities, Futures, Options | ✅ Equities, Futures, Options | TWS/Gateway API |
 | **Bitfinex** | ✅ Spot | ❌ | WebSocket |
 | **BitMEX** | ✅ Perpetual | ❌ | WebSocket |
 | **Bybit** | ✅ Spot, Perpetual | ❌ | WebSocket |
@@ -69,9 +69,9 @@ types each execution client accepts.
 
 | Provider | Asset Classes | Notes |
 |----------|---------------|-------|
-| **Massive** | Stocks, Crypto, Forex, Options, Futures | Historical + live streaming |
+| **Massive** | Stocks, Crypto, Forex, Options, Futures | Historical + live streaming (Futures historical only) |
 | **Databento** | Equities, Futures, Options | Nanosecond precision, DBN format |
-| **London Strategic Edge** | FX, Crypto, Equities/ETFs, Futures proxies, CFDs | Live ticks, historical candles, bulk export. ⚠️ Data is **not redistributable** |
+| **London Strategic Edge** | FX, Crypto, Equities/ETFs, Options, Futures proxies, CFDs | Live ticks, historical candles, bulk export. ⚠️ Data is **not redistributable** |
 
 > **⚠️ London Strategic Edge data is NOT redistributable.** This integration's *code* is MIT
 > like the rest of the repository; the *data* it retrieves is not. LSE permits use for your own

@@ -315,7 +315,7 @@ where
 /// without enabling generic use.
 ///
 /// **vs. default impl returning `Unsupported`**: Puts a "dead method" on every
-/// client (MockClient, BinanceClient, HyperliquidClient). Compile-time capability
+/// client (MockExecution, BinanceSpot, HyperliquidClient). Compile-time capability
 /// via trait bounds is better than runtime errors.
 ///
 /// # Result Types
