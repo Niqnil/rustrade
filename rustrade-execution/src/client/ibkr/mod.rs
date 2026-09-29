@@ -57,8 +57,10 @@
 //!    state. The IBKR account snapshot carries no open orders (#371).
 //! 2. **Permanent disconnect**: when `ibapi` gives up reconnecting, or fill recovery
 //!    fails repeatedly, `account_stream` ends with `StreamTerminated` within about a
-//!    second. Its reader thread then stays blocked until TWS sends another event, so
-//!    replace the client rather than call `account_stream` on it again. Recovering from
+//!    second. Its reader thread then stays blocked until TWS sends another event, and
+//!    another `account_stream` call on the client fails until it exits. After recovery
+//!    fails, the client is still connected, so that is the next event. After a
+//!    shutdown, no event follows, so replace the client. Recovering from
 //!    that, by reconnecting with [`IbkrClient::connect_sync`] and choosing the client
 //!    ID, is the caller's decision. A new `IbkrClient` does not know the orders the old
 //!    one placed, so their later events are dropped.
@@ -1521,6 +1523,11 @@ impl ExecutionClient for IbkrClient {
     /// holds `ibapi`'s single order-update slot, until TWS sends another event.
     /// Calling `account_stream` again on the same client fails meanwhile. After a
     /// shutdown, TWS sends nothing more, so replace the client.
+    ///
+    /// Shutdown is detected only while this stream is open. Called on a client
+    /// that has already shut down, this method still returns a stream, which
+    /// never ends. After a stream ends with a shutdown, replace the client rather
+    /// than resubscribe on it.
     ///
     /// # Duplicate Events
     ///
