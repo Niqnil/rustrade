@@ -404,7 +404,8 @@ binance-sdk=70.2.0  # 2026-09-14 | Exchange SDK, signing/IO. PINNED: margin user
 #   2. `WebsocketEventEmitter::subscribe` (websocket.rs:128): body hashes identically (19 lines) --
 #      one unbounded channel (:132), ONE spawned task (:140) draining it via a sequential
 #      `while let Some(event) = rx.recv().await { callback(event) }` (:141-142). The contract the
-#      non-atomic `Option::take()` in the margin `account_stream` callback (margin.rs:1896) relies on holds.
+#      non-atomic `Option::take()` calls (margin.rs:1917-1944) in the margin `account_stream` callback
+#      registered at margin.rs:1896 rely on holds.
 #   3. `send_request` (utils.rs:951): utils.rs is byte-identical, md5 1541c46b7c5ba4f5f7ef57286c99695d
 #      unchanged, so the signing, `timestamp`, `signature` and `X-MBX-APIKEY` lines recorded at 70.1.0
 #      hold verbatim. The hand-rolled `userListenToken` POST (margin.rs:1389) is still signed as intended.
