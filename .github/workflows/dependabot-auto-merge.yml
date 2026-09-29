@@ -6,9 +6,12 @@ on:
     branches:
       - develop
 
-# A later event on the same PR replaces this run, including its wait for the merge below.
+# A later Dependabot event on the same PR replaces this run, including its wait for the merge
+# below. Keyed on the actor too: the group is claimed before the job's `if`, so without it a
+# maintainer labelling or reopening the PR would start a skipped run that cancels the wait, and
+# CI would silently not be dispatched.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}-${{ github.actor }}
   cancel-in-progress: true
 
 jobs:
@@ -97,7 +100,8 @@ jobs:
         run: |
           deadline=$(( $(date +%s) + 60 * 60 ))
           while :; do
-            state=$(gh pr view "$PR_URL" --json state --jq .state)
+            # A transient API failure is retried on the next poll; the deadline still bounds it.
+            state=$(gh pr view "$PR_URL" --json state --jq .state) || state=UNKNOWN
             case "$state" in
               MERGED)
                 gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref develop
@@ -110,7 +114,7 @@ jobs:
                 ;;
             esac
             if [ "$(date +%s)" -ge "$deadline" ]; then
-              echo "::error::Not merged within 60 minutes, so CI was not dispatched on develop. If it merges later, run ci.yml on develop by hand."
+              echo "::error::Not merged within 60 minutes, likely because its CI failed or the merge is blocked, so CI was not dispatched on develop. If it merges later, run ci.yml on develop by hand."
               exit 1
             fi
             sleep 30
