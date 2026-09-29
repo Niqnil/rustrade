@@ -36,6 +36,12 @@
 #   DRY_RUN=1            print the order and what would be published; publish nothing
 #   INDEX_TIMEOUT_SECS   how long to wait for a published version to appear (default 300)
 #   INDEX_POLL_SECS      interval between index polls (default 10)
+#   RELEASE_TAG          the release's tag, `vX.Y.Z`; when set, every crate must be at X.Y.Z. The
+#                        workflow passes the pushed tag, and also runs the check with DRY_RUN=1
+#                        first thing in its validate job. Without it, a tag on a tree whose
+#                        versions were not bumped would find every crate already in the index,
+#                        publish nothing, and still get a GitHub Release. Before tagging, run
+#                        `RELEASE_TAG=vX.Y.Z DRY_RUN=1` locally to catch that early
 
 set -euo pipefail
 
@@ -43,6 +49,7 @@ INDEX_URL="https://index.crates.io"
 INDEX_TIMEOUT_SECS="${INDEX_TIMEOUT_SECS:-300}"
 INDEX_POLL_SECS="${INDEX_POLL_SECS:-10}"
 DRY_RUN="${DRY_RUN:-0}"
+RELEASE_TAG="${RELEASE_TAG:-}"
 
 body="$(mktemp)"
 trap 'rm -f "$body"' EXIT
@@ -113,6 +120,18 @@ done < <(jq -r '
 ' <<<"$metadata")
 
 (( ${#version[@]} > 0 )) || die "cargo metadata listed no publishable crates"
+
+if [[ -n "$RELEASE_TAG" ]]; then
+    [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+        || die "RELEASE_TAG must look like vX.Y.Z, got '$RELEASE_TAG'"
+    mismatched=()
+    for name in "${!version[@]}"; do
+        [[ "${version[$name]}" == "${RELEASE_TAG#v}" ]] || mismatched+=("$name@${version[$name]}")
+    done
+    (( ${#mismatched[@]} == 0 )) \
+        || die "tag $RELEASE_TAG does not match the version of: $(printf '%s\n' "${mismatched[@]}" | sort | xargs)"
+    echo "Every crate is at ${RELEASE_TAG#v}, matching tag $RELEASE_TAG"
+fi
 
 # Topological order, ties broken by name so the order is stable across runs.
 order=()
