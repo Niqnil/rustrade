@@ -40,7 +40,15 @@ binance = [
     # graph — reqwest is already a workspace dep and a binance-sdk transitive dep.
     "dep:reqwest",
 ]
-ibkr = ["dep:ibapi", "dep:parking_lot", "dep:chrono-tz", "rustrade-instrument/ibkr"]
+ibkr = [
+    "dep:ibapi",
+    "dep:parking_lot",
+    "dep:chrono-tz",
+    "rustrade-instrument/ibkr",
+    # Account-event dedup cache: fills recovered after ibapi reconnects overlap the ones the
+    # stream already delivered. Already a direct dependency under other features.
+    "dep:lru",
+]
 hyperliquid = [
     "dep:hyperliquid_rust_sdk",
     "dep:ethers",

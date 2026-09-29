@@ -98,6 +98,18 @@ impl ExecutionBuffer {
         Some(build_trade(pending, report))
     }
 
+    /// Move every pending execution into `target`, returning how many moved.
+    ///
+    /// Fill recovery buffers what it reads in a buffer of its own, then hands over whatever is
+    /// still waiting for a commission report, so a report that reaches the account stream later
+    /// can complete it there.
+    pub(crate) fn drain_into(&self, target: &ExecutionBuffer) -> usize {
+        let drained = std::mem::take(&mut self.inner.lock().pending);
+        let count = drained.len();
+        target.inner.lock().pending.extend(drained);
+        count
+    }
+
     /// Get number of pending executions (for diagnostics).
     pub fn pending_count(&self) -> usize {
         self.inner.lock().pending.len()
