@@ -1,9 +1,9 @@
-//! OSI option contract symbols, in the unpadded spelling the options channel publishes:
-//! `SPY260930C00700000`.
+//! OSI option contract symbols, in the unpadded spelling London Strategic Edge and Massive both
+//! publish: `SPY260930C00700000`. Massive prefixes it with `O:`, which is its own and left to it.
 //!
 //! The symbol is the underlying's root, then the expiry as `YYMMDD`, then `C` or `P`, then the
 //! strike in thousandths as eight digits. The standard pads the root to six characters with spaces;
-//! this provider does not, and neither does anything here.
+//! neither provider does, and neither does anything here.
 
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use rustrade_instrument::instrument::{
@@ -20,7 +20,7 @@ const MAX_STRIKE_THOUSANDTHS: u64 = 99_999_999;
 /// Spell `contract` on `root` as an OSI symbol.
 ///
 /// The root is upper-cased, because the symbol is also the key a tick is resolved through and the
-/// provider publishes it upper-case.
+/// providers publish it upper-case.
 ///
 /// The expiry is the **UTC calendar date** of `contract.expiry`, the convention the other option
 /// connectors in this crate follow. An instant set at the US close (20:00 or 21:00 UTC) or at
@@ -30,7 +30,7 @@ const MAX_STRIKE_THOUSANDTHS: u64 = 99_999_999;
 /// `None` when the strike cannot be spelled: OSI carries it in thousandths across eight digits, so
 /// a strike with more than three decimal places, a non-positive one, or one of 100,000 or more has
 /// no symbol.
-pub(super) fn symbol(root: &str, contract: &MarketDataOptionContract) -> Option<SmolStr> {
+pub(crate) fn symbol(root: &str, contract: &MarketDataOptionContract) -> Option<SmolStr> {
     let thousandths = contract.strike.checked_mul(Decimal::ONE_THOUSAND)?;
     if !thousandths.fract().is_zero() || thousandths <= Decimal::ZERO {
         return None;
@@ -56,7 +56,7 @@ pub(super) fn symbol(root: &str, contract: &MarketDataOptionContract) -> Option<
 /// Only the fixed-width suffix is checked for shape. The root is whatever precedes it, provided it
 /// is non-empty and holds no whitespace, so a root carrying a class suffix (`BRK.B`) or a digit
 /// survives.
-pub(super) fn root(symbol: &str) -> Option<&str> {
+pub(crate) fn root(symbol: &str) -> Option<&str> {
     let split = symbol.len().checked_sub(SUFFIX_LEN)?;
     let (root, suffix) = (symbol.get(..split)?, symbol.get(split..)?.as_bytes());
 

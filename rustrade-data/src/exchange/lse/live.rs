@@ -4,10 +4,10 @@ use super::{
     connection::{AttachRequest, LseAttachment, LseConnection},
     mapper::LseSubMapper,
     market::LseDataset,
-    osi,
     resume::{LseResumeState, epoch_seconds},
 };
 use crate::exchange::lse::transport::api_key_from_env;
+use crate::exchange::osi;
 use crate::{
     Identifier,
     exchange::Connector,

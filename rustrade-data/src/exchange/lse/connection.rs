@@ -69,11 +69,11 @@ use super::{
         unsubscribe_message, unsubscribe_options_message,
     },
     mapper::subscription_id,
-    osi,
     resume::{LseResumeKey, LseResumeState},
     subscription::LseSubResponse,
     transformer::{LseResume, ResumeContext},
 };
+use crate::exchange::osi;
 use crate::subscriber::shared::{
     self, AttachId, Attachment, Batch, Connections, Frame, Handshake, Protocol, Registration,
     Registry,

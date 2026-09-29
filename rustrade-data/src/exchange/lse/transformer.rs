@@ -7,10 +7,10 @@
 
 use super::{
     live::subscribes_per_underlying,
-    osi,
     resume::{LseResumeKey, LseResumeState, LseWatermark},
     tick::LseMessage,
 };
+use crate::exchange::osi;
 use crate::{
     Identifier,
     error::DataError,

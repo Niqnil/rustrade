@@ -63,6 +63,10 @@ pub mod massive;
 #[cfg(feature = "lse")]
 pub mod lse;
 
+/// OSI option contract symbols, shared by the providers that spell contracts that way.
+#[cfg(any(feature = "lse", feature = "massive"))]
+pub(crate) mod osi;
+
 /// Defines the generic [`ExchangeSub`] containing a market and channel combination used by an
 /// exchange [`Connector`] to build [`WsMessage`] subscription payloads.
 pub mod subscription;
