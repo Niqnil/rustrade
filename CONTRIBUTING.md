@@ -190,6 +190,9 @@ We use a **two-PR flow** so `develop` and `main` stay in sync — the version bu
    ```bash
    git fetch origin
    git log -1 origin/main   # confirm this is the release merge commit
+   git switch --detach origin/main
+   RELEASE_TAG=vx.y.z DRY_RUN=1 .github/scripts/publish-crates.sh   # every crate must be at x.y.z
+   git switch -
    git tag vx.y.z origin/main
    git push origin vx.y.z
    ```
@@ -198,7 +201,9 @@ We use a **two-PR flow** so `develop` and `main` stay in sync — the version bu
    It runs `.github/scripts/publish-crates.sh`, which derives the publish order from the
    workspace's dependency graph and waits for each crate to appear in the crates.io index before
    publishing the next, failing if it does not appear in time. Test it with `DRY_RUN=1`, which
-   prints the order and what would be published without uploading anything.
+   prints the order and what would be published without uploading anything. The workflow passes
+   the tag as `RELEASE_TAG`, so a tag that does not match every crate's version fails before
+   anything is published, and before the GitHub Release is created.
 
    **A failed publish does not need a version bump.** Before publishing a crate, the script looks
    up its exact version in the crates.io sparse index, so crates already there are skipped and a
