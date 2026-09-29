@@ -18,14 +18,6 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v7
 
-      # Fails in seconds on a tag that does not match every crate's version, instead of after the
-      # tests. The publish step checks again, since it can be re-run on its own.
-      - name: Check the tag matches every crate version
-        run: ./.github/scripts/publish-crates.sh
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-          DRY_RUN: "1"
-
       - name: Install mold linker
         uses: rui314/setup-mold@v1
         with:
@@ -35,6 +27,14 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      # Fails in seconds on a tag that does not match every crate's version, before the tests run
+      # rather than after them. The publish step checks again, since it can be re-run on its own.
+      - name: Check the tag matches every crate version
+        run: ./.github/scripts/publish-crates.sh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          DRY_RUN: "1"
 
       - name: Run cargo fmt check
         run: cargo fmt --all -- --check

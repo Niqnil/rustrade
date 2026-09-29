@@ -204,7 +204,7 @@ We use a **two-PR flow** so `develop` and `main` stay in sync — the version bu
    publishing the next, failing if it does not appear in time. Test it with `DRY_RUN=1`, which
    prints the order and what would be published without uploading anything. The workflow passes
    the tag as `RELEASE_TAG`, so a tag that does not match every crate's version fails in the
-   workflow's first step, before the tests run, and again before anything is published, so no
+   workflow's validate job, before the tests run, and again before anything is published, so no
    GitHub Release is created for it.
 
    **A failed publish does not need a version bump.** Before publishing a crate, the script looks
