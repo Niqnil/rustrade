@@ -434,34 +434,3 @@ pub async fn schedule_pings_to_exchange(
         }
     }
 }
-
-pub mod test_utils {
-    use crate::{
-        event::{DataKind, MarketEvent},
-        subscription::trade::PublicTrade,
-    };
-    use chrono::{DateTime, Utc};
-    use rust_decimal::Decimal;
-    use rustrade_instrument::{Side, exchange::ExchangeId};
-
-    pub fn market_event_trade_buy<InstrumentKey>(
-        time_exchange: DateTime<Utc>,
-        time_received: DateTime<Utc>,
-        instrument: InstrumentKey,
-        price: Decimal,
-        quantity: Decimal,
-    ) -> MarketEvent<InstrumentKey, DataKind> {
-        MarketEvent {
-            time_exchange,
-            time_received,
-            exchange: ExchangeId::BinanceSpot,
-            instrument,
-            kind: DataKind::Trade(PublicTrade {
-                id: "trade_id".into(),
-                price,
-                amount: quantity,
-                side: Some(Side::Buy),
-            }),
-        }
-    }
-}

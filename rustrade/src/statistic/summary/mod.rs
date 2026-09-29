@@ -40,6 +40,10 @@ pub struct TradingSummary<Interval> {
     pub instruments: FnvIndexMap<InstrumentNameInternal, TearSheet<Interval>>,
 
     /// [`ExchangeAsset`] [`TearSheet`]s.
+    ///
+    /// Serialised as a sequence of `(key, value)` pairs, since `ExchangeAsset` is a struct and
+    /// JSON object keys must be strings.
+    #[serde(with = "rustrade_integration::collection::pair_seq")]
     pub assets: FnvIndexMap<ExchangeAsset<AssetNameInternal>, TearSheetAsset>,
 
     /// [`BalanceBasis`] the asset drawdown and end-of-session balance figures were computed from.
@@ -142,6 +146,10 @@ pub struct TradingSummaryGenerator {
     pub instruments: FnvIndexMap<InstrumentNameInternal, TearSheetGenerator>,
 
     /// [`ExchangeAsset`] [`TearSheetAssetGenerator`]s.
+    ///
+    /// Serialised as a sequence of `(key, value)` pairs, since `ExchangeAsset` is a struct and
+    /// JSON object keys must be strings.
+    #[serde(with = "rustrade_integration::collection::pair_seq")]
     pub assets: FnvIndexMap<ExchangeAsset<AssetNameInternal>, TearSheetAssetGenerator>,
 }
 
@@ -443,5 +451,32 @@ mod tests {
         assert_eq!(summary.fills_unmatched, 9);
         assert_eq!(summary.fills_routed_by_fallback, 0);
         assert!(!summary.has_split_positions());
+    }
+
+    /// `ExchangeAsset` is a struct, so the `assets` maps of both the generator and the summary must
+    /// serialise as `(key, value)` pairs: as JSON objects, `serde_json` refuses them outright.
+    #[test]
+    fn generator_and_summary_with_assets_round_trip_through_json() {
+        let mut assets = FnvIndexMap::default();
+        for (exchange, name) in [
+            (ExchangeId::Kraken, "usdt"),
+            (ExchangeId::BinanceSpot, "btc"),
+        ] {
+            assets.insert(
+                ExchangeAsset::new(exchange, AssetNameInternal::new(name)),
+                TearSheetAssetGenerator::default(),
+            );
+        }
+        let mut generator = generator_with_assets(assets);
+
+        let json = serde_json::to_string(&generator).unwrap();
+        let restored: TradingSummaryGenerator = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, generator);
+
+        let summary = generator.generate(Annual365);
+        let json = serde_json::to_string(&summary).unwrap();
+        let restored: TradingSummary<Annual365> = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, summary);
+        assert!(restored.assets.keys().eq(summary.assets.keys()));
     }
 }

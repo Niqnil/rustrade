@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`collection::pair_seq`, a serde adapter for maps with non-string keys**
+  (`rustrade-integration`, feature `collection`). Put `#[serde(with =
+  "rustrade_integration::collection::pair_seq")]` on an `IndexMap` field to write it as a sequence
+  of `(key, value)` pairs, which JSON reads as `[[key, value], …]`. Insertion order is kept.
+  Deserialising rejects a repeated key, naming the positions of both pairs, rather than keeping
+  the last one.
+
 - **Massive WebSocket market data through `Streams`, with `MassiveSubscriber` sharing one
   connection per cluster** (`rustrade-data`, feature `massive`). Four connectors, `MassiveStocks`,
   `MassiveCrypto`, `MassiveForex` and `MassiveOptions`, serve `PublicTrades`, `Quotes`,
@@ -389,6 +396,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   payload that breaks an invariant fails with the same `IndexError`, and no index is ever read
   from input. The old object format no longer loads, so previously serialised output must be
   regenerated. `IndexedInstruments` also implements `TryFrom<Vec<Instrument<ExchangeId, Asset>>>`.
+
+- **BREAKING: `TradingSummary` and `TradingSummaryGenerator` serialise `assets` as a sequence of
+  `(key, value)` pairs, and serialise to JSON** (`rustrade`). `assets` is keyed by
+  `ExchangeAsset`, a struct, and JSON object keys must be strings, so `serde_json` refused any
+  summary or generator with an asset in it. Both fields now use `collection::pair_seq`, the
+  format `AssetStates` already used. In a format that accepted struct map keys, such as bincode,
+  `assets` changes from a map to a sequence, so a summary or generator saved in such a format by
+  an earlier version no longer loads.
+
+- **BREAKING (behaviour): `AssetStates` rejects a repeated `ExchangeAsset` when deserialising**
+  (`rustrade`). It previously kept the last pair silently. Its wire format is unchanged: the
+  hand-written serde impls are replaced by `collection::pair_seq`.
+
+- **BREAKING: test fixtures are no longer public API** (`rustrade-instrument`, `rustrade`,
+  `rustrade-data`). `rustrade_instrument::test_utils` is now behind a new off-by-default
+  `test-utils` feature; a crate whose tests use its fixtures enables it under
+  `[dev-dependencies]`. `rustrade::test_utils` is compiled only for that crate's own tests, and
+  `rustrade_data::test_utils` is removed, since nothing called its one function. The fixtures
+  hard-code names and assets and were never meant for use outside tests, yet as public items any
+  change to them was a breaking change.
+
+- **BREAKING: `PositionManager::positions` is an `FnvIndexMap`** (`rustrade`), like the other maps
+  in `EngineState`, instead of a SipHash-keyed `IndexMap`. Both keep insertion order, so iteration
+  is unchanged. Code that names the field's type, or builds a map to assign to it, uses
+  `rustrade_integration::collection::FnvIndexMap`.
+
+- **BREAKING: `IndexedInstruments::find_instrument_index` reports a missing instrument as
+  `IndexError::InstrumentIndex`** (`rustrade-instrument`). It returned `IndexError::AssetIndex`,
+  with a message that said "Asset" and listed the assets, which the lookup never searches. Code
+  that matched `IndexError::AssetIndex` from this method matches `IndexError::InstrumentIndex`
+  instead. The message now names the exchange and instrument sought, and lists the instruments by
+  exchange and internal name.
 
 - **REST clients negotiate and transparently decode gzip** (workspace `reqwest` dependency). The
   workspace now enables reqwest's `gzip` feature, so every `reqwest::Client` the crates build sends
