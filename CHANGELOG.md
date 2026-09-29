@@ -622,6 +622,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrap its failure in their own error type, so that redaction has a single definition and cannot
   drift between the two surfaces. The messages themselves are unchanged.
 
+- **IBKR orders and account reads fail fast across a TWS disconnect, and reject malformed order
+  frames** (`rustrade-execution`, feature `ibkr`; `ibapi` 4.1.0 → 4.2.0). While `ibapi`'s transport
+  is reconnecting, `open_order` and `cancel_order` are refused at once instead of being written to
+  the socket being replaced. A single order or cancel refused this way never reached TWS, so it is
+  reported as `OrderError::Connectivity`, which is transient, rather than as a venue rejection.
+  An `ibapi` `Shutdown` or `ConnectionFailed` error is non-transient; a send on a permanently
+  shut-down client is still refused with `ConnectionReset` and reads as transient. A placement
+  still waiting for its first status when the socket drops is no longer reported as rejected
+  either. TWS may already hold it, so it comes back open with its order id still tracked, as when
+  the status wait times out, and `fetch_open_orders` can resolve it. A bracket order whose
+  rollback cancels cannot be sent now names those order ids in its error and logs them; before,
+  the failed cancels were discarded. `fetch_open_orders` and `fetch_trades` now fail on an order frame
+  missing its action, or an order or execution frame missing a required part, where `ibapi` used
+  to hand back a default-built order that read as a buy; the account stream ends on such a frame.
+  Wire encoding of every order this crate builds is unchanged.
+
+- **BREAKING (behaviour): a failed IBKR bracket order returns legs of unknown fate as `Open`**
+  (`rustrade-execution`, feature `ibkr`). `IbkrClient::open_bracket_order` still cancels every
+  sent leg when placement fails. But a leg that reported no status, or was accepted and then its
+  rollback cancel could not be sent, may still be live or held at TWS. Such a leg now comes back `Open` with zero fill,
+  and its order id stays tracked so the account stream reports how it ends, as for a no-status
+  single order. The other legs, including any IB rejected, come back `Inactive` with the error,
+  as before. Previously all
+  three legs were always `Inactive` and untracked, so later events for a leg that was in fact live
+  were dropped. A failed bracket can therefore return a mix of `Open` and `Inactive` legs, and
+  `BracketOrderClient::open_bracket_order`'s rustdoc now states this exception to its
+  all-or-nothing contract.
+
 ### Removed
 
 - **BREAKING: `MassiveLive`, `ChannelType` and `massive::Market`** (`rustrade-data`, feature
