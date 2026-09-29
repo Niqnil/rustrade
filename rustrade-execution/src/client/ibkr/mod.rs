@@ -278,8 +278,8 @@ enum PlacementOutcome {
     /// Carries the filled quantity reported with the status.
     Accepted { filled: f64 },
     /// A terminal rejection: a `Cancelled`/`Inactive` `OrderStatus`, a genuine
-    /// non-informational TWS notice, or a transport error. Carries the
-    /// human-readable reason.
+    /// non-informational TWS notice, or an ibapi error other than transport
+    /// loss (see [`is_transport_loss`]). Carries the human-readable reason.
     Rejected(String),
     /// The order exists, but the placement subscription could not classify its
     /// state: either an informational notice (see
@@ -288,10 +288,44 @@ enum PlacementOutcome {
     /// the order is live/held and its authoritative status will arrive via the
     /// order-update/account stream. Carries the notice or status text.
     HeldPending(String),
-    /// The subscription ended — or [`PLACEMENT_STATUS_TIMEOUT`] elapsed —
-    /// without any terminal status or informational notice. The order may or
-    /// may not have been accepted; resolve via the order-update/account stream.
+    /// The subscription ended — or [`PLACEMENT_STATUS_TIMEOUT`] elapsed, or the
+    /// transport was lost — without any terminal status or informational
+    /// notice. The order may or may not have been accepted; resolve via the
+    /// order-update/account stream.
     NoStatus,
+}
+
+/// Whether `e` means the TWS transport was lost, as opposed to TWS or ibapi
+/// answering the request.
+///
+/// Since ibapi 4.2 the sync transport fails in-flight requests with one of these
+/// the moment the socket drops, and refuses new sends until the reconnect has
+/// completed. None of them says what TWS did with an order already written.
+fn is_transport_loss(e: &ibapi::Error) -> bool {
+    matches!(
+        e,
+        ibapi::Error::ConnectionReset
+            | ibapi::Error::ConnectionFailed
+            | ibapi::Error::Shutdown
+            | ibapi::Error::Io(_)
+    )
+}
+
+/// Classify the error from a send (`place_order` / `cancel_order`) that failed
+/// before TWS acknowledged anything, carrying `message` as the reason.
+///
+/// Transport loss is a transient [`OrderError::Connectivity`]: the request did
+/// not reach TWS and may be retried once the connection is back. Anything else
+/// is a refusal, [`ApiError::OrderRejected`].
+fn send_error<AssetKey, InstrumentKey>(
+    e: &ibapi::Error,
+    message: String,
+) -> OrderError<AssetKey, InstrumentKey> {
+    if is_transport_loss(e) {
+        OrderError::Connectivity(ConnectivityError::Socket(message))
+    } else {
+        OrderError::Rejected(ApiError::OrderRejected(message))
+    }
 }
 
 /// Drive an order-placement subscription to its initial [`PlacementOutcome`].
@@ -307,8 +341,9 @@ enum PlacementOutcome {
 /// informational order messages (e.g. code 399, order held until RTH) the same
 /// way, so treating every `Err` as a rejection would falsely reject orders that
 /// are actually live. We instead key off the notice code: known informational
-/// codes yield [`PlacementOutcome::HeldPending`]; all other notices and
-/// transport errors yield [`PlacementOutcome::Rejected`]. The `OrderStatus`
+/// codes yield [`PlacementOutcome::HeldPending`]; transport loss yields
+/// [`PlacementOutcome::NoStatus`], because the order may already be live; all
+/// other notices and errors yield [`PlacementOutcome::Rejected`]. The `OrderStatus`
 /// event — when one is delivered before the closing notice — remains
 /// authoritative.
 ///
@@ -332,7 +367,15 @@ where
             Err(ibapi::Error::Notice(n)) if INFORMATIONAL_ORDER_CODES.contains(&n.code) => {
                 return PlacementOutcome::HeldPending(format!("[{}] {}", n.code, n.message));
             }
-            // Genuine notice (e.g. 201 reject) or transport error.
+            // The socket dropped before TWS reported a status. ibapi 4.2 fails
+            // in-flight requests at the drop rather than after the reconnect, so
+            // this can arrive after TWS received the order: its fate is unknown,
+            // not rejected.
+            Err(e) if is_transport_loss(&e) => {
+                warn!(error = %e, "transport lost while awaiting order placement; status unknown");
+                return PlacementOutcome::NoStatus;
+            }
+            // Genuine notice (e.g. 201 reject) or another ibapi error.
             Err(e) => return PlacementOutcome::Rejected(e.to_string()),
         };
 
@@ -799,19 +842,44 @@ impl IbkrClient {
         // Place all three orders in spawn_blocking
         let client = self.client.clone();
         let result = tokio::task::spawn_blocking(move || {
+            // Roll back legs already sent, returning a suffix for the error
+            // message that names every cancel that could not be sent. A refused
+            // cancel must not vanish: ibapi refuses sends while the transport is
+            // down, and the leg it names may then be live at TWS.
+            let rollback = |ids: &[i32]| -> String {
+                let failed: Vec<String> = ids
+                    .iter()
+                    .filter_map(|&id| {
+                        let e = client.cancel_order(id, "").err()?;
+                        error!(order_id = id, error = %e, "bracket rollback cancel failed; leg may be live");
+                        Some(format!("{id} ({e})"))
+                    })
+                    .collect();
+                if failed.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; rollback cancel failed for order ids {}, which may be live",
+                        failed.join(", ")
+                    )
+                }
+            };
+
             // Place parent (transmit=false, held until SL is sent)
             let parent_sub = match client.place_order(parent_ib_id, &contract, &ib_orders[0]) {
                 Ok(s) => s,
-                Err(e) => return Err(format!("parent order failed: {e}")),
+                Err(e) => return Err(send_error(&e, format!("parent order failed: {e}"))),
             };
 
             // Place take-profit (transmit=false)
             let tp_sub = match client.place_order(tp_ib_id, &contract, &ib_orders[1]) {
                 Ok(s) => s,
                 Err(e) => {
-                    // Cancel parent before returning
-                    let _ = client.cancel_order(parent_ib_id, "");
-                    return Err(format!("take_profit order failed: {e}"));
+                    let rollback = rollback(&[parent_ib_id]);
+                    return Err(send_error(
+                        &e,
+                        format!("take_profit order failed: {e}{rollback}"),
+                    ));
                 }
             };
 
@@ -819,10 +887,8 @@ impl IbkrClient {
             let sl_sub = match client.place_order(sl_ib_id, &contract, &ib_orders[2]) {
                 Ok(s) => s,
                 Err(e) => {
-                    // Cancel parent and TP before returning
-                    let _ = client.cancel_order(parent_ib_id, "");
-                    let _ = client.cancel_order(tp_ib_id, "");
-                    return Err(format!("stop_loss order failed: {e}"));
+                    let rollback = rollback(&[parent_ib_id, tp_ib_id]);
+                    return Err(send_error(&e, format!("stop_loss order failed: {e}{rollback}")));
                 }
             };
 
@@ -860,12 +926,10 @@ impl IbkrClient {
             match (parent_status, tp_status, sl_status) {
                 (Some(Ok(parent)), Some(Ok(tp)), Some(Ok(sl))) => Ok((parent, tp, sl)),
                 (parent, tp, sl) => {
-                    let _ = client.cancel_order(parent_ib_id, "");
-                    let _ = client.cancel_order(tp_ib_id, "");
-                    let _ = client.cancel_order(sl_ib_id, "");
-                    Err(format!(
-                        "bracket order rejected: parent={parent:?}, tp={tp:?}, sl={sl:?}"
-                    ))
+                    let rollback = rollback(&[parent_ib_id, tp_ib_id, sl_ib_id]);
+                    Err(OrderError::Rejected(ApiError::OrderRejected(format!(
+                        "bracket order rejected: parent={parent:?}, tp={tp:?}, sl={sl:?}{rollback}"
+                    ))))
                 }
             }
         })
@@ -940,16 +1004,13 @@ impl IbkrClient {
                     },
                 }
             }
-            Ok(Err(err_msg)) => {
+            Ok(Err(error)) => {
                 // Clean up order ID mappings
                 self.order_ids.remove_by_ib_id(parent_ib_id);
                 self.order_ids.remove_by_ib_id(tp_ib_id);
                 self.order_ids.remove_by_ib_id(sl_ib_id);
 
-                make_all_inactive_bracket(
-                    &request,
-                    OrderError::Rejected(ApiError::OrderRejected(err_msg)),
-                )
+                make_all_inactive_bracket(&request, error)
             }
             Err(join_err) => {
                 // Clean up order ID mappings
@@ -1464,9 +1525,7 @@ impl ExecutionClient for IbkrClient {
                 error!(order_id = ib_order_id, error = %e, "Failed to cancel order");
                 Some(OrderResponseCancel {
                     key,
-                    state: Err(crate::error::OrderError::Rejected(ApiError::OrderRejected(
-                        e.to_string(),
-                    ))),
+                    state: Err(send_error(&e, e.to_string())),
                 })
             }
             Err(e) => {
@@ -1590,7 +1649,7 @@ impl ExecutionClient for IbkrClient {
         let result = tokio::task::spawn_blocking(move || {
             let sub = match client.place_order(ib_order_id, &contract, &ib_order) {
                 Ok(s) => s,
-                Err(e) => return Err(e.to_string()),
+                Err(e) => return Err(send_error(&e, e.to_string())),
             };
 
             match await_order_placement(sub.timeout_iter_data(PLACEMENT_STATUS_TIMEOUT)) {
@@ -1601,7 +1660,9 @@ impl ExecutionClient for IbkrClient {
                 // Cancelled/Inactive/unexpected status or a genuine notice/error.
                 // Don't remove the mapping here — the outer match centralizes all
                 // error-path removals.
-                PlacementOutcome::Rejected(reason) => Err(reason),
+                PlacementOutcome::Rejected(reason) => {
+                    Err(OrderError::Rejected(ApiError::OrderRejected(reason)))
+                }
                 // Held until RTH (informational notice): the order is live; its
                 // authoritative status arrives via account_stream. Surface as
                 // "no terminal status yet" (Open with zero fill), same as below.
@@ -1658,8 +1719,9 @@ impl ExecutionClient for IbkrClient {
                     )),
                 })
             }
-            Ok(Err(status)) => {
-                // Cleanup order_ids for rejection (place_order error or Cancelled/Inactive)
+            Ok(Err(error)) => {
+                // Cleanup order_ids: the order was never sent (place_order error)
+                // or TWS rejected it (Cancelled/Inactive or a genuine notice).
                 self.order_ids.remove_by_ib_id(ib_order_id);
                 Some(Order {
                     key,
@@ -1668,9 +1730,7 @@ impl ExecutionClient for IbkrClient {
                     quantity: req_quantity,
                     kind,
                     time_in_force: tif,
-                    state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
-                        status,
-                    ))),
+                    state: OrderState::inactive(error),
                 })
             }
             Err(e) => {
@@ -2282,6 +2342,63 @@ mod order_status_tests {
             await_order_placement(events),
             PlacementOutcome::NoStatus
         ));
+    }
+
+    /// ibapi 4.2 fails an in-flight placement with a transport error the moment
+    /// the socket drops. TWS may already hold the order, so it must stay
+    /// trackable (`NoStatus` keeps the order-id mapping), not read as rejected.
+    #[test]
+    fn transport_loss_while_awaiting_placement_is_no_status() {
+        for e in [
+            ibapi::Error::ConnectionReset,
+            ibapi::Error::ConnectionFailed,
+            ibapi::Error::Shutdown,
+            ibapi::Error::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        ] {
+            let label = e.to_string();
+            assert!(
+                matches!(
+                    await_order_placement(vec![Err(e)]),
+                    PlacementOutcome::NoStatus
+                ),
+                "{label} must leave the placement unresolved, not rejected"
+            );
+        }
+
+        // A status that arrived before the drop still decides.
+        let events = vec![
+            status(OrderStatusKind::Submitted, 0.0),
+            Err(ibapi::Error::ConnectionReset),
+        ];
+        assert!(matches!(
+            await_order_placement(events),
+            PlacementOutcome::Accepted { .. }
+        ));
+    }
+
+    #[test]
+    fn non_transport_error_while_awaiting_placement_is_rejected() {
+        let events = vec![Err(ibapi::Error::Simple("boom".into()))];
+        assert!(matches!(
+            await_order_placement(events),
+            PlacementOutcome::Rejected(reason) if reason.contains("boom")
+        ));
+    }
+
+    /// A send refused because the transport is down never reached TWS: it is a
+    /// transient connectivity error, not a venue rejection.
+    #[test]
+    fn send_error_separates_transport_loss_from_refusal() {
+        let refused: OrderError<AssetNameExchange, InstrumentNameExchange> =
+            send_error(&ibapi::Error::ConnectionReset, "down".into());
+        assert!(
+            matches!(&refused, OrderError::Connectivity(ConnectivityError::Socket(m)) if m == "down")
+        );
+        assert!(refused.is_transient());
+
+        let rejected: OrderError<AssetNameExchange, InstrumentNameExchange> =
+            send_error(&ibapi::Error::Simple("no".into()), "no".into());
+        assert!(matches!(&rejected, OrderError::Rejected(ApiError::OrderRejected(m)) if m == "no"));
     }
 
     /// Regression anchors: the statuses that were already decisive must keep

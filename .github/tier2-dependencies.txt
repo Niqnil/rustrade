@@ -239,7 +239,7 @@ ibapi=4.2.0  # 2026-09-14 | Financial protocol, community-maintained, no officia
 # UPSTREAM BREAKING IN A MINOR RELEASE, the second time for this crate: `TimeInForce::GoodTilCanceled`
 # / `GoodTilDate` / `DayTilCanceled` renamed to `GoodTill*`, plus new `GoodTillCrossing` and
 # `Unknown(String)` variants. This is the only forced change: 2 library sites and 7 test sites in
-# rustrade-execution/src/client/ibkr/order.rs. Our match at order.rs:362 is on rustrade's own
+# rustrade-execution/src/client/ibkr/order.rs. Our match at order.rs:364 is on rustrade's own
 # TimeInForce, and we never read a decoded `tif`, so the new variants are not swallowed anywhere.
 #
 # BEHAVIOUR CHANGES ON PATHS WE COMPILE (sync transport, #816):
@@ -251,6 +251,14 @@ ibapi=4.2.0  # 2026-09-14 | Financial protocol, community-maintained, no officia
 #   - Strict decode: an order frame with a missing/empty `action`, or an absent contract / order /
 #     order_state / execution submessage, is Error::Parse instead of a default-constructed phantom
 #     (`action == Buy`). Our open_orders / executions propagate it via `?`; our account stream ends on it.
+#   - HOW THE WRAPPER NOW READS THIS (changed in the same PR): a transport error (ConnectionReset,
+#     ConnectionFailed, Shutdown, Io) while awaiting a placement's first status is `NoStatus` --
+#     the order may be live, so it is reported open and its id mapping kept -- not a rejection; a
+#     send refused before anything was written is OrderError::Connectivity; and bracket rollback
+#     cancels that cannot be sent are logged and named in the error instead of discarded.
+#   - UPSTREAM-DOCUMENTED CAVEAT that reaches us: `reset()` notifies but does not drain the shared
+#     channels, and `all_open_orders` is not one-shot, so our fetch_open_orders issued right after a
+#     reconnect can read the stale ConnectionReset first and fail once.
 #   - PRE-EXISTING WRAPPER GAP this bump makes easier to see, NOT a regression: `reset()` does not touch
 #     `order_update_stream`, so across ibapi's internal reconnect our account_stream stays open and
 #     silently misses the lifecycle events of the outage -- contrary to the ibkr module docs, which say
