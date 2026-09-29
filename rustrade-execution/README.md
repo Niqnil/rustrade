@@ -15,8 +15,9 @@ Execution client library for streaming private account data and executing orders
 
 **Positions** means `account_snapshot` reports each open position in
 `InstrumentAccountSnapshot::position`: signed quantity, entry price, unrealised PnL, margin,
-liquidation price and leverage. Only Hyperliquid perpetuals do. On a spot or margin venue a
-holding is an asset balance instead. Two clients report less than the account holds:
+liquidation price and leverage. Only Hyperliquid perpetuals do. On Binance (Spot and Margin) and
+Hyperliquid Spot a holding is an asset balance instead. Two clients report less than the account
+holds:
 
 - **Alpaca** reports crypto holdings as balances, and a USD balance whose total is account equity
   and whose free amount is buying power. Equity and option positions are counted in that total but

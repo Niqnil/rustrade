@@ -1513,7 +1513,7 @@ impl ExecutionClient for IbkrClient {
         Self::connect_sync(config).expect("failed to connect to IB")
     }
 
-    /// Fetch account snapshot (balances and positions).
+    /// Fetch account snapshot (balances, and which instruments hold a position).
     ///
     /// # Limitations
     ///
