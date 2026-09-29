@@ -497,7 +497,8 @@ databento  # 2026-09-13 | Direct dep (historical + live market data). Meets the 
 #   `process_batch()`, which indexes offsets recorded only for records that passed the header length checks,
 #   and drops the batch before every buffer-mutating call (space/write_all/reset/reset_for_seek), so no
 #   offset outlives the bytes it points at. WE REACH THAT PATH: our `decode_record::<T>()` calls (historical.rs)
-#   go decode() -> decode_ref() -> process_batch(), in both the sync and async decoders.
+#   go decode() -> decode_ref() -> process_batch(), in both the sync and async decoders. The live client does
+#   NOT: databento's live/client.rs:447 still drives `fsm.process()`, one record at a time.
 #   API break, not a format change: `Record::header()` is replaced by per-field methods, and
 #   `RType::try_into_schema` takes `u16` (it `u8::try_from`s internally, so a value above 255 is `None`, not
 #   wrapped). record.rs is BYTE-IDENTICAL, so `RecordHeader` -- and `hd.rtype: u8` -- is unchanged, and
