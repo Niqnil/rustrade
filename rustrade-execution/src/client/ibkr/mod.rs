@@ -1513,7 +1513,7 @@ impl ExecutionClient for IbkrClient {
         Self::connect_sync(config).expect("failed to connect to IB")
     }
 
-    /// Fetch account snapshot (balances and positions).
+    /// Fetch account snapshot (balances, and which instruments hold a position).
     ///
     /// # Limitations
     ///
@@ -1522,9 +1522,10 @@ impl ExecutionClient for IbkrClient {
     ///   Use `fetch_open_orders()` or `account_stream()` for order state.
     ///
     /// - Position quantity and average cost from IB are not carried in the
-    ///   returned `InstrumentAccountSnapshot`. The struct only indicates which
-    ///   instruments have positions, not the position sizes. This is a
-    ///   limitation of the `InstrumentAccountSnapshot` type, not the IB API.
+    ///   returned `InstrumentAccountSnapshot`: its `position` is always `None`,
+    ///   so the snapshot only indicates which instruments have positions, not
+    ///   their sizes. IB reports both, and `position` could carry them; this
+    ///   client does not fill it yet (#417).
     ///
     /// # Known Issue: ibapi Decode Errors
     ///

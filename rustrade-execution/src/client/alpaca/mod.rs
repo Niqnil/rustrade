@@ -1168,6 +1168,13 @@ impl ExecutionClient for AlpacaClient {
         }
     }
 
+    /// # Limitations
+    ///
+    /// No position is reported per instrument: every `InstrumentAccountSnapshot::position` is
+    /// `None`. Crypto holdings from `/v2/positions` become asset balances. Equity and option
+    /// positions are left out (#418); they count only toward the USD balance, whose `total` is
+    /// account equity and whose `free` is buying power.
+    ///
     /// # Rate limit note
     ///
     /// When both USD and non-USD assets are requested (the common startup case), this
