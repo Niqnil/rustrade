@@ -6,6 +6,11 @@ on:
     branches:
       - develop
 
+# A later event on the same PR replaces this run, including its wait for the merge below.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   auto-merge:
     name: Auto-merge patch updates
@@ -13,8 +18,10 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      actions: write # dispatch ci.yml after the merge
     if: github.actor == 'dependabot[bot]'
-    timeout-minutes: 5
+    # Most of this is the wait for the merge, bounded at 60 minutes in its own step.
+    timeout-minutes: 70
     steps:
       - name: Checkout for tier-2 config
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -44,7 +51,7 @@ jobs:
               | sed 's/|$//')
             # Word-boundary matching: DEP_NAMES is comma-separated from fetch-metadata
             if [ -n "$TIER2_DEPS" ] && echo "$DEP_NAMES" | grep -qE "(^|, )($TIER2_DEPS)(,|$)"; then
-              echo "match=true" >> $GITHUB_OUTPUT
+              echo "match=true" >> "$GITHUB_OUTPUT"
               echo "::notice::Tier-2 dependency detected: requires manual review"
             fi
           fi
@@ -66,6 +73,7 @@ jobs:
         run: gh pr merge --disable-auto "$PR_URL" || true
 
       - name: Auto-merge patch updates
+        id: auto-merge
         if: |
           steps.metadata.outputs.update-type == 'version-update:semver-patch' &&
           !contains(github.event.pull_request.labels.*.name, 'tier-2') &&
@@ -76,3 +84,34 @@ jobs:
         run: |
           gh pr review --approve "$PR_URL"
           gh pr merge --auto --squash "$PR_URL"
+
+      # The merge above is made with GITHUB_TOKEN, and events GITHUB_TOKEN causes trigger no
+      # workflows, so ci.yml's `push` run never happens for the squash commit on develop. The PR's
+      # own run tested its head against an older develop, not the merge result. Wait for the merge,
+      # then dispatch ci.yml on develop, which GITHUB_TOKEN is allowed to do.
+      - name: Run CI on develop after the merge
+        if: steps.auto-merge.outcome == 'success'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          deadline=$(( $(date +%s) + 60 * 60 ))
+          while :; do
+            state=$(gh pr view "$PR_URL" --json state --jq .state)
+            case "$state" in
+              MERGED)
+                gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref develop
+                echo "::notice::Merged; dispatched CI on develop"
+                exit 0
+                ;;
+              CLOSED)
+                echo "::notice::Closed without merging; no CI to dispatch"
+                exit 0
+                ;;
+            esac
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::Not merged within 60 minutes, so CI was not dispatched on develop. If it merges later, run ci.yml on develop by hand."
+              exit 1
+            fi
+            sleep 30
+          done
