@@ -365,13 +365,13 @@ pub fn time_in_force_to_ib(tif: &TimeInForce) -> Result<IbTimeInForce, OrderMapp
             if *post_only {
                 Err(OrderMappingError::PostOnlyNotSupported)
             } else {
-                Ok(IbTimeInForce::GoodTilCanceled)
+                Ok(IbTimeInForce::GoodTillCanceled)
             }
         }
         TimeInForce::GoodUntilEndOfDay => Ok(IbTimeInForce::Day),
         TimeInForce::FillOrKill => Ok(IbTimeInForce::FillOrKill),
         TimeInForce::ImmediateOrCancel => Ok(IbTimeInForce::ImmediateOrCancel),
-        TimeInForce::GoodTillDate { .. } => Ok(IbTimeInForce::GoodTilDate),
+        TimeInForce::GoodTillDate { .. } => Ok(IbTimeInForce::GoodTillDate),
         TimeInForce::AtOpen => Ok(IbTimeInForce::OnOpen),
         // AtClose changes the order TYPE to MOC/LOC, not just the TIF.
         // `build_ib_order` intercepts AtClose; surfacing Err here lets other
@@ -723,7 +723,7 @@ mod tests {
     fn test_time_in_force_conversion() {
         assert_eq!(
             time_in_force_to_ib(&TimeInForce::GoodUntilCancelled { post_only: false }),
-            Ok(IbTimeInForce::GoodTilCanceled)
+            Ok(IbTimeInForce::GoodTillCanceled)
         );
 
         assert!(matches!(
@@ -752,7 +752,7 @@ mod tests {
         let expiry = Utc.with_ymd_and_hms(2025, 6, 30, 23, 59, 59).unwrap();
         assert_eq!(
             time_in_force_to_ib(&TimeInForce::GoodTillDate { expiry }),
-            Ok(IbTimeInForce::GoodTilDate)
+            Ok(IbTimeInForce::GoodTillDate)
         );
     }
 
@@ -1336,7 +1336,7 @@ mod tests {
         assert_eq!(order.action, Action::Buy);
         assert_eq!(order.total_quantity, 100.0);
         assert_eq!(order.order_type, "LMT");
-        assert_eq!(order.tif, IbTimeInForce::GoodTilDate);
+        assert_eq!(order.tif, IbTimeInForce::GoodTillDate);
         assert_eq!(order.good_till_date, "20250630-23:59:59");
     }
 
@@ -1504,11 +1504,11 @@ mod tests {
             150.0,
             160.0,
             140.0,
-            IbTimeInForce::GoodTilCanceled,
+            IbTimeInForce::GoodTillCanceled,
         );
 
-        assert_eq!(orders[0].tif, IbTimeInForce::GoodTilCanceled);
-        assert_eq!(orders[1].tif, IbTimeInForce::GoodTilCanceled);
-        assert_eq!(orders[2].tif, IbTimeInForce::GoodTilCanceled);
+        assert_eq!(orders[0].tif, IbTimeInForce::GoodTillCanceled);
+        assert_eq!(orders[1].tif, IbTimeInForce::GoodTillCanceled);
+        assert_eq!(orders[2].tif, IbTimeInForce::GoodTillCanceled);
     }
 }

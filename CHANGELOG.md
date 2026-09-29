@@ -622,6 +622,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrap its failure in their own error type, so that redaction has a single definition and cannot
   drift between the two surfaces. The messages themselves are unchanged.
 
+- **IBKR orders and account reads fail fast across a TWS disconnect, and reject malformed order
+  frames** (`rustrade-execution`, feature `ibkr`; `ibapi` 4.1.0 → 4.2.0). While `ibapi`'s transport
+  is reconnecting, `open_order` and `cancel_order` now return an error at once instead of writing to
+  the socket being replaced, and a placement or read in flight when the socket drops fails at the
+  drop rather than after the reconnect backoff, which could run for minutes. `fetch_open_orders` and
+  `fetch_trades` now fail on an order or execution frame that is missing its action or a required
+  part, where `ibapi` used to hand back a default-built order that read as a buy; the account stream
+  ends on such a frame. Wire encoding of every order this crate builds is unchanged.
+
 ### Removed
 
 - **BREAKING: `MassiveLive`, `ChannelType` and `massive::Market`** (`rustrade-data`, feature
