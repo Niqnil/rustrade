@@ -58,12 +58,15 @@
 //! 2. **Permanent disconnect**: when `ibapi` gives up reconnecting, or fill recovery
 //!    fails repeatedly, `account_stream` ends with `StreamTerminated` within about a
 //!    second. Its reader thread then stays blocked until TWS sends another event, and
-//!    another `account_stream` call on the client fails until it exits. After recovery
-//!    fails, the client is still connected, so that is the next event. After a
-//!    shutdown, no event follows, so replace the client. Recovering from
-//!    that, by reconnecting with [`IbkrClient::connect_sync`] and choosing the client
-//!    ID, is the caller's decision. A new `IbkrClient` does not know the orders the old
-//!    one placed, so their later events are dropped.
+//!    another `account_stream` call on the client fails until the thread exits. After
+//!    recovery fails, the client is still connected, so the reader exits on the next
+//!    TWS event and `account_stream` works again. After a shutdown, no event follows,
+//!    so replace the client. Shutdown is detected only while a stream is open, so
+//!    `account_stream` on a client that has already shut down returns a stream that
+//!    never ends; see [`ExecutionClient::account_stream`]. Replacing the client, by
+//!    reconnecting with [`IbkrClient::connect_sync`] and choosing the client ID, is the
+//!    caller's decision. A new `IbkrClient` does not know the orders the old one
+//!    placed, so their later events are dropped.
 //! 3. **Stale state cleanup**: Periodically call [`IbkrClient::clear_stale_executions`],
 //!    [`IbkrClient::clear_stale_order_ids`], and [`IbkrClient::clear_stale_pending_cancels`]
 //!
