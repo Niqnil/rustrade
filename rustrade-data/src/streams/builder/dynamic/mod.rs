@@ -1174,6 +1174,11 @@ mod tests {
         let groups = route(
             vec![vec![
                 subscription(
+                    ExchangeId::MassiveStocks,
+                    MarketDataInstrumentKind::Spot,
+                    SubKind::PublicTrades,
+                ),
+                subscription(
                     ExchangeId::MassiveCrypto,
                     MarketDataInstrumentKind::Spot,
                     SubKind::PublicTrades,
@@ -1204,7 +1209,7 @@ mod tests {
         // One group per (cluster, kind), each holding a clone of the one subscriber: a group given
         // a subscriber of its own would open a second socket to its cluster, and Massive would close
         // the older one.
-        assert_eq!(groups.len(), 5);
+        assert_eq!(groups.len(), 6);
         assert_eq!(subscriber.connection_handles(), before + groups.len());
 
         drop(groups);
@@ -1265,24 +1270,32 @@ mod tests {
 
     #[test]
     fn massive_pairs_outside_the_support_matrix_are_refused_before_routing() {
-        for sub_kind in [
-            SubKind::Candles {
-                interval: CandleInterval::Min5,
-            },
-            // Forex publishes no trades, and the engine's market data carries no quote.
-            SubKind::PublicTrades,
-            SubKind::Quotes,
-        ] {
-            let error = validate_batches([[subscription(
+        let spot = MarketDataInstrumentKind::Spot;
+        for (exchange, kind, sub_kind) in [
+            (
                 ExchangeId::MassiveForex,
-                MarketDataInstrumentKind::Spot,
-                sub_kind,
-            )]])
-            .unwrap_err();
+                spot.clone(),
+                SubKind::Candles {
+                    interval: CandleInterval::Min5,
+                },
+            ),
+            // Forex publishes no trades, and the engine's market data carries no quote.
+            (
+                ExchangeId::MassiveForex,
+                spot.clone(),
+                SubKind::PublicTrades,
+            ),
+            (ExchangeId::MassiveForex, spot.clone(), SubKind::Quotes),
+            // Each cluster streams its own instrument kind only.
+            (ExchangeId::MassiveOptions, spot, SubKind::PublicTrades),
+            (ExchangeId::MassiveStocks, option(), SubKind::PublicTrades),
+        ] {
+            let error =
+                validate_batches([[subscription(exchange, kind.clone(), sub_kind)]]).unwrap_err();
 
             assert!(
-                matches!(&error, DataError::Socket(message) if message.contains("massive_forex")),
-                "{sub_kind}: {error:?}"
+                matches!(&error, DataError::Socket(message) if message.contains(exchange.as_str())),
+                "{exchange} ({kind}, {sub_kind}): {error:?}"
             );
         }
     }
