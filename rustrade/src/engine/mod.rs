@@ -32,7 +32,6 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use derive_more::Constructor;
-use indexmap::IndexMap;
 use rust_decimal::Decimal;
 use rustrade_data::{event::MarketEvent, streams::consumer::MarketStreamEvent};
 use rustrade_execution::{
@@ -51,6 +50,7 @@ use rustrade_instrument::{
     },
 };
 use rustrade_integration::channel::Tx;
+use rustrade_integration::collection::FnvIndexMap;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use std::fmt::Debug;
@@ -385,11 +385,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 // An untracked exchange skips `on_disconnect` as well as the state update: the
                 // strategy has no link to that venue to react to, and the engine's own health is
                 // unaffected by one it never tracked.
-                match self
-                    .state
-                    .connectivity
-                    .update_from_account_reconnecting(exchange)
-                {
+                match self.state.update_from_account_reconnecting(exchange) {
                     Ok(()) => UpdateFromAccountOutput::OnDisconnect(Strategy::on_disconnect(
                         self, *exchange,
                     )),
@@ -1422,7 +1418,7 @@ pub(crate) struct SplitCommitContext<'a, InstrumentKey> {
 /// normalized message template.
 #[track_caller]
 pub(crate) fn split_plan_position_mut<'m, AssetKey, InstrumentKey>(
-    positions: &'m mut IndexMap<PositionId, Position<AssetKey, InstrumentKey>>,
+    positions: &'m mut FnvIndexMap<PositionId, Position<AssetKey, InstrumentKey>>,
     pos_id: &PositionId,
     context: SplitCommitContext<'_, InstrumentKey>,
 ) -> &'m mut Position<AssetKey, InstrumentKey>
@@ -1731,7 +1727,7 @@ pub enum EngineOutput<
     /// see [`UntrackedExchange`] for the full rationale and for exactly what was left untouched.
     ///
     /// **No state was mutated**, including
-    /// [`ConnectivityStates::global`](crate::engine::state::connectivity::ConnectivityStates::global).
+    /// [`ConnectivityStates::global()`](crate::engine::state::connectivity::ConnectivityStates::global()).
     /// A consumer folding
     /// observables into a mutation tally must not count this variant — the same treatment as
     /// [`CorporateActionAlreadyProcessed`](Self::CorporateActionAlreadyProcessed).

@@ -226,7 +226,9 @@ pub fn exchange_supports_instrument_kind(
             Spot,
         ) => false,
         (LseFx | LseCrypto | LseEquities, Spot) => true,
-        (LseCfd | LseFutures, Spot) => false,
+        (LseCfd | LseFutures | LseOptions, Spot) => false,
+        (MassiveStocks | MassiveCrypto | MassiveForex, Spot) => true,
+        (MassiveOptions, Spot) => false,
         // NOTE: this default is OPEN -- an exchange that serves no spot market claims spot support
         // unless it is denied above, with no compile error to prompt the edit. It is left open
         // deliberately: closing it means writing an explicit arm for every existing variant and
@@ -247,7 +249,7 @@ pub fn exchange_supports_instrument_kind(
         (_, Perpetual) => false,
 
         // Option
-        (GateioOptions | Okx, Option { .. }) => true,
+        (GateioOptions | Okx | LseOptions | MassiveOptions, Option { .. }) => true,
         (_, Option { .. }) => false,
 
         // Cfd
@@ -325,6 +327,16 @@ pub fn exchange_supports_instrument_kind_sub_kind(
         (Okx, Spot | Future { .. } | Perpetual | Option { .. }, PublicTrades) => true,
         (HyperliquidPerp, Perpetual, PublicTrades | OrderBooksL2) => true,
 
+        // Alpaca's top of book is its quote: `OrderBooksL1` reads the `quotes` channel, which the
+        // typed `Quotes` kind also serves. `Quotes` itself has no arm because `DynamicStreams`, the
+        // one caller of this matrix, carries no quote channel, and the engine's market data no quote
+        // event. IEX quotes are IEX's own top of book rather than the NBBO; SIP quotes are the NBBO.
+        //
+        // ⚠️ `AlpacaSip` is declared on the strength of the code path, which it shares with IEX, and
+        // has never been run against the real feed: it needs a paid subscription. See
+        // `exchange::alpaca`.
+        (AlpacaCrypto | AlpacaIex | AlpacaSip, Spot, PublicTrades | OrderBooksL1) => true,
+
         // London Strategic Edge serves both kinds from ONE frame: its WebSocket publishes a single
         // tick carrying `price`, `bid`, `ask` and `volume` together, so a dataset that serves one
         // of these kinds necessarily serves the other. The two arms differ only in instrument kind,
@@ -348,10 +360,42 @@ pub fn exchange_supports_instrument_kind_sub_kind(
         // answer. The full reasoning lives on the trade decoder in the `lse` module.
         (LseFx | LseCrypto | LseEquities, Spot, PublicTrades | OrderBooksL1) => true,
         (LseCfd | LseFutures, Cfd, PublicTrades | OrderBooksL1) => true,
+        // Option contracts tick on the same frame, subscribed per underlying, but with `bid` and
+        // `ask` null on every one -- there is no quote to serve, so `PublicTrades` is the only
+        // kind. Unlike the venues above, these trades ARE prints: they reconcile one-for-one
+        // against the provider's REST option-print tape.
+        (LseOptions, Option { .. }, PublicTrades) => true,
         // No `Candles` arm exists for any London Strategic Edge venue, deliberately: the provider's
         // WebSocket carries no candle channel at all -- the tick above is its only data frame, so
         // there is nothing to subscribe to. Its candles are served exclusively over the REST vault,
         // by a path that never reaches this matrix. The absence is a decision, not an omission.
+
+        // Massive: a cluster per `ExchangeId`. The top of book is the cluster's quote channel, read
+        // as `OrderBooksL1`; `Quotes` itself has no arm, for the reason given for Alpaca above.
+        // Forex publishes no trades. Candles are Massive's per-second and per-minute aggregates,
+        // the only intervals it aggregates at; the connectors refuse any other, and this matrix
+        // refuses it first. `Massive` alone is the REST client's id and streams nothing.
+        //
+        // ⚠️ `MassiveOptions` is declared on the strength of the code path, which it shares with
+        // stocks, and has never been run against the real feed: it needs an options subscription.
+        (MassiveStocks | MassiveCrypto, Spot, PublicTrades | OrderBooksL1) => true,
+        (MassiveForex, Spot, OrderBooksL1) => true,
+        (MassiveOptions, Option { .. }, PublicTrades | OrderBooksL1) => true,
+        (
+            MassiveStocks | MassiveCrypto | MassiveForex,
+            Spot,
+            Candles {
+                interval: CandleInterval::Sec1 | CandleInterval::Min1,
+            },
+        ) => true,
+        (
+            MassiveOptions,
+            Option { .. },
+            Candles {
+                interval: CandleInterval::Sec1 | CandleInterval::Min1,
+            },
+        ) => true,
+
         (_, _, _) => false,
     }
 }
@@ -414,7 +458,15 @@ mod tests {
 
     mod supports {
         use super::*;
-        use rustrade_instrument::exchange::ExchangeId;
+        use chrono::{DateTime, Utc};
+        use rust_decimal::Decimal;
+        use rustrade_instrument::{
+            exchange::ExchangeId,
+            instrument::{
+                kind::option::{OptionExercise, OptionKind},
+                market_data::kind::MarketDataOptionContract,
+            },
+        };
 
         /// The London Strategic Edge datasets, paired with the single
         /// [`MarketDataInstrumentKind`] each one serves.
@@ -451,6 +503,67 @@ mod tests {
                     );
                 }
             }
+        }
+
+        fn option_kind() -> MarketDataInstrumentKind {
+            MarketDataInstrumentKind::Option(MarketDataOptionContract {
+                kind: OptionKind::Call,
+                exercise: OptionExercise::American,
+                expiry: DateTime::<Utc>::MAX_UTC,
+                strike: Decimal::ONE,
+            })
+        }
+
+        #[test]
+        fn test_lse_options_supports_only_the_option_kind() {
+            assert!(exchange_supports_instrument_kind(
+                ExchangeId::LseOptions,
+                &option_kind()
+            ));
+            for denied in [
+                MarketDataInstrumentKind::Spot,
+                MarketDataInstrumentKind::Cfd,
+                MarketDataInstrumentKind::Perpetual,
+            ] {
+                assert!(
+                    !exchange_supports_instrument_kind(ExchangeId::LseOptions, &denied),
+                    "LseOptions should not support {denied:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn test_lse_options_serves_public_trades_only() {
+            assert!(exchange_supports_instrument_kind_sub_kind(
+                &ExchangeId::LseOptions,
+                &option_kind(),
+                SubKind::PublicTrades
+            ));
+
+            // Every option tick publishes `bid` and `ask` as null, so there is no quote to serve.
+            for sub_kind in [
+                SubKind::OrderBooksL1,
+                SubKind::OrderBooksL2,
+                SubKind::OrderBooksL3,
+            ] {
+                assert!(
+                    !exchange_supports_instrument_kind_sub_kind(
+                        &ExchangeId::LseOptions,
+                        &option_kind(),
+                        sub_kind
+                    ),
+                    "LseOptions should not serve {sub_kind}"
+                );
+            }
+
+            assert!(
+                !exchange_supports_instrument_kind_sub_kind(
+                    &ExchangeId::LseOptions,
+                    &MarketDataInstrumentKind::Spot,
+                    SubKind::PublicTrades
+                ),
+                "LseOptions serves option contracts only"
+            );
         }
 
         #[test]
@@ -535,6 +648,136 @@ mod tests {
                         !exchange_supports_instrument_kind_sub_kind(&exchange, &kind, sub_kind),
                         "{exchange:?} should not support ({kind:?}, {sub_kind})"
                     );
+                }
+            }
+        }
+    }
+
+    mod supports_massive {
+        use super::*;
+        use rustrade_instrument::instrument::{
+            kind::option::{OptionExercise, OptionKind},
+            market_data::kind::MarketDataOptionContract,
+        };
+
+        fn option_kind() -> MarketDataInstrumentKind {
+            MarketDataInstrumentKind::Option(MarketDataOptionContract {
+                kind: OptionKind::Call,
+                exercise: OptionExercise::American,
+                expiry: chrono::DateTime::<chrono::Utc>::MAX_UTC,
+                strike: rust_decimal::Decimal::ONE,
+            })
+        }
+
+        /// Each cluster, paired with the one instrument kind it streams.
+        fn clusters() -> [(ExchangeId, MarketDataInstrumentKind); 4] {
+            [
+                (ExchangeId::MassiveStocks, MarketDataInstrumentKind::Spot),
+                (ExchangeId::MassiveCrypto, MarketDataInstrumentKind::Spot),
+                (ExchangeId::MassiveForex, MarketDataInstrumentKind::Spot),
+                (ExchangeId::MassiveOptions, option_kind()),
+            ]
+        }
+
+        fn other_kinds() -> [MarketDataInstrumentKind; 4] {
+            [
+                MarketDataInstrumentKind::Spot,
+                MarketDataInstrumentKind::Perpetual,
+                MarketDataInstrumentKind::Cfd,
+                option_kind(),
+            ]
+        }
+
+        #[test]
+        fn each_cluster_supports_exactly_its_own_instrument_kind() {
+            for (exchange, supported) in clusters() {
+                assert!(
+                    exchange_supports_instrument_kind(exchange, &supported),
+                    "{exchange:?} should support {supported:?}"
+                );
+                for denied in other_kinds().into_iter().filter(|kind| *kind != supported) {
+                    assert!(
+                        !exchange_supports_instrument_kind(exchange, &denied),
+                        "{exchange:?} should not support {denied:?}"
+                    );
+                    assert!(
+                        !exchange_supports_instrument_kind_sub_kind(
+                            &exchange,
+                            &denied,
+                            SubKind::OrderBooksL1
+                        ),
+                        "{exchange:?} should not serve {denied:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn every_cluster_but_forex_serves_trades_and_every_cluster_serves_top_of_book() {
+            for (exchange, kind) in clusters() {
+                assert_eq!(
+                    exchange_supports_instrument_kind_sub_kind(
+                        &exchange,
+                        &kind,
+                        SubKind::PublicTrades
+                    ),
+                    exchange != ExchangeId::MassiveForex,
+                    "{exchange:?} trades"
+                );
+                assert!(
+                    exchange_supports_instrument_kind_sub_kind(
+                        &exchange,
+                        &kind,
+                        SubKind::OrderBooksL1
+                    ),
+                    "{exchange:?} top of book"
+                );
+            }
+        }
+
+        #[test]
+        fn candles_are_served_at_one_second_and_one_minute_only() {
+            for (exchange, kind) in clusters() {
+                for interval in CandleInterval::ALL {
+                    assert_eq!(
+                        exchange_supports_instrument_kind_sub_kind(
+                            &exchange,
+                            &kind,
+                            SubKind::Candles { interval }
+                        ),
+                        matches!(interval, CandleInterval::Sec1 | CandleInterval::Min1),
+                        "{exchange:?} candles at {interval:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn quotes_depth_and_liquidations_are_refused() {
+            for (exchange, kind) in clusters() {
+                for sub_kind in [
+                    SubKind::Quotes,
+                    SubKind::OrderBooksL2,
+                    SubKind::OrderBooksL3,
+                    SubKind::Liquidations,
+                ] {
+                    assert!(
+                        !exchange_supports_instrument_kind_sub_kind(&exchange, &kind, sub_kind),
+                        "{exchange:?} should not serve {sub_kind}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn the_rest_client_id_streams_nothing() {
+            for kind in other_kinds() {
+                for sub_kind in [SubKind::PublicTrades, SubKind::OrderBooksL1] {
+                    assert!(!exchange_supports_instrument_kind_sub_kind(
+                        &ExchangeId::Massive,
+                        &kind,
+                        sub_kind
+                    ));
                 }
             }
         }

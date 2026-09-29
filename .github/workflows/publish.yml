@@ -28,6 +28,14 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # Fails in seconds on a tag that does not match every crate's version, before the tests run
+      # rather than after them. The publish step checks again, since it can be re-run on its own.
+      - name: Check the tag matches every crate version
+        run: ./.github/scripts/publish-crates.sh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          DRY_RUN: "1"
+
       - name: Run cargo fmt check
         run: cargo fmt --all -- --check
 
@@ -41,7 +49,9 @@ jobs:
     name: Publish crates
     needs: validate
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Comfortably above the expected total, even with every crate slow to reach the index, so the
+    # script's own timeout error fires before the job is killed
+    timeout-minutes: 45
     steps:
       - name: Checkout sources
         uses: actions/checkout@v7
@@ -54,71 +64,13 @@ jobs:
         env:
           CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
 
-      - name: Publish rustrade-macro
-        run: |
-          VERSION=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | select(.name=="rustrade-macro") | .version')
-          if cargo search rustrade-macro --limit 1 | grep -q "rustrade-macro = \"$VERSION\""; then
-            echo "rustrade-macro@$VERSION already published, skipping"
-          else
-            cargo publish -p rustrade-macro --no-verify
-          fi
-
-      - name: Wait for crates.io index
-        run: sleep 60
-
-      - name: Publish rustrade-instrument
-        run: |
-          VERSION=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | select(.name=="rustrade-instrument") | .version')
-          if cargo search rustrade-instrument --limit 1 | grep -q "rustrade-instrument = \"$VERSION\""; then
-            echo "rustrade-instrument@$VERSION already published, skipping"
-          else
-            cargo publish -p rustrade-instrument --no-verify
-          fi
-
-      - name: Wait for crates.io index
-        run: sleep 60
-
-      - name: Publish rustrade-integration
-        run: |
-          VERSION=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | select(.name=="rustrade-integration") | .version')
-          if cargo search rustrade-integration --limit 1 | grep -q "rustrade-integration = \"$VERSION\""; then
-            echo "rustrade-integration@$VERSION already published, skipping"
-          else
-            cargo publish -p rustrade-integration --no-verify
-          fi
-
-      - name: Wait for crates.io index
-        run: sleep 60
-
-      - name: Publish rustrade-execution
-        run: |
-          VERSION=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | select(.name=="rustrade-execution") | .version')
-          if cargo search rustrade-execution --limit 1 | grep -q "rustrade-execution = \"$VERSION\""; then
-            echo "rustrade-execution@$VERSION already published, skipping"
-          else
-            cargo publish -p rustrade-execution --no-verify
-          fi
-
-      - name: Publish rustrade-data
-        run: |
-          VERSION=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | select(.name=="rustrade-data") | .version')
-          if cargo search rustrade-data --limit 1 | grep -q "rustrade-data = \"$VERSION\""; then
-            echo "rustrade-data@$VERSION already published, skipping"
-          else
-            cargo publish -p rustrade-data --no-verify
-          fi
-
-      - name: Wait for crates.io index
-        run: sleep 60
-
-      - name: Publish rustrade
-        run: |
-          VERSION=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | select(.name=="rustrade") | .version')
-          if cargo search rustrade --limit 1 | grep -q "rustrade = \"$VERSION\""; then
-            echo "rustrade@$VERSION already published, skipping"
-          else
-            cargo publish -p rustrade --no-verify
-          fi
+      # Publishes in dependency order, waits for each crate to reach the index before the next, and
+      # skips any version already there, so a re-run resumes where a failed one stopped. The order,
+      # the index check and the barrier are explained at the top of the script.
+      - name: Publish crates
+        run: ./.github/scripts/publish-crates.sh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3

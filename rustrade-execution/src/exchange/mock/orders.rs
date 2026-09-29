@@ -363,7 +363,7 @@ mod tests {
     use super::*;
     use crate::order::{
         OrderKey, OrderKind, TimeInForce,
-        id::{OrderId, StrategyId},
+        id::{OrderId, StrategyId, VenueOrderId},
     };
     use rust_decimal_macros::dec;
 
@@ -397,7 +397,7 @@ mod tests {
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
             state: Open {
-                id: OrderId::new(cid),
+                id: VenueOrderId::Assigned(OrderId::new(cid)),
                 time_exchange: at(millis),
                 filled_quantity: Decimal::ZERO,
             },

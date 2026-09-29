@@ -320,6 +320,7 @@ impl Sequence {
 }
 
 /// Barter core test utilities.
+#[cfg(test)]
 #[allow(clippy::unwrap_used)] // Test utilities: callers provide valid inputs
 pub mod test_utils {
     use crate::{

@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics acceptable
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Days, TimeDelta, Utc};
 use fnv::FnvHashMap;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -40,7 +40,6 @@ use rustrade::{
         on_disconnect::OnDisconnectStrategy,
         on_trading_disabled::OnTradingDisabled,
     },
-    test_utils::time_plus_days,
 };
 use rustrade_data::{
     event::{DataKind, MarketEvent},
@@ -53,7 +52,7 @@ use rustrade_execution::{
     balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate},
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
-        id::{ClientOrderId, OrderId, PositionId, StrategyId},
+        id::{ClientOrderId, OrderId, PositionId, StrategyId, VenueOrderId},
         request::{OrderRequestCancel, OrderRequestOpen, OrderResponseCancel, RequestOpen},
         state::{ActiveOrderState, Cancelled, Filled, Open, OrderState},
     },
@@ -88,6 +87,10 @@ const STARTING_BALANCE_USDT: Balance = Balance::new(dec!(40_000.0), dec!(40_000.
 const STARTING_BALANCE_BTC: Balance = Balance::new(dec!(1.0), dec!(1.0));
 const STARTING_BALANCE_ETH: Balance = Balance::new(dec!(10.0), dec!(10.0));
 const QUOTE_FEES_PERCENT: f64 = 0.1; // 10%
+
+fn time_plus_days(base: DateTime<Utc>, plus: u64) -> DateTime<Utc> {
+    base.checked_add_days(Days::new(plus)).unwrap()
+}
 
 // Asset indices after alphabetical sorting: btc(0), eth(1), usdt(2)
 // For BTCUSDT (instrument 0): quote = usdt = AssetIndex(2)
@@ -133,21 +136,21 @@ fn test_engine_process_engine_event_with_audit() {
 
     let mut engine = build_engine(TradingState::Disabled, execution_tx);
     assert_eq!(engine.meta.sequence, Sequence(0));
-    assert_eq!(engine.state.connectivity.global, Health::Reconnecting);
+    assert_eq!(engine.state.connectivity.global(), Health::Reconnecting);
 
     // Simulate AccountSnapshot from ExecutionManager::init
     let event = account_event_snapshot(&engine.state.assets);
     let audit = process_with_audit(&mut engine, event.clone());
     assert_eq!(audit.context.sequence, Sequence(0));
     assert_eq!(audit.event, EngineAudit::process(event));
-    assert_eq!(engine.state.connectivity.global, Health::Reconnecting);
+    assert_eq!(engine.state.connectivity.global(), Health::Reconnecting);
 
     // Process 1st MarketEvent for btc_usdt
     let event = market_event_trade(1, 0, dec!(10_000));
     let audit = process_with_audit(&mut engine, event.clone());
     assert_eq!(audit.context.sequence, Sequence(1));
     assert_eq!(audit.event, EngineAudit::process(event));
-    assert_eq!(engine.state.connectivity.global, Health::Healthy);
+    assert_eq!(engine.state.connectivity.global(), Health::Healthy);
 
     // Process 1st MarketEvent for eth_btc
     let event = market_event_trade(1, 1, dec!(0.1));
@@ -426,7 +429,7 @@ fn test_engine_process_engine_event_with_audit() {
             kind: OrderKind::Market,
             time_in_force: TimeInForce::ImmediateOrCancel,
             state: OrderState::active(Open {
-                id: gen_order_id(0),
+                id: VenueOrderId::Assigned(gen_order_id(0)),
                 time_exchange: time_plus_days(STARTING_TIMESTAMP, 3),
                 filled_quantity: dec!(1),
             }),
@@ -513,13 +516,13 @@ fn test_engine_process_engine_event_with_audit() {
         audit.event,
         EngineAudit::process_with_output(event, EngineOutput::MarketDisconnect(OnDisconnectOutput))
     );
-    assert_eq!(engine.state.connectivity.global, Health::Reconnecting);
+    assert_eq!(engine.state.connectivity.global(), Health::Reconnecting);
     assert_eq!(
         engine
             .state
             .connectivity
             .connectivity(&ExchangeId::BinanceSpot)
-            .market_data,
+            .market_data(),
         Health::Reconnecting
     );
     assert_eq!(
@@ -527,7 +530,7 @@ fn test_engine_process_engine_event_with_audit() {
             .state
             .connectivity
             .connectivity(&ExchangeId::BinanceSpot)
-            .account,
+            .account(),
         Health::Healthy
     );
 
@@ -619,7 +622,7 @@ fn test_engine_process_engine_event_with_audit() {
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: true },
             state: ActiveOrderState::Open(Open {
-                id: gen_order_id(1),
+                id: VenueOrderId::Assigned(gen_order_id(1)),
                 time_exchange: time_plus_days(STARTING_TIMESTAMP, 4),
                 filled_quantity: dec!(0),
             }),
@@ -1164,7 +1167,7 @@ fn account_event_order_response(
             kind: OrderKind::Market,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: true },
             state: OrderState::active(Open {
-                id: gen_order_id(instrument),
+                id: VenueOrderId::Assigned(gen_order_id(instrument)),
                 time_exchange: time_plus_days(STARTING_TIMESTAMP, time_plus),
                 filled_quantity: Decimal::try_from(filled).unwrap(),
             }),
@@ -3810,7 +3813,7 @@ fn send_order_ack(
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
             state: OrderState::active(Open {
-                id: exchange_order_id,
+                id: VenueOrderId::Assigned(exchange_order_id),
                 time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
                 filled_quantity: dec!(0),
             }),
@@ -3995,7 +3998,7 @@ fn send_fully_filled_open_snapshot(
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
             // filled_quantity == quantity: the order is finished, said without a distinct state.
             state: OrderState::active(Open {
-                id: exchange_order_id,
+                id: VenueOrderId::Assigned(exchange_order_id),
                 time_exchange: time_plus_days(STARTING_TIMESTAMP, 2),
                 filled_quantity: dec!(1),
             }),
@@ -6134,7 +6137,7 @@ fn test_untracked_exchange_replica_parity_across_all_three_paths() {
             .state
             .connectivity
             .connectivity(&ExchangeId::BinanceSpot)
-            .market_data,
+            .market_data(),
         Health::Healthy,
         "the tracked event must actually mutate, or the parity asserts below are vacuous"
     );
@@ -6240,7 +6243,11 @@ fn test_untracked_exchange_reconnecting_is_reported_without_disconnect_or_mutati
         "an untracked exchange must not mutate connectivity state"
     );
     assert!(
-        !engine.state.connectivity.exchanges.contains_key(&UNTRACKED),
+        !engine
+            .state
+            .connectivity
+            .exchanges()
+            .contains_key(&UNTRACKED),
         "an untracked exchange must not become tracked by reporting it"
     );
 }

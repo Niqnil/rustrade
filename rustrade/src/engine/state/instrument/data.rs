@@ -6,7 +6,7 @@ use derive_more::Constructor;
 use rust_decimal::Decimal;
 use rustrade_data::{
     event::{DataKind, MarketEvent},
-    subscription::{book::OrderBookL1, candle::Candle},
+    subscription::{book::OrderBookL1, candle::Candle, greeks::OptionGreeks},
 };
 use rustrade_execution::{
     AccountEvent,
@@ -403,6 +403,106 @@ impl<ExchangeKey, InstrumentKey> InFlightRequestRecorder<ExchangeKey, Instrument
     fn record_in_flight_open(&mut self, _: &OrderRequestOpen<ExchangeKey, InstrumentKey>) {}
 }
 
+/// [`InstrumentDataState`] for an option contract: everything [`DefaultInstrumentMarketData`]
+/// tracks, plus the contract's most recent [`OptionGreeks`].
+///
+/// Greeks are risk sensitivities rather than a price, so they never reach
+/// [`price`](InstrumentDataState::price) — marking is delegated unchanged to
+/// [`market`](Self::market). This is the dedicated state that type's
+/// [`Processor`] impl defers [`DataKind::OptionGreeks`] to, kept separate so non-option users do
+/// not clone a greeks field per instrument.
+///
+/// # ⚠️ Greeks here are only as fresh as their source
+/// [`greeks`](Self::greeks) carries the instant it was stamped with, and **nothing ages it out**.
+/// Some sources publish greeks only when the contract trades — the London Strategic Edge options
+/// feed is one, and it has no snapshot to fall back on — so on an illiquid strike the value held
+/// here can be days or weeks old, and a contract that has not traded since the state was built
+/// holds `None` however long it has been held. Check [`Timed::time`] against the engine clock
+/// before treating it as a current risk figure; this state does not make that judgement for you.
+///
+/// # Which greeks events update it
+/// The newest by `time_exchange`, with a tie going to the event processed later — some sources
+/// stamp at whole-second granularity, so several updates for one contract can share an instant
+/// and arrival order is the only sequencing left. An event carrying no greek at all
+/// ([`OptionGreeks::has_any_greek`] is `false`) is ignored rather than allowed to replace a real
+/// value with an empty one: a source that could not compute greeks for one update has said nothing
+/// about the contract, and the previous value keeps its own, older, stamp.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
+pub struct OptionInstrumentMarketData {
+    pub market: DefaultInstrumentMarketData,
+    pub greeks: Option<Timed<OptionGreeks>>,
+}
+
+impl OptionInstrumentMarketData {
+    /// The most recent greeks and the instant they were stamped with, if any have arrived.
+    #[must_use]
+    pub fn greeks(&self) -> Option<&Timed<OptionGreeks>> {
+        self.greeks.as_ref()
+    }
+}
+
+impl InstrumentDataState for OptionInstrumentMarketData {
+    type MarketEventKind = DataKind;
+
+    /// Delegates to [`DefaultInstrumentMarketData::price`]; greeks never contribute a price.
+    fn price(&self) -> Option<Decimal> {
+        self.market.price()
+    }
+
+    fn market_snapshot(&self) -> MarketSnapshot {
+        self.market.market_snapshot()
+    }
+}
+
+impl<InstrumentKey> Processor<&MarketEvent<InstrumentKey, DataKind>>
+    for OptionInstrumentMarketData
+{
+    type Audit = ();
+
+    fn process(&mut self, event: &MarketEvent<InstrumentKey, DataKind>) -> Self::Audit {
+        if let DataKind::OptionGreeks(greeks) = &event.kind {
+            if greeks.has_any_greek()
+                && self
+                    .greeks
+                    .as_ref()
+                    .is_none_or(|held| held.time <= event.time_exchange)
+            {
+                self.greeks = Some(Timed::new(greeks.clone(), event.time_exchange));
+            }
+        } else {
+            self.market.process(event);
+        }
+    }
+}
+
+impl<ExchangeKey, AssetKey, InstrumentKey>
+    Processor<&AccountEvent<ExchangeKey, AssetKey, InstrumentKey>> for OptionInstrumentMarketData
+{
+    type Audit = ();
+
+    fn process(
+        &mut self,
+        event: &AccountEvent<ExchangeKey, AssetKey, InstrumentKey>,
+    ) -> Self::Audit {
+        self.market.process(event);
+    }
+}
+
+impl<ExchangeKey, InstrumentKey> InFlightRequestRecorder<ExchangeKey, InstrumentKey>
+    for OptionInstrumentMarketData
+{
+    fn record_in_flight_cancel(
+        &mut self,
+        request: &OrderRequestCancel<ExchangeKey, InstrumentKey>,
+    ) {
+        self.market.record_in_flight_cancel(request);
+    }
+
+    fn record_in_flight_open(&mut self, request: &OrderRequestOpen<ExchangeKey, InstrumentKey>) {
+        self.market.record_in_flight_open(request);
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // Test code: panicking on a bad fixture is acceptable
 mod tests {
@@ -749,5 +849,62 @@ mod tests {
 
         assert_eq!(data.price(), Some(dec!(200)));
         assert_eq!(data.candle, None);
+    }
+
+    mod option {
+        use super::*;
+
+        fn greeks(delta: Option<f64>) -> DataKind {
+            // `OptionGreeks` is `#[non_exhaustive]`, so it is built by mutation outside its crate.
+            let mut greeks = OptionGreeks::default();
+            greeks.delta = delta;
+            DataKind::OptionGreeks(greeks)
+        }
+
+        #[test]
+        fn greeks_are_held_with_their_stamp_and_never_become_a_price() {
+            let mut state = OptionInstrumentMarketData::default();
+
+            state.process(&event(at(10), greeks(Some(0.5))));
+
+            let held = state.greeks().unwrap();
+            assert_eq!(held.value.delta, Some(0.5));
+            assert_eq!(held.time, at(10));
+            assert_eq!(state.price(), None);
+        }
+
+        #[test]
+        fn price_inputs_reach_the_wrapped_market_state() {
+            let mut state = OptionInstrumentMarketData::default();
+
+            state.process(&event(at(10), trade(dec!(1.25))));
+
+            assert_eq!(state.price(), Some(dec!(1.25)));
+            assert_eq!(state.greeks(), None);
+        }
+
+        #[test]
+        fn older_greeks_do_not_replace_newer_but_a_tie_goes_to_the_later_arrival() {
+            let mut state = OptionInstrumentMarketData::default();
+
+            state.process(&event(at(10), greeks(Some(0.5))));
+            state.process(&event(at(9), greeks(Some(0.1))));
+            assert_eq!(state.greeks().unwrap().value.delta, Some(0.5));
+
+            state.process(&event(at(10), greeks(Some(0.6))));
+            assert_eq!(state.greeks().unwrap().value.delta, Some(0.6));
+        }
+
+        #[test]
+        fn an_update_carrying_no_greek_keeps_the_previous_value_and_its_stamp() {
+            let mut state = OptionInstrumentMarketData::default();
+
+            state.process(&event(at(10), greeks(Some(0.5))));
+            state.process(&event(at(20), greeks(None)));
+
+            let held = state.greeks().unwrap();
+            assert_eq!(held.value.delta, Some(0.5));
+            assert_eq!(held.time, at(10));
+        }
     }
 }

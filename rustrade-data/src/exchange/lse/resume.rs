@@ -5,8 +5,6 @@
 //! module holds the state that survives a reconnect; [`transformer`](super::transformer) applies
 //! it, and [`live`](super::live) sends it.
 
-use super::channel::LseChannel;
-use crate::{Identifier, exchange::ExchangeSub};
 use chrono::{DateTime, Utc};
 use fnv::FnvHashMap;
 use rustrade_instrument::exchange::ExchangeId;
@@ -42,7 +40,7 @@ pub(super) struct LseWatermark {
 ///
 /// # Why the subscription alone is not enough
 /// The provider publishes one data frame from one host, so a subscribe names a symbol and nothing
-/// else. Every stream therefore files its ticks under a wire identifier — `tick|BTC/USD` — that
+/// else. Every stream therefore files its ticks under a wire identifier — the symbol, `BTC/USD` — that
 /// says nothing about which stream produced it. Two axes collapse onto it:
 ///
 /// - **Kind.** Both supported kinds are decodings of the same frame, so one instrument subscribed
@@ -90,22 +88,6 @@ impl LseResumeKey {
             subscription,
             kind,
         }
-    }
-
-    /// The dataset this key partitions on.
-    pub(super) fn exchange(&self) -> ExchangeId {
-        self.exchange
-    }
-
-    /// The kind this key partitions on.
-    pub(super) fn kind(&self) -> &'static str {
-        self.kind
-    }
-
-    /// Consume the key for the subscription half, which is what a transformer keys its own
-    /// per-connection bookkeeping on once it has filtered the snapshot to its own kind.
-    pub(super) fn into_subscription(self) -> SubscriptionId {
-        self.subscription
     }
 }
 
@@ -168,13 +150,12 @@ impl LseResumeKey {
 /// ```
 #[derive(Debug, Default)]
 pub struct LseResumeState {
-    // A plain `Mutex` rather than an `RwLock`. Within one reconnect chain the two accessors never
-    // overlap at all -- the chain polls the outer stream (where the subscriber reads) only once the
-    // inner stream (where the transformer writes) has fully drained. Across chains they do: this
-    // state is documented as shareable between concurrently-spawned per-batch streams, and those
-    // contend. A `Mutex` is still the right choice for that: the critical section is a hash lookup
-    // and a field update with no allocation, which an `RwLock` would only make more expensive to
-    // acquire. The lock is never held across an `await`.
+    // A plain `Mutex` rather than an `RwLock`. Writes dominate: every stream sharing this state
+    // records once per emitted tick, while reads happen once per resumed symbol per reconnect --
+    // in the shared connection, choosing each symbol's replay window, and in each transformer as
+    // it is built. The critical section is a hash lookup and a field update with no allocation,
+    // which an `RwLock` would only make more expensive to acquire. The lock is never held across
+    // an `await`.
     marks: Mutex<FnvHashMap<LseResumeKey, MarkState>>,
 }
 
@@ -280,31 +261,12 @@ impl LseResumeState {
         self.lock().get(key).map(|state| state.watermark)
     }
 
-    /// Every watermark recorded so far, across every dataset and kind.
-    ///
-    /// Taken as a snapshot so a transformer can carry its own drop counters without holding the
-    /// lock, or consulting it, per tick. The caller filters to its own dataset and kind.
-    pub(super) fn snapshot(&self) -> FnvHashMap<LseResumeKey, LseWatermark> {
-        self.lock()
-            .iter()
-            .map(|(key, state)| (key.clone(), state.watermark))
-            .collect()
-    }
-
     // A poisoned lock means some other thread panicked mid-update. The data behind it is a
     // high-water mark whose worst case is a slightly stale resume point, so recovering the inner
     // value is strictly better than propagating the panic and taking the market stream down.
     fn lock(&self) -> std::sync::MutexGuard<'_, FnvHashMap<LseResumeKey, MarkState>> {
         self.marks.lock().unwrap_or_else(PoisonError::into_inner)
     }
-}
-
-/// The [`SubscriptionId`] the provider's ticks for `symbol` arrive under.
-///
-/// Shared with the tick decoder's own construction of the same identifier so the subscriber and
-/// the stream cannot disagree about which subscription a watermark belongs to.
-pub(super) fn subscription_id(symbol: &str) -> SubscriptionId {
-    ExchangeSub::from((LseChannel::Tick, symbol)).id()
 }
 
 /// Render an instant as the epoch-seconds number the provider's `start` parameter expects.
@@ -331,7 +293,7 @@ pub(super) fn epoch_seconds(time: DateTime<Utc>) -> f64 {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
-    use super::*;
+    use super::{super::mapper::subscription_id, *};
     use crate::subscription::{SubscriptionKind, book::OrderBooksL1, trade::PublicTrades};
 
     fn at(spelling: &str) -> DateTime<Utc> {
@@ -470,8 +432,7 @@ mod tests {
             LseResumeKey::new(ExchangeId::LseFutures, bare.clone(), PublicTrades.as_str());
 
         assert_eq!(
-            equities.clone().into_subscription(),
-            futures.clone().into_subscription(),
+            equities.subscription, futures.subscription,
             "this test is only meaningful while both datasets file under one identifier",
         );
 

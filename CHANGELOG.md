@@ -7,6 +7,1077 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-29
+
+### Added
+
+- **`collection::pair_seq`, a serde adapter for maps with non-string keys**
+  (`rustrade-integration`, feature `collection`). Put `#[serde(with =
+  "rustrade_integration::collection::pair_seq")]` on an `IndexMap` field to write it as a sequence
+  of `(key, value)` pairs, which JSON reads as `[[key, value], …]`. Insertion order is kept.
+  Deserialising rejects a repeated key, naming the positions of both pairs, rather than keeping
+  the last one.
+
+- **Massive WebSocket market data through `Streams`, with `MassiveSubscriber` sharing one
+  connection per cluster** (`rustrade-data`, feature `massive`). Four connectors, `MassiveStocks`,
+  `MassiveCrypto`, `MassiveForex` and `MassiveOptions`, serve `PublicTrades`, `Quotes`,
+  `OrderBooksL1` and `Candles` like any other exchange. Forex publishes no trades, so
+  `MassiveForex` has no `PublicTrades`. Candles come at `CandleInterval::Sec1` and `Min1` only,
+  the two intervals Massive aggregates at; any other is refused before a connection is opened. A
+  forex quote carries no sizes, so its amounts are zero, and a forex candle reports no volume,
+  because Massive builds it from quote updates. Only crypto trades carry an aggressor side.
+  Markets are spelled from the instrument as each cluster's messages spell them: `AAPL`,
+  `BTC-USD`, `EUR/USD`, and `O:` plus the OSI symbol. The options connector refuses an instrument
+  that is not an option contract. It is untested, because it needs an options subscription. Every
+  connector refuses a market holding a comma or whitespace, which would otherwise split into
+  extra subscriptions. A `Quotes` side with nothing quoted on it is a zero price, and
+  `OrderBooksL1` makes it `None`.
+
+  Massive allows a key a fixed number of connections per cluster, one on an individual plan, and
+  past it **closes the older connection** with a `max_connections` status. So every stream a
+  subscriber and its clones open on a cluster shares one socket to it. Each channel and market is
+  subscribed once, however many streams hold it, and unsubscribed when the last of them is dropped.
+  A subscribe returns once Massive has confirmed every subscription by name. Massive refuses one
+  with a bare `not authorized` that names nothing, so the error lists what it never confirmed. It
+  answers nothing at all for a channel the cluster does not publish, so that case surfaces as the
+  subscription timeout, again naming what went unconfirmed. The connection pings every 20 s
+  (`connection::KEEPALIVE`) and treats a socket that stays silent since the previous ping as lost.
+  A lost or evicted socket ends every stream on it, and they reconnect together on one new socket.
+  **Pass clones of one subscriber to every stream on a key**: a subscriber built separately, or
+  another process, evicts this one, and the warning logged for the lost connection quotes
+  Massive's `max_connections` status. The new public `MassiveServer` trait lets a cluster type of
+  your own point elsewhere, such as the legacy `socket.polygon.io` host. This replaces `MassiveLive`;
+  see Removed.
+
+  ⚠️ Massive data may not be redistributed. See
+  <https://massive.com/legal/market-data-terms-of-service> (§5(c)).
+
+- **`DynamicStreams` serves Massive market data, through `DynamicSubscribers::with_massive`**
+  (`rustrade-data`, feature `massive`). The support matrix now accepts the four Massive clusters,
+  and `DynamicStreams::init_with` and `init_indexed_multi_exchange_market_stream_with` route them.
+  `MassiveStocks` and `MassiveCrypto` with `Spot`, and `MassiveOptions` with `Option`, serve
+  `PublicTrades`, `OrderBooksL1` and `Candles`. `MassiveForex` with `Spot` serves `OrderBooksL1`
+  and `Candles`, because forex publishes no trades. Candles are accepted at
+  `CandleInterval::Sec1` and `Min1` only, and any other interval now fails validation before
+  anything is routed. `SubKind::Quotes` is refused, as for Alpaca, because the engine's market data
+  carries a top of book rather than a quote. Massive closes the older connection when a key goes
+  past its per-cluster cap, so the caller builds one `MassiveSubscriber` and passes it in with
+  `DynamicSubscribers::default().with_massive(subscriber)`. Every Massive group takes a clone of
+  it, whatever its cluster, kind or batch, so each cluster's groups share one socket. A `Massive*`
+  subscription with no subscriber supplied fails with `DataError::SubscriberRequired`, and one in a
+  build without the `massive` feature fails with `DataError::FeatureDisabled`. `MassiveOptions` is
+  routed on the code path it shares with stocks and has never been run against the real feed,
+  which needs an options subscription.
+
+  ⚠️ Massive data may not be redistributed. See
+  <https://massive.com/legal/market-data-terms-of-service> (§5(c)).
+
+- **`DynamicStreams` serves Alpaca market data, through `DynamicSubscribers::with_alpaca`**
+  (`rustrade-data`, feature `alpaca`). The support matrix now accepts trades and top of book on
+  `AlpacaCrypto`, `AlpacaIex` and `AlpacaSip`, and `DynamicStreams::init_with` routes them. Alpaca
+  allows an account one market data connection per feed, so the caller builds the subscriber and
+  passes it in with `DynamicSubscribers::default().with_alpaca(subscriber)`. Every Alpaca group
+  takes a clone of it, whatever its feed, kind or batch, so each feed's groups share one socket. The
+  top of book is Alpaca's quote, delivered as `OrderBookL1` through a new
+  `StreamSelector<_, OrderBooksL1>` for the Alpaca connectors, which reads the same `quotes`
+  channel as `Quotes`. The engine's market data carries a top of book rather than a quote, so
+  `SubKind::Quotes` stays with the typed `Streams` builder and `DynamicStreams` refuses it. A side
+  Alpaca quotes at a zero price has no quote, and the book leaves it `None`. IEX quotes are IEX's
+  own top of book rather than the NBBO. `AlpacaSip` is routed on the code path it shares with IEX
+  and has never been run against the real feed, which needs a paid subscription.
+  `AlpacaQuoteTransformer` gains a `Kind` parameter, defaulting to `Quotes`, for the event it
+  produces.
+
+- **`DynamicStreams` serves London Strategic Edge and Hyperliquid perpetuals, through the new
+  `DynamicStreams::init_with` and `DynamicSubscribers`** (`rustrade-data`). The support matrix
+  accepted `Lse*` and `HyperliquidPerp` subscriptions, then `DynamicStreams::init` refused every one
+  with `DataError::Unsupported`, because it had no route to either connector. Both are routed now.
+  London Strategic Edge needs an API key, and it allows a key a single WebSocket, so its subscriber
+  is built by the caller and passed in with `DynamicSubscribers::default().with_lse(subscriber)`.
+  Every `Lse*` group takes a clone of that one subscriber, whatever its dataset, kind or batch, so
+  they all share one connection. A resuming subscriber resumes every one of them. `init` keeps its
+  signature and is `init_with` with no subscribers. `init_indexed_multi_exchange_market_stream_with`
+  is the indexed counterpart. Two new `DataError` variants cover the cases that used to be reported
+  as `Unsupported`: `SubscriberRequired`, for a venue with no subscriber supplied, and
+  `FeatureDisabled`, for a venue whose cargo feature (`lse`, `hyperliquid`) the build lacks. A test
+  routes every pair the matrix accepts, so the two cannot drift apart again.
+
+  ⚠️ London Strategic Edge data may not be redistributed. See
+  <https://londonstrategicedge.com/terms>.
+
+- **London Strategic Edge option prints and option candles, with
+  `LseVaultClient::fetch_option_flow` / `collect_option_flow` and `fetch_option_candles` /
+  `collect_option_candles`** (`rustrade-data`, feature `lse`). US equity and ETF options: every
+  executed print as an `LseOptionPrint` carrying its contract (`ticker`, `underlying`, `kind`,
+  `strike`, `expiry`), price, size in contracts, notional premium and the greeks computed at that
+  print, including `rho`; and one-minute premium bars as an `LseOptionCandle`, with the print count
+  as `trade_count` and greeks **averaged over the minute** rather than sampled at its close. Both
+  convert into the engine's `DataKind` events via `into_market_events` on the new
+  `ExchangeId::LseOptions`: a print is stamped at the print, a candle at its close so the minute's
+  outcome is never visible before it ends.
+
+  **The flow fetch is oldest-first, which the endpoint is not.** `/options/flow` answers
+  newest-first, truncates silently at a 5,000-row cap, ignores `offset`, and accepts only
+  whole-second bounds, so a range can only be read in windows small enough to come back whole. The
+  fetch walks forward in adaptive windows — a full page is treated as a truncated one, halved and
+  re-read; a sparse one lets the next window grow — and emits each window in order, holding at most
+  one page in memory. A single second too dense for one page is a typed
+  `LseError::OptionFlowWindowSaturated` rather than a short tape. Because a full page is the only
+  sign of truncation, each fetch first reads the provider's own `max_rows_per_request` from
+  `usage()` and treats the smaller of that and `with_page_limit` as a full page — so a page limit
+  raised past the provider's cap cannot hide a truncated window. The live canary checks that the
+  walk, forced to halve repeatedly, reproduces a single-page read print for print, and that the cap
+  `usage()` reports is the one `/options/flow` actually enforces.
+
+  **Recent data is refused, not returned short.** The provider's ingestion lag is variable and
+  episodic: a closed window was measured returning zero rows thirty seconds after closing, and
+  another holding a fifth of its final count across two consecutive reads, both with a `200`. A
+  partial window holds steady, so no amount of polling detects it. A range ending within
+  `OPTION_FLOW_SETTLE_MARGIN` (60 s) of now is therefore `LseError::InvalidInput`.
+
+  The endpoint silently ignores parameters it does not recognise — a `ticker` filter returns every
+  contract — so there is no per-contract flow fetch (select from the result), and a row outside its
+  requested window or underlying fails that window with `LseError::UnexpectedOptionFlowRow` before
+  any of it is yielded. Option candles reuse the vault candle pager, whose range semantics the
+  options endpoint was measured to share.
+
+  ⚠️ **Greeks on this feed are print-triggered.** They arrive only with a trade, so a contract's
+  greeks are as old as its last print and an unheld, untraded contract has none. The provider's
+  chain snapshot endpoint, the only continuous alternative, serves stale stored fields and is
+  deliberately not wrapped. There are no quotes on these paths, and timestamps are whole-second
+  batch stamps: key on the print `id`. Strikes can be fractional on adjusted contracts, so they are
+  `Decimal`. Exercise style is not reported and none is claimed.
+
+  A live canary (`lse_options_canary`) is wired into `lse-weekly.yml`. It reads a window days old
+  and fails on an empty tape, so a stopped feed cannot pass on nothing.
+
+  ⚠️ Option data is provider data and may not be redistributed or committed as fixtures. See
+  <https://londonstrategicedge.com/terms>.
+
+- **Live London Strategic Edge option prints over the WebSocket, with the `LseOptions` connector**
+  (`rustrade-data`, feature `lse`). Register option contracts as ordinary `PublicTrades`
+  subscriptions, one per contract. The connector spells each as the unpadded OSI symbol the
+  provider ticks under (`SPY260930C00700000`), reading the expiry as a UTC date. The provider
+  streams options per underlying, so contracts that share an underlying collapse into one
+  `subscribe_options`, and the connection's subscription cap (100 when measured) counts
+  underlyings, not contracts. Every option tick is a genuine print; none carries a quote, so
+  `PublicTrades` is the only kind.
+
+  **The whole chain arrives, and only registered contracts are delivered.** One subscribe streams
+  every contract on the underlying, around 45 prints a second on a busy one. Unregistered prints are
+  dropped and reported as a per-underlying `info` count every minute, rather than raised one error
+  at a time. The set of contracts that trade keeps growing through a session, so a contract that
+  starts trading mid-session is missed unless registered up front; the REST print tape carries them
+  all.
+
+  Guards run before anything is sent. A contract with no OSI spelling (not an option, or a strike
+  with more than three decimal places) fails the batch before a connection is opened. An underlying
+  with no options is rejected by the provider by name. A registered contract that does not exist is
+  confirmed and stays silent, because the provider does not list its contracts. Options do not
+  resume: the provider accepts a `start` on an options subscribe but silently replays nothing, so
+  none is requested.
+
+  The WebSocket canary now covers option contracts. Every contract on a slice of the provider's own
+  print tape must rebuild to its exact ticker, and the busiest must subscribe. In session, at least
+  one must print. Outside the session the print check reports `CANARY_SKIP`, so `lse-weekly.yml`
+  now runs inside it, on Tuesday at 15:00 UTC instead of Monday at 07:00, and queues a second run
+  rather than letting two hold the key's one connection. New example: `lse_options_stream`.
+
+  ⚠️ Live option prints are provider data and may not be redistributed. See
+  <https://londonstrategicedge.com/terms>.
+
+- **Every London Strategic Edge stream on one key now shares one WebSocket**
+  (`rustrade-data`, feature `lse`), in the new `lse::connection` module. The provider allows a key
+  one connection and refuses a second with `TOO_MANY_CONNECTIONS`, so until now a key could stream
+  one `subscribe` batch at a time: one dataset, one kind. Streams opened by one `LseSubscriber` and
+  its clones now share a socket owned by a connection task. That covers every dataset, both kinds
+  and option chains, across any number of `subscribe` calls. Each stream receives the raw frames
+  for its own symbols as an `LseAttachment`. The task reads only the routing key of each frame, so
+  each stream's parse is still the only full one.
+  - A symbol or underlying the socket already holds is not subscribed again, and one symbol held by
+    several streams costs one slot. When the last stream holding a symbol detaches, the task
+    unsubscribes it. When the last stream detaches, the socket closes.
+  - The subscription cap belongs to the connection. A batch is checked against everything the
+    connection would then hold, before anything is sent, and the error says the cap is shared. If
+    the provider rejects a subscribe anyway, that batch fails and what it sent is unsubscribed
+    again.
+  - When the socket drops, every stream on it ends. The first stream to re-attach reconnects and
+    re-subscribes everything the lost socket held. A stream keeps its place for `REATTACH_GRACE`
+    (30 s) from the loss. Frames for streams that have not re-attached yet are held until then,
+    and discarded with a warning if they still have not. They are also discarded, with a warning,
+    if the new socket is lost before those streams re-attach; a stream that resumes asks for them
+    again on the next reconnect. A stream dropped while no socket was open is forgotten at the
+    same deadline, so no later reconnect re-subscribes its symbols. A reconnect that fails does
+    not extend the deadline.
+  - With resumption on, each resumed symbol gets one replay window, opened at the earliest
+    watermark among the streams holding it: the provider ignores `start` on a symbol it already
+    streams. Each stream silently drops replayed ticks it had already delivered. Replayed frames go
+    only to streams that asked for a window on that symbol.
+  - A separately built subscriber for the same key still opens its own connection, and the
+    provider's refusal is left visible.
+  - The WebSocket canary gains a shared-connection signal. Clones of one subscriber stream three
+    crypto batches across both kinds, re-reading symbols the connection already holds, and every
+    stream must deliver.
+
+  ⚠️ Data streamed over the connection is provider data and may not be redistributed. See
+  <https://londonstrategicedge.com/terms>.
+
+- **`OptionInstrumentMarketData`** (`rustrade`): an `InstrumentDataState` for option contracts that
+  wraps `DefaultInstrumentMarketData` and holds the contract's most recent `OptionGreeks` with the
+  instant they were stamped. Greeks never contribute a price; marking is delegated unchanged. Nothing
+  ages the held value out, and the rustdoc says so: check its stamp against the engine clock before
+  treating it as a current risk figure. An update carrying no greek does not overwrite a real one.
+
+- **`OptionGreeks::rho`** (`rustrade-data`). `OptionGreeks` is `#[non_exhaustive]`, so the field is
+  additive, and greeks serialised before it existed still deserialise, as `None`. Alpaca published
+  rho already and discarded it for want of a field; it is now mapped through. IBKR and Massive
+  publish none and report `None`. `has_any_greek` now counts `rho`.
+
+- **`ExchangeId::LseOptions`** (`rustrade-instrument`), appended at the end of the enum so no
+  existing index is renumbered. It supports the `Option` instrument kind and one subscription
+  kind, `PublicTrades`, served over the WebSocket by the `LseOptions` connector.
+  *Note:* `ExchangeId` is not `#[non_exhaustive]`, so downstream exhaustive `match`es need a new arm.
+
+- **`ExchangeId::MassiveStocks`, `MassiveCrypto`, `MassiveForex` and `MassiveOptions`**
+  (`rustrade-instrument`), appended at the end of the enum so no existing index is renumbered.
+  There is one per Massive WebSocket cluster, because Massive caps connections per cluster, and each
+  is served by the connector of the same name. `ExchangeId::Massive` stays, for the REST client.
+  *Note:* `ExchangeId` is not `#[non_exhaustive]`, so downstream exhaustive `match`es need new arms.
+
+- **`LseCalendarEvent` and the economic-calendar fetch, with
+  `LseDataApiClient::fetch_economic_calendar` and `fetch_economic_calendar_stats`**
+  (`rustrade-data`, feature `lse`). The provider's archive of scheduled macroeconomic releases —
+  124,896 events across 108 country codes, each carrying the consensus estimate, the previous
+  figure and the actual outcome. Added to the existing `LseDataApiClient` rather than a new client,
+  since it is the same host as `/bond-yields`.
+
+  🔴 **The feed stopped on 2026-03-24, and that is documented as a limitation rather than a
+  footnote.** It was measured frozen to the unit two months of wall-clock apart — `total_events`
+  124,896 and `latest` 2026-03-24 on both readings — and confirmed from the other side: any window
+  after that date returns `200` with zero events across all 108 countries. The forward-looking use
+  case an economic calendar exists for is therefore **not served at all**. What remains is a genuine
+  historical archive spanning 2014-12-31 to 2026-03-24, with an `estimate` on 74,843 events, which
+  is useful for backtesting and event studies and is what this models. The module rustdoc says so
+  first, and `LseCalendarStats::latest` is the live figure rather than a constant so a caller can
+  detect a revival.
+
+  Like `/bond-yields`, the endpoint validates nothing: an unknown country, an unknown impact rating,
+  a reversed range and a window past the freeze all answer an identical `200 count=0`. So
+  `fetch_economic_calendar` takes an `LseCalendarStats` as a **required** argument. But the
+  validation it can offer is genuinely weaker, and the difference is documented rather than papered
+  over: `/economic-calendar/stats` publishes **no per-country coverage**, only a flat global
+  `earliest`/`latest`, while coverage is wildly uneven — 88 of 108 countries hold fewer than 100
+  events and `UK` holds 56. An empty result inside the global range is therefore a legitimate answer
+  and deliberately **not** an error, because inventing one would mean inventing knowledge the
+  provider does not publish.
+
+  Two silent wire traps are closed by construction. A repeated `country` key makes the provider keep
+  only the **last** value — `country=US&country=UK` returns the 56 UK events and drops 36,421 US
+  ones, with no error — so `LseCalendarQuery` joins with commas, which is a genuine OR, and nothing
+  in the API can express the broken form. And `format` defaults to **CSV**, so every request sends
+  `format=json` explicitly.
+
+  Field choices are measurements. `event_date` is a `DateTime<Utc>` rather than the `NaiveDate`
+  `/bond-yields` uses — the opposite call from its sibling, because every event carries a real time
+  of day and 348 distinct ones occur, so a date would destroy intraday ordering. Numerics are
+  `Option<Decimal>` via `rust_decimal::serde::str_option`: every numeric arrives as a JSON string,
+  all ~462,000 non-null values parse, and negatives are abundant on `change` and
+  `change_percentage`. Absence is always `null` and never `""` — the empty-string count is zero for
+  every one of the eleven fields across the whole corpus. `impact` is a closed `LseCalendarImpact`
+  enum in which **`None` is a literal provider rating carried by 592 events, not an absent value**,
+  which is why the field is not an `Option`.
+
+  `UK`-not-`GB` carries over from `/bond-yields`, so `normalise_country` applies the same single
+  documented alias — but the vocabularies are **not** the same set: the calendar's 108 codes include
+  `EA` and `EU`, which are not countries.
+
+  A live canary (`lse_economic_calendar_canary`) is wired into `lse-weekly.yml` as a fourth REST
+  canary. Its assertions are structural so they hold on a frozen feed, and it **records**
+  `total_events`/`latest` in the log rather than asserting them — a revival is the outcome we want
+  and must not fail the build.
+
+  ⚠️ Calendar events are provider data and may not be redistributed or committed as fixtures. See
+  <https://londonstrategicedge.com/terms>.
+
+- **`LseDataApiClient` and the London Strategic Edge bond-yield endpoints** (`rustrade-data`,
+  feature `lse`). Daily open/high/low/close sovereign yields for 34 countries — 716,820
+  observations at the last measurement — via `fetch_bond_yield_stats` and `fetch_bond_yields`.
+  These live on the provider's *second* host, `data-api.londonstrategicedge.com`, because a
+  bond-yield symbol has no candle data on the vault at all (`GET /vault/candles?symbol=UK5Y`
+  answers `404`). `LseDataApiClient` is a second thin wrapper over the transport introduced
+  alongside it, so both hosts share auth, agent, timeouts, redirect policy, rationing and error
+  mapping.
+
+  **The stats handle is a required argument to `fetch_bond_yields`, not an option**, because the
+  endpoint performs no validation of its own. Measured: an unknown country (`ZZ`), the ISO-3166
+  spelling of a country the provider keys differently (`GB`), and a nonsense tenor (`99Y`) each
+  answer `200` with `count: 0` — an envelope identical to a genuinely quiet window. Making
+  validation unskippable in the type system is the only way a wrong query fails loudly rather than
+  returning an empty `Vec`.
+
+  Validation checks the requested window against the **tenor's own** coverage, not merely that the
+  `(country, maturity)` pair exists. Membership alone is insufficient: `US 10Y TIPS` and `TR 2Y`
+  both exist and both return nothing for 2023–2024, because neither was published before
+  2025-07-07. Three typed errors distinguish the three causes a zero-row response otherwise
+  conflates — `LseError::UnknownBondYieldCountry`, `UnknownBondYieldMaturity` (carrying the
+  country's published tenor list) and `BondYieldRangeOutsideCoverage` (carrying the window that
+  does exist).
+
+  ⚠️ **The provider keys the United Kingdom `UK`, not `GB`**, despite naming the column
+  `country_iso2`; `GB` is absent from all 34 keys, while the vault's catalog spells the same
+  country `GB`. It is the only divergence in the set. `LseBondYieldStats::normalise_country` maps
+  it, and every entry point applies the mapping before the request is sent.
+
+  ⚠️ **A tenor is a provider label, not a duration.** Each US TIPS tenor reports the same
+  `maturity_days` as its nominal twin (`5Y` and `5Y TIPS` both `1825`), so keying a series on
+  `(country, maturity_days)` silently merges a real yield with an inflation-linked one. `maturity`
+  identifies the series; `maturity_days` is a derived hint.
+
+  Every field of a row arrives as a JSON **string**, numerics included, so prices decode with
+  `rust_decimal::serde::str` — the `rust_decimal::serde::float` helper used by `AlpacaStockSplit`
+  expects a JSON number and fails here. The response is **not paged**: a request for one tenor's
+  full published history returned all 10,004 rows in a single response, matching what the stats
+  endpoint reports, so the fetch returns a `Vec` rather than inventing pagination for a surface
+  that has none. The envelope's own `count` is checked against the rows delivered, which is the
+  signal a silently introduced page cap would produce.
+
+  A live canary (`lse_bond_yield_canary`, `#[ignore]`d, wired into the weekly drift workflow)
+  asserts each of those premises against the real API rather than against a fixture.
+
+  ⚠️ Bond-yield rows are provider data and may not be redistributed or committed as fixtures. See
+  <https://londonstrategicedge.com/terms>.
+
+- **`LseCatalogEntry`, the London Strategic Edge catalog record, with
+  `LseVaultClient::fetch_catalog`** (`rustrade-data`, feature `lse`). The provider's index of
+  everything it publishes — 22,966 entries at the last measurement — as a provider-shaped type in
+  the same spirit as `AlpacaStockSplit`, not a provider-agnostic abstraction. Nothing is wired into
+  the engine: reference series never stream.
+
+  `LseCatalogEntry::class` separates price datasets from reference series using the provider's own
+  `frequency`/`category` pair. The rule is not a heuristic — across all 22,966 entries it classifies
+  every row with none left over (15,537 reference / 7,429 price) — so a dataset the provider adds
+  later classifies itself with no list here to update.
+
+  Three field choices are measurements rather than taste. `ticks` is `u64` because the largest
+  observed count is 96.5% of `u32::MAX` on a tape that is still growing. `frequency` stays the
+  provider's own string because the vocabulary is dirty — ten spellings including both `biannually`
+  and `bi-annually`, both `quarterly` and `quarter` — so a closed enum over the obvious six values
+  would have silently mishandled seven rows; the label also fails to predict observed spacing, so it
+  must not be read as a cadence contract. `first_tick`/`last_tick` are parsed on demand rather than
+  at decode, so one malformed timestamp surfaces on its own entry instead of failing a whole fetch.
+
+  `LseCatalogEntry::price_dataset` resolves to an `LseDataset` where one exists and returns `None`
+  otherwise. `None` does not mean "reference data": `options` is a price dataset with no
+  `LseDataset` variant, and it accounts for 3,186 of the 7,429 price entries, so callers pair this
+  with `class` rather than reading `None` as a classification. `LseDataset::from_catalog_str`'s
+  documented `UnknownDataset` contract is left exactly as it was.
+
+  ⚠️ Catalog contents are provider data and may not be redistributed or committed as fixtures. See
+  <https://londonstrategicedge.com/terms>.
+
+### Changed
+
+- **BREAKING (behaviour): building an `IndexedInstruments` rejects two distinct assets on one
+  exchange that share an `AssetNameInternal`** (`rustrade-instrument`). The new
+  `IndexError::DuplicateAssetNameInternal` covers two assets that differ only in `name_exchange`,
+  such as a venue spelling its quote asset `USDT` for one instrument and `usdt.e` for another.
+  Since `Asset::new_from_exchange`, and so `SystemConfig`, lowercases `name_exchange` into
+  `name_internal`, spellings that differ only in letter case (`USDT` and `usdt`) collide too.
+  `try_build` and `try_new` return it, and `build`, `new` and deserialisation fail on it. Such a
+  pair survived the de-duplication as two `AssetIndex` slots. Asset lookups and engine asset
+  state are keyed on `(exchange, name_internal)` but read by position, so the pair collapsed into
+  one entry, and every later index resolved to the wrong asset: balances were attributed to their
+  neighbour with no error. The same asset name on two exchanges is still fine.
+
+- **BREAKING: `IndexedInstruments` serialises as the plain list of instruments it indexes, and
+  deserialises by building from that list** (`rustrade-instrument`). It derived serde over its
+  private index tables, so a payload was loaded as written: it could skip every check
+  `try_new` makes (unique `name_internal`, positive `contract_size`), or declare indices that
+  disagree with their positions, so that every lookup resolved to the wrong entity. It now
+  writes a JSON array of `Instrument<ExchangeId, Asset>` and reads one through `try_new`, so a
+  payload that breaks an invariant fails with the same `IndexError`, and no index is ever read
+  from input. The old object format no longer loads, so previously serialised output must be
+  regenerated. `IndexedInstruments` also implements `TryFrom<Vec<Instrument<ExchangeId, Asset>>>`.
+
+- **BREAKING: `TradingSummary` and `TradingSummaryGenerator` serialise `assets` as a sequence of
+  `(key, value)` pairs, and serialise to JSON** (`rustrade`). `assets` is keyed by
+  `ExchangeAsset`, a struct, and JSON object keys must be strings, so `serde_json` refused any
+  summary or generator with an asset in it. Both fields now use `collection::pair_seq`, the
+  format `AssetStates` already used. In a format that accepted struct map keys, such as bincode,
+  `assets` changes from a map to a sequence, so a summary or generator saved in such a format by
+  an earlier version no longer loads.
+
+- **BREAKING (behaviour): `AssetStates` rejects a repeated `ExchangeAsset` when deserialising**
+  (`rustrade`). It previously kept the last pair silently. Its wire format is unchanged: the
+  hand-written serde impls are replaced by `collection::pair_seq`.
+
+- **BREAKING: test fixtures are no longer public API** (`rustrade-instrument`, `rustrade`,
+  `rustrade-data`). `rustrade_instrument::test_utils` is now behind a new off-by-default
+  `test-utils` feature; a crate whose tests use its fixtures enables it under
+  `[dev-dependencies]`. `rustrade::test_utils` is compiled only for that crate's own tests, and
+  `rustrade_data::test_utils` is removed, since nothing called its one function. The fixtures
+  hard-code names and assets and were never meant for use outside tests, yet as public items any
+  change to them was a breaking change.
+
+- **BREAKING: `PositionManager::positions` is an `FnvIndexMap`** (`rustrade`), like the other maps
+  in `EngineState`, instead of a SipHash-keyed `IndexMap`. Both keep insertion order, so iteration
+  is unchanged. Code that names the field's type, or builds a map to assign to it, uses
+  `rustrade_integration::collection::FnvIndexMap`.
+
+- **BREAKING: `IndexedInstruments::find_instrument_index` reports a missing instrument as
+  `IndexError::InstrumentIndex`** (`rustrade-instrument`). It returned `IndexError::AssetIndex`,
+  with a message that said "Asset" and listed the assets, which the lookup never searches. Code
+  that matched `IndexError::AssetIndex` from this method matches `IndexError::InstrumentIndex`
+  instead. The message now names the exchange and instrument sought, and lists the instruments by
+  exchange and internal name.
+
+- **REST clients negotiate and transparently decode gzip** (workspace `reqwest` dependency). The
+  workspace now enables reqwest's `gzip` feature, so every `reqwest::Client` the crates build sends
+  `Accept-Encoding: gzip` and decompresses gzip-encoded bodies before the caller sees them. That
+  covers `rustrade-integration`'s `RestClient::new`, `BinanceHistoricalClient::spot()`/`futures()`,
+  the Massive, IBKR Flex and London Strategic Edge REST clients, and both Alpaca clients: market
+  data in `rustrade-data` and trading in `rustrade-execution`. Nothing changes at a call site.
+  Market data REST responses compress well: an hour of Massive one-second aggregates was measured
+  at 380 KB before and 60–82 KB after, with the median fetch going from 1.56 s to 1.13 s; a
+  1,000-candle page of Binance one-second klines went from 158 KB to 20–28 KB. Decoding costs about
+  0.6 ms per response. The London Strategic Edge export download is the one exception: it asks
+  for `Accept-Encoding: identity`, because it resumes with `Range` and verifies a SHA-256 over the
+  artifact as stored, and a byte range addresses the encoded body, not the decoded one.
+  Cargo feature unification also turns gzip on for any reqwest 0.13 client a downstream crate builds
+  in the same build, including one passed in through a `with_client` method; build it with
+  `ClientBuilder::gzip(false)` to opt out. No new crates enter the dependency graph: the compression
+  crates were already compiled for other dependencies. `binance-sdk`, which decodes gzip itself, is
+  on a separate reqwest major and is unaffected.
+
+- **Massive WebSocket clients connect to `socket.massive.com`** (`rustrade-data`, feature
+  `massive`). The WebSocket client used to default every market (stocks, crypto, forex, options)
+  to the legacy `socket.polygon.io` host, while the REST client already used `api.massive.com`. A
+  live probe of the new host found the greeting, authentication, subscribe acknowledgement and tick
+  schema identical to the old one. The new connectors use it (`WEBSOCKET_URL_STOCKS` and so on).
+  The legacy host is reachable through a `MassiveServer` type of your own.
+
+- **BREAKING: an `AlpacaSubscriber` and its clones share one connection per feed, so one feed can
+  stream trades and quotes at once** (`rustrade-data`, feature `alpaca`). Alpaca allows an account
+  one market data connection per feed (crypto, IEX and SIP each count separately), and refuses a
+  second with `connection limit exceeded`. The subscriber used to open a socket per `subscribe`
+  call, and each call carries one kind, so trades and quotes on one feed could not both be
+  streamed. Now every stream a subscriber and its clones open on a feed attaches to one socket.
+  Each `(channel, symbol)` pair is subscribed once however many streams hold it, and unsubscribed
+  when the last of them is dropped. The socket closes when no stream is left. Alpaca's frames mix
+  symbols and kinds, so the connection splits each frame and hands every stream only its own
+  messages. A stream therefore never decodes another stream's message as an error. When the
+  socket is lost, every stream on it ends and they reconnect together on one new socket. Alpaca
+  replays nothing, so what it sent while no socket was open is lost. A stream that has not
+  re-attached within `REATTACH_GRACE` (30 s) of the loss, including one dropped while no socket was
+  open, is forgotten and its pairs released, so it cannot push every later reconnect over the pair
+  cap. A subscribe that would take
+  the connection past Alpaca's pair cap fails and says the cap is shared. The cap is plan-dependent,
+  30 on the free IEX plan as last measured. **Pass clones of one subscriber to every stream on an
+  account**: a subscriber built separately opens its own connection, which Alpaca refuses while
+  another is open on the feed. The error now says so. Breaking changes: `AlpacaSubscriber`'s
+  `Subscriber::Transport` is the new `AlpacaAttachment`; `AlpacaWsStream` is replaced by
+  `AlpacaStream`, the type every `StreamSelector` impl now names, an alias of the generic
+  `SharedStream` described below; and cloning a subscriber is no
+  longer equivalent to building another, because clones share its connections. **An attachment's queue
+  is unbounded**: the connection reads one socket for every stream on it and never waits for a
+  slow one, so a stream that stops being polled buffers in memory rather than applying back-pressure.
+  Symbol spelling moves to a new public `AlpacaServer` trait, with a per-feed `AlpacaSymbolShape`,
+  and the `Identifier<AlpacaMarket>` impls become blanket impls over it. The shipped feeds implement
+  it and spell every symbol as before. A server type declared outside this crate can now serve
+  `Alpaca<Server>` by implementing it. `AlpacaWebSocketSubValidator` and the `alpaca::validator`
+  module are removed: the subscriber confirms each subscribe on its shared connection, by coverage
+  as before, so the Alpaca connectors' `Connector::SubValidator` is the generic
+  `WebSocketSubValidator`, which it never calls.
+
+- **BREAKING: `DynamicStreams::init` bounds its instrument type on the new `DynamicInstrument`
+  trait, and fails without connecting anything when a group cannot be routed** (`rustrade-data`).
+  The per-connector `Identifier` bounds that `init` listed now sit behind that one trait. It is
+  implemented for `MarketDataInstrument`, `Keyed<_, MarketDataInstrument>` and
+  `MarketInstrumentData<_>`, so callers passing those types change nothing. A generic caller
+  restates `Instrument: DynamicInstrument` instead of the list. `init` now routes every group of
+  every batch before it connects any. Before, an unroutable group failed the call only after the
+  groups beside it had connected. If a group fails to initialise, `init` now stops every stream that
+  did start before it returns the error, where it used to leave them running with no receiver.
+  On London Strategic Edge, one of those streams would have kept the key's only connection.
+
+- **BREAKING: the London Strategic Edge and Hyperliquid perpetual market identifiers are blanket
+  impls over the new `LseInstrument` and `HyperliquidInstrument` traits** (`rustrade-data`,
+  features `lse` and `hyperliquid`). They replace three impls each, one per instrument type, and
+  spell every symbol as before. An instrument type declared outside this crate identifies its market
+  by implementing the trait.
+
+- **BREAKING: the Alpaca market identifier is one blanket impl over the new `AlpacaInstrument`
+  trait, and an exchange-named Alpaca instrument's symbol is uppercased** (`rustrade-data`, feature
+  `alpaca`). The trait replaces the three impls, one per instrument type, that the `AlpacaServer`
+  blanket impls still needed. A `MarketInstrumentData` instrument's `name_exchange` used to be sent
+  as given. Alpaca spells its symbols in uppercase and confirms a subscribe only once its answer
+  names each requested symbol exactly, so a lowercase name timed out unconfirmed. It is now
+  uppercased, as the symbol reconstructed from a `MarketDataInstrument` always was. Every other
+  symbol is spelled as before. An instrument type declared outside this crate identifies its market
+  by implementing the trait.
+
+- **BREAKING: `LseTick::bid` and `LseTick::ask` are now `Option<Decimal>`** (`rustrade-data`,
+  feature `lse`). Option contracts tick on the same WebSocket frame and publish both sides as
+  `null` on every tick, which failed the decode outright. The L1 decoder treats a null side as
+  absent, as it already treated a zero one.
+
+- **BREAKING: London Strategic Edge `OrderBooksL1` streams require the new `LseQuoteServer` marker
+  trait, and `LseSymbolShape` gains an `OptionContract` variant** (`rustrade-data`, feature `lse`).
+  The five quoting datasets implement the trait. The options dataset does not, because it
+  publishes no quote, so an L1 subscription on it is a compile error rather than a stream of empty
+  books. A server type declared outside this crate must implement `LseQuoteServer` to keep serving
+  `OrderBooksL1`.
+
+- **BREAKING: a London Strategic Edge tick is filed under its bare symbol, so no tick allocates
+  its key** (`rustrade-data`, feature `lse`). The `SubscriptionId` was `tick|<symbol>`. An option
+  contract's symbol is its root plus fifteen characters, so on a root of four or more characters
+  (`AAPL`, `GOOGL`) the key passed `SmolStr`'s 23 inline bytes and was heap-allocated on every
+  print, including the unregistered prints the stream drops. The channel prefix carried nothing,
+  because the provider has one channel. Without it the longest key is 21 bytes. `LseSubscriber`
+  now maps subscriptions with the new `LseSubMapper` instead of `WebSocketSubMapper`, and the
+  instrument map in its `Subscribed` answer is keyed by the bare symbol. `ExchangeSub::id` still
+  spells `tick|<symbol>` for this connector, and no tick arrives under that key.
+
+- **BREAKING: connectivity state is read-only outside `rustrade`** (`ConnectivityStates`,
+  `ConnectivityState`). `ConnectivityStates::update_from_account_reconnecting` is crate-private. So
+  are the fields `ConnectivityStates::{global, exchanges}` and `ConnectivityState::{market_data,
+  account, role}`, and the `connectivity_mut` and `connectivity_index_mut` accessors.
+  `EngineState::connectivity` is public. A caller could therefore mark an exchange's account
+  connection as reconnecting without arming its instruments for the account resync, which only
+  `EngineState::update_from_account_reconnecting` does. The next complete snapshot then could not
+  retire an order that ended while the stream was down. A direct field write also left the cached
+  `global` health out of step with the venues it summarises. To migrate:
+  - Read through the new getters of the same names: `global()`, `exchanges()`, `market_data()`,
+    `account()` and `role()`.
+  - Report an account disconnect through `EngineState::update_from_account_reconnecting`.
+  - Build a `ConnectivityState` with `ConnectivityState::new`.
+
+- **BREAKING: the Hyperliquid clients refuse an order whose client id is not a UUID in
+  `ClientOrderId::uuid()` form** (`rustrade-execution`, `HyperliquidClient` and
+  `HyperliquidSpotClient`). Hyperliquid names an order by the 16-byte `cloid` it was placed with,
+  and only a lowercase, hyphenated UUID comes back from it as the same id; an order placed under any
+  other id could never be matched to its own updates. Previously only trigger orders required a
+  UUID, and other orders were sent without a `cloid`. `open_order` now answers such a request with
+  `OrderError::Rejected` before anything is sent, whatever the order kind. `common::cid_to_cloid`
+  returns `None` for every other spelling of a UUID, uppercase or unhyphenated included. To
+  migrate, generate Hyperliquid client ids with `ClientOrderId::uuid()`.
+
+- **BREAKING: `InstrumentAccountSnapshot` gains `orders_complete`, a client's statement that its
+  `orders` list is every order open at the venue for that instrument** (`rustrade-execution`). A
+  snapshot's list could previously miss an open order without saying so: Alpaca drops a notional
+  order on conversion, IBKR's list is always empty, and Hyperliquid reports each order under its
+  venue `oid` rather than the id it was placed with. So nothing could read an order's absence as
+  meaning it was gone. `orders_complete: true` now states that it can, which the engine relies on
+  to retire vanished orders (see Fixed). The field is `#[serde(default)]` false, the answer that
+  claims nothing, and `ExecutionClient::account_snapshot` now documents what a client must
+  guarantee before setting it. Binance Spot and Margin set it per symbol, only when every
+  `openOrders` row converted under its own `clientOrderId`; the mock venue sets it always, and
+  Hyperliquid and Alpaca per instrument (see the entries below). IBKR sets it `false` until its
+  gap above is closed (#371). To migrate, pass the new
+  argument to `InstrumentAccountSnapshot::new` after `orders`, or add the field to a struct literal;
+  `false` keeps the previous behaviour.
+
+  `InstrumentState` gains `orders_open_at_resync` (`#[serde(default)]`), and
+  `EngineState::update_from_account_reconnecting` now handles an account stream's reconnect notice.
+  The engine and the audit replica both call it in place of
+  `ConnectivityStates::update_from_account_reconnecting`, which it wraps and which is now
+  crate-private (see the entry above).
+
+- **BREAKING: `Subscriber` gains an associated `Transport: Send` type, and `Subscribed` is generic
+  over it** (`rustrade-data`). `Subscribed<InstrumentKey, Transport = WebSocket>` names what a successful
+  subscribe hands the stream, and its `websocket` field is renamed `transport`. Every in-tree
+  subscriber sets `type Transport = WebSocket`, so behaviour is unchanged; the standard
+  `ExchangeWsStream` initialisation is bounded on `Subscriber<Transport = WebSocket>`. This is the
+  seam that lets a subscriber whose streams share one connection hand each stream a view of it
+  rather than a socket of its own, for providers that allow a key a single connection. To migrate a
+  custom `Subscriber`, add `type Transport = WebSocket;` and construct `Subscribed` with
+  `transport:` in place of `websocket:`.
+
+- **BREAKING: `LseSubscriber` hands its streams an `LseAttachment` rather than a socket, and its
+  clones share one connection** (`rustrade-data`, feature `lse`). `LseSubscriber::Transport` is
+  `LseAttachment`. `LseStream` now reads from the attachment and no longer drives a socket of its
+  own. Clones used to open a connection each, and a key allows one, so every clone past the first
+  was refused. Clones now share one connection, and building one subscriber and cloning it is the
+  intended way to stream several batches on a key. `LseSubscriber::subscribe` now rejects an empty
+  batch, where it used to open a connection that never ticked. Its `Subscribed` never carries
+  buffered events, because frames go straight to the attachment. A stream that stops being polled
+  no longer back-pressures the socket, which must keep being read for the other streams; its frames
+  queue in memory until it is polled again or dropped. See the shared-connection entry under Added.
+
+- **BREAKING: `AlpacaStream` and `LseStream` are type aliases of one generic `SharedStream`**
+  (`rustrade-data`, features `alpaca`, `lse` or `massive`). The new public module
+  `subscriber::shared_stream` holds `SharedStream<Transport, Transformer>`: a single `MarketStream`
+  implementation for every provider whose streams share one connection, `MassiveStream` included.
+  The transport it reads is one of the providers' attachments, behind the sealed `SharedTransport`
+  trait. Anything a stream needs from its attachment while initialising passes through the
+  `AttachedTransformer` trait. The London Strategic Edge resume position travels that way, as the
+  opaque `LseResume`. Code naming `AlpacaStream<T>` or `LseStream<E, K, Kind>` is unaffected.
+  Code that named either as a distinct type, for instance to implement a trait for it, must now
+  target `SharedStream`.
+
+- **BREAKING: `Open::id` and `RequestCancel::id` now carry a `VenueOrderId`, which distinguishes an
+  order the venue named from one it did not** (`rustrade-execution`). Both fields previously held a
+  plain `OrderId`, and that field had come to mean two different things. A venue that accepts an
+  order without assigning an identifier of its own — Hyperliquid, for one resting but not yet
+  triggered — leaves it addressable only by the client id sent with it, and the Hyperliquid client
+  stored that client id in the venue-id field. Nothing marked which kind an `OrderId` held, so the
+  cancel path recovered the distinction by parsing: numeric meant a venue oid, UUID-shaped meant a
+  client id. Two identifiers told apart by the shape of their text is not a distinction a caller can
+  rely on.
+
+  `VenueOrderId::Assigned(OrderId)` and `VenueOrderId::ClientAssigned` now state it outright.
+  `VenueOrderId::assigned` yields the venue's identifier or `None`; `is_same_order_as` and
+  `contradicts` answer identity without treating two absent identifiers as a match, which plain `==`
+  on the old field could not avoid. `RequestCancel::id` is `Option<VenueOrderId>`, keeping three
+  cases apart that would otherwise collapse into two: nothing acknowledged yet, cancel by venue
+  identifier, and cancel by client id. Hyperliquid's cancel now reads the variant instead of parsing.
+
+  Migration: construct `Open` with `VenueOrderId::Assigned(order_id)` where a venue assigned one,
+  and `VenueOrderId::ClientAssigned` where it did not; `From<OrderId>` is available for the common
+  case. Replace `open.id == some_order_id` with `open.id.assigned() == Some(&some_order_id)`, and any
+  "is this the same order" test with `is_same_order_as` or `contradicts`. `Open` serialises
+  differently as a result, so persisted order state from an earlier version will not load. The
+  terminal states — `Cancelled`, `Filled` and `Expired` — keep a plain `OrderId`: they are records
+  of an order that has ended rather than handles for addressing one, and nothing compares them for
+  identity.
+
+- **Successive `Open` states for one order are now ordered by cumulative fill as well as by
+  `Open::time_exchange`** (`rustrade`, `rustrade-execution`). The new `Open::is_superseded_by`
+  replaces the bare timestamp comparison that `OrderManager::update_from_order_snapshot` used at
+  its three merge points. Cumulative fill is append-only for a single venue order, which makes it
+  a stronger ordering signal than a timestamp the venue may not supply: an update reporting
+  strictly less filled than the tracked state is refused however it is stamped, and one reporting
+  strictly more is admitted however it is stamped.
+
+  Two behaviours change as a result. A snapshot stamped earlier than the tracked state but
+  reporting more filled is now applied rather than discarded — this is what lets a reconciliation
+  fetch pinned to an order's creation time deliver the cumulative it alone holds. And a snapshot
+  reporting an order fully filled now retires it even when stamped earlier, because an order the
+  venue has once reported complete cannot become live again. Consumers that relied on the tracked
+  `time_exchange` never moving backwards should note that adopting an earlier-stamped update
+  carries its stamp with it; the state is taken as the venue reported it rather than recombined.
+
+- **The London Strategic Edge candle path now documents two limitations it had been passing on in
+  silence** (`rustrade-data`, `rustrade`; `lse` feature; documentation only, no behaviour change).
+
+  **Volume can be wrong by three to four orders of magnitude, in opposite directions.** The module
+  documentation already recorded that a majority of sampled one-minute equity bars report `0` in
+  minutes that demonstrably had trades. Since 2026-04-27 ETF bars have additionally been reported
+  over-stating volume enormously — one `QQQ` minute published at roughly 5,700× that session's
+  entire consolidated volume, repeated across `SPY`, `IWM`, `SMH`, `XLE`, `XLF` and `TLT` on every
+  trading day sampled over two months — while equity daily totals ran at 24–45% of the
+  consolidated tape against 65–80% before the same date. Those bars are structurally valid, so
+  neither `fetch_candles` nor any shape check on its output can distinguish them from correct
+  ones. `fetch_candles`, the module documentation and both candle examples now say so, and say
+  that a volume-derived quantity must be reconciled against a second source before it is trusted.
+
+  **History depth varies per symbol and per dataset, and a range exceeding it is not an error.**
+  Equities are stated to reach back to 2004, while an ETF has been reported carrying a first tick
+  of 2026-04-27 — about three months of spot. The provider publishes a first tick and a coverage
+  span for every catalog entry, but the catalog is on its discovery host and this integration does
+  not wrap it, so nothing here can check a requested range against it. A fetch starting before a
+  symbol's coverage returns the bars that exist and nothing to indicate the remainder was never
+  published, which in a backtest presents as a successful run over a shorter period than the one
+  asked for. Both the API documentation and the backtest example now state this and direct callers
+  to establish depth per symbol first.
+
+- **The London Strategic Edge HTTP plumbing now lives in one internal transport shared by the
+  provider's hosts** (`rustrade-data`; `lse` feature; internal refactor, no public API or behaviour
+  change). The auth header, the `User-Agent` their CDN requires, the timeouts, the no-redirect
+  policy that keeps the key off a server-named host, the concurrency-and-pacing gate and the
+  status-to-error mapping were all defined inside `LseVaultClient`. The provider serves reference
+  data from a second host that needs every one of them, so they moved to an `LseHttpCore` that
+  takes its base URL from whichever client wraps it; `LseVaultClient` keeps its own base URL and
+  page limit and is otherwise a thin wrapper.
+
+  `LseVaultClient`'s public surface, its `Debug` output and its rationing semantics are unchanged —
+  a core is still one ration pool shared by clones, so two clients still ration independently. The
+  `User-Agent` requirement is now documented as measured on both hosts rather than on the vault
+  alone: each answers a request carrying the default agent of a common HTTP client with `403`
+  `error code: 1010` at the edge, before it reaches the API. The one observable difference is a
+  `debug`-level log line, which reads `lse response received` in place of `vault response
+  received` now that it is emitted for either host.
+
+  Reading `LSE_API_KEY` is now shared too. The REST clients and the WebSocket connector had
+  separate copies of the variable name and of the redaction that keeps a mis-encoded key out of
+  the error message — `VarError`'s non-UTF-8 arm embeds the raw value, so interpolating it would
+  put essentially the whole key into a string callers log. They now read through one helper and
+  wrap its failure in their own error type, so that redaction has a single definition and cannot
+  drift between the two surfaces. The messages themselves are unchanged.
+
+- **IBKR orders and account reads fail fast across a TWS disconnect, and reject malformed order
+  frames** (`rustrade-execution`, feature `ibkr`; `ibapi` 4.1.0 → 4.2.0). While `ibapi`'s transport
+  is reconnecting, `open_order` and `cancel_order` are refused at once instead of being written to
+  the socket being replaced. A single order or cancel refused this way never reached TWS, so it is
+  reported as `OrderError::Connectivity`, which is transient, rather than as a venue rejection.
+  An `ibapi` `Shutdown` or `ConnectionFailed` error is non-transient; a send on a permanently
+  shut-down client is still refused with `ConnectionReset` and reads as transient. A placement
+  still waiting for its first status when the socket drops is no longer reported as rejected
+  either. TWS may already hold it, so it comes back open with its order id still tracked, as when
+  the status wait times out, and `fetch_open_orders` can resolve it. A bracket order whose
+  rollback cancels cannot be sent now names those order ids in its error and logs them; before,
+  the failed cancels were discarded. `fetch_open_orders` and `fetch_trades` now fail on an order frame
+  missing its action, or an order or execution frame missing a required part, where `ibapi` used
+  to hand back a default-built order that read as a buy; the account stream ends on such a frame.
+  Wire encoding of every order this crate builds is unchanged.
+
+- **BREAKING (behaviour): a failed IBKR bracket order returns legs of unknown fate as `Open`**
+  (`rustrade-execution`, feature `ibkr`). `IbkrClient::open_bracket_order` still cancels every
+  sent leg when placement fails. But a leg that reported no status, or was accepted and then its
+  rollback cancel could not be sent, may still be live or held at TWS. Such a leg now comes back `Open` with zero fill,
+  and its order id stays tracked so the account stream reports how it ends, as for a no-status
+  single order. The other legs, including any IB rejected, come back `Inactive` with the error,
+  as before. Previously all
+  three legs were always `Inactive` and untracked, so later events for a leg that was in fact live
+  were dropped. A failed bracket can therefore return a mix of `Open` and `Inactive` legs, and
+  `BracketOrderClient::open_bracket_order`'s rustdoc now states this exception to its
+  all-or-nothing contract.
+
+- **The IBKR client now documents that `fetch_open_orders` is unreliable on `ibapi` 4.2.0**
+  (`rustrade-execution`, feature `ibkr`; documentation only, no behaviour change). `ibapi` 4.2.0
+  answers open-orders and positions requests from one queue per request type. Every call reads
+  from it and nothing clears it between calls, so a call can read what was meant for another.
+  Order updates received since the previous call are read as part of `fetch_open_orders`' result,
+  which can therefore report an order that has since filled or been cancelled as open. Each
+  connection drop makes three `fetch_open_orders` calls fail and adds three calls of lag that never
+  clears: after the first drop, every call returns the reply to the call three before it.
+  `account_snapshot` fails twice after a drop, then recovers. `ibapi` also keeps a copy of every
+  order update in two queues this client never reads, for the life of the client; its own reconnect
+  does not clear them. The module, `fetch_open_orders`, `account_snapshot` and `account_stream` rustdoc
+  now say so. The comments claiming `ibapi` never routes `PositionEnd` are corrected: it arrives,
+  but positions is a live subscription, and reading until quiet is what drains replies left over
+  from failed calls. Fixed upstream after 4.2.0 by
+  [rust-ibapi#836](https://github.com/wboayue/rust-ibapi/pull/836). The fix reaches this client
+  with the first `ibapi` release that includes it.
+
+### Removed
+
+- **BREAKING: `MassiveLive`, `ChannelType` and `massive::Market`** (`rustrade-data`, feature
+  `massive`). Massive's WebSocket is now served through `Streams` by the new connectors and
+  `MassiveSubscriber` (see Added). They share one connection per cluster, confirm every
+  subscription by name, ping, and reconnect. `MassiveLive` opened a socket per client and
+  subscribed channels that do not exist (see Fixed). To migrate, build one
+  `MassiveSubscriber::from_env()?` and subscribe to `(MassiveCrypto::default(), "btc", "usd",
+  MarketDataInstrumentKind::Spot, PublicTrades)` and the like through `Streams::builder()`, passing
+  a clone of the subscriber to every stream. `MassiveError::Disconnected` and
+  `From<tungstenite::Error> for MassiveError`, which only `MassiveLive` produced, are removed too.
+  The `massive` feature no longer enables `tokio-tungstenite` with `native-tls`. WebSockets go
+  through `rustrade-integration`, over rustls, like every other connector.
+
+### Fixed
+
+- **The IBKR account stream recovers fills sent while `ibapi` was reconnecting** (#402,
+  `rustrade-execution`, feature `ibkr`). `ibapi` reconnects its socket to TWS/Gateway by itself,
+  and `account_stream` stayed open across that without noticing. It ended with no error and
+  emitted no `StreamTerminated`, and everything TWS sent while the socket was down was lost
+  silently. The stream now watches `ibapi`'s notices and connection state. When delivery is
+  restored, after `ibapi`'s reconnect notice or TWS's 1101/1102 following a 1100, it asks TWS for
+  the day's executions and emits those from the gap as `Trade` events, with their commissions.
+  Trades pass through a 10k LRU dedup cache, so none is delivered twice. If recovery fails three
+  times for a reason other than another drop, the stream ends with `StreamTerminated` rather than
+  stay open with a gap. It also ends with `StreamTerminated` when the client shuts down for good,
+  because `ibapi` gave up reconnecting or `IbkrClient::disconnect` was called. `ibapi` never ends
+  the order update subscription, so the stream used to stay open and silent then, and
+  `disconnect`'s rustdoc wrongly promised errors on it. Order lifecycle events from the gap are still not recovered (#370), so
+  reconcile with `fetch_open_orders` after a reconnect. The module rustdoc said the client had
+  "no auto-reconnect" and that a drop would show on the account stream as an error or EOF. Both
+  were wrong, and the docs now describe `ibapi`'s reconnect and what remains the caller's job. A
+  side fix: `ibapi` copies every execution it receives to the account stream, including those
+  answering an executions request, so each `fetch_trades` call could replay the day's fills onto a
+  live stream. The stream now skips executions that answer a request.
+
+- **An ended IBKR account stream releases `ibapi`'s order-update slot on the next TWS event**
+  (`rustrade-execution`, feature `ibkr`). The stream can end because the consumer dropped it or
+  because fill recovery gave up. Afterwards, its reader thread noticed only when it next had
+  something to forward: a status update for an order this client placed, or a completed fill.
+  Until then it held `ibapi`'s single order-update subscription, so another `account_stream` call
+  on the client failed, possibly for a long time when this client had nothing in flight. The
+  reader now checks on every order-update event it receives, so the first event after the stream
+  ends releases the slot. The `account_stream` rustdoc also no longer suggests disconnecting to release a stalled
+  reader: `ibapi` does not end the subscription on shutdown (wboayue/rust-ibapi#871), so that does
+  not work.
+
+- **Massive WebSocket channels and symbols that `MassiveLive` got wrong in 0.6.0** (`rustrade-data`,
+  feature `massive`). These are fixed by the connectors that replace it; if you consumed its
+  output, check what you stored.
+  - A per-second crypto or forex aggregate subscribed `XA` or `CA`, which are the **per-minute**
+    channels, so one-minute bars arrived labelled as one-second bars. The per-second channels are
+    `XAS` and `CAS`.
+  - A per-minute crypto or forex aggregate subscribed `XAM` or `CAM`, which do not exist. Massive
+    answers nothing for a channel it does not publish, so the stream stayed silent.
+  - Forex was documented, and subscribed, as `EUR-USD`. Massive accepts that spelling, but its
+    messages say `EUR/USD`. The connectors subscribe with the slash.
+  - Subscription validation passed on the first `success` status in the answer, so a subscribe
+    that Massive partly refused with `not authorized` counted as a success. Every subscription must
+    now be confirmed by name.
+  - Stock and option trades were given a side from trade conditions `1` and `2`. Those codes mean
+    sell and buy only on crypto; on stocks and options they are unrelated conditions. Stock and
+    option trades now have no side.
+
+- **The `lse_market_data` example no longer opens three connections on a key that holds one**
+  (`rustrade-data`, feature `lse`). It subscribed two datasets and a second subscription kind, each
+  on a connection of its own. A free key allows one concurrent connection, so the second and third
+  were refused with `TOO_MANY_CONNECTIONS`. The same three batches now share one connection. The
+  `WEBSOCKET_URL` rustdoc claimed eight concurrent connections were served. It now states the
+  one-connection limit, and how every stream opened by a subscriber and its clones shares that
+  connection.
+
+- **The Alpaca account snapshot no longer leaves out an open order silently, and declares its
+  order lists complete** (#369, `rustrade-execution`). The snapshot and `fetch_open_orders` dropped
+  an open order they could not represent without a trace. That is a notional order, placed by
+  dollar value so its `qty` is null, which this client never places but the Alpaca dashboard can,
+  or one whose side, quantity or kind does not parse. Such an order is now logged at `warn`. Its
+  instrument's `orders_complete` is `false`, and so is the entry of an instrument whose only open
+  order it is, which is now listed rather than missing. Every other instrument's list is declared
+  complete, so the engine retires an Alpaca order that ended while the account stream was down.
+  That holds because the open-order list is unpaged: a response at Alpaca's 500-order cap already
+  fails the snapshot with `TruncatedSnapshot`. It also holds because every order is listed under
+  the client order id the order stream reports it under: the one it was placed with, or the one
+  Alpaca assigns to a bracket's take-profit and stop-loss legs.
+
+- **Hyperliquid reports each order under the client id it was placed with** (#368,
+  `rustrade-execution`). The account snapshot and `fetch_open_orders` reported every open order
+  under its venue `oid`, because the SDK's type for the `openOrders` response drops the `cloid`
+  the venue sends. Order updates on the account stream reported the `cloid` as the venue echoes it,
+  `0x` and 32 hex digits, which is not the id the order was placed with either. So no order state
+  reached the order the engine tracked: each snapshot inserted a duplicate of every open order,
+  keyed by its `oid` and owned by `StrategyId::unknown()`, while the tracked order was never
+  advanced by a partial fill or retired when cancelled. Both paths now turn the `cloid` back into
+  the id the order was placed with; an order placed without one, such as from the web app, is
+  still reported under its `oid`. Open orders now also carry their filled quantity, from the
+  `origSz` the SDK type dropped.
+
+  With every order identifiable, the account snapshot declares its order list complete
+  (`orders_complete`), so the engine retires an order that ended while the account stream was
+  down. The snapshot now has an entry for every requested instrument, open orders or not, so that
+  covers the instrument whose last order ended. An order that does not convert is logged at `warn`
+  and leaves its instrument's list incomplete, rather than being left out silently.
+
+- **Hyperliquid order updates that end an order for a stated reason now end it**
+  (`rustrade-execution`). Only `open`, `filled` and `canceled` were recognised. Every other status
+  Hyperliquid sends, such as `marginCanceled`, `selfTradeCanceled`, `reduceOnlyCanceled`,
+  `scheduledCancel` and the `…Rejected` family, was logged and dropped, leaving the order tracked
+  as open. A status ending in `Canceled` now cancels the order, one ending in `Rejected` rejects
+  it, and `triggered` keeps a trigger order open until its own ending arrives.
+
+- **The London Strategic Edge canaries no longer print provider data when they fail**
+  (`rustrade-data` tests). `lse-weekly.yml` runs them with `--nocapture` in a public repository,
+  so their failure messages are published in the workflow log. Three put provider data there:
+  - the bond-yield canary's OHLC checks printed a row's yields;
+  - the economic-calendar canary's checks debug-printed a whole event, readings included;
+  - the WebSocket canary's stream-error line printed a decode failure's raw frame.
+
+  Each now names the row, event or field that failed and nothing else. The frame cut is pinned by
+  an ordinary test, so a change to the error's wording fails CI rather than leaking a frame. LSE
+  data may not be redistributed; see <https://londonstrategicedge.com/terms>.
+
+- **The engine retires an order that a complete account snapshot no longer lists** (`rustrade`).
+  A snapshot applied only the orders it listed, and `ExecutionManager` re-reads one on every
+  account-stream reconnect. So an order that filled, was cancelled or expired while the stream was
+  down stayed active in `Orders` indefinitely, and a strategy could go on treating it as working
+  liquidity. The snapshot a reconnect produces now retires each tracked `Open` order that its
+  instrument's list leaves out, when the client declares that list complete, and logs each
+  retirement at `warn`. Absence cannot say how an order ended, so the order's fill is left to the
+  fill path, and a late fill still routes to its position.
+
+  Only an order that was already `Open` when the reconnect began is eligible. The venue is re-read
+  while order requests are still being answered, so an order accepted just after the read can
+  reach the engine as `Open` before the snapshot that cannot list it; the engine records which
+  orders were `Open` at the reconnect notice and leaves every other order alone. An order in flight
+  is never retired, since its request's answer settles it, and neither is anything in a snapshot
+  that does not declare its list complete, including the one that starts a run. An order is retired
+  only when its venue order id proves it is the order recorded, so a client id reused for a new
+  order before the snapshot arrives keeps the new order, and so does an order the venue never
+  assigned an id. Each order kept that way is logged at `warn` too, since it may be gone. (#364)
+
+- **A Binance fill recovered after a disconnect now advances its order** (`rustrade-execution`,
+  feature `binance`; Spot and Margin). Recovery reads missed fills from REST `myTrades`, which
+  reports executions only, so a recovered `Trade` carried no `order_filled_quantity`. It moved the
+  position and left the order's `filled_quantity` where it stood before the gap, while the same
+  fill arriving live over the WebSocket advanced it. Recovery now reads each recovered order's
+  executions from its first (`myTrades` by `orderId`, one extra request per order, up to four
+  orders at a time per instrument) and sets the cumulative as of each fill, the same figure the
+  WebSocket reports as `z`. An order that fills completely during an outage is therefore retired
+  by its recovered fills.
+
+  The lookups have their own budget, half of the 30-second recovery timeout, so they never cost a
+  fill. A fill whose order was not looked up in time, or whose lookup failed or came back unusable,
+  goes out with `order_filled_quantity: None` as before, logged at `warn`. Alpaca's recovery
+  already carried the cumulative (activity `cum_qty`). Order cancellations during an outage are
+  still not recovered; see #364 for the engine side of reconciling them.
+
+- **A Binance REST order that is no longer live can no longer become an `Open` order**
+  (`rustrade-execution`, feature `binance`; Spot and Margin). The shared open-order converter read
+  every field but the order's status, so it treated any row it was given as resting. The two
+  `openOrders` call sites only ever serve live orders, but the converter also accepts Spot
+  `allOrders` rows, where a cancelled order that had partly filled would have converted to `Open`
+  with quantity remaining and rested in engine state indefinitely. The converter now admits only
+  `NEW`, `PARTIALLY_FILLED` and `PENDING_NEW` (an order-list leg waiting on its working order), and
+  drops any other or missing status with a `warn`, matching the guard the `executionReport` path
+  already applies. (#329)
+
+- **An IBKR market-depth RESET no longer leaves a silently stale order book** (`rustrade-data`,
+  feature `ibkr`). IB sends notice 317, *"Market depth data has been RESET"*, when TWS discards the
+  book on its side; every level held locally is stale from that moment. `ibapi` 4.1.0 reclassified
+  317 from an error to a data advisory, which is the correct reading — but the depth loop consumed
+  the subscription through `iter_data()`, and that iterator drops notices. The reset therefore
+  became invisible, and `DepthAggregator` went on applying updates to a book the venue had already
+  thrown away. Before 4.1.0 the same notice ended the stream, so the book was rebuilt by accident
+  rather than by design.
+
+  The loop now reads the subscription through `iter()` and handles the notice. `DepthAggregator`
+  gains `on_venue_reset`, which empties both sides and returns the emptied snapshot so it is
+  forwarded immediately rather than after the next depth row — the window in between is exactly
+  when a consumer would still be holding levels that no longer exist. It advances the sequence
+  counter instead of resetting it, which `clear` does and which would have been wrong here: a
+  consumer ordering by sequence reads a book renumbered to 0 as older than the stale one it
+  replaces, and keeps the stale one. Notice 316 (*"HALTED"*) remains terminal and is unchanged.
+
+  A book that looks live and is not is worse than no book, so this is a correctness fix rather than
+  a robustness one. It is unit-tested; confirming it end to end needs a live level-2 subscription
+  that receives a reset, which CI does not run.
+
+  `IB_MARKET_DEPTH_RESET_CODE` is exported alongside it: `DepthAggregator` is public, so a caller
+  driving one from their own subscription loop needs the code that triggers `on_venue_reset`.
+  `ibapi` names no constant for it, exposing only membership in `DATA_ADVISORY_CODES`.
+
+
+- **An out-of-sequence order snapshot can no longer rewind an order's state at a venue that
+  reports no timestamp of its own** (`rustrade`). IBKR's `orderStatus` callback carries no
+  timestamp field, so the client stamps `Utc::now()` as it processes each one. Those stamps record
+  arrival rather than the venue's own sequence and rise monotonically, so ordering on the stamp
+  alone admitted every snapshot and left the venue with last-writer-wins: a snapshot that overtook
+  a newer one in flight silently overwrote newer state with older, including the order's cumulative
+  filled quantity. Ordering now also rests on that cumulative, which is append-only for one venue
+  order, so the overtaken snapshot is recognised as out of sequence and refused. This is a
+  venue-independent change to engine state, not an IBKR one; IBKR is where the absence of a usable
+  timestamp made it load-bearing.
+
+- **An order snapshot is no longer applied to a tracked order it does not belong to** (`rustrade`).
+  `OrderManager::update_from_order_snapshot` resolves a snapshot to a tracked order by
+  `ClientOrderId` and nothing else, so two exchange orders sharing one client id occupy the same
+  slot. `Orders::update_from_fill` had long refused a fill whose venue identifier disagreed with the
+  order it would advance; the snapshot path, which writes the order's price, quantity, kind, time in
+  force and cumulative fill and can retire it outright, had no equivalent check. The three arms that
+  merge an incoming `Open` into a state the venue has already named now refuse an update that names
+  a different venue order, and report it. The test is for contradiction rather than inequality: an
+  order the venue has not yet named carries nothing to disagree with, and must still be able to
+  adopt the identifier a later snapshot brings — refusing that would strand such an order on its
+  placeholder for the rest of its life, never learning its venue identifier and never learning its
+  fills.
+
+- **A Binance Margin fill now advances its order** (`rustrade-execution`, `binance` feature). A
+  Binance `executionReport` of type `TRADE` carries two facts: the execution print (`l`/`L`) and
+  the order's new cumulative filled quantity (`z`). The margin client emitted only the first, and
+  an execution on its own never moves an order — `Orders::update_from_fill` writes
+  `Open::filled_quantity` and does nothing at all when the order is not already tracked, which is
+  the case for an order placed out of band, after an engine restart mid-order, or for a fill
+  arriving inside the documented subscribe/listener race. A margin `TRADE` now emits the paired
+  `OrderSnapshot` alongside the `Trade`, as Binance Spot has since 0.6.0, unless the report's own
+  order status (`X`) says the order is no longer working — emitting one then would resurrect an
+  order the engine has already retired. The snapshot is stamped with the execution's transaction
+  time (`T`), which is also what gives the engine's staleness gate an ordering key on the margin
+  WebSocket path.
+
+- **Binance Spot and Margin now share one `executionReport` converter** (`rustrade-execution`,
+  `binance` feature). The margin client carried a hand-maintained copy of spot's WebSocket
+  user-data converter, and the fix above is the third correction to reach spot and not margin. The
+  new `BinanceExecutionReportFields` trait names the eighteen fields the conversion reads — they
+  are identical in name and type across `spot::websocket_api::ExecutionReport` and
+  `margin_trading::websocket_streams::ExecutionReport`, even though the structs around them are
+  not (55 fields against 50, with eight sharing a name while differing in type) — and a single
+  converter parameterised by `ExchangeId` now serves both clients. This mirrors
+  `BinanceOrderFields` on the REST path. No public API changes; diagnostics from this path now
+  carry the venue as a structured `exchange` field rather than a hard-coded message prefix.
+
+- **A Binance Margin REST order snapshot is now stamped with when the order last changed, not when
+  it was created** (`rustrade-execution`, `binance` feature). The engine orders an order's states by
+  `Open::time_exchange` and discards any snapshot no newer than the state it already tracks. Margin
+  stamped every snapshot with the venue's creation time, which is identical across every snapshot of
+  one order, so margin had no usable ordering key: reconciliation snapshots compared equal and were
+  applied in whatever order they arrived, and any snapshot would be discarded outright as soon as
+  something advanced the order past creation — precisely the partially filled orders a reconciliation
+  fetch exists to repair. The converter now prefers the venue's `updateTime`, falling back to
+  creation time only where the venue omits it. Binance Spot has behaved this way since 0.6.0.
+
+- **Binance Spot and Margin now share one REST order-response converter** (`rustrade-execution`,
+  `binance` feature). The margin client carried a hand-maintained copy of the spot converter, and
+  the fix above is the second correction that reached spot and not margin. The `BinanceOrderFields`
+  trait, which names the eleven fields the conversion reads, now covers the margin open-orders
+  response alongside both spot responses, and the single converter is parameterised by `ExchangeId`.
+  Those eleven fields are identical in name and type across all three SDK types even though the
+  structs around them are not, so naming the read subset is what makes one converter safe to share.
+  No public API changes; diagnostics from this path now carry the venue as a structured `exchange`
+  field rather than a hard-coded message prefix.
+
+- **The London Strategic Edge vault canary no longer races the provider's concurrency cap**
+  (`rustrade-data`, `lse` feature). The vault permits two concurrent requests and
+  `LseVaultClient` never retries a `429` by design, so running the canary's four tests in
+  parallel — the harness default — could put three requests in flight and fail whichever test
+  lost the race with `LseError::RateLimited`. The failure was indistinguishable from the
+  provider-side drift the canary exists to detect. The tests are now `#[serial]`, matching the
+  Alpaca and Massive live tests, which holds the binary to one in-flight request. Test-only; no
+  library behaviour changes.
+
+- **The London Strategic Edge WebSocket canary could not be run as a file, and now runs weekly**
+  (`rustrade-data`, `lse` feature). The provider permits **one** WebSocket connection per API key
+  and answers a second with `TOO_MANY_CONNECTIONS`. Rust's harness runs a file's tests in
+  parallel and four of these five open a socket, so running the file exactly as its own
+  documentation prescribes failed four tests inside their `expect`, before any assertion — while
+  the one that won the race passed. The tests are now `#[serial]`, matching the vault canary and
+  the Massive WebSocket tests, which holds the binary to one socket at a time; the full file now
+  passes in about seventy seconds.
+
+  The canary was also wired into the weekly live-API workflow, which until now ran only the vault
+  and export canaries — so this surface had never been scheduled at all, independently of that
+  workflow's own reachability. The job's timeout rises to thirty minutes, since serialised tests
+  sum their timeouts rather than overlapping them.
+
+- **The London Strategic Edge WebSocket canary no longer reports green on a throttled stream**
+  (`rustrade-data`, `lse` feature). It asserted that every subscribed symbol delivers a tick, that
+  each tick's decoded instant is plausible, and that no frame failed to decode — none of which a
+  throttled connection violates. A session serving a couple of percent of its normal tick rate,
+  with the socket up and no error frame, satisfies all three: every symbol still delivers, and
+  every timestamp on what arrives is genuinely fresh. A new test counts ticks over a fixed window
+  on the continuously-traded crypto tape and fails below a floor set more than an order of
+  magnitude beneath the slowest rate ever measured on that feed.
+
+  The floor is held against crypto alone, and the canary's documentation now says so outright. On
+  a venue that keeps market hours the same low count is produced by a shut market and by a
+  throttled feed alike, so a floor there would fail for a closure and would end up muted, taking
+  the signal with it. A passing run therefore reports that the crypto tape is flowing and says
+  nothing about throughput on the equities, ETF, FX and CFD venues, which stay covered only
+  against a subscription that never ticks and a frame that cannot be read. Test-only; no library
+  behaviour changes.
+
+### Security
+
+- **The Binance execution clients now document that `binance-sdk` logs request credentials at
+  `DEBUG`** (`rustrade-execution`, feature `binance`). The SDK's WebSocket API client logs every
+  request it sends at `DEBUG`, after signing. For `BinanceSpot` that is every order placement and
+  cancellation and the user-data subscription, each carrying the account's API key and the
+  request's signature. For `BinanceMargin` it is the user-data subscription, carrying the listen
+  token. The API secret and private key are never logged. This library installs no subscriber, so
+  the fix belongs in the application's filter. The `binance` module rustdoc now explains the
+  exposure and gives an `EnvFilter` recipe: seed a `binance_sdk=info` directive before the user's
+  own, so a bare `RUST_LOG=debug` cannot lift it while an explicit `binance_sdk=debug` still can.
+
+- **The dead `RUSTSEC-2024-0436` (`paste`) suppression has been dropped from `deny.toml` and the
+  CI audit job's ignore list.** `paste` left the graph when `parquet` moved to 59.2.0; it appears
+  zero times in `Cargo.lock`, so the entry has been suppressing an advisory for a crate the build
+  no longer contains. Its justification had gone stale on both counts — it still read *"Transitive
+  via parquet 59.1.0 (latest)"* while the manifest is on 60.0.0.
+
+  Removing it is bookkeeping, not a behaviour change: an ignore for an absent crate can never fire,
+  so no advisory becomes newly visible and no gate becomes newly strict. It is removed because a
+  suppression list is only readable as a list of accepted risks if every line on it is a risk that
+  still exists. The two lists stay synchronised at ten ids each, which is the property the CI job's
+  *"Synced with deny.toml"* comment asserts.
+
+  The neighbouring `rkyv` (`RUSTSEC-2026-0235`) entry is deliberately kept: unlike `paste` it is
+  still in `Cargo.lock`, as an unenabled optional dependency of `rust_decimal` that the build never
+  compiles but the feature-agnostic lockfile still records.
+
 ## [0.6.0] - 2026-09-18
 
 ### Added
@@ -3560,43 +4631,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `DatabentoHistorical::fetch_quotes_stream()`: Stream quotes without collecting into memory
   - Avoids memory spikes for large historical queries (millions of records)
 
-### Changed
-
-- **BREAKING: Migrate from `async_trait` to native AFIT** ([#85](https://github.com/Niqnil/rustrade/issues/85))
-  - `Subscriber`, `SubscriptionValidator`, `ExchangeTransformer`, and `MarketStream` traits now use native async fn in trait (Rust 1.75+)
-  - Removed `async-trait` crate dependency
-  - Additional `Sync` bounds added to some generic parameters where required
-  - Return type changed from `Pin<Box<dyn Future + Send>>` to opaque `impl Future + Send`
-  - No code changes required for most downstream users unless explicitly naming future types
-
-- **Databento structured error types** ([#47](https://github.com/Niqnil/rustrade/issues/47))
-  - New `DatabentoErrorKind` enum: `Authentication`, `RateLimit`, `Network`, `Decode`, `Api`
-  - New `DataError::Databento { kind, context, message }` variant for programmatic error handling
-  - Enables proper retry logic: don't retry auth errors, backoff on rate limits, retry network errors
-  - All Databento errors now use structured types instead of `DataError::Socket(String)`
-
-- **Databento `Arc<K>` performance documentation** ([#45](https://github.com/Niqnil/rustrade/issues/45))
-  - Documented that instrument keys are cloned per record
-  - Recommended `Arc<K>` for high-frequency scenarios to avoid per-record heap allocations
-  - Added examples in rustdoc for `fetch_trades`, `fetch_quotes`, and `DatabentoLive`
-
-- **BREAKING: Stateful `Subscriber` trait for credential injection** ([#43](https://github.com/Niqnil/rustrade/issues/43))
-  - `Subscriber::subscribe` now takes `&self` instead of being a static method
-  - `Subscriber` trait requires `Clone + Send + Sync` bounds
-  - `StreamBuilder::subscribe()` now requires a subscriber instance as first argument:
-    - Unauthenticated: `.subscribe(WebSocketSubscriber, [...])`
-    - Authenticated (Alpaca): `.subscribe(AlpacaSubscriber::from_env()?, [...])`
-  - `init_market_stream()` now takes subscriber as second argument
-  - `AlpacaSubscriber` is now stateful with `AlpacaCredentials`:
-    - `AlpacaSubscriber::new(credentials)`: Create with explicit credentials
-    - `AlpacaSubscriber::from_env()`: Load from `ALPACA_API_KEY`/`ALPACA_SECRET_KEY`
-    - `AlpacaCredentials::new(key, secret)`: Create credentials explicitly
-    - `AlpacaCredentials::from_env()`: Load from environment
-  - Auth errors now fail at construction time (fast fail) instead of first reconnect
-  - Credentials are cloned into reconnect closure, available on every reconnect
-
-### Added
-
 - **BracketOrderClient supertrait**: Unified trait for bracket orders
   - `BracketOrderClient` trait extending `ExecutionClient` for exchanges supporting native bracket orders
   - `RequestOpenBracket` struct: Common request parameters (side, quantity, prices, TIF)
@@ -3669,6 +4703,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (distinct from market data feed identifiers)
 
 ### Changed
+
+- **BREAKING: Migrate from `async_trait` to native AFIT** ([#85](https://github.com/Niqnil/rustrade/issues/85))
+  - `Subscriber`, `SubscriptionValidator`, `ExchangeTransformer`, and `MarketStream` traits now use native async fn in trait (Rust 1.75+)
+  - Removed `async-trait` crate dependency
+  - Additional `Sync` bounds added to some generic parameters where required
+  - Return type changed from `Pin<Box<dyn Future + Send>>` to opaque `impl Future + Send`
+  - No code changes required for most downstream users unless explicitly naming future types
+
+- **Databento structured error types** ([#47](https://github.com/Niqnil/rustrade/issues/47))
+  - New `DatabentoErrorKind` enum: `Authentication`, `RateLimit`, `Network`, `Decode`, `Api`
+  - New `DataError::Databento { kind, context, message }` variant for programmatic error handling
+  - Enables proper retry logic: don't retry auth errors, backoff on rate limits, retry network errors
+  - All Databento errors now use structured types instead of `DataError::Socket(String)`
+
+- **Databento `Arc<K>` performance documentation** ([#45](https://github.com/Niqnil/rustrade/issues/45))
+  - Documented that instrument keys are cloned per record
+  - Recommended `Arc<K>` for high-frequency scenarios to avoid per-record heap allocations
+  - Added examples in rustdoc for `fetch_trades`, `fetch_quotes`, and `DatabentoLive`
+
+- **BREAKING: Stateful `Subscriber` trait for credential injection** ([#43](https://github.com/Niqnil/rustrade/issues/43))
+  - `Subscriber::subscribe` now takes `&self` instead of being a static method
+  - `Subscriber` trait requires `Clone + Send + Sync` bounds
+  - `StreamBuilder::subscribe()` now requires a subscriber instance as first argument:
+    - Unauthenticated: `.subscribe(WebSocketSubscriber, [...])`
+    - Authenticated (Alpaca): `.subscribe(AlpacaSubscriber::from_env()?, [...])`
+  - `init_market_stream()` now takes subscriber as second argument
+  - `AlpacaSubscriber` is now stateful with `AlpacaCredentials`:
+    - `AlpacaSubscriber::new(credentials)`: Create with explicit credentials
+    - `AlpacaSubscriber::from_env()`: Load from `ALPACA_API_KEY`/`ALPACA_SECRET_KEY`
+    - `AlpacaCredentials::new(key, secret)`: Create credentials explicitly
+    - `AlpacaCredentials::from_env()`: Load from environment
+  - Auth errors now fail at construction time (fast fail) instead of first reconnect
+  - Credentials are cloned into reconnect closure, available on every reconnect
 
 - **deps(ibkr)**: Bump `ibapi` from 2.11.4 to 2.12.0 — fixes TWS error surfacing on
   subscription channels ([rust-ibapi#567](https://github.com/wboayue/rust-ibapi/pull/567),

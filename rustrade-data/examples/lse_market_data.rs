@@ -30,6 +30,8 @@
 //! - **Per-dataset provenance.** Each dataset family is its own connector, so `MarketEvent.exchange`
 //!   says which one an event came from — worth having, because two of the five fabricate `volume`.
 //! - **Opt-in resumption across a reconnect**, with one state shared across every stream.
+//! - **Three batches, two datasets and two kinds over the key's one connection.** Every stream opened
+//!   by one subscriber and its clones shares a single socket.
 //!
 //! # Properties worth knowing before you build on this
 //!
@@ -47,10 +49,17 @@
 //!   sampled run was unique on `(ts, price, bid, ask, volume)`, yet removing the repeats destroyed
 //!   volume that otherwise reconciles exactly. Do not add a filter.
 //! - **Both book levels carry a zero size.** The feed publishes bid and ask *prices* only.
-//! - **Each `subscribe` call opens its own connection, and a connection accepts 16 symbols.** A
-//!   batch that exceeds the cap, or that names a symbol the key cannot subscribe to, is rejected
-//!   before anything reaches the wire — so a typo costs no subscription slot and never presents as
-//!   a symbol that is confirmed and then silently never ticks.
+//! - **A free key holds exactly one connection, and every stream shares it.** The provider's
+//!   handshake says so, and a second connection is refused with `TOO_MANY_CONNECTIONS`. Streams
+//!   opened by clones of one subscriber share one socket, so this example opens one however many
+//!   `subscribe` calls it makes — but a *separately built* subscriber for the same key, or another
+//!   process using it, would be refused.
+//! - **The connection holds 100 subscriptions, shared by every stream on it** (as last measured;
+//!   the handshake reports the live figure). A symbol two streams hold — `BTC/USD` below, as a
+//!   trade and as a top-of-book — costs one slot. A batch that would exceed the cap, or that names a
+//!   symbol the key cannot subscribe to, is rejected before anything reaches the wire — so a typo
+//!   costs no subscription slot and never presents as a symbol that is confirmed and then silently
+//!   never ticks.
 
 use futures::StreamExt;
 use rustrade_data::{
@@ -77,13 +86,17 @@ async fn main() {
         .expect("set LSE_API_KEY - get a free key at https://londonstrategicedge.com/data");
 
     // Resumption is opt-in, and one state serves every stream below — including the top-of-book
-    // connection, which carries the *same* crypto symbols as the crypto trade connection.
-    // Watermarks are filed per subscription *and* kind, so those two advance independently and
-    // neither can set the other's resume point; nothing about sharing needs thinking about here.
+    // stream, which carries the *same* crypto symbols as the crypto trade stream. Watermarks are
+    // filed per subscription *and* kind, so those two advance independently and neither can set
+    // the other's resume point; nothing about sharing needs thinking about here.
     //
     // On a first connection there is nothing to resume from, so nothing replays here. The state
-    // matters after a drop: the reconnect re-subscribes from the last event each stream actually
-    // delivered instead of leaving a gap.
+    // matters after a drop: every stream ends with the connection, the first to re-attach
+    // reconnects for all of them, and each resumes from the last event it actually delivered
+    // instead of leaving a gap.
+    //
+    // Every `subscribe` below is handed a clone of one subscriber, which is what makes them share
+    // the key's one connection.
     let resume = Arc::new(LseResumeState::new());
 
     let streams: Streams<MarketStreamResult<MarketDataInstrument, DataKind>> =
@@ -109,7 +122,7 @@ async fn main() {
                             ),
                         ],
                     )
-                    // A second dataset family, on its own connection: same frame, same decoder,
+                    // A second dataset family, on the same connection: same frame, same decoder,
                     // different `MarketEvent.exchange` — and a `volume` the provider invents.
                     .subscribe(
                         subscriber.clone().with_resume(Arc::clone(&resume)),

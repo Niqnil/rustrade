@@ -61,4 +61,17 @@ pub enum IndexError {
     /// Contains a description naming the instrument and the rejected value.
     #[error("invalid contract_size: {0}")]
     InvalidContractSize(String),
+
+    /// Two distinct [`Asset`](crate::asset::Asset)s on one exchange share an
+    /// [`AssetNameInternal`](crate::asset::name::AssetNameInternal), differing only in
+    /// `name_exchange`.
+    ///
+    /// The asset-side twin of [`Self::DuplicateInstrumentNameInternal`]. Asset lookups and
+    /// downstream asset state are keyed on `(exchange, name_internal)` while being read
+    /// **positionally** by `AssetIndex`, so the pair would take two indices but collapse into one
+    /// entry, and every index past it would resolve to the wrong asset.
+    ///
+    /// Contains a description naming the exchange, the shared name, and both `name_exchange`s.
+    #[error("duplicate AssetNameInternal: {0}")]
+    DuplicateAssetNameInternal(String),
 }

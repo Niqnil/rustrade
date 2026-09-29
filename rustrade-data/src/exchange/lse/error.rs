@@ -1,6 +1,6 @@
 use crate::exchange::lse::quota::QuotaStatus;
 use crate::subscription::candle::CandleInterval;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -87,6 +87,129 @@ pub enum LseError {
     /// The request is malformed in a way the caller must fix, detected before it is sent.
     #[error("invalid input: {message}")]
     InvalidInput { message: String },
+
+    /// The requested country is not one the provider publishes bond yields for.
+    ///
+    /// Raised before the request is sent, because `/bond-yields` performs **no validation of its
+    /// own**: a country it does not know answers `200` with `count: 0`, which is byte-for-byte
+    /// indistinguishable from an unknown maturity and from a range that is simply empty. Measured:
+    /// `country=ZZ` and `country=GB` both return `200 count=0`, against `country=UK` returning rows.
+    ///
+    /// `normalised` is what `requested` became before the lookup — the provider keys the United
+    /// Kingdom `UK`, **not** the ISO-3166 `GB` its own `country_iso2` column name implies, and that
+    /// is the only divergence among its 34 codes. Both forms are reported so a caller can see which
+    /// one was actually looked up.
+    #[error(
+        "unknown bond-yield country {requested:?} (looked up as {normalised:?}): the provider does          not publish it - consult the stats handle for the countries it does"
+    )]
+    UnknownBondYieldCountry {
+        requested: String,
+        normalised: String,
+    },
+
+    /// The requested maturity is not one the provider publishes for that country.
+    ///
+    /// Raised before the request is sent, for the same reason as
+    /// [`UnknownBondYieldCountry`](Self::UnknownBondYieldCountry): measured, `maturity=99Y` answers
+    /// `200` with `count: 0` rather than an error.
+    ///
+    /// `available` is the country's published tenor list, carried in full because it is short
+    /// (fifteen at the widest measured) and because a tenor is a **provider label**, not a
+    /// duration — `5Y` and `5Y TIPS` are distinct series that report the same `maturity_days`, so
+    /// there is nothing a caller can compute the right spelling from.
+    #[error(
+        "unknown bond-yield maturity {requested:?} for country {country}: the provider publishes          {available:?}"
+    )]
+    UnknownBondYieldMaturity {
+        country: String,
+        requested: String,
+        available: Vec<String>,
+    },
+
+    /// The requested range lies entirely outside the published coverage of that series.
+    ///
+    /// The third cause of a `200 count=0`, and the one that membership alone cannot catch: a
+    /// `(country, maturity)` pair can exist and still hold nothing in the window asked for.
+    /// Measured on `US 10Y TIPS` and `TR 2Y`, both of which return zero rows for 2023-2024 and both
+    /// of which report a `first_date` of 2025-07-07 — correct behaviour from the provider, and
+    /// silent.
+    ///
+    /// Raised only when the requested range and the published one are **disjoint**. A partial
+    /// overlap is not an error: it returns the rows that exist, which is what was asked for.
+    #[error(
+        "bond-yield range {start}..={end} lies outside the published coverage of {country}{} \
+         ({first_date}..={last_date})",
+        match .maturity {
+            Some(maturity) => format!(" {maturity}"),
+            None => String::new(),
+        }
+    )]
+    BondYieldRangeOutsideCoverage {
+        country: String,
+        /// `None` when the query named no maturity, so the bound is the country's own coverage.
+        maturity: Option<String>,
+        start: NaiveDate,
+        end: NaiveDate,
+        first_date: NaiveDate,
+        last_date: NaiveDate,
+    },
+
+    /// The requested country is not one the economic calendar publishes.
+    ///
+    /// Raised before the request is sent, for the same reason as
+    /// [`UnknownBondYieldCountry`](Self::UnknownBondYieldCountry): the endpoint answers an unknown
+    /// country with `200` and `count: 0`, indistinguishable from a quiet window.
+    ///
+    /// `normalised` is what `requested` became before the lookup. The calendar keys the United
+    /// Kingdom `UK` rather than `GB`, exactly as `/bond-yields` does — but the two vocabularies are
+    /// **not** the same set: the calendar's 108 codes also include `EA` and `EU`, which are not
+    /// countries. Both forms are reported so a caller can see which one was actually looked up.
+    #[error(
+        "unknown economic-calendar country {requested:?} (looked up as {normalised:?}): the          provider does not publish it - consult the stats handle for the countries it does"
+    )]
+    UnknownCalendarCountry {
+        requested: String,
+        normalised: String,
+    },
+
+    /// The requested impact rating is not one the economic calendar publishes.
+    ///
+    /// Measured: `impact=Critical` answers `200` with `count: 0` rather than an error, so this is
+    /// raised before the request is sent.
+    ///
+    /// `available` is carried in full because the vocabulary is closed and short — exactly
+    /// `["High", "Low", "Medium", "None"]`. ⚠️ `"None"` in that list is a literal rating, not an
+    /// absent value.
+    #[error("unknown economic-calendar impact {requested:?}: the provider publishes {available:?}")]
+    UnknownCalendarImpact {
+        requested: String,
+        available: Vec<String>,
+    },
+
+    /// The requested range lies entirely outside the calendar's published coverage.
+    ///
+    /// ⚠️ **A global bound, not a per-country one**, which makes this weaker than
+    /// [`BondYieldRangeOutsideCoverage`](Self::BondYieldRangeOutsideCoverage).
+    /// `/economic-calendar/stats` publishes no per-country coverage at all, so a window *inside*
+    /// this range may still legitimately return nothing — 88 of the 108 countries hold fewer than
+    /// 100 events. That case is deliberately **not** an error: the library has no way to
+    /// distinguish it from a quiet period, and inventing an error for it would mean inventing
+    /// knowledge the provider does not publish.
+    ///
+    /// 🔴 `latest` has been 2026-03-24 across measurements two months apart — the feed is frozen,
+    /// so **every** forward-looking window lands here.
+    ///
+    /// Raised only when the requested range and the published one are **disjoint**. A partial
+    /// overlap is not an error: it returns the events that exist, which is what was asked for.
+    #[error(
+        "economic-calendar range {start}..={end} lies outside the published coverage          ({earliest}..={latest})"
+    )]
+    CalendarRangeOutsideCoverage {
+        start: NaiveDate,
+        end: NaiveDate,
+        earliest: NaiveDate,
+        latest: NaiveDate,
+    },
 
     /// The requested resolution is not one the provider serves.
     ///
@@ -214,6 +337,29 @@ pub enum LseError {
         // difference between two instants and the type that produces it is chrono's.
         actual: chrono::TimeDelta,
     },
+
+    /// A single second of the option print tape holds more prints than one page can carry.
+    ///
+    /// The flow endpoint truncates silently at its row cap and accepts only whole-second bounds, so
+    /// a one-second window that still comes back full cannot be narrowed further, and the prints
+    /// beyond the cap cannot be read at all. Terminal rather than returned short: the alternative is
+    /// a tape missing prints with nothing to say so.
+    #[error(
+        "the option print tape holds at least {rows} prints in the one second from {window_start}, \
+         more than one page can carry"
+    )]
+    OptionFlowWindowSaturated {
+        window_start: DateTime<Utc>,
+        rows: usize,
+    },
+
+    /// An option print came back outside the window or underlying it was requested for.
+    ///
+    /// Means the provider ignored a request parameter, which it is known to do silently — the flow
+    /// endpoint answers a `ticker` filter by returning every contract. Raised before any print of
+    /// the offending window is yielded.
+    #[error("option print {id} does not match its request: {message}")]
+    UnexpectedOptionFlowRow { id: u64, message: String },
 
     /// The shared allowance is exhausted.
     ///
@@ -546,7 +692,10 @@ impl LseError {
             Self::RateLimited { .. } | Self::QuotaExceeded { .. } => LseErrorKind::RateLimit,
             Self::Http(_) => LseErrorKind::Network,
             Self::ExportTimeout { .. } => LseErrorKind::Timeout,
-            Self::Api { .. } | Self::ExportFailed { .. } => LseErrorKind::Api,
+            // The request was valid and the provider cannot serve it whole; retrying changes nothing.
+            Self::Api { .. }
+            | Self::ExportFailed { .. }
+            | Self::OptionFlowWindowSaturated { .. } => LseErrorKind::Api,
             Self::Io { .. } => LseErrorKind::Io,
 
             // The caller's request or registry, not the provider's answer.
@@ -555,7 +704,13 @@ impl LseError {
             | Self::UnknownDataset(_)
             | Self::AmbiguousSlug { .. }
             | Self::UnknownInstrument { .. }
-            | Self::QuoteAssetMismatch { .. } => LseErrorKind::InvalidInput,
+            | Self::QuoteAssetMismatch { .. }
+            | Self::UnknownBondYieldCountry { .. }
+            | Self::UnknownBondYieldMaturity { .. }
+            | Self::BondYieldRangeOutsideCoverage { .. }
+            | Self::UnknownCalendarCountry { .. }
+            | Self::UnknownCalendarImpact { .. }
+            | Self::CalendarRangeOutsideCoverage { .. } => LseErrorKind::InvalidInput,
 
             // Everything the provider sent that could not be read as what it claims to be. An
             // integrity or job mismatch belongs here rather than under `Api`: the request was
@@ -566,6 +721,7 @@ impl LseError {
             | Self::UnexpectedCandleRange { .. }
             | Self::NonMonotonicCandlePage { .. }
             | Self::UnexpectedCandleResolution { .. }
+            | Self::UnexpectedOptionFlowRow { .. }
             | Self::IntegrityMismatch { .. }
             | Self::ExportJobMismatch { .. }
             | Self::UnsupportedSchema { .. }

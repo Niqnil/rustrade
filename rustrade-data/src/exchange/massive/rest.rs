@@ -23,7 +23,7 @@ use tracing::debug;
 use url::Url;
 
 const BASE_URL: &str = "https://api.massive.com";
-const ENV_API_KEY: &str = "MASSIVE_API_KEY";
+pub(super) const ENV_API_KEY: &str = "MASSIVE_API_KEY";
 
 /// Byte cap applied to a response body before it is stored in a [`MassiveError`] message.
 const ERROR_MESSAGE_BODY_BYTES: usize = 512;

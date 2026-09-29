@@ -184,7 +184,6 @@ where
                 AccountStreamEvent::Reconnecting(exchange) => {
                     let _untracked = self
                         .replica_engine_state_mut()
-                        .connectivity
                         .update_from_account_reconnecting(&exchange);
                 }
                 AccountStreamEvent::Item(event) => {

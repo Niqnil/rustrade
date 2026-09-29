@@ -591,6 +591,73 @@ async fn an_interrupted_download_resumes_from_the_partial_file() {
 }
 
 #[tokio::test]
+async fn the_artifact_download_asks_for_identity_while_json_calls_keep_gzip() {
+    // The client decodes gzip transparently, counting bytes after decoding, while a `Range`
+    // addresses them before it. A byte-exact, resumable transfer therefore has to ask for the
+    // artifact as stored -- on the first request and on every resume -- or a resume would land at
+    // the wrong offset of a stream that cannot be decoded from the middle. The JSON endpoints keep
+    // gzip: they are read whole, so they only gain from it.
+    let payload = b"0123456789abcdef";
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/vault/export/job1"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ready_body("job1", payload)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/vault/export/job1/download"))
+        .and(header("range", "bytes=10-"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-range", "bytes 10-15/16")
+                .set_body_bytes(payload[10..].to_vec()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/vault/export/job1/download"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload[..10].to_vec()))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join("out.parquet");
+    let client = client(&server);
+    let job = client.export_status("job1").await.unwrap();
+
+    // Truncated first transfer, then the resume that completes it.
+    client
+        .download_export(&job, &destination, &tick_request())
+        .await
+        .unwrap_err();
+    client
+        .download_export(&job, &destination, &tick_request())
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&destination).unwrap(), payload);
+
+    let requests = server.received_requests().await.unwrap();
+    let accept_encoding = |index: usize| {
+        requests[index]
+            .headers
+            .get("accept-encoding")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    assert_eq!(requests.len(), 3);
+    assert!(
+        accept_encoding(0).is_some_and(|value| value.contains("gzip")),
+        "a JSON call should advertise gzip, sent {:?}",
+        accept_encoding(0)
+    );
+    assert!(!requests[1].headers.contains_key("range"));
+    assert!(requests[2].headers.contains_key("range"));
+    for index in [1, 2] {
+        assert_eq!(accept_encoding(index).as_deref(), Some("identity"));
+    }
+}
+
+#[tokio::test]
 async fn a_server_that_ignores_range_restarts_the_download_instead_of_appending() {
     // A server is entitled to answer a `Range` request with `200` and the whole artifact. Appending
     // that to the existing prefix would double it, so the transfer must restart from zero -- hasher

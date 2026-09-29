@@ -1,7 +1,7 @@
 //! The London Strategic Edge WebSocket tick frame, and the three timestamp spellings it arrives in.
 
-use super::channel::LseChannel;
-use crate::{Identifier, exchange::ExchangeSub};
+use super::mapper::subscription_id;
+use crate::Identifier;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rustrade_integration::subscription::SubscriptionId;
@@ -23,12 +23,31 @@ use std::fmt;
 ///  "price":42000.5,"bid":42000.5,"ask":42001.0,"volume":0.00155}
 /// ```
 ///
-/// # ⚠️ The tick is a QUOTE, not a print
+/// # ⚠️ The tick is a QUOTE, not a print — except on the options channel
 /// `price` equals `bid` exactly — measured on 3,966 of 3,966 sampled ticks spanning every dataset
 /// family, plus every sample taken on the provider's other price endpoint. Anything decoded from
 /// this frame as a trade is therefore a bid-side quote wearing a trade's shape, and is not evidence
 /// that a transaction occurred at that price or at all. See the trade transformer for what ships
 /// anyway and why.
+///
+/// # Option contract ticks differ in four ways
+/// Option contracts tick on this same frame, under their OSI symbol (`SPY260930C00700000`):
+///
+/// - **`bid` and `ask` are `null` on every one**, while an equity tick on the same connection in
+///   the same second carries both. It is a property of the channel, not of market hours, so an
+///   option contract has no quote here at all — [`bid`](Self::bid) and [`ask`](Self::ask) are
+///   optional for this reason alone.
+/// - **The tick is a real print.** Over one identical window every option tick matched a row of the
+///   provider's REST option-print tape exactly on `(price, volume)`, and vice versa. The quote
+///   caveat above does not apply to it.
+/// - **`ts` is whole-second.** Dozens of prints share one value, so an option tick's instant is
+///   neither a unique key nor an ordering: arrival order is the only sequencing, and it was never
+///   observed out of order.
+/// - **An extra `name` key** carries a human-readable contract label. It is present on every live
+///   option tick, so it marks the channel and says nothing about replay — only [`replay`] does
+///   that. It is not decoded.
+///
+/// [`replay`]: Self::replay
 ///
 /// # ⚠️ `volume` is real on some datasets and fabricated on others
 /// Crypto and equity ticks carry a genuine per-tick size: summing it over three whole minutes of
@@ -114,16 +133,21 @@ pub struct LseTick {
     #[serde(rename = "ts", deserialize_with = "de_timestamp")]
     pub time_exchange: DateTime<Utc>,
 
-    /// The tick price. Equal to [`bid`](Self::bid) on every sample taken; see the type-level note,
+    /// The tick price. Equal to [`bid`](Self::bid) on every non-option sample taken, and the traded
+    /// premium on an option contract; see the type-level note,
     /// which also covers the ~15-significant-digit ceiling this and the three fields below decode
     /// under.
     pub price: Decimal,
 
-    /// The bid.
-    pub bid: Decimal,
+    /// The bid. `None` on every option contract tick, which the provider publishes as `null`;
+    /// present on every other dataset sampled.
+    #[serde(default)]
+    pub bid: Option<Decimal>,
 
-    /// The ask.
-    pub ask: Decimal,
+    /// The ask. `None` on every option contract tick, which the provider publishes as `null`;
+    /// present on every other dataset sampled.
+    #[serde(default)]
+    pub ask: Option<Decimal>,
 
     /// The size traded at this tick — genuine on crypto and equities, fabricated on FX and
     /// commodities. See the type-level note.
@@ -166,10 +190,13 @@ pub enum LseMessage {
     /// # Why it is modelled on the stream rather than caught during the handshake
     /// The provider answers `subscribe` *before* it announces the window — measured on both a
     /// crypto and an FX symbol, the order is `subscribed`, then `replay_started`, then the replayed
-    /// ticks. The subscription validator stops reading the socket the moment the last confirmation
-    /// arrives, so a single-symbol resumed subscription never has a `replay_started` to inspect at
-    /// handshake time, and a batch never has one for its last symbol. Reading it here instead makes
-    /// the check independent of frame ordering and of batch size.
+    /// ticks. A subscribe handshake is complete the moment its last confirmation arrives, so a
+    /// single-symbol resumed subscription never has a `replay_started` to inspect at handshake
+    /// time, and a batch never has one for its last symbol. Reading it here instead makes the check
+    /// independent of frame ordering and of batch size.
+    ///
+    /// The shared connection routes it only to the streams a replay window was opened for — see
+    /// [`connection`](super::connection).
     ReplayStarted {
         /// The subscription the window belongs to, built from `symbol` exactly as a tick's is.
         #[serde(rename = "symbol", deserialize_with = "de_tick_subscription_id")]
@@ -180,15 +207,18 @@ pub enum LseMessage {
         from: DateTime<Utc>,
     },
 
-    /// A rejection raised *after* the handshake completed.
+    /// A rejection raised outside a subscribe handshake.
     ///
-    /// # Why the handshake cannot catch these
-    /// The subscription validator stops reading the socket the moment the last confirmation
-    /// arrives, so every rejection the provider raises afterwards lands here instead — a later
-    /// `LIMIT_REACHED`, an `INVALID_START` on a resumed symbol, a credential that expired
-    /// mid-connection. Collapsed into [`Other`](Self::Other) it would be discarded in silence,
-    /// which is the one thing a rejection must never be: the provider does **not** name the symbol
-    /// it rejected, so the only outward sign is a subscription that stops ticking.
+    /// # Why no stream normally sees one
+    /// The provider does **not** name the symbol it rejected, so a rejection arriving outside a
+    /// handshake — a later `LIMIT_REACHED`, a credential that expired mid-connection — cannot be
+    /// routed to the stream it concerns. The shared [`connection`](super::connection) logs it once
+    /// instead, and one arriving *during* a handshake fails that handshake.
+    ///
+    /// It is still decoded rather than collapsed into [`Other`](Self::Other), so a rejection that
+    /// reaches a stream by any other route is reported rather than discarded in silence — the one
+    /// thing a rejection must never be, since the only outward sign of one is a subscription that
+    /// stops ticking.
     ///
     /// Both fields are optional for the same reason they are on the handshake's own rejection: a
     /// frame missing one must still decode, because failing the parse on an error frame would take
@@ -235,13 +265,15 @@ impl Identifier<Option<SubscriptionId>> for LseMessage {
 /// enough that several encoders do it by default. A borrowed `&str` cannot be produced from an
 /// escaped string, because unescaping needs somewhere to write the result, so a decoder typed that
 /// way fails at runtime on a frame that is entirely legal. `SmolStr` accepts either spelling and
-/// keeps a symbol of this length inline, so nothing is allocated for the ordinary case.
+/// holds up to 23 bytes inline, so the symbol itself is not allocated.
+///
+/// The identifier is the symbol, so it is not allocated either — every symbol this feed publishes
+/// fits inline. See [`subscription_id`].
 fn de_tick_subscription_id<'de, D>(deserializer: D) -> Result<SubscriptionId, D::Error>
 where
     D: Deserializer<'de>,
 {
-    SmolStr::deserialize(deserializer)
-        .map(|symbol| ExchangeSub::from((LseChannel::Tick, symbol.as_str())).id())
+    SmolStr::deserialize(deserializer).map(|symbol| subscription_id(&symbol))
 }
 
 /// Deserialise a WebSocket timestamp from any of the three spellings the provider uses.
@@ -487,10 +519,52 @@ mod tests {
         assert!(!tick.replay);
     }
 
+    /// An option contract tick, synthetic but in the shape the options channel publishes: `bid`
+    /// and `ask` present as `null`, a whole-second `ts`, an integer `volume` and a `name` label.
+    const OPTION_TICK: &str = r#"{"type":"tick","symbol":"TEST261231C00010500",
+        "ts":"2026-01-02T15:00:00+00:00","price":1.25,"bid":null,"ask":null,"volume":3,
+        "name":"TEST $10.50 Call Dec 31"}"#;
+
+    /// Both sides are null on every option tick. Required fields would fail the whole frame, and
+    /// every print on the channel with it.
+    #[test]
+    fn an_option_tick_decodes_with_no_quote() {
+        let tick: LseTick = serde_json::from_str(OPTION_TICK).unwrap();
+
+        assert_eq!(tick.subscription_id.as_ref(), "TEST261231C00010500");
+        assert_eq!(tick.price, dec!(1.25));
+        assert_eq!(tick.volume, dec!(3));
+        assert_eq!(tick.bid, None);
+        assert_eq!(tick.ask, None);
+        assert_eq!(
+            tick.time_exchange,
+            "2026-01-02T15:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+    }
+
+    /// `name` rides on every live option tick. It marks the channel, so reading it as a replay
+    /// marker would classify every live option print as replayed.
+    #[test]
+    fn an_option_ticks_name_does_not_mark_it_as_replayed() {
+        let tick: LseTick = serde_json::from_str(OPTION_TICK).unwrap();
+        assert!(!tick.replay);
+    }
+
+    /// The decoder builds the identifier on every tick, so it must fit inline for the longest
+    /// symbol the feed publishes: an OSI contract on a six-character root.
+    #[test]
+    fn a_long_root_option_ticks_identifier_is_not_allocated() {
+        let frame = OPTION_TICK.replace("TEST261231C00010500", "GOOGLX261231C00010500");
+        let tick: LseTick = serde_json::from_str(&frame).unwrap();
+
+        assert_eq!(tick.subscription_id.as_ref(), "GOOGLX261231C00010500");
+        assert!(!tick.subscription_id.0.is_heap_allocated());
+    }
+
     #[test]
     fn the_subscription_id_is_built_from_the_symbol() {
         let tick: LseTick = serde_json::from_str(LIVE_T_SEPARATED).unwrap();
-        assert_eq!(tick.subscription_id.as_ref(), "tick|BTC/USD");
+        assert_eq!(tick.subscription_id.as_ref(), "BTC/USD");
     }
 
     /// A timestamp carrying no offset is ambiguous, and guessing at it would silently misdate the
@@ -525,7 +599,7 @@ mod tests {
         let message: LseMessage = serde_json::from_str(LIVE_T_SEPARATED).unwrap();
         assert_eq!(
             message.id(),
-            Some(SubscriptionId::from("tick|BTC/USD")),
+            Some(SubscriptionId::from("BTC/USD")),
             "a tick must resolve to the subscription it was registered under"
         );
     }
@@ -609,7 +683,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(escaped.id(), Some(SubscriptionId::from("tick|BTC/USD")));
+        assert_eq!(escaped.id(), Some(SubscriptionId::from("BTC/USD")));
 
         // The replay boundary decodes its symbol through the same function, and a clamp that went
         // undetected because the boundary frame failed to parse would be silent.
@@ -621,7 +695,7 @@ mod tests {
         assert_eq!(
             boundary,
             LseMessage::ReplayStarted {
-                subscription_id: SubscriptionId::from("tick|BTC/USD"),
+                subscription_id: SubscriptionId::from("BTC/USD"),
                 from: "2026-01-02T09:37:24Z".parse::<DateTime<Utc>>().unwrap(),
             }
         );
@@ -642,7 +716,7 @@ mod tests {
             assert_eq!(
                 message,
                 LseMessage::ReplayStarted {
-                    subscription_id: SubscriptionId::from("tick|BTC/USD"),
+                    subscription_id: SubscriptionId::from("BTC/USD"),
                     from: "2026-01-02T09:39:31.716622Z"
                         .parse::<DateTime<Utc>>()
                         .unwrap(),

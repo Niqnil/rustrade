@@ -101,12 +101,12 @@ struct AlpacaGreeks {
 
 impl From<AlpacaGreeks> for OptionGreeks {
     fn from(g: AlpacaGreeks) -> Self {
-        // `rho` is intentionally dropped — `OptionGreeks` does not expose it.
         Self {
             delta: g.delta,
             gamma: g.gamma,
             theta: g.theta,
             vega: g.vega,
+            rho: g.rho,
             implied_volatility: None,
             theoretical_price: None,
             underlying_price: None,
@@ -141,7 +141,7 @@ pub struct AlpacaOptionSnapshot {
 impl AlpacaOptionSnapshot {
     /// Get option Greeks in the standard format.
     ///
-    /// Returns [`OptionGreeks`] with delta, gamma, theta, vega populated from the
+    /// Returns [`OptionGreeks`] with delta, gamma, theta, vega and rho populated from the
     /// Alpaca response. Implied volatility is stored separately in [`Self::implied_volatility`].
     pub fn greeks(&self) -> OptionGreeks {
         let mut greeks: OptionGreeks = self.greeks.unwrap_or_default().into();
@@ -398,6 +398,7 @@ mod tests {
         assert_eq!(greeks.gamma, Some(0.0412));
         assert_eq!(greeks.theta, Some(-0.0285));
         assert_eq!(greeks.vega, Some(0.3156));
+        assert_eq!(greeks.rho, Some(0.1829));
         assert_eq!(greeks.implied_volatility, Some(0.287));
     }
 
@@ -431,7 +432,7 @@ mod tests {
         assert_eq!(greeks.gamma, Some(0.02));
         assert_eq!(greeks.theta, Some(-0.05));
         assert_eq!(greeks.vega, Some(0.15));
-        // rho is not in OptionGreeks, so it's dropped
+        assert_eq!(greeks.rho, Some(0.10));
         // implied_volatility comes from snapshot, not greeks struct
         assert!(greeks.implied_volatility.is_none());
     }

@@ -9,6 +9,9 @@ on:
     paths-ignore:
       - "**.md"
     branches: ["main", "develop"]
+  # Dispatched by `dependabot-auto-merge.yml` once it has merged a PR: a merge made with
+  # GITHUB_TOKEN triggers no `push` run, but GITHUB_TOKEN may dispatch one.
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -96,6 +99,14 @@ jobs:
     # 25 minutes keeps a real hang bounded while leaving room for a cold cache. Revisit if the
     # warm-cache figure climbs far enough to erode the margin again.
     timeout-minutes: 25
+    # With full debug info, the `rustrade-data` library alone compiles at up to 13 GB in one
+    # rustc process on this 16 GB runner, almost all of it debug info. That left the job within
+    # ~0.7 GB of the runner's memory and got it intermittently killed with exit 143 (#385).
+    # Line tables keep file:line in backtraces and cut that compile to ~1.1 GB (measured locally).
+    # This is a profile setting, not a rustflag, so `.cargo/config.toml`'s mold and
+    # `split-debuginfo` flags still apply. The underlying cost, which consumers pay too, is #387.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - name: Checkout sources
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -126,13 +137,35 @@ jobs:
         # That is viable because `.cargo/config.toml` sets `-C split-debuginfo=unpacked`;
         # without it the multi-exchange examples carry enough `.debug_str` to overflow a
         # 32-bit relocation and the link fails.
-        run: cargo test --locked --workspace --all-features --lib --bins --tests --examples
+        #
+        # This step has been intermittently killed with exit 143 (SIGTERM) during the final
+        # parallel compile-and-link of the `rustrade` crate. The kill ends the whole job, skipping
+        # every later step including `if: always()` ones, so the sampler runs inside this step and
+        # prints as it goes: whatever it saw before the kill is already in the log.
+        run: |
+          .github/scripts/sample-memory.sh 5 "$RUNNER_TEMP/mem.log" &
+          sampler=$!
+          trap 'kill "$sampler"' EXIT
+          cargo test --locked --workspace --all-features --lib --bins --tests --examples
 
       # The target list above excludes doc-tests, so without this step a rustdoc example
       # that no longer compiles ships green. Separate from the step above so a failure here is
       # attributable at a glance; it reuses that step's build.
       - name: Run doc-tests
         run: cargo test --locked --workspace --all-features --doc
+
+      # Put the build's peak in the job summary, so the headroom on runs that survive is on record
+      # alongside the kills. A killed run never reaches this step; its samples are in the log above.
+      - name: Memory peak
+        if: always()
+        run: |
+          record="$RUNNER_TEMP/mem.log"
+          # `|| true`: the step shell runs with `-e -o pipefail`, and a failure before the sampler
+          # started leaves no record.
+          peak=$(grep -o 'used=[0-9]*' "$record" 2>/dev/null | cut -d= -f2 | sort -n | tail -1 || true)
+          low=$(grep -o 'avail=[0-9]*' "$record" 2>/dev/null | cut -d= -f2 | sort -n | head -1 || true)
+          echo "Build memory: peak used ${peak:-?} MB, lowest available ${low:-?} MB, of $(free -m | awk 'NR==2 {print $2}') MB" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
 
   clippy:
     name: cargo clippy
@@ -216,7 +249,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           # Synced with deny.toml [advisories.ignore] - see that file for full justifications
-          ignore: RUSTSEC-2024-0436,RUSTSEC-2026-0235,RUSTSEC-2025-0057,RUSTSEC-2024-0384,RUSTSEC-2025-0009,RUSTSEC-2025-0010,RUSTSEC-2025-0134,RUSTSEC-2026-0098,RUSTSEC-2026-0099,RUSTSEC-2026-0104,RUSTSEC-2026-0258
+          ignore: RUSTSEC-2026-0235,RUSTSEC-2025-0057,RUSTSEC-2024-0384,RUSTSEC-2025-0009,RUSTSEC-2025-0010,RUSTSEC-2025-0134,RUSTSEC-2026-0098,RUSTSEC-2026-0099,RUSTSEC-2026-0104,RUSTSEC-2026-0258
 
   deny:
     name: cargo deny

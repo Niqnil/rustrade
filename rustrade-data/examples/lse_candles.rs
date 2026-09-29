@@ -42,6 +42,21 @@
 //! - **London (`.L`) listings are quoted in pence**, not pounds — `BP.L` prints ~548 where BP
 //!   trades around £5.48. This integration quotes them in GBX, an asset distinct from GBP, and
 //!   passes prices through unscaled.
+//! - **⚠️ The `volume` this prints for `AAPL` is not a figure to size on.** Where the vault
+//!   publishes volume at all it is unreliable in both directions: a majority of sampled
+//!   one-minute equity bars report `0` in minutes that demonstrably had trades, and ETF bars have
+//!   been reported carrying three to four orders of magnitude too much — one `QQQ` minute
+//!   published at roughly 5,700× that session's entire consolidated volume — while equity totals
+//!   over the same period ran well under the consolidated tape. Those bars are structurally
+//!   valid, so nothing here can tell them from correct ones. Reconcile against a second source
+//!   before building on volume.
+//! - **⚠️ How far back a symbol goes varies per dataset, and is not discoverable from this API.**
+//!   The provider publishes a first tick and a coverage span per symbol in its catalog, on a
+//!   different host that this integration does not wrap. An ETF has been reported carrying three
+//!   months of spot where equities reach back two decades. Asking for a range that starts before
+//!   a symbol's coverage is **not an error**: you get the bars that exist, with nothing to say the
+//!   rest were never published. The 30-day window below is well inside every dataset's depth;
+//!   a longer backfill is not, so check the catalog first.
 
 use chrono::{Duration, Utc};
 use futures::StreamExt;

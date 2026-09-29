@@ -1,6 +1,6 @@
 [package]
 name = "rustrade-data"
-version = "0.6.0"
+version = "0.7.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -21,7 +21,7 @@ hyperliquid = ["dep:hyperliquid_rust_sdk"]
 # extra effect is to flip every `Decimal`'s default serialization workspace-wide to a lossy f64
 # number (Cargo unifies features across the build). Keeping it field-level preserves the
 # deterministic, lossless string wire format for all other `Decimal` values.
-alpaca = ["rust_decimal/serde-with-float"]
+alpaca = ["rust_decimal/serde-with-float", "serde_json/raw_value"]
 databento = ["dep:databento"]
 # London Strategic Edge. No extra dependencies today; the feature exists so the integration is
 # opt-in from the start, matching every other provider in this crate.
@@ -41,9 +41,10 @@ lse = ["dep:sha2", "dep:hex", "reqwest/stream", "tokio/fs", "tokio/io-util"]
 # The column-reader API this uses needs none of it. Tier-2 reviewed — see
 # `.github/tier2-dependencies.txt`.
 lse-parquet = ["lse", "dep:parquet"]
-massive = ["dep:tokio-tungstenite", "dep:urlencoding", "rust_decimal/serde-with-float", "serde_json/raw_value"]
+massive = ["dep:urlencoding", "rust_decimal/serde-with-float", "serde_json/raw_value"]
 
 [dev-dependencies]
+rustrade-instrument = { workspace = true, features = ["test-utils"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 rust_decimal_macros = { workspace = true }
 time = { version = "0.3", features = ["macros"] }  # For ibkr tests and databento examples
@@ -97,7 +98,7 @@ hex = { workspace = true, optional = true }
 # which is why the other codecs are not enabled pre-emptively. Adding e.g. `snap` here is a
 # one-line fix if that day comes; carrying the dependency for a switch that has not happened is
 # supply-chain surface a public library should not spend up front.
-parquet = { version = "59.1.0", default-features = false, features = ["zstd"], optional = true }
+parquet = { version = "60.0.0", default-features = false, features = ["zstd"], optional = true }
 
 # Protocol
 url = { workspace = true }
@@ -123,7 +124,7 @@ vecmap-rs = { workspace = true }
 fnv = { workspace = true }
 
 # IBKR (optional, behind "ibkr" feature)
-ibapi = { version = "=4.0.1", optional = true, default-features = false, features = ["sync"] }
+ibapi = { version = "=4.2.0", optional = true, default-features = false, features = ["sync"] }
 time = { version = "0.3", optional = true, features = ["macros"] }
 # XML parser for IBKR Flex Web Service statements (corporate-action reconciliation). New normal dep
 # (serde-xml-rs/xml-rs are only a build-dep of time-tz via ibapi, not reusable). Note for tier-2 review.
@@ -137,10 +138,9 @@ hyperliquid_rust_sdk = { version = "0.6", optional = true }
 # `chrono` enables `DateTimeRange: From<(DateTime<Utc>, DateTime<Utc>)>`, so the
 # candle historical path can build `GetRangeParams` from a chrono range without a
 # manual chrono->time conversion (chrono is already a core dependency).
-databento = { version = "0.61", optional = true, features = ["chrono"] }
+databento = { version = "0.62", optional = true, features = ["chrono"] }
 
 # Massive (optional, behind "massive" feature)
-tokio-tungstenite = { version = "0.30", optional = true, features = ["native-tls"] }
 urlencoding = { version = "2.1", optional = true }
 
 # Integration tests whose contents are entirely feature-gated. Without `required-features`, the
@@ -161,6 +161,10 @@ required-features = ["alpaca"]
 
 [[test]]
 name = "alpaca_pagination"
+required-features = ["alpaca"]
+
+[[test]]
+name = "alpaca_ws_shared"
 required-features = ["alpaca"]
 
 [[test]]
@@ -192,7 +196,23 @@ name = "lse_export"
 required-features = ["lse"]
 
 [[test]]
+name = "lse_bond_yield"
+required-features = ["lse"]
+
+[[test]]
 name = "lse_vault"
+required-features = ["lse"]
+
+[[test]]
+name = "lse_economic_calendar"
+required-features = ["lse"]
+
+[[test]]
+name = "lse_bond_yield_canary"
+required-features = ["lse"]
+
+[[test]]
+name = "lse_economic_calendar_canary"
 required-features = ["lse"]
 
 [[test]]
@@ -223,6 +243,10 @@ required-features = ["massive"]
 name = "massive_pagination"
 required-features = ["massive"]
 
+[[test]]
+name = "massive_ws_shared"
+required-features = ["massive"]
+
 # Examples that depend on optional features. Without `required-features`,
 # `cargo check --all-targets` (default features) fails to compile them.
 
@@ -244,6 +268,14 @@ required-features = ["hyperliquid"]
 
 [[example]]
 name = "lse_candles"
+required-features = ["lse"]
+
+[[example]]
+name = "lse_options"
+required-features = ["lse"]
+
+[[example]]
+name = "lse_options_stream"
 required-features = ["lse"]
 
 [[example]]

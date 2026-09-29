@@ -110,7 +110,13 @@ pub(crate) fn dedup_key_from_event(event: &UnindexedAccountEvent) -> Option<Dedu
                     match active {
                         ActiveOrderState::Open(open) => Some(DedupKey {
                             instrument: snap.0.key.instrument.name().clone(),
-                            id: open.id.0.clone(),
+                            // A venue that named the order gives the key; one that did not leaves
+                            // the client id, which is stable across re-deliveries for the same
+                            // reason the venue id is.
+                            id: match open.id.assigned() {
+                                Some(id) => id.0.clone(),
+                                None => snap.0.key.cid.0.clone(),
+                            },
                             kind: DedupEventKind::OrderState {
                                 filled_quantity: open.filled_quantity,
                             },

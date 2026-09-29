@@ -19,6 +19,12 @@ use smol_str::SmolStr;
 /// than withholding a feed whose sizes do reconcile; but a strategy that treats these as executions
 /// is reading one side of a quote as a fill.
 ///
+/// # [`LseOptions`](super::LseOptions) is the exception: its trades ARE prints
+/// Option contract ticks reconcile one-for-one against the provider's REST option-print tape on
+/// `(price, volume)`, so there `price` is the traded premium per share and `amount` the number of
+/// contracts. They carry no quote at all — `bid` and `ask` are `null` on every one — which is why
+/// this is the only kind that venue serves.
+///
 /// # ⚠️ `amount` is genuine on some venues and FABRICATED on others
 /// This is per-dataset and there is no in-band signal separating the two:
 ///

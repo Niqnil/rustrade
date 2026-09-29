@@ -98,6 +98,43 @@ fn btc_instrument() -> InstrumentNameExchange {
     "BTC/USD".into()
 }
 
+/// Wait until [`ExecutionClient::fetch_open_orders`] lists nothing on `instrument`, panicking once
+/// 15 seconds have passed.
+///
+/// Alpaca answers a cancel once it has accepted the request, while the order may still be
+/// `pending_cancel` and live. The order tests run one after another on the same symbols, so an
+/// order still live when its test ends can get the next test's order refused: a sell against a
+/// buy still open is "potential wash trade detected" or "cannot open a short sell while a long
+/// buy order is open". Every test that cancels waits here, so it leaves the instrument as it
+/// found it. Waiting on the instrument rather than on the one order also covers a bracket's
+/// legs, whose ids the placement does not return.
+///
+/// The list is Alpaca's `status=open`, which its documentation does not define status by status.
+/// This relies on `pending_cancel`, which is not a final status, being included. If it were not,
+/// the wait would end early and the refusals above would recur, not some new failure. The list
+/// also leaves out what `fetch_open_orders` cannot convert, notional orders among them, and
+/// these tests place none.
+async fn await_no_open_orders(client: &AlpacaClient, instrument: &InstrumentNameExchange) {
+    const POLL: Duration = Duration::from_millis(250);
+    const DEADLINE: Duration = Duration::from_secs(15);
+
+    let instruments = [instrument.clone()];
+    let started = tokio::time::Instant::now();
+    loop {
+        let listed = client.fetch_open_orders(&instruments).await;
+        if matches!(&listed, Ok(orders) if orders.is_empty()) {
+            println!("{instrument}: no open orders after {:?}", started.elapsed());
+            return;
+        }
+        // A rate-limited fetch can wait out its own backoff, so report the time actually taken.
+        let waited = started.elapsed();
+        if waited >= DEADLINE {
+            panic!("{instrument} still lists open orders {waited:?} after the cancel: {listed:?}");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 // ============================================================================
 // Connection Tests
 // ============================================================================
@@ -312,6 +349,8 @@ async fn test_place_and_cancel_limit_order() {
                     panic!("Cancel rejected: {:?}", e);
                 }
             }
+
+            await_no_open_orders(&client, &instrument).await;
         }
         OrderState::Inactive(InactiveOrderState::FullyFilled(_)) => {
             panic!("Unexpected full fill at $1.00 - market moved unexpectedly");
@@ -323,6 +362,140 @@ async fn test_place_and_cancel_limit_order() {
             panic!("Unexpected active state: {:?}", other);
         }
     }
+}
+
+/// Place `request` on `instrument`, then check the account snapshot lists it under the client id
+/// it was placed with and declares the instrument's list complete; once the order is cancelled,
+/// the complete list must no longer show it. Together these are what let the engine retire an
+/// order that ended while the account stream was down. The instrument is requested by the name
+/// the order is placed under, so this also checks Alpaca reports that name back unchanged.
+async fn assert_snapshot_lists_the_order_then_drops_it(
+    instrument: InstrumentNameExchange,
+    request: RequestOpen,
+) {
+    let client = AlpacaClient::new(test_config());
+    let instruments = [instrument.clone()];
+    let cid = ClientOrderId::new(format!(
+        "test-listed-{}",
+        chrono::Utc::now().timestamp_millis()
+    ));
+    let key = OrderKey {
+        exchange: ExchangeId::AlpacaBroker,
+        instrument: &instrument,
+        strategy: StrategyId::new("test-strategy"),
+        cid: cid.clone(),
+    };
+
+    let response = client
+        .open_order(rustrade_execution::order::OrderEvent {
+            key: key.clone(),
+            state: request,
+        })
+        .await
+        .expect("Expected order response");
+    let OrderState::Active(ActiveOrderState::Open(open)) = &response.state else {
+        panic!(
+            "{instrument} limit order did not rest: {:?}",
+            response.state
+        );
+    };
+
+    let listed = client
+        .account_snapshot(&[], &instruments)
+        .await
+        .expect("account_snapshot failed");
+    let snapshot = listed
+        .instruments
+        .iter()
+        .find(|snapshot| snapshot.instrument == instrument)
+        .expect("a requested instrument always has an entry");
+    assert!(
+        snapshot.orders_complete,
+        "{instrument}'s order list is not declared complete"
+    );
+    assert!(
+        snapshot.orders.iter().any(|order| order.key.cid == cid),
+        "the resting {instrument} order is not listed under its client id {cid}: {:?}",
+        snapshot.orders
+    );
+
+    let cancelled = client
+        .cancel_order(rustrade_execution::order::OrderEvent {
+            key,
+            state: rustrade_execution::order::request::RequestCancel {
+                id: Some(open.id.clone()),
+            },
+        })
+        .await
+        .expect("Expected cancel response");
+    assert!(
+        cancelled.state.is_ok(),
+        "Cancel rejected: {:?}",
+        cancelled.state
+    );
+    await_no_open_orders(&client, &instrument).await;
+
+    let listed = client
+        .account_snapshot(&[], &instruments)
+        .await
+        .expect("account_snapshot failed");
+    let snapshot = listed
+        .instruments
+        .iter()
+        .find(|snapshot| snapshot.instrument == instrument)
+        .expect("a requested instrument always has an entry");
+    assert!(
+        snapshot.orders_complete,
+        "{instrument}'s order list is not declared complete"
+    );
+    assert!(
+        snapshot.orders.iter().all(|order| order.key.cid != cid),
+        "the cancelled {instrument} order is still listed: {:?}",
+        snapshot.orders
+    );
+}
+
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_snapshot_lists_an_equity_order_under_its_client_id_and_complete() {
+    init_logging();
+    assert_snapshot_lists_the_order_then_drops_it(
+        spy_instrument(),
+        RequestOpen {
+            side: Side::Buy,
+            price: Some(dec!(1.00)),
+            quantity: dec!(1),
+            kind: OrderKind::Limit,
+            time_in_force: TimeInForce::GoodUntilEndOfDay,
+            position_id: None,
+            reduce_only: false,
+            market: None,
+        },
+    )
+    .await;
+}
+
+/// Alpaca names a crypto pair with a slash (`BTC/USD`), unlike an equity ticker.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_snapshot_lists_a_crypto_order_under_its_client_id_and_complete() {
+    init_logging();
+    assert_snapshot_lists_the_order_then_drops_it(
+        btc_instrument(),
+        RequestOpen {
+            side: Side::Buy,
+            price: Some(dec!(1000.00)),
+            quantity: dec!(0.01),
+            kind: OrderKind::Limit,
+            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+            position_id: None,
+            reduce_only: false,
+            market: None,
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -400,6 +573,8 @@ async fn test_place_crypto_limit_order() {
                 Ok(_) => println!("Crypto order canceled successfully!"),
                 Err(e) => panic!("Cancel rejected: {:?}", e),
             }
+
+            await_no_open_orders(&client, &instrument).await;
         }
         OrderState::Inactive(e) => {
             panic!("Crypto order rejected: {:?}", e);
@@ -589,6 +764,7 @@ async fn test_account_stream_with_order() {
                 state: rustrade_execution::order::request::RequestCancel { id: Some(oid) },
             })
             .await;
+        await_no_open_orders(&client, &instrument).await;
         println!("Cleanup complete");
     }
 }
@@ -685,6 +861,8 @@ async fn test_place_and_cancel_stop_order() {
                     panic!("Cancel rejected: {:?}", e);
                 }
             }
+
+            await_no_open_orders(&client, &instrument).await;
         }
         OrderState::Inactive(e) => {
             panic!("Stop order rejected: {:?}", e);
@@ -783,6 +961,8 @@ async fn test_place_and_cancel_trailing_stop_order() {
                     panic!("Cancel rejected: {:?}", e);
                 }
             }
+
+            await_no_open_orders(&client, &instrument).await;
         }
         OrderState::Inactive(e) => {
             panic!("Trailing stop order rejected: {:?}", e);
@@ -899,6 +1079,8 @@ async fn test_place_and_cancel_bracket_order_with_stop() {
                     panic!("Cancel rejected: {:?}", e);
                 }
             }
+
+            await_no_open_orders(&client, &instrument).await;
         }
         OrderState::Inactive(e) => {
             panic!("Bracket order rejected: {:?}", e);
@@ -983,6 +1165,8 @@ async fn test_place_and_cancel_bracket_order_with_stop_limit() {
                     panic!("Cancel rejected: {:?}", e);
                 }
             }
+
+            await_no_open_orders(&client, &instrument).await;
         }
         OrderState::Inactive(e) => {
             panic!("Bracket order (stop-limit) rejected: {:?}", e);

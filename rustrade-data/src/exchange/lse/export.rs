@@ -1026,7 +1026,20 @@ impl LseVaultClient {
 
         let url = format!("{}/export/{}/download", self.base_url(), job.id);
         // Overrides the client's total deadline for this request only; see `DOWNLOAD_TIMEOUT`.
-        let mut builder = self.http().get(&url).timeout(DOWNLOAD_TIMEOUT);
+        // `identity` because the transfer must be byte-exact against the artifact as stored. The
+        // client otherwise advertises gzip and decodes it transparently, which would count
+        // `downloaded` in decoded bytes while a `Range` addresses the *encoded* representation
+        // (RFC 9110 §14.1.2), so a resume would ask for the wrong offset of a stream it cannot
+        // decode from the middle. reqwest does not drop gzip for `Range` requests on its own.
+        // This relies on the server honouring the request: the client decodes any response that
+        // arrives gzip-encoded regardless of what was asked for. A server that ignored it would
+        // still verify on a full transfer, and on a resume fail loudly with a decode error rather
+        // than write a corrupt file.
+        let mut builder = self
+            .http()
+            .get(&url)
+            .timeout(DOWNLOAD_TIMEOUT)
+            .header(reqwest::header::ACCEPT_ENCODING, "identity");
         if downloaded > 0 {
             builder = builder.header(reqwest::header::RANGE, format!("bytes={downloaded}-"));
         }

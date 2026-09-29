@@ -1,3 +1,4 @@
+use super::channel::AlpacaChannel;
 use rustrade_integration::{Validator, error::SocketError};
 use serde::{Deserialize, Deserializer, Serialize};
 use smol_str::SmolStr;
@@ -67,6 +68,30 @@ pub enum AlpacaSubResponseInner {
     },
     /// Success message (auth confirmation, handled separately).
     Success { msg: SmolStr },
+}
+
+impl AlpacaSubResponseInner {
+    /// Every `(channel, symbol)` pair this message reports the connection holding.
+    ///
+    /// Only `Subscription` names symbols; `Success` and `Error` cover nothing. The report is the
+    /// connection's whole state, not only what the last request added.
+    pub(super) fn covered(&self) -> impl Iterator<Item = (AlpacaChannel, &SmolStr)> {
+        let (trades, quotes): (&[SmolStr], &[SmolStr]) = match self {
+            // `bars` is deliberately ignored: AlpacaChannel models only trades and quotes, so no
+            // subscription is ever keyed against a bars channel and nothing could match it.
+            Self::Subscription {
+                trades,
+                quotes,
+                bars: _,
+            } => (trades, quotes),
+            Self::Error { .. } | Self::Success { .. } => (&[], &[]),
+        };
+
+        let trades = trades.iter().map(|market| (AlpacaChannel::Trades, market));
+        let quotes = quotes.iter().map(|market| (AlpacaChannel::Quotes, market));
+
+        trades.chain(quotes)
+    }
 }
 
 #[cfg(test)]

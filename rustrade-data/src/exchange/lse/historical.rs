@@ -27,6 +27,7 @@
 //! Candles retrieved here are **not redistributable**. See the [module documentation](super) and
 //! <https://londonstrategicedge.com/terms>.
 
+use crate::exchange::lse::PROVIDER_TIMESTAMP_FORMAT;
 use crate::exchange::lse::error::LseError;
 use crate::exchange::lse::market::candle_interval_str;
 use crate::exchange::lse::vault::LseVaultClient;
@@ -37,14 +38,8 @@ use async_stream::try_stream;
 use chrono::{DateTime, Duration as TimeDelta, NaiveDateTime, Utc};
 use futures::{Stream, StreamExt};
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use tracing::debug;
-
-/// Format of the `ts` field in a candle row (`2024-01-02 09:09:00.000000`).
-///
-/// `%.f` makes the fractional part optional, so a response that drops the microseconds still
-/// parses. The value carries no timezone and is UTC.
-const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.f";
 
 /// Format accepted by the `start` / `end` query parameters.
 ///
@@ -71,7 +66,7 @@ const CURSOR_STEP_SECS: i64 = 1;
 /// does not break decoding.
 #[derive(Debug, Deserialize)]
 struct LseCandleRow {
-    /// Bar **open** time, UTC. See [`TIMESTAMP_FORMAT`].
+    /// Bar **open** time, UTC. See [`PROVIDER_TIMESTAMP_FORMAT`].
     ts: String,
     open: Decimal,
     high: Decimal,
@@ -82,16 +77,32 @@ struct LseCandleRow {
     volume: Option<Decimal>,
 }
 
-impl LseCandleRow {
-    /// Parse the row's `ts` as the bar's open instant.
-    fn open_time(&self) -> Result<DateTime<Utc>, LseError> {
-        NaiveDateTime::parse_from_str(&self.ts, TIMESTAMP_FORMAT)
-            .map(|naive| naive.and_utc())
-            .map_err(|error| LseError::Deserialize {
-                message: format!("invalid candle timestamp {:?}: {error}", self.ts),
-            })
-    }
+/// A vault row describing one candle, identified by the instant its bar opens.
+///
+/// Implemented by every row type [`candle_rows`](LseVaultClient::candle_rows) pages over, so the
+/// cursor arithmetic and the structural page checks are written once for every vault candle
+/// endpoint rather than once per row shape.
+pub(super) trait VaultCandleRow: DeserializeOwned {
+    /// Parse the row's timestamp as the bar's open instant.
+    fn open_time(&self) -> Result<DateTime<Utc>, LseError>;
+}
 
+/// Parse a vault candle label, which carries the bar's **open** in UTC with no zone suffix.
+pub(super) fn parse_candle_open(label: &str) -> Result<DateTime<Utc>, LseError> {
+    NaiveDateTime::parse_from_str(label, PROVIDER_TIMESTAMP_FORMAT)
+        .map(|naive| naive.and_utc())
+        .map_err(|error| LseError::Deserialize {
+            message: format!("invalid candle timestamp {label:?}: {error}"),
+        })
+}
+
+impl VaultCandleRow for LseCandleRow {
+    fn open_time(&self) -> Result<DateTime<Utc>, LseError> {
+        parse_candle_open(&self.ts)
+    }
+}
+
+impl LseCandleRow {
     /// Convert into the library [`Candle`] model, given the period-end boundary.
     ///
     /// `trade_count` is unconditionally `None`: the vault reports no trade count for any dataset.
@@ -147,10 +158,29 @@ impl LseVaultClient {
     /// and the flat OHLC is the only signal. Do not infer "no bar means the market was closed": see
     /// the [module's data characteristics](super#data-characteristics).
     ///
-    /// # Volume
+    /// # Volume — ⚠️ not a figure to size on without reconciling it
     /// FX candles carry **no volume**: the vault omits the field, which surfaces as
     /// [`volume: None`](Candle::volume) rather than a zero. `trade_count` is `None` for every
     /// dataset — the vault reports none.
+    ///
+    /// Where volume *is* published it is unreliable in both directions, and by margins large
+    /// enough to invert a result rather than blur it: a majority of sampled one-minute equity bars
+    /// report `0` in minutes the tick tape shows real trades, and ETF bars have been reported
+    /// carrying three to four orders of magnitude too much — one `QQQ` minute published at some
+    /// 5,700× that session's entire consolidated volume. Equity totals over the same period ran
+    /// well under the consolidated tape. Every one of those bars is structurally valid, so neither
+    /// this method nor any shape check on its output can tell them from correct ones. See the
+    /// [module's data characteristics](super#data-characteristics) for the measurements and their
+    /// provenance. Reconcile against a second source before trusting a volume-derived quantity.
+    ///
+    /// # Coverage — a range the symbol does not cover is not an error
+    /// The provider publishes a first tick and a coverage span per symbol per dataset, and the two
+    /// vary widely: an ETF has been reported carrying three months of spot history where equities
+    /// reach back two decades. Those fields live in the catalog on the discovery host, which this
+    /// integration does not wrap, so this method cannot check `start` against them. A range
+    /// beginning before a symbol's coverage yields the bars that exist and nothing to say the
+    /// remainder was never published — indistinguishable here from a genuinely quiet period.
+    /// Establish a symbol's depth from the catalog before choosing a range to backfill.
     ///
     /// # Arguments
     /// * `symbol` - Display symbol, e.g. `"EUR/USD"` or `"AAPL"`.
@@ -194,6 +224,56 @@ impl LseVaultClient {
         end: DateTime<Utc>,
     ) -> impl Stream<Item = Result<Candle, LseError>> + 'a {
         try_stream! {
+            // Rejected up front so the caller gets a typed answer instead of a relayed 400.
+            let timeframe = candle_interval_str(interval)
+                .ok_or(LseError::UnsupportedInterval { interval })?;
+
+            let rows = self.candle_rows::<LseCandleRow>(
+                "candles",
+                symbol,
+                vec![
+                    ("symbol", symbol.to_owned()),
+                    // ⚠️ `timeframe`, NOT `resolution`. An unknown parameter is ignored silently
+                    // and the vault defaults to 1-minute bars, returning a byte-identical shape.
+                    ("timeframe", timeframe.to_owned()),
+                ],
+                interval,
+                start,
+                end,
+            );
+            futures::pin_mut!(rows);
+
+            while let Some(row) = rows.next().await {
+                let (row, close_time) = row?;
+                yield row.into_candle(close_time);
+            }
+        }
+    }
+
+    /// The paging core shared by every vault candle endpoint.
+    ///
+    /// Yields each row whose close falls in `[start, end]`, paired with that close, under exactly
+    /// the range, ordering, resolution and request-count contract documented on
+    /// [`fetch_candles`](Self::fetch_candles) — every error described there originates here.
+    ///
+    /// `path` is the vault endpoint and `selector` the query parameters naming what to fetch; the
+    /// range and page-size parameters are appended per page. `symbol` labels the typed errors only.
+    ///
+    /// Relies on the endpoint sharing the vault's measured range semantics: `start` inclusive and
+    /// `end` exclusive, both on the bar's **open**, at second precision.
+    pub(super) fn candle_rows<'a, R>(
+        &'a self,
+        path: &'static str,
+        symbol: &'a str,
+        selector: Vec<(&'static str, String)>,
+        interval: CandleInterval,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> impl Stream<Item = Result<(R, DateTime<Utc>), LseError>> + 'a
+    where
+        R: VaultCandleRow + 'a,
+    {
+        try_stream! {
             // An inverted range is a caller error, not an empty result: the vault would answer 200
             // with a confusing selection rather than complaining.
             if start > end {
@@ -201,10 +281,6 @@ impl LseVaultClient {
                     message: format!("start ({start}) must not be after end ({end})"),
                 })?;
             }
-
-            // Rejected up front so the caller gets a typed answer instead of a relayed 400.
-            let timeframe = candle_interval_str(interval)
-                .ok_or(LseError::UnsupportedInterval { interval })?;
 
             let step = interval.to_step();
 
@@ -234,19 +310,16 @@ impl LseVaultClient {
                 // every clone of this client. Spacing pages from inside this loop would only ever
                 // pace *this* fetch, so N concurrent fetches would issue N requests per interval —
                 // see `LseVaultClient::with_pace`.
-                let query = [
-                    ("symbol", symbol.to_owned()),
-                    // ⚠️ `timeframe`, NOT `resolution`. An unknown parameter is ignored silently
-                    // and the vault defaults to 1-minute bars, returning a byte-identical shape.
-                    ("timeframe", timeframe.to_owned()),
+                let mut query = selector.clone();
+                query.extend([
                     ("start", cursor.format(CURSOR_FORMAT).to_string()),
                     ("end", range_end.format(CURSOR_FORMAT).to_string()),
                     ("limit", self.page_limit().to_string()),
-                ];
+                ]);
 
-                let rows: Vec<LseCandleRow> = self.get_json("candles", &query).await?;
+                let rows: Vec<R> = self.get_json(path, &query).await?;
                 page += 1;
-                debug!(symbol, %cursor, rows = rows.len(), page, "vault candle page received");
+                debug!(path, symbol, %cursor, rows = rows.len(), page, "vault candle page received");
 
                 // The only reliable end-of-data signal; see the request-count note above.
                 if rows.is_empty() {
@@ -342,7 +415,7 @@ impl LseVaultClient {
                         continue;
                     }
 
-                    yield row.into_candle(close_time);
+                    yield (row, close_time);
                 }
 
                 if reached_end {

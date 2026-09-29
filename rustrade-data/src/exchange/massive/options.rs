@@ -848,6 +848,8 @@ impl RawSnapshot {
             gamma: g.gamma,
             theta: g.theta,
             vega: g.vega,
+            // The snapshot's `greeks` object carries no rho.
+            rho: None,
             implied_volatility: self.implied_volatility,
             theoretical_price: None,
             // Decimal::to_f64 returns None only for values outside f64 range

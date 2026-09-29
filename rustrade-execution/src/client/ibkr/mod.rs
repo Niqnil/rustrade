@@ -34,25 +34,81 @@
 //! - **Order types**: Market, Limit, Stop, StopLimit, TrailingStop, TrailingStopLimit,
 //!   and Bracket (entry + take-profit + stop-loss) supported. No Algo orders.
 //! - **TimeInForce**: No `post_only` (IB has no maker-only orders)
-//! - **No auto-reconnect**: Caller responsibility per library philosophy
+//! - **Order lifecycle events missed during a gap are not recovered** (see below)
 //!
-//! # Caller Responsibilities (Reconnection & Recovery)
+//! # Reconnection & Recovery
 //!
-//! Unlike WebSocket-based connectors (Binance, Alpaca), this client does **not**
-//! auto-reconnect. The caller must handle:
+//! `ibapi` reconnects its socket to TWS/Gateway by itself, with the same client ID.
+//! In-flight requests fail with `ConnectionReset` at the drop, and new sends are refused
+//! until the reconnect completes. Order sends classify that as a transient
+//! [`OrderError::Connectivity`]. If the reconnect fails, `ibapi` shuts the client down.
 //!
-//! 1. **Disconnect detection**: Monitor [`ExecutionClient::account_stream`] for EOF or errors
-//! 2. **Reconnection**: Call [`IbkrClient::connect_sync`] with a new client ID
-//! 3. **Fill recovery**: After reconnect, call [`ExecutionClient::fetch_trades`] to
-//!    query executions since disconnect, then deduplicate against known fills
-//! 4. **Order reconciliation**: Call [`ExecutionClient::fetch_open_orders`] to
-//!    reconcile open-order state (order lifecycle events during disconnect are lost)
-//! 5. **Stale state cleanup**: Periodically call [`IbkrClient::clear_stale_executions`],
+//! [`ExecutionClient::account_stream`] stays open across a successful reconnect. It
+//! detects the gap and, once delivery is restored, recovers the fills TWS sent while
+//! the socket was down, emitting each as a `Trade` exactly once. The same applies when
+//! TWS loses its own link to IB's servers (notice 1100) and later restores it (1101/1102).
+//! See that method for the details.
+//!
+//! # Caller Responsibilities
+//!
+//! 1. **Order reconciliation**: order lifecycle events sent during a gap are lost. An
+//!    order cancelled, expired or rejected in that window is not reported. After a
+//!    reconnect, call [`ExecutionClient::fetch_open_orders`] to reconcile open-order
+//!    state. The IBKR account snapshot carries no open orders (#371). On `ibapi` 4.2.0
+//!    that call is unreliable, and fails for a while after a reconnect: see
+//!    [Known Issues](#known-issues-ibapi-420-shared-queues).
+//! 2. **Permanent disconnect**: when `ibapi` gives up reconnecting, or fill recovery
+//!    fails repeatedly, `account_stream` ends with `StreamTerminated` within about a
+//!    second. Its reader thread then stays blocked until TWS sends another event, and
+//!    another `account_stream` call on the client fails until the thread exits. After
+//!    recovery fails, the client is still connected, so the reader exits on the next
+//!    TWS event and `account_stream` works again. After a shutdown, no event follows,
+//!    so replace the client. Shutdown is detected only while a stream is open, so
+//!    `account_stream` on a client that has already shut down returns a stream that
+//!    never ends; see [`ExecutionClient::account_stream`]. Replacing the client, by
+//!    reconnecting with [`IbkrClient::connect_sync`] and choosing the client ID, is the
+//!    caller's decision. A new `IbkrClient` does not know the orders the old one
+//!    placed, so their later events are dropped.
+//! 3. **Stale state cleanup**: Periodically call [`IbkrClient::clear_stale_executions`],
 //!    [`IbkrClient::clear_stale_order_ids`], and [`IbkrClient::clear_stale_pending_cancels`]
 //!
-//! **Rationale**: IBKR uses TCP to local TWS/Gateway, not cloud WebSocket. Reconnection
-//! requires IB Gateway availability and client ID coordination — decisions that belong
-//! in the caller's wrapper, not the library.
+//! **Rationale**: IBKR uses TCP to local TWS/Gateway, not cloud WebSocket. `ibapi`
+//! owns the transient reconnect. Replacing a client that is gone for good requires IB
+//! Gateway availability and client ID coordination, decisions that belong in the
+//! caller's wrapper, not the library.
+//!
+//! # Known Issues: `ibapi` 4.2.0 Shared Queues
+//!
+//! `ibapi` 4.2.0 answers the open-orders and positions requests from one queue per
+//! request type. Every call on the client reads from the same queue, and nothing clears
+//! it between calls. Besides each call's own reply, two things land in it:
+//!
+//! - A connection drop queues one `ConnectionReset` per response type: three on the
+//!   open-orders queue, two on the positions queue.
+//! - Every `OpenOrder` and `OrderStatus` message for an order with no live placement
+//!   subscription is copied into `ibapi`'s three open-orders queues. That covers every
+//!   update for an order this client placed, once its placement call has returned, and
+//!   every row of an open-orders reply.
+//!
+//! As a result:
+//!
+//! - [`ExecutionClient::fetch_open_orders`] can report orders that have since filled or
+//!   been cancelled as open. Each connection drop makes three calls fail and adds three
+//!   calls of lag, which never clears. See that method.
+//! - [`ExecutionClient::account_snapshot`] fails twice after each connection drop, then
+//!   recovers.
+//! - This client never reads two of the three open-orders queues, and reads the third
+//!   only when `fetch_open_orders` is called. They keep a copy of every order update
+//!   until read, so the two unread ones grow for the life of the client: `ibapi`'s own
+//!   reconnect does not clear them. `ibapi` logs a warning each time one of them passes a
+//!   multiple of 10,000 queued messages.
+//!
+//! [Account order events](ExecutionClient::account_stream) come through a separate
+//! channel and are unaffected.
+//!
+//! Fixed upstream after 4.2.0 by
+//! [rust-ibapi#836](https://github.com/wboayue/rust-ibapi/pull/836), which gives each
+//! call its own queue and drops messages no call asked for.
 //!
 //! # See Also
 //!
@@ -63,13 +119,13 @@ pub mod account;
 pub mod contract;
 pub mod execution;
 pub mod order;
+mod recovery;
 
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, Snapshot, UnindexedAccountEvent,
     UnindexedAccountSnapshot,
     balance::AssetBalance,
-    client::{BracketOrderClient, ExecutionClient},
-    emit_stream_terminated,
+    client::{BracketOrderClient, ExecutionClient, dedup::new_dedup_cache},
     error::{
         ApiError, ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
     },
@@ -79,7 +135,7 @@ use crate::{
             BracketOrderRequest as UnifiedBracketOrderRequest,
             BracketOrderResult as UnifiedBracketOrderResult,
         },
-        id::{ClientOrderId, OrderId, StrategyId},
+        id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         request::{
             OrderRequestCancel, OrderRequestOpen, OrderResponseCancel, UnindexedOrderResponseCancel,
         },
@@ -209,8 +265,16 @@ impl ContractConfig {
 static ACCOUNT_GROUP_ALL: std::sync::LazyLock<AccountGroup> =
     std::sync::LazyLock::new(|| AccountGroup("All".to_string()));
 
-/// Timeout for position stream iteration.
-/// Workaround for ibapi bug where `PositionEnd` isn't routed to subscription.
+/// Quiet period that ends the positions read in `account_snapshot`.
+///
+/// IB's positions request is a live subscription that keeps streaming after its
+/// `PositionEnd` marker, so the read stops once this long passes without an
+/// update. It does not stop at `PositionEnd`: on `ibapi` 4.2.0 the positions
+/// queue is shared across calls (see the module's Known Issues), so after a
+/// connection drop it may hold the replies to the calls that failed. Stopping at
+/// the first `PositionEnd` would return one of those replies and leave the rest
+/// for the next call, which would lag behind for good. Reading until quiet
+/// drains them.
 const POSITION_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Maximum time to await an initial `OrderStatus` on an order-placement
@@ -222,8 +286,9 @@ const PLACEMENT_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_
 
 /// IBKR "Order Message" codes that are informational rather than rejections.
 ///
-/// ibapi classifies the whole `200..=399` range as order rejections
-/// (`ORDER_REJECTION_CODE_RANGE`), but IBKR uses code 399 as a generic order
+/// ibapi classifies the `200..=399` range as order rejections
+/// (`ORDER_REJECTION_CODE_RANGE`) — bar 202 and, since 4.1.0, 317, both of
+/// which are resolved ahead of the range — but IBKR uses code 399 as a generic order
 /// message — e.g. *"Your order will not be placed at the exchange until
 /// 09:30:00 US/Eastern"* — for an order that is in fact **accepted and held**
 /// (it proceeds to `PreSubmitted`). We therefore report the order as
@@ -246,6 +311,12 @@ const PLACEMENT_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_
 ///   stream, because the notice had already closed the subscription.
 /// - **399 without one** — still `Err(Error::Notice)`, still closes the
 ///   subscription, and is still matched against this list.
+///
+/// Re-verified against ibapi 4.1.0, which reworked this classification: the
+/// warning band widened to `2100..=2199`, `classify_error`'s predicate became
+/// `is_informational_code`, and 317 joined the data advisories. The change is
+/// strictly additive and 399 is in neither the advisory nor the system list, so
+/// both forms above route exactly as described.
 ///
 /// The list stays load-bearing for the second form. It documents the known gap
 /// between ibapi's range heuristic and IBKR's actual protocol semantics; if
@@ -271,8 +342,8 @@ enum PlacementOutcome {
     /// Carries the filled quantity reported with the status.
     Accepted { filled: f64 },
     /// A terminal rejection: a `Cancelled`/`Inactive` `OrderStatus`, a genuine
-    /// non-informational TWS notice, or a transport error. Carries the
-    /// human-readable reason.
+    /// non-informational TWS notice, or an ibapi error other than transport
+    /// loss (see [`is_transport_loss`]). Carries the human-readable reason.
     Rejected(String),
     /// The order exists, but the placement subscription could not classify its
     /// state: either an informational notice (see
@@ -281,10 +352,205 @@ enum PlacementOutcome {
     /// the order is live/held and its authoritative status will arrive via the
     /// order-update/account stream. Carries the notice or status text.
     HeldPending(String),
-    /// The subscription ended — or [`PLACEMENT_STATUS_TIMEOUT`] elapsed —
-    /// without any terminal status or informational notice. The order may or
-    /// may not have been accepted; resolve via the order-update/account stream.
+    /// The subscription ended — or [`PLACEMENT_STATUS_TIMEOUT`] elapsed, or the
+    /// transport was lost — without any terminal status or informational
+    /// notice. The order may or may not have been accepted; resolve via the
+    /// order-update/account stream.
     NoStatus,
+}
+
+/// Whether `e` means the TWS transport was lost, as opposed to TWS or ibapi
+/// answering the request.
+///
+/// Since ibapi 4.2 the sync transport fails in-flight requests with one of these
+/// the moment the socket drops, and refuses new sends until the reconnect has
+/// completed. None of them says what TWS did with an order already written.
+fn is_transport_loss(e: &ibapi::Error) -> bool {
+    matches!(
+        e,
+        ibapi::Error::ConnectionReset
+            | ibapi::Error::ConnectionFailed
+            | ibapi::Error::Shutdown
+            | ibapi::Error::Io(_)
+    )
+}
+
+/// The instrument and client order id `execution` belongs to, or `None` when this
+/// client does not track its order or its contract.
+fn resolve_execution(
+    execution: &ibapi::orders::ExecutionData,
+    contracts: &ContractRegistry,
+    order_ids: &OrderIdMap,
+) -> Option<(InstrumentNameExchange, ClientOrderId)> {
+    let order_id = execution.execution.order_id;
+    let con_id = execution.contract.contract_id;
+
+    // Fail-fast: skip second lookup if first fails
+    let Some(client_id) = order_ids.get_client_id(order_id) else {
+        debug!(
+            ib_order_id = order_id,
+            con_id, "ExecutionData for unknown order ID, dropping"
+        );
+        return None;
+    };
+    let Some(instrument) = contracts.get_name_by_con_id(con_id) else {
+        debug!(
+            ib_order_id = order_id,
+            con_id, "ExecutionData for unknown contract ID, dropping"
+        );
+        return None;
+    };
+    Some((instrument, client_id))
+}
+
+/// Forward `updates`, from `ibapi`'s order-update subscription, to `sink` as account events,
+/// until the subscription ends or the account stream does.
+///
+/// A closed stream is noticed on the next update, whether or not that update would be
+/// forwarded, so the thread running this releases `ibapi`'s single order-update slot as soon as
+/// TWS sends anything.
+fn forward_order_updates(
+    updates: impl IntoIterator<Item = Result<ibapi::orders::OrderUpdate, ibapi::Error>>,
+    sink: &recovery::EventSink,
+    contracts: &ContractRegistry,
+    order_ids: &OrderIdMap,
+    pending_cancels: &PendingCancels,
+    exec_buffer: &ExecutionBuffer,
+) {
+    use ibapi::orders::{OrderStatusKind, OrderUpdate};
+
+    for update in updates {
+        // Recovery ended the stream, or the consumer dropped it. Stop on this update rather than
+        // the next one that would be forwarded, which may never come.
+        if !sink.is_open() {
+            return;
+        }
+        let update = match update {
+            Ok(u) => u,
+            Err(e) => {
+                // ibapi's own reconnect does not surface here (see the
+                // recovery module), so an error on the subscription is terminal.
+                // Surface it in-band as StreamTerminated(Error) so the caller
+                // gets a programmatic signal rather than inferring EOF.
+                // (best-effort — a no-op if the consumer already dropped rx.)
+                error!(error = %e, "Order stream subscription error");
+                sink.terminate(StreamTerminationReason::Error(e.to_string()));
+                return;
+            }
+        };
+        let event = match update {
+            OrderUpdate::OrderStatus(status) => {
+                let ib_id = status.order_id;
+                // Use single-lock method for terminal status to avoid read+write.
+                // Only `Cancelled`/`Inactive` remove the mapping here: a `Filled`
+                // order's mapping is intentionally retained so late-arriving
+                // ExecutionData/CommissionReport events still resolve it (reaped
+                // later by `OrderIdMap::clear_stale`), so this is deliberately
+                // narrower than `OrderStatusKind::is_terminal()`.
+                let is_terminal = matches!(
+                    status.status,
+                    OrderStatusKind::Cancelled | OrderStatusKind::Inactive
+                );
+
+                let lookup_result = if is_terminal {
+                    order_ids.remove_and_get_context(ib_id)
+                } else {
+                    order_ids.get_client_id_and_context(ib_id)
+                };
+
+                if let Some((client_id, ctx)) = lookup_result {
+                    let order = make_order_from_status(&status, client_id, &ctx, pending_cancels);
+                    Some(UnindexedAccountEvent {
+                        exchange: ExchangeId::Ibkr,
+                        kind: AccountEventKind::OrderSnapshot(Snapshot::new(order)),
+                    })
+                } else {
+                    debug!(ib_order_id = ib_id, "OrderStatus for unknown order ID");
+                    None
+                }
+            }
+            OrderUpdate::ExecutionData(exec) => {
+                // ibapi copies an executions request's answers here too; they
+                // are not fills happening now, and recovery emits its own.
+                if recovery::is_replayed_execution(&exec) {
+                    trace!(
+                        exec_id = %exec.execution.execution_id,
+                        request_id = exec.request_id,
+                        "ExecutionData answering an executions request, skipping"
+                    );
+                    continue;
+                }
+                let Some((instrument, client_id)) = resolve_execution(&exec, contracts, order_ids)
+                else {
+                    continue;
+                };
+
+                exec_buffer.add_execution(exec, instrument, client_id);
+                None
+            }
+            OrderUpdate::CommissionReport(report) => {
+                if let Some(trade) = exec_buffer.complete_with_commission(&report)
+                    && !sink.send_trade(trade)
+                {
+                    return;
+                }
+                None
+            }
+            _ => None,
+        };
+
+        if let Some(e) = event
+            && !sink.send(e)
+        {
+            // The consumer dropped rx, or recovery ended the stream: either
+            // way nothing more may be sent.
+            return;
+        }
+    }
+
+    // The subscription iterator ended without an error (e.g. clean
+    // disconnect/unsubscribe, or ibapi giving up reconnecting). Still a
+    // terminal stream death — surface it in-band so the consumer doesn't have
+    // to infer it from channel EOF.
+    sink.terminate(StreamTerminationReason::Error(
+        "IBKR order-update stream ended".to_string(),
+    ));
+}
+
+/// The message a worker thread panicked with.
+fn panic_message(panic_info: &(dyn std::any::Any + Send)) -> String {
+    panic_info
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic_info.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
+
+/// Classify the error from a send (`place_order` / `cancel_order`) that failed
+/// before TWS acknowledged anything, carrying `message` as the reason.
+///
+/// A dropped or reconnecting transport (`ConnectionReset`, `Io`) is a transient
+/// [`OrderError::Connectivity`]: the request did not reach TWS and may be retried
+/// once the connection is back. `Shutdown` and `ConnectionFailed` mean ibapi has
+/// given up reconnecting, so they are non-transient, like any other refusal
+/// ([`ApiError::OrderRejected`]).
+///
+/// # Known limitation
+///
+/// ibapi refuses a send with `ConnectionReset` whenever the session is not
+/// connected, including after it has shut down for good, so a send refused on a
+/// dead client still reads as transient here. The client's streams ending is
+/// the signal that it will not come back.
+fn send_error<AssetKey, InstrumentKey>(
+    e: &ibapi::Error,
+    message: String,
+) -> OrderError<AssetKey, InstrumentKey> {
+    match e {
+        ibapi::Error::ConnectionReset | ibapi::Error::Io(_) => {
+            OrderError::Connectivity(ConnectivityError::Socket(message))
+        }
+        _ => OrderError::Rejected(ApiError::OrderRejected(message)),
+    }
 }
 
 /// Drive an order-placement subscription to its initial [`PlacementOutcome`].
@@ -300,8 +566,9 @@ enum PlacementOutcome {
 /// informational order messages (e.g. code 399, order held until RTH) the same
 /// way, so treating every `Err` as a rejection would falsely reject orders that
 /// are actually live. We instead key off the notice code: known informational
-/// codes yield [`PlacementOutcome::HeldPending`]; all other notices and
-/// transport errors yield [`PlacementOutcome::Rejected`]. The `OrderStatus`
+/// codes yield [`PlacementOutcome::HeldPending`]; transport loss yields
+/// [`PlacementOutcome::NoStatus`], because the order may already be live; all
+/// other notices and errors yield [`PlacementOutcome::Rejected`]. The `OrderStatus`
 /// event — when one is delivered before the closing notice — remains
 /// authoritative.
 ///
@@ -325,7 +592,15 @@ where
             Err(ibapi::Error::Notice(n)) if INFORMATIONAL_ORDER_CODES.contains(&n.code) => {
                 return PlacementOutcome::HeldPending(format!("[{}] {}", n.code, n.message));
             }
-            // Genuine notice (e.g. 201 reject) or transport error.
+            // The socket dropped before TWS reported a status. ibapi 4.2 fails
+            // in-flight requests at the drop rather than after the reconnect, so
+            // this can arrive after TWS received the order: its fate is unknown,
+            // not rejected.
+            Err(e) if is_transport_loss(&e) => {
+                warn!(error = %e, "transport lost while awaiting order placement; status unknown");
+                return PlacementOutcome::NoStatus;
+            }
+            // Genuine notice (e.g. 201 reject) or another ibapi error.
             Err(e) => return PlacementOutcome::Rejected(e.to_string()),
         };
 
@@ -588,8 +863,8 @@ impl IbkrClient {
     /// is dropped. Calling `disconnect()` explicitly terminates the connection
     /// **immediately for all clones** sharing this client.
     ///
-    /// Any active `account_stream()` iterators will receive errors on their
-    /// next iteration attempt.
+    /// Any active `account_stream()` ends with `StreamTerminated` within about a
+    /// second.
     ///
     /// This is idempotent — calling it multiple times is safe.
     pub fn disconnect(&self) {
@@ -610,19 +885,33 @@ impl IbkrClient {
     /// prevents the dangerous scenario where take-profit fills but stop-loss
     /// remains open, potentially opening an unintended opposing position.
     ///
-    /// # All-or-Nothing Semantics
+    /// # Failure Semantics
     ///
     /// If any leg is rejected by IB (e.g., insufficient margin, invalid price),
-    /// this method cancels all other legs and returns all three as `Inactive`.
-    /// You will never receive a mix of active and inactive legs.
+    /// or cannot be sent, this method cancels every leg already sent and
+    /// returns the legs as `Inactive`, except for legs of unknown fate (below).
     ///
     /// The same all-legs cancellation applies if any leg fails to report a
-    /// terminal status within the placement timeout (an unknown/no-status
-    /// outcome): leaving part of a bracket working while the rest is in an
-    /// unknown state is unsafe, so all three legs are cancelled and an error is
-    /// returned. This is intentionally stricter than single-order placement
-    /// (`open_order`), where a no-status outcome retains the order and defers
-    /// resolution to the account stream.
+    /// status within the placement timeout, or the transport drops while
+    /// waiting (an unknown/no-status outcome): leaving part of a bracket
+    /// working while the rest is in an unknown state is unsafe, so every leg is
+    /// cancelled and an error is returned.
+    ///
+    /// # Legs of Unknown Fate
+    ///
+    /// Cancelling does not settle a leg whose fate is unknown: a leg that
+    /// reported no status, or whose rollback cancel could not be sent (ibapi
+    /// refuses sends while its transport is down), may still be live or held
+    /// at TWS. Such a leg comes back `Open` with zero fill and keeps its
+    /// order-id mapping, as a no-status single order does, so the account
+    /// stream can report how it ends. The other legs come back `Inactive` with
+    /// the error. A leg IB rejected is settled even if its cancel was refused.
+    /// So a failed bracket can return a mix of `Open` and `Inactive` legs, and
+    /// every leg can be `Open` when none reported a status: an all-`Open`
+    /// result is then indistinguishable from success, and the failure shows
+    /// only in the log and on the account stream. Treat an `Open` leg as
+    /// working until the account stream or
+    /// [`ExecutionClient::fetch_open_orders`] says otherwise.
     ///
     /// # Cancellation Safety
     ///
@@ -792,19 +1081,62 @@ impl IbkrClient {
         // Place all three orders in spawn_blocking
         let client = self.client.clone();
         let result = tokio::task::spawn_blocking(move || {
+            // Roll back legs already sent. Returns the ids whose cancel could not
+            // be sent, and a suffix for the error message naming them. A refused
+            // cancel must not vanish: ibapi refuses sends while the transport is
+            // down, and the leg it names may then be live at TWS.
+            let rollback = |ids: &[i32]| -> (Vec<i32>, String) {
+                let failed: Vec<(i32, ibapi::Error)> = ids
+                    .iter()
+                    .filter_map(|&id| {
+                        let e = client.cancel_order(id, "").err()?;
+                        error!(order_id = id, error = %e, "bracket rollback cancel failed; leg may be live");
+                        Some((id, e))
+                    })
+                    .collect();
+                if failed.is_empty() {
+                    return (Vec::new(), String::new());
+                }
+                let named: Vec<String> = failed.iter().map(|(id, e)| format!("{id} ({e})")).collect();
+                let suffix = format!(
+                    "; rollback cancel failed for order ids {}, which may be live",
+                    named.join(", ")
+                );
+                (failed.into_iter().map(|(id, _)| id).collect(), suffix)
+            };
+
+            // A later leg's send failed after the legs in `sent` were written:
+            // roll them back. A leg whose cancel was refused may be held at TWS,
+            // so it is unresolved. The failing leg itself is treated as never
+            // having reached TWS, as in `send_error`.
+            let leg_send_failure = |e: &ibapi::Error, message: String, sent: &[i32]| {
+                let (cancel_failed, rollback) = rollback(sent);
+                BracketFailure {
+                    error: leg_send_error(e, message, &rollback),
+                    unresolved: cancel_failed,
+                }
+            };
+
             // Place parent (transmit=false, held until SL is sent)
             let parent_sub = match client.place_order(parent_ib_id, &contract, &ib_orders[0]) {
                 Ok(s) => s,
-                Err(e) => return Err(format!("parent order failed: {e}")),
+                Err(e) => {
+                    return Err(BracketFailure {
+                        error: send_error(&e, format!("parent order failed: {e}")),
+                        unresolved: Vec::new(),
+                    });
+                }
             };
 
             // Place take-profit (transmit=false)
             let tp_sub = match client.place_order(tp_ib_id, &contract, &ib_orders[1]) {
                 Ok(s) => s,
                 Err(e) => {
-                    // Cancel parent before returning
-                    let _ = client.cancel_order(parent_ib_id, "");
-                    return Err(format!("take_profit order failed: {e}"));
+                    return Err(leg_send_failure(
+                        &e,
+                        format!("take_profit order failed: {e}"),
+                        &[parent_ib_id],
+                    ));
                 }
             };
 
@@ -812,10 +1144,11 @@ impl IbkrClient {
             let sl_sub = match client.place_order(sl_ib_id, &contract, &ib_orders[2]) {
                 Ok(s) => s,
                 Err(e) => {
-                    // Cancel parent and TP before returning
-                    let _ = client.cancel_order(parent_ib_id, "");
-                    let _ = client.cancel_order(tp_ib_id, "");
-                    return Err(format!("stop_loss order failed: {e}"));
+                    return Err(leg_send_failure(
+                        &e,
+                        format!("stop_loss order failed: {e}"),
+                        &[parent_ib_id, tp_ib_id],
+                    ));
                 }
             };
 
@@ -853,12 +1186,24 @@ impl IbkrClient {
             match (parent_status, tp_status, sl_status) {
                 (Some(Ok(parent)), Some(Ok(tp)), Some(Ok(sl))) => Ok((parent, tp, sl)),
                 (parent, tp, sl) => {
-                    let _ = client.cancel_order(parent_ib_id, "");
-                    let _ = client.cancel_order(tp_ib_id, "");
-                    let _ = client.cancel_order(sl_ib_id, "");
-                    Err(format!(
-                        "bracket order rejected: parent={parent:?}, tp={tp:?}, sl={sl:?}"
-                    ))
+                    let (cancel_failed, rollback) = rollback(&[parent_ib_id, tp_ib_id, sl_ib_id]);
+                    let unresolved = unresolved_legs(
+                        [(parent_ib_id, &parent), (tp_ib_id, &tp), (sl_ib_id, &sl)],
+                        &cancel_failed,
+                    );
+                    let show = |status: Option<Result<f64, String>>| match status {
+                        Some(status) => format!("{status:?}"),
+                        None => "no status (timed out or transport lost)".to_string(),
+                    };
+                    Err(BracketFailure {
+                        error: OrderError::Rejected(ApiError::OrderRejected(format!(
+                            "bracket order failed: parent={}, tp={}, sl={}{rollback}",
+                            show(parent),
+                            show(tp),
+                            show(sl)
+                        ))),
+                        unresolved,
+                    })
                 }
             }
         })
@@ -885,7 +1230,10 @@ impl IbkrClient {
                         kind: OrderKind::Limit,
                         time_in_force: request.time_in_force,
                         state: OrderState::active(Open::new(
-                            OrderId::new(format_smolstr!("{}", parent_ib_id)),
+                            VenueOrderId::Assigned(OrderId::new(format_smolstr!(
+                                "{}",
+                                parent_ib_id
+                            ))),
                             now,
                             parent_filled_dec,
                         )),
@@ -903,7 +1251,7 @@ impl IbkrClient {
                         kind: OrderKind::Limit,
                         time_in_force: request.time_in_force,
                         state: OrderState::active(Open::new(
-                            OrderId::new(format_smolstr!("{}", tp_ib_id)),
+                            VenueOrderId::Assigned(OrderId::new(format_smolstr!("{}", tp_ib_id))),
                             now,
                             tp_filled_dec,
                         )),
@@ -923,26 +1271,24 @@ impl IbkrClient {
                         },
                         time_in_force: request.time_in_force,
                         state: OrderState::active(Open::new(
-                            OrderId::new(format_smolstr!("{}", sl_ib_id)),
+                            VenueOrderId::Assigned(OrderId::new(format_smolstr!("{}", sl_ib_id))),
                             now,
                             sl_filled_dec,
                         )),
                     },
                 }
             }
-            Ok(Err(err_msg)) => {
-                // Clean up order ID mappings
-                self.order_ids.remove_by_ib_id(parent_ib_id);
-                self.order_ids.remove_by_ib_id(tp_ib_id);
-                self.order_ids.remove_by_ib_id(sl_ib_id);
-
-                make_all_inactive_bracket(
-                    &request,
-                    OrderError::Rejected(ApiError::OrderRejected(err_msg)),
-                )
-            }
+            Ok(Err(failure)) => failed_bracket(
+                &request,
+                [parent_ib_id, tp_ib_id, sl_ib_id],
+                failure,
+                &self.order_ids,
+            ),
             Err(join_err) => {
-                // Clean up order ID mappings
+                // The placement task panicked, and which legs it sent was lost
+                // with it. Unlike `failed_bracket`, all three are released: a
+                // leg it did send is then untracked, but keeping unsent legs
+                // Open would report orders that do not exist.
                 self.order_ids.remove_by_ib_id(parent_ib_id);
                 self.order_ids.remove_by_ib_id(tp_ib_id);
                 self.order_ids.remove_by_ib_id(sl_ib_id);
@@ -967,6 +1313,99 @@ fn derive_child_cids(parent_cid: &ClientOrderId) -> (ClientOrderId, ClientOrderI
         ClientOrderId::new(format_smolstr!("{}_tp", parent_cid.0)),
         ClientOrderId::new(format_smolstr!("{}_sl", parent_cid.0)),
     )
+}
+
+/// A failed bracket placement: the error each settled leg carries, and the legs
+/// whose fate at TWS is unknown.
+struct BracketFailure {
+    error: OrderError<AssetNameExchange, InstrumentNameExchange>,
+    /// IB order ids of legs that may be live at TWS: no placement status
+    /// arrived for them, or their rollback cancel could not be sent.
+    unresolved: Vec<i32>,
+}
+
+/// The legs of a bracket that failed after all three were sent whose fate at
+/// TWS is unknown: those without a placement status (`None`), and those that
+/// were accepted but whose rollback cancel could not be sent.
+///
+/// A rejected leg (`Some(Err)`) is settled whether or not its cancel went out:
+/// its terminal status was consumed by the placement subscription and will not
+/// be replayed, so keeping it `Open` would leave a phantom order. An accepted
+/// leg whose cancel went out is settled as being cancelled.
+fn unresolved_legs<T, E>(
+    legs: [(i32, &Option<Result<T, E>>); 3],
+    cancel_failed: &[i32],
+) -> Vec<i32> {
+    legs.into_iter()
+        .filter(|(id, status)| match status {
+            None => true,
+            Some(Ok(_)) => cancel_failed.contains(id),
+            Some(Err(_)) => false,
+        })
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// Classify a later bracket leg's send failure, after the legs sent before it
+/// were rolled back. `rollback` is the suffix naming the cancels that could
+/// not be sent, empty when every cancel went out.
+///
+/// Retrying is only safe when every rollback cancel went out, so only then does
+/// the failure keep [`send_error`]'s classification. Otherwise a leg may still
+/// be held at TWS, and the failure is a non-transient rejection naming it.
+fn leg_send_error(
+    e: &ibapi::Error,
+    message: String,
+    rollback: &str,
+) -> OrderError<AssetNameExchange, InstrumentNameExchange> {
+    if rollback.is_empty() {
+        send_error(e, message)
+    } else {
+        OrderError::Rejected(ApiError::OrderRejected(format!("{message}{rollback}")))
+    }
+}
+
+/// Build the result of a failed bracket placement, releasing the order-id
+/// mappings of its settled legs.
+///
+/// A leg in `failure.unresolved` comes back `Open` with zero fill and keeps its
+/// mapping, as single-order placement does for an unknown outcome, so the
+/// account stream can still resolve it. Every other leg was never sent, was
+/// rejected, or had its cancel sent: it comes back `Inactive` with
+/// `failure.error`, and its mapping is removed.
+fn failed_bracket(
+    request: &BracketOrderRequest,
+    [parent_ib_id, tp_ib_id, sl_ib_id]: [i32; 3],
+    failure: BracketFailure,
+    order_ids: &OrderIdMap,
+) -> BracketOrderResult {
+    let BracketFailure { error, unresolved } = failure;
+    if !unresolved.is_empty() {
+        warn!(
+            %error,
+            ?unresolved,
+            "bracket placement failed with legs of unknown fate; returning them Open, tracking via stream"
+        );
+    }
+
+    let mut result = make_all_inactive_bracket(request, error);
+    let now = Utc::now();
+    for (leg, ib_id) in [
+        (&mut result.parent, parent_ib_id),
+        (&mut result.take_profit, tp_ib_id),
+        (&mut result.stop_loss, sl_ib_id),
+    ] {
+        if unresolved.contains(&ib_id) {
+            leg.state = OrderState::active(Open::new(
+                VenueOrderId::Assigned(OrderId::new(format_smolstr!("{ib_id}"))),
+                now,
+                Decimal::ZERO,
+            ));
+        } else {
+            order_ids.remove_by_ib_id(ib_id);
+        }
+    }
+    result
 }
 
 /// Helper to create a BracketOrderResult with all legs inactive (same error).
@@ -1074,7 +1513,7 @@ impl ExecutionClient for IbkrClient {
         Self::connect_sync(config).expect("failed to connect to IB")
     }
 
-    /// Fetch account snapshot (balances and positions).
+    /// Fetch account snapshot (balances, and which instruments hold a position).
     ///
     /// # Limitations
     ///
@@ -1083,9 +1522,10 @@ impl ExecutionClient for IbkrClient {
     ///   Use `fetch_open_orders()` or `account_stream()` for order state.
     ///
     /// - Position quantity and average cost from IB are not carried in the
-    ///   returned `InstrumentAccountSnapshot`. The struct only indicates which
-    ///   instruments have positions, not the position sizes. This is a
-    ///   limitation of the `InstrumentAccountSnapshot` type, not the IB API.
+    ///   returned `InstrumentAccountSnapshot`: its `position` is always `None`,
+    ///   so the snapshot only indicates which instruments have positions, not
+    ///   their sizes. IB reports both, and `position` could carry them; this
+    ///   client does not fill it yet (#417).
     ///
     /// # Known Issue: ibapi Decode Errors
     ///
@@ -1096,12 +1536,17 @@ impl ExecutionClient for IbkrClient {
     ///
     /// # Timeout
     ///
-    /// Uses 5-second timeout between position updates. If IB stalls mid-stream
-    /// (e.g., due to the ibapi `PositionEnd` routing bug), returns partial results
-    /// after 5s of inactivity rather than blocking indefinitely.
+    /// IB's positions request is a live subscription that keeps streaming after
+    /// the initial set, so the read ends once 5 seconds pass without a position
+    /// update. **Every call therefore takes at least 5 seconds**, including for
+    /// an account with no positions. If IB stalls mid-stream, the positions
+    /// received so far are returned rather than blocking indefinitely.
     ///
-    /// **For accounts with no positions, this method waits the full 5-second
-    /// timeout before returning an empty position list.**
+    /// # Known Issue: Errors After a Connection Drop on `ibapi` 4.2.0
+    ///
+    /// After each connection drop, the next two calls fail with
+    /// [`UnindexedClientError::Internal`]. The third succeeds. See the
+    /// [module's Known Issues](self#known-issues-ibapi-420-shared-queues).
     async fn account_snapshot(
         &self,
         assets: &[AssetNameExchange],
@@ -1131,10 +1576,8 @@ impl ExecutionClient for IbkrClient {
             let mut snapshots = Vec::new();
             let mut seen = HashSet::new();
 
-            // Use the timeout-bounded data iterator instead of the plain blocking
-            // iterator to avoid hang. ibapi bug: PositionEnd has no request_id so it
-            // is not routed to the subscription, causing iteration to block forever;
-            // the per-item timeout yields `None` to end the loop instead.
+            // Read until `POSITION_STREAM_TIMEOUT` passes with no update, not until
+            // `PositionEnd`: see that constant for why.
             for pos_update in positions_sub.timeout_iter_data(POSITION_STREAM_TIMEOUT) {
                 // Surface subscription errors rather than returning partial positions
                 // (a truncated snapshot could be misread as positions having closed).
@@ -1171,6 +1614,8 @@ impl ExecutionClient for IbkrClient {
                 snapshots.push(InstrumentAccountSnapshot {
                     instrument,
                     orders: Vec::new(),
+                    // Nothing is read, so absence says nothing: see the limitation above and #371.
+                    orders_complete: false,
                     position: None,
                     isolated: None,
                 });
@@ -1196,15 +1641,60 @@ impl ExecutionClient for IbkrClient {
     ///
     /// # Thread Lifecycle
     ///
-    /// Spawns a background thread to read from the blocking IB subscription.
-    /// The thread terminates when:
-    /// - The returned `BoxStream` is dropped (channel closes)
-    /// - The IB subscription ends (disconnect)
+    /// Spawns two background threads: `ibkr-order-stream` reads the blocking IB
+    /// subscription, and `ibkr-fill-recovery` watches for gaps in event delivery
+    /// (see below). The watcher exits within about a second of the returned
+    /// `BoxStream` being dropped or the stream ending. The reader exits when:
+    /// - The returned `BoxStream` is dropped (channel closes), or the stream has
+    ///   ended, and the next IB event arrives
+    /// - The IB subscription ends
     ///
-    /// **Important:** If IB is stalled (no events flowing), the thread blocks on
-    /// the iterator. Dropping the stream signals termination, but the thread won't
-    /// observe it until the next IB event arrives. For graceful shutdown during
-    /// stalls, the caller should disconnect the IB connection.
+    /// **Important:** If IB is stalled (no events flowing), the reader thread blocks
+    /// on the iterator. Dropping the stream signals termination, but the thread won't
+    /// observe it until the next IB event arrives. Disconnecting does not release
+    /// it either: `ibapi` does not end the order-update subscription when the
+    /// client shuts down (wboayue/rust-ibapi#871), so after a shutdown the thread
+    /// stays blocked until the process exits.
+    ///
+    /// # Reconnects and Fill Recovery
+    ///
+    /// `ibapi` reconnects its socket to TWS/Gateway by itself, and this stream
+    /// stays open across that: a transient drop produces neither an error nor
+    /// `StreamTerminated`. TWS does not resend what it sent while the socket was
+    /// down, and TWS losing its own link to IB's servers (notice 1100) opens the
+    /// same kind of gap. Once delivery is restored, this stream asks TWS for the
+    /// day's executions and emits the ones from the gap as `Trade` events. The
+    /// gap is taken to start up to a poll interval before the drop was noticed,
+    /// minus a lookback margin. Trades the stream already delivered are not
+    /// emitted twice.
+    ///
+    /// **Order lifecycle events are not recovered.** An order that was cancelled,
+    /// expired or rejected during the gap is not reported here. Reconcile with
+    /// [`ExecutionClient::fetch_open_orders`] after a reconnect, minding its
+    /// known issue on `ibapi` 4.2.0. The log line
+    /// `Recovered IBKR fills after a gap in event delivery` marks one.
+    ///
+    /// While TWS reports its link to IB's servers lost (1100), nothing marks the
+    /// gap on this stream until the link is restored and the recovered fills
+    /// arrive.
+    ///
+    /// The stream ends with `StreamTerminated` when:
+    /// - recovery fails three times for a reason other than the transport
+    ///   dropping again, rather than stay open with a gap;
+    /// - the client shuts down for good, because `ibapi` gave up reconnecting or
+    ///   [`IbkrClient::disconnect`] was called. `ibapi` never ends the order
+    ///   update subscription itself, so this is detected from its notice stream,
+    ///   which it does close.
+    ///
+    /// After either, the reader thread stays blocked on the subscription, and
+    /// holds `ibapi`'s single order-update slot, until TWS sends another event.
+    /// Calling `account_stream` again on the same client fails meanwhile. After a
+    /// shutdown, TWS sends nothing more, so replace the client.
+    ///
+    /// Shutdown is detected only while this stream is open. Called on a client
+    /// that has already shut down, this method still returns a stream, which
+    /// never ends. After a stream ends with a shutdown, replace the client rather
+    /// than resubscribe on it.
     ///
     /// # Duplicate Events
     ///
@@ -1213,6 +1703,10 @@ impl ExecutionClient for IbkrClient {
     /// is inherent to IB's API — both the per-order subscription and the global
     /// order update stream receive the same `OrderStatus` events. Callers should
     /// deduplicate if needed.
+    ///
+    /// `Trade` events are delivered once each. Executions that answer an
+    /// executions request, such as [`ExecutionClient::fetch_trades`], are not
+    /// reported here as fills.
     ///
     /// # Filter Parameters
     ///
@@ -1229,10 +1723,15 @@ impl ExecutionClient for IbkrClient {
 
         // M-8 fix: Wrap blocking subscription call in spawn_blocking
         // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
-        let order_sub = tokio::task::spawn_blocking(move || client.order_update_stream())
-            .await
-            .map_err(|e| UnindexedClientError::TaskFailed(format!("task join: {e}")))?
-            .map_err(|e| UnindexedClientError::Internal(format!("order updates: {e}")))?;
+        let (notices, order_sub) = tokio::task::spawn_blocking(move || {
+            // Notices first, so a reconnect that lands while the order stream is being set up is
+            // not missed.
+            let notices = client.notice_stream()?;
+            client.order_update_stream().map(|sub| (notices, sub))
+        })
+        .await
+        .map_err(|e| UnindexedClientError::TaskFailed(format!("task join: {e}")))?
+        .map_err(|e| UnindexedClientError::Internal(format!("order updates: {e}")))?;
 
         let contracts_clone = self.contracts.clone();
         let order_ids_clone = self.order_ids.clone();
@@ -1240,144 +1739,62 @@ impl ExecutionClient for IbkrClient {
         let exec_buffer_clone = self.execution_buffer.clone();
 
         let (tx, rx) = mpsc::unbounded_channel();
+        let sink = recovery::EventSink::new(tx, new_dedup_cache());
+
+        // Spawned before the reader: if the reader fails to spawn, `rx` drops with the error and
+        // the watcher sees its consumer gone.
+        let watcher = recovery::RecoveryWatcher {
+            client: self.client.clone(),
+            notices,
+            contracts: self.contracts.clone(),
+            order_ids: self.order_ids.clone(),
+            pending: self.execution_buffer.clone(),
+            sink: sink.clone(),
+        };
+        let watcher_sink = sink.clone();
+        std::thread::Builder::new()
+            .name("ibkr-fill-recovery".to_string())
+            .spawn(move || {
+                // Same panic policy as the reader below: a panic ends recovery, and a stream that
+                // can no longer recover must say so rather than stay open.
+                if let Err(panic_info) = catch_unwind(AssertUnwindSafe(|| watcher.run())) {
+                    let msg = panic_message(panic_info.as_ref());
+                    error!("Fill recovery worker panicked: {msg}");
+                    watcher_sink.terminate(StreamTerminationReason::Error(format!(
+                        "IBKR fill-recovery worker panicked: {msg}"
+                    )));
+                }
+            })
+            .map_err(|e| UnindexedClientError::TaskFailed(format!("thread spawn: {e}")))?;
 
         std::thread::Builder::new()
             .name("ibkr-order-stream".to_string())
             .spawn(move || {
                 // Panic safety: parking_lot mutexes do not poison on panic, so shared state
                 // (ContractRegistry, OrderIdMap, etc.) remains usable. catch_unwind unwinds only
-                // the inner closure — `tx` lives in this outer thread closure and is still open
-                // afterward, so the panic handler below emits a terminal StreamTerminated before
-                // `tx` drops (a panic is a terminal stream death like any other).
+                // the inner closure — `sink` lives in this outer thread closure and is still open
+                // afterward, so the panic handler below emits a terminal StreamTerminated
+                // (a panic is a terminal stream death like any other).
                 let result = catch_unwind(AssertUnwindSafe(|| {
-                    use ibapi::orders::{OrderStatusKind, OrderUpdate};
-
-                    for update in order_sub.iter_data() {
-                        let update = match update {
-                            Ok(u) => u,
-                            Err(e) => {
-                                // IBKR has no library-managed reconnection: a subscription
-                                // error ends the stream. Surface it in-band as a terminal
-                                // StreamTerminated(Error) before tx drops so the caller gets a
-                                // programmatic signal rather than inferring EOF. (best-effort
-                                // send — if the consumer already dropped rx it is a no-op.)
-                                error!(error = %e, "Order stream subscription error");
-                                emit_stream_terminated(
-                                    &tx,
-                                    ExchangeId::Ibkr,
-                                    StreamTerminationReason::Error(e.to_string()),
-                                );
-                                return;
-                            }
-                        };
-                        let event = match update {
-                            OrderUpdate::OrderStatus(status) => {
-                                let ib_id = status.order_id;
-                                // Use single-lock method for terminal status to avoid read+write.
-                                // Only `Cancelled`/`Inactive` remove the mapping here: a `Filled`
-                                // order's mapping is intentionally retained so late-arriving
-                                // ExecutionData/CommissionReport events still resolve it (reaped
-                                // later by `OrderIdMap::clear_stale`), so this is deliberately
-                                // narrower than `OrderStatusKind::is_terminal()`.
-                                let is_terminal = matches!(
-                                    status.status,
-                                    OrderStatusKind::Cancelled | OrderStatusKind::Inactive
-                                );
-
-                                let lookup_result = if is_terminal {
-                                    order_ids_clone.remove_and_get_context(ib_id)
-                                } else {
-                                    order_ids_clone.get_client_id_and_context(ib_id)
-                                };
-
-                                if let Some((client_id, ctx)) = lookup_result {
-                                    let order = make_order_from_status(
-                                        &status,
-                                        client_id,
-                                        &ctx,
-                                        &pending_cancels_clone,
-                                    );
-                                    Some(UnindexedAccountEvent {
-                                        exchange: ExchangeId::Ibkr,
-                                        kind: AccountEventKind::OrderSnapshot(Snapshot::new(order)),
-                                    })
-                                } else {
-                                    debug!(ib_order_id = ib_id, "OrderStatus for unknown order ID");
-                                    None
-                                }
-                            }
-                            OrderUpdate::ExecutionData(exec) => {
-                                let order_id = exec.execution.order_id;
-                                let con_id = exec.contract.contract_id;
-
-                                // Fail-fast: skip second lookup if first fails
-                                let Some(client_id) = order_ids_clone.get_client_id(order_id)
-                                else {
-                                    debug!(
-                                        ib_order_id = order_id,
-                                        con_id, "ExecutionData for unknown order ID, dropping"
-                                    );
-                                    continue;
-                                };
-                                let Some(instrument) = contracts_clone.get_name_by_con_id(con_id)
-                                else {
-                                    debug!(
-                                        ib_order_id = order_id,
-                                        con_id, "ExecutionData for unknown contract ID, dropping"
-                                    );
-                                    continue;
-                                };
-
-                                exec_buffer_clone.add_execution(exec, instrument, client_id);
-                                None
-                            }
-                            OrderUpdate::CommissionReport(report) => exec_buffer_clone
-                                .complete_with_commission(&report)
-                                .map(|trade| UnindexedAccountEvent {
-                                    exchange: ExchangeId::Ibkr,
-                                    kind: AccountEventKind::Trade(trade),
-                                }),
-                            _ => None,
-                        };
-
-                        if let Some(e) = event
-                            && tx.send(e).is_err()
-                        {
-                            // Consumer dropped rx: no point emitting StreamTerminated
-                            // (the channel is already closed — it would be a no-op).
-                            return;
-                        }
-                    }
-
-                    // The subscription iterator ended without an error (e.g. clean
-                    // disconnect/unsubscribe). Still a terminal stream death — surface it
-                    // in-band so the consumer doesn't have to infer it from channel EOF.
-                    emit_stream_terminated(
-                        &tx,
-                        ExchangeId::Ibkr,
-                        StreamTerminationReason::Error(
-                            "IBKR order-update stream ended".to_string(),
-                        ),
+                    forward_order_updates(
+                        order_sub.iter_data(),
+                        &sink,
+                        &contracts_clone,
+                        &order_ids_clone,
+                        &pending_cancels_clone,
+                        &exec_buffer_clone,
                     );
                 }));
 
                 if let Err(panic_info) = result {
-                    let msg = panic_info
-                        .downcast_ref::<&str>()
-                        .map(|s| s.to_string())
-                        .or_else(|| panic_info.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "unknown panic".to_string());
+                    let msg = panic_message(panic_info.as_ref());
                     error!("Order stream worker panicked: {msg}");
-                    // A panic is a terminal stream death — surface it in-band before tx drops so
-                    // the consumer gets a programmatic signal rather than inferring EOF.
+                    // A panic is a terminal stream death — surface it in-band so the consumer
+                    // gets a programmatic signal rather than inferring EOF.
                     // Best-effort: a no-op if the consumer already dropped rx.
-                    emit_stream_terminated(
-                        &tx,
-                        ExchangeId::Ibkr,
-                        StreamTerminationReason::Error(format!(
-                            "IBKR order-update worker panicked: {msg}"
-                        )),
-                    );
+                    sink.terminate(StreamTerminationReason::Error(format!(
+                        "IBKR order-update worker panicked: {msg}"
+                    )));
                 }
             })
             .map_err(|e| UnindexedClientError::TaskFailed(format!("thread spawn: {e}")))?;
@@ -1452,9 +1869,7 @@ impl ExecutionClient for IbkrClient {
                 error!(order_id = ib_order_id, error = %e, "Failed to cancel order");
                 Some(OrderResponseCancel {
                     key,
-                    state: Err(crate::error::OrderError::Rejected(ApiError::OrderRejected(
-                        e.to_string(),
-                    ))),
+                    state: Err(send_error(&e, e.to_string())),
                 })
             }
             Err(e) => {
@@ -1578,7 +1993,7 @@ impl ExecutionClient for IbkrClient {
         let result = tokio::task::spawn_blocking(move || {
             let sub = match client.place_order(ib_order_id, &contract, &ib_order) {
                 Ok(s) => s,
-                Err(e) => return Err(e.to_string()),
+                Err(e) => return Err(send_error(&e, e.to_string())),
             };
 
             match await_order_placement(sub.timeout_iter_data(PLACEMENT_STATUS_TIMEOUT)) {
@@ -1589,7 +2004,9 @@ impl ExecutionClient for IbkrClient {
                 // Cancelled/Inactive/unexpected status or a genuine notice/error.
                 // Don't remove the mapping here — the outer match centralizes all
                 // error-path removals.
-                PlacementOutcome::Rejected(reason) => Err(reason),
+                PlacementOutcome::Rejected(reason) => {
+                    Err(OrderError::Rejected(ApiError::OrderRejected(reason)))
+                }
                 // Held until RTH (informational notice): the order is live; its
                 // authoritative status arrives via account_stream. Surface as
                 // "no terminal status yet" (Open with zero fill), same as below.
@@ -1618,7 +2035,7 @@ impl ExecutionClient for IbkrClient {
                     kind,
                     time_in_force: tif,
                     state: OrderState::active(Open::new(
-                        OrderId::new(format_smolstr!("{}", order_id)),
+                        VenueOrderId::Assigned(OrderId::new(format_smolstr!("{}", order_id))),
                         Utc::now(),
                         filled,
                     )),
@@ -1640,14 +2057,15 @@ impl ExecutionClient for IbkrClient {
                     kind,
                     time_in_force: tif,
                     state: OrderState::active(Open::new(
-                        OrderId::new(format_smolstr!("{}", ib_order_id)),
+                        VenueOrderId::Assigned(OrderId::new(format_smolstr!("{}", ib_order_id))),
                         Utc::now(),
                         Decimal::ZERO,
                     )),
                 })
             }
-            Ok(Err(status)) => {
-                // Cleanup order_ids for rejection (place_order error or Cancelled/Inactive)
+            Ok(Err(error)) => {
+                // Cleanup order_ids: the order was never sent (place_order error)
+                // or TWS rejected it (Cancelled/Inactive or a genuine notice).
                 self.order_ids.remove_by_ib_id(ib_order_id);
                 Some(Order {
                     key,
@@ -1656,9 +2074,7 @@ impl ExecutionClient for IbkrClient {
                     quantity: req_quantity,
                     kind,
                     time_in_force: tif,
-                    state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
-                        status,
-                    ))),
+                    state: OrderState::inactive(error),
                 })
             }
             Err(e) => {
@@ -1738,6 +2154,23 @@ impl ExecutionClient for IbkrClient {
     ///   does not return the original TIF setting.
     /// - This method blocks on IB's subscription until IB sends an end-of-data marker.
     ///   If IB is stalled, this will block indefinitely.
+    ///
+    /// # Known Issue: Stale Results on `ibapi` 4.2.0
+    ///
+    /// The result may not be this call's answer. See the
+    /// [module's Known Issues](self#known-issues-ibapi-420-shared-queues).
+    ///
+    /// - Order updates received since the previous call are read as part of the
+    ///   result. It can hold the same order more than once, and orders that have
+    ///   since filled or been cancelled, reported as open.
+    /// - After the first connection drop, the next three calls fail with
+    ///   [`UnindexedClientError::Internal`], and every call after them returns
+    ///   the reply to the call three before it. Each later drop adds three more
+    ///   calls of lag, and three more failures, which come once the replies
+    ///   already queued have been read. Retrying does not catch up.
+    ///
+    /// Do not treat the result as authoritative open-order state on 4.2.0. The
+    /// order events from [`ExecutionClient::account_stream`] are unaffected.
     async fn fetch_open_orders(
         &self,
         instruments: &[InstrumentNameExchange],
@@ -1823,7 +2256,10 @@ impl ExecutionClient for IbkrClient {
                     // IB's open orders endpoint doesn't return TIF; default to GTC
                     time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
                     state: Open::new(
-                        OrderId::new(format_smolstr!("{}", order_data.order_id)),
+                        VenueOrderId::Assigned(OrderId::new(format_smolstr!(
+                            "{}",
+                            order_data.order_id
+                        ))),
                         Utc::now(),
                         Decimal::ZERO, // M-5: filled_qty unavailable from open orders endpoint
                     ),
@@ -2038,9 +2474,11 @@ fn make_order_from_status(
         | OrderStatusKind::PendingSubmit
         | OrderStatusKind::ApiPending
         | OrderStatusKind::PendingCancel
-        | OrderStatusKind::ApiCancelled => {
-            OrderState::active(Open::new(order_id, Utc::now(), filled_qty))
-        }
+        | OrderStatusKind::ApiCancelled => OrderState::active(Open::new(
+            VenueOrderId::Assigned(order_id),
+            Utc::now(),
+            filled_qty,
+        )),
         // A status string ibapi does not model. Upstream declines to classify
         // it — `is_active()` and `is_terminal()` are both false — and so do we:
         // report it active/Open so the order-id mapping is retained and the
@@ -2056,7 +2494,11 @@ fn make_order_from_status(
                 "unmodelled IBKR order status; treating as live, account \
                  stream is authoritative"
             );
-            OrderState::active(Open::new(order_id, Utc::now(), filled_qty))
+            OrderState::active(Open::new(
+                VenueOrderId::Assigned(order_id),
+                Utc::now(),
+                filled_qty,
+            ))
         }
     };
 
@@ -2201,6 +2643,7 @@ mod contract_config_tests {
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod order_status_tests {
     use super::*;
+    use crate::order::state::ActiveOrderState;
     use ibapi::orders::{OrderStatus, OrderStatusKind, PlaceOrder};
 
     fn status(kind: OrderStatusKind, filled: f64) -> Result<PlaceOrder, ibapi::Error> {
@@ -2261,6 +2704,81 @@ mod order_status_tests {
             await_order_placement(events),
             PlacementOutcome::NoStatus
         ));
+    }
+
+    /// ibapi 4.2 fails an in-flight placement with a transport error the moment
+    /// the socket drops. TWS may already hold the order, so it must stay
+    /// trackable (`NoStatus` keeps the order-id mapping), not read as rejected.
+    #[test]
+    fn transport_loss_while_awaiting_placement_is_no_status() {
+        for e in [
+            ibapi::Error::ConnectionReset,
+            ibapi::Error::ConnectionFailed,
+            ibapi::Error::Shutdown,
+            ibapi::Error::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        ] {
+            let label = e.to_string();
+            assert!(
+                matches!(
+                    await_order_placement(vec![Err(e)]),
+                    PlacementOutcome::NoStatus
+                ),
+                "{label} must leave the placement unresolved, not rejected"
+            );
+        }
+
+        // A status that arrived before the drop still decides.
+        let events = vec![
+            status(OrderStatusKind::Submitted, 0.0),
+            Err(ibapi::Error::ConnectionReset),
+        ];
+        assert!(matches!(
+            await_order_placement(events),
+            PlacementOutcome::Accepted { .. }
+        ));
+    }
+
+    #[test]
+    fn non_transport_error_while_awaiting_placement_is_rejected() {
+        let events = vec![Err(ibapi::Error::Simple("boom".into()))];
+        assert!(matches!(
+            await_order_placement(events),
+            PlacementOutcome::Rejected(reason) if reason.contains("boom")
+        ));
+    }
+
+    /// A send refused because the transport is down or reconnecting never
+    /// reached TWS: it is a transient connectivity error, not a venue rejection.
+    #[test]
+    fn send_error_separates_transport_loss_from_refusal() {
+        let refused: OrderError<AssetNameExchange, InstrumentNameExchange> =
+            send_error(&ibapi::Error::ConnectionReset, "down".into());
+        assert!(
+            matches!(&refused, OrderError::Connectivity(ConnectivityError::Socket(m)) if m == "down")
+        );
+        assert!(refused.is_transient());
+
+        let io: OrderError<AssetNameExchange, InstrumentNameExchange> = send_error(
+            &ibapi::Error::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+            "io".into(),
+        );
+        assert!(io.is_transient());
+
+        // ibapi has given up reconnecting: retrying cannot succeed.
+        for e in [
+            ibapi::Error::Shutdown,
+            ibapi::Error::ConnectionFailed,
+            ibapi::Error::Simple("no".into()),
+        ] {
+            let label = e.to_string();
+            let rejected: OrderError<AssetNameExchange, InstrumentNameExchange> =
+                send_error(&e, "no".into());
+            assert!(
+                matches!(&rejected, OrderError::Rejected(ApiError::OrderRejected(m)) if m == "no"),
+                "{label} must be a non-transient refusal"
+            );
+            assert!(!rejected.is_transient(), "{label}");
+        }
     }
 
     /// Regression anchors: the statuses that were already decisive must keep
@@ -2329,5 +2847,212 @@ mod order_status_tests {
             pending.remove(42),
             "the pending cancel must still be there for the confirmed Cancelled"
         );
+    }
+
+    /// A rejected leg is settled even when its rollback cancel was refused: its
+    /// terminal status will not be replayed, so keeping it Open would leave a
+    /// phantom order.
+    #[test]
+    fn rejected_leg_with_failed_cancel_is_settled() {
+        let accepted: Option<Result<f64, String>> = Some(Ok(0.0));
+        let rejected: Option<Result<f64, String>> = Some(Err("Cancelled".into()));
+
+        assert_eq!(
+            unresolved_legs([(1, &rejected), (2, &accepted), (3, &accepted)], &[1, 2, 3]),
+            vec![2, 3]
+        );
+    }
+
+    /// A later leg's send failure keeps `send_error`'s classification only when
+    /// every rollback cancel went out; otherwise it is a non-transient
+    /// rejection naming the cancels that failed.
+    #[test]
+    fn leg_send_error_is_transient_only_after_a_clean_rollback() {
+        let clean = leg_send_error(&ibapi::Error::ConnectionReset, "sl failed".into(), "");
+        assert!(matches!(clean, OrderError::Connectivity(_)));
+
+        let dirty = leg_send_error(
+            &ibapi::Error::ConnectionReset,
+            "sl failed".into(),
+            "; rollback cancel failed for order ids 10 (connection reset), which may be live",
+        );
+        match dirty {
+            OrderError::Rejected(ApiError::OrderRejected(message)) => {
+                assert!(message.starts_with("sl failed; rollback cancel failed"));
+            }
+            other => panic!("expected a non-transient rejection, got {other:?}"),
+        }
+    }
+
+    /// A leg is unresolved when it reported no status, or was accepted and its
+    /// rollback cancel was refused; a leg whose cancel went out is settled.
+    #[test]
+    fn unresolved_legs_are_no_status_or_failed_cancel() {
+        let accepted: Option<Result<f64, String>> = Some(Ok(0.0));
+        let rejected: Option<Result<f64, String>> = Some(Err("201".into()));
+        let no_status: Option<Result<f64, String>> = None;
+
+        assert_eq!(
+            unresolved_legs([(1, &accepted), (2, &rejected), (3, &no_status)], &[]),
+            vec![3]
+        );
+        assert_eq!(
+            unresolved_legs([(1, &accepted), (2, &rejected), (3, &accepted)], &[1]),
+            vec![1]
+        );
+        assert_eq!(
+            unresolved_legs([(1, &no_status), (2, &no_status), (3, &accepted)], &[2]),
+            vec![1, 2]
+        );
+        assert!(unresolved_legs([(1, &accepted), (2, &rejected), (3, &accepted)], &[]).is_empty());
+    }
+
+    fn bracket_request() -> BracketOrderRequest {
+        BracketOrderRequest {
+            instrument: InstrumentNameExchange::new("AAPL"),
+            strategy: StrategyId::new("test"),
+            parent_cid: ClientOrderId::new("br"),
+            side: Side::Buy,
+            quantity: Decimal::from(10),
+            entry_price: Decimal::from(150),
+            take_profit_price: Decimal::from(160),
+            stop_loss_price: Decimal::from(145),
+            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+        }
+    }
+
+    /// An unresolved leg comes back Open under its IB id and keeps its mapping,
+    /// so the account stream can still resolve it; a settled leg comes back
+    /// Inactive with the error and its mapping is released.
+    #[test]
+    fn failed_bracket_keeps_unresolved_legs_open_and_tracked() {
+        let request = bracket_request();
+        let (tp_cid, sl_cid) = derive_child_cids(&request.parent_cid);
+        let order_ids = OrderIdMap::new();
+        order_ids.register(request.parent_cid.clone(), 10, ctx());
+        order_ids.register(tp_cid, 11, ctx());
+        order_ids.register(sl_cid, 12, ctx());
+
+        let result = failed_bracket(
+            &request,
+            [10, 11, 12],
+            BracketFailure {
+                error: OrderError::Rejected(ApiError::OrderRejected("boom".into())),
+                unresolved: vec![11],
+            },
+            &order_ids,
+        );
+
+        assert!(matches!(result.parent.state, OrderState::Inactive(_)));
+        assert!(matches!(result.stop_loss.state, OrderState::Inactive(_)));
+        match &result.take_profit.state {
+            OrderState::Active(ActiveOrderState::Open(open)) => {
+                assert_eq!(open.id.assigned(), Some(&OrderId::new("11")));
+                assert_eq!(open.filled_quantity, Decimal::ZERO);
+            }
+            other => panic!("unresolved leg must be Open, got {other:?}"),
+        }
+
+        assert!(order_ids.get_client_id(10).is_none());
+        assert!(order_ids.get_client_id(11).is_some());
+        assert!(order_ids.get_client_id(12).is_none());
+    }
+
+    /// With no unresolved leg the failure keeps its all-inactive shape and
+    /// releases every mapping.
+    #[test]
+    fn failed_bracket_without_unresolved_legs_is_all_inactive() {
+        let request = bracket_request();
+        let (tp_cid, sl_cid) = derive_child_cids(&request.parent_cid);
+        let order_ids = OrderIdMap::new();
+        order_ids.register(request.parent_cid.clone(), 10, ctx());
+        order_ids.register(tp_cid, 11, ctx());
+        order_ids.register(sl_cid, 12, ctx());
+
+        let result = failed_bracket(
+            &request,
+            [10, 11, 12],
+            BracketFailure {
+                error: OrderError::Rejected(ApiError::OrderRejected("boom".into())),
+                unresolved: Vec::new(),
+            },
+            &order_ids,
+        );
+
+        for leg in [&result.parent, &result.take_profit, &result.stop_loss] {
+            assert!(matches!(leg.state, OrderState::Inactive(_)));
+        }
+        for ib_id in [10, 11, 12] {
+            assert!(order_ids.get_client_id(ib_id).is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics are the correct failure mode
+mod order_reader_tests {
+    use super::*;
+    use crate::client::dedup::new_dedup_cache;
+    use ibapi::orders::{OrderStatus, OrderUpdate};
+    use std::cell::Cell;
+
+    /// Status updates for an order this client did not place, so none is forwarded.
+    fn unforwarded(n: usize) -> Vec<Result<OrderUpdate, ibapi::Error>> {
+        (0..n)
+            .map(|_| {
+                Ok(OrderUpdate::OrderStatus(OrderStatus {
+                    order_id: 999,
+                    ..OrderStatus::default()
+                }))
+            })
+            .collect()
+    }
+
+    /// Run the reader over `updates` and return how many of them it pulled.
+    fn run(sink: &recovery::EventSink, updates: Vec<Result<OrderUpdate, ibapi::Error>>) -> usize {
+        let pulled = Cell::new(0);
+        forward_order_updates(
+            updates
+                .into_iter()
+                .inspect(|_| pulled.set(pulled.get() + 1)),
+            sink,
+            &ContractRegistry::new(),
+            &OrderIdMap::new(),
+            &PendingCancels::new(),
+            &ExecutionBuffer::new(),
+        );
+        pulled.get()
+    }
+
+    #[test]
+    fn stops_on_the_first_update_after_the_stream_ends() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink = recovery::EventSink::new(tx, new_dedup_cache());
+        sink.terminate(StreamTerminationReason::Error("recovery failed".into()));
+
+        assert_eq!(run(&sink, unforwarded(3)), 1);
+    }
+
+    #[test]
+    fn stops_on_the_first_update_after_the_consumer_goes() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let sink = recovery::EventSink::new(tx, new_dedup_cache());
+        drop(rx);
+
+        assert_eq!(run(&sink, unforwarded(3)), 1);
+    }
+
+    #[test]
+    fn open_stream_reads_past_unforwarded_updates() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = recovery::EventSink::new(tx, new_dedup_cache());
+
+        assert_eq!(run(&sink, unforwarded(3)), 3);
+        // The subscription ended, so the stream says so.
+        assert!(matches!(
+            rx.try_recv().unwrap().kind,
+            AccountEventKind::StreamTerminated(StreamTerminationReason::Error(ref reason))
+                if reason == "IBKR order-update stream ended"
+        ));
     }
 }

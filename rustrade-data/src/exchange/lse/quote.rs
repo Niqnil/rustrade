@@ -72,9 +72,12 @@ impl<InstrumentKey> From<(ExchangeId, InstrumentKey, LseMessage)>
 /// One side of the book, or `None` where the provider published no quote for it.
 ///
 /// The size is a placeholder rather than a measurement — see the type-level note — so only the
-/// price can say whether the side exists at all.
-fn quoted(price: Decimal) -> Option<Level> {
-    (!price.is_zero()).then(|| Level::new(price, Decimal::ZERO))
+/// price can say whether the side exists at all. A side published as `null` is absent for the same
+/// reason a zero one is.
+fn quoted(price: Option<Decimal>) -> Option<Level> {
+    price
+        .filter(|price| !price.is_zero())
+        .map(|price| Level::new(price, Decimal::ZERO))
 }
 
 #[cfg(test)]
@@ -151,6 +154,18 @@ mod tests {
         let neither = decode(&one_sided("0.0", "0.0"));
         assert_eq!(neither[0].kind.best_bid, None);
         assert_eq!(neither[0].kind.best_ask, None);
+    }
+
+    /// Option contract ticks publish both sides as `null`. That is no quote, exactly as a zero is.
+    #[test]
+    fn a_null_side_is_absent() {
+        let events = decode(
+            r#"{"type":"tick","symbol":"TEST261231C00010500","ts":"2026-01-02T15:00:00+00:00",
+                "price":1.25,"bid":null,"ask":null,"volume":3,"name":"TEST $10.50 Call Dec 31"}"#,
+        );
+
+        assert_eq!(events[0].kind.best_bid, None);
+        assert_eq!(events[0].kind.best_ask, None);
     }
 
     /// Why the zero *price* is the dangerous one while the zero *sizes* are safe: the fallback that

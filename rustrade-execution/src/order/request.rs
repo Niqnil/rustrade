@@ -3,7 +3,7 @@ use crate::{
     market::MarketSnapshot,
     order::{
         OrderEvent, OrderKind, TimeInForce,
-        id::{OrderId, PositionId},
+        id::{PositionId, VenueOrderId},
         state::Cancelled,
     },
 };
@@ -130,5 +130,16 @@ pub struct RequestOpen {
     Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Default, Deserialize, Serialize, Constructor,
 )]
 pub struct RequestCancel {
-    pub id: Option<OrderId>,
+    /// How the venue addresses the order to cancel, when that is known.
+    ///
+    /// Three cases, and a client must distinguish all three:
+    /// - `None` -- the order is still in flight, so the venue has acknowledged nothing and there
+    ///   is no identifier to cancel by.
+    /// - `Some(VenueOrderId::Assigned(id))` -- cancel by the venue's identifier.
+    /// - `Some(VenueOrderId::ClientAssigned)` -- the venue accepted the order without assigning an
+    ///   identifier; cancel by the `ClientOrderId` in the request's key.
+    ///
+    /// Collapsing the last two into `None` would leave a client unable to tell "nothing to cancel"
+    /// from "cancel by client id".
+    pub id: Option<VenueOrderId>,
 }

@@ -2,12 +2,15 @@
 //!
 //! # Connector Comparison
 //!
-//! | Connector | Reconnect | Dedup | Fill Recovery | Heartbeat |
-//! |-----------|-----------|-------|---------------|-----------|
-//! | [`binance`] | Auto (1s→30s backoff) | 10k LRU | REST after reconnect | 30s |
-//! | [`alpaca`] | Auto (1s→30s backoff) | 2k LRU | REST after reconnect | 35s |
-//! | [`ibkr`] | Caller responsibility | N/A | Caller responsibility | N/A |
-//! | [`hyperliquid`] | SDK-managed | 10k LRU, fills only | Caller responsibility | SDK-managed |
+//! | Connector | Reconnect | Dedup | Fill Recovery | Heartbeat | Cancel answers once |
+//! |-----------|-----------|-------|---------------|-----------|---------------------|
+//! | [`binance`] | Auto (1s→30s backoff) | 10k LRU | REST after reconnect | 30s | cancelled |
+//! | [`alpaca`] | Auto (1s→30s backoff) | 2k LRU | REST after reconnect | 35s | accepted |
+//! | [`ibkr`] | ibapi-managed | 10k LRU, fills only | Executions request after reconnect | N/A | submitted |
+//! | [`hyperliquid`] | SDK-managed | 10k LRU, fills only | Caller responsibility | SDK-managed | cancelled |
+//!
+//! The last column is when [`ExecutionClient::cancel_order`] answers `Ok`. Only for "cancelled" has
+//! the order ended by then; see that method.
 //!
 //! # Resilience Philosophy
 //!
@@ -15,9 +18,11 @@
 //! fill recovery and deduplication. After reconnect, they query REST APIs for missed
 //! fills and deduplicate against the LRU cache to prevent duplicate processing.
 //!
-//! **IBKR** uses TCP to local TWS/Gateway. Reconnection requires IB Gateway availability
-//! and client ID coordination — decisions that belong in the caller's wrapper. See
-//! [`ibkr`] module docs for caller responsibilities.
+//! **IBKR** uses TCP to local TWS/Gateway. `ibapi` reconnects that socket itself; the
+//! account stream stays open across it and recovers the missed fills from TWS's executions,
+//! deduplicating against the LRU cache. Replacing a client that is gone for good requires IB
+//! Gateway availability and client ID coordination — decisions that belong in the caller's
+//! wrapper. See [`ibkr`] module docs for caller responsibilities.
 //!
 //! **Hyperliquid** delegates reconnection to the official SDK's `with_reconnect()` mechanism, but
 //! deduplicates fills itself: the SDK resubscribes on reconnect and the venue opens a `userFills`
@@ -27,9 +32,15 @@
 //!
 //! # Known Limitations
 //!
-//! All connectors have a gap between reconnection and fill recovery: **order lifecycle
-//! events** (NEW, CANCELED, EXPIRED) during disconnect are NOT recovered. Callers must
-//! call [`ExecutionClient::fetch_open_orders`] after reconnect to reconcile state.
+//! No connector recovers the **order lifecycle events** (NEW, CANCELED, EXPIRED) it missed while
+//! disconnected; only fills are recovered (#370).
+//!
+//! The engine closes part of that gap from the account snapshot each reconnect produces: an order a
+//! complete list no longer shows is retired (see [`ExecutionClient::account_snapshot`]). That covers
+//! the connectors whose snapshot declares its orders complete — Binance Spot and Margin,
+//! Hyperliquid, Alpaca, and the mock venue — but not IBKR (#371), and it cannot tell how an order
+//! ended. A caller that needs more reconciles against
+//! [`ExecutionClient::fetch_open_orders`] after a reconnect.
 
 use crate::{
     UnindexedAccountEvent, UnindexedAccountSnapshot,
@@ -53,9 +64,9 @@ use rustrade_instrument::{
 use std::future::Future;
 
 // Account-event deduplication over rustrade's own event type. Gated on the clients that use it
-// so a build selecting neither does not compile it unused. Alpaca deduplicates too, but against
-// a raw `SmolStr` fill key rather than this cache, so it is deliberately not in this list.
-#[cfg(any(feature = "binance", feature = "hyperliquid"))]
+// so a build selecting none of them does not compile it unused. Alpaca deduplicates too, but
+// against a raw `SmolStr` fill key rather than this cache, so it is deliberately not in this list.
+#[cfg(any(feature = "binance", feature = "hyperliquid", feature = "ibkr"))]
 pub(crate) mod dedup;
 
 // Alpaca ExecutionClient implementation (options, equities, crypto — single unified API)
@@ -117,6 +128,21 @@ where
 
     fn new(config: Self::Config) -> Self;
 
+    /// Reads the account's balances, and its open orders and positions for `instruments`, from the
+    /// venue.
+    ///
+    /// Besides startup, the engine's `ExecutionManager` calls this again on every account-stream
+    /// reconnect, and emits the result ahead of the new stream's updates. It is how the engine
+    /// catches up on what changed while the stream was down.
+    ///
+    /// # Order completeness
+    ///
+    /// Each [`InstrumentAccountSnapshot`](crate::InstrumentAccountSnapshot) states through
+    /// `orders_complete` whether its `orders` list is every order open at the venue for that
+    /// instrument. Set it only when it is true: the engine retires a tracked order that a complete
+    /// list omits, so a list that can miss an open order (a capped page, an order dropped on
+    /// conversion, an order reported under an id other than the one it was placed with) must say
+    /// `false`. `false` is always safe; it only forgoes that reconciliation.
     fn account_snapshot(
         &self,
         assets: &[AssetNameExchange],
@@ -146,6 +172,37 @@ where
         instruments: &[InstrumentNameExchange],
     ) -> impl Future<Output = Result<Self::AccountStream, UnindexedClientError>> + Send;
 
+    /// Cancel an order at the venue.
+    ///
+    /// # Return value
+    ///
+    /// - `Some` with `Ok(Cancelled)`: the venue took the cancel. Whether the order has *ended* by
+    ///   then depends on the venue; see below.
+    /// - `Some` with `Err`: the venue refused the cancel, or it could not be sent or answered. The
+    ///   order may still be open, or may have ended some other way, such as by filling. The account
+    ///   stream reports which.
+    /// - `None`: nothing to report, so the engine's `ExecutionManager` emits nothing for the
+    ///   request. No client in this crate returns it.
+    ///
+    /// # A taken cancel is not always an ended order
+    ///
+    /// Some venues answer a cancel before carrying it out. Until they do, the order is live and can
+    /// still fill. From those venues `Ok(Cancelled)` means only that the cancel was accepted, and
+    /// the account stream reports how the order actually ended, including any fill in between. The
+    /// engine stops tracking an order on `Ok(Cancelled)` from any venue.
+    ///
+    /// Binance, Hyperliquid and the mock venue answer once the order is cancelled. Alpaca answers
+    /// once it has accepted the cancel, and IBKR once the cancel is submitted. The
+    /// [connector comparison](crate::client#connector-comparison) lists the same for each
+    /// connector; the mock venue is not one, so it has no row there.
+    ///
+    /// # `filled_quantity` and `time_exchange`
+    ///
+    /// `Cancelled::filled_quantity` is the quantity the venue reported filled where the answer
+    /// carries one, which Binance's and the mock venue's do. Alpaca, IBKR and Hyperliquid answer
+    /// without it and report zero, which does not mean nothing filled. The fill total comes from
+    /// the account stream, or from [`Self::fetch_trades`]. Likewise `time_exchange` is the venue's
+    /// time where the answer carries one, and the local time the answer arrived otherwise.
     fn cancel_order(
         &self,
         request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
@@ -258,7 +315,7 @@ where
 /// without enabling generic use.
 ///
 /// **vs. default impl returning `Unsupported`**: Puts a "dead method" on every
-/// client (MockClient, BinanceClient, HyperliquidClient). Compile-time capability
+/// client (MockExecution, BinanceSpot, HyperliquidClient). Compile-time capability
 /// via trait bounds is better than runtime errors.
 ///
 /// # Result Types
@@ -314,7 +371,11 @@ pub trait BracketOrderClient: ExecutionClient {
     /// - `take_profit`: `Some` if exchange returns legs immediately (IBKR), `None` otherwise (Alpaca)
     /// - `stop_loss`: `Some` if exchange returns legs immediately (IBKR), `None` otherwise (Alpaca)
     ///
-    /// Either all orders are `Active(Open)` or all are `Inactive` (placement failed).
+    /// Either all orders are `Active(Open)` or all are `Inactive` (placement failed), with one
+    /// exception: a leg of a failed placement whose fate at the venue is unknown (no status
+    /// arrived, or it was accepted and its rollback cancel could not be sent) is returned
+    /// `Active(Open)`, so the account stream can resolve it. Only IBKR returns such legs today;
+    /// see its `open_bracket_order`.
     fn open_bracket_order(
         &self,
         request: BracketOrderRequest<ExchangeId, &InstrumentNameExchange>,

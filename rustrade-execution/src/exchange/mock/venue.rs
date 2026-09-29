@@ -14,7 +14,7 @@ use crate::{
     market::{MarketDepth, MarketSnapshot},
     order::{
         Order, OrderKind, TimeInForce, UnindexedOrder,
-        id::{ClientOrderId, OrderId},
+        id::{ClientOrderId, OrderId, VenueOrderId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Cancelled, Expired, Filled, Open, OrderState, UnindexedOrderState},
     },
@@ -448,6 +448,7 @@ impl SimulatedVenue {
                 events.push(self.build_account_event(Snapshot(balance)));
             }
 
+            let expired_id = order.state.id.or_client_id(&order.key.cid);
             let expired_order = Order {
                 key: order.key,
                 side: order.side,
@@ -456,7 +457,7 @@ impl SimulatedVenue {
                 kind: order.kind,
                 time_in_force: order.time_in_force,
                 state: Expired {
-                    id: order.state.id,
+                    id: expired_id,
                     time_exchange,
                     filled_quantity: order.state.filled_quantity,
                 },
@@ -627,7 +628,7 @@ impl SimulatedVenue {
 
             let balance = self.settle_resting(&order, reservation, &settlement, time_exchange);
 
-            let order_id = order.state.id.clone();
+            let order_id = order.state.id.or_client_id(&order.key.cid);
             let trade = Trade {
                 id: self.trade_id_sequence_fetch_add(),
                 order_id: order_id.clone(),
@@ -854,7 +855,7 @@ impl SimulatedVenue {
         };
 
         let cancelled = Cancelled {
-            id: order.state.id.clone(),
+            id: order.state.id.or_client_id(&order.key.cid),
             time_exchange,
             filled_quantity: order.state.filled_quantity,
         };
@@ -928,6 +929,10 @@ impl SimulatedVenue {
             .map(|(instrument, orders)| InstrumentAccountSnapshot {
                 instrument,
                 orders: orders.into_iter().collect(),
+                // Read from the venue's own book, so every open order is here under the id it was
+                // placed with. Cancelled and expired orders are listed too, which only adds to what
+                // a consumer can see.
+                orders_complete: true,
                 position: None,
                 isolated: None,
             })
@@ -1407,7 +1412,11 @@ impl SimulatedVenue {
             // carrying what has already traded so `Open::quantity_remaining` stays true for the
             // rest of its life -- which is what `match_resting` settles and prints.
             Some(held) => {
-                let open = Open::new(order_id, time_exchange, fill.quantity);
+                let open = Open::new(
+                    VenueOrderId::Assigned(order_id),
+                    time_exchange,
+                    fill.quantity,
+                );
                 let released = self.book_rested(
                     Order {
                         key: request.key.clone(),
@@ -1573,7 +1582,7 @@ impl SimulatedVenue {
         // The order rests carrying whatever it has already done, so the book, the client and this
         // venue's own later arithmetic all read the same remainder off it.
         let open = Open::new(
-            self.order_id_sequence_fetch_add(),
+            VenueOrderId::Assigned(self.order_id_sequence_fetch_add()),
             time_exchange,
             filled_quantity,
         );
@@ -2421,7 +2430,7 @@ mod tests {
                 kind: OrderKind::Limit,
                 time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
                 state: Open {
-                    id: OrderId::new("resting"),
+                    id: VenueOrderId::Assigned(OrderId::new("resting")),
                     time_exchange: arrived,
                     filled_quantity: Decimal::ZERO,
                 },
@@ -3154,7 +3163,7 @@ mod tests {
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
             state: OrderState::active(Open {
-                id: OrderId::new(cid),
+                id: VenueOrderId::Assigned(OrderId::new(cid)),
                 time_exchange: Default::default(),
                 filled_quantity: Decimal::ZERO,
             }),
@@ -3164,6 +3173,7 @@ mod tests {
         config.initial_state.instruments = vec![InstrumentAccountSnapshot {
             instrument: instrument_name(),
             orders: CIDS.into_iter().map(resting).collect(),
+            orders_complete: true,
             position: None,
             isolated: None,
         }];
@@ -3443,7 +3453,11 @@ mod tests {
             quantity: d(quantity),
             kind: OrderKind::Limit,
             time_in_force: gtc(),
-            state: OrderState::active(Open::new(OrderId::new("part_filled"), time(1), d(filled))),
+            state: OrderState::active(Open::new(
+                VenueOrderId::Assigned(OrderId::new("part_filled")),
+                time(1),
+                d(filled),
+            )),
         })
         .expect("the seeded order is Open")
     }
@@ -4772,7 +4786,11 @@ mod tests {
             quantity: d("1"),
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodTillDate { expiry },
-            state: OrderState::active(Open::new(OrderId::new("seeded"), time(1), Decimal::ZERO)),
+            state: OrderState::active(Open::new(
+                VenueOrderId::Assigned(OrderId::new("seeded")),
+                time(1),
+                Decimal::ZERO,
+            )),
         };
 
         let mut venue = make_market_venue("10", "1000000");

@@ -152,7 +152,7 @@ async fn backtest_derives_venue_roles_from_the_execution_clients_it_builds() {
     // The state alone cannot tell that nothing executes on `DATA`: the instrument model says only
     // that some instrument is priced there. This is what the run has to correct.
     assert_eq!(
-        engine_state.connectivity.connectivity(&DATA).role,
+        engine_state.connectivity.connectivity(&DATA).role(),
         VenueRole::Both
     );
 
@@ -174,12 +174,12 @@ async fn backtest_derives_venue_roles_from_the_execution_clients_it_builds() {
     let connectivity = &result.engine_state.connectivity;
 
     assert_eq!(
-        connectivity.connectivity(&DATA).role,
+        connectivity.connectivity(&DATA).role(),
         VenueRole::DataOnly,
         "no execution client was registered for the pricing venue, so it holds no account"
     );
     assert_eq!(
-        connectivity.connectivity(&EXECUTION).role,
+        connectivity.connectivity(&EXECUTION).role(),
         VenueRole::Both,
         "the traded instrument is priced on its own venue, so that venue provides both dimensions"
     );
@@ -188,7 +188,7 @@ async fn backtest_derives_venue_roles_from_the_execution_clients_it_builds() {
     // connection alone. Approximated as `Both` it would sit at `Reconnecting` forever, since no
     // account event can arrive from a venue with no execution client.
     assert_eq!(
-        connectivity.connectivity(&DATA).market_data,
+        connectivity.connectivity(&DATA).market_data(),
         Health::Healthy,
         "the run fed market events tagged with the pricing venue"
     );
@@ -201,7 +201,7 @@ async fn backtest_derives_venue_roles_from_the_execution_clients_it_builds() {
             .engine_state
             .connectivity
             .connectivity(&DATA)
-            .role,
+            .role(),
         VenueRole::Both,
         "the caller's state must not be modified"
     );

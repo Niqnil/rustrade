@@ -268,7 +268,7 @@ where
 ///
 /// One configuration still cannot converge, and is reported rather than inferred: a venue that
 /// neither prices an instrument nor has an execution client provides no connection that could
-/// report healthy, so `ConnectivityStates::global` stays [`Health::Reconnecting`] for the whole
+/// report healthy, so `ConnectivityStates::global()` stays [`Health::Reconnecting`] for the whole
 /// run. `reconcile_venue_roles` logs a warning naming it.
 ///
 /// [`SystemBuilder`]: crate::system::builder::SystemBuilder

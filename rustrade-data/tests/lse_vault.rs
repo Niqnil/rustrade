@@ -15,6 +15,8 @@ use chrono::{DateTime, TimeDelta, Utc};
 use futures::StreamExt;
 use rust_decimal_macros::dec;
 use rustrade_data::exchange::lse::error::LseError;
+use rustrade_data::exchange::lse::market::LseDataset;
+use rustrade_data::exchange::lse::reference::LseDatasetClass;
 use rustrade_data::exchange::lse::vault::LseVaultClient;
 use rustrade_data::subscription::candle::CandleInterval;
 use std::num::NonZeroU32;
@@ -902,5 +904,80 @@ async fn a_gap_wider_than_the_interval_is_accepted() {
         candles.len(),
         2,
         "a weekend gap is not a resolution failure"
+    );
+}
+
+// ============================================================================
+// Catalog
+// ============================================================================
+
+/// Two synthetic catalog entries: one price-shaped, one reference-shaped.
+///
+/// Field values are structural — shaped from measurements of the live catalog, reproducing none of
+/// it. The pair is what the classification rule turns on: a price entry leaves `frequency` and
+/// `category` empty, a reference entry populates both.
+fn catalog_body() -> String {
+    let price = r#"{
+        "dataset":"crypto","symbol":"AAA/BBB","name":"Example","ticks":4145394353,
+        "first_tick":"2017-08-17 04:00:28.322000","last_tick":"2026-09-21 04:32:26.473000",
+        "years":9.1,"last_value":1.5,"change_pct":0.08,"change_1y":-29.5,
+        "unit":"","source":"","category":"","frequency":"","country":"","country_name":"","live":1
+    }"#;
+    let reference = r#"{
+        "dataset":"economics","symbol":"exampleind","name":"Example Indicator","ticks":412,
+        "first_tick":"1990-01-02 00:00:00.000000","last_tick":"2026-08-01 00:00:00.000000",
+        "years":36,"last_value":3.25,"change_pct":0.1,"change_1y":2,
+        "unit":"percent","source":"World Bank","category":"Inflation Index",
+        "frequency":"monthly","country":"GB","country_name":"United Kingdom","live":0
+    }"#;
+    format!("[{price},{reference}]")
+}
+
+#[tokio::test]
+async fn the_catalog_decodes_both_entry_shapes_from_one_unpaginated_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/vault/catalog"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(catalog_body()))
+        .mount(&server)
+        .await;
+
+    let entries = client(&server).fetch_catalog().await.unwrap();
+
+    assert_eq!(entries.len(), 2);
+
+    // The price entry: classified by its empty `frequency`/`category`, and it resolves.
+    assert_eq!(entries[0].class(), LseDatasetClass::Price);
+    assert_eq!(entries[0].price_dataset(), Some(LseDataset::Crypto));
+    assert!(entries[0].is_live());
+    assert_eq!(entries[0].ticks, 4_145_394_353);
+    assert_eq!(
+        entries[0].first_tick_time().unwrap(),
+        utc("2017-08-17T04:00:28.322Z")
+    );
+
+    // The reference entry: not an instrument, never live.
+    assert_eq!(entries[1].class(), LseDatasetClass::Reference);
+    assert_eq!(entries[1].price_dataset(), None);
+    assert!(!entries[1].is_live());
+    assert_eq!(entries[1].frequency, "monthly");
+    // The vault spells the United Kingdom `GB`; `data-api`'s `/bond-yields` spells it `UK`.
+    assert_eq!(entries[1].country, "GB");
+}
+
+#[tokio::test]
+async fn a_catalog_error_status_surfaces_as_a_typed_api_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/vault/catalog"))
+        .respond_with(ResponseTemplate::new(503).set_body_string(r#"{"detail":"unavailable"}"#))
+        .mount(&server)
+        .await;
+
+    let error = client(&server).fetch_catalog().await.unwrap_err();
+
+    assert!(
+        matches!(error, LseError::Api { status: 503, .. }),
+        "expected a typed API error, got {error:?}"
     );
 }

@@ -1,7 +1,7 @@
 use super::Alpaca;
 use crate::{
     Identifier,
-    subscription::{Subscription, quote::Quotes, trade::PublicTrades},
+    subscription::{Subscription, book::OrderBooksL1, quote::Quotes, trade::PublicTrades},
 };
 
 /// Alpaca WebSocket channel types.
@@ -16,6 +16,17 @@ pub enum AlpacaChannel {
     Trades,
     /// Real-time quotes stream (NBBO for equities, bid/ask for crypto).
     Quotes,
+}
+
+impl AlpacaChannel {
+    /// The channel [`AsRef<str>`] spells as `name`, if any.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "trades" => Some(Self::Trades),
+            "quotes" => Some(Self::Quotes),
+            _ => None,
+        }
+    }
 }
 
 impl AsRef<str> for AlpacaChannel {
@@ -43,6 +54,16 @@ impl<Server, Instrument> Identifier<AlpacaChannel>
     }
 }
 
+/// Alpaca's top of book is its quote, so an L1 stream reads the `quotes` channel. It shares the
+/// `(channel, symbol)` pair with any [`Quotes`] stream on the same symbol and feed.
+impl<Server, Instrument> Identifier<AlpacaChannel>
+    for Subscription<Alpaca<Server>, Instrument, OrderBooksL1>
+{
+    fn id(&self) -> AlpacaChannel {
+        AlpacaChannel::Quotes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,5 +72,13 @@ mod tests {
     fn test_channel_as_ref() {
         assert_eq!(AlpacaChannel::Trades.as_ref(), "trades");
         assert_eq!(AlpacaChannel::Quotes.as_ref(), "quotes");
+    }
+
+    #[test]
+    fn every_channel_round_trips_through_its_name() {
+        for channel in [AlpacaChannel::Trades, AlpacaChannel::Quotes] {
+            assert_eq!(AlpacaChannel::from_name(channel.as_ref()), Some(channel));
+        }
+        assert_eq!(AlpacaChannel::from_name("bars"), None);
     }
 }

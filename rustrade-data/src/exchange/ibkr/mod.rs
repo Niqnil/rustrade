@@ -81,9 +81,9 @@ use crate::{
     event::{DataKind, MarketEvent},
 };
 use chrono::Utc;
-use depth::DepthAggregator;
+use depth::{DepthAggregator, IB_MARKET_DEPTH_RESET_CODE};
 use greeks::GreeksAggregator;
-use ibapi::{client::blocking::Client, contracts::SecurityType};
+use ibapi::{client::blocking::Client, contracts::SecurityType, subscriptions::SubscriptionItem};
 use quotes::QuoteAggregator;
 use rust_decimal::Decimal;
 use rustrade_instrument::{exchange::ExchangeId, ibkr::ContractRegistry};
@@ -384,15 +384,61 @@ where
 
                     let mut aggregator = DepthAggregator::new();
 
-                    for depth in sub.iter_data() {
-                        let depth = match depth {
-                            Ok(d) => d,
+                    // `iter()`, not `iter_data()`: the latter filters notices away, and
+                    // since ibapi 4.1.0 the venue-reset advisory (317) arrives as a
+                    // notice rather than as the stream-ending error it used to be. Under
+                    // `iter_data()` it would be dropped silently and this loop would keep
+                    // applying updates to a book TWS has already discarded.
+                    for item in sub.iter() {
+                        let item = match item {
+                            Ok(i) => i,
                             Err(e) => {
                                 error!(symbol = %symbol, error = %e, "Depth subscription error");
                                 let _ = tx.send(Err(DataError::Socket(format!(
                                     "depth subscription {symbol}: {e}"
                                 ))));
                                 break;
+                            }
+                        };
+
+                        let depth = match item {
+                            SubscriptionItem::Data(d) => d,
+                            SubscriptionItem::Notice(notice)
+                                if notice.code == IB_MARKET_DEPTH_RESET_CODE =>
+                            {
+                                warn!(
+                                    symbol = %symbol,
+                                    code = notice.code,
+                                    message = %notice.message,
+                                    "Market depth RESET by venue; dropping local book"
+                                );
+                                // Forward the emptied book at once. Waiting for the next
+                                // depth row would leave the consumer holding levels the
+                                // venue has already thrown away.
+                                let now = Utc::now();
+                                let event = MarketEvent {
+                                    time_exchange: now,
+                                    time_received: now,
+                                    exchange: ExchangeId::Ibkr,
+                                    instrument: key.clone(),
+                                    kind: DataKind::OrderBook(aggregator.on_venue_reset(now)),
+                                };
+                                if tx.send(Ok(event)).is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            // Every other notice is non-fatal and carries no depth
+                            // payload. `iter_data()` used to log these at `warn!`; keep
+                            // that, so switching iterators loses no observability.
+                            SubscriptionItem::Notice(notice) => {
+                                warn!(
+                                    symbol = %symbol,
+                                    code = notice.code,
+                                    message = %notice.message,
+                                    "Depth subscription notice"
+                                );
+                                continue;
                             }
                         };
                         // IB's MarketDepth events have no timestamp. Stamp `now`

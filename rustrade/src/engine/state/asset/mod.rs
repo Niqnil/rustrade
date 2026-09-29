@@ -15,12 +15,8 @@ use rustrade_instrument::{
     index::IndexedInstruments,
 };
 use rustrade_integration::collection::{FnvIndexMap, snapshot::Snapshot};
-use serde::{
-    Deserialize, Deserializer, Serialize, Serializer,
-    de::{SeqAccess, Visitor},
-    ser::SerializeSeq,
-};
-use std::fmt::{self, Debug};
+use serde::{Deserialize, Serialize};
+use std::fmt::Debug;
 
 /// Defines an `AssetFilter`, used to filter asset-centric data structures.
 pub mod filter;
@@ -28,46 +24,14 @@ pub mod filter;
 /// Collection of exchange [`AssetState`]s indexed by [`AssetIndex`].
 ///
 /// Note that the same named assets on different exchanges will have their own [`AssetState`].
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct AssetStates(pub FnvIndexMap<ExchangeAsset<AssetNameInternal>, AssetState>);
-
-impl Serialize for AssetStates {
-    fn serialize<S: Serializer>(&self, serialiser: S) -> Result<S::Ok, S::Error> {
-        // serde_json cannot use struct keys in JSON objects, so serialise as a sequence of pairs.
-        // Stream directly from the map iterator — no intermediate Vec allocation.
-        let mut seq = serialiser.serialize_seq(Some(self.0.len()))?;
-        for pair in &self.0 {
-            seq.serialize_element(&pair)?;
-        }
-        seq.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for AssetStates {
-    fn deserialize<D: Deserializer<'de>>(deserialiser: D) -> Result<Self, D::Error> {
-        struct AssetStatesVisitor;
-
-        impl<'de> Visitor<'de> for AssetStatesVisitor {
-            type Value = AssetStates;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "a sequence of (ExchangeAsset, AssetState) pairs")
-            }
-
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                // Pre-allocate with the size hint to avoid rehashing, then populate in one pass.
-                let mut map = FnvIndexMap::default();
-                map.reserve(seq.size_hint().unwrap_or(0));
-                while let Some((k, v)) = seq.next_element()? {
-                    map.insert(k, v);
-                }
-                Ok(AssetStates(map))
-            }
-        }
-
-        deserialiser.deserialize_seq(AssetStatesVisitor)
-    }
-}
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct AssetStates(
+    // `ExchangeAsset` is a struct key, which JSON objects cannot hold, so (de)serialise the map as
+    // a sequence of `(key, value)` pairs.
+    #[serde(with = "rustrade_integration::collection::pair_seq")]
+    pub  FnvIndexMap<ExchangeAsset<AssetNameInternal>, AssetState>,
+);
 
 impl AssetStates {
     /// Return a reference to the `AssetState` associated with an `AssetIndex`.
@@ -377,6 +341,52 @@ mod tests {
         // Key lookup.
         assert_eq!(restored.asset(&btc_key), &btc_state);
         assert_eq!(restored.asset(&usdt_key), &usdt_state);
+    }
+
+    #[test]
+    fn test_asset_states_wire_format_is_a_sequence_of_key_state_pairs() {
+        let btc_state = asset_state("btc", 1.0, 0.5, DateTime::<Utc>::MIN_UTC);
+        let usdt_state = asset_state("usdt", 1000.0, 1000.0, DateTime::<Utc>::MIN_UTC);
+        let states = AssetStates(
+            [
+                (
+                    ExchangeAsset::new(ExchangeId::BinanceSpot, AssetNameInternal::new("btc")),
+                    btc_state.clone(),
+                ),
+                (
+                    ExchangeAsset::new(ExchangeId::Kraken, AssetNameInternal::new("usdt")),
+                    usdt_state.clone(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        // `AssetStates` is not wrapped in a newtype array or object: it is the pair sequence itself.
+        let expected = serde_json::json!([
+            [
+                {"exchange": "binance_spot", "asset": "btc"},
+                serde_json::to_value(&btc_state).unwrap()
+            ],
+            [
+                {"exchange": "kraken", "asset": "usdt"},
+                serde_json::to_value(&usdt_state).unwrap()
+            ]
+        ]);
+        assert_eq!(serde_json::to_value(&states).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_asset_states_deserialise_rejects_a_repeated_exchange_asset() {
+        let state =
+            serde_json::to_value(asset_state("btc", 1.0, 0.5, DateTime::<Utc>::MIN_UTC)).unwrap();
+        let key = serde_json::json!({"exchange": "binance_spot", "asset": "btc"});
+        let json = serde_json::json!([[key.clone(), state.clone()], [key, state]]);
+
+        let err = serde_json::from_value::<AssetStates>(json)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate key"), "{err}");
     }
 
     #[test]

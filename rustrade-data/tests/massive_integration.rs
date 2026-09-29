@@ -17,7 +17,7 @@
 //! | REST tick trades (stocks) | ❌ | Requires stocks subscription |
 //! | REST quotes (forex) | ✅ | Currencies subscription |
 //! | REST quotes (stocks) | ❌ | Requires stocks subscription |
-//! | WebSocket (crypto) | ✅ | Currencies subscription |
+//! | WebSocket (crypto, forex) | ✅ | Currencies subscription |
 //! | WebSocket (stocks) | ❌ | Requires stocks subscription |
 //! | Reference data | ✅ | Free tier |
 //! | Corporate actions (dividends, splits) | ✅ | Free tier |
@@ -46,8 +46,9 @@
 //!
 //! # WebSocket Limitations
 //!
-//! - **Individual plan**: 1 concurrent WebSocket connection per product
-//! - WebSocket tests are marked `#[serial]` to prevent connection conflicts
+//! - **Individual plan**: 1 concurrent WebSocket connection per cluster; a second closes the first
+//! - WebSocket tests are marked `#[serial]` to prevent connection conflicts, and each test shares
+//!   one subscriber's connection by cloning it
 //! - Live streaming requires an active subscription for the asset class
 //!
 //! # Running
@@ -65,7 +66,7 @@
 //! # Run tests that should pass with currencies subscription
 //! cargo test --test massive_integration --features massive -- --ignored \
 //!     test_rest_aggregates_crypto test_rest_aggregates_forex \
-//!     test_rest_trades_crypto test_rest_quotes_forex test_websocket_crypto
+//!     test_rest_trades_crypto test_rest_quotes_forex test_websocket_crypto test_websocket_forex
 //! ```
 
 #![cfg(feature = "massive")]
@@ -76,14 +77,21 @@ use chrono::{Duration, Utc};
 use futures_util::StreamExt;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use rustrade_data::exchange::massive::{
-    ChannelType, DividendQuery, Market, MassiveLive, MassiveRestClient, OptionContractQuery,
-    OptionSnapshotQuery, SplitQuery, TickerQuery,
+use rustrade_data::{
+    exchange::massive::{
+        DividendQuery, MassiveCrypto, MassiveForex, MassiveRestClient, MassiveStocks,
+        MassiveSubscriber, OptionContractQuery, OptionSnapshotQuery, SplitQuery, TickerQuery,
+    },
+    streams::{
+        Streams,
+        reconnect::{Event, stream::ReconnectingStream},
+    },
+    subscription::{book::OrderBooksL1, quote::Quotes, trade::PublicTrades},
 };
 use rustrade_instrument::exchange::ExchangeId;
 use rustrade_instrument::instrument::kind::option::OptionKind;
+use rustrade_instrument::instrument::market_data::kind::MarketDataInstrumentKind;
 use serial_test::serial;
-use std::collections::HashMap;
 use std::pin::pin;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -560,52 +568,120 @@ async fn test_rest_quotes_stocks() {
 }
 
 // ============================================================================
-// WebSocket Tests (12.5.7 - 12.5.8)
+// WebSocket Tests
 // ============================================================================
 
+/// Wait for `wanted` items from a stream, failing if it ends or stays silent for `timeout`.
+async fn first_items<S, T>(stream: S, wanted: usize, timeout: std::time::Duration) -> Vec<T>
+where
+    S: futures_util::Stream<Item = Event<ExchangeId, T>>,
+    T: std::fmt::Debug,
+{
+    let mut stream = pin!(stream);
+    let mut items = Vec::with_capacity(wanted);
+
+    while items.len() < wanted {
+        match tokio::time::timeout(timeout, stream.next()).await {
+            Err(_) => panic!("no data within {timeout:?} (received {})", items.len()),
+            Ok(None) => panic!("stream ended after {} items", items.len()),
+            Ok(Some(Event::Item(item))) => {
+                tracing::info!(?item, "Received market event");
+                items.push(item);
+            }
+            Ok(Some(Event::Reconnecting(exchange))) => {
+                tracing::warn!(%exchange, "Stream reconnecting");
+            }
+        }
+    }
+
+    items
+}
+
+/// Trades and quotes on one crypto socket, from two clones of one subscriber. A second subscriber
+/// built separately would evict the first's connection.
 #[tokio::test]
 #[ignore]
 #[serial]
 async fn test_websocket_crypto() {
     init_logging();
 
-    let instruments: HashMap<String, String> = [("BTC-USD".to_string(), "btc-usd".to_string())]
-        .into_iter()
-        .collect();
+    let subscriber = MassiveSubscriber::from_env().expect("MASSIVE_API_KEY not set");
+    let btc = (
+        MassiveCrypto::default(),
+        "btc",
+        "usd",
+        MarketDataInstrumentKind::Spot,
+    );
 
-    let mut client = MassiveLive::from_env(Market::Crypto, ExchangeId::Massive, instruments)
-        .expect("Failed to create WebSocket client");
+    let trades = Streams::<PublicTrades>::builder()
+        .subscribe(
+            subscriber.clone(),
+            [(btc.0, btc.1, btc.2, btc.3.clone(), PublicTrades)],
+        )
+        .init()
+        .await
+        .expect("Failed to init crypto trades")
+        .select_all()
+        .with_error_handler(|error| tracing::warn!(?error, "Stream error"));
 
-    client.subscribe(&["BTC-USD"], ChannelType::Trade);
-    tracing::info!("Subscribed to BTC-USD trades");
+    let quotes = Streams::<Quotes>::builder()
+        .subscribe(subscriber, [(btc.0, btc.1, btc.2, btc.3, Quotes)])
+        .init()
+        .await
+        .expect("Failed to init crypto quotes")
+        .select_all()
+        .with_error_handler(|error| tracing::warn!(?error, "Stream error"));
 
-    let stream = client.start().await.expect("Failed to start stream");
-    let mut stream = pin!(stream);
+    let timeout = std::time::Duration::from_secs(30);
+    let (trades, quotes) = tokio::join!(
+        first_items(trades, 3, timeout),
+        first_items(quotes, 3, timeout)
+    );
 
-    let timeout = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        let mut count = 0;
-        while let Some(event) = stream.next().await {
-            match event {
-                Ok(market_event) => {
-                    tracing::info!(?market_event, "Received market event");
-                    count += 1;
-                    if count >= 3 {
-                        return Ok(count);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Stream error");
-                }
-            }
-        }
-        Err("Stream ended without sufficient data")
-    })
-    .await;
+    for trade in trades {
+        assert!(trade.kind.price > Decimal::ZERO, "Invalid trade price");
+        assert!(trade.kind.amount > Decimal::ZERO, "Invalid trade amount");
+    }
+    for quote in quotes {
+        assert!(quote.kind.bid_price > Decimal::ZERO, "Invalid bid");
+        assert!(
+            quote.kind.ask_price >= quote.kind.bid_price,
+            "Crossed quote"
+        );
+    }
+}
 
-    match timeout {
-        Ok(Ok(count)) => tracing::info!(count, "WebSocket crypto test passed"),
-        Ok(Err(e)) => panic!("Stream error: {}", e),
-        Err(_) => panic!("Timeout waiting for crypto WebSocket data"),
+/// Forex quotes as a top of book. Forex quotes carry no sizes.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_websocket_forex() {
+    init_logging();
+
+    let books = Streams::<OrderBooksL1>::builder()
+        .subscribe(
+            MassiveSubscriber::from_env().expect("MASSIVE_API_KEY not set"),
+            [(
+                MassiveForex::default(),
+                "eur",
+                "usd",
+                MarketDataInstrumentKind::Spot,
+                OrderBooksL1,
+            )],
+        )
+        .init()
+        .await
+        .expect("Failed to init forex quotes")
+        .select_all()
+        .with_error_handler(|error| tracing::warn!(?error, "Stream error"));
+
+    for book in first_items(books, 3, std::time::Duration::from_secs(30)).await {
+        let bid = book.kind.best_bid.expect("a forex quote has a bid");
+        let ask = book.kind.best_ask.expect("a forex quote has an ask");
+        assert!(
+            bid.price > Decimal::ZERO && ask.price >= bid.price,
+            "{book:?}"
+        );
     }
 }
 
@@ -616,44 +692,24 @@ async fn test_websocket_crypto() {
 async fn test_websocket_stocks() {
     init_logging();
 
-    let instruments: HashMap<String, String> = [("AAPL".to_string(), "aapl".to_string())]
-        .into_iter()
-        .collect();
+    let trades = Streams::<PublicTrades>::builder()
+        .subscribe(
+            MassiveSubscriber::from_env().expect("MASSIVE_API_KEY not set"),
+            [(
+                MassiveStocks::default(),
+                "aapl",
+                "usd",
+                MarketDataInstrumentKind::Spot,
+                PublicTrades,
+            )],
+        )
+        .init()
+        .await
+        .expect("Failed to init stock trades")
+        .select_all()
+        .with_error_handler(|error| tracing::warn!(?error, "Stream error"));
 
-    let mut client = MassiveLive::from_env(Market::Stocks, ExchangeId::Massive, instruments)
-        .expect("Failed to create WebSocket client");
-
-    client.subscribe(&["AAPL"], ChannelType::Trade);
-    tracing::info!("Subscribed to AAPL trades");
-
-    let stream = client.start().await.expect("Failed to start stream");
-    let mut stream = pin!(stream);
-
-    let timeout = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        let mut count = 0;
-        while let Some(event) = stream.next().await {
-            match event {
-                Ok(market_event) => {
-                    tracing::info!(?market_event, "Received market event");
-                    count += 1;
-                    if count >= 3 {
-                        return Ok(count);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Stream error");
-                }
-            }
-        }
-        Err("Stream ended without sufficient data")
-    })
-    .await;
-
-    match timeout {
-        Ok(Ok(count)) => tracing::info!(count, "WebSocket stocks test passed"),
-        Ok(Err(e)) => panic!("Stream error: {}", e),
-        Err(_) => panic!("Timeout waiting for stock WebSocket data"),
-    }
+    first_items(trades, 3, std::time::Duration::from_secs(30)).await;
 }
 
 // ============================================================================

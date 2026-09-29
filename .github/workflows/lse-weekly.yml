@@ -7,15 +7,27 @@ name: "LSE Weekly"
 # the export endpoint permits five jobs an hour, and the point is detecting provider-side drift,
 # which does not correlate with our commits.
 #
-# Both canaries SKIP (and pass) when `LSE_API_KEY` is unset, so a fork or an unconfigured repo
+# Every canary SKIPs (and passes) when `LSE_API_KEY` is unset, so a fork or an unconfigured repo
 # stays green. That makes an unset secret indistinguishable from a passing run *in the test*, which
 # is why the guard job below fails loudly instead.
 
 on:
   schedule:
-    # Monday 07:00 UTC - before the London session, so a drift report lands before it matters.
-    - cron: "0 7 * * 1"
+    # Tuesday 15:00 UTC - inside the US options session all year (13:30-20:00 UTC in US summer
+    # time, 14:30-21:00 in winter), which the WebSocket canary's option-print check needs: outside
+    # it that check reports `CANARY_SKIP`, so a schedule outside the session never exercises live
+    # option delivery at all. Tuesday rather than Monday because most US market holidays fall on
+    # a Monday; a holiday is read from the print tape and skips, it does not fail.
+    - cron: "0 15 * * 2"
   workflow_dispatch:
+
+concurrency:
+  # The provider permits ONE WebSocket connection per API key. A manual run started while another
+  # run holds the socket would fail its WebSocket canary on `TOO_MANY_CONNECTIONS`, which reads as
+  # provider drift rather than as two runs overlapping. A second run waits for the first rather
+  # than cancelling it: a canary cut off mid-export still spends one of the five hourly jobs.
+  group: lse-api-key
+  cancel-in-progress: false
 
 env:
   MOLD_VERSION: "2.35.1"
@@ -44,7 +56,10 @@ jobs:
     name: LSE live-API canaries
     needs: secret-present
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # The WebSocket canary adds up to six minutes on top of the build and the five REST canaries:
+    # its seven tests are serialised against the provider's one-connection-per-key cap, and their
+    # timeouts sum rather than overlap.
+    timeout-minutes: 30
     env:
       LSE_API_KEY: ${{ secrets.LSE_API_KEY }}
     steps:
@@ -70,13 +85,54 @@ jobs:
         continue-on-error: true
         run: cargo test --locked --test lse_vault_canary --features lse -- --ignored --nocapture
 
+      # Also quota-free, and on the provider's OTHER host: a failure here is isolated from the
+      # vault entirely, so it distinguishes a data-api change from an account-wide one.
+      - name: Bond-yield canary (stats, country vocabulary, row encoding, pagination)
+        id: bond-yield-canary
+        continue-on-error: true
+        run: cargo test --locked --test lse_bond_yield_canary --features lse -- --ignored --nocapture
+
+      # Same host again, and quota-free. 🔴 Its assertions are deliberately STRUCTURAL: the feed
+      # stopped publishing on 2026-03-24, so a freshness check would fail every week for a reason
+      # nobody can fix. It RECORDS `total_events`/`latest` in the log instead, which is what makes
+      # a revival visible without a revival failing the build.
+      - name: Economic-calendar canary (vocabulary, event encoding, country OR, pagination)
+        id: calendar-canary
+        continue-on-error: true
+        run: cargo test --locked --test lse_economic_calendar_canary --features lse -- --ignored --nocapture
+
+      # Vault again, quota-free. Reads a window days old, so neither the time of day nor a closed
+      # US market is a reason for it to be empty; an empty tape means the feed stopped, and the
+      # canary fails on that rather than passing on nothing.
+      - name: Options canary (print tape liveness, adaptive walk, option candles)
+        id: options-canary
+        continue-on-error: true
+        run: cargo test --locked --test lse_options_canary --features lse -- --ignored --nocapture
+
       # Spends one of five hourly export jobs.
       - name: Export canary (job lifecycle, download, Parquet schema)
         id: export-canary
         continue-on-error: true
         run: cargo test --locked --test lse_export_canary --features lse-parquet -- --ignored --nocapture
 
-      # Both run even if the first fails, so one report covers both surfaces.
+      # Last because it is the slowest, and because it is the one step that holds a socket open.
+      # The provider permits ONE WebSocket connection per API key -- it answers a second with
+      # `TOO_MANY_CONNECTIONS` -- so nothing else may connect while this runs. Steps inside a job
+      # are sequential, which is what makes that safe here; adding a parallel job that uses the
+      # same key would break it, and the failure would look like provider drift rather than like
+      # a scheduling mistake. The tests are `#[serial]` for the same cap within the binary.
+      - name: WebSocket canary (delivery, timestamps, tick rate, resume, option contracts, shared connection)
+        id: ws-canary
+        continue-on-error: true
+        run: cargo test --locked --test lse_ws_canary --features lse -- --ignored --nocapture
+
+      # All six run even if an earlier one fails, so one report covers every surface.
       - name: Check canary results
-        if: steps.vault-canary.outcome == 'failure' || steps.export-canary.outcome == 'failure'
+        if: >-
+          steps.vault-canary.outcome == 'failure' ||
+          steps.bond-yield-canary.outcome == 'failure' ||
+          steps.calendar-canary.outcome == 'failure' ||
+          steps.options-canary.outcome == 'failure' ||
+          steps.export-canary.outcome == 'failure' ||
+          steps.ws-canary.outcome == 'failure'
         run: exit 1

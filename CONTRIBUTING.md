@@ -184,8 +184,39 @@ We use a **two-PR flow** so `develop` and `main` stay in sync — the version bu
    - Rename `[Unreleased]` → `[x.y.z] - YYYY-MM-DD` and add a fresh empty `[Unreleased]`.
 3. Open the release-prep PR targeting **`develop`**; merge after CI is green.
 4. Open the release PR **`develop` → `main`**; merge after CI is green.
-5. Tag the release: `git tag vx.y.z && git push origin vx.y.z`.
+5. Tag the **merge commit on `main`** — not `develop`'s tip. Step 4 leaves you on `develop`, so a
+   bare `git tag vx.y.z` would tag the wrong commit. Name the commit explicitly:
+
+   ```bash
+   git fetch origin
+   git log -1 origin/main   # confirm this is the release merge commit
+   # Check that every crate on that commit is at x.y.z, in a throwaway worktree so local changes
+   # cannot leak into the check. The tag is created and pushed only if the check passes.
+   git worktree add --detach ../rustrade-release-check origin/main
+   (cd ../rustrade-release-check && RELEASE_TAG=vx.y.z DRY_RUN=1 .github/scripts/publish-crates.sh) \
+     && git tag vx.y.z origin/main && git push origin vx.y.z
+   git worktree remove ../rustrade-release-check
+   ```
 6. The publish workflow runs automatically on the tag.
+
+   It runs `.github/scripts/publish-crates.sh`, which derives the publish order from the
+   workspace's dependency graph and waits for each crate to appear in the crates.io index before
+   publishing the next, failing if it does not appear in time. Test it with `DRY_RUN=1`, which
+   prints the order and what would be published without uploading anything. The workflow passes
+   the tag as `RELEASE_TAG`, so a tag that does not match every crate's version fails in the
+   workflow's validate job, before the tests run, and again before anything is published, so no
+   GitHub Release is created for it.
+
+   **A failed publish does not need a version bump.** Before publishing a crate, the script looks
+   up its exact version in the crates.io sparse index, so crates already there are skipped and a
+   re-run resumes where it stopped. `publish.yml` has no `workflow_dispatch` trigger, so a retry
+   means deleting and re-pushing the same tag:
+
+   ```bash
+   git push origin :refs/tags/vx.y.z
+   git tag -d vx.y.z
+   # fix the cause, then re-tag and re-push as in step 5
+   ```
 
 ## What NOT to Contribute
 

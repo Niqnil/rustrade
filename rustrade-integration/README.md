@@ -6,7 +6,7 @@ Low-level framework for composing flexible web integrations, especially with fin
 
 rustrade-integration provides the core building blocks for:
 - **RestClient**: Configurable signed HTTP communication
-- **ExchangeStream**: Async communication over WebSocket, FIX, and other streaming protocols
+- **ExchangeStream**: Async communication over WebSocket and other streaming protocols
 
 Used by `rustrade-data` and `rustrade-execution` for exchange integrations.
 

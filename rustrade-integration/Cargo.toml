@@ -1,6 +1,6 @@
 [package]
 name = "rustrade-integration"
-version = "0.6.0"
+version = "0.7.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -32,6 +32,7 @@ stream = ["dep:tokio-stream", "dep:pin-project", "dep:futures", "dep:rustrade-in
 [dev-dependencies]
 tokio-test = { workspace = true }
 sha2 = { workspace = true }
+wiremock = { workspace = true }
 
 [dependencies]
 # Rustrade Ecosystem

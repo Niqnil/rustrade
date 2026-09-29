@@ -64,11 +64,40 @@
 //! before believing a result. Equity candles track the trade tape instead, so the bias is
 //! FX-specific.
 //!
-//! Two related properties of the same data: candle `volume` is unreliable where it is published at
-//! all (a majority of sampled one-minute equity bars report zero in minutes that demonstrably had
-//! trades), and non-trading days arrive as **flat** `o == h == l == c` bars rather than being
-//! omitted, so a daily backtest sees a tradeable price on a closed market. See the
-//! `rustrade_data::exchange::lse` module documentation.
+//! A related property of the same data: non-trading days arrive as **flat** `o == h == l == c`
+//! bars rather than being omitted, so a daily backtest sees a tradeable price on a closed market.
+//!
+//! # ⚠️ Candle `volume` is unreliable in both directions — do not size on it
+//!
+//! This example never reads `volume`, and that is deliberate. Where the vault publishes the field
+//! at all it is wrong by margins that invert results rather than blur them: a majority of sampled
+//! one-minute equity bars report zero in minutes that demonstrably had trades, and since
+//! 2026-04-27 ETF bars have been reported over-stating volume by three to four orders of magnitude
+//! — one `QQQ` minute published at roughly 5,700× that session's entire consolidated volume,
+//! repeated across `SPY`, `IWM`, `SMH`, `XLE`, `XLF` and `TLT` on every trading day sampled over
+//! two months. Equities went the other way over the same period, with `AAPL`, `MSFT` and `NVDA`
+//! daily totals at 24–45% of the consolidated tape against 65–80% before.
+//!
+//! Every one of those bars is structurally valid, so no check the library can perform tells them
+//! from correct ones. A strategy gated on volume — a liquidity filter, a VWAP benchmark, a
+//! participation-rate cap — would therefore backtest against a quantity that is not the market's.
+//! Reconcile against a second source before adding one.
+//!
+//! # ⚠️ Do not assume a long history exists — check depth per symbol first
+//!
+//! The range below is two months of `AAPL` and `MSFT`, which is comfortably inside what those
+//! symbols carry. That is not a general guarantee. Coverage is a per-symbol, per-dataset property
+//! and the spread is wide: equities are stated to reach back to 2004 and options on some tickers
+//! to 2014, while an ETF has been reported carrying a first tick of 2026-04-27 — about three
+//! months of spot. The provider publishes a first tick and a coverage span for every catalog
+//! entry, but the catalog lives on its discovery host and this integration does not wrap it.
+//!
+//! So a range starting before a symbol's coverage is **not** rejected and does not error. The
+//! fetch returns the bars that exist, the backtest runs on them, and the summary statistics are
+//! computed over a period shorter than the one requested — with nothing anywhere to say so. A
+//! backtest quietly evaluated over three months instead of ten years is the failure mode here, and
+//! it looks exactly like a successful run. Establish each symbol's depth from the catalog before
+//! widening the range below.
 
 use chrono::{DateTime, Utc};
 use futures::StreamExt;

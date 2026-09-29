@@ -133,6 +133,16 @@ pub enum ExchangeId {
     LseFutures,
     /// London Strategic Edge CFDs (index, commodity, interest rates, currency index, volatility)
     LseCfd,
+    /// London Strategic Edge US equity & ETF options (prints and print-time greeks; no quotes)
+    LseOptions,
+    /// Massive US equities WebSocket market data (`wss://socket.massive.com/stocks`)
+    MassiveStocks,
+    /// Massive crypto WebSocket market data (`wss://socket.massive.com/crypto`)
+    MassiveCrypto,
+    /// Massive forex WebSocket market data (`wss://socket.massive.com/forex`)
+    MassiveForex,
+    /// Massive US equity options WebSocket market data (`wss://socket.massive.com/options`)
+    MassiveOptions,
     // ---------------------------------------------------------------------------------------
     // NOTE: append new variants HERE, at the end. See `# Index stability` on this enum.
     // ---------------------------------------------------------------------------------------
@@ -203,6 +213,11 @@ impl ExchangeId {
             ExchangeId::LseEquities => "lse_equities",
             ExchangeId::LseFutures => "lse_futures",
             ExchangeId::LseCfd => "lse_cfd",
+            ExchangeId::LseOptions => "lse_options",
+            ExchangeId::MassiveStocks => "massive_stocks",
+            ExchangeId::MassiveCrypto => "massive_crypto",
+            ExchangeId::MassiveForex => "massive_forex",
+            ExchangeId::MassiveOptions => "massive_options",
         }
     }
 }
@@ -235,6 +250,29 @@ mod tests {
             (ExchangeId::LseEquities, "lse_equities"),
             (ExchangeId::LseFutures, "lse_futures"),
             (ExchangeId::LseCfd, "lse_cfd"),
+            (ExchangeId::LseOptions, "lse_options"),
+        ] {
+            assert_eq!(exchange.as_str(), expected);
+            assert_eq!(
+                serde_json::to_string(&exchange).unwrap(),
+                format!(r#""{expected}""#)
+            );
+            assert_eq!(
+                serde_json::from_str::<ExchangeId>(&format!(r#""{expected}""#)).unwrap(),
+                exchange
+            );
+        }
+    }
+
+    #[test]
+    fn test_serde_massive_variants() {
+        // See `test_serde_lse_variants`: `as_str` and the serde string must agree.
+        for (exchange, expected) in [
+            (ExchangeId::Massive, "massive"),
+            (ExchangeId::MassiveStocks, "massive_stocks"),
+            (ExchangeId::MassiveCrypto, "massive_crypto"),
+            (ExchangeId::MassiveForex, "massive_forex"),
+            (ExchangeId::MassiveOptions, "massive_options"),
         ] {
             assert_eq!(exchange.as_str(), expected);
             assert_eq!(
@@ -265,6 +303,11 @@ mod tests {
             ExchangeId::LseEquities,
             ExchangeId::LseFutures,
             ExchangeId::LseCfd,
+            ExchangeId::LseOptions,
+            ExchangeId::MassiveStocks,
+            ExchangeId::MassiveCrypto,
+            ExchangeId::MassiveForex,
+            ExchangeId::MassiveOptions,
         ];
 
         for pair in tail.windows(2) {

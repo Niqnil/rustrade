@@ -127,6 +127,9 @@ impl Display for Side {
     }
 }
 
+/// Test fixtures. Behind the `test-utils` feature, which dependents enable only for their tests:
+/// the fixtures hard-code names and assets and are not part of the supported API.
+#[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils {
     use crate::{
         Underlying,
