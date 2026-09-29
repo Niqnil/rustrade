@@ -45,9 +45,11 @@ jobs:
     # Skip runs Dependabot triggers. GitHub hands those the Dependabot secret store, not the Actions
     # one, so ALPACA_API_KEY / ALPACA_SECRET_KEY arrive empty and every test fails `unauthorized`
     # -- a red check that says nothing about the bump. Keeping the paper-account keys out of that
-    # store is deliberate: a Dependabot run executes the new dependency's code. The bump is still
-    # exercised here by the `push` run on develop once it merges, and a human push to a Dependabot
-    # branch still runs these tests, with the real secrets.
+    # store is deliberate: a Dependabot run executes the new dependency's code. A human push to a
+    # Dependabot branch still runs these tests, with the real secrets. After merge, coverage depends
+    # on who merged: a human merge triggers the `push` run on develop, but an auto-merged patch bump
+    # lands through GITHUB_TOKEN, which triggers no workflow at all -- such a bump is first exercised
+    # by the next push to develop or by `alpaca-weekly.yml`.
     if: |
       github.actor != 'dependabot[bot]' && (
         github.event_name == 'push' ||
