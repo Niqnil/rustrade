@@ -13,6 +13,10 @@ use crate::exchange::hyperliquid::Hyperliquid;
 use crate::exchange::lse::{
     LseCfd, LseCrypto, LseEquities, LseFutures, LseFx, LseOptions, live::LseSubscriber,
 };
+#[cfg(feature = "massive")]
+use crate::exchange::massive::{
+    MassiveCrypto, MassiveForex, MassiveOptions, MassiveStocks, MassiveSubscriber,
+};
 use crate::{
     Identifier,
     error::DataError,
@@ -113,6 +117,7 @@ where
         + 'static
         + super::DynamicAlpacaInstrument
         + super::DynamicLseInstrument
+        + super::DynamicMassiveInstrument
         + super::DynamicHyperliquidInstrument,
     Instrument::Key: Debug + Clone + PartialEq + Send + Sync + 'static,
     Subscription<BinanceSpot, Instrument, PublicTrades>: Identifier<BinanceMarket>,
@@ -152,8 +157,8 @@ where
     ) -> Result<GroupFuture, DataError> {
         use SubKind::{OrderBooksL1 as L1, OrderBooksL2 as L2, PublicTrades as Trades};
 
-        // Only the Alpaca and London Strategic Edge arms take a subscriber from the caller.
-        #[cfg(not(any(feature = "alpaca", feature = "lse")))]
+        // Only the Alpaca, London Strategic Edge and Massive arms take a subscriber from the caller.
+        #[cfg(not(any(feature = "alpaca", feature = "lse", feature = "massive")))]
         let _ = subscribers;
 
         let subs = subscriptions;
@@ -511,6 +516,108 @@ where
                 return Err(feature_disabled(exchange, "lse"));
             }
 
+            // Every Massive group takes a clone of the ONE subscriber supplied, so the groups on each
+            // cluster share its connection to it: past its per-cluster cap, Massive closes the
+            // older connection. The top of book is the cluster's quote channel, and the candle
+            // interval, Sec1 or Min1, picks its aggregate channel; see the Binance candle arm.
+            #[cfg(feature = "massive")]
+            (ExchangeId::MassiveStocks, Trades) => group(
+                massive(subscribers, exchange)?,
+                MassiveStocks::default(),
+                PublicTrades,
+                subs,
+                tx(&txs.trades, exchange),
+            ),
+            #[cfg(feature = "massive")]
+            (ExchangeId::MassiveStocks, L1) => group(
+                massive(subscribers, exchange)?,
+                MassiveStocks::default(),
+                OrderBooksL1,
+                subs,
+                tx(&txs.l1s, exchange),
+            ),
+            #[cfg(feature = "massive")]
+            (ExchangeId::MassiveStocks, SubKind::Candles { interval }) => group(
+                massive(subscribers, exchange)?,
+                MassiveStocks::default(),
+                Candles { interval },
+                subs,
+                tx(&txs.candles, exchange),
+            ),
+            #[cfg(feature = "massive")]
+            (ExchangeId::MassiveCrypto, Trades) => group(
+                massive(subscribers, exchange)?,
+                MassiveCrypto::default(),
+                PublicTrades,
+                subs,
+                tx(&txs.trades, exchange),
+            ),
+            #[cfg(feature = "massive")]
+            (ExchangeId::MassiveCrypto, L1) => group(
+                massive(subscribers, exchange)?,
+                MassiveCrypto::default(),
+                OrderBooksL1,
+                subs,
+                tx(&txs.l1s, exchange),
+            ),
+            #[cfg(feature = "massive")]
+            (ExchangeId::MassiveCrypto, SubKind::Candles { interval }) => group(
+                massive(subscribers, exchange)?,
+                MassiveCrypto::default(),
+                Candles { interval },
+                subs,
+                tx(&txs.candles, exchange),
+            ),
+            // Forex publishes no trades, so there is no trades arm; the support matrix refuses one.
+            #[cfg(feature = "massive")]
+            (ExchangeId::MassiveForex, L1) => group(
+                massive(subscribers, exchange)?,
+                MassiveForex::default(),
+                OrderBooksL1,
+                subs,
+                tx(&txs.l1s, exchange),
+            ),
+            #[cfg(feature = "massive")]
+            (ExchangeId::MassiveForex, SubKind::Candles { interval }) => group(
+                massive(subscribers, exchange)?,
+                MassiveForex::default(),
+                Candles { interval },
+                subs,
+                tx(&txs.candles, exchange),
+            ),
+            #[cfg(feature = "massive")]
+            (ExchangeId::MassiveOptions, Trades) => group(
+                massive(subscribers, exchange)?,
+                MassiveOptions::default(),
+                PublicTrades,
+                subs,
+                tx(&txs.trades, exchange),
+            ),
+            #[cfg(feature = "massive")]
+            (ExchangeId::MassiveOptions, L1) => group(
+                massive(subscribers, exchange)?,
+                MassiveOptions::default(),
+                OrderBooksL1,
+                subs,
+                tx(&txs.l1s, exchange),
+            ),
+            #[cfg(feature = "massive")]
+            (ExchangeId::MassiveOptions, SubKind::Candles { interval }) => group(
+                massive(subscribers, exchange)?,
+                MassiveOptions::default(),
+                Candles { interval },
+                subs,
+                tx(&txs.candles, exchange),
+            ),
+            #[cfg(not(feature = "massive"))]
+            (
+                ExchangeId::MassiveStocks | ExchangeId::MassiveCrypto | ExchangeId::MassiveOptions,
+                Trades | L1 | SubKind::Candles { .. },
+            )
+            | (ExchangeId::MassiveForex, L1 | SubKind::Candles { .. }) => {
+                return Err(feature_disabled(exchange, "massive"));
+            }
+
             (exchange, sub_kind) => return Err(DataError::Unsupported { exchange, sub_kind }),
         })
     }
@@ -572,9 +679,22 @@ fn lse(subscribers: &DynamicSubscribers, exchange: ExchangeId) -> Result<LseSubs
         .ok_or(DataError::SubscriberRequired { exchange })
 }
 
+/// A clone of the Massive subscriber, sharing its connection to each cluster.
+#[cfg(feature = "massive")]
+fn massive(
+    subscribers: &DynamicSubscribers,
+    exchange: ExchangeId,
+) -> Result<MassiveSubscriber, DataError> {
+    subscribers
+        .massive
+        .clone()
+        .ok_or(DataError::SubscriberRequired { exchange })
+}
+
 #[cfg(any(
     not(feature = "alpaca"),
     not(feature = "lse"),
+    not(feature = "massive"),
     not(feature = "hyperliquid")
 ))]
 fn feature_disabled(exchange: ExchangeId, feature: &str) -> DataError {

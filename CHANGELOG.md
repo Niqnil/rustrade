@@ -43,6 +43,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ⚠️ Massive data may not be redistributed. See
   <https://massive.com/legal/market-data-terms-of-service> (§5(c)).
 
+- **`DynamicStreams` serves Massive market data, through `DynamicSubscribers::with_massive`**
+  (`rustrade-data`, feature `massive`). The support matrix now accepts the four Massive clusters,
+  and `DynamicStreams::init_with` and `init_indexed_multi_exchange_market_stream_with` route them.
+  `MassiveStocks` and `MassiveCrypto` with `Spot`, and `MassiveOptions` with `Option`, serve
+  `PublicTrades`, `OrderBooksL1` and `Candles`. `MassiveForex` with `Spot` serves `OrderBooksL1`
+  and `Candles`, because forex publishes no trades. Candles are accepted at
+  `CandleInterval::Sec1` and `Min1` only, and any other interval now fails validation before
+  anything is routed. `SubKind::Quotes` is refused, as for Alpaca, because the engine's market data
+  carries a top of book rather than a quote. Massive closes the older connection when a key goes
+  past its per-cluster cap, so the caller builds one `MassiveSubscriber` and passes it in with
+  `DynamicSubscribers::default().with_massive(subscriber)`. Every Massive group takes a clone of
+  it, whatever its cluster, kind or batch, so each cluster's groups share one socket. A `Massive*`
+  subscription with no subscriber supplied fails with `DataError::SubscriberRequired`, and one in a
+  build without the `massive` feature fails with `DataError::FeatureDisabled`. `MassiveOptions` is
+  routed on the code path it shares with stocks and has never been run against the real feed,
+  which needs an options subscription.
+
+  ⚠️ Massive data may not be redistributed. See
+  <https://massive.com/legal/market-data-terms-of-service> (§5(c)).
+
 - **`DynamicStreams` serves Alpaca market data, through `DynamicSubscribers::with_alpaca`**
   (`rustrade-data`, feature `alpaca`). The support matrix now accepts trades and top of book on
   `AlpacaCrypto`, `AlpacaIex` and `AlpacaSip`, and `DynamicStreams::init_with` routes them. Alpaca
