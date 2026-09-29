@@ -270,7 +270,7 @@ ibapi=4.2.0  # 2026-09-14 | Financial protocol, community-maintained, no officia
 # NOT VERIFIABLE OFF-GATEWAY, unchanged in force: the ibkr integration tests are all #[ignore]d and CI
 # does not run them. Nothing has exercised 4.2.0's connection-state gate, early reset or strict decode
 # against a real gateway. Do that before relying on 4.2.0 in production.
-binance-sdk=70.1.0  # 2026-09-14 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
+binance-sdk=70.2.0  # 2026-09-14 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
 #   1. common::websocket::WebsocketApi::send_message      — signature + WebsocketMessageSendOptions signing fields (margin WS subscribe send)
 #   2. ws.common.events.subscribe (WebsocketEventEmitter) — receive/event-callback path (margin WS event delivery)
 #   3. common::utils::send_request                        — signature + HMAC signing + X-MBX-APIKEY header (hand-rolled `userListenToken` POST; SDK binds no endpoint for it)
@@ -433,6 +433,54 @@ binance-sdk=70.1.0  # 2026-09-14 | Exchange SDK, signing/IO. PINNED: margin user
 # manifest -- and adds or removes ZERO packages from our Cargo.lock; binance-sdk's own 32-entry dep
 # list there is untouched. The crate's VENDORED Cargo.lock drops `tinyvec_macros`, which is
 # irrelevant: Cargo ignores a dependency's own lockfile and ours shows no delta.
+#
+# Re-verified against the =70.2.0 crates.io source on 2026-09-29 (70.1.0 -> 70.2.0). A MINOR bump, and
+# the first since 69.2.3 to touch `src/common/` at all -- so the 3 internals were re-read, not assumed.
+# `diff -rq` over the crate: outside the manifests, the only changes are common/config.rs,
+# common/websocket.rs and derivatives_trading_usds_futures/ (feature-gated at lib.rs:33-34, not in our
+# `spot` + `margin_trading` selection; the 70.2.0 trading-schedule FX models and session stream).
+# `src/spot/`, `src/margin_trading/`, `src/lib.rs` and `common/{mod,models,utils}.rs` are BYTE-IDENTICAL.
+# Published from git 01eaf08eefe7fc99046d5ff2a90b04a7b7c6eed5 (70.1.0 = 592f16b6bb34ff11d9eb47fbcd956c80be1529ef).
+#
+# What changed in common/: ONE additive feature, an optional caller-supplied WebSocket handshake
+# (`WebsocketHandshakeFn`, config.rs), meant for tunnelling through e.g. SOCKS5. It is a new
+# `handshake: Option<..>` field, `#[builder(setter(strip_option), default)]`, on
+# ConfigurationWebsocketApi and ConfigurationWebsocketStreams. When `None` -- and rustrade never sets
+# it -- `create_websocket` (websocket.rs:~800-812) takes the unchanged `connect_async_tls_with_config`
+# path, under the same 10 s timeout. Every non-test hunk in websocket.rs is that plumbing: imports,
+# the `WebsocketCommon` field + `new_with_handshake` constructor, `create_websocket`, and the two
+# config constructors forwarding the field. ConfigurationWebsocketStreams swaps `#[derive(Debug)]` for
+# a manual impl printing `<custom handshake fn>`; the redacting manual Debug on
+# ConfigurationWebsocketApi (config.rs:306) gains the same field and still redacts. websocket.rs md5
+# moves 38b5990bb85497fdbcec39984732509b -> 367bbb4fe76c40d401ba23bcaba8c08a for that reason alone.
+#
+# The 3 internals, quoted from 70.2.0:
+#   1. `send_message` (websocket.rs:1667): the whole function body extracted from each version
+#      hashes identically (109 lines). WebsocketMessageSendOptions (websocket.rs:1439-1444) still
+#      carries exactly with_api_key / is_signed / is_session_logon / is_session_logout. Both margin
+#      call sites (margin.rs:1477, :1517) still pass `WebsocketMessageSendOptions::new()`.
+#   2. `WebsocketEventEmitter::subscribe` (websocket.rs:128): body hashes identically (19 lines) --
+#      one unbounded channel (:132), ONE spawned task (:140) draining it via a sequential
+#      `while let Some(event) = rx.recv().await { callback(event) }` (:141-142). The contract the
+#      non-atomic `Option::take()` calls (margin.rs:1917-1944) in the margin `account_stream` callback
+#      registered at margin.rs:1896 rely on holds.
+#   3. `send_request` (utils.rs:951): utils.rs is byte-identical, md5 1541c46b7c5ba4f5f7ef57286c99695d
+#      unchanged, so the signing, `timestamp`, `signature` and `X-MBX-APIKEY` lines recorded at 70.1.0
+#      hold verbatim. The hand-rolled `userListenToken` POST (margin.rs:1389) is still signed as intended.
+#
+# Security: PASS. `unsafe` grep 17 -> 17 at identical sites (the 10 real ones all `#[cfg(test)]`
+# env::set_var/remove_var in utils.rs, which did not change). build.rs identical (md5
+# 32353f57fa3d951fe6be1ce5c5edb33c). Every new URL in src/ is a `ws://127.0.0.1` in the new handshake
+# tests -- zero new hosts. No new env reads, filesystem sites, process spawns or obfuscation; both
+# standing caveats (the USER_AGENT crafted-value panic, the DEBUG log of the signed WS request) carry
+# forward unchanged, as utils.rs and that log line are untouched.
+#
+# Dependency surface: Cargo.toml differs by the version line ALONE -- `[dependencies]`,
+# `[dev-dependencies]`, `[build-dependencies]` and `[features]` identical (`default = ["openssl-tls"]`
+# unchanged). The PR changes binance-sdk's version and checksum in our Cargo.lock and nothing else:
+# zero packages added or removed. The vendored Cargo.lock's syn/thiserror/etc. drift is irrelevant.
+# CONSUMER-SIDE API CHURN: NONE -- the new field is builder-defaulted and we construct both configs via
+# the builder, so the crate type-checks unchanged (CI `cargo check --all-features` passed on the bump).
 quick-xml  # 2026-07-08 | New direct dep (XML parsing of broker Flex statements). Reviewed @ 0.41.0: #![forbid(unsafe_code)] crate-wide, zero net-new transitive deps (serde+memchr only, both already in tree), no RUSTSEC advisories, de-facto-standard parser. Not pinned — any version bump still needs review.
 #   Re-reviewed @ 0.42.0 (2026-09-16), the review this entry's "any version bump still needs
 #   review" mandates. All four properties recorded at 0.41.0 re-verified and still hold:
