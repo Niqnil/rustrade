@@ -673,16 +673,27 @@ impl IbkrClient {
     /// # All-or-Nothing Semantics
     ///
     /// If any leg is rejected by IB (e.g., insufficient margin, invalid price),
-    /// this method cancels all other legs and returns all three as `Inactive`.
-    /// You will never receive a mix of active and inactive legs.
+    /// or cannot be sent, this method cancels every leg already sent and
+    /// returns the legs as `Inactive`.
     ///
     /// The same all-legs cancellation applies if any leg fails to report a
-    /// terminal status within the placement timeout (an unknown/no-status
-    /// outcome): leaving part of a bracket working while the rest is in an
-    /// unknown state is unsafe, so all three legs are cancelled and an error is
-    /// returned. This is intentionally stricter than single-order placement
-    /// (`open_order`), where a no-status outcome retains the order and defers
-    /// resolution to the account stream.
+    /// status within the placement timeout, or the transport drops while
+    /// waiting (an unknown/no-status outcome): leaving part of a bracket
+    /// working while the rest is in an unknown state is unsafe, so every leg is
+    /// cancelled and an error is returned.
+    ///
+    /// # Legs of Unknown Fate
+    ///
+    /// Cancelling does not settle a leg whose fate is unknown: a leg that
+    /// reported no status, or whose rollback cancel could not be sent (ibapi
+    /// refuses sends while its transport is down), may still be live or held
+    /// at TWS. Such a leg comes back `Open` with zero fill and keeps its
+    /// order-id mapping, as a no-status single order does, so the account
+    /// stream can report how it ends. The other legs come back `Inactive` with
+    /// the error. So a failed bracket can return a mix of `Open` and `Inactive`
+    /// legs, and every leg can be `Open` when none reported a status. Treat an
+    /// `Open` leg of a failed bracket as working until the account stream or
+    /// [`ExecutionClient::fetch_open_orders`] says otherwise.
     ///
     /// # Cancellation Safety
     ///
@@ -852,58 +863,66 @@ impl IbkrClient {
         // Place all three orders in spawn_blocking
         let client = self.client.clone();
         let result = tokio::task::spawn_blocking(move || {
-            // Roll back legs already sent, returning a suffix for the error
-            // message that names every cancel that could not be sent. A refused
+            // Roll back legs already sent. Returns the ids whose cancel could not
+            // be sent, and a suffix for the error message naming them. A refused
             // cancel must not vanish: ibapi refuses sends while the transport is
             // down, and the leg it names may then be live at TWS.
-            let rollback = |ids: &[i32]| -> String {
-                let failed: Vec<String> = ids
+            let rollback = |ids: &[i32]| -> (Vec<i32>, String) {
+                let failed: Vec<(i32, ibapi::Error)> = ids
                     .iter()
                     .filter_map(|&id| {
                         let e = client.cancel_order(id, "").err()?;
                         error!(order_id = id, error = %e, "bracket rollback cancel failed; leg may be live");
-                        Some(format!("{id} ({e})"))
+                        Some((id, e))
                     })
                     .collect();
                 if failed.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        "; rollback cancel failed for order ids {}, which may be live",
-                        failed.join(", ")
-                    )
+                    return (Vec::new(), String::new());
                 }
+                let named: Vec<String> = failed.iter().map(|(id, e)| format!("{id} ({e})")).collect();
+                let suffix = format!(
+                    "; rollback cancel failed for order ids {}, which may be live",
+                    named.join(", ")
+                );
+                (failed.into_iter().map(|(id, _)| id).collect(), suffix)
             };
 
             // A later leg's send failed after earlier legs were written. Retrying
             // is only safe when every rollback cancel went out; otherwise a leg
-            // may still be held at TWS, so the failure is not transient.
-            let leg_send_error = |e: &ibapi::Error,
-                                  message: String,
-                                  rollback: String|
-             -> OrderError<AssetNameExchange, InstrumentNameExchange> {
-                if rollback.is_empty() {
+            // may still be held at TWS, so the failure is not transient. The
+            // failing leg itself was refused, so it never reached TWS.
+            let leg_send_failure = |e: &ibapi::Error, message: String, sent: &[i32]| {
+                let (cancel_failed, rollback) = rollback(sent);
+                let error = if cancel_failed.is_empty() {
                     send_error(e, message)
                 } else {
                     OrderError::Rejected(ApiError::OrderRejected(format!("{message}{rollback}")))
+                };
+                BracketFailure {
+                    error,
+                    unresolved: cancel_failed,
                 }
             };
 
             // Place parent (transmit=false, held until SL is sent)
             let parent_sub = match client.place_order(parent_ib_id, &contract, &ib_orders[0]) {
                 Ok(s) => s,
-                Err(e) => return Err(send_error(&e, format!("parent order failed: {e}"))),
+                Err(e) => {
+                    return Err(BracketFailure {
+                        error: send_error(&e, format!("parent order failed: {e}")),
+                        unresolved: Vec::new(),
+                    });
+                }
             };
 
             // Place take-profit (transmit=false)
             let tp_sub = match client.place_order(tp_ib_id, &contract, &ib_orders[1]) {
                 Ok(s) => s,
                 Err(e) => {
-                    let rollback = rollback(&[parent_ib_id]);
-                    return Err(leg_send_error(
+                    return Err(leg_send_failure(
                         &e,
                         format!("take_profit order failed: {e}"),
-                        rollback,
+                        &[parent_ib_id],
                     ));
                 }
             };
@@ -912,11 +931,10 @@ impl IbkrClient {
             let sl_sub = match client.place_order(sl_ib_id, &contract, &ib_orders[2]) {
                 Ok(s) => s,
                 Err(e) => {
-                    let rollback = rollback(&[parent_ib_id, tp_ib_id]);
-                    return Err(leg_send_error(
+                    return Err(leg_send_failure(
                         &e,
                         format!("stop_loss order failed: {e}"),
-                        rollback,
+                        &[parent_ib_id, tp_ib_id],
                     ));
                 }
             };
@@ -955,17 +973,24 @@ impl IbkrClient {
             match (parent_status, tp_status, sl_status) {
                 (Some(Ok(parent)), Some(Ok(tp)), Some(Ok(sl))) => Ok((parent, tp, sl)),
                 (parent, tp, sl) => {
-                    let rollback = rollback(&[parent_ib_id, tp_ib_id, sl_ib_id]);
+                    let (cancel_failed, rollback) = rollback(&[parent_ib_id, tp_ib_id, sl_ib_id]);
+                    let unresolved = unresolved_legs(
+                        [(parent_ib_id, &parent), (tp_ib_id, &tp), (sl_ib_id, &sl)],
+                        &cancel_failed,
+                    );
                     let show = |status: Option<Result<f64, String>>| match status {
                         Some(status) => format!("{status:?}"),
                         None => "no status (timed out or transport lost)".to_string(),
                     };
-                    Err(OrderError::Rejected(ApiError::OrderRejected(format!(
-                        "bracket order rejected: parent={}, tp={}, sl={}{rollback}",
-                        show(parent),
-                        show(tp),
-                        show(sl)
-                    ))))
+                    Err(BracketFailure {
+                        error: OrderError::Rejected(ApiError::OrderRejected(format!(
+                            "bracket order failed: parent={}, tp={}, sl={}{rollback}",
+                            show(parent),
+                            show(tp),
+                            show(sl)
+                        ))),
+                        unresolved,
+                    })
                 }
             }
         })
@@ -1040,14 +1065,12 @@ impl IbkrClient {
                     },
                 }
             }
-            Ok(Err(error)) => {
-                // Clean up order ID mappings
-                self.order_ids.remove_by_ib_id(parent_ib_id);
-                self.order_ids.remove_by_ib_id(tp_ib_id);
-                self.order_ids.remove_by_ib_id(sl_ib_id);
-
-                make_all_inactive_bracket(&request, error)
-            }
+            Ok(Err(failure)) => failed_bracket(
+                &request,
+                [parent_ib_id, tp_ib_id, sl_ib_id],
+                failure,
+                &self.order_ids,
+            ),
             Err(join_err) => {
                 // Clean up order ID mappings
                 self.order_ids.remove_by_ib_id(parent_ib_id);
@@ -1074,6 +1097,71 @@ fn derive_child_cids(parent_cid: &ClientOrderId) -> (ClientOrderId, ClientOrderI
         ClientOrderId::new(format_smolstr!("{}_tp", parent_cid.0)),
         ClientOrderId::new(format_smolstr!("{}_sl", parent_cid.0)),
     )
+}
+
+/// A failed bracket placement: the error each settled leg carries, and the legs
+/// whose fate at TWS is unknown.
+struct BracketFailure {
+    error: OrderError<AssetNameExchange, InstrumentNameExchange>,
+    /// IB order ids of legs that may be live at TWS: no placement status
+    /// arrived for them, or their rollback cancel could not be sent.
+    unresolved: Vec<i32>,
+}
+
+/// The legs of a bracket that failed after all three were sent whose fate at
+/// TWS is unknown: those without a placement status (`None`), and those whose
+/// rollback cancel could not be sent.
+///
+/// A leg that reported a status and whose cancel went out is settled: rejected,
+/// or being cancelled.
+fn unresolved_legs<T>(legs: [(i32, &Option<T>); 3], cancel_failed: &[i32]) -> Vec<i32> {
+    legs.into_iter()
+        .filter(|(id, status)| status.is_none() || cancel_failed.contains(id))
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// Build the result of a failed bracket placement, releasing the order-id
+/// mappings of its settled legs.
+///
+/// A leg in `failure.unresolved` comes back `Open` with zero fill and keeps its
+/// mapping, as single-order placement does for an unknown outcome, so the
+/// account stream can still resolve it. Every other leg was never sent, was
+/// rejected, or had its cancel sent: it comes back `Inactive` with
+/// `failure.error`, and its mapping is removed.
+fn failed_bracket(
+    request: &BracketOrderRequest,
+    [parent_ib_id, tp_ib_id, sl_ib_id]: [i32; 3],
+    failure: BracketFailure,
+    order_ids: &OrderIdMap,
+) -> BracketOrderResult {
+    let BracketFailure { error, unresolved } = failure;
+    if !unresolved.is_empty() {
+        warn!(
+            %error,
+            ?unresolved,
+            "bracket placement failed with legs of unknown fate; returning them Open, tracking via stream"
+        );
+    }
+
+    let mut result = make_all_inactive_bracket(request, error);
+    let now = Utc::now();
+    for (leg, ib_id) in [
+        (&mut result.parent, parent_ib_id),
+        (&mut result.take_profit, tp_ib_id),
+        (&mut result.stop_loss, sl_ib_id),
+    ] {
+        if unresolved.contains(&ib_id) {
+            leg.state = OrderState::active(Open::new(
+                VenueOrderId::Assigned(OrderId::new(format_smolstr!("{ib_id}"))),
+                now,
+                Decimal::ZERO,
+            ));
+        } else {
+            order_ids.remove_by_ib_id(ib_id);
+        }
+    }
+    result
 }
 
 /// Helper to create a BracketOrderResult with all legs inactive (same error).
@@ -2318,6 +2406,7 @@ mod contract_config_tests {
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod order_status_tests {
     use super::*;
+    use crate::order::state::ActiveOrderState;
     use ibapi::orders::{OrderStatus, OrderStatusKind, PlaceOrder};
 
     fn status(kind: OrderStatusKind, filled: f64) -> Result<PlaceOrder, ibapi::Error> {
@@ -2521,5 +2610,108 @@ mod order_status_tests {
             pending.remove(42),
             "the pending cancel must still be there for the confirmed Cancelled"
         );
+    }
+
+    /// A leg is unresolved when it reported no status or its rollback cancel
+    /// was refused; a leg with a status whose cancel went out is settled.
+    #[test]
+    fn unresolved_legs_are_no_status_or_failed_cancel() {
+        let accepted: Option<Result<f64, String>> = Some(Ok(0.0));
+        let rejected: Option<Result<f64, String>> = Some(Err("201".into()));
+        let no_status: Option<Result<f64, String>> = None;
+
+        assert_eq!(
+            unresolved_legs([(1, &accepted), (2, &rejected), (3, &no_status)], &[]),
+            vec![3]
+        );
+        assert_eq!(
+            unresolved_legs([(1, &accepted), (2, &rejected), (3, &accepted)], &[1]),
+            vec![1]
+        );
+        assert_eq!(
+            unresolved_legs([(1, &no_status), (2, &no_status), (3, &accepted)], &[2]),
+            vec![1, 2]
+        );
+        assert!(unresolved_legs([(1, &accepted), (2, &rejected), (3, &accepted)], &[]).is_empty());
+    }
+
+    fn bracket_request() -> BracketOrderRequest {
+        BracketOrderRequest {
+            instrument: InstrumentNameExchange::new("AAPL"),
+            strategy: StrategyId::new("test"),
+            parent_cid: ClientOrderId::new("br"),
+            side: Side::Buy,
+            quantity: Decimal::from(10),
+            entry_price: Decimal::from(150),
+            take_profit_price: Decimal::from(160),
+            stop_loss_price: Decimal::from(145),
+            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+        }
+    }
+
+    /// An unresolved leg comes back Open under its IB id and keeps its mapping,
+    /// so the account stream can still resolve it; a settled leg comes back
+    /// Inactive with the error and its mapping is released.
+    #[test]
+    fn failed_bracket_keeps_unresolved_legs_open_and_tracked() {
+        let request = bracket_request();
+        let (tp_cid, sl_cid) = derive_child_cids(&request.parent_cid);
+        let order_ids = OrderIdMap::new();
+        order_ids.register(request.parent_cid.clone(), 10, ctx());
+        order_ids.register(tp_cid, 11, ctx());
+        order_ids.register(sl_cid, 12, ctx());
+
+        let result = failed_bracket(
+            &request,
+            [10, 11, 12],
+            BracketFailure {
+                error: OrderError::Rejected(ApiError::OrderRejected("boom".into())),
+                unresolved: vec![11],
+            },
+            &order_ids,
+        );
+
+        assert!(matches!(result.parent.state, OrderState::Inactive(_)));
+        assert!(matches!(result.stop_loss.state, OrderState::Inactive(_)));
+        match &result.take_profit.state {
+            OrderState::Active(ActiveOrderState::Open(open)) => {
+                assert_eq!(open.id.assigned(), Some(&OrderId::new("11")));
+                assert_eq!(open.filled_quantity, Decimal::ZERO);
+            }
+            other => panic!("unresolved leg must be Open, got {other:?}"),
+        }
+
+        assert!(order_ids.get_client_id(10).is_none());
+        assert!(order_ids.get_client_id(11).is_some());
+        assert!(order_ids.get_client_id(12).is_none());
+    }
+
+    /// With no unresolved leg the failure keeps its all-inactive shape and
+    /// releases every mapping.
+    #[test]
+    fn failed_bracket_without_unresolved_legs_is_all_inactive() {
+        let request = bracket_request();
+        let (tp_cid, sl_cid) = derive_child_cids(&request.parent_cid);
+        let order_ids = OrderIdMap::new();
+        order_ids.register(request.parent_cid.clone(), 10, ctx());
+        order_ids.register(tp_cid, 11, ctx());
+        order_ids.register(sl_cid, 12, ctx());
+
+        let result = failed_bracket(
+            &request,
+            [10, 11, 12],
+            BracketFailure {
+                error: OrderError::Rejected(ApiError::OrderRejected("boom".into())),
+                unresolved: Vec::new(),
+            },
+            &order_ids,
+        );
+
+        for leg in [&result.parent, &result.take_profit, &result.stop_loss] {
+            assert!(matches!(leg.state, OrderState::Inactive(_)));
+        }
+        for ib_id in [10, 11, 12] {
+            assert!(order_ids.get_client_id(ib_id).is_none());
+        }
     }
 }
