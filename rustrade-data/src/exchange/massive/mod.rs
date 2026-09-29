@@ -41,7 +41,9 @@
 //!   [`MassiveCrypto`](crate::exchange::massive::MassiveCrypto),
 //!   [`MassiveForex`](crate::exchange::massive::MassiveForex) and
 //!   [`MassiveOptions`](crate::exchange::massive::MassiveOptions) connectors: real-time streaming
-//!   through [`Streams`](crate::streams::Streams), like any other exchange
+//!   through [`Streams`](crate::streams::Streams), like any other exchange, or through
+//!   [`DynamicStreams`](crate::streams::builder::dynamic::DynamicStreams) with
+//!   [`DynamicSubscribers::with_massive`](crate::streams::builder::dynamic::DynamicSubscribers::with_massive)
 //!
 //! # Authentication
 //!
@@ -534,6 +536,12 @@ impl MassiveSubscriber {
     /// Equivalent to `MassiveSubscriber::new(MassiveCredentials::from_env()?)`.
     pub fn from_env() -> Result<Self, SocketError> {
         Ok(Self::new(MassiveCredentials::from_env()?))
+    }
+
+    /// How many handles share this subscriber's connections: this subscriber and each clone of it.
+    #[cfg(test)]
+    pub(crate) fn connection_handles(&self) -> usize {
+        Arc::strong_count(&self.connections)
     }
 }
 

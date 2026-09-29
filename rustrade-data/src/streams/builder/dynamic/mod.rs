@@ -4,6 +4,8 @@ use crate::exchange::alpaca::{AlpacaSubscriber, market::AlpacaInstrument};
 use crate::exchange::hyperliquid::market::HyperliquidInstrument;
 #[cfg(feature = "lse")]
 use crate::exchange::lse::{live::LseSubscriber, market::LseInstrument};
+#[cfg(feature = "massive")]
+use crate::exchange::massive::{MassiveSubscriber, market::MassiveInstrument};
 use crate::{
     error::DataError,
     instrument::InstrumentData,
@@ -63,6 +65,8 @@ pub struct DynamicStreams<InstrumentKey> {
 /// Venues that need one:
 /// - **Alpaca** (`alpaca` feature): `AlpacaCrypto`, `AlpacaIex` and `AlpacaSip`.
 /// - **London Strategic Edge** (`lse` feature): every `Lse*` dataset.
+/// - **Massive** (`massive` feature): `MassiveStocks`, `MassiveCrypto`, `MassiveForex` and
+///   `MassiveOptions`.
 ///
 /// # Example
 /// ```ignore
@@ -90,6 +94,8 @@ pub struct DynamicSubscribers {
     alpaca: Option<AlpacaSubscriber>,
     #[cfg(feature = "lse")]
     lse: Option<LseSubscriber>,
+    #[cfg(feature = "massive")]
+    massive: Option<MassiveSubscriber>,
 }
 
 impl DynamicSubscribers {
@@ -143,6 +149,43 @@ impl DynamicSubscribers {
         self.lse = Some(subscriber);
         self
     }
+
+    /// Serve every Massive subscription — any cluster, any kind — from clones of `subscriber`.
+    ///
+    /// Massive allows a key a fixed number of WebSocket connections per cluster, one on an
+    /// individual plan, and past it does not refuse the new connection: it **closes the older
+    /// one**. Clones of one subscriber share one connection per cluster, so every `Massive*` group
+    /// of every batch on a cluster attaches to the same socket, and the stocks, crypto, forex and
+    /// options clusters each get one of their own. Any other stream the caller opens on the same
+    /// key should take a clone of this subscriber too: one built separately evicts this one's
+    /// connection, and the warning logged for the lost connection quotes Massive's
+    /// `max_connections` status.
+    ///
+    /// What each cluster serves:
+    /// - `SubKind::PublicTrades` on every cluster but forex, which publishes no trades.
+    /// - `SubKind::OrderBooksL1`, read from the cluster's quote channel. A side quoted at a zero
+    ///   price is `None`, and a forex quote carries no sizes, so its amounts are zero.
+    ///   `SubKind::Quotes` is not served here; the typed [`Streams`](crate::streams::Streams)
+    ///   builder serves it.
+    /// - `SubKind::Candles` at `CandleInterval::Sec1` and `Min1`, the only intervals Massive
+    ///   aggregates at. Forex candles report no volume. Both intervals on one cluster arrive on its
+    ///   one candle stream; see [`DynamicStreams::select_candles`].
+    ///
+    /// `MassiveOptions` takes option contracts only and has never been run against the live feed,
+    /// which needs an options subscription. An instrument given as
+    /// [`MarketInstrumentData`](crate::instrument::MarketInstrumentData) is subscribed by its
+    /// `name_exchange` as given, so that must be the cluster's own spelling: `AAPL`, `BTC-USD`,
+    /// `EUR/USD` or `O:AAPL251219C00150000`. See [`exchange::massive`](crate::exchange::massive).
+    ///
+    /// # ⚠️ The data is not redistributable
+    /// Massive's terms prohibit redistributing the data it serves. See
+    /// <https://massive.com/legal/market-data-terms-of-service> (§5(c)).
+    #[cfg(feature = "massive")]
+    #[must_use]
+    pub fn with_massive(mut self, subscriber: MassiveSubscriber) -> Self {
+        self.massive = Some(subscriber);
+        self
+    }
 }
 
 /// An instrument type every venue [`DynamicStreams`] routes to can subscribe with.
@@ -155,8 +198,9 @@ impl DynamicSubscribers {
 /// connector and kind.
 ///
 /// Which connectors it covers depends on the cargo features enabled: with `alpaca` it also
-/// requires [`AlpacaInstrument`], with `lse` [`LseInstrument`], with `hyperliquid`
-/// [`HyperliquidInstrument`]. The three types above satisfy every combination.
+/// requires [`AlpacaInstrument`], with `lse` [`LseInstrument`], with `massive`
+/// [`MassiveInstrument`], with `hyperliquid` [`HyperliquidInstrument`]. The three types above
+/// satisfy every combination.
 ///
 /// # Only this crate's instrument types implement it
 /// It is sealed: its supertrait lives in a private module, so no crate but this one can name it
@@ -204,6 +248,21 @@ pub trait DynamicLseInstrument {}
 
 #[cfg(not(feature = "lse"))]
 impl<Instrument> DynamicLseInstrument for Instrument {}
+
+/// Requires [`MassiveInstrument`] when the `massive` feature is enabled, and nothing otherwise. See
+/// [`DynamicLseInstrument`] for why this is a trait.
+#[cfg(feature = "massive")]
+pub trait DynamicMassiveInstrument: MassiveInstrument {}
+
+#[cfg(feature = "massive")]
+impl<Instrument> DynamicMassiveInstrument for Instrument where Instrument: MassiveInstrument {}
+
+/// Requires `MassiveInstrument` when the `massive` feature is enabled, and nothing otherwise.
+#[cfg(not(feature = "massive"))]
+pub trait DynamicMassiveInstrument {}
+
+#[cfg(not(feature = "massive"))]
+impl<Instrument> DynamicMassiveInstrument for Instrument {}
 
 /// Requires [`HyperliquidInstrument`] when the `hyperliquid` feature is enabled, and nothing
 /// otherwise. See [`DynamicLseInstrument`] for why this is a trait.
@@ -254,8 +313,8 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
     /// # Streams sharing a connection
     /// A venue supplied through `subscribers` receives a clone of that subscriber for every group,
     /// whichever batch it came from. Where clones share a connection, every group on that venue
-    /// shares it: across datasets and kinds on London Strategic Edge, and across kinds on each
-    /// Alpaca feed.
+    /// shares it: across datasets and kinds on London Strategic Edge, across kinds on each Alpaca
+    /// feed, and across kinds on each Massive cluster.
     ///
     /// # Errors
     /// Nothing is connected until every group has been routed, so these fail the call with no
@@ -270,12 +329,13 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
     /// finish initialising, stops every stream that succeeded, and returns the first error — so a
     /// failed call leaves no stream running: each is dropped before the call returns.
     ///
-    /// A dropped London Strategic Edge or Alpaca stream asks its connection to release its share,
-    /// and the connection does so asynchronously, closing the socket once no stream remains. A
-    /// retry through the same subscriber, or a clone of it, reuses that connection whatever state
-    /// it is in. A retry through a subscriber built separately for the same account may still be
-    /// refused — `TOO_MANY_CONNECTIONS` on London Strategic Edge, `connection limit exceeded` on
-    /// Alpaca — until the socket has closed.
+    /// A dropped London Strategic Edge, Alpaca or Massive stream asks its connection to release
+    /// its share, and the connection does so asynchronously, closing the socket once no stream
+    /// remains. A retry through the same subscriber, or a clone of it, reuses that connection
+    /// whatever state it is in. A retry through a subscriber built separately for the same account
+    /// may still be refused — `TOO_MANY_CONNECTIONS` on London Strategic Edge, `connection limit
+    /// exceeded` on Alpaca — until the socket has closed. Massive refuses nothing: it closes the
+    /// older socket instead, ending every stream still on it.
     ///
     /// ## Examples
     /// Please see rustrade-data-rs/examples/dynamic_multi_stream_multi_exchange.rs for a
@@ -844,12 +904,7 @@ mod tests {
             MarketDataInstrumentKind::Perpetual,
             MarketDataInstrumentKind::Cfd,
             MarketDataInstrumentKind::Future(MarketDataFutureContract { expiry }),
-            MarketDataInstrumentKind::Option(MarketDataOptionContract {
-                kind: OptionKind::Call,
-                exercise: OptionExercise::American,
-                expiry,
-                strike: Decimal::ONE_HUNDRED,
-            }),
+            option(),
         ]
     }
 
@@ -904,7 +959,26 @@ mod tests {
             crate::exchange::lse::live::LseCredentials::new("test-key"),
         ));
 
+        #[cfg(feature = "massive")]
+        let subscribers = subscribers.with_massive(massive_subscriber());
+
         subscribers
+    }
+
+    #[cfg(feature = "massive")]
+    fn massive_subscriber() -> MassiveSubscriber {
+        MassiveSubscriber::new(crate::exchange::massive::MassiveCredentials::new(
+            "test-key",
+        ))
+    }
+
+    fn option() -> MarketDataInstrumentKind {
+        MarketDataInstrumentKind::Option(MarketDataOptionContract {
+            kind: OptionKind::Call,
+            exercise: OptionExercise::American,
+            expiry: Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap(),
+            strike: Decimal::ONE_HUNDRED,
+        })
     }
 
     #[cfg(feature = "alpaca")]
@@ -919,6 +993,7 @@ mod tests {
         match feature {
             "alpaca" => cfg!(feature = "alpaca"),
             "lse" => cfg!(feature = "lse"),
+            "massive" => cfg!(feature = "massive"),
             "hyperliquid" => cfg!(feature = "hyperliquid"),
             other => panic!("no dynamic route is gated on the `{other}` feature"),
         }
@@ -966,17 +1041,9 @@ mod tests {
     #[test]
     fn a_pair_the_support_matrix_refuses_is_refused_before_routing() {
         // Options publish no quote, so an options L1 stream is refused rather than left silent.
-        let expiry = Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap();
-        let option = MarketDataInstrumentKind::Option(MarketDataOptionContract {
-            kind: OptionKind::Call,
-            exercise: OptionExercise::American,
-            expiry,
-            strike: Decimal::ONE_HUNDRED,
-        });
-
         let error = validate_batches([[subscription(
             ExchangeId::LseOptions,
-            option,
+            option(),
             SubKind::OrderBooksL1,
         )]])
         .unwrap_err();
@@ -1095,6 +1162,129 @@ mod tests {
             matches!(&error, DataError::Socket(message) if message.contains("alpaca_crypto")),
             "{error:?}"
         );
+    }
+
+    #[cfg(feature = "massive")]
+    #[test]
+    fn one_massive_batch_across_clusters_and_kinds_shares_one_subscriber() {
+        let subscriber = massive_subscriber();
+        let subscribers = DynamicSubscribers::default().with_massive(subscriber.clone());
+        let before = subscriber.connection_handles();
+
+        let groups = route(
+            vec![vec![
+                subscription(
+                    ExchangeId::MassiveCrypto,
+                    MarketDataInstrumentKind::Spot,
+                    SubKind::PublicTrades,
+                ),
+                subscription(
+                    ExchangeId::MassiveCrypto,
+                    MarketDataInstrumentKind::Spot,
+                    SubKind::OrderBooksL1,
+                ),
+                subscription(
+                    ExchangeId::MassiveCrypto,
+                    MarketDataInstrumentKind::Spot,
+                    SubKind::Candles {
+                        interval: CandleInterval::Min1,
+                    },
+                ),
+                subscription(
+                    ExchangeId::MassiveForex,
+                    MarketDataInstrumentKind::Spot,
+                    SubKind::OrderBooksL1,
+                ),
+                subscription(ExchangeId::MassiveOptions, option(), SubKind::PublicTrades),
+            ]],
+            &subscribers,
+        )
+        .unwrap();
+
+        // One group per (cluster, kind), each holding a clone of the one subscriber: a group given
+        // a subscriber of its own would open a second socket to its cluster, and Massive would close
+        // the older one.
+        assert_eq!(groups.len(), 5);
+        assert_eq!(subscriber.connection_handles(), before + groups.len());
+
+        drop(groups);
+        assert_eq!(subscriber.connection_handles(), before);
+    }
+
+    #[cfg(feature = "massive")]
+    #[test]
+    fn a_massive_subscription_without_a_subscriber_fails_the_call_before_any_group_connects() {
+        let error = route(
+            vec![
+                vec![subscription(
+                    ExchangeId::BinanceSpot,
+                    MarketDataInstrumentKind::Spot,
+                    SubKind::PublicTrades,
+                )],
+                vec![subscription(
+                    ExchangeId::MassiveForex,
+                    MarketDataInstrumentKind::Spot,
+                    SubKind::OrderBooksL1,
+                )],
+            ],
+            &DynamicSubscribers::default(),
+        )
+        .err()
+        .unwrap();
+
+        assert_eq!(
+            error,
+            DataError::SubscriberRequired {
+                exchange: ExchangeId::MassiveForex
+            }
+        );
+    }
+
+    #[cfg(not(feature = "massive"))]
+    #[test]
+    fn a_massive_subscription_without_the_feature_names_the_feature() {
+        let error = route(
+            vec![vec![subscription(
+                ExchangeId::MassiveCrypto,
+                MarketDataInstrumentKind::Spot,
+                SubKind::PublicTrades,
+            )]],
+            &DynamicSubscribers::default(),
+        )
+        .err()
+        .unwrap();
+
+        assert_eq!(
+            error,
+            DataError::FeatureDisabled {
+                exchange: ExchangeId::MassiveCrypto,
+                feature: "massive".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn massive_pairs_outside_the_support_matrix_are_refused_before_routing() {
+        for sub_kind in [
+            SubKind::Candles {
+                interval: CandleInterval::Min5,
+            },
+            // Forex publishes no trades, and the engine's market data carries no quote.
+            SubKind::PublicTrades,
+            SubKind::Quotes,
+        ] {
+            let error = validate_batches([[subscription(
+                ExchangeId::MassiveForex,
+                MarketDataInstrumentKind::Spot,
+                sub_kind,
+            )]])
+            .unwrap_err();
+
+            assert!(
+                matches!(&error, DataError::Socket(message) if message.contains("massive_forex")),
+                "{sub_kind}: {error:?}"
+            );
+        }
     }
 
     #[cfg(feature = "lse")]
