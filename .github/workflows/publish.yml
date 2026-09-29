@@ -41,8 +41,8 @@ jobs:
     name: Publish crates
     needs: validate
     runs-on: ubuntu-latest
-    # Above the worst case of six crates each spending cargo's own index wait plus the script's
-    # INDEX_TIMEOUT_SECS, so the script's timeout error fires before the job is killed
+    # Comfortably above the expected total, even with every crate slow to reach the index, so the
+    # script's own timeout error fires before the job is killed
     timeout-minutes: 45
     steps:
       - name: Checkout sources

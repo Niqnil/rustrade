@@ -74,7 +74,7 @@ index_lookup() {
     url="$INDEX_URL/$(index_path "$name")"
     INDEX_STATE=unreadable
     if ! status="$(curl -sS --retry 3 --max-time 30 -o "$body" -w '%{http_code}' \
-        "$url?nocache=$EPOCHSECONDS$RANDOM")"; then
+        "$url?nocache=$(date +%s)$RANDOM")"; then
         INDEX_ERROR="could not reach $url"
         return 0
     fi
