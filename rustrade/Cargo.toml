@@ -35,6 +35,7 @@ path = "benches/backtest/mod.rs"
 harness = false
 
 [dev-dependencies]
+rustrade-instrument = { workspace = true, features = ["test-utils"] }
 rust_decimal_macros = { workspace = true }
 serde_json = { workspace = true }
 spin_sleep = { workspace = true }

@@ -387,6 +387,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`rustrade`). It previously kept the last pair silently. Its wire format is unchanged: the
   hand-written serde impls are replaced by `collection::pair_seq`.
 
+- **BREAKING: test fixtures are no longer public API** (`rustrade-instrument`, `rustrade`,
+  `rustrade-data`). `rustrade_instrument::test_utils` is now behind a new off-by-default
+  `test-utils` feature; a crate whose tests use its fixtures enables it under
+  `[dev-dependencies]`. `rustrade::test_utils` is compiled only for that crate's own tests, and
+  `rustrade_data::test_utils` is removed, since nothing called its one function. The fixtures
+  hard-code names and assets and were never meant for use outside tests, yet as public items any
+  change to them was a breaking change.
+
+- **BREAKING: `PositionManager::positions` is an `FnvIndexMap`** (`rustrade`), like the other maps
+  in `EngineState`, instead of a SipHash-keyed `IndexMap`. Both keep insertion order, so iteration
+  is unchanged. Code that names the field's type, or builds a map to assign to it, uses
+  `rustrade_integration::collection::FnvIndexMap`.
+
+- **BREAKING: `IndexedInstruments::find_instrument_index` reports a missing instrument as
+  `IndexError::InstrumentIndex`** (`rustrade-instrument`). It returned `IndexError::AssetIndex`,
+  with a message that said "Asset" and listed the assets, which the lookup never searches. Code
+  that matched `IndexError::AssetIndex` from this method matches `IndexError::InstrumentIndex`
+  instead. The message now names the exchange and instrument sought, and lists the instruments by
+  exchange and internal name.
+
 - **REST clients negotiate and transparently decode gzip** (workspace `reqwest` dependency). The
   workspace now enables reqwest's `gzip` feature, so every `reqwest::Client` the crates build sends
   `Accept-Encoding: gzip` and decompresses gzip-encoded bodies before the caller sees them. That

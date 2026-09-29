@@ -14,6 +14,9 @@ description = "Core Rustrade Exchange, Instrument and Asset data structures and 
 [features]
 default = []
 ibkr = ["dep:ibapi", "dep:fnv", "dep:parking_lot"]
+# Test fixtures (`test_utils`) for this crate's dependents' tests. Enable it under
+# `[dev-dependencies]` only: the fixtures are not part of the supported API.
+test-utils = []
 
 [dev-dependencies]
 rust_decimal_macros = { workspace = true }

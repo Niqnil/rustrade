@@ -32,7 +32,6 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use derive_more::Constructor;
-use indexmap::IndexMap;
 use rust_decimal::Decimal;
 use rustrade_data::{event::MarketEvent, streams::consumer::MarketStreamEvent};
 use rustrade_execution::{
@@ -51,6 +50,7 @@ use rustrade_instrument::{
     },
 };
 use rustrade_integration::channel::Tx;
+use rustrade_integration::collection::FnvIndexMap;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use std::fmt::Debug;
@@ -1418,7 +1418,7 @@ pub(crate) struct SplitCommitContext<'a, InstrumentKey> {
 /// normalized message template.
 #[track_caller]
 pub(crate) fn split_plan_position_mut<'m, AssetKey, InstrumentKey>(
-    positions: &'m mut IndexMap<PositionId, Position<AssetKey, InstrumentKey>>,
+    positions: &'m mut FnvIndexMap<PositionId, Position<AssetKey, InstrumentKey>>,
     pos_id: &PositionId,
     context: SplitCommitContext<'_, InstrumentKey>,
 ) -> &'m mut Position<AssetKey, InstrumentKey>

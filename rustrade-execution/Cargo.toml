@@ -132,6 +132,7 @@ tokio-util = { version = "0.7", optional = true }
 uuid = { version = "1.0", optional = true }
 
 [dev-dependencies]
+rustrade-instrument = { workspace = true, features = ["test-utils"] }
 # test-util enables tokio::time::pause() and advance() for behavioral timing tests
 tokio = { workspace = true, features = ["test-util"] }
 # Mock HTTP server for testing REST pagination and truncation logic (H-1, H-3)

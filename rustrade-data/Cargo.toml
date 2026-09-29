@@ -44,6 +44,7 @@ lse-parquet = ["lse", "dep:parquet"]
 massive = ["dep:urlencoding", "rust_decimal/serde-with-float", "serde_json/raw_value"]
 
 [dev-dependencies]
+rustrade-instrument = { workspace = true, features = ["test-utils"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 rust_decimal_macros = { workspace = true }
 time = { version = "0.3", features = ["macros"] }  # For ibkr tests and databento examples
