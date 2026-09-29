@@ -33,18 +33,22 @@
 //!
 //! # Sharing is by clone, and only by clone
 //! Clones of one subscriber share its connections. Two subscribers built separately open a socket
-//! each, and a provider that caps connections refuses the second — visibly, which is left to
-//! surface rather than papered over by a process-wide registry.
+//! each, and a provider that caps connections refuses the second, or closes the first — visibly,
+//! which is left to surface rather than papered over by a process-wide registry.
 
 // A toolkit for the providers that share a connection, each of which uses only part of it, so a
 // build enabling some of them leaves the rest unused. A build enabling all of them, as CI's does,
 // still reports anything none of them uses.
 #![cfg_attr(
-    not(all(feature = "alpaca", feature = "lse")),
+    not(all(feature = "alpaca", feature = "lse", feature = "massive")),
     allow(dead_code, unused_imports)
 )]
 
 mod actor;
+// Only the providers that pack several messages into one frame use it, and it needs
+// `serde_json/raw_value`, which only their features enable.
+#[cfg(any(feature = "alpaca", feature = "massive"))]
+pub(crate) mod elements;
 mod registry;
 
 pub(crate) use registry::{Registration, Registry};
@@ -106,6 +110,14 @@ pub(crate) trait Protocol: Debug + Sized + Send + 'static {
 
     /// Whether a refused subscribe added none of what it asked for, so there is nothing to release.
     const REFUSAL_IS_ATOMIC: bool;
+
+    /// How often the connection pings the provider, if at all.
+    ///
+    /// For a provider whose sockets can die without a close — a dropped route, a provider that
+    /// stops answering — and whose streams can be quiet for longer than the consumer would wait to
+    /// notice. A socket that delivers nothing, not even the pong, between one ping and the next is
+    /// lost, so a dead socket is noticed within twice the interval.
+    const KEEPALIVE: Option<Duration> = None;
 
     /// Appended to the warning for frames discarded when a reconnect is lost before the stream
     /// they were held for re-attached.
@@ -208,6 +220,13 @@ pub(crate) trait Handshake<Answer>: Send {
 
     /// Why the handshake did not settle within `timeout`.
     fn timed_out(&self, timeout: Duration) -> String;
+
+    /// Add to a refusal what the handshake knows of it, such as what was not confirmed.
+    ///
+    /// Called once every confirmation in the refusal's frame has been observed.
+    fn refusal(&self, error: SocketError) -> SocketError {
+        error
+    }
 }
 
 /// What one frame amounted to, once whatever it carries for the streams is routed.

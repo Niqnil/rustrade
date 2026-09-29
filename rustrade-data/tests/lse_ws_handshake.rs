@@ -701,18 +701,15 @@ where
         .expect("the stream yielded an error instead of an event")
 }
 
-/// The invariant [`LseStream`] exists for, end to end.
+/// The resume ordering [`LseStream`] guarantees, end to end.
 ///
-/// A replayed tick can already be sitting in the handshake's buffered events: it fails to
-/// deserialise as a subscription response while other symbols are still confirming, and lands
-/// there. The resume state must therefore reach the transformer **before** those buffered events
-/// are processed, which is the only reason this connector does not use the blanket WebSocket
-/// stream.
+/// A replayed tick can already be waiting for the stream when its attach returns. The resume state
+/// must therefore reach the transformer **before** any frame is processed.
 ///
 /// The pieces are covered in isolation elsewhere — the transformer's skip logic in its own unit
-/// tests, the buffering in `frames_arriving_during_validation_are_buffered_rather_than_dropped`.
-/// This is what joins them: reorder the two statements in `LseStream::init` and every other test in
-/// this repository still passes, while every reconnect of a resumed subscription starts delivering
+/// tests, the hand-over in the connection's. This is what joins them: hand the resume state to the
+/// transformer after the first frame in `SharedStream::init` and every other test in this
+/// repository still passes, while every reconnect of a resumed subscription starts delivering
 /// duplicates.
 #[tokio::test]
 #[serial]

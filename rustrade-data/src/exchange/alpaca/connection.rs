@@ -62,8 +62,10 @@ use super::{
 };
 use crate::subscriber::shared::{
     self, AttachId, Attachment, Connections, Frame, Handshake, Protocol, Registry,
+    elements::{self, Element, Elements, excerpt},
 };
-use fnv::{FnvHashMap, FnvHashSet};
+use crate::subscriber::shared_stream::{SharedTransport, sealed};
+use fnv::FnvHashSet;
 use futures::Stream;
 use rustrade_instrument::exchange::ExchangeId;
 use rustrade_integration::{
@@ -292,9 +294,7 @@ impl Protocol for Alpaca {
                 data,
                 answers,
             } => {
-                if !data.is_empty() {
-                    route(registry, message, total, &data);
-                }
+                elements::route(registry, message, total, &data);
                 Frame::Answers(answers)
             }
             Classified::Closed(cause) => Frame::Closed(cause),
@@ -343,6 +343,17 @@ impl Stream for AlpacaAttachment {
     }
 }
 
+impl sealed::Sealed for AlpacaAttachment {}
+
+/// Alpaca hands a stream nothing on attaching.
+impl SharedTransport for AlpacaAttachment {
+    type Attached = ();
+
+    fn take_attached(&mut self) {
+        self.0.take_attached()
+    }
+}
+
 /// Add to a refused authentication what usually causes it.
 fn connection_limit_context(error: SocketError) -> SocketError {
     match error {
@@ -355,80 +366,6 @@ fn connection_limit_context(error: SocketError) -> SocketError {
         }
         other => other,
     }
-}
-
-/// One data element of a frame, as routing reads it.
-#[derive(Debug)]
-struct Element<'a> {
-    slot: Slot,
-    raw: &'a RawValue,
-}
-
-/// Deliver a frame's data `elements` to the registrations holding them.
-///
-/// A registration every element of `frame` belongs to — `total` counts the frame's elements of
-/// every kind — receives `frame` itself. Any other receives a frame of only its own elements, in
-/// their original order and spelling.
-fn route(
-    registry: &mut Registry<Alpaca>,
-    frame: &WsMessage,
-    total: usize,
-    elements: &[Element<'_>],
-) {
-    // Counted before anything is copied, so a stream owning the whole frame costs no copy.
-    let mut counts = FnvHashMap::<AttachId, usize>::default();
-
-    for element in elements {
-        let Some(holders) = registry.holders(&element.slot) else {
-            // Normal for a moment after an unsubscribe, while frames already in flight arrive.
-            debug!(
-                channel = element.slot.channel.as_ref(),
-                symbol = %element.slot.symbol,
-                "Alpaca message for a subscription no stream holds",
-            );
-            continue;
-        };
-
-        for id in holders {
-            *counts.entry(*id).or_default() += 1;
-        }
-    }
-
-    for (id, count) in counts {
-        let frame = if count == total {
-            frame.clone()
-        } else {
-            WsMessage::text(share(registry, id, elements))
-        };
-
-        registry.deliver(id, frame);
-    }
-}
-
-/// A frame of only the `elements` `id` holds, in their original order and spelling.
-fn share(registry: &Registry<Alpaca>, id: AttachId, elements: &[Element<'_>]) -> String {
-    // Sized for every element, so it never grows: bounded by the frame it is cut from.
-    let capacity = elements
-        .iter()
-        .map(|element| element.raw.get().len() + 1)
-        .sum::<usize>()
-        + 1;
-    let mut share = String::with_capacity(capacity);
-
-    share.push('[');
-    for element in elements.iter().filter(|element| {
-        registry
-            .holders(&element.slot)
-            .is_some_and(|holders| holders.contains(&id))
-    }) {
-        if share.len() > 1 {
-            share.push(',');
-        }
-        share.push_str(element.raw.get());
-    }
-    share.push(']');
-
-    share
 }
 
 /// The part of a frame element routing reads.
@@ -447,7 +384,7 @@ enum Classified<'a> {
     Elements {
         /// Every element in the frame, of every kind.
         total: usize,
-        data: Vec<Element<'a>>,
+        data: Vec<Element<'a, Slot>>,
         answers: Vec<Result<FnvHashSet<Slot>, SocketError>>,
     },
     Closed(String),
@@ -455,35 +392,10 @@ enum Classified<'a> {
 }
 
 fn classify(message: &WsMessage) -> Classified<'_> {
-    let text = match message {
-        WsMessage::Text(text) => text.as_str(),
-        WsMessage::Binary(bytes) => match std::str::from_utf8(bytes) {
-            Ok(text) => text,
-            Err(_) => {
-                warn!(
-                    len = bytes.len(),
-                    "Alpaca sent a binary frame that is not UTF-8; ignored"
-                );
-                return Classified::Ignored;
-            }
-        },
-        WsMessage::Close(frame) => {
-            return Classified::Closed(format!("closed by Alpaca: {frame:?}"));
-        }
-        // Pings are answered by the socket itself.
-        _ => return Classified::Ignored,
-    };
-
-    let elements = match serde_json::from_str::<Vec<&RawValue>>(text) {
-        Ok(elements) => elements,
-        Err(error) => {
-            warn!(
-                %error,
-                frame = %text.chars().take(200).collect::<String>(),
-                "Alpaca sent a frame that is not a JSON array; ignored",
-            );
-            return Classified::Ignored;
-        }
+    let elements = match elements::elements::<Alpaca>(message) {
+        Elements::Array(elements) => elements,
+        Elements::Closed(cause) => return Classified::Closed(cause),
+        Elements::Ignored => return Classified::Ignored,
     };
 
     let total = elements.len();
@@ -496,7 +408,7 @@ fn classify(message: &WsMessage) -> Classified<'_> {
             Err(error) => {
                 warn!(
                     %error,
-                    element = %raw.get().chars().take(200).collect::<String>(),
+                    element = %excerpt(raw.get()),
                     "Alpaca sent a message with no type; ignored",
                 );
                 continue;
@@ -519,7 +431,7 @@ fn classify(message: &WsMessage) -> Classified<'_> {
 
         let Some(symbol) = envelope.symbol else {
             warn!(
-                element = %raw.get().chars().take(200).collect::<String>(),
+                element = %excerpt(raw.get()),
                 "Alpaca sent a market data message with no symbol; ignored",
             );
             continue;

@@ -4,10 +4,10 @@ use super::{
     connection::{AttachRequest, LseAttachment, LseConnection},
     mapper::LseSubMapper,
     market::LseDataset,
-    osi,
     resume::{LseResumeState, epoch_seconds},
 };
 use crate::exchange::lse::transport::api_key_from_env;
+use crate::exchange::osi;
 use crate::{
     Identifier,
     exchange::Connector,
@@ -194,11 +194,6 @@ impl LseSubscriber {
     pub(crate) fn connection_handles(&self) -> usize {
         Arc::strong_count(&self.connection)
     }
-
-    /// The resume state this subscriber shares with the streams it opens, if any.
-    pub(super) fn resume_state(&self) -> Option<Arc<LseResumeState>> {
-        self.resume.clone()
-    }
 }
 
 impl Subscriber for LseSubscriber {
@@ -283,6 +278,14 @@ impl Subscriber for LseSubscriber {
         let underlyings = subscribes_per_underlying(exchange)
             .then(|| option_underlyings(exchange, &markets))
             .transpose()?;
+
+        if underlyings.is_some() && self.resume.is_some() {
+            warn!(
+                %exchange,
+                "London Strategic Edge option contracts do not resume; this stream will not \
+                 replay what a reconnect missed",
+            );
+        }
 
         // Only the instrument map is taken from the mapper. The subscribe payloads are
         // built by the connection instead, because it alone knows what the socket already holds

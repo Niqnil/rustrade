@@ -69,14 +69,16 @@ use super::{
         unsubscribe_message, unsubscribe_options_message,
     },
     mapper::subscription_id,
-    osi,
     resume::{LseResumeKey, LseResumeState},
     subscription::LseSubResponse,
+    transformer::{LseResume, ResumeContext},
 };
+use crate::exchange::osi;
 use crate::subscriber::shared::{
     self, AttachId, Attachment, Batch, Connections, Frame, Handshake, Protocol, Registration,
     Registry,
 };
+use crate::subscriber::shared_stream::{SharedTransport, sealed};
 use chrono::{DateTime, Utc};
 use fnv::{FnvHashMap, FnvHashSet};
 use futures::Stream;
@@ -183,6 +185,7 @@ impl From<AttachRequest> for shared::AttachRequest<Lse> {
             slots,
             timeout,
             batch: LseBatch {
+                kind,
                 markets,
                 per_underlying,
                 resume,
@@ -196,6 +199,9 @@ impl From<AttachRequest> for shared::AttachRequest<Lse> {
 /// What a London Strategic Edge registration keeps beyond its exchange, kind and slots.
 #[derive(Debug)]
 pub(super) struct LseBatch {
+    /// [`SubscriptionKind::as_str`](crate::subscription::SubscriptionKind::as_str) of the batch,
+    /// which the resume state is partitioned by.
+    kind: &'static str,
     /// The symbols requested, in request order: option contracts on the options dataset.
     markets: Vec<SmolStr>,
     /// Whether the batch subscribes per option underlying rather than per symbol.
@@ -210,7 +216,7 @@ pub(super) struct LseBatch {
 }
 
 impl Batch for LseBatch {
-    type Attached = FnvHashMap<SubscriptionId, DateTime<Utc>>;
+    type Attached = LseResume;
 
     /// Equal markets, and the same resume state by identity: the replay windows opened for a
     /// registration were chosen from its own state, so a clone resuming from a different one, or
@@ -226,8 +232,24 @@ impl Batch for LseBatch {
         self.markets == other.markets && same_resume
     }
 
-    fn attached(&self) -> Self::Attached {
-        self.starts.clone()
+    /// The resume state, the kind it is filed under, and the replay windows opened for the stream
+    /// on the current socket. A window may open earlier than the stream's own watermark, because a
+    /// symbol has one per connection, opened at the earliest watermark any stream holding it
+    /// needs.
+    ///
+    /// Nothing for option contracts, which never resume -- see `LseOptions`. Handed over, the
+    /// state would skip live prints at the watermark's instant as though a replay had re-sent
+    /// them, when no replay was asked for.
+    fn attached(&self) -> LseResume {
+        if self.per_underlying {
+            return LseResume::default();
+        }
+
+        LseResume(self.resume.as_ref().map(|state| ResumeContext {
+            state: Arc::clone(state),
+            kind: self.kind,
+            starts: self.starts.clone(),
+        }))
     }
 
     fn reset(&mut self) {
@@ -426,22 +448,22 @@ impl Protocol for Lse {
 #[derive(Debug)]
 pub struct LseAttachment(Attachment<Lse>);
 
-impl LseAttachment {
-    /// The replay windows opened for this stream: each subscription the connection resumed on its
-    /// behalf, and the instant the window opens at.
-    ///
-    /// That instant may be earlier than the stream's own watermark, because a symbol has one window
-    /// per connection and it opens at the earliest watermark any stream holding it needs.
-    pub(super) fn take_starts(&mut self) -> FnvHashMap<SubscriptionId, DateTime<Utc>> {
-        self.0.take_attached()
-    }
-}
-
 impl Stream for LseAttachment {
     type Item = Result<WsMessage, WsError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.0).poll_next(cx)
+    }
+}
+
+impl sealed::Sealed for LseAttachment {}
+
+/// A stream is handed what it needs to resume, if it resumes.
+impl SharedTransport for LseAttachment {
+    type Attached = LseResume;
+
+    fn take_attached(&mut self) -> LseResume {
+        self.0.take_attached()
     }
 }
 
@@ -643,7 +665,7 @@ fn classify(message: &WsMessage) -> Classified {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
     use crate::subscription::{SubscriptionKind, book::OrderBooksL1, trade::PublicTrades};
@@ -722,7 +744,7 @@ mod tests {
     }
 
     fn starts(registry: &Registry<Lse>, id: AttachId) -> FnvHashMap<SubscriptionId, DateTime<Utc>> {
-        registry.get(id).unwrap().batch.attached()
+        registry.get(id).unwrap().batch.starts.clone()
     }
 
     #[test]
@@ -843,6 +865,50 @@ mod tests {
                 Some(&at("2026-08-14T10:00:01Z")),
             );
         }
+    }
+
+    /// A stream is handed its subscriber's resume state, filed under its own kind, with the windows
+    /// opened for it; one that does not resume, and an option batch, which never does, nothing.
+    #[test]
+    fn a_stream_is_handed_what_it_resumes_from_and_an_option_batch_nothing() {
+        let state = Arc::new(LseResumeState::new());
+        record(
+            &state,
+            ExchangeId::LseCrypto,
+            "BTC/USD",
+            TRADES,
+            "2026-08-14T10:00:01Z",
+        );
+
+        let mut registry = Registry::default();
+        let (resumed, _rx1) = live(
+            &mut registry,
+            request(ExchangeId::LseCrypto, TRADES, &["BTC/USD"], Some(&state)),
+        );
+        let (unresumed, _rx2) = live(
+            &mut registry,
+            request(ExchangeId::LseCrypto, TRADES, &["ETH/USD"], None),
+        );
+        let (options, _rx3) = live(
+            &mut registry,
+            AttachRequest {
+                resume: Some(Arc::clone(&state)),
+                ..options_request(&["SPY260930C00700000"], &["SPY"])
+            },
+        );
+        plan_starts(&mut registry, &[symbol("BTC/USD")]);
+
+        let attached = |id| registry.get(id).unwrap().batch.attached().0;
+
+        let context = attached(resumed).expect("a resuming stream was handed nothing");
+        assert!(Arc::ptr_eq(&context.state, &state));
+        assert_eq!(context.kind, TRADES);
+        assert_eq!(
+            context.starts.get(&subscription_id("BTC/USD")),
+            Some(&at("2026-08-14T10:00:01Z")),
+        );
+        assert!(attached(unresumed).is_none());
+        assert!(attached(options).is_none());
     }
 
     /// A window is asked for on the strength of what the holder itself delivered, per dataset and

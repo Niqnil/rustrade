@@ -40,7 +40,9 @@ Integration library for streaming public market data from exchanges and data pro
 
 | Provider | Constructor | InstrumentKinds | SubscriptionKinds |
 |:--------:|:-----------:|:---------------:|:-----------------:|
-| **Massive** | `MassiveRestClient` / `MassiveLive` | Spot, Future, Option | PublicTrades, Quotes, Candles |
+| **Massive** (REST) | `MassiveRestClient::from_env()` | Spot, Future, Option | PublicTrades, Quotes, Candles (historical) |
+| **MassiveStocks** / **MassiveCrypto** / **MassiveOptions** | `MassiveStocks::default()` etc., with `MassiveSubscriber` | Spot (Equities, Crypto), Option | PublicTrades, Quotes, OrderBooksL1, Candles (1s, 1m) |
+| **MassiveForex** | `MassiveForex::default()`, with `MassiveSubscriber` | Spot (FX) | Quotes, OrderBooksL1, Candles (1s, 1m) |
 | **Databento** | `DatabentoHistorical` / `DatabentoLive` | Spot, Future, Option | PublicTrades, Quotes, Candles |
 | **LseFx** | `LseFx::default()` | Spot (FX) | PublicTrades, OrderBooksL1 |
 | **LseCrypto** | `LseCrypto::default()` | Spot (Crypto) | PublicTrades, OrderBooksL1 |

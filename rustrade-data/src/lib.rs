@@ -128,7 +128,7 @@ use wiremock as _;
 #[cfg(test)]
 use time as _;
 // temp_env is only referenced by the in-tree unit tests under the `massive` feature
-// (exchange::massive::{live, rest}), so it is unused when that feature is off.
+// (exchange::massive::rest), so it is unused when that feature is off.
 #[cfg(test)]
 use temp_env as _;
 // http is only referenced by the in-tree unit tests under the `ibkr` feature
@@ -142,11 +142,11 @@ use http as _;
 // only when that feature is off.)
 #[cfg(test)]
 use {hex as _, sha2 as _, tempfile as _};
-// tokio_tungstenite is a dev-dependency for the `lse` WebSocket handshake test
-// (tests/lse_ws_handshake.rs), which speaks the server half of the protocol in-process and compiles
-// as a separate unit. It is *also* a non-dev dependency under the `massive` feature, where the lib
-// itself uses it -- so this stub matters only when that feature is off, and the `cfg(test)` gate is
-// load-bearing: an unconditional `use` would fail to resolve in a non-test build without `massive`.
+// tokio_tungstenite is a dev-dependency, for the tests that speak the server half of a WebSocket
+// protocol in-process: the shared-connection actor's unit tests, and the integration tests
+// (tests/lse_ws_handshake.rs, tests/alpaca_ws_shared.rs, tests/massive_ws_shared.rs), which compile
+// as separate units. The `cfg(test)` gate is load-bearing: it is not a dependency of a non-test
+// build, so an unconditional `use` would fail to resolve.
 #[cfg(test)]
 use tokio_tungstenite as _;
 

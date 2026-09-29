@@ -41,7 +41,7 @@ lse = ["dep:sha2", "dep:hex", "reqwest/stream", "tokio/fs", "tokio/io-util"]
 # The column-reader API this uses needs none of it. Tier-2 reviewed — see
 # `.github/tier2-dependencies.txt`.
 lse-parquet = ["lse", "dep:parquet"]
-massive = ["dep:tokio-tungstenite", "dep:urlencoding", "rust_decimal/serde-with-float", "serde_json/raw_value"]
+massive = ["dep:urlencoding", "rust_decimal/serde-with-float", "serde_json/raw_value"]
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
@@ -140,7 +140,6 @@ hyperliquid_rust_sdk = { version = "0.6", optional = true }
 databento = { version = "0.61", optional = true, features = ["chrono"] }
 
 # Massive (optional, behind "massive" feature)
-tokio-tungstenite = { version = "0.30", optional = true, features = ["native-tls"] }
 urlencoding = { version = "2.1", optional = true }
 
 # Integration tests whose contents are entirely feature-gated. Without `required-features`, the
@@ -241,6 +240,10 @@ required-features = ["massive"]
 
 [[test]]
 name = "massive_pagination"
+required-features = ["massive"]
+
+[[test]]
+name = "massive_ws_shared"
 required-features = ["massive"]
 
 # Examples that depend on optional features. Without `required-features`,

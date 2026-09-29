@@ -27,8 +27,12 @@ pub mod validator;
 
 /// One connection shared by every stream a subscriber and its clones open, for providers that cap
 /// how many connections a key may hold.
-#[cfg(any(feature = "alpaca", feature = "lse"))]
+#[cfg(any(feature = "alpaca", feature = "lse", feature = "massive"))]
 pub(crate) mod shared;
+
+/// The market stream of every provider whose streams share one connection.
+#[cfg(any(feature = "alpaca", feature = "lse", feature = "massive"))]
+pub mod shared_stream;
 
 /// Defines how to connect to a socket and subscribe to market data streams.
 ///

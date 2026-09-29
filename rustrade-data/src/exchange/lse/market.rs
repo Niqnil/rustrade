@@ -1,5 +1,6 @@
-use super::{Lse, osi};
+use super::Lse;
 use crate::exchange::lse::error::LseError;
+use crate::exchange::osi;
 use crate::subscription::candle::CandleInterval;
 use crate::{Identifier, instrument::MarketInstrumentData, subscription::Subscription};
 use rustrade_instrument::asset::name::AssetNameInternal;

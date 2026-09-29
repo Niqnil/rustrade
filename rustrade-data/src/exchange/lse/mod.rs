@@ -129,8 +129,6 @@ pub mod options;
 /// London Strategic Edge symbology: datasets, underlying assets, quote currencies and slugs.
 pub mod market;
 
-pub(crate) mod osi;
-
 #[cfg(feature = "lse-parquet")]
 pub mod parquet;
 
@@ -168,6 +166,7 @@ use self::{
     stream::LseStream,
     subscription::LseSubResponse,
 };
+use crate::exchange::osi;
 use crate::{
     NoInitialSnapshots,
     exchange::{Connector, ExchangeServer, ExchangeSub, StreamSelector},

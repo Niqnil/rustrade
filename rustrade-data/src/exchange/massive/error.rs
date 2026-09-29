@@ -30,8 +30,8 @@ fn truncate_for_display(s: &str, max_bytes: usize) -> (&str, &'static str) {
 
 /// Massive-specific errors.
 ///
-/// The library returns these errors without automatic retry or reconnection.
-/// Consumers decide how to handle rate limits, disconnections, and auth failures.
+/// The library returns these errors without automatic retry.
+/// Consumers decide how to handle rate limits and auth failures.
 ///
 /// `#[non_exhaustive]`: new variants may be added without a major-version bump, so
 /// downstream `match`es must include a wildcard arm.
@@ -42,15 +42,6 @@ pub enum MassiveError {
     ///
     /// Returned on HTTP 429 responses. The consumer decides whether and when to retry.
     RateLimited { retry_after: Option<Duration> },
-
-    /// WebSocket connection dropped or ping timeout exceeded.
-    ///
-    /// Returned when:
-    /// - WebSocket connection closes unexpectedly
-    /// - Pong not received within 19 seconds of ping
-    ///
-    /// The consumer owns reconnection policy (backoff, credential refresh, dedup).
-    Disconnected { reason: String },
 
     /// Authentication failed.
     ///
@@ -166,9 +157,6 @@ impl std::fmt::Display for MassiveError {
                 }
                 Ok(())
             }
-            MassiveError::Disconnected { reason } => {
-                write!(f, "Massive disconnected: {}", reason)
-            }
             MassiveError::Auth { message } => {
                 write!(f, "Massive auth failed: {}", message)
             }
@@ -243,14 +231,6 @@ impl From<reqwest::Error> for MassiveError {
     fn from(err: reqwest::Error) -> Self {
         MassiveError::Http {
             message: err.to_string(),
-        }
-    }
-}
-
-impl From<tokio_tungstenite::tungstenite::Error> for MassiveError {
-    fn from(err: tokio_tungstenite::tungstenite::Error) -> Self {
-        MassiveError::Disconnected {
-            reason: err.to_string(),
         }
     }
 }
@@ -380,9 +360,6 @@ mod tests {
                 retry_after: Some(Duration::from_secs(5)),
             },
             MassiveError::RateLimited { retry_after: None },
-            MassiveError::Disconnected {
-                reason: multibyte.clone(),
-            },
             MassiveError::Auth {
                 message: multibyte.clone(),
             },
