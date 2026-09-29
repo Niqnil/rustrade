@@ -176,14 +176,30 @@ Before cutting a release, verify documentation is current:
 
 **Release process (maintainers):**
 
-We use a **two-PR flow** so `develop` and `main` stay in sync — the version bump lands on `develop` first, so there's no post-release back-merge:
+We use a **two-PR flow** so `develop` and `main` stay in sync — the version bump lands on `develop` first, so there's no post-release back-merge, only a fast-forward (step 4):
 
 1. Complete the pre-release checklist above.
 2. Create a release-prep branch off `develop` (e.g. `release/x.y.z`):
    - Bump versions in all `Cargo.toml` files and re-sync `Cargo.lock` (CI runs `--locked`, so the lock must stay consistent).
    - Rename `[Unreleased]` → `[x.y.z] - YYYY-MM-DD` and add a fresh empty `[Unreleased]`.
 3. Open the release-prep PR targeting **`develop`**; merge after CI is green.
-4. Open the release PR **`develop` → `main`**; merge after CI is green.
+4. Open the release PR **`develop` → `main`**; merge it after CI is green, **as a merge commit,
+   not a squash**. A `Closes #N` in a commit message on `develop` fires only when that commit
+   reaches `main`, and a squash leaves those messages behind.
+
+   Then fast-forward `develop` to the merge commit:
+
+   ```bash
+   git fetch origin
+   git push origin origin/main:refs/heads/develop
+   ```
+
+   The merge commit's parents are the previous `main` tip and `develop`'s tip, so this adds no
+   commit to `develop` and changes no file. It makes `main` an ancestor of `develop` again. Skip it
+   and `develop` never holds `main`'s merge commits, so the next release PR shows as out of date,
+   which `main`'s branch protection treats as a blocker. The push goes straight to `develop`, so it
+   needs a maintainer who can bypass that branch's protection. Git refuses it if `develop` gained a
+   commit after the release PR merged; in that case, open a PR from `main` into `develop` instead.
 5. Tag the **merge commit on `main`** — not `develop`'s tip. Step 4 leaves you on `develop`, so a
    bare `git tag vx.y.z` would tag the wrong commit. Name the commit explicitly:
 
