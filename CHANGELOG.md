@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Massive WebSocket market data through `Streams`, with `MassiveSubscriber` sharing one
+  connection per cluster** (`rustrade-data`, feature `massive`). Four connectors, `MassiveStocks`,
+  `MassiveCrypto`, `MassiveForex` and `MassiveOptions`, serve `PublicTrades`, `Quotes`,
+  `OrderBooksL1` and `Candles` like any other exchange. Forex publishes no trades, so
+  `MassiveForex` has no `PublicTrades`. Candles come at `CandleInterval::Sec1` and `Min1` only,
+  the two intervals Massive aggregates at; any other is refused before a connection is opened. A
+  forex quote carries no sizes, so its amounts are zero, and a forex candle reports no volume,
+  because Massive builds it from quote updates. Only crypto trades carry an aggressor side.
+  Markets are spelled from the instrument as each cluster's messages spell them: `AAPL`,
+  `BTC-USD`, `EUR/USD`, and `O:` plus the OSI symbol. The options connector refuses an instrument
+  that is not an option contract. It is untested, because it needs an options subscription.
+
+  Massive allows a key a fixed number of connections per cluster, one on an individual plan, and
+  past it **closes the older connection** with a `max_connections` status. So every stream a
+  subscriber and its clones open on a cluster shares one socket to it. Each channel and market is
+  subscribed once, however many streams hold it, and unsubscribed when the last of them is dropped.
+  A subscribe returns once Massive has confirmed every subscription by name. Massive refuses one
+  with a bare `not authorized` that names nothing, so the error lists what it never confirmed. It
+  answers nothing at all for a channel the cluster does not publish, so that case surfaces as the
+  subscription timeout, again naming what went unconfirmed. The connection pings every 20 s
+  (`connection::KEEPALIVE`) and treats a socket that stays silent since the previous ping as lost.
+  A lost or evicted socket ends every stream on it, and they reconnect together on one new socket.
+  **Pass clones of one subscriber to every stream on a key**: a subscriber built separately, or
+  another process, evicts this one, and the warning logged for the lost connection quotes
+  Massive's `max_connections` status. The new public `MassiveServer` trait lets a cluster type of
+  your own point elsewhere, such as the legacy `socket.polygon.io` host. This replaces `MassiveLive`;
+  see Removed.
+
+  ⚠️ Massive data may not be redistributed. See
+  <https://massive.com/legal/market-data-terms-of-service> (§5(c)).
+
 - **`DynamicStreams` serves Alpaca market data, through `DynamicSubscribers::with_alpaca`**
   (`rustrade-data`, feature `alpaca`). The support matrix now accepts trades and top of book on
   `AlpacaCrypto`, `AlpacaIex` and `AlpacaSip`, and `DynamicStreams::init_with` routes them. Alpaca
@@ -175,6 +206,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kind, `PublicTrades`, served over the WebSocket by the `LseOptions` connector.
   *Note:* `ExchangeId` is not `#[non_exhaustive]`, so downstream exhaustive `match`es need a new arm.
 
+- **`ExchangeId::MassiveStocks`, `MassiveCrypto`, `MassiveForex` and `MassiveOptions`**
+  (`rustrade-instrument`), appended at the end of the enum so no existing index is renumbered.
+  There is one per Massive WebSocket cluster, because Massive caps connections per cluster, and each
+  is served by the connector of the same name. `ExchangeId::Massive` stays, for the REST client.
+  *Note:* `ExchangeId` is not `#[non_exhaustive]`, so downstream exhaustive `match`es need new arms.
+
 - **`LseCalendarEvent` and the economic-calendar fetch, with
   `LseDataApiClient::fetch_economic_calendar` and `fetch_economic_calendar_stats`**
   (`rustrade-data`, feature `lse`). The provider's archive of scheduled macroeconomic releases —
@@ -327,11 +364,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on a separate reqwest major and is unaffected.
 
 - **Massive WebSocket clients connect to `socket.massive.com`** (`rustrade-data`, feature
-  `massive`). `MassiveLive` still defaulted every market (stocks, crypto, forex, options) to the
-  legacy `socket.polygon.io` host, while the REST client already used `api.massive.com`. A live
-  probe of the new host found the greeting, authentication, subscribe acknowledgement and tick
-  schema identical to the old one. The legacy host is still reachable through
-  `MassiveLive::with_ws_url`, which takes the full URL including the market path. No API change.
+  `massive`). The WebSocket client used to default every market (stocks, crypto, forex, options)
+  to the legacy `socket.polygon.io` host, while the REST client already used `api.massive.com`. A
+  live probe of the new host found the greeting, authentication, subscribe acknowledgement and tick
+  schema identical to the old one. The new connectors use it (`WEBSOCKET_URL_STOCKS` and so on).
+  The legacy host is reachable through a `MassiveServer` type of your own.
 
 - **BREAKING: an `AlpacaSubscriber` and its clones share one connection per feed, so one feed can
   stream trades and quotes at once** (`rustrade-data`, feature `alpaca`). Alpaca allows an account
@@ -353,7 +390,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   account**: a subscriber built separately opens its own connection, which Alpaca refuses while
   another is open on the feed. The error now says so. Breaking changes: `AlpacaSubscriber`'s
   `Subscriber::Transport` is the new `AlpacaAttachment`; `AlpacaWsStream` is replaced by
-  `AlpacaStream`, the type both `StreamSelector` impls now name; and cloning a subscriber is no
+  `AlpacaStream`, the type every `StreamSelector` impl now names, an alias of the generic
+  `SharedStream` described below; and cloning a subscriber is no
   longer equivalent to building another, because clones share its connections. **An attachment's queue
   is unbounded**: the connection reads one socket for every stream on it and never waits for a
   slow one, so a stream that stops being polled buffers in memory rather than applying back-pressure.
@@ -480,6 +518,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no longer back-pressures the socket, which must keep being read for the other streams; its frames
   queue in memory until it is polled again or dropped. See the shared-connection entry under Added.
 
+- **BREAKING: `AlpacaStream` and `LseStream` are type aliases of one generic `SharedStream`**
+  (`rustrade-data`, features `alpaca`, `lse` or `massive`). The new public module
+  `subscriber::shared_stream` holds `SharedStream<Transport, Transformer>`: a single `MarketStream`
+  implementation for every provider whose streams share one connection, `MassiveStream` included.
+  The transport it reads is one of the providers' attachments, behind the sealed `SharedTransport`
+  trait. Anything a stream needs from its attachment while initialising passes through the
+  `AttachedTransformer` trait. The London Strategic Edge resume position travels that way, as the
+  opaque `LseResume`. Code naming `AlpacaStream<T>` or `LseStream<E, K, Kind>` is unaffected.
+  Code that named either as a distinct type, for instance to implement a trait for it, must now
+  target `SharedStream`.
+
 - **BREAKING: `Open::id` and `RequestCancel::id` now carry a `VenueOrderId`, which distinguishes an
   order the venue named from one it did not** (`rustrade-execution`). Both fields previously held a
   plain `OrderId`, and that field had come to mean two different things. A venue that accepts an
@@ -570,7 +619,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrap its failure in their own error type, so that redaction has a single definition and cannot
   drift between the two surfaces. The messages themselves are unchanged.
 
+### Removed
+
+- **BREAKING: `MassiveLive`, `ChannelType` and `massive::Market`** (`rustrade-data`, feature
+  `massive`). Massive's WebSocket is now served through `Streams` by the new connectors and
+  `MassiveSubscriber` (see Added). They share one connection per cluster, confirm every
+  subscription by name, ping, and reconnect. `MassiveLive` opened a socket per client and
+  subscribed channels that do not exist (see Fixed). To migrate, build one
+  `MassiveSubscriber::from_env()?` and subscribe to `(MassiveCrypto::default(), "btc", "usd",
+  MarketDataInstrumentKind::Spot, PublicTrades)` and the like through `Streams::builder()`, passing
+  a clone of the subscriber to every stream. `MassiveError::Disconnected` and
+  `From<tungstenite::Error> for MassiveError`, which only `MassiveLive` produced, are removed too.
+  The `massive` feature no longer enables `tokio-tungstenite` with `native-tls`. WebSockets go
+  through `rustrade-integration`, over rustls, like every other connector.
+
 ### Fixed
+
+- **Massive WebSocket channels and symbols that `MassiveLive` got wrong in 0.6.0** (`rustrade-data`,
+  feature `massive`). These are fixed by the connectors that replace it; if you consumed its
+  output, check what you stored.
+  - A per-second crypto or forex aggregate subscribed `XA` or `CA`, which are the **per-minute**
+    channels, so one-minute bars arrived labelled as one-second bars. The per-second channels are
+    `XAS` and `CAS`.
+  - A per-minute crypto or forex aggregate subscribed `XAM` or `CAM`, which do not exist. Massive
+    answers nothing for a channel it does not publish, so the stream stayed silent.
+  - Forex was documented, and subscribed, as `EUR-USD`. Massive accepts that spelling, but its
+    messages say `EUR/USD`. The connectors subscribe with the slash.
+  - Subscription validation passed on the first `success` status in the answer, so a subscribe
+    that Massive partly refused with `not authorized` counted as a success. Every subscription must
+    now be confirmed by name.
+  - Stock and option trades were given a side from trade conditions `1` and `2`. Those codes mean
+    sell and buy only on crypto; on stocks and options they are unrelated conditions. Stock and
+    option trades now have no side.
 
 - **The `lse_market_data` example no longer opens three connections on a key that holds one**
   (`rustrade-data`, feature `lse`). It subscribed two datasets and a second subscription kind, each

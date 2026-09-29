@@ -33,14 +33,14 @@
 //!
 //! # Sharing is by clone, and only by clone
 //! Clones of one subscriber share its connections. Two subscribers built separately open a socket
-//! each, and a provider that caps connections refuses the second — visibly, which is left to
-//! surface rather than papered over by a process-wide registry.
+//! each, and a provider that caps connections refuses the second, or closes the first — visibly,
+//! which is left to surface rather than papered over by a process-wide registry.
 
 // A toolkit for the providers that share a connection, each of which uses only part of it, so a
 // build enabling some of them leaves the rest unused. A build enabling all of them, as CI's does,
 // still reports anything none of them uses.
 #![cfg_attr(
-    not(all(feature = "alpaca", feature = "lse")),
+    not(all(feature = "alpaca", feature = "lse", feature = "massive")),
     allow(dead_code, unused_imports)
 )]
 
