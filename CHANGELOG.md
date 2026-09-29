@@ -372,6 +372,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exchange that share an `AssetNameInternal`** (`rustrade-instrument`). The new
   `IndexError::DuplicateAssetNameInternal` covers two assets that differ only in `name_exchange`,
   such as a venue spelling its quote asset `USDT` for one instrument and `usdt.e` for another.
+  Since `Asset::new_from_exchange`, and so `SystemConfig`, lowercases `name_exchange` into
+  `name_internal`, spellings that differ only in letter case (`USDT` and `usdt`) collide too.
   `try_build` and `try_new` return it, and `build`, `new` and deserialisation fail on it. Such a
   pair survived the de-duplication as two `AssetIndex` slots. Asset lookups and engine asset
   state are keyed on `(exchange, name_internal)` but read by position, so the pair collapsed into
