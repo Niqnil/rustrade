@@ -142,8 +142,9 @@ enum Control {
 /// It keeps each connection's subscriptions as Massive does: it confirms each new one by name,
 /// says nothing to one the connection already holds, refuses the `refused` ones with a bare
 /// `not authorized` placed **first** in the answer, whatever order they were sent in, and confirms
-/// an unsubscribe only for what the connection held. It logs every payload but `auth` against the
-/// connection it arrived on, and sends frames when the test says to.
+/// an unsubscribe only for what the connection held. It pings ahead of its `connected` and
+/// `auth_success` statuses. It logs every payload but `auth` against the connection it arrived on,
+/// and sends frames when the test says to.
 struct Provider {
     log: Arc<Mutex<Vec<(usize, Value)>>>,
     connections: Arc<AtomicUsize>,
@@ -286,6 +287,9 @@ async fn serve_connection(
         return;
     };
 
+    // A ping ahead of each authentication status, which the client must skip rather than read as
+    // its answer.
+    let _ = websocket.send(Message::Ping(Vec::new().into())).await;
     let connected = json!([status("connected", "Connected Successfully")]);
     let _ = websocket.send(Message::text(connected.to_string())).await;
 
@@ -341,7 +345,16 @@ async fn serve_connection(
             .collect::<Vec<_>>();
 
         let answer = match action.as_str() {
-            "auth" => vec![status("auth_success", "authenticated")],
+            "auth" => {
+                if websocket
+                    .send(Message::Ping(Vec::new().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                vec![status("auth_success", "authenticated")]
+            }
             "subscribe" => {
                 let mut refusals = Vec::new();
                 let mut confirmations = Vec::new();

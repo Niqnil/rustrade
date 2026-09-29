@@ -546,36 +546,42 @@ async fn authenticate(
     }
 }
 
-/// The first status of the next frame, while authenticating.
+/// The first status of the next text frame, while authenticating.
+///
+/// Control frames are skipped: the socket answers a ping itself, and neither is an answer.
 async fn next_status(
     websocket: &mut WebSocket,
     awaiting: &str,
 ) -> Result<(Option<String>, Option<String>), SocketError> {
-    let frame = tokio::time::timeout(AUTH_TIMEOUT, websocket.next())
-        .await
-        .map_err(|_| {
-            SocketError::Subscribe(format!(
-                "Massive sent nothing within {AUTH_TIMEOUT:?} while awaiting {awaiting}"
-            ))
-        })?;
+    let deadline = tokio::time::Instant::now() + AUTH_TIMEOUT;
+    let text = loop {
+        let frame = tokio::time::timeout_at(deadline, websocket.next())
+            .await
+            .map_err(|_| {
+                SocketError::Subscribe(format!(
+                    "Massive sent nothing within {AUTH_TIMEOUT:?} while awaiting {awaiting}"
+                ))
+            })?;
 
-    let text = match frame {
-        Some(Ok(WsMessage::Text(text))) => text,
-        Some(Ok(WsMessage::Close(close))) => {
-            return Err(SocketError::Subscribe(format!(
-                "Massive closed the connection while awaiting {awaiting}: {close:?}"
-            )));
-        }
-        Some(Ok(other)) => {
-            return Err(SocketError::Subscribe(format!(
-                "Massive sent {other:?} while awaiting {awaiting}"
-            )));
-        }
-        Some(Err(error)) => return Err(SocketError::WebSocket(Box::new(error))),
-        None => {
-            return Err(SocketError::Subscribe(format!(
-                "Massive ended the connection while awaiting {awaiting}"
-            )));
+        match frame {
+            Some(Ok(WsMessage::Text(text))) => break text,
+            Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => continue,
+            Some(Ok(WsMessage::Close(close))) => {
+                return Err(SocketError::Subscribe(format!(
+                    "Massive closed the connection while awaiting {awaiting}: {close:?}"
+                )));
+            }
+            Some(Ok(other)) => {
+                return Err(SocketError::Subscribe(format!(
+                    "Massive sent {other:?} while awaiting {awaiting}"
+                )));
+            }
+            Some(Err(error)) => return Err(SocketError::WebSocket(Box::new(error))),
+            None => {
+                return Err(SocketError::Subscribe(format!(
+                    "Massive ended the connection while awaiting {awaiting}"
+                )));
+            }
         }
     };
 
