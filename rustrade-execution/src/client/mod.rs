@@ -6,7 +6,7 @@
 //! |-----------|-----------|-------|---------------|-----------|---------------------|
 //! | [`binance`] | Auto (1s→30s backoff) | 10k LRU | REST after reconnect | 30s | cancelled |
 //! | [`alpaca`] | Auto (1s→30s backoff) | 2k LRU | REST after reconnect | 35s | accepted |
-//! | [`ibkr`] | Caller responsibility | N/A | Caller responsibility | N/A | submitted |
+//! | [`ibkr`] | ibapi-managed | 10k LRU, fills only | Executions request after reconnect | N/A | submitted |
 //! | [`hyperliquid`] | SDK-managed | 10k LRU, fills only | Caller responsibility | SDK-managed | cancelled |
 //!
 //! The last column is when [`ExecutionClient::cancel_order`] answers `Ok`. Only for "cancelled" has
@@ -18,9 +18,11 @@
 //! fill recovery and deduplication. After reconnect, they query REST APIs for missed
 //! fills and deduplicate against the LRU cache to prevent duplicate processing.
 //!
-//! **IBKR** uses TCP to local TWS/Gateway. Reconnection requires IB Gateway availability
-//! and client ID coordination — decisions that belong in the caller's wrapper. See
-//! [`ibkr`] module docs for caller responsibilities.
+//! **IBKR** uses TCP to local TWS/Gateway. `ibapi` reconnects that socket itself; the
+//! account stream stays open across it and recovers the missed fills from TWS's executions,
+//! deduplicating against the LRU cache. Replacing a client that is gone for good requires IB
+//! Gateway availability and client ID coordination — decisions that belong in the caller's
+//! wrapper. See [`ibkr`] module docs for caller responsibilities.
 //!
 //! **Hyperliquid** delegates reconnection to the official SDK's `with_reconnect()` mechanism, but
 //! deduplicates fills itself: the SDK resubscribes on reconnect and the venue opens a `userFills`
@@ -62,9 +64,9 @@ use rustrade_instrument::{
 use std::future::Future;
 
 // Account-event deduplication over rustrade's own event type. Gated on the clients that use it
-// so a build selecting neither does not compile it unused. Alpaca deduplicates too, but against
-// a raw `SmolStr` fill key rather than this cache, so it is deliberately not in this list.
-#[cfg(any(feature = "binance", feature = "hyperliquid"))]
+// so a build selecting none of them does not compile it unused. Alpaca deduplicates too, but
+// against a raw `SmolStr` fill key rather than this cache, so it is deliberately not in this list.
+#[cfg(any(feature = "binance", feature = "hyperliquid", feature = "ibkr"))]
 pub(crate) mod dedup;
 
 // Alpaca ExecutionClient implementation (options, equities, crypto — single unified API)
