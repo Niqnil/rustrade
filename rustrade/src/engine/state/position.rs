@@ -372,8 +372,9 @@ pub struct PositionSeed {
     ///   orders with this id as their
     ///   [`RequestOpen::position_id`](rustrade_execution::order::request::RequestOpen::position_id).
     pub position_id: Option<PositionId>,
-    /// Fees paid to enter the position, in the instrument's quote asset. Must not be negative.
-    /// Zero by default, including when absent from a deserialised seed.
+    /// Fees paid to enter the position, in the instrument's quote asset. Must not be negative, so
+    /// a net rebate on entry cannot be seeded. Zero by default, including when absent from a
+    /// deserialised seed.
     #[serde(default)]
     pub fees_enter: Decimal,
 }
@@ -413,7 +414,7 @@ impl PositionSeed {
     ///
     /// The amount must not be negative, which
     /// [`EngineStateBuilder::try_build`](crate::engine::state::builder::EngineStateBuilder::try_build)
-    /// checks.
+    /// checks: a net rebate on entry cannot be seeded, although a fill may carry one.
     pub fn with_fees_enter(self, fees_enter: Decimal) -> Self {
         Self { fees_enter, ..self }
     }

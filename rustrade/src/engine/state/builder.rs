@@ -307,7 +307,11 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
 mod tests {
     use super::*;
     use crate::{
-        engine::state::{EngineState, connectivity::VenueRole, position::PositionId},
+        engine::state::{
+            EngineState,
+            connectivity::VenueRole,
+            position::{PnlUnrealisedUpdate, PositionId},
+        },
         statistic::{summary::TradingSummaryGenerator, time::Annual365},
     };
     use rust_decimal::Decimal;
@@ -553,8 +557,8 @@ mod tests {
         assert!(spot.position.positions.is_empty());
     }
 
-    /// Seeded entry fees are held in the quote asset and realised when paid, as a fill opening the
-    /// position would record them.
+    /// Seeded entry fees are held in the quote asset and realised when paid, and unrealised PnL
+    /// deducts an exit-fee estimate scaled from them, as for a position opened by a fill.
     #[test]
     fn seeded_entry_fees_are_realised_up_front() {
         let instruments = seed_instruments();
@@ -580,6 +584,30 @@ mod tests {
             AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO))
         );
         assert_eq!(position.pnl_realised, dec!(-5));
+
+        let mut position = position.clone();
+        assert_eq!(
+            position.update_pnl_unrealised(dec!(52_000)),
+            PnlUnrealisedUpdate::Updated
+        );
+        // 0.5 * (52_000 - 50_000) = 1_000, less exit fees estimated at 5 * (0.5 / 0.5).
+        assert_eq!(position.pnl_unrealised, dec!(995));
+    }
+
+    /// A seed serialised without `fees_enter` still deserialises, with zero entry fees.
+    #[test]
+    fn seed_without_fees_enter_deserialises_with_zero_fees() {
+        let seed = long_seed(SPOT, dec!(0.5));
+        let mut json = serde_json::to_value(&seed).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("fees_enter")
+            .expect("a serialised seed holds fees_enter");
+
+        let deserialised: PositionSeed = serde_json::from_value(json).unwrap();
+
+        assert_eq!(deserialised.fees_enter, Decimal::ZERO);
+        assert_eq!(deserialised, seed);
     }
 
     /// Closing a position seeded with entry fees nets them out of its realised PnL, together with
