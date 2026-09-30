@@ -129,6 +129,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Crypto holdings stay asset balances, since Alpaca crypto is spot-only. The snapshot now always
   fetches `/v2/positions`, even for a USD-only request.
 
+- **IBKR's `account_snapshot` dropped each position's quantity and average cost**
+  (`rustrade-execution`, feature `ibkr`). It listed the instruments holding a position but left
+  every `position` as `None`. Each now carries the signed quantity (negative for a short) and the
+  entry price: IB's average cost divided by the contract multiplier, so a future or an option is
+  quoted as its orders are priced, commissions included. A zero quantity, reported for a position
+  closed today, still gives `None`. With several accounts, the first account to hold an
+  instrument is kept and the others are dropped with a warning, never summed. For each account,
+  IB's latest report now wins; the snapshot used to keep the first one, which after a connection
+  drop could be a stale reply to an earlier failed call.
+
 ## [0.7.0] - 2026-09-30
 
 ### Added

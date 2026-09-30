@@ -226,6 +226,9 @@ async fn test_account_snapshot() {
     println!("Exchange: {:?}", snapshot.exchange);
     println!("Balances: {}", snapshot.balances.len());
     println!("Instruments: {}", snapshot.instruments.len());
+    for snap in &snapshot.instruments {
+        println!("  {}: position {:?}", snap.instrument, snap.position);
+    }
 }
 
 // ============================================================================
