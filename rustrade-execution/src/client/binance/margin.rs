@@ -2877,7 +2877,8 @@ impl MarginTradesQuery {
 ///   `startTime`..`endTime` span of 24 hours or more. So the walk first steps forward in windows
 ///   of [`MARGIN_MY_TRADES_WINDOW_MS`], each bounded by `startTime` and `endTime`, from `from` to
 ///   the call's start by the local clock. At the first window holding a trade it switches to
-///   `from_id = last_id + 1` and reads on until a short page, unless that window was the last.
+///   `from_id = last_id + 1` and reads on until a short page, unless that window was the last
+///   and read a short page.
 ///
 /// **Cost:** each window before the first trade is one request (weight 10), so the cost grows
 /// with the lookback: about one request per day, and about 21,000 from the Unix epoch. An
