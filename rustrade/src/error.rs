@@ -1,4 +1,4 @@
-use crate::execution::error::ExecutionError;
+use crate::{engine::state::position::PositionSeedError, execution::error::ExecutionError};
 use chrono::{DateTime, Utc};
 use rustrade_data::error::DataError;
 use rustrade_instrument::{exchange::ExchangeId, index::error::IndexError};
@@ -96,6 +96,14 @@ pub enum BarterError {
         time: DateTime<Utc>,
         limit: usize,
     },
+
+    /// A position seeded into the engine's starting state was invalid — see
+    /// [`PositionSeedError`].
+    ///
+    /// # Appended deliberately
+    /// See [`BacktestMarketData`](Self::BacktestMarketData) — new variants belong at the end.
+    #[error("position seed: {0}")]
+    PositionSeed(#[from] PositionSeedError),
 }
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]
 #[error("RxDropped")]
