@@ -360,8 +360,8 @@ pub struct PositionSeed {
     /// Not checked, as a fill's price is not: a negative price is legal on some instruments, and
     /// zero is a genuine cost basis for an asset received without paying for it.
     pub price_entry_average: Decimal,
-    /// When the position was entered. Not checked; it should not be later than the engine's
-    /// start time, or hold-time statistics for the position come out negative.
+    /// When the position was entered. Not checked: a value later than the fill that closes the
+    /// position gives its [`PositionExited`] a `time_enter` after its `time_exit`.
     pub time_enter: DateTime<Utc>,
     /// Slot the position occupies in its instrument's [`PositionManager`].
     ///
