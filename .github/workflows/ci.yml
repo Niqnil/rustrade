@@ -1,13 +1,16 @@
 name: "rustrade CI"
 
 on:
+  # Branch protection does not gate on push runs, so a Markdown-only push can skip the workflow
+  # outright.
   push:
     paths-ignore:
       - "**.md"
     branches: ["main", "develop"]
+  # No `paths-ignore` here: a filtered-out workflow never starts, so a Markdown-only PR would wait
+  # forever on required checks that never report. The `changes` job below skips the work instead,
+  # and a job skipped by its `if:` reports as passed.
   pull_request:
-    paths-ignore:
-      - "**.md"
     branches: ["main", "develop"]
   # Dispatched by `dependabot-auto-merge.yml` once it has merged a PR: a merge made with
   # GITHUB_TOKEN triggers no `push` run, but GITHUB_TOKEN may dispatch one.
@@ -21,8 +24,58 @@ env:
   MOLD_VERSION: "2.35.1"
 
 jobs:
+  # Decides whether a PR changes anything besides Markdown. Every other job gates on it, and the
+  # gate fails closed: a job skips only when this one succeeded *and* reported `code=false`. If it
+  # fails at any point, even after writing its output, everything runs.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      # On `pull_request`, checkout lands on the test merge commit, whose first parent is the base
+      # branch tip. Depth 2 fetches that parent, so the diff below is exactly what the PR merges.
+      - name: Checkout sources
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          fetch-depth: 2
+
+      # `push` is already filtered by `paths-ignore`, and a dispatch has no diff to classify.
+      # `--no-renames` lists both sides of a rename, so renaming `x.rs` to `x.md` counts as code.
+      # The `HEAD^2` check refuses to diff a non-merge commit, whose first parent would cover only
+      # the PR's last commit.
+      - name: Classify changed files
+        id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" != pull_request ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git rev-parse --verify --quiet HEAD^2 > /dev/null
+          changed=$(git diff --name-only --no-renames HEAD^1 HEAD)
+          # Only a path that matches `*.md` can keep `code` false, so an empty diff counts as code.
+          code=false
+          while IFS= read -r path; do
+            # Indented so that a path starting with `::` is not parsed as a workflow command.
+            printf '  %s\n' "$path"
+            case $path in
+              *.md) ;;
+              *) code=true ;;
+            esac
+          done <<< "$changed"
+          if [ "$code" = false ]; then
+            echo "Markdown-only change: skipping every check" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
   fmt:
     name: cargo fmt
+    needs: changes
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -39,6 +92,8 @@ jobs:
 
   tier2-pins:
     name: tier-2 pins
+    needs: changes
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -55,6 +110,8 @@ jobs:
 
   check:
     name: cargo check
+    needs: changes
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -87,6 +144,11 @@ jobs:
   test:
     name: cargo test
     needs: [fmt, check]
+    # Explicit, because the implicit `success()` also looks at `changes`, an ancestor: if that job
+    # failed, this one would be skipped -- and a skip passes a required check -- even though `fmt`
+    # and `check` ran and passed. On a Markdown-only PR both are skipped, so this skips too.
+    # `clippy` and `docs` use the same gate.
+    if: ${{ !cancelled() && needs.fmt.result == 'success' && needs.check.result == 'success' }}
     runs-on: ubuntu-latest
     # This job debug-builds the whole workspace with `--all-features` (ethers, aws-lc-sys, ring and
     # every exchange SDK) and then runs both `--lib --bins --tests` and the doc-tests against that
@@ -170,6 +232,7 @@ jobs:
   clippy:
     name: cargo clippy
     needs: [fmt, check]
+    if: ${{ !cancelled() && needs.fmt.result == 'success' && needs.check.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -196,6 +259,7 @@ jobs:
   docs:
     name: cargo doc
     needs: [fmt, check]
+    if: ${{ !cancelled() && needs.fmt.result == 'success' && needs.check.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -229,6 +293,8 @@ jobs:
 
   audit:
     name: cargo audit
+    needs: changes
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -253,6 +319,8 @@ jobs:
 
   deny:
     name: cargo deny
+    needs: changes
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
