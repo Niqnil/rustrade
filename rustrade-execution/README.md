@@ -11,7 +11,7 @@ Execution client library for streaming private account data and executing orders
 | **Alpaca** | `AlpacaClient::new(AlpacaConfig)` | Spot (Equities, Crypto), Option | Orders, Balances, Positions, BracketOrders |
 | **Hyperliquid** | `HyperliquidClient::connect(HyperliquidConfig)` | Perpetual | Orders, Balances, Positions |
 | **HyperliquidSpot** | `HyperliquidSpotClient::connect(HyperliquidConfig)` | Spot | Orders, Balances |
-| **IBKR** | `IbkrClient::connect_sync(IbkrConfig)` | Spot, Future, Option | Orders, Balances, BracketOrders |
+| **IBKR** | `IbkrClient::connect_sync(IbkrConfig)` | Spot, Future, Option | Orders, Balances, Positions, BracketOrders |
 
 **Positions** means `account_snapshot` reports each open position in
 `InstrumentAccountSnapshot::position`: signed quantity, entry price and unrealised PnL, plus
@@ -25,7 +25,9 @@ Hyperliquid Spot a holding is an asset balance instead.
   cash, which is negative while the account borrows on margin, and its free amount is the cash
   that can be spent without borrowing: the lesser of cash and non-marginable buying power.
   Account equity is cash plus the positions' value, and is not reported separately.
-- **IBKR** lists the instruments that hold a position, without their size or cost.
+- **IBKR** reports each position's quantity and entry price (its average cost divided by the
+  contract multiplier, commissions included). It reports no unrealised PnL. With several
+  accounts, the first account holding an instrument is kept; positions are never summed.
 
 The `new` constructors are `ExecutionClient::new`. Each connector is behind a Cargo feature, and
 none is enabled by default: `alpaca`, `binance` (Spot and Margin), `hyperliquid` (perpetuals and
