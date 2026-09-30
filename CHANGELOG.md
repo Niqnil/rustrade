@@ -26,6 +26,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `BarterError` is not `#[non_exhaustive]`, so a downstream `match` on it that lists every
     variant needs an arm for this one.
 
+- **`EngineOutput::ContractExpiryNotSettled`** (`rustrade`), emitted when a `ContractExpiry` does
+  not settle its instrument. Its `ContractExpiryNotSettledReason` is `InstrumentNeverExpires` for
+  a `Spot`, `Perpetual` or `Cfd` instrument (see Fixed), or `SettlementPriceUnavailable` when the
+  price settlement needs has not arrived. That second case was only logged before; the event
+  stays retryable. Both enums are `#[non_exhaustive]`, so no downstream `match` breaks.
+
+### Changed
+
+- **`Engine::process_contract_expiry` returns `Vec<EngineOutput>`** (`rustrade`), like
+  `process_corporate_action`, instead of `Vec<PositionExited>`. **Breaking** for code that calls
+  it directly: closed positions now arrive as `EngineOutput::PositionExit`, and a rejection as
+  `EngineOutput::ContractExpiryNotSettled`. Name the output type where inference needs it, e.g.
+  `let outputs: Vec<EngineOutput<_, _>> = engine.process_contract_expiry(&key);`. Code that
+  only sends `EngineEvent::ContractExpiry` is unaffected.
+
 ### Fixed
 
 - **Binance margin `fetch_trades` and reconnect fill recovery could miss fills more than 24 hours
@@ -42,16 +57,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   For a `Spot`, `Perpetual` or `Cfd` instrument the engine settled the event as it would a
   future: it closed every open position at the last price and set `expiration_processed`, so the
   instrument could not trade again for the rest of the run. Nothing was logged. The engine now
-  rejects the event without touching any state, and emits the new
-  `EngineOutput::ContractExpiryNotSettled` with
-  `ContractExpiryNotSettledReason::InstrumentNeverExpires`. The audit replica marked such an instrument processed when it held no position; it now follows
-  the live engine. It also leaves state alone on a repeated expiry, as the live engine does.
-  - An expiry that cannot settle because the price it needs is missing was only logged. It now
-    emits the same output with `SettlementPriceUnavailable`, and stays retryable.
-  - `Engine::process_contract_expiry` now returns `Vec<EngineOutput>`, like
-    `process_corporate_action`, instead of `Vec<PositionExited>`. Closed positions arrive as
-    `EngineOutput::PositionExit`, so code that calls it directly needs updating. `EngineOutput` is
-    `#[non_exhaustive]`, so the new variant breaks no `match`.
+  rejects the event without touching any state, and emits `EngineOutput::ContractExpiryNotSettled`
+  with `ContractExpiryNotSettledReason::InstrumentNeverExpires`.
+  - The audit replica marked such an instrument processed when it held no position. It now
+    follows the live engine, and it also leaves state alone on a repeated expiry, as the live
+    engine does.
 
 ## [0.7.0] - 2026-09-30
 

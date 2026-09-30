@@ -184,10 +184,11 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
 /// [`InstrumentStates::split_eligible_target`], and the only way to reach
 /// [`prepare_corporate_action_split`](Self::prepare_corporate_action_split).
 ///
-/// The fields are private to this module, so holding one is proof that the eligibility check ran
-/// against *these* `states`: the precondition the split pass relies on is discharged by the type
-/// system in every build, instead of by an assertion that compiles out in release. Carrying the
-/// `states` it was checked against also ties the plan to the same registry the check read.
+/// The fields are private, and `split_eligible_target` is the only constructor, so outside this
+/// module holding one is proof that the eligibility check ran: the precondition the split pass
+/// relies on is discharged by the type system in every build, instead of by an assertion that
+/// compiles out in release. That constructor takes `target` from `states` itself, so the plan is
+/// built from the same registry the check read.
 ///
 /// [`InstrumentKind::is_split_eligible`]: rustrade_instrument::instrument::kind::InstrumentKind::is_split_eligible
 pub(crate) struct SplitEligibleTarget<'a, InstrumentData> {

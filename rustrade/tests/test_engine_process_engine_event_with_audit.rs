@@ -1780,13 +1780,31 @@ fn test_contract_expiry_rejects_never_expiring_instruments() {
     for kind in kinds {
         for with_position in [false, true] {
             let context = format!("{kind:?}, with_position={with_position}");
-            let (execution_tx, _execution_rx) = mpsc_unbounded();
+            let (execution_tx, mut execution_rx) = mpsc_unbounded();
             let mut engine = build_single_kind_engine(kind.clone(), execution_tx);
 
             send_spot_price(&mut engine, 0, dec!(45_000));
             if with_position {
                 open_option_position(&mut engine, dec!(1), dec!(40_000));
             }
+            // A resting order, so a cancel sent before the rejection would be observable.
+            send_order_ack(
+                &mut engine,
+                ClientOrderId::new("resting"),
+                OrderId::new("resting-venue"),
+                Side::Buy,
+            );
+            assert_eq!(
+                engine
+                    .state
+                    .instruments
+                    .instrument_index(&InstrumentIndex(0))
+                    .orders
+                    .0
+                    .len(),
+                1,
+                "{context}: the resting order must be tracked before the expiry"
+            );
             let pre_state = engine.state.clone();
 
             let event = EngineEvent::ContractExpiry(InstrumentIndex(0));
@@ -1820,6 +1838,10 @@ fn test_contract_expiry_rejects_never_expiring_instruments() {
                 usize::from(with_position),
                 "{context}"
             );
+            assert!(
+                execution_rx.rx.try_recv().is_err(),
+                "{context}: a rejected expiry must send no request"
+            );
 
             let seed_tick: AuditTick<_, EngineContext> = AuditTick {
                 event: pre_state,
@@ -1842,6 +1864,133 @@ fn test_contract_expiry_rejects_never_expiring_instruments() {
             );
         }
     }
+}
+
+/// Drive `event` through the live engine with audit, then mirror it into `replica` from the same
+/// outputs — the path `StateReplicaManager::run` takes. Evaluates to the live outputs.
+macro_rules! process_live_and_replica {
+    ($engine:expr, $replica:expr, $event:expr) => {{
+        let event = $event;
+        let audit_tick = process_with_audit($engine, event.clone());
+        let outputs = match audit_tick.event {
+            EngineAudit::Process(audit) => audit.outputs,
+            _ => panic!("expected EngineAudit::Process"),
+        };
+        $replica.update_from_event(event, &outputs);
+        outputs
+    }};
+}
+
+/// The audit replica follows the live engine through every `ContractExpiry` branch that leaves an
+/// instrument unsettled or already settled: a price bail (positions kept, retryable), the retry
+/// that settles, and a repeated expiry after settlement, which must not clear orders the live
+/// engine kept.
+#[test]
+fn test_contract_expiry_replica_parity_price_bail_then_settle_then_duplicate() {
+    use rustrade::engine::audit::{context::EngineContext, state_replica::StateReplicaManager};
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    open_option_position(&mut engine, dec!(1), dec!(1_000));
+
+    let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+        event: engine.state.clone(),
+        context: EngineContext {
+            time: STARTING_TIMESTAMP,
+            sequence: Sequence(0),
+        },
+    };
+    let dummy_updates: DummyAuditUpdates = std::iter::empty();
+    let mut replica = StateReplicaManager::new(seed_tick, dummy_updates);
+    let option = InstrumentIndex(0);
+
+    // 1. No underlying price: the live engine declines, keeping the position; so must the replica.
+    let outputs =
+        process_live_and_replica!(&mut engine, replica, EngineEvent::ContractExpiry(option));
+    assert_eq!(
+        outputs,
+        NoneOneOrMany::One(EngineOutput::ContractExpiryNotSettled {
+            instrument: option,
+            reason: ContractExpiryNotSettledReason::SettlementPriceUnavailable,
+        })
+    );
+    let live = engine.state.instruments.instrument_index(&option);
+    assert_eq!(live.position.positions.len(), 1);
+    assert!(!live.expiration_processed);
+    assert_eq!(
+        replica
+            .replica_engine_state()
+            .instruments
+            .instrument_index(&option),
+        live
+    );
+
+    // 2. The underlying price arrives and the retry settles on both sides.
+    process_live_and_replica!(&mut engine, replica, market_event_trade(2, 1, dec!(45_000)));
+    let outputs =
+        process_live_and_replica!(&mut engine, replica, EngineEvent::ContractExpiry(option));
+    assert!(
+        outputs
+            .iter()
+            .any(|output| matches!(output, EngineOutput::PositionExit(_)))
+    );
+    let live = engine.state.instruments.instrument_index(&option);
+    let mirrored = replica
+        .replica_engine_state()
+        .instruments
+        .instrument_index(&option);
+    assert!(live.position.positions.is_empty());
+    assert_eq!(mirrored.position.positions, live.position.positions);
+    assert!(live.expiration_processed && mirrored.expiration_processed);
+
+    // 3. An order snapshot lands after settlement and both sides track it. A repeated expiry is a
+    //    no-op on the live engine, so the replica must keep that order too.
+    process_live_and_replica!(
+        &mut engine,
+        replica,
+        EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+            exchange: ExchangeIndex(0),
+            kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+                key: OrderKey {
+                    exchange: ExchangeIndex(0),
+                    instrument: option,
+                    strategy: strategy_id(),
+                    cid: ClientOrderId::new("late"),
+                },
+                side: Side::Buy,
+                price: Some(dec!(1_000)),
+                quantity: dec!(1),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                state: OrderState::active(Open {
+                    id: VenueOrderId::Assigned(OrderId::new("late-venue")),
+                    time_exchange: time_plus_days(STARTING_TIMESTAMP, 3),
+                    filled_quantity: dec!(0),
+                }),
+            })),
+        }))
+    );
+    assert_eq!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&option)
+            .orders
+            .0
+            .len(),
+        1
+    );
+    let outputs =
+        process_live_and_replica!(&mut engine, replica, EngineEvent::ContractExpiry(option));
+    assert_eq!(outputs, NoneOneOrMany::None);
+    let live = engine.state.instruments.instrument_index(&option);
+    let mirrored = replica
+        .replica_engine_state()
+        .instruments
+        .instrument_index(&option);
+    assert_eq!(live.orders.0.len(), 1);
+    assert_eq!(mirrored.orders, live.orders);
+    assert_eq!(mirrored.exchange_id_to_cid, live.exchange_id_to_cid);
 }
 
 /// A future settles at its own last price, not at an option's intrinsic value, and — unlike an
