@@ -14,6 +14,9 @@ use smol_str::{SmolStr, StrExt, format_smolstr};
 /// Characters after the root: `YYMMDD`, `C`/`P`, and an eight-digit strike.
 const SUFFIX_LEN: usize = 15;
 
+/// Characters of the suffix that carry the strike, in thousandths.
+const STRIKE_LEN: usize = 8;
+
 /// The largest strike an eight-digit field of thousandths can carry.
 const MAX_STRIKE_THOUSANDTHS: u64 = 99_999_999;
 
@@ -67,6 +70,22 @@ pub(crate) fn root(symbol: &str) -> Option<&str> {
         && suffix[7..].iter().all(u8::is_ascii_digit);
 
     well_formed.then_some(root)
+}
+
+/// The strike an OSI symbol carries, or `None` if `symbol` is not one or its strike is zero.
+///
+/// Exact by construction: the field is a count of thousandths, so no float is involved. Reading the
+/// strike here rather than from a provider's separate numeric field is what guarantees
+/// [`symbol`] spells the contract back to the same symbol.
+pub(crate) fn strike(symbol: &str) -> Option<Decimal> {
+    root(symbol)?;
+    let thousandths = symbol
+        .get(symbol.len() - STRIKE_LEN..)?
+        .parse::<i64>()
+        .ok()
+        .filter(|thousandths| *thousandths > 0)?;
+
+    Some(Decimal::new(thousandths, 3).normalize())
 }
 
 #[cfg(test)]
@@ -143,6 +162,50 @@ mod tests {
             "SPY (not an option contract: spot)",
         ] {
             assert_eq!(root(symbol), None, "{symbol}");
+        }
+    }
+
+    #[test]
+    fn a_strike_is_read_back_exactly_from_a_symbol() {
+        assert_eq!(strike("SPY261130P00505000"), Some(dec!(505)));
+        assert_eq!(strike("F261016C00002670"), Some(dec!(2.67)));
+        assert_eq!(strike("BRK.B261016C00450500"), Some(dec!(450.5)));
+    }
+
+    #[test]
+    fn a_symbol_that_is_not_osi_or_has_a_zero_strike_has_no_strike() {
+        for symbol in [
+            "SPY",
+            "SPY260930X00700000",
+            "SPY260930C0070000",
+            "SPY260930C00000000",
+        ] {
+            assert_eq!(strike(symbol), None, "{symbol}");
+        }
+    }
+
+    /// The round trip the option-contract subscriptions depend on: a strike read from a symbol
+    /// spells that same symbol back.
+    #[test]
+    fn a_strike_read_from_a_symbol_spells_it_back() {
+        for (osi, kind, expiry) in [
+            (
+                "SPY261130P00505000",
+                OptionKind::Put,
+                "2026-11-30T20:00:00Z",
+            ),
+            ("F261016C00002670", OptionKind::Call, "2026-10-16T20:00:00Z"),
+            (
+                "BRK.B261016C00450500",
+                OptionKind::Call,
+                "2026-10-16T20:00:00Z",
+            ),
+        ] {
+            let spelled = symbol(
+                root(osi).unwrap(),
+                &contract(kind, expiry, strike(osi).unwrap()),
+            );
+            assert_eq!(spelled.unwrap(), osi);
         }
     }
 

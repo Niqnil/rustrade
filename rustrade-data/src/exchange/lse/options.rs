@@ -44,6 +44,9 @@
 //! - **Strikes are not always round.** Contracts adjusted for a corporate action carry fractional
 //!   strikes (`2.67`, `9.85`), so the strike is a [`Decimal`] and the contract's identity is its
 //!   [`ticker`](LseOptionContract::ticker), not a strike rebuilt from integers.
+//! - **⚠️ The served `strike` field is a float and is not used.** It has carried float noise
+//!   (`504.99999999999994` for a 505 strike), so [`strike`](LseOptionContract::strike) is read from
+//!   the ticker instead, exactly. A row whose ticker is not an OSI symbol is a decode error.
 //! - **An unknown underlying or ticker is an empty result, not an error.** The provider answers
 //!   `200` with no rows for a symbol it has never heard of, indistinguishable here from a quiet
 //!   period.
@@ -55,6 +58,7 @@ use crate::exchange::lse::PROVIDER_TIMESTAMP_FORMAT;
 use crate::exchange::lse::error::LseError;
 use crate::exchange::lse::historical::{VaultCandleRow, parse_candle_open};
 use crate::exchange::lse::vault::LseVaultClient;
+use crate::exchange::osi;
 use crate::subscription::{
     candle::{Candle, CandleInterval},
     greeks::OptionGreeks,
@@ -113,9 +117,37 @@ pub struct LseOptionContract {
     /// The underlying's symbol, e.g. `SPY`.
     pub underlying: SmolStr,
     pub kind: OptionKind,
+    /// Read from [`ticker`](Self::ticker), so it is exact and always spells the ticker back.
     /// Fractional on contracts adjusted for a corporate action.
     pub strike: Decimal,
     pub expiry: NaiveDate,
+}
+
+impl LseOptionContract {
+    /// Build a contract from a served row, reading the strike from the ticker.
+    ///
+    /// ⚠️ The row's own `strike` field is deliberately ignored. It is a JSON float, and the provider
+    /// has served `504.99999999999994` on `SPY261130P00505000`: carried through, that strike spells
+    /// no OSI symbol, so a subscription built from the contract is rejected. The ticker is the
+    /// contract's identity and carries the strike exactly, in thousandths.
+    fn from_row(
+        ticker: SmolStr,
+        underlying: SmolStr,
+        kind: OptionKind,
+        expiry: NaiveDate,
+    ) -> Result<Self, LseError> {
+        let strike = osi::strike(&ticker).ok_or_else(|| LseError::Deserialize {
+            message: format!("option ticker {ticker:?} is not an OSI contract symbol"),
+        })?;
+
+        Ok(Self {
+            ticker,
+            underlying,
+            kind,
+            strike,
+            expiry,
+        })
+    }
 }
 
 /// One executed option trade, with the greeks the provider computed at that print.
@@ -198,7 +230,6 @@ struct FlowRow {
     ts: String,
     underlying: SmolStr,
     ticker: SmolStr,
-    strike: Decimal,
     expiry: NaiveDate,
     contract_type: OptionKind,
     last_price: Decimal,
@@ -229,17 +260,16 @@ impl FlowRow {
             })
     }
 
-    fn into_print(self, time: DateTime<Utc>) -> LseOptionPrint {
-        LseOptionPrint {
+    fn into_print(self, time: DateTime<Utc>) -> Result<LseOptionPrint, LseError> {
+        Ok(LseOptionPrint {
             id: self.id,
             time,
-            contract: LseOptionContract {
-                ticker: self.ticker,
-                underlying: self.underlying,
-                kind: self.contract_type,
-                strike: self.strike,
-                expiry: self.expiry,
-            },
+            contract: LseOptionContract::from_row(
+                self.ticker,
+                self.underlying,
+                self.contract_type,
+                self.expiry,
+            )?,
             price: self.last_price,
             volume: self.volume,
             premium: self.premium,
@@ -253,7 +283,7 @@ impl FlowRow {
                 theoretical_price: None,
                 underlying_price: self.underlying_price,
             },
-        }
+        })
     }
 }
 
@@ -262,7 +292,6 @@ impl FlowRow {
 struct OptionCandleRow {
     ticker: SmolStr,
     underlying: SmolStr,
-    strike: Decimal,
     expiry: NaiveDate,
     contract_type: OptionKind,
     /// The bar's **open**, UTC, with no zone suffix.
@@ -331,15 +360,14 @@ fn option_event<InstrumentKey>(
 }
 
 impl OptionCandleRow {
-    fn into_option_candle(self, close_time: DateTime<Utc>) -> LseOptionCandle {
-        LseOptionCandle {
-            contract: LseOptionContract {
-                ticker: self.ticker,
-                underlying: self.underlying,
-                kind: self.contract_type,
-                strike: self.strike,
-                expiry: self.expiry,
-            },
+    fn into_option_candle(self, close_time: DateTime<Utc>) -> Result<LseOptionCandle, LseError> {
+        Ok(LseOptionCandle {
+            contract: LseOptionContract::from_row(
+                self.ticker,
+                self.underlying,
+                self.contract_type,
+                self.expiry,
+            )?,
             candle: Candle {
                 close_time,
                 open: self.open,
@@ -360,7 +388,7 @@ impl OptionCandleRow {
                 theoretical_price: None,
                 underlying_price: self.underlying_price,
             },
-        }
+        })
     }
 }
 
@@ -394,7 +422,7 @@ impl LseVaultClient {
             start,
             end,
         )
-        .map(|row| row.map(|(row, close_time)| row.into_option_candle(close_time)))
+        .map(|row| row.and_then(|(row, close_time)| row.into_option_candle(close_time)))
     }
 
     /// Fetch option candles into a `Vec`. **Buffers the whole range.**
@@ -578,7 +606,7 @@ impl LseVaultClient {
                         })?;
                     }
 
-                    prints.push(row.into_print(time));
+                    prints.push(row.into_print(time)?);
                 }
 
                 // The provider serves newest-first; sort rather than reverse, so the order promised
@@ -663,7 +691,7 @@ mod tests {
     fn a_flow_row_decodes_integer_or_float_numbers_and_maps_every_greek() {
         let row: FlowRow = serde_json::from_str(FLOW_ROW).unwrap();
         let time = row.time().unwrap();
-        let print = row.into_print(time);
+        let print = row.into_print(time).unwrap();
 
         assert_eq!(
             time,
@@ -691,7 +719,7 @@ mod tests {
             .replace(r#""delta":0.5"#, r#""delta":null"#)
             .replace(r#""rho":0.003"#, r#""rho":null"#);
         let row: FlowRow = serde_json::from_str(&json).unwrap();
-        let print = row.into_print(Utc::now());
+        let print = row.into_print(Utc::now()).unwrap();
 
         assert_eq!(print.greeks.implied_volatility, None);
         assert_eq!(print.greeks.delta, None);
@@ -701,7 +729,7 @@ mod tests {
     #[test]
     fn a_print_is_a_public_trade_sized_in_contracts_with_no_side() {
         let row: FlowRow = serde_json::from_str(FLOW_ROW).unwrap();
-        let trade = row.into_print(Utc::now()).public_trade();
+        let trade = row.into_print(Utc::now()).unwrap().public_trade();
 
         assert_eq!(trade.id, "7");
         assert_eq!(trade.price, dec!(1));
@@ -718,7 +746,9 @@ mod tests {
             "rho_avg":-0.001,"underlying_price":10.25}"#;
         let row: OptionCandleRow = serde_json::from_str(json).unwrap();
         let open = row.open_time().unwrap();
-        let candle = row.into_option_candle(open + TimeDelta::minutes(1));
+        let candle = row
+            .into_option_candle(open + TimeDelta::minutes(1))
+            .unwrap();
 
         assert_eq!(candle.contract.kind, OptionKind::Put);
         assert_eq!(candle.candle.trade_count, Some(9));
@@ -736,7 +766,7 @@ mod tests {
     fn a_print_becomes_a_trade_then_its_greeks_stamped_at_the_print() {
         let row: FlowRow = serde_json::from_str(FLOW_ROW).unwrap();
         let time = row.time().unwrap();
-        let [trade, greeks] = row.into_print(time).into_market_events(0usize);
+        let [trade, greeks] = row.into_print(time).unwrap().into_market_events(0usize);
 
         for event in [&trade, &greeks] {
             assert_eq!(event.exchange, ExchangeId::LseOptions);
@@ -754,11 +784,35 @@ mod tests {
             "open":1.0,"high":2.0,"low":0.5,"close":1.5,"volume":40,"premium":6000,"print_count":9}"#;
         let row: OptionCandleRow = serde_json::from_str(json).unwrap();
         let close = row.open_time().unwrap() + TimeDelta::minutes(1);
-        let [bar, greeks] = row.into_option_candle(close).into_market_events(0usize);
+        let [bar, greeks] = row
+            .into_option_candle(close)
+            .unwrap()
+            .into_market_events(0usize);
 
         assert_eq!(bar.time_exchange, close);
         assert_eq!(greeks.time_exchange, close);
         assert!(matches!(bar.kind, DataKind::Candle(c) if c.close_time == close));
+    }
+
+    /// The served `strike` is a float, and the provider has put float noise on it. The strike is
+    /// read from the ticker, so noise on the field cannot reach the contract.
+    #[test]
+    fn the_strike_is_read_from_the_ticker_not_the_float_field() {
+        let json = FLOW_ROW.replace(r#""strike":10.5"#, r#""strike":10.499999999999998"#);
+        let row: FlowRow = serde_json::from_str(&json).unwrap();
+        let print = row.into_print(Utc::now()).unwrap();
+
+        assert_eq!(print.contract.strike, dec!(10.5));
+    }
+
+    #[test]
+    fn a_ticker_that_is_not_osi_is_a_typed_error() {
+        let json = FLOW_ROW.replace("TEST240105C00010500", "TEST");
+        let row: FlowRow = serde_json::from_str(&json).unwrap();
+        let error = row.into_print(Utc::now()).unwrap_err();
+
+        assert!(matches!(error, LseError::Deserialize { .. }));
+        assert!(error.to_string().contains("\"TEST\""), "{error}");
     }
 
     #[test]
