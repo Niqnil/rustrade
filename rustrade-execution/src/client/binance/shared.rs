@@ -1295,11 +1295,30 @@ pub(crate) fn contains_error_code(msg: &str, code: &str) -> bool {
     false
 }
 
-/// Whether a Binance error message carries a code meaning the credentials were refused, on any
-/// endpoint: `-1002` ("You are not authorized to execute this request") or `-2015` ("Invalid
-/// API-key, IP, or permissions for action").
-fn has_auth_error_code(msg: &str) -> bool {
-    contains_error_code(msg, "-1002") || contains_error_code(msg, "-2015")
+/// Whether a Binance error message means the credentials were refused, on any endpoint.
+///
+/// By code: `-1002` ("You are not authorized to execute this request"), `-2015` ("Invalid
+/// API-key, IP, or permissions for action"), `-1022` ("Signature for this request is not valid")
+/// or `-2014` ("API-key format invalid"). By wording, for messages that arrive without a code.
+fn is_auth_failure(msg: &str) -> bool {
+    contains_error_code(msg, "-1002")
+        || contains_error_code(msg, "-2015")
+        || contains_error_code(msg, "-1022")
+        || contains_error_code(msg, "-2014")
+        || contains_ignore_case(msg, "invalid api-key")
+        || contains_ignore_case(msg, "invalid signature")
+        || contains_ignore_case(msg, "signature for this request is not valid")
+}
+
+/// Whether a Binance error message carries a code meaning the venue itself failed the request:
+/// `-1000` (unknown error), `-1001` (internal error), `-1006` (unexpected response from the
+/// message bus), `-1007` (backend timeout) or `-1008` (server overloaded). Binance says to retry
+/// these, and for `-1006`/`-1007` states that the execution status is unknown, so an order that
+/// fails this way may still have executed.
+fn has_venue_failure_code(msg: &str) -> bool {
+    ["-1000", "-1001", "-1006", "-1007", "-1008"]
+        .iter()
+        .any(|code| contains_error_code(msg, code))
 }
 
 /// Whether a Binance error message carries a throttling code, on any endpoint: `-1003` (too many
@@ -1318,7 +1337,7 @@ pub(crate) fn parse_binance_api_error(
     instrument: &InstrumentNameExchange,
 ) -> ApiError<AssetNameExchange, InstrumentNameExchange> {
     // Match on Binance error codes first — these are stable numeric identifiers
-    if has_auth_error_code(&error_msg) {
+    if is_auth_failure(&error_msg) {
         // Auth failures must not be retried as order rejections.
         return ApiError::Unauthenticated(error_msg);
     }
@@ -1376,16 +1395,22 @@ pub(crate) fn parse_binance_api_error(
     }
 }
 
-/// Whether a Binance error message on a query means the credentials were refused, by code
-/// ([`has_auth_error_code`], plus `-1022` invalid signature and `-2014` malformed API key) or by
-/// wording, for messages that arrive without a code.
-fn is_query_auth_failure(msg: &str) -> bool {
-    has_auth_error_code(msg)
-        || contains_error_code(msg, "-1022")
-        || contains_error_code(msg, "-2014")
-        || contains_ignore_case(msg, "invalid api-key")
-        || contains_ignore_case(msg, "invalid signature")
-        || contains_ignore_case(msg, "signature for this request is not valid")
+/// Parse the message of a Binance rejection of an *order* request (place or cancel, REST or WS
+/// API) into an [`UnindexedOrderError`].
+///
+/// A venue failure ([`has_venue_failure_code`]) → [`OrderError::Connectivity`]: the order may
+/// or may not have reached the matching engine, and reporting a definitive rejection for one that
+/// executed would leave the caller blind to a fill. Everything else is a rejection, mapped by
+/// [`parse_binance_api_error`].
+pub(crate) fn parse_binance_order_rejection(
+    msg: String,
+    instrument: &InstrumentNameExchange,
+) -> UnindexedOrderError {
+    if has_venue_failure_code(&msg) {
+        OrderError::Connectivity(ConnectivityError::Socket(msg))
+    } else {
+        OrderError::Rejected(parse_binance_api_error(msg, instrument))
+    }
 }
 
 /// Parse the message of a Binance rejection of a *query* (a non-order request) into a
@@ -1396,10 +1421,9 @@ fn is_query_auth_failure(msg: &str) -> bool {
 /// [`ApiError::OrderRejected`]. A query has no order to reject, so an unrecognised code is
 /// [`ApiError::RequestRejected`].
 ///
-/// - an auth failure ([`is_query_auth_failure`]) → [`ApiError::Unauthenticated`];
+/// - an auth failure ([`is_auth_failure`]) → [`ApiError::Unauthenticated`];
 ///   `-1003`/`-1015` → [`ApiError::RateLimit`].
-/// - `-1000`/`-1001`/`-1006`/`-1007`/`-1008` (Binance's unknown or internal failure, unexpected
-///   bus response, backend timeout, server overload) → [`ConnectivityError::Socket`]: the venue
+/// - a venue failure ([`has_venue_failure_code`]) → [`ConnectivityError::Socket`]: the venue
 ///   failed the request, not the other way round, and Binance says to retry.
 /// - `-1021` (timestamp outside `recvWindow`) → [`ConnectivityError::Socket`]: the request took
 ///   too long to arrive, or the local clock drifted. The SDK stamps each attempt afresh, so a
@@ -1411,16 +1435,11 @@ fn parse_binance_query_rejection(
     msg: String,
     instrument: Option<&InstrumentNameExchange>,
 ) -> UnindexedClientError {
-    const RETRYABLE_CODES: [&str; 6] = ["-1000", "-1001", "-1006", "-1007", "-1008", "-1021"];
-
-    let api = if is_query_auth_failure(&msg) {
+    let api = if is_auth_failure(&msg) {
         ApiError::Unauthenticated(msg)
     } else if has_rate_limit_error_code(&msg) {
         ApiError::RateLimit
-    } else if RETRYABLE_CODES
-        .iter()
-        .any(|code| contains_error_code(&msg, code))
-    {
+    } else if has_venue_failure_code(&msg) || contains_error_code(&msg, "-1021") {
         return UnindexedClientError::Connectivity(ConnectivityError::Socket(msg));
     } else if let Some(instrument) = instrument.filter(|_| contains_error_code(&msg, "-1121")) {
         ApiError::InstrumentInvalid(instrument.clone(), msg)
@@ -1445,7 +1464,7 @@ fn parse_binance_query_rejection(
 /// - Anything else failed before the request was sent: the SDK returns every network and venue
 ///   failure as a `ConnectorError`, so untyped text comes from its request plumbing (joining or
 ///   parsing the URL, signing, header values), which fails identically on retry. An auth failure
-///   ([`is_query_auth_failure`]) → [`ApiError::Unauthenticated`], otherwise
+///   ([`is_auth_failure`]) → [`ApiError::Unauthenticated`], otherwise
 ///   [`UnindexedClientError::Internal`].
 ///
 /// A response body that arrives but does not decode is a separate path: see
@@ -1463,16 +1482,6 @@ pub(crate) fn classify_rest_query_error(
             RestFailure::Unauthenticated(msg) => {
                 UnindexedClientError::Api(ApiError::Unauthenticated(msg))
             }
-            // A 403 is an auth failure only when it says so; otherwise it is Binance's WAF limit,
-            // which a caller should back off from and retry.
-            RestFailure::Forbidden(msg) if is_query_auth_failure(&msg) => {
-                UnindexedClientError::Api(ApiError::Unauthenticated(msg))
-            }
-            RestFailure::Forbidden(msg) => {
-                // `ApiError::RateLimit` carries no message, so log the body it replaces.
-                warn!(%msg, "Binance REST query answered 403 (WAF limit); reporting RateLimit");
-                UnindexedClientError::Api(ApiError::RateLimit)
-            }
             RestFailure::Transport(msg) => {
                 UnindexedClientError::Connectivity(ConnectivityError::Socket(msg))
             }
@@ -1481,7 +1490,7 @@ pub(crate) fn classify_rest_query_error(
     }
 
     let msg = format!("{e:#}");
-    if is_query_auth_failure(&msg) {
+    if is_auth_failure(&msg) {
         return UnindexedClientError::Api(ApiError::Unauthenticated(msg));
     }
 
@@ -1698,14 +1707,11 @@ pub(crate) fn classify_order_kind_tif(
 /// query) decides which rustrade error that is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RestFailure {
-    /// HTTP 429 or 418: throttled or IP-banned.
+    /// HTTP 429 or 418 (throttled or IP-banned), or a 403 that is not an auth failure.
     RateLimited,
-    /// HTTP 401. Carries the message with the Binance code spliced in.
+    /// HTTP 401, or a 403 that is an auth failure. Carries the message with the Binance code
+    /// spliced in.
     Unauthenticated(String),
-    /// HTTP 403, which Binance documents as its web application firewall (WAF) limit being
-    /// violated; a CDN block answers 403 too. It is not necessarily a credentials failure. Carries
-    /// the message with the Binance code spliced in.
-    Forbidden(String),
     /// The request never completed, the venue failed it (5xx), or a response body could not be
     /// read. Whether the venue acted on it is unknown.
     Transport(String),
@@ -1732,8 +1738,19 @@ fn classify_connector_error(ce: &ConnectorError) -> RestFailure {
         ConnectorError::UnauthorizedError { msg, code } => {
             RestFailure::Unauthenticated(with_code(msg, *code))
         }
+        // Binance documents 403 as its web application firewall (WAF) limit being violated, and a
+        // CDN block answers 403 too: an auth failure only when it says so, otherwise a limit to
+        // back off from. The request was refused at the edge, so an order never reached the
+        // matching engine.
         ConnectorError::ForbiddenError { msg, code } => {
-            RestFailure::Forbidden(with_code(msg, *code))
+            let msg = with_code(msg, *code);
+            if is_auth_failure(&msg) {
+                RestFailure::Unauthenticated(msg)
+            } else {
+                // `RateLimited` carries no message, so log the body it replaces.
+                warn!(%msg, "Binance REST answered 403 (WAF limit); reporting RateLimit");
+                RestFailure::RateLimited
+            }
         }
         ConnectorError::ServerError { msg, .. } | ConnectorError::NetworkError(msg) => {
             RestFailure::Transport(msg.clone())
@@ -1776,10 +1793,12 @@ fn classify_connector_error(ce: &ConnectorError) -> RestFailure {
 /// separate `code` field). So the WS classifier [`is_api_rejection_error`] (which downcasts
 /// to `WebsocketError`) does not apply here — we downcast to `ConnectorError` instead, classify
 /// it with [`classify_connector_error`], and map a venue rejection with
-/// [`parse_binance_api_error`].
+/// [`parse_binance_order_rejection`].
 ///
-/// - 401/403 → [`ApiError::Unauthenticated`]; 429/418 → [`ApiError::RateLimit`].
-/// - 400/404 / other client errors that carry a Binance code → mapped by code/text.
+/// - 401 → [`ApiError::Unauthenticated`]; 429/418 → [`ApiError::RateLimit`]; 403 →
+///   `Unauthenticated` when it is an auth failure, else `RateLimit` (Binance's WAF limit).
+/// - 400/404 / other client errors that carry a Binance code → mapped by code/text; a venue
+///   failure code → [`OrderError::Connectivity`].
 /// - Network/server failures (and the SDK's codeless transport/decode wrappers — failed HTTP
 ///   request, response-byte read, gzip, or UTF-8 decode) → [`OrderError::Connectivity`]: the
 ///   order may or may not have reached the matching engine.
@@ -1794,13 +1813,9 @@ pub(crate) fn classify_rest_order_error(
 
     match classify_connector_error(ce) {
         RestFailure::RateLimited => OrderError::Rejected(ApiError::RateLimit),
-        RestFailure::Unauthenticated(msg) | RestFailure::Forbidden(msg) => {
-            OrderError::Rejected(ApiError::Unauthenticated(msg))
-        }
+        RestFailure::Unauthenticated(msg) => OrderError::Rejected(ApiError::Unauthenticated(msg)),
         RestFailure::Transport(msg) => OrderError::Connectivity(ConnectivityError::Socket(msg)),
-        RestFailure::Rejected(msg) => {
-            OrderError::Rejected(parse_binance_api_error(msg, instrument))
-        }
+        RestFailure::Rejected(msg) => parse_binance_order_rejection(msg, instrument),
     }
 }
 
@@ -2072,15 +2087,15 @@ mod tests {
 
     #[test]
     fn auth_variants_map_to_unauthenticated() {
-        // 401/403 are definitive auth rejections, not connectivity.
+        // A 401, or a 403 that is an auth failure, is a definitive auth rejection.
         for ce in [
             ConnectorError::UnauthorizedError {
                 msg: "bad key".to_string(),
                 code: Some(-2014),
             },
             ConnectorError::ForbiddenError {
-                msg: "forbidden".to_string(),
-                code: None,
+                msg: "Invalid API-key, IP, or permissions for action.".to_string(),
+                code: Some(-2015),
             },
         ] {
             assert!(matches!(
@@ -2331,6 +2346,74 @@ mod tests {
         );
         assert!(
             matches!(err, UnindexedClientError::Api(ApiError::RequestRejected(_))),
+            "got {err:?}"
+        );
+    }
+
+    // --- Order rejection codes ---
+
+    #[test]
+    fn an_order_forbidden_by_the_waf_is_a_rate_limit() {
+        // Refused at the edge: the order never reached the matching engine.
+        assert!(matches!(
+            classify_err(ConnectorError::ForbiddenError {
+                msg: "<html>403 Forbidden</html>".to_string(),
+                code: None,
+            }),
+            OrderError::Rejected(ApiError::RateLimit)
+        ));
+    }
+
+    #[test]
+    fn an_order_the_venue_failed_has_an_unknown_status() {
+        // Binance: the order may have executed. A definitive rejection would hide a fill.
+        for code in [-1000, -1001, -1006, -1007, -1008] {
+            let err = classify_err(ConnectorError::BadRequestError {
+                msg: "Timeout waiting for response from backend server.".to_string(),
+                code: Some(code),
+            });
+            assert!(
+                matches!(err, OrderError::Connectivity(_)),
+                "{code}: got {err:?}"
+            );
+            assert!(err.is_transient());
+        }
+
+        // The WS-API reports the same codes in its `ResponseError` text.
+        let err = parse_binance_order_rejection(
+            "Server\u{2010}side response error (code -1007): Timeout waiting for response from \
+             backend server. Send status unknown; execution status unknown."
+                .to_string(),
+            &InstrumentNameExchange::new("BTCUSDT"),
+        );
+        assert!(matches!(err, OrderError::Connectivity(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn an_order_with_a_bad_signature_or_key_format_is_unauthenticated() {
+        for (code, msg) in [
+            (-1022, "Signature for this request is not valid."),
+            (-2014, "API-key format invalid."),
+        ] {
+            let err = classify_err(ConnectorError::BadRequestError {
+                msg: msg.to_string(),
+                code: Some(code),
+            });
+            assert!(
+                matches!(err, OrderError::Rejected(ApiError::Unauthenticated(_))),
+                "{code}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_definitive_order_rejection_is_still_a_rejection() {
+        let err = classify_err(ConnectorError::BadRequestError {
+            msg: "Account has insufficient balance for requested action.".to_string(),
+            code: Some(-2010),
+        });
+        assert!(
+            matches!(err, OrderError::Rejected(ApiError::BalanceInsufficient(..))),
             "got {err:?}"
         );
     }

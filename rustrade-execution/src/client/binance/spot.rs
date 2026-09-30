@@ -38,7 +38,7 @@ use super::shared::{
     SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, classify_order_kind_tif,
     classify_rest_query_error, convert_execution_report, convert_open_order_listing,
     convert_open_order_owned_symbol, dedup_key_from_event, is_api_rejection_error, is_duplicate,
-    is_rate_limit_error, new_dedup_cache, parse_binance_api_error, recovered_order_totals,
+    is_rate_limit_error, new_dedup_cache, parse_binance_order_rejection, recovered_order_totals,
     response_decode_error, rest_call_with_retry,
 };
 use crate::{
@@ -845,14 +845,14 @@ impl ExecutionClient for BinanceSpot {
                 // common case; rate limits during placement are rare.
                 if is_api_rejection_error(&e) {
                     // API-level rejection — WS session is healthy, don't tear it down
-                    let api_err = parse_binance_api_error(e.to_string(), &instrument);
-                    // if api_err is BalanceInsufficient, its AssetNameExchange field
+                    let order_err = parse_binance_order_rejection(e.to_string(), &instrument);
+                    // if this is BalanceInsufficient, its AssetNameExchange field
                     // holds the instrument name ("BTCUSDT"), not an asset name — see
                     // parse_binance_api_error for details. Do not match on that field
                     // to identify the low-balance asset.
                     Some(UnindexedOrderResponseCancel {
                         key,
-                        state: Err(UnindexedOrderError::from(api_err)),
+                        state: Err(order_err),
                     })
                 } else if is_rate_limit_error(&e) {
                     // WS-level 429 — update the shared rate limiter so REST calls also back off.
@@ -1136,8 +1136,8 @@ impl ExecutionClient for BinanceSpot {
                 // common case; rate limits during placement are rare.
                 if is_api_rejection_error(&e) {
                     // API-level rejection — WS session is healthy, don't tear it down
-                    let api_err = parse_binance_api_error(e.to_string(), &instrument);
-                    // if api_err is BalanceInsufficient, its AssetNameExchange field
+                    let order_err = parse_binance_order_rejection(e.to_string(), &instrument);
+                    // if this is BalanceInsufficient, its AssetNameExchange field
                     // holds the instrument name ("BTCUSDT"), not an asset name — see
                     // parse_binance_api_error for details. Do not match on that field
                     // to identify the low-balance asset.
@@ -1148,7 +1148,7 @@ impl ExecutionClient for BinanceSpot {
                         quantity,
                         kind,
                         time_in_force,
-                        state: OrderState::inactive(OrderError::from(api_err)),
+                        state: OrderState::inactive(order_err),
                     })
                 } else if is_rate_limit_error(&e) {
                     // WS-level 429 — update the shared rate limiter so REST calls also back off.
