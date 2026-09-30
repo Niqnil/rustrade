@@ -64,9 +64,10 @@ jobs:
     name: Publish crates
     needs: validate
     runs-on: ubuntu-latest
-    # The crates.io token expires 30 minutes after it is issued, so nothing can publish past that
-    # point anyway. A normal run takes a minute or two; only an index slow to list several crates
-    # gets near this, and a re-run resumes where it stopped (see the script).
+    # The crates.io token lasts 30 minutes, so the job gets no longer: nothing could publish past
+    # that anyway. A normal run takes a minute or two; only an index slow to list several crates gets
+    # near this. The job clock starts before the token is issued, so the job is cancelled before the
+    # token can expire. Re-run it and it resumes where it stopped, with a fresh token.
     timeout-minutes: 30
     # Each crate's trusted publisher on crates.io names this repository, `publish.yml` and this
     # environment, so only this job can obtain a publish token. The environment only deploys from
@@ -85,8 +86,7 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
 
       # Trusted publishing: no long-lived crates.io token exists. The token this returns expires
-      # after 30 minutes and is revoked when the job ends. A publish that outlasts it fails with an
-      # authentication error from `cargo publish`; re-run the job and it resumes with a fresh token.
+      # after 30 minutes and is revoked when the job ends.
       - name: Authenticate with crates.io
         id: auth
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18  # v1.0.5
@@ -96,8 +96,8 @@ jobs:
       # the index check and the barrier are explained at the top of the script.
       #
       # The script publishes with `--no-verify`, so no build script or proc macro runs while the
-      # token is set; the validate job is what builds the release. Dropping that flag would hand the
-      # token to every dependency's build script.
+      # token is set; the validate job, which has no token, builds and tests the tree. Dropping that
+      # flag would hand the token to every dependency's build script.
       - name: Publish crates
         run: ./.github/scripts/publish-crates.sh
         env:
