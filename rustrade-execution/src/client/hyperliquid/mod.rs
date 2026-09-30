@@ -1110,7 +1110,6 @@ impl ExecutionClient for HyperliquidClient {
     }
 }
 
-/// Convert SDK TradeInfo (fill) to AccountEvent::Trade.
 /// Report one perpetual position from Hyperliquid's user state.
 ///
 /// [`PositionReport::Open`] for a non-zero size, [`PositionReport::Flat`] for zero, and
@@ -1140,6 +1139,7 @@ fn perp_position_report(
     ))
 }
 
+/// Convert SDK TradeInfo (fill) to AccountEvent::Trade.
 fn fill_to_account_event(fill: &hyperliquid_rust_sdk::TradeInfo) -> Option<UnindexedAccountEvent> {
     let side = parse_side(&fill.side)?;
     let price = parse_decimal(&fill.px, "fill.px")?;

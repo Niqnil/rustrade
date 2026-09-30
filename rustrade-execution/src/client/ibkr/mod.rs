@@ -1538,6 +1538,10 @@ impl ExecutionClient for IbkrClient {
     /// marked the end of its listing (`PositionEnd`) during the read. Without that marker such
     /// instruments are left out, with a warning, since the listing may be incomplete: IB can
     /// start the read with a stale listing, and only an end marker after the last report counts.
+    /// IB's positions request carries no request ID, so one case cannot be caught: a stale end
+    /// marker on its own, followed by a current listing that does not start within the read's
+    /// 5-second quiet period. It reads as the listing of an account holding nothing, and the
+    /// requested instruments are reported flat.
     /// A requested instrument registered without a contract ID, or whose ID was registered again
     /// under another name, cannot be matched to IB's reports and is left out too.
     ///

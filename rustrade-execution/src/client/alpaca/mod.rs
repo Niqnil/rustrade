@@ -3178,13 +3178,27 @@ fn build_instrument_snapshots(
             .map(|(sym, listing)| snapshot(InstrumentNameExchange::new(sym), listing))
             .collect()
     } else {
+        // Upper-case symbols already given to an earlier requested name.
+        let mut claimed = std::collections::HashSet::new();
         instruments
             .iter()
             .map(|inst| {
+                let symbol = inst.name().as_str().to_ascii_uppercase();
+                // A second name for the same symbol, differing only in case: its listing went to
+                // the first, so nothing is known about it rather than it being flat and orderless.
+                if !claimed.insert(symbol.clone()) {
+                    return InstrumentAccountSnapshot::new(
+                        inst.clone(),
+                        Vec::new(),
+                        false,
+                        PositionReport::Unreported,
+                        None,
+                    );
+                }
                 // swap_remove is O(1); output order is determined by the `instruments`
                 // slice, not by the internal IndexMap order of `by_symbol`.
                 let listing = by_symbol
-                    .swap_remove(inst.name().as_str().to_ascii_uppercase().as_str())
+                    .swap_remove(symbol.as_str())
                     .unwrap_or_else(Listing::empty);
                 snapshot(inst.clone(), listing)
             })
@@ -5253,6 +5267,7 @@ mod tests {
             InstrumentNameExchange::new("tsla"),
             InstrumentNameExchange::new("MSFT"),
             InstrumentNameExchange::new("BTC/USD"),
+            InstrumentNameExchange::new("TSLA"),
         ];
 
         let snapshots = build_instrument_snapshots(Vec::new(), positions, &instruments);
@@ -5261,15 +5276,18 @@ mod tests {
             .map(|s| (s.instrument.name().as_str(), s.position.quantity()))
             .collect();
         // A requested equity with no position is reported flat, and one requested in another case
-        // still finds its position; crypto is never a position.
+        // still finds its position; crypto is never a position. A second name for a symbol
+        // already claimed is unknown, not flat.
         assert_eq!(
             listed,
             vec![
                 ("tsla", Some(dec!(-2))),
                 ("MSFT", Some(Decimal::ZERO)),
-                ("BTC/USD", None)
+                ("BTC/USD", None),
+                ("TSLA", None)
             ]
         );
+        assert!(!snapshots[3].orders_complete);
     }
 
     /// Verifies that the dedup key synthesised by `recover_fills` (REST path) matches
