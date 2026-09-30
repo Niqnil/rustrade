@@ -1,7 +1,8 @@
 name: "rustrade CI"
 
 on:
-  # No required checks run on a push, so a Markdown-only push can skip the workflow outright.
+  # Branch protection does not gate on push runs, so a Markdown-only push can skip the workflow
+  # outright.
   push:
     paths-ignore:
       - "**.md"
@@ -24,8 +25,8 @@ env:
 
 jobs:
   # Decides whether a PR changes anything besides Markdown. Every other job gates on it, and the
-  # gate fails closed: `code` is only ever `false` when this job succeeds and says so, so if it
-  # errors the output is empty and everything runs.
+  # gate fails closed: a job skips only when this one succeeded *and* reported `code=false`. If it
+  # fails at any point, even after writing its output, everything runs.
   changes:
     name: changes
     runs-on: ubuntu-latest
@@ -56,18 +57,25 @@ jobs:
           fi
           git rev-parse --verify --quiet HEAD^2 > /dev/null
           changed=$(git diff --name-only --no-renames HEAD^1 HEAD)
-          printf '%s\n' "$changed"
-          if grep -qv '\.md$' <<< "$changed"; then
-            echo "code=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "code=false" >> "$GITHUB_OUTPUT"
+          # Only a path that matches `*.md` can keep `code` false, so an empty diff counts as code.
+          code=false
+          while IFS= read -r path; do
+            # Indented so that a path starting with `::` is not parsed as a workflow command.
+            printf '  %s\n' "$path"
+            case $path in
+              *.md) ;;
+              *) code=true ;;
+            esac
+          done <<< "$changed"
+          if [ "$code" = false ]; then
             echo "Markdown-only change: skipping every check" >> "$GITHUB_STEP_SUMMARY"
           fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
 
   fmt:
     name: cargo fmt
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -85,7 +93,7 @@ jobs:
   tier2-pins:
     name: tier-2 pins
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -103,7 +111,7 @@ jobs:
   check:
     name: cargo check
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -286,7 +294,7 @@ jobs:
   audit:
     name: cargo audit
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -312,7 +320,7 @@ jobs:
   deny:
     name: cargo deny
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
