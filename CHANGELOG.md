@@ -48,6 +48,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `engine.process_contract_expiry::<MyOnTradingDisabled, MyOnDisconnect>(&key)`. Code that only
   sends `EngineEvent::ContractExpiry` is unaffected.
 
+- **Alpaca's USD balance is now cash, not account equity** (`rustrade-execution`, feature
+  `alpaca`). **Breaking** for code that reads it: `account_snapshot` and `fetch_balances` report
+  `total` as the account's `cash`, and `free` as the lesser of cash and
+  `non_marginable_buying_power`, instead of `equity` and buying power (`options_buying_power`,
+  else `buying_power`). Equity counts the value of every position, which `account_snapshot` now
+  reports one by one (see Fixed), so keeping it would count them twice. Every Alpaca buying power
+  figure counts the loan value of held stock, so `free` could exceed `total`; capped at cash it
+  cannot. Cash is negative while the account borrows on margin, and then `free` is negative too. A
+  short sale's proceeds are credited to cash but not to buying power, so `free` stays below
+  `total` while a short is open. This matches IBKR, whose USD `total` is already
+  `TotalCashValue`. Code that wants equity can add the positions' value to cash. A missing or
+  malformed amount in Alpaca's account or positions response now fails the call instead of
+  reading as zero; so does an equity or option position whose side is neither long nor short.
+
 ### Fixed
 
 - **Binance margin `fetch_trades` and reconnect fill recovery could miss fills more than 24 hours
@@ -104,6 +118,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The audit replica marked such an instrument processed when it held no position. It now
     follows the live engine, and it also leaves state alone on a repeated expiry, as the live
     engine does.
+
+- **Alpaca's `account_snapshot` did not report equity and option positions**
+  (`rustrade-execution`, feature `alpaca`). Every `InstrumentAccountSnapshot::position` was
+  `None`, so a caller could not see what the account held, or which way. Each equity and option
+  holding is now its instrument's `position`: signed quantity (negative for a short, taken from
+  Alpaca's `side`), average entry price, and unrealised PnL in USD. An option's entry price is the
+  premium per share, as its orders are priced, not per contract. With no instruments requested,
+  every instrument holding a position gets a snapshot, as one with an open order already did.
+  Crypto holdings stay asset balances, since Alpaca crypto is spot-only. The snapshot now always
+  fetches `/v2/positions`, even for a USD-only request.
 
 ## [0.7.0] - 2026-09-30
 
