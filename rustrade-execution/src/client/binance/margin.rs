@@ -52,9 +52,10 @@ use super::shared::{
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
     MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, RateLimitTracker,
     SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, classify_order_kind_tif,
-    classify_rest_order_error, connectivity_error, convert_execution_report,
+    classify_rest_order_error, classify_rest_query_error, convert_execution_report,
     convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event,
-    is_duplicate, new_dedup_cache, recovered_order_totals, rest_call_with_retry,
+    is_duplicate, new_dedup_cache, recovered_order_totals, response_decode_error,
+    rest_call_with_retry,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, InstrumentBalanceUpdate,
@@ -908,12 +909,9 @@ impl ExecutionClient for BinanceMargin {
             })
         })
         .await
-        .map_err(connectivity_error)?;
+        .map_err(|e| classify_rest_query_error(&e, None))?;
 
-        let account = response
-            .data()
-            .await
-            .map_err(|e| connectivity_error(e.into()))?;
+        let account = response.data().await.map_err(response_decode_error)?;
 
         let balances =
             filter_and_convert_margin_balances(account.user_assets.unwrap_or_default(), assets);
@@ -982,12 +980,9 @@ impl ExecutionClient for BinanceMargin {
             })
         })
         .await
-        .map_err(connectivity_error)?;
+        .map_err(|e| classify_rest_query_error(&e, None))?;
 
-        let account = response
-            .data()
-            .await
-            .map_err(|e| connectivity_error(e.into()))?;
+        let account = response.data().await.map_err(response_decode_error)?;
 
         Ok(filter_and_convert_margin_balances(
             account.user_assets.unwrap_or_default(),
@@ -1413,12 +1408,9 @@ async fn acquire_user_listen_token(
         })
     })
     .await
-    .map_err(connectivity_error)?;
+    .map_err(|e| classify_rest_query_error(&e, symbol))?;
 
-    let data = response
-        .data()
-        .await
-        .map_err(|e| connectivity_error(e.into()))?;
+    let data = response.data().await.map_err(response_decode_error)?;
     Ok(UserListenToken {
         token: data.token,
         expiration_time_ms: data.expiration_time,
@@ -2752,12 +2744,9 @@ async fn fetch_margin_open_orders_for_instrument(
         })
     })
     .await
-    .map_err(connectivity_error)?;
+    .map_err(|e| classify_rest_query_error(&e, Some(&instrument)))?;
 
-    let orders_data = response
-        .data()
-        .await
-        .map_err(|e| connectivity_error(e.into()))?;
+    let orders_data = response.data().await.map_err(response_decode_error)?;
 
     let listing = convert_open_order_listing(&orders_data, ExchangeId::BinanceMargin, &instrument);
 
@@ -2786,12 +2775,9 @@ async fn fetch_margin_all_open_orders(
         })
     })
     .await
-    .map_err(connectivity_error)?;
+    .map_err(|e| classify_rest_query_error(&e, None))?;
 
-    let orders_data = response
-        .data()
-        .await
-        .map_err(|e| connectivity_error(e.into()))?;
+    let orders_data = response.data().await.map_err(response_decode_error)?;
 
     let orders = orders_data
         .into_iter()
@@ -2933,12 +2919,9 @@ async fn paginate_margin_my_trades(
             })
         })
         .await
-        .map_err(connectivity_error)?;
+        .map_err(|e| classify_rest_query_error(&e, Some(instrument)))?;
 
-        let page = response
-            .data()
-            .await
-            .map_err(|e| connectivity_error(e.into()))?;
+        let page = response.data().await.map_err(response_decode_error)?;
 
         let page_len = page.len();
         let last_id = page.last().and_then(|t| t.id);
@@ -3234,12 +3217,9 @@ async fn fetch_isolated_margin_account_info(
                 })
             })
             .await
-            .map_err(connectivity_error)?;
+            .map_err(|e| classify_rest_query_error(&e, None))?;
 
-            let info = response
-                .data()
-                .await
-                .map_err(|e| connectivity_error(e.into()))?;
+            let info = response.data().await.map_err(response_decode_error)?;
             Ok::<_, UnindexedClientError>(info.assets.unwrap_or_default())
         }
     }))
@@ -5478,5 +5458,66 @@ mod tests {
                     && !query.contains_key("endTime")
             )
         );
+    }
+
+    /// Run `paginate_margin_my_trades` against a venue that answers every request with
+    /// `response`, returning the error it fails with.
+    async fn margin_trades_error(response: wiremock::ResponseTemplate) -> UnindexedClientError {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/myTrades"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        let rest = Arc::new(MarginTradingRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server.uri())
+                .build()
+                .unwrap(),
+        ));
+
+        paginate_margin_my_trades(
+            &rest,
+            &Arc::new(RateLimitTracker::new()),
+            &InstrumentNameExchange::new("BTCUSDT"),
+            MyTradesFrom::Time(Utc::now().timestamp_millis() - HOUR_MS),
+            true,
+        )
+        .await
+        .unwrap_err()
+    }
+
+    /// A venue rejection of a query is reported as such, with its code, and not as a transient
+    /// connectivity failure a caller would retry forever.
+    #[tokio::test]
+    async fn margin_trades_report_a_venue_rejection_as_a_non_transient_request_rejection() {
+        let err = margin_trades_error(wiremock::ResponseTemplate::new(400).set_body_json(
+            serde_json::json!({"code": -1127, "msg": "More than 24 hours between startTime and endTime."}),
+        ))
+        .await;
+
+        let UnindexedClientError::Api(ApiError::RequestRejected(msg)) = &err else {
+            panic!("expected RequestRejected, got {err:?}");
+        };
+        assert!(msg.contains("-1127"), "code missing from {msg:?}");
+        assert!(!err.is_transient());
+    }
+
+    /// A 2xx body that does not fit the SDK's model fails identically on every retry.
+    #[tokio::test]
+    async fn margin_trades_report_an_undecodable_response_as_internal() {
+        let err = margin_trades_error(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"unexpected": 1})),
+        )
+        .await;
+
+        assert!(
+            matches!(err, UnindexedClientError::Internal(_)),
+            "got {err:?}"
+        );
+        assert!(!err.is_transient());
     }
 }
