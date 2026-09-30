@@ -339,6 +339,11 @@ impl<AssetKey: Debug + Clone, InstrumentKey> PositionManager<AssetKey, Instrumen
 /// `price_entry_average`, so a session summary includes any PnL accrued before the engine started.
 /// Seed the current price instead if the summary should cover only this session.
 ///
+/// A seed is not checked when it is constructed or deserialised. The checks listed on
+/// [`PositionSeedError`] run when the state is built, by
+/// [`EngineStateBuilder::try_build`](crate::engine::state::builder::EngineStateBuilder::try_build)
+/// or [`SystemBuilder::build`](crate::system::builder::SystemBuilder::build).
+///
 /// `#[non_exhaustive]`: construct with [`PositionSeed::new`], so a field can be added without a
 /// breaking change.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -351,8 +356,12 @@ pub struct PositionSeed {
     /// Absolute position quantity. Must be greater than zero.
     pub quantity_abs: Decimal,
     /// Volume-weighted average entry price.
+    ///
+    /// Not checked, as a fill's price is not: a negative price is legal on some instruments, and
+    /// zero is a genuine cost basis for an asset received without paying for it.
     pub price_entry_average: Decimal,
-    /// When the position was entered.
+    /// When the position was entered. Not checked; it should not be later than the engine's
+    /// start time, or hold-time statistics for the position come out negative.
     pub time_enter: DateTime<Utc>,
     /// Slot the position occupies in its instrument's [`PositionManager`].
     ///
@@ -474,7 +483,7 @@ pub enum PositionSeedError {
 
     /// Two seeds target the same slot on one instrument. Under [`OmsMode::Netting`] that is any
     /// two seeds for the instrument.
-    #[error("position seed for {instrument} targets slot {position_id}, which is already seeded")]
+    #[error("position seeded more than once for {instrument} (slot {position_id})")]
     DuplicateSlot {
         instrument: InstrumentNameInternal,
         position_id: PositionId,

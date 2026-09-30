@@ -510,6 +510,11 @@ mod tests {
         })
     }
 
+    /// A function pointer rather than a closure, so [`system_args`] can name its type.
+    type MarketDataInit = fn(
+        &Keyed<InstrumentIndex, Instrument<Keyed<ExchangeIndex, ExchangeId>, AssetIndex>>,
+    ) -> DefaultInstrumentMarketData;
+
     /// Arguments for a system trading on `EXECUTION` through one mock client.
     fn system_args(
         instruments: &IndexedInstruments,
@@ -533,11 +538,6 @@ mod tests {
             |_| DefaultInstrumentMarketData::default(),
         )
     }
-
-    /// A function pointer rather than a closure, so [`system_args`] can name its type.
-    type MarketDataInit = fn(
-        &Keyed<InstrumentIndex, Instrument<Keyed<ExchangeIndex, ExchangeId>, AssetIndex>>,
-    ) -> DefaultInstrumentMarketData;
 
     /// `SystemBuilder::positions` reaches the engine's starting state, and an invalid seed is
     /// returned as [`BarterError::PositionSeed`] rather than panicking.

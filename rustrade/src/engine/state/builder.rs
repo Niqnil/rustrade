@@ -313,7 +313,7 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use rustrade_execution::{
-        order::id::{OrderId, StrategyId},
+        order::id::{ClientOrderId, OrderId, StrategyId},
         trade::{AssetFees, Trade, TradeId},
     };
     use rustrade_instrument::{
@@ -575,6 +575,67 @@ mod tests {
         assert_eq!(positions.len(), 2);
         assert_eq!(positions[&PositionId::new("a")].quantity_abs, dec!(1));
         assert_eq!(positions[&PositionId::new("b")].quantity_abs, dec!(2));
+    }
+
+    /// Under Hedging, a fill for an order submitted with a seeded slot's `PositionId` reduces and
+    /// then closes that slot, as the `PositionSeed::position_id` rustdoc promises.
+    #[test]
+    fn seeded_hedging_slot_is_reduced_and_closed_by_its_orders_fills() {
+        let instruments = seed_instruments();
+        let mut state = try_build(
+            &instruments,
+            OmsMode::Hedging,
+            vec![
+                long_seed(SPOT, dec!(3)).with_position_id(PositionId::new("a")),
+                long_seed(SPOT, dec!(5)).with_position_id(PositionId::new("b")),
+            ],
+        )
+        .unwrap();
+
+        let spot = state
+            .instruments
+            .instrument_mut(&InstrumentNameInternal::new(SPOT));
+        let (key, quote) = (spot.key, spot.instrument.underlying.quote);
+
+        // Routing the engine records when an order is submitted with `position_id: "a"`
+        // and acknowledged under exchange order id "close_a".
+        let cid = ClientOrderId::new("close_a");
+        spot.position_ids.insert(cid.clone(), PositionId::new("a"));
+        spot.exchange_id_to_cid.insert(OrderId::new("close_a"), cid);
+
+        let sell = |id: &str, quantity| Trade {
+            id: TradeId::new(id),
+            order_id: OrderId::new("close_a"),
+            instrument: key,
+            strategy: StrategyId::new("strategy"),
+            time_exchange: time(3_000),
+            side: Side::Sell,
+            price: dec!(52_000),
+            quantity,
+            order_filled_quantity: None,
+            fees: AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO)),
+        };
+
+        let first = sell("fill_1", dec!(1));
+        assert!(spot.update_from_trade(&first).is_none());
+        assert_eq!(
+            spot.position.positions[&PositionId::new("a")].quantity_abs,
+            dec!(2)
+        );
+
+        let second = sell("fill_2", dec!(2));
+        let exited = spot
+            .update_from_trade(&second)
+            .expect("the remaining quantity closes slot a");
+        assert_eq!(exited.position_id, PositionId::new("a"));
+        assert_eq!(exited.pnl_realised, dec!(6_000));
+
+        // Slot b is untouched.
+        assert_eq!(spot.position.positions.len(), 1);
+        assert_eq!(
+            spot.position.positions[&PositionId::new("b")].quantity_abs,
+            dec!(5)
+        );
     }
 
     /// Naming the netting slot explicitly is the same as naming none.

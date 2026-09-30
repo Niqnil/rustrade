@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     not fit the `OmsMode`. `build` keeps its signature and panics on the same errors; a builder
     with no seeds never panics.
   - `SystemBuilder::build` returns the error as the new `BarterError::PositionSeed` variant.
+    `BarterError` is not `#[non_exhaustive]`, so a downstream `match` on it that lists every
+    variant needs an arm for this one.
 
 ## [0.7.0] - 2026-09-30
 
