@@ -53,8 +53,8 @@ fn date(year: i32, month: u32, day: u32) -> NaiveDate {
 const STATS_BODY: &str = r#"{
     "countries": ["EA", "EU", "JP", "UK", "US"],
     "impacts": ["High", "Low", "Medium", "None"],
-    "earliest": "2014-12-31",
-    "latest": "2026-03-24",
+    "earliest": "2014-12-31 23:00:00+00:00",
+    "latest": "2026-03-24 20:00:00+00:00",
     "total_events": 124896
 }"#;
 

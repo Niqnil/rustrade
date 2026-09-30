@@ -143,11 +143,11 @@ const ECONOMIC_CALENDAR_PATH: &str = "economic-calendar";
 /// Path of the economic-calendar stats endpoint, relative to the data API base URL.
 const ECONOMIC_CALENDAR_STATS_PATH: &str = "economic-calendar/stats";
 
-/// Spelling of the `start_date`/`end_date` query parameters, and of the stats bounds.
+/// Spelling of the `start_date`/`end_date` query parameters.
 ///
-/// ⚠️ **Not** the spelling of a row's [`event_date`](LseCalendarEvent::event_date), which carries a
-/// time of day and an offset. The query is bounded by whole days; an event is stamped to the
-/// second.
+/// ⚠️ **Not** the spelling of a row's [`event_date`](LseCalendarEvent::event_date) or of the stats
+/// bounds, which carry a time of day and an offset. The query is bounded by whole days; an event is
+/// stamped to the second.
 const DATE_FORMAT: &str = "%Y-%m-%d";
 
 /// Value of the `format` parameter that selects JSON.
@@ -169,11 +169,18 @@ const UK_CODE: &str = "UK";
 /// The ISO-3166-1 alpha-2 code for the United Kingdom, which this host does **not** use.
 const GB_CODE: &str = "GB";
 
-/// Parse a provider date, naming the field so a caller can tell which one failed.
-fn parse_date(value: &str, field: &str) -> Result<NaiveDate, LseError> {
-    NaiveDate::parse_from_str(value, DATE_FORMAT).map_err(|error| LseError::Deserialize {
-        message: format!("invalid economic-calendar {field} {value:?}: {error}"),
-    })
+/// Parse a provider instant, naming the field so a caller can tell which one failed.
+///
+/// The provider's space-separated spelling (`2026-03-24 14:00:00+00:00`) is accepted by
+/// [`DateTime::parse_from_rfc3339`] directly, as the RFC 3339 §5.6 lenience it is — the same path
+/// [`LseTick`](super::tick::LseTick) takes for the vault's timestamps. No second grammar is used,
+/// so the two cannot drift apart in what they admit.
+fn parse_instant(value: &str, field: &str) -> Result<DateTime<Utc>, LseError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|parsed| parsed.with_timezone(&Utc))
+        .map_err(|error| LseError::Deserialize {
+            message: format!("invalid economic-calendar {field} {value:?}: {error}"),
+        })
 }
 
 /// How much market impact the provider attributes to an event.
@@ -322,22 +329,13 @@ pub struct LseCalendarEvent {
 impl LseCalendarEvent {
     /// Parses [`event_date`](Self::event_date) as an instant.
     ///
-    /// The provider's space-separated spelling (`2026-03-24 14:00:00+00:00`) is accepted by
-    /// [`DateTime::parse_from_rfc3339`] directly, as the RFC 3339 §5.6 lenience it is — the same
-    /// path [`LseTick`](super::tick::LseTick) takes for the vault's timestamps. No second grammar
-    /// is used, so the two cannot drift apart in what they admit.
+    /// The provider's space-separated spelling (`2026-03-24 14:00:00+00:00`) is accepted as the
+    /// RFC 3339 §5.6 lenience it is.
     ///
     /// # Errors
     /// Returns [`LseError::Deserialize`] if the value is not a valid RFC 3339 instant.
     pub fn event_time(&self) -> Result<DateTime<Utc>, LseError> {
-        DateTime::parse_from_rfc3339(&self.event_date)
-            .map(|parsed| parsed.with_timezone(&Utc))
-            .map_err(|error| LseError::Deserialize {
-                message: format!(
-                    "invalid economic-calendar event_date {:?}: {error}",
-                    self.event_date
-                ),
-            })
+        parse_instant(&self.event_date, "event_date")
     }
 
     /// The calendar day of [`event_date`](Self::event_date), in UTC.
@@ -388,14 +386,19 @@ pub struct LseCalendarStats {
     ///
     /// ⚠️ `"None"` is a literal string here too — see [`LseCalendarImpact`].
     pub impacts: Vec<SmolStr>,
-    /// Date of the earliest published event, spelled `YYYY-MM-DD`. Measured at `2014-12-31`.
+    /// Instant of the earliest published event, spelled like
+    /// [`event_date`](LseCalendarEvent::event_date): `2014-12-31 23:00:00+00:00`.
     ///
-    /// Parse with [`earliest_date`](Self::earliest_date).
+    /// ⚠️ The provider once served a bare `YYYY-MM-DD` here and changed it without notice; the
+    /// bare spelling is no longer accepted. Parse with [`earliest_time`](Self::earliest_time), or
+    /// [`earliest_date`](Self::earliest_date) for its UTC day.
     pub earliest: String,
-    /// Date of the latest published event, spelled `YYYY-MM-DD`. Measured at `2026-03-24`.
+    /// Instant of the latest published event, spelled like `earliest`. Measured at
+    /// `2026-03-24 20:00:00+00:00`.
     ///
-    /// 🔴 The feed has not moved past this date since it was first measured. Parse with
-    /// [`latest_date`](Self::latest_date); compare it against 2026-03-24 to detect a revival.
+    /// 🔴 The feed has not moved past this day since it was first measured. Parse with
+    /// [`latest_time`](Self::latest_time) or [`latest_date`](Self::latest_date); compare the day
+    /// against 2026-03-24 to detect a revival.
     pub latest: String,
     /// Total events across every country. Measured at 124,896, unchanged over two months.
     pub total_events: u64,
@@ -453,22 +456,36 @@ impl LseCalendarStats {
             .find(|known| known.eq_ignore_ascii_case(wanted))
     }
 
-    /// Parses [`earliest`](Self::earliest) as a calendar date.
+    /// Parses [`earliest`](Self::earliest) as an instant.
     ///
     /// # Errors
-    /// Returns [`LseError::Deserialize`] if the value is not in the provider's `YYYY-MM-DD`
-    /// spelling.
-    pub fn earliest_date(&self) -> Result<NaiveDate, LseError> {
-        parse_date(&self.earliest, "earliest")
+    /// Returns [`LseError::Deserialize`] if the value is not a valid RFC 3339 instant.
+    pub fn earliest_time(&self) -> Result<DateTime<Utc>, LseError> {
+        parse_instant(&self.earliest, "earliest")
     }
 
-    /// Parses [`latest`](Self::latest) as a calendar date.
+    /// Parses [`latest`](Self::latest) as an instant.
     ///
     /// # Errors
-    /// Returns [`LseError::Deserialize`] if the value is not in the provider's `YYYY-MM-DD`
-    /// spelling.
+    /// Returns [`LseError::Deserialize`] if the value is not a valid RFC 3339 instant.
+    pub fn latest_time(&self) -> Result<DateTime<Utc>, LseError> {
+        parse_instant(&self.latest, "latest")
+    }
+
+    /// The calendar day of [`earliest`](Self::earliest), in UTC.
+    ///
+    /// # Errors
+    /// As [`earliest_time`](Self::earliest_time).
+    pub fn earliest_date(&self) -> Result<NaiveDate, LseError> {
+        Ok(self.earliest_time()?.date_naive())
+    }
+
+    /// The calendar day of [`latest`](Self::latest), in UTC.
+    ///
+    /// # Errors
+    /// As [`latest_time`](Self::latest_time).
     pub fn latest_date(&self) -> Result<NaiveDate, LseError> {
-        parse_date(&self.latest, "latest")
+        Ok(self.latest_time()?.date_naive())
     }
 }
 
@@ -774,8 +791,8 @@ mod tests {
                 .into_iter()
                 .map(SmolStr::new)
                 .collect(),
-            earliest: "2014-12-31".to_string(),
-            latest: "2026-03-24".to_string(),
+            earliest: "2014-12-31 23:00:00+00:00".to_string(),
+            latest: "2026-03-24 20:00:00+00:00".to_string(),
             total_events: 124_896,
         }
     }
@@ -1132,16 +1149,38 @@ mod tests {
         let json = r#"{
             "countries": ["EA", "UK", "US"],
             "impacts": ["High", "Low", "Medium", "None"],
-            "earliest": "2014-12-31",
-            "latest": "2026-03-24",
+            "earliest": "2014-12-31 23:00:00+00:00",
+            "latest": "2026-03-24 20:00:00+00:00",
             "total_events": 124896
         }"#;
 
         let stats: LseCalendarStats = serde_json::from_str(json).unwrap();
 
         assert_eq!(stats.total_events, 124_896);
+        assert_eq!(
+            stats.earliest_time().unwrap(),
+            date(2014, 12, 31).and_hms_opt(23, 0, 0).unwrap().and_utc()
+        );
+        assert_eq!(
+            stats.latest_time().unwrap(),
+            date(2026, 3, 24).and_hms_opt(20, 0, 0).unwrap().and_utc()
+        );
         assert_eq!(stats.earliest_date().unwrap(), date(2014, 12, 31));
         assert_eq!(stats.latest_date().unwrap(), date(2026, 3, 24));
+    }
+
+    /// The spelling the provider served before it switched to timestamps. Rejected rather than
+    /// read as midnight: one grammar for every calendar instant, and a switch back surfaces here and
+    /// in the live canary instead of being absorbed.
+    #[test]
+    fn a_bare_date_stats_bound_is_rejected() {
+        let mut stats = stats();
+        stats.earliest = "2014-12-31".to_string();
+
+        let error = stats.earliest_date().unwrap_err();
+
+        assert!(matches!(error, LseError::Deserialize { .. }));
+        assert!(error.to_string().contains("earliest"), "{error}");
     }
 
     #[test]
