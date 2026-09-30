@@ -15,6 +15,9 @@ use std::fmt::Debug;
 use thiserror::Error;
 use tracing::{error, warn};
 
+mod venue;
+pub use venue::{SkippedVenuePosition, VenuePositionSeeds, VenuePositionSkipReason};
+
 /// Order Management System mode governing how positions are tracked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 pub enum OmsMode {
@@ -326,7 +329,9 @@ impl<AssetKey: Debug + Clone, InstrumentKey> PositionManager<AssetKey, Instrumen
 /// it. A seed is also how a backtest starts from an existing portfolio.
 ///
 /// The caller supplies the entry price, from its own records or the venue's trade history. The
-/// engine cannot recover one: it is not in a balance, and many venues do not report it.
+/// engine cannot recover one: it is not in a balance, and many venues do not report it. Where a
+/// venue does report positions with an entry price, [`VenuePositionSeeds::from_account_snapshot`]
+/// builds seeds from its account snapshot.
 ///
 /// # What the seeded position holds
 /// - `contract_size` from the instrument, as a fill would set it.

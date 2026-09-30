@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `SystemBuilder::build` returns the error as the new `BarterError::PositionSeed` variant.
     `BarterError` is not `#[non_exhaustive]`, so a downstream `match` on it that lists every
     variant needs an arm for this one.
+  - `VenuePositionSeeds::from_account_snapshot` builds seeds from the positions a venue reports
+    in an account snapshot (Alpaca, IBKR and Hyperliquid perpetuals report them), resolving the
+    venue's instrument names through the engine's `IndexedInstruments`. An open position it
+    cannot seed is returned in `skipped` with a `VenuePositionSkipReason`: the instrument is not
+    one the engine is built with, or the venue reported no entry price. The single-position form
+    is `PositionSeed::from_venue_position`. A seed takes the venue's entry price as reported (IBKR
+    includes commissions in it, Alpaca does not), no entry fees, and the report time as its entry
+    time, since venues report none.
 
 - **`EngineOutput::ContractExpiryNotSettled`** (`rustrade`), emitted when a `ContractExpiry` does
   not settle its instrument. Its `ContractExpiryNotSettledReason` is `InstrumentNeverExpires` for

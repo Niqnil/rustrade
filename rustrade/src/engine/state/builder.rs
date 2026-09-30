@@ -191,6 +191,8 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
     /// see it. Seed each one here, once, before the engine starts. Also useful for back-tests
     /// that start from an existing portfolio. See [`PositionSeed`] for what a seeded position
     /// holds, and why its entry price must come from the caller.
+    /// [`VenuePositionSeeds::from_account_snapshot`](crate::engine::state::position::VenuePositionSeeds::from_account_snapshot)
+    /// builds seeds from a venue's account snapshot.
     ///
     /// Seeds are validated by [`Self::try_build`] against the [`OmsMode`] set with
     /// [`Self::oms_mode`], whichever order the two are called in. Repeated calls append.

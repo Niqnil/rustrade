@@ -579,6 +579,57 @@ mod tests {
         );
     }
 
+    /// A venue account snapshot, converted by [`VenuePositionSeeds::from_account_snapshot`], seeds
+    /// the engine with the venue's position under the engine's instrument name.
+    #[test]
+    fn venue_snapshot_positions_seed_the_engine_state() {
+        use crate::engine::state::position::VenuePositionSeeds;
+        use rust_decimal_macros::dec;
+        use rustrade_execution::{InstrumentAccountSnapshot, position::Position as VenuePosition};
+
+        let instruments = IndexedInstruments::new([instrument(EXECUTION, "btc", "usdt")]);
+        let name = instruments.instruments()[0].value.name_internal.clone();
+        let position = VenuePosition::new(
+            dec!(-0.5),
+            Some(dec!(30000)),
+            None,
+            None,
+            None,
+            None,
+            DateTime::<Utc>::MIN_UTC,
+        );
+        let snapshot = AccountSnapshot::new(
+            EXECUTION,
+            vec![],
+            vec![InstrumentAccountSnapshot::new(
+                "btc_usdt".into(),
+                vec![],
+                false,
+                Some(position),
+                None,
+            )],
+        );
+
+        let seeds = VenuePositionSeeds::from_account_snapshot(&instruments, &snapshot);
+        assert!(seeds.skipped.is_empty(), "{:?}", seeds.skipped);
+
+        let system = SystemBuilder::new(system_args(&instruments))
+            .positions(seeds.seeds)
+            .build::<EngineEvent, _>()
+            .expect("a venue seed must build");
+        let seeded = &system
+            .engine
+            .state
+            .instruments
+            .instrument(&name)
+            .position
+            .positions[&PositionId::NETTING];
+        assert_eq!(
+            (seeded.side, seeded.quantity_abs, seeded.price_entry_average),
+            (Side::Sell, dec!(0.5), dec!(30000))
+        );
+    }
+
     /// `SystemBuilder` derives the account dimension from the execution clients it registers, so a
     /// venue that prices instruments without being traded on is not given an account connection to
     /// wait on.
