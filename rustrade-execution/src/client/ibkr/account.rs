@@ -88,7 +88,7 @@ impl BalanceAggregator {
 /// start with stale replies to earlier failed calls (see `POSITION_STREAM_TIMEOUT`).
 ///
 /// When more than one account holds the same instrument, the first account to report a non-zero
-/// quantity is kept and the others are dropped with a warning. Summing them would report a
+/// quantity, in IB's reporting order, is kept and the others are dropped with a warning. Summing them would report a
 /// position that no single account holds.
 #[derive(Debug, Default)]
 pub(crate) struct PositionAggregator {
@@ -157,8 +157,8 @@ impl PositionAggregator {
 /// Convert one IB position report to a [`Position`], or `None` if its quantity is zero.
 ///
 /// - `quantity`: IB's signed position, negative when short. `ibapi` 4.2.0 hands it over as an
-///   `f64`, converted with `Decimal::try_from`, which keeps the shortest decimal that round-trips
-///   (0.1 stays 0.1) rather than the float's exact binary expansion.
+///   `f64`, converted with `Decimal::try_from`, which rounds to the float's precision of about 15
+///   significant digits (0.1 stays 0.1) rather than keeping its exact binary expansion.
 /// - `entry_price`: see [`entry_price`].
 /// - `time_exchange`: `now`, since IB does not timestamp positions.
 fn convert_position(
@@ -315,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_position_fractional_quantity_is_shortest_decimal() {
+    fn test_convert_position_fractional_quantity_is_rounded_to_float_precision() {
         // 0.3 is not exact in binary; the conversion must not keep the float's expansion.
         let position = convert_position(&report("DU1", SecurityType::Stock, "", 0.3, 100.0), now())
             .unwrap()
@@ -427,6 +427,43 @@ mod tests {
             agg.into_positions(now()).unwrap(),
             vec![(instrument("AAPL"), None)]
         );
+    }
+
+    #[test]
+    fn test_position_aggregator_later_flat_account_and_update_keep_latest() {
+        let mut agg = PositionAggregator::default();
+        agg.process(
+            instrument("AAPL"),
+            report("DU2", SecurityType::Stock, "", 7.0, 150.0),
+        );
+        // A flat account after a held one changes nothing.
+        agg.process(
+            instrument("AAPL"),
+            report("DU1", SecurityType::Stock, "", 0.0, 0.0),
+        );
+        // DU2's newer report replaces its earlier one.
+        agg.process(
+            instrument("AAPL"),
+            report("DU2", SecurityType::Stock, "", 9.0, 151.0),
+        );
+
+        let positions = agg.into_positions(now()).unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].1.as_ref().unwrap().quantity, dec!(9));
+    }
+
+    #[test]
+    fn test_position_aggregator_non_finite_quantity_is_internal_error() {
+        let mut agg = PositionAggregator::default();
+        agg.process(
+            instrument("AAPL"),
+            report("DU1", SecurityType::Stock, "", f64::NAN, 150.0),
+        );
+
+        assert!(matches!(
+            agg.into_positions(now()),
+            Err(UnindexedClientError::Internal(_))
+        ));
     }
 
     #[test]

@@ -1521,8 +1521,8 @@ impl ExecutionClient for IbkrClient {
     /// when that is not empty), gets an `InstrumentAccountSnapshot`. Its `position` carries:
     /// - `quantity`: IB's signed position, negative when short, in shares for a stock and in
     ///   contracts for a future or an option. `ibapi` 4.2.0 hands it over as an `f64`, converted
-    ///   with `Decimal::try_from`, which keeps the shortest decimal that round-trips (0.1 stays
-    ///   0.1), not the float's exact binary expansion.
+    ///   with `Decimal::try_from`, which rounds to the float's precision of about 15 significant
+    ///   digits (0.1 stays 0.1) rather than keeping its exact binary expansion.
     /// - `entry_price`: IB's average cost divided by the contract multiplier, so a future or an
     ///   option is quoted as its orders are priced. It includes commissions. `None` when IB sends
     ///   no average cost, or no multiplier for a contract other than a stock or a forex pair.
@@ -1540,6 +1540,8 @@ impl ExecutionClient for IbkrClient {
     /// **Several accounts.** IB reports positions per account, and this client does not select
     /// one. When more than one account holds the same instrument, the first account to report a
     /// non-zero quantity is kept and the others are dropped with a warning; they are never summed.
+    /// Which account comes first depends on the order IB reports them in, so a caller holding the
+    /// same instrument in several accounts should not rely on it.
     ///
     /// # Limitations
     ///
