@@ -14,9 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hours of trades to a query without `fromId`, but the client sent `startTime` alone and then
   stopped at the first short page. So a lookback longer than a day could read one day's fills
   and silently miss every later one. The client now reads in 23-hour windows, each bounded by
-  `startTime` and `endTime`, until the first window holding a trade, then pages on by trade id to
-  the present. A lookback with no trades costs one request (weight 10) per window. Spot is
-  unaffected: its `myTrades` returns every trade since a bare `startTime`.
+  `startTime` and `endTime`, up to the local clock at the call. From the first window holding a
+  trade it pages on by trade id. Each window before the first trade costs one request (weight 10),
+  so the cost grows with the lookback: about 32 requests per instrument for 30 days with no
+  trades. Spot is unaffected: its `myTrades` returns every trade since a bare `startTime`.
 
 ## [0.7.0] - 2026-09-30
 
