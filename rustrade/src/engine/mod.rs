@@ -17,7 +17,7 @@ use crate::{
             connectivity::UntrackedExchange,
             instrument::{OptionSplitPlan, data::InstrumentDataState},
             order::{Orders, in_flight_recorder::InFlightRequestRecorder, manager::OrderManager},
-            position::{Position, PositionExited, PositionId, SplitRoundingPolicy},
+            position::{Position, PositionDrift, PositionExited, PositionId, SplitRoundingPolicy},
             trading::TradingState,
         },
     },
@@ -35,7 +35,7 @@ use derive_more::Constructor;
 use rust_decimal::Decimal;
 use rustrade_data::{event::MarketEvent, streams::consumer::MarketStreamEvent};
 use rustrade_execution::{
-    AccountEvent,
+    AccountEvent, AccountEventKind,
     order::{Order, id::ClientOrderId},
     trade::{AssetFees, Trade, TradeId},
 };
@@ -392,11 +392,28 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                     Err(untracked) => UpdateFromAccountOutput::UntrackedExchange(untracked),
                 }
             }
-            AccountStreamEvent::Item(event) => self
-                .state
-                .update_from_account(event)
-                .map(UpdateFromAccountOutput::PositionExit)
-                .unwrap_or(UpdateFromAccountOutput::None),
+            AccountStreamEvent::Item(event) => {
+                if let Some(exited) = self.state.update_from_account(event) {
+                    return UpdateFromAccountOutput::PositionExit(exited);
+                }
+                let AccountEventKind::Snapshot(snapshot) = &event.kind else {
+                    return UpdateFromAccountOutput::None;
+                };
+                let drift = self.state.position_drift(snapshot);
+                if drift.is_empty() {
+                    return UpdateFromAccountOutput::None;
+                }
+                for drift in &drift {
+                    warn!(
+                        exchange = ?event.exchange,
+                        instrument = ?drift.instrument,
+                        quantity_engine = %drift.quantity_engine,
+                        quantity_venue = %drift.quantity_venue,
+                        "venue account snapshot reports a different position than the engine holds"
+                    );
+                }
+                UpdateFromAccountOutput::PositionDrift(drift)
+            }
         }
     }
 
@@ -1745,6 +1762,23 @@ pub enum EngineOutput<
         /// Why the expiry was not settled.
         reason: ContractExpiryNotSettledReason,
     },
+
+    /// An account snapshot reported a position that differs from the engine's, one output per
+    /// instrument. See [`PositionDrift`] and
+    /// [`EngineState::position_drift`](crate::engine::state::EngineState::position_drift) for what
+    /// is compared.
+    ///
+    /// The engine checks every account snapshot it processes: the one each execution link sends
+    /// when it connects, and again after every reconnect. Only instruments whose position the
+    /// venue reports are compared, see
+    /// [`PositionReport`](rustrade_execution::position::PositionReport).
+    ///
+    /// Nothing is corrected: the engine keeps its own positions, and the strategy and risk
+    /// manager keep acting on them. Drift can be transient, when a fill reached the venue's
+    /// position before its trade reached the engine; it can also mean a position changed outside
+    /// the engine, by a manual order, a liquidation or an expiry the engine did not see. Deciding
+    /// between them, and what to do, is the caller's.
+    PositionDrift(PositionDrift<InstrumentKey>),
 }
 
 /// A single resting order captured in an [`EngineOutput::OpenOrdersAtSplit`] observable.
@@ -1915,6 +1949,10 @@ pub enum UpdateFromAccountOutput<OnDisconnect, InstrumentKey = InstrumentIndex> 
     /// The event named an exchange the engine does not track; nothing was updated, and
     /// `on_disconnect` was **not** called. See [`UntrackedExchange`].
     UntrackedExchange(UntrackedExchange),
+
+    /// An account snapshot reported positions that differ from the engine's, one per instrument.
+    /// See [`EngineOutput::PositionDrift`].
+    PositionDrift(Vec<PositionDrift<InstrumentKey>>),
 }
 
 /// Output produced by the [`Engine`] updating from an [`MarketStreamEvent`], used to construct

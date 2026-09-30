@@ -34,6 +34,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     includes commissions in it, Alpaca does not), no entry fees, and the time the position was
     read as its entry time, since venues report none.
 
+- **`EngineOutput::PositionDrift`: the engine reports where a venue's positions differ from its
+  own** (`rustrade`). The engine checks each account snapshot it processes, the one sent when an
+  execution link connects and again after every reconnect, against its own positions. For every
+  instrument the venue reports as `PositionReport::Flat` or `Open` (see Changed) whose signed
+  quantity differs from the engine's net quantity, it logs a warning and emits one
+  `PositionDrift`: the instrument, both quantities, and both entry prices for information.
+  Nothing is corrected, and entry prices are not compared. An unreported position is never
+  compared, so a venue that does not report positions, such as Binance, never drifts. Drift can be
+  transient, when a fill reaches the venue's position before its trade reaches the engine.
+  - `EngineState::position_drift` runs the same check on any indexed `AccountSnapshot`, for a
+    caller that fetches snapshots itself.
+  - `PositionManager::quantity_net` gives an instrument's signed net quantity; under
+    `OmsMode::Hedging` longs and shorts offset.
+  - `UpdateFromAccountOutput` gains a matching `PositionDrift` variant. Both enums are
+    `#[non_exhaustive]`.
+
 - **`EngineOutput::ContractExpiryNotSettled`** (`rustrade`), emitted when a `ContractExpiry` does
   not settle its instrument. Its `ContractExpiryNotSettledReason` is `InstrumentNeverExpires` for
   a `Spot`, `Perpetual` or `Cfd` instrument (see Fixed), or `SettlementPriceUnavailable` when the

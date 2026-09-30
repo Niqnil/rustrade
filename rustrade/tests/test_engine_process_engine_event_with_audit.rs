@@ -28,7 +28,7 @@ use rustrade::{
                 data::{DefaultInstrumentMarketData, InstrumentDataState},
                 filter::InstrumentFilter,
             },
-            position::{OmsMode, PositionExited, SplitRoundingPolicy},
+            position::{OmsMode, PositionDrift, PositionExited, SplitRoundingPolicy},
             trading::TradingState,
         },
     },
@@ -48,8 +48,8 @@ use rustrade_data::{
     subscription::trade::PublicTrade,
 };
 use rustrade_execution::{
-    AccountEvent, AccountEventKind, AccountSnapshot, FeeModelConfig, MarketSnapshot,
-    PerContractFeeModel,
+    AccountEvent, AccountEventKind, AccountSnapshot, FeeModelConfig, InstrumentAccountSnapshot,
+    MarketSnapshot, PerContractFeeModel,
     balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate},
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
@@ -57,6 +57,7 @@ use rustrade_execution::{
         request::{OrderRequestCancel, OrderRequestOpen, OrderResponseCancel, RequestOpen},
         state::{ActiveOrderState, Cancelled, Filled, Open, OrderState},
     },
+    position::{Position, PositionReport},
     trade::{AssetFees, Trade, TradeId},
 };
 use rustrade_instrument::{
@@ -6770,5 +6771,128 @@ fn test_hedging_pending_fill_replayed_on_fully_filled_ack() {
     assert!(
         instr.pending_fills.is_empty(),
         "pending_fills should be drained after replay"
+    );
+}
+
+fn account_event_positions(reports: Vec<(usize, PositionReport)>) -> EngineEvent<DataKind> {
+    EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+        exchange: ExchangeIndex(0),
+        kind: AccountEventKind::Snapshot(AccountSnapshot {
+            exchange: ExchangeIndex(0),
+            balances: vec![],
+            instruments: reports
+                .into_iter()
+                .map(|(instrument, position)| {
+                    InstrumentAccountSnapshot::new(
+                        InstrumentIndex(instrument),
+                        vec![],
+                        false,
+                        position,
+                        None,
+                    )
+                })
+                .collect(),
+        }),
+    }))
+}
+
+fn position_drift_outputs(
+    engine: &mut TestEngine,
+    reports: Vec<(usize, PositionReport)>,
+) -> Vec<PositionDrift> {
+    let audit = process_with_audit(engine, account_event_positions(reports));
+    let EngineAudit::Process(audit) = audit.event else {
+        panic!("expected a processed event");
+    };
+    audit
+        .outputs
+        .into_iter()
+        .map(|output| match output {
+            EngineOutput::PositionDrift(drift) => drift,
+            other => panic!("unexpected output {other:?}"),
+        })
+        .collect()
+}
+
+/// An account snapshot whose reported position differs from the engine's emits
+/// `EngineOutput::PositionDrift` and leaves the engine's position alone. An unreported position is
+/// not compared, and entry prices are not compared.
+#[test]
+fn test_account_snapshot_position_drift() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx);
+
+    // Engine holds 1 btc_usdt long @ 10_000.
+    process_with_audit(
+        &mut engine,
+        account_event_trade(0, 1, Side::Buy, 10_000.0, 1.0),
+    );
+    let venue_position = |quantity, entry_price| {
+        PositionReport::from_position(Position::new(
+            quantity,
+            Some(entry_price),
+            None,
+            None,
+            None,
+            None,
+            STARTING_TIMESTAMP,
+        ))
+    };
+
+    // The venue says flat: drift. eth_btc is unreported: not compared.
+    let drift = position_drift_outputs(
+        &mut engine,
+        vec![(0, PositionReport::Flat), (1, PositionReport::Unreported)],
+    );
+    assert_eq!(drift.len(), 1);
+    assert_eq!(
+        (
+            drift[0].instrument,
+            drift[0].quantity_engine,
+            drift[0].quantity_venue,
+            drift[0].price_entry_engine,
+            drift[0].price_entry_venue,
+        ),
+        (
+            InstrumentIndex(0),
+            dec!(1),
+            dec!(0),
+            Some(dec!(10_000)),
+            None
+        )
+    );
+
+    // Same quantity at a different entry price: no drift.
+    assert!(
+        position_drift_outputs(
+            &mut engine,
+            vec![(0, venue_position(dec!(1), dec!(10_100)))]
+        )
+        .is_empty()
+    );
+
+    // The venue is short where the engine is long.
+    let drift = position_drift_outputs(
+        &mut engine,
+        vec![(0, venue_position(dec!(-2), dec!(9_000)))],
+    );
+    assert_eq!(
+        (
+            drift[0].quantity_engine,
+            drift[0].quantity_venue,
+            drift[0].price_entry_venue
+        ),
+        (dec!(1), dec!(-2), Some(dec!(9_000)))
+    );
+
+    // Nothing was corrected.
+    assert_eq!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .position
+            .quantity_net(),
+        dec!(1)
     );
 }
