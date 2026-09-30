@@ -157,13 +157,17 @@ pub enum EngineEvent<
     Account(AccountStreamEvent<ExchangeKey, AssetKey, InstrumentKey>),
     Market(MarketStreamEvent<InstrumentKey, MarketKind>),
 
-    /// Signal that an option contract has expired and settlement should be computed.
+    /// Signal that an option or future contract has expired and settlement should be computed.
     ///
-    /// The library handles: cancelling open orders, computing intrinsic-value settlement,
-    /// synthesising a closing fill, and setting the `expiration_processed` flag.
+    /// The library handles: cancelling open orders, computing the settlement price (intrinsic
+    /// value for an option, the last price for a future), synthesising a closing fill, and setting
+    /// the `expiration_processed` flag.
     ///
-    /// **Caller obligation**: inject this event when `Utc::now() >= option.expiry`.
-    /// The handler is idempotent — duplicate events for the same instrument are safe.
+    /// **Caller obligation**: inject this event when `Utc::now() >= contract.expiry`, and only
+    /// for an instrument that expires. One that never expires (`Spot`, `Perpetual`, `Cfd`) is
+    /// rejected without touching any state, with an
+    /// [`EngineOutput::ContractExpiryNotSettled`](engine::EngineOutput::ContractExpiryNotSettled)
+    /// output. The handler is idempotent — duplicate events for the same instrument are safe.
     ///
     /// Note: `From` is skipped here because the generic `InstrumentKey` parameter
     /// would conflict with the `From<Shutdown>` impl when `InstrumentKey = Shutdown`.

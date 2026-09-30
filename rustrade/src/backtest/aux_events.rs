@@ -37,7 +37,9 @@ use std::sync::Arc;
 ///   positions the event by `Timed::time`, while the handler advances the clock to the instrument's
 ///   `expiry` (see below). A mismatch would *order* the expiry at one instant but *settle* it at
 ///   another. Enforced pre-merge via `assert_aux_contract_expiry_times` (a hard panic naming the
-///   offending event); non-expiring or unregistered targets are skipped.
+///   offending event); non-expiring or unregistered targets are skipped. The engine rejects a
+///   non-expiring target itself, with an
+///   [`EngineOutput::ContractExpiryNotSettled`](crate::engine::EngineOutput::ContractExpiryNotSettled).
 ///
 /// # `ContractExpiry` clock advance
 /// [`EngineEvent::ContractExpiry`] carries no timestamp on its payload (unlike
@@ -164,7 +166,8 @@ pub(crate) fn assert_aux_corporate_action_effective_times<
 /// equality at the same pre-merge site as [`assert_aux_events_sorted`] (a hard panic in all builds —
 /// the handler itself cannot see the wrapping `Timed`, so the harness is the only place this can be
 /// checked). Events whose target is non-expiring (`expiry() == None`) or not registered are skipped
-/// — those are not this check's concern (the engine surfaces an unregistered target on its own). The
+/// — those are not this check's concern (the engine rejects a non-expiring target and surfaces an
+/// unregistered one on its own). The
 /// O(N) scan over the handful-sized aux set is negligible, and the message names the offending event
 /// so a failing source is debuggable without a rebuild.
 pub(crate) fn assert_aux_contract_expiry_times<MarketKind, AssetKey>(

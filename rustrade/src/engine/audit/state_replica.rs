@@ -140,9 +140,9 @@ where
     ///
     /// - **`ContractExpiry`**: consults `outputs` from the live engine rather than replaying
     ///   the event. This is necessary because `process_contract_expiry` is *conditional*: it
-    ///   bails early (returning no exits) when the underlying spot price is unavailable. The
-    ///   replica cannot independently determine which branch the live engine took, so it
-    ///   mirrors the decision by inspecting `PositionExit` outputs.
+    ///   declines to settle (emitting `ContractExpiryNotSettled` and no exits) when the instrument
+    ///   never expires or the settlement price is unavailable. The replica mirrors the decision
+    ///   by inspecting the `ContractExpiryNotSettled` and `PositionExit` outputs.
     ///
     /// - **`CorporateAction`**: a *hybrid*. `Position::apply_split` is deterministic, so the
     ///   adjustment (quantity / basis / unrealised PnL) is **event-replayed** for every position
@@ -202,19 +202,35 @@ where
                 }
             },
             EngineEvent::ContractExpiry(key) => {
-                // The live engine's `process_contract_expiry` is conditional: if the
-                // underlying spot price is unavailable, it returns early without
-                // mutating state and emits no `PositionExit` outputs. The replica
-                // mirrors this by deciding from the outputs of *this* audit tick:
+                // The live engine's `process_contract_expiry` is conditional: it may decline
+                // to settle, closing no position and leaving `expiration_processed` unset. The
+                // replica mirrors this by deciding from the outputs of *this* audit tick:
                 //
+                // - `ContractExpiryNotSettled` for this instrument → the instrument never
+                //   expires, or the settlement price was unavailable → leave state untouched.
+                //   Checked first: a never-expiring instrument with no position must not fall
+                //   through to the empty-branch arm below and be marked processed.
+                // - Already `expiration_processed` → the live engine skipped the duplicate
+                //   without touching state → neither does the replica.
                 // - Any `PositionExit` output → live engine processed expiry → clear
                 //   positions and mark processed.
                 // - No `PositionExit` outputs but instrument has no positions → live
                 //   engine took the empty branch and marked it processed → mark only.
-                // - No `PositionExit` outputs and positions exist → live engine bailed
-                //   on missing spot price → leave state untouched (event is retryable).
+                let not_settled = outputs.iter().any(|o| {
+                    matches!(
+                        o,
+                        EngineOutput::ContractExpiryNotSettled { instrument, .. }
+                            if *instrument == key
+                    )
+                });
+                if not_settled {
+                    return;
+                }
                 let state = self.replica_engine_state_mut();
                 let instrument_state = state.instruments.instrument_index_mut(&key);
+                if instrument_state.expiration_processed {
+                    return;
+                }
                 let any_exit = outputs
                     .iter()
                     .any(|o| matches!(o, EngineOutput::PositionExit(_)));

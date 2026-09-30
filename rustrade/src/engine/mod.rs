@@ -45,7 +45,7 @@ use rustrade_instrument::{
     corporate_action::{CorporateActionKind, SplitAdjustmentKind, SplitRatio},
     exchange::ExchangeIndex,
     instrument::{
-        InstrumentIndex,
+        Instrument, InstrumentIndex,
         kind::{InstrumentKind, option::OptionKind},
     },
 };
@@ -214,12 +214,12 @@ where
                 ProcessAudit::with_market_update(event, output)
             }
             EngineEvent::ContractExpiry(key) => {
-                let exited = self.process_contract_expiry(key);
-                // Fold all closed positions into the audit as separate PositionExit outputs.
-                // In Netting mode this is 0 or 1 entries; in Hedging mode it may be N.
+                let outputs = self.process_contract_expiry(key);
+                // Fold each output into the audit: one PositionExit per closed position (0 or 1 in
+                // Netting mode, up to N in Hedging mode), or a single ContractExpiryNotSettled.
                 let mut audit = ProcessAudit::with_event(event);
-                for position_exited in exited {
-                    audit = audit.add_output(position_exited);
+                for output in outputs {
+                    audit = audit.add_output(output);
                 }
                 // ContractExpiry settles regardless of TradingState and does not
                 // trigger algo order generation.
@@ -450,24 +450,34 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
         )
     }
 
-    /// Processes a `ContractExpiry` event for the given `InstrumentIndex`.
+    /// Processes a `ContractExpiry` event for the given `InstrumentIndex`, returning the outputs to
+    /// fold into the audit.
     ///
     /// # Algorithm
-    /// 1. Guards on `expiration_processed` (idempotent).
-    /// 2. Cancels all open orders for the instrument by sending `ExecutionRequest::Cancel` for each.
-    /// 3. Derives settlement price from instrument data and contract specification:
-    ///    - OTM: settlement price = 0
-    ///    - ITM call: settlement = spot - strike (per-contract intrinsic value)
-    ///    - ITM put: settlement = strike - spot (per-contract intrinsic value)
-    /// 4. Synthesises a closing `Trade` at the settlement price and routes it through
-    ///    `instrument_state.update_from_trade`.
-    /// 5. Sets `instrument_state.expiration_processed = true`.
+    /// 1. Rejects an instrument that never expires (`Spot`, `Perpetual`, `Cfd`) with an
+    ///    [`EngineOutput::ContractExpiryNotSettled`] carrying
+    ///    [`ContractExpiryNotSettledReason::InstrumentNeverExpires`]. Nothing is mutated: no order
+    ///    is cancelled, no position is closed, and `expiration_processed` stays unset.
+    /// 2. Guards on `expiration_processed` (idempotent).
+    /// 3. Cancels all open orders for the instrument by sending `ExecutionRequest::Cancel` for each.
+    /// 4. Derives the settlement price from instrument data and the contract specification:
+    ///    - option, OTM: settlement price = 0
+    ///    - option, ITM call: settlement = spot - strike (per-contract intrinsic value), where spot
+    ///      is the last price of the underlying `Spot` instrument on the same exchange
+    ///    - option, ITM put: settlement = strike - spot (per-contract intrinsic value)
+    ///    - future: the contract's own last price
+    /// 5. Synthesises a closing `Trade` at the settlement price for every open position, and emits
+    ///    an [`EngineOutput::PositionExit`] for each.
+    /// 6. Sets `instrument_state.expiration_processed = true`.
     ///
-    /// If no position is open for the instrument, steps 3–4 are skipped.
-    /// If no market price is available, settlement cannot be computed and the method
-    /// logs a warning and returns without synthesising a fill. The `expiration_processed`
-    /// flag is **not** set in this case, making the event **retryable** — re-inject
-    /// `ContractExpiry` once the underlying spot instrument has received market data.
+    /// If no position is open for the instrument, steps 4–5 are skipped.
+    ///
+    /// If the price settlement needs is unavailable, the method emits an
+    /// [`EngineOutput::ContractExpiryNotSettled`] carrying
+    /// [`ContractExpiryNotSettledReason::SettlementPriceUnavailable`] and synthesises no fill. The
+    /// orders cancelled in step 3 stay cancelled, but positions are untouched and
+    /// `expiration_processed` is **not** set, so the event is **retryable**: re-inject
+    /// `ContractExpiry` once that price has arrived.
     ///
     /// # Not modelled (deferred)
     ///
@@ -481,10 +491,10 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     ///   settlement price adjusts PnL). No separate "deliver/receive underlying" position is
     ///   opened. Physically-settled contracts (e.g. some futures-style options) are out of scope
     ///   until this is revisited.
-    pub fn process_contract_expiry(
+    pub fn process_contract_expiry<OnTradingDisabled, OnDisconnect>(
         &mut self,
         key: &InstrumentIndex,
-    ) -> Vec<PositionExited<AssetIndex, InstrumentIndex>>
+    ) -> Vec<EngineOutput<OnTradingDisabled, OnDisconnect>>
     where
         Clock: EngineClock,
         InstrumentData: InstrumentDataState + InFlightRequestRecorder,
@@ -492,9 +502,25 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     {
         let instrument_state = self.state.instruments.instrument_index_mut(key);
 
-        // Guard: idempotent — ignore duplicates after first processing. Warn so the skip is
-        // observable in logs (this settlement path returns PositionExits, not EngineOutputs, so it
-        // has no audit-stream signal to emit — unlike process_corporate_action's duplicate-id path).
+        // Step 1: reject an instrument that never expires, before anything is touched. Settling it
+        // would close every position at the last price and set `expiration_processed` for good,
+        // so the instrument could never trade again in this run.
+        let Some((expiry, settlement)) = ExpirySettlement::of(&instrument_state.instrument) else {
+            warn!(
+                instrument = ?key,
+                kind = ?instrument_state.instrument.kind,
+                "ContractExpiry targets an instrument that never expires — rejected, nothing \
+                 mutated. Emitting ContractExpiryNotSettled."
+            );
+            return vec![EngineOutput::ContractExpiryNotSettled {
+                instrument: *key,
+                reason: ContractExpiryNotSettledReason::InstrumentNeverExpires,
+            }];
+        };
+
+        // Step 2: idempotent — ignore duplicates after first processing. Warn so the skip is
+        // observable in logs. It emits no output: a duplicate is the expected shape of an
+        // at-least-once injector, not a failure to settle.
         if instrument_state.expiration_processed {
             warn!(
                 instrument = ?key,
@@ -504,7 +530,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             return vec![];
         }
 
-        // Step 2: Cancel all open orders for this instrument.
+        // Step 3: Cancel all open orders for this instrument.
         let cancel_requests: Vec<_> = instrument_state
             .orders
             .orders()
@@ -516,7 +542,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
         // Re-borrow after send_requests (which takes &self for execution_txs).
         let instrument_state = self.state.instruments.instrument_index_mut(key);
 
-        // Step 3–4: Synthesise settlement fills only if positions are open.
+        // Steps 4–5: Synthesise settlement fills only if positions are open.
         if instrument_state.position.positions.is_empty() {
             instrument_state.expiration_processed = true;
             instrument_state.orders.clear();
@@ -529,29 +555,20 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             return vec![];
         }
 
-        // Derive settlement price from the underlying spot price and contract spec.
+        // The reference price settlement is computed from (see `ExpirySettlement`).
         // For options, ITM/OTM determination requires the *underlying's* price, not the
         // option's own market price (which includes premium and would give wrong results).
-        // We find the underlying spot instrument by matching the option's underlying.base.
-        // Capture both the underlying base key and the exchange so we can filter
-        // the spot scan to the same exchange. Without the exchange filter, a
+        // We find the underlying spot instrument by matching the option's underlying base and
+        // quote, filtered to the option's exchange. Without the exchange filter, a
         // multi-exchange setup (e.g. BTC/USD on both Binance and Alpaca) would
         // silently use the wrong exchange's price.
-        let option_spec = match &instrument_state.instrument.kind {
-            InstrumentKind::Option(_) => Some((
-                instrument_state.instrument.underlying.base,
-                instrument_state.instrument.underlying.quote,
-                instrument_state.instrument.exchange,
-            )),
-            _ => None,
-        };
-
-        // Capture the contract expiry while `instrument_state` is already borrowed (used further
-        // below to advance the engine clock) — avoids a second `instrument_index` lookup for `kind`.
-        let expiry = instrument_state.instrument.kind.expiry();
-
-        let spot_price = match option_spec {
-            Some((base_key, quote_key, exchange)) => {
+        let reference_price = match settlement {
+            ExpirySettlement::OptionIntrinsic {
+                base: base_key,
+                quote: quote_key,
+                exchange,
+                ..
+            } => {
                 // Find the spot instrument on the same exchange whose underlying matches
                 // the option's underlying base AND quote. Both are required: without the
                 // quote filter, BTC/USDT and BTC/USDC options on the same exchange would
@@ -594,50 +611,30 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 }
                 spot_matches.into_iter().next().and_then(|s| s.data.price())
             }
-            // Non-option instruments: use the instrument's own last price.
-            None => self.state.instruments.instrument_index(key).data.price(),
+            ExpirySettlement::OwnLastPrice => {
+                self.state.instruments.instrument_index(key).data.price()
+            }
         };
 
         // Re-borrow mutably after the immutable scan above.
         let instrument_state = self.state.instruments.instrument_index_mut(key);
 
-        let Some(spot_price) = spot_price else {
+        let Some(reference_price) = reference_price else {
             warn!(
                 instrument = ?key,
-                "ContractExpiry: underlying price unavailable — cannot compute settlement. \
-                 Ensure the underlying spot instrument is subscribed. \
-                 Re-inject ContractExpiry once market data arrives."
+                "ContractExpiry: settlement price unavailable — cannot compute settlement. \
+                 For an option, ensure the underlying spot instrument is subscribed. \
+                 Re-inject ContractExpiry once market data arrives. Emitting \
+                 ContractExpiryNotSettled."
             );
             // Do NOT set expiration_processed — the event is retryable once data is available.
-            return vec![];
+            return vec![EngineOutput::ContractExpiryNotSettled {
+                instrument: *key,
+                reason: ContractExpiryNotSettledReason::SettlementPriceUnavailable,
+            }];
         };
 
-        let settlement_price = match &instrument_state.instrument.kind {
-            InstrumentKind::Option(contract) => {
-                match contract.kind {
-                    OptionKind::Call => {
-                        // ITM call: intrinsic = underlying_spot - strike (per-share)
-                        // ATM (spot == strike): intrinsic = 0 by cash-settlement convention.
-                        if spot_price > contract.strike {
-                            spot_price - contract.strike
-                        } else {
-                            Decimal::ZERO
-                        }
-                    }
-                    OptionKind::Put => {
-                        // ITM put: intrinsic = strike - underlying_spot (per-share)
-                        // ATM (spot == strike): intrinsic = 0 by cash-settlement convention.
-                        if contract.strike > spot_price {
-                            contract.strike - spot_price
-                        } else {
-                            Decimal::ZERO
-                        }
-                    }
-                }
-            }
-            // Non-option instruments: settlement at current market price.
-            _ => spot_price,
-        };
+        let settlement_price = settlement.price(reference_price);
 
         // Collect all position IDs before iterating so we can re-borrow instrument_state
         // mutably inside the loop without conflicting with the keys() borrow.
@@ -653,10 +650,8 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
         // (unlike `CorporateAction`, whose `effective_time` advances the clock via `TimeExchange`),
         // so without this a backtest would stamp the settlement fill at the prior market tick. The
         // expiry instant is engine-side ground truth on the instrument's kind (captured above).
-        // `advance_to` is monotonic and a no-op on `LiveClock`; non-expiring kinds yield `None`.
-        if let Some(expiry) = expiry {
-            self.clock.advance_to(expiry);
-        }
+        // `advance_to` is monotonic and a no-op on `LiveClock`.
+        self.clock.advance_to(expiry);
 
         // Engine clock time for all synthetic trades in this expiry batch.
         // Using self.time() (not Utc::now()) keeps backtests deterministic.
@@ -729,11 +724,11 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 contract_size,
             ) {
                 instrument_state.tear_sheet.update_from_position(&exit);
-                exited.push(exit);
+                exited.push(EngineOutput::PositionExit(exit));
             }
         }
 
-        // Step 5: Mark as processed and clear all routing tables.
+        // Step 6: Mark as processed and clear all routing tables.
         // No fills will arrive for this instrument post-expiry. Cancel-ack messages
         // for the orders cancelled in step 2 may never arrive (exchanges silently void
         // them), so cleanup_routing_tables() cannot remove the CancelInFlight entries —
@@ -1737,6 +1732,19 @@ pub enum EngineOutput<
     /// set for untracked venues, since by definition it has no state keyed on them. A consumer that
     /// wants one alert per venue must deduplicate on `exchange` itself.
     UntrackedExchange(UntrackedExchange),
+
+    /// Observable signal that a [`ContractExpiry`](crate::EngineEvent::ContractExpiry) did **not**
+    /// settle the instrument: no position was closed and `expiration_processed` was **not** set.
+    ///
+    /// Whether the event is worth re-injecting depends on `reason` — see
+    /// [`ContractExpiryNotSettledReason`]. An expiry that settles with no position open emits no
+    /// output at all, and neither does a duplicate of an expiry already processed.
+    ContractExpiryNotSettled {
+        /// The instrument the expiry targeted.
+        instrument: InstrumentKey,
+        /// Why the expiry was not settled.
+        reason: ContractExpiryNotSettledReason,
+    },
 }
 
 /// A single resting order captured in an [`EngineOutput::OpenOrdersAtSplit`] observable.
@@ -1750,6 +1758,88 @@ pub struct OpenOrderAtSplit {
     pub price_pre_split: Option<Decimal>,
     /// Order quantity before the split.
     pub quantity_pre_split: Decimal,
+}
+
+/// Reason a [`ContractExpiry`](crate::EngineEvent::ContractExpiry) was not settled, carried by
+/// [`EngineOutput::ContractExpiryNotSettled`].
+///
+/// `#[non_exhaustive]`: further causes can be added without breaking downstream exhaustive
+/// matches.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+#[non_exhaustive]
+pub enum ContractExpiryNotSettledReason {
+    /// The instrument never expires (`Spot`, `Perpetual`, `Cfd`), so the event is a caller error.
+    /// It was rejected before anything was touched: no order was cancelled, no position closed.
+    /// **Not** retryable — the same event is rejected every time.
+    InstrumentNeverExpires,
+    /// The price settlement is computed from was unavailable: for an option, the last price of
+    /// its underlying `Spot` instrument on the same exchange; for a future, its own last price.
+    ///
+    /// The instrument's open orders **were** cancelled (that step precedes the price lookup), but
+    /// its positions are untouched. **Retryable**: re-inject the `ContractExpiry` once that price
+    /// has arrived.
+    SettlementPriceUnavailable,
+}
+
+/// How a [`ContractExpiry`](crate::EngineEvent::ContractExpiry) settles an expiring contract.
+#[derive(Debug, Clone, Copy)]
+enum ExpirySettlement {
+    /// An option settles at intrinsic value against the last price of its deliverable underlying,
+    /// the `Spot` instrument on the option's `(base, quote, exchange)`.
+    OptionIntrinsic {
+        kind: OptionKind,
+        strike: Decimal,
+        base: AssetIndex,
+        quote: AssetIndex,
+        exchange: ExchangeIndex,
+    },
+    /// A future settles at its own last price.
+    OwnLastPrice,
+}
+
+impl ExpirySettlement {
+    /// The instrument's expiry and how it settles, or `None` for an instrument that never expires.
+    ///
+    /// Matches every [`InstrumentKind`] explicitly, so a new kind must decide here whether and how
+    /// it settles rather than fall through to a default.
+    fn of(instrument: &Instrument<ExchangeIndex, AssetIndex>) -> Option<(DateTime<Utc>, Self)> {
+        match &instrument.kind {
+            InstrumentKind::Option(contract) => Some((
+                contract.expiry,
+                Self::OptionIntrinsic {
+                    kind: contract.kind,
+                    strike: contract.strike,
+                    base: instrument.underlying.base,
+                    quote: instrument.underlying.quote,
+                    exchange: instrument.exchange,
+                },
+            )),
+            InstrumentKind::Future(contract) => Some((contract.expiry, Self::OwnLastPrice)),
+            InstrumentKind::Spot | InstrumentKind::Perpetual(_) | InstrumentKind::Cfd(_) => None,
+        }
+    }
+
+    /// The settlement price, given the reference price: the underlying's last price for
+    /// [`Self::OptionIntrinsic`], the contract's own for [`Self::OwnLastPrice`].
+    fn price(self, reference: Decimal) -> Decimal {
+        match self {
+            // ITM call: intrinsic = underlying_spot - strike (per-share).
+            // ATM (spot == strike): intrinsic = 0 by cash-settlement convention.
+            Self::OptionIntrinsic {
+                kind: OptionKind::Call,
+                strike,
+                ..
+            } => (reference - strike).max(Decimal::ZERO),
+            // ITM put: intrinsic = strike - underlying_spot (per-share).
+            // ATM (spot == strike): intrinsic = 0 by cash-settlement convention.
+            Self::OptionIntrinsic {
+                kind: OptionKind::Put,
+                strike,
+                ..
+            } => (strike - reference).max(Decimal::ZERO),
+            Self::OwnLastPrice => reference,
+        }
+    }
 }
 
 /// Reason a [`CorporateAction`](crate::EngineEvent::CorporateAction) could not be processed,

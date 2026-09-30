@@ -7,7 +7,8 @@ use rust_decimal_macros::dec;
 use rustrade::{
     EngineEvent, Sequence, Timed,
     engine::{
-        Engine, EngineOutput, Processor, UnsupportedCorporateActionReason,
+        ContractExpiryNotSettledReason, Engine, EngineOutput, Processor,
+        UnsupportedCorporateActionReason,
         action::{
             ActionOutput,
             generate_algo_orders::GenerateAlgoOrdersOutput,
@@ -60,7 +61,7 @@ use rustrade_execution::{
 };
 use rustrade_instrument::{
     Side, Underlying,
-    asset::AssetIndex,
+    asset::{Asset, AssetIndex},
     corporate_action::{CorporateActionKind, SplitRatio},
     exchange::{ExchangeId, ExchangeIndex},
     index::IndexedInstruments,
@@ -68,7 +69,10 @@ use rustrade_instrument::{
         Instrument, InstrumentIndex,
         kind::{
             InstrumentKind,
+            cfd::CfdContract,
+            future::FutureContract,
             option::{OptionContract, OptionExercise, OptionKind},
+            perpetual::PerpetualContract,
         },
         spec::{
             InstrumentSpec, InstrumentSpecNotional, InstrumentSpecPrice, InstrumentSpecQuantity,
@@ -1376,6 +1380,20 @@ fn send_spot_price(engine: &mut TestEngine, instrument: usize, price: Decimal) {
     engine.process(event);
 }
 
+/// The `PositionExit`s from a direct `process_contract_expiry` call, panicking on any other output
+/// so a test expecting a settlement (or a silent no-op) cannot pass on a `ContractExpiryNotSettled`.
+fn expiry_exits(
+    outputs: Vec<EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>>,
+) -> Vec<PositionExited<AssetIndex, InstrumentIndex>> {
+    outputs
+        .into_iter()
+        .map(|output| match output {
+            EngineOutput::PositionExit(exit) => exit,
+            other => panic!("expected only PositionExit outputs, got {other:?}"),
+        })
+        .collect()
+}
+
 /// Open a long position in the option instrument (index 0) by sending a buy trade.
 fn open_option_position(engine: &mut TestEngine, quantity: Decimal, price: Decimal) {
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
@@ -1420,7 +1438,7 @@ fn test_contract_expiry_otm_call() {
     );
 
     // Process ContractExpiry
-    let exited = engine.process_contract_expiry(&InstrumentIndex(0));
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
 
     // OTM: settlement price is 0, position closes at zero value → position exits
     assert_eq!(exited.len(), 1);
@@ -1459,7 +1477,7 @@ fn test_contract_expiry_itm_call() {
     // Open a long call position with 1 contract at premium 2_000
     open_option_position(&mut engine, dec!(1), dec!(2_000));
 
-    let exited = engine.process_contract_expiry(&InstrumentIndex(0));
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
 
     // ITM: 1 contract closed at intrinsic value 5_000
     assert_eq!(exited.len(), 1);
@@ -1512,7 +1530,7 @@ fn test_contract_expiry_advances_clock_to_expiry() {
         "precondition: clock has not yet advanced to expiry"
     );
 
-    let exited = engine.process_contract_expiry(&InstrumentIndex(0));
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
     assert_eq!(exited.len(), 1);
 
     // The settlement fill is stamped at ~expiry: its `time_exit` derives from the synthetic
@@ -1543,7 +1561,7 @@ fn test_contract_expiry_idempotent() {
     open_option_position(&mut engine, dec!(1), dec!(1_000));
 
     // First expiry processes the position
-    let exited_first = engine.process_contract_expiry(&InstrumentIndex(0));
+    let exited_first = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
     assert_eq!(exited_first.len(), 1);
     assert!(
         engine
@@ -1554,7 +1572,7 @@ fn test_contract_expiry_idempotent() {
     );
 
     // Second call: idempotent — returns empty vec, does not panic
-    let exited_second = engine.process_contract_expiry(&InstrumentIndex(0));
+    let exited_second = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
     assert!(exited_second.is_empty());
 }
 
@@ -1566,7 +1584,7 @@ fn test_contract_expiry_no_position() {
     send_spot_price(&mut engine, 1, dec!(45_000));
 
     // No position open — expiry should still mark as processed
-    let exited = engine.process_contract_expiry(&InstrumentIndex(0));
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
     assert!(exited.is_empty());
     assert!(
         engine
@@ -1587,9 +1605,26 @@ fn test_contract_expiry_missing_spot_price() {
     // Open a position so expiry has something to settle
     open_option_position(&mut engine, dec!(1), dec!(1_000));
 
-    // Without spot price, expiry cannot compute settlement — returns empty
-    let exited = engine.process_contract_expiry(&InstrumentIndex(0));
-    assert!(exited.is_empty());
+    // Without spot price, expiry cannot compute settlement — it says so, and closes nothing
+    let outputs: Vec<EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>> =
+        engine.process_contract_expiry(&InstrumentIndex(0));
+    assert_eq!(
+        outputs,
+        vec![EngineOutput::ContractExpiryNotSettled {
+            instrument: InstrumentIndex(0),
+            reason: ContractExpiryNotSettledReason::SettlementPriceUnavailable,
+        }]
+    );
+    assert_eq!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .position
+            .positions
+            .len(),
+        1
+    );
 
     // expiration_processed must NOT be set (event is retryable)
     assert!(
@@ -1678,6 +1713,169 @@ fn test_contract_expiry_replica_state_cleared() {
     assert!(replica_instrument.orders.0.is_empty());
     // expiration_processed must be set
     assert!(replica_instrument.expiration_processed);
+}
+
+/// A single-instrument engine — index 0, BTC/USD on `BinanceSpot`, quote USD = `AssetIndex(1)` —
+/// whose instrument is of the given `kind`, for handler behaviour that depends on the kind alone.
+fn build_single_kind_engine(
+    kind: InstrumentKind<Asset>,
+    execution_tx: UnboundedTx<ExecutionRequest>,
+) -> TestEngine {
+    let instruments = IndexedInstruments::builder()
+        .add_instrument(Instrument::new(
+            ExchangeId::BinanceSpot,
+            "binance_btc_usd",
+            "BTCUSD",
+            Underlying::new("btc", "usd"),
+            rustrade_instrument::instrument::quote::InstrumentQuoteAsset::UnderlyingQuote,
+            kind,
+            None,
+        ))
+        .build();
+
+    let state = EngineState::builder(&instruments, DefaultGlobalData, |_| {
+        DefaultInstrumentMarketData::default()
+    })
+    .time_engine_start(STARTING_TIMESTAMP)
+    .trading_state(TradingState::Disabled)
+    .balances([
+        (ExchangeId::BinanceSpot, "usd", STARTING_BALANCE_USDT),
+        (ExchangeId::BinanceSpot, "btc", STARTING_BALANCE_BTC),
+    ])
+    .build();
+
+    Engine::new(
+        HistoricalClock::new(STARTING_TIMESTAMP),
+        state,
+        MultiExchangeTxMap::from_iter([(ExchangeId::BinanceSpot, Some(execution_tx))]),
+        TestBuyAndHoldStrategy { id: strategy_id() },
+        DefaultRiskManager::default(),
+    )
+}
+
+/// A `ContractExpiry` naming an instrument that never expires is a caller error. It is rejected
+/// observably and touches nothing: before, it closed every position at the last price and set
+/// `expiration_processed` for good, so the instrument could never trade again.
+///
+/// The audit replica must reach the same verdict. The case that used to split them is the one
+/// with no position: the replica took its "no positions" branch and marked the instrument
+/// processed while the live engine had not.
+#[test]
+fn test_contract_expiry_rejects_never_expiring_instruments() {
+    use rustrade::engine::audit::{context::EngineContext, state_replica::StateReplicaManager};
+
+    let usd = || Asset::from("usd");
+    let kinds = [
+        InstrumentKind::Spot,
+        InstrumentKind::Perpetual(PerpetualContract {
+            contract_size: dec!(1),
+            settlement_asset: usd(),
+        }),
+        InstrumentKind::Cfd(CfdContract {
+            contract_size: dec!(1),
+            settlement_asset: usd(),
+        }),
+    ];
+
+    for kind in kinds {
+        for with_position in [false, true] {
+            let context = format!("{kind:?}, with_position={with_position}");
+            let (execution_tx, _execution_rx) = mpsc_unbounded();
+            let mut engine = build_single_kind_engine(kind.clone(), execution_tx);
+
+            send_spot_price(&mut engine, 0, dec!(45_000));
+            if with_position {
+                open_option_position(&mut engine, dec!(1), dec!(40_000));
+            }
+            let pre_state = engine.state.clone();
+
+            let event = EngineEvent::ContractExpiry(InstrumentIndex(0));
+            let audit_tick = process_with_audit(&mut engine, event.clone());
+
+            let outputs = match &audit_tick.event {
+                EngineAudit::Process(audit) => audit.outputs.clone(),
+                _ => panic!("{context}: expected EngineAudit::Process"),
+            };
+            assert_eq!(
+                outputs,
+                NoneOneOrMany::One(EngineOutput::ContractExpiryNotSettled {
+                    instrument: InstrumentIndex(0),
+                    reason: ContractExpiryNotSettledReason::InstrumentNeverExpires,
+                }),
+                "{context}"
+            );
+
+            let live_instrument = engine
+                .state
+                .instruments
+                .instrument_index(&InstrumentIndex(0));
+            assert_eq!(
+                live_instrument,
+                pre_state.instruments.instrument_index(&InstrumentIndex(0)),
+                "{context}: a rejected expiry must not mutate the instrument"
+            );
+            assert!(!live_instrument.expiration_processed, "{context}");
+            assert_eq!(
+                live_instrument.position.positions.len(),
+                usize::from(with_position),
+                "{context}"
+            );
+
+            let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+                event: pre_state,
+                context: EngineContext {
+                    time: STARTING_TIMESTAMP,
+                    sequence: Sequence(0),
+                },
+            };
+            let dummy_updates: DummyAuditUpdates = std::iter::empty();
+            let mut replica_manager = StateReplicaManager::new(seed_tick, dummy_updates);
+            replica_manager.update_from_event(event, &outputs);
+
+            assert_eq!(
+                replica_manager
+                    .replica_engine_state()
+                    .instruments
+                    .instrument_index(&InstrumentIndex(0)),
+                live_instrument,
+                "{context}: replica diverged from the live engine"
+            );
+        }
+    }
+}
+
+/// A future settles at its own last price, not at an option's intrinsic value, and — unlike an
+/// option — needs no separate underlying instrument to do so.
+#[test]
+fn test_contract_expiry_future_settles_at_own_last_price() {
+    let expiry = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_single_kind_engine(
+        InstrumentKind::Future(FutureContract {
+            contract_size: dec!(1),
+            settlement_asset: Asset::from("usd"),
+            expiry,
+        }),
+        execution_tx,
+    );
+
+    open_option_position(&mut engine, dec!(2), dec!(1_000));
+    send_spot_price(&mut engine, 0, dec!(1_100));
+
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
+
+    assert_eq!(exited.len(), 1);
+    // Long 2 at 1_000, settled at the future's own last price 1_100.
+    assert_eq!(exited[0].pnl_realised, dec!(200));
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .expiration_processed
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3609,7 +3807,7 @@ fn test_contract_expiry_itm_put() {
     send_spot_price(&mut engine, 1, dec!(45_000));
     open_option_position(&mut engine, dec!(1), dec!(2_000)); // bought at 2_000 premium
 
-    let exited = engine.process_contract_expiry(&InstrumentIndex(0));
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
 
     assert_eq!(exited.len(), 1);
     // Entry: 1 * 2_000, Exit: 1 * 5_000 → pnl = 3_000
@@ -3642,7 +3840,7 @@ fn test_contract_expiry_otm_put() {
     send_spot_price(&mut engine, 1, dec!(55_000));
     open_option_position(&mut engine, dec!(1), dec!(2_000));
 
-    let exited = engine.process_contract_expiry(&InstrumentIndex(0));
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
 
     assert_eq!(exited.len(), 1);
     // Bought at 2_000, settled at 0 → loss of 2_000
@@ -3664,7 +3862,7 @@ fn test_contract_expiry_short_call_itm() {
     send_spot_price(&mut engine, 1, dec!(55_000));
     open_option_position_side(&mut engine, Side::Sell, dec!(1), dec!(2_000)); // sold at 2_000 premium
 
-    let exited = engine.process_contract_expiry(&InstrumentIndex(0));
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
 
     assert_eq!(exited.len(), 1);
     assert_eq!(exited[0].side, Side::Sell);
@@ -3682,7 +3880,7 @@ fn test_contract_expiry_short_call_otm() {
     send_spot_price(&mut engine, 1, dec!(45_000));
     open_option_position_side(&mut engine, Side::Sell, dec!(1), dec!(2_000));
 
-    let exited = engine.process_contract_expiry(&InstrumentIndex(0));
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
 
     assert_eq!(exited.len(), 1);
     assert_eq!(exited[0].side, Side::Sell);
@@ -4495,7 +4693,7 @@ fn test_contract_expiry_hedging_multi_position() {
         "two open positions before expiry"
     );
 
-    let exited = engine.process_contract_expiry(&InstrumentIndex(0));
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
 
     // Both positions must be settled.
     assert_eq!(
@@ -5018,7 +5216,7 @@ fn test_corporate_action_unheld_option_strike_adjusted_then_settles_post_split()
     );
     engine.process(market_event_trade(12, 1, dec!(30_000)));
 
-    let exited = engine.process_contract_expiry(&InstrumentIndex(0));
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
     assert_eq!(exited.len(), 1);
     // Intrinsic 5_000 (= 30_000 − post-split strike 25_000), premium 1_000, 1 contract:
     // pnl = (5_000 − 1_000) × 1 = 4_000. Against the stale 50_000 strike it would be −1_000.
