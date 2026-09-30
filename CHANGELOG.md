@@ -37,9 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`Engine::process_contract_expiry` returns `Vec<EngineOutput>`** (`rustrade`), like
   `process_corporate_action`, instead of `Vec<PositionExited>`. **Breaking** for code that calls
   it directly: closed positions now arrive as `EngineOutput::PositionExit`, and a rejection as
-  `EngineOutput::ContractExpiryNotSettled`. Name the output type where inference needs it, e.g.
-  `let outputs: Vec<EngineOutput<_, _>> = engine.process_contract_expiry(&key);`. Code that
-  only sends `EngineEvent::ContractExpiry` is unaffected.
+  `EngineOutput::ContractExpiryNotSettled`. Only the return type mentions the two output type
+  parameters, so name them unless later code fixes them, usually as the strategy's
+  `OnTradingDisabled` and `OnDisconnect` output types:
+  `engine.process_contract_expiry::<MyOnTradingDisabled, MyOnDisconnect>(&key)`. Code that only
+  sends `EngineEvent::ContractExpiry` is unaffected.
 
 ### Fixed
 
