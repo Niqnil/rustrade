@@ -38,8 +38,8 @@ use super::shared::{
     SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, classify_order_kind_tif,
     classify_rest_query_error, classify_ws_order_error, convert_execution_report,
     convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event,
-    is_duplicate, is_rate_limit_error, new_dedup_cache, recovered_order_totals,
-    response_decode_error, rest_call_with_retry,
+    is_duplicate, new_dedup_cache, recovered_order_totals, response_decode_error,
+    rest_call_with_retry,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
@@ -859,13 +859,6 @@ impl ExecutionClient for BinanceSpot {
                         key,
                         state: Err(order_err),
                     })
-                } else if is_rate_limit_error(&e) {
-                    // WS-level 429 — update the shared rate limiter so REST calls also back off.
-                    self.rate_limiter.on_rate_limited(None);
-                    Some(UnindexedOrderResponseCancel {
-                        key,
-                        state: Err(UnindexedOrderError::from(ApiError::RateLimit)),
-                    })
                 } else {
                     // Transport-level error — clear cached session so next call reconnects.
                     // Order status is unknown (may or may not have reached the matching engine).
@@ -1159,18 +1152,6 @@ impl ExecutionClient for BinanceSpot {
                         kind,
                         time_in_force,
                         state: OrderState::inactive(order_err),
-                    })
-                } else if is_rate_limit_error(&e) {
-                    // WS-level 429 — update the shared rate limiter so REST calls also back off.
-                    self.rate_limiter.on_rate_limited(None);
-                    Some(Order {
-                        key: order_key,
-                        side,
-                        price,
-                        quantity,
-                        kind,
-                        time_in_force,
-                        state: OrderState::inactive(OrderError::from(ApiError::RateLimit)),
                     })
                 } else {
                     // Transport-level error — clear cached session so next call reconnects.

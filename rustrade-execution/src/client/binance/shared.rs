@@ -229,9 +229,10 @@ impl RateLimitTracker {
     // call A succeeds → clears cooldown → call B's 429 cooldown is erased.
 }
 
-/// Check if an anyhow::Error from binance-sdk is a rate-limit error.
-/// Covers HTTP 429 / -1003 (WAF/queue overflow: requests rejected before execution)
-/// and -1015 (IP rate-limit ban). Both warrant the same backoff response.
+/// Check if an anyhow::Error from binance-sdk REST is a rate-limit error.
+/// Covers HTTP 429 / -1003 (WAF/queue overflow: requests rejected before execution),
+/// -1015 (IP rate-limit ban), and a WAF 403 (`ConnectorError::ForbiddenError` without an auth
+/// code or wording). All warrant the same backoff response.
 pub(crate) fn is_rate_limit_error(e: &anyhow::Error) -> bool {
     // A WAF 403 carries none of the texts below; recognise it by type so it is backed off too.
     if let Some(ConnectorError::ForbiddenError { msg, code }) = e.downcast_ref::<ConnectorError>()
@@ -1861,8 +1862,9 @@ pub(crate) fn classify_ws_order_error(
     instrument: &InstrumentNameExchange,
 ) -> Option<UnindexedOrderError> {
     match e.downcast_ref::<WebsocketError>()? {
-        WebsocketError::ResponseError { code, .. } => Some(order_error_from(
-            classify_ws_response_error(*code, e.to_string()),
+        // The typed error's own `Display`, not `e`'s: a context layer would hide the code.
+        response @ WebsocketError::ResponseError { code, .. } => Some(order_error_from(
+            classify_ws_response_error(*code, response.to_string()),
             instrument,
         )),
         _ => None,
@@ -2559,6 +2561,18 @@ mod tests {
     #[test]
     fn a_ws_response_with_a_binance_code_is_read_by_its_code() {
         let err = classify_ws(-1007, "Timeout waiting for response from backend server.");
+        assert!(
+            matches!(err, Some(OrderError::Connectivity(_))),
+            "got {err:?}"
+        );
+
+        // A context layer must not hide the code.
+        let wrapped = anyhow::Error::new(WebsocketError::ResponseError {
+            code: -1007,
+            message: "Timeout waiting for response from backend server.".to_string(),
+        })
+        .context("outer");
+        let err = classify_ws_order_error(&wrapped, &InstrumentNameExchange::new("BTCUSDT"));
         assert!(
             matches!(err, Some(OrderError::Connectivity(_))),
             "got {err:?}"
