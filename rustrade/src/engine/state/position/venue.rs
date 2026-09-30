@@ -23,13 +23,15 @@ impl PositionSeed {
     /// # What the seed holds
     /// - The side from the sign of the venue's quantity, and its absolute value as the quantity.
     /// - The venue's entry price as reported. It is quoted as orders are priced, so for an option
-    ///   or a future it is per unit of the underlying, as a fill's price is. Some venues fold
-    ///   commissions into it (IBKR does, Alpaca does not), so realised PnL at close measured from
-    ///   it may already be net of the entry commission.
+    ///   or a future it is per unit of the underlying, as a fill's price is. IBKR folds
+    ///   commissions into it, so realised PnL at close measured from it is already net of the
+    ///   entry commission. Alpaca's excludes them. Hyperliquid does not document whether its
+    ///   `entryPx` includes fees.
     /// - No entry fees: the venue does not report them separately. Add them with
     ///   [`Self::with_fees_enter`] only for a venue whose entry price excludes them.
-    /// - The time the venue reported the position as its `time_enter`. Venues report no entry
-    ///   time, so this is later than the true entry.
+    /// - The position's `time_exchange`, when it was read, as its `time_enter`. The venues do not
+    ///   report an entry time (the Alpaca, IBKR and Hyperliquid clients stamp their own clock),
+    ///   so this is later than the true entry.
     /// - No slot: under [`OmsMode::Hedging`](super::OmsMode::Hedging) add one with
     ///   [`Self::with_position_id`].
     pub fn from_venue_position(
@@ -85,6 +87,12 @@ impl VenuePositionSeeds {
     /// Only venues that report positions yield seeds (see
     /// [`InstrumentAccountSnapshot::position`](rustrade_execution::InstrumentAccountSnapshot::position)).
     /// A holding reported as an asset balance, such as spot crypto, has no position to seed.
+    ///
+    /// Each snapshot entry yields its own seed, so a snapshot listing one instrument twice yields
+    /// two, which the build rejects as
+    /// [`PositionSeedError::DuplicateSlot`](super::PositionSeedError::DuplicateSlot). Seeds take
+    /// the netting slot; under [`OmsMode::Hedging`](super::OmsMode::Hedging) give each a slot with
+    /// [`PositionSeed::with_position_id`] before building.
     pub fn from_account_snapshot(
         instruments: &IndexedInstruments,
         snapshot: &UnindexedAccountSnapshot,
@@ -108,6 +116,7 @@ impl VenuePositionSeeds {
 
             let seed = match name_internal {
                 None => Err(VenuePositionSkipReason::UnknownInstrument),
+                // Flat positions were filtered above, so `None` here means no entry price.
                 Some(name_internal) => {
                     PositionSeed::from_venue_position(name_internal.clone(), position)
                         .ok_or(VenuePositionSkipReason::NoEntryPrice)
@@ -208,6 +217,7 @@ mod tests {
     fn flat_or_unpriced_position_seeds_nothing() {
         for position in [
             venue_position(Decimal::ZERO, Some(dec!(7))),
+            venue_position(-Decimal::ZERO, Some(dec!(7))),
             venue_position(Decimal::ZERO, None),
             venue_position(dec!(1), None),
         ] {

@@ -31,8 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     cannot seed is returned in `skipped` with a `VenuePositionSkipReason`: the instrument is not
     one the engine is built with, or the venue reported no entry price. The single-position form
     is `PositionSeed::from_venue_position`. A seed takes the venue's entry price as reported (IBKR
-    includes commissions in it, Alpaca does not), no entry fees, and the report time as its entry
-    time, since venues report none.
+    includes commissions in it, Alpaca does not), no entry fees, and the time the position was
+    read as its entry time, since venues report none.
 
 - **`EngineOutput::ContractExpiryNotSettled`** (`rustrade`), emitted when a `ContractExpiry` does
   not settle its instrument. Its `ContractExpiryNotSettledReason` is `InstrumentNeverExpires` for
