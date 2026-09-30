@@ -299,9 +299,12 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
 #[non_exhaustive]
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]
 pub enum OrderError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
-    /// Connectivity-based error (timeout, socket failure, exchange offline).
+    /// Connectivity-based error (timeout, socket failure, exchange offline), or a venue failure
+    /// that leaves the order's status unknown.
     ///
-    /// Transient — retry with backoff. See [`ConnectivityError`] for details.
+    /// Transient — retry with backoff. See [`ConnectivityError`] for details. The order may or
+    /// may not have reached the matching engine, so before resubmitting an open request,
+    /// reconcile its state (open orders, fills); a blind retry can place it twice.
     #[error("connectivity: {0}")]
     Connectivity(#[from] ConnectivityError),
 

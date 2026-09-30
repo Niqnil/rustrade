@@ -36,9 +36,9 @@ use super::shared::{
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
     MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, RateLimitTracker,
     SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, classify_order_kind_tif,
-    classify_rest_query_error, convert_execution_report, convert_open_order_listing,
-    convert_open_order_owned_symbol, dedup_key_from_event, is_api_rejection_error, is_duplicate,
-    is_rate_limit_error, new_dedup_cache, parse_binance_order_rejection, recovered_order_totals,
+    classify_rest_query_error, classify_ws_order_error, convert_execution_report,
+    convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event,
+    is_duplicate, is_rate_limit_error, new_dedup_cache, recovered_order_totals,
     response_decode_error, rest_call_with_retry,
 };
 use crate::{
@@ -837,15 +837,20 @@ impl ExecutionClient for BinanceSpot {
                 }
             },
             Err(e) => {
-                // binance-sdk =50.0.0 routes both transport failures and API-level
-                // rejections (status >= 400) through this outer Err path as ResponseError.
-                // Distinguish them so API rejections (-2010, -1121, etc.) don't tear down
-                // a healthy WS session and don't surface as ConnectivityError to the engine.
-                // Check api_rejection first (zero-alloc downcast) — order rejections are the
-                // common case; rate limits during placement are rare.
-                if is_api_rejection_error(&e) {
-                    // API-level rejection — WS session is healthy, don't tear it down
-                    let order_err = parse_binance_order_rejection(e.to_string(), &instrument);
+                // binance-sdk routes both transport failures and venue responses with status
+                // >= 400 (ResponseError) through this outer Err path. Distinguish them so a
+                // venue response (-2010, -1121, etc.) doesn't tear down a healthy WS session.
+                // A venue response is mostly a rejection, but one that leaves the order's
+                // status unknown (a venue-failure code, a 5xx) surfaces as Connectivity.
+                // Check the venue response first (zero-alloc downcast) — order rejections are
+                // the common case; rate limits during placement are rare.
+                if let Some(order_err) = classify_ws_order_error(&e, &instrument) {
+                    // Venue response — WS session is healthy, don't tear it down. A throttle
+                    // (429, -1003, a WAF 403) backs off the shared limiter so REST calls
+                    // back off too.
+                    if matches!(order_err, OrderError::Rejected(ApiError::RateLimit)) {
+                        self.rate_limiter.on_rate_limited(None);
+                    }
                     // if this is BalanceInsufficient, its AssetNameExchange field
                     // holds the instrument name ("BTCUSDT"), not an asset name — see
                     // parse_binance_api_error for details. Do not match on that field
@@ -1128,15 +1133,20 @@ impl ExecutionClient for BinanceSpot {
                 }
             },
             Err(e) => {
-                // binance-sdk =50.0.0 routes both transport failures and API-level
-                // rejections (status >= 400) through this outer Err path as ResponseError.
-                // Distinguish them so API rejections (-2010, -1121, etc.) don't tear down
-                // a healthy WS session and don't surface as ConnectivityError to the engine.
-                // Check api_rejection first (zero-alloc downcast) — order rejections are the
-                // common case; rate limits during placement are rare.
-                if is_api_rejection_error(&e) {
-                    // API-level rejection — WS session is healthy, don't tear it down
-                    let order_err = parse_binance_order_rejection(e.to_string(), &instrument);
+                // binance-sdk routes both transport failures and venue responses with status
+                // >= 400 (ResponseError) through this outer Err path. Distinguish them so a
+                // venue response (-2010, -1121, etc.) doesn't tear down a healthy WS session.
+                // A venue response is mostly a rejection, but one that leaves the order's
+                // status unknown (a venue-failure code, a 5xx) surfaces as Connectivity.
+                // Check the venue response first (zero-alloc downcast) — order rejections are
+                // the common case; rate limits during placement are rare.
+                if let Some(order_err) = classify_ws_order_error(&e, &instrument) {
+                    // Venue response — WS session is healthy, don't tear it down. A throttle
+                    // (429, -1003, a WAF 403) backs off the shared limiter so REST calls
+                    // back off too.
+                    if matches!(order_err, OrderError::Rejected(ApiError::RateLimit)) {
+                        self.rate_limiter.on_rate_limited(None);
+                    }
                     // if this is BalanceInsufficient, its AssetNameExchange field
                     // holds the instrument name ("BTCUSDT"), not an asset name — see
                     // parse_binance_api_error for details. Do not match on that field
@@ -2726,29 +2736,34 @@ mod tests {
     }
 
     #[test]
-    fn test_is_api_rejection_error() {
-        // A ResponseError from binance-sdk (HTTP 4xx API rejection) is detected
+    fn test_classify_ws_order_error_recognises_venue_responses_only() {
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+
+        // A ResponseError from binance-sdk (the venue answered with status >= 400) is classified
         let rejection = anyhow::anyhow!(WebsocketError::ResponseError {
             code: -2010,
             message: "Account has insufficient balance for requested action.".into(),
         });
         assert!(
-            is_api_rejection_error(&rejection),
-            "ResponseError should be detected as API rejection"
+            matches!(
+                classify_ws_order_error(&rejection, &instrument),
+                Some(OrderError::Rejected(ApiError::BalanceInsufficient(..)))
+            ),
+            "ResponseError should be classified as a venue response"
         );
 
-        // A transport error (e.g. connection reset) is NOT an API rejection
+        // A transport error (e.g. connection reset) is NOT a venue response
         let transport = anyhow::anyhow!("connection reset by peer");
         assert!(
-            !is_api_rejection_error(&transport),
-            "plain transport error should not be detected as API rejection"
+            classify_ws_order_error(&transport, &instrument).is_none(),
+            "plain transport error should not be classified as a venue response"
         );
 
-        // A rate-limit error string (not a WebsocketError) is NOT an API rejection
+        // A rate-limit error string (not a WebsocketError) is NOT a venue response
         let rate_limit = anyhow::anyhow!("Too many requests. You are being rate-limited.");
         assert!(
-            !is_api_rejection_error(&rate_limit),
-            "rate-limit string error should not be detected as API rejection"
+            classify_ws_order_error(&rate_limit, &instrument).is_none(),
+            "rate-limit string error should not be classified as a venue response"
         );
     }
 
@@ -4223,28 +4238,29 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // L1: is_api_rejection_error with a context-wrapped error chain
+    // L1: classify_ws_order_error with a context-wrapped error chain
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn test_is_api_rejection_error_with_wrapped_error_chain() {
-        // `is_api_rejection_error` uses `anyhow::Error::downcast_ref`, which searches
+    fn test_classify_ws_order_error_with_wrapped_error_chain() {
+        // `classify_ws_order_error` uses `anyhow::Error::downcast_ref`, which searches
         // the *entire* error chain (not just the root). This test verifies that a
         // ResponseError wrapped in anyhow context layers is still detected correctly,
         // so SDK-internal context wrapping does not break the rejection check.
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
         let raw = anyhow::anyhow!(WebsocketError::ResponseError {
             code: -2010,
             message: "insufficient balance".into(),
         });
         // Unwrapped root: must be detected
         assert!(
-            is_api_rejection_error(&raw),
+            classify_ws_order_error(&raw, &instrument).is_some(),
             "unwrapped ResponseError at root must be detected"
         );
         // Context-wrapped: anyhow::downcast_ref searches the full chain, so this is also detected
         let wrapped = raw.context("outer context (e.g. SDK adds context layer)");
         assert!(
-            is_api_rejection_error(&wrapped),
+            classify_ws_order_error(&wrapped, &instrument).is_some(),
             "context-wrapped ResponseError must still be detected — anyhow::downcast_ref searches the full chain"
         );
     }

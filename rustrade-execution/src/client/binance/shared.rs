@@ -233,6 +233,12 @@ impl RateLimitTracker {
 /// Covers HTTP 429 / -1003 (WAF/queue overflow: requests rejected before execution)
 /// and -1015 (IP rate-limit ban). Both warrant the same backoff response.
 pub(crate) fn is_rate_limit_error(e: &anyhow::Error) -> bool {
+    // A WAF 403 carries none of the texts below; recognise it by type so it is backed off too.
+    if let Some(ConnectorError::ForbiddenError { msg, code }) = e.downcast_ref::<ConnectorError>()
+        && is_waf_block(&with_code(msg, *code))
+    {
+        return true;
+    }
     // iterate the error chain and match against the actual Display strings
     // from binance-sdk's TooManyRequestsError and RateLimitBanError variants.
     // Note: cause.to_string() allocates per chain entry — acceptable since this
@@ -247,18 +253,6 @@ pub(crate) fn is_rate_limit_error(e: &anyhow::Error) -> bool {
         }
     }
     false
-}
-
-/// Check if an anyhow::Error from binance-sdk is an API-level rejection (HTTP 4xx).
-///
-/// binance-sdk wraps both transport failures and API rejections as
-/// `WebsocketError::ResponseError`. This function distinguishes them so API rejections
-/// (-2010, -1121, etc.) don't tear down a healthy WS session.
-/// Re-verify on SDK upgrade — if the SDK changes error wrapping, `downcast_ref` returns
-/// `None` and all rejections would be misclassified as transport errors.
-pub(crate) fn is_api_rejection_error(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<WebsocketError>()
-        .is_some_and(|we| matches!(we, WebsocketError::ResponseError { .. }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1327,7 +1321,10 @@ fn has_rate_limit_error_code(msg: &str) -> bool {
     contains_error_code(msg, "-1003") || contains_error_code(msg, "-1015")
 }
 
-/// Parse Binance error strings to rustrade ApiError.
+/// Parse Binance error strings to rustrade ApiError, in an order's context.
+///
+/// Order and cancel paths call it through [`parse_binance_order_rejection`], which first catches
+/// the venue-failure codes that leave an order's status unknown.
 ///
 /// depends on binance-sdk's internal error formatting (not a public API contract).
 /// If the SDK changes its error message format, these string matches may silently stop working.
@@ -1401,7 +1398,9 @@ pub(crate) fn parse_binance_api_error(
 /// A venue failure ([`has_venue_failure_code`]) → [`OrderError::Connectivity`]: the order may
 /// or may not have reached the matching engine, and reporting a definitive rejection for one that
 /// executed would leave the caller blind to a fill. Everything else is a rejection, mapped by
-/// [`parse_binance_api_error`].
+/// [`parse_binance_api_error`]. The venue-failure check comes first on purpose: should a message
+/// ever carry both a venue-failure code and an auth or throttle marker, "status unknown" is the
+/// label that cannot hide a fill.
 pub(crate) fn parse_binance_order_rejection(
     msg: String,
     instrument: &InstrumentNameExchange,
@@ -1478,14 +1477,14 @@ pub(crate) fn classify_rest_query_error(
     }
     if let Some(ce) = e.downcast_ref::<ConnectorError>() {
         return match classify_connector_error(ce) {
-            RestFailure::RateLimited => UnindexedClientError::Api(ApiError::RateLimit),
-            RestFailure::Unauthenticated(msg) => {
+            RequestFailure::RateLimited => UnindexedClientError::Api(ApiError::RateLimit),
+            RequestFailure::Unauthenticated(msg) => {
                 UnindexedClientError::Api(ApiError::Unauthenticated(msg))
             }
-            RestFailure::Transport(msg) => {
+            RequestFailure::Transport(msg) => {
                 UnindexedClientError::Connectivity(ConnectivityError::Socket(msg))
             }
-            RestFailure::Rejected(msg) => parse_binance_query_rejection(msg, instrument),
+            RequestFailure::Rejected(msg) => parse_binance_query_rejection(msg, instrument),
         };
     }
 
@@ -1700,13 +1699,14 @@ pub(crate) fn classify_order_kind_tif(
 }
 
 // ---------------------------------------------------------------------------
-// REST order-error classification
+// Request-error classification (REST and WS API)
 // ---------------------------------------------------------------------------
 
-/// How a binance-sdk REST [`ConnectorError`] failed, before the caller's context (an order or a
-/// query) decides which rustrade error that is.
+/// How a binance-sdk request failed — a REST [`ConnectorError`] or a WS-API
+/// [`WebsocketError::ResponseError`] — before the caller's context (an order or a query) decides
+/// which rustrade error that is.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum RestFailure {
+enum RequestFailure {
     /// HTTP 429 or 418 (throttled or IP-banned), or a 403 that is not an auth failure.
     RateLimited,
     /// HTTP 401, or a 403 that is an auth failure. Carries the message with the Binance code
@@ -1720,40 +1720,73 @@ enum RestFailure {
     Rejected(String),
 }
 
+/// Splice a Binance code back into a message whose `Display` omits it.
+fn with_code(msg: &str, code: Option<i64>) -> String {
+    code.map_or_else(|| msg.to_owned(), |c| format!("{c} {msg}"))
+}
+
+/// Whether an HTTP 403 is Binance's web application firewall (WAF) limit rather than an auth
+/// failure. Binance documents 403 as the WAF limit being violated, and a CDN block answers 403
+/// too; it is an auth failure only when its code or wording says so. `msg` carries the code.
+fn is_waf_block(msg: &str) -> bool {
+    !is_auth_failure(msg)
+}
+
+/// Classify an HTTP 403 (REST or WS API). A WAF block was refused at the edge, so an order never
+/// reached the matching engine; it is a limit to back off from, which [`is_rate_limit_error`]
+/// also recognises so [`rest_call_with_retry`] backs off in place.
+fn classify_forbidden(msg: String) -> RequestFailure {
+    if is_waf_block(&msg) {
+        // `RateLimited` carries no message, so log the body it replaces. A CDN's 403 body is a
+        // full HTML page: log only its start.
+        const LOG_EXCERPT_CHARS: usize = 256;
+        let excerpt = msg
+            .char_indices()
+            .nth(LOG_EXCERPT_CHARS)
+            .map_or(msg.as_str(), |(end, _)| &msg[..end]);
+        warn!(body = %excerpt, "Binance answered 403 (WAF limit); reporting RateLimit");
+        RequestFailure::RateLimited
+    } else {
+        RequestFailure::Unauthenticated(msg)
+    }
+}
+
+/// Classify a binance-sdk WS-API [`WebsocketError::ResponseError`]: the venue answered a request
+/// with a status of 400 or more. `msg` is the error's `Display`, which already carries `code`.
+///
+/// A negative `code` is Binance's own error code, for a code-first parser. When the response had
+/// no error object, the SDK falls back to the HTTP status as `code` (and `"Unknown error"` as
+/// the message), so a non-negative `code` is read as a status, as the REST path reads one:
+/// 429/418 → rate-limited, 401 → unauthenticated, 403 → [`classify_forbidden`], 5xx →
+/// transport (the venue failed it; the status of any order is unknown).
+fn classify_ws_response_error(code: i64, msg: String) -> RequestFailure {
+    match code {
+        429 | 418 => RequestFailure::RateLimited,
+        401 => RequestFailure::Unauthenticated(msg),
+        403 => classify_forbidden(msg),
+        500..=599 => RequestFailure::Transport(msg),
+        _ => RequestFailure::Rejected(msg),
+    }
+}
+
 /// Classify a binance-sdk REST [`ConnectorError`], shared by [`classify_rest_order_error`] and
 /// [`classify_rest_query_error`].
 ///
 /// `ConnectorError`'s `Display` **omits** the Binance numeric code (it lives in a separate `code`
 /// field), so the code is spliced back into the carried message wherever the caller parses it.
-fn classify_connector_error(ce: &ConnectorError) -> RestFailure {
-    let with_code = |msg: &str, code: Option<i64>| {
-        code.map_or_else(|| msg.to_owned(), |c| format!("{c} {msg}"))
-    };
+fn classify_connector_error(ce: &ConnectorError) -> RequestFailure {
     match ce {
         ConnectorError::TooManyRequestsError { .. } | ConnectorError::RateLimitBanError { .. } => {
-            RestFailure::RateLimited
+            RequestFailure::RateLimited
         }
         // Splice the code in so callers can tell auth-failure subtypes apart (e.g. -2014
         // invalid key vs -2015 IP/permission).
         ConnectorError::UnauthorizedError { msg, code } => {
-            RestFailure::Unauthenticated(with_code(msg, *code))
+            RequestFailure::Unauthenticated(with_code(msg, *code))
         }
-        // Binance documents 403 as its web application firewall (WAF) limit being violated, and a
-        // CDN block answers 403 too: an auth failure only when it says so, otherwise a limit to
-        // back off from. The request was refused at the edge, so an order never reached the
-        // matching engine.
-        ConnectorError::ForbiddenError { msg, code } => {
-            let msg = with_code(msg, *code);
-            if is_auth_failure(&msg) {
-                RestFailure::Unauthenticated(msg)
-            } else {
-                // `RateLimited` carries no message, so log the body it replaces.
-                warn!(%msg, "Binance REST answered 403 (WAF limit); reporting RateLimit");
-                RestFailure::RateLimited
-            }
-        }
+        ConnectorError::ForbiddenError { msg, code } => classify_forbidden(with_code(msg, *code)),
         ConnectorError::ServerError { msg, .. } | ConnectorError::NetworkError(msg) => {
-            RestFailure::Transport(msg.clone())
+            RequestFailure::Transport(msg.clone())
         }
         ConnectorError::BadRequestError { msg, code }
         | ConnectorError::NotFoundError { msg, code }
@@ -1778,9 +1811,9 @@ fn classify_connector_error(ce: &ConnectorError) -> RestFailure {
                 "Failed to convert response to UTF-8",
             ];
             if code.is_none() && TRANSPORT_PREFIXES.iter().any(|p| msg.starts_with(p)) {
-                RestFailure::Transport(msg.clone())
+                RequestFailure::Transport(msg.clone())
             } else {
-                RestFailure::Rejected(with_code(msg, *code))
+                RequestFailure::Rejected(with_code(msg, *code))
             }
         }
     }
@@ -1790,7 +1823,7 @@ fn classify_connector_error(ce: &ConnectorError) -> RestFailure {
 ///
 /// REST errors differ from the WS-API path: binance-sdk surfaces them as
 /// [`ConnectorError`], whose `Display` **omits** the Binance numeric code (it lives in a
-/// separate `code` field). So the WS classifier [`is_api_rejection_error`] (which downcasts
+/// separate `code` field). So the WS classifier [`classify_ws_order_error`] (which downcasts
 /// to `WebsocketError`) does not apply here — we downcast to `ConnectorError` instead, classify
 /// it with [`classify_connector_error`], and map a venue rejection with
 /// [`parse_binance_order_rejection`].
@@ -1811,11 +1844,43 @@ pub(crate) fn classify_rest_order_error(
         return OrderError::Connectivity(ConnectivityError::Socket(format!("{e:#}")));
     };
 
-    match classify_connector_error(ce) {
-        RestFailure::RateLimited => OrderError::Rejected(ApiError::RateLimit),
-        RestFailure::Unauthenticated(msg) => OrderError::Rejected(ApiError::Unauthenticated(msg)),
-        RestFailure::Transport(msg) => OrderError::Connectivity(ConnectivityError::Socket(msg)),
-        RestFailure::Rejected(msg) => parse_binance_order_rejection(msg, instrument),
+    order_error_from(classify_connector_error(ce), instrument)
+}
+
+/// Classify an `anyhow::Error` from a WS-API order/cancel request.
+///
+/// binance-sdk returns both transport failures and venue responses with status >= 400 through
+/// the same `Err`. Returns `None` unless it is a [`WebsocketError::ResponseError`]: the venue
+/// answered, so the session is healthy and the caller keeps it. Any other error is a transport
+/// failure for the caller to handle. `downcast_ref` searches the whole error chain, so context
+/// layers do not hide the `ResponseError`. Re-verify on an SDK upgrade: if the SDK changes its
+/// error wrapping, `downcast_ref` returns `None` and every rejection would be treated as a
+/// transport failure.
+pub(crate) fn classify_ws_order_error(
+    e: &anyhow::Error,
+    instrument: &InstrumentNameExchange,
+) -> Option<UnindexedOrderError> {
+    match e.downcast_ref::<WebsocketError>()? {
+        WebsocketError::ResponseError { code, .. } => Some(order_error_from(
+            classify_ws_response_error(*code, e.to_string()),
+            instrument,
+        )),
+        _ => None,
+    }
+}
+
+/// Map a [`RequestFailure`] of an order or cancel request to an [`OrderError`].
+fn order_error_from(
+    failure: RequestFailure,
+    instrument: &InstrumentNameExchange,
+) -> UnindexedOrderError {
+    match failure {
+        RequestFailure::RateLimited => OrderError::Rejected(ApiError::RateLimit),
+        RequestFailure::Unauthenticated(msg) => {
+            OrderError::Rejected(ApiError::Unauthenticated(msg))
+        }
+        RequestFailure::Transport(msg) => OrderError::Connectivity(ConnectivityError::Socket(msg)),
+        RequestFailure::Rejected(msg) => parse_binance_order_rejection(msg, instrument),
     }
 }
 
@@ -2416,5 +2481,107 @@ mod tests {
             matches!(err, OrderError::Rejected(ApiError::BalanceInsufficient(..))),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn order_rejections_keep_their_order_meaning() {
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+        for (msg, expected) in [
+            // Cancel races stay "already cancelled".
+            (
+                "-2013 Order does not exist.",
+                ApiError::OrderAlreadyCancelled,
+            ),
+            ("-2011 Unknown order sent.", ApiError::OrderAlreadyCancelled),
+            // A stale timestamp on an order is a definitive refusal: it did not execute.
+            (
+                "-1021 Timestamp for this request is outside of the recvWindow.",
+                ApiError::OrderRejected(
+                    "-1021 Timestamp for this request is outside of the recvWindow.".to_string(),
+                ),
+            ),
+            // Auth by wording alone, with no code.
+            (
+                "Invalid API-key, IP, or permissions for action.",
+                ApiError::Unauthenticated(
+                    "Invalid API-key, IP, or permissions for action.".to_string(),
+                ),
+            ),
+        ] {
+            assert_eq!(
+                parse_binance_order_rejection(msg.to_string(), &instrument),
+                OrderError::Rejected(expected),
+                "{msg:?}"
+            );
+        }
+    }
+
+    fn classify_ws(code: i64, message: &str) -> Option<UnindexedOrderError> {
+        classify_ws_order_error(
+            &anyhow::Error::new(WebsocketError::ResponseError {
+                code,
+                message: message.to_string(),
+            }),
+            &InstrumentNameExchange::new("BTCUSDT"),
+        )
+    }
+
+    #[test]
+    fn a_ws_response_without_an_error_body_is_read_by_its_status() {
+        // With no error object the SDK reports the HTTP status as `code`, "Unknown error" as text.
+        let err = classify_ws(503, "Unknown error");
+        assert!(
+            matches!(err, Some(OrderError::Connectivity(_))),
+            "a 5xx leaves the order's status unknown: {err:?}"
+        );
+        for code in [429, 418, 403] {
+            let err = classify_ws(code, "Unknown error");
+            assert!(
+                matches!(err, Some(OrderError::Rejected(ApiError::RateLimit))),
+                "{code}: got {err:?}"
+            );
+        }
+        let err = classify_ws(401, "Unknown error");
+        assert!(
+            matches!(
+                err,
+                Some(OrderError::Rejected(ApiError::Unauthenticated(_)))
+            ),
+            "got {err:?}"
+        );
+        let err = classify_ws(409, "Unknown error");
+        assert!(
+            matches!(err, Some(OrderError::Rejected(ApiError::OrderRejected(_)))),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_ws_response_with_a_binance_code_is_read_by_its_code() {
+        let err = classify_ws(-1007, "Timeout waiting for response from backend server.");
+        assert!(
+            matches!(err, Some(OrderError::Connectivity(_))),
+            "got {err:?}"
+        );
+        let err = classify_ws(-1003, "Too much request weight used.");
+        assert!(
+            matches!(err, Some(OrderError::Rejected(ApiError::RateLimit))),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_waf_403_is_backed_off_as_a_rate_limit_but_an_auth_403_is_not() {
+        let waf = anyhow::Error::new(ConnectorError::ForbiddenError {
+            msg: "<html>403 Forbidden</html>".to_string(),
+            code: None,
+        });
+        assert!(is_rate_limit_error(&waf));
+
+        let auth = anyhow::Error::new(ConnectorError::ForbiddenError {
+            msg: "Invalid API-key, IP, or permissions for action.".to_string(),
+            code: Some(-2015),
+        });
+        assert!(!is_rate_limit_error(&auth));
     }
 }
