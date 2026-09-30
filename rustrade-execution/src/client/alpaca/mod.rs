@@ -1231,8 +1231,8 @@ impl ExecutionClient for AlpacaClient {
     /// # Errors
     ///
     /// Besides request failures, [`ClientError::Internal`](crate::error::ClientError::Internal)
-    /// when any equity or option position, requested or not, has a missing or unrecognised
-    /// `side`: its direction cannot be known, and leaving it out would read as flat.
+    /// when any non-zero equity or option position, requested or not, has a missing or
+    /// unrecognised `side`: its direction cannot be known, and leaving it out would read as flat.
     ///
     /// # Rate limit note
     ///
