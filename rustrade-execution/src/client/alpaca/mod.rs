@@ -1228,6 +1228,12 @@ impl ExecutionClient for AlpacaClient {
     /// equity and the OCC symbol for an option. With `instruments` empty, every instrument that
     /// has an open order or a position gets a snapshot; otherwise only the requested ones do.
     ///
+    /// # Errors
+    ///
+    /// Besides request failures, [`ClientError::Internal`](crate::error::ClientError::Internal)
+    /// when any equity or option position, requested or not, has a missing or unrecognised
+    /// `side`: its direction cannot be known, and leaving it out would read as flat.
+    ///
     /// # Rate limit note
     ///
     /// `/v2/positions` is fetched on every call, since it holds both the crypto balances and the
@@ -1276,14 +1282,14 @@ impl ExecutionClient for AlpacaClient {
             balances.extend(convert_positions_to_balances(&positions, assets));
         }
 
+        // Converted before the open orders are fetched, so a position that cannot be converted
+        // fails the call without a wasted request.
+        let converted_positions = convert_positions(&positions, Utc::now())?;
         let open_orders = fetch_raw_open_orders(&http, rl, base, instruments).await?;
 
         // Group open orders and positions by instrument symbol.
-        let instrument_snapshots = build_instrument_snapshots(
-            open_orders,
-            convert_positions(&positions, Utc::now())?,
-            instruments,
-        );
+        let instrument_snapshots =
+            build_instrument_snapshots(open_orders, converted_positions, instruments);
 
         Ok(AccountSnapshot::new(
             ExchangeId::AlpacaBroker,
@@ -3051,8 +3057,8 @@ fn is_crypto_position(position: &AlpacaPosition) -> bool {
 /// # Errors
 ///
 /// [`ClientError::Internal`](crate::error::ClientError::Internal) when a position's `side` is
-/// neither `long` nor `short`: reporting it either way could invert it, and leaving it out would
-/// read as flat.
+/// missing or neither `long` nor `short`: reporting it either way could invert it, and leaving it
+/// out would read as flat.
 fn convert_positions(
     positions: &[AlpacaPosition],
     now: DateTime<Utc>,
@@ -3067,7 +3073,7 @@ fn convert_positions(
                 AlpacaPositionSide::Short => -size,
                 AlpacaPositionSide::Unknown => {
                     return Err(UnindexedClientError::Internal(format!(
-                        "Alpaca position {} has an unrecognised side",
+                        "Alpaca position {} has a missing or unrecognised side",
                         p.symbol
                     )));
                 }
