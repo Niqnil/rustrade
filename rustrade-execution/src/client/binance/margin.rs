@@ -1078,6 +1078,11 @@ impl ExecutionClient for BinanceMargin {
     /// **Isolated**: the empty sentinel resolves to the configured `isolated_symbols` (the effective
     /// isolated set; out-of-set instruments skipped with a warning), iterated per-symbol (Design
     /// decision #4).
+    ///
+    /// **Lookback cost:** Binance serves margin trades by time only in spans under 24 hours, so
+    /// each instrument is read in 23-hour windows from `time_since` until its first trade, one
+    /// request (weight 10) per window, then by trade id. A `time_since` 30 days back with no
+    /// trades costs about 32 requests per instrument.
     async fn fetch_trades(
         &self,
         time_since: DateTime<Utc>,
@@ -2784,11 +2789,27 @@ async fn fetch_margin_all_open_orders(
     Ok(orders)
 }
 
+/// Length of each time window [`paginate_margin_my_trades`] walks before it finds a trade.
+///
+/// Binance requires "less than 24 hours between startTime and endTime" on margin `myTrades`,
+/// and returns only 24 hours of trades to a query without `fromId`. Kept well under that
+/// limit so no reading of the bound (inclusive ends, clock rounding) can make a window too long.
+const MARGIN_MY_TRADES_WINDOW_MS: i64 = 23 * 60 * 60 * 1000;
+
 /// Paginate the margin trade list for a single instrument from `from` (`isIsolated`
-/// config-driven). Mirrors `BinanceSpot::paginate_my_trades`: cursor-based, first page by
-/// `start_time` or, for one order's executions, by `order_id`; subsequent pages by
-/// `from_id = last_id + 1` (Binance ignores `start_time` once `from_id` is set), keeping
-/// `order_id` alongside it. Produces a gapless result.
+/// config-driven), returning every trade from `from` onwards with no gap.
+///
+/// - [`MyTradesFrom::Order`]: first page by `order_id`, then `from_id = last_id + 1` alongside it,
+///   as `BinanceSpot::paginate_my_trades` does.
+/// - [`MyTradesFrom::Time`]: unlike spot, margin `myTrades` does not return every trade since a
+///   bare `startTime` — without `fromId` it returns only 24 hours of trades, and it rejects a
+///   `startTime`..`endTime` span of 24 hours or more. So the walk first steps forward in windows
+///   of [`MARGIN_MY_TRADES_WINDOW_MS`], each bounded by `startTime` and `endTime`, from `from` until
+///   the call's start. At the first window holding a trade it switches to `from_id = last_id + 1`,
+///   which Binance serves regardless of time, and reads on until a short page.
+///
+/// **Cost:** a lookback with no trades costs one request (weight 10) per window, so about one per
+/// day of lookback before the first trade. An ordinary reconnect gap fits in one window.
 ///
 /// **Isolated correctness:** this also backs reconnect fill-recovery (`recover_margin_fills`), so a
 /// missed `isIsolated` flip would silently query *cross* trades on an isolated client — hence the
@@ -2809,10 +2830,48 @@ async fn paginate_margin_my_trades(
     // rules that out.
     #[allow(clippy::cast_possible_wrap)]
     let limit = BINANCE_MAX_TRADES as i64;
+    // The windows stop here. A trade after it is still read once the walk has switched to
+    // `from_id`; before that it is left to the caller's next read (or, on reconnect, the stream).
+    let now_ms = Utc::now().timestamp_millis();
     let mut all_pages = Vec::new();
     let mut cursor: Option<i64> = None;
+    // Start of the current window; only read while `from` is `Time` and `cursor` is `None`.
+    let mut window_start = match from {
+        MyTradesFrom::Time(start_time_ms) => start_time_ms,
+        MyTradesFrom::Order(_) => 0,
+    };
+    /// What one request asks Binance for.
+    #[derive(Clone, Copy)]
+    enum PageQuery {
+        /// Trades stamped from `start` to `end`, in epoch milliseconds.
+        Window { start: i64, end: i64 },
+        /// Trades from this id onwards, whatever their time.
+        FromId(i64),
+        /// One order's executions, from its first.
+        Order(i64),
+        /// One order's executions, from this id onwards.
+        OrderFromId { order_id: i64, from_id: i64 },
+    }
     loop {
-        let fid = cursor; // Option<i64> is Copy
+        let query = match (from, cursor) {
+            (MyTradesFrom::Time(_), None) => {
+                if window_start > now_ms {
+                    break;
+                }
+                PageQuery::Window {
+                    start: window_start,
+                    end: window_start
+                        .saturating_add(MARGIN_MY_TRADES_WINDOW_MS)
+                        .min(now_ms),
+                }
+            }
+            (MyTradesFrom::Time(_), Some(id)) => PageQuery::FromId(id),
+            (MyTradesFrom::Order(order_id), None) => PageQuery::Order(order_id),
+            (MyTradesFrom::Order(order_id), Some(id)) => PageQuery::OrderFromId {
+                order_id,
+                from_id: id,
+            },
+        };
         let response = rest_call_with_retry(rest, rate_limiter, |rest| {
             let sym = symbol_str.clone();
             let isolated = isolated.clone();
@@ -2820,12 +2879,12 @@ async fn paginate_margin_my_trades(
                 let builder = QueryMarginAccountsTradeListParams::builder(sym)
                     .is_isolated(isolated)
                     .limit(limit);
-                let params = match (from, fid) {
-                    (MyTradesFrom::Time(start_time_ms), None) => builder.start_time(start_time_ms),
-                    (MyTradesFrom::Time(_), Some(id)) => builder.from_id(id),
-                    (MyTradesFrom::Order(order_id), None) => builder.order_id(order_id),
-                    (MyTradesFrom::Order(order_id), Some(id)) => {
-                        builder.order_id(order_id).from_id(id)
+                let params = match query {
+                    PageQuery::Window { start, end } => builder.start_time(start).end_time(end),
+                    PageQuery::FromId(id) => builder.from_id(id),
+                    PageQuery::Order(order_id) => builder.order_id(order_id),
+                    PageQuery::OrderFromId { order_id, from_id } => {
+                        builder.order_id(order_id).from_id(from_id)
                     }
                 }
                 .build()?;
@@ -2844,7 +2903,24 @@ async fn paginate_margin_my_trades(
         let last_id = page.last().and_then(|t| t.id);
         all_pages.extend(page);
 
-        if page_len < BINANCE_MAX_TRADES {
+        if let PageQuery::Window {
+            end: window_end, ..
+        } = query
+        {
+            if page_len == 0 {
+                // An empty window: step on. The next window starts at this one's end, so a trade
+                // stamped exactly on the boundary is read whether Binance treats `endTime` as
+                // inclusive or not. The overlap cannot duplicate a trade: a window only repeats
+                // while every window so far was empty.
+                if window_end >= now_ms {
+                    break;
+                }
+                window_start = window_end;
+                continue;
+            }
+            // A window holding a trade: whether or not the page is full, trades after it may lie
+            // beyond the window's end, so read on by `from_id` rather than stopping at a short page.
+        } else if page_len < BINANCE_MAX_TRADES {
             break;
         }
         match last_id {
@@ -5119,5 +5195,145 @@ mod tests {
             }
             other => panic!("expected OrderSnapshot, got {other:?}"),
         }
+    }
+
+    /// A margin `myTrades` venue that enforces Binance's documented 24-hour rules: a
+    /// `startTime`..`endTime` span of 24 hours or more is rejected, and a query without `fromId`
+    /// returns at most 24 hours of trades (modelled here as the 24 hours from `startTime`). A
+    /// `fromId` query returns trades from that id onwards whatever their time. Pages hold at most
+    /// `limit` trades, in ascending id.
+    struct MarginMyTradesVenue {
+        /// `(id, time_ms)`, in ascending id and time.
+        trades: Vec<(i64, i64)>,
+    }
+
+    impl wiremock::Respond for MarginMyTradesVenue {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+            let query: std::collections::HashMap<String, String> =
+                request.url.query_pairs().into_owned().collect();
+            let param = |name: &str| query.get(name).map(|v| v.parse::<i64>().unwrap());
+            let limit = usize::try_from(param("limit").unwrap_or(500)).unwrap();
+
+            let selected: Vec<&(i64, i64)> = if let Some(from_id) = param("fromId") {
+                self.trades
+                    .iter()
+                    .filter(|(id, _)| *id >= from_id)
+                    .collect()
+            } else {
+                let start = param("startTime").unwrap();
+                let end = match param("endTime") {
+                    Some(end) if end - start >= DAY_MS => {
+                        return wiremock::ResponseTemplate::new(400).set_body_json(
+                            serde_json::json!({"code": -1127, "msg": "More than 24 hours between startTime and endTime."}),
+                        );
+                    }
+                    Some(end) => end,
+                    None => start + DAY_MS - 1,
+                };
+                self.trades
+                    .iter()
+                    .filter(|(_, time)| (start..=end).contains(time))
+                    .collect()
+            };
+
+            let page: Vec<serde_json::Value> = selected
+                .into_iter()
+                .take(limit)
+                .map(|(id, time)| {
+                    serde_json::json!({
+                        "id": id, "symbol": "BTCUSDT", "time": time, "orderId": id,
+                        "price": "50000", "qty": "0.01", "commission": "0",
+                        "commissionAsset": "USDT", "isBuyer": true, "isMaker": false,
+                        "isBestMatch": true, "isIsolated": true,
+                    })
+                })
+                .collect();
+            wiremock::ResponseTemplate::new(200).set_body_json(page)
+        }
+    }
+
+    /// Run `paginate_margin_my_trades` from `from_ms` against a [`MarginMyTradesVenue`] holding
+    /// `trades`, returning the ids read and the number of requests sent.
+    async fn read_margin_trades(trades: Vec<(i64, i64)>, from_ms: i64) -> (Vec<i64>, usize) {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/myTrades"))
+            .respond_with(MarginMyTradesVenue { trades })
+            .mount(&server)
+            .await;
+        let rest = Arc::new(MarginTradingRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server.uri())
+                .build()
+                .unwrap(),
+        ));
+
+        let read = paginate_margin_my_trades(
+            &rest,
+            &Arc::new(RateLimitTracker::new()),
+            &InstrumentNameExchange::new("BTCUSDT"),
+            MyTradesFrom::Time(from_ms),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let requests = server.received_requests().await.unwrap().len();
+        (read.into_iter().map(|t| t.id.unwrap()).collect(), requests)
+    }
+
+    const HOUR_MS: i64 = 60 * 60 * 1000;
+
+    /// The only fill lies on day 3 of a five-day lookback. A bare `startTime` query sees only the
+    /// first 24 hours, finds nothing and stops; the windows must reach day 3.
+    #[tokio::test]
+    async fn margin_trades_read_a_lone_fill_beyond_the_first_day() {
+        let now = Utc::now().timestamp_millis();
+        let (ids, _) = read_margin_trades(vec![(7, now - 72 * HOUR_MS)], now - 120 * HOUR_MS).await;
+
+        assert_eq!(ids, vec![7]);
+    }
+
+    /// Fills in separate days, with empty days between and a short page in the first window
+    /// that holds one: every fill is read once, in order.
+    #[tokio::test]
+    async fn margin_trades_read_fills_across_several_windows_once_each() {
+        let now = Utc::now().timestamp_millis();
+        let trades = vec![
+            (1, now - 119 * HOUR_MS),
+            (2, now - 72 * HOUR_MS),
+            (3, now - HOUR_MS),
+        ];
+        let (ids, _) = read_margin_trades(trades, now - 144 * HOUR_MS).await;
+
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    /// A window holding more than one page of fills pages on by `fromId`.
+    #[tokio::test]
+    async fn margin_trades_page_on_by_id_past_a_full_window() {
+        let now = Utc::now().timestamp_millis();
+        let count = i64::try_from(BINANCE_MAX_TRADES).unwrap() + 1;
+        let trades = (1..=count)
+            .map(|id| (id, now - 48 * HOUR_MS + id))
+            .collect();
+        let (ids, _) = read_margin_trades(trades, now - 50 * HOUR_MS).await;
+
+        assert_eq!(ids, (1..=count).collect::<Vec<_>>());
+    }
+
+    /// A lookback with no fills costs one request per window, and every window is accepted
+    /// (the venue rejects a span of 24 hours or more, which would fail the read).
+    #[tokio::test]
+    async fn margin_trades_quiet_lookback_sends_one_request_per_window() {
+        let now = Utc::now().timestamp_millis();
+        let (ids, requests) = read_margin_trades(Vec::new(), now - 72 * HOUR_MS).await;
+
+        assert!(ids.is_empty());
+        // Windows start at 0, 23, 46 and 69 hours into the 72-hour lookback.
+        assert_eq!(requests, 4);
     }
 }
