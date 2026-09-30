@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   price settlement needs has not arrived. That second case was only logged before; the event
   stays retryable. Both enums are `#[non_exhaustive]`, so no downstream `match` breaks.
 
+- **`ApiError::RequestRejected`** (`rustrade-execution`): the venue refused the request itself,
+  such as a missing, malformed or out-of-range parameter, as opposed to an order failing a
+  business rule (`OrderRejected`). It is not transient, and its message carries the venue's error
+  code where there is one. `ApiError` is `#[non_exhaustive]`, so no downstream `match` breaks.
+
 ### Changed
 
 - **`Engine::process_contract_expiry` returns `Vec<EngineOutput>`** (`rustrade`), like
@@ -54,6 +59,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trade it pages on by trade id. Each window before the first trade costs one request (weight 10),
   so the cost grows with the lookback: about 32 requests per instrument for 30 days with no
   trades. Spot is unaffected: its `myTrades` returns every trade since a bare `startTime`.
+
+- **Binance spot and margin reported every failed query as a transient connectivity error**
+  (`rustrade-execution`, feature `binance`). Apart from recognised auth failures, any failure of
+  a non-order REST call became `ClientError::Connectivity`, so `is_transient()` told a caller to
+  retry a request the venue would refuse forever, such as one it rejected with `-1127`. This
+  affected `account_snapshot`, `fetch_balances`, `fetch_open_orders`, `fetch_trades`, reconnect
+  fill recovery, and the margin user-data listen token. Failures are now classified from the
+  SDK's typed error, as order calls already were:
+  - a venue rejection is `ApiError::RequestRejected`, or `InstrumentInvalid` for `-1121` when the
+    request named one instrument, and keeps `Unauthenticated` and `RateLimit` for their codes;
+  - HTTP 429/418 is `RateLimit` and 401/403 is `Unauthenticated`, now with the Binance code;
+  - a request that never completed, a 5xx, and Binance's own internal-failure codes (`-1001`,
+    `-1006`, `-1007`, `-1008`) stay transient `Connectivity`;
+  - a response body that does not fit the SDK's model, and a request the client failed to build,
+    are `ClientError::Internal`, since retrying cannot change either.
 
 - **A `ContractExpiry` for an instrument that never expires closed its positions** (`rustrade`).
   For a `Spot`, `Perpetual` or `Cfd` instrument the engine settled the event as it would a
