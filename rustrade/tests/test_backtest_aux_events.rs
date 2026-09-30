@@ -217,6 +217,10 @@ async fn backtest_runs_with_corporate_action_injected_mid_stream() {
 
 /// A `ContractExpiry` injected mid-stream is now backtest-testable for the first time — assert the
 /// run completes (the aux seam delivers a non-split, non-market `EngineEvent`).
+///
+/// Every instrument in this config is `Spot`, which never expires, so the engine rejects the event
+/// with a `ContractExpiryNotSettled` rather than settling anything. This checks delivery through
+/// the seam, not settlement, which the engine-level expiry tests cover.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backtest_runs_with_contract_expiry_injected_mid_stream() {
     let expiry = Timed::new(
