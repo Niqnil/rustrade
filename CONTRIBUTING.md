@@ -227,9 +227,14 @@ We use a **two-PR flow** so `develop` and `main` stay in sync — the version bu
 
    Publishing uses crates.io [Trusted Publishing](https://crates.io/docs/trusted-publishing): the
    workflow holds no crates.io token. Each crate's **Settings → Trusted Publishing** lists a GitHub
-   publisher for this repository, workflow `publish.yml`, environment `release`. **A new crate**
-   cannot publish this way until it exists: publish its first version by hand with an API token,
-   then add the same trusted publisher to it before the next release tag.
+   publisher with owner `Niqnil`, repository `rustrade`, workflow `publish.yml` and environment
+   `release`. The `release` environment (**Settings → Environments**) only deploys from tags
+   matching `v*`. A crate missing that publisher fails the release when its turn comes, after the
+   crates before it in the publish order are already out; add it and re-run.
+
+   **A new crate** cannot publish this way until it exists on crates.io. Publish its first version
+   by hand with a short-lived API token scoped to `publish-new`, revoke the token, then add the
+   trusted publisher to the crate before the next release tag.
 
    **A failed publish does not need a version bump.** Before publishing a crate, the script looks
    up its exact version in the crates.io sparse index, so crates already there are skipped and a
