@@ -19,9 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the quote asset, so realised PnL at close is net of them; they default to zero. Seeds are
   also how a backtest starts from an existing portfolio.
   - New `EngineStateBuilder::try_build` returns a `PositionSeedError` for an invalid seed: an
-    unknown instrument, a quantity that is not positive, negative entry fees, a slot seeded
-    twice, or a slot that does not fit the `OmsMode`. `build` keeps its signature and panics on
-    the same errors; a builder with no seeds never panics.
+    unknown instrument, a quantity that is not positive, a slot seeded twice, or a slot that does
+    not fit the `OmsMode`. `build` keeps its signature and panics on the same errors; a builder
+    with no seeds never panics.
   - `SystemBuilder::build` returns the error as the new `BarterError::PositionSeed` variant.
     `BarterError` is not `#[non_exhaustive]`, so a downstream `match` on it that lists every
     variant needs an arm for this one.

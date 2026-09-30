@@ -225,8 +225,8 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
     /// an invalid [`PositionSeed`] instead of panicking.
     ///
     /// A seed is rejected if it names an instrument the builder was not given, has a
-    /// non-positive quantity or negative entry fees, targets a slot another seed already filled,
-    /// or names a slot that does not fit the [`OmsMode`] — see [`PositionSeedError`].
+    /// non-positive quantity, targets a slot another seed already filled, or names a slot that
+    /// does not fit the [`OmsMode`] — see [`PositionSeedError`].
     pub fn try_build<InstrumentData>(
         self,
     ) -> Result<EngineState<GlobalData, InstrumentData>, PositionSeedError>
@@ -594,6 +594,27 @@ mod tests {
         assert_eq!(position.pnl_unrealised, dec!(995));
     }
 
+    /// A net rebate on entry is seeded as negative fees, as a fill carries one, and starts
+    /// realised PnL above zero.
+    #[test]
+    fn seeded_entry_rebate_starts_realised_pnl_above_zero() {
+        let instruments = seed_instruments();
+        let state = try_build(
+            &instruments,
+            OmsMode::Netting,
+            vec![long_seed(SPOT, dec!(0.5)).with_fees_enter(dec!(-0.25))],
+        )
+        .unwrap();
+
+        let spot = state
+            .instruments
+            .instrument(&InstrumentNameInternal::new(SPOT));
+        let position = &spot.position.positions[&PositionId::NETTING];
+
+        assert_eq!(position.fees_enter.fees, dec!(-0.25));
+        assert_eq!(position.pnl_realised, dec!(0.25));
+    }
+
     /// A seed serialised without `fees_enter` still deserialises, with zero entry fees.
     #[test]
     fn seed_without_fees_enter_deserialises_with_zero_fees() {
@@ -785,14 +806,6 @@ mod tests {
                 PositionSeedError::NonPositiveQuantity {
                     instrument: spot.clone(),
                     quantity_abs: dec!(-1),
-                },
-            ),
-            (
-                OmsMode::Netting,
-                vec![long_seed(SPOT, dec!(1)).with_fees_enter(dec!(-0.01))],
-                PositionSeedError::NegativeFees {
-                    instrument: spot.clone(),
-                    fees_enter: dec!(-0.01),
                 },
             ),
             (

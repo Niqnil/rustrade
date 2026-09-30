@@ -372,9 +372,8 @@ pub struct PositionSeed {
     ///   orders with this id as their
     ///   [`RequestOpen::position_id`](rustrade_execution::order::request::RequestOpen::position_id).
     pub position_id: Option<PositionId>,
-    /// Fees paid to enter the position, in the instrument's quote asset. Must not be negative, so
-    /// a net rebate on entry cannot be seeded. Zero by default, including when absent from a
-    /// deserialised seed.
+    /// Fees paid to enter the position, in the instrument's quote asset. Negative for a net
+    /// rebate, as on a fill. Zero by default, including when absent from a deserialised seed.
     #[serde(default)]
     pub fees_enter: Decimal,
 }
@@ -412,9 +411,8 @@ impl PositionSeed {
     /// at close is net of them. Without this the seed carries zero entry fees and realised PnL
     /// overstates the position's result by what they cost.
     ///
-    /// The amount must not be negative, which
-    /// [`EngineStateBuilder::try_build`](crate::engine::state::builder::EngineStateBuilder::try_build)
-    /// checks: a net rebate on entry cannot be seeded, although a fill may carry one.
+    /// Not checked, as a fill's fees are not: a negative amount is a net rebate on entry, and
+    /// starts realised PnL above zero.
     pub fn with_fees_enter(self, fees_enter: Decimal) -> Self {
         Self { fees_enter, ..self }
     }
@@ -434,13 +432,6 @@ impl PositionSeed {
             return Err(PositionSeedError::NonPositiveQuantity {
                 instrument: self.instrument,
                 quantity_abs: self.quantity_abs,
-            });
-        }
-
-        if self.fees_enter < Decimal::ZERO {
-            return Err(PositionSeedError::NegativeFees {
-                instrument: self.instrument,
-                fees_enter: self.fees_enter,
             });
         }
 
@@ -506,13 +497,6 @@ pub enum PositionSeedError {
     NonPositiveQuantity {
         instrument: InstrumentNameInternal,
         quantity_abs: Decimal,
-    },
-
-    /// The seed's entry fees are negative.
-    #[error("position seed for {instrument} has negative entry fees {fees_enter}")]
-    NegativeFees {
-        instrument: InstrumentNameInternal,
-        fees_enter: Decimal,
     },
 
     /// Two seeds target the same slot on one instrument. Under [`OmsMode::Netting`] that is any
