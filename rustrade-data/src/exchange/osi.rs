@@ -5,6 +5,7 @@
 //! strike in thousandths as eight digits. The standard pads the root to six characters with spaces;
 //! neither provider does, and neither does anything here.
 
+use chrono::NaiveDate;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use rustrade_instrument::instrument::{
     kind::option::OptionKind, market_data::kind::MarketDataOptionContract,
@@ -67,6 +68,46 @@ pub(crate) fn root(symbol: &str) -> Option<&str> {
         && suffix[7..].iter().all(u8::is_ascii_digit);
 
     well_formed.then_some(root)
+}
+
+/// An OSI symbol read back into its parts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Parsed<'a> {
+    pub(crate) root: &'a str,
+    pub(crate) expiry: NaiveDate,
+    pub(crate) kind: OptionKind,
+    pub(crate) strike: Decimal,
+}
+
+/// Read an OSI symbol back into its parts.
+///
+/// `None` if `symbol` is not one, if its `YYMMDD` names no calendar date, or if its strike is zero
+/// — every case in which [`symbol`] could not spell it back.
+///
+/// Exact by construction: the strike is a count of thousandths and the expiry a date, so no float
+/// is involved. Reading a contract from here rather than from a provider's separate fields is what
+/// guarantees [`symbol`] spells it back to the same symbol. The two-digit year is read as 20YY, the
+/// century [`symbol`] writes.
+pub(crate) fn parse(symbol: &str) -> Option<Parsed<'_>> {
+    let root = root(symbol)?;
+    // `root` has checked the suffix's shape, so every slice below is ASCII digits or `C`/`P`.
+    let suffix = &symbol[root.len()..];
+    let number = |range: std::ops::Range<usize>| suffix[range].parse::<u32>().ok();
+
+    let year = 2000 + i32::try_from(number(0..2)?).ok()?;
+    let expiry = NaiveDate::from_ymd_opt(year, number(2..4)?, number(4..6)?)?;
+    let kind = match suffix.as_bytes()[6] {
+        b'C' => OptionKind::Call,
+        _ => OptionKind::Put,
+    };
+    let thousandths = number(7..SUFFIX_LEN).filter(|thousandths| *thousandths > 0)?;
+
+    Some(Parsed {
+        root,
+        expiry,
+        kind,
+        strike: Decimal::new(i64::from(thousandths), 3).normalize(),
+    })
 }
 
 #[cfg(test)]
@@ -143,6 +184,57 @@ mod tests {
             "SPY (not an option contract: spot)",
         ] {
             assert_eq!(root(symbol), None, "{symbol}");
+        }
+    }
+
+    #[test]
+    fn a_symbol_is_read_back_into_its_parts_exactly() {
+        let put = parse("SPY261130P00505000").unwrap();
+        assert_eq!(put.root, "SPY");
+        assert_eq!(put.expiry, NaiveDate::from_ymd_opt(2026, 11, 30).unwrap());
+        assert_eq!(put.kind, OptionKind::Put);
+        // Normalised, so it prints and serialises as `505` rather than `505.000`.
+        assert_eq!(put.strike.to_string(), "505");
+
+        let call = parse("F261016C00002670").unwrap();
+        assert_eq!(call.kind, OptionKind::Call);
+        assert_eq!(call.strike.to_string(), "2.67");
+
+        assert_eq!(parse("BRK.B261016C00450500").unwrap().root, "BRK.B");
+    }
+
+    #[test]
+    fn a_symbol_that_cannot_be_spelled_back_does_not_parse() {
+        for symbol in [
+            "SPY",
+            "SPY260930X00700000",
+            "SPY260930C0070000",
+            "SPY260931C00700000",
+            "SPY261330C00700000",
+            "SPY260930C00000000",
+        ] {
+            assert_eq!(parse(symbol), None, "{symbol}");
+        }
+    }
+
+    /// The round trip the option-contract subscriptions depend on: a contract read from a symbol
+    /// spells that same symbol back.
+    #[test]
+    fn a_parsed_symbol_spells_itself_back() {
+        for osi in [
+            "SPY261130P00505000",
+            "F261016C00002670",
+            "BRK.B261016C00450500",
+        ] {
+            let parsed = parse(osi).unwrap();
+            let contract = MarketDataOptionContract {
+                kind: parsed.kind,
+                exercise: OptionExercise::American,
+                expiry: parsed.expiry.and_hms_opt(20, 0, 0).unwrap().and_utc(),
+                strike: parsed.strike,
+            };
+
+            assert_eq!(symbol(parsed.root, &contract).unwrap(), osi);
         }
     }
 
