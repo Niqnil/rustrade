@@ -1403,7 +1403,7 @@ fn is_query_auth_failure(msg: &str) -> bool {
 ///   failed the request, not the other way round, and Binance says to retry.
 /// - `-1021` (timestamp outside `recvWindow`) → [`ConnectivityError::Socket`]: the request took
 ///   too long to arrive, or the local clock drifted. The SDK stamps each attempt afresh, so a
-///   retry can succeed.
+///   retry can succeed; a clock that stays wrong keeps failing, so callers should bound retries.
 /// - `-1121` → [`ApiError::InstrumentInvalid`] when the request named one instrument; otherwise
 ///   there is no instrument to attach, so it falls through.
 /// - anything else → [`ApiError::RequestRejected`].
@@ -1468,7 +1468,11 @@ pub(crate) fn classify_rest_query_error(
             RestFailure::Forbidden(msg) if is_query_auth_failure(&msg) => {
                 UnindexedClientError::Api(ApiError::Unauthenticated(msg))
             }
-            RestFailure::Forbidden(_) => UnindexedClientError::Api(ApiError::RateLimit),
+            RestFailure::Forbidden(msg) => {
+                // `ApiError::RateLimit` carries no message, so log the body it replaces.
+                warn!(%msg, "Binance REST query answered 403 (WAF limit); reporting RateLimit");
+                UnindexedClientError::Api(ApiError::RateLimit)
+            }
             RestFailure::Transport(msg) => {
                 UnindexedClientError::Connectivity(ConnectivityError::Socket(msg))
             }
