@@ -35,10 +35,11 @@ use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
     MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, RateLimitTracker,
-    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, classify_order_kind_tif, connectivity_error,
-    convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
-    dedup_key_from_event, is_api_rejection_error, is_duplicate, is_rate_limit_error,
-    new_dedup_cache, parse_binance_api_error, recovered_order_totals, rest_call_with_retry,
+    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, classify_order_kind_tif,
+    classify_rest_query_error, convert_execution_report, convert_open_order_listing,
+    convert_open_order_owned_symbol, dedup_key_from_event, is_api_rejection_error, is_duplicate,
+    is_rate_limit_error, new_dedup_cache, parse_binance_api_error, recovered_order_totals,
+    response_decode_error, rest_call_with_retry,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
@@ -395,12 +396,9 @@ async fn fetch_open_orders_for_instrument(
         })
     })
     .await
-    .map_err(connectivity_error)?;
+    .map_err(|e| classify_rest_query_error(&e, Some(&instrument)))?;
 
-    let orders_data = response
-        .data()
-        .await
-        .map_err(|e| connectivity_error(e.into()))?;
+    let orders_data = response.data().await.map_err(response_decode_error)?;
 
     let listing = convert_open_order_listing(&orders_data, ExchangeId::BinanceSpot, &instrument);
 
@@ -422,12 +420,9 @@ async fn fetch_all_open_orders(
         })
     })
     .await
-    .map_err(connectivity_error)?;
+    .map_err(|e| classify_rest_query_error(&e, None))?;
 
-    let orders_data = response
-        .data()
-        .await
-        .map_err(|e| connectivity_error(e.into()))?;
+    let orders_data = response.data().await.map_err(response_decode_error)?;
 
     let orders = orders_data
         .into_iter()
@@ -481,12 +476,9 @@ async fn paginate_my_trades(
             })
         })
         .await
-        .map_err(connectivity_error)?;
+        .map_err(|e| classify_rest_query_error(&e, Some(instrument)))?;
 
-        let page = response
-            .data()
-            .await
-            .map_err(|e| connectivity_error(e.into()))?;
+        let page = response.data().await.map_err(response_decode_error)?;
 
         let page_len = page.len();
         let last_id = page.last().and_then(|t| t.id);
@@ -555,12 +547,9 @@ impl ExecutionClient for BinanceSpot {
             })
         })
         .await
-        .map_err(connectivity_error)?;
+        .map_err(|e| classify_rest_query_error(&e, None))?;
 
-        let account = response
-            .data()
-            .await
-            .map_err(|e| connectivity_error(e.into()))?;
+        let account = response.data().await.map_err(response_decode_error)?;
 
         // Convert balances, filtering to requested assets
         let balances = filter_and_convert_balances(account.balances.unwrap_or_default(), assets);
@@ -1204,12 +1193,9 @@ impl ExecutionClient for BinanceSpot {
             })
         })
         .await
-        .map_err(connectivity_error)?;
+        .map_err(|e| classify_rest_query_error(&e, None))?;
 
-        let account = response
-            .data()
-            .await
-            .map_err(|e| connectivity_error(e.into()))?;
+        let account = response.data().await.map_err(response_decode_error)?;
 
         Ok(filter_and_convert_balances(
             account.balances.unwrap_or_default(),
@@ -2763,54 +2749,6 @@ mod tests {
         assert!(
             !is_api_rejection_error(&rate_limit),
             "rate-limit string error should not be detected as API rejection"
-        );
-    }
-
-    #[test]
-    fn test_connectivity_error_detects_auth_failures() {
-        // -1002: "You are not authorized to execute this request"
-        let err = connectivity_error(anyhow::anyhow!("Error -1002: unauthorized"));
-        assert!(
-            matches!(err, UnindexedClientError::Api(ApiError::Unauthenticated(_))),
-            "expected Unauthenticated for -1002, got {err:?}"
-        );
-
-        // -2015: "Invalid API-key, IP, or permissions for action"
-        // Use a code-only body (no auth text keyword) to isolate the numeric-code branch.
-        let err = connectivity_error(anyhow::anyhow!("Error -2015: permission denied for action"));
-        assert!(
-            matches!(err, UnindexedClientError::Api(ApiError::Unauthenticated(_))),
-            "expected Unauthenticated for -2015, got {err:?}"
-        );
-
-        // Text-based detection: "invalid signature"
-        let err = connectivity_error(anyhow::anyhow!("invalid signature provided"));
-        assert!(
-            matches!(err, UnindexedClientError::Api(ApiError::Unauthenticated(_))),
-            "expected Unauthenticated for 'invalid signature', got {err:?}"
-        );
-
-        // Text-based detection: "signature for this request is not valid"
-        let err = connectivity_error(anyhow::anyhow!(
-            "The signature for this request is not valid."
-        ));
-        assert!(
-            matches!(err, UnindexedClientError::Api(ApiError::Unauthenticated(_))),
-            "expected Unauthenticated for 'signature for this request is not valid', got {err:?}"
-        );
-
-        // Text-based detection: "invalid api-key"
-        let err = connectivity_error(anyhow::anyhow!("Invalid API-key format"));
-        assert!(
-            matches!(err, UnindexedClientError::Api(ApiError::Unauthenticated(_))),
-            "expected Unauthenticated for 'invalid api-key', got {err:?}"
-        );
-
-        // Non-auth errors should remain as Connectivity
-        let err = connectivity_error(anyhow::anyhow!("connection timeout"));
-        assert!(
-            matches!(err, UnindexedClientError::Connectivity(_)),
-            "expected Connectivity for timeout, got {err:?}"
         );
     }
 

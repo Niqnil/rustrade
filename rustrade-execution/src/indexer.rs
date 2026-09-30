@@ -316,6 +316,7 @@ impl AccountEventIndexer {
             UnindexedApiError::OrderAlreadyCancelled => ApiError::OrderAlreadyCancelled,
             UnindexedApiError::OrderAlreadyFullyFilled => ApiError::OrderAlreadyFullyFilled,
             UnindexedApiError::OrderAlreadyExpired => ApiError::OrderAlreadyExpired,
+            UnindexedApiError::RequestRejected(reason) => ApiError::RequestRejected(reason),
         })
     }
 

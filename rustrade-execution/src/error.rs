@@ -278,6 +278,18 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// Not transient — do not retry. The order no longer exists to cancel.
     #[error("order already expired")]
     OrderAlreadyExpired,
+
+    /// The exchange refused the request itself, rather than an order it carried.
+    ///
+    /// The request was malformed or asked for something the venue does not serve — a missing,
+    /// malformed or out-of-range parameter, such as a query time window longer than the venue
+    /// allows. Distinct from [`OrderRejected`](Self::OrderRejected), which is an order failing a
+    /// business rule; this variant arises from queries and other non-order requests. The message
+    /// carries the venue's own error code where it provides one (e.g. `-1127 ...` on Binance).
+    ///
+    /// Not transient — the same request fails identically on retry. Change the request.
+    #[error("request rejected: {0}")]
+    RequestRejected(String),
 }
 
 /// Represents all errors that can be generated when cancelling or opening orders.
@@ -445,6 +457,10 @@ mod tests {
 
         let err: ClientError =
             ClientError::Api(ApiError::Unauthenticated("invalid signature".into()));
+        assert!(!err.is_transient(), "expected non-transient for {:?}", err);
+
+        let err: ClientError =
+            ClientError::Api(ApiError::RequestRejected("-1127 More than 24 hours".into()));
         assert!(!err.is_transient(), "expected non-transient for {:?}", err);
     }
 
