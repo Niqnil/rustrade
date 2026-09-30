@@ -3,21 +3,24 @@ use derive_more::Constructor;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-/// Represents an open position in a derivative instrument (perpetuals, futures, margin).
+/// An open position in an instrument whose holding is tracked separately from cash balances:
+/// perpetuals, futures, options, and equities.
 ///
-/// For spot instruments, positions are implicit in asset balances — this struct is only
-/// used for instruments that track position state separately from cash balances.
+/// A holding a venue reports as an asset balance instead, such as spot crypto, has no
+/// `Position`.
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize, Constructor,
 )]
 pub struct Position {
     /// Signed quantity: positive = long, negative = short, zero = flat.
     ///
-    /// Using signed quantity is the industry standard for derivatives and avoids
+    /// Using signed quantity is the industry standard for positions and avoids
     /// a separate `side` field.
     pub quantity: Decimal,
 
-    /// Average entry price. `None` if position is flat or entry price unavailable.
+    /// Average entry price, quoted as the instrument's orders are priced: for an option or a
+    /// future, per unit of the underlying, not multiplied by the contract size. `None` if position
+    /// is flat or entry price unavailable.
     pub entry_price: Option<Decimal>,
 
     /// Unrealized PnL in quote currency. `None` if not provided by exchange.

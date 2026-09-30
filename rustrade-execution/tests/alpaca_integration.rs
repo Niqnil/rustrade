@@ -195,7 +195,12 @@ async fn test_account_snapshot() {
 
     println!("Instruments: {}", snapshot.instruments.len());
     for snap in &snapshot.instruments {
-        println!("  {}: {} open orders", snap.instrument, snap.orders.len());
+        println!(
+            "  {}: {} open orders, position {:?}",
+            snap.instrument,
+            snap.orders.len(),
+            snap.position
+        );
     }
 }
 

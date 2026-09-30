@@ -317,8 +317,12 @@ pub struct InstrumentAccountSnapshot<
     /// say.
     #[serde(default)]
     pub orders_complete: bool,
-    /// Open position for derivative instruments (perpetuals, futures, margin).
-    /// `None` for spot instruments where position is implicit in balances.
+    /// Open position in this instrument, for any instrument whose holding the venue tracks
+    /// separately from cash balances: perpetuals, futures, options, and equities (e.g. Alpaca).
+    ///
+    /// `None` when the instrument is flat, when the venue does not report positions, and for
+    /// holdings reported as asset balances instead, such as spot crypto. See each client's
+    /// `account_snapshot` for what it reports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<Position>,
     /// Per-pair isolated-margin balances and risk, for venues with isolated sub-accounts
