@@ -14,12 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the strategy could not close it, and risk checks did not see it. `EngineStateBuilder::positions`
   and `SystemBuilder::positions` now take `PositionSeed`s (instrument, side, quantity, entry price,
   entry time, and a `PositionId` under `OmsMode::Hedging`). The caller supplies the entry price.
-  A seeded position takes its contract size from the instrument and starts with zero fees and
-  zero PnL; no `Trade` is generated. Seeds are also how a backtest starts from an existing
-  portfolio.
+  A seeded position takes its contract size from the instrument and starts with zero unrealised
+  PnL; no `Trade` is generated. `PositionSeed::with_fees_enter` records the fees paid to enter,
+  in the quote asset, so realised PnL at close is net of them; they default to zero. Seeds are
+  also how a backtest starts from an existing portfolio.
   - New `EngineStateBuilder::try_build` returns a `PositionSeedError` for an invalid seed: an
-    unknown instrument, a quantity that is not positive, a slot seeded twice, or a slot that does
-    not fit the `OmsMode`. `build` keeps its signature and panics on the same errors; a builder
+    unknown instrument, a quantity that is not positive, negative entry fees, a slot seeded
+    twice, or a slot that does not fit the `OmsMode`. `build` keeps its signature and panics on the same errors; a builder
     with no seeds never panics.
   - `SystemBuilder::build` returns the error as the new `BarterError::PositionSeed` variant.
     `BarterError` is not `#[non_exhaustive]`, so a downstream `match` on it that lists every

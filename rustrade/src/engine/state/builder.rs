@@ -225,8 +225,8 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
     /// an invalid [`PositionSeed`] instead of panicking.
     ///
     /// A seed is rejected if it names an instrument the builder was not given, has a
-    /// non-positive quantity, targets a slot another seed already filled, or names a slot that
-    /// does not fit the [`OmsMode`] — see [`PositionSeedError`].
+    /// non-positive quantity or negative entry fees, targets a slot another seed already filled,
+    /// or names a slot that does not fit the [`OmsMode`] — see [`PositionSeedError`].
     pub fn try_build<InstrumentData>(
         self,
     ) -> Result<EngineState<GlobalData, InstrumentData>, PositionSeedError>
@@ -553,6 +553,78 @@ mod tests {
         assert!(spot.position.positions.is_empty());
     }
 
+    /// Seeded entry fees are held in the quote asset and realised when paid, as a fill opening the
+    /// position would record them.
+    #[test]
+    fn seeded_entry_fees_are_realised_up_front() {
+        let instruments = seed_instruments();
+        let state = try_build(
+            &instruments,
+            OmsMode::Netting,
+            vec![long_seed(SPOT, dec!(0.5)).with_fees_enter(dec!(5))],
+        )
+        .unwrap();
+
+        let spot = state
+            .instruments
+            .instrument(&InstrumentNameInternal::new(SPOT));
+        let position = &spot.position.positions[&PositionId::NETTING];
+        let quote = spot.instrument.underlying.quote;
+
+        assert_eq!(
+            position.fees_enter,
+            AssetFees::new(quote, dec!(5), Some(dec!(5)))
+        );
+        assert_eq!(
+            position.fees_exit,
+            AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO))
+        );
+        assert_eq!(position.pnl_realised, dec!(-5));
+    }
+
+    /// Closing a position seeded with entry fees nets them out of its realised PnL, together with
+    /// the closing fill's own fees.
+    #[test]
+    fn seeded_entry_fees_are_netted_out_at_close() {
+        let instruments = seed_instruments();
+        let mut state = try_build(
+            &instruments,
+            OmsMode::Netting,
+            vec![long_seed(SPOT, dec!(0.5)).with_fees_enter(dec!(5))],
+        )
+        .unwrap();
+
+        let spot = state
+            .instruments
+            .instrument_mut(&InstrumentNameInternal::new(SPOT));
+        let quote = spot.instrument.underlying.quote;
+        let exited = spot
+            .update_from_trade(&Trade {
+                id: TradeId::new("close"),
+                order_id: OrderId::new("close"),
+                instrument: spot.key,
+                strategy: StrategyId::new("strategy"),
+                time_exchange: time(3_000),
+                side: Side::Sell,
+                price: dec!(52_000),
+                quantity: dec!(0.5),
+                order_filled_quantity: None,
+                fees: AssetFees::new(quote, dec!(3), Some(dec!(3))),
+            })
+            .expect("a fill for the whole quantity exits the seeded position");
+
+        // 0.5 * (52_000 - 50_000) = 1_000, less 5 entry and 3 exit fees.
+        assert_eq!(exited.pnl_realised, dec!(992));
+        assert_eq!(
+            exited.fees_enter,
+            AssetFees::new(quote, dec!(5), Some(dec!(5)))
+        );
+        assert_eq!(
+            exited.fees_exit,
+            AssetFees::new(quote, dec!(3), Some(dec!(3)))
+        );
+    }
+
     /// Under Hedging, seeds occupy the slots they name, and `oms_mode` may be set after
     /// `positions`: the seeds are checked against the mode at build time.
     #[test]
@@ -685,6 +757,14 @@ mod tests {
                 PositionSeedError::NonPositiveQuantity {
                     instrument: spot.clone(),
                     quantity_abs: dec!(-1),
+                },
+            ),
+            (
+                OmsMode::Netting,
+                vec![long_seed(SPOT, dec!(1)).with_fees_enter(dec!(-0.01))],
+                PositionSeedError::NegativeFees {
+                    instrument: spot.clone(),
+                    fees_enter: dec!(-0.01),
                 },
             ),
             (

@@ -329,15 +329,17 @@ impl<AssetKey: Debug + Clone, InstrumentKey> PositionManager<AssetKey, Instrumen
 ///
 /// # What the seeded position holds
 /// - `contract_size` from the instrument, as a fill would set it.
-/// - Zero entry fees and zero realised PnL. Fees paid before the seed are not the engine's to
-///   know, so they stay in the caller's own records.
+/// - Entry fees from [`PositionSeed::with_fees_enter`], zero by default, in the instrument's
+///   quote asset, and zero exit fees. As for a position opened by a fill, realised PnL starts at
+///   minus the entry fees, and unrealised PnL deducts an exit-fee estimate scaled from them.
 /// - Zero unrealised PnL until the first market price for the instrument arrives.
 /// - `quantity_abs_max` equal to `quantity_abs`, and no [`TradeId`]s.
 ///
 /// No [`Trade`] is generated, so nothing reaches the audit stream or the trading summary until the
 /// position changes. When it closes, its realised PnL is measured from the seeded
-/// `price_entry_average`, so a session summary includes any PnL accrued before the engine started.
-/// Seed the current price instead if the summary should cover only this session.
+/// `price_entry_average`, net of the seeded entry fees, so a session summary includes any PnL
+/// accrued before the engine started. Seed the current price, and no fees, instead if the summary
+/// should cover only this session.
 ///
 /// A seed is not checked when it is constructed or deserialised. The checks listed on
 /// [`PositionSeedError`] run when the state is built, by
@@ -370,6 +372,10 @@ pub struct PositionSeed {
     ///   orders with this id as their
     ///   [`RequestOpen::position_id`](rustrade_execution::order::request::RequestOpen::position_id).
     pub position_id: Option<PositionId>,
+    /// Fees paid to enter the position, in the instrument's quote asset. Must not be negative.
+    /// Zero by default, including when absent from a deserialised seed.
+    #[serde(default)]
+    pub fees_enter: Decimal,
 }
 
 impl PositionSeed {
@@ -389,6 +395,7 @@ impl PositionSeed {
             price_entry_average,
             time_enter,
             position_id: None,
+            fees_enter: Decimal::ZERO,
         }
     }
 
@@ -400,9 +407,20 @@ impl PositionSeed {
         }
     }
 
+    /// Set the fees paid to enter the position, in the instrument's quote asset, so realised PnL
+    /// at close is net of them. Without this the seed carries zero entry fees and realised PnL
+    /// overstates the position's result by what they cost.
+    ///
+    /// The amount must not be negative, which
+    /// [`EngineStateBuilder::try_build`](crate::engine::state::builder::EngineStateBuilder::try_build)
+    /// checks.
+    pub fn with_fees_enter(self, fees_enter: Decimal) -> Self {
+        Self { fees_enter, ..self }
+    }
+
     /// Validate this seed against `manager` and insert it as an open [`Position`].
     ///
-    /// `quote` is the fee asset of the zero entry fees, and `contract_size` the instrument's
+    /// `quote` is the fee asset of the entry and exit fees, and `contract_size` the instrument's
     /// multiplier. On error `manager` is unchanged.
     pub(crate) fn seed_into(
         self,
@@ -415,6 +433,13 @@ impl PositionSeed {
             return Err(PositionSeedError::NonPositiveQuantity {
                 instrument: self.instrument,
                 quantity_abs: self.quantity_abs,
+            });
+        }
+
+        if self.fees_enter < Decimal::ZERO {
+            return Err(PositionSeedError::NegativeFees {
+                instrument: self.instrument,
+                fees_enter: self.fees_enter,
             });
         }
 
@@ -449,8 +474,9 @@ impl PositionSeed {
             quantity_abs: self.quantity_abs,
             quantity_abs_max: self.quantity_abs,
             pnl_unrealised: Decimal::ZERO,
-            pnl_realised: Decimal::ZERO,
-            fees_enter: AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO)),
+            // As `Position::from(&Trade)` sets it: the entry fees are realised when paid.
+            pnl_realised: -self.fees_enter,
+            fees_enter: AssetFees::new(quote, self.fees_enter, Some(self.fees_enter)),
             fees_exit: AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO)),
             time_enter: self.time_enter,
             time_exchange_update: self.time_enter,
@@ -479,6 +505,13 @@ pub enum PositionSeedError {
     NonPositiveQuantity {
         instrument: InstrumentNameInternal,
         quantity_abs: Decimal,
+    },
+
+    /// The seed's entry fees are negative.
+    #[error("position seed for {instrument} has negative entry fees {fees_enter}")]
+    NegativeFees {
+        instrument: InstrumentNameInternal,
+        fees_enter: Decimal,
     },
 
     /// Two seeds target the same slot on one instrument. Under [`OmsMode::Netting`] that is any
