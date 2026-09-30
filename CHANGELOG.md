@@ -69,11 +69,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SDK's typed error, as order calls already were:
   - a venue rejection is `ApiError::RequestRejected`, or `InstrumentInvalid` for `-1121` when the
     request named one instrument, and keeps `Unauthenticated` and `RateLimit` for their codes;
-  - HTTP 429/418 is `RateLimit` and 401/403 is `Unauthenticated`, now with the Binance code;
-  - a request that never completed, a 5xx, and Binance's own internal-failure codes (`-1001`,
-    `-1006`, `-1007`, `-1008`) stay transient `Connectivity`;
-  - a response body that does not fit the SDK's model, and a request the client failed to build,
-    are `ClientError::Internal`, since retrying cannot change either.
+  - HTTP 429/418 is `RateLimit`, and 401 is `Unauthenticated`, now with the Binance code. A 403,
+    which Binance documents as its web application firewall limit, is `RateLimit` unless it
+    carries an auth code;
+  - a request that never completed, a 5xx, Binance's own failure codes (`-1000`, `-1001`,
+    `-1006`, `-1007`, `-1008`) and a stale timestamp (`-1021`) stay transient `Connectivity`;
+  - a response body that does not fit the SDK's model, and a request that failed before it was
+    sent (building it, its URL, signing), are `ClientError::Internal`, since retrying cannot
+    change either.
 
 - **A `ContractExpiry` for an instrument that never expires closed its positions** (`rustrade`).
   For a `Spot`, `Perpetual` or `Cfd` instrument the engine settled the event as it would a
