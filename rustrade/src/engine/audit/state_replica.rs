@@ -279,22 +279,21 @@ where
 
                 // Guards — each skips WITHOUT mutating or recording `id`, exactly as the live
                 // handler does, so the replica never applies an action the live engine rejected.
+                let instruments = &self.replica_engine_state().instruments;
+                // Idempotency: already applied (the set mirrors the live engine's).
+                if instruments
+                    .instrument_index(&instrument)
+                    .corporate_actions_processed
+                    .contains(&id)
                 {
-                    let instrument_state = self
-                        .replica_engine_state_mut()
-                        .instruments
-                        .instrument_index_mut(&instrument);
-                    // Idempotency: already applied (the set mirrors the live engine's).
-                    if instrument_state.corporate_actions_processed.contains(&id) {
-                        return;
-                    }
-                    // Unsupported instrument kind (checked first, like the live handler): equity
-                    // splits only apply to the deliverable equity. `id` not recorded ⇒ retryable.
-                    // Shares `is_split_eligible` with the live handler so the two cannot drift.
-                    if !instrument_state.instrument.kind.is_split_eligible() {
-                        return;
-                    }
+                    return;
                 }
+                // Unsupported instrument kind (checked first, like the live handler): equity
+                // splits only apply to the deliverable equity. `id` not recorded ⇒ retryable.
+                // Shares `split_eligible_target` with the live handler so the two cannot drift.
+                let Some(split_target) = instruments.split_eligible_target(&instrument) else {
+                    return;
+                };
                 // Unsupported action kind — the compiler-mandated arm for the `#[non_exhaustive]`
                 // `CorporateActionKind` (runtime-unreachable in this phase). `id` not recorded.
                 let CorporateActionKind::StockSplit { ratio } = kind else {
@@ -325,16 +324,12 @@ where
                 // identical accept/reject decision AND the identical committed values — including
                 // which options are excluded as already-adjusted by this `id`. No output emitted —
                 // the replica mirrors state, and the live engine already logged the rejection.
-                let split_plan = match self
-                    .replica_engine_state()
-                    .instruments
-                    .prepare_corporate_action_split(
-                        &id,
-                        &instrument,
-                        ratio,
-                        policy,
-                        adjust_options_in_place,
-                    ) {
+                let split_plan = match split_target.prepare_corporate_action_split(
+                    &id,
+                    ratio,
+                    policy,
+                    adjust_options_in_place,
+                ) {
                     Ok(plan) => plan,
                     Err(_) => return,
                 };

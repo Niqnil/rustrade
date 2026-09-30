@@ -153,11 +153,12 @@ pub enum PnlRealisedUpdate {
 /// position infallibly — so a mid-commit `Decimal` overflow is impossible *by construction* rather
 /// than merely caught by an `unreachable!`.
 ///
-/// `pub(crate)`: the handler's pre-validation ([`InstrumentStates::prepare_corporate_action_split`])
-/// carries a batch of these in its [`SplitPlan`]; the fields stay private so only [`Position`] can
-/// read them back (via [`Position::commit_split`]).
+/// `pub(crate)`: the handler's pre-validation
+/// ([`SplitEligibleTarget::prepare_corporate_action_split`]) carries a batch of these in its
+/// [`SplitPlan`]; the fields stay private so only [`Position`] can read them back (via
+/// [`Position::commit_split`]).
 ///
-/// [`InstrumentStates::prepare_corporate_action_split`]: super::instrument::InstrumentStates::prepare_corporate_action_split
+/// [`SplitEligibleTarget::prepare_corporate_action_split`]: super::instrument::SplitEligibleTarget::prepare_corporate_action_split
 /// [`SplitPlan`]: super::instrument::SplitPlan
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PreparedSplit {
@@ -1121,8 +1122,8 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
         // Two-phase: prepare (fallible arithmetic, no mutation) then commit (infallible). Kept as a
         // single call for callers that apply one position in isolation; the corporate-action handler
         // instead batches `prepare_split` across every affected position (atomic pre-validation) via
-        // `InstrumentStates::prepare_corporate_action_split`, then commits each with `commit_split`,
-        // so a mid-batch overflow can never leave a subset of positions rescaled.
+        // `SplitEligibleTarget::prepare_corporate_action_split`, then commits each with
+        // `commit_split`, so a mid-batch overflow can never leave a subset of positions rescaled.
         let prepared = self.prepare_split(ratio, policy)?;
         Ok(self.commit_split(prepared, last_price))
     }
@@ -1207,7 +1208,7 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
     /// if any product/quotient exceeds `Decimal::MAX`, leaving nothing to commit.
     ///
     /// `pub(crate)` so the engine's atomic pre-validation
-    /// ([`InstrumentStates::prepare_corporate_action_split`](super::instrument::InstrumentStates::prepare_corporate_action_split))
+    /// ([`SplitEligibleTarget::prepare_corporate_action_split`](super::instrument::SplitEligibleTarget::prepare_corporate_action_split))
     /// can pre-compute every affected position *before* [`commit_split`](Self::commit_split) mutates
     /// any.
     pub(crate) fn prepare_split(

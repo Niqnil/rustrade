@@ -847,7 +847,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
         // event's `effective_time` before this handler runs).
         let engine_time = self.time();
 
-        let instrument_state = self.state.instruments.instrument_index_mut(key);
+        let instrument_state = self.state.instruments.instrument_index(key);
 
         // Step 1: idempotency guard (keyed on `id` alone). Warn on suppression — a wrapper-reused
         // `id` would otherwise silently drop a real action.
@@ -876,11 +876,13 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
         // Do NOT record `id`.
         //
         // The rule is "the deliverable equity" — `InstrumentKind::Spot` is merely its current
-        // spelling — and it lives in `InstrumentKind::is_split_eligible`, which the audit replica
-        // calls too. Single-sourced deliberately: the split arithmetic these guards protect was
-        // already single-sourced into `prepare_corporate_action_split` for the same reason, so
-        // the replica cannot drift from the live engine by hand-mirroring vigilance.
-        if !instrument_state.instrument.kind.is_split_eligible() {
+        // spelling — and it lives in `InstrumentKind::is_split_eligible`, applied by
+        // `InstrumentStates::split_eligible_target`, which the audit replica calls too.
+        // Single-sourced deliberately: the split arithmetic these guards protect was already
+        // single-sourced into `prepare_corporate_action_split` for the same reason, so the replica
+        // cannot drift from the live engine by hand-mirroring vigilance. The returned target is
+        // the only way to reach that split pass, so the check cannot be skipped by a caller.
+        let Some(split_target) = self.state.instruments.split_eligible_target(key) else {
             warn!(
                 %id,
                 instrument = ?key,
@@ -895,7 +897,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 reason: UnsupportedCorporateActionReason::InstrumentKindNotSupported,
             });
             return outputs;
-        }
+        };
 
         // Step 2b: extract the split ratio. `CorporateActionKind` is `#[non_exhaustive]` and
         // defined in another crate, so the compiler mandates this `else` arm even though
@@ -937,14 +939,13 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
         // corrupted (non-integer) option contract count, rejects the action ATOMICALLY here — no
         // position or strike is partially mutated and the `id` is NOT recorded (retryable once the
         // blocking condition is resolved). Single-sourced with the audit replica via
-        // `InstrumentStates::prepare_corporate_action_split`, so both reach the identical
+        // `SplitEligibleTarget::prepare_corporate_action_split`, so both reach the identical
         // accept/reject decision AND the identical committed values by construction rather than by
         // hand-mirrored vigilance. Because every fallible arithmetic step ran here, the commit loops
         // below carry no overflow error path — the previous per-position `apply_split` `unreachable!`
         // arms are gone by construction.
-        let split_plan = match self.state.instruments.prepare_corporate_action_split(
+        let split_plan = match split_target.prepare_corporate_action_split(
             id,
-            key,
             ratio,
             policy,
             adjust_options_in_place,
