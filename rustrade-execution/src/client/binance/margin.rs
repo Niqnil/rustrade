@@ -1088,7 +1088,8 @@ impl ExecutionClient for BinanceMargin {
     ///
     /// **Upper bound:** trades are read up to the local clock at the call. A trade stamped later,
     /// including one inside any skew between the local clock and Binance's, is left to the next
-    /// read unless the walk has already reached a trade and is paging by id.
+    /// read, unless a window before the last one held a trade (or the last one read a full page)
+    /// and the walk went on to page by id, which has no time bound.
     async fn fetch_trades(
         &self,
         time_since: DateTime<Utc>,
@@ -2943,7 +2944,7 @@ async fn paginate_margin_my_trades(
         all_pages.extend(page);
 
         if page_len > 0 && last_id.is_none() {
-            warn!(%instrument, "BinanceMargin paginate_my_trades: trade missing ID, stopping pagination");
+            warn!(%instrument, "BinanceMargin paginate_my_trades: trade missing ID, cannot page past it");
             break;
         }
         next = query.next(page_len, last_id, now_ms);
@@ -5390,6 +5391,20 @@ mod tests {
             read_margin_trades(venue(trades), MyTradesFrom::Time(now - 50 * HOUR_MS)).await;
 
         assert_eq!(ids, (1..=count).collect::<Vec<_>>());
+    }
+
+    /// A final window holding more than one page still pages on by `fromId`: the early stop
+    /// after the final window applies only to a short page.
+    #[tokio::test]
+    async fn margin_trades_page_on_past_a_full_final_window() {
+        let now = Utc::now().timestamp_millis();
+        let count = i64::try_from(BINANCE_MAX_TRADES).unwrap() + 1;
+        let trades = (1..=count).map(|id| (id, now - HOUR_MS + id)).collect();
+        let (ids, requests) =
+            read_margin_trades(venue(trades), MyTradesFrom::Time(now - 2 * HOUR_MS)).await;
+
+        assert_eq!(ids, (1..=count).collect::<Vec<_>>());
+        assert_eq!(requests.len(), 2);
     }
 
     /// A lookback with no fills costs one request per window, and every window is accepted
