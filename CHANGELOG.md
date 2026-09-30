@@ -116,11 +116,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ExchangeId::LseOptions`: a print is stamped at the print, a candle at its close so the minute's
   outcome is never visible before it ends.
 
-  **The strike is read from the contract's OSI ticker, not from the served `strike` field.** That
-  field is a JSON float and has carried noise — `504.99999999999994` on a 505 strike — which, carried
-  through, spells no OSI symbol, so a subscription built from the contract would be rejected. The
-  ticker holds the strike exactly, in thousandths. A row whose ticker is not an OSI symbol is an
-  `LseError::Deserialize`.
+  **A contract's kind, strike and expiry are read from its OSI ticker, not from the row's separate
+  fields.** The served `strike` is a JSON float and has carried noise — `504.99999999999994` on a
+  505 strike — which, carried through, spells no OSI symbol, so a subscription built from the
+  contract would be rejected. The ticker holds all three exactly, so a contract always spells its
+  ticker back. A row whose ticker is not an OSI symbol is an `LseError::Deserialize`.
 
   **The flow fetch is oldest-first, which the endpoint is not.** `/options/flow` answers
   newest-first, truncates silently at a 5,000-row cap, ignores `offset`, and accepts only

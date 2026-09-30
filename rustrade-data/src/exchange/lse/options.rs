@@ -44,9 +44,11 @@
 //! - **Strikes are not always round.** Contracts adjusted for a corporate action carry fractional
 //!   strikes (`2.67`, `9.85`), so the strike is a [`Decimal`] and the contract's identity is its
 //!   [`ticker`](LseOptionContract::ticker), not a strike rebuilt from integers.
-//! - **⚠️ The served `strike` field is a float and is not used.** It has carried float noise
-//!   (`504.99999999999994` for a 505 strike), so [`strike`](LseOptionContract::strike) is read from
-//!   the ticker instead, exactly. A row whose ticker is not an OSI symbol is a decode error.
+//! - **⚠️ A contract is read from its ticker, not from the row's separate fields.** The served
+//!   `strike` is a float and has carried noise (`504.99999999999994` for a 505 strike), so
+//!   [`kind`](LseOptionContract::kind), [`strike`](LseOptionContract::strike) and
+//!   [`expiry`](LseOptionContract::expiry) are all read exactly from the OSI ticker. A row whose
+//!   ticker is not an OSI symbol is a decode error.
 //! - **An unknown underlying or ticker is an empty result, not an error.** The provider answers
 //!   `200` with no rows for a symbol it has never heard of, indistinguishable here from a quiet
 //!   period.
@@ -116,29 +118,35 @@ pub struct LseOptionContract {
     pub ticker: SmolStr,
     /// The underlying's symbol, e.g. `SPY`.
     pub underlying: SmolStr,
+    /// Read from [`ticker`](Self::ticker), like `strike` and `expiry`.
     pub kind: OptionKind,
-    /// Read from [`ticker`](Self::ticker), so it is exact and always spells the ticker back.
-    /// Fractional on contracts adjusted for a corporate action.
+    /// Fractional on contracts adjusted for a corporate action. Read from
+    /// [`ticker`](Self::ticker), so it is exact and spells the ticker back.
     pub strike: Decimal,
+    /// Read from [`ticker`](Self::ticker), like `kind` and `strike`.
     pub expiry: NaiveDate,
 }
 
 impl LseOptionContract {
-    /// Build a contract from a served row, reading the strike from the ticker.
+    /// Build a contract from a served row, reading its kind, strike and expiry from the ticker.
     ///
-    /// ⚠️ The row's own `strike` field is deliberately ignored. It is a JSON float, and the provider
-    /// has served `504.99999999999994` on `SPY261130P00505000`: carried through, that strike spells
-    /// no OSI symbol, so a subscription built from the contract is rejected. The ticker is the
-    /// contract's identity and carries the strike exactly, in thousandths.
-    fn from_row(
-        ticker: SmolStr,
-        underlying: SmolStr,
-        kind: OptionKind,
-        expiry: NaiveDate,
-    ) -> Result<Self, LseError> {
-        let strike = osi::strike(&ticker).ok_or_else(|| LseError::Deserialize {
-            message: format!("option ticker {ticker:?} is not an OSI contract symbol"),
+    /// ⚠️ The row's own `strike`, `contract_type` and `expiry` fields are deliberately not decoded.
+    /// The strike is a JSON float, and the provider has served `504.99999999999994` on
+    /// `SPY261130P00505000`: carried through, that strike spells no OSI symbol, so a subscription
+    /// built from the contract is rejected. The ticker is the contract's identity and carries all
+    /// three exactly, so reading them from it is what guarantees the contract spells the ticker
+    /// back.
+    ///
+    /// `underlying` stays the row's: an adjusted contract's OSI root (`SPY1`) is not its
+    /// underlying's symbol.
+    fn from_row(ticker: SmolStr, underlying: SmolStr) -> Result<Self, LseError> {
+        let parsed = osi::parse(&ticker).ok_or_else(|| LseError::Deserialize {
+            message: format!(
+                "option ticker {ticker:?} is not an OSI contract symbol with a calendar expiry \
+                 and a positive strike"
+            ),
         })?;
+        let (kind, strike, expiry) = (parsed.kind, parsed.strike, parsed.expiry);
 
         Ok(Self {
             ticker,
@@ -230,8 +238,6 @@ struct FlowRow {
     ts: String,
     underlying: SmolStr,
     ticker: SmolStr,
-    expiry: NaiveDate,
-    contract_type: OptionKind,
     last_price: Decimal,
     volume: u64,
     premium: Decimal,
@@ -264,12 +270,7 @@ impl FlowRow {
         Ok(LseOptionPrint {
             id: self.id,
             time,
-            contract: LseOptionContract::from_row(
-                self.ticker,
-                self.underlying,
-                self.contract_type,
-                self.expiry,
-            )?,
+            contract: LseOptionContract::from_row(self.ticker, self.underlying)?,
             price: self.last_price,
             volume: self.volume,
             premium: self.premium,
@@ -292,8 +293,6 @@ impl FlowRow {
 struct OptionCandleRow {
     ticker: SmolStr,
     underlying: SmolStr,
-    expiry: NaiveDate,
-    contract_type: OptionKind,
     /// The bar's **open**, UTC, with no zone suffix.
     minute: String,
     open: Decimal,
@@ -362,12 +361,7 @@ fn option_event<InstrumentKey>(
 impl OptionCandleRow {
     fn into_option_candle(self, close_time: DateTime<Utc>) -> Result<LseOptionCandle, LseError> {
         Ok(LseOptionCandle {
-            contract: LseOptionContract::from_row(
-                self.ticker,
-                self.underlying,
-                self.contract_type,
-                self.expiry,
-            )?,
+            contract: LseOptionContract::from_row(self.ticker, self.underlying)?,
             candle: Candle {
                 close_time,
                 open: self.open,
@@ -406,7 +400,8 @@ impl LseVaultClient {
     ///
     /// # Errors
     /// See [`fetch_candles`](Self::fetch_candles). A ticker the provider does not know yields an
-    /// empty stream, not an error.
+    /// empty stream, not an error. A row whose ticker is not an OSI symbol is an
+    /// [`LseError::Deserialize`].
     #[must_use = "fetch_option_candles returns a lazy Stream that does nothing unless polled"]
     pub fn fetch_option_candles<'a>(
         &'a self,
@@ -494,7 +489,9 @@ impl LseVaultClient {
     ///   print's time. Prints sharing that time are then yielded again; de-duplicate on
     ///   [`id`](LseOptionPrint::id).
     /// - Otherwise [`LseError::Api`] / [`Http`](LseError::Http) /
-    ///   [`Deserialize`](LseError::Deserialize) — the last also when the reported row cap is zero.
+    ///   [`Deserialize`](LseError::Deserialize) — the last also when the reported row cap is zero,
+    ///   or when a row's ticker is not an OSI symbol. Like the row checks above, that fails the
+    ///   whole window before any of it is yielded.
     #[must_use = "fetch_option_flow returns a lazy Stream that does nothing unless polled"]
     pub fn fetch_option_flow<'a>(
         &'a self,
@@ -794,15 +791,24 @@ mod tests {
         assert!(matches!(bar.kind, DataKind::Candle(c) if c.close_time == close));
     }
 
-    /// The served `strike` is a float, and the provider has put float noise on it. The strike is
-    /// read from the ticker, so noise on the field cannot reach the contract.
+    /// The served `strike` is a float, and the provider has put float noise on it. The contract is
+    /// read from the ticker, so neither that noise nor a row field disagreeing with the ticker can
+    /// reach it.
     #[test]
-    fn the_strike_is_read_from_the_ticker_not_the_float_field() {
-        let json = FLOW_ROW.replace(r#""strike":10.5"#, r#""strike":10.499999999999998"#);
+    fn the_contract_is_read_from_the_ticker_not_the_row_fields() {
+        let json = FLOW_ROW
+            .replace(r#""strike":10.5"#, r#""strike":10.499999999999998"#)
+            .replace(r#""contract_type":"call""#, r#""contract_type":"put""#)
+            .replace(r#""expiry":"2024-01-05""#, r#""expiry":"2024-01-06""#);
         let row: FlowRow = serde_json::from_str(&json).unwrap();
-        let print = row.into_print(Utc::now()).unwrap();
+        let contract = row.into_print(Utc::now()).unwrap().contract;
 
-        assert_eq!(print.contract.strike, dec!(10.5));
+        assert_eq!(contract.strike.to_string(), "10.5");
+        assert_eq!(contract.kind, OptionKind::Call);
+        assert_eq!(
+            contract.expiry,
+            NaiveDate::from_ymd_opt(2024, 1, 5).unwrap()
+        );
     }
 
     #[test]
@@ -813,6 +819,19 @@ mod tests {
 
         assert!(matches!(error, LseError::Deserialize { .. }));
         assert!(error.to_string().contains("\"TEST\""), "{error}");
+    }
+
+    #[test]
+    fn a_candle_row_whose_ticker_is_not_osi_is_a_typed_error() {
+        let json = r#"{"ticker":"TEST","underlying":"TEST","minute":"2024-01-02 15:00:00",
+            "open":1.0,"high":2.0,"low":0.5,"close":1.5,"volume":40,"premium":6000,"print_count":9}"#;
+        let row: OptionCandleRow = serde_json::from_str(json).unwrap();
+        let close = row.open_time().unwrap() + TimeDelta::minutes(1);
+
+        assert!(matches!(
+            row.into_option_candle(close),
+            Err(LseError::Deserialize { .. })
+        ));
     }
 
     #[test]

@@ -67,6 +67,7 @@
 #![cfg(feature = "lse")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 
+use chrono::NaiveDate;
 use rustrade_data::exchange::lse::calendar::{
     LseCalendarImpact, LseCalendarQuery, LseCalendarStats,
 };
@@ -78,7 +79,7 @@ const KEY_ENV: &str = "LSE_API_KEY";
 
 /// The UTC day the feed stopped, as measured. Printed for comparison, never asserted — see the module
 /// documentation for why a revival must not fail this canary.
-const MEASURED_LATEST: &str = "2026-03-24";
+const MEASURED_LATEST: NaiveDate = NaiveDate::from_ymd_opt(2026, 3, 24).expect("a valid date");
 
 /// The event count at both measurements, two months apart. Printed, never asserted.
 const MEASURED_TOTAL_EVENTS: u64 = 124_896;
@@ -153,7 +154,7 @@ async fn stats_describe_a_non_empty_vocabulary_and_a_parseable_range() {
         stats.countries.len(),
         stats.total_events
     );
-    if latest.to_string() != MEASURED_LATEST || stats.total_events != MEASURED_TOTAL_EVENTS {
+    if latest != MEASURED_LATEST || stats.total_events != MEASURED_TOTAL_EVENTS {
         println!(
             "CANARY_NOTE: the feed has MOVED. Measured {MEASURED_LATEST} / \
              {MEASURED_TOTAL_EVENTS} events; now {} / {} events. If `latest` has advanced, the \
