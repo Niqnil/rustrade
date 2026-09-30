@@ -22,9 +22,9 @@ Hyperliquid Spot a holding is an asset balance instead.
 - **Alpaca** reports equity and option holdings as positions, each with its entry price (for an
   option, the premium per share, not per contract) and its unrealised PnL in USD. Crypto holdings
   are balances of the base asset, since Alpaca crypto is spot-only. The USD balance's total is
-  cash, which is negative while the account borrows on margin, and its free amount is
-  non-marginable buying power. Account equity is cash plus the positions' value, and is not
-  reported separately.
+  cash, which is negative while the account borrows on margin, and its free amount is the cash
+  that can be spent without borrowing: the lesser of cash and non-marginable buying power.
+  Account equity is cash plus the positions' value, and is not reported separately.
 - **IBKR** lists the instruments that hold a position, without their size or cost.
 
 The `new` constructors are `ExecutionClient::new`. Each connector is behind a Cargo feature, and

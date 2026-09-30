@@ -50,14 +50,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Alpaca's USD balance is now cash, not account equity** (`rustrade-execution`, feature
   `alpaca`). **Breaking** for code that reads it: `account_snapshot` and `fetch_balances` report
-  `total` as the account's `cash` and `free` as its `non_marginable_buying_power`, instead of
-  `equity` and buying power (`options_buying_power`, else `buying_power`). Equity counts the
-  value of every position, which `account_snapshot` now reports one by one (see Fixed), so
-  keeping it would count them twice; and buying power includes margin, so `free` could exceed
-  `total`. Cash is negative while the account borrows on margin, and a short sale's proceeds are
-  credited to it. This matches IBKR, whose USD `total` is already `TotalCashValue`. Code that
-  wants equity can add the positions' value to cash. A malformed amount in Alpaca's account or
-  positions response now fails the call instead of reading as zero.
+  `total` as the account's `cash`, and `free` as the lesser of cash and
+  `non_marginable_buying_power`, instead of `equity` and buying power (`options_buying_power`,
+  else `buying_power`). Equity counts the value of every position, which `account_snapshot` now
+  reports one by one (see Fixed), so keeping it would count them twice. Every Alpaca buying power
+  figure counts the loan value of held stock, so `free` could exceed `total`; capped at cash it
+  cannot. Cash is negative while the account borrows on margin, and then `free` equals it. A
+  short sale's proceeds are credited to cash but not to buying power, so `free` stays below
+  `total` while a short is open. This matches IBKR, whose USD `total` is already
+  `TotalCashValue`. Code that wants equity can add the positions' value to cash. A malformed
+  amount in Alpaca's account or positions response now fails the call instead of reading as zero.
 
 ### Fixed
 

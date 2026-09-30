@@ -546,8 +546,9 @@ struct AlpacaAccount {
     /// sale's proceeds are credited to it.
     #[serde(with = "rust_decimal::serde::str")]
     cash: Decimal,
-    /// What the account can spend on securities that cannot be bought on margin: cash, less what
-    /// open orders reserve, and never borrowed money.
+    /// Buying power for securities that cannot be bought on margin. On a margin account it is
+    /// equity less the initial margin requirement, so it counts the loan value of held
+    /// marginable stock and can exceed cash; a short sale's proceeds do not raise it.
     #[serde(with = "rust_decimal::serde::str")]
     non_marginable_buying_power: Decimal,
 }
@@ -1196,10 +1197,13 @@ impl ExecutionClient for AlpacaClient {
 
     /// # Balances and positions
     ///
-    /// - **USD**: `total` is the account's `cash` and `free` its `non_marginable_buying_power`.
-    ///   Cash is negative while the account borrows on margin, and then `free` is zero and so
-    ///   exceeds `total`. A short sale's proceeds are credited to cash. Account equity is not
-    ///   reported: it is cash plus the value of the positions below, so it can be derived.
+    /// - **USD**: `total` is the account's `cash`, and `free` the lesser of cash and its
+    ///   `non_marginable_buying_power`: cash that can be spent without borrowing. Alpaca's
+    ///   buying power figures include the loan value of held stock, so none of them alone is
+    ///   free cash. A short sale's proceeds are credited to cash but do not raise buying power,
+    ///   so `free` stays below `total` while a short is open. Cash is negative while the account
+    ///   borrows on margin, and then `free` equals `total`. Account equity is not reported: it is
+    ///   cash plus the value of the positions below, so it can be derived.
     /// - **Equities and options**: each holding becomes the
     ///   [`InstrumentAccountSnapshot::position`] of its instrument, a signed [`Position`] (negative
     ///   for a short) with the average entry price and the unrealised PnL in USD. An option's
@@ -2922,7 +2926,12 @@ async fn recover_fills(
 ///
 /// Returns a single USD balance with:
 /// - `total` = `cash`, which is negative while the account borrows on margin
-/// - `free` = `non_marginable_buying_power`, which never includes borrowed money
+/// - `free` = the lesser of `cash` and `non_marginable_buying_power`: cash that can be spent
+///   without borrowing, within what Alpaca allows
+///
+/// `free` is capped at cash because `non_marginable_buying_power` counts the loan value of held
+/// marginable stock, so it exceeds cash whenever such stock is held. The cap keeps
+/// `free <= total`; with negative cash, `free` equals it.
 ///
 /// Account equity is not the total: equity and option holdings are reported as positions, and
 /// counting them again here would double them.
@@ -2950,7 +2959,10 @@ fn convert_account_to_balances(
 
     vec![AssetBalance::new(
         usd_name,
-        Balance::new(account.cash, account.non_marginable_buying_power),
+        Balance::new(
+            account.cash,
+            account.cash.min(account.non_marginable_buying_power),
+        ),
         Utc::now(),
     )]
 }
@@ -4371,9 +4383,25 @@ mod tests {
         assert_eq!(
             balances[0].balance.free,
             dec!(8500.25),
-            "free is non-marginable buying power"
+            "free is non-marginable buying power when below cash"
         );
         assert_eq!(balances[0].balance.margin, None);
+    }
+
+    /// Long marginable stock: non-marginable buying power is equity less initial margin, which
+    /// exceeds cash, so `free` is capped at cash.
+    #[test]
+    fn test_convert_account_to_balances_free_capped_at_cash_with_long_stock() {
+        let account: AlpacaAccount = serde_json::from_value(serde_json::json!({
+            "cash": "50000",
+            "equity": "100000",
+            "initial_margin": "25000",
+            "non_marginable_buying_power": "75000",
+        }))
+        .unwrap();
+        let balances = convert_account_to_balances(&account, &[]);
+        assert_eq!(balances[0].balance.total, dec!(50000));
+        assert_eq!(balances[0].balance.free, dec!(50000));
     }
 
     #[test]
@@ -4382,13 +4410,17 @@ mod tests {
             "cash": "-2500.75",
             "equity": "7500.00",
             "buying_power": "5000.00",
-            "non_marginable_buying_power": "0",
+            "non_marginable_buying_power": "1250.00",
         }))
         .unwrap();
         let balances = convert_account_to_balances(&account, &[]);
         assert_eq!(balances.len(), 1);
         assert_eq!(balances[0].balance.total, dec!(-2500.75));
-        assert_eq!(balances[0].balance.free, Decimal::ZERO);
+        assert_eq!(
+            balances[0].balance.free,
+            dec!(-2500.75),
+            "no free cash while borrowing; free <= total still holds"
+        );
     }
 
     #[test]
@@ -5753,7 +5785,7 @@ mod tests {
                     "equity": "4000.00",
                     "buying_power": "5000.00",
                     "options_buying_power": "2000.00",
-                    "non_marginable_buying_power": "0",
+                    "non_marginable_buying_power": "1000.00",
                 })))
                 .mount(server)
                 .await;
@@ -5827,7 +5859,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            // USD: cash (negative on margin) and non-marginable buying power, not equity.
+            // USD: cash (negative on margin), and free capped at it, not equity or buying power.
             let balances: Vec<_> = snapshot
                 .balances
                 .iter()
@@ -5836,7 +5868,7 @@ mod tests {
             assert_eq!(
                 balances,
                 vec![
-                    ("usd", dec!(-1500.50), dec!(0)),
+                    ("usd", dec!(-1500.50), dec!(-1500.50)),
                     ("btc", dec!(0.75), dec!(0.5)),
                 ],
                 "crypto stays a balance; equities and options do not appear as balances"
