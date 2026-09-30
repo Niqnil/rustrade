@@ -1226,9 +1226,13 @@ impl ExecutionClient for AlpacaClient {
     ///
     /// # Limitations
     ///
-    /// A position is reported only under the instrument name Alpaca uses for it: the ticker for an
-    /// equity and the OCC symbol for an option. With `instruments` empty, every instrument that
-    /// has an open order or a position gets a snapshot; otherwise only the requested ones do.
+    /// A position is reported only under the instrument name Alpaca uses for it, ignoring case:
+    /// the ticker for an equity and the OCC symbol for an option. A requested equity or option
+    /// named otherwise is reported [`PositionReport::Flat`] even while Alpaca holds it. A crypto
+    /// pair is recognised by the `/` in its name (e.g. `BTC/USD`, the form its orders use); one
+    /// named without it is taken for an equity and reported flat too. With `instruments` empty,
+    /// every instrument that has an open order or a position gets a snapshot; otherwise only the
+    /// requested ones do.
     ///
     /// # Errors
     ///
@@ -3135,9 +3139,11 @@ fn build_instrument_snapshots(
     // Build ordered map from symbol → snapshot to preserve deterministic ordering.
     let mut by_symbol: IndexMap<SmolStr, Listing> = IndexMap::new();
 
+    // Keyed by the upper-case symbol, so a requested name in another case still finds its
+    // listing. Alpaca's own symbols are upper case, so an unfiltered read lists them unchanged.
     for order in orders {
         let listing = by_symbol
-            .entry(SmolStr::new(&order.symbol))
+            .entry(order.symbol.to_ascii_uppercase().into())
             .or_insert_with(Listing::empty);
         match convert_open_order(&order) {
             Some(converted) => listing.orders.push(converted.into()),
@@ -3147,7 +3153,7 @@ fn build_instrument_snapshots(
 
     for (symbol, position) in positions {
         by_symbol
-            .entry(SmolStr::new(symbol))
+            .entry(symbol.to_ascii_uppercase().into())
             .or_insert_with(Listing::empty)
             .position = Some(position);
     }
@@ -3178,7 +3184,7 @@ fn build_instrument_snapshots(
                 // swap_remove is O(1); output order is determined by the `instruments`
                 // slice, not by the internal IndexMap order of `by_symbol`.
                 let listing = by_symbol
-                    .swap_remove(inst.name().as_str())
+                    .swap_remove(inst.name().as_str().to_ascii_uppercase().as_str())
                     .unwrap_or_else(Listing::empty);
                 snapshot(inst.clone(), listing)
             })
@@ -5209,7 +5215,11 @@ mod tests {
 
     #[test]
     fn test_build_instrument_snapshots_unfiltered_lists_positions_without_orders() {
-        let orders = vec![make_order_response("o1", "AAPL")];
+        let orders = vec![
+            make_order_response("o1", "AAPL"),
+            make_order_response("o2", "MSFT"),
+            make_order_response("o3", "BTC/USD"),
+        ];
         let positions = vec![("AAPL", position(dec!(5))), ("TSLA", position(dec!(-2)))];
 
         let snapshots = build_instrument_snapshots(orders, positions, &[]);
@@ -5223,9 +5233,15 @@ mod tests {
                 )
             })
             .collect();
+        // An equity with an order but no position is flat; crypto is never a position.
         assert_eq!(
             listed,
-            vec![("AAPL", 1, Some(dec!(5))), ("TSLA", 0, Some(dec!(-2)))]
+            vec![
+                ("AAPL", 1, Some(dec!(5))),
+                ("MSFT", 1, Some(Decimal::ZERO)),
+                ("BTC/USD", 1, None),
+                ("TSLA", 0, Some(dec!(-2)))
+            ]
         );
         assert!(snapshots.iter().all(|s| s.orders_complete));
     }
@@ -5234,7 +5250,7 @@ mod tests {
     fn test_build_instrument_snapshots_filtered_attaches_only_requested_positions() {
         let positions = vec![("AAPL", position(dec!(5))), ("TSLA", position(dec!(-2)))];
         let instruments = vec![
-            InstrumentNameExchange::new("TSLA"),
+            InstrumentNameExchange::new("tsla"),
             InstrumentNameExchange::new("MSFT"),
             InstrumentNameExchange::new("BTC/USD"),
         ];
@@ -5244,11 +5260,12 @@ mod tests {
             .iter()
             .map(|s| (s.instrument.name().as_str(), s.position.quantity()))
             .collect();
-        // A requested equity with no position is reported flat; crypto is never a position.
+        // A requested equity with no position is reported flat, and one requested in another case
+        // still finds its position; crypto is never a position.
         assert_eq!(
             listed,
             vec![
-                ("TSLA", Some(dec!(-2))),
+                ("tsla", Some(dec!(-2))),
                 ("MSFT", Some(Decimal::ZERO)),
                 ("BTC/USD", None)
             ]

@@ -77,8 +77,8 @@ pub enum PositionReport {
     Unreported,
     /// The venue reports positions for this instrument and holds none.
     Flat,
-    /// The venue's open position. Its quantity is never zero: build it with
-    /// [`Self::from_position`], which reports a zero quantity as [`Flat`](Self::Flat).
+    /// The venue's open position. A client must not report a zero quantity as open: build it
+    /// with [`Self::from_position`], which reports one as [`Flat`](Self::Flat).
     Open(Position),
 }
 
@@ -118,9 +118,38 @@ impl PositionReport {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panicking on a bad fixture is acceptable
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+
+    /// The snapshot field is absent when unreported, `"Flat"` when flat and `{"Open": ...}` when
+    /// open, and an absent field reads back as unreported.
+    #[test]
+    fn instrument_snapshot_position_serde() {
+        use crate::InstrumentAccountSnapshot;
+        use rustrade_instrument::{
+            asset::name::AssetNameExchange, exchange::ExchangeId,
+            instrument::name::InstrumentNameExchange,
+        };
+        type Snapshot =
+            InstrumentAccountSnapshot<ExchangeId, AssetNameExchange, InstrumentNameExchange>;
+
+        let open = Position::new(dec!(-2), Some(dec!(10)), None, None, None, None, Utc::now());
+        for (position, expected) in [
+            (PositionReport::Unreported, None),
+            (PositionReport::Flat, Some(serde_json::json!("Flat"))),
+            (
+                PositionReport::Open(open.clone()),
+                Some(serde_json::json!({ "Open": serde_json::to_value(&open).unwrap() })),
+            ),
+        ] {
+            let snapshot = Snapshot::new("x".into(), vec![], false, position, None);
+            let json = serde_json::to_value(&snapshot).unwrap();
+            assert_eq!(json.get("position").cloned(), expected);
+            assert_eq!(serde_json::from_value::<Snapshot>(json).unwrap(), snapshot);
+        }
+    }
 
     #[test]
     fn position_report_from_position_reports_zero_as_flat() {

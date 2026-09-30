@@ -70,18 +70,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only `Flat` and `Open` are claims about the venue's position. A client that reports positions
   now lists every requested instrument whose position it reports, flat ones included:
   - Alpaca: every requested equity and option, `Flat` when Alpaca lists no position for it.
-    Crypto pairs are `Unreported`, since their holdings are balances.
+    Requested names now match Alpaca's symbols ignoring case. Crypto pairs, recognised by the `/`
+    in `BTC/USD`, are `Unreported`, since their holdings are balances.
   - Hyperliquid perpetuals: every requested perpetual, `Flat` when the user state holds no
     position in it. A size that does not parse is `Unreported`; it used to read as zero.
   - IBKR: a zero quantity is `Flat`, and so is a requested instrument registered with its
-    contract ID that IB did not list, but only when IB marked the end of its listing during the
-    read. Otherwise it is left out, with a warning.
+    contract ID that IB did not list, but only when the read ended on IB's end-of-listing marker
+    (a stale listing's marker does not count) and the ID resolves back to that instrument.
+    Otherwise it is left out, with a warning when the listing was incomplete.
   - Binance, Hyperliquid spot and the mock exchange: `Unreported`.
 
   Replace `position.as_ref()` with `position.open()`; `PositionReport::quantity` gives the signed
   quantity, zero when flat and `None` when unreported. `PositionReport::from_position` reports a
   zero quantity as `Flat`. In JSON the field is `"Flat"` or `{"Open": {...}}`, and absent when
-  unreported.
+  unreported; a snapshot serialised by an earlier version, with a bare position object there, no
+  longer deserialises.
 
 - **`Engine::process_contract_expiry` returns `Vec<EngineOutput>`** (`rustrade`), like
   `process_corporate_action`, instead of `Vec<PositionExited>`. **Breaking** for code that calls

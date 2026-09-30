@@ -16,8 +16,8 @@ Execution client library for streaming private account data and executing orders
 **Positions** means `account_snapshot` reports each open position in
 `InstrumentAccountSnapshot::position`: signed quantity, entry price and unrealised PnL, plus
 margin, liquidation price and leverage where the venue has them, as `PositionReport::Open`. Each
-requested instrument whose position the venue reports is listed, as `PositionReport::Flat` when
-it holds none, so a missing position is never mistaken for a flat one. On Binance (Spot and
+requested instrument whose position the client can establish is listed, as
+`PositionReport::Flat` when it holds none; an instrument left out is unknown, never flat. On Binance (Spot and
 Margin) and Hyperliquid Spot a holding is an asset balance instead, and `position` is
 `PositionReport::Unreported`.
 

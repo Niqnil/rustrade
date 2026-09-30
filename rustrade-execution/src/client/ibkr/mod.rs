@@ -143,7 +143,7 @@ use crate::{
     },
     trade::{AssetFees, Trade, TradeId},
 };
-use account::{BalanceAggregator, PositionAggregator, position_reports};
+use account::{BalanceAggregator, PositionAggregator};
 use chrono::{DateTime, Utc};
 use execution::{ExecutionBuffer, parse_decimal_or_warn};
 use futures::stream::BoxStream;
@@ -1536,9 +1536,10 @@ impl ExecutionClient for IbkrClient {
     /// [`PositionReport::Flat`](crate::position::PositionReport::Flat). So is each instrument in
     /// `instruments` that is registered with its contract ID but that IB did not list, provided IB
     /// marked the end of its listing (`PositionEnd`) during the read. Without that marker such
-    /// instruments are left out, with a warning, since the listing may be incomplete. A requested
-    /// instrument registered without a contract ID cannot be matched to IB's reports and is left
-    /// out too.
+    /// instruments are left out, with a warning, since the listing may be incomplete: IB can
+    /// start the read with a stale listing, and only an end marker after the last report counts.
+    /// A requested instrument registered without a contract ID, or whose ID was registered again
+    /// under another name, cannot be matched to IB's reports and is left out too.
     ///
     /// IB can report the same position more than once during the read, as it changes. The latest
     /// report for each account is used.
@@ -1546,6 +1547,8 @@ impl ExecutionClient for IbkrClient {
     /// **Several accounts.** IB reports positions per account, and this client does not select
     /// one. When more than one account holds the same instrument, the first account to report a
     /// non-zero quantity is kept and the others are dropped with a warning; they are never summed.
+    /// A consumer comparing the reported quantity with its own, as the `rustrade` engine's position
+    /// drift check does, therefore compares against that one account.
     /// Which account comes first depends on the order IB reports them in, so a caller holding the
     /// same instrument in several accounts should not rely on it.
     ///
@@ -1607,9 +1610,6 @@ impl ExecutionClient for IbkrClient {
                 .map_err(|e| UnindexedClientError::Internal(format!("positions: {e}")))?;
 
             let mut positions = PositionAggregator::default();
-            // Whether IB finished listing the account's positions during the read. Only then can
-            // an instrument it did not list be reported flat.
-            let mut listed_all = false;
 
             // Read until `POSITION_STREAM_TIMEOUT` passes with no update, not until
             // `PositionEnd`: see that constant for why.
@@ -1625,9 +1625,12 @@ impl ExecutionClient for IbkrClient {
                     }
                 };
                 let pos = match pos_update {
-                    PositionUpdate::Position(pos) => pos,
+                    PositionUpdate::Position(pos) => {
+                        positions.report_seen();
+                        pos
+                    }
                     PositionUpdate::PositionEnd => {
-                        listed_all = true;
+                        positions.listing_ended();
                         continue;
                     }
                 };
@@ -1643,14 +1646,17 @@ impl ExecutionClient for IbkrClient {
                 }
                 positions.process(instrument, pos);
             }
-            // Only a contract registered with its ID can be matched to IB's reports.
+            // IB's reports are attributed by contract ID, so a requested instrument can be
+            // reported flat only if its ID is registered and resolves back to it: with no ID, or
+            // one another name took over, IB's position in it would be missed.
             let requested = instruments_filter.iter().flatten().filter(|instrument| {
-                contracts
-                    .get_contract(instrument)
-                    .is_some_and(|contract| contract.contract_id != 0)
+                contracts.get_contract(instrument).is_some_and(|contract| {
+                    contract.contract_id != 0
+                        && contracts.get_name_by_con_id(contract.contract_id).as_ref()
+                            == Some(*instrument)
+                })
             });
-            let reported =
-                position_reports(positions.into_positions(Utc::now())?, requested, listed_all);
+            let reported = positions.into_reports(Utc::now(), requested)?;
             let snapshots = reported
                 .into_iter()
                 .map(|(instrument, position)| InstrumentAccountSnapshot {

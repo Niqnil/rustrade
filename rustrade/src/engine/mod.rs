@@ -393,6 +393,8 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 }
             }
             AccountStreamEvent::Item(event) => {
+                // Never taken for a snapshot, whose arm yields no exit, so the drift check below
+                // always runs for one.
                 if let Some(exited) = self.state.update_from_account(event) {
                     return UpdateFromAccountOutput::PositionExit(exited);
                 }

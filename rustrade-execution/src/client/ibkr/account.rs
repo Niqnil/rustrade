@@ -95,9 +95,26 @@ pub(crate) struct PositionAggregator {
     /// Latest report per account and instrument, in the order each pair was first reported.
     reports: Vec<(InstrumentNameExchange, ibapi::accounts::Position)>,
     index: FnvHashMap<(String, InstrumentNameExchange), usize>,
+    /// Whether the last thing IB sent was the end of a listing (`PositionEnd`), so every
+    /// position it holds has been reported.
+    listed_all: bool,
 }
 
 impl PositionAggregator {
+    /// Note that IB sent a position report, whether or not it is for a registered instrument.
+    ///
+    /// A listing is then in progress, and an earlier end marker no longer vouches for it: after
+    /// a connection drop the read can start with a stale listing, complete with its end marker,
+    /// followed by the current one.
+    pub(crate) fn report_seen(&mut self) {
+        self.listed_all = false;
+    }
+
+    /// Note that IB marked the end of its listing (`PositionEnd`).
+    pub(crate) fn listing_ended(&mut self) {
+        self.listed_all = true;
+    }
+
     /// Record a report for `instrument`, replacing any earlier one from the same account.
     pub(crate) fn process(
         &mut self,
@@ -112,6 +129,53 @@ impl PositionAggregator {
                 self.reports.push((key.1, position));
             }
         }
+    }
+
+    /// The [`PositionReport`] of each instrument in an `account_snapshot`.
+    ///
+    /// Each reported instrument is [`PositionReport::Open`], or [`PositionReport::Flat`] when
+    /// every account reported zero, as IB does for a position closed today. `requested` are the
+    /// requested instruments that IB's reports can be attributed to. Those IB did not report are
+    /// [`PositionReport::Flat`] when the read ended on a complete listing (see
+    /// [`Self::listing_ended`]). Otherwise the listing may be incomplete, so they are left out,
+    /// with a warning.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::into_positions`].
+    pub(crate) fn into_reports<'a>(
+        self,
+        now: DateTime<Utc>,
+        requested: impl IntoIterator<Item = &'a InstrumentNameExchange>,
+    ) -> Result<Vec<(InstrumentNameExchange, PositionReport)>, UnindexedClientError> {
+        let listed_all = self.listed_all;
+        let mut reports: Vec<_> = self
+            .into_positions(now)?
+            .into_iter()
+            .map(|(instrument, position)| {
+                let report = position.map_or(PositionReport::Flat, PositionReport::Open);
+                (instrument, report)
+            })
+            .collect();
+        let unlisted: Vec<_> = requested
+            .into_iter()
+            .filter(|instrument| !reports.iter().any(|(listed, _)| listed == *instrument))
+            .cloned()
+            .collect();
+        if listed_all {
+            reports.extend(
+                unlisted
+                    .into_iter()
+                    .map(|instrument| (instrument, PositionReport::Flat)),
+            );
+        } else if !unlisted.is_empty() {
+            warn!(
+                unlisted = unlisted.len(),
+                "IB did not finish listing positions during the read; requested instruments it \
+                 did not list are left out rather than reported flat"
+            );
+        }
+        Ok(reports)
     }
 
     /// One entry per reported instrument, in the order instruments were first reported.
@@ -152,47 +216,6 @@ impl PositionAggregator {
         }
         Ok(positions)
     }
-}
-
-/// The [`PositionReport`] of each instrument in an `account_snapshot`.
-///
-/// `positions` is [`PositionAggregator::into_positions`]: each is [`PositionReport::Open`], or
-/// [`PositionReport::Flat`] when every account reported zero, as IB does for a position closed
-/// today. `requested` are the requested instruments that can be matched to IB's reports. Those IB
-/// did not report are [`PositionReport::Flat`] when `listed_all`, meaning IB marked the end of its
-/// listing during the read. Otherwise the listing may be incomplete, so they are left out, with a
-/// warning.
-pub(crate) fn position_reports<'a>(
-    positions: Vec<(InstrumentNameExchange, Option<Position>)>,
-    requested: impl IntoIterator<Item = &'a InstrumentNameExchange>,
-    listed_all: bool,
-) -> Vec<(InstrumentNameExchange, PositionReport)> {
-    let mut reports: Vec<_> = positions
-        .into_iter()
-        .map(|(instrument, position)| {
-            let report = position.map_or(PositionReport::Flat, PositionReport::Open);
-            (instrument, report)
-        })
-        .collect();
-    let unlisted: Vec<_> = requested
-        .into_iter()
-        .filter(|instrument| !reports.iter().any(|(listed, _)| listed == *instrument))
-        .cloned()
-        .collect();
-    if listed_all {
-        reports.extend(
-            unlisted
-                .into_iter()
-                .map(|instrument| (instrument, PositionReport::Flat)),
-        );
-    } else if !unlisted.is_empty() {
-        warn!(
-            unlisted = unlisted.len(),
-            "IB did not finish listing positions during the read; requested instruments it did \
-             not list are left out rather than reported flat"
-        );
-    }
-    reports
 }
 
 /// Convert one IB position report to a [`Position`], or `None` if its quantity is zero.
@@ -541,31 +564,57 @@ mod tests {
     }
 
     #[test]
-    fn position_reports_are_open_or_flat_and_add_unlisted_instruments_only_after_listing_end() {
-        let open = Position::new(dec!(3), Some(dec!(10)), None, None, None, None, now());
-        let positions = || {
-            vec![
-                (instrument("AAPL"), Some(open.clone())),
-                (instrument("F"), None),
-            ]
-        };
+    fn reports_are_open_or_flat_and_add_unlisted_instruments_only_after_a_complete_listing() {
         let requested = [instrument("AAPL"), instrument("MSFT")];
+        let reports = |events: &[&str]| {
+            let mut agg = PositionAggregator::default();
+            for event in events {
+                match *event {
+                    "end" => agg.listing_ended(),
+                    // A report IB sends for an instrument that is not registered.
+                    "other" => agg.report_seen(),
+                    name => {
+                        agg.report_seen();
+                        let quantity = if name == "F" { 0.0 } else { 3.0 };
+                        agg.process(
+                            instrument(name),
+                            report("DU1", SecurityType::Stock, "", quantity, 10.0),
+                        );
+                    }
+                }
+            }
+            agg.into_reports(now(), &requested).unwrap()
+        };
+        let aapl = || {
+            (
+                instrument("AAPL"),
+                PositionReport::from_position(
+                    convert_position(&report("DU1", SecurityType::Stock, "", 3.0, 10.0), now())
+                        .unwrap()
+                        .unwrap(),
+                ),
+            )
+        };
 
         assert_eq!(
-            position_reports(positions(), &requested, true),
+            reports(&["AAPL", "F", "end"]),
             vec![
-                (instrument("AAPL"), PositionReport::Open(open.clone())),
+                aapl(),
                 (instrument("F"), PositionReport::Flat),
                 (instrument("MSFT"), PositionReport::Flat),
             ]
         );
-        // Without the end of the listing, MSFT's absence establishes nothing.
+        // No end marker: MSFT's absence establishes nothing.
         assert_eq!(
-            position_reports(positions(), &requested, false),
-            vec![
-                (instrument("AAPL"), PositionReport::Open(open)),
-                (instrument("F"), PositionReport::Flat),
-            ]
+            reports(&["AAPL", "F"]),
+            vec![aapl(), (instrument("F"), PositionReport::Flat)]
+        );
+        // A stale listing's end marker, then a fresh listing that stalls: not complete.
+        assert_eq!(reports(&["AAPL", "end", "other"]), vec![aapl()]);
+        // A stale listing, then the fresh one to its end: complete.
+        assert_eq!(
+            reports(&["other", "end", "AAPL", "end"]),
+            vec![aapl(), (instrument("MSFT"), PositionReport::Flat)]
         );
     }
 }

@@ -327,9 +327,11 @@ pub struct InstrumentAccountSnapshot<
     /// a client reports it only when it read every position the venue has for the instrument. See
     /// each client's `account_snapshot` for what it reports.
     ///
-    /// A client that reports positions lists every instrument it was asked for whose position it
-    /// reports, flat ones included, so a consumer need not read a missing instrument as flat.
-    /// Asked for all instruments (an empty list), it may list only those with something to report.
+    /// A client that reports positions lists each instrument it was asked for whose position it
+    /// can establish, flat ones included. An instrument it leaves out, like one it reports as
+    /// `Unreported`, is unknown, never flat: a client can be unable to establish a position (see
+    /// its `account_snapshot`). Asked for all instruments (an empty list), it may list only those
+    /// with something to report.
     #[serde(default, skip_serializing_if = "PositionReport::is_unreported")]
     pub position: PositionReport,
     /// Per-pair isolated-margin balances and risk, for venues with isolated sub-accounts
