@@ -78,6 +78,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     sent (building it, its URL, signing), are `ClientError::Internal`, since retrying cannot
     change either.
 
+- **A Binance order that failed on the venue's side was reported as definitively rejected**
+  (`rustrade-execution`, feature `binance`). When Binance answered an order or cancel with
+  `-1000`, `-1001`, `-1006`, `-1007` or `-1008`, the spot and margin clients reported
+  `OrderError::Rejected(OrderRejected)`. Binance documents `-1006` and `-1007` as leaving the
+  execution status unknown, and gives no assurance for the other three, so such an order may have
+  filled while the caller believed it had not. These codes are now `OrderError::Connectivity`,
+  like any other failure that leaves the order's status unknown, on both the REST and the
+  WebSocket API paths. So is a WebSocket API response with a 5xx status and no error body, which
+  was also reported as rejected. Other order-path labels change with it:
+  - `-1022` (invalid signature) and `-2014` (malformed API key), and messages worded as an auth
+    failure, are `ApiError::Unauthenticated`, as they already were for queries;
+  - a 403 is `Unauthenticated` only when it carries an auth code or wording. Otherwise it is
+    Binance's web application firewall limit, now `RateLimit`, and the order never reached the
+    matching engine. A REST call now backs off and retries a firewall 403 as it does a 429, and
+    a throttled WebSocket API order, from a 429, `-1003` or a firewall 403, now backs off the
+    shared rate limiter, which it did not before.
+
 - **A `ContractExpiry` for an instrument that never expires closed its positions** (`rustrade`).
   For a `Spot`, `Perpetual` or `Cfd` instrument the engine settled the event as it would a
   future: it closed every open position at the last price and set `expiration_processed`, so the
