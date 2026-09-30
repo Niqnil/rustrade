@@ -225,6 +225,12 @@ We use a **two-PR flow** so `develop` and `main` stay in sync — the version bu
    workflow's validate job, before the tests run, and again before anything is published, so no
    GitHub Release is created for it.
 
+   Publishing uses crates.io [Trusted Publishing](https://crates.io/docs/trusted-publishing): the
+   workflow holds no crates.io token. Each crate's **Settings → Trusted Publishing** lists a GitHub
+   publisher for this repository, workflow `publish.yml`, environment `release`. **A new crate**
+   cannot publish this way until it exists: publish its first version by hand with an API token,
+   then add the same trusted publisher to it before the next release tag.
+
    **A failed publish does not need a version bump.** Before publishing a crate, the script looks
    up its exact version in the crates.io sparse index, so crates already there are skipped and a
    re-run resumes where it stopped. `publish.yml` has no `workflow_dispatch` trigger, so a retry
