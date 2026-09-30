@@ -61,10 +61,83 @@ impl Position {
     }
 }
 
+/// What a venue reported about its position in one instrument, in an
+/// [`InstrumentAccountSnapshot`](crate::InstrumentAccountSnapshot).
+///
+/// Only [`Flat`](Self::Flat) and [`Open`](Self::Open) are claims about the position. A consumer
+/// comparing the venue's position with its own (the engine does, see
+/// `EngineOutput::PositionDrift` in `rustrade`) must compare only those, and read nothing into
+/// [`Unreported`](Self::Unreported) or into an instrument the snapshot does not list.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+pub enum PositionReport {
+    /// The venue does not report a position for this instrument: it does not report positions
+    /// at all, it reports this holding as an asset balance instead (such as spot crypto), or
+    /// this read could not establish it.
+    #[default]
+    Unreported,
+    /// The venue reports positions for this instrument and holds none.
+    Flat,
+    /// The venue's open position. Its quantity is never zero: build it with
+    /// [`Self::from_position`], which reports a zero quantity as [`Flat`](Self::Flat).
+    Open(Position),
+}
+
+impl PositionReport {
+    /// Report a position the venue returned: [`Flat`](Self::Flat) when its quantity is zero,
+    /// otherwise [`Open`](Self::Open).
+    pub fn from_position(position: Position) -> Self {
+        if position.is_flat() {
+            Self::Flat
+        } else {
+            Self::Open(position)
+        }
+    }
+
+    /// The open position, if any.
+    pub fn open(&self) -> Option<&Position> {
+        match self {
+            Self::Open(position) => Some(position),
+            Self::Unreported | Self::Flat => None,
+        }
+    }
+
+    /// The venue's signed quantity: zero when [`Flat`](Self::Flat), `None` when
+    /// [`Unreported`](Self::Unreported).
+    pub fn quantity(&self) -> Option<Decimal> {
+        match self {
+            Self::Unreported => None,
+            Self::Flat => Some(Decimal::ZERO),
+            Self::Open(position) => Some(position.quantity),
+        }
+    }
+
+    /// Whether this is [`Unreported`](Self::Unreported).
+    pub fn is_unreported(&self) -> bool {
+        matches!(self, Self::Unreported)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn position_report_from_position_reports_zero_as_flat() {
+        let now = Utc::now();
+        let open = Position::new(dec!(-2), None, None, None, None, None, now);
+        assert_eq!(
+            PositionReport::from_position(open.clone()),
+            PositionReport::Open(open.clone())
+        );
+        for zero in [dec!(0), -dec!(0)] {
+            let flat = Position::new(zero, None, None, None, None, None, now);
+            assert_eq!(PositionReport::from_position(flat), PositionReport::Flat);
+        }
+        assert_eq!(PositionReport::Open(open).quantity(), Some(dec!(-2)));
+        assert_eq!(PositionReport::Flat.quantity(), Some(Decimal::ZERO));
+        assert_eq!(PositionReport::Unreported.quantity(), None);
+    }
 
     #[test]
     fn test_position_side_detection() {

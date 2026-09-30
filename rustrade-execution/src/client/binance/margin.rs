@@ -72,6 +72,7 @@ use crate::{
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
     },
+    position::PositionReport,
     trade::{AssetFees, Trade, TradeId},
 };
 use binance_sdk::{
@@ -544,7 +545,7 @@ impl BinanceMargin {
                     inst,
                     wrapped,
                     listing.complete,
-                    None,
+                    PositionReport::Unreported,
                     isolated,
                 ))
             })
@@ -943,7 +944,7 @@ impl ExecutionClient for BinanceMargin {
                     inst,
                     wrapped,
                     listing.complete,
-                    None,
+                    PositionReport::Unreported,
                     None,
                 ))
             })

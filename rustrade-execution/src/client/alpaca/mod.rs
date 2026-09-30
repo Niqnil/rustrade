@@ -56,7 +56,7 @@ use crate::{
         state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
     },
     parse_env_bool,
-    position::Position,
+    position::{Position, PositionReport},
     trade::{AssetFees, Trade, TradeId},
 };
 use chrono::{DateTime, Utc};
@@ -1213,14 +1213,16 @@ impl ExecutionClient for AlpacaClient {
     ///   borrows on margin, and then `free` is negative too. Account equity is not reported: it
     ///   is cash plus the value of the positions below, so it can be derived.
     /// - **Equities and options**: each holding becomes the
-    ///   [`InstrumentAccountSnapshot::position`] of its instrument, a signed [`Position`] (negative
-    ///   for a short) with the average entry price and the unrealised PnL in USD. An option's
+    ///   [`InstrumentAccountSnapshot::position`] of its instrument, [`PositionReport::Open`] with a
+    ///   signed [`Position`] (negative for a short), the average entry price and the unrealised
+    ///   PnL in USD. An equity or option without a holding is [`PositionReport::Flat`], since
+    ///   Alpaca lists every open position. An option's
     ///   entry price is the premium per share of the underlying, as quoted and as orders are
     ///   priced, not per contract. Margin, liquidation price and leverage are `None`, and
     ///   `time_exchange` is the time of the call, since Alpaca does not timestamp positions.
     /// - **Crypto**: each holding is an asset balance of its base asset (e.g. `btc` for
     ///   `BTC/USD`), in base units. Alpaca crypto is spot-only and cannot be sold short, so there
-    ///   is no position to report.
+    ///   is no position to report: its instruments are [`PositionReport::Unreported`].
     ///
     /// # Limitations
     ///
@@ -3098,7 +3100,9 @@ fn convert_positions(
 /// (possibly with no orders and no position). When empty, only instruments with an open order or
 /// a position are returned.
 ///
-/// `positions` come from [`convert_positions`]; an instrument without one has `position: None`.
+/// `positions` come from [`convert_positions`], which holds every non-zero equity and option
+/// position, so an equity or option without one is [`PositionReport::Flat`]. A crypto pair (a
+/// symbol with a `/`) is [`PositionReport::Unreported`]: its holding is a balance.
 ///
 /// Each snapshot declares its orders complete unless [`convert_open_order`] left one of its
 /// orders out. That holds because `orders` is every open order, unpaged: a response at Alpaca's
@@ -3148,14 +3152,17 @@ fn build_instrument_snapshots(
             .position = Some(position);
     }
 
-    let snapshot = |instrument, listing: Listing| {
-        InstrumentAccountSnapshot::new(
-            instrument,
-            listing.orders,
-            listing.complete,
-            listing.position,
-            None,
-        )
+    let snapshot = |instrument: InstrumentNameExchange, listing: Listing| {
+        // `positions` holds every non-zero equity and option position, so one missing here is
+        // flat. Crypto is reported as balances, never as a position.
+        let position = if is_options_or_equity_symbol(instrument.name().as_str()) {
+            listing
+                .position
+                .map_or(PositionReport::Flat, PositionReport::from_position)
+        } else {
+            PositionReport::Unreported
+        };
+        InstrumentAccountSnapshot::new(instrument, listing.orders, listing.complete, position, None)
     };
 
     // If instruments is empty, return all; otherwise filter to requested set.
@@ -5212,7 +5219,7 @@ mod tests {
                 (
                     s.instrument.name().as_str(),
                     s.orders.len(),
-                    s.position.as_ref().map(|p| p.quantity),
+                    s.position.quantity(),
                 )
             })
             .collect();
@@ -5229,19 +5236,23 @@ mod tests {
         let instruments = vec![
             InstrumentNameExchange::new("TSLA"),
             InstrumentNameExchange::new("MSFT"),
+            InstrumentNameExchange::new("BTC/USD"),
         ];
 
         let snapshots = build_instrument_snapshots(Vec::new(), positions, &instruments);
         let listed: Vec<_> = snapshots
             .iter()
-            .map(|s| {
-                (
-                    s.instrument.name().as_str(),
-                    s.position.as_ref().map(|p| p.quantity),
-                )
-            })
+            .map(|s| (s.instrument.name().as_str(), s.position.quantity()))
             .collect();
-        assert_eq!(listed, vec![("TSLA", Some(dec!(-2))), ("MSFT", None)]);
+        // A requested equity with no position is reported flat; crypto is never a position.
+        assert_eq!(
+            listed,
+            vec![
+                ("TSLA", Some(dec!(-2))),
+                ("MSFT", Some(Decimal::ZERO)),
+                ("BTC/USD", None)
+            ]
+        );
     }
 
     /// Verifies that the dedup key synthesised by `recover_fills` (REST path) matches
@@ -5955,7 +5966,7 @@ mod tests {
                 .instruments
                 .iter()
                 .map(|i| {
-                    let p = i.position.as_ref().unwrap();
+                    let p = i.position.open().unwrap();
                     (
                         i.instrument.name().as_str(),
                         p.quantity,
@@ -6002,13 +6013,7 @@ mod tests {
             assert_eq!(snapshot.balances[0].balance.total, dec!(-1500.50));
 
             assert_eq!(snapshot.instruments.len(), 1);
-            assert_eq!(
-                snapshot.instruments[0]
-                    .position
-                    .as_ref()
-                    .map(|p| p.quantity),
-                Some(dec!(-10))
-            );
+            assert_eq!(snapshot.instruments[0].position.quantity(), Some(dec!(-10)));
         }
 
         /// A non-USD request skips `/v2/account` entirely.

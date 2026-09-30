@@ -110,19 +110,17 @@ async fn main() {
             let positions: Vec<_> = snapshot
                 .instruments
                 .iter()
-                .filter(|i| i.position.is_some())
+                .filter_map(|i| Some((&i.instrument, i.position.open()?)))
                 .collect();
 
             if positions.is_empty() {
                 info!("  (no open positions)");
             }
-            for inst in positions {
-                if let Some(pos) = &inst.position {
-                    info!(
-                        "  {}: qty={}, entry={:?}, pnl={:?}",
-                        inst.instrument, pos.quantity, pos.entry_price, pos.unrealized_pnl
-                    );
-                }
+            for (instrument, pos) in positions {
+                info!(
+                    "  {}: qty={}, entry={:?}, pnl={:?}",
+                    instrument, pos.quantity, pos.entry_price, pos.unrealized_pnl
+                );
             }
 
             info!("Open Orders:");

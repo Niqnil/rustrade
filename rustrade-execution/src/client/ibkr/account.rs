@@ -1,7 +1,7 @@
 use crate::{
     balance::{AssetBalance, Balance},
     error::UnindexedClientError,
-    position::Position,
+    position::{Position, PositionReport},
 };
 use chrono::{DateTime, Utc};
 use fnv::FnvHashMap;
@@ -152,6 +152,47 @@ impl PositionAggregator {
         }
         Ok(positions)
     }
+}
+
+/// The [`PositionReport`] of each instrument in an `account_snapshot`.
+///
+/// `positions` is [`PositionAggregator::into_positions`]: each is [`PositionReport::Open`], or
+/// [`PositionReport::Flat`] when every account reported zero, as IB does for a position closed
+/// today. `requested` are the requested instruments that can be matched to IB's reports. Those IB
+/// did not report are [`PositionReport::Flat`] when `listed_all`, meaning IB marked the end of its
+/// listing during the read. Otherwise the listing may be incomplete, so they are left out, with a
+/// warning.
+pub(crate) fn position_reports<'a>(
+    positions: Vec<(InstrumentNameExchange, Option<Position>)>,
+    requested: impl IntoIterator<Item = &'a InstrumentNameExchange>,
+    listed_all: bool,
+) -> Vec<(InstrumentNameExchange, PositionReport)> {
+    let mut reports: Vec<_> = positions
+        .into_iter()
+        .map(|(instrument, position)| {
+            let report = position.map_or(PositionReport::Flat, PositionReport::Open);
+            (instrument, report)
+        })
+        .collect();
+    let unlisted: Vec<_> = requested
+        .into_iter()
+        .filter(|instrument| !reports.iter().any(|(listed, _)| listed == *instrument))
+        .cloned()
+        .collect();
+    if listed_all {
+        reports.extend(
+            unlisted
+                .into_iter()
+                .map(|instrument| (instrument, PositionReport::Flat)),
+        );
+    } else if !unlisted.is_empty() {
+        warn!(
+            unlisted = unlisted.len(),
+            "IB did not finish listing positions during the read; requested instruments it did \
+             not list are left out rather than reported flat"
+        );
+    }
+    reports
 }
 
 /// Convert one IB position report to a [`Position`], or `None` if its quantity is zero.
@@ -497,5 +538,34 @@ mod tests {
 
         agg.clear();
         assert!(agg.to_balances().is_empty());
+    }
+
+    #[test]
+    fn position_reports_are_open_or_flat_and_add_unlisted_instruments_only_after_listing_end() {
+        let open = Position::new(dec!(3), Some(dec!(10)), None, None, None, None, now());
+        let positions = || {
+            vec![
+                (instrument("AAPL"), Some(open.clone())),
+                (instrument("F"), None),
+            ]
+        };
+        let requested = [instrument("AAPL"), instrument("MSFT")];
+
+        assert_eq!(
+            position_reports(positions(), &requested, true),
+            vec![
+                (instrument("AAPL"), PositionReport::Open(open.clone())),
+                (instrument("F"), PositionReport::Flat),
+                (instrument("MSFT"), PositionReport::Flat),
+            ]
+        );
+        // Without the end of the listing, MSFT's absence establishes nothing.
+        assert_eq!(
+            position_reports(positions(), &requested, false),
+            vec![
+                (instrument("AAPL"), PositionReport::Open(open)),
+                (instrument("F"), PositionReport::Flat),
+            ]
+        );
     }
 }

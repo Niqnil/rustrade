@@ -58,6 +58,7 @@ use crate::{
         state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
     },
     parse_env_bool,
+    position::PositionReport,
     trade::{AssetFees, Trade, TradeId},
 };
 use binance_sdk::{
@@ -588,7 +589,7 @@ impl ExecutionClient for BinanceSpot {
                     inst,
                     wrapped,
                     listing.complete,
-                    None,
+                    PositionReport::Unreported,
                     None,
                 ))
             })

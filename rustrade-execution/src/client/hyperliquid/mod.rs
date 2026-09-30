@@ -118,7 +118,7 @@ use crate::{
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Filled, Open, OrderState, UnindexedOrderState},
     },
-    position::Position,
+    position::{Position, PositionReport},
     trade::{AssetFees, Trade, TradeId},
 };
 use chrono::{DateTime, Utc};
@@ -279,6 +279,14 @@ impl ExecutionClient for HyperliquidClient {
         }
     }
 
+    /// The USDC collateral balance, and each perpetual's open orders and position.
+    ///
+    /// # Positions
+    ///
+    /// Every requested perpetual is listed. Its position is [`PositionReport::Open`] when
+    /// Hyperliquid reports a non-zero size for it, and [`PositionReport::Flat`] otherwise, since
+    /// the user state holds every open perpetual position. A size that does not parse is
+    /// [`PositionReport::Unreported`], with a warning.
     async fn account_snapshot(
         &self,
         _assets: &[AssetNameExchange],
@@ -347,7 +355,7 @@ impl ExecutionClient for HyperliquidClient {
                 continue;
             }
 
-            let quantity = parse_decimal(&pos.szi, "szi").unwrap_or(Decimal::ZERO);
+            let quantity = parse_decimal(&pos.szi, "szi");
             let entry_price = pos
                 .entry_px
                 .as_ref()
@@ -360,10 +368,10 @@ impl ExecutionClient for HyperliquidClient {
                 .and_then(|p| parse_decimal(p, "liquidation_px"));
             let leverage = Some(Decimal::from(pos.leverage.value));
 
-            let position = if quantity.is_zero() {
-                None
-            } else {
-                Some(Position::new(
+            // An unparseable size establishes nothing, so it must not read as flat.
+            let position = match quantity {
+                None => PositionReport::Unreported,
+                Some(quantity) => PositionReport::from_position(Position::new(
                     quantity,
                     entry_price,
                     unrealized_pnl,
@@ -371,7 +379,7 @@ impl ExecutionClient for HyperliquidClient {
                     liquidation_price,
                     leverage,
                     now,
-                ))
+                )),
             };
 
             let (orders, orders_complete) = match listing.remove(&instrument) {
@@ -391,7 +399,11 @@ impl ExecutionClient for HyperliquidClient {
         }
 
         // Every other instrument listed: open orders but no position, or requested with neither.
-        instrument_snapshots.extend(listing.into_snapshots());
+        // `asset_positions` holds every open perp position, so these are flat.
+        instrument_snapshots.extend(listing.into_snapshots().map(|mut snapshot| {
+            snapshot.position = PositionReport::Flat;
+            snapshot
+        }));
 
         Ok(AccountSnapshot {
             exchange: ExchangeId::HyperliquidPerp,

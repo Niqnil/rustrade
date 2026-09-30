@@ -143,7 +143,7 @@ use crate::{
     },
     trade::{AssetFees, Trade, TradeId},
 };
-use account::{BalanceAggregator, PositionAggregator};
+use account::{BalanceAggregator, PositionAggregator, position_reports};
 use chrono::{DateTime, Utc};
 use execution::{ExecutionBuffer, parse_decimal_or_warn};
 use futures::stream::BoxStream;
@@ -1518,7 +1518,8 @@ impl ExecutionClient for IbkrClient {
     /// # Positions
     ///
     /// Each instrument IB reports a position in, and that is registered (and in `instruments`,
-    /// when that is not empty), gets an `InstrumentAccountSnapshot`. Its `position` carries:
+    /// when that is not empty), gets an `InstrumentAccountSnapshot`. Its `position` is
+    /// [`PositionReport::Open`](crate::position::PositionReport::Open), carrying:
     /// - `quantity`: IB's signed position, negative when short, in shares for a stock and in
     ///   contracts for a future or an option. `ibapi` 4.2.0 hands it over as an `f64`, converted
     ///   with `Decimal::try_from`, which rounds to the float's precision of about 15 significant
@@ -1531,8 +1532,13 @@ impl ExecutionClient for IbkrClient {
     /// `unrealized_pnl` and the margin fields are `None`: IB's positions subscription does not
     /// carry them.
     ///
-    /// A zero quantity, which IB reports for a position closed today, lists the instrument with
-    /// `position: None`.
+    /// A zero quantity, which IB reports for a position closed today, is
+    /// [`PositionReport::Flat`](crate::position::PositionReport::Flat). So is each instrument in
+    /// `instruments` that is registered with its contract ID but that IB did not list, provided IB
+    /// marked the end of its listing (`PositionEnd`) during the read. Without that marker such
+    /// instruments are left out, with a warning, since the listing may be incomplete. A requested
+    /// instrument registered without a contract ID cannot be matched to IB's reports and is left
+    /// out too.
     ///
     /// IB can report the same position more than once during the read, as it changes. The latest
     /// report for each account is used.
@@ -1601,6 +1607,9 @@ impl ExecutionClient for IbkrClient {
                 .map_err(|e| UnindexedClientError::Internal(format!("positions: {e}")))?;
 
             let mut positions = PositionAggregator::default();
+            // Whether IB finished listing the account's positions during the read. Only then can
+            // an instrument it did not list be reported flat.
+            let mut listed_all = false;
 
             // Read until `POSITION_STREAM_TIMEOUT` passes with no update, not until
             // `PositionEnd`: see that constant for why.
@@ -1615,9 +1624,12 @@ impl ExecutionClient for IbkrClient {
                         )));
                     }
                 };
-                let PositionUpdate::Position(pos) = pos_update else {
-                    trace!(?pos_update, "Ignoring non-Position variant");
-                    continue;
+                let pos = match pos_update {
+                    PositionUpdate::Position(pos) => pos,
+                    PositionUpdate::PositionEnd => {
+                        listed_all = true;
+                        continue;
+                    }
                 };
                 let Some(instrument) = contracts.get_name_by_con_id(pos.contract.contract_id)
                 else {
@@ -1631,8 +1643,15 @@ impl ExecutionClient for IbkrClient {
                 }
                 positions.process(instrument, pos);
             }
-            let snapshots = positions
-                .into_positions(Utc::now())?
+            // Only a contract registered with its ID can be matched to IB's reports.
+            let requested = instruments_filter.iter().flatten().filter(|instrument| {
+                contracts
+                    .get_contract(instrument)
+                    .is_some_and(|contract| contract.contract_id != 0)
+            });
+            let reported =
+                position_reports(positions.into_positions(Utc::now())?, requested, listed_all);
+            let snapshots = reported
                 .into_iter()
                 .map(|(instrument, position)| InstrumentAccountSnapshot {
                     instrument,
