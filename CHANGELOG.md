@@ -55,11 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   else `buying_power`). Equity counts the value of every position, which `account_snapshot` now
   reports one by one (see Fixed), so keeping it would count them twice. Every Alpaca buying power
   figure counts the loan value of held stock, so `free` could exceed `total`; capped at cash it
-  cannot. Cash is negative while the account borrows on margin, and then `free` equals it. A
+  cannot. Cash is negative while the account borrows on margin, and then `free` is negative too. A
   short sale's proceeds are credited to cash but not to buying power, so `free` stays below
   `total` while a short is open. This matches IBKR, whose USD `total` is already
-  `TotalCashValue`. Code that wants equity can add the positions' value to cash. A malformed
-  amount in Alpaca's account or positions response now fails the call instead of reading as zero.
+  `TotalCashValue`. Code that wants equity can add the positions' value to cash. A missing or
+  malformed amount in Alpaca's account or positions response now fails the call instead of
+  reading as zero; so does an equity or option position whose side is neither long nor short.
 
 ### Fixed
 

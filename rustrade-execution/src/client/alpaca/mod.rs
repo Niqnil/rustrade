@@ -565,7 +565,9 @@ struct AlpacaPosition {
     /// Asset class: "us_equity", "crypto", "us_option".
     asset_class: String,
     /// Direction of the position. The size is taken from `qty`'s magnitude and the sign from
-    /// this, so a short reads as short whichever sign `qty` carries.
+    /// this, so a short reads as short whichever sign `qty` carries. Missing reads as
+    /// [`AlpacaPositionSide::Unknown`].
+    #[serde(default)]
     side: AlpacaPositionSide,
     /// Quantity held: shares, contracts, or base currency for crypto.
     #[serde(with = "rust_decimal::serde::str")]
@@ -582,11 +584,17 @@ struct AlpacaPosition {
 }
 
 /// Direction of an [`AlpacaPosition`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum AlpacaPositionSide {
     Long,
     Short,
+    /// A missing side or a value Alpaca does not document. Decoded rather than rejected so that
+    /// one position cannot fail the whole response, which also carries the crypto balances; a
+    /// position that needs a direction fails in [`convert_positions`] instead.
+    #[default]
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1202,8 +1210,8 @@ impl ExecutionClient for AlpacaClient {
     ///   buying power figures include the loan value of held stock, so none of them alone is
     ///   free cash. A short sale's proceeds are credited to cash but do not raise buying power,
     ///   so `free` stays below `total` while a short is open. Cash is negative while the account
-    ///   borrows on margin, and then `free` equals `total`. Account equity is not reported: it is
-    ///   cash plus the value of the positions below, so it can be derived.
+    ///   borrows on margin, and then `free` is negative too. Account equity is not reported: it
+    ///   is cash plus the value of the positions below, so it can be derived.
     /// - **Equities and options**: each holding becomes the
     ///   [`InstrumentAccountSnapshot::position`] of its instrument, a signed [`Position`] (negative
     ///   for a short) with the average entry price and the unrealised PnL in USD. An option's
@@ -1251,7 +1259,9 @@ impl ExecutionClient for AlpacaClient {
         let (account, positions): (Option<AlpacaAccount>, Vec<AlpacaPosition>) = tokio::try_join!(
             async {
                 if wants_usd {
-                    rest_with_retry(rl, || http.get(&account_url)).await.map(Some)
+                    rest_with_retry(rl, || http.get(&account_url))
+                        .await
+                        .map(Some)
                 } else {
                     Ok(None)
                 }
@@ -1271,7 +1281,7 @@ impl ExecutionClient for AlpacaClient {
         // Group open orders and positions by instrument symbol.
         let instrument_snapshots = build_instrument_snapshots(
             open_orders,
-            convert_positions(&positions, Utc::now()),
+            convert_positions(&positions, Utc::now())?,
             instruments,
         );
 
@@ -2931,7 +2941,7 @@ async fn recover_fills(
 ///
 /// `free` is capped at cash because `non_marginable_buying_power` counts the loan value of held
 /// marginable stock, so it exceeds cash whenever such stock is held. The cap keeps
-/// `free <= total`; with negative cash, `free` equals it.
+/// `free <= total`, so with negative cash `free` is negative too.
 ///
 /// Account equity is not the total: equity and option holdings are reported as positions, and
 /// counting them again here would double them.
@@ -3037,10 +3047,16 @@ fn is_crypto_position(position: &AlpacaPosition) -> bool {
 /// - `time_exchange`: `now`, since Alpaca does not timestamp positions.
 ///
 /// A position with zero quantity is left out.
+///
+/// # Errors
+///
+/// [`ClientError::Internal`](crate::error::ClientError::Internal) when a position's `side` is
+/// neither `long` nor `short`: reporting it either way could invert it, and leaving it out would
+/// read as flat.
 fn convert_positions(
     positions: &[AlpacaPosition],
     now: DateTime<Utc>,
-) -> Vec<(&str, Position)> {
+) -> Result<Vec<(&str, Position)>, UnindexedClientError> {
     positions
         .iter()
         .filter(|p| !is_crypto_position(p) && !p.qty.is_zero())
@@ -3049,6 +3065,12 @@ fn convert_positions(
             let quantity = match p.side {
                 AlpacaPositionSide::Long => size,
                 AlpacaPositionSide::Short => -size,
+                AlpacaPositionSide::Unknown => {
+                    return Err(UnindexedClientError::Internal(format!(
+                        "Alpaca position {} has an unrecognised side",
+                        p.symbol
+                    )));
+                }
             };
             let position = Position::new(
                 quantity,
@@ -3059,7 +3081,7 @@ fn convert_positions(
                 None,
                 now,
             );
-            (p.symbol.as_str(), position)
+            Ok((p.symbol.as_str(), position))
         })
         .collect()
 }
@@ -4404,6 +4426,22 @@ mod tests {
         assert_eq!(balances[0].balance.free, dec!(50000));
     }
 
+    /// A short sale credits its proceeds to cash but lowers non-marginable buying power, so
+    /// `free` is the buying power, below `total`.
+    #[test]
+    fn test_convert_account_to_balances_open_short_keeps_free_below_cash() {
+        let account: AlpacaAccount = serde_json::from_value(serde_json::json!({
+            "cash": "10200",
+            "equity": "10000",
+            "initial_margin": "100",
+            "non_marginable_buying_power": "9900",
+        }))
+        .unwrap();
+        let balances = convert_account_to_balances(&account, &[]);
+        assert_eq!(balances[0].balance.total, dec!(10200));
+        assert_eq!(balances[0].balance.free, dec!(9900));
+    }
+
     #[test]
     fn test_convert_account_to_balances_negative_cash_on_margin() {
         let account: AlpacaAccount = serde_json::from_value(serde_json::json!({
@@ -4851,7 +4889,7 @@ mod tests {
             alpaca_position("MSFT", "us_equity", AlpacaPositionSide::Short, dec!(4)),
         ];
 
-        let converted = convert_positions(&positions, now);
+        let converted = convert_positions(&positions, now).unwrap();
         let quantities: Vec<_> = converted.iter().map(|(s, p)| (*s, p.quantity)).collect();
         assert_eq!(
             quantities,
@@ -4868,7 +4906,7 @@ mod tests {
             alpaca_position("SPY", "us_equity", AlpacaPositionSide::Long, dec!(1)),
         ];
 
-        let converted = convert_positions(&positions, Utc::now());
+        let converted = convert_positions(&positions, Utc::now()).unwrap();
         let symbols: Vec<_> = converted.iter().map(|(s, _)| *s).collect();
         assert_eq!(symbols, vec!["SPY"]);
     }
@@ -4909,9 +4947,12 @@ mod tests {
         ]))
         .unwrap();
 
-        let converted = convert_positions(&positions, Utc::now());
-        let [(short_sym, short), (option_sym, option), (fraction_sym, fraction)] =
-            converted.as_slice()
+        let converted = convert_positions(&positions, Utc::now()).unwrap();
+        let [
+            (short_sym, short),
+            (option_sym, option),
+            (fraction_sym, fraction),
+        ] = converted.as_slice()
         else {
             panic!("expected three positions, got {converted:?}");
         };
@@ -4937,16 +4978,38 @@ mod tests {
         }
     }
 
+    /// An unknown or missing side decodes, so the crypto balances in the same response survive,
+    /// but a position that needs a direction fails rather than guessing one or reading as flat.
     #[test]
-    fn test_alpaca_position_unknown_side_fails_to_decode() {
-        let result = serde_json::from_value::<AlpacaPosition>(serde_json::json!({
-            "symbol": "XYZ",
-            "asset_class": "us_equity",
-            "qty": "1",
-            "qty_available": "1",
-            "side": "sideways",
-        }));
-        assert!(result.is_err(), "an unknown side must not guess a direction");
+    fn test_alpaca_position_unknown_side_fails_only_where_a_direction_is_needed() {
+        let positions: Vec<AlpacaPosition> = serde_json::from_value(serde_json::json!([
+            {
+                "symbol": "BTC/USD",
+                "asset_class": "crypto",
+                "qty": "0.5",
+                "qty_available": "0.5",
+            },
+            {
+                "symbol": "XYZ",
+                "asset_class": "us_equity",
+                "qty": "1",
+                "qty_available": "1",
+                "side": "sideways",
+            },
+        ]))
+        .unwrap();
+        assert_eq!(positions[0].side, AlpacaPositionSide::Unknown);
+        assert_eq!(positions[1].side, AlpacaPositionSide::Unknown);
+
+        let balances = convert_positions_to_balances(&positions, &[]);
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].balance.total, dec!(0.5));
+
+        let result = convert_positions(&positions, Utc::now());
+        assert!(
+            matches!(&result, Err(UnindexedClientError::Internal(msg)) if msg.contains("XYZ")),
+            "an unknown side must not guess a direction: {result:?}"
+        );
     }
 
     /// `updated_at` orders an order's states; `created_at` is constant across all of them.
@@ -5120,7 +5183,15 @@ mod tests {
     }
 
     fn position(quantity: Decimal) -> Position {
-        Position::new(quantity, Some(dec!(100)), None, None, None, None, Utc::now())
+        Position::new(
+            quantity,
+            Some(dec!(100)),
+            None,
+            None,
+            None,
+            None,
+            Utc::now(),
+        )
     }
 
     #[test]
@@ -5926,7 +5997,10 @@ mod tests {
 
             assert_eq!(snapshot.instruments.len(), 1);
             assert_eq!(
-                snapshot.instruments[0].position.as_ref().map(|p| p.quantity),
+                snapshot.instruments[0]
+                    .position
+                    .as_ref()
+                    .map(|p| p.quantity),
                 Some(dec!(-10))
             );
         }
