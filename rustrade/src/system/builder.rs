@@ -5,7 +5,9 @@ use crate::{
         clock::EngineClock,
         execution_tx::MultiExchangeTxMap,
         run::{async_run, async_run_with_audit, sync_run, sync_run_with_audit},
-        state::{EngineState, builder::EngineStateBuilder, trading::TradingState},
+        state::{
+            EngineState, builder::EngineStateBuilder, position::PositionSeed, trading::TradingState,
+        },
     },
     error::BarterError,
     execution::{
@@ -104,6 +106,7 @@ pub struct SystemBuilder<'a, Clock, Strategy, Risk, MarketStream, GlobalData, Fn
     audit_mode: Option<AuditMode>,
     trading_state: Option<TradingState>,
     balances: FnvHashMap<ExchangeAsset<AssetNameInternal>, Balance>,
+    positions: Vec<PositionSeed>,
 }
 
 impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
@@ -121,6 +124,7 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             audit_mode: None,
             trading_state: None,
             balances: FnvHashMap::default(),
+            positions: Vec::new(),
         }
     }
 
@@ -174,6 +178,21 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
         self
     }
 
+    /// Optionally provide open positions the engine starts with, such as those held across a
+    /// process restart.
+    ///
+    /// See [`EngineStateBuilder::positions`]. The engine built here uses
+    /// [`OmsMode::Netting`](crate::engine::state::position::OmsMode::Netting), so a seed may name
+    /// only the netting slot. An invalid seed makes [`Self::build`] return
+    /// [`BarterError::PositionSeed`]. Repeated calls append.
+    pub fn positions<Iter>(mut self, positions: Iter) -> Self
+    where
+        Iter: IntoIterator<Item = PositionSeed>,
+    {
+        self.positions.extend(positions);
+        self
+    }
+
     /// Build the [`SystemBuild`] with the configured builder settings.
     ///
     /// This constructs all the system components but does not start any tasks or streams.
@@ -217,6 +236,7 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             audit_mode,
             trading_state,
             balances,
+            positions,
         } = self;
 
         // Default if not provided
@@ -253,7 +273,8 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
                     .into_iter()
                     .map(|(key, value)| Keyed::new(key, value)),
             )
-            .build();
+            .positions(positions)
+            .try_build()?;
 
         // Construct Engine
         let engine = Engine::new(clock, state, execution.execution_tx_map, strategy, risk);
@@ -449,6 +470,7 @@ where
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panicking on a bad fixture is acceptable
 mod tests {
     use super::*;
+    use crate::engine::state::position::{PositionId, PositionSeedError};
     use crate::{
         EngineEvent,
         engine::{
@@ -462,8 +484,9 @@ mod tests {
         strategy::DefaultStrategy,
     };
     use chrono::{DateTime, Utc};
+    use rust_decimal::Decimal;
     use rustrade_execution::{AccountSnapshot, client::mock::MockExecutionConfig};
-    use rustrade_instrument::test_utils::instrument;
+    use rustrade_instrument::{Side, test_utils::instrument};
 
     /// Prices an instrument nothing is traded on, and has no execution client.
     const DATA: ExchangeId = ExchangeId::BinanceSpot;
@@ -487,6 +510,75 @@ mod tests {
         })
     }
 
+    /// Arguments for a system trading on `EXECUTION` through one mock client.
+    fn system_args(
+        instruments: &IndexedInstruments,
+    ) -> SystemArgs<
+        '_,
+        HistoricalClock,
+        DefaultStrategy<TestState>,
+        DefaultRiskManager<TestState>,
+        futures::stream::Empty<EngineEvent>,
+        DefaultGlobalData,
+        MarketDataInit,
+    > {
+        SystemArgs::new(
+            instruments,
+            vec![mock_config(EXECUTION)],
+            HistoricalClock::new(DateTime::<Utc>::MIN_UTC),
+            DefaultStrategy::<TestState>::default(),
+            DefaultRiskManager::<TestState>::default(),
+            futures::stream::empty::<EngineEvent>(),
+            DefaultGlobalData,
+            |_| DefaultInstrumentMarketData::default(),
+        )
+    }
+
+    /// A function pointer rather than a closure, so [`system_args`] can name its type.
+    type MarketDataInit = fn(
+        &Keyed<InstrumentIndex, Instrument<Keyed<ExchangeIndex, ExchangeId>, AssetIndex>>,
+    ) -> DefaultInstrumentMarketData;
+
+    /// `SystemBuilder::positions` reaches the engine's starting state, and an invalid seed is
+    /// returned as [`BarterError::PositionSeed`] rather than panicking.
+    #[test]
+    fn position_seeds_reach_the_engine_state_or_fail_the_build() {
+        let instruments = IndexedInstruments::new([instrument(EXECUTION, "btc", "usdt")]);
+        let name = instruments.instruments()[0].value.name_internal.clone();
+        let seed = |quantity_abs| {
+            PositionSeed::new(
+                name.clone(),
+                Side::Buy,
+                quantity_abs,
+                Decimal::ONE,
+                DateTime::<Utc>::MIN_UTC,
+            )
+        };
+
+        let system = SystemBuilder::new(system_args(&instruments))
+            .positions([seed(Decimal::TWO)])
+            .build::<EngineEvent, _>()
+            .expect("a valid seed must build");
+        let positions = &system.engine.state.instruments.instrument(&name).position;
+        assert_eq!(
+            positions.positions[&PositionId::NETTING].quantity_abs,
+            Decimal::TWO
+        );
+
+        let error = SystemBuilder::new(system_args(&instruments))
+            .positions([seed(Decimal::ZERO)])
+            .build::<EngineEvent, _>()
+            .err()
+            .expect("a zero-quantity seed must fail the build");
+        assert_eq!(
+            error,
+            BarterError::PositionSeed(PositionSeedError::NonPositiveQuantity {
+                instrument: name,
+                quantity_abs: Decimal::ZERO,
+            })
+        );
+    }
+
     /// `SystemBuilder` derives the account dimension from the execution clients it registers, so a
     /// venue that prices instruments without being traded on is not given an account connection to
     /// wait on.
@@ -505,18 +597,7 @@ mod tests {
             instrument(EXECUTION, "btc", "usdt"),
         ]);
 
-        let args = SystemArgs::new(
-            &instruments,
-            vec![mock_config(EXECUTION)],
-            HistoricalClock::new(DateTime::<Utc>::MIN_UTC),
-            DefaultStrategy::<TestState>::default(),
-            DefaultRiskManager::<TestState>::default(),
-            futures::stream::empty::<EngineEvent>(),
-            DefaultGlobalData,
-            |_| DefaultInstrumentMarketData::default(),
-        );
-
-        let system = SystemBuilder::new(args)
+        let system = SystemBuilder::new(system_args(&instruments))
             .build::<EngineEvent, _>()
             .expect("a system with one mock execution client must build");
 

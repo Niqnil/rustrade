@@ -5,7 +5,7 @@ use crate::{
         connectivity::generate_empty_indexed_connectivity_states,
         instrument::generate_indexed_instrument_states,
         order::Orders,
-        position::{OmsMode, PositionManager},
+        position::{OmsMode, PositionManager, PositionSeed, PositionSeedError},
         trading::TradingState,
     },
     statistic::summary::asset::BalanceBasis,
@@ -46,6 +46,8 @@ pub struct EngineStateBuilder<'a, GlobalData, FnInstrumentData> {
     /// Venues with a registered execution client, if known — see
     /// [`EngineStateBuilder::execution_venues`].
     execution_venues: Option<FnvHashSet<ExchangeId>>,
+    /// Open positions to place in the built state — see [`EngineStateBuilder::positions`].
+    positions: Vec<PositionSeed>,
 }
 
 impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInstrumentData> {
@@ -71,6 +73,7 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
             oms_mode: OmsMode::Netting,
             balance_basis: BalanceBasis::default(),
             execution_venues: None,
+            positions: Vec::new(),
         }
     }
 
@@ -181,10 +184,52 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
         self
     }
 
+    /// Optionally provide open positions the engine starts with.
+    ///
+    /// The engine builds positions only from fills, so without this a position held across a
+    /// process restart is invisible to it: the strategy cannot close it, and risk checks do not
+    /// see it. Seed each one here, once, before the engine starts. Also useful for back-tests
+    /// that start from an existing portfolio. See [`PositionSeed`] for what a seeded position
+    /// holds, and why its entry price must come from the caller.
+    ///
+    /// Seeds are validated by [`Self::try_build`] against the [`OmsMode`] set with
+    /// [`Self::oms_mode`], whichever order the two are called in. Repeated calls append.
+    pub fn positions<Iter>(mut self, positions: Iter) -> Self
+    where
+        Iter: IntoIterator<Item = PositionSeed>,
+    {
+        self.positions.extend(positions);
+        self
+    }
+
     /// Use the builder data to generate the associated [`EngineState`].
     ///
     /// If optional data is not provided (eg/ Balances), default values are used (eg/ zero Balance).
+    ///
+    /// # Panics
+    /// Panics if a [`PositionSeed`] provided via [`Self::positions`] is invalid — see
+    /// [`Self::try_build`], which returns that as a [`PositionSeedError`] instead. A builder with
+    /// no position seeds never panics.
     pub fn build<InstrumentData>(self) -> EngineState<GlobalData, InstrumentData>
+    where
+        FnInstrumentData: Fn(
+            &'a Keyed<InstrumentIndex, Instrument<Keyed<ExchangeIndex, ExchangeId>, AssetIndex>>,
+        ) -> InstrumentData,
+    {
+        #[allow(clippy::panic)] // Documented in this method's `# Panics` section.
+        self.try_build()
+            .unwrap_or_else(|error| panic!("failed to build EngineState: {error}"))
+    }
+
+    /// Use the builder data to generate the associated [`EngineState`], returning an error for
+    /// an invalid [`PositionSeed`] instead of panicking.
+    ///
+    /// A seed is rejected if it names an instrument the builder was not given, has a
+    /// non-positive quantity, targets a slot another seed already filled, or names a slot that
+    /// does not fit the [`OmsMode`] — see [`PositionSeedError`].
+    pub fn try_build<InstrumentData>(
+        self,
+    ) -> Result<EngineState<GlobalData, InstrumentData>, PositionSeedError>
     where
         FnInstrumentData: Fn(
             &'a Keyed<InstrumentIndex, Instrument<Keyed<ExchangeIndex, ExchangeId>, AssetIndex>>,
@@ -200,6 +245,7 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
             oms_mode,
             balance_basis,
             execution_venues,
+            positions,
         } = self;
 
         // Default if not provided
@@ -226,7 +272,7 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
         }
 
         // Generate empty InstrumentStates using provided FnInstrumentData etc.
-        let instruments = generate_indexed_instrument_states(
+        let mut instruments = generate_indexed_instrument_states(
             instruments,
             time_engine_start,
             move || PositionManager::new(oms_mode),
@@ -234,26 +280,106 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
             instrument_data_init,
         );
 
-        EngineState {
+        // Seed open positions into their instruments' PositionManagers
+        for seed in positions {
+            let Some(state) = instruments.0.get_mut(&seed.instrument) else {
+                return Err(PositionSeedError::UnknownInstrument {
+                    instrument: seed.instrument,
+                });
+            };
+            let contract_size = state.instrument.kind.contract_size();
+            let quote = state.instrument.underlying.quote;
+            seed.seed_into(&mut state.position, state.key, quote, contract_size)?;
+        }
+
+        Ok(EngineState {
             trading,
             global,
             connectivity,
             assets,
             instruments,
-        }
+        })
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
     use crate::{
-        engine::state::{EngineState, connectivity::VenueRole},
+        engine::state::{EngineState, connectivity::VenueRole, position::PositionId},
         statistic::{summary::TradingSummaryGenerator, time::Annual365},
     };
     use rust_decimal::Decimal;
-    use rustrade_instrument::{Underlying, instrument::Instrument};
+    use rust_decimal_macros::dec;
+    use rustrade_execution::{
+        order::id::{OrderId, StrategyId},
+        trade::{AssetFees, Trade, TradeId},
+    };
+    use rustrade_instrument::{
+        Side, Underlying,
+        asset::Asset,
+        instrument::{
+            Instrument,
+            kind::{InstrumentKind, perpetual::PerpetualContract},
+            name::InstrumentNameInternal,
+            quote::InstrumentQuoteAsset,
+        },
+    };
+
+    const SPOT: &str = "binance_spot_btc_usdt";
+    const PERP: &str = "binance_futures_usd_btc_usdt_perp";
+
+    /// A spot instrument (contract size 1) and a perpetual with contract size 10, so a seed's
+    /// `contract_size` can be seen to come from its own instrument.
+    fn seed_instruments() -> IndexedInstruments {
+        IndexedInstruments::builder()
+            .add_instrument(Instrument::spot(
+                ExchangeId::BinanceSpot,
+                SPOT,
+                "BTCUSDT",
+                Underlying::new("btc", "usdt"),
+                None,
+            ))
+            .add_instrument(Instrument::new(
+                ExchangeId::BinanceFuturesUsd,
+                PERP,
+                "BTCUSDT",
+                Underlying::new("btc", "usdt"),
+                InstrumentQuoteAsset::UnderlyingQuote,
+                InstrumentKind::Perpetual(PerpetualContract {
+                    contract_size: dec!(10),
+                    settlement_asset: Asset::new_from_exchange("usdt"),
+                }),
+                None,
+            ))
+            .build()
+    }
+
+    fn time(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(secs, 0).unwrap()
+    }
+
+    fn long_seed(instrument: &str, quantity_abs: Decimal) -> PositionSeed {
+        PositionSeed::new(
+            instrument,
+            Side::Buy,
+            quantity_abs,
+            dec!(50_000),
+            time(1_000),
+        )
+    }
+
+    fn try_build(
+        instruments: &IndexedInstruments,
+        oms_mode: OmsMode,
+        seeds: Vec<PositionSeed>,
+    ) -> Result<EngineState<(), ()>, PositionSeedError> {
+        EngineState::builder(instruments, (), |_| ())
+            .oms_mode(oms_mode)
+            .positions(seeds)
+            .try_build()
+    }
 
     /// End-to-end seam: `EngineStateBuilder::balance_basis(NetAsset)` rides the asset generators
     /// into the on-demand `TradingSummaryGenerator` (which clones `AssetState.statistics`) and is
@@ -339,5 +465,219 @@ mod tests {
             approximated.connectivity.connectivity(&DATA).role(),
             VenueRole::Both
         );
+    }
+
+    /// A netting seed lands in the netting slot with the documented starting values, and takes
+    /// its `contract_size` and fee asset from its own instrument.
+    #[test]
+    fn netting_seed_opens_position_with_documented_starting_values() {
+        let instruments = seed_instruments();
+        let state = try_build(
+            &instruments,
+            OmsMode::Netting,
+            vec![
+                long_seed(SPOT, dec!(0.5)),
+                PositionSeed::new(PERP, Side::Sell, dec!(3), dec!(60_000), time(2_000)),
+            ],
+        )
+        .unwrap();
+
+        let spot = state
+            .instruments
+            .instrument(&InstrumentNameInternal::new(SPOT));
+        let position = &spot.position.positions[&PositionId::NETTING];
+        let quote = spot.instrument.underlying.quote;
+
+        assert_eq!(spot.position.positions.len(), 1);
+        assert_eq!(position.instrument, spot.key);
+        assert_eq!(position.side, Side::Buy);
+        assert_eq!(position.price_entry_average, dec!(50_000));
+        assert_eq!(position.quantity_abs, dec!(0.5));
+        assert_eq!(position.quantity_abs_max, dec!(0.5));
+        assert_eq!(position.pnl_unrealised, Decimal::ZERO);
+        assert_eq!(position.pnl_realised, Decimal::ZERO);
+        assert_eq!(
+            position.fees_enter,
+            AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO))
+        );
+        assert_eq!(position.fees_exit, position.fees_enter);
+        assert_eq!(position.time_enter, time(1_000));
+        assert_eq!(position.time_exchange_update, time(1_000));
+        assert!(position.trades.is_empty());
+        assert_eq!(position.contract_size, Decimal::ONE);
+
+        let perp = state
+            .instruments
+            .instrument(&InstrumentNameInternal::new(PERP));
+        let position = &perp.position.positions[&PositionId::NETTING];
+        assert_eq!(position.side, Side::Sell);
+        assert_eq!(position.contract_size, dec!(10));
+    }
+
+    /// A seeded position behaves as one opened by a fill: a closing trade exits it, with realised
+    /// PnL measured from the seeded entry price.
+    #[test]
+    fn seeded_netting_position_is_closed_by_a_fill() {
+        let instruments = seed_instruments();
+        let mut state = try_build(
+            &instruments,
+            OmsMode::Netting,
+            vec![long_seed(SPOT, dec!(0.5))],
+        )
+        .unwrap();
+
+        let spot = state
+            .instruments
+            .instrument_mut(&InstrumentNameInternal::new(SPOT));
+        let quote = spot.instrument.underlying.quote;
+        let exited = spot
+            .update_from_trade(&Trade {
+                id: TradeId::new("close"),
+                order_id: OrderId::new("close"),
+                instrument: spot.key,
+                strategy: StrategyId::new("strategy"),
+                time_exchange: time(3_000),
+                side: Side::Sell,
+                price: dec!(52_000),
+                quantity: dec!(0.5),
+                order_filled_quantity: None,
+                fees: AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO)),
+            })
+            .expect("a fill for the whole quantity exits the seeded position");
+
+        assert_eq!(exited.position_id, PositionId::NETTING);
+        assert_eq!(exited.side, Side::Buy);
+        assert_eq!(exited.price_entry_average, dec!(50_000));
+        assert_eq!(exited.pnl_realised, dec!(1_000));
+        assert_eq!(exited.time_enter, time(1_000));
+        assert!(spot.position.positions.is_empty());
+    }
+
+    /// Under Hedging, seeds occupy the slots they name, and `oms_mode` may be set after
+    /// `positions`: the seeds are checked against the mode at build time.
+    #[test]
+    fn hedging_seeds_occupy_named_slots_whatever_the_call_order() {
+        let instruments = seed_instruments();
+        let state: EngineState<(), ()> = EngineState::builder(&instruments, (), |_| ())
+            .positions([
+                long_seed(SPOT, dec!(1)).with_position_id(PositionId::new("a")),
+                long_seed(SPOT, dec!(2)).with_position_id(PositionId::new("b")),
+            ])
+            .oms_mode(OmsMode::Hedging)
+            .try_build()
+            .unwrap();
+
+        let positions = &state
+            .instruments
+            .instrument(&InstrumentNameInternal::new(SPOT))
+            .position
+            .positions;
+        assert_eq!(positions.len(), 2);
+        assert_eq!(positions[&PositionId::new("a")].quantity_abs, dec!(1));
+        assert_eq!(positions[&PositionId::new("b")].quantity_abs, dec!(2));
+    }
+
+    /// Naming the netting slot explicitly is the same as naming none.
+    #[test]
+    fn netting_seed_may_name_the_netting_slot() {
+        let instruments = seed_instruments();
+        let state = try_build(
+            &instruments,
+            OmsMode::Netting,
+            vec![long_seed(SPOT, dec!(1)).with_position_id(PositionId::NETTING)],
+        )
+        .unwrap();
+
+        assert!(
+            state
+                .instruments
+                .instrument(&InstrumentNameInternal::new(SPOT))
+                .position
+                .positions
+                .contains_key(&PositionId::NETTING)
+        );
+    }
+
+    #[test]
+    fn invalid_seeds_are_rejected() {
+        let instruments = seed_instruments();
+        let spot = InstrumentNameInternal::new(SPOT);
+        let cases = [
+            (
+                OmsMode::Netting,
+                vec![long_seed("unknown", dec!(1))],
+                PositionSeedError::UnknownInstrument {
+                    instrument: InstrumentNameInternal::new("unknown"),
+                },
+            ),
+            (
+                OmsMode::Netting,
+                vec![long_seed(SPOT, Decimal::ZERO)],
+                PositionSeedError::NonPositiveQuantity {
+                    instrument: spot.clone(),
+                    quantity_abs: Decimal::ZERO,
+                },
+            ),
+            (
+                OmsMode::Netting,
+                vec![long_seed(SPOT, dec!(-1))],
+                PositionSeedError::NonPositiveQuantity {
+                    instrument: spot.clone(),
+                    quantity_abs: dec!(-1),
+                },
+            ),
+            (
+                OmsMode::Netting,
+                vec![long_seed(SPOT, dec!(1)), long_seed(SPOT, dec!(2))],
+                PositionSeedError::DuplicateSlot {
+                    instrument: spot.clone(),
+                    position_id: PositionId::NETTING,
+                },
+            ),
+            (
+                OmsMode::Netting,
+                vec![long_seed(SPOT, dec!(1)).with_position_id(PositionId::new("a"))],
+                PositionSeedError::PositionIdInNetting {
+                    instrument: spot.clone(),
+                    position_id: PositionId::new("a"),
+                },
+            ),
+            (
+                OmsMode::Hedging,
+                vec![long_seed(SPOT, dec!(1))],
+                PositionSeedError::MissingPositionIdInHedging {
+                    instrument: spot.clone(),
+                },
+            ),
+            (
+                OmsMode::Hedging,
+                vec![
+                    long_seed(SPOT, dec!(1)).with_position_id(PositionId::new("a")),
+                    long_seed(SPOT, dec!(2)).with_position_id(PositionId::new("a")),
+                ],
+                PositionSeedError::DuplicateSlot {
+                    instrument: spot.clone(),
+                    position_id: PositionId::new("a"),
+                },
+            ),
+        ];
+
+        for (oms_mode, seeds, expected) in cases {
+            assert_eq!(
+                try_build(&instruments, oms_mode, seeds).unwrap_err(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "failed to build EngineState: position seed names unknown instrument"
+    )]
+    fn build_panics_on_an_invalid_seed() {
+        let instruments = seed_instruments();
+        let _: EngineState<(), ()> = EngineState::builder(&instruments, (), |_| ())
+            .positions([long_seed("unknown", dec!(1))])
+            .build();
     }
 }
