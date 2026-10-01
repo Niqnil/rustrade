@@ -563,9 +563,8 @@ fn pause_after(sent_ms: u128, now_ms: u128) -> Option<Duration> {
     let resume_ms = sent_ms - sent_ms % 60_000 + 60_000 + u128::from(MINUTE_BOUNDARY_SLACK_MS);
     let remaining_ms = resume_ms.checked_sub(now_ms).filter(|&ms| ms > 0)?;
     // At most a minute plus the slack, so it fits in a u64.
-    Some(Duration::from_millis(
-        u64::try_from(remaining_ms).unwrap_or(u64::MAX),
-    ))
+    #[allow(clippy::cast_possible_truncation)]
+    Some(Duration::from_millis(remaining_ms as u64))
 }
 
 /// Check if an anyhow::Error from binance-sdk REST is a rate-limit error.

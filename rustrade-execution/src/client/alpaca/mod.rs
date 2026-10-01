@@ -6415,6 +6415,29 @@ mod tests {
             }
         }
 
+        /// A reset further out than Alpaca's one-minute window holds requests back for a minute
+        /// at most.
+        #[tokio::test]
+        async fn a_pause_lasts_a_minute_at_most() {
+            tokio::time::pause();
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+            headers.insert(
+                "x-ratelimit-reset",
+                (now_secs + 3_600).to_string().parse().unwrap(),
+            );
+            let rl = RateLimitTracker::new();
+
+            observe_rate_limit_remaining(&rl, &headers);
+            assert!(holds_back(&rl).await);
+            tokio::time::advance(Duration::from_secs(DEFAULT_RATE_LIMIT_DELAY_SECS)).await;
+            assert!(!holds_back(&rl).await);
+        }
+
         /// A cancel's response reporting no requests left holds later requests back too.
         #[tokio::test]
         async fn rest_delete_with_retry_pauses_once_no_requests_remain() {
