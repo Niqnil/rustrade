@@ -164,8 +164,8 @@ pub enum EngineEvent<
     /// the `expiration_processed` flag.
     ///
     /// **Caller obligation**: inject this event when `Utc::now() >= contract.expiry`, and only
-    /// for an instrument that expires. One that never expires (`Spot`, `Perpetual`, `Cfd`) is
-    /// rejected without touching any state, with an
+    /// for an instrument that expires. One that never expires (`Spot`, `Perpetual`, `Cfd`), or a
+    /// key the engine was not built with, is rejected without touching any state, with an
     /// [`EngineOutput::ContractExpiryNotSettled`](engine::EngineOutput::ContractExpiryNotSettled)
     /// output. The handler is idempotent — duplicate events for the same instrument are safe.
     ///
@@ -206,9 +206,12 @@ pub enum EngineEvent<
     ///
     /// # Caller obligations
     /// - Assign a unique `id` per action.
-    /// - Resolve the ticker to a **valid** engine `InstrumentKey`. The engine indexes it directly
-    ///   and **panics on an unknown key** (consistent with the rest of the `EngineEvent` API), so
-    ///   validate the key before constructing the event.
+    /// - Resolve the ticker to the engine's `InstrumentKey`. A key the engine was not built with
+    ///   is rejected without touching any state, with an
+    ///   [`EngineOutput::UnsupportedCorporateAction`](engine::EngineOutput::UnsupportedCorporateAction)
+    ///   carrying
+    ///   [`UnknownInstrument`](engine::UnsupportedCorporateActionReason::UnknownInstrument); a valid
+    ///   key for the wrong instrument cannot be detected.
     /// - Supply the `policy` (matching the broker's rounding behaviour) and a resolved
     ///   `effective_time` (see [`split_effective_instant`]).
     /// - **Inject once**, after the broker has applied the action, before processing new fills on
