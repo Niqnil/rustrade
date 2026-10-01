@@ -21,7 +21,7 @@ use rustrade::{
         execution_tx::MultiExchangeTxMap,
         process_with_audit,
         state::{
-            EngineState,
+            EngineState, MarketSnapshotSource,
             asset::AssetStates,
             connectivity::{ConnectivityDimension, Health, UntrackedExchange},
             global::DefaultGlobalData,
@@ -2180,14 +2180,16 @@ fn test_command_send_requests_unknown_instrument_rejected_before_send() {
         "the sent open is recorded in flight"
     );
 
-    // Cancels: rejected before the send, so nothing reaches the venue and nothing is recorded.
-    let instruments_before_cancel = engine.state.instruments.clone();
+    // Cancels: the unknown one is rejected before the send, so it never reaches the venue; the known
+    // one beside it is sent and recorded in flight as usual.
     let unknown_cancel = cancel_request(unknown, "unknown-cancel");
+    let known_cancel = cancel_request(known, "known-open");
     let audit = process_with_audit(
         &mut engine,
-        EngineEvent::Command(Command::SendCancelRequests(OneOrMany::One(
+        EngineEvent::Command(Command::SendCancelRequests(OneOrMany::Many(vec![
             unknown_cancel.clone(),
-        ))),
+            known_cancel.clone(),
+        ]))),
     );
     let EngineAudit::Process(audit) = audit.event else {
         panic!("expected EngineAudit::Process");
@@ -2200,7 +2202,7 @@ fn test_command_send_requests_unknown_instrument_rejected_before_send() {
         audit.outputs,
         NoneOneOrMany::One(EngineOutput::Commanded(ActionOutput::CancelOrders(
             SendRequestsOutput {
-                sent: NoneOneOrMany::None,
+                sent: NoneOneOrMany::One(Box::new(known_cancel.clone())),
                 errors: NoneOneOrMany::One(Box::new((
                     unknown_cancel,
                     unknown_instrument_error(unknown)
@@ -2208,11 +2210,28 @@ fn test_command_send_requests_unknown_instrument_rejected_before_send() {
             }
         )))
     );
+    match execution_rx.rx.try_recv() {
+        Ok(ExecutionRequest::Cancel(request)) => assert_eq!(request.key, known_cancel.key),
+        other => panic!("expected the known cancel to be sent, got {other:?}"),
+    }
     assert!(
         execution_rx.rx.try_recv().is_err(),
         "the unknown cancel must not be sent"
     );
-    assert_eq!(engine.state.instruments, instruments_before_cancel);
+    let known_orders = &engine.state.instruments.instrument_index(&known).orders.0;
+    assert_eq!(known_orders.len(), 1);
+    assert!(matches!(
+        known_orders[&known_cancel.key.cid].state,
+        ActiveOrderState::CancelInFlight(_)
+    ));
+
+    // Asked directly, the state has no market for an unknown instrument rather than panicking.
+    assert_eq!(engine.state.market_snapshot(&unknown), None);
+    for (index, state) in engine.state.instruments.0.values().enumerate() {
+        if index != known.index() {
+            assert!(state.orders.0.is_empty());
+        }
+    }
 }
 
 /// Emits one cancel and one open for a fixed instrument, from both the algo and the

@@ -113,6 +113,18 @@ where
 /// [`RecoverableEngineError::UnknownInstrument`](crate::engine::error::RecoverableEngineError::UnknownInstrument)
 /// in the action output's `errors`, so nothing reaches the venue that the state could not record.
 ///
+/// The check runs before anything else on the request, including the lookup of its exchange's
+/// execution channel, so a request naming both an unknown instrument and an unknown exchange is
+/// rejected as an unknown instrument. It does not check that the instrument belongs to that
+/// exchange.
+///
+/// # Implementing this
+/// Returning `true` for a key promises that this state's
+/// [`InFlightRequestRecorder`](order::in_flight_recorder::InFlightRequestRecorder) and
+/// [`MarketSnapshotSource`] accept it: the `Engine` records a request only after it has been sent,
+/// so a recorder that panics on a key this reported as tracked fails after the venue has the
+/// request.
+///
 /// # Type Parameters
 /// * `InstrumentKey` - Type used to identify an instrument (defaults to [`InstrumentIndex`]).
 pub trait TracksInstrument<InstrumentKey = InstrumentIndex> {

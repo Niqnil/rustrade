@@ -196,10 +196,11 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk>
             .into_iter()
             .map(|mut request| {
                 if !self.state.tracks_instrument(&request.key.instrument) {
+                    // The whole request is returned in `errors`; the log names what finds it.
                     warn!(
-                        exchange = ?request.key.exchange,
                         instrument = ?request.key.instrument,
-                        ?request,
+                        strategy = %request.key.strategy,
+                        cid = %request.key.cid,
                         "order request for an instrument the Engine does not track -- rejected, \
                          not sent"
                     );
