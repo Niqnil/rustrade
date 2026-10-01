@@ -112,6 +112,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Binance spot's `account_stream` delivered no user-data events at all** (`rustrade-execution`,
+  feature `binance`). The stream subscribes through the WebSocket API
+  (`userDataStream.subscribe.signature`), which wraps each event as
+  `{ "subscriptionId", "event": { "e", .. } }`, and binance-sdk passes that frame on unchanged.
+  The converter read the event type from the top level of the frame, found none, and dropped
+  every order update, fill, balance update and `eventStreamTerminated` without a log. So a fill
+  never reached the engine as a trade, and the stream did not reconnect when Binance ended it.
+  Fills recovered over REST after a reconnect, and the order snapshot `open_order` returns, were
+  unaffected. The converter now unwraps the envelope, sharing the parsing with Binance margin,
+  which already did. A frame that is neither an RPC response nor an event envelope with an `e`
+  tag is now logged on both, instead of being dropped silently: at `warn` for the first and every
+  1000th after it, counted per venue across the process, and at `trace` otherwise.
+
 - **Binance margin `fetch_trades` and reconnect fill recovery could miss fills more than 24 hours
   back** (`rustrade-execution`, feature `binance`). Binance's margin `myTrades` returns only 24
   hours of trades to a query without `fromId`, but the client sent `startTime` alone and then
