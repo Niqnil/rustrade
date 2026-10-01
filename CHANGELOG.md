@@ -122,7 +122,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unaffected. The converter now unwraps the envelope, sharing the parsing with Binance margin,
   which already did. A frame that is neither an RPC response nor an event envelope with an `e`
   tag is now logged on both, instead of being dropped silently: at `warn` for the first and every
-  1000th after it, at `trace` otherwise.
+  1000th after it, counted per venue across the process, and at `trace` otherwise.
 
 - **Binance margin `fetch_trades` and reconnect fill recovery could miss fills more than 24 hours
   back** (`rustrade-execution`, feature `binance`). Binance's margin `myTrades` returns only 24

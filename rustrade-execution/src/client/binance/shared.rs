@@ -227,8 +227,11 @@ pub(crate) fn parse_user_data_frame(frame: &str) -> UserDataFrame<'_> {
 
 /// Log an [`UserDataFrame::Unrecognised`] frame: at `warn` for the first, and for every 1000th
 /// after it with the running count, and at `trace` otherwise. So a change in delivery that makes
-/// every frame unrecognised is seen at once, without a warning per frame. `seen` counts across
-/// every stream that shares it.
+/// every frame unrecognised is seen at once, without a warning per frame.
+///
+/// `seen` is the caller's process-wide counter, one per venue: it is shared by every stream of
+/// that venue and never resets, so a later stream or outage warns again only at the next
+/// thousandth frame, not on its first.
 pub(crate) fn log_unrecognised_frame(venue: &'static str, seen: &AtomicU64, frame: &str) {
     let count = seen.fetch_add(1, Ordering::Relaxed) + 1;
     if count == 1 || count.is_multiple_of(1000) {
@@ -237,8 +240,8 @@ pub(crate) fn log_unrecognised_frame(venue: &'static str, seen: &AtomicU64, fram
             count,
             frame = frame_excerpt(frame),
             "Binance WS: unrecognised user-data frame (not an RPC response, nor an event envelope \
-             with an `e` tag), ignoring it; further ones are logged at trace, with a warning \
-             every 1000th"
+             with a readable `e` tag), ignoring it; further ones are logged at trace, with a \
+             warning every 1000th"
         );
     } else {
         trace!(
