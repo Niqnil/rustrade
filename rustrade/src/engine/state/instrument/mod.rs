@@ -109,26 +109,44 @@ pub(crate) struct OptionSplitPlan {
 }
 
 impl<InstrumentData> InstrumentStates<InstrumentData> {
+    /// Return a reference to the `InstrumentState` associated with an `InstrumentIndex`, or
+    /// `None` if these `InstrumentStates` hold no instrument at that index.
+    ///
+    /// An index is only meaningful for the `IndexedInstruments` it was taken from: one from
+    /// another set can resolve here to a different instrument, which no lookup can detect.
+    pub fn get_index(&self, key: &InstrumentIndex) -> Option<&InstrumentState<InstrumentData>> {
+        self.0.get_index(key.index()).map(|(_key, state)| state)
+    }
+
+    /// Return a mutable reference to the `InstrumentState` associated with an `InstrumentIndex`,
+    /// or `None` if these `InstrumentStates` hold no instrument at that index.
+    ///
+    /// See [`Self::get_index`] for what the index identifies.
+    pub fn get_index_mut(
+        &mut self,
+        key: &InstrumentIndex,
+    ) -> Option<&mut InstrumentState<InstrumentData>> {
+        self.0.get_index_mut(key.index()).map(|(_key, state)| state)
+    }
+
     /// Return a reference to the `InstrumentState` associated with an `InstrumentIndex`.
     ///
-    /// Panics if `InstrumentState` associated with the `InstrumentIndex` does not exist.
+    /// Panics if `InstrumentState` associated with the `InstrumentIndex` does not exist; see
+    /// [`Self::get_index`] for the non-panicking form.
     pub fn instrument_index(&self, key: &InstrumentIndex) -> &InstrumentState<InstrumentData> {
-        self.0
-            .get_index(key.index())
-            .map(|(_key, state)| state)
+        self.get_index(key)
             .unwrap_or_else(|| panic!("InstrumentStates does not contain: {key}"))
     }
 
     /// Return a mutable reference to the `InstrumentState` associated with an `InstrumentIndex`.
     ///
-    /// Panics if `InstrumentState` associated with the `InstrumentIndex` does not exist.
+    /// Panics if `InstrumentState` associated with the `InstrumentIndex` does not exist; see
+    /// [`Self::get_index_mut`] for the non-panicking form.
     pub fn instrument_index_mut(
         &mut self,
         key: &InstrumentIndex,
     ) -> &mut InstrumentState<InstrumentData> {
-        self.0
-            .get_index_mut(key.index())
-            .map(|(_key, state)| state)
+        self.get_index_mut(key)
             .unwrap_or_else(|| panic!("InstrumentStates does not contain: {key}"))
     }
 

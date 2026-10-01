@@ -52,9 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`EngineOutput::ContractExpiryNotSettled`** (`rustrade`), emitted when a `ContractExpiry` does
   not settle its instrument. Its `ContractExpiryNotSettledReason` is `InstrumentNeverExpires` for
-  a `Spot`, `Perpetual` or `Cfd` instrument (see Fixed), or `SettlementPriceUnavailable` when the
-  price settlement needs has not arrived. That second case was only logged before; the event
-  stays retryable. Both enums are `#[non_exhaustive]`, so no downstream `match` breaks.
+  a `Spot`, `Perpetual` or `Cfd` instrument (see Fixed), `SettlementPriceUnavailable` when the
+  price settlement needs has not arrived, or `UnknownInstrument` (see Fixed).
+  `SettlementPriceUnavailable` was only logged before; the event stays retryable. Both enums are
+  `#[non_exhaustive]`, so no downstream `match` breaks.
 
 - **`ApiError::RequestRejected`** (`rustrade-execution`): the venue refused the request itself,
   such as a missing, malformed or out-of-range parameter, as opposed to an order failing a
@@ -165,6 +166,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The audit replica marked such an instrument processed when it held no position. It now
     follows the live engine, and it also leaves state alone on a repeated expiry, as the live
     engine does.
+
+- **A `ContractExpiry` or `CorporateAction` naming an unknown instrument panicked the engine**
+  (`rustrade`). Both events are built by the caller, and an `InstrumentIndex` the engine was not
+  built with, such as one taken from another `IndexedInstruments`, reached a positional lookup
+  that panicked, stopping a live engine. The engine now rejects the event without touching any
+  state: a `ContractExpiry` with `EngineOutput::ContractExpiryNotSettled`, a `CorporateAction`
+  with `EngineOutput::UnsupportedCorporateAction` and its `id` unrecorded, each with a new
+  `UnknownInstrument` reason. Both reason enums are `#[non_exhaustive]`, so no downstream `match`
+  breaks. The audit replica does the same. New `InstrumentStates::get_index` and `get_index_mut`
+  look an index up without panicking. A valid index for the wrong instrument still cannot be
+  detected.
+
+- **The audit replica left a settled contract expiry out of its tear sheet** (`rustrade`). When a
+  `ContractExpiry` closed positions, the live engine added each closed position to the
+  instrument's tear sheet, but the replica only removed the position, so its statistics drifted
+  from the live engine's after every settled expiry. It now adds each closed position as well.
+  The replica's rustdoc now also states that it does not mirror in-flight requests: an order the
+  engine has just sent, or a cancel it is waiting on, shows in the replica only once the venue
+  answers.
 
 - **Alpaca's `account_snapshot` did not report equity and option positions**
   (`rustrade-execution`, feature `alpaca`). Every `InstrumentAccountSnapshot::position` was
