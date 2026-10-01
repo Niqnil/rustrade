@@ -48,7 +48,10 @@ use smol_str::format_smolstr;
 use std::{
     pin::Pin,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -160,13 +163,14 @@ pub(crate) enum UserDataFrame<'a> {
     Event {
         /// The subscription the event belongs to; it routes isolated-margin events.
         subscription_id: Option<i64>,
-        /// The inner event's `e` tag; empty when it has none.
+        /// The inner event's `e` tag.
         event_type: &'a str,
         /// The inner event, unparsed, for the matched branch's one typed pass.
         event: &'a str,
     },
-    /// Neither: a frame shape this client does not know. Its caller logs it, since a change in
-    /// how Binance delivers events would otherwise drop every event without a trace.
+    /// A frame shape this client does not know: neither of the above, or an event whose `e` tag
+    /// is missing or not a plain string. Its caller logs it through [`log_unrecognised_frame`],
+    /// since a change in how Binance delivers events would otherwise drop every event silently.
     Unrecognised,
 }
 
@@ -206,10 +210,14 @@ pub(crate) fn parse_user_data_frame(frame: &str) -> UserDataFrame<'_> {
         return UserDataFrame::Unrecognised;
     };
     let event = event.get();
-    let event_type = serde_json::from_str::<EventTag<'_>>(event)
+    // A missing tag, or one that cannot be borrowed (escaped, or not a string), is unrecognised
+    // rather than an empty type: an unknown type is ignored quietly, and this must not be.
+    let Some(event_type) = serde_json::from_str::<EventTag<'_>>(event)
         .ok()
         .and_then(|tag| tag.e)
-        .unwrap_or_default();
+    else {
+        return UserDataFrame::Unrecognised;
+    };
     UserDataFrame::Event {
         subscription_id: envelope.subscription_id,
         event_type,
@@ -217,8 +225,33 @@ pub(crate) fn parse_user_data_frame(frame: &str) -> UserDataFrame<'_> {
     }
 }
 
+/// Log an [`UserDataFrame::Unrecognised`] frame: at `warn` for the first, and for every 1000th
+/// after it with the running count, and at `trace` otherwise. So a change in delivery that makes
+/// every frame unrecognised is seen at once, without a warning per frame. `seen` counts across
+/// every stream that shares it.
+pub(crate) fn log_unrecognised_frame(venue: &'static str, seen: &AtomicU64, frame: &str) {
+    let count = seen.fetch_add(1, Ordering::Relaxed) + 1;
+    if count == 1 || count.is_multiple_of(1000) {
+        warn!(
+            venue,
+            count,
+            frame = frame_excerpt(frame),
+            "Binance WS: unrecognised user-data frame (not an RPC response, nor an event envelope \
+             with an `e` tag), ignoring it; further ones are logged at trace, with a warning \
+             every 1000th"
+        );
+    } else {
+        trace!(
+            venue,
+            count,
+            frame = frame_excerpt(frame),
+            "Binance WS: unrecognised user-data frame, ignoring it"
+        );
+    }
+}
+
 /// The first 200 characters of a frame, for a log line about it.
-pub(crate) fn frame_excerpt(frame: &str) -> &str {
+fn frame_excerpt(frame: &str) -> &str {
     frame
         .char_indices()
         .nth(200)
@@ -1985,12 +2018,21 @@ mod tests {
                 event: r#"{"e":"outboundAccountPosition","E":1}"#,
             }
         );
-        // An envelope whose event has no `e` is still an event, with an empty type.
-        assert!(matches!(
-            parse_user_data_frame(r#"{"subscriptionId":4,"event":{"E":1}}"#),
-            UserDataFrame::Event { event_type: "", .. }
-        ));
-        for frame in [r#"{"e":"executionReport","i":1}"#, "not json", "[]"] {
+        // A frame with both `id` and `event` is a response.
+        assert_eq!(
+            parse_user_data_frame(r#"{"id":1,"subscriptionId":4,"event":{"e":"x"}}"#),
+            UserDataFrame::Response
+        );
+        for frame in [
+            // A bare event: the shape the spot converter used to assume.
+            r#"{"e":"executionReport","i":1}"#,
+            // An envelope whose event has no `e`, a non-string `e`, or an escaped one.
+            r#"{"subscriptionId":4,"event":{"E":1}}"#,
+            r#"{"subscriptionId":4,"event":{"e":7}}"#,
+            r#"{"subscriptionId":4,"event":{"e":"executionRep\u006frt"}}"#,
+            "not json",
+            "[]",
+        ] {
             assert_eq!(
                 parse_user_data_frame(frame),
                 UserDataFrame::Unrecognised,
@@ -2002,6 +2044,8 @@ mod tests {
     #[test]
     fn frame_excerpt_cuts_at_200_characters_on_a_char_boundary() {
         assert_eq!(frame_excerpt("short"), "short");
+        let exact = "a".repeat(200);
+        assert_eq!(frame_excerpt(&exact), exact);
         let long = "é".repeat(300);
         assert_eq!(frame_excerpt(&long).chars().count(), 200);
     }

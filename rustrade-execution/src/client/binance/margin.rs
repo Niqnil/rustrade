@@ -54,8 +54,8 @@ use super::shared::{
     SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UserDataFrame, classify_order_kind_tif,
     classify_rest_order_error, classify_rest_query_error, convert_execution_report,
     convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event,
-    frame_excerpt, is_duplicate, new_dedup_cache, parse_user_data_frame, recovered_order_totals,
-    response_decode_error, rest_call_with_retry,
+    is_duplicate, log_unrecognised_frame, new_dedup_cache, parse_user_data_frame,
+    recovered_order_totals, response_decode_error, rest_call_with_retry,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, InstrumentBalanceUpdate,
@@ -121,7 +121,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -1562,8 +1562,9 @@ fn convert_margin_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEv
 ///
 /// Each text frame is either an RPC response (`{ "id", "status", "result", … }` — e.g. the
 /// subscribe ack) or a pushed user-data event wrapped as `{ "subscriptionId", "event": { "e", … } }`.
-/// Returns `true` if the exchange signalled stream termination (a reconnect trigger). Unknown frames
-/// are ignored. Deserialization of a known event type is defensive: a mismatch is logged and the
+/// Returns `true` if the exchange signalled stream termination (a reconnect trigger). Unrecognised
+/// frames are ignored and logged by [`log_unrecognised_frame`] (throttled `warn`); unknown event
+/// types are ignored at `trace`. Deserialization of a known event type is defensive: a mismatch is logged and the
 /// event dropped (observable), never silently mis-parsed.
 ///
 /// The `outboundAccountPosition` (balance) arm is delegated to `handle_position` — the **only** arm
@@ -1589,11 +1590,8 @@ fn convert_margin_user_data_events_with(
             event,
         } => (subscription_id, event_type, event),
         UserDataFrame::Unrecognised => {
-            warn!(
-                frame = frame_excerpt(frame),
-                "BinanceMargin WS: unrecognised user-data frame (neither a response nor an event \
-                 envelope), ignoring"
-            );
+            static SEEN: AtomicU64 = AtomicU64::new(0);
+            log_unrecognised_frame("BinanceMargin", &SEEN, frame);
             return false;
         }
     };
@@ -4579,6 +4577,20 @@ mod tests {
         let mut buf = Vec::new();
         assert!(!convert_margin_user_data_events(&frame, &mut buf));
         assert!(buf.is_empty());
+    }
+
+    /// A bare event, with no envelope, or an envelope whose event has no `e` tag, is not a shape
+    /// the subscription delivers: nothing is converted and the stream is not terminated.
+    #[test]
+    fn margin_ws_unrecognised_frames_yield_no_events() {
+        for frame in [
+            r#"{"e":"eventStreamTerminated","E":1}"#,
+            r#"{"subscriptionId":1,"event":{"E":1}}"#,
+        ] {
+            let mut buf = Vec::new();
+            assert!(!convert_margin_user_data_events(frame, &mut buf), "{frame}");
+            assert!(buf.is_empty(), "{frame}");
+        }
     }
 
     /// A partial fill carries two facts, and both must reach the consumer: the execution print

@@ -38,8 +38,8 @@ use super::shared::{
     SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UserDataFrame, classify_order_kind_tif,
     classify_rest_query_error, classify_ws_order_error, convert_execution_report,
     convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event,
-    frame_excerpt, is_duplicate, new_dedup_cache, parse_user_data_frame, recovered_order_totals,
-    response_decode_error, rest_call_with_retry,
+    is_duplicate, log_unrecognised_frame, new_dedup_cache, parse_user_data_frame,
+    recovered_order_totals, response_decode_error, rest_call_with_retry,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
@@ -91,7 +91,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -1426,8 +1426,8 @@ async fn connection_manager(
                     // `true` is visible before the monitor swaps in `false`.
                     hb_callback.store(true, Ordering::Release);
                     // Borrowed discriminator + matched-variant parse (no full Value DOM).
-                    // Unparseable / non-user-data frames (subscribe acks, WS-API metadata)
-                    // are ignored inside the converter.
+                    // RPC responses (the subscribe ack) are ignored inside the converter, and
+                    // unrecognised frames are logged there (throttled warn).
                     let stream_terminated = convert_user_data_events(&json_str, &mut event_buf);
                     for ev in event_buf.drain(..) {
                         // Dedup check
@@ -1913,7 +1913,8 @@ fn convert_my_trade(
 /// The subscription is WS-API `userDataStream.subscribe.signature`, so each pushed event arrives
 /// wrapped as `{ "subscriptionId", "event": { "e", .. } }`, and binance-sdk passes the frame on
 /// unchanged; [`parse_user_data_frame`] unwraps it, as for margin. RPC responses (the subscribe
-/// acknowledgement) are ignored. A frame of any other shape is logged at `warn` and ignored, so a
+/// acknowledgement) are ignored. A frame of any other shape, including an event without a
+/// readable `e` tag, is ignored and logged by [`log_unrecognised_frame`] (throttled `warn`), so a
 /// change in delivery cannot drop events silently. Unknown event types inside the envelope are
 /// ignored at `trace`.
 ///
@@ -1930,11 +1931,8 @@ fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -
             event_type, event, ..
         } => (event_type, event),
         UserDataFrame::Unrecognised => {
-            warn!(
-                frame = frame_excerpt(frame),
-                "BinanceSpot WS: unrecognised user-data frame (neither a response nor an event \
-                 envelope), ignoring"
-            );
+            static SEEN: AtomicU64 = AtomicU64::new(0);
+            log_unrecognised_frame("BinanceSpot", &SEEN, frame);
             return false;
         }
     };
@@ -4138,7 +4136,7 @@ mod tests {
 
     #[test]
     fn test_convert_user_data_events_non_user_data_frame_ignored() {
-        // Subscribe acks / WS-API metadata carry no `e` tag — ignored, not mis-parsed.
+        // RPC responses such as the subscribe ack carry a top-level `id` — ignored, not mis-parsed.
         let frame = r#"{"id":"abc","status":200,"result":[]}"#;
         let mut buf = Vec::new();
         let terminated = convert_user_data_events(frame, &mut buf);

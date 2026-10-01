@@ -120,8 +120,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never reached the engine as a trade, and the stream did not reconnect when Binance ended it.
   Fills recovered over REST after a reconnect, and the order snapshot `open_order` returns, were
   unaffected. The converter now unwraps the envelope, sharing the parsing with Binance margin,
-  which already did. A frame that is neither an event envelope nor an RPC response is now logged
-  at `warn` on both, instead of being dropped silently.
+  which already did. A frame that is neither an RPC response nor an event envelope with an `e`
+  tag is now logged on both, instead of being dropped silently: at `warn` for the first and every
+  1000th after it, at `trace` otherwise.
 
 - **Binance margin `fetch_trades` and reconnect fill recovery could miss fills more than 24 hours
   back** (`rustrade-execution`, feature `binance`). Binance's margin `myTrades` returns only 24
