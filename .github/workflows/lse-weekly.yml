@@ -29,6 +29,10 @@ concurrency:
   group: lse-api-key
   cancel-in-progress: false
 
+# Read-only: the canaries only need the checkout.
+permissions:
+  contents: read
+
 env:
   MOLD_VERSION: "2.35.1"
 
