@@ -15,8 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   current market, and without recording the request as in flight, so the engine's own state did
   not know the order existed. The engine no longer used either internally. Send orders through the
   engine's actions instead, such as `Command::SendOpenRequests` and `Command::SendCancelRequests`,
-  which reject an untracked instrument, stamp each open with the current market, and record every
-  request as in flight. `SendRequestsOutput` and `SendCancelsAndOpensOutput` are unchanged.
+  which reject an untracked instrument, stamp each open with the current market, and record each
+  request they send as in flight. `SendRequestsOutput` and `SendCancelsAndOpensOutput` are unchanged.
 
 ### Fixed
 
