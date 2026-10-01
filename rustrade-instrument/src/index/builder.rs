@@ -608,6 +608,40 @@ mod tests {
         assert!(message.contains("underlying btc/usdc"), "{message}");
     }
 
+    #[test]
+    fn test_duplicate_name_internal_message_distinguishes_underlyings_differing_only_in_an_exchange_name()
+     {
+        // Both underlyings read `btc/usdt` by internal name, so only the assets' exchange-side
+        // names tell them apart, and the message must reach for them.
+        let build = |quote_name_exchange| {
+            Instrument::new(
+                ExchangeId::BinanceSpot,
+                "binance_spot-btc_usdt",
+                "BTCUSDT",
+                Underlying::new(
+                    Asset::new_from_exchange("btc"),
+                    Asset::new("usdt", quote_name_exchange),
+                ),
+                InstrumentQuoteAsset::UnderlyingQuote,
+                InstrumentKind::Spot,
+                None,
+            )
+        };
+
+        let error = IndexedInstrumentsBuilder::default()
+            .add_instrument(build("USDT"))
+            .add_instrument(build("USDT-ERC20"))
+            .try_build()
+            .expect_err("duplicate name_internal must be rejected");
+
+        let IndexError::DuplicateInstrumentNameInternal(message) = &error else {
+            panic!("unexpected error variant: {error:?}")
+        };
+
+        assert!(message.contains("\"USDT\""), "{message}");
+        assert!(message.contains("USDT-ERC20"), "{message}");
+    }
+
     /// A spot and a CFD named `AAPL` on one venue, with distinct internal names: the
     /// `name_internal` check passes them, but every fill the venue reports for `AAPL` could resolve
     /// to either.
