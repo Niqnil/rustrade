@@ -24,114 +24,6 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use tracing::{error, warn};
 
-/// Trait that defines how the [`Engine`] sends order requests.
-///
-/// It sends exactly what it is given. The `Engine`'s own actions first reject any request for an
-/// instrument the state does not track (see [`TracksInstrument`]) and stamp each open with the
-/// market, then send through it and record what was sent as in flight.
-///
-/// # Type Parameters
-/// * `ExchangeKey` - Type used to identify an exchange (defaults to [`ExchangeIndex`]).
-/// * `InstrumentKey` - Type used to identify an instrument (defaults to [`InstrumentIndex`]).
-pub trait SendRequests<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex> {
-    fn send_requests<Kind>(
-        &self,
-        requests: impl IntoIterator<Item = OrderEvent<Kind, ExchangeKey, InstrumentKey>>,
-    ) -> SendRequestsOutput<Kind, ExchangeKey, InstrumentKey>
-    where
-        Kind: Debug + Clone,
-        ExecutionRequest<ExchangeKey, InstrumentKey>:
-            From<OrderEvent<Kind, ExchangeKey, InstrumentKey>>;
-
-    fn send_request<Kind>(
-        &self,
-        request: &OrderEvent<Kind, ExchangeKey, InstrumentKey>,
-    ) -> Result<(), EngineError>
-    where
-        Kind: Debug + Clone,
-        ExecutionRequest<ExchangeKey, InstrumentKey>:
-            From<OrderEvent<Kind, ExchangeKey, InstrumentKey>>;
-}
-
-impl<Clock, State, ExecutionTxs, Strategy, Risk, ExchangeKey, InstrumentKey>
-    SendRequests<ExchangeKey, InstrumentKey> for Engine<Clock, State, ExecutionTxs, Strategy, Risk>
-where
-    ExecutionTxs: ExecutionTxMap<ExchangeKey, InstrumentKey>,
-    ExchangeKey: Debug + Clone,
-    InstrumentKey: Debug + Clone,
-{
-    fn send_requests<Kind>(
-        &self,
-        requests: impl IntoIterator<Item = OrderEvent<Kind, ExchangeKey, InstrumentKey>>,
-    ) -> SendRequestsOutput<Kind, ExchangeKey, InstrumentKey>
-    where
-        Kind: Debug + Clone,
-        ExecutionRequest<ExchangeKey, InstrumentKey>:
-            From<OrderEvent<Kind, ExchangeKey, InstrumentKey>>,
-    {
-        // Send order requests
-        let (sent, errors): (Vec<_>, Vec<_>) = requests
-            .into_iter()
-            .map(|request| {
-                self.send_request(&request)
-                    .map_err(|error| (request.clone(), error))
-                    .map(|_| request)
-            })
-            .partition_result();
-
-        SendRequestsOutput::new(
-            sent.into_iter().map(Box::new).collect(),
-            errors.into_iter().map(Box::new).collect(),
-        )
-    }
-
-    fn send_request<Kind>(
-        &self,
-        request: &OrderEvent<Kind, ExchangeKey, InstrumentKey>,
-    ) -> Result<(), EngineError>
-    where
-        Kind: Debug + Clone,
-        ExecutionRequest<ExchangeKey, InstrumentKey>:
-            From<OrderEvent<Kind, ExchangeKey, InstrumentKey>>,
-    {
-        match self
-            .execution_txs
-            .find(&request.key.exchange)?
-            .send(ExecutionRequest::from(request.clone()))
-        {
-            Ok(()) => Ok(()),
-            Err(error) if error.is_unrecoverable() => {
-                error!(
-                    exchange = ?request.key.exchange,
-                    ?request,
-                    ?error,
-                    "failed to send ExecutionRequest due to terminated channel"
-                );
-                Err(EngineError::Unrecoverable(
-                    UnrecoverableEngineError::ExecutionChannelTerminated(format!(
-                        "{:?} execution channel terminated: {:?}",
-                        request.key.exchange, error
-                    )),
-                ))
-            }
-            Err(error) => {
-                error!(
-                    exchange = ?request.key.exchange,
-                    ?request,
-                    ?error,
-                    "failed to send ExecutionRequest due to unhealthy channel"
-                );
-                Err(EngineError::Recoverable(
-                    RecoverableEngineError::ExecutionChannelUnhealthy(format!(
-                        "{:?} execution channel unhealthy: {:?}",
-                        request.key.exchange, error
-                    )),
-                ))
-            }
-        }
-    }
-}
-
 impl<Clock, State, ExecutionTxs, Strategy, Risk>
     Engine<Clock, State, ExecutionTxs, Strategy, Risk>
 {
@@ -220,6 +112,60 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk>
             .partition_result();
 
         SendRequestsOutput::new(sent.into_iter().collect(), errors.into_iter().collect())
+    }
+
+    /// Send one request down its exchange's execution channel, exactly as given.
+    ///
+    /// Private: it neither checks the instrument is tracked nor records the request as in flight.
+    /// Every request the `Engine` sends goes through [`Self::send_tracked_requests`], which does
+    /// the first, and its callers, which do the second.
+    fn send_request<Kind, ExchangeKey, InstrumentKey>(
+        &self,
+        request: &OrderEvent<Kind, ExchangeKey, InstrumentKey>,
+    ) -> Result<(), EngineError>
+    where
+        ExecutionTxs: ExecutionTxMap<ExchangeKey, InstrumentKey>,
+        Kind: Debug + Clone,
+        ExchangeKey: Debug + Clone,
+        InstrumentKey: Debug + Clone,
+        ExecutionRequest<ExchangeKey, InstrumentKey>:
+            From<OrderEvent<Kind, ExchangeKey, InstrumentKey>>,
+    {
+        match self
+            .execution_txs
+            .find(&request.key.exchange)?
+            .send(ExecutionRequest::from(request.clone()))
+        {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_unrecoverable() => {
+                error!(
+                    exchange = ?request.key.exchange,
+                    ?request,
+                    ?error,
+                    "failed to send ExecutionRequest due to terminated channel"
+                );
+                Err(EngineError::Unrecoverable(
+                    UnrecoverableEngineError::ExecutionChannelTerminated(format!(
+                        "{:?} execution channel terminated: {:?}",
+                        request.key.exchange, error
+                    )),
+                ))
+            }
+            Err(error) => {
+                error!(
+                    exchange = ?request.key.exchange,
+                    ?request,
+                    ?error,
+                    "failed to send ExecutionRequest due to unhealthy channel"
+                );
+                Err(EngineError::Recoverable(
+                    RecoverableEngineError::ExecutionChannelUnhealthy(format!(
+                        "{:?} execution channel unhealthy: {:?}",
+                        request.key.exchange, error
+                    )),
+                ))
+            }
+        }
     }
 }
 

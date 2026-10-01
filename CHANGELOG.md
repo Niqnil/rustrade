@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **The public `SendRequests` trait** (`rustrade`). **Breaking.** Its two methods,
+  `send_requests` and `send_request`, sent order requests exactly as given: without the engine's
+  rejection of a request for an instrument it does not track, without stamping an open with the
+  current market, and without recording the request as in flight, so the engine's own state did
+  not know the order existed. The engine no longer used either internally. Send orders through the
+  engine's actions instead, such as `Command::SendOpenRequests` and `Command::SendCancelRequests`,
+  which do all three. `SendRequestsOutput` and `SendCancelsAndOpensOutput` are unchanged.
+
 ## [0.8.0] - 2026-10-01
 
 ### Added
