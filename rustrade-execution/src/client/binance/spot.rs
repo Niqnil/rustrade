@@ -4627,8 +4627,22 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/api/v3/myTrades"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
-            .expect(1)
+            // One trade, so recovery also looks its order up: both reads run under the pause.
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "symbol": "BTCUSDT",
+                    "id": 1,
+                    "orderId": 7,
+                    "price": "100",
+                    "qty": "1",
+                    "commission": "0",
+                    "commissionAsset": "USDT",
+                    "time": Utc::now().timestamp_millis(),
+                    "isBuyer": true,
+                    "isMaker": false,
+                }])),
+            )
+            .expect(2)
             .mount(&server)
             .await;
         let rest = Arc::new(SpotRestApi::from_config(
@@ -4643,7 +4657,7 @@ mod tests {
         tracker.throttle(Duration::from_secs(60));
         let (tx, _rx) = mpsc::unbounded_channel();
 
-        // Well under the shortest pause, which is at least a second.
+        // Far under the 60 s pause set above, and ample for two local round trips.
         tokio::time::timeout(
             Duration::from_millis(800),
             recover_fills(

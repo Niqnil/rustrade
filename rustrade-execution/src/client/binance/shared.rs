@@ -343,9 +343,10 @@ struct Deadlines {
 /// - a cooldown after Binance answered with a rate-limit error, which every request honours;
 /// - a pause until the next minute once the weight used reaches [`WEIGHT_PAUSE_PERCENT`] of the
 ///   per-minute limit, which only [`RequestKind::Query`] requests honour, so the weight left
-///   stays free for orders, cancels and [`RequestKind::Essential`] reads. The weight used comes from successful responses
-///   ([`observe_rest`](Self::observe_rest), [`observe_ws_api`](Self::observe_ws_api)); a
-///   rejected request's response is not observed, so usage can only be under-counted.
+///   stays free for orders, cancels and [`RequestKind::Essential`] reads. The weight used comes
+///   from successful responses ([`observe_rest`](Self::observe_rest),
+///   [`observe_ws_api`](Self::observe_ws_api)); a rejected request's response is not observed,
+///   so usage can only be under-counted.
 pub(crate) struct RateLimitTracker {
     // parking_lot::Mutex — never poisons, consistent with SharedDedupCache
     deadlines: parking_lot::Mutex<Deadlines>,
