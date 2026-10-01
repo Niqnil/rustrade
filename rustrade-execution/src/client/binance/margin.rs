@@ -2086,6 +2086,7 @@ async fn recover_margin_fills(
                 recovered,
                 duplicates,
                 failed_instruments,
+                is_isolated,
                 unrecovered = ?unrecovered_instruments(instruments, &recovered_instruments),
                 "BinanceMargin fill recovery complete with failures — fills since the disconnect may be permanently missed for the unrecovered instruments"
             );
