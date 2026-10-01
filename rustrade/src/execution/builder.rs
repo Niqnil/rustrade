@@ -356,24 +356,33 @@ impl ExecutionBuildFutures {
         self,
         runtime: tokio::runtime::Handle,
     ) -> Result<ExecutionHandles, BarterError> {
-        let mock_exchanges = self
+        // Spawned first: the ExecutionManager build futures below connect to them.
+        let mock_exchanges: Vec<_> = self
             .mock_exchange_run_futures
             .into_iter()
             .map(|mock_exchange_run_future| runtime.spawn(mock_exchange_run_future))
             .collect();
 
-        // Await ExecutionManager build futures and ensure success
-        let (managers, account_to_engines) =
-            futures::future::try_join_all(self.execution_init_futures)
-                .await?
-                .into_iter()
-                .map(|(manager_run_future, account_event_forward_future)| {
-                    (
-                        runtime.spawn(manager_run_future),
-                        runtime.spawn(account_event_forward_future),
-                    )
-                })
-                .unzip();
+        // Await ExecutionManager build futures and ensure success. On failure, abort the mock
+        // exchanges spawned above: dropping a `JoinHandle` only detaches its task, which would
+        // leave each one running with nothing able to stop it.
+        let execution_inits = match try_join_all(self.execution_init_futures).await {
+            Ok(execution_inits) => execution_inits,
+            Err(error) => {
+                mock_exchanges.iter().for_each(JoinHandle::abort);
+                return Err(error.into());
+            }
+        };
+
+        let (managers, account_to_engines) = execution_inits
+            .into_iter()
+            .map(|(manager_run_future, account_event_forward_future)| {
+                (
+                    runtime.spawn(manager_run_future),
+                    runtime.spawn(account_event_forward_future),
+                )
+            })
+            .unzip();
 
         Ok(ExecutionHandles {
             mock_exchanges,
@@ -963,5 +972,47 @@ mod tests {
         };
         assert!(message.contains(EXCHANGE.as_str()), "{message}");
         assert!(message.contains("contract \"X\" is wrong"), "{message}");
+    }
+
+    /// A failed `ExecutionManager` build aborts the mock exchanges spawned before it, rather than
+    /// leaving them running detached.
+    #[tokio::test]
+    async fn init_aborts_spawned_mock_exchanges_when_an_execution_build_fails() {
+        /// Sets its flag when dropped, which an aborted task does to the future it was running.
+        struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = SetOnDrop(Arc::clone(&dropped));
+        let mock_exchange: RunFuture = Box::pin(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        let failing_init: ExecutionInitFuture =
+            Box::pin(async { Err(ExecutionError::Config("fixture".to_owned())) });
+
+        let result = ExecutionBuildFutures {
+            mock_exchange_run_futures: vec![mock_exchange],
+            execution_init_futures: vec![failing_init],
+        }
+        .init()
+        .await;
+        assert!(matches!(
+            result,
+            Err(BarterError::Execution(ExecutionError::Config(_)))
+        ));
+
+        // An abort takes effect when the runtime next reaches the task, so let it run.
+        for _ in 0..100 {
+            if dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the mock exchange task was left running after the build failed");
     }
 }
