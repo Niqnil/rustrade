@@ -3801,24 +3801,24 @@ fn connectivity_err(msg: impl Into<String>) -> UnindexedClientError {
 /// Map a failed order `POST` through [`rest_with_retry`] to the order's error.
 ///
 /// [`UnindexedClientError::Internal`] there means Alpaca answered 2xx, so it accepted the order,
-/// but the body did not decode. The order may be live, so it is reported as
-/// [`OrderError::Connectivity`], the status-unknown error, never as a rejection.
+/// but the response could not be read. The order may be live, so it is reported as
+/// [`OrderError::Connectivity`], the status-unknown error, never as a rejection. A caller must
+/// reconcile it (open orders, fills) before resubmitting, or it may place the order twice.
 fn order_post_error(error: UnindexedClientError) -> UnindexedOrderError {
     match error {
         UnindexedClientError::Connectivity(ce) => OrderError::Connectivity(ce),
         UnindexedClientError::Api(ae) => OrderError::Rejected(ae),
         UnindexedClientError::Internal(msg) => OrderError::Connectivity(ConnectivityError::Socket(
-            format!("Alpaca accepted the order but its response did not decode: {msg}"),
+            format!("Alpaca order status unknown, its 2xx response could not be read: {msg}"),
         )),
-        // Not returned by `rest_with_retry`. Matched explicitly so a new `ClientError` variant is
-        // a compile error here rather than silently misclassified.
-        UnindexedClientError::TaskFailed(_)
+        // `rest_with_retry` returns none of these today. Matched explicitly so a new
+        // `ClientError` variant is a compile error here, and reported as status unknown rather
+        // than panicking an order path if that ever changes.
+        other @ (UnindexedClientError::TaskFailed(_)
         | UnindexedClientError::Truncated { .. }
-        | UnindexedClientError::TruncatedSnapshot { .. } => {
-            unreachable!(
-                "rest_with_retry does not produce TaskFailed/Truncated/TruncatedSnapshot variants"
-            )
-        }
+        | UnindexedClientError::TruncatedSnapshot { .. }) => OrderError::Connectivity(
+            ConnectivityError::Socket(format!("Alpaca order status unknown: {other}")),
+        ),
     }
 }
 
@@ -6369,6 +6369,49 @@ mod tests {
                 ),
                 "{:?}",
                 order.state
+            );
+        }
+
+        /// The bracket path maps an accepted (2xx) but unreadable response the same way: the
+        /// parent fails as status unknown (`Connectivity`), never as a rejection.
+        #[tokio::test]
+        async fn open_bracket_order_with_an_undecodable_2xx_response_is_status_unknown() {
+            use crate::error::OrderError;
+            use crate::order::state::{InactiveOrderState, OrderState};
+            use rustrade_instrument::instrument::name::InstrumentNameExchange;
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v2/orders"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({ "id": 1 })),
+                )
+                .mount(&server)
+                .await;
+
+            let result = client_for(&server)
+                .open_bracket_order(AlpacaBracketOrderRequest::new(
+                    InstrumentNameExchange::new("SPY"),
+                    crate::order::id::StrategyId::new("test"),
+                    crate::order::id::ClientOrderId::new("test-bracket"),
+                    Side::Buy,
+                    Decimal::ONE,
+                    Decimal::new(100, 0),
+                    Decimal::new(120, 0),
+                    Decimal::new(90, 0),
+                    TimeInForce::GoodUntilCancelled { post_only: false },
+                ))
+                .await;
+
+            assert!(
+                matches!(
+                    result.parent.state,
+                    OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Connectivity(
+                        _
+                    )))
+                ),
+                "{:?}",
+                result.parent.state
             );
         }
 

@@ -1490,33 +1490,7 @@ async fn connection_manager(
         // the next account_snapshot or fetch_open_orders call. A caller MUST call
         // fetch_open_orders after each reconnect to reconcile open-order state.
         if let Some(dt) = disconnect_time.take() {
-            let mut finished = Vec::new();
-            match tokio::time::timeout(
-                Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS),
-                recover_fills(
-                    &rest,
-                    &rate_limiter,
-                    &instruments,
-                    dt,
-                    &tx,
-                    &dedup,
-                    &mut finished,
-                ),
-            )
-            .await
-            {
-                Ok(()) => {}
-                Err(_) => {
-                    // Timeout fires when REST calls are slow (rate-limited, network latency).
-                    // Fills of the finished instruments are already in the channel; the rest
-                    // were not forwarded, so name them.
-                    warn!(
-                        timeout_secs = FILL_RECOVERY_TIMEOUT_SECS,
-                        unrecovered = ?unrecovered_instruments(&instruments, &finished),
-                        "BinanceSpot fill recovery timed out — fills since the disconnect were not recovered for the unrecovered instruments"
-                    );
-                }
-            }
+            recover_fills(&rest, &rate_limiter, &instruments, dt, &tx, &dedup).await;
         }
 
         // --- Monitor: wait for disconnect, heartbeat timeout, or consumer drop ---
@@ -1629,8 +1603,9 @@ async fn connection_manager(
 /// `order_filled_quantity` is rebuilt from its order's executions by
 /// [`recovered_order_totals`]. A trade whose order could not be looked up keeps `None`.
 ///
-/// Each instrument is pushed to `finished` once its fills are forwarded, or once its query failed
-/// (logged), so a caller that times this out can name the instruments it did not get through.
+/// The whole recovery is bounded by [`FILL_RECOVERY_TIMEOUT_SECS`]. Fills forwarded before the
+/// deadline stay delivered. The instruments whose fills were not recovered, because their query
+/// failed or had not finished, are named in the warning or error that ends the recovery.
 // `.iter().cloned()` is required: Rust async closures cannot satisfy the HRTB
 // `for<'a> FnMut(&'a InstrumentNameExchange) -> impl Future + 'static` needed by
 // the iterator machinery, even when the clone is moved inside the closure body.
@@ -1642,7 +1617,6 @@ async fn recover_fills(
     disconnect_time: DateTime<Utc>,
     tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
     dedup: &SharedDedupCache,
-    finished: &mut Vec<InstrumentNameExchange>,
 ) {
     use futures::StreamExt;
 
@@ -1658,96 +1632,115 @@ async fn recover_fills(
         "BinanceSpot recovering fills after reconnect"
     );
 
-    let start_time_ms = disconnect_time.timestamp_millis();
-    let order_executions_deadline = tokio::time::Instant::now() + ORDER_EXECUTIONS_BUDGET;
-    let mut recovered = 0u32;
-    let mut duplicates = 0u32;
-    let mut failed_instruments = 0u32;
+    // Instruments whose fills have all been forwarded; the rest are named if recovery fails.
+    let mut recovered_instruments = Vec::with_capacity(instruments.len());
+    let recovery = async {
+        let start_time_ms = disconnect_time.timestamp_millis();
+        let order_executions_deadline = tokio::time::Instant::now() + ORDER_EXECUTIONS_BUDGET;
+        let mut recovered = 0u32;
+        let mut duplicates = 0u32;
+        let mut failed_instruments = 0u32;
 
-    // limit concurrency to avoid bursting Binance's request weight limits
-    // (each GET /api/v3/myTrades costs 20 weight; 8 concurrent = 160 weight).
-    // Returns None on per-instrument REST failure so the outer loop can count failures.
-    // pagination is critical for fill recovery — missing a page means permanently
-    // lost fills (no second chance after the recovery window). paginate_my_trades handles
-    // the full cursor-based pagination loop shared with fetch_trades.
-    let mut stream = futures::stream::iter(instruments.iter().cloned().map(|inst| {
-        let rest = rest.clone();
-        let rl = rate_limiter.clone();
-        async move {
-            let raw = match paginate_my_trades(&rest, &rl, &inst, MyTradesFrom::Time(start_time_ms))
-                .await
-            {
-                Ok(pages) => pages,
-                Err(e) => {
-                    warn!(%e, %inst, "BinanceSpot fill recovery: REST request failed");
-                    return (inst, None);
+        // limit concurrency to avoid bursting Binance's request weight limits
+        // (each GET /api/v3/myTrades costs 20 weight; 8 concurrent = 160 weight).
+        // Returns `(inst, None)` on per-instrument REST failure so the outer loop can count failures.
+        // pagination is critical for fill recovery — missing a page means permanently
+        // lost fills (no second chance after the recovery window). paginate_my_trades handles
+        // the full cursor-based pagination loop shared with fetch_trades.
+        let mut stream = futures::stream::iter(instruments.iter().cloned().map(|inst| {
+            let rest = rest.clone();
+            let rl = rate_limiter.clone();
+            async move {
+                let raw =
+                    match paginate_my_trades(&rest, &rl, &inst, MyTradesFrom::Time(start_time_ms))
+                        .await
+                    {
+                        Ok(pages) => pages,
+                        Err(e) => {
+                            warn!(%e, %inst, "BinanceSpot fill recovery: REST request failed");
+                            return (inst, None);
+                        }
+                    };
+                // `myTrades` carries no cumulative, so each recovered fill's is rebuilt from its
+                // order's executions; without it the fill advances the position but not the order.
+                let totals = recovered_order_totals(
+                    ExchangeId::BinanceSpot,
+                    &inst,
+                    &raw,
+                    order_executions_deadline,
+                    |order_id| paginate_my_trades(&rest, &rl, &inst, MyTradesFrom::Order(order_id)),
+                )
+                .await;
+                let trades: Vec<_> = raw
+                    .iter()
+                    .filter_map(|t| {
+                        let mut trade = convert_my_trade(t, &inst)?;
+                        trade.order_filled_quantity = t.id.and_then(|id| totals.get(&id).copied());
+                        Some(trade)
+                    })
+                    .collect();
+                (inst, Some(trades))
+            }
+        }))
+        .buffer_unordered(8);
+        while let Some((inst, result)) = stream.next().await {
+            let trades = match result {
+                Some(t) => t,
+                None => {
+                    failed_instruments += 1;
+                    continue;
                 }
             };
-            // `myTrades` carries no cumulative, so each recovered fill's is rebuilt from its
-            // order's executions; without it the fill advances the position but not the order.
-            let totals = recovered_order_totals(
-                ExchangeId::BinanceSpot,
-                &inst,
-                &raw,
-                order_executions_deadline,
-                |order_id| paginate_my_trades(&rest, &rl, &inst, MyTradesFrom::Order(order_id)),
-            )
-            .await;
-            let trades: Vec<_> = raw
-                .iter()
-                .filter_map(|t| {
-                    let mut trade = convert_my_trade(t, &inst)?;
-                    trade.order_filled_quantity = t.id.and_then(|id| totals.get(&id).copied());
-                    Some(trade)
-                })
-                .collect();
-            (inst, Some(trades))
+            for trade in trades {
+                // Construct the event first so dedup_key_from_event can be reused,
+                // keeping key construction in one place.
+                let event = UnindexedAccountEvent::new(
+                    ExchangeId::BinanceSpot,
+                    AccountEventKind::Trade(trade),
+                );
+                // Only Trade events are deduped during recovery — we don't recover NEW/CANCELLED
+                // lifecycle events here (those require fetch_open_orders reconciliation).
+                if let Some(key) = dedup_key_from_event(&event)
+                    && is_duplicate(dedup, key)
+                {
+                    duplicates += 1;
+                    continue;
+                }
+                if tx.send(event).is_err() {
+                    // early return on consumer drop — no point recovering remaining
+                    // instruments if the receiver is gone.
+                    debug!("BinanceSpot fill recovery: consumer dropped during recovery");
+                    return;
+                }
+                recovered += 1;
+            }
+            recovered_instruments.push(inst);
         }
-    }))
-    .buffer_unordered(8);
-    while let Some((inst, result)) = stream.next().await {
-        let trades = match result {
-            Some(t) => t,
-            None => {
-                failed_instruments += 1;
-                finished.push(inst);
-                continue;
-            }
-        };
-        for trade in trades {
-            // Construct the event first so dedup_key_from_event can be reused,
-            // keeping key construction in one place.
-            let event =
-                UnindexedAccountEvent::new(ExchangeId::BinanceSpot, AccountEventKind::Trade(trade));
-            // Only Trade events are deduped during recovery — we don't recover NEW/CANCELLED
-            // lifecycle events here (those require fetch_open_orders reconciliation).
-            if let Some(key) = dedup_key_from_event(&event)
-                && is_duplicate(dedup, key)
-            {
-                duplicates += 1;
-                continue;
-            }
-            if tx.send(event).is_err() {
-                // early return on consumer drop — no point recovering remaining
-                // instruments if the receiver is gone. The timeout wrapper in
-                // connection_manager treats this identically to normal completion.
-                debug!("BinanceSpot fill recovery: consumer dropped during recovery");
-                return;
-            }
-            recovered += 1;
-        }
-        finished.push(inst);
-    }
 
-    if failed_instruments > 0 {
-        error!(
-            recovered,
-            duplicates,
-            failed_instruments,
-            "BinanceSpot fill recovery complete with failures — some fills may be permanently missed"
+        if failed_instruments > 0 {
+            error!(
+                recovered,
+                duplicates,
+                failed_instruments,
+                unrecovered = ?unrecovered_instruments(instruments, &recovered_instruments),
+                "BinanceSpot fill recovery complete with failures — fills since the disconnect may be permanently missed for the unrecovered instruments"
+            );
+        } else {
+            info!(recovered, duplicates, "BinanceSpot fill recovery complete");
+        }
+    };
+    // A timeout drops `recovery` at an await, between instruments: one instrument's fills are sent
+    // without awaiting, so each is either fully forwarded and listed, or not forwarded at all.
+    if tokio::time::timeout(Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS), recovery)
+        .await
+        .is_err()
+    {
+        warn!(
+            timeout_secs = FILL_RECOVERY_TIMEOUT_SECS,
+            unrecovered = ?unrecovered_instruments(instruments, &recovered_instruments),
+            "BinanceSpot fill recovery timed out — fills since the disconnect were not recovered \
+             for the unrecovered instruments (failed or still pending)"
         );
-    } else {
-        info!(recovered, duplicates, "BinanceSpot fill recovery complete");
     }
 }
 

@@ -118,15 +118,16 @@ const _: () = assert!(
 /// Timeout for fill recovery REST queries after reconnect.
 pub(crate) const FILL_RECOVERY_TIMEOUT_SECS: u64 = 30;
 
-/// The names of the `instruments` a fill recovery did not get through before it timed out, for
-/// its warning: those not in `finished`, whose fills since the disconnect were never forwarded.
+/// The names of the `instruments` a fill recovery did not recover, for the log line that ends it:
+/// those not in `recovered`, because their query failed or had not finished, so their fills since
+/// the disconnect were never forwarded.
 pub(crate) fn unrecovered_instruments<'a>(
     instruments: &'a [InstrumentNameExchange],
-    finished: &[InstrumentNameExchange],
+    recovered: &[InstrumentNameExchange],
 ) -> Vec<&'a str> {
     instruments
         .iter()
-        .filter(|instrument| !finished.contains(instrument))
+        .filter(|instrument| !recovered.contains(instrument))
         .map(|instrument| instrument.name().as_str())
         .collect()
 }
@@ -1903,16 +1904,16 @@ fn order_error_from(
 mod tests {
     use super::*;
 
-    /// A timed-out recovery names, in request order, exactly the instruments it did not finish.
+    /// A recovery names, in request order, exactly the instruments it did not recover.
     #[test]
-    fn unrecovered_instruments_names_those_not_finished() {
+    fn unrecovered_instruments_names_those_not_recovered() {
         let instruments: Vec<InstrumentNameExchange> = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
             .into_iter()
             .map(InstrumentNameExchange::new)
             .collect();
-        let finished = vec![InstrumentNameExchange::new("ETHUSDT")];
+        let recovered = vec![InstrumentNameExchange::new("ETHUSDT")];
         assert_eq!(
-            unrecovered_instruments(&instruments, &finished),
+            unrecovered_instruments(&instruments, &recovered),
             ["BTCUSDT", "SOLUSDT"]
         );
         assert!(unrecovered_instruments(&instruments, &instruments).is_empty());
