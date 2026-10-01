@@ -19,6 +19,10 @@ concurrency:
   group: alpaca-paper-account
   cancel-in-progress: false
 
+# Read-only: the tests only need the checkout.
+permissions:
+  contents: read
+
 env:
   MOLD_VERSION: "2.35.1"
   ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
