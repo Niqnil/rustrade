@@ -16,8 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fill went to whichever of the two a lookup reached first, with that instrument's contract size
   and settlement asset. `IndexedInstrumentsBuilder::try_build` and `IndexedInstruments::try_new`
   now return the new `IndexError::DuplicateInstrumentNameExchange` (`build` and `new` panic with
-  it). Instruments built from a `SystemConfig` were not affected, since their `name_internal` is
-  derived from `name_exchange`. `IndexError` is `#[non_exhaustive]`.
+  it). **Breaking:** a programmatic instrument set that shares a `name_exchange` on one exchange
+  built before and is now rejected; register each instrument under the name its venue tells it
+  apart by (IBKR's `AAPL` and `AAPL.CFD`, say). Instruments built from a `SystemConfig` were not
+  affected, since their `name_internal` is derived from `name_exchange`. `IndexError` is
+  `#[non_exhaustive]`.
   - A collision error now names every field on which the two instruments differ, so two that
     differ only in, say, their underlying no longer read as `BTCUSD (Spot) and BTCUSD (Spot)`.
 

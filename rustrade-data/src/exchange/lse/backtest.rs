@@ -33,9 +33,10 @@ use std::sync::Arc;
 /// - `instrument` is the [`InstrumentIndex`] the instrument received in `IndexedInstruments`.
 ///   Positions and unrealised PnL are strictly index-scoped, so a wrong index attributes this
 ///   symbol's prices to a different instrument — silently.
-/// - `exchange` must be the [`ExchangeId`] that instrument was registered under, since engine state
-///   panics on a market event from an exchange it does not know. [`LseDataset::exchange_id`] gives
-///   the variant a given dataset belongs to.
+/// - `exchange` must be the [`ExchangeId`] the instrument is priced on: its `DataVenue`'s exchange
+///   if it declares one, otherwise the exchange it was registered under. Either is one the engine
+///   knows, and engine state panics on a market event from an exchange it does not.
+///   [`LseDataset::exchange_id`] gives the variant a given dataset belongs to.
 ///
 /// [`LseDataset::exchange_id`]: super::market::LseDataset::exchange_id
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -462,6 +463,26 @@ mod tests {
         let error = LseCandleSource::resolve(&instruments, ExchangeId::LseEquities, "BP")
             .expect_err("the execution-side symbol is not priced on LSE");
         assert!(matches!(error, LseError::UnknownInstrument { .. }));
+
+        // The ambiguity spans both ways of being priced on LSE: one registered there directly,
+        // with no `DataVenue`, and one priced there through its `DataVenue`.
+        let registered_on_lse = Instrument::spot(
+            ExchangeId::LseEquities,
+            "lse-bp",
+            "BP.L",
+            Underlying::new("bp", "gbx"),
+            None,
+        );
+        let instruments = IndexedInstrumentsBuilder::default()
+            .add_instrument(priced_on_lse(ExchangeId::Ibkr, "ibkr-bp"))
+            .add_instrument(registered_on_lse)
+            .build();
+        let error = LseCandleSource::resolve(&instruments, ExchangeId::LseEquities, "BP.L")
+            .expect_err("one symbol pricing two instruments must not build a source");
+        assert!(
+            matches!(error, LseError::AmbiguousInstrument { .. }),
+            "{error:?}"
+        );
 
         let instruments = IndexedInstrumentsBuilder::default()
             .add_instrument(priced_on_lse(ExchangeId::Ibkr, "ibkr-bp"))

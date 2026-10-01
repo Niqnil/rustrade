@@ -150,7 +150,9 @@ impl IndexedInstrumentsBuilder {
     /// `(exchange, name_exchange)` must be unique too: it is how a venue names an instrument, so it
     /// is what every venue-sourced order, fill and position is resolved by. Two instruments
     /// sharing it, such as a spot and a CFD both named `AAPL` on one venue, would leave each of
-    /// those lookups to pick one of the two arbitrarily.
+    /// those lookups to pick one of the two arbitrarily. Register each on the name that venue
+    /// distinguishes it by (IBKR's `AAPL` and `AAPL.CFD`, say); two instruments a venue reports
+    /// under one name cannot be represented.
     pub fn try_build(mut self) -> Result<IndexedInstruments, IndexError> {
         // Sort & dedup
         self.exchanges.sort();
@@ -328,7 +330,19 @@ fn describe_collision(
             differences.push(format!("{:?}", this.kind));
         }
         if this.underlying != other.underlying {
-            differences.push(format!("underlying {:?}", this.underlying));
+            let pair = |underlying: &crate::Underlying<Asset>| {
+                format!(
+                    "{}/{}",
+                    underlying.base.name_internal, underlying.quote.name_internal
+                )
+            };
+            // The internal names are what a config spells, so they are the readable form; only an
+            // underlying differing in its assets' exchange-side names alone needs the full dump.
+            differences.push(if pair(&this.underlying) != pair(&other.underlying) {
+                format!("underlying {}", pair(&this.underlying))
+            } else {
+                format!("underlying {:?}", this.underlying)
+            });
         }
         if this.quote != other.quote {
             differences.push(format!("quote {:?}", this.quote));
@@ -590,8 +604,8 @@ mod tests {
             panic!("unexpected error variant: {error:?}")
         };
 
-        assert!(message.contains("usdt"), "{message}");
-        assert!(message.contains("usdc"), "{message}");
+        assert!(message.contains("underlying btc/usdt"), "{message}");
+        assert!(message.contains("underlying btc/usdc"), "{message}");
     }
 
     /// A spot and a CFD named `AAPL` on one venue, with distinct internal names: the
