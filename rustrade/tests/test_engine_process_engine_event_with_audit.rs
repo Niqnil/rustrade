@@ -1640,6 +1640,46 @@ fn test_contract_expiry_missing_spot_price() {
     );
 }
 
+/// An option whose underlying matches two `Spot` listings on its `(base, quote, exchange)` is not
+/// settled: nothing says which listing's price is the settlement reference, so either would be a
+/// guess. It is rejected as `AmbiguousUnderlying`, as a split on that identity is rejected as
+/// `AmbiguousSplitTarget`, and re-injecting the event is rejected the same way.
+#[test]
+fn test_contract_expiry_ambiguous_underlying_not_settled() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_ambiguous_underlying_engine(TradingState::Disabled, execution_tx);
+
+    // The two listings disagree, so settling against either would change the result.
+    engine.process(market_event_trade(1, 0, dec!(1200)));
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+    engine.process(market_event_trade(1, 2, dec!(55_000)));
+    open_position_on(&mut engine, 0, Side::Buy, dec!(1_000), dec!(2), "opt-open");
+
+    for attempt in 1..=2 {
+        let outputs: Vec<EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>> =
+            engine.process_contract_expiry(&InstrumentIndex(0));
+        assert_eq!(
+            outputs,
+            vec![EngineOutput::ContractExpiryNotSettled {
+                instrument: InstrumentIndex(0),
+                reason: ContractExpiryNotSettledReason::AmbiguousUnderlying,
+            }],
+            "attempt {attempt}"
+        );
+
+        let option_state = engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0));
+        assert_eq!(
+            option_state.position.positions.len(),
+            1,
+            "attempt {attempt}"
+        );
+        assert!(!option_state.expiration_processed, "attempt {attempt}");
+    }
+}
+
 #[test]
 fn test_contract_expiry_replica_state_cleared() {
     use rustrade::{
@@ -6379,14 +6419,18 @@ fn test_corporate_action_option_already_carrying_the_id_is_not_readjusted() {
     assert_eq!(position.quantity_abs, dec!(4));
     assert_eq!(position.price_entry_average, dec!(500));
 
-    // The suppression is observable, not silent — per skipped option.
-    assert!(
-        outputs.iter().any(|o| matches!(
-            o,
-            EngineOutput::CorporateActionAlreadyProcessed { instrument, .. }
-                if *instrument == InstrumentIndex(0)
-        )),
-        "a suppressed option re-adjust must be surfaced, not silently dropped"
+    // The suppression is observable, not silent — once per skipped option, not once per pass.
+    assert_eq!(
+        outputs
+            .iter()
+            .filter(|o| matches!(
+                o,
+                EngineOutput::CorporateActionAlreadyProcessed { instrument, .. }
+                    if *instrument == InstrumentIndex(0)
+            ))
+            .count(),
+        1,
+        "a suppressed option re-adjust must be surfaced exactly once, not silently dropped"
     );
     assert!(
         !outputs
