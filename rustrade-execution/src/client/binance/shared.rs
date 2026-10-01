@@ -339,7 +339,8 @@ struct Deadlines {
 /// - a pause until the next minute once the weight used reaches [`WEIGHT_PAUSE_PERCENT`] of the
 ///   per-minute limit, which only [`RequestKind::Query`] requests honour, so the weight left
 ///   stays free for orders and cancels. The weight used comes from successful responses
-///   ([`observe_rest`](Self::observe_rest), [`observe_ws_api`](Self::observe_ws_api)).
+///   ([`observe_rest`](Self::observe_rest), [`observe_ws_api`](Self::observe_ws_api)); a
+///   rejected request's response is not observed, so usage can only be under-counted.
 pub(crate) struct RateLimitTracker {
     // parking_lot::Mutex — never poisons, consistent with SharedDedupCache
     deadlines: parking_lot::Mutex<Deadlines>,
@@ -384,15 +385,17 @@ impl RateLimitTracker {
                     // as_millis() returns u128; truncation impossible (u64::MAX ms ≈ 584M years)
                     #[allow(clippy::cast_possible_truncation)]
                     let delay_ms = (until - now).as_millis() as u64;
-                    debug!(
-                        delay_ms,
-                        ?kind,
-                        "Binance REST rate-limited, waiting before request"
-                    );
+                    debug!(delay_ms, ?kind, "Binance request held back, waiting");
                     tokio::time::sleep_until(until).await;
                 }
             }
         }
+    }
+
+    /// The per-minute weight limit the pause is measured against.
+    #[cfg(test)]
+    pub(crate) fn weight_limit(&self) -> u32 {
+        self.weight_limit.load(Ordering::Relaxed)
     }
 
     /// Whether a rate-limit cooldown is active now.
@@ -429,10 +432,11 @@ impl RateLimitTracker {
         }
     }
 
-    /// Record the weight a successful REST response reports as used this minute.
+    /// Record the weight a successful REST response reports as used, for a request sent at
+    /// `sent_ms` (from [`unix_ms`]).
     ///
     /// Reads the header of this tracker's [`WeightPool`]; a response without it changes nothing.
-    pub(crate) fn observe_rest<D>(&self, response: &RestApiResponse<D>) {
+    pub(crate) fn observe_rest<D>(&self, response: &RestApiResponse<D>, sent_ms: u128) {
         let used = match self.pool {
             // The SDK has already parsed `x-mbx-used-weight-1m` into `rate_limits`.
             WeightPool::Spot => response
@@ -454,45 +458,57 @@ impl RateLimitTracker {
                 .and_then(|used| used.parse().ok()),
         };
         if let Some(used) = used {
-            self.observe_used_weight(used);
+            self.observe_used_weight(used, sent_ms);
         }
     }
 
-    /// Record the weight limit and the weight used that a WS-API response reports.
+    /// Record the weight limit and the weight used that a WS-API response reports, for a request
+    /// sent at `sent_ms` (from [`unix_ms`]).
     ///
-    /// Only a spot tracker should be given these: the WS-API draws on the spot pool.
-    pub(crate) fn observe_ws_api(&self, rate_limits: Option<&[WebsocketApiRateLimit]>) {
+    /// The WS-API draws on the spot pool, so a margin tracker ignores these.
+    pub(crate) fn observe_ws_api(
+        &self,
+        rate_limits: Option<&[WebsocketApiRateLimit]>,
+        sent_ms: u128,
+    ) {
+        debug_assert_eq!(self.pool, WeightPool::Spot, "WS-API usage is spot weight");
+        if self.pool != WeightPool::Spot {
+            return;
+        }
         let Some(weight) = rate_limits.into_iter().flatten().find(|limit| {
             is_weight_per_minute(&limit.rate_limit_type, &limit.interval, limit.interval_num)
         }) else {
             return;
         };
-        // A limit of 0 would pause every query; keep the last good value instead.
-        if weight.limit > 0 {
-            let previous = self.weight_limit.swap(weight.limit, Ordering::Relaxed);
-            if previous != weight.limit {
-                debug!(
-                    previous,
-                    limit = weight.limit,
-                    "Binance request-weight limit per minute updated"
-                );
-            }
+        // A limit of 0 would pause every query; keep the last good value instead. It rarely
+        // changes, so it is only written when it does.
+        let previous = self.weight_limit.load(Ordering::Relaxed);
+        if weight.limit > 0 && weight.limit != previous {
+            self.weight_limit.store(weight.limit, Ordering::Relaxed);
+            debug!(
+                previous,
+                limit = weight.limit,
+                "Binance request-weight limit per minute updated"
+            );
         }
-        self.observe_used_weight(weight.count);
+        self.observe_used_weight(weight.count, sent_ms);
     }
 
-    /// Pause queries until the next minute if `used` has reached [`WEIGHT_PAUSE_PERCENT`] of the
-    /// limit.
-    fn observe_used_weight(&self, used: u32) {
+    /// Pause queries until the end of the minute the request was sent in, `sent_ms`, if `used`
+    /// has reached [`WEIGHT_PAUSE_PERCENT`] of the limit.
+    ///
+    /// Binance counts a request in the minute it receives it, which is the minute it was sent in
+    /// barring clock skew and a request in flight across the boundary. A response observed after
+    /// that minute has ended describes a counter that has since reset, so it pauses nothing,
+    /// rather than holding queries back for the whole of the next minute.
+    fn observe_used_weight(&self, used: u32, sent_ms: u128) {
         let limit = self.weight_limit.load(Ordering::Relaxed);
         if u64::from(used) * 100 < u64::from(limit) * WEIGHT_PAUSE_PERCENT {
             return;
         }
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let pause = until_next_minute(now_ms);
+        let Some(pause) = pause_after(sent_ms, unix_ms()) else {
+            return;
+        };
         let now = tokio::time::Instant::now();
         let was_throttled = extend_deadline(&mut self.deadlines.lock().throttled_until, now, pause);
         // info! not warn!: nothing was refused. The pause keeps the next query from being refused.
@@ -532,12 +548,24 @@ fn is_weight_per_minute(kind: &RateLimitType, interval: &Interval, interval_num:
     *kind == RateLimitType::RequestWeight && *interval == Interval::Minute && interval_num == 1
 }
 
-/// The time from `now_ms` (Unix milliseconds) until just after the next UTC minute boundary.
-fn until_next_minute(now_ms: u128) -> Duration {
-    // The remainder is below 60 000, so it fits in a u64.
-    #[allow(clippy::cast_possible_truncation)]
-    let into_minute = (now_ms % 60_000) as u64;
-    Duration::from_millis(60_000 - into_minute + MINUTE_BOUNDARY_SLACK_MS)
+/// The current time in Unix milliseconds, the clock a weight observation's send time is taken
+/// from.
+pub(crate) fn unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+/// How long queries pause, observed at `now_ms`, for a request sent at `sent_ms` (both Unix
+/// milliseconds): until just after the UTC minute it was sent in ends, or `None` once it has.
+fn pause_after(sent_ms: u128, now_ms: u128) -> Option<Duration> {
+    let resume_ms = sent_ms - sent_ms % 60_000 + 60_000 + u128::from(MINUTE_BOUNDARY_SLACK_MS);
+    let remaining_ms = resume_ms.checked_sub(now_ms).filter(|&ms| ms > 0)?;
+    // At most a minute plus the slack, so it fits in a u64.
+    Some(Duration::from_millis(
+        u64::try_from(remaining_ms).unwrap_or(u64::MAX),
+    ))
 }
 
 /// Check if an anyhow::Error from binance-sdk REST is a rate-limit error.
@@ -1871,9 +1899,10 @@ where
     // safety net — the loop body always returns before exhaustion.
     for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
         rate_limiter.wait_if_blocked(kind).await;
+        let sent_ms = unix_ms();
         match make_call(Arc::clone(rest)).await {
             Ok(response) => {
-                rate_limiter.observe_rest(&response);
+                rate_limiter.observe_rest(&response, sent_ms);
                 return Ok(response);
             }
             Err(e) if is_rate_limit_error(&e) && attempt < MAX_RATE_LIMIT_RETRIES => {
@@ -3023,22 +3052,24 @@ mod tests {
             .is_err()
     }
 
-    /// The pause runs to just past the next minute boundary, never less than the slack.
+    /// The pause runs to just past the end of the minute the request was sent in, and a
+    /// response observed after that pauses nothing.
     #[test]
-    fn until_next_minute_reaches_just_past_the_boundary() {
+    fn pause_after_ends_just_past_the_send_minute() {
         let minute = 29_000_000 * 60_000_u128;
+        let slack = MINUTE_BOUNDARY_SLACK_MS;
+        let ms = |ms: u64| Some(Duration::from_millis(ms));
         assert_eq!(
-            until_next_minute(minute + 15_000),
-            Duration::from_millis(45_000 + MINUTE_BOUNDARY_SLACK_MS)
+            pause_after(minute + 15_000, minute + 15_000),
+            ms(45_000 + slack)
         );
-        assert_eq!(
-            until_next_minute(minute + 59_999),
-            Duration::from_millis(1 + MINUTE_BOUNDARY_SLACK_MS)
-        );
-        assert_eq!(
-            until_next_minute(minute),
-            Duration::from_millis(60_000 + MINUTE_BOUNDARY_SLACK_MS)
-        );
+        assert_eq!(pause_after(minute, minute + 100), ms(59_900 + slack));
+        assert_eq!(pause_after(minute + 59_999, minute + 59_999), ms(1 + slack));
+        // Sent in the previous minute, observed during the slack: only the slack's rest.
+        assert_eq!(pause_after(minute - 100, minute + 400), ms(slack - 400));
+        // Sent in the previous minute, observed after it and the slack ended.
+        assert_eq!(pause_after(minute - 100, minute + u128::from(slack)), None);
+        assert_eq!(pause_after(minute - 100, minute + 30_000), None);
     }
 
     /// At the threshold, queries pause and orders do not; one under it, nothing pauses.
@@ -3046,10 +3077,10 @@ mod tests {
     async fn weight_near_the_limit_pauses_queries_but_not_orders() {
         tokio::time::pause();
         let tracker = RateLimitTracker::new(WeightPool::Spot);
-        tracker.observe_ws_api(Some(&ws_weight(1_000, 899)));
+        tracker.observe_ws_api(Some(&ws_weight(1_000, 899)), unix_ms());
         assert!(!waits(&tracker, RequestKind::Query).await, "below 90%");
 
-        tracker.observe_ws_api(Some(&ws_weight(1_000, 900)));
+        tracker.observe_ws_api(Some(&ws_weight(1_000, 900)), unix_ms());
         assert!(waits(&tracker, RequestKind::Query).await, "at 90%");
         assert!(!waits(&tracker, RequestKind::Order).await);
         assert!(
@@ -3082,16 +3113,43 @@ mod tests {
     async fn the_ws_api_limit_replaces_the_default() {
         tokio::time::pause();
         let tracker = RateLimitTracker::new(WeightPool::Spot);
-        tracker.observe_ws_api(Some(&ws_weight(0, 1_000)));
+        tracker.observe_ws_api(Some(&ws_weight(0, 1_000)), unix_ms());
         assert_eq!(
             tracker.weight_limit.load(Ordering::Relaxed),
             SPOT_REQUEST_WEIGHT_PER_MINUTE
         );
         assert!(!waits(&tracker, RequestKind::Query).await);
 
-        tracker.observe_ws_api(Some(&ws_weight(1_100, 1_000)));
+        tracker.observe_ws_api(Some(&ws_weight(1_100, 1_000)), unix_ms());
         assert_eq!(tracker.weight_limit.load(Ordering::Relaxed), 1_100);
         assert!(waits(&tracker, RequestKind::Query).await);
+    }
+
+    /// A late response, for a request sent in an earlier minute, pauses nothing.
+    #[tokio::test]
+    async fn a_response_from_an_earlier_minute_pauses_nothing() {
+        tokio::time::pause();
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
+        tracker.observe_ws_api(Some(&ws_weight(1_000, 1_000)), unix_ms() - 120_000);
+        assert!(!waits(&tracker, RequestKind::Query).await);
+    }
+
+    /// A margin tracker ignores WS-API usage, which is spot weight. A debug build asserts that it
+    /// is never given any.
+    #[tokio::test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "WS-API usage is spot weight")
+    )]
+    async fn a_margin_tracker_ignores_ws_api_usage() {
+        tokio::time::pause();
+        let tracker = RateLimitTracker::new(WeightPool::Sapi);
+        tracker.observe_ws_api(Some(&ws_weight(1_000, 1_000)), unix_ms());
+        assert_eq!(
+            tracker.weight_limit.load(Ordering::Relaxed),
+            SAPI_IP_WEIGHT_PER_MINUTE
+        );
+        assert!(!waits(&tracker, RequestKind::Query).await);
     }
 
     /// A response without the weight-per-minute entry changes nothing.
@@ -3099,8 +3157,8 @@ mod tests {
     async fn a_response_without_weight_changes_nothing() {
         tokio::time::pause();
         let tracker = RateLimitTracker::new(WeightPool::Spot);
-        tracker.observe_ws_api(None);
-        tracker.observe_ws_api(Some(&ws_weight(1_000, 1_000)[..1]));
+        tracker.observe_ws_api(None, unix_ms());
+        tracker.observe_ws_api(Some(&ws_weight(1_000, 1_000)[..1]), unix_ms());
         assert_eq!(
             tracker.weight_limit.load(Ordering::Relaxed),
             SPOT_REQUEST_WEIGHT_PER_MINUTE

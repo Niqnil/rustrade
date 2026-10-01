@@ -114,7 +114,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`rustrade-execution`, features `alpaca` and `binance`). Each used to back off only once the
   venue refused a request.
   - Alpaca: once a response reports `X-Ratelimit-Remaining: 0`, every request waits until
-    `X-Ratelimit-Reset`, logged at `info`, where a 429 logs at `warn`.
+    `X-Ratelimit-Reset`, at most a minute, logged at `info`, where a 429 logs at `warn`.
   - Binance: once a response reports at least 90% of the per-minute request-weight limit used,
     REST queries wait for the next minute. Orders and cancels never wait for it, so they can use
     the rest. Spot reads the weight used from REST and WebSocket API responses, and the limit from

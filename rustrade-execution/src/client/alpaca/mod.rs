@@ -948,8 +948,8 @@ struct AlpacaOrderWs<'a> {
 ///
 /// # Rate limits
 /// Once a response reports no requests left in the current window (`X-Ratelimit-Remaining: 0`),
-/// every request, orders included, waits until the window resets (`X-Ratelimit-Reset`), so it
-/// is not refused. A 429 waits the same way and is retried.
+/// every request, orders included, waits until the window resets (`X-Ratelimit-Reset`, at most a
+/// minute away), so it is not refused. A 429 waits the same way and is retried.
 ///
 /// Cloning is cheap: all inner state is behind `Arc`.
 #[derive(Clone)]
@@ -1030,7 +1030,8 @@ fn parse_rate_limit_delay(headers: &reqwest::header::HeaderMap) -> Option<Durati
 
 /// Pause every request until the window resets when a response reports none remaining in it.
 ///
-/// Call on any response except a 429, which sets its own cooldown. Without an
+/// The pause is at most [`DEFAULT_RATE_LIMIT_DELAY_SECS`], the length of Alpaca's window. Call on
+/// any response except a 429, which sets its own cooldown. Without an
 /// `X-Ratelimit-Reset` there is nothing to pause until, so the next request goes ahead and a 429,
 /// if it comes, backs off.
 fn observe_rate_limit_remaining(
@@ -1046,7 +1047,10 @@ fn observe_rate_limit_remaining(
         return;
     }
     match parse_rate_limit_delay(headers) {
-        Some(reset) => rate_limiter.on_bucket_exhausted(reset),
+        // Alpaca's window is a minute, so a reset further out is a bad header or clock skew, and
+        // must not hold orders back for longer.
+        Some(reset) => rate_limiter
+            .on_bucket_exhausted(reset.min(Duration::from_secs(DEFAULT_RATE_LIMIT_DELAY_SECS))),
         None => debug!(
             "Alpaca REST rate-limit window exhausted (X-Ratelimit-Remaining: 0) without X-Ratelimit-Reset"
         ),

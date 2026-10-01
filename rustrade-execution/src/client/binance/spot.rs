@@ -42,7 +42,7 @@ use super::shared::{
     convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
     dedup_key_from_event, is_duplicate, is_handshake_rate_limit, log_unrecognised_frame,
     new_dedup_cache, parse_user_data_frame, recovered_order_totals, response_decode_error,
-    rest_call_with_retry, unrecovered_instruments,
+    rest_call_with_retry, unix_ms, unrecovered_instruments,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
@@ -850,11 +850,12 @@ impl ExecutionClient for BinanceSpot {
             }
         };
 
+        let sent_ms = unix_ms();
         let result = ws.order_cancel(params).await;
         // A WS-API response reports the shared spot pool's weight limit and usage.
         if let Ok(response) = &result {
             self.rate_limiter
-                .observe_ws_api(response.rate_limits.as_deref());
+                .observe_ws_api(response.rate_limits.as_deref(), sent_ms);
         }
         match result {
             Ok(response) => match response.data() {
@@ -1109,11 +1110,12 @@ impl ExecutionClient for BinanceSpot {
             }
         };
 
+        let sent_ms = unix_ms();
         let result = ws.order_place(params).await;
         // A WS-API response reports the shared spot pool's weight limit and usage.
         if let Ok(response) = &result {
             self.rate_limiter
-                .observe_ws_api(response.rate_limits.as_deref());
+                .observe_ws_api(response.rate_limits.as_deref(), sent_ms);
         }
         match result {
             Ok(response) => match response.data() {
@@ -4416,12 +4418,58 @@ mod tests {
         }
     }
 
+    /// A spot client whose WS-API order session connects to `ws_url`.
+    fn client_with_ws_api(ws_url: String) -> BinanceSpot {
+        let mut client = <BinanceSpot as ExecutionClient>::new(BinanceSpotConfig::new(
+            "key".into(),
+            "secret".into(),
+        ));
+        client.ws_handle = SpotWsApi::from_config(
+            ConfigurationWebsocketApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .ws_url(ws_url)
+                .build()
+                .unwrap(),
+        );
+        client
+    }
+
+    /// A cancel by client order ID for `instrument`.
+    fn cancel_request(
+        instrument: &InstrumentNameExchange,
+    ) -> OrderRequestCancel<ExchangeId, &InstrumentNameExchange> {
+        crate::order::OrderEvent {
+            key: OrderKey {
+                exchange: ExchangeId::BinanceSpot,
+                instrument,
+                strategy: StrategyId::new("strategy"),
+                cid: ClientOrderId::new("cid"),
+            },
+            state: crate::order::request::RequestCancel { id: None },
+        }
+    }
+
+    /// A local WebSocket server: every connection is handed to `serve`. Returns its `ws://` URL.
+    async fn ws_server<F, Fut>(serve: F) -> String
+    where
+        F: Fn(tokio::net::TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(serve(stream));
+            }
+        });
+        url
+    }
+
     /// During a rate-limit cooldown a cancel with no WS-API session is not sent: it fails as a
     /// rate-limit rejection, without a handshake.
     #[tokio::test]
     async fn cancel_without_a_session_during_a_cooldown_is_rejected_unsent() {
-        use crate::order::{OrderEvent, request::RequestCancel};
-
         let client = <BinanceSpot as ExecutionClient>::new(BinanceSpotConfig::new(
             "key".into(),
             "secret".into(),
@@ -4431,15 +4479,7 @@ mod tests {
             .on_rate_limited(Some(Duration::from_secs(60)));
         let instrument = InstrumentNameExchange::new("BTCUSDT");
         let response = client
-            .cancel_order(OrderEvent {
-                key: OrderKey {
-                    exchange: ExchangeId::BinanceSpot,
-                    instrument: &instrument,
-                    strategy: StrategyId::new("strategy"),
-                    cid: ClientOrderId::new("cid"),
-                },
-                state: RequestCancel { id: None },
-            })
+            .cancel_order(cancel_request(&instrument))
             .await
             .expect("a cancel always answers");
 
@@ -4455,5 +4495,109 @@ mod tests {
             client.ws_api.read().await.is_none(),
             "no session was opened"
         );
+    }
+
+    /// A WS-API handshake Binance refuses with 429 starts a cooldown, and the cancel that needed
+    /// the session fails as a rate-limit rejection.
+    #[tokio::test]
+    async fn a_handshake_refused_with_429_starts_a_cooldown() {
+        use tokio_tungstenite::tungstenite::http;
+
+        let url = ws_server(|stream| async move {
+            // tungstenite's handshake callback fixes the error type to a whole HTTP response.
+            #[allow(clippy::result_large_err)]
+            let refuse = |_: &http::Request<()>, _| {
+                Err(http::Response::builder()
+                    .status(http::StatusCode::TOO_MANY_REQUESTS)
+                    .body(None)
+                    .unwrap())
+            };
+            let _ = tokio_tungstenite::accept_hdr_async(stream, refuse).await;
+        })
+        .await;
+        let client = client_with_ws_api(url);
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+
+        let response = client
+            .cancel_order(cancel_request(&instrument))
+            .await
+            .expect("a cancel always answers");
+
+        assert!(
+            matches!(
+                response.state,
+                Err(UnindexedOrderError::Rejected(ApiError::RateLimit))
+            ),
+            "{:?}",
+            response.state
+        );
+        assert!(client.rate_limiter.is_blocked());
+    }
+
+    /// A WS-API cancel response carries the spot pool's weight limit and usage: the limit
+    /// replaces the default, and usage at 90% of it pauses queries but not orders.
+    #[tokio::test]
+    async fn a_ws_api_response_near_the_weight_limit_pauses_queries() {
+        use futures::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let url = ws_server(|stream| async move {
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            while let Some(Ok(message)) = ws.next().await {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let response = serde_json::json!({
+                    "id": request["id"],
+                    "status": 200,
+                    "result": {
+                        "symbol": "BTCUSDT",
+                        "origClientOrderId": "cid",
+                        "orderId": 7,
+                        "transactTime": 1_700_000_000_000_i64,
+                        "executedQty": "0",
+                    },
+                    "rateLimits": [{
+                        "rateLimitType": "REQUEST_WEIGHT",
+                        "interval": "MINUTE",
+                        "intervalNum": 1,
+                        "limit": 1_000,
+                        "count": 950,
+                    }],
+                });
+                if ws.send(Message::text(response.to_string())).await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await;
+        let client = client_with_ws_api(url);
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+
+        let response = client
+            .cancel_order(cancel_request(&instrument))
+            .await
+            .expect("a cancel always answers");
+
+        assert!(response.state.is_ok(), "{:?}", response.state);
+        assert_eq!(client.rate_limiter.weight_limit(), 1_000);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                client.rate_limiter.wait_if_blocked(RequestKind::Query),
+            )
+            .await
+            .is_err(),
+            "queries pause"
+        );
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            client.rate_limiter.wait_if_blocked(RequestKind::Order),
+        )
+        .await
+        .expect("orders never wait on the pause");
     }
 }

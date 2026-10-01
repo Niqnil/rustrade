@@ -5518,16 +5518,16 @@ mod tests {
     }
 
     /// A `/sapi` response reporting `x-sapi-used-ip-weight-1m` at 90% of the documented IP limit
-    /// pauses later queries but not orders; under it, nothing pauses.
+    /// pauses later queries but not orders; under it, or unreadable, nothing pauses.
     #[tokio::test]
     async fn sapi_used_ip_weight_near_the_limit_pauses_queries() {
-        for (used, pauses) in [(10_799, false), (10_800, true)] {
+        for (used, pauses) in [("10799", false), ("10800", true), ("not a number", false)] {
             let server = wiremock::MockServer::start().await;
             wiremock::Mock::given(wiremock::matchers::method("GET"))
                 .and(wiremock::matchers::path("/sapi/v1/margin/openOrders"))
                 .respond_with(
                     wiremock::ResponseTemplate::new(200)
-                        .insert_header("x-sapi-used-ip-weight-1m", used.to_string())
+                        .insert_header("x-sapi-used-ip-weight-1m", used)
                         .set_body_json(serde_json::json!([])),
                 )
                 .mount(&server)
