@@ -429,7 +429,8 @@ impl BinanceMargin {
     /// Build the WS-API configuration for the `userListenToken` user-data stream.
     ///
     /// Captures the credentials and pins the WS-API endpoint (the same `wss://ws-api.binance.com`
-    /// endpoint spot uses). The connection itself is established by [`account_stream`] later (it
+    /// endpoint spot uses). The connection itself is established by
+    /// [`account_stream`](crate::client::ExecutionClient::account_stream) later (it
     /// constructs a `common::websocket::WebsocketApi` directly); this only prepares the config.
     ///
     /// # Panics
@@ -1189,7 +1190,7 @@ impl ExecutionClient for BinanceMargin {
     /// ## Live per-pair balances — [`InstrumentBalanceUpdate`](crate::AccountEventKind::InstrumentBalanceUpdate)
     /// The isolated stream delivers live fills and order updates (routed by the inner `symbol`) **and**
     /// live per-pair `free`/`locked` balances, emitted as
-    /// [`AccountEventKind::InstrumentBalanceUpdate`](crate::AccountEventKind::InstrumentBalanceUpdate)
+    /// [`AccountEventKind::InstrumentBalanceUpdate`]
     /// (base + quote per pair). Debt totals (`borrowed`/`interest`) stay REST-`BalanceSnapshot`-fresh
     /// per the debt-freshness contract; the stream keeps only `free`/`locked` live.
     ///
