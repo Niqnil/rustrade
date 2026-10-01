@@ -117,6 +117,19 @@ const _: () = assert!(
 );
 /// Timeout for fill recovery REST queries after reconnect.
 pub(crate) const FILL_RECOVERY_TIMEOUT_SECS: u64 = 30;
+
+/// The names of the `instruments` a fill recovery did not get through before it timed out, for
+/// its warning: those not in `finished`, whose fills since the disconnect were never forwarded.
+pub(crate) fn unrecovered_instruments<'a>(
+    instruments: &'a [InstrumentNameExchange],
+    finished: &[InstrumentNameExchange],
+) -> Vec<&'a str> {
+    instruments
+        .iter()
+        .filter(|instrument| !finished.contains(instrument))
+        .map(|instrument| instrument.name().as_str())
+        .collect()
+}
 /// Timeout for the initial WebSocket API TCP+TLS handshake.
 /// Without this, a network partition holds the write lock for up to 75–127 s
 /// (OS TCP timeout), stalling all concurrent open_order/cancel_order callers.
@@ -1889,6 +1902,21 @@ fn order_error_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A timed-out recovery names, in request order, exactly the instruments it did not finish.
+    #[test]
+    fn unrecovered_instruments_names_those_not_finished() {
+        let instruments: Vec<InstrumentNameExchange> = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+            .into_iter()
+            .map(InstrumentNameExchange::new)
+            .collect();
+        let finished = vec![InstrumentNameExchange::new("ETHUSDT")];
+        assert_eq!(
+            unrecovered_instruments(&instruments, &finished),
+            ["BTCUSDT", "SOLUSDT"]
+        );
+        assert!(unrecovered_instruments(&instruments, &instruments).is_empty());
+    }
 
     /// A `myTrades` execution reduced to the three fields recovery reads.
     #[derive(Debug, Clone, Copy)]

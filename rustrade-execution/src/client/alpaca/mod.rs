@@ -1009,6 +1009,14 @@ fn parse_rate_limit_delay(headers: &reqwest::header::HeaderMap) -> Option<Durati
 ///
 /// On HTTP 429, reads `X-Ratelimit-Reset` (Unix epoch) to determine the cooldown
 /// duration and retries up to `MAX_RATE_LIMIT_ATTEMPTS - 1` times.
+///
+/// # Errors
+///
+/// - [`UnindexedClientError::Connectivity`]: the request or its body read failed, or a 5xx.
+/// - [`UnindexedClientError::Api`]: a 4xx, classified by [`parse_api_error`], or 429 retries
+///   exhausted ([`ApiError::RateLimit`]).
+/// - [`UnindexedClientError::Internal`]: a 2xx body that does not decode into `T`, or a 204 on a
+///   call that expects a body. Retrying returns the same answer.
 async fn rest_with_retry<T>(
     rate_limiter: &RateLimitTracker,
     mut build_request: impl FnMut() -> reqwest::RequestBuilder,
@@ -1061,9 +1069,9 @@ where
 
         // 204 No Content is only valid for DELETE endpoints; use rest_delete_with_retry
         // for those. Reaching here for a 204 indicates API misuse — return a clear error
-        // rather than a misleading "EOF while parsing" JSON failure.
+        // rather than a misleading "EOF while parsing" JSON failure. A retry cannot fix it.
         if status == reqwest::StatusCode::NO_CONTENT {
-            return Err(connectivity_err(
+            return Err(UnindexedClientError::Internal(
                 "Alpaca REST returned 204 No Content — use rest_delete_with_retry for DELETE endpoints"
                     .to_string(),
             ));
@@ -1074,9 +1082,11 @@ where
             .await
             .map_err(|e| connectivity_err(format!("Alpaca REST read body failed: {e}")))?;
 
+        // A 2xx body that does not fit the model is not transient: retrying returns the same
+        // body. An order path must still treat it as status unknown; see `order_post_error`.
         if status.is_success() {
             return serde_json::from_slice::<T>(&bytes).map_err(|e| {
-                connectivity_err(format!(
+                UnindexedClientError::Internal(format!(
                     "Alpaca REST JSON parse error ({status}): {e} | body: {}",
                     String::from_utf8_lossy(&bytes)
                         .chars()
@@ -1236,9 +1246,10 @@ impl ExecutionClient for AlpacaClient {
     ///
     /// # Errors
     ///
-    /// Besides request failures, [`ClientError::Internal`](crate::error::ClientError::Internal)
-    /// when any non-zero equity or option position, requested or not, has a missing or
+    /// [`ClientError::Internal`](crate::error::ClientError::Internal) when a response does not
+    /// decode, or when any non-zero equity or option position, requested or not, has a missing or
     /// unrecognised `side`: its direction cannot be known, and leaving it out would read as flat.
+    /// Other request failures are `Connectivity` or `Api`, as for every Alpaca REST call.
     ///
     /// # Rate limit note
     ///
@@ -1838,16 +1849,7 @@ impl AlpacaClient {
                 }
             }
             Err(e) => {
-                let order_err = match e {
-                    UnindexedClientError::Connectivity(ce) => OrderError::Connectivity(ce),
-                    UnindexedClientError::Api(ae) => OrderError::Rejected(ae),
-                    UnindexedClientError::TaskFailed(_)
-                    | UnindexedClientError::Internal(_)
-                    | UnindexedClientError::Truncated { .. }
-                    | UnindexedClientError::TruncatedSnapshot { .. } => {
-                        unreachable!("rest_with_retry (order path) does not produce these variants")
-                    }
-                };
+                let order_err = order_post_error(e);
                 AlpacaBracketOrderResult {
                     parent: Order {
                         key: order_key,
@@ -2047,24 +2049,7 @@ impl AlpacaClient {
                 })
             }
             Err(e) => {
-                let order_err = match e {
-                    UnindexedClientError::Connectivity(ce) => OrderError::Connectivity(ce),
-                    UnindexedClientError::Api(ae) => OrderError::Rejected(ae),
-                    // TaskFailed, Internal, Truncated, and TruncatedSnapshot are not
-                    // returned by rest_with_retry (REST-only path for orders), but matching
-                    // explicitly ensures any new ClientError variant causes a compile error
-                    // here rather than being silently misclassified. If a future refactor
-                    // makes them reachable, the panic surfaces the bug loudly rather than
-                    // producing a wrong error type.
-                    UnindexedClientError::TaskFailed(_)
-                    | UnindexedClientError::Internal(_)
-                    | UnindexedClientError::Truncated { .. }
-                    | UnindexedClientError::TruncatedSnapshot { .. } => {
-                        unreachable!(
-                            "rest_with_retry (order path) does not produce TaskFailed/Internal/Truncated/TruncatedSnapshot variants"
-                        )
-                    }
-                };
+                let order_err = order_post_error(e);
                 Some(Order {
                     key: order_key,
                     side,
@@ -2322,9 +2307,16 @@ async fn connection_manager(
             .await
             {
                 Ok(()) => {}
+                // One account-wide activities query serves every instrument, so a timeout can
+                // have missed fills in any of them: name the requested set.
                 Err(_) => warn!(
                     timeout_secs = FILL_RECOVERY_TIMEOUT_SECS,
-                    "Alpaca fill recovery timed out — some fills may be missing"
+                    instruments = ?instruments
+                        .iter()
+                        .map(|instrument| instrument.name().as_str())
+                        .collect::<Vec<_>>(),
+                    "Alpaca fill recovery timed out — fills since the disconnect may be missing \
+                     for any of the instruments (every instrument when the list is empty)"
                 ),
             }
         }
@@ -3108,6 +3100,10 @@ fn convert_positions(
 /// position, so an equity or option without one is [`PositionReport::Flat`]. A crypto pair (a
 /// symbol with a `/`) is [`PositionReport::Unreported`]: its holding is a balance.
 ///
+/// Requested names match Alpaca's symbols ignoring case. When two requested names differ only in
+/// case, the first gets the symbol's orders and position; the second is
+/// [`PositionReport::Unreported`] with its orders not complete, since nothing is known about it.
+///
 /// Each snapshot declares its orders complete unless [`convert_open_order`] left one of its
 /// orders out. That holds because `orders` is every open order, unpaged: a response at Alpaca's
 /// cap fails the whole snapshot in [`fetch_raw_open_orders`] rather than arriving here short. And
@@ -3800,6 +3796,30 @@ fn parse_order_error(status: reqwest::StatusCode, message: &str) -> UnindexedOrd
 
 fn connectivity_err(msg: impl Into<String>) -> UnindexedClientError {
     UnindexedClientError::Connectivity(ConnectivityError::Socket(msg.into()))
+}
+
+/// Map a failed order `POST` through [`rest_with_retry`] to the order's error.
+///
+/// [`UnindexedClientError::Internal`] there means Alpaca answered 2xx, so it accepted the order,
+/// but the body did not decode. The order may be live, so it is reported as
+/// [`OrderError::Connectivity`], the status-unknown error, never as a rejection.
+fn order_post_error(error: UnindexedClientError) -> UnindexedOrderError {
+    match error {
+        UnindexedClientError::Connectivity(ce) => OrderError::Connectivity(ce),
+        UnindexedClientError::Api(ae) => OrderError::Rejected(ae),
+        UnindexedClientError::Internal(msg) => OrderError::Connectivity(ConnectivityError::Socket(
+            format!("Alpaca accepted the order but its response did not decode: {msg}"),
+        )),
+        // Not returned by `rest_with_retry`. Matched explicitly so a new `ClientError` variant is
+        // a compile error here rather than silently misclassified.
+        UnindexedClientError::TaskFailed(_)
+        | UnindexedClientError::Truncated { .. }
+        | UnindexedClientError::TruncatedSnapshot { .. } => {
+            unreachable!(
+                "rest_with_retry does not produce TaskFailed/Truncated/TruncatedSnapshot variants"
+            )
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6267,6 +6287,88 @@ mod tests {
                 body.get("position_intent").and_then(|v| v.as_str()),
                 Some("buy_to_open"),
                 "reduce_only=false + Side::Buy should produce position_intent=buy_to_open, got: {body}"
+            );
+        }
+
+        /// A 2xx body that does not decode is not transient, so a query reports it as `Internal`
+        /// rather than as connectivity a caller would retry.
+        #[tokio::test]
+        async fn rest_with_retry_reports_an_undecodable_2xx_body_as_internal() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+                .mount(&server)
+                .await;
+
+            let http = reqwest::Client::new();
+            let rl = RateLimitTracker::new();
+            let url = format!("{}/v2/account", server.uri());
+            let result: Result<serde_json::Value, _> =
+                rest_with_retry(&rl, || http.get(&url)).await;
+            assert!(
+                matches!(result, Err(UnindexedClientError::Internal(_))),
+                "{result:?}"
+            );
+        }
+
+        /// An order Alpaca accepted (2xx) but whose response does not decode may be live, so it
+        /// fails as status unknown (`Connectivity`), never as a rejection, and does not panic.
+        #[tokio::test]
+        async fn open_order_with_an_undecodable_2xx_response_is_status_unknown() {
+            use crate::client::ExecutionClient;
+            use crate::error::OrderError;
+            use crate::order::request::{OrderRequestOpen, RequestOpen};
+            use crate::order::state::{InactiveOrderState, OrderState};
+            use crate::order::{
+                OrderKey, OrderKind, TimeInForce,
+                id::{ClientOrderId, StrategyId},
+            };
+            use rustrade_instrument::Side;
+            use rustrade_instrument::exchange::ExchangeId;
+            use rustrade_instrument::instrument::name::InstrumentNameExchange;
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v2/orders"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({ "id": 1 })),
+                )
+                .mount(&server)
+                .await;
+
+            let instrument = InstrumentNameExchange::new("AAPL");
+            let order = client_for(&server)
+                .open_order(OrderRequestOpen {
+                    key: OrderKey {
+                        exchange: ExchangeId::AlpacaBroker,
+                        instrument: &instrument,
+                        strategy: StrategyId::new("test-strategy"),
+                        cid: ClientOrderId::new("test-cid"),
+                    },
+                    state: RequestOpen {
+                        side: Side::Buy,
+                        price: None,
+                        quantity: Decimal::new(10, 0),
+                        kind: OrderKind::Market,
+                        time_in_force: TimeInForce::ImmediateOrCancel,
+                        position_id: None,
+                        reduce_only: false,
+                        market: None,
+                    },
+                })
+                .await
+                .expect("open_order should return a result");
+
+            assert!(
+                matches!(
+                    order.state,
+                    OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Connectivity(
+                        _
+                    )))
+                ),
+                "{:?}",
+                order.state
             );
         }
 

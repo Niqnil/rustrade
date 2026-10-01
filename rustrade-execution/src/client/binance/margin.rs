@@ -55,7 +55,7 @@ use super::shared::{
     classify_rest_order_error, classify_rest_query_error, convert_execution_report,
     convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event,
     is_duplicate, new_dedup_cache, recovered_order_totals, response_decode_error,
-    rest_call_with_retry,
+    rest_call_with_retry, unrecovered_instruments,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, InstrumentBalanceUpdate,
@@ -1970,6 +1970,12 @@ fn register_user_data_listener(
 /// [`paginate_margin_my_trades`]), so each day of outage before an instrument's first missed fill
 /// costs one sequential request. An outage of weeks across many instruments can therefore run into
 /// [`FILL_RECOVERY_TIMEOUT_SECS`], which bounds the whole recovery.
+///
+/// Each instrument is pushed to `finished` once its fills are forwarded, or once its query failed
+/// (logged), so a caller that times this out can name the instruments it did not get through.
+// One parameter over clippy's limit; bundling the borrowed handles into a struct for this one
+// private call would only move the list.
+#[allow(clippy::too_many_arguments)]
 async fn recover_margin_fills(
     rest: &Arc<RestApi>,
     rate_limiter: &Arc<RateLimitTracker>,
@@ -1978,6 +1984,7 @@ async fn recover_margin_fills(
     tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
     dedup: &SharedDedupCache,
     is_isolated: bool,
+    finished: &mut Vec<InstrumentNameExchange>,
 ) {
     use futures::StreamExt as _;
 
@@ -2013,7 +2020,7 @@ async fn recover_margin_fills(
                 Ok(pages) => pages,
                 Err(e) => {
                     warn!(%e, %inst, "BinanceMargin fill recovery: REST request failed");
-                    return None;
+                    return (inst, None);
                 }
             };
             // `myTrades` carries no cumulative, so each recovered fill's is rebuilt from its
@@ -2034,23 +2041,24 @@ async fn recover_margin_fills(
                 },
             )
             .await;
-            Some(
-                raw.iter()
-                    .filter_map(|t| {
-                        let mut trade = convert_margin_trade(t, &inst)?;
-                        trade.order_filled_quantity = t.id.and_then(|id| totals.get(&id).copied());
-                        Some(trade)
-                    })
-                    .collect::<Vec<_>>(),
-            )
+            let trades = raw
+                .iter()
+                .filter_map(|t| {
+                    let mut trade = convert_margin_trade(t, &inst)?;
+                    trade.order_filled_quantity = t.id.and_then(|id| totals.get(&id).copied());
+                    Some(trade)
+                })
+                .collect::<Vec<_>>();
+            (inst, Some(trades))
         }
     }))
     .buffer_unordered(8);
-    while let Some(result) = stream.next().await {
+    while let Some((inst, result)) = stream.next().await {
         let trades = match result {
             Some(t) => t,
             None => {
                 failed_instruments += 1;
+                finished.push(inst);
                 continue;
             }
         };
@@ -2071,6 +2079,7 @@ async fn recover_margin_fills(
             }
             recovered += 1;
         }
+        finished.push(inst);
     }
 
     if failed_instruments > 0 {
@@ -2221,20 +2230,32 @@ async fn margin_connection_manager(
             tokio::time::Instant::now() + token_renew_after(token.expiration_time_ms);
 
         // --- Fill recovery after a reconnect (bounded) ---
-        if let Some(dt) = disconnect_time.take()
-            && tokio::time::timeout(
+        if let Some(dt) = disconnect_time.take() {
+            let mut finished = Vec::new();
+            if tokio::time::timeout(
                 Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS),
                 // This is the cross manager (account-wide); fill recovery is always cross-scoped.
                 // The isolated manager (a separate path) passes `true`.
-                recover_margin_fills(&rest, &rate_limiter, &instruments, dt, &tx, &dedup, false),
+                recover_margin_fills(
+                    &rest,
+                    &rate_limiter,
+                    &instruments,
+                    dt,
+                    &tx,
+                    &dedup,
+                    false,
+                    &mut finished,
+                ),
             )
             .await
             .is_err()
-        {
-            warn!(
-                timeout_secs = FILL_RECOVERY_TIMEOUT_SECS,
-                "BinanceMargin fill recovery timed out — remaining instruments not queried"
-            );
+            {
+                warn!(
+                    timeout_secs = FILL_RECOVERY_TIMEOUT_SECS,
+                    unrecovered = ?unrecovered_instruments(&instruments, &finished),
+                    "BinanceMargin fill recovery timed out — fills since the disconnect were not recovered for the unrecovered instruments"
+                );
+            }
         }
 
         // --- Monitor: disconnect signal, heartbeat timeout, token refresh, or consumer drop ---
@@ -2616,19 +2637,31 @@ async fn isolated_connection_manager(
         let token_deadline = tokio::time::Instant::now() + token_renew_after(earliest_expiry_ms);
 
         // --- Fill recovery after a reconnect (isolated-scoped over the full symbol set) ---
-        if let Some(dt) = disconnect_time.take()
-            && tokio::time::timeout(
+        if let Some(dt) = disconnect_time.take() {
+            let mut finished = Vec::new();
+            if tokio::time::timeout(
                 Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS),
                 // is_isolated = true: paginate_margin_my_trades must query isolated trades.
-                recover_margin_fills(&rest, &rate_limiter, &symbols, dt, &tx, &dedup, true),
+                recover_margin_fills(
+                    &rest,
+                    &rate_limiter,
+                    &symbols,
+                    dt,
+                    &tx,
+                    &dedup,
+                    true,
+                    &mut finished,
+                ),
             )
             .await
             .is_err()
-        {
-            warn!(
-                timeout_secs = FILL_RECOVERY_TIMEOUT_SECS,
-                "BinanceMargin isolated fill recovery timed out — remaining instruments not queried"
-            );
+            {
+                warn!(
+                    timeout_secs = FILL_RECOVERY_TIMEOUT_SECS,
+                    unrecovered = ?unrecovered_instruments(&symbols, &finished),
+                    "BinanceMargin isolated fill recovery timed out — fills since the disconnect were not recovered for the unrecovered instruments"
+                );
+            }
         }
 
         // --- Monitor: disconnect signal, heartbeat timeout, token refresh, or consumer drop ---

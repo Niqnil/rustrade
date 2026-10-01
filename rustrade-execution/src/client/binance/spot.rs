@@ -39,7 +39,7 @@ use super::shared::{
     classify_rest_query_error, classify_ws_order_error, convert_execution_report,
     convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event,
     is_duplicate, new_dedup_cache, recovered_order_totals, response_decode_error,
-    rest_call_with_retry,
+    rest_call_with_retry, unrecovered_instruments,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
@@ -1490,21 +1490,30 @@ async fn connection_manager(
         // the next account_snapshot or fetch_open_orders call. A caller MUST call
         // fetch_open_orders after each reconnect to reconcile open-order state.
         if let Some(dt) = disconnect_time.take() {
+            let mut finished = Vec::new();
             match tokio::time::timeout(
                 Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS),
-                recover_fills(&rest, &rate_limiter, &instruments, dt, &tx, &dedup),
+                recover_fills(
+                    &rest,
+                    &rate_limiter,
+                    &instruments,
+                    dt,
+                    &tx,
+                    &dedup,
+                    &mut finished,
+                ),
             )
             .await
             {
                 Ok(()) => {}
                 Err(_) => {
                     // Timeout fires when REST calls are slow (rate-limited, network latency).
-                    // Fills recovered so far are already in the channel; remaining instruments
-                    // were not queried. The count of recovered fills (if any) is logged inside
-                    // recover_fills before the timeout fires.
+                    // Fills of the finished instruments are already in the channel; the rest
+                    // were not forwarded, so name them.
                     warn!(
                         timeout_secs = FILL_RECOVERY_TIMEOUT_SECS,
-                        "BinanceSpot fill recovery timed out — remaining instruments not queried, some fills may be missing"
+                        unrecovered = ?unrecovered_instruments(&instruments, &finished),
+                        "BinanceSpot fill recovery timed out — fills since the disconnect were not recovered for the unrecovered instruments"
                     );
                 }
             }
@@ -1619,6 +1628,9 @@ async fn connection_manager(
 /// `myTrades` reports executions only, with no cumulative, so each recovered trade's
 /// `order_filled_quantity` is rebuilt from its order's executions by
 /// [`recovered_order_totals`]. A trade whose order could not be looked up keeps `None`.
+///
+/// Each instrument is pushed to `finished` once its fills are forwarded, or once its query failed
+/// (logged), so a caller that times this out can name the instruments it did not get through.
 // `.iter().cloned()` is required: Rust async closures cannot satisfy the HRTB
 // `for<'a> FnMut(&'a InstrumentNameExchange) -> impl Future + 'static` needed by
 // the iterator machinery, even when the clone is moved inside the closure body.
@@ -1630,6 +1642,7 @@ async fn recover_fills(
     disconnect_time: DateTime<Utc>,
     tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
     dedup: &SharedDedupCache,
+    finished: &mut Vec<InstrumentNameExchange>,
 ) {
     use futures::StreamExt;
 
@@ -1667,7 +1680,7 @@ async fn recover_fills(
                 Ok(pages) => pages,
                 Err(e) => {
                     warn!(%e, %inst, "BinanceSpot fill recovery: REST request failed");
-                    return None;
+                    return (inst, None);
                 }
             };
             // `myTrades` carries no cumulative, so each recovered fill's is rebuilt from its
@@ -1688,15 +1701,16 @@ async fn recover_fills(
                     Some(trade)
                 })
                 .collect();
-            Some(trades)
+            (inst, Some(trades))
         }
     }))
     .buffer_unordered(8);
-    while let Some(result) = stream.next().await {
+    while let Some((inst, result)) = stream.next().await {
         let trades = match result {
             Some(t) => t,
             None => {
                 failed_instruments += 1;
+                finished.push(inst);
                 continue;
             }
         };
@@ -1722,6 +1736,7 @@ async fn recover_fills(
             }
             recovered += 1;
         }
+        finished.push(inst);
     }
 
     if failed_instruments > 0 {
