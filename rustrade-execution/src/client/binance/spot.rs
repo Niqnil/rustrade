@@ -4825,9 +4825,13 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/api/v3/myTrades"))
             .and(wiremock::matchers::query_param("fromId", "1001"))
+            // A full page that reaches past the end: only the end, not a short page, stops the walk.
             .respond_with(
-                wiremock::ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!([trade(1001, end), trade(1002, end + 1),])),
+                wiremock::ResponseTemplate::new(200).set_body_json(
+                    (1_001..=2_000)
+                        .map(|id| trade(id, if id == 1_001 { end } else { end + 1 }))
+                        .collect::<Vec<_>>(),
+                ),
             )
             .with_priority(1)
             .mount(&server)

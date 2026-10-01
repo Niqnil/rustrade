@@ -199,14 +199,14 @@ impl UnrecoveredFills {
         let end_ms = (now + chrono::Duration::seconds(GAP_END_SLACK_SECS)).timestamp_millis();
         let due = tokio::time::Instant::now();
         for instrument in instruments {
-            let gaps = self.0.entry(instrument.clone()).or_default();
-            let start_ms = gaps
+            let kept = self.0.get(instrument).map_or(&[][..], Vec::as_slice);
+            let start_ms = kept
                 .iter()
                 .filter(|kept| kept.start_ms <= end_ms && start_ms <= kept.end_ms)
                 .map(|kept| kept.end_ms + 1)
                 .fold(start_ms, i64::max);
             if start_ms <= end_ms {
-                gaps.push(FillGap {
+                self.0.entry(instrument.clone()).or_default().push(FillGap {
                     start_ms,
                     end_ms,
                     failures: 0,

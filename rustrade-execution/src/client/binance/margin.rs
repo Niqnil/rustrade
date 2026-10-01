@@ -5793,4 +5793,66 @@ mod tests {
             "only the fill inside the gap: {forwarded:?}"
         );
     }
+
+    /// When margin recovery times out, a gap whose read started has failed and waits for its retry, but
+    /// one never started (eight are read at a time) is not charged and stays due.
+    #[tokio::test]
+    async fn a_timed_out_margin_recovery_charges_only_the_gaps_it_started() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/myTrades"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([]))
+                    .set_delay(Duration::from_secs(3_600)),
+            )
+            .mount(&server)
+            .await;
+        let rest = Arc::new(MarginTradingRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server.uri())
+                .timeout(3_600_000_u64)
+                .retries(0_u32)
+                .build()
+                .unwrap(),
+        ));
+        let instruments: Vec<_> = (0..9)
+            .map(|i| InstrumentNameExchange::new(format!("SYM{i}USDT")))
+            .collect();
+        let mut unrecovered = UnrecoveredFills::default();
+        unrecovered.open(
+            &instruments,
+            Utc::now() - chrono::Duration::minutes(10),
+            Utc::now(),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        // Paused: once every read is waiting, the clock jumps to the recovery timeout.
+        tokio::time::pause();
+
+        recover_margin_fills(
+            &rest,
+            &Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
+            &mut unrecovered,
+            &tx,
+            &new_dedup_cache(),
+            false,
+        )
+        .await;
+
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            unrecovered.due(now).len(),
+            1,
+            "the gap never started stays due"
+        );
+        assert_eq!(
+            unrecovered
+                .due(now + Duration::from_secs(crate::client::binance::shared::GAP_RETRY_BASE_SECS))
+                .len(),
+            9,
+            "the eight started wait for their first retry"
+        );
+    }
 }
