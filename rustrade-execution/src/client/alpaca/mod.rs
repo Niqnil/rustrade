@@ -16,6 +16,7 @@
 //
 // Resilience features:
 // - Rate limit handling: reads X-Ratelimit-Remaining / X-Ratelimit-Reset headers;
+//   pauses every request until the reset once a response reports none remaining, and
 //   backs off on 429 with up to MAX_RATE_LIMIT_ATTEMPTS total attempts
 // - Reconnection: account_stream reconnects on WS close/error with exponential
 //   backoff (1 s → 30 s, max 10 attempts)
@@ -225,10 +226,7 @@ impl RateLimitTracker {
     /// Record a rate-limit event, extending any existing cooldown if longer.
     fn on_rate_limited(&self, retry_after: Option<Duration>) {
         let delay = retry_after.unwrap_or(Duration::from_secs(DEFAULT_RATE_LIMIT_DELAY_SECS));
-        let new_deadline = tokio::time::Instant::now() + delay;
-        let mut guard = self.blocked_until.lock();
-        let was_blocked = guard.is_some();
-        *guard = Some(guard.map_or(new_deadline, |existing| existing.max(new_deadline)));
+        let was_blocked = self.extend(delay);
         if was_blocked {
             debug!(
                 delay_secs = delay.as_secs(),
@@ -240,6 +238,30 @@ impl RateLimitTracker {
                 "Alpaca entering rate-limit degradation mode"
             );
         }
+    }
+
+    /// Record a response reporting no requests left in the current window: pause every request
+    /// until the window resets, `reset` from now, so the next one is not refused with a 429.
+    fn on_bucket_exhausted(&self, reset: Duration) {
+        let was_blocked = self.extend(reset);
+        // info! not warn!: nothing was refused. A 429 logs at warn.
+        if !was_blocked {
+            info!(
+                delay_ms = u64::try_from(reset.as_millis()).unwrap_or(u64::MAX),
+                "Alpaca rate-limit window exhausted (X-Ratelimit-Remaining: 0), pausing requests until it resets"
+            );
+        }
+    }
+
+    /// Push the cooldown out to `delay` from now unless it already ends later, and return whether
+    /// one was active.
+    fn extend(&self, delay: Duration) -> bool {
+        let now = tokio::time::Instant::now();
+        let new_deadline = now + delay;
+        let mut guard = self.blocked_until.lock();
+        let was_blocked = guard.is_some_and(|until| until > now);
+        *guard = Some(guard.map_or(new_deadline, |existing| existing.max(new_deadline)));
+        was_blocked
     }
 }
 
@@ -924,6 +946,11 @@ struct AlpacaOrderWs<'a> {
 ///   fractional quantities are supported natively via `Decimal::to_string()`
 /// - Equities: `position_intent` is valid but optional for long-only strategies
 ///
+/// # Rate limits
+/// Once a response reports no requests left in the current window (`X-Ratelimit-Remaining: 0`),
+/// every request, orders included, waits until the window resets (`X-Ratelimit-Reset`, at most a
+/// minute away), so it is not refused. A 429 waits the same way and is retried.
+///
 /// Cloning is cheap: all inner state is behind `Arc`.
 #[derive(Clone)]
 pub struct AlpacaClient {
@@ -1001,6 +1028,35 @@ fn parse_rate_limit_delay(headers: &reqwest::header::HeaderMap) -> Option<Durati
         })
 }
 
+/// Pause every request until the window resets when a response reports none remaining in it.
+///
+/// The pause is at most [`DEFAULT_RATE_LIMIT_DELAY_SECS`], the length of Alpaca's window. Call on
+/// any response except a 429, which sets its own cooldown. Without an
+/// `X-Ratelimit-Reset` there is nothing to pause until, so the next request goes ahead and a 429,
+/// if it comes, backs off.
+fn observe_rate_limit_remaining(
+    rate_limiter: &RateLimitTracker,
+    headers: &reqwest::header::HeaderMap,
+) {
+    let exhausted = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u32>().ok())
+        == Some(0);
+    if !exhausted {
+        return;
+    }
+    match parse_rate_limit_delay(headers) {
+        // Alpaca's window is a minute, so a reset further out is a bad header or clock skew, and
+        // must not hold orders back for longer.
+        Some(reset) => rate_limiter
+            .on_bucket_exhausted(reset.min(Duration::from_secs(DEFAULT_RATE_LIMIT_DELAY_SECS))),
+        None => debug!(
+            "Alpaca REST rate-limit window exhausted (X-Ratelimit-Remaining: 0) without X-Ratelimit-Reset"
+        ),
+    }
+}
+
 /// Execute a REST request with rate-limit awareness and retry.
 ///
 /// The `build_request` closure is called on every attempt so the caller doesn't
@@ -1008,7 +1064,9 @@ fn parse_rate_limit_delay(headers: &reqwest::header::HeaderMap) -> Option<Durati
 /// For GET/POST/DELETE with fixed bodies, the closure is a cheap re-construction.
 ///
 /// On HTTP 429, reads `X-Ratelimit-Reset` (Unix epoch) to determine the cooldown
-/// duration and retries up to `MAX_RATE_LIMIT_ATTEMPTS - 1` times.
+/// duration and retries up to `MAX_RATE_LIMIT_ATTEMPTS - 1` times. Any other response reporting
+/// `X-Ratelimit-Remaining: 0` pauses later requests until that reset; see
+/// [`observe_rate_limit_remaining`].
 ///
 /// # Errors
 ///
@@ -1030,19 +1088,6 @@ where
             .send()
             .await
             .map_err(|e| connectivity_err(format!("Alpaca REST request failed: {e}")))?;
-
-        // Check X-Ratelimit-Remaining as an early warning; if exactly 0, the next
-        // request will 429. We don't proactively pause here — let the 429 handle it —
-        // but log at debug level so it's visible in traces.
-        if response
-            .headers()
-            .get("x-ratelimit-remaining")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u32>().ok())
-            == Some(0)
-        {
-            debug!("Alpaca REST rate-limit bucket exhausted (X-Ratelimit-Remaining: 0)");
-        }
 
         let status = response.status();
 
@@ -1066,6 +1111,8 @@ where
             );
             return Err(UnindexedClientError::Api(ApiError::RateLimit));
         }
+
+        observe_rate_limit_remaining(rate_limiter, response.headers());
 
         // 204 No Content is only valid for DELETE endpoints; use rest_delete_with_retry
         // for those. Reaching here for a 204 indicates API misuse — return a clear error
@@ -1121,7 +1168,8 @@ where
 
 /// Execute a DELETE request, returning an order error on rejection.
 ///
-/// Handles 204 No Content (success), 422 / 403 (API rejection), and 429 (rate limit).
+/// Handles 204 No Content (success), 422 / 403 (API rejection), and 429 (rate limit). Any other
+/// response reporting `X-Ratelimit-Remaining: 0` pauses later requests, as in [`rest_with_retry`].
 async fn rest_delete_with_retry(
     rate_limiter: &RateLimitTracker,
     mut build_request: impl FnMut() -> reqwest::RequestBuilder,
@@ -1156,6 +1204,8 @@ async fn rest_delete_with_retry(
             );
             return Err(UnindexedOrderError::Rejected(ApiError::RateLimit));
         }
+
+        observe_rate_limit_remaining(rate_limiter, response.headers());
 
         // 204 No Content: cancel succeeded.
         if status == reqwest::StatusCode::NO_CONTENT || status.is_success() {
@@ -6310,6 +6360,101 @@ mod tests {
                 matches!(result, Err(UnindexedClientError::Internal(_))),
                 "{result:?}"
             );
+        }
+
+        /// Whether `rl` still holds requests back after 50 ms.
+        async fn holds_back(rl: &RateLimitTracker) -> bool {
+            tokio::time::timeout(Duration::from_millis(50), rl.wait_if_blocked())
+                .await
+                .is_err()
+        }
+
+        /// The rate-limit headers of a response: `remaining`, and a reset 30 s ahead if `reset`.
+        fn with_rate_limit(
+            template: ResponseTemplate,
+            remaining: u32,
+            reset: bool,
+        ) -> ResponseTemplate {
+            let template = template.insert_header("x-ratelimit-remaining", remaining.to_string());
+            if !reset {
+                return template;
+            }
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            template.insert_header("x-ratelimit-reset", (now_secs + 30).to_string())
+        }
+
+        /// A response reporting no requests left holds every later request back until the reset;
+        /// one with requests left, or with no reset to wait for, does not.
+        #[tokio::test]
+        async fn rest_with_retry_pauses_once_no_requests_remain() {
+            for (remaining, reset, pauses) in [(0, true, true), (1, true, false), (0, false, false)]
+            {
+                let server = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path("/v2/account"))
+                    .respond_with(with_rate_limit(
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({})),
+                        remaining,
+                        reset,
+                    ))
+                    .mount(&server)
+                    .await;
+
+                let http = reqwest::Client::new();
+                let rl = RateLimitTracker::new();
+                let url = format!("{}/v2/account", server.uri());
+                let _: serde_json::Value = rest_with_retry(&rl, || http.get(&url)).await.unwrap();
+                assert_eq!(
+                    holds_back(&rl).await,
+                    pauses,
+                    "remaining {remaining}, reset {reset}"
+                );
+            }
+        }
+
+        /// A reset further out than Alpaca's one-minute window holds requests back for a minute
+        /// at most.
+        #[tokio::test]
+        async fn a_pause_lasts_a_minute_at_most() {
+            tokio::time::pause();
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+            headers.insert(
+                "x-ratelimit-reset",
+                (now_secs + 3_600).to_string().parse().unwrap(),
+            );
+            let rl = RateLimitTracker::new();
+
+            observe_rate_limit_remaining(&rl, &headers);
+            assert!(holds_back(&rl).await);
+            tokio::time::advance(Duration::from_secs(DEFAULT_RATE_LIMIT_DELAY_SECS)).await;
+            assert!(!holds_back(&rl).await);
+        }
+
+        /// A cancel's response reporting no requests left holds later requests back too.
+        #[tokio::test]
+        async fn rest_delete_with_retry_pauses_once_no_requests_remain() {
+            let server = MockServer::start().await;
+            Mock::given(method("DELETE"))
+                .and(path("/v2/orders/abc"))
+                .respond_with(with_rate_limit(ResponseTemplate::new(204), 0, true))
+                .mount(&server)
+                .await;
+
+            let http = reqwest::Client::new();
+            let rl = RateLimitTracker::new();
+            let url = format!("{}/v2/orders/abc", server.uri());
+            rest_delete_with_retry(&rl, || http.delete(&url))
+                .await
+                .unwrap();
+            assert!(holds_back(&rl).await);
         }
 
         /// An order Alpaca accepted (2xx) but whose response does not decode may be live, so it

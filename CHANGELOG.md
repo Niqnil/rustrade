@@ -110,7 +110,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   malformed amount in Alpaca's account or positions response now fails the call instead of
   reading as zero; so does an equity or option position whose side is neither long nor short.
 
+- **Alpaca and Binance pause before a rate limit is hit, not only after a 429**
+  (`rustrade-execution`, features `alpaca` and `binance`). Each used to back off only once the
+  venue refused a request.
+  - Alpaca: once a response reports `X-Ratelimit-Remaining: 0`, every request waits until
+    `X-Ratelimit-Reset`, at most a minute, logged at `info`, where a 429 logs at `warn`.
+  - Binance: once a response reports at least 90% of the per-minute request-weight limit used,
+    REST queries wait for the next minute. Orders and cancels never wait for it, so they can use
+    the rest. A reconnect's fill recovery never waits for it either, since a fill not recovered
+    within its 30 s budget is lost, and neither does margin's `userListenToken` request, which
+    that recovery depends on. Spot reads the weight used from REST and WebSocket API responses,
+    and the limit from WebSocket API responses, falling back to Binance's documented 6000.
+    Margin reads `x-sapi-used-ip-weight-1m` against the documented `/sapi` IP limit of 12000; the
+    per-UID limit is not tracked.
+
+  A query near the limit can now take up to about a minute longer. The rustdoc of `AlpacaClient`,
+  `BinanceSpot` and `BinanceMargin` describes each client's limits.
+
 ### Fixed
+
+- **Binance spot reopened its WebSocket API session during a rate-limit cooldown**
+  (`rustrade-execution`, feature `binance`). An order or cancel with no open session ran a new
+  handshake even while REST calls were waiting out a 429, and a handshake Binance refused with
+  429 or 418 did not start a cooldown, so the next order tried again at once. Repeated refusals
+  risk an IP ban. A handshake is now not attempted during a cooldown, and a refused one starts a
+  cooldown. Either way the order or cancel fails with `ApiError::RateLimit`, unsent, instead of
+  as a connectivity error. Also, after the first cooldown, every later one logged its start at
+  `debug` instead of `warn`.
 
 - **Binance spot's `account_stream` delivered no user-data events at all** (`rustrade-execution`,
   feature `binance`). The stream subscribes through the WebSocket API
