@@ -20,8 +20,8 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Read-only by default: every job builds third-party code, and none of it should hold a token
-# that can write to this repository. `audit` widens this for itself below.
+# Read-only by default: jobs here compile third-party code (build scripts, proc macros), which
+# should not hold a token that can write to this repository. `audit` widens this for itself below.
 permissions:
   contents: read
 
@@ -317,7 +317,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-      checks: write  # audit-check reports its result as a check run
+      checks: write  # audit-check reports an advisory it finds as a check run
     steps:
       - name: Checkout sources
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
