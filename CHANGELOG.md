@@ -25,8 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     not fit the `OmsMode`. `build` keeps its signature and panics on the same errors; a builder
     with no seeds never panics.
   - `SystemBuilder::build` returns the error as the new `BarterError::PositionSeed` variant.
-    `BarterError` is not `#[non_exhaustive]`, so a downstream `match` on it that lists every
-    variant needs an arm for this one.
+    **Breaking:** `BarterError` is not `#[non_exhaustive]`, so a downstream `match` on it that
+    lists every variant needs an arm for this one.
   - `VenuePositionSeeds::from_account_snapshot` builds seeds from the positions a venue reports
     in an account snapshot (Alpaca, IBKR and Hyperliquid perpetuals report them), resolving the
     venue's instrument names through the engine's `IndexedInstruments`. An open position it
@@ -239,11 +239,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   engine now checks every request before sending it. It rejects one for an unknown instrument
   unsent, reports it in its action output's `errors` as the new
   `RecoverableEngineError::UnknownInstrument`, logs a warning, and keeps running.
-  - New `TracksInstrument` trait, implemented for `EngineState`. The engine's `GenerateAlgoOrders`
-    and `ClosePositions` implementations now require it of their `State`, so a custom `State`
-    used with them must implement it.
-  - `RecoverableEngineError` is now `#[non_exhaustive]`, so a downstream `match` on it needs a
-    wildcard arm.
+  - **Breaking:** new `TracksInstrument` trait, implemented for `EngineState`. The engine's
+    `GenerateAlgoOrders` and `ClosePositions` implementations now require it of their `State`, so
+    a custom `State` used with them must implement it.
+  - **Breaking:** `RecoverableEngineError` is now `#[non_exhaustive]`, so a downstream `match` on
+    it needs a wildcard arm.
   - `MarketSnapshotSource::market_snapshot` on `EngineState` returns `None` for an unknown
     instrument instead of panicking.
 
