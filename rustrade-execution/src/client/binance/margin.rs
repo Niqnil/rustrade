@@ -51,11 +51,12 @@ use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
     MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, RateLimitTracker,
-    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UserDataFrame, classify_order_kind_tif,
-    classify_rest_order_error, classify_rest_query_error, convert_execution_report,
-    convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event,
-    is_duplicate, log_unrecognised_frame, new_dedup_cache, parse_user_data_frame,
-    recovered_order_totals, response_decode_error, rest_call_with_retry, unrecovered_instruments,
+    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnrecoveredFills, UserDataFrame,
+    classify_order_kind_tif, classify_rest_order_error, classify_rest_query_error,
+    convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
+    dedup_key_from_event, is_duplicate, log_unrecognised_frame, new_dedup_cache,
+    parse_user_data_frame, recovered_order_totals, response_decode_error, rest_call_with_retry,
+    unrecovered_instruments,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, InstrumentBalanceUpdate,
@@ -1154,6 +1155,11 @@ impl ExecutionClient for BinanceMargin {
     /// re-subscribed before its ~24h expiry — there is **no** listen-key keepalive (that API is
     /// retired).
     ///
+    /// As on spot, the fills of an instrument a recovery did not finish (timeout or failed query)
+    /// are read again from the start of their gap by the next reconnect's recovery; the token
+    /// renewal reconnects at least daily. The warning or error that ended the recovery names the
+    /// instruments, whose fills [`ExecutionClient::fetch_trades`] can read sooner.
+    ///
     /// # Debt cold-start
     /// This method does **not** seed balances. Margin debt (`borrowed`/`interest`) is correct only
     /// if the caller invokes [`ExecutionClient::account_snapshot`] at startup (the `BalanceSnapshot`
@@ -1937,12 +1943,14 @@ fn register_user_data_listener(
 ///
 /// Fills forwarded before the deadline stay delivered. The instruments whose fills were not
 /// recovered, because their query failed or had not finished, are named in the warning or error
-/// that ends the recovery.
+/// that ends the recovery, and recorded in `unrecovered`, so the next reconnect's recovery reads
+/// each from the start of its gap rather than from its own disconnect.
 async fn recover_margin_fills(
     rest: &Arc<RestApi>,
     rate_limiter: &Arc<RateLimitTracker>,
     instruments: &[InstrumentNameExchange],
     disconnect_time: DateTime<Utc>,
+    unrecovered: &mut UnrecoveredFills,
     tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
     dedup: &SharedDedupCache,
     is_isolated: bool,
@@ -1956,19 +1964,27 @@ async fn recover_margin_fills(
     info!(
         since = %disconnect_time,
         instruments = instruments.len(),
+        retrying_earlier_gaps = !unrecovered.is_empty(),
         "BinanceMargin recovering fills after reconnect"
     );
+    // Each instrument's start: its disconnect, or the start of a gap an earlier recovery left.
+    let starts: Vec<_> = instruments
+        .iter()
+        .map(|inst| {
+            let since = unrecovered.since(inst, disconnect_time);
+            (inst.clone(), since.timestamp_millis())
+        })
+        .collect();
 
     // Instruments whose fills have all been forwarded; the rest are named if recovery fails.
     let mut recovered_instruments = Vec::with_capacity(instruments.len());
     let recovery = async {
-        let start_time_ms = disconnect_time.timestamp_millis();
         let order_executions_deadline = tokio::time::Instant::now() + ORDER_EXECUTIONS_BUDGET;
         let mut recovered = 0u32;
         let mut duplicates = 0u32;
         let mut failed_instruments = 0u32;
 
-        let mut stream = futures::stream::iter(instruments.iter().cloned().map(|inst| {
+        let mut stream = futures::stream::iter(starts.into_iter().map(|(inst, start_time_ms)| {
             let rest = rest.clone();
             let rl = rate_limiter.clone();
             async move {
@@ -2052,7 +2068,7 @@ async fn recover_margin_fills(
                 failed_instruments,
                 is_isolated,
                 unrecovered = ?unrecovered_instruments(instruments, &recovered_instruments),
-                "BinanceMargin fill recovery complete with failures — fills since the disconnect may be permanently missed for the unrecovered instruments"
+                "BinanceMargin fill recovery complete with failures — fills since the disconnect were not recovered for the unrecovered instruments; the next reconnect retries them"
             );
         } else {
             info!(
@@ -2072,9 +2088,10 @@ async fn recover_margin_fills(
             is_isolated,
             unrecovered = ?unrecovered_instruments(instruments, &recovered_instruments),
             "BinanceMargin fill recovery timed out — fills since the disconnect were not recovered \
-             for the unrecovered instruments (failed or still pending)"
+             for the unrecovered instruments (failed or still pending); the next reconnect retries them"
         );
     }
+    unrecovered.record(instruments, &recovered_instruments, disconnect_time);
 }
 
 /// Long-running task driving the `account_stream` WebSocket lifecycle.
@@ -2107,6 +2124,8 @@ async fn margin_connection_manager(
 
     let mut backoff = ExponentialBackoff::new();
     let mut disconnect_time: Option<DateTime<Utc>> = None;
+    // Gaps a recovery did not finish, read again by the next one.
+    let mut unrecovered = UnrecoveredFills::default();
     let (mut current_ws, mut current_token) = match initial {
         Some((ws, token)) => (Some(ws), Some(token)),
         None => (None, None),
@@ -2213,7 +2232,17 @@ async fn margin_connection_manager(
         if let Some(dt) = disconnect_time.take() {
             // This is the cross manager (account-wide); fill recovery is always cross-scoped.
             // The isolated manager (a separate path) passes `true`.
-            recover_margin_fills(&rest, &rate_limiter, &instruments, dt, &tx, &dedup, false).await;
+            recover_margin_fills(
+                &rest,
+                &rate_limiter,
+                &instruments,
+                dt,
+                &mut unrecovered,
+                &tx,
+                &dedup,
+                false,
+            )
+            .await;
         }
 
         // --- Monitor: disconnect signal, heartbeat timeout, token refresh, or consumer drop ---
@@ -2517,6 +2546,8 @@ async fn isolated_connection_manager(
 
     let mut backoff = ExponentialBackoff::new();
     let mut disconnect_time: Option<DateTime<Utc>> = None;
+    // Gaps a recovery did not finish, read again by the next one.
+    let mut unrecovered = UnrecoveredFills::default();
     let mut current = initial;
 
     loop {
@@ -2597,7 +2628,17 @@ async fn isolated_connection_manager(
         // --- Fill recovery after a reconnect (isolated-scoped over the full symbol set) ---
         if let Some(dt) = disconnect_time.take() {
             // is_isolated = true: paginate_margin_my_trades must query isolated trades.
-            recover_margin_fills(&rest, &rate_limiter, &symbols, dt, &tx, &dedup, true).await;
+            recover_margin_fills(
+                &rest,
+                &rate_limiter,
+                &symbols,
+                dt,
+                &mut unrecovered,
+                &tx,
+                &dedup,
+                true,
+            )
+            .await;
         }
 
         // --- Monitor: disconnect signal, heartbeat timeout, token refresh, or consumer drop ---
@@ -5503,5 +5544,83 @@ mod tests {
             "got {err:?}"
         );
         assert!(!err.is_transient());
+    }
+
+    /// A recovery that fails for an instrument does not lose its gap: the next reconnect's
+    /// recovery reads that instrument from the first disconnect, not from its own.
+    #[tokio::test]
+    async fn an_unfinished_recovery_is_retried_from_its_gap_at_the_next_reconnect() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/myTrades"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({"code": -1100, "msg": "rejected"})),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/myTrades"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        let rest = Arc::new(MarginTradingRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server.uri())
+                .build()
+                .unwrap(),
+        ));
+        let tracker = Arc::new(RateLimitTracker::new());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let dedup = new_dedup_cache();
+        let instruments = [InstrumentNameExchange::new("BTCUSDT")];
+        let first = Utc::now() - chrono::Duration::minutes(10);
+        let second = Utc::now() - chrono::Duration::minutes(1);
+        let mut unrecovered = UnrecoveredFills::default();
+
+        recover_margin_fills(
+            &rest,
+            &tracker,
+            &instruments,
+            first,
+            &mut unrecovered,
+            &tx,
+            &dedup,
+            false,
+        )
+        .await;
+        recover_margin_fills(
+            &rest,
+            &tracker,
+            &instruments,
+            second,
+            &mut unrecovered,
+            &tx,
+            &dedup,
+            false,
+        )
+        .await;
+
+        let start_times: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| {
+                request
+                    .url
+                    .query_pairs()
+                    .find(|(key, _)| key == "startTime")
+                    .map(|(_, value)| value.into_owned())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let first_ms = first.timestamp_millis().to_string();
+        assert_eq!(start_times, [first_ms.clone(), first_ms], "BinanceMargin");
+        assert!(unrecovered.is_empty(), "the retry recovered it");
     }
 }

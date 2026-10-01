@@ -112,6 +112,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Binance fills a reconnect's recovery did not finish were lost** (`rustrade-execution`,
+  feature `binance`). After a reconnect, `BinanceSpot` and `BinanceMargin` recover the fills
+  missed during the disconnect, within 30 s. An instrument whose query failed or had not finished
+  in time was only logged: the next reconnect recovered from its own disconnect, so the earlier
+  gap's fills were never delivered. The client now keeps each such instrument's gap, and the next
+  reconnect's recovery reads it from the start of that gap. Margin's daily token renewal
+  reconnects, so its gaps are retried within a day; a caller that cannot wait can read them with
+  `fetch_trades`. Instruments already recovered are not re-read, so their fills are not delivered
+  twice.
+
 - **Binance spot's `account_stream` delivered no user-data events at all** (`rustrade-execution`,
   feature `binance`). The stream subscribes through the WebSocket API
   (`userDataStream.subscribe.signature`), which wraps each event as

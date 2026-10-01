@@ -121,9 +121,58 @@ const _: () = assert!(
 /// Timeout for fill recovery REST queries after reconnect.
 pub(crate) const FILL_RECOVERY_TIMEOUT_SECS: u64 = 30;
 
+/// The fills a reconnect's recovery has not yet forwarded: for each instrument whose recovery
+/// failed or did not finish, the time its gap starts.
+///
+/// A failed or timed-out recovery used to lose its instruments' gaps, since the next reconnect
+/// recovered only from its own disconnect. Kept across reconnects, this makes the next recovery
+/// read each such instrument from the start of its older gap instead, so those fills are delayed
+/// rather than lost. Only instruments still unrecovered are kept: re-reading one already
+/// recovered would forward its fills again once they had left the dedup cache.
+#[derive(Debug, Default)]
+pub(crate) struct UnrecoveredFills(fnv::FnvHashMap<InstrumentNameExchange, DateTime<Utc>>);
+
+impl UnrecoveredFills {
+    /// The time a recovery after a disconnect at `disconnect_time` reads `instrument`'s fills from:
+    /// the start of its unrecovered gap, if that is earlier.
+    pub(crate) fn since(
+        &self,
+        instrument: &InstrumentNameExchange,
+        disconnect_time: DateTime<Utc>,
+    ) -> DateTime<Utc> {
+        self.0
+            .get(instrument)
+            .map_or(disconnect_time, |&gap| gap.min(disconnect_time))
+    }
+
+    /// Record a recovery after a disconnect at `disconnect_time` over `instruments`, which
+    /// forwarded every fill of those in `recovered`: they are done, and the rest keep their gap.
+    pub(crate) fn record(
+        &mut self,
+        instruments: &[InstrumentNameExchange],
+        recovered: &[InstrumentNameExchange],
+        disconnect_time: DateTime<Utc>,
+    ) {
+        for instrument in instruments {
+            if recovered.contains(instrument) {
+                self.0.remove(instrument);
+            } else {
+                let since = self.since(instrument, disconnect_time);
+                self.0.insert(instrument.clone(), since);
+            }
+        }
+    }
+
+    /// Whether any instrument still has fills to recover.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// The names of the `instruments` a fill recovery did not recover, for the log line that ends it:
 /// those not in `recovered`, because their query failed or had not finished, so their fills since
-/// the disconnect were never forwarded.
+/// the disconnect were not forwarded. [`UnrecoveredFills`] keeps their gaps for the next
+/// reconnect.
 pub(crate) fn unrecovered_instruments<'a>(
     instruments: &'a [InstrumentNameExchange],
     recovered: &[InstrumentNameExchange],
@@ -2018,6 +2067,36 @@ fn order_error_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An instrument a recovery did not finish keeps the start of its gap until one does; a later
+    /// disconnect does not move it later, and an instrument never unrecovered reads from the
+    /// disconnect.
+    #[test]
+    fn unrecovered_fills_keep_the_start_of_the_gap() {
+        let btc = InstrumentNameExchange::new("BTCUSDT");
+        let eth = InstrumentNameExchange::new("ETHUSDT");
+        let instruments = [btc.clone(), eth.clone()];
+        let first = Utc.timestamp_millis_opt(1_000_000).unwrap();
+        let second = Utc.timestamp_millis_opt(2_000_000).unwrap();
+        let mut unrecovered = UnrecoveredFills::default();
+        assert!(unrecovered.is_empty());
+        assert_eq!(unrecovered.since(&btc, first), first);
+
+        // BTC failed after the first disconnect, ETH was recovered.
+        unrecovered.record(&instruments, std::slice::from_ref(&eth), first);
+        assert!(!unrecovered.is_empty());
+        assert_eq!(unrecovered.since(&btc, second), first);
+        assert_eq!(unrecovered.since(&eth, second), second);
+
+        // Both failed after the second disconnect: BTC's gap still starts at the first.
+        unrecovered.record(&instruments, &[], second);
+        assert_eq!(unrecovered.since(&btc, second), first);
+        assert_eq!(unrecovered.since(&eth, second), second);
+
+        // A recovery that finishes both clears them.
+        unrecovered.record(&instruments, &instruments, second);
+        assert!(unrecovered.is_empty());
+    }
 
     /// A recovery names, in request order, exactly the instruments it did not recover.
     #[test]
