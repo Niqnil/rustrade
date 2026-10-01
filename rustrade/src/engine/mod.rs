@@ -1852,8 +1852,9 @@ pub enum ContractExpiryNotSettledReason {
     /// example one taken from another `IndexedInstruments`. It was rejected before anything was
     /// touched. **Not** retryable — the same event is rejected every time.
     ///
-    /// The output's `instrument` is that unresolved index: do not look it up in the engine's
-    /// state, where the panicking accessors would panic on it.
+    /// The output's `instrument` is that unresolved index: look it up, if at all, with
+    /// [`InstrumentStates::get_index`](crate::engine::state::instrument::InstrumentStates::get_index),
+    /// since `instrument_index` would panic on it.
     UnknownInstrument,
 }
 
@@ -1970,8 +1971,9 @@ pub enum UnsupportedCorporateActionReason {
     /// touched and the `id` is not recorded. **Not** self-healing on retry: the same event is
     /// rejected every time.
     ///
-    /// The output's `instrument` is that unresolved index: do not look it up in the engine's
-    /// state, where the panicking accessors would panic on it.
+    /// The output's `instrument` is that unresolved index: look it up, if at all, with
+    /// [`InstrumentStates::get_index`](crate::engine::state::instrument::InstrumentStates::get_index),
+    /// since `instrument_index` would panic on it.
     UnknownInstrument,
 }
 
