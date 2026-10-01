@@ -117,10 +117,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `X-Ratelimit-Reset`, at most a minute, logged at `info`, where a 429 logs at `warn`.
   - Binance: once a response reports at least 90% of the per-minute request-weight limit used,
     REST queries wait for the next minute. Orders and cancels never wait for it, so they can use
-    the rest. A reconnect's fill recovery never waits for it either, since a fill not recovered
-    within its 30 s budget is lost, and neither does margin's `userListenToken` request, which
-    that recovery depends on. Spot reads the weight used from REST and WebSocket API responses,
-    and the limit from WebSocket API responses, falling back to Binance's documented 6000.
+    the rest. A reconnect's fill recovery never waits for it either, since a pause could outlast
+    its 30 s budget and leave its fills to a later retry, and neither does margin's
+    `userListenToken` request, which that recovery depends on. Spot reads the weight used from
+    REST and WebSocket API responses, and the limit from WebSocket API responses, falling back to
+    Binance's documented 6000.
     Margin reads `x-sapi-used-ip-weight-1m` against the documented `/sapi` IP limit of 12000; the
     per-UID limit is not tracked.
 
@@ -128,6 +129,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BinanceSpot` and `BinanceMargin` describes each client's limits.
 
 ### Fixed
+
+- **Binance fills a reconnect's recovery did not finish were lost** (`rustrade-execution`,
+  feature `binance`). After a reconnect, `BinanceSpot` and `BinanceMargin` recover the fills
+  missed during the disconnect, within 30 s. An instrument whose query failed or had not finished
+  in time was only logged, and its fills were never delivered. Each instrument's gap, from the
+  disconnect to just after its recovery began, is now kept until its fills are forwarded. A gap
+  not read is retried after 1, 2, 4, 8 and 16 minutes, whether the stream stays connected or
+  reconnects in between. A retry reads only the gap, not the fills the stream has delivered
+  live since; the few seconds at its end that overlap live delivery are deduplicated. After five
+  failed retries the gap is given up and logged at `error`; its fills can still be read with
+  `fetch_trades`.
 
 - **Binance spot reopened its WebSocket API session during a rate-limit cooldown**
   (`rustrade-execution`, feature `binance`). An order or cancel with no open session ran a new

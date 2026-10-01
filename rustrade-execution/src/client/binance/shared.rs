@@ -55,7 +55,7 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 // ---------------------------------------------------------------------------
 // AbortOnDropStream — ensures connection_manager task is cleaned up
@@ -121,18 +121,223 @@ const _: () = assert!(
 /// Timeout for fill recovery REST queries after reconnect.
 pub(crate) const FILL_RECOVERY_TIMEOUT_SECS: u64 = 30;
 
-/// The names of the `instruments` a fill recovery did not recover, for the log line that ends it:
-/// those not in `recovered`, because their query failed or had not finished, so their fills since
-/// the disconnect were never forwarded.
-pub(crate) fn unrecovered_instruments<'a>(
-    instruments: &'a [InstrumentNameExchange],
-    recovered: &[InstrumentNameExchange],
-) -> Vec<&'a str> {
-    instruments
-        .iter()
-        .filter(|instrument| !recovered.contains(instrument))
-        .map(|instrument| instrument.name().as_str())
-        .collect()
+/// How far past the start of the recovery that opens it a [`FillGap`] reaches.
+///
+/// Recovery starts after the live stream is subscribed, so a fill after that moment arrives live.
+/// Binance stamps fills by its own clock, which may run ahead of this host's. Binance rejects a
+/// signed request stamped more than `recvWindow` (5 s by default) from its clock, so a skew past
+/// this margin would already fail every REST call. The overlap with live delivery it leaves is
+/// seconds long, and the dedup cache absorbs it, as long as those fills have not left it by the
+/// time the gap is read.
+pub(crate) const GAP_END_SLACK_SECS: i64 = 10;
+/// How many times a [`FillGap`] is retried after its first read fails before it is given up.
+pub(crate) const MAX_GAP_RETRIES: u32 = 5;
+/// The wait before a [`FillGap`]'s first retry. It doubles after each failure, so the retries
+/// come 1, 2, 4, 8 and 16 minutes apart, about half an hour in all.
+pub(crate) const GAP_RETRY_BASE_SECS: u64 = 60;
+
+/// A span of one instrument's fills that a reconnect's recovery has not yet forwarded.
+///
+/// It runs from the disconnect to just after the recovery that opened it began
+/// ([`GAP_END_SLACK_SECS`]). The live stream delivers every fill after that, so reading the gap
+/// never re-reads a fill the stream already delivered, however long the gap waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FillGap {
+    /// The first moment of the gap, in epoch milliseconds.
+    pub(crate) start_ms: i64,
+    /// The last moment of the gap, in epoch milliseconds.
+    pub(crate) end_ms: i64,
+    /// How many reads of the gap have failed or not finished.
+    failures: u32,
+    /// When the gap may next be read.
+    due: tokio::time::Instant,
+}
+
+impl FillGap {
+    /// Whether this is the same span as `other`, whatever its retry state.
+    fn same_span(&self, other: &Self) -> bool {
+        self.start_ms == other.start_ms && self.end_ms == other.end_ms
+    }
+}
+
+/// What became of a [`FillGap`] whose read failed or did not finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GapFailure {
+    /// It is read again after this delay.
+    Retry(Duration),
+    /// It has failed [`MAX_GAP_RETRIES`] retries and is dropped: its fills are not delivered.
+    GivenUp,
+}
+
+/// The fills a reconnect's recovery has not yet forwarded, as [`FillGap`]s per instrument.
+///
+/// A reconnect opens a gap for every instrument ([`open`](Self::open)) before reading any, so a
+/// recovery that fails or times out loses nothing: each gap stays until its fills are forwarded
+/// ([`recovered`](Self::recovered)), and a failed one is retried with a backoff, connected or
+/// across reconnects, until it has failed [`MAX_GAP_RETRIES`] retries
+/// ([`failed`](Self::failed)). A reconnect does not bring a retry forward, so a flapping
+/// connection cannot use the retries up.
+#[derive(Debug, Default)]
+pub(crate) struct UnrecoveredFills(fnv::FnvHashMap<InstrumentNameExchange, Vec<FillGap>>);
+
+impl UnrecoveredFills {
+    /// Open a gap for each of `instruments`, from `disconnect_time` to just after `now`, the start
+    /// of the recovery that will read it, due at once.
+    ///
+    /// Where the new gap overlaps one the instrument already has, it starts after it instead: the
+    /// kept gap covers that part and keeps its retry schedule, so no span is read twice and a
+    /// reconnect never brings a retry forward. Disconnects come in time order, so an earlier part
+    /// of the new gap that no kept gap covers is from before the previous disconnect, when the
+    /// stream was live.
+    pub(crate) fn open(
+        &mut self,
+        instruments: &[InstrumentNameExchange],
+        disconnect_time: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) {
+        let start_ms = disconnect_time.timestamp_millis();
+        let end_ms = (now + chrono::Duration::seconds(GAP_END_SLACK_SECS)).timestamp_millis();
+        let due = tokio::time::Instant::now();
+        for instrument in instruments {
+            let kept = self.0.get(instrument).map_or(&[][..], Vec::as_slice);
+            let start_ms = kept
+                .iter()
+                .filter(|kept| kept.start_ms <= end_ms && start_ms <= kept.end_ms)
+                .map(|kept| kept.end_ms + 1)
+                .fold(start_ms, i64::max);
+            if start_ms <= end_ms {
+                self.0.entry(instrument.clone()).or_default().push(FillGap {
+                    start_ms,
+                    end_ms,
+                    failures: 0,
+                    due,
+                });
+            }
+        }
+    }
+
+    /// The gaps due by `now`, to read.
+    pub(crate) fn due(&self, now: tokio::time::Instant) -> Vec<(InstrumentNameExchange, FillGap)> {
+        self.0
+            .iter()
+            .flat_map(|(instrument, gaps)| {
+                gaps.iter()
+                    .filter(move |gap| gap.due <= now)
+                    .map(move |gap| (instrument.clone(), *gap))
+            })
+            .collect()
+    }
+
+    /// When the next gap is due, or `None` when there is none.
+    pub(crate) fn next_due(&self) -> Option<tokio::time::Instant> {
+        self.0.values().flatten().map(|gap| gap.due).min()
+    }
+
+    /// Whether no gap is left.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Make every gap due now, as if its retry delay had passed.
+    #[cfg(test)]
+    pub(crate) fn make_due(&mut self) {
+        let now = tokio::time::Instant::now();
+        for gap in self.0.values_mut().flatten() {
+            gap.due = now;
+        }
+    }
+
+    /// Record that `gap`'s fills have all been forwarded.
+    pub(crate) fn recovered(&mut self, instrument: &InstrumentNameExchange, gap: &FillGap) {
+        self.remove_where(instrument, |kept| kept.same_span(gap));
+    }
+
+    /// Record that a read of `gap` failed or did not finish at `now`: it is retried after a
+    /// backoff, or dropped once it has failed [`MAX_GAP_RETRIES`] retries. Returns which, or
+    /// `None` if the gap is no longer kept.
+    pub(crate) fn failed(
+        &mut self,
+        instrument: &InstrumentNameExchange,
+        gap: &FillGap,
+        now: tokio::time::Instant,
+    ) -> Option<GapFailure> {
+        let gaps = self.0.get_mut(instrument)?;
+        let index = gaps.iter().position(|kept| kept.same_span(gap))?;
+        gaps[index].failures += 1;
+        if gaps[index].failures > MAX_GAP_RETRIES {
+            gaps.remove(index);
+            if gaps.is_empty() {
+                self.0.remove(instrument);
+            }
+            return Some(GapFailure::GivenUp);
+        }
+        let delay = Duration::from_secs(GAP_RETRY_BASE_SECS << (gaps[index].failures - 1));
+        gaps[index].due = now + delay;
+        Some(GapFailure::Retry(delay))
+    }
+
+    fn remove_where(
+        &mut self,
+        instrument: &InstrumentNameExchange,
+        matches: impl Fn(&FillGap) -> bool,
+    ) {
+        if let Some(gaps) = self.0.get_mut(instrument) {
+            gaps.retain(|gap| !matches(gap));
+            if gaps.is_empty() {
+                self.0.remove(instrument);
+            }
+        }
+    }
+}
+
+/// A gap boundary in epoch milliseconds, as a time for a log line.
+pub(crate) fn gap_time(ms: i64) -> DateTime<Utc> {
+    Utc.timestamp_millis_opt(ms).single().unwrap_or_default()
+}
+
+/// Record that fill recovery on `venue` did not read `gap` of `instrument`, because of `reason`,
+/// and log what follows: a retry, or, once it has failed [`MAX_GAP_RETRIES`] retries, giving the
+/// gap up, which leaves its fills undelivered.
+pub(crate) fn gap_failed(
+    unrecovered: &mut UnrecoveredFills,
+    venue: ExchangeId,
+    instrument: &InstrumentNameExchange,
+    gap: &FillGap,
+    reason: &str,
+) {
+    let (start, end) = (gap_time(gap.start_ms), gap_time(gap.end_ms));
+    match unrecovered.failed(instrument, gap, tokio::time::Instant::now()) {
+        Some(GapFailure::Retry(delay)) => warn!(
+            %venue,
+            %instrument,
+            %start,
+            %end,
+            retry_in_secs = delay.as_secs(),
+            reason,
+            "Binance fill recovery did not read this gap, retrying it later"
+        ),
+        Some(GapFailure::GivenUp) => error!(
+            %venue,
+            %instrument,
+            %start,
+            %end,
+            retries = MAX_GAP_RETRIES,
+            reason,
+            "Binance fill recovery gave up on this gap: its fills are not delivered; read them \
+             with fetch_trades"
+        ),
+        None => {}
+    }
+}
+
+/// Drop the executions in `page` stamped after `end_ms`, and return whether there were any: a
+/// walk over a span then has everything in it, since Binance returns executions in trade-id order,
+/// which is time order. An execution without a time is kept.
+pub(crate) fn drop_after<T: BinanceExecutionFields>(page: &mut Vec<T>, end_ms: i64) -> bool {
+    let len = page.len();
+    page.retain(|execution| execution.time().is_none_or(|time| time <= end_ms));
+    page.len() < len
 }
 /// Timeout for the initial WebSocket API TCP+TLS handshake.
 /// Without this, a network partition holds the write lock for up to 75–127 s
@@ -322,10 +527,10 @@ pub(crate) enum RequestKind {
     Order,
     /// Reads account or order state. Also waits while the weight used is near the limit.
     Query,
-    /// Reads state that cannot be fetched again later, such as the fills a reconnect's recovery
-    /// forwards, or what that recovery depends on. Like [`Order`](Self::Order), waits only for a
-    /// rate-limit cooldown: the pause near the limit can outlast the recovery's time budget, and
-    /// fills it does not recover are lost, not delayed.
+    /// Reads what a reconnect's fill recovery needs, or what that recovery depends on. Like
+    /// [`Order`](Self::Order), waits only for a rate-limit cooldown: the pause near the limit can
+    /// outlast the recovery's time budget, which would leave its fills to a retry minutes later,
+    /// or undelivered once every retry has failed.
     Essential,
 }
 
@@ -991,6 +1196,9 @@ pub(crate) fn convert_open_order_owned_symbol<T: BinanceOrderFields>(
 pub(crate) enum MyTradesFrom {
     /// Every execution on the instrument at or after this time, in epoch milliseconds.
     Time(i64),
+    /// Every execution on the instrument from `start` to `end`, both included, in epoch
+    /// milliseconds: a [`FillGap`].
+    Span { start: i64, end: i64 },
     /// Every execution of this one order, from its first.
     ///
     /// Queried by `orderId` alone, Binance returns an order's oldest executions first, in
@@ -1001,13 +1209,15 @@ pub(crate) enum MyTradesFrom {
 }
 
 /// The fields of a `myTrades` execution that fill recovery reads to rebuild an order's
-/// cumulative filled quantity. Spot and margin serve different types that share these three.
+/// cumulative filled quantity. Spot and margin serve different types that share these fields.
 pub(crate) trait BinanceExecutionFields {
     /// The trade id, which Binance assigns in increasing order per symbol.
     fn id(&self) -> Option<i64>;
     fn order_id(&self) -> Option<i64>;
     /// The size of this execution.
     fn qty(&self) -> Option<&str>;
+    /// When this execution happened, in epoch milliseconds.
+    fn time(&self) -> Option<i64>;
 }
 
 macro_rules! impl_binance_execution_fields {
@@ -1017,6 +1227,7 @@ macro_rules! impl_binance_execution_fields {
                 fn id(&self) -> Option<i64> { self.id }
                 fn order_id(&self) -> Option<i64> { self.order_id }
                 fn qty(&self) -> Option<&str> { self.qty.as_deref() }
+                fn time(&self) -> Option<i64> { self.time }
             }
         )*
     };
@@ -2265,19 +2476,102 @@ fn order_error_from(
 mod tests {
     use super::*;
 
-    /// A recovery names, in request order, exactly the instruments it did not recover.
-    #[test]
-    fn unrecovered_instruments_names_those_not_recovered() {
-        let instruments: Vec<InstrumentNameExchange> = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-            .into_iter()
-            .map(InstrumentNameExchange::new)
-            .collect();
-        let recovered = vec![InstrumentNameExchange::new("ETHUSDT")];
+    /// A gap is due once opened, leaves when recovered, and when its read fails is retried with a
+    /// doubling delay until it has failed every retry, then given up.
+    #[tokio::test]
+    async fn a_fill_gap_is_retried_with_backoff_then_given_up() {
+        tokio::time::pause();
+        let btc = InstrumentNameExchange::new("BTCUSDT");
+        let eth = InstrumentNameExchange::new("ETHUSDT");
+        let disconnect = Utc.timestamp_millis_opt(1_000_000).unwrap();
+        let reconnect = Utc.timestamp_millis_opt(2_000_000).unwrap();
+        let mut unrecovered = UnrecoveredFills::default();
+        unrecovered.open(&[btc.clone(), eth.clone()], disconnect, reconnect);
+
+        let due = unrecovered.due(tokio::time::Instant::now());
+        assert_eq!(due.len(), 2);
+        let gap_of = |instrument: &InstrumentNameExchange| {
+            let Some((_, gap)) = due.iter().find(|(inst, _)| inst == instrument) else {
+                panic!("{instrument} has a gap");
+            };
+            *gap
+        };
+        let gap = gap_of(&btc);
+        assert_eq!(gap.start_ms, 1_000_000);
+        assert_eq!(gap.end_ms, 2_000_000 + GAP_END_SLACK_SECS * 1_000);
+
+        unrecovered.recovered(&eth, &gap_of(&eth));
+        for retry in 0..MAX_GAP_RETRIES {
+            let delay = Duration::from_secs(GAP_RETRY_BASE_SECS << retry);
+            let now = tokio::time::Instant::now();
+            assert_eq!(
+                unrecovered.failed(&btc, &gap, now),
+                Some(GapFailure::Retry(delay))
+            );
+            assert!(unrecovered.due(now).is_empty(), "not due before its delay");
+            assert_eq!(unrecovered.next_due(), Some(now + delay));
+            tokio::time::advance(delay).await;
+            assert_eq!(unrecovered.due(tokio::time::Instant::now()).len(), 1);
+        }
         assert_eq!(
-            unrecovered_instruments(&instruments, &recovered),
-            ["BTCUSDT", "SOLUSDT"]
+            unrecovered.failed(&btc, &gap, tokio::time::Instant::now()),
+            Some(GapFailure::GivenUp)
         );
-        assert!(unrecovered_instruments(&instruments, &instruments).is_empty());
+        assert!(unrecovered.is_empty());
+        assert_eq!(unrecovered.next_due(), None);
+        assert_eq!(
+            unrecovered.failed(&btc, &gap, tokio::time::Instant::now()),
+            None
+        );
+    }
+
+    /// A new gap that overlaps a kept one starts after it, so the kept one keeps its retry
+    /// schedule and no span is read twice; a gap wholly covered is not opened.
+    #[tokio::test]
+    async fn an_overlapping_fill_gap_starts_after_the_kept_one() {
+        tokio::time::pause();
+        let btc = InstrumentNameExchange::new("BTCUSDT");
+        let at = |secs: i64| Utc.timestamp_millis_opt(secs * 1_000).unwrap();
+        let mut unrecovered = UnrecoveredFills::default();
+        unrecovered.open(std::slice::from_ref(&btc), at(1_000), at(1_100));
+        let (_, first) = unrecovered.due(tokio::time::Instant::now())[0].clone();
+        unrecovered.failed(&btc, &first, tokio::time::Instant::now());
+
+        // Disconnected again within the first gap's slack: only the rest is a new gap, due now.
+        unrecovered.open(std::slice::from_ref(&btc), at(1_105), at(1_200));
+        let due = unrecovered.due(tokio::time::Instant::now());
+        assert_eq!(due.len(), 1, "the failed gap waits for its retry");
+        assert_eq!(due[0].1.start_ms, first.end_ms + 1);
+        assert_eq!(due[0].1.end_ms, (1_200 + GAP_END_SLACK_SECS) * 1_000);
+
+        // A gap wholly inside kept ones adds nothing.
+        unrecovered.open(std::slice::from_ref(&btc), at(1_150), at(1_150));
+        assert_eq!(unrecovered.due(tokio::time::Instant::now()).len(), 1);
+        tokio::time::advance(Duration::from_secs(GAP_RETRY_BASE_SECS)).await;
+        assert_eq!(unrecovered.due(tokio::time::Instant::now()).len(), 2);
+    }
+
+    /// Executions after a span's end are dropped, and their presence ends the walk.
+    #[test]
+    fn drop_after_keeps_only_the_span() {
+        let execution =
+            |id: i64, time: Option<i64>| binance_sdk::spot::rest_api::MyTradesResponseInner {
+                id: Some(id),
+                time,
+                ..Default::default()
+            };
+        let mut page = vec![
+            execution(1, Some(100)),
+            execution(2, None),
+            execution(3, Some(200)),
+            execution(4, Some(201)),
+        ];
+        assert!(drop_after(&mut page, 200));
+        assert_eq!(
+            page.iter().map(|e| e.id).collect::<Vec<_>>(),
+            [Some(1), Some(2), Some(3)]
+        );
+        assert!(!drop_after(&mut page, 200));
     }
 
     #[test]
@@ -2328,7 +2622,7 @@ mod tests {
         assert_eq!(frame_excerpt(&long).chars().count(), 200);
     }
 
-    /// A `myTrades` execution reduced to the three fields recovery reads.
+    /// A `myTrades` execution reduced to the fields recovery's order totals read.
     #[derive(Debug, Clone, Copy)]
     struct Execution {
         id: Option<i64>,
@@ -2345,6 +2639,10 @@ mod tests {
         }
         fn qty(&self) -> Option<&str> {
             self.qty
+        }
+        // Recovery's order totals never read the time.
+        fn time(&self) -> Option<i64> {
+            None
         }
     }
 
