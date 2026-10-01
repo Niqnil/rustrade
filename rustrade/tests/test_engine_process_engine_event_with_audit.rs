@@ -7,7 +7,8 @@ use rust_decimal_macros::dec;
 use rustrade::{
     EngineEvent, Sequence, Timed,
     engine::{
-        Engine, EngineOutput, Processor, UnsupportedCorporateActionReason,
+        ContractExpiryNotSettledReason, Engine, EngineOutput, Processor,
+        UnsupportedCorporateActionReason,
         action::{
             ActionOutput,
             generate_algo_orders::GenerateAlgoOrdersOutput,
@@ -16,10 +17,11 @@ use rustrade::{
         audit::{AuditTick, EngineAudit},
         clock::HistoricalClock,
         command::Command,
+        error::{EngineError, RecoverableEngineError},
         execution_tx::MultiExchangeTxMap,
         process_with_audit,
         state::{
-            EngineState,
+            EngineState, MarketSnapshotSource,
             asset::AssetStates,
             connectivity::{ConnectivityDimension, Health, UntrackedExchange},
             global::DefaultGlobalData,
@@ -27,7 +29,7 @@ use rustrade::{
                 data::{DefaultInstrumentMarketData, InstrumentDataState},
                 filter::InstrumentFilter,
             },
-            position::{OmsMode, PositionExited, SplitRoundingPolicy},
+            position::{OmsMode, PositionDrift, PositionExited, SplitRoundingPolicy},
             trading::TradingState,
         },
     },
@@ -47,20 +49,23 @@ use rustrade_data::{
     subscription::trade::PublicTrade,
 };
 use rustrade_execution::{
-    AccountEvent, AccountEventKind, AccountSnapshot, FeeModelConfig, MarketSnapshot,
-    PerContractFeeModel,
+    AccountEvent, AccountEventKind, AccountSnapshot, FeeModelConfig, InstrumentAccountSnapshot,
+    MarketSnapshot, PerContractFeeModel,
     balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate},
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, OrderId, PositionId, StrategyId, VenueOrderId},
-        request::{OrderRequestCancel, OrderRequestOpen, OrderResponseCancel, RequestOpen},
+        request::{
+            OrderRequestCancel, OrderRequestOpen, OrderResponseCancel, RequestCancel, RequestOpen,
+        },
         state::{ActiveOrderState, Cancelled, Filled, Open, OrderState},
     },
+    position::{Position, PositionReport},
     trade::{AssetFees, Trade, TradeId},
 };
 use rustrade_instrument::{
     Side, Underlying,
-    asset::AssetIndex,
+    asset::{Asset, AssetIndex},
     corporate_action::{CorporateActionKind, SplitRatio},
     exchange::{ExchangeId, ExchangeIndex},
     index::IndexedInstruments,
@@ -68,7 +73,10 @@ use rustrade_instrument::{
         Instrument, InstrumentIndex,
         kind::{
             InstrumentKind,
+            cfd::CfdContract,
+            future::FutureContract,
             option::{OptionContract, OptionExercise, OptionKind},
+            perpetual::PerpetualContract,
         },
         spec::{
             InstrumentSpec, InstrumentSpecNotional, InstrumentSpecPrice, InstrumentSpecQuantity,
@@ -1376,6 +1384,20 @@ fn send_spot_price(engine: &mut TestEngine, instrument: usize, price: Decimal) {
     engine.process(event);
 }
 
+/// The `PositionExit`s from a direct `process_contract_expiry` call, panicking on any other output
+/// so a test expecting a settlement (or a silent no-op) cannot pass on a `ContractExpiryNotSettled`.
+fn expiry_exits(
+    outputs: Vec<EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>>,
+) -> Vec<PositionExited<AssetIndex, InstrumentIndex>> {
+    outputs
+        .into_iter()
+        .map(|output| match output {
+            EngineOutput::PositionExit(exit) => exit,
+            other => panic!("expected only PositionExit outputs, got {other:?}"),
+        })
+        .collect()
+}
+
 /// Open a long position in the option instrument (index 0) by sending a buy trade.
 fn open_option_position(engine: &mut TestEngine, quantity: Decimal, price: Decimal) {
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
@@ -1420,7 +1442,7 @@ fn test_contract_expiry_otm_call() {
     );
 
     // Process ContractExpiry
-    let exited = engine.process_contract_expiry(&InstrumentIndex(0));
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
 
     // OTM: settlement price is 0, position closes at zero value → position exits
     assert_eq!(exited.len(), 1);
@@ -1459,7 +1481,7 @@ fn test_contract_expiry_itm_call() {
     // Open a long call position with 1 contract at premium 2_000
     open_option_position(&mut engine, dec!(1), dec!(2_000));
 
-    let exited = engine.process_contract_expiry(&InstrumentIndex(0));
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
 
     // ITM: 1 contract closed at intrinsic value 5_000
     assert_eq!(exited.len(), 1);
@@ -1512,7 +1534,7 @@ fn test_contract_expiry_advances_clock_to_expiry() {
         "precondition: clock has not yet advanced to expiry"
     );
 
-    let exited = engine.process_contract_expiry(&InstrumentIndex(0));
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
     assert_eq!(exited.len(), 1);
 
     // The settlement fill is stamped at ~expiry: its `time_exit` derives from the synthetic
@@ -1543,7 +1565,7 @@ fn test_contract_expiry_idempotent() {
     open_option_position(&mut engine, dec!(1), dec!(1_000));
 
     // First expiry processes the position
-    let exited_first = engine.process_contract_expiry(&InstrumentIndex(0));
+    let exited_first = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
     assert_eq!(exited_first.len(), 1);
     assert!(
         engine
@@ -1554,7 +1576,7 @@ fn test_contract_expiry_idempotent() {
     );
 
     // Second call: idempotent — returns empty vec, does not panic
-    let exited_second = engine.process_contract_expiry(&InstrumentIndex(0));
+    let exited_second = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
     assert!(exited_second.is_empty());
 }
 
@@ -1566,7 +1588,7 @@ fn test_contract_expiry_no_position() {
     send_spot_price(&mut engine, 1, dec!(45_000));
 
     // No position open — expiry should still mark as processed
-    let exited = engine.process_contract_expiry(&InstrumentIndex(0));
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
     assert!(exited.is_empty());
     assert!(
         engine
@@ -1587,9 +1609,26 @@ fn test_contract_expiry_missing_spot_price() {
     // Open a position so expiry has something to settle
     open_option_position(&mut engine, dec!(1), dec!(1_000));
 
-    // Without spot price, expiry cannot compute settlement — returns empty
-    let exited = engine.process_contract_expiry(&InstrumentIndex(0));
-    assert!(exited.is_empty());
+    // Without spot price, expiry cannot compute settlement — it says so, and closes nothing
+    let outputs: Vec<EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>> =
+        engine.process_contract_expiry(&InstrumentIndex(0));
+    assert_eq!(
+        outputs,
+        vec![EngineOutput::ContractExpiryNotSettled {
+            instrument: InstrumentIndex(0),
+            reason: ContractExpiryNotSettledReason::SettlementPriceUnavailable,
+        }]
+    );
+    assert_eq!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .position
+            .positions
+            .len(),
+        1
+    );
 
     // expiration_processed must NOT be set (event is retryable)
     assert!(
@@ -1678,6 +1717,670 @@ fn test_contract_expiry_replica_state_cleared() {
     assert!(replica_instrument.orders.0.is_empty());
     // expiration_processed must be set
     assert!(replica_instrument.expiration_processed);
+}
+
+/// A single-instrument engine — index 0, BTC/USD on `BinanceSpot`, quote USD = `AssetIndex(1)` —
+/// whose instrument is of the given `kind`, for handler behaviour that depends on the kind alone.
+fn build_single_kind_engine(
+    kind: InstrumentKind<Asset>,
+    execution_tx: UnboundedTx<ExecutionRequest>,
+) -> TestEngine {
+    let instruments = IndexedInstruments::builder()
+        .add_instrument(Instrument::new(
+            ExchangeId::BinanceSpot,
+            "binance_btc_usd",
+            "BTCUSD",
+            Underlying::new("btc", "usd"),
+            rustrade_instrument::instrument::quote::InstrumentQuoteAsset::UnderlyingQuote,
+            kind,
+            None,
+        ))
+        .build();
+
+    let state = EngineState::builder(&instruments, DefaultGlobalData, |_| {
+        DefaultInstrumentMarketData::default()
+    })
+    .time_engine_start(STARTING_TIMESTAMP)
+    .trading_state(TradingState::Disabled)
+    .balances([
+        (ExchangeId::BinanceSpot, "usd", STARTING_BALANCE_USDT),
+        (ExchangeId::BinanceSpot, "btc", STARTING_BALANCE_BTC),
+    ])
+    .build();
+
+    Engine::new(
+        HistoricalClock::new(STARTING_TIMESTAMP),
+        state,
+        MultiExchangeTxMap::from_iter([(ExchangeId::BinanceSpot, Some(execution_tx))]),
+        TestBuyAndHoldStrategy { id: strategy_id() },
+        DefaultRiskManager::default(),
+    )
+}
+
+/// A `ContractExpiry` naming an instrument that never expires is a caller error. It is rejected
+/// observably and touches nothing: before, it closed every position at the last price and set
+/// `expiration_processed` for good, so the instrument could never trade again.
+///
+/// The audit replica must reach the same verdict. The case that used to split them is the one
+/// with no position: the replica took its "no positions" branch and marked the instrument
+/// processed while the live engine had not.
+#[test]
+fn test_contract_expiry_rejects_never_expiring_instruments() {
+    use rustrade::engine::audit::{context::EngineContext, state_replica::StateReplicaManager};
+
+    let usd = || Asset::from("usd");
+    let kinds = [
+        InstrumentKind::Spot,
+        InstrumentKind::Perpetual(PerpetualContract {
+            contract_size: dec!(1),
+            settlement_asset: usd(),
+        }),
+        InstrumentKind::Cfd(CfdContract {
+            contract_size: dec!(1),
+            settlement_asset: usd(),
+        }),
+    ];
+
+    for kind in kinds {
+        for with_position in [false, true] {
+            let context = format!("{kind:?}, with_position={with_position}");
+            let (execution_tx, mut execution_rx) = mpsc_unbounded();
+            let mut engine = build_single_kind_engine(kind.clone(), execution_tx);
+
+            send_spot_price(&mut engine, 0, dec!(45_000));
+            if with_position {
+                open_option_position(&mut engine, dec!(1), dec!(40_000));
+            }
+            // A resting order, so a cancel sent before the rejection would be observable.
+            send_order_ack(
+                &mut engine,
+                ClientOrderId::new("resting"),
+                OrderId::new("resting-venue"),
+                Side::Buy,
+            );
+            assert_eq!(
+                engine
+                    .state
+                    .instruments
+                    .instrument_index(&InstrumentIndex(0))
+                    .orders
+                    .0
+                    .len(),
+                1,
+                "{context}: the resting order must be tracked before the expiry"
+            );
+            let pre_state = engine.state.clone();
+
+            let event = EngineEvent::ContractExpiry(InstrumentIndex(0));
+            let audit_tick = process_with_audit(&mut engine, event.clone());
+
+            let outputs = match &audit_tick.event {
+                EngineAudit::Process(audit) => audit.outputs.clone(),
+                _ => panic!("{context}: expected EngineAudit::Process"),
+            };
+            assert_eq!(
+                outputs,
+                NoneOneOrMany::One(EngineOutput::ContractExpiryNotSettled {
+                    instrument: InstrumentIndex(0),
+                    reason: ContractExpiryNotSettledReason::InstrumentNeverExpires,
+                }),
+                "{context}"
+            );
+
+            let live_instrument = engine
+                .state
+                .instruments
+                .instrument_index(&InstrumentIndex(0));
+            assert_eq!(
+                live_instrument,
+                pre_state.instruments.instrument_index(&InstrumentIndex(0)),
+                "{context}: a rejected expiry must not mutate the instrument"
+            );
+            assert!(!live_instrument.expiration_processed, "{context}");
+            assert_eq!(
+                live_instrument.position.positions.len(),
+                usize::from(with_position),
+                "{context}"
+            );
+            assert!(
+                execution_rx.rx.try_recv().is_err(),
+                "{context}: a rejected expiry must send no request"
+            );
+
+            let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+                event: pre_state,
+                context: EngineContext {
+                    time: STARTING_TIMESTAMP,
+                    sequence: Sequence(0),
+                },
+            };
+            let dummy_updates: DummyAuditUpdates = std::iter::empty();
+            let mut replica_manager = StateReplicaManager::new(seed_tick, dummy_updates);
+            replica_manager.update_from_event(event, &outputs);
+
+            assert_eq!(
+                replica_manager
+                    .replica_engine_state()
+                    .instruments
+                    .instrument_index(&InstrumentIndex(0)),
+                live_instrument,
+                "{context}: replica diverged from the live engine"
+            );
+        }
+    }
+}
+
+/// Drive `event` through the live engine with audit, then mirror it into `replica` from the same
+/// outputs — the path `StateReplicaManager::run` takes. Evaluates to the live outputs.
+macro_rules! process_live_and_replica {
+    ($engine:expr, $replica:expr, $event:expr) => {{
+        let event = $event;
+        let audit_tick = process_with_audit($engine, event.clone());
+        let outputs = match audit_tick.event {
+            EngineAudit::Process(audit) => audit.outputs,
+            _ => panic!("expected EngineAudit::Process"),
+        };
+        $replica.update_from_event(event, &outputs);
+        outputs
+    }};
+}
+
+/// The audit replica follows the live engine through every `ContractExpiry` branch that leaves an
+/// instrument unsettled or already settled: a price bail (positions kept, retryable), the retry
+/// that settles, and a repeated expiry after settlement, which must not clear orders the live
+/// engine kept.
+#[test]
+fn test_contract_expiry_replica_parity_price_bail_then_settle_then_duplicate() {
+    use rustrade::engine::audit::{context::EngineContext, state_replica::StateReplicaManager};
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    open_option_position(&mut engine, dec!(1), dec!(1_000));
+
+    let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+        event: engine.state.clone(),
+        context: EngineContext {
+            time: STARTING_TIMESTAMP,
+            sequence: Sequence(0),
+        },
+    };
+    let dummy_updates: DummyAuditUpdates = std::iter::empty();
+    let mut replica = StateReplicaManager::new(seed_tick, dummy_updates);
+    let option = InstrumentIndex(0);
+
+    // 1. No underlying price: the live engine declines, keeping the position; so must the replica.
+    let outputs =
+        process_live_and_replica!(&mut engine, replica, EngineEvent::ContractExpiry(option));
+    assert_eq!(
+        outputs,
+        NoneOneOrMany::One(EngineOutput::ContractExpiryNotSettled {
+            instrument: option,
+            reason: ContractExpiryNotSettledReason::SettlementPriceUnavailable,
+        })
+    );
+    let live = engine.state.instruments.instrument_index(&option);
+    assert_eq!(live.position.positions.len(), 1);
+    assert!(!live.expiration_processed);
+    assert_eq!(
+        replica
+            .replica_engine_state()
+            .instruments
+            .instrument_index(&option),
+        live
+    );
+
+    // 2. The underlying price arrives and the retry settles on both sides.
+    process_live_and_replica!(&mut engine, replica, market_event_trade(2, 1, dec!(45_000)));
+    let pre_settle_tear_sheet = engine
+        .state
+        .instruments
+        .instrument_index(&option)
+        .tear_sheet
+        .clone();
+    let outputs =
+        process_live_and_replica!(&mut engine, replica, EngineEvent::ContractExpiry(option));
+    assert!(
+        outputs
+            .iter()
+            .any(|output| matches!(output, EngineOutput::PositionExit(_)))
+    );
+    let live = engine.state.instruments.instrument_index(&option);
+    let mirrored = replica
+        .replica_engine_state()
+        .instruments
+        .instrument_index(&option);
+    assert!(live.position.positions.is_empty());
+    assert_eq!(mirrored.position.positions, live.position.positions);
+    assert!(live.expiration_processed && mirrored.expiration_processed);
+    // The settlement's exit reaches the tear sheet on both sides.
+    assert_ne!(live.tear_sheet, pre_settle_tear_sheet);
+    assert_eq!(mirrored.tear_sheet, live.tear_sheet);
+
+    // 3. An order snapshot lands after settlement and both sides track it. A repeated expiry is a
+    //    no-op on the live engine, so the replica must keep that order too.
+    process_live_and_replica!(
+        &mut engine,
+        replica,
+        EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+            exchange: ExchangeIndex(0),
+            kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+                key: OrderKey {
+                    exchange: ExchangeIndex(0),
+                    instrument: option,
+                    strategy: strategy_id(),
+                    cid: ClientOrderId::new("late"),
+                },
+                side: Side::Buy,
+                price: Some(dec!(1_000)),
+                quantity: dec!(1),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                state: OrderState::active(Open {
+                    id: VenueOrderId::Assigned(OrderId::new("late-venue")),
+                    time_exchange: time_plus_days(STARTING_TIMESTAMP, 3),
+                    filled_quantity: dec!(0),
+                }),
+            })),
+        }))
+    );
+    assert_eq!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&option)
+            .orders
+            .0
+            .len(),
+        1
+    );
+    let outputs =
+        process_live_and_replica!(&mut engine, replica, EngineEvent::ContractExpiry(option));
+    assert_eq!(outputs, NoneOneOrMany::None);
+    let live = engine.state.instruments.instrument_index(&option);
+    let mirrored = replica
+        .replica_engine_state()
+        .instruments
+        .instrument_index(&option);
+    assert_eq!(live.orders.0.len(), 1);
+    assert_eq!(mirrored.orders, live.orders);
+    assert_eq!(mirrored.exchange_id_to_cid, live.exchange_id_to_cid);
+}
+
+/// A `ContractExpiry` or `CorporateAction` is built by the caller, so its `InstrumentIndex` can
+/// name no instrument the engine was built with. It is rejected observably and touches nothing,
+/// on the live engine and on the audit replica, instead of panicking either.
+#[test]
+fn test_unknown_instrument_index_is_rejected_not_panicked() {
+    use rustrade::engine::audit::{context::EngineContext, state_replica::StateReplicaManager};
+
+    let (execution_tx, mut execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    send_spot_price(&mut engine, 1, dec!(45_000));
+    open_option_position(&mut engine, dec!(1), dec!(1_000));
+    let pre_state = engine.state.clone();
+
+    let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+        event: pre_state.clone(),
+        context: EngineContext {
+            time: STARTING_TIMESTAMP,
+            sequence: Sequence(0),
+        },
+    };
+    let dummy_updates: DummyAuditUpdates = std::iter::empty();
+    let mut replica = StateReplicaManager::new(seed_tick, dummy_updates);
+
+    let unknown = InstrumentIndex(pre_state.instruments.0.len());
+    assert!(pre_state.instruments.get_index(&unknown).is_none());
+
+    let outputs =
+        process_live_and_replica!(&mut engine, replica, EngineEvent::ContractExpiry(unknown));
+    assert_eq!(
+        outputs,
+        NoneOneOrMany::One(EngineOutput::ContractExpiryNotSettled {
+            instrument: unknown,
+            reason: ContractExpiryNotSettledReason::UnknownInstrument,
+        })
+    );
+
+    let kind = CorporateActionKind::StockSplit {
+        ratio: SplitRatio::new(dec!(2)).unwrap(),
+    };
+    let outputs = process_live_and_replica!(
+        &mut engine,
+        replica,
+        EngineEvent::CorporateAction {
+            id: "unknown-split".into(),
+            instrument: unknown,
+            kind: kind.clone(),
+            policy: SplitRoundingPolicy::Floor,
+            effective_time: STARTING_TIMESTAMP,
+        }
+    );
+    assert_eq!(
+        outputs,
+        NoneOneOrMany::One(EngineOutput::UnsupportedCorporateAction {
+            instrument: unknown,
+            kind,
+            reason: UnsupportedCorporateActionReason::UnknownInstrument,
+        })
+    );
+
+    assert_eq!(engine.state.instruments, pre_state.instruments);
+    assert_eq!(
+        replica.replica_engine_state().instruments,
+        pre_state.instruments
+    );
+    assert!(
+        execution_rx.rx.try_recv().is_err(),
+        "a rejected event must send no request"
+    );
+}
+
+fn open_request(instrument: InstrumentIndex, cid: &str) -> OrderRequestOpen {
+    OrderRequestOpen {
+        key: OrderKey {
+            exchange: ExchangeIndex(0),
+            instrument,
+            strategy: strategy_id(),
+            cid: ClientOrderId::new(cid),
+        },
+        state: RequestOpen {
+            side: Side::Buy,
+            kind: OrderKind::Limit,
+            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+            price: Some(dec!(45_000)),
+            quantity: dec!(1),
+            position_id: None,
+            reduce_only: false,
+            market: None,
+        },
+    }
+}
+
+fn cancel_request(instrument: InstrumentIndex, cid: &str) -> OrderRequestCancel {
+    OrderRequestCancel {
+        key: OrderKey {
+            exchange: ExchangeIndex(0),
+            instrument,
+            strategy: strategy_id(),
+            cid: ClientOrderId::new(cid),
+        },
+        state: RequestCancel { id: None },
+    }
+}
+
+fn unknown_instrument_error(instrument: InstrumentIndex) -> EngineError {
+    EngineError::Recoverable(RecoverableEngineError::UnknownInstrument(format!(
+        "{instrument:?}"
+    )))
+}
+
+/// A `Command` naming an instrument the engine was not built with is rejected before anything is
+/// sent — the open before it is stamped, the cancel before it reaches the venue — and reported as a
+/// recoverable error beside the requests that did go out. The engine keeps running.
+#[test]
+fn test_command_send_requests_unknown_instrument_rejected_before_send() {
+    let (execution_tx, mut execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    send_spot_price(&mut engine, 1, dec!(45_000));
+    let pre_instruments = engine.state.instruments.clone();
+
+    let unknown = InstrumentIndex(pre_instruments.0.len());
+    let known = InstrumentIndex(1);
+    assert!(pre_instruments.get_index(&unknown).is_none());
+
+    // Opens: the unknown one is rejected, the known one is stamped, sent and recorded in flight.
+    let unknown_open = open_request(unknown, "unknown-open");
+    let known_open = open_request(known, "known-open");
+    let audit = process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendOpenRequests(OneOrMany::Many(vec![
+            unknown_open.clone(),
+            known_open.clone(),
+        ]))),
+    );
+    let EngineAudit::Process(audit) = audit.event else {
+        panic!("expected EngineAudit::Process");
+    };
+    assert!(
+        audit.errors.is_empty(),
+        "an unknown instrument must not stop the engine"
+    );
+    let NoneOneOrMany::One(EngineOutput::Commanded(ActionOutput::OpenOrders(output))) =
+        audit.outputs
+    else {
+        panic!("expected one OpenOrders output, got {:?}", audit.outputs);
+    };
+    assert_eq!(
+        output.errors,
+        NoneOneOrMany::One(Box::new((unknown_open, unknown_instrument_error(unknown))))
+    );
+    let sent: Vec<_> = output.sent_iter().collect();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].key, known_open.key);
+    assert!(sent[0].state.market.is_some(), "a known open is stamped");
+
+    match execution_rx.rx.try_recv() {
+        Ok(ExecutionRequest::Open(request)) => assert_eq!(request.key, known_open.key),
+        other => panic!("expected the known open to be sent, got {other:?}"),
+    }
+    assert!(
+        execution_rx.rx.try_recv().is_err(),
+        "the unknown open must not be sent"
+    );
+    assert_eq!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&known)
+            .orders
+            .0
+            .len(),
+        1,
+        "the sent open is recorded in flight"
+    );
+
+    // Cancels: the unknown one is rejected before the send, so it never reaches the venue; the known
+    // one beside it is sent and recorded in flight as usual.
+    let unknown_cancel = cancel_request(unknown, "unknown-cancel");
+    let known_cancel = cancel_request(known, "known-open");
+    let audit = process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendCancelRequests(OneOrMany::Many(vec![
+            unknown_cancel.clone(),
+            known_cancel.clone(),
+        ]))),
+    );
+    let EngineAudit::Process(audit) = audit.event else {
+        panic!("expected EngineAudit::Process");
+    };
+    assert!(
+        audit.errors.is_empty(),
+        "an unknown instrument must not stop the engine"
+    );
+    assert_eq!(
+        audit.outputs,
+        NoneOneOrMany::One(EngineOutput::Commanded(ActionOutput::CancelOrders(
+            SendRequestsOutput {
+                sent: NoneOneOrMany::One(Box::new(known_cancel.clone())),
+                errors: NoneOneOrMany::One(Box::new((
+                    unknown_cancel,
+                    unknown_instrument_error(unknown)
+                ))),
+            }
+        )))
+    );
+    match execution_rx.rx.try_recv() {
+        Ok(ExecutionRequest::Cancel(request)) => assert_eq!(request.key, known_cancel.key),
+        other => panic!("expected the known cancel to be sent, got {other:?}"),
+    }
+    assert!(
+        execution_rx.rx.try_recv().is_err(),
+        "the unknown cancel must not be sent"
+    );
+    let known_orders = &engine.state.instruments.instrument_index(&known).orders.0;
+    assert_eq!(known_orders.len(), 1);
+    assert!(matches!(
+        known_orders[&known_cancel.key.cid].state,
+        ActiveOrderState::CancelInFlight(_)
+    ));
+
+    // Asked directly, the state has no market for an unknown instrument rather than panicking.
+    assert_eq!(engine.state.market_snapshot(&unknown), None);
+    for (index, state) in engine.state.instruments.0.values().enumerate() {
+        if index != known.index() {
+            assert!(state.orders.0.is_empty());
+        }
+    }
+}
+
+/// Emits one cancel and one open for a fixed instrument, from both the algo and the
+/// close-positions hooks, regardless of state — standing in for user strategy code that holds an
+/// index the engine was not built with.
+struct FixedInstrumentStrategy {
+    instrument: InstrumentIndex,
+}
+
+impl AlgoStrategy for FixedInstrumentStrategy {
+    type State = EngineState<DefaultGlobalData, DefaultInstrumentMarketData>;
+
+    fn generate_algo_orders(
+        &self,
+        _: &Self::State,
+    ) -> (
+        impl IntoIterator<Item = OrderRequestCancel<ExchangeIndex, InstrumentIndex>>,
+        impl IntoIterator<Item = OrderRequestOpen<ExchangeIndex, InstrumentIndex>>,
+    ) {
+        (
+            [cancel_request(self.instrument, "algo-cancel")],
+            [open_request(self.instrument, "algo-open")],
+        )
+    }
+}
+
+impl ClosePositionsStrategy for FixedInstrumentStrategy {
+    type State = EngineState<DefaultGlobalData, DefaultInstrumentMarketData>;
+
+    fn close_positions_requests<'a>(
+        &'a self,
+        _: &'a Self::State,
+        _: &'a InstrumentFilter<ExchangeIndex, AssetIndex, InstrumentIndex>,
+    ) -> (
+        impl IntoIterator<Item = OrderRequestCancel<ExchangeIndex, InstrumentIndex>> + 'a,
+        impl IntoIterator<Item = OrderRequestOpen<ExchangeIndex, InstrumentIndex>> + 'a,
+    )
+    where
+        ExchangeIndex: 'a,
+        AssetIndex: 'a,
+        InstrumentIndex: 'a,
+    {
+        (
+            [cancel_request(self.instrument, "close-cancel")],
+            [open_request(self.instrument, "close-open")],
+        )
+    }
+}
+
+/// Strategy code is user code too: an algo or close-positions strategy that emits an unknown
+/// instrument has its requests rejected unsent, exactly as a `Command` does.
+#[test]
+fn test_strategy_requests_unknown_instrument_rejected_before_send() {
+    use rustrade::engine::action::{
+        close_positions::ClosePositions, generate_algo_orders::GenerateAlgoOrders,
+    };
+
+    let (execution_tx, mut execution_rx) = mpsc_unbounded();
+    let built = build_option_engine(TradingState::Enabled, execution_tx);
+    let unknown = InstrumentIndex(built.state.instruments.0.len());
+    let mut engine = Engine {
+        clock: built.clock,
+        meta: built.meta,
+        state: built.state,
+        execution_txs: built.execution_txs,
+        strategy: FixedInstrumentStrategy {
+            instrument: unknown,
+        },
+        risk: built.risk,
+    };
+    let pre_instruments = engine.state.instruments.clone();
+
+    let output = engine.generate_algo_orders();
+    let output = output.cancels_and_opens;
+    assert_eq!(output.cancels.sent, NoneOneOrMany::None);
+    assert_eq!(output.opens.sent, NoneOneOrMany::None);
+    assert_eq!(
+        output.cancels.errors,
+        NoneOneOrMany::One(Box::new((
+            cancel_request(unknown, "algo-cancel"),
+            unknown_instrument_error(unknown)
+        )))
+    );
+    assert_eq!(
+        output.opens.errors,
+        NoneOneOrMany::One(Box::new((
+            open_request(unknown, "algo-open"),
+            unknown_instrument_error(unknown)
+        )))
+    );
+    assert!(output.unrecoverable_errors().is_none());
+
+    let output = engine.close_positions(&InstrumentFilter::None);
+    assert_eq!(output.cancels.sent, NoneOneOrMany::None);
+    assert_eq!(output.opens.sent, NoneOneOrMany::None);
+    assert_eq!(
+        output.cancels.errors,
+        NoneOneOrMany::One(Box::new((
+            cancel_request(unknown, "close-cancel"),
+            unknown_instrument_error(unknown)
+        )))
+    );
+    assert_eq!(
+        output.opens.errors,
+        NoneOneOrMany::One(Box::new((
+            open_request(unknown, "close-open"),
+            unknown_instrument_error(unknown)
+        )))
+    );
+
+    assert!(
+        execution_rx.rx.try_recv().is_err(),
+        "no request for an unknown instrument may be sent"
+    );
+    assert_eq!(engine.state.instruments, pre_instruments);
+}
+
+/// A future settles at its own last price, not at an option's intrinsic value, and — unlike an
+/// option — needs no separate underlying instrument to do so.
+#[test]
+fn test_contract_expiry_future_settles_at_own_last_price() {
+    let expiry = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_single_kind_engine(
+        InstrumentKind::Future(FutureContract {
+            contract_size: dec!(1),
+            settlement_asset: Asset::from("usd"),
+            expiry,
+        }),
+        execution_tx,
+    );
+
+    open_option_position(&mut engine, dec!(2), dec!(1_000));
+    send_spot_price(&mut engine, 0, dec!(1_100));
+
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
+
+    assert_eq!(exited.len(), 1);
+    // Long 2 at 1_000, settled at the future's own last price 1_100.
+    assert_eq!(exited[0].pnl_realised, dec!(200));
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .expiration_processed
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3609,7 +4312,7 @@ fn test_contract_expiry_itm_put() {
     send_spot_price(&mut engine, 1, dec!(45_000));
     open_option_position(&mut engine, dec!(1), dec!(2_000)); // bought at 2_000 premium
 
-    let exited = engine.process_contract_expiry(&InstrumentIndex(0));
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
 
     assert_eq!(exited.len(), 1);
     // Entry: 1 * 2_000, Exit: 1 * 5_000 → pnl = 3_000
@@ -3642,7 +4345,7 @@ fn test_contract_expiry_otm_put() {
     send_spot_price(&mut engine, 1, dec!(55_000));
     open_option_position(&mut engine, dec!(1), dec!(2_000));
 
-    let exited = engine.process_contract_expiry(&InstrumentIndex(0));
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
 
     assert_eq!(exited.len(), 1);
     // Bought at 2_000, settled at 0 → loss of 2_000
@@ -3664,7 +4367,7 @@ fn test_contract_expiry_short_call_itm() {
     send_spot_price(&mut engine, 1, dec!(55_000));
     open_option_position_side(&mut engine, Side::Sell, dec!(1), dec!(2_000)); // sold at 2_000 premium
 
-    let exited = engine.process_contract_expiry(&InstrumentIndex(0));
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
 
     assert_eq!(exited.len(), 1);
     assert_eq!(exited[0].side, Side::Sell);
@@ -3682,7 +4385,7 @@ fn test_contract_expiry_short_call_otm() {
     send_spot_price(&mut engine, 1, dec!(45_000));
     open_option_position_side(&mut engine, Side::Sell, dec!(1), dec!(2_000));
 
-    let exited = engine.process_contract_expiry(&InstrumentIndex(0));
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
 
     assert_eq!(exited.len(), 1);
     assert_eq!(exited[0].side, Side::Sell);
@@ -4495,7 +5198,7 @@ fn test_contract_expiry_hedging_multi_position() {
         "two open positions before expiry"
     );
 
-    let exited = engine.process_contract_expiry(&InstrumentIndex(0));
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
 
     // Both positions must be settled.
     assert_eq!(
@@ -5018,7 +5721,7 @@ fn test_corporate_action_unheld_option_strike_adjusted_then_settles_post_split()
     );
     engine.process(market_event_trade(12, 1, dec!(30_000)));
 
-    let exited = engine.process_contract_expiry(&InstrumentIndex(0));
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
     assert_eq!(exited.len(), 1);
     // Intrinsic 5_000 (= 30_000 − post-split strike 25_000), premium 1_000, 1 contract:
     // pnl = (5_000 − 1_000) × 1 = 4_000. Against the stale 50_000 strike it would be −1_000.
@@ -6423,5 +7126,128 @@ fn test_hedging_pending_fill_replayed_on_fully_filled_ack() {
     assert!(
         instr.pending_fills.is_empty(),
         "pending_fills should be drained after replay"
+    );
+}
+
+fn account_event_positions(reports: Vec<(usize, PositionReport)>) -> EngineEvent<DataKind> {
+    EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+        exchange: ExchangeIndex(0),
+        kind: AccountEventKind::Snapshot(AccountSnapshot {
+            exchange: ExchangeIndex(0),
+            balances: vec![],
+            instruments: reports
+                .into_iter()
+                .map(|(instrument, position)| {
+                    InstrumentAccountSnapshot::new(
+                        InstrumentIndex(instrument),
+                        vec![],
+                        false,
+                        position,
+                        None,
+                    )
+                })
+                .collect(),
+        }),
+    }))
+}
+
+fn position_drift_outputs(
+    engine: &mut TestEngine,
+    reports: Vec<(usize, PositionReport)>,
+) -> Vec<PositionDrift> {
+    let audit = process_with_audit(engine, account_event_positions(reports));
+    let EngineAudit::Process(audit) = audit.event else {
+        panic!("expected a processed event");
+    };
+    audit
+        .outputs
+        .into_iter()
+        .map(|output| match output {
+            EngineOutput::PositionDrift(drift) => drift,
+            other => panic!("unexpected output {other:?}"),
+        })
+        .collect()
+}
+
+/// An account snapshot whose reported position differs from the engine's emits
+/// `EngineOutput::PositionDrift` and leaves the engine's position alone. An unreported position is
+/// not compared, and entry prices are not compared.
+#[test]
+fn test_account_snapshot_position_drift() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx);
+
+    // Engine holds 1 btc_usdt long @ 10_000.
+    process_with_audit(
+        &mut engine,
+        account_event_trade(0, 1, Side::Buy, 10_000.0, 1.0),
+    );
+    let venue_position = |quantity, entry_price| {
+        PositionReport::from_position(Position::new(
+            quantity,
+            Some(entry_price),
+            None,
+            None,
+            None,
+            None,
+            STARTING_TIMESTAMP,
+        ))
+    };
+
+    // The venue says flat: drift. eth_btc is unreported: not compared.
+    let drift = position_drift_outputs(
+        &mut engine,
+        vec![(0, PositionReport::Flat), (1, PositionReport::Unreported)],
+    );
+    assert_eq!(drift.len(), 1);
+    assert_eq!(
+        (
+            drift[0].instrument,
+            drift[0].quantity_engine,
+            drift[0].quantity_venue,
+            drift[0].price_entry_engine,
+            drift[0].price_entry_venue,
+        ),
+        (
+            InstrumentIndex(0),
+            dec!(1),
+            dec!(0),
+            Some(dec!(10_000)),
+            None
+        )
+    );
+
+    // Same quantity at a different entry price: no drift.
+    assert!(
+        position_drift_outputs(
+            &mut engine,
+            vec![(0, venue_position(dec!(1), dec!(10_100)))]
+        )
+        .is_empty()
+    );
+
+    // The venue is short where the engine is long.
+    let drift = position_drift_outputs(
+        &mut engine,
+        vec![(0, venue_position(dec!(-2), dec!(9_000)))],
+    );
+    assert_eq!(
+        (
+            drift[0].quantity_engine,
+            drift[0].quantity_venue,
+            drift[0].price_entry_venue
+        ),
+        (dec!(1), dec!(-2), Some(dec!(9_000)))
+    );
+
+    // Nothing was corrected.
+    assert_eq!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .position
+            .quantity_net(),
+        dec!(1)
     );
 }

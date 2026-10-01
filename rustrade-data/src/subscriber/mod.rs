@@ -25,8 +25,8 @@ pub mod mapper;
 /// validate actioned [`Subscription`]s were successful.
 pub mod validator;
 
-/// One connection shared by every stream a subscriber and its clones open, for providers that cap
-/// how many connections a key may hold.
+// One connection shared by every stream a subscriber and its clones open; documented in its own
+// file.
 #[cfg(any(feature = "alpaca", feature = "lse", feature = "massive"))]
 pub(crate) mod shared;
 

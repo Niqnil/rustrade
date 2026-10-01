@@ -213,7 +213,7 @@ async fn test_account_snapshot() {
             "  {}: orders={}, position={:?}",
             inst.instrument,
             inst.orders.len(),
-            inst.position.as_ref().map(|p| p.quantity)
+            inst.position.quantity()
         );
     }
 }

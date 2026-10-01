@@ -25,6 +25,7 @@ use rustrade_execution::{
         request::OrderResponseCancel,
         state::{ActiveOrderState, InactiveOrderState, OrderState},
     },
+    position::PositionReport,
     trade::Trade,
 };
 use rustrade_instrument::{
@@ -70,8 +71,8 @@ pub struct InstrumentStates<
 );
 
 /// The full, pre-computed mutation a stock split applies — produced by
-/// [`InstrumentStates::prepare_corporate_action_split`] with **no** mutation, then committed by the
-/// corporate-action handler (and its audit replica).
+/// [`SplitEligibleTarget::prepare_corporate_action_split`] with **no** mutation, then committed by
+/// the corporate-action handler (and its audit replica).
 ///
 /// Splitting *prepare* (fallible arithmetic) from *commit* (infallible writes) makes the whole
 /// action atomic by construction: every `Decimal` overflow — including the option **strike**
@@ -108,26 +109,44 @@ pub(crate) struct OptionSplitPlan {
 }
 
 impl<InstrumentData> InstrumentStates<InstrumentData> {
+    /// Return a reference to the `InstrumentState` associated with an `InstrumentIndex`, or
+    /// `None` if these `InstrumentStates` hold no instrument at that index.
+    ///
+    /// An index is only meaningful for the `IndexedInstruments` it was taken from: one from
+    /// another set can resolve here to a different instrument, which no lookup can detect.
+    pub fn get_index(&self, key: &InstrumentIndex) -> Option<&InstrumentState<InstrumentData>> {
+        self.0.get_index(key.index()).map(|(_key, state)| state)
+    }
+
+    /// Return a mutable reference to the `InstrumentState` associated with an `InstrumentIndex`,
+    /// or `None` if these `InstrumentStates` hold no instrument at that index.
+    ///
+    /// See [`Self::get_index`] for what the index identifies.
+    pub fn get_index_mut(
+        &mut self,
+        key: &InstrumentIndex,
+    ) -> Option<&mut InstrumentState<InstrumentData>> {
+        self.0.get_index_mut(key.index()).map(|(_key, state)| state)
+    }
+
     /// Return a reference to the `InstrumentState` associated with an `InstrumentIndex`.
     ///
-    /// Panics if `InstrumentState` associated with the `InstrumentIndex` does not exist.
+    /// Panics if `InstrumentState` associated with the `InstrumentIndex` does not exist; see
+    /// [`Self::get_index`] for the non-panicking form.
     pub fn instrument_index(&self, key: &InstrumentIndex) -> &InstrumentState<InstrumentData> {
-        self.0
-            .get_index(key.index())
-            .map(|(_key, state)| state)
+        self.get_index(key)
             .unwrap_or_else(|| panic!("InstrumentStates does not contain: {key}"))
     }
 
     /// Return a mutable reference to the `InstrumentState` associated with an `InstrumentIndex`.
     ///
-    /// Panics if `InstrumentState` associated with the `InstrumentIndex` does not exist.
+    /// Panics if `InstrumentState` associated with the `InstrumentIndex` does not exist; see
+    /// [`Self::get_index_mut`] for the non-panicking form.
     pub fn instrument_index_mut(
         &mut self,
         key: &InstrumentIndex,
     ) -> &mut InstrumentState<InstrumentData> {
-        self.0
-            .get_index_mut(key.index())
-            .map(|(_key, state)| state)
+        self.get_index_mut(key)
             .unwrap_or_else(|| panic!("InstrumentStates does not contain: {key}"))
     }
 
@@ -153,6 +172,50 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
             .unwrap_or_else(|| panic!("InstrumentStates does not contain: {key}"))
     }
 
+    /// Return `key` as a [`SplitEligibleTarget`] if its instrument is split-eligible (the
+    /// deliverable equity — see [`InstrumentKind::is_split_eligible`]), or `None` if a corporate
+    /// action must be rejected for targeting it.
+    ///
+    /// The single place that check is made for a split: both the live handler and the audit replica
+    /// call this, and the split pass is reachable only through the returned target.
+    ///
+    /// Panics if `InstrumentState` associated with the `InstrumentIndex` does not exist.
+    ///
+    /// [`InstrumentKind::is_split_eligible`]: rustrade_instrument::instrument::kind::InstrumentKind::is_split_eligible
+    pub(crate) fn split_eligible_target(
+        &self,
+        key: &InstrumentIndex,
+    ) -> Option<SplitEligibleTarget<'_, InstrumentData>> {
+        let target = self.instrument_index(key);
+        target
+            .instrument
+            .kind
+            .is_split_eligible()
+            .then_some(SplitEligibleTarget {
+                states: self,
+                target,
+            })
+    }
+}
+
+/// A corporate-action target proven **split-eligible** — the deliverable equity, see
+/// [`InstrumentKind::is_split_eligible`] — obtainable only from
+/// [`InstrumentStates::split_eligible_target`], and the only way to reach
+/// [`prepare_corporate_action_split`](Self::prepare_corporate_action_split).
+///
+/// The fields are private, and `split_eligible_target` is the only constructor, so outside this
+/// module holding one is proof that the eligibility check ran: the precondition the split pass
+/// relies on is discharged by the type system in every build, instead of by an assertion that
+/// compiles out in release. That constructor takes `target` from `states` itself, so the plan is
+/// built from the same registry the check read.
+///
+/// [`InstrumentKind::is_split_eligible`]: rustrade_instrument::instrument::kind::InstrumentKind::is_split_eligible
+pub(crate) struct SplitEligibleTarget<'a, InstrumentData> {
+    states: &'a InstrumentStates<InstrumentData>,
+    target: &'a InstrumentState<InstrumentData>,
+}
+
+impl<InstrumentData> SplitEligibleTarget<'_, InstrumentData> {
     /// Pre-compute a stock split against **every** position and option it would mutate, **without
     /// mutating anything**, returning the full [`SplitPlan`] the handler will commit — so
     /// `process_corporate_action` (and its audit replica) can reject an un-applicable action
@@ -162,11 +225,11 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
     /// Single-sourced so the live handler and the audit replica reach the identical decision — and
     /// the identical pre-computed values — by construction, not by hand-mirrored vigilance. Checks,
     /// in the same order the handler commits:
-    /// - `equity` is the **unique** split-eligible instrument on its `(base, quote, exchange)`
+    /// - the target is the **unique** split-eligible instrument on its `(base, quote, exchange)`
     ///   underlying identity ⇒ otherwise [`UnsupportedCorporateActionReason::AmbiguousSplitTarget`]
     ///   (see that variant for why a second eligible instrument makes the option scan unsound);
-    /// - every open position on the splitting `equity` rescales without `Decimal` overflow (equity
-    ///   quantities may legitimately be fractional, so there is no integer check here);
+    /// - every open position on the target rescales without `Decimal` overflow (equity quantities
+    ///   may legitimately be fractional, so there is no integer check here);
     /// - iff `adjust_options_in_place` (a standard, whole-number forward split), for every registered
     ///   option on the same underlying (held **or** unheld): its **strike** divides by `ratio`
     ///   without `Decimal` overflow, and — for each **held** position — the contract count is an
@@ -184,14 +247,20 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
     /// correct strike), and that division is otherwise unchecked. A non-standard split touches no
     /// option state, so only the equity positions are pre-computed for it.
     ///
-    /// # Preconditions
-    /// `equity` must already have been established as split-eligible
-    /// ([`InstrumentKind::is_split_eligible`]) by the caller — this function **assumes** it rather
-    /// than checking it, and `debug_assert!`s the assumption. It is a precondition and not a
-    /// returned [`UnsupportedCorporateActionReason::InstrumentKindNotSupported`] because both
+    /// # Eligibility is a type, not a check
+    /// The target is split-eligible ([`InstrumentKind::is_split_eligible`]) by construction:
+    /// `self` can only be obtained from [`InstrumentStates::split_eligible_target`]. That matters
+    /// because an ineligible target is not inert here — the underlying identity every scan below resolves
+    /// against is derived FROM the target, so a derivative reaching this pass would have its own
+    /// positions rescaled through the equity leg (bypassing the option path's integer-contract
+    /// check), and an option target would then match its own scan and be adjusted a second time.
+    ///
+    /// Eligibility is not a returned
+    /// [`UnsupportedCorporateActionReason::InstrumentKindNotSupported`] from this pass because both
     /// callers must reject an ineligible target *before* the action kind is matched, so that a
-    /// split delivered against an option is attributed to the instrument rather than to the
-    /// action — an ordering this function is called too late to produce.
+    /// split delivered against an option is attributed to the instrument rather than to the action
+    /// — an ordering this pass runs too late to produce. Each caller obtains the target where it
+    /// performs that rejection.
     ///
     /// Returns the [`UnsupportedCorporateActionReason`] the caller should surface on the first
     /// failure, or the [`SplitPlan`] to commit when the whole action can be applied.
@@ -200,23 +269,11 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
     pub(crate) fn prepare_corporate_action_split(
         &self,
         id: &SmolStr,
-        equity: &InstrumentIndex,
         ratio: SplitRatio,
         policy: SplitRoundingPolicy,
         adjust_options_in_place: bool,
     ) -> Result<SplitPlan, UnsupportedCorporateActionReason> {
-        let equity_state = self.instrument_index(equity);
-
-        // Asserted, not checked: see `# Preconditions`. It earns an assertion because an ineligible
-        // target is not inert here — the underlying identity below is derived FROM the target, so a
-        // derivative reaching this function would have its own positions rescaled through the equity
-        // leg (bypassing the option path's integer-contract check), and an option target would then
-        // match its own scan and be adjusted a second time.
-        debug_assert!(
-            equity_state.instrument.kind.is_split_eligible(),
-            "prepare_corporate_action_split: target is not split-eligible: {:?}",
-            equity_state.instrument.kind
-        );
+        let equity_state = self.target;
 
         // The underlying identity every option scan below (and the handler's non-standard signal)
         // resolves against. Derived from the TARGET, so it is only a sound proxy for "this option
@@ -232,8 +289,9 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
         // recorded only against its own trigger. Reject the ambiguity instead of picking a winner:
         // nothing here can tell which instrument the chain is actually written on. Runs FIRST so an
         // ambiguous target is reported as such even when the arithmetic below would also fail.
-        if self.0.values().any(|state| {
-            state.key != *equity && state.is_split_eligible_on_underlying(&base, &quote, &exchange)
+        if self.states.0.values().any(|state| {
+            state.key != equity_state.key
+                && state.is_split_eligible_on_underlying(&base, &quote, &exchange)
         }) {
             return Err(UnsupportedCorporateActionReason::AmbiguousSplitTarget);
         }
@@ -274,6 +332,7 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
         let mut options = Vec::new();
         let mut options_already_adjusted = Vec::new();
         for option_state in self
+            .states
             .0
             .values()
             .filter(|state| state.is_option_on_underlying(&base, &quote, &exchange))
@@ -336,7 +395,9 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
             options_already_adjusted,
         })
     }
+}
 
+impl<InstrumentData> InstrumentStates<InstrumentData> {
     /// Return an `Iterator` of references to `InstrumentState`s being tracked, optionally filtered
     /// by the provided `InstrumentFilter`.
     pub fn instruments<'a>(
@@ -735,7 +796,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// second eligible instrument carrying it would be an equally valid trigger for adjusting the
     /// same options, with nothing in the state able to say which of the two the chain is written
     /// on. Shared by the live handler and the audit replica via
-    /// [`InstrumentStates::prepare_corporate_action_split`].
+    /// [`SplitEligibleTarget::prepare_corporate_action_split`].
     pub(crate) fn is_split_eligible_on_underlying(
         &self,
         base: &AssetKey,
@@ -753,7 +814,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// `exchange` — the identity match shared by the kind-specific predicates above, with no
     /// [`InstrumentKind`] constraint of its own.
     ///
-    /// Both `base` AND `quote` are matched: [`Underlying`](rustrade_instrument::instrument::Underlying)
+    /// Both `base` AND `quote` are matched: [`Underlying`](rustrade_instrument::Underlying)
     /// is a full pair identity, so without the quote filter a BTC/USDT action would also reach
     /// BTC/USDC instruments.
     fn is_on_underlying(&self, base: &AssetKey, quote: &AssetKey, exchange: &ExchangeKey) -> bool
@@ -1675,7 +1736,8 @@ where
         // The engine's own record, not a read of the venue: it leaves out orders in flight, and
         // may still hold orders the venue has finished.
         orders_complete: false,
-        position: None,
+        // The engine does not know the venue's position.
+        position: PositionReport::Unreported,
         isolated: None,
     }
 }
@@ -2742,7 +2804,7 @@ mod tests {
             instrument: InstrumentIndex(0),
             orders,
             orders_complete,
-            position: None,
+            position: PositionReport::Unreported,
             isolated: None,
         }
     }

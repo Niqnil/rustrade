@@ -255,6 +255,11 @@ impl<Event, OnTradingDisabled, OnDisconnect>
             UpdateFromAccountOutput::UntrackedExchange(untracked) => {
                 Self::with_output(event, EngineOutput::UntrackedExchange(untracked))
             }
+            UpdateFromAccountOutput::PositionDrift(drift) => drift
+                .into_iter()
+                .fold(Self::with_event(event), |audit, drift| {
+                    audit.add_output(EngineOutput::PositionDrift(drift))
+                }),
         }
     }
 

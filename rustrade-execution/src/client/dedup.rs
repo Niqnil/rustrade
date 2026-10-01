@@ -14,7 +14,7 @@
 //! than by growing without limit.
 //!
 //! This module is exchange-agnostic: it operates on rustrade's own
-//! [`UnindexedAccountEvent`](crate::UnindexedAccountEvent), never on any SDK's wire types.
+//! [`UnindexedAccountEvent`], never on any SDK's wire types.
 
 use crate::{AccountEventKind, UnindexedAccountEvent, order::state::OrderState};
 use lru::LruCache;
@@ -23,9 +23,9 @@ use smol_str::SmolStr;
 use std::{num::NonZeroUsize, sync::Arc};
 
 /// Size of the LRU dedup cache. 10k entries covers ~hours of high-frequency
-/// trading at typical fill rates; each entry is ~100-104 bytes (DedupKey =
-/// SmolStr[24] + SmolStr[24] + DedupEventKind[20] + padding[4] = 72 bytes, plus
-/// LruCache node overhead: 2 linked-list pointers[16] + hashbrown slot[~12-16]
+/// trading at typical fill rates; each entry is ~100-104 bytes (`DedupKey` =
+/// `SmolStr` 24 + `SmolStr` 24 + `DedupEventKind` 20 + padding 4 = 72 bytes, plus
+/// `LruCache` node overhead: 2 linked-list pointers 16 + hashbrown slot ~12-16
 /// ≈ 28-32 bytes). At 10k: ~1.0 MB.
 /// At very high fill rates (>333 distinct fills/sec sustained during the 30s
 /// recovery window), LRU eviction could allow a fill to pass dedup twice.

@@ -151,8 +151,7 @@ pub mod trade;
 
 pub mod transformer;
 
-/// HTTP plumbing shared by the provider's two hosts. Internal: the host clients
-/// ([`vault::LseVaultClient`] and [`data_api::LseDataApiClient`]) are the public surface.
+// HTTP plumbing shared by the provider's two hosts; documented in its own file.
 pub(crate) mod transport;
 
 pub mod vault;

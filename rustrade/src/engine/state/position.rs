@@ -4,13 +4,21 @@ use rust_decimal::Decimal;
 pub use rustrade_execution::order::id::PositionId;
 use rustrade_execution::trade::{AssetFees, Trade, TradeId};
 use rustrade_instrument::{
-    Side, asset::AssetIndex, corporate_action::SplitRatio, instrument::InstrumentIndex,
+    Side,
+    asset::AssetIndex,
+    corporate_action::SplitRatio,
+    instrument::{InstrumentIndex, name::InstrumentNameInternal},
 };
 use rustrade_integration::collection::FnvIndexMap;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use thiserror::Error;
 use tracing::{error, warn};
+
+mod drift;
+mod venue;
+pub use drift::PositionDrift;
+pub use venue::{SkippedVenuePosition, VenuePositionSeeds, VenuePositionSkipReason};
 
 /// Order Management System mode governing how positions are tracked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -150,11 +158,12 @@ pub enum PnlRealisedUpdate {
 /// position infallibly — so a mid-commit `Decimal` overflow is impossible *by construction* rather
 /// than merely caught by an `unreachable!`.
 ///
-/// `pub(crate)`: the handler's pre-validation ([`InstrumentStates::prepare_corporate_action_split`])
-/// carries a batch of these in its [`SplitPlan`]; the fields stay private so only [`Position`] can
-/// read them back (via [`Position::commit_split`]).
+/// `pub(crate)`: the handler's pre-validation
+/// ([`SplitEligibleTarget::prepare_corporate_action_split`]) carries a batch of these in its
+/// [`SplitPlan`]; the fields stay private so only [`Position`] can read them back (via
+/// [`Position::commit_split`]).
 ///
-/// [`InstrumentStates::prepare_corporate_action_split`]: super::instrument::InstrumentStates::prepare_corporate_action_split
+/// [`SplitEligibleTarget::prepare_corporate_action_split`]: super::instrument::SplitEligibleTarget::prepare_corporate_action_split
 /// [`SplitPlan`]: super::instrument::SplitPlan
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PreparedSplit {
@@ -311,6 +320,215 @@ impl<AssetKey: Debug + Clone, InstrumentKey> PositionManager<AssetKey, Instrumen
 
         closed
     }
+}
+
+/// An open [`Position`] to place in an [`EngineState`](crate::engine::state::EngineState)
+/// before the engine starts, via
+/// [`EngineStateBuilder::positions`](crate::engine::state::builder::EngineStateBuilder::positions).
+///
+/// The engine builds positions only from fills, so a position held across a process restart is
+/// invisible to it until one is seeded: the strategy cannot close it, and risk checks do not see
+/// it. A seed is also how a backtest starts from an existing portfolio.
+///
+/// The caller supplies the entry price, from its own records or the venue's trade history. The
+/// engine cannot recover one: it is not in a balance, and many venues do not report it. Where a
+/// venue does report positions with an entry price, [`VenuePositionSeeds::from_account_snapshot`]
+/// builds seeds from its account snapshot.
+///
+/// # What the seeded position holds
+/// - `contract_size` from the instrument, as a fill would set it.
+/// - Entry fees from [`PositionSeed::with_fees_enter`], zero by default, in the instrument's
+///   quote asset, and zero exit fees. As for a position opened by a fill, realised PnL starts at
+///   minus the entry fees, and unrealised PnL deducts an exit-fee estimate scaled from them.
+/// - Zero unrealised PnL until the first market price for the instrument arrives.
+/// - `quantity_abs_max` equal to `quantity_abs`, and no [`TradeId`]s.
+///
+/// No [`Trade`] is generated, so nothing reaches the audit stream or the trading summary until the
+/// position changes. When it closes, its realised PnL is measured from the seeded
+/// `price_entry_average`, net of the seeded entry fees, so a session summary includes any PnL
+/// accrued before the engine started. Seed the current price, and no fees, instead if the summary
+/// should cover only this session.
+///
+/// A seed is not checked when it is constructed or deserialised. The checks listed on
+/// [`PositionSeedError`] run when the state is built, by
+/// [`EngineStateBuilder::try_build`](crate::engine::state::builder::EngineStateBuilder::try_build)
+/// or [`SystemBuilder::build`](crate::system::builder::SystemBuilder::build).
+///
+/// `#[non_exhaustive]`: construct with [`PositionSeed::new`], so a field can be added without a
+/// breaking change.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[non_exhaustive]
+pub struct PositionSeed {
+    /// Instrument the position is held on.
+    pub instrument: InstrumentNameInternal,
+    /// Position direction (`Side::Buy` => LONG, `Side::Sell` => SHORT).
+    pub side: Side,
+    /// Absolute position quantity. Must be greater than zero.
+    pub quantity_abs: Decimal,
+    /// Volume-weighted average entry price.
+    ///
+    /// Not checked, as a fill's price is not: a negative price is legal on some instruments, and
+    /// zero is a genuine cost basis for an asset received without paying for it.
+    pub price_entry_average: Decimal,
+    /// When the position was entered. Not checked: a value later than the fill that closes the
+    /// position gives its [`PositionExited`] a `time_enter` after its `time_exit`.
+    pub time_enter: DateTime<Utc>,
+    /// Slot the position occupies in its instrument's [`PositionManager`].
+    ///
+    /// - [`OmsMode::Netting`]: `None`, or [`PositionId::NETTING`], the only netting slot.
+    /// - [`OmsMode::Hedging`]: required. A strategy reduces or closes the position by submitting
+    ///   orders with this id as their
+    ///   [`RequestOpen::position_id`](rustrade_execution::order::request::RequestOpen::position_id).
+    pub position_id: Option<PositionId>,
+    /// Fees paid to enter the position, in the instrument's quote asset. Negative for a net
+    /// rebate, as on a fill. Zero by default, including when absent from a deserialised seed.
+    #[serde(default)]
+    pub fees_enter: Decimal,
+}
+
+impl PositionSeed {
+    /// Construct a seed for the netting slot. Add a slot for [`OmsMode::Hedging`] with
+    /// [`Self::with_position_id`].
+    pub fn new(
+        instrument: impl Into<InstrumentNameInternal>,
+        side: Side,
+        quantity_abs: Decimal,
+        price_entry_average: Decimal,
+        time_enter: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            instrument: instrument.into(),
+            side,
+            quantity_abs,
+            price_entry_average,
+            time_enter,
+            position_id: None,
+            fees_enter: Decimal::ZERO,
+        }
+    }
+
+    /// Place the position in the given slot. Required under [`OmsMode::Hedging`].
+    pub fn with_position_id(self, position_id: PositionId) -> Self {
+        Self {
+            position_id: Some(position_id),
+            ..self
+        }
+    }
+
+    /// Set the fees paid to enter the position, in the instrument's quote asset, so realised PnL
+    /// at close is net of them. Without this the seed carries zero entry fees and realised PnL
+    /// overstates the position's result by what they cost.
+    ///
+    /// Not checked, as a fill's fees are not: a negative amount is a net rebate on entry, and
+    /// starts realised PnL above zero.
+    pub fn with_fees_enter(self, fees_enter: Decimal) -> Self {
+        Self { fees_enter, ..self }
+    }
+
+    /// Validate this seed against `manager` and insert it as an open [`Position`].
+    ///
+    /// `quote` is the fee asset of the entry and exit fees, and `contract_size` the instrument's
+    /// multiplier. On error `manager` is unchanged.
+    pub(crate) fn seed_into(
+        self,
+        manager: &mut PositionManager,
+        instrument: InstrumentIndex,
+        quote: AssetIndex,
+        contract_size: Decimal,
+    ) -> Result<(), PositionSeedError> {
+        if self.quantity_abs <= Decimal::ZERO {
+            return Err(PositionSeedError::NonPositiveQuantity {
+                instrument: self.instrument,
+                quantity_abs: self.quantity_abs,
+            });
+        }
+
+        let position_id = match (manager.mode, self.position_id) {
+            (OmsMode::Netting, None) => PositionId::NETTING,
+            (OmsMode::Netting, Some(id)) if id == PositionId::NETTING => id,
+            (OmsMode::Netting, Some(position_id)) => {
+                return Err(PositionSeedError::PositionIdInNetting {
+                    instrument: self.instrument,
+                    position_id,
+                });
+            }
+            (OmsMode::Hedging, Some(id)) => id,
+            (OmsMode::Hedging, None) => {
+                return Err(PositionSeedError::MissingPositionIdInHedging {
+                    instrument: self.instrument,
+                });
+            }
+        };
+
+        if manager.positions.contains_key(&position_id) {
+            return Err(PositionSeedError::DuplicateSlot {
+                instrument: self.instrument,
+                position_id,
+            });
+        }
+
+        let position = Position {
+            instrument,
+            side: self.side,
+            price_entry_average: self.price_entry_average,
+            quantity_abs: self.quantity_abs,
+            quantity_abs_max: self.quantity_abs,
+            pnl_unrealised: Decimal::ZERO,
+            // As `Position::from(&Trade)` sets it: the entry fees are realised when paid.
+            pnl_realised: -self.fees_enter,
+            fees_enter: AssetFees::new(quote, self.fees_enter, Some(self.fees_enter)),
+            fees_exit: AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO)),
+            time_enter: self.time_enter,
+            time_exchange_update: self.time_enter,
+            trades: Vec::new(),
+            contract_size,
+        };
+        manager.positions.insert(position_id, position);
+        Ok(())
+    }
+}
+
+/// Why a [`PositionSeed`] was rejected by
+/// [`EngineStateBuilder::try_build`](crate::engine::state::builder::EngineStateBuilder::try_build).
+///
+/// `#[non_exhaustive]`: a further check can be added without breaking downstream exhaustive
+/// matches.
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]
+#[non_exhaustive]
+pub enum PositionSeedError {
+    /// The seed names an instrument the engine was not built with.
+    #[error("position seed names unknown instrument {instrument}")]
+    UnknownInstrument { instrument: InstrumentNameInternal },
+
+    /// The seed's quantity is zero or negative. Direction belongs in the seed's `side`.
+    #[error("position seed for {instrument} has non-positive quantity {quantity_abs}")]
+    NonPositiveQuantity {
+        instrument: InstrumentNameInternal,
+        quantity_abs: Decimal,
+    },
+
+    /// Two seeds target the same slot on one instrument. Under [`OmsMode::Netting`] that is any
+    /// two seeds for the instrument.
+    #[error("position seeded more than once for {instrument} (slot {position_id})")]
+    DuplicateSlot {
+        instrument: InstrumentNameInternal,
+        position_id: PositionId,
+    },
+
+    /// A seed under [`OmsMode::Netting`] names a slot other than [`PositionId::NETTING`], the only
+    /// one netting has.
+    #[error(
+        "position seed for {instrument} names slot {position_id}, but OmsMode::Netting has only \
+         the netting slot"
+    )]
+    PositionIdInNetting {
+        instrument: InstrumentNameInternal,
+        position_id: PositionId,
+    },
+
+    /// A seed under [`OmsMode::Hedging`] has no slot, so no order could later close it.
+    #[error("position seed for {instrument} has no position_id, which OmsMode::Hedging requires")]
+    MissingPositionIdInHedging { instrument: InstrumentNameInternal },
 }
 
 /// Represents an open trading position for a specific instrument.
@@ -911,8 +1129,8 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
         // Two-phase: prepare (fallible arithmetic, no mutation) then commit (infallible). Kept as a
         // single call for callers that apply one position in isolation; the corporate-action handler
         // instead batches `prepare_split` across every affected position (atomic pre-validation) via
-        // `InstrumentStates::prepare_corporate_action_split`, then commits each with `commit_split`,
-        // so a mid-batch overflow can never leave a subset of positions rescaled.
+        // `SplitEligibleTarget::prepare_corporate_action_split`, then commits each with
+        // `commit_split`, so a mid-batch overflow can never leave a subset of positions rescaled.
         let prepared = self.prepare_split(ratio, policy)?;
         Ok(self.commit_split(prepared, last_price))
     }
@@ -997,7 +1215,7 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
     /// if any product/quotient exceeds `Decimal::MAX`, leaving nothing to commit.
     ///
     /// `pub(crate)` so the engine's atomic pre-validation
-    /// ([`InstrumentStates::prepare_corporate_action_split`](super::instrument::InstrumentStates::prepare_corporate_action_split))
+    /// ([`SplitEligibleTarget::prepare_corporate_action_split`](super::instrument::SplitEligibleTarget::prepare_corporate_action_split))
     /// can pre-compute every affected position *before* [`commit_split`](Self::commit_split) mutates
     /// any.
     pub(crate) fn prepare_split(

@@ -16,6 +16,7 @@
 //
 // Resilience features:
 // - Rate limit handling: reads X-Ratelimit-Remaining / X-Ratelimit-Reset headers;
+//   pauses every request until the reset once a response reports none remaining, and
 //   backs off on 429 with up to MAX_RATE_LIMIT_ATTEMPTS total attempts
 // - Reconnection: account_stream reconnects on WS close/error with exponential
 //   backoff (1 s → 30 s, max 10 attempts)
@@ -56,6 +57,7 @@ use crate::{
         state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
     },
     parse_env_bool,
+    position::{Position, PositionReport},
     trade::{AssetFees, Trade, TradeId},
 };
 use chrono::{DateTime, Utc};
@@ -224,10 +226,7 @@ impl RateLimitTracker {
     /// Record a rate-limit event, extending any existing cooldown if longer.
     fn on_rate_limited(&self, retry_after: Option<Duration>) {
         let delay = retry_after.unwrap_or(Duration::from_secs(DEFAULT_RATE_LIMIT_DELAY_SECS));
-        let new_deadline = tokio::time::Instant::now() + delay;
-        let mut guard = self.blocked_until.lock();
-        let was_blocked = guard.is_some();
-        *guard = Some(guard.map_or(new_deadline, |existing| existing.max(new_deadline)));
+        let was_blocked = self.extend(delay);
         if was_blocked {
             debug!(
                 delay_secs = delay.as_secs(),
@@ -239,6 +238,30 @@ impl RateLimitTracker {
                 "Alpaca entering rate-limit degradation mode"
             );
         }
+    }
+
+    /// Record a response reporting no requests left in the current window: pause every request
+    /// until the window resets, `reset` from now, so the next one is not refused with a 429.
+    fn on_bucket_exhausted(&self, reset: Duration) {
+        let was_blocked = self.extend(reset);
+        // info! not warn!: nothing was refused. A 429 logs at warn.
+        if !was_blocked {
+            info!(
+                delay_ms = u64::try_from(reset.as_millis()).unwrap_or(u64::MAX),
+                "Alpaca rate-limit window exhausted (X-Ratelimit-Remaining: 0), pausing requests until it resets"
+            );
+        }
+    }
+
+    /// Push the cooldown out to `delay` from now unless it already ends later, and return whether
+    /// one was active.
+    fn extend(&self, delay: Duration) -> bool {
+        let now = tokio::time::Instant::now();
+        let new_deadline = now + delay;
+        let mut guard = self.blocked_until.lock();
+        let was_blocked = guard.is_some_and(|until| until > now);
+        *guard = Some(guard.map_or(new_deadline, |existing| existing.max(new_deadline)));
+        was_blocked
     }
 }
 
@@ -535,31 +558,65 @@ pub enum AlpacaConfigError {
 // REST response serde types
 // ---------------------------------------------------------------------------
 
+/// The fields of GET /v2/account the USD balance is built from.
+///
+/// Amounts are decoded as decimals, so a malformed one fails the request instead of reading as
+/// zero.
 #[derive(Debug, Deserialize)]
 struct AlpacaAccount {
-    equity: String,
-    buying_power: String,
-    options_buying_power: Option<String>,
-    // crypto_buying_power is present in Alpaca's account response and represents
-    // available buying power specifically for crypto orders. Not currently used in
-    // balance logic (buying_power serves as the general free USD balance), but
-    // retained so serde doesn't error on accounts where the field is present.
-    #[allow(dead_code)]
-    // retained for serde completeness; may be used for per-asset-class reporting
-    crypto_buying_power: Option<String>,
+    /// Settled and unsettled cash. Negative when the account has borrowed on margin; a short
+    /// sale's proceeds are credited to it.
+    #[serde(with = "rust_decimal::serde::str")]
+    cash: Decimal,
+    /// Buying power for securities that cannot be bought on margin. On a margin account it is
+    /// equity less the initial margin requirement, so it counts the loan value of held
+    /// marginable stock and can exceed cash; a short sale's proceeds do not raise it.
+    #[serde(with = "rust_decimal::serde::str")]
+    non_marginable_buying_power: Decimal,
 }
 
 /// A single position returned by GET /v2/positions.
+///
+/// Amounts are decoded as decimals, so a malformed one fails the request instead of reading as
+/// zero or as a flat position.
 #[derive(Debug, Deserialize)]
 struct AlpacaPosition {
-    /// Exchange symbol (e.g., "BTC/USD" for crypto, "AAPL" for equity).
+    /// Exchange symbol (e.g., "BTC/USD" for crypto, "AAPL" for equity, an OCC symbol for an
+    /// option).
     symbol: String,
     /// Asset class: "us_equity", "crypto", "us_option".
     asset_class: String,
-    /// Total quantity held (base currency for crypto).
-    qty: String,
+    /// Direction of the position. The size is taken from `qty`'s magnitude and the sign from
+    /// this, so a short reads as short whichever sign `qty` carries. Missing reads as
+    /// [`AlpacaPositionSide::Unknown`].
+    #[serde(default)]
+    side: AlpacaPositionSide,
+    /// Quantity held: shares, contracts, or base currency for crypto.
+    #[serde(with = "rust_decimal::serde::str")]
+    qty: Decimal,
     /// Quantity available to trade (not locked in open orders).
-    qty_available: String,
+    #[serde(with = "rust_decimal::serde::str")]
+    qty_available: Decimal,
+    /// Average entry price per unit.
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    avg_entry_price: Option<Decimal>,
+    /// Unrealised profit or loss of the whole position, in USD.
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    unrealized_pl: Option<Decimal>,
+}
+
+/// Direction of an [`AlpacaPosition`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum AlpacaPositionSide {
+    Long,
+    Short,
+    /// A missing side or a value Alpaca does not document. Decoded rather than rejected so that
+    /// one position cannot fail the whole response, which also carries the crypto balances; a
+    /// position that needs a direction fails in [`convert_positions`] instead.
+    #[default]
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Deserialize)]
@@ -889,6 +946,11 @@ struct AlpacaOrderWs<'a> {
 ///   fractional quantities are supported natively via `Decimal::to_string()`
 /// - Equities: `position_intent` is valid but optional for long-only strategies
 ///
+/// # Rate limits
+/// Once a response reports no requests left in the current window (`X-Ratelimit-Remaining: 0`),
+/// every request, orders included, waits until the window resets (`X-Ratelimit-Reset`, at most a
+/// minute away), so it is not refused. A 429 waits the same way and is retried.
+///
 /// Cloning is cheap: all inner state is behind `Arc`.
 #[derive(Clone)]
 pub struct AlpacaClient {
@@ -966,6 +1028,35 @@ fn parse_rate_limit_delay(headers: &reqwest::header::HeaderMap) -> Option<Durati
         })
 }
 
+/// Pause every request until the window resets when a response reports none remaining in it.
+///
+/// The pause is at most [`DEFAULT_RATE_LIMIT_DELAY_SECS`], the length of Alpaca's window. Call on
+/// any response except a 429, which sets its own cooldown. Without an
+/// `X-Ratelimit-Reset` there is nothing to pause until, so the next request goes ahead and a 429,
+/// if it comes, backs off.
+fn observe_rate_limit_remaining(
+    rate_limiter: &RateLimitTracker,
+    headers: &reqwest::header::HeaderMap,
+) {
+    let exhausted = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u32>().ok())
+        == Some(0);
+    if !exhausted {
+        return;
+    }
+    match parse_rate_limit_delay(headers) {
+        // Alpaca's window is a minute, so a reset further out is a bad header or clock skew, and
+        // must not hold orders back for longer.
+        Some(reset) => rate_limiter
+            .on_bucket_exhausted(reset.min(Duration::from_secs(DEFAULT_RATE_LIMIT_DELAY_SECS))),
+        None => debug!(
+            "Alpaca REST rate-limit window exhausted (X-Ratelimit-Remaining: 0) without X-Ratelimit-Reset"
+        ),
+    }
+}
+
 /// Execute a REST request with rate-limit awareness and retry.
 ///
 /// The `build_request` closure is called on every attempt so the caller doesn't
@@ -973,7 +1064,17 @@ fn parse_rate_limit_delay(headers: &reqwest::header::HeaderMap) -> Option<Durati
 /// For GET/POST/DELETE with fixed bodies, the closure is a cheap re-construction.
 ///
 /// On HTTP 429, reads `X-Ratelimit-Reset` (Unix epoch) to determine the cooldown
-/// duration and retries up to `MAX_RATE_LIMIT_ATTEMPTS - 1` times.
+/// duration and retries up to `MAX_RATE_LIMIT_ATTEMPTS - 1` times. Any other response reporting
+/// `X-Ratelimit-Remaining: 0` pauses later requests until that reset; see
+/// [`observe_rate_limit_remaining`].
+///
+/// # Errors
+///
+/// - [`UnindexedClientError::Connectivity`]: the request or its body read failed, or a 5xx.
+/// - [`UnindexedClientError::Api`]: a 4xx, classified by [`parse_api_error`], or 429 retries
+///   exhausted ([`ApiError::RateLimit`]).
+/// - [`UnindexedClientError::Internal`]: a 2xx body that does not decode into `T`, or a 204 on a
+///   call that expects a body. Retrying returns the same answer.
 async fn rest_with_retry<T>(
     rate_limiter: &RateLimitTracker,
     mut build_request: impl FnMut() -> reqwest::RequestBuilder,
@@ -987,19 +1088,6 @@ where
             .send()
             .await
             .map_err(|e| connectivity_err(format!("Alpaca REST request failed: {e}")))?;
-
-        // Check X-Ratelimit-Remaining as an early warning; if exactly 0, the next
-        // request will 429. We don't proactively pause here — let the 429 handle it —
-        // but log at debug level so it's visible in traces.
-        if response
-            .headers()
-            .get("x-ratelimit-remaining")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u32>().ok())
-            == Some(0)
-        {
-            debug!("Alpaca REST rate-limit bucket exhausted (X-Ratelimit-Remaining: 0)");
-        }
 
         let status = response.status();
 
@@ -1024,11 +1112,13 @@ where
             return Err(UnindexedClientError::Api(ApiError::RateLimit));
         }
 
+        observe_rate_limit_remaining(rate_limiter, response.headers());
+
         // 204 No Content is only valid for DELETE endpoints; use rest_delete_with_retry
         // for those. Reaching here for a 204 indicates API misuse — return a clear error
-        // rather than a misleading "EOF while parsing" JSON failure.
+        // rather than a misleading "EOF while parsing" JSON failure. A retry cannot fix it.
         if status == reqwest::StatusCode::NO_CONTENT {
-            return Err(connectivity_err(
+            return Err(UnindexedClientError::Internal(
                 "Alpaca REST returned 204 No Content — use rest_delete_with_retry for DELETE endpoints"
                     .to_string(),
             ));
@@ -1039,9 +1129,11 @@ where
             .await
             .map_err(|e| connectivity_err(format!("Alpaca REST read body failed: {e}")))?;
 
+        // A 2xx body that does not fit the model is not transient: retrying returns the same
+        // body. An order path must still treat it as status unknown; see `order_post_error`.
         if status.is_success() {
             return serde_json::from_slice::<T>(&bytes).map_err(|e| {
-                connectivity_err(format!(
+                UnindexedClientError::Internal(format!(
                     "Alpaca REST JSON parse error ({status}): {e} | body: {}",
                     String::from_utf8_lossy(&bytes)
                         .chars()
@@ -1076,7 +1168,8 @@ where
 
 /// Execute a DELETE request, returning an order error on rejection.
 ///
-/// Handles 204 No Content (success), 422 / 403 (API rejection), and 429 (rate limit).
+/// Handles 204 No Content (success), 422 / 403 (API rejection), and 429 (rate limit). Any other
+/// response reporting `X-Ratelimit-Remaining: 0` pauses later requests, as in [`rest_with_retry`].
 async fn rest_delete_with_retry(
     rate_limiter: &RateLimitTracker,
     mut build_request: impl FnMut() -> reqwest::RequestBuilder,
@@ -1111,6 +1204,8 @@ async fn rest_delete_with_retry(
             );
             return Err(UnindexedOrderError::Rejected(ApiError::RateLimit));
         }
+
+        observe_rate_limit_remaining(rate_limiter, response.headers());
 
         // 204 No Content: cancel succeeded.
         if status == reqwest::StatusCode::NO_CONTENT || status.is_success() {
@@ -1168,20 +1263,51 @@ impl ExecutionClient for AlpacaClient {
         }
     }
 
+    /// # Balances and positions
+    ///
+    /// - **USD**: `total` is the account's `cash`, and `free` the lesser of cash and its
+    ///   `non_marginable_buying_power`: cash that can be spent without borrowing. Alpaca's
+    ///   buying power figures include the loan value of held stock, so none of them alone is
+    ///   free cash. A short sale's proceeds are credited to cash but do not raise buying power,
+    ///   so `free` stays below `total` while a short is open. Cash is negative while the account
+    ///   borrows on margin, and then `free` is negative too. Account equity is not reported: it
+    ///   is cash plus the value of the positions below, so it can be derived.
+    /// - **Equities and options**: each holding becomes the
+    ///   [`InstrumentAccountSnapshot::position`] of its instrument, [`PositionReport::Open`] with a
+    ///   signed [`Position`] (negative for a short), the average entry price and the unrealised
+    ///   PnL in USD. An equity or option without a holding is [`PositionReport::Flat`], since
+    ///   Alpaca lists every open position. An option's
+    ///   entry price is the premium per share of the underlying, as quoted and as orders are
+    ///   priced, not per contract. Margin, liquidation price and leverage are `None`, and
+    ///   `time_exchange` is the time of the call, since Alpaca does not timestamp positions.
+    /// - **Crypto**: each holding is an asset balance of its base asset (e.g. `btc` for
+    ///   `BTC/USD`), in base units. Alpaca crypto is spot-only and cannot be sold short, so there
+    ///   is no position to report: its instruments are [`PositionReport::Unreported`].
+    ///
     /// # Limitations
     ///
-    /// No position is reported per instrument: every `InstrumentAccountSnapshot::position` is
-    /// `None`. Crypto holdings from `/v2/positions` become asset balances. Equity and option
-    /// positions are left out (#418); they count only toward the USD balance, whose `total` is
-    /// account equity and whose `free` is buying power.
+    /// A position is reported only under the instrument name Alpaca uses for it, ignoring case:
+    /// the ticker for an equity and the OCC symbol for an option. A requested equity or option
+    /// named otherwise is reported [`PositionReport::Flat`] even while Alpaca holds it. A crypto
+    /// pair is recognised by the `/` in its name (e.g. `BTC/USD`, the form its orders use); one
+    /// named without it is taken for an equity and reported flat too. With `instruments` empty,
+    /// every instrument that has an open order or a position gets a snapshot; otherwise only the
+    /// requested ones do.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Internal`](crate::error::ClientError::Internal) when a response does not
+    /// decode, or when any non-zero equity or option position, requested or not, has a missing or
+    /// unrecognised `side`: its direction cannot be known, and leaving it out would read as flat.
+    /// Other request failures are `Connectivity` or `Api`, as for every Alpaca REST call.
     ///
     /// # Rate limit note
     ///
-    /// When both USD and non-USD assets are requested (the common startup case), this
-    /// method fetches `/v2/account` and `/v2/positions` in parallel for ~100-300ms
-    /// latency savings. Under rate pressure, both requests may hit 429 simultaneously
-    /// and retry independently. Operators approaching Alpaca rate limits should call
-    /// with explicit asset filters to serialize requests if needed.
+    /// `/v2/positions` is fetched on every call, since it holds both the crypto balances and the
+    /// equity and option positions. When USD is requested too (the common startup case),
+    /// `/v2/account` is fetched in parallel with it for ~100-300ms latency savings. Under rate
+    /// pressure, both requests may hit 429 simultaneously and retry independently. Operators
+    /// approaching Alpaca rate limits can request only non-USD assets to skip `/v2/account`.
     async fn account_snapshot(
         &self,
         assets: &[AssetNameExchange],
@@ -1200,36 +1326,37 @@ impl ExecutionClient for AlpacaClient {
                 .iter()
                 .any(|a| !a.name().as_str().eq_ignore_ascii_case("usd"));
 
-        // Fetch account + positions in parallel when both are needed (common startup case).
         // URLs are extracted before the closures to avoid re-allocating on each retry attempt.
         let account_url = format!("{base}/v2/account");
         let positions_url = format!("{base}/v2/positions");
-        let balances = match (wants_usd, wants_non_usd) {
-            (true, true) => {
-                let (account, positions): (AlpacaAccount, Vec<AlpacaPosition>) = tokio::try_join!(
-                    rest_with_retry(rl, || http.get(&account_url)),
-                    rest_with_retry(rl, || http.get(&positions_url)),
-                )?;
-                let mut balances = convert_account_to_balances(&account, assets);
-                balances.extend(convert_positions_to_balances(&positions, assets));
-                balances
-            }
-            (true, false) => {
-                let account: AlpacaAccount = rest_with_retry(rl, || http.get(&account_url)).await?;
-                convert_account_to_balances(&account, assets)
-            }
-            (false, true) => {
-                let positions: Vec<AlpacaPosition> =
-                    rest_with_retry(rl, || http.get(&positions_url)).await?;
-                convert_positions_to_balances(&positions, assets)
-            }
-            (false, false) => Vec::new(),
-        };
+        let (account, positions): (Option<AlpacaAccount>, Vec<AlpacaPosition>) = tokio::try_join!(
+            async {
+                if wants_usd {
+                    rest_with_retry(rl, || http.get(&account_url))
+                        .await
+                        .map(Some)
+                } else {
+                    Ok(None)
+                }
+            },
+            rest_with_retry(rl, || http.get(&positions_url)),
+        )?;
 
+        let mut balances = account
+            .map(|account| convert_account_to_balances(&account, assets))
+            .unwrap_or_default();
+        if wants_non_usd {
+            balances.extend(convert_positions_to_balances(&positions, assets));
+        }
+
+        // Converted before the open orders are fetched, so a position that cannot be converted
+        // fails the call without a wasted request.
+        let converted_positions = convert_positions(&positions, Utc::now())?;
         let open_orders = fetch_raw_open_orders(&http, rl, base, instruments).await?;
 
-        // Group open orders by instrument symbol, building InstrumentAccountSnapshots.
-        let instrument_snapshots = build_instrument_snapshots(open_orders, instruments);
+        // Group open orders and positions by instrument symbol.
+        let instrument_snapshots =
+            build_instrument_snapshots(open_orders, converted_positions, instruments);
 
         Ok(AccountSnapshot::new(
             ExchangeId::AlpacaBroker,
@@ -1772,16 +1899,7 @@ impl AlpacaClient {
                 }
             }
             Err(e) => {
-                let order_err = match e {
-                    UnindexedClientError::Connectivity(ce) => OrderError::Connectivity(ce),
-                    UnindexedClientError::Api(ae) => OrderError::Rejected(ae),
-                    UnindexedClientError::TaskFailed(_)
-                    | UnindexedClientError::Internal(_)
-                    | UnindexedClientError::Truncated { .. }
-                    | UnindexedClientError::TruncatedSnapshot { .. } => {
-                        unreachable!("rest_with_retry (order path) does not produce these variants")
-                    }
-                };
+                let order_err = order_post_error(e);
                 AlpacaBracketOrderResult {
                     parent: Order {
                         key: order_key,
@@ -1981,24 +2099,7 @@ impl AlpacaClient {
                 })
             }
             Err(e) => {
-                let order_err = match e {
-                    UnindexedClientError::Connectivity(ce) => OrderError::Connectivity(ce),
-                    UnindexedClientError::Api(ae) => OrderError::Rejected(ae),
-                    // TaskFailed, Internal, Truncated, and TruncatedSnapshot are not
-                    // returned by rest_with_retry (REST-only path for orders), but matching
-                    // explicitly ensures any new ClientError variant causes a compile error
-                    // here rather than being silently misclassified. If a future refactor
-                    // makes them reachable, the panic surfaces the bug loudly rather than
-                    // producing a wrong error type.
-                    UnindexedClientError::TaskFailed(_)
-                    | UnindexedClientError::Internal(_)
-                    | UnindexedClientError::Truncated { .. }
-                    | UnindexedClientError::TruncatedSnapshot { .. } => {
-                        unreachable!(
-                            "rest_with_retry (order path) does not produce TaskFailed/Internal/Truncated/TruncatedSnapshot variants"
-                        )
-                    }
-                };
+                let order_err = order_post_error(e);
                 Some(Order {
                     key: order_key,
                     side,
@@ -2256,9 +2357,16 @@ async fn connection_manager(
             .await
             {
                 Ok(()) => {}
+                // One account-wide activities query serves every instrument, so a timeout can
+                // have missed fills in any of them: name the requested set.
                 Err(_) => warn!(
                     timeout_secs = FILL_RECOVERY_TIMEOUT_SECS,
-                    "Alpaca fill recovery timed out — some fills may be missing"
+                    instruments = ?instruments
+                        .iter()
+                        .map(|instrument| instrument.name().as_str())
+                        .collect::<Vec<_>>(),
+                    "Alpaca fill recovery timed out — fills since the disconnect may be missing \
+                     for any of the instruments (every instrument when the list is empty)"
                 ),
             }
         }
@@ -2881,8 +2989,16 @@ async fn recover_fills(
 /// Convert an Alpaca account response to rustrade balance entries.
 ///
 /// Returns a single USD balance with:
-/// - `total` = equity (total account value including open positions)
-/// - `free` = options_buying_power (if available) or buying_power
+/// - `total` = `cash`, which is negative while the account borrows on margin
+/// - `free` = the lesser of `cash` and `non_marginable_buying_power`: cash that can be spent
+///   without borrowing, within what Alpaca allows
+///
+/// `free` is capped at cash because `non_marginable_buying_power` counts the loan value of held
+/// marginable stock, so it exceeds cash whenever such stock is held. The cap keeps
+/// `free <= total`, so with negative cash `free` is negative too.
+///
+/// Account equity is not the total: equity and option holdings are reported as positions, and
+/// counting them again here would double them.
 ///
 /// If `assets` is non-empty, only returns the balance if "usd" (case-insensitive)
 /// is in the requested set. An empty `assets` slice returns the USD balance unconditionally.
@@ -2905,29 +3021,20 @@ fn convert_account_to_balances(
         .cloned()
         .unwrap_or_else(|| AssetNameExchange::new("usd"));
 
-    let total = Decimal::from_str(&account.equity).unwrap_or(Decimal::ZERO);
-    let free = account
-        .options_buying_power
-        .as_deref()
-        .and_then(|s| Decimal::from_str(s).ok())
-        // Filter out zero: Alpaca returns options_buying_power="0.00" for equity-only
-        // accounts (options not enabled) rather than omitting the field. Without this
-        // filter, unwrap_or_else never fires and the engine reports free=0, blocking
-        // all orders on an account that may have substantial buying_power.
-        .filter(|d| !d.is_zero())
-        .unwrap_or_else(|| Decimal::from_str(&account.buying_power).unwrap_or(Decimal::ZERO));
-
     vec![AssetBalance::new(
         usd_name,
-        Balance::new(total, free),
+        Balance::new(
+            account.cash,
+            account.cash.min(account.non_marginable_buying_power),
+        ),
         Utc::now(),
     )]
 }
 
 /// Convert Alpaca positions to crypto asset balance entries.
 ///
-/// Only positions with `asset_class == "crypto"` are included. The base asset
-/// is extracted from the symbol (e.g., `"BTC/USD"` → `"btc"`).
+/// Only positions with `asset_class == "crypto"` are included; [`convert_positions`] reports the
+/// rest. The base asset is extracted from the symbol (e.g., `"BTC/USD"` → `"btc"`).
 ///
 /// - `total` = quantity of the holding in base currency units (e.g. 0.5 BTC)
 /// - `free`  = qty_available (base currency units not locked in open orders)
@@ -2941,7 +3048,7 @@ fn convert_positions_to_balances(
     let now = Utc::now();
     positions
         .iter()
-        .filter(|p| p.asset_class.eq_ignore_ascii_case("crypto"))
+        .filter(|p| is_crypto_position(p))
         .filter_map(|p| {
             // Alpaca crypto symbols are "BASE/QUOTE" (e.g., "BTC/USD").
             // Extract the base currency as the asset name.
@@ -2963,23 +3070,89 @@ fn convert_positions_to_balances(
 
             // total and free are in base currency units (e.g., BTC), not USD,
             // consistent with AssetBalance semantics for currency/crypto assets.
-            let total = Decimal::from_str(&p.qty).unwrap_or(Decimal::ZERO);
-            let free = Decimal::from_str(&p.qty_available).unwrap_or(Decimal::ZERO);
             let asset_name = AssetNameExchange::new(base);
             Some(AssetBalance::new(
                 asset_name,
-                Balance::new(total, free),
+                Balance::new(p.qty, p.qty_available),
                 now,
             ))
         })
         .collect()
 }
 
-/// Group a list of open orders into per-instrument snapshots for account_snapshot.
+/// Whether an Alpaca position is a crypto holding, which is reported as an asset balance rather
+/// than a [`Position`].
+fn is_crypto_position(position: &AlpacaPosition) -> bool {
+    position.asset_class.eq_ignore_ascii_case("crypto")
+}
+
+/// Convert Alpaca's non-crypto positions (equities and options) to [`Position`]s, each with its
+/// symbol, in Alpaca's order.
+///
+/// Crypto is left to [`convert_positions_to_balances`]: Alpaca crypto is spot-only and cannot be
+/// sold short, so a holding is simply a balance of the base asset, as on every spot venue. Every
+/// other asset class is a position, so a class Alpaca adds later is reported rather than dropped.
+///
+/// Each [`Position`] carries:
+/// - `quantity`: the magnitude of `qty`, negative when `side` is `short`;
+/// - `entry_price`: `avg_entry_price`, per share for an equity and per share of the underlying
+///   for an option (the premium as quoted, not multiplied by the contract size);
+/// - `unrealized_pnl`: `unrealized_pl`, in USD for the whole position;
+/// - `time_exchange`: `now`, since Alpaca does not timestamp positions.
+///
+/// A position with zero quantity is left out.
+///
+/// # Errors
+///
+/// [`ClientError::Internal`](crate::error::ClientError::Internal) when a position's `side` is
+/// missing or neither `long` nor `short`: reporting it either way could invert it, and leaving it
+/// out would read as flat.
+fn convert_positions(
+    positions: &[AlpacaPosition],
+    now: DateTime<Utc>,
+) -> Result<Vec<(&str, Position)>, UnindexedClientError> {
+    positions
+        .iter()
+        .filter(|p| !is_crypto_position(p) && !p.qty.is_zero())
+        .map(|p| {
+            let size = p.qty.abs();
+            let quantity = match p.side {
+                AlpacaPositionSide::Long => size,
+                AlpacaPositionSide::Short => -size,
+                AlpacaPositionSide::Unknown => {
+                    return Err(UnindexedClientError::Internal(format!(
+                        "Alpaca position {} has a missing or unrecognised side",
+                        p.symbol
+                    )));
+                }
+            };
+            let position = Position::new(
+                quantity,
+                p.avg_entry_price,
+                p.unrealized_pl,
+                None,
+                None,
+                None,
+                now,
+            );
+            Ok((p.symbol.as_str(), position))
+        })
+        .collect()
+}
+
+/// Group open orders and positions into per-instrument snapshots for account_snapshot.
 ///
 /// When `instruments` is non-empty, a snapshot is returned for every requested instrument
-/// (possibly with an empty orders list). When empty, only instruments with open orders
-/// are returned.
+/// (possibly with no orders and no position). When empty, only instruments with an open order or
+/// a position are returned.
+///
+/// `positions` come from [`convert_positions`], which holds every non-zero equity and option
+/// position, so an equity or option without one is [`PositionReport::Flat`]. A crypto pair (a
+/// symbol with a `/`) is [`PositionReport::Unreported`]: its holding is a balance.
+///
+/// Requested names match Alpaca's symbols ignoring case. When two requested names differ only in
+/// case, the first gets the symbol's orders and position; the second is
+/// [`PositionReport::Unreported`] with its orders not complete, since nothing is known about it.
 ///
 /// Each snapshot declares its orders complete unless [`convert_open_order`] left one of its
 /// orders out. That holds because `orders` is every open order, unpaged: a response at Alpaca's
@@ -2989,32 +3162,59 @@ fn convert_positions_to_balances(
 /// take-profit and stop-loss legs.
 fn build_instrument_snapshots(
     orders: Vec<AlpacaOrderResponse>,
+    positions: Vec<(&str, Position)>,
     instruments: &[InstrumentNameExchange],
 ) -> Vec<InstrumentAccountSnapshot<ExchangeId, AssetNameExchange, InstrumentNameExchange>> {
-    /// One instrument's converted orders, and whether none was left out.
+    /// One instrument's converted orders, whether none was left out, and its position.
     struct Listing {
         orders: Vec<UnindexedOrderSnapshot>,
         complete: bool,
+        position: Option<Position>,
+    }
+
+    impl Listing {
+        fn empty() -> Self {
+            Self {
+                orders: Vec::new(),
+                complete: true,
+                position: None,
+            }
+        }
     }
 
     // Build ordered map from symbol → snapshot to preserve deterministic ordering.
     let mut by_symbol: IndexMap<SmolStr, Listing> = IndexMap::new();
 
+    // Keyed by the upper-case symbol, so a requested name in another case still finds its
+    // listing. Alpaca's own symbols are upper case, so an unfiltered read lists them unchanged.
     for order in orders {
         let listing = by_symbol
-            .entry(SmolStr::new(&order.symbol))
-            .or_insert_with(|| Listing {
-                orders: Vec::new(),
-                complete: true,
-            });
+            .entry(order.symbol.to_ascii_uppercase().into())
+            .or_insert_with(Listing::empty);
         match convert_open_order(&order) {
             Some(converted) => listing.orders.push(converted.into()),
             None => listing.complete = false,
         }
     }
 
-    let snapshot = |instrument, listing: Listing| {
-        InstrumentAccountSnapshot::new(instrument, listing.orders, listing.complete, None, None)
+    for (symbol, position) in positions {
+        by_symbol
+            .entry(symbol.to_ascii_uppercase().into())
+            .or_insert_with(Listing::empty)
+            .position = Some(position);
+    }
+
+    let snapshot = |instrument: InstrumentNameExchange, listing: Listing| {
+        // `positions` holds every non-zero equity and option position, so one missing here is
+        // flat. Crypto is reported as balances, never as a position.
+        let position = if is_options_or_equity_symbol(instrument.name().as_str()) {
+            listing
+                .position
+                .map_or(PositionReport::Flat, PositionReport::from_position)
+        } else {
+            PositionReport::Unreported
+        };
+        InstrumentAccountSnapshot::new(instrument, listing.orders, listing.complete, position, None)
     };
 
     // If instruments is empty, return all; otherwise filter to requested set.
@@ -3024,17 +3224,28 @@ fn build_instrument_snapshots(
             .map(|(sym, listing)| snapshot(InstrumentNameExchange::new(sym), listing))
             .collect()
     } else {
+        // Upper-case symbols already given to an earlier requested name.
+        let mut claimed = std::collections::HashSet::new();
         instruments
             .iter()
             .map(|inst| {
+                let symbol = inst.name().as_str().to_ascii_uppercase();
+                // A second name for the same symbol, differing only in case: its listing went to
+                // the first, so nothing is known about it rather than it being flat and orderless.
+                if !claimed.insert(symbol.clone()) {
+                    return InstrumentAccountSnapshot::new(
+                        inst.clone(),
+                        Vec::new(),
+                        false,
+                        PositionReport::Unreported,
+                        None,
+                    );
+                }
                 // swap_remove is O(1); output order is determined by the `instruments`
                 // slice, not by the internal IndexMap order of `by_symbol`.
                 let listing = by_symbol
-                    .swap_remove(inst.name().as_str())
-                    .unwrap_or(Listing {
-                        orders: Vec::new(),
-                        complete: true,
-                    });
+                    .swap_remove(symbol.as_str())
+                    .unwrap_or_else(Listing::empty);
                 snapshot(inst.clone(), listing)
             })
             .collect()
@@ -3637,6 +3848,30 @@ fn connectivity_err(msg: impl Into<String>) -> UnindexedClientError {
     UnindexedClientError::Connectivity(ConnectivityError::Socket(msg.into()))
 }
 
+/// Map a failed order `POST` through [`rest_with_retry`] to the order's error.
+///
+/// [`UnindexedClientError::Internal`] there means Alpaca answered 2xx, so it accepted the order,
+/// but the response could not be read. The order may be live, so it is reported as
+/// [`OrderError::Connectivity`], the status-unknown error, never as a rejection. A caller must
+/// reconcile it (open orders, fills) before resubmitting, or it may place the order twice.
+fn order_post_error(error: UnindexedClientError) -> UnindexedOrderError {
+    match error {
+        UnindexedClientError::Connectivity(ce) => OrderError::Connectivity(ce),
+        UnindexedClientError::Api(ae) => OrderError::Rejected(ae),
+        UnindexedClientError::Internal(msg) => OrderError::Connectivity(ConnectivityError::Socket(
+            format!("Alpaca order status unknown, its 2xx response could not be read: {msg}"),
+        )),
+        // `rest_with_retry` returns none of these today. Matched explicitly so a new
+        // `ClientError` variant is a compile error here, and reported as status unknown rather
+        // than panicking an order path if that ever changes.
+        other @ (UnindexedClientError::TaskFailed(_)
+        | UnindexedClientError::Truncated { .. }
+        | UnindexedClientError::TruncatedSnapshot { .. }) => OrderError::Connectivity(
+            ConnectivityError::Socket(format!("Alpaca order status unknown: {other}")),
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BracketOrderClient implementation
 // ---------------------------------------------------------------------------
@@ -3673,6 +3908,7 @@ impl BracketOrderClient for AlpacaClient {
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
 
     #[test]
     fn test_alpaca_config_new_uses_paper_trading_by_default() {
@@ -4254,36 +4490,99 @@ mod tests {
 
     #[test]
     fn test_convert_account_to_balances_empty_assets() {
-        let account = AlpacaAccount {
-            equity: "12000.00".into(),
-            buying_power: "10000.00".into(),
-            options_buying_power: Some("8000.00".into()),
-            crypto_buying_power: None,
-        };
+        // equity and buying_power are larger than cash on a margin account holding positions;
+        // neither may leak into the balance.
+        let account: AlpacaAccount = serde_json::from_value(serde_json::json!({
+            "cash": "9000.50",
+            "equity": "12000.00",
+            "buying_power": "36000.00",
+            "regt_buying_power": "18000.00",
+            "options_buying_power": "8000.00",
+            "non_marginable_buying_power": "8500.25",
+        }))
+        .unwrap();
         let balances = convert_account_to_balances(&account, &[]);
         assert_eq!(balances.len(), 1);
-        assert_eq!(
-            balances[0].balance.total,
-            Decimal::from_str("12000.00").unwrap()
-        );
-        // options_buying_power is preferred for free
+        assert_eq!(balances[0].asset, AssetNameExchange::new("usd"));
+        assert_eq!(balances[0].balance.total, dec!(9000.50), "total is cash");
         assert_eq!(
             balances[0].balance.free,
-            Decimal::from_str("8000.00").unwrap()
+            dec!(8500.25),
+            "free is non-marginable buying power when below cash"
         );
+        assert_eq!(balances[0].balance.margin, None);
+    }
+
+    /// Long marginable stock: non-marginable buying power is equity less initial margin, which
+    /// exceeds cash, so `free` is capped at cash.
+    #[test]
+    fn test_convert_account_to_balances_free_capped_at_cash_with_long_stock() {
+        let account: AlpacaAccount = serde_json::from_value(serde_json::json!({
+            "cash": "50000",
+            "equity": "100000",
+            "initial_margin": "25000",
+            "non_marginable_buying_power": "75000",
+        }))
+        .unwrap();
+        let balances = convert_account_to_balances(&account, &[]);
+        assert_eq!(balances[0].balance.total, dec!(50000));
+        assert_eq!(balances[0].balance.free, dec!(50000));
+    }
+
+    /// A short sale credits its proceeds to cash but lowers non-marginable buying power, so
+    /// `free` is the buying power, below `total`.
+    #[test]
+    fn test_convert_account_to_balances_open_short_keeps_free_below_cash() {
+        let account: AlpacaAccount = serde_json::from_value(serde_json::json!({
+            "cash": "10200",
+            "equity": "10000",
+            "initial_margin": "100",
+            "non_marginable_buying_power": "9900",
+        }))
+        .unwrap();
+        let balances = convert_account_to_balances(&account, &[]);
+        assert_eq!(balances[0].balance.total, dec!(10200));
+        assert_eq!(balances[0].balance.free, dec!(9900));
+    }
+
+    #[test]
+    fn test_convert_account_to_balances_negative_cash_on_margin() {
+        let account: AlpacaAccount = serde_json::from_value(serde_json::json!({
+            "cash": "-2500.75",
+            "equity": "7500.00",
+            "buying_power": "5000.00",
+            "non_marginable_buying_power": "1250.00",
+        }))
+        .unwrap();
+        let balances = convert_account_to_balances(&account, &[]);
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].balance.total, dec!(-2500.75));
+        assert_eq!(
+            balances[0].balance.free,
+            dec!(-2500.75),
+            "no free cash while borrowing; free <= total still holds"
+        );
+    }
+
+    #[test]
+    fn test_alpaca_account_malformed_cash_fails_to_decode() {
+        let result = serde_json::from_value::<AlpacaAccount>(serde_json::json!({
+            "cash": "not-a-number",
+            "non_marginable_buying_power": "0",
+        }));
+        assert!(result.is_err(), "a malformed cash must not read as zero");
     }
 
     #[test]
     fn test_convert_account_to_balances_usd_filter() {
         let account = AlpacaAccount {
-            equity: "12000.00".into(),
-            buying_power: "10000.00".into(),
-            options_buying_power: None,
-            crypto_buying_power: None,
+            cash: dec!(12000.00),
+            non_marginable_buying_power: dec!(10000.00),
         };
         let usd = vec![AssetNameExchange::new("USD")];
         let balances = convert_account_to_balances(&account, &usd);
         assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].asset, AssetNameExchange::new("USD"));
 
         let non_usd = vec![AssetNameExchange::new("BTC")];
         let balances = convert_account_to_balances(&account, &non_usd);
@@ -4642,24 +4941,12 @@ mod tests {
     fn test_convert_positions_to_balances_crypto() {
         let positions = vec![
             AlpacaPosition {
-                symbol: "BTC/USD".into(),
-                asset_class: "crypto".into(),
-                qty: "0.5".into(),
-                qty_available: "0.4".into(),
+                qty_available: dec!(0.4),
+                ..alpaca_position("BTC/USD", "crypto", AlpacaPositionSide::Long, dec!(0.5))
             },
-            AlpacaPosition {
-                symbol: "ETH/USD".into(),
-                asset_class: "crypto".into(),
-                qty: "2.0".into(),
-                qty_available: "2.0".into(),
-            },
+            alpaca_position("ETH/USD", "crypto", AlpacaPositionSide::Long, dec!(2.0)),
             // Equity positions should be filtered out
-            AlpacaPosition {
-                symbol: "AAPL".into(),
-                asset_class: "us_equity".into(),
-                qty: "10".into(),
-                qty_available: "10".into(),
-            },
+            alpaca_position("AAPL", "us_equity", AlpacaPositionSide::Long, dec!(10)),
         ];
 
         // All crypto assets
@@ -4667,14 +4954,165 @@ mod tests {
         assert_eq!(balances.len(), 2, "only crypto positions returned");
         assert_eq!(balances[0].asset.name().as_str(), "btc");
         // total = qty (0.5 BTC), free = qty_available (0.4 BTC)
-        assert_eq!(balances[0].balance.total, Decimal::from_str("0.5").unwrap());
-        assert_eq!(balances[0].balance.free, Decimal::from_str("0.4").unwrap());
+        assert_eq!(balances[0].balance.total, dec!(0.5));
+        assert_eq!(balances[0].balance.free, dec!(0.4));
 
         // Filter to BTC only
         let btc_only = vec![AssetNameExchange::new("BTC")];
         let balances = convert_positions_to_balances(&positions, &btc_only);
         assert_eq!(balances.len(), 1);
         assert_eq!(balances[0].asset.name().as_str(), "btc");
+    }
+
+    /// A position as `/v2/positions` reports it, with `qty_available` equal to `qty`.
+    fn alpaca_position(
+        symbol: &str,
+        asset_class: &str,
+        side: AlpacaPositionSide,
+        qty: Decimal,
+    ) -> AlpacaPosition {
+        AlpacaPosition {
+            symbol: symbol.into(),
+            asset_class: asset_class.into(),
+            side,
+            qty,
+            qty_available: qty,
+            avg_entry_price: Some(dec!(100)),
+            unrealized_pl: Some(dec!(0)),
+        }
+    }
+
+    #[test]
+    fn test_convert_positions_sign_comes_from_side_not_qty() {
+        let now = Utc::now();
+        let positions = vec![
+            alpaca_position("AAPL", "us_equity", AlpacaPositionSide::Long, dec!(10)),
+            alpaca_position("TSLA", "us_equity", AlpacaPositionSide::Short, dec!(-3)),
+            // Short with an unsigned qty still reads as short.
+            alpaca_position("MSFT", "us_equity", AlpacaPositionSide::Short, dec!(4)),
+        ];
+
+        let converted = convert_positions(&positions, now).unwrap();
+        let quantities: Vec<_> = converted.iter().map(|(s, p)| (*s, p.quantity)).collect();
+        assert_eq!(
+            quantities,
+            vec![("AAPL", dec!(10)), ("TSLA", dec!(-3)), ("MSFT", dec!(-4))]
+        );
+        assert!(converted.iter().all(|(_, p)| p.time_exchange == now));
+    }
+
+    #[test]
+    fn test_convert_positions_leaves_out_crypto_and_flat() {
+        let positions = vec![
+            alpaca_position("BTC/USD", "crypto", AlpacaPositionSide::Long, dec!(0.5)),
+            alpaca_position("AAPL", "us_equity", AlpacaPositionSide::Long, dec!(0)),
+            alpaca_position("SPY", "us_equity", AlpacaPositionSide::Long, dec!(1)),
+        ];
+
+        let converted = convert_positions(&positions, Utc::now()).unwrap();
+        let symbols: Vec<_> = converted.iter().map(|(s, _)| *s).collect();
+        assert_eq!(symbols, vec!["SPY"]);
+    }
+
+    #[test]
+    fn test_alpaca_position_decodes_equity_option_and_fractional() {
+        let positions: Vec<AlpacaPosition> = serde_json::from_value(serde_json::json!([
+            {
+                "asset_id": "00000000-0000-0000-0000-000000000001",
+                "symbol": "XYZ",
+                "exchange": "NASDAQ",
+                "asset_class": "us_equity",
+                "qty": "-7",
+                "qty_available": "-7",
+                "side": "short",
+                "avg_entry_price": "50.25",
+                "market_value": "-351.75",
+                "unrealized_pl": "0",
+            },
+            {
+                "symbol": "XYZ271217C00055000",
+                "asset_class": "us_option",
+                "qty": "2",
+                "qty_available": "2",
+                "side": "long",
+                "avg_entry_price": "1.35",
+                "unrealized_pl": "-20",
+            },
+            {
+                "symbol": "ABC",
+                "asset_class": "us_equity",
+                "qty": "0.125",
+                "qty_available": "0.125",
+                "side": "long",
+                "avg_entry_price": "80",
+                "unrealized_pl": null,
+            },
+        ]))
+        .unwrap();
+
+        let converted = convert_positions(&positions, Utc::now()).unwrap();
+        let [
+            (short_sym, short),
+            (option_sym, option),
+            (fraction_sym, fraction),
+        ] = converted.as_slice()
+        else {
+            panic!("expected three positions, got {converted:?}");
+        };
+
+        assert_eq!(*short_sym, "XYZ");
+        assert_eq!(short.quantity, dec!(-7));
+        assert_eq!(short.entry_price, Some(dec!(50.25)));
+        assert!(short.is_short());
+
+        assert_eq!(*option_sym, "XYZ271217C00055000");
+        assert_eq!(option.quantity, dec!(2));
+        assert_eq!(option.entry_price, Some(dec!(1.35)), "per-share premium");
+        assert_eq!(option.unrealized_pnl, Some(dec!(-20)));
+
+        assert_eq!(*fraction_sym, "ABC");
+        assert_eq!(fraction.quantity, dec!(0.125));
+        assert_eq!(fraction.unrealized_pnl, None);
+
+        for (_, p) in &converted {
+            assert_eq!(p.margin_used, None);
+            assert_eq!(p.liquidation_price, None);
+            assert_eq!(p.leverage, None);
+        }
+    }
+
+    /// An unknown or missing side decodes, so the crypto balances in the same response survive,
+    /// but a position that needs a direction fails rather than guessing one or reading as flat.
+    #[test]
+    fn test_alpaca_position_unknown_side_fails_only_where_a_direction_is_needed() {
+        let positions: Vec<AlpacaPosition> = serde_json::from_value(serde_json::json!([
+            {
+                "symbol": "BTC/USD",
+                "asset_class": "crypto",
+                "qty": "0.5",
+                "qty_available": "0.5",
+            },
+            {
+                "symbol": "XYZ",
+                "asset_class": "us_equity",
+                "qty": "1",
+                "qty_available": "1",
+                "side": "sideways",
+            },
+        ]))
+        .unwrap();
+        assert_eq!(positions[0].side, AlpacaPositionSide::Unknown);
+        assert_eq!(positions[1].side, AlpacaPositionSide::Unknown);
+
+        let balances = convert_positions_to_balances(&positions, &[]);
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].balance.total, dec!(0.5));
+
+        let result = convert_positions(&positions, Utc::now());
+        assert!(
+            matches!(&result, Err(UnindexedClientError::Internal(msg)) if msg.contains("XYZ")),
+            "an unknown side must not guess a direction: {result:?}"
+        );
     }
 
     /// `updated_at` orders an order's states; `created_at` is constant across all of them.
@@ -4732,7 +5170,7 @@ mod tests {
             make_order_response("o1", "AAPL"),
             make_order_response("o2", "SPY"),
         ];
-        let snapshots = build_instrument_snapshots(orders, &[]);
+        let snapshots = build_instrument_snapshots(orders, Vec::new(), &[]);
         assert_eq!(snapshots.len(), 2);
         let symbols: Vec<&str> = snapshots
             .iter()
@@ -4751,7 +5189,7 @@ mod tests {
             InstrumentNameExchange::new("AAPL"),
             InstrumentNameExchange::new("SPY"),
         ];
-        let snapshots = build_instrument_snapshots(orders, &instruments);
+        let snapshots = build_instrument_snapshots(orders, Vec::new(), &instruments);
         assert_eq!(snapshots.len(), 2);
         let spy = snapshots
             .iter()
@@ -4793,7 +5231,7 @@ mod tests {
         ];
         for requested in [&instruments[..], &[]] {
             let orders = vec![make_order_response("o1", "AAPL")];
-            let snapshots = build_instrument_snapshots(orders, requested);
+            let snapshots = build_instrument_snapshots(orders, Vec::new(), requested);
             assert!(!snapshots.is_empty());
             assert!(snapshots.iter().all(|snapshot| snapshot.orders_complete));
         }
@@ -4813,7 +5251,7 @@ mod tests {
             InstrumentNameExchange::new("AAPL"),
             InstrumentNameExchange::new("SPY"),
         ];
-        let snapshots = build_instrument_snapshots(orders, &instruments);
+        let snapshots = build_instrument_snapshots(orders, Vec::new(), &instruments);
 
         assert!(snapshot_for(&snapshots, "AAPL").orders_complete);
         let spy = snapshot_for(&snapshots, "SPY");
@@ -4826,7 +5264,7 @@ mod tests {
     #[test]
     fn test_build_instrument_snapshots_unfiltered_lists_an_instrument_with_only_a_notional_order() {
         let orders = vec![make_notional_order_response("o1", "SPY")];
-        let snapshots = build_instrument_snapshots(orders, &[]);
+        let snapshots = build_instrument_snapshots(orders, Vec::new(), &[]);
 
         let spy = snapshot_for(&snapshots, "SPY");
         assert!(!spy.orders_complete);
@@ -4842,9 +5280,84 @@ mod tests {
             make_order_response("o2", "MSFT"), // not requested
         ];
         let instruments = vec![InstrumentNameExchange::new("AAPL")];
-        let snapshots = build_instrument_snapshots(orders, &instruments);
+        let snapshots = build_instrument_snapshots(orders, Vec::new(), &instruments);
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].instrument.name().as_str(), "AAPL");
+    }
+
+    fn position(quantity: Decimal) -> Position {
+        Position::new(
+            quantity,
+            Some(dec!(100)),
+            None,
+            None,
+            None,
+            None,
+            Utc::now(),
+        )
+    }
+
+    #[test]
+    fn test_build_instrument_snapshots_unfiltered_lists_positions_without_orders() {
+        let orders = vec![
+            make_order_response("o1", "AAPL"),
+            make_order_response("o2", "MSFT"),
+            make_order_response("o3", "BTC/USD"),
+        ];
+        let positions = vec![("AAPL", position(dec!(5))), ("TSLA", position(dec!(-2)))];
+
+        let snapshots = build_instrument_snapshots(orders, positions, &[]);
+        let listed: Vec<_> = snapshots
+            .iter()
+            .map(|s| {
+                (
+                    s.instrument.name().as_str(),
+                    s.orders.len(),
+                    s.position.quantity(),
+                )
+            })
+            .collect();
+        // An equity with an order but no position is flat; crypto is never a position.
+        assert_eq!(
+            listed,
+            vec![
+                ("AAPL", 1, Some(dec!(5))),
+                ("MSFT", 1, Some(Decimal::ZERO)),
+                ("BTC/USD", 1, None),
+                ("TSLA", 0, Some(dec!(-2)))
+            ]
+        );
+        assert!(snapshots.iter().all(|s| s.orders_complete));
+    }
+
+    #[test]
+    fn test_build_instrument_snapshots_filtered_attaches_only_requested_positions() {
+        let positions = vec![("AAPL", position(dec!(5))), ("TSLA", position(dec!(-2)))];
+        let instruments = vec![
+            InstrumentNameExchange::new("tsla"),
+            InstrumentNameExchange::new("MSFT"),
+            InstrumentNameExchange::new("BTC/USD"),
+            InstrumentNameExchange::new("TSLA"),
+        ];
+
+        let snapshots = build_instrument_snapshots(Vec::new(), positions, &instruments);
+        let listed: Vec<_> = snapshots
+            .iter()
+            .map(|s| (s.instrument.name().as_str(), s.position.quantity()))
+            .collect();
+        // A requested equity with no position is reported flat, and one requested in another case
+        // still finds its position; crypto is never a position. A second name for a symbol
+        // already claimed is unknown, not flat.
+        assert_eq!(
+            listed,
+            vec![
+                ("tsla", Some(dec!(-2))),
+                ("MSFT", Some(Decimal::ZERO)),
+                ("BTC/USD", None),
+                ("TSLA", None)
+            ]
+        );
+        assert!(!snapshots[3].orders_complete);
     }
 
     /// Verifies that the dedup key synthesised by `recover_fills` (REST path) matches
@@ -5066,27 +5579,6 @@ mod tests {
         );
     }
 
-    // H-2: zero options_buying_power falls back to buying_power (not free=0).
-    // Alpaca returns options_buying_power="0.00" on equity-only accounts (options
-    // not enabled) rather than omitting the field. Without the .filter(!is_zero())
-    // guard the engine would see free=0 and block all orders.
-    #[test]
-    fn convert_account_to_balances_zero_options_buying_power_falls_back_to_buying_power() {
-        let account = AlpacaAccount {
-            equity: "12000.00".into(),
-            buying_power: "10000.00".into(),
-            options_buying_power: Some("0.00".into()), // equity-only: options not enabled
-            crypto_buying_power: None,
-        };
-        let balances = convert_account_to_balances(&account, &[]);
-        assert_eq!(balances.len(), 1);
-        assert_eq!(
-            balances[0].balance.free,
-            Decimal::from_str("10000.00").unwrap(),
-            "zero options_buying_power must fall back to buying_power, not report free=0"
-        );
-    }
-
     // M-2: map_position_intent derives intent from (reduce_only, side).
     #[test]
     fn map_position_intent_open_buy_maps_to_buy_to_open() {
@@ -5199,7 +5691,7 @@ mod tests {
             InstrumentNameExchange::new("MSFT"),
             InstrumentNameExchange::new("AAPL"),
         ];
-        let snapshots = build_instrument_snapshots(orders, &instruments);
+        let snapshots = build_instrument_snapshots(orders, Vec::new(), &instruments);
         assert_eq!(snapshots.len(), 2);
         assert_eq!(
             snapshots[0].instrument.name().as_str(),
@@ -5472,6 +5964,186 @@ mod tests {
             );
         }
 
+        // --- account_snapshot: cash balance, equity/option positions, crypto balances ---
+
+        /// Mounts `/v2/account`, `/v2/positions` and an empty `/v2/orders` on `server`.
+        /// Synthetic values only; no provider data.
+        async fn mount_account_and_positions(server: &MockServer) {
+            Mock::given(method("GET"))
+                .and(path("/v2/account"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "status": "ACTIVE",
+                    "currency": "USD",
+                    "cash": "-1500.50",
+                    "equity": "4000.00",
+                    "buying_power": "5000.00",
+                    "options_buying_power": "2000.00",
+                    "non_marginable_buying_power": "1000.00",
+                })))
+                .mount(server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/v2/positions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {
+                        "symbol": "XYZ",
+                        "asset_class": "us_equity",
+                        "side": "short",
+                        "qty": "-10",
+                        "qty_available": "-10",
+                        "avg_entry_price": "20.00",
+                        "unrealized_pl": "15.50",
+                    },
+                    {
+                        "symbol": "XYZ271217C00025000",
+                        "asset_class": "us_option",
+                        "side": "long",
+                        "qty": "3",
+                        "qty_available": "3",
+                        "avg_entry_price": "0.85",
+                        "unrealized_pl": "-45",
+                    },
+                    {
+                        "symbol": "ABC",
+                        "asset_class": "us_equity",
+                        "side": "long",
+                        "qty": "2.5",
+                        "qty_available": "2.5",
+                        "avg_entry_price": "40.00",
+                        "unrealized_pl": "1.25",
+                    },
+                    {
+                        "symbol": "BTC/USD",
+                        "asset_class": "crypto",
+                        "side": "long",
+                        "qty": "0.75",
+                        "qty_available": "0.5",
+                        "avg_entry_price": "50000",
+                        "unrealized_pl": "0",
+                    },
+                ])))
+                .mount(server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/v2/orders"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+                .mount(server)
+                .await;
+        }
+
+        fn client_for(server: &MockServer) -> AlpacaClient {
+            AlpacaClient::new(AlpacaConfig::with_base_url(
+                "test-key".into(),
+                "test-secret".into(),
+                server.uri(),
+            ))
+        }
+
+        #[tokio::test]
+        async fn account_snapshot_reports_cash_positions_and_crypto_balances() {
+            use crate::client::ExecutionClient;
+            use rust_decimal_macros::dec;
+
+            let server = MockServer::start().await;
+            mount_account_and_positions(&server).await;
+
+            let snapshot = client_for(&server)
+                .account_snapshot(&[], &[])
+                .await
+                .unwrap();
+
+            // USD: cash (negative on margin), and free capped at it, not equity or buying power.
+            let balances: Vec<_> = snapshot
+                .balances
+                .iter()
+                .map(|b| (b.asset.name().as_str(), b.balance.total, b.balance.free))
+                .collect();
+            assert_eq!(
+                balances,
+                vec![
+                    ("usd", dec!(-1500.50), dec!(-1500.50)),
+                    ("btc", dec!(0.75), dec!(0.5)),
+                ],
+                "crypto stays a balance; equities and options do not appear as balances"
+            );
+
+            let positions: Vec<_> = snapshot
+                .instruments
+                .iter()
+                .map(|i| {
+                    let p = i.position.open().unwrap();
+                    (
+                        i.instrument.name().as_str(),
+                        p.quantity,
+                        p.entry_price,
+                        p.unrealized_pnl,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                positions,
+                vec![
+                    ("XYZ", dec!(-10), Some(dec!(20.00)), Some(dec!(15.50))),
+                    (
+                        "XYZ271217C00025000",
+                        dec!(3),
+                        Some(dec!(0.85)),
+                        Some(dec!(-45))
+                    ),
+                    ("ABC", dec!(2.5), Some(dec!(40.00)), Some(dec!(1.25))),
+                ],
+                "short equity, option and fractional positions; no crypto position"
+            );
+        }
+
+        /// A USD-only request still fetches positions, since they back the instrument
+        /// snapshots, and reports no crypto balance.
+        #[tokio::test]
+        async fn account_snapshot_usd_only_still_reports_positions() {
+            use crate::client::ExecutionClient;
+            use rust_decimal_macros::dec;
+
+            let server = MockServer::start().await;
+            mount_account_and_positions(&server).await;
+
+            let usd = [AssetNameExchange::new("USD")];
+            let instruments = [InstrumentNameExchange::new("XYZ")];
+            let snapshot = client_for(&server)
+                .account_snapshot(&usd, &instruments)
+                .await
+                .unwrap();
+
+            assert_eq!(snapshot.balances.len(), 1);
+            assert_eq!(snapshot.balances[0].asset, AssetNameExchange::new("USD"));
+            assert_eq!(snapshot.balances[0].balance.total, dec!(-1500.50));
+
+            assert_eq!(snapshot.instruments.len(), 1);
+            assert_eq!(snapshot.instruments[0].position.quantity(), Some(dec!(-10)));
+        }
+
+        /// A non-USD request skips `/v2/account` entirely.
+        #[tokio::test]
+        async fn account_snapshot_non_usd_only_skips_account_request() {
+            use crate::client::ExecutionClient;
+
+            let server = MockServer::start().await;
+            mount_account_and_positions(&server).await;
+
+            let btc = [AssetNameExchange::new("btc")];
+            let snapshot = client_for(&server)
+                .account_snapshot(&btc, &[])
+                .await
+                .unwrap();
+
+            assert_eq!(snapshot.balances.len(), 1);
+            assert_eq!(snapshot.balances[0].asset, AssetNameExchange::new("btc"));
+            let requests = server.received_requests().await.unwrap();
+            assert!(
+                requests.iter().all(|r| r.url.path() != "/v2/account"),
+                "no USD requested, so /v2/account must not be fetched"
+            );
+        }
+
         // --- L-2: open_order passes reduce_only through to position_intent ---
 
         /// Verifies that `open_order` correctly derives `position_intent` from
@@ -5665,6 +6337,226 @@ mod tests {
                 body.get("position_intent").and_then(|v| v.as_str()),
                 Some("buy_to_open"),
                 "reduce_only=false + Side::Buy should produce position_intent=buy_to_open, got: {body}"
+            );
+        }
+
+        /// A 2xx body that does not decode is not transient, so a query reports it as `Internal`
+        /// rather than as connectivity a caller would retry.
+        #[tokio::test]
+        async fn rest_with_retry_reports_an_undecodable_2xx_body_as_internal() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+                .mount(&server)
+                .await;
+
+            let http = reqwest::Client::new();
+            let rl = RateLimitTracker::new();
+            let url = format!("{}/v2/account", server.uri());
+            let result: Result<serde_json::Value, _> =
+                rest_with_retry(&rl, || http.get(&url)).await;
+            assert!(
+                matches!(result, Err(UnindexedClientError::Internal(_))),
+                "{result:?}"
+            );
+        }
+
+        /// Whether `rl` still holds requests back after 50 ms.
+        async fn holds_back(rl: &RateLimitTracker) -> bool {
+            tokio::time::timeout(Duration::from_millis(50), rl.wait_if_blocked())
+                .await
+                .is_err()
+        }
+
+        /// The rate-limit headers of a response: `remaining`, and a reset 30 s ahead if `reset`.
+        fn with_rate_limit(
+            template: ResponseTemplate,
+            remaining: u32,
+            reset: bool,
+        ) -> ResponseTemplate {
+            let template = template.insert_header("x-ratelimit-remaining", remaining.to_string());
+            if !reset {
+                return template;
+            }
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            template.insert_header("x-ratelimit-reset", (now_secs + 30).to_string())
+        }
+
+        /// A response reporting no requests left holds every later request back until the reset;
+        /// one with requests left, or with no reset to wait for, does not.
+        #[tokio::test]
+        async fn rest_with_retry_pauses_once_no_requests_remain() {
+            for (remaining, reset, pauses) in [(0, true, true), (1, true, false), (0, false, false)]
+            {
+                let server = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path("/v2/account"))
+                    .respond_with(with_rate_limit(
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({})),
+                        remaining,
+                        reset,
+                    ))
+                    .mount(&server)
+                    .await;
+
+                let http = reqwest::Client::new();
+                let rl = RateLimitTracker::new();
+                let url = format!("{}/v2/account", server.uri());
+                let _: serde_json::Value = rest_with_retry(&rl, || http.get(&url)).await.unwrap();
+                assert_eq!(
+                    holds_back(&rl).await,
+                    pauses,
+                    "remaining {remaining}, reset {reset}"
+                );
+            }
+        }
+
+        /// A reset further out than Alpaca's one-minute window holds requests back for a minute
+        /// at most.
+        #[tokio::test]
+        async fn a_pause_lasts_a_minute_at_most() {
+            tokio::time::pause();
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+            headers.insert(
+                "x-ratelimit-reset",
+                (now_secs + 3_600).to_string().parse().unwrap(),
+            );
+            let rl = RateLimitTracker::new();
+
+            observe_rate_limit_remaining(&rl, &headers);
+            assert!(holds_back(&rl).await);
+            tokio::time::advance(Duration::from_secs(DEFAULT_RATE_LIMIT_DELAY_SECS)).await;
+            assert!(!holds_back(&rl).await);
+        }
+
+        /// A cancel's response reporting no requests left holds later requests back too.
+        #[tokio::test]
+        async fn rest_delete_with_retry_pauses_once_no_requests_remain() {
+            let server = MockServer::start().await;
+            Mock::given(method("DELETE"))
+                .and(path("/v2/orders/abc"))
+                .respond_with(with_rate_limit(ResponseTemplate::new(204), 0, true))
+                .mount(&server)
+                .await;
+
+            let http = reqwest::Client::new();
+            let rl = RateLimitTracker::new();
+            let url = format!("{}/v2/orders/abc", server.uri());
+            rest_delete_with_retry(&rl, || http.delete(&url))
+                .await
+                .unwrap();
+            assert!(holds_back(&rl).await);
+        }
+
+        /// An order Alpaca accepted (2xx) but whose response does not decode may be live, so it
+        /// fails as status unknown (`Connectivity`), never as a rejection, and does not panic.
+        #[tokio::test]
+        async fn open_order_with_an_undecodable_2xx_response_is_status_unknown() {
+            use crate::client::ExecutionClient;
+            use crate::error::OrderError;
+            use crate::order::request::{OrderRequestOpen, RequestOpen};
+            use crate::order::state::{InactiveOrderState, OrderState};
+            use crate::order::{
+                OrderKey, OrderKind, TimeInForce,
+                id::{ClientOrderId, StrategyId},
+            };
+            use rustrade_instrument::Side;
+            use rustrade_instrument::exchange::ExchangeId;
+            use rustrade_instrument::instrument::name::InstrumentNameExchange;
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v2/orders"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({ "id": 1 })),
+                )
+                .mount(&server)
+                .await;
+
+            let instrument = InstrumentNameExchange::new("AAPL");
+            let order = client_for(&server)
+                .open_order(OrderRequestOpen {
+                    key: OrderKey {
+                        exchange: ExchangeId::AlpacaBroker,
+                        instrument: &instrument,
+                        strategy: StrategyId::new("test-strategy"),
+                        cid: ClientOrderId::new("test-cid"),
+                    },
+                    state: RequestOpen {
+                        side: Side::Buy,
+                        price: None,
+                        quantity: Decimal::new(10, 0),
+                        kind: OrderKind::Market,
+                        time_in_force: TimeInForce::ImmediateOrCancel,
+                        position_id: None,
+                        reduce_only: false,
+                        market: None,
+                    },
+                })
+                .await
+                .expect("open_order should return a result");
+
+            assert!(
+                matches!(
+                    order.state,
+                    OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Connectivity(
+                        _
+                    )))
+                ),
+                "{:?}",
+                order.state
+            );
+        }
+
+        /// The bracket path maps an accepted (2xx) but unreadable response the same way: the
+        /// parent fails as status unknown (`Connectivity`), never as a rejection.
+        #[tokio::test]
+        async fn open_bracket_order_with_an_undecodable_2xx_response_is_status_unknown() {
+            use crate::error::OrderError;
+            use crate::order::state::{InactiveOrderState, OrderState};
+            use rustrade_instrument::instrument::name::InstrumentNameExchange;
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v2/orders"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({ "id": 1 })),
+                )
+                .mount(&server)
+                .await;
+
+            let result = client_for(&server)
+                .open_bracket_order(AlpacaBracketOrderRequest::new(
+                    InstrumentNameExchange::new("SPY"),
+                    crate::order::id::StrategyId::new("test"),
+                    crate::order::id::ClientOrderId::new("test-bracket"),
+                    Side::Buy,
+                    Decimal::ONE,
+                    Decimal::new(100, 0),
+                    Decimal::new(120, 0),
+                    Decimal::new(90, 0),
+                    TimeInForce::GoodUntilCancelled { post_only: false },
+                ))
+                .await;
+
+            assert!(
+                matches!(
+                    result.parent.state,
+                    OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Connectivity(
+                        _
+                    )))
+                ),
+                "{:?}",
+                result.parent.state
             );
         }
 

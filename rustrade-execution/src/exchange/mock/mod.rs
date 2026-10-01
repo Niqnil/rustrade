@@ -170,7 +170,7 @@ impl MockExchange {
     }
 
     /// Sends the provided `Response` via the [`oneshot::Sender`] after waiting for the latency
-    /// [`Duration`].
+    /// [`Duration`](std::time::Duration).
     ///
     /// Used to simulate network latency between the exchange and client.
     fn respond_with_latency<Response>(
@@ -376,6 +376,7 @@ pub(crate) mod fixtures {
             request::{OrderRequestOpen, RequestOpen},
             state::{Open, OrderState},
         },
+        position::PositionReport,
     };
     use chrono::{DateTime, Utc};
     use fnv::FnvHashMap;
@@ -468,7 +469,7 @@ pub(crate) mod fixtures {
                     instrument: instrument_name(),
                     orders: vec![order],
                     orders_complete: true,
-                    position: None,
+                    position: PositionReport::Unreported,
                     isolated: None,
                 }],
             },

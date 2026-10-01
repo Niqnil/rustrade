@@ -14,7 +14,9 @@
 //   duplicate processing after reconnect + fill recovery
 // - Rate limit handling: detects HTTP 429 / Binance -1015, retries with exponential
 //   backoff (Retry-After header is not accessible through the SDK's anyhow::Error
-//   chain, so computed delays are used), blocks further REST calls until cooldown expires
+//   chain, so computed delays are used), blocks further REST calls until cooldown expires,
+//   and does not open a WS-API session during it. Separately, pauses REST queries until the
+//   next minute once responses report >= 90% of the request-weight limit used
 // - Reconnection: account_stream auto-reconnects on WS disconnect/error with
 //   exponential backoff (1s → 30s, max 10 attempts)
 // - Heartbeat monitoring: tracks WS activity via AtomicBool flag; forces reconnect
@@ -34,11 +36,13 @@
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
-    MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, RateLimitTracker,
-    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, classify_order_kind_tif, connectivity_error,
+    MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, RateLimitTracker, RequestKind,
+    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnrecoveredFills, UserDataFrame, WeightPool,
+    classify_order_kind_tif, classify_rest_query_error, classify_ws_order_error,
     convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
-    dedup_key_from_event, is_api_rejection_error, is_duplicate, is_rate_limit_error,
-    new_dedup_cache, parse_binance_api_error, recovered_order_totals, rest_call_with_retry,
+    dedup_key_from_event, drop_after, gap_failed, gap_time, is_duplicate, is_handshake_rate_limit,
+    log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, recovered_order_totals,
+    response_decode_error, rest_call_with_retry, unix_ms,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
@@ -57,6 +61,7 @@ use crate::{
         state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
     },
     parse_env_bool,
+    position::PositionReport,
     trade::{AssetFees, Trade, TradeId},
 };
 use binance_sdk::{
@@ -89,7 +94,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -250,10 +255,45 @@ pub enum BinanceSpotConfigError {
 // BinanceSpot client
 // ---------------------------------------------------------------------------
 
+/// Why [`BinanceSpot::get_ws_api`] has no WS-API session to hand out. Either way, nothing was
+/// sent.
+#[derive(Debug)]
+enum WsApiUnavailable {
+    /// A rate-limit cooldown is active, or Binance refused the handshake with 429 or 418.
+    RateLimited(String),
+    /// Any other connect failure.
+    Connect(String),
+}
+
+impl WsApiUnavailable {
+    /// The error an order or cancel that could not be sent fails with. A rate limit is a
+    /// rejection, which tells the caller the request was not sent and to back off.
+    fn into_order_error(self) -> UnindexedOrderError {
+        match self {
+            Self::RateLimited(msg) => {
+                warn!(%msg, "BinanceSpot WS-API rate-limited, request not sent");
+                UnindexedOrderError::Rejected(ApiError::RateLimit)
+            }
+            Self::Connect(msg) => UnindexedOrderError::Connectivity(ConnectivityError::Socket(msg)),
+        }
+    }
+}
+
 /// BinanceSpot execution client using the official binance-sdk.
 ///
 /// - REST API: account snapshot, balance/order/trade queries (startup/cold paths)
 /// - WebSocket API: order placement, order cancellation, user data stream (hot paths)
+///
+/// # Rate limits
+/// REST and the WebSocket API share one per-IP request-weight limit per minute. Its value comes
+/// from each WebSocket API response, and is Binance's documented 6000 until the first one. Once
+/// a response reports at least 90% of it used, REST queries wait for the next minute, so the
+/// rest is left for orders and cancels, which never wait for it. A query, including a
+/// [`fetch_open_orders`](Self::fetch_open_orders) after a reconnect, can therefore take up to
+/// about a minute longer. A reconnect's fill recovery does not wait for it either, since a pause
+/// could outlast the recovery's 30 s and delay its fills to a retry. After Binance answers with a
+/// rate-limit error, REST calls wait out a cooldown, and an order or cancel that would have to
+/// open a new WebSocket API session fails with [`ApiError::RateLimit`] instead, unsent.
 #[derive(Clone)]
 pub struct BinanceSpot {
     config: Arc<BinanceSpotConfig>,
@@ -316,7 +356,12 @@ impl BinanceSpot {
     /// Returns the shared WebSocket session, connecting on the first call.
     /// If the previous session was cleared (due to a connectivity error),
     /// establishes a new connection.
-    async fn get_ws_api(&self) -> anyhow::Result<WebsocketApi> {
+    ///
+    /// Does not connect during a rate-limit cooldown: a handshake then counts against the limit
+    /// that set it, and repeated refusals can escalate to an IP ban (418). A handshake Binance
+    /// refuses with 429 or 418 starts a cooldown, so REST calls back off too. An existing session
+    /// is handed out regardless, since orders do not wait on the cooldown.
+    async fn get_ws_api(&self) -> Result<WebsocketApi, WsApiUnavailable> {
         // Fast path: read lock to check if already connected
         {
             let guard = self.ws_api.read().await;
@@ -335,14 +380,29 @@ impl BinanceSpot {
         if let Some(ref ws) = *guard {
             return Ok(ws.clone());
         }
-        let ws = tokio::time::timeout(
+        if self.rate_limiter.is_blocked() {
+            return Err(WsApiUnavailable::RateLimited(
+                "rate-limit cooldown active, not connecting the WS-API session".into(),
+            ));
+        }
+        let ws = match tokio::time::timeout(
             Duration::from_secs(CONNECT_TIMEOUT_SECS),
             self.ws_handle.connect(),
         )
         .await
-        .map_err(|_| {
-            anyhow::anyhow!("BinanceSpot WS connect timed out after {CONNECT_TIMEOUT_SECS}s")
-        })??;
+        {
+            Ok(Ok(ws)) => ws,
+            Ok(Err(e)) if is_handshake_rate_limit(&e) => {
+                self.rate_limiter.on_rate_limited(None);
+                return Err(WsApiUnavailable::RateLimited(format!("{e:#}")));
+            }
+            Ok(Err(e)) => return Err(WsApiUnavailable::Connect(format!("{e:#}"))),
+            Err(_) => {
+                return Err(WsApiUnavailable::Connect(format!(
+                    "BinanceSpot WS connect timed out after {CONNECT_TIMEOUT_SECS}s"
+                )));
+            }
+        };
         *guard = Some(ws.clone());
         Ok(ws)
     }
@@ -387,7 +447,7 @@ async fn fetch_open_orders_for_instrument(
 ) -> Result<(InstrumentNameExchange, OpenOrderListing), UnindexedClientError> {
     // Convert once before the retry closure to avoid a String allocation on every retry.
     let symbol_str = instrument.name().to_string();
-    let response = rest_call_with_retry(&rest, &rate_limiter, |rest| {
+    let response = rest_call_with_retry(&rest, &rate_limiter, RequestKind::Query, |rest| {
         let sym = symbol_str.clone();
         Box::pin(async move {
             let params = GetOpenOrdersParams::builder().symbol(sym).build()?;
@@ -395,12 +455,9 @@ async fn fetch_open_orders_for_instrument(
         })
     })
     .await
-    .map_err(connectivity_error)?;
+    .map_err(|e| classify_rest_query_error(&e, Some(&instrument)))?;
 
-    let orders_data = response
-        .data()
-        .await
-        .map_err(|e| connectivity_error(e.into()))?;
+    let orders_data = response.data().await.map_err(response_decode_error)?;
 
     let listing = convert_open_order_listing(&orders_data, ExchangeId::BinanceSpot, &instrument);
 
@@ -415,19 +472,16 @@ async fn fetch_all_open_orders(
     rest: Arc<RestApi>,
     rate_limiter: Arc<RateLimitTracker>,
 ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError> {
-    let response = rest_call_with_retry(&rest, &rate_limiter, |rest| {
+    let response = rest_call_with_retry(&rest, &rate_limiter, RequestKind::Query, |rest| {
         Box::pin(async move {
             let params = GetOpenOrdersParams::builder().build()?;
             rest.get_open_orders(params).await
         })
     })
     .await
-    .map_err(connectivity_error)?;
+    .map_err(|e| classify_rest_query_error(&e, None))?;
 
-    let orders_data = response
-        .data()
-        .await
-        .map_err(|e| connectivity_error(e.into()))?;
+    let orders_data = response.data().await.map_err(response_decode_error)?;
 
     let orders = orders_data
         .into_iter()
@@ -442,7 +496,8 @@ async fn fetch_all_open_orders(
 /// Uses cursor-based pagination: the first page queries by `start_time`, or by `order_id` for a
 /// single order's executions; subsequent pages use `from_id = last_id + 1` (Binance ignores
 /// `start_time` when `from_id` is set), keeping `order_id` alongside it, a combination Binance
-/// documents as supported. Trade IDs are monotonically increasing per symbol, so this produces a
+/// documents as supported. A [`MyTradesFrom::Span`] stops at the first page reaching past its end
+/// and drops the executions after it. Trade IDs are monotonically increasing per symbol, so this produces a
 /// gapless result.
 ///
 /// Returns raw response items. Callers decide how to handle `Err` (propagate vs. log-skip).
@@ -451,6 +506,7 @@ async fn paginate_my_trades(
     rate_limiter: &Arc<RateLimitTracker>,
     instrument: &InstrumentNameExchange,
     from: MyTradesFrom,
+    kind: RequestKind,
 ) -> Result<Vec<binance_sdk::spot::rest_api::MyTradesResponseInner>, UnindexedClientError> {
     // Convert once before the retry closure to avoid a String allocation on every retry.
     let symbol_str = instrument.name().to_string();
@@ -462,15 +518,24 @@ async fn paginate_my_trades(
     let mut cursor: Option<i64> = None;
     loop {
         let fid = cursor; // Option<i64> is Copy
-        let response = rest_call_with_retry(rest, rate_limiter, |rest| {
+        let response = rest_call_with_retry(rest, rate_limiter, kind, |rest| {
             let sym = symbol_str.clone();
             Box::pin(async move {
                 // const_assert! above guarantees BINANCE_MAX_TRADES fits in i32
                 #[allow(clippy::cast_possible_truncation)]
                 let builder = MyTradesParams::builder(sym).limit(BINANCE_MAX_TRADES as i32);
                 let params = match (from, fid) {
-                    (MyTradesFrom::Time(start_time_ms), None) => builder.start_time(start_time_ms),
-                    (MyTradesFrom::Time(_), Some(id)) => builder.from_id(id),
+                    (
+                        MyTradesFrom::Time(start_time_ms)
+                        | MyTradesFrom::Span {
+                            start: start_time_ms,
+                            ..
+                        },
+                        None,
+                    ) => builder.start_time(start_time_ms),
+                    (MyTradesFrom::Time(_) | MyTradesFrom::Span { .. }, Some(id)) => {
+                        builder.from_id(id)
+                    }
                     (MyTradesFrom::Order(order_id), None) => builder.order_id(order_id),
                     (MyTradesFrom::Order(order_id), Some(id)) => {
                         builder.order_id(order_id).from_id(id)
@@ -481,18 +546,20 @@ async fn paginate_my_trades(
             })
         })
         .await
-        .map_err(connectivity_error)?;
+        .map_err(|e| classify_rest_query_error(&e, Some(instrument)))?;
 
-        let page = response
-            .data()
-            .await
-            .map_err(|e| connectivity_error(e.into()))?;
+        let mut page = response.data().await.map_err(response_decode_error)?;
 
         let page_len = page.len();
         let last_id = page.last().and_then(|t| t.id);
+        // A span ends once a page reaches past it.
+        let past_end = match from {
+            MyTradesFrom::Span { end, .. } => drop_after(&mut page, end),
+            MyTradesFrom::Time(_) | MyTradesFrom::Order(_) => false,
+        };
         all_pages.extend(page);
 
-        if page_len < BINANCE_MAX_TRADES {
+        if past_end || page_len < BINANCE_MAX_TRADES {
             break;
         }
         match last_id {
@@ -538,7 +605,7 @@ impl ExecutionClient for BinanceSpot {
             rest,
             ws_handle,
             ws_api: Arc::new(RwLock::new(None)),
-            rate_limiter: Arc::new(RateLimitTracker::new()),
+            rate_limiter: Arc::new(RateLimitTracker::new(WeightPool::Spot)),
         }
     }
 
@@ -548,19 +615,17 @@ impl ExecutionClient for BinanceSpot {
         instruments: &[InstrumentNameExchange],
     ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
         // Fetch account info via REST (with rate-limit retry)
-        let response = rest_call_with_retry(&self.rest, &self.rate_limiter, |rest| {
-            Box::pin(async move {
-                let params = GetAccountParams::builder().build()?;
-                rest.get_account(params).await
+        let response =
+            rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+                Box::pin(async move {
+                    let params = GetAccountParams::builder().build()?;
+                    rest.get_account(params).await
+                })
             })
-        })
-        .await
-        .map_err(connectivity_error)?;
-
-        let account = response
-            .data()
             .await
-            .map_err(|e| connectivity_error(e.into()))?;
+            .map_err(|e| classify_rest_query_error(&e, None))?;
+
+        let account = response.data().await.map_err(response_decode_error)?;
 
         // Convert balances, filtering to requested assets
         let balances = filter_and_convert_balances(account.balances.unwrap_or_default(), assets);
@@ -599,7 +664,7 @@ impl ExecutionClient for BinanceSpot {
                     inst,
                     wrapped,
                     listing.complete,
-                    None,
+                    PositionReport::Unreported,
                     None,
                 ))
             })
@@ -628,6 +693,20 @@ impl ExecutionClient for BinanceSpot {
     /// Callers MUST also call [`ExecutionClient::fetch_open_orders`] after each
     /// reconnect to reconcile open-order state — order lifecycle events (NEW, CANCELED)
     /// are not recovered after a WS disconnect, only TRADE fills are.
+    ///
+    /// # A recovery that does not finish
+    ///
+    /// Recovery after a reconnect is bounded by a 30 s timeout, and an instrument's query can
+    /// fail. Each instrument's gap, from the disconnect to just after the recovery began, is kept
+    /// until its fills are forwarded. A gap not read is retried after 1, 2, 4, 8 and 16 minutes,
+    /// whether the stream stays connected or reconnects in between. A retry reads only the gap,
+    /// not fills the stream delivered live after it; the few seconds at its end that overlap live
+    /// delivery are deduplicated. Each failed read is logged at `warn` with the instrument and the
+    /// gap. After five failed retries the gap is given up, logged at `error`, and its fills are not
+    /// delivered: read them with [`ExecutionClient::fetch_trades`].
+    ///
+    /// A recovered gap counts as read even when a fill in it could not be converted, which is
+    /// logged, or its order's cumulative could not be looked up (see below).
     ///
     /// # A recovered fill advances the order too
     ///
@@ -758,12 +837,10 @@ impl ExecutionClient for BinanceSpot {
 
         let ws = match self.get_ws_api().await {
             Ok(ws) => ws,
-            Err(e) => {
+            Err(unavailable) => {
                 return Some(UnindexedOrderResponseCancel {
                     key,
-                    state: Err(UnindexedOrderError::Connectivity(
-                        ConnectivityError::Socket(format!("{e:#}")),
-                    )),
+                    state: Err(unavailable.into_order_error()),
                 });
             }
         };
@@ -805,7 +882,14 @@ impl ExecutionClient for BinanceSpot {
             }
         };
 
-        match ws.order_cancel(params).await {
+        let sent_ms = unix_ms();
+        let result = ws.order_cancel(params).await;
+        // A WS-API response reports the shared spot pool's weight limit and usage.
+        if let Ok(response) = &result {
+            self.rate_limiter
+                .observe_ws_api(response.rate_limits.as_deref(), sent_ms);
+        }
+        match result {
             Ok(response) => match response.data() {
                 Ok(data) => {
                     let time_exchange = data
@@ -848,29 +932,27 @@ impl ExecutionClient for BinanceSpot {
                 }
             },
             Err(e) => {
-                // binance-sdk =50.0.0 routes both transport failures and API-level
-                // rejections (status >= 400) through this outer Err path as ResponseError.
-                // Distinguish them so API rejections (-2010, -1121, etc.) don't tear down
-                // a healthy WS session and don't surface as ConnectivityError to the engine.
-                // Check api_rejection first (zero-alloc downcast) — order rejections are the
-                // common case; rate limits during placement are rare.
-                if is_api_rejection_error(&e) {
-                    // API-level rejection — WS session is healthy, don't tear it down
-                    let api_err = parse_binance_api_error(e.to_string(), &instrument);
-                    // if api_err is BalanceInsufficient, its AssetNameExchange field
+                // binance-sdk routes both transport failures and venue responses with status
+                // >= 400 (ResponseError) through this outer Err path. Distinguish them so a
+                // venue response (-2010, -1121, etc.) doesn't tear down a healthy WS session.
+                // A venue response is mostly a rejection, but one that leaves the order's
+                // status unknown (a venue-failure code, a 5xx) surfaces as Connectivity.
+                // Check the venue response first (zero-alloc downcast) — order rejections are
+                // the common case; rate limits during placement are rare.
+                if let Some(order_err) = classify_ws_order_error(&e, &instrument) {
+                    // Venue response — WS session is healthy, don't tear it down. A throttle
+                    // (429, -1003, a WAF 403) backs off the shared limiter so REST calls
+                    // back off too.
+                    if matches!(order_err, OrderError::Rejected(ApiError::RateLimit)) {
+                        self.rate_limiter.on_rate_limited(None);
+                    }
+                    // if this is BalanceInsufficient, its AssetNameExchange field
                     // holds the instrument name ("BTCUSDT"), not an asset name — see
                     // parse_binance_api_error for details. Do not match on that field
                     // to identify the low-balance asset.
                     Some(UnindexedOrderResponseCancel {
                         key,
-                        state: Err(UnindexedOrderError::from(api_err)),
-                    })
-                } else if is_rate_limit_error(&e) {
-                    // WS-level 429 — update the shared rate limiter so REST calls also back off.
-                    self.rate_limiter.on_rate_limited(None);
-                    Some(UnindexedOrderResponseCancel {
-                        key,
-                        state: Err(UnindexedOrderError::from(ApiError::RateLimit)),
+                        state: Err(order_err),
                     })
                 } else {
                     // Transport-level error — clear cached session so next call reconnects.
@@ -908,7 +990,7 @@ impl ExecutionClient for BinanceSpot {
 
         let ws = match self.get_ws_api().await {
             Ok(ws) => ws,
-            Err(e) => {
+            Err(unavailable) => {
                 return Some(Order {
                     key: order_key,
                     side,
@@ -916,9 +998,7 @@ impl ExecutionClient for BinanceSpot {
                     quantity,
                     kind,
                     time_in_force,
-                    state: OrderState::inactive(OrderError::Connectivity(
-                        ConnectivityError::Socket(format!("{e:#}")),
-                    )),
+                    state: OrderState::inactive(unavailable.into_order_error()),
                 });
             }
         };
@@ -1062,7 +1142,14 @@ impl ExecutionClient for BinanceSpot {
             }
         };
 
-        match ws.order_place(params).await {
+        let sent_ms = unix_ms();
+        let result = ws.order_place(params).await;
+        // A WS-API response reports the shared spot pool's weight limit and usage.
+        if let Ok(response) = &result {
+            self.rate_limiter
+                .observe_ws_api(response.rate_limits.as_deref(), sent_ms);
+        }
+        match result {
             Ok(response) => match response.data() {
                 Ok(data) => {
                     let time_exchange = data
@@ -1139,16 +1226,21 @@ impl ExecutionClient for BinanceSpot {
                 }
             },
             Err(e) => {
-                // binance-sdk =50.0.0 routes both transport failures and API-level
-                // rejections (status >= 400) through this outer Err path as ResponseError.
-                // Distinguish them so API rejections (-2010, -1121, etc.) don't tear down
-                // a healthy WS session and don't surface as ConnectivityError to the engine.
-                // Check api_rejection first (zero-alloc downcast) — order rejections are the
-                // common case; rate limits during placement are rare.
-                if is_api_rejection_error(&e) {
-                    // API-level rejection — WS session is healthy, don't tear it down
-                    let api_err = parse_binance_api_error(e.to_string(), &instrument);
-                    // if api_err is BalanceInsufficient, its AssetNameExchange field
+                // binance-sdk routes both transport failures and venue responses with status
+                // >= 400 (ResponseError) through this outer Err path. Distinguish them so a
+                // venue response (-2010, -1121, etc.) doesn't tear down a healthy WS session.
+                // A venue response is mostly a rejection, but one that leaves the order's
+                // status unknown (a venue-failure code, a 5xx) surfaces as Connectivity.
+                // Check the venue response first (zero-alloc downcast) — order rejections are
+                // the common case; rate limits during placement are rare.
+                if let Some(order_err) = classify_ws_order_error(&e, &instrument) {
+                    // Venue response — WS session is healthy, don't tear it down. A throttle
+                    // (429, -1003, a WAF 403) backs off the shared limiter so REST calls
+                    // back off too.
+                    if matches!(order_err, OrderError::Rejected(ApiError::RateLimit)) {
+                        self.rate_limiter.on_rate_limited(None);
+                    }
+                    // if this is BalanceInsufficient, its AssetNameExchange field
                     // holds the instrument name ("BTCUSDT"), not an asset name — see
                     // parse_binance_api_error for details. Do not match on that field
                     // to identify the low-balance asset.
@@ -1159,19 +1251,7 @@ impl ExecutionClient for BinanceSpot {
                         quantity,
                         kind,
                         time_in_force,
-                        state: OrderState::inactive(OrderError::from(api_err)),
-                    })
-                } else if is_rate_limit_error(&e) {
-                    // WS-level 429 — update the shared rate limiter so REST calls also back off.
-                    self.rate_limiter.on_rate_limited(None);
-                    Some(Order {
-                        key: order_key,
-                        side,
-                        price,
-                        quantity,
-                        kind,
-                        time_in_force,
-                        state: OrderState::inactive(OrderError::from(ApiError::RateLimit)),
+                        state: OrderState::inactive(order_err),
                     })
                 } else {
                     // Transport-level error — clear cached session so next call reconnects.
@@ -1197,19 +1277,17 @@ impl ExecutionClient for BinanceSpot {
         &self,
         assets: &[AssetNameExchange],
     ) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError> {
-        let response = rest_call_with_retry(&self.rest, &self.rate_limiter, |rest| {
-            Box::pin(async move {
-                let params = GetAccountParams::builder().build()?;
-                rest.get_account(params).await
+        let response =
+            rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+                Box::pin(async move {
+                    let params = GetAccountParams::builder().build()?;
+                    rest.get_account(params).await
+                })
             })
-        })
-        .await
-        .map_err(connectivity_error)?;
-
-        let account = response
-            .data()
             .await
-            .map_err(|e| connectivity_error(e.into()))?;
+            .map_err(|e| classify_rest_query_error(&e, None))?;
+
+        let account = response.data().await.map_err(response_decode_error)?;
 
         Ok(filter_and_convert_balances(
             account.balances.unwrap_or_default(),
@@ -1288,6 +1366,7 @@ impl ExecutionClient for BinanceSpot {
                     &rate_limiter,
                     &inst,
                     MyTradesFrom::Time(start_time_ms),
+                    RequestKind::Query,
                 )
                 .await?;
                 Ok::<_, UnindexedClientError>((inst, pages))
@@ -1378,6 +1457,8 @@ async fn connection_manager(
 ) {
     let mut backoff = ExponentialBackoff::new();
     let mut disconnect_time: Option<DateTime<Utc>> = None;
+    // Gaps not yet recovered: read at reconnect, and retried on a timer while connected, once due.
+    let mut unrecovered = UnrecoveredFills::default();
     let mut current_ws = initial_ws;
 
     loop {
@@ -1448,8 +1529,8 @@ async fn connection_manager(
                     // `true` is visible before the monitor swaps in `false`.
                     hb_callback.store(true, Ordering::Release);
                     // Borrowed discriminator + matched-variant parse (no full Value DOM).
-                    // Unparseable / non-user-data frames (subscribe acks, WS-API metadata)
-                    // are ignored inside the converter.
+                    // RPC responses (the subscribe ack) are ignored inside the converter, and
+                    // unrecognised frames are logged there (throttled warn).
                     let stream_terminated = convert_user_data_events(&json_str, &mut event_buf);
                     for ev in event_buf.drain(..) {
                         // Dedup check
@@ -1511,26 +1592,11 @@ async fn connection_manager(
         // disconnect window are NOT recovered. Open-order state may be stale until
         // the next account_snapshot or fetch_open_orders call. A caller MUST call
         // fetch_open_orders after each reconnect to reconcile open-order state.
+        // The gap is opened before it is read, so a recovery that fails or times out keeps it.
         if let Some(dt) = disconnect_time.take() {
-            match tokio::time::timeout(
-                Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS),
-                recover_fills(&rest, &rate_limiter, &instruments, dt, &tx, &dedup),
-            )
-            .await
-            {
-                Ok(()) => {}
-                Err(_) => {
-                    // Timeout fires when REST calls are slow (rate-limited, network latency).
-                    // Fills recovered so far are already in the channel; remaining instruments
-                    // were not queried. The count of recovered fills (if any) is logged inside
-                    // recover_fills before the timeout fires.
-                    warn!(
-                        timeout_secs = FILL_RECOVERY_TIMEOUT_SECS,
-                        "BinanceSpot fill recovery timed out — remaining instruments not queried, some fills may be missing"
-                    );
-                }
-            }
+            unrecovered.open(&instruments, dt, Utc::now());
         }
+        recover_fills(&rest, &rate_limiter, &mut unrecovered, &tx, &dedup).await;
 
         // --- Monitor: wait for disconnect, heartbeat timeout, or consumer drop ---
         enum DisconnectReason {
@@ -1540,8 +1606,23 @@ async fn connection_manager(
         }
         let reason = {
             let mut signal_rx = signal_rx;
+            // Gaps a recovery did not read are retried as they fall due, alongside the monitor, so
+            // a disconnect is still seen at once. It never completes; dropping it when the monitor
+            // ends loses nothing, since each gap is settled as soon as its read ends.
+            let retry_gaps = async {
+                loop {
+                    match unrecovered.next_due() {
+                        Some(due) => tokio::time::sleep_until(due).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                    recover_fills(&rest, &rate_limiter, &mut unrecovered, &tx, &dedup).await;
+                }
+            };
+            tokio::pin!(retry_gaps);
             loop {
                 tokio::select! {
+                    // Biased: a consumer drop is terminal and wins; the gap retry is polled last.
+                    biased;
                     _ = tx.closed() => {
                         debug!("BinanceSpot account_stream consumer dropped, terminating");
                         break DisconnectReason::ConsumerDropped;
@@ -1567,6 +1648,8 @@ async fn connection_manager(
                         warn!("BinanceSpot heartbeat timeout ({}s), will attempt reconnect", HEARTBEAT_TIMEOUT_SECS);
                         break DisconnectReason::HeartbeatTimeout;
                     }
+                    // Last: the arms above end the monitor and win when ready together.
+                    () = &mut retry_gaps => {}
                 }
             }
         };
@@ -1632,129 +1715,168 @@ async fn connection_manager(
     }
 }
 
-/// Recover fills missed during a WebSocket disconnection.
+/// Recover the fills of every gap in `unrecovered` that is due: the fills missed while the stream
+/// was disconnected.
 ///
-/// Fetches trades since `disconnect_time` via REST and sends them through the dedup
-/// cache. Trades already seen (from before the disconnect) are filtered out; only
-/// genuinely missed fills reach the consumer.
+/// Reads each gap's span by REST and sends its trades through the dedup cache, so a trade already
+/// delivered is not sent again. A gap whose fills are all forwarded leaves `unrecovered`; one whose
+/// read fails or does not finish is retried later, until it is given up (see
+/// [`UnrecoveredFills`]). Each gap is settled as soon as its read ends, so dropping this future
+/// part-way, as a disconnect during a retry does, loses nothing.
 ///
 /// `myTrades` reports executions only, with no cumulative, so each recovered trade's
 /// `order_filled_quantity` is rebuilt from its order's executions by
 /// [`recovered_order_totals`]. A trade whose order could not be looked up keeps `None`.
-// `.iter().cloned()` is required: Rust async closures cannot satisfy the HRTB
-// `for<'a> FnMut(&'a InstrumentNameExchange) -> impl Future + 'static` needed by
-// the iterator machinery, even when the clone is moved inside the closure body.
-#[allow(clippy::redundant_iter_cloned)]
+///
+/// The whole recovery is bounded by [`FILL_RECOVERY_TIMEOUT_SECS`]. Fills forwarded before the
+/// deadline stay delivered. Its reads are [`RequestKind::Essential`]: they wait out a rate-limit
+/// cooldown but not the pause near the weight limit, which could outlast the budget.
 async fn recover_fills(
     rest: &Arc<RestApi>,
     rate_limiter: &Arc<RateLimitTracker>,
-    instruments: &[InstrumentNameExchange],
-    disconnect_time: DateTime<Utc>,
+    unrecovered: &mut UnrecoveredFills,
     tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
     dedup: &SharedDedupCache,
 ) {
     use futures::StreamExt;
 
-    if instruments.is_empty() {
-        debug!(
-            "BinanceSpot recover_fills called with empty instruments slice — no fills will be recovered"
-        );
+    let due = unrecovered.due(tokio::time::Instant::now());
+    let Some(oldest) = due.iter().map(|(_, gap)| gap.start_ms).min() else {
         return;
-    }
+    };
     info!(
-        since = %disconnect_time,
-        instruments = instruments.len(),
-        "BinanceSpot recovering fills after reconnect"
+        gaps = due.len(),
+        oldest = %gap_time(oldest),
+        "BinanceSpot recovering fills missed while disconnected"
     );
 
-    let start_time_ms = disconnect_time.timestamp_millis();
-    let order_executions_deadline = tokio::time::Instant::now() + ORDER_EXECUTIONS_BUDGET;
-    let mut recovered = 0u32;
-    let mut duplicates = 0u32;
-    let mut failed_instruments = 0u32;
+    // Which gaps of `due` have been settled, recovered or failed, and how many have started: the
+    // stream starts them in order, eight at a time, so those from `started` on were never read.
+    let mut settled = vec![false; due.len()];
+    let started = AtomicUsize::new(0);
+    let recovery = async {
+        let order_executions_deadline = tokio::time::Instant::now() + ORDER_EXECUTIONS_BUDGET;
+        let mut recovered = 0u32;
+        let mut duplicates = 0u32;
 
-    // limit concurrency to avoid bursting Binance's request weight limits
-    // (each GET /api/v3/myTrades costs 20 weight; 8 concurrent = 160 weight).
-    // Returns None on per-instrument REST failure so the outer loop can count failures.
-    // pagination is critical for fill recovery — missing a page means permanently
-    // lost fills (no second chance after the recovery window). paginate_my_trades handles
-    // the full cursor-based pagination loop shared with fetch_trades.
-    let mut stream = futures::stream::iter(instruments.iter().cloned().map(|inst| {
-        let rest = rest.clone();
-        let rl = rate_limiter.clone();
-        async move {
-            let raw = match paginate_my_trades(&rest, &rl, &inst, MyTradesFrom::Time(start_time_ms))
-                .await
-            {
-                Ok(pages) => pages,
+        // limit concurrency to avoid bursting Binance's request weight limits
+        // (each GET /api/v3/myTrades costs 20 weight; 8 concurrent = 160 weight).
+        // pagination is critical for fill recovery — a missed page means a gap read short.
+        // paginate_my_trades handles the full cursor-based pagination loop shared with
+        // fetch_trades.
+        let mut stream =
+            futures::stream::iter(due.iter().cloned().enumerate().map(|(index, (inst, gap))| {
+                started.store(index + 1, Ordering::Relaxed);
+                let rest = rest.clone();
+                let rl = rate_limiter.clone();
+                async move {
+                    let span = MyTradesFrom::Span {
+                        start: gap.start_ms,
+                        end: gap.end_ms,
+                    };
+                    let raw =
+                        match paginate_my_trades(&rest, &rl, &inst, span, RequestKind::Essential)
+                            .await
+                        {
+                            Ok(pages) => pages,
+                            Err(e) => return (index, Err(e)),
+                        };
+                    // `myTrades` carries no cumulative, so each recovered fill's is rebuilt from
+                    // its order's executions; without it the fill advances the position but not
+                    // the order.
+                    let totals = recovered_order_totals(
+                        ExchangeId::BinanceSpot,
+                        &inst,
+                        &raw,
+                        order_executions_deadline,
+                        |order_id| {
+                            paginate_my_trades(
+                                &rest,
+                                &rl,
+                                &inst,
+                                MyTradesFrom::Order(order_id),
+                                RequestKind::Essential,
+                            )
+                        },
+                    )
+                    .await;
+                    let trades: Vec<_> = raw
+                        .iter()
+                        .filter_map(|t| {
+                            let mut trade = convert_my_trade(t, &inst)?;
+                            trade.order_filled_quantity =
+                                t.id.and_then(|id| totals.get(&id).copied());
+                            Some(trade)
+                        })
+                        .collect();
+                    (index, Ok(trades))
+                }
+            }))
+            .buffer_unordered(8);
+        while let Some((index, result)) = stream.next().await {
+            let (inst, gap) = &due[index];
+            settled[index] = true;
+            let trades = match result {
+                Ok(trades) => trades,
                 Err(e) => {
-                    warn!(%e, %inst, "BinanceSpot fill recovery: REST request failed");
-                    return None;
+                    gap_failed(
+                        unrecovered,
+                        ExchangeId::BinanceSpot,
+                        inst,
+                        gap,
+                        &e.to_string(),
+                    );
+                    continue;
                 }
             };
-            // `myTrades` carries no cumulative, so each recovered fill's is rebuilt from its
-            // order's executions; without it the fill advances the position but not the order.
-            let totals = recovered_order_totals(
-                ExchangeId::BinanceSpot,
-                &inst,
-                &raw,
-                order_executions_deadline,
-                |order_id| paginate_my_trades(&rest, &rl, &inst, MyTradesFrom::Order(order_id)),
-            )
-            .await;
-            let trades: Vec<_> = raw
-                .iter()
-                .filter_map(|t| {
-                    let mut trade = convert_my_trade(t, &inst)?;
-                    trade.order_filled_quantity = t.id.and_then(|id| totals.get(&id).copied());
-                    Some(trade)
-                })
-                .collect();
-            Some(trades)
+            for trade in trades {
+                // Construct the event first so dedup_key_from_event can be reused,
+                // keeping key construction in one place.
+                let event = UnindexedAccountEvent::new(
+                    ExchangeId::BinanceSpot,
+                    AccountEventKind::Trade(trade),
+                );
+                // Only Trade events are deduped during recovery — we don't recover NEW/CANCELLED
+                // lifecycle events here (those require fetch_open_orders reconciliation).
+                if let Some(key) = dedup_key_from_event(&event)
+                    && is_duplicate(dedup, key)
+                {
+                    duplicates += 1;
+                    continue;
+                }
+                if tx.send(event).is_err() {
+                    // early return on consumer drop — no point recovering remaining
+                    // gaps if the receiver is gone.
+                    debug!("BinanceSpot fill recovery: consumer dropped during recovery");
+                    return;
+                }
+                recovered += 1;
+            }
+            unrecovered.recovered(inst, gap);
         }
-    }))
-    .buffer_unordered(8);
-    while let Some(result) = stream.next().await {
-        let trades = match result {
-            Some(t) => t,
-            None => {
-                failed_instruments += 1;
-                continue;
-            }
-        };
-        for trade in trades {
-            // Construct the event first so dedup_key_from_event can be reused,
-            // keeping key construction in one place.
-            let event =
-                UnindexedAccountEvent::new(ExchangeId::BinanceSpot, AccountEventKind::Trade(trade));
-            // Only Trade events are deduped during recovery — we don't recover NEW/CANCELLED
-            // lifecycle events here (those require fetch_open_orders reconciliation).
-            if let Some(key) = dedup_key_from_event(&event)
-                && is_duplicate(dedup, key)
-            {
-                duplicates += 1;
-                continue;
-            }
-            if tx.send(event).is_err() {
-                // early return on consumer drop — no point recovering remaining
-                // instruments if the receiver is gone. The timeout wrapper in
-                // connection_manager treats this identically to normal completion.
-                debug!("BinanceSpot fill recovery: consumer dropped during recovery");
-                return;
-            }
-            recovered += 1;
-        }
-    }
-
-    if failed_instruments > 0 {
-        error!(
-            recovered,
-            duplicates,
-            failed_instruments,
-            "BinanceSpot fill recovery complete with failures — some fills may be permanently missed"
-        );
-    } else {
         info!(recovered, duplicates, "BinanceSpot fill recovery complete");
+    };
+    // A timeout drops `recovery` at an await, between gaps: one gap's fills are sent without
+    // awaiting, so each is either fully forwarded and settled, or not forwarded at all. A gap
+    // whose read started and did not finish has failed; one never started stays due as it was.
+    if tokio::time::timeout(Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS), recovery)
+        .await
+        .is_err()
+    {
+        let started = started.load(Ordering::Relaxed);
+        for ((inst, gap), _) in due[..started]
+            .iter()
+            .zip(&settled)
+            .filter(|(_, settled)| !**settled)
+        {
+            gap_failed(
+                unrecovered,
+                ExchangeId::BinanceSpot,
+                inst,
+                gap,
+                "fill recovery timed out",
+            );
+        }
     }
 }
 
@@ -1930,34 +2052,40 @@ fn convert_my_trade(
 ///
 /// Returns `true` if the stream should be considered terminated (requires reconnect).
 ///
+/// # Frame shape
+///
+/// The subscription is WS-API `userDataStream.subscribe.signature`, so each pushed event arrives
+/// wrapped as `{ "subscriptionId", "event": { "e", .. } }`, and binance-sdk passes the frame on
+/// unchanged; [`parse_user_data_frame`] unwraps it, as for margin. RPC responses (the subscribe
+/// acknowledgement) are ignored. A frame of any other shape, including an event without a
+/// readable `e` tag, is ignored and logged by [`log_unrecognised_frame`] (throttled `warn`), so a
+/// change in delivery cannot drop events silently. Unknown event types inside the envelope are
+/// ignored at `trace`.
+///
 /// # Hot path
 ///
 /// Reads the `e` discriminator from a borrowed view of the frame, then deserializes **only**
-/// the matched variant straight from the same slice — avoiding the full `serde_json::Value`
-/// DOM that `UserDataStreamEventsResponse`'s `#[serde(try_from = "Value")]` would build for
-/// every inbound frame (it parses the whole payload into a `Value`, then re-parses the matched
-/// variant out of it). Mirrors `convert_margin_user_data_events`. Unrecognized or unparseable
-/// frames (subscribe acks, WS-API metadata, future event types) are ignored, never mis-parsed.
+/// the matched variant straight from the inner event slice — avoiding the full
+/// `serde_json::Value` DOM that `UserDataStreamEventsResponse`'s `#[serde(try_from = "Value")]`
+/// would build for every inbound frame.
 fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -> bool {
-    // Discriminator-only view: reads the `e` event-type tag without materialising the payload.
-    // The BinanceSpot user-data frame is the bare event (`{ "e": "...", ... }`) — no envelope,
-    // unlike the margin WS-API path. Tag values match `UserDataStreamEventsResponse`'s
-    // `try_from = "Value"` arms (binance-sdk).
-    #[derive(Deserialize)]
-    struct EventTag<'a> {
-        #[serde(borrow, default)]
-        e: Option<&'a str>,
-    }
-
-    let event_type = serde_json::from_str::<EventTag<'_>>(frame)
-        .ok()
-        .and_then(|tag| tag.e)
-        .unwrap_or_default();
+    let (event_type, event) = match parse_user_data_frame(frame) {
+        UserDataFrame::Response => return false,
+        UserDataFrame::Event {
+            event_type, event, ..
+        } => (event_type, event),
+        UserDataFrame::Unrecognised => {
+            static SEEN: AtomicU64 = AtomicU64::new(0);
+            log_unrecognised_frame("BinanceSpot", &SEEN, frame);
+            return false;
+        }
+    };
+    // Tag values match `UserDataStreamEventsResponse`'s `try_from = "Value"` arms (binance-sdk).
     match event_type {
         "executionReport" => {
-            // Single typed pass straight from the raw frame — no intermediate DOM, and only the
+            // Single typed pass straight from the inner event — no intermediate DOM, and only the
             // matched branch deserializes its payload. The SDK struct ignores the unknown `e` tag.
-            match serde_json::from_str::<binance_sdk::spot::websocket_api::ExecutionReport>(frame) {
+            match serde_json::from_str::<binance_sdk::spot::websocket_api::ExecutionReport>(event) {
                 Ok(report) => {
                     convert_execution_report(&report, ExchangeId::BinanceSpot, buf);
                 }
@@ -1969,7 +2097,7 @@ fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -
         }
         "outboundAccountPosition" => {
             match serde_json::from_str::<binance_sdk::spot::websocket_api::OutboundAccountPosition>(
-                frame,
+                event,
             ) {
                 Ok(position) => convert_account_position(position, buf),
                 Err(e) => {
@@ -2649,13 +2777,15 @@ mod tests {
         delivered
     }
 
-    const WS_NEW: &str = r#"{"e":"executionReport","s":"BTCUSDT","i":12345,"c":"client-1",
-        "x":"NEW","X":"NEW","S":"BUY","o":"LIMIT","f":"GTC","q":"2","p":"100","z":"0",
-        "T":1700000000000}"#;
+    // Wrapped as the WS-API subscription delivers them: `{ subscriptionId, event }`.
+    const WS_NEW: &str = r#"{"subscriptionId":0,"event":{"e":"executionReport","s":"BTCUSDT",
+        "i":12345,"c":"client-1","x":"NEW","X":"NEW","S":"BUY","o":"LIMIT","f":"GTC","q":"2",
+        "p":"100","z":"0","T":1700000000000}}"#;
 
-    const WS_PARTIAL_FILL: &str = r#"{"e":"executionReport","s":"BTCUSDT","i":12345,"c":"client-1",
-        "x":"TRADE","X":"PARTIALLY_FILLED","S":"BUY","o":"LIMIT","f":"GTC","q":"2","p":"100",
-        "z":"1","l":"1","L":"100","t":555,"n":"0.1","N":"USDT","T":1700000001000}"#;
+    const WS_PARTIAL_FILL: &str = r#"{"subscriptionId":0,"event":{"e":"executionReport",
+        "s":"BTCUSDT","i":12345,"c":"client-1","x":"TRADE","X":"PARTIALLY_FILLED","S":"BUY",
+        "o":"LIMIT","f":"GTC","q":"2","p":"100","z":"1","l":"1","L":"100","t":555,"n":"0.1",
+        "N":"USDT","T":1700000001000}}"#;
 
     /// A fill's order snapshot must survive the dedup gate that sits between the converter and the
     /// consumer.
@@ -2740,77 +2870,34 @@ mod tests {
     }
 
     #[test]
-    fn test_is_api_rejection_error() {
-        // A ResponseError from binance-sdk (HTTP 4xx API rejection) is detected
+    fn test_classify_ws_order_error_recognises_venue_responses_only() {
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+
+        // A ResponseError from binance-sdk (the venue answered with status >= 400) is classified
         let rejection = anyhow::anyhow!(WebsocketError::ResponseError {
             code: -2010,
             message: "Account has insufficient balance for requested action.".into(),
         });
         assert!(
-            is_api_rejection_error(&rejection),
-            "ResponseError should be detected as API rejection"
+            matches!(
+                classify_ws_order_error(&rejection, &instrument),
+                Some(OrderError::Rejected(ApiError::BalanceInsufficient(..)))
+            ),
+            "ResponseError should be classified as a venue response"
         );
 
-        // A transport error (e.g. connection reset) is NOT an API rejection
+        // A transport error (e.g. connection reset) is NOT a venue response
         let transport = anyhow::anyhow!("connection reset by peer");
         assert!(
-            !is_api_rejection_error(&transport),
-            "plain transport error should not be detected as API rejection"
+            classify_ws_order_error(&transport, &instrument).is_none(),
+            "plain transport error should not be classified as a venue response"
         );
 
-        // A rate-limit error string (not a WebsocketError) is NOT an API rejection
+        // A rate-limit error string (not a WebsocketError) is NOT a venue response
         let rate_limit = anyhow::anyhow!("Too many requests. You are being rate-limited.");
         assert!(
-            !is_api_rejection_error(&rate_limit),
-            "rate-limit string error should not be detected as API rejection"
-        );
-    }
-
-    #[test]
-    fn test_connectivity_error_detects_auth_failures() {
-        // -1002: "You are not authorized to execute this request"
-        let err = connectivity_error(anyhow::anyhow!("Error -1002: unauthorized"));
-        assert!(
-            matches!(err, UnindexedClientError::Api(ApiError::Unauthenticated(_))),
-            "expected Unauthenticated for -1002, got {err:?}"
-        );
-
-        // -2015: "Invalid API-key, IP, or permissions for action"
-        // Use a code-only body (no auth text keyword) to isolate the numeric-code branch.
-        let err = connectivity_error(anyhow::anyhow!("Error -2015: permission denied for action"));
-        assert!(
-            matches!(err, UnindexedClientError::Api(ApiError::Unauthenticated(_))),
-            "expected Unauthenticated for -2015, got {err:?}"
-        );
-
-        // Text-based detection: "invalid signature"
-        let err = connectivity_error(anyhow::anyhow!("invalid signature provided"));
-        assert!(
-            matches!(err, UnindexedClientError::Api(ApiError::Unauthenticated(_))),
-            "expected Unauthenticated for 'invalid signature', got {err:?}"
-        );
-
-        // Text-based detection: "signature for this request is not valid"
-        let err = connectivity_error(anyhow::anyhow!(
-            "The signature for this request is not valid."
-        ));
-        assert!(
-            matches!(err, UnindexedClientError::Api(ApiError::Unauthenticated(_))),
-            "expected Unauthenticated for 'signature for this request is not valid', got {err:?}"
-        );
-
-        // Text-based detection: "invalid api-key"
-        let err = connectivity_error(anyhow::anyhow!("Invalid API-key format"));
-        assert!(
-            matches!(err, UnindexedClientError::Api(ApiError::Unauthenticated(_))),
-            "expected Unauthenticated for 'invalid api-key', got {err:?}"
-        );
-
-        // Non-auth errors should remain as Connectivity
-        let err = connectivity_error(anyhow::anyhow!("connection timeout"));
-        assert!(
-            matches!(err, UnindexedClientError::Connectivity(_)),
-            "expected Connectivity for timeout, got {err:?}"
+            classify_ws_order_error(&rate_limit, &instrument).is_none(),
+            "rate-limit string error should not be classified as a venue response"
         );
     }
 
@@ -4064,8 +4151,8 @@ mod tests {
     /// Build a raw user-data wire frame from an SDK event struct.
     ///
     /// The SDK event structs carry only the `E` (event time) field, not the lowercase `e`
-    /// discriminator, so the tag must be injected to reproduce the on-the-wire shape
-    /// (`{ "e": "<type>", .. }`) that `convert_user_data_events` reads.
+    /// discriminator, so the tag must be injected. The event is then wrapped as the WS-API
+    /// subscription delivers it, `{ "subscriptionId": 0, "event": { "e": "<type>", .. } }`.
     fn user_data_frame<T: serde::Serialize>(event_type: &str, event: &T) -> String {
         let mut value = serde_json::to_value(event).expect("event serializes to Value");
         value
@@ -4075,7 +4162,7 @@ mod tests {
                 "e".to_string(),
                 serde_json::Value::String(event_type.to_string()),
             );
-        serde_json::to_string(&value).expect("frame serializes")
+        serde_json::json!({ "subscriptionId": 0, "event": value }).to_string()
     }
 
     #[test]
@@ -4139,8 +4226,9 @@ mod tests {
 
     #[test]
     fn test_convert_user_data_events_stream_terminated_signals_reconnect() {
-        // No payload struct — the terminal frame is just the bare discriminator.
-        let frame = r#"{"e":"eventStreamTerminated","E":1700000000000}"#;
+        // No payload struct — the terminal event is just the discriminator and its time.
+        let frame =
+            r#"{"subscriptionId":0,"event":{"e":"eventStreamTerminated","E":1700000000000}}"#;
         let mut buf = Vec::new();
         let terminated = convert_user_data_events(frame, &mut buf);
         assert!(
@@ -4157,16 +4245,42 @@ mod tests {
     fn test_convert_user_data_events_unknown_event_ignored() {
         // listStatus / externalLockUpdate / future event types: harmless fall-through —
         // ignored, no events pushed, stream not terminated.
-        let frame = r#"{"e":"listStatus","E":1700000000000,"s":"BTCUSDT"}"#;
+        let frame =
+            r#"{"subscriptionId":0,"event":{"e":"listStatus","E":1700000000000,"s":"BTCUSDT"}}"#;
         let mut buf = Vec::new();
         let terminated = convert_user_data_events(frame, &mut buf);
         assert!(!terminated, "unknown event must not signal termination");
         assert!(buf.is_empty(), "unknown event should push no events");
     }
 
+    /// Regression: the WS-API subscription wraps every event, and binance-sdk passes the frame on
+    /// unchanged. The converter used to read `e` from the top level, found none in the envelope,
+    /// and dropped every event without a log. An enveloped fill must reach the buffer, and a frame
+    /// that is not an envelope must not be read as one.
+    #[test]
+    fn test_convert_user_data_events_reads_the_ws_api_envelope() {
+        let fill = r#"{"subscriptionId":3,"event":{"e":"executionReport","E":1700000001000,
+            "s":"BTCUSDT","c":"client-1","S":"SELL","o":"MARKET","f":"GTC","q":"0.5","p":"0",
+            "x":"TRADE","X":"FILLED","i":777,"l":"0.5","z":"0.5","L":"40000","n":"0.02",
+            "N":"USDT","T":1700000001000,"t":888}}"#;
+        let mut buf = Vec::new();
+        assert!(!convert_user_data_events(fill, &mut buf));
+        assert!(
+            buf.iter()
+                .any(|ev| matches!(ev.kind, AccountEventKind::Trade(_))),
+            "the enveloped fill must produce its trade, got: {buf:?}"
+        );
+
+        // The pre-fix fixture shape: a bare event with no envelope is not an event frame.
+        let bare = r#"{"e":"executionReport","s":"BTCUSDT","i":777,"x":"NEW","X":"NEW"}"#;
+        buf.clear();
+        assert!(!convert_user_data_events(bare, &mut buf));
+        assert!(buf.is_empty());
+    }
+
     #[test]
     fn test_convert_user_data_events_non_user_data_frame_ignored() {
-        // Subscribe acks / WS-API metadata carry no `e` tag — ignored, not mis-parsed.
+        // RPC responses such as the subscribe ack carry a top-level `id` — ignored, not mis-parsed.
         let frame = r#"{"id":"abc","status":200,"result":[]}"#;
         let mut buf = Vec::new();
         let terminated = convert_user_data_events(frame, &mut buf);
@@ -4184,11 +4298,11 @@ mod tests {
     #[tokio::test]
     async fn test_rate_limit_tracker_not_blocked_initially() {
         tokio::time::pause();
-        let tracker = RateLimitTracker::new();
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
         // wait_if_blocked should return immediately (no cooldown set)
         tokio::time::timeout(
             std::time::Duration::from_millis(1),
-            tracker.wait_if_blocked(),
+            tracker.wait_if_blocked(RequestKind::Order),
         )
         .await
         .expect("wait_if_blocked should return immediately when not blocked");
@@ -4197,29 +4311,35 @@ mod tests {
     #[tokio::test]
     async fn test_rate_limit_tracker_blocks_until_deadline() {
         tokio::time::pause();
-        let tracker = RateLimitTracker::new();
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
         let delay = Duration::from_secs(5);
         tracker.on_rate_limited(Some(delay));
 
         // Should not complete immediately
         assert!(
-            tokio::time::timeout(Duration::from_millis(1), tracker.wait_if_blocked())
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                Duration::from_millis(1),
+                tracker.wait_if_blocked(RequestKind::Order)
+            )
+            .await
+            .is_err(),
             "wait_if_blocked should block while cooldown is active"
         );
 
         // Advance past cooldown
         tokio::time::advance(delay + Duration::from_millis(1)).await;
-        tokio::time::timeout(Duration::from_millis(1), tracker.wait_if_blocked())
-            .await
-            .expect("wait_if_blocked should return after cooldown expires");
+        tokio::time::timeout(
+            Duration::from_millis(1),
+            tracker.wait_if_blocked(RequestKind::Order),
+        )
+        .await
+        .expect("wait_if_blocked should return after cooldown expires");
     }
 
     #[tokio::test]
     async fn test_rate_limit_tracker_cooldown_extends_to_max() {
         tokio::time::pause();
-        let tracker = RateLimitTracker::new();
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
 
         // Set initial 5s cooldown
         tracker.on_rate_limited(Some(Duration::from_secs(5)));
@@ -4229,23 +4349,29 @@ mod tests {
         // Advance past the initial 5s — should still be blocked
         tokio::time::advance(Duration::from_secs(6)).await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(1), tracker.wait_if_blocked())
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                Duration::from_millis(1),
+                tracker.wait_if_blocked(RequestKind::Order)
+            )
+            .await
+            .is_err(),
             "cooldown should have been extended to 10s"
         );
 
         // Advance past the extended 10s deadline
         tokio::time::advance(Duration::from_secs(5)).await;
-        tokio::time::timeout(Duration::from_millis(1), tracker.wait_if_blocked())
-            .await
-            .expect("wait_if_blocked should return after extended cooldown expires");
+        tokio::time::timeout(
+            Duration::from_millis(1),
+            tracker.wait_if_blocked(RequestKind::Order),
+        )
+        .await
+        .expect("wait_if_blocked should return after extended cooldown expires");
     }
 
     #[tokio::test]
     async fn test_rate_limit_tracker_shorter_cooldown_does_not_shorten() {
         tokio::time::pause();
-        let tracker = RateLimitTracker::new();
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
 
         // Set 10s cooldown then try to shorten with 2s — deadline should stay at 10s
         tracker.on_rate_limited(Some(Duration::from_secs(10)));
@@ -4254,9 +4380,12 @@ mod tests {
         // Advance past 2s — should still be blocked
         tokio::time::advance(Duration::from_secs(3)).await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(1), tracker.wait_if_blocked())
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                Duration::from_millis(1),
+                tracker.wait_if_blocked(RequestKind::Order)
+            )
+            .await
+            .is_err(),
             "shorter on_rate_limited must not shorten existing cooldown"
         );
     }
@@ -4285,29 +4414,516 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // L1: is_api_rejection_error with a context-wrapped error chain
+    // L1: classify_ws_order_error with a context-wrapped error chain
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn test_is_api_rejection_error_with_wrapped_error_chain() {
-        // `is_api_rejection_error` uses `anyhow::Error::downcast_ref`, which searches
+    fn test_classify_ws_order_error_with_wrapped_error_chain() {
+        // `classify_ws_order_error` uses `anyhow::Error::downcast_ref`, which searches
         // the *entire* error chain (not just the root). This test verifies that a
         // ResponseError wrapped in anyhow context layers is still detected correctly,
         // so SDK-internal context wrapping does not break the rejection check.
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
         let raw = anyhow::anyhow!(WebsocketError::ResponseError {
             code: -2010,
             message: "insufficient balance".into(),
         });
         // Unwrapped root: must be detected
         assert!(
-            is_api_rejection_error(&raw),
+            classify_ws_order_error(&raw, &instrument).is_some(),
             "unwrapped ResponseError at root must be detected"
         );
         // Context-wrapped: anyhow::downcast_ref searches the full chain, so this is also detected
         let wrapped = raw.context("outer context (e.g. SDK adds context layer)");
         assert!(
-            is_api_rejection_error(&wrapped),
+            classify_ws_order_error(&wrapped, &instrument).is_some(),
             "context-wrapped ResponseError must still be detected — anyhow::downcast_ref searches the full chain"
+        );
+    }
+
+    /// A spot REST response reporting `x-mbx-used-weight-1m` at 90% of the default limit pauses
+    /// later queries but not orders; under it, nothing pauses.
+    #[tokio::test]
+    async fn rest_used_weight_near_the_limit_pauses_queries() {
+        for (used, pauses) in [(5_399, false), (5_400, true)] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/v3/openOrders"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .insert_header("x-mbx-used-weight-1m", used.to_string())
+                        .set_body_json(serde_json::json!([])),
+                )
+                .mount(&server)
+                .await;
+            let rest = Arc::new(SpotRestApi::from_config(
+                ConfigurationRestApi::builder()
+                    .api_key("key")
+                    .api_secret("secret")
+                    .base_path(server.uri())
+                    .build()
+                    .unwrap(),
+            ));
+            let tracker = Arc::new(RateLimitTracker::new(WeightPool::Spot));
+
+            fetch_all_open_orders(rest, Arc::clone(&tracker))
+                .await
+                .unwrap();
+
+            let query_waits = tokio::time::timeout(
+                Duration::from_millis(50),
+                tracker.wait_if_blocked(RequestKind::Query),
+            )
+            .await
+            .is_err();
+            assert_eq!(query_waits, pauses, "used weight {used}");
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                tracker.wait_if_blocked(RequestKind::Order),
+            )
+            .await
+            .expect("orders never wait on the pause");
+        }
+    }
+
+    /// A spot client whose WS-API order session connects to `ws_url`.
+    fn client_with_ws_api(ws_url: String) -> BinanceSpot {
+        let mut client = <BinanceSpot as ExecutionClient>::new(BinanceSpotConfig::new(
+            "key".into(),
+            "secret".into(),
+        ));
+        client.ws_handle = SpotWsApi::from_config(
+            ConfigurationWebsocketApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .ws_url(ws_url)
+                .build()
+                .unwrap(),
+        );
+        client
+    }
+
+    /// A cancel by client order ID for `instrument`.
+    fn cancel_request(
+        instrument: &InstrumentNameExchange,
+    ) -> OrderRequestCancel<ExchangeId, &InstrumentNameExchange> {
+        crate::order::OrderEvent {
+            key: OrderKey {
+                exchange: ExchangeId::BinanceSpot,
+                instrument,
+                strategy: StrategyId::new("strategy"),
+                cid: ClientOrderId::new("cid"),
+            },
+            state: crate::order::request::RequestCancel { id: None },
+        }
+    }
+
+    /// A local WebSocket server: every connection is handed to `serve`. Returns its `ws://` URL.
+    async fn ws_server<F, Fut>(serve: F) -> String
+    where
+        F: Fn(tokio::net::TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(serve(stream));
+            }
+        });
+        url
+    }
+
+    /// During a rate-limit cooldown a cancel with no WS-API session is not sent: it fails as a
+    /// rate-limit rejection, without a handshake.
+    #[tokio::test]
+    async fn cancel_without_a_session_during_a_cooldown_is_rejected_unsent() {
+        let client = <BinanceSpot as ExecutionClient>::new(BinanceSpotConfig::new(
+            "key".into(),
+            "secret".into(),
+        ));
+        client
+            .rate_limiter
+            .on_rate_limited(Some(Duration::from_secs(60)));
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+        let response = client
+            .cancel_order(cancel_request(&instrument))
+            .await
+            .expect("a cancel always answers");
+
+        assert!(
+            matches!(
+                response.state,
+                Err(UnindexedOrderError::Rejected(ApiError::RateLimit))
+            ),
+            "{:?}",
+            response.state
+        );
+        assert!(
+            client.ws_api.read().await.is_none(),
+            "no session was opened"
+        );
+    }
+
+    /// A WS-API handshake Binance refuses with 429 starts a cooldown, and the cancel that needed
+    /// the session fails as a rate-limit rejection.
+    #[tokio::test]
+    async fn a_handshake_refused_with_429_starts_a_cooldown() {
+        use tokio_tungstenite::tungstenite::http;
+
+        let url = ws_server(|stream| async move {
+            // tungstenite's handshake callback fixes the error type to a whole HTTP response.
+            #[allow(clippy::result_large_err)]
+            let refuse = |_: &http::Request<()>, _| {
+                Err(http::Response::builder()
+                    .status(http::StatusCode::TOO_MANY_REQUESTS)
+                    .body(None)
+                    .unwrap())
+            };
+            let _ = tokio_tungstenite::accept_hdr_async(stream, refuse).await;
+        })
+        .await;
+        let client = client_with_ws_api(url);
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+
+        let response = client
+            .cancel_order(cancel_request(&instrument))
+            .await
+            .expect("a cancel always answers");
+
+        assert!(
+            matches!(
+                response.state,
+                Err(UnindexedOrderError::Rejected(ApiError::RateLimit))
+            ),
+            "{:?}",
+            response.state
+        );
+        assert!(client.rate_limiter.is_blocked());
+    }
+
+    /// A WS-API cancel response carries the spot pool's weight limit and usage: the limit
+    /// replaces the default, and usage at 90% of it pauses queries but not orders.
+    #[tokio::test]
+    async fn a_ws_api_response_near_the_weight_limit_pauses_queries() {
+        use futures::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let url = ws_server(|stream| async move {
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            while let Some(Ok(message)) = ws.next().await {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let response = serde_json::json!({
+                    "id": request["id"],
+                    "status": 200,
+                    "result": {
+                        "symbol": "BTCUSDT",
+                        "origClientOrderId": "cid",
+                        "orderId": 7,
+                        "transactTime": 1_700_000_000_000_i64,
+                        "executedQty": "0",
+                    },
+                    "rateLimits": [{
+                        "rateLimitType": "REQUEST_WEIGHT",
+                        "interval": "MINUTE",
+                        "intervalNum": 1,
+                        "limit": 1_000,
+                        "count": 950,
+                    }],
+                });
+                if ws.send(Message::text(response.to_string())).await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await;
+        let client = client_with_ws_api(url);
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+
+        let response = client
+            .cancel_order(cancel_request(&instrument))
+            .await
+            .expect("a cancel always answers");
+
+        assert!(response.state.is_ok(), "{:?}", response.state);
+        assert_eq!(client.rate_limiter.weight_limit(), 1_000);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                client.rate_limiter.wait_if_blocked(RequestKind::Query),
+            )
+            .await
+            .is_err(),
+            "queries pause"
+        );
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            client.rate_limiter.wait_if_blocked(RequestKind::Order),
+        )
+        .await
+        .expect("orders never wait on the pause");
+    }
+
+    /// Fill recovery does not wait for the pause near the weight limit, which could outlast its
+    /// budget and lose the fills: with queries paused, it still reads the trades at once.
+    #[tokio::test]
+    async fn fill_recovery_does_not_wait_for_the_weight_pause() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/myTrades"))
+            // One trade, so recovery also looks its order up: both reads run under the pause.
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "symbol": "BTCUSDT",
+                    "id": 1,
+                    "orderId": 7,
+                    "price": "100",
+                    "qty": "1",
+                    "commission": "0",
+                    "commissionAsset": "USDT",
+                    "time": Utc::now().timestamp_millis(),
+                    "isBuyer": true,
+                    "isMaker": false,
+                }])),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let rest = Arc::new(SpotRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server.uri())
+                .build()
+                .unwrap(),
+        ));
+        let tracker = Arc::new(RateLimitTracker::new(WeightPool::Spot));
+        tracker.throttle(Duration::from_secs(60));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut unrecovered = UnrecoveredFills::default();
+        unrecovered.open(
+            &[InstrumentNameExchange::new("BTCUSDT")],
+            Utc::now() - chrono::Duration::minutes(1),
+            Utc::now(),
+        );
+
+        // Far under the 60 s pause set above, and ample for two local round trips.
+        tokio::time::timeout(
+            Duration::from_millis(800),
+            recover_fills(&rest, &tracker, &mut unrecovered, &tx, &new_dedup_cache()),
+        )
+        .await
+        .expect("recovery does not wait for the pause");
+    }
+
+    /// A recovery that fails keeps its gap, closed at its own start; the retry reads exactly that
+    /// span, forwards only the fill inside it (a later one arrived live), and clears it.
+    #[tokio::test]
+    async fn a_failed_recovery_keeps_its_closed_gap_for_the_retry() {
+        let disconnect = Utc::now() - chrono::Duration::minutes(10);
+        let reconnect = Utc::now() - chrono::Duration::minutes(5);
+        let trade = |id: i64, time: DateTime<Utc>| {
+            serde_json::json!({
+                "symbol": "BTCUSDT", "id": id, "orderId": id, "price": "100", "qty": "1",
+                "commission": "0", "commissionAsset": "USDT", "time": time.timestamp_millis(),
+                "isBuyer": true, "isMaker": false, "isBestMatch": true,
+            })
+        };
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/myTrades"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({"code": -1100, "msg": "rejected"})),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/myTrades"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    trade(1, disconnect + chrono::Duration::minutes(1)),
+                    trade(2, Utc::now() - chrono::Duration::minutes(1)),
+                ])),
+            )
+            .mount(&server)
+            .await;
+        let rest = Arc::new(SpotRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server.uri())
+                .build()
+                .unwrap(),
+        ));
+        let tracker = Arc::new(RateLimitTracker::new(WeightPool::Spot));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let dedup = new_dedup_cache();
+        let mut unrecovered = UnrecoveredFills::default();
+        unrecovered.open(
+            &[InstrumentNameExchange::new("BTCUSDT")],
+            disconnect,
+            reconnect,
+        );
+
+        recover_fills(&rest, &tracker, &mut unrecovered, &tx, &dedup).await;
+        assert!(!unrecovered.is_empty(), "the failed gap is kept");
+        assert!(rx.try_recv().is_err(), "nothing forwarded");
+        assert!(
+            unrecovered.due(tokio::time::Instant::now()).is_empty(),
+            "and waits for its retry"
+        );
+
+        unrecovered.make_due();
+        recover_fills(&rest, &tracker, &mut unrecovered, &tx, &dedup).await;
+        assert!(unrecovered.is_empty(), "the retry recovered it");
+        let forwarded: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            forwarded.len(),
+            1,
+            "only the fill inside the gap: {forwarded:?}"
+        );
+
+        let start_times: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|request| {
+                request
+                    .url
+                    .query_pairs()
+                    .find(|(key, _)| key == "startTime")
+                    .map(|(_, value)| value.into_owned())
+            })
+            .collect();
+        let start = disconnect.timestamp_millis().to_string();
+        assert_eq!(start_times, [start.clone(), start]);
+    }
+
+    /// A span walk reads on by id through a full page inside the span, and stops at the page that
+    /// reaches past its end, without the executions after it.
+    #[tokio::test]
+    async fn a_span_walk_pages_by_id_and_stops_past_the_end() {
+        let start = Utc::now().timestamp_millis() - 600_000;
+        let end = start + 10_000;
+        let trade = |id: i64, time: i64| {
+            serde_json::json!({
+                "symbol": "BTCUSDT", "id": id, "orderId": id, "price": "100", "qty": "1",
+                "commission": "0", "commissionAsset": "USDT", "time": time,
+                "isBuyer": true, "isMaker": false, "isBestMatch": true,
+            })
+        };
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/myTrades"))
+            .and(wiremock::matchers::query_param("fromId", "1001"))
+            // A full page that reaches past the end: only the end, not a short page, stops the walk.
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(
+                    (1_001..=2_000)
+                        .map(|id| trade(id, if id == 1_001 { end } else { end + 1 }))
+                        .collect::<Vec<_>>(),
+                ),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let full_page: Vec<_> = (1..=1_000).map(|id| trade(id, start + id)).collect();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/myTrades"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(full_page))
+            .mount(&server)
+            .await;
+        let rest = Arc::new(SpotRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server.uri())
+                .build()
+                .unwrap(),
+        ));
+
+        let read = paginate_my_trades(
+            &rest,
+            &Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+            &InstrumentNameExchange::new("BTCUSDT"),
+            MyTradesFrom::Span { start, end },
+            RequestKind::Query,
+        )
+        .await
+        .unwrap();
+
+        let ids: Vec<_> = read.iter().filter_map(|t| t.id).collect();
+        assert_eq!(ids, (1..=1_001).collect::<Vec<_>>());
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    /// When recovery times out, a gap whose read started has failed and waits for its retry, but
+    /// one never started (eight are read at a time) is not charged and stays due.
+    #[tokio::test]
+    async fn a_timed_out_recovery_charges_only_the_gaps_it_started() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/myTrades"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([]))
+                    .set_delay(Duration::from_secs(3_600)),
+            )
+            .mount(&server)
+            .await;
+        let rest = Arc::new(SpotRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server.uri())
+                .timeout(3_600_000_u64)
+                .retries(0_u32)
+                .build()
+                .unwrap(),
+        ));
+        let instruments: Vec<_> = (0..9)
+            .map(|i| InstrumentNameExchange::new(format!("SYM{i}USDT")))
+            .collect();
+        let mut unrecovered = UnrecoveredFills::default();
+        unrecovered.open(
+            &instruments,
+            Utc::now() - chrono::Duration::minutes(10),
+            Utc::now(),
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        // Paused: once every read is waiting, the clock jumps to the recovery timeout.
+        tokio::time::pause();
+
+        recover_fills(
+            &rest,
+            &Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+            &mut unrecovered,
+            &tx,
+            &new_dedup_cache(),
+        )
+        .await;
+
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            unrecovered.due(now).len(),
+            1,
+            "the gap never started stays due"
+        );
+        assert_eq!(
+            unrecovered
+                .due(now + Duration::from_secs(GAP_RETRY_BASE_SECS))
+                .len(),
+            9,
+            "the eight started wait for their first retry"
         );
     }
 }

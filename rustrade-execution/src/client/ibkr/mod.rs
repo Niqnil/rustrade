@@ -143,7 +143,7 @@ use crate::{
     },
     trade::{AssetFees, Trade, TradeId},
 };
-use account::BalanceAggregator;
+use account::{BalanceAggregator, PositionAggregator};
 use chrono::{DateTime, Utc};
 use execution::{ExecutionBuffer, parse_decimal_or_warn};
 use futures::stream::BoxStream;
@@ -1513,7 +1513,48 @@ impl ExecutionClient for IbkrClient {
         Self::connect_sync(config).expect("failed to connect to IB")
     }
 
-    /// Fetch account snapshot (balances, and which instruments hold a position).
+    /// Fetch account snapshot: balances, and a position per registered instrument IB reports.
+    ///
+    /// # Positions
+    ///
+    /// Each instrument IB reports a position in, and that is registered (and in `instruments`,
+    /// when that is not empty), gets an `InstrumentAccountSnapshot`. Its `position` is
+    /// [`PositionReport::Open`](crate::position::PositionReport::Open), carrying:
+    /// - `quantity`: IB's signed position, negative when short, in shares for a stock and in
+    ///   contracts for a future or an option. `ibapi` 4.2.0 hands it over as an `f64`, converted
+    ///   with `Decimal::try_from`, which rounds to the float's precision of about 15 significant
+    ///   digits (0.1 stays 0.1) rather than keeping its exact binary expansion.
+    /// - `entry_price`: IB's average cost divided by the contract multiplier, so a future or an
+    ///   option is quoted as its orders are priced. It includes commissions. `None` when IB sends
+    ///   no average cost, or no multiplier for a contract other than a stock or a forex pair.
+    /// - `time_exchange`: the time of the call, since IB does not timestamp positions.
+    ///
+    /// `unrealized_pnl` and the margin fields are `None`: IB's positions subscription does not
+    /// carry them.
+    ///
+    /// A zero quantity, which IB reports for a position closed today, is
+    /// [`PositionReport::Flat`](crate::position::PositionReport::Flat). So is each instrument in
+    /// `instruments` that is registered with its contract ID but that IB did not list, provided IB
+    /// marked the end of its listing (`PositionEnd`) during the read. Without that marker such
+    /// instruments are left out, with a warning, since the listing may be incomplete: IB can
+    /// start the read with a stale listing, and only an end marker after the last report counts.
+    /// IB's positions request carries no request ID, so one case cannot be caught: a stale end
+    /// marker on its own, followed by a current listing that does not start within the read's
+    /// 5-second quiet period. It reads as the listing of an account holding nothing, and the
+    /// requested instruments are reported flat.
+    /// A requested instrument registered without a contract ID, or whose ID was registered again
+    /// under another name, cannot be matched to IB's reports and is left out too.
+    ///
+    /// IB can report the same position more than once during the read, as it changes. The latest
+    /// report for each account is used.
+    ///
+    /// **Several accounts.** IB reports positions per account, and this client does not select
+    /// one. When more than one account holds the same instrument, the first account to report a
+    /// non-zero quantity is kept and the others are dropped with a warning; they are never summed.
+    /// A consumer comparing the reported quantity with its own, as the `rustrade` engine's position
+    /// drift check does, therefore compares against that one account.
+    /// Which account comes first depends on the order IB reports them in, so a caller holding the
+    /// same instrument in several accounts should not rely on it.
     ///
     /// # Limitations
     ///
@@ -1521,11 +1562,10 @@ impl ExecutionClient for IbkrClient {
     ///   IB's positions endpoint returns position data only, not open orders.
     ///   Use `fetch_open_orders()` or `account_stream()` for order state.
     ///
-    /// - Position quantity and average cost from IB are not carried in the
-    ///   returned `InstrumentAccountSnapshot`: its `position` is always `None`,
-    ///   so the snapshot only indicates which instruments have positions, not
-    ///   their sizes. IB reports both, and `position` could carry them; this
-    ///   client does not fill it yet (#417).
+    /// # Errors
+    ///
+    /// [`UnindexedClientError::Internal`] if a position quantity does not convert to a
+    /// `Decimal`, or if the positions subscription fails.
     ///
     /// # Known Issue: ibapi Decode Errors
     ///
@@ -1573,8 +1613,7 @@ impl ExecutionClient for IbkrClient {
                 .positions()
                 .map_err(|e| UnindexedClientError::Internal(format!("positions: {e}")))?;
 
-            let mut snapshots = Vec::new();
-            let mut seen = HashSet::new();
+            let mut positions = PositionAggregator::default();
 
             // Read until `POSITION_STREAM_TIMEOUT` passes with no update, not until
             // `PositionEnd`: see that constant for why.
@@ -1589,9 +1628,15 @@ impl ExecutionClient for IbkrClient {
                         )));
                     }
                 };
-                let PositionUpdate::Position(pos) = pos_update else {
-                    trace!(?pos_update, "Ignoring non-Position variant");
-                    continue;
+                let pos = match pos_update {
+                    PositionUpdate::Position(pos) => {
+                        positions.report_seen();
+                        pos
+                    }
+                    PositionUpdate::PositionEnd => {
+                        positions.listing_ended();
+                        continue;
+                    }
                 };
                 let Some(instrument) = contracts.get_name_by_con_id(pos.contract.contract_id)
                 else {
@@ -1603,23 +1648,30 @@ impl ExecutionClient for IbkrClient {
                 {
                     continue;
                 }
-                if seen.contains(&instrument) {
-                    debug!(
-                        instrument = %instrument,
-                        "Duplicate position for instrument (multi-account?), skipping"
-                    );
-                    continue;
-                }
-                seen.insert(instrument.clone());
-                snapshots.push(InstrumentAccountSnapshot {
+                positions.process(instrument, pos);
+            }
+            // IB's reports are attributed by contract ID, so a requested instrument can be
+            // reported flat only if its ID is registered and resolves back to it: with no ID, or
+            // one another name took over, IB's position in it would be missed.
+            let requested = instruments_filter.iter().flatten().filter(|instrument| {
+                contracts.get_contract(instrument).is_some_and(|contract| {
+                    contract.contract_id != 0
+                        && contracts.get_name_by_con_id(contract.contract_id).as_ref()
+                            == Some(*instrument)
+                })
+            });
+            let reported = positions.into_reports(Utc::now(), requested)?;
+            let snapshots = reported
+                .into_iter()
+                .map(|(instrument, position)| InstrumentAccountSnapshot {
                     instrument,
                     orders: Vec::new(),
                     // Nothing is read, so absence says nothing: see the limitation above and #371.
                     orders_complete: false,
-                    position: None,
+                    position,
                     isolated: None,
-                });
-            }
+                })
+                .collect::<Vec<_>>();
             Ok::<_, UnindexedClientError>(snapshots)
         });
 

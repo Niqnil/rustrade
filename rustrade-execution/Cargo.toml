@@ -1,6 +1,6 @@
 [package]
 name = "rustrade-execution"
-version = "0.7.0"
+version = "0.8.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -137,6 +137,8 @@ rustrade-instrument = { workspace = true, features = ["test-utils"] }
 tokio = { workspace = true, features = ["test-util"] }
 # Mock HTTP server for testing REST pagination and truncation logic (H-1, H-3)
 wiremock = { workspace = true }
+# Mock WebSocket server for the Binance WS-API order session (already a workspace dependency)
+tokio-tungstenite = { workspace = true }
 # Tracing for examples
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 # Decimal literals for examples

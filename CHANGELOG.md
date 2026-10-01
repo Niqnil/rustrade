@@ -7,6 +7,295 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-01
+
+### Added
+
+- **Seed open positions into the engine's starting state** (`rustrade`). The engine builds
+  positions only from fills, so a position held across a process restart was invisible to it:
+  the strategy could not close it, and risk checks did not see it. `EngineStateBuilder::positions`
+  and `SystemBuilder::positions` now take `PositionSeed`s (instrument, side, quantity, entry price,
+  entry time, and a `PositionId` under `OmsMode::Hedging`). The caller supplies the entry price.
+  A seeded position takes its contract size from the instrument and starts with zero unrealised
+  PnL; no `Trade` is generated. `PositionSeed::with_fees_enter` records the fees paid to enter,
+  in the quote asset, so realised PnL at close is net of them; they default to zero. Seeds are
+  also how a backtest starts from an existing portfolio.
+  - New `EngineStateBuilder::try_build` returns a `PositionSeedError` for an invalid seed: an
+    unknown instrument, a quantity that is not positive, a slot seeded twice, or a slot that does
+    not fit the `OmsMode`. `build` keeps its signature and panics on the same errors; a builder
+    with no seeds never panics.
+  - `SystemBuilder::build` returns the error as the new `BarterError::PositionSeed` variant.
+    **Breaking:** `BarterError` is not `#[non_exhaustive]`, so a downstream `match` on it that
+    lists every variant needs an arm for this one.
+  - `VenuePositionSeeds::from_account_snapshot` builds seeds from the positions a venue reports
+    in an account snapshot (Alpaca, IBKR and Hyperliquid perpetuals report them), resolving the
+    venue's instrument names through the engine's `IndexedInstruments`. An open position it
+    cannot seed is returned in `skipped` with a `VenuePositionSkipReason`: the instrument is not
+    one the engine is built with, or the venue reported no entry price. The single-position form
+    is `PositionSeed::from_venue_position`. A seed takes the venue's entry price as reported (IBKR
+    includes commissions in it, Alpaca does not), no entry fees, and the time the position was
+    read as its entry time, since venues report none.
+
+- **`EngineOutput::PositionDrift`: the engine reports where a venue's positions differ from its
+  own** (`rustrade`). The engine checks each account snapshot it processes, the one sent when an
+  execution link connects and again after every reconnect, against its own positions. For every
+  instrument the venue reports as `PositionReport::Flat` or `Open` (see Changed) whose signed
+  quantity differs from the engine's net quantity, it logs a warning and emits one
+  `PositionDrift`: the instrument, both quantities, and both entry prices for information.
+  Nothing is corrected, and entry prices are not compared. An unreported position is never
+  compared, so a venue that does not report positions, such as Binance, never drifts. Drift can be
+  transient, when a fill reaches the venue's position before its trade reaches the engine.
+  - `EngineState::position_drift` runs the same check on any indexed `AccountSnapshot`, for a
+    caller that fetches snapshots itself.
+  - `PositionManager::quantity_net` gives an instrument's signed net quantity; under
+    `OmsMode::Hedging` longs and shorts offset.
+  - `UpdateFromAccountOutput` gains a matching `PositionDrift` variant. Both enums are
+    `#[non_exhaustive]`.
+
+- **`EngineOutput::ContractExpiryNotSettled`** (`rustrade`), emitted when a `ContractExpiry` does
+  not settle its instrument. Its `ContractExpiryNotSettledReason` is `InstrumentNeverExpires` for
+  a `Spot`, `Perpetual` or `Cfd` instrument (see Fixed), `SettlementPriceUnavailable` when the
+  price settlement needs has not arrived, or `UnknownInstrument` (see Fixed).
+  `SettlementPriceUnavailable` was only logged before; the event stays retryable. Both enums are
+  `#[non_exhaustive]`, so no downstream `match` breaks.
+
+- **`ApiError::RequestRejected`** (`rustrade-execution`): the venue refused the request itself,
+  such as a missing, malformed or out-of-range parameter, as opposed to an order failing a
+  business rule (`OrderRejected`). It is not transient, and its message carries the venue's error
+  code where there is one. `ApiError` is `#[non_exhaustive]`, so no downstream `match` breaks.
+
+### Changed
+
+- **`InstrumentAccountSnapshot::position` is a `PositionReport`, not an `Option<Position>`**
+  (`rustrade-execution`). **Breaking.** `None` used to mean flat, not reported, or held as a
+  balance, so a consumer could not tell an instrument the venue holds nothing in from one it says
+  nothing about. `PositionReport` is `Unreported` (the default), `Flat`, or `Open(Position)`, and
+  only `Flat` and `Open` are claims about the venue's position. A client that reports positions
+  now lists every requested instrument whose position it reports, flat ones included:
+  - Alpaca: every requested equity and option, `Flat` when Alpaca lists no position for it.
+    Requested names now match Alpaca's symbols ignoring case. Crypto pairs, recognised by the `/`
+    in `BTC/USD`, are `Unreported`, since their holdings are balances.
+  - Hyperliquid perpetuals: every requested perpetual, `Flat` when the user state holds no
+    position in it. A size that does not parse is `Unreported`; it used to read as zero.
+  - IBKR: a zero quantity is `Flat`, and so is a requested instrument registered with its
+    contract ID that IB did not list, but only when the read ended on IB's end-of-listing marker
+    (a stale listing's marker does not count) and the ID resolves back to that instrument.
+    Otherwise it is left out, with a warning when the listing was incomplete.
+  - Binance, Hyperliquid spot and the mock exchange: `Unreported`.
+
+  Replace `position.as_ref()` with `position.open()`; `PositionReport::quantity` gives the signed
+  quantity, zero when flat and `None` when unreported. `PositionReport::from_position` reports a
+  zero quantity as `Flat`. In JSON the field is `"Flat"` or `{"Open": {...}}`, and absent when
+  unreported; a snapshot serialised by an earlier version, with a bare position object there, no
+  longer deserialises.
+
+- **`Engine::process_contract_expiry` returns `Vec<EngineOutput>`** (`rustrade`), like
+  `process_corporate_action`, instead of `Vec<PositionExited>`. **Breaking** for code that calls
+  it directly: closed positions now arrive as `EngineOutput::PositionExit`, and a rejection as
+  `EngineOutput::ContractExpiryNotSettled`. Only the return type mentions the two output type
+  parameters, so name them unless later code fixes them, usually as the strategy's
+  `OnTradingDisabled` and `OnDisconnect` output types:
+  `engine.process_contract_expiry::<MyOnTradingDisabled, MyOnDisconnect>(&key)`. Code that only
+  sends `EngineEvent::ContractExpiry` is unaffected.
+
+- **Alpaca's USD balance is now cash, not account equity** (`rustrade-execution`, feature
+  `alpaca`). **Breaking** for code that reads it: `account_snapshot` and `fetch_balances` report
+  `total` as the account's `cash`, and `free` as the lesser of cash and
+  `non_marginable_buying_power`, instead of `equity` and buying power (`options_buying_power`,
+  else `buying_power`). Equity counts the value of every position, which `account_snapshot` now
+  reports one by one (see Fixed), so keeping it would count them twice. Every Alpaca buying power
+  figure counts the loan value of held stock, so `free` could exceed `total`; capped at cash it
+  cannot. Cash is negative while the account borrows on margin, and then `free` is negative too. A
+  short sale's proceeds are credited to cash but not to buying power, so `free` stays below
+  `total` while a short is open. This matches IBKR, whose USD `total` is already
+  `TotalCashValue`. Code that wants equity can add the positions' value to cash. A missing or
+  malformed amount in Alpaca's account or positions response now fails the call instead of
+  reading as zero; so does an equity or option position whose side is neither long nor short.
+
+- **Alpaca and Binance pause before a rate limit is hit, not only after a 429**
+  (`rustrade-execution`, features `alpaca` and `binance`). Each used to back off only once the
+  venue refused a request.
+  - Alpaca: once a response reports `X-Ratelimit-Remaining: 0`, every request waits until
+    `X-Ratelimit-Reset`, at most a minute, logged at `info`, where a 429 logs at `warn`.
+  - Binance: once a response reports at least 90% of the per-minute request-weight limit used,
+    REST queries wait for the next minute. Orders and cancels never wait for it, so they can use
+    the rest. A reconnect's fill recovery never waits for it either, since a pause could outlast
+    its 30 s budget and leave its fills to a later retry, and neither does margin's
+    `userListenToken` request, which that recovery depends on. Spot reads the weight used from
+    REST and WebSocket API responses, and the limit from WebSocket API responses, falling back to
+    Binance's documented 6000.
+    Margin reads `x-sapi-used-ip-weight-1m` against the documented `/sapi` IP limit of 12000; the
+    per-UID limit is not tracked.
+
+  A query near the limit can now take up to about a minute longer. The rustdoc of `AlpacaClient`,
+  `BinanceSpot` and `BinanceMargin` describes each client's limits.
+
+### Fixed
+
+- **Binance fills a reconnect's recovery did not finish were lost** (`rustrade-execution`,
+  feature `binance`). After a reconnect, `BinanceSpot` and `BinanceMargin` recover the fills
+  missed during the disconnect, within 30 s. An instrument whose query failed or had not finished
+  in time was only logged, and its fills were never delivered. Each instrument's gap, from the
+  disconnect to just after its recovery began, is now kept until its fills are forwarded. A gap
+  not read is retried after 1, 2, 4, 8 and 16 minutes, whether the stream stays connected or
+  reconnects in between. A retry reads only the gap, not the fills the stream has delivered
+  live since; the few seconds at its end that overlap live delivery are deduplicated. After five
+  failed retries the gap is given up and logged at `error`; its fills can still be read with
+  `fetch_trades`.
+
+- **Binance spot reopened its WebSocket API session during a rate-limit cooldown**
+  (`rustrade-execution`, feature `binance`). An order or cancel with no open session ran a new
+  handshake even while REST calls were waiting out a 429, and a handshake Binance refused with
+  429 or 418 did not start a cooldown, so the next order tried again at once. Repeated refusals
+  risk an IP ban. A handshake is now not attempted during a cooldown, and a refused one starts a
+  cooldown. Either way the order or cancel fails with `ApiError::RateLimit`, unsent, instead of
+  as a connectivity error. Also, after the first cooldown, every later one logged its start at
+  `debug` instead of `warn`.
+
+- **Binance spot's `account_stream` delivered no user-data events at all** (`rustrade-execution`,
+  feature `binance`). The stream subscribes through the WebSocket API
+  (`userDataStream.subscribe.signature`), which wraps each event as
+  `{ "subscriptionId", "event": { "e", .. } }`, and binance-sdk passes that frame on unchanged.
+  The converter read the event type from the top level of the frame, found none, and dropped
+  every order update, fill, balance update and `eventStreamTerminated` without a log. So a fill
+  never reached the engine as a trade, and the stream did not reconnect when Binance ended it.
+  Fills recovered over REST after a reconnect, and the order snapshot `open_order` returns, were
+  unaffected. The converter now unwraps the envelope, sharing the parsing with Binance margin,
+  which already did. A frame that is neither an RPC response nor an event envelope with an `e`
+  tag is now logged on both, instead of being dropped silently: at `warn` for the first and every
+  1000th after it, counted per venue across the process, and at `trace` otherwise.
+
+- **Binance margin `fetch_trades` and reconnect fill recovery could miss fills more than 24 hours
+  back** (`rustrade-execution`, feature `binance`). Binance's margin `myTrades` returns only 24
+  hours of trades to a query without `fromId`, but the client sent `startTime` alone and then
+  stopped at the first short page. So a lookback longer than a day could read one day's fills
+  and silently miss every later one. The client now reads in 23-hour windows, each bounded by
+  `startTime` and `endTime`, up to the local clock at the call. From the first window holding a
+  trade it pages on by trade id. Each window before the first trade costs one request (weight 10),
+  so the cost grows with the lookback: about 32 requests per instrument for 30 days with no
+  trades. Spot is unaffected: its `myTrades` returns every trade since a bare `startTime`.
+
+- **Binance spot and margin reported every failed query as a transient connectivity error**
+  (`rustrade-execution`, feature `binance`). Apart from recognised auth failures, any failure of
+  a non-order REST call became `ClientError::Connectivity`, so `is_transient()` told a caller to
+  retry a request the venue would refuse forever, such as one it rejected with `-1127`. This
+  affected `account_snapshot`, `fetch_balances`, `fetch_open_orders`, `fetch_trades`, reconnect
+  fill recovery, and the margin user-data listen token. Failures are now classified from the
+  SDK's typed error, as order calls already were:
+  - a venue rejection is `ApiError::RequestRejected`, or `InstrumentInvalid` for `-1121` when the
+    request named one instrument, and keeps `Unauthenticated` and `RateLimit` for their codes;
+  - HTTP 429/418 is `RateLimit`, and 401 is `Unauthenticated`, now with the Binance code. A 403,
+    which Binance documents as its web application firewall limit, is `RateLimit` unless it
+    carries an auth code;
+  - a request that never completed, a 5xx, Binance's own failure codes (`-1000`, `-1001`,
+    `-1006`, `-1007`, `-1008`) and a stale timestamp (`-1021`) stay transient `Connectivity`;
+  - a response body that does not fit the SDK's model, and a request that failed before it was
+    sent (building it, its URL, signing), are `ClientError::Internal`, since retrying cannot
+    change either.
+
+- **A Binance order that failed on the venue's side was reported as definitively rejected**
+  (`rustrade-execution`, feature `binance`). When Binance answered an order or cancel with
+  `-1000`, `-1001`, `-1006`, `-1007` or `-1008`, the spot and margin clients reported
+  `OrderError::Rejected(OrderRejected)`. Binance documents `-1006` and `-1007` as leaving the
+  execution status unknown, and gives no assurance for the other three, so such an order may have
+  filled while the caller believed it had not. These codes are now `OrderError::Connectivity`,
+  like any other failure that leaves the order's status unknown, on both the REST and the
+  WebSocket API paths. So is a WebSocket API response with a 5xx status and no error body, which
+  was also reported as rejected. Other order-path labels change with it:
+  - `-1022` (invalid signature) and `-2014` (malformed API key), and messages worded as an auth
+    failure, are `ApiError::Unauthenticated`, as they already were for queries;
+  - a 403 is `Unauthenticated` only when it carries an auth code or wording. Otherwise it is
+    Binance's web application firewall limit, now `RateLimit`, and the order never reached the
+    matching engine. A REST call now backs off and retries a firewall 403 as it does a 429, and
+    a throttled WebSocket API order, from a 429, `-1003` or a firewall 403, now backs off the
+    shared rate limiter, which it did not before.
+
+- **A `ContractExpiry` for an instrument that never expires closed its positions** (`rustrade`).
+  For a `Spot`, `Perpetual` or `Cfd` instrument the engine settled the event as it would a
+  future: it closed every open position at the last price and set `expiration_processed`, so the
+  instrument could not trade again for the rest of the run. Nothing was logged. The engine now
+  rejects the event without touching any state, and emits `EngineOutput::ContractExpiryNotSettled`
+  with `ContractExpiryNotSettledReason::InstrumentNeverExpires`.
+  - The audit replica marked such an instrument processed when it held no position. It now
+    follows the live engine, and it also leaves state alone on a repeated expiry, as the live
+    engine does.
+
+- **A `ContractExpiry` or `CorporateAction` naming an unknown instrument panicked the engine**
+  (`rustrade`). Both events are built by the caller, and an `InstrumentIndex` the engine was not
+  built with, such as one taken from another `IndexedInstruments`, reached a positional lookup
+  that panicked, stopping a live engine. The engine now rejects the event without touching any
+  state: a `ContractExpiry` with `EngineOutput::ContractExpiryNotSettled`, a `CorporateAction`
+  with `EngineOutput::UnsupportedCorporateAction` and its `id` unrecorded, each with a new
+  `UnknownInstrument` reason. Both reason enums are `#[non_exhaustive]`, so no downstream `match`
+  breaks. The audit replica does the same. New `InstrumentStates::get_index` and `get_index_mut`
+  look an index up without panicking. A valid index for the wrong instrument still cannot be
+  detected.
+
+- **An order request naming an unknown instrument panicked the engine** (`rustrade`). Requests
+  from a `Command::SendOpenRequests` or `SendCancelRequests`, an `AlgoStrategy` or a
+  `ClosePositionsStrategy` are built by caller code, and an `InstrumentIndex` the engine was not
+  built with panicked it. An open panicked before it was sent. A cancel panicked after it had
+  already gone to the venue, so the venue acted on a request the engine never recorded. The
+  engine now checks every request before sending it. It rejects one for an unknown instrument
+  unsent, reports it in its action output's `errors` as the new
+  `RecoverableEngineError::UnknownInstrument`, logs a warning, and keeps running.
+  - **Breaking:** new `TracksInstrument` trait, implemented for `EngineState`. The engine's
+    `GenerateAlgoOrders` and `ClosePositions` implementations now require it of their `State`, so
+    a custom `State` used with them must implement it.
+  - **Breaking:** `RecoverableEngineError` is now `#[non_exhaustive]`, so a downstream `match` on
+    it needs a wildcard arm.
+  - `MarketSnapshotSource::market_snapshot` on `EngineState` returns `None` for an unknown
+    instrument instead of panicking.
+
+- **The audit replica left a settled contract expiry out of its tear sheet** (`rustrade`). When a
+  `ContractExpiry` closed positions, the live engine added each closed position to the
+  instrument's tear sheet, but the replica only removed the position, so its statistics drifted
+  from the live engine's after every settled expiry. It now adds each closed position as well.
+  The replica's rustdoc now also states that it does not mirror in-flight requests: an order the
+  engine has just sent, or a cancel it is waiting on, shows in the replica only once the venue
+  answers.
+
+- **Alpaca reported a response it could not decode as a transient connectivity error**
+  (`rustrade-execution`, feature `alpaca`). A 2xx response whose body did not fit the expected
+  model became `ClientError::Connectivity`, so `is_transient()` told a caller to retry a request
+  that returns the same body every time. It is now `ClientError::Internal`, as for Binance, on
+  `account_snapshot`, `fetch_balances`, `fetch_open_orders` and `fetch_trades`; a caller that
+  matched `Connectivity` for these failures must handle `Internal`. An order whose 2xx response
+  does not decode stays `OrderError::Connectivity`: Alpaca accepted it, so it may be live, and its
+  status is unknown rather than rejected. Reconcile it through `fetch_open_orders` before
+  resubmitting.
+
+- **`Position::is_short` reported a negative zero quantity as short** (`rustrade-execution`).
+  `Decimal` keeps a sign on zero, so a `-0` quantity, as from parsing `"-0"`, was short while
+  `is_flat` also held. It is now flat only.
+
+- **A timed-out fill recovery did not say whose fills it missed** (`rustrade-execution`, features
+  `binance` and `alpaca`). When reconnect fill recovery hit its 30-second limit, the warning
+  said only that some fills may be missing. Binance spot and margin now name the instruments
+  whose fills were not recovered, because their query failed or had not finished, both on a
+  timeout and when recovery ends with failed queries. Alpaca, which recovers every instrument
+  with one query, names the requested instruments.
+
+- **Alpaca's `account_snapshot` did not report equity and option positions**
+  (`rustrade-execution`, feature `alpaca`). Every `InstrumentAccountSnapshot::position` was
+  `None`, so a caller could not see what the account held, or which way. Each equity and option
+  holding is now its instrument's `position`: signed quantity (negative for a short, taken from
+  Alpaca's `side`), average entry price, and unrealised PnL in USD. An option's entry price is the
+  premium per share, as its orders are priced, not per contract. With no instruments requested,
+  every instrument holding a position gets a snapshot, as one with an open order already did.
+  Crypto holdings stay asset balances, since Alpaca crypto is spot-only. The snapshot now always
+  fetches `/v2/positions`, even for a USD-only request.
+
+- **IBKR's `account_snapshot` dropped each position's quantity and average cost**
+  (`rustrade-execution`, feature `ibkr`). It listed the instruments holding a position but left
+  every `position` as `None`. Each now carries the signed quantity (negative for a short) and the
+  entry price: IB's average cost divided by the contract multiplier, so a future or an option is
+  quoted as its orders are priced, commissions included. A zero quantity, reported for a position
+  closed today, is `PositionReport::Flat` (see Changed). With several accounts, the first account to hold an
+  instrument is kept and the others are dropped with a warning, never summed. For each account,
+  IB's latest report now wins; the snapshot used to keep the first one, which after a connection
+  drop could be a stale reply to an earlier failed call.
+
 ## [0.7.0] - 2026-09-30
 
 ### Added

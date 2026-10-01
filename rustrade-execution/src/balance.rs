@@ -65,6 +65,10 @@ pub struct MarginDetails {
 pub struct Balance {
     /// Gross holdings of the asset (`free + locked`). Unaffected by any borrowing — debt is
     /// carried separately in [`Balance::margin`].
+    ///
+    /// Exception: a venue whose margin is account-level (Alpaca, IBKR) reports only the account's
+    /// cash here, which is negative while the account borrows, with `margin` left `None`. See
+    /// the client's `account_snapshot`.
     pub total: Decimal,
     /// Portion of `total` available to trade (not reserved against resting orders).
     pub free: Decimal,
