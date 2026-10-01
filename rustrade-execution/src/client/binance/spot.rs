@@ -35,11 +35,11 @@ use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
     MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, RateLimitTracker,
-    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, classify_order_kind_tif,
+    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UserDataFrame, classify_order_kind_tif,
     classify_rest_query_error, classify_ws_order_error, convert_execution_report,
     convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event,
-    is_duplicate, new_dedup_cache, recovered_order_totals, response_decode_error,
-    rest_call_with_retry,
+    frame_excerpt, is_duplicate, new_dedup_cache, parse_user_data_frame, recovered_order_totals,
+    response_decode_error, rest_call_with_retry,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
@@ -1908,34 +1908,42 @@ fn convert_my_trade(
 ///
 /// Returns `true` if the stream should be considered terminated (requires reconnect).
 ///
+/// # Frame shape
+///
+/// The subscription is WS-API `userDataStream.subscribe.signature`, so each pushed event arrives
+/// wrapped as `{ "subscriptionId", "event": { "e", .. } }`, and binance-sdk passes the frame on
+/// unchanged; [`parse_user_data_frame`] unwraps it, as for margin. RPC responses (the subscribe
+/// acknowledgement) are ignored. A frame of any other shape is logged at `warn` and ignored, so a
+/// change in delivery cannot drop events silently. Unknown event types inside the envelope are
+/// ignored at `trace`.
+///
 /// # Hot path
 ///
 /// Reads the `e` discriminator from a borrowed view of the frame, then deserializes **only**
-/// the matched variant straight from the same slice — avoiding the full `serde_json::Value`
-/// DOM that `UserDataStreamEventsResponse`'s `#[serde(try_from = "Value")]` would build for
-/// every inbound frame (it parses the whole payload into a `Value`, then re-parses the matched
-/// variant out of it). Mirrors `convert_margin_user_data_events`. Unrecognized or unparseable
-/// frames (subscribe acks, WS-API metadata, future event types) are ignored, never mis-parsed.
+/// the matched variant straight from the inner event slice — avoiding the full
+/// `serde_json::Value` DOM that `UserDataStreamEventsResponse`'s `#[serde(try_from = "Value")]`
+/// would build for every inbound frame.
 fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -> bool {
-    // Discriminator-only view: reads the `e` event-type tag without materialising the payload.
-    // The BinanceSpot user-data frame is the bare event (`{ "e": "...", ... }`) — no envelope,
-    // unlike the margin WS-API path. Tag values match `UserDataStreamEventsResponse`'s
-    // `try_from = "Value"` arms (binance-sdk).
-    #[derive(Deserialize)]
-    struct EventTag<'a> {
-        #[serde(borrow, default)]
-        e: Option<&'a str>,
-    }
-
-    let event_type = serde_json::from_str::<EventTag<'_>>(frame)
-        .ok()
-        .and_then(|tag| tag.e)
-        .unwrap_or_default();
+    let (event_type, event) = match parse_user_data_frame(frame) {
+        UserDataFrame::Response => return false,
+        UserDataFrame::Event {
+            event_type, event, ..
+        } => (event_type, event),
+        UserDataFrame::Unrecognised => {
+            warn!(
+                frame = frame_excerpt(frame),
+                "BinanceSpot WS: unrecognised user-data frame (neither a response nor an event \
+                 envelope), ignoring"
+            );
+            return false;
+        }
+    };
+    // Tag values match `UserDataStreamEventsResponse`'s `try_from = "Value"` arms (binance-sdk).
     match event_type {
         "executionReport" => {
-            // Single typed pass straight from the raw frame — no intermediate DOM, and only the
+            // Single typed pass straight from the inner event — no intermediate DOM, and only the
             // matched branch deserializes its payload. The SDK struct ignores the unknown `e` tag.
-            match serde_json::from_str::<binance_sdk::spot::websocket_api::ExecutionReport>(frame) {
+            match serde_json::from_str::<binance_sdk::spot::websocket_api::ExecutionReport>(event) {
                 Ok(report) => {
                     convert_execution_report(&report, ExchangeId::BinanceSpot, buf);
                 }
@@ -1947,7 +1955,7 @@ fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -
         }
         "outboundAccountPosition" => {
             match serde_json::from_str::<binance_sdk::spot::websocket_api::OutboundAccountPosition>(
-                frame,
+                event,
             ) {
                 Ok(position) => convert_account_position(position, buf),
                 Err(e) => {
@@ -2627,13 +2635,15 @@ mod tests {
         delivered
     }
 
-    const WS_NEW: &str = r#"{"e":"executionReport","s":"BTCUSDT","i":12345,"c":"client-1",
-        "x":"NEW","X":"NEW","S":"BUY","o":"LIMIT","f":"GTC","q":"2","p":"100","z":"0",
-        "T":1700000000000}"#;
+    // Wrapped as the WS-API subscription delivers them: `{ subscriptionId, event }`.
+    const WS_NEW: &str = r#"{"subscriptionId":0,"event":{"e":"executionReport","s":"BTCUSDT",
+        "i":12345,"c":"client-1","x":"NEW","X":"NEW","S":"BUY","o":"LIMIT","f":"GTC","q":"2",
+        "p":"100","z":"0","T":1700000000000}}"#;
 
-    const WS_PARTIAL_FILL: &str = r#"{"e":"executionReport","s":"BTCUSDT","i":12345,"c":"client-1",
-        "x":"TRADE","X":"PARTIALLY_FILLED","S":"BUY","o":"LIMIT","f":"GTC","q":"2","p":"100",
-        "z":"1","l":"1","L":"100","t":555,"n":"0.1","N":"USDT","T":1700000001000}"#;
+    const WS_PARTIAL_FILL: &str = r#"{"subscriptionId":0,"event":{"e":"executionReport",
+        "s":"BTCUSDT","i":12345,"c":"client-1","x":"TRADE","X":"PARTIALLY_FILLED","S":"BUY",
+        "o":"LIMIT","f":"GTC","q":"2","p":"100","z":"1","l":"1","L":"100","t":555,"n":"0.1",
+        "N":"USDT","T":1700000001000}}"#;
 
     /// A fill's order snapshot must survive the dedup gate that sits between the converter and the
     /// consumer.
@@ -3999,8 +4009,8 @@ mod tests {
     /// Build a raw user-data wire frame from an SDK event struct.
     ///
     /// The SDK event structs carry only the `E` (event time) field, not the lowercase `e`
-    /// discriminator, so the tag must be injected to reproduce the on-the-wire shape
-    /// (`{ "e": "<type>", .. }`) that `convert_user_data_events` reads.
+    /// discriminator, so the tag must be injected. The event is then wrapped as the WS-API
+    /// subscription delivers it, `{ "subscriptionId": 0, "event": { "e": "<type>", .. } }`.
     fn user_data_frame<T: serde::Serialize>(event_type: &str, event: &T) -> String {
         let mut value = serde_json::to_value(event).expect("event serializes to Value");
         value
@@ -4010,7 +4020,7 @@ mod tests {
                 "e".to_string(),
                 serde_json::Value::String(event_type.to_string()),
             );
-        serde_json::to_string(&value).expect("frame serializes")
+        serde_json::json!({ "subscriptionId": 0, "event": value }).to_string()
     }
 
     #[test]
@@ -4074,8 +4084,9 @@ mod tests {
 
     #[test]
     fn test_convert_user_data_events_stream_terminated_signals_reconnect() {
-        // No payload struct — the terminal frame is just the bare discriminator.
-        let frame = r#"{"e":"eventStreamTerminated","E":1700000000000}"#;
+        // No payload struct — the terminal event is just the discriminator and its time.
+        let frame =
+            r#"{"subscriptionId":0,"event":{"e":"eventStreamTerminated","E":1700000000000}}"#;
         let mut buf = Vec::new();
         let terminated = convert_user_data_events(frame, &mut buf);
         assert!(
@@ -4092,11 +4103,37 @@ mod tests {
     fn test_convert_user_data_events_unknown_event_ignored() {
         // listStatus / externalLockUpdate / future event types: harmless fall-through —
         // ignored, no events pushed, stream not terminated.
-        let frame = r#"{"e":"listStatus","E":1700000000000,"s":"BTCUSDT"}"#;
+        let frame =
+            r#"{"subscriptionId":0,"event":{"e":"listStatus","E":1700000000000,"s":"BTCUSDT"}}"#;
         let mut buf = Vec::new();
         let terminated = convert_user_data_events(frame, &mut buf);
         assert!(!terminated, "unknown event must not signal termination");
         assert!(buf.is_empty(), "unknown event should push no events");
+    }
+
+    /// Regression: the WS-API subscription wraps every event, and binance-sdk passes the frame on
+    /// unchanged. The converter used to read `e` from the top level, found none in the envelope,
+    /// and dropped every event without a log. An enveloped fill must reach the buffer, and a frame
+    /// that is not an envelope must not be read as one.
+    #[test]
+    fn test_convert_user_data_events_reads_the_ws_api_envelope() {
+        let fill = r#"{"subscriptionId":3,"event":{"e":"executionReport","E":1700000001000,
+            "s":"BTCUSDT","c":"client-1","S":"SELL","o":"MARKET","f":"GTC","q":"0.5","p":"0",
+            "x":"TRADE","X":"FILLED","i":777,"l":"0.5","z":"0.5","L":"40000","n":"0.02",
+            "N":"USDT","T":1700000001000,"t":888}}"#;
+        let mut buf = Vec::new();
+        assert!(!convert_user_data_events(fill, &mut buf));
+        assert!(
+            buf.iter()
+                .any(|ev| matches!(ev.kind, AccountEventKind::Trade(_))),
+            "the enveloped fill must produce its trade, got: {buf:?}"
+        );
+
+        // The pre-fix fixture shape: a bare event with no envelope is not an event frame.
+        let bare = r#"{"e":"executionReport","s":"BTCUSDT","i":777,"x":"NEW","X":"NEW"}"#;
+        buf.clear();
+        assert!(!convert_user_data_events(bare, &mut buf));
+        assert!(buf.is_empty());
     }
 
     #[test]

@@ -51,11 +51,11 @@ use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
     MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, RateLimitTracker,
-    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, classify_order_kind_tif,
+    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UserDataFrame, classify_order_kind_tif,
     classify_rest_order_error, classify_rest_query_error, convert_execution_report,
     convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event,
-    is_duplicate, new_dedup_cache, recovered_order_totals, response_decode_error,
-    rest_call_with_retry,
+    frame_excerpt, is_duplicate, new_dedup_cache, parse_user_data_frame, recovered_order_totals,
+    response_decode_error, rest_call_with_retry,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, InstrumentBalanceUpdate,
@@ -1580,58 +1580,23 @@ fn convert_margin_user_data_events_with(
         &mut Vec<UnindexedAccountEvent>,
     ),
 ) -> bool {
-    use serde_json::value::RawValue;
-
-    // Borrowed envelope — avoids building a full `serde_json::Value` DOM for every inbound frame
-    // (hot path). RPC responses (subscribe ack, errors) carry a top-level `id`; pushed user-data
-    // events are wrapped as `{ subscriptionId, event: { e, .. } }`. The inner `event` is kept as an
-    // un-parsed raw slice so only the matched branch below pays for a single typed pass. The
-    // `subscriptionId` (present on pushed frames) is recovered as a plain int for isolated routing.
-    #[derive(Deserialize)]
-    struct Envelope<'a> {
-        #[serde(borrow, default)]
-        id: Option<&'a RawValue>,
-        #[serde(borrow, default)]
-        event: Option<&'a RawValue>,
-        #[serde(rename = "subscriptionId", default)]
-        subscription_id: Option<i64>,
-    }
-    // Discriminator-only view of the inner event: reads `e` without materialising the payload.
-    #[derive(Deserialize)]
-    struct EventTag<'a> {
-        #[serde(borrow, default)]
-        e: Option<&'a str>,
-    }
-
-    let envelope = match serde_json::from_str::<Envelope<'_>>(frame) {
-        Ok(env) => env,
-        Err(e) => {
-            trace!(error = %e, "BinanceMargin WS: skipped unparseable frame");
+    let (subscription_id, event_type, event_raw) = match parse_user_data_frame(frame) {
+        // RPC responses (subscribe ack, errors): not a user-data event.
+        UserDataFrame::Response => return false,
+        UserDataFrame::Event {
+            subscription_id,
+            event_type,
+            event,
+        } => (subscription_id, event_type, event),
+        UserDataFrame::Unrecognised => {
+            warn!(
+                frame = frame_excerpt(frame),
+                "BinanceMargin WS: unrecognised user-data frame (neither a response nor an event \
+                 envelope), ignoring"
+            );
             return false;
         }
     };
-    // RPC responses (subscribe ack, errors) carry a top-level "id"; not a user-data event.
-    if envelope.id.is_some() {
-        return false;
-    }
-    // Pushed user-data events are wrapped: { subscriptionId, event: { e: "...", ... } }.
-    let Some(event) = envelope.event else {
-        trace!("BinanceMargin WS: ignoring frame without `event` or `id`");
-        return false;
-    };
-    let subscription_id = envelope.subscription_id;
-    let event_raw = event.get();
-    // INTENTIONAL two-pass discriminator (do NOT "optimize" away): this cheap pass reads only the
-    // `e` tag (Binance places it in the ~30B prefix) so the expensive typed deserialization below
-    // runs once, on the matched branch only. The two passes touch the same borrowed slice — no DOM,
-    // no extra allocation — and the prefix scan is ~5 orders of magnitude cheaper than the 1–50ms
-    // network round-trip per frame. The tempting single-pass alternatives are both worse: a manual
-    // byte-scan for `"e"` is fragile (whitespace/escaping/key-order), and mirror structs that parse
-    // tag + payload together drift against the SDK types. Keep the typed two-pass.
-    let event_type = serde_json::from_str::<EventTag<'_>>(event_raw)
-        .ok()
-        .and_then(|tag| tag.e)
-        .unwrap_or_default();
     match event_type {
         "executionReport" => {
             // Single typed pass straight from the raw inner slice — no intermediate DOM, and only

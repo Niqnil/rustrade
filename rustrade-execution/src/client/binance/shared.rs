@@ -147,6 +147,85 @@ pub(crate) const DEFAULT_RATE_LIMIT_DELAY_SECS: u64 = 10;
 pub(crate) const MAX_RATE_LIMIT_RETRIES: u32 = 3;
 
 // ---------------------------------------------------------------------------
+// WS-API user-data frames
+// ---------------------------------------------------------------------------
+
+/// A text frame from a WS-API user-data subscription (`userDataStream.subscribe*`), as
+/// binance-sdk hands it to a `subscribe_on_ws_events` callback: the raw frame, unchanged.
+#[derive(Debug, PartialEq)]
+pub(crate) enum UserDataFrame<'a> {
+    /// An RPC response, such as the subscribe acknowledgement: it carries a top-level `id`.
+    Response,
+    /// A pushed event, which Binance wraps as `{ "subscriptionId", "event": { "e", .. } }`.
+    Event {
+        /// The subscription the event belongs to; it routes isolated-margin events.
+        subscription_id: Option<i64>,
+        /// The inner event's `e` tag; empty when it has none.
+        event_type: &'a str,
+        /// The inner event, unparsed, for the matched branch's one typed pass.
+        event: &'a str,
+    },
+    /// Neither: a frame shape this client does not know. Its caller logs it, since a change in
+    /// how Binance delivers events would otherwise drop every event without a trace.
+    Unrecognised,
+}
+
+/// Split a WS-API user-data frame into a [`UserDataFrame`].
+///
+/// Reads borrowed views only, with no `serde_json::Value` DOM: this runs on every inbound frame.
+/// The inner event stays an unparsed slice, and only its `e` tag is read here.
+pub(crate) fn parse_user_data_frame(frame: &str) -> UserDataFrame<'_> {
+    use serde_json::value::RawValue;
+
+    #[derive(serde::Deserialize)]
+    struct Envelope<'a> {
+        #[serde(borrow, default)]
+        id: Option<&'a RawValue>,
+        #[serde(borrow, default)]
+        event: Option<&'a RawValue>,
+        #[serde(rename = "subscriptionId", default)]
+        subscription_id: Option<i64>,
+    }
+    // Discriminator-only view of the inner event: reads `e` without materialising the payload.
+    // Binance places `e` first, so this is cheap next to the typed pass the caller then makes on
+    // the matched branch only. A manual byte scan for `"e"` would be fragile to whitespace,
+    // escaping and key order, so keep the typed two-pass read.
+    #[derive(serde::Deserialize)]
+    struct EventTag<'a> {
+        #[serde(borrow, default)]
+        e: Option<&'a str>,
+    }
+
+    let Ok(envelope) = serde_json::from_str::<Envelope<'_>>(frame) else {
+        return UserDataFrame::Unrecognised;
+    };
+    if envelope.id.is_some() {
+        return UserDataFrame::Response;
+    }
+    let Some(event) = envelope.event else {
+        return UserDataFrame::Unrecognised;
+    };
+    let event = event.get();
+    let event_type = serde_json::from_str::<EventTag<'_>>(event)
+        .ok()
+        .and_then(|tag| tag.e)
+        .unwrap_or_default();
+    UserDataFrame::Event {
+        subscription_id: envelope.subscription_id,
+        event_type,
+        event,
+    }
+}
+
+/// The first 200 characters of a frame, for a log line about it.
+pub(crate) fn frame_excerpt(frame: &str) -> &str {
+    frame
+        .char_indices()
+        .nth(200)
+        .map_or(frame, |(end, _)| &frame[..end])
+}
+
+// ---------------------------------------------------------------------------
 // Rate limit tracker
 // ---------------------------------------------------------------------------
 
@@ -1889,6 +1968,43 @@ fn order_error_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_user_data_frame_splits_responses_events_and_unknown_shapes() {
+        assert_eq!(
+            parse_user_data_frame(r#"{"id":"abc","status":200,"result":{"subscriptionId":0}}"#),
+            UserDataFrame::Response
+        );
+        assert_eq!(
+            parse_user_data_frame(
+                r#"{"subscriptionId":4,"event":{"e":"outboundAccountPosition","E":1}}"#
+            ),
+            UserDataFrame::Event {
+                subscription_id: Some(4),
+                event_type: "outboundAccountPosition",
+                event: r#"{"e":"outboundAccountPosition","E":1}"#,
+            }
+        );
+        // An envelope whose event has no `e` is still an event, with an empty type.
+        assert!(matches!(
+            parse_user_data_frame(r#"{"subscriptionId":4,"event":{"E":1}}"#),
+            UserDataFrame::Event { event_type: "", .. }
+        ));
+        for frame in [r#"{"e":"executionReport","i":1}"#, "not json", "[]"] {
+            assert_eq!(
+                parse_user_data_frame(frame),
+                UserDataFrame::Unrecognised,
+                "{frame}"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_excerpt_cuts_at_200_characters_on_a_char_boundary() {
+        assert_eq!(frame_excerpt("short"), "short");
+        let long = "é".repeat(300);
+        assert_eq!(frame_excerpt(&long).chars().count(), 200);
+    }
 
     /// A `myTrades` execution reduced to the three fields recovery reads.
     #[derive(Debug, Clone, Copy)]
