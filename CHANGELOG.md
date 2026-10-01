@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A simulated venue could mint an `OrderId` its seeded account state already used**
+  (`rustrade-execution`). `SimulatedVenue` counted its order ids from zero whatever its
+  `initial_state` held, so an order seeded with id `3` shared it with the fourth order the venue
+  minted, and anything keyed on the id alone, such as a position under `OmsMode::Hedging`, merged
+  the two. Minted ids now start one past the highest decimal id among the seeded open, cancelled
+  and expired orders. A venue seeded with no decimal id counts from zero as before, and
+  `order_sequence` still counts the orders booked. `OrderId`'s rustdoc now states that ids are
+  unique per venue, not across the venues of a multi-exchange backtest, so the key is
+  `(exchange, OrderId)`.
+
 ## [0.8.0] - 2026-10-01
 
 ### Added

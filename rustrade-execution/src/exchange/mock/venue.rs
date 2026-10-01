@@ -309,6 +309,13 @@ pub struct SimulatedVenue {
     /// Counts every order this venue booked, including those that retired without trading, so it
     /// is also what [`order_sequence`](Self::order_sequence) reports.
     order_sequence: u64,
+    /// The `OrderId` the first booked order is minted with; each later one counts up from it.
+    ///
+    /// Zero, unless the seeded account state already carries a decimal id, in which case it is one
+    /// past the highest such id, so no minted id can repeat a seeded one. A seeded id that is not
+    /// decimal can never equal a minted one, so it is left out. `u128` so that one past a seeded
+    /// `u64::MAX`, and every id counted up from it, stays representable.
+    order_id_start: u128,
     /// Monotone `TradeId` source, independent of [`order_sequence`](Self::order_sequence).
     ///
     /// Separate because one order can print more than once — a taker the book fills in part rests
@@ -358,14 +365,17 @@ impl SimulatedVenue {
         instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
         regime: VenueRegime,
     ) -> Self {
+        let account = AccountState::from(config.initial_state.clone());
+        let order_id_start = first_unseeded_order_id(&account);
         Self {
             exchange: config.mocked_exchange,
             fee_model: config.fee_model,
             fill_model: config.fill_model,
             instruments,
-            account: AccountState::from(config.initial_state.clone()),
+            account,
             market: FnvHashMap::default(),
             order_sequence: 0,
+            order_id_start,
             trade_sequence: 0,
             time_exchange_latest: Default::default(),
             regime,
@@ -734,7 +744,11 @@ impl SimulatedVenue {
         self.market.get(instrument)
     }
 
-    /// Number of orders this venue has booked, and so the next `OrderId` it will mint.
+    /// Number of orders this venue has booked.
+    ///
+    /// Also how far the next `OrderId` is past the first one this venue minted, which is `0` unless
+    /// the seeded account state carried a decimal id: then the first is one past the highest such
+    /// id, so a minted id never repeats a seeded one.
     ///
     /// Counts every order it gave an id to, including those that retired without ever trading. It
     /// is **not** a count of trades — one order can print more than once, and trade ids are minted
@@ -1798,7 +1812,7 @@ impl SimulatedVenue {
     fn order_id_sequence_fetch_add(&mut self) -> OrderId {
         let sequence = self.order_sequence;
         self.order_sequence += 1;
-        OrderId(sequence.to_smolstr())
+        OrderId((self.order_id_start + u128::from(sequence)).to_smolstr())
     }
 
     /// Mints the next `TradeId`, which no other trade from this venue instance carries.
@@ -2157,6 +2171,28 @@ impl Settlement {
             reserved: remainder.amount,
         }
     }
+}
+
+/// The id a venue seeded with `account` mints its first order with: one past the highest decimal
+/// `OrderId` among the seeded orders, or `0` if none carries one.
+///
+/// Open, cancelled and expired orders all count. Each was given its id by the venue the state
+/// describes, so reusing one would make two orders indistinguishable to anything keyed on it.
+fn first_unseeded_order_id(account: &AccountState) -> u128 {
+    let open = account
+        .orders_open()
+        .filter_map(|order| match &order.state.id {
+            VenueOrderId::Assigned(id) => Some(id),
+            VenueOrderId::ClientAssigned => None,
+        });
+    let cancelled = account.orders_cancelled().map(|order| &order.state.id);
+    let expired = account.orders_expired().map(|order| &order.state.id);
+
+    open.chain(cancelled)
+        .chain(expired)
+        .filter_map(|id| id.0.parse::<u64>().ok())
+        .max()
+        .map_or(0, |highest| u128::from(highest) + 1)
 }
 
 #[cfg(test)]
@@ -3195,6 +3231,72 @@ mod tests {
             cids, expected,
             "orders on one instrument must be ordered by a key no two of them share"
         );
+    }
+
+    /// A venue seeded with orders carrying decimal ids mints its own past the highest of them, so
+    /// no minted id repeats a seeded one. Anything keyed on the id alone — a position under
+    /// `OmsMode::Hedging`, say — would otherwise merge the two orders.
+    #[test]
+    fn minted_order_ids_start_past_the_highest_decimal_id_seeded() {
+        let resting = |cid: &str, id: &str| UnindexedOrder {
+            key: OrderKey {
+                exchange: EXCHANGE,
+                instrument: instrument_name(),
+                strategy: StrategyId::new("test"),
+                cid: ClientOrderId::new(cid),
+            },
+            side: Side::Buy,
+            price: Some(d("50000")),
+            quantity: d("1"),
+            kind: OrderKind::Limit,
+            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+            state: OrderState::active(Open {
+                id: VenueOrderId::Assigned(OrderId::new(id)),
+                time_exchange: Default::default(),
+                filled_quantity: Decimal::ZERO,
+            }),
+        };
+
+        let mut config = spot_config("10", "10000000", FeeModelConfig::default());
+        config.initial_state.instruments = vec![InstrumentAccountSnapshot {
+            instrument: instrument_name(),
+            // A non-decimal id can never equal a minted one, however it sorts.
+            orders: vec![resting("a", "3"), resting("b", "1"), resting("c", "zzz")],
+            orders_complete: true,
+            position: PositionReport::Unreported,
+            isolated: None,
+        }];
+        let mut venue = SimulatedVenue::new(&config, spot_instruments());
+
+        assert_eq!(venue.order_id_sequence_fetch_add(), OrderId::new("4"));
+        assert_eq!(venue.order_id_sequence_fetch_add(), OrderId::new("5"));
+        // Still a count of the orders this venue booked, not an id.
+        assert_eq!(venue.order_sequence(), 2);
+    }
+
+    /// With nothing seeded, or nothing decimal, ids count from zero as they always have.
+    #[test]
+    fn minted_order_ids_start_at_zero_when_no_decimal_id_is_seeded() {
+        let config = spot_config("10", "10000000", FeeModelConfig::default());
+        let mut venue = SimulatedVenue::new(&config, spot_instruments());
+
+        assert_eq!(venue.order_id_sequence_fetch_add(), OrderId::new("0"));
+    }
+
+    /// A seeded `u64::MAX` leaves the next id one past it, rather than overflowing.
+    #[test]
+    fn a_seeded_u64_max_order_id_does_not_overflow_the_next() {
+        let mut account = AccountState::from(
+            spot_config("10", "10000000", FeeModelConfig::default()).initial_state,
+        );
+        let mut seeded = seeded_part_filled("48000", "1", "0");
+        seeded.state.id = VenueOrderId::Assigned(OrderId::new(u64::MAX.to_string()));
+        assert!(
+            account.orders_mut().insert(seeded, None).is_none(),
+            "an empty book displaces nothing"
+        );
+
+        assert_eq!(first_unseeded_order_id(&account), u128::from(u64::MAX) + 1);
     }
 
     /// A [`RequestPriced`](VenueRegime::RequestPriced) venue rejects a limit order on its kind,

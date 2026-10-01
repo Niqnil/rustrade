@@ -66,6 +66,18 @@ impl Default for ClientOrderId<SmolStr> {
     }
 }
 
+/// A venue's own identifier for one order, carried through opaquely.
+///
+/// # Uniqueness is the venue's to define, and is not global
+///
+/// Each venue mints its own ids, so two venues can issue the same one: the key that identifies an
+/// order is `(exchange, OrderId)`, not the id alone. A consumer that keys on the id by itself will
+/// merge unrelated orders from different venues.
+///
+/// [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue) mints ids unique within one venue
+/// instance for its lifetime — and, because each venue counts from zero, **not** across the
+/// several a multi-exchange backtest holds. That is the same scoping a real venue gives. Within
+/// one venue, a minted id never repeats a decimal id seeded through its initial account state.
 #[derive(
     Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Display, From,
 )]
