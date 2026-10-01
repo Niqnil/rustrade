@@ -231,7 +231,8 @@ impl ContractConfig {
     ///   — `right` is present but not one of `C`/`CALL`/`P`/`PUT` (case-insensitive).
     ///
     /// A security type added here must also be added to `security_types_of`, or every entry naming
-    /// it fails `validate_config`; `security_types_cover_every_type_to_contract_builds` checks it.
+    /// it fails `validate_config`. Nothing enforces that: add the type to
+    /// `security_types_cover_every_type_to_contract_builds` too.
     fn to_contract(&self) -> Result<ibapi::contracts::Contract, contract::ContractConfigError> {
         use contract::ContractConfigError as E;
         Ok(match self.security_type.as_str() {
@@ -2862,7 +2863,18 @@ mod contract_config_tests {
             .flat_map(security_types_of)
             .copied()
             .collect::<Vec<_>>();
-        // Every type `to_contract` builds; `BOND` stands for one it does not.
+
+        // Every type listed must be one `to_contract` can build.
+        for security_type in &listed {
+            assert!(
+                full_config(security_type).to_contract().is_ok(),
+                "{security_type}"
+            );
+        }
+
+        // Every type `to_contract` builds must be listed. A `match` cannot be enumerated, so this
+        // names them by hand, and a type added to `to_contract` must be added here as well.
+        // `BOND` stands for a type it does not build.
         for security_type in ["STK", "CASH", "FUT", "OPT", "BOND"] {
             assert_eq!(
                 full_config(security_type).to_contract().is_ok(),
@@ -2870,6 +2882,22 @@ mod contract_config_tests {
                 "{security_type}"
             );
         }
+    }
+
+    /// A kind this client cannot trade is named as such, rather than as a mismatch with no
+    /// security type to expect.
+    #[test]
+    fn validate_config_names_a_kind_this_client_cannot_trade() {
+        let name = InstrumentNameExchange::new("X");
+        let instruments = [ClientInstrument::new(
+            &name,
+            InstrumentKindDiscriminant::Perpetual,
+        )];
+        let config = ibkr_config(vec![named("X", "STK")]);
+
+        let error = IbkrClient::validate_config(&config, &instruments).unwrap_err();
+        assert!(error.contains("perpetual"), "{error}");
+        assert!(error.contains("cannot trade"), "{error}");
     }
 
     /// A contract can also be registered later with `register_contract`, so neither side of an
