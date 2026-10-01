@@ -35,6 +35,15 @@ pub trait InFlightRequestRecorder<ExchangeKey = ExchangeIndex, InstrumentKey = I
     fn record_in_flight_open(&mut self, request: &OrderRequestOpen<ExchangeKey, InstrumentKey>);
 }
 
+/// Records into the request's instrument state.
+///
+/// # Panics
+/// Each method panics if the request's instrument is not tracked, as
+/// [`InstrumentStates::instrument_index_mut`](crate::engine::state::instrument::InstrumentStates::instrument_index_mut)
+/// does. The `Engine` never records one: it rejects a request for an untracked instrument before
+/// sending it (see [`TracksInstrument`](crate::engine::state::TracksInstrument)). A caller that
+/// sends through [`SendRequests`](crate::engine::action::send_requests::SendRequests) and records
+/// here itself must check first.
 impl<GlobalData, InstrumentData> InFlightRequestRecorder<ExchangeIndex, InstrumentIndex>
     for EngineState<GlobalData, InstrumentData>
 where

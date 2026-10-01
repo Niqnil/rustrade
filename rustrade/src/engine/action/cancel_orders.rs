@@ -1,6 +1,6 @@
 use crate::engine::{
     Engine,
-    action::send_requests::{SendRequests, SendRequestsOutput},
+    action::send_requests::SendRequestsOutput,
     execution_tx::ExecutionTxMap,
     state::{
         EngineState,
@@ -44,20 +44,15 @@ where
         &mut self,
         filter: &InstrumentFilter<ExchangeIndex, AssetIndex, InstrumentIndex>,
     ) -> SendRequestsOutput<RequestCancel, ExchangeIndex, InstrumentIndex> {
-        let requests = self
+        let requests: Vec<_> = self
             .state
             .instruments
             .orders(filter)
-            .flat_map(|state| state.orders().filter_map(Order::to_request_cancel));
+            .flat_map(|state| state.orders().filter_map(Order::to_request_cancel))
+            .collect();
 
         // Bypass risk checks...
 
-        // Send order requests
-        let cancels = self.send_requests(requests);
-
-        // Record in flight order requests
-        self.state.record_in_flight_cancels(cancels.sent_iter());
-
-        cancels
+        self.send_cancel_requests(requests)
     }
 }

@@ -1,10 +1,10 @@
 use crate::{
     engine::{
         Engine,
-        action::send_requests::{SendCancelsAndOpensOutput, SendRequests},
+        action::send_requests::SendCancelsAndOpensOutput,
         execution_tx::ExecutionTxMap,
         state::{
-            MarketSnapshotSource, instrument::filter::InstrumentFilter,
+            MarketSnapshotSource, TracksInstrument, instrument::filter::InstrumentFilter,
             order::in_flight_recorder::InFlightRequestRecorder,
         },
     },
@@ -41,8 +41,9 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk, ExchangeKey, AssetKey, Instrume
     ClosePositions<ExchangeKey, AssetKey, InstrumentKey>
     for Engine<Clock, State, ExecutionTxs, Strategy, Risk>
 where
-    State:
-        InFlightRequestRecorder<ExchangeKey, InstrumentKey> + MarketSnapshotSource<InstrumentKey>,
+    State: InFlightRequestRecorder<ExchangeKey, InstrumentKey>
+        + MarketSnapshotSource<InstrumentKey>
+        + TracksInstrument<InstrumentKey>,
     ExecutionTxs: ExecutionTxMap<ExchangeKey, InstrumentKey>,
     Strategy: ClosePositionsStrategy<ExchangeKey, AssetKey, InstrumentKey, State = State>,
     ExchangeKey: Debug + Clone,
@@ -55,20 +56,18 @@ where
         // Generate orders
         let (cancels, opens) = self.strategy.close_positions_requests(&self.state, filter);
 
+        // Collect both Iterators, since the strategy may have borrowed the state to build them,
+        // and sending records in-flight requests on it. An empty Vec does not allocate.
+        let cancels: Vec<_> = cancels.into_iter().collect();
+        let opens: Vec<_> = opens.into_iter().collect();
+
         // Bypass risk checks...
 
         // Send order requests, stamping each open with the market this state holds now -- see
         // `MarketSnapshotSource`. A close is an ordinary open request to the venue, and a simulated
         // one needs a price just as much as an entry does.
-        let cancels = self.send_requests(cancels);
-        let opens = self.send_requests(opens.into_iter().map(|mut open| {
-            open.state.market = self.state.market_snapshot(&open.key.instrument);
-            open
-        }));
-
-        // Record in flight order requests
-        self.state.record_in_flight_cancels(cancels.sent_iter());
-        self.state.record_in_flight_opens(opens.sent_iter());
+        let cancels = self.send_cancel_requests(cancels);
+        let opens = self.send_open_requests(opens);
 
         SendCancelsAndOpensOutput::new(cancels, opens)
     }

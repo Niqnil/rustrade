@@ -6,14 +6,13 @@ use crate::{
             cancel_orders::CancelOrders,
             close_positions::ClosePositions,
             generate_algo_orders::{GenerateAlgoOrders, GenerateAlgoOrdersOutput},
-            send_requests::SendRequests,
         },
         audit::{AuditTick, Auditor, EngineAudit, ProcessAudit, context::EngineContext},
         clock::EngineClock,
         command::Command,
         execution_tx::ExecutionTxMap,
         state::{
-            EngineState, MarketSnapshotSource,
+            EngineState,
             connectivity::UntrackedExchange,
             instrument::{OptionSplitPlan, data::InstrumentDataState},
             order::{Orders, in_flight_recorder::InFlightRequestRecorder, manager::OrderManager},
@@ -321,21 +320,14 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                     ?requests,
                     "Engine actioning user Command::SendCancelRequests"
                 );
-                let output = self.send_requests(requests.clone());
-                self.state.record_in_flight_cancels(output.sent_iter());
-                ActionOutput::CancelOrders(output)
+                ActionOutput::CancelOrders(self.send_cancel_requests(requests.clone()))
             }
             Command::SendOpenRequests(requests) => {
                 info!(?requests, "Engine actioning user Command::SendOpenRequests");
                 // Stamped like any other open the Engine emits -- a user command is no less a
                 // decision point than an algo order, and a simulated venue needs a price for it
                 // just the same. See `MarketSnapshotSource`.
-                let output = self.send_requests(requests.iter().cloned().map(|mut open| {
-                    open.state.market = self.state.market_snapshot(&open.key.instrument);
-                    open
-                }));
-                self.state.record_in_flight_opens(output.sent_iter());
-                ActionOutput::OpenOrders(output)
+                ActionOutput::OpenOrders(self.send_open_requests(requests.clone()))
             }
             Command::ClosePositions(filter) => {
                 info!(?filter, "Engine actioning user Command::ClosePositions");
@@ -571,10 +563,10 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             .orders()
             .filter_map(Order::to_request_cancel)
             .collect();
-        let cancels = self.send_requests(cancel_requests);
-        self.state.record_in_flight_cancels(cancels.sent_iter());
+        // A cancel that fails to send is logged where it fails, and settlement goes ahead anyway.
+        let _cancels = self.send_cancel_requests(cancel_requests);
 
-        // Re-borrow after send_requests (which takes &self for execution_txs).
+        // Re-borrow after sending (which needs all of `self`).
         let instrument_state = self.state.instruments.instrument_index_mut(key);
 
         // Steps 4–5: Synthesise settlement fills only if positions are open.
