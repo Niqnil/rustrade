@@ -50,12 +50,13 @@
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
-    MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, RateLimitTracker,
-    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UserDataFrame, classify_order_kind_tif,
-    classify_rest_order_error, classify_rest_query_error, convert_execution_report,
-    convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event,
-    is_duplicate, log_unrecognised_frame, new_dedup_cache, parse_user_data_frame,
-    recovered_order_totals, response_decode_error, rest_call_with_retry, unrecovered_instruments,
+    MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, RateLimitTracker, RequestKind,
+    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UserDataFrame, WeightPool,
+    classify_order_kind_tif, classify_rest_order_error, classify_rest_query_error,
+    convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
+    dedup_key_from_event, is_duplicate, log_unrecognised_frame, new_dedup_cache,
+    parse_user_data_frame, recovered_order_totals, response_decode_error, rest_call_with_retry,
+    unrecovered_instruments,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, InstrumentBalanceUpdate,
@@ -374,6 +375,13 @@ impl BinanceMarginConfig {
 /// asset — call it at startup and refresh on demand (see [`account_stream`](Self::account_stream)'s
 /// cold-start note).
 ///
+/// # Rate limits
+/// Once a `/sapi` response reports at least 90% of the documented per-IP weight limit (12000 per
+/// minute) used, queries wait for the next minute, so the rest is left for orders and cancels,
+/// which never wait for it. A query can therefore take up to about a minute longer. The per-UID
+/// `/sapi` limit is not tracked. After Binance answers with a rate-limit error, every REST call
+/// waits out a cooldown.
+///
 /// # One client per engine (`ExchangeId`)
 /// All emitted events — cross and isolated alike — are stamped [`ExchangeId::BinanceMargin`], and
 /// the engine routes `AssetStates` / `ConnectivityStates` by `ExchangeId`. Running **two**
@@ -609,7 +617,7 @@ impl ExecutionClient for BinanceMargin {
             rest,
             rest_config,
             ws_config,
-            rate_limiter: Arc::new(RateLimitTracker::new()),
+            rate_limiter: Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
         }
     }
 
@@ -686,20 +694,21 @@ impl ExecutionClient for BinanceMargin {
             }
         };
 
-        let response = match rest_call_with_retry(&self.rest, &self.rate_limiter, |rest| {
-            let params = params.clone();
-            Box::pin(async move { rest.margin_account_new_order(params).await })
-        })
-        .await
-        {
-            Ok(response) => response,
-            Err(e) => {
-                return inactive(OrderState::inactive(classify_rest_order_error(
-                    &e,
-                    &instrument,
-                )));
-            }
-        };
+        let response =
+            match rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Order, |rest| {
+                let params = params.clone();
+                Box::pin(async move { rest.margin_account_new_order(params).await })
+            })
+            .await
+            {
+                Ok(response) => response,
+                Err(e) => {
+                    return inactive(OrderState::inactive(classify_rest_order_error(
+                        &e,
+                        &instrument,
+                    )));
+                }
+            };
 
         let data = match response.data().await {
             Ok(data) => data,
@@ -812,20 +821,21 @@ impl ExecutionClient for BinanceMargin {
             }
         };
 
-        let response = match rest_call_with_retry(&self.rest, &self.rate_limiter, |rest| {
-            let params = params.clone();
-            Box::pin(async move { rest.margin_account_cancel_order(params).await })
-        })
-        .await
-        {
-            Ok(response) => response,
-            Err(e) => {
-                return Some(UnindexedOrderResponseCancel {
-                    key,
-                    state: Err(classify_rest_order_error(&e, &instrument)),
-                });
-            }
-        };
+        let response =
+            match rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Order, |rest| {
+                let params = params.clone();
+                Box::pin(async move { rest.margin_account_cancel_order(params).await })
+            })
+            .await
+            {
+                Ok(response) => response,
+                Err(e) => {
+                    return Some(UnindexedOrderResponseCancel {
+                        key,
+                        state: Err(classify_rest_order_error(&e, &instrument)),
+                    });
+                }
+            };
 
         let data = match response.data().await {
             Ok(data) => data,
@@ -904,14 +914,15 @@ impl ExecutionClient for BinanceMargin {
         if self.config.is_isolated {
             return self.isolated_account_snapshot(instruments).await;
         }
-        let response = rest_call_with_retry(&self.rest, &self.rate_limiter, |rest| {
-            Box::pin(async move {
-                let params = QueryCrossMarginAccountDetailsParams::builder().build()?;
-                rest.query_cross_margin_account_details(params).await
+        let response =
+            rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+                Box::pin(async move {
+                    let params = QueryCrossMarginAccountDetailsParams::builder().build()?;
+                    rest.query_cross_margin_account_details(params).await
+                })
             })
-        })
-        .await
-        .map_err(|e| classify_rest_query_error(&e, None))?;
+            .await
+            .map_err(|e| classify_rest_query_error(&e, None))?;
 
         let account = response.data().await.map_err(response_decode_error)?;
 
@@ -975,14 +986,15 @@ impl ExecutionClient for BinanceMargin {
         if self.config.is_isolated {
             return Ok(Vec::new());
         }
-        let response = rest_call_with_retry(&self.rest, &self.rate_limiter, |rest| {
-            Box::pin(async move {
-                let params = QueryCrossMarginAccountDetailsParams::builder().build()?;
-                rest.query_cross_margin_account_details(params).await
+        let response =
+            rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+                Box::pin(async move {
+                    let params = QueryCrossMarginAccountDetailsParams::builder().build()?;
+                    rest.query_cross_margin_account_details(params).await
+                })
             })
-        })
-        .await
-        .map_err(|e| classify_rest_query_error(&e, None))?;
+            .await
+            .map_err(|e| classify_rest_query_error(&e, None))?;
 
         let account = response.data().await.map_err(response_decode_error)?;
 
@@ -1392,7 +1404,7 @@ async fn acquire_user_listen_token(
     // Cross sends no params; isolated scopes the token to one symbol. Built once and cloned per
     // retry attempt (the closure runs per attempt; mirrors `fetch_isolated_margin_account_info`).
     let query = build_listen_token_query(symbol);
-    let response = rest_call_with_retry(rest_config, rate_limiter, |cfg| {
+    let response = rest_call_with_retry(rest_config, rate_limiter, RequestKind::Query, |cfg| {
         let query = query.clone();
         Box::pin(async move {
             binance_sdk::common::utils::send_request::<UserListenTokenResponse>(
@@ -2702,7 +2714,7 @@ async fn fetch_margin_open_orders_for_instrument(
     // Convert once before the retry closure to avoid a String allocation on every retry.
     let symbol_str = instrument.name().to_string();
     let isolated = QueryMarginAccountsOpenOrdersIsIsolatedEnum::from_flag(is_isolated);
-    let response = rest_call_with_retry(&rest, &rate_limiter, |rest| {
+    let response = rest_call_with_retry(&rest, &rate_limiter, RequestKind::Query, |rest| {
         let sym = symbol_str.clone();
         let isolated = isolated.clone();
         Box::pin(async move {
@@ -2735,7 +2747,7 @@ async fn fetch_margin_all_open_orders(
     is_isolated: bool,
 ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError> {
     let isolated = QueryMarginAccountsOpenOrdersIsIsolatedEnum::from_flag(is_isolated);
-    let response = rest_call_with_retry(&rest, &rate_limiter, |rest| {
+    let response = rest_call_with_retry(&rest, &rate_limiter, RequestKind::Query, |rest| {
         let isolated = isolated.clone();
         Box::pin(async move {
             let params = QueryMarginAccountsOpenOrdersParams::builder()
@@ -2867,7 +2879,7 @@ async fn paginate_margin_my_trades(
     let mut next = MarginTradesQuery::first(from, now_ms);
     while let Some(query) = next {
         requests += 1;
-        let response = rest_call_with_retry(rest, rate_limiter, |rest| {
+        let response = rest_call_with_retry(rest, rate_limiter, RequestKind::Query, |rest| {
             let sym = symbol_str.clone();
             let isolated = isolated.clone();
             Box::pin(async move {
@@ -3177,7 +3189,7 @@ async fn fetch_isolated_margin_account_info(
         let rest = rest.clone();
         let rate_limiter = rate_limiter.clone();
         async move {
-            let response = rest_call_with_retry(&rest, &rate_limiter, |rest| {
+            let response = rest_call_with_retry(&rest, &rate_limiter, RequestKind::Query, |rest| {
                 let symbols_param = symbols_param.clone();
                 Box::pin(async move {
                     let params = QueryIsolatedMarginAccountInfoParams::builder()
@@ -5266,7 +5278,7 @@ mod tests {
 
         let read = paginate_margin_my_trades(
             &rest,
-            &Arc::new(RateLimitTracker::new()),
+            &Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
             &InstrumentNameExchange::new("BTCUSDT"),
             from,
             true,
@@ -5464,7 +5476,7 @@ mod tests {
 
         paginate_margin_my_trades(
             &rest,
-            &Arc::new(RateLimitTracker::new()),
+            &Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
             &InstrumentNameExchange::new("BTCUSDT"),
             MyTradesFrom::Time(Utc::now().timestamp_millis() - HOUR_MS),
             true,
@@ -5503,5 +5515,50 @@ mod tests {
             "got {err:?}"
         );
         assert!(!err.is_transient());
+    }
+
+    /// A `/sapi` response reporting `x-sapi-used-ip-weight-1m` at 90% of the documented IP limit
+    /// pauses later queries but not orders; under it, nothing pauses.
+    #[tokio::test]
+    async fn sapi_used_ip_weight_near_the_limit_pauses_queries() {
+        for (used, pauses) in [(10_799, false), (10_800, true)] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/sapi/v1/margin/openOrders"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .insert_header("x-sapi-used-ip-weight-1m", used.to_string())
+                        .set_body_json(serde_json::json!([])),
+                )
+                .mount(&server)
+                .await;
+            let rest = Arc::new(MarginTradingRestApi::from_config(
+                ConfigurationRestApi::builder()
+                    .api_key("key")
+                    .api_secret("secret")
+                    .base_path(server.uri())
+                    .build()
+                    .unwrap(),
+            ));
+            let tracker = Arc::new(RateLimitTracker::new(WeightPool::Sapi));
+
+            fetch_margin_all_open_orders(rest, Arc::clone(&tracker), false)
+                .await
+                .unwrap();
+
+            let query_waits = tokio::time::timeout(
+                Duration::from_millis(50),
+                tracker.wait_if_blocked(RequestKind::Query),
+            )
+            .await
+            .is_err();
+            assert_eq!(query_waits, pauses, "used IP weight {used}");
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                tracker.wait_if_blocked(RequestKind::Order),
+            )
+            .await
+            .expect("orders never wait on the pause");
+        }
     }
 }

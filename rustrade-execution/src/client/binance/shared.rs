@@ -36,7 +36,7 @@ pub(crate) use crate::client::dedup::{
 };
 use binance_sdk::common::{
     errors::{ConnectorError, WebsocketError},
-    models::ParamBuildError,
+    models::{Interval, ParamBuildError, RateLimitType, RestApiResponse, WebsocketApiRateLimit},
 };
 use chrono::{DateTime, TimeZone, Utc};
 use rust_decimal::Decimal;
@@ -50,12 +50,12 @@ use std::{
     str::FromStr,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     task::{Context, Poll},
     time::Duration,
 };
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 // ---------------------------------------------------------------------------
 // AbortOnDropStream — ensures connection_manager task is cleaned up
@@ -279,30 +279,98 @@ fn frame_excerpt(frame: &str) -> &str {
 // Rate limit tracker
 // ---------------------------------------------------------------------------
 
+/// Binance's documented spot request-weight limit per minute. REST `/api` and the WS-API draw on
+/// it together, per IP. A spot tracker starts from this value and replaces it with the limit each
+/// WS-API response reports.
+pub(crate) const SPOT_REQUEST_WEIGHT_PER_MINUTE: u32 = 6_000;
+/// Binance's documented per-IP weight limit per minute for IP-weighted `/sapi` endpoints. No
+/// response reports it, so a margin tracker keeps this value. The separate per-UID `/sapi` limit
+/// is not tracked.
+pub(crate) const SAPI_IP_WEIGHT_PER_MINUTE: u32 = 12_000;
+/// Used weight, as a percentage of the per-minute limit, at which queries pause until the next
+/// minute. Orders and cancels keep the remainder.
+const WEIGHT_PAUSE_PERCENT: u64 = 90;
+/// Added to the wait for the next minute to cover clock skew between this host and Binance, whose
+/// weight counters reset on its own minute boundary.
+const MINUTE_BOUNDARY_SLACK_MS: u64 = 1_000;
+
+/// The Binance per-minute request-weight pool a [`RateLimitTracker`] follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WeightPool {
+    /// Spot REST `/api` and the spot WS-API, which share one per-IP pool. A REST response reports
+    /// the weight used in `x-mbx-used-weight-1m`; a WS-API response reports it with the limit.
+    Spot,
+    /// IP-weighted margin `/sapi` endpoints, which report the weight used in
+    /// `x-sapi-used-ip-weight-1m`.
+    Sapi,
+}
+
+impl WeightPool {
+    fn default_limit(self) -> u32 {
+        match self {
+            Self::Spot => SPOT_REQUEST_WEIGHT_PER_MINUTE,
+            Self::Sapi => SAPI_IP_WEIGHT_PER_MINUTE,
+        }
+    }
+}
+
+/// What a request does, which decides the rate-limit waits it honours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestKind {
+    /// Places or cancels an order. Waits only for a rate-limit cooldown, so it can use the weight
+    /// left once queries pause.
+    Order,
+    /// Reads account or order state. Also waits while the weight used is near the limit.
+    Query,
+}
+
+#[derive(Default)]
+struct Deadlines {
+    /// Set by a rate-limit response. Every request waits for it.
+    blocked_until: Option<tokio::time::Instant>,
+    /// Set when the weight used nears the per-minute limit. Only queries wait for it.
+    throttled_until: Option<tokio::time::Instant>,
+}
+
 /// Tracks rate-limit state across REST API calls.
 ///
-/// Thread-safe: inner state is behind a Mutex so clones of the client (which
-/// share the same `Arc<RateLimitTracker>`) all respect the same cooldown.
+/// Two waits, both shared by clones of the client (which share one `Arc<RateLimitTracker>`):
+/// - a cooldown after Binance answered with a rate-limit error, which every request honours;
+/// - a pause until the next minute once the weight used reaches [`WEIGHT_PAUSE_PERCENT`] of the
+///   per-minute limit, which only [`RequestKind::Query`] requests honour, so the weight left
+///   stays free for orders and cancels. The weight used comes from successful responses
+///   ([`observe_rest`](Self::observe_rest), [`observe_ws_api`](Self::observe_ws_api)).
 pub(crate) struct RateLimitTracker {
-    /// If set, REST calls should wait until this instant before proceeding.
     // parking_lot::Mutex — never poisons, consistent with SharedDedupCache
-    blocked_until: parking_lot::Mutex<Option<tokio::time::Instant>>,
+    deadlines: parking_lot::Mutex<Deadlines>,
+    pool: WeightPool,
+    /// The pool's per-minute weight limit.
+    weight_limit: AtomicU32,
 }
 
 impl RateLimitTracker {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(pool: WeightPool) -> Self {
         Self {
-            blocked_until: parking_lot::Mutex::new(None),
+            deadlines: parking_lot::Mutex::new(Deadlines::default()),
+            pool,
+            weight_limit: AtomicU32::new(pool.default_limit()),
         }
     }
 
-    /// Sleep if currently in a rate-limit cooldown. Returns immediately if not blocked.
+    /// Sleep until the waits `kind` honours have passed. Returns immediately if none is active.
     ///
-    /// Loops after waking to re-check the deadline: another task may have called
-    /// `on_rate_limited` with a longer cooldown while this task was sleeping.
-    pub(crate) async fn wait_if_blocked(&self) {
+    /// Loops after waking to re-check the deadline: another task may have extended it while this
+    /// task was sleeping.
+    pub(crate) async fn wait_if_blocked(&self, kind: RequestKind) {
         loop {
-            let deadline = *self.blocked_until.lock();
+            let deadline = {
+                let deadlines = self.deadlines.lock();
+                match kind {
+                    RequestKind::Order => deadlines.blocked_until,
+                    // `None` orders below `Some`, so this is whichever deadline is later.
+                    RequestKind::Query => deadlines.blocked_until.max(deadlines.throttled_until),
+                }
+            };
             match deadline {
                 None => return,
                 Some(until) => {
@@ -310,20 +378,30 @@ impl RateLimitTracker {
                     if until <= now {
                         return;
                     }
-                    // debug! not warn! — on_rate_limited already logs the event;
-                    // multiple concurrent callers all hitting wait_if_blocked during
-                    // recover_fills would otherwise flood the log with identical lines.
+                    // debug! not warn! — on_rate_limited and observe_used_weight already log
+                    // the event; multiple concurrent callers all waiting during recover_fills
+                    // would otherwise flood the log with identical lines.
                     // as_millis() returns u128; truncation impossible (u64::MAX ms ≈ 584M years)
                     #[allow(clippy::cast_possible_truncation)]
                     let delay_ms = (until - now).as_millis() as u64;
                     debug!(
                         delay_ms,
+                        ?kind,
                         "Binance REST rate-limited, waiting before request"
                     );
                     tokio::time::sleep_until(until).await;
                 }
             }
         }
+    }
+
+    /// Whether a rate-limit cooldown is active now.
+    pub(crate) fn is_blocked(&self) -> bool {
+        let now = tokio::time::Instant::now();
+        self.deadlines
+            .lock()
+            .blocked_until
+            .is_some_and(|until| until > now)
     }
 
     /// Record a rate-limit event. Extends the cooldown if a longer one is already active.
@@ -334,10 +412,8 @@ impl RateLimitTracker {
     /// requires an active runtime).
     pub(crate) fn on_rate_limited(&self, retry_after: Option<Duration>) {
         let delay = retry_after.unwrap_or(Duration::from_secs(DEFAULT_RATE_LIMIT_DELAY_SECS));
-        let new_deadline = tokio::time::Instant::now() + delay;
-        let mut guard = self.blocked_until.lock();
-        let was_blocked = guard.is_some();
-        *guard = Some(guard.map_or(new_deadline, |existing| existing.max(new_deadline)));
+        let now = tokio::time::Instant::now();
+        let was_blocked = extend_deadline(&mut self.deadlines.lock().blocked_until, now, delay);
         // only warn on mode entry; subsequent calls from the retry loop extend
         // the cooldown silently to avoid duplicate "entering degradation mode" lines.
         if was_blocked {
@@ -353,9 +429,115 @@ impl RateLimitTracker {
         }
     }
 
+    /// Record the weight a successful REST response reports as used this minute.
+    ///
+    /// Reads the header of this tracker's [`WeightPool`]; a response without it changes nothing.
+    pub(crate) fn observe_rest<D>(&self, response: &RestApiResponse<D>) {
+        let used = match self.pool {
+            // The SDK has already parsed `x-mbx-used-weight-1m` into `rate_limits`.
+            WeightPool::Spot => response
+                .rate_limits
+                .iter()
+                .flatten()
+                .find(|limit| {
+                    is_weight_per_minute(
+                        &limit.rate_limit_type,
+                        &limit.interval,
+                        limit.interval_num,
+                    )
+                })
+                .map(|limit| limit.count),
+            // The SDK parses only `x-mbx-*` headers. reqwest names headers in lowercase.
+            WeightPool::Sapi => response
+                .headers
+                .get("x-sapi-used-ip-weight-1m")
+                .and_then(|used| used.parse().ok()),
+        };
+        if let Some(used) = used {
+            self.observe_used_weight(used);
+        }
+    }
+
+    /// Record the weight limit and the weight used that a WS-API response reports.
+    ///
+    /// Only a spot tracker should be given these: the WS-API draws on the spot pool.
+    pub(crate) fn observe_ws_api(&self, rate_limits: Option<&[WebsocketApiRateLimit]>) {
+        let Some(weight) = rate_limits.into_iter().flatten().find(|limit| {
+            is_weight_per_minute(&limit.rate_limit_type, &limit.interval, limit.interval_num)
+        }) else {
+            return;
+        };
+        // A limit of 0 would pause every query; keep the last good value instead.
+        if weight.limit > 0 {
+            let previous = self.weight_limit.swap(weight.limit, Ordering::Relaxed);
+            if previous != weight.limit {
+                debug!(
+                    previous,
+                    limit = weight.limit,
+                    "Binance request-weight limit per minute updated"
+                );
+            }
+        }
+        self.observe_used_weight(weight.count);
+    }
+
+    /// Pause queries until the next minute if `used` has reached [`WEIGHT_PAUSE_PERCENT`] of the
+    /// limit.
+    fn observe_used_weight(&self, used: u32) {
+        let limit = self.weight_limit.load(Ordering::Relaxed);
+        if u64::from(used) * 100 < u64::from(limit) * WEIGHT_PAUSE_PERCENT {
+            return;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let pause = until_next_minute(now_ms);
+        let now = tokio::time::Instant::now();
+        let was_throttled = extend_deadline(&mut self.deadlines.lock().throttled_until, now, pause);
+        // info! not warn!: nothing was refused. The pause keeps the next query from being refused.
+        if !was_throttled {
+            // as_millis() returns u128; truncation impossible (at most ~61 s here)
+            #[allow(clippy::cast_possible_truncation)]
+            let pause_ms = pause.as_millis() as u64;
+            info!(
+                used,
+                limit,
+                pause_ms,
+                "Binance request weight near the per-minute limit, pausing queries until the next minute"
+            );
+        }
+    }
+
     // no clear() method — cooldowns expire naturally via wait_if_blocked().
     // A previous unconditional clear() on success raced with concurrent calls:
     // call A succeeds → clears cooldown → call B's 429 cooldown is erased.
+}
+
+/// Push `deadline` out to `now + delay` unless it is already later, and return whether it was
+/// still active at `now`.
+fn extend_deadline(
+    deadline: &mut Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+    delay: Duration,
+) -> bool {
+    let was_active = deadline.is_some_and(|until| until > now);
+    let new_deadline = now + delay;
+    *deadline = Some(deadline.map_or(new_deadline, |existing| existing.max(new_deadline)));
+    was_active
+}
+
+/// Whether a reported rate limit is the per-minute request weight, the one the pause follows.
+fn is_weight_per_minute(kind: &RateLimitType, interval: &Interval, interval_num: u32) -> bool {
+    *kind == RateLimitType::RequestWeight && *interval == Interval::Minute && interval_num == 1
+}
+
+/// The time from `now_ms` (Unix milliseconds) until just after the next UTC minute boundary.
+fn until_next_minute(now_ms: u128) -> Duration {
+    // The remainder is below 60 000, so it fits in a u64.
+    #[allow(clippy::cast_possible_truncation)]
+    let into_minute = (now_ms % 60_000) as u64;
+    Duration::from_millis(60_000 - into_minute + MINUTE_BOUNDARY_SLACK_MS)
 }
 
 /// Check if an anyhow::Error from binance-sdk REST is a rate-limit error.
@@ -383,6 +565,21 @@ pub(crate) fn is_rate_limit_error(e: &anyhow::Error) -> bool {
         }
     }
     false
+}
+
+/// Whether a WebSocket connect failed because Binance refused the handshake for rate limiting:
+/// HTTP 429, or 418 for an IP ban.
+///
+/// depends on the SDK reporting a refused handshake as `WebsocketError::Handshake` holding
+/// tungstenite's `HTTP error: <status>` text (not a public API contract).
+pub(crate) fn is_handshake_rate_limit(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<WebsocketError>(),
+            Some(WebsocketError::Handshake(msg))
+                if msg.contains("HTTP error: 429") || msg.contains("HTTP error: 418")
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1643,19 +1840,24 @@ pub(crate) fn response_decode_error(e: ConnectorError) -> UnindexedClientError {
 
 /// Execute a REST call with rate-limit awareness and retry.
 ///
+/// Waits first for the rate-limit waits `kind` honours (see [`RateLimitTracker`]), and records
+/// the weight a successful response reports as used, which can pause later queries.
+///
 /// Generic over the SDK `RestApi` type (`R`) so it serves both the spot
 /// (`binance_sdk::spot::rest_api::RestApi`) and margin
 /// (`binance_sdk::margin_trading::rest_api::RestApi`) clients — the helper never touches
 /// `R` itself, it only hands an `Arc<R>` clone to the per-attempt closure. Also usable
 /// from concurrent per-instrument futures that hold only `Arc<R>` + `Arc<RateLimitTracker>`.
-pub(crate) async fn rest_call_with_retry<R, T>(
+pub(crate) async fn rest_call_with_retry<R, D>(
     rest: &Arc<R>,
     rate_limiter: &RateLimitTracker,
+    kind: RequestKind,
     mut make_call: impl FnMut(
         Arc<R>,
-    )
-        -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<T>> + Send>>,
-) -> anyhow::Result<T>
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<RestApiResponse<D>>> + Send>,
+    >,
+) -> anyhow::Result<RestApiResponse<D>>
 where
     // `Arc<R>` is moved into the `+ Send` future, which requires `R: Send + Sync`. Both SDK
     // RestApi types satisfy this; stating it here surfaces the constraint at the definition
@@ -1668,9 +1870,12 @@ where
     // return on the last iteration, so the post-loop unreachable!() is a runtime
     // safety net — the loop body always returns before exhaustion.
     for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
-        rate_limiter.wait_if_blocked().await;
+        rate_limiter.wait_if_blocked(kind).await;
         match make_call(Arc::clone(rest)).await {
-            Ok(v) => return Ok(v),
+            Ok(response) => {
+                rate_limiter.observe_rest(&response);
+                return Ok(response);
+            }
             Err(e) if is_rate_limit_error(&e) && attempt < MAX_RATE_LIMIT_RETRIES => {
                 // exponential delay starting at 1s (not DEFAULT_RATE_LIMIT_DELAY_SECS=10s).
                 // The retry loop uses an aggressive initial delay to recover quickly from
@@ -2789,5 +2994,141 @@ mod tests {
             code: Some(-2015),
         });
         assert!(!is_rate_limit_error(&auth));
+    }
+
+    /// The weight-per-minute entry a WS-API response carries.
+    fn ws_weight(limit: u32, count: u32) -> Vec<WebsocketApiRateLimit> {
+        vec![
+            WebsocketApiRateLimit {
+                rate_limit_type: RateLimitType::Orders,
+                interval: Interval::Second,
+                interval_num: 10,
+                limit: 100,
+                count: 100,
+            },
+            WebsocketApiRateLimit {
+                rate_limit_type: RateLimitType::RequestWeight,
+                interval: Interval::Minute,
+                interval_num: 1,
+                limit,
+                count,
+            },
+        ]
+    }
+
+    /// Whether a wait of `kind` is still pending after 1 ms of (paused) time.
+    async fn waits(tracker: &RateLimitTracker, kind: RequestKind) -> bool {
+        tokio::time::timeout(Duration::from_millis(1), tracker.wait_if_blocked(kind))
+            .await
+            .is_err()
+    }
+
+    /// The pause runs to just past the next minute boundary, never less than the slack.
+    #[test]
+    fn until_next_minute_reaches_just_past_the_boundary() {
+        let minute = 29_000_000 * 60_000_u128;
+        assert_eq!(
+            until_next_minute(minute + 15_000),
+            Duration::from_millis(45_000 + MINUTE_BOUNDARY_SLACK_MS)
+        );
+        assert_eq!(
+            until_next_minute(minute + 59_999),
+            Duration::from_millis(1 + MINUTE_BOUNDARY_SLACK_MS)
+        );
+        assert_eq!(
+            until_next_minute(minute),
+            Duration::from_millis(60_000 + MINUTE_BOUNDARY_SLACK_MS)
+        );
+    }
+
+    /// At the threshold, queries pause and orders do not; one under it, nothing pauses.
+    #[tokio::test]
+    async fn weight_near_the_limit_pauses_queries_but_not_orders() {
+        tokio::time::pause();
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
+        tracker.observe_ws_api(Some(&ws_weight(1_000, 899)));
+        assert!(!waits(&tracker, RequestKind::Query).await, "below 90%");
+
+        tracker.observe_ws_api(Some(&ws_weight(1_000, 900)));
+        assert!(waits(&tracker, RequestKind::Query).await, "at 90%");
+        assert!(!waits(&tracker, RequestKind::Order).await);
+        assert!(
+            !tracker.is_blocked(),
+            "a pause is not a rate-limit cooldown"
+        );
+
+        tokio::time::advance(Duration::from_millis(60_000 + MINUTE_BOUNDARY_SLACK_MS)).await;
+        assert!(!waits(&tracker, RequestKind::Query).await, "the pause ends");
+    }
+
+    /// A rate-limit cooldown holds back orders as well as queries.
+    #[tokio::test]
+    async fn a_rate_limit_cooldown_holds_back_both_kinds() {
+        tokio::time::pause();
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
+        tracker.on_rate_limited(Some(Duration::from_secs(5)));
+        assert!(tracker.is_blocked());
+        assert!(waits(&tracker, RequestKind::Order).await);
+        assert!(waits(&tracker, RequestKind::Query).await);
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(!tracker.is_blocked());
+        assert!(!waits(&tracker, RequestKind::Order).await);
+    }
+
+    /// A WS-API response replaces the default limit, so the same usage can cross the threshold
+    /// under the reported limit that it stays under by default. A zero limit is ignored.
+    #[tokio::test]
+    async fn the_ws_api_limit_replaces_the_default() {
+        tokio::time::pause();
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
+        tracker.observe_ws_api(Some(&ws_weight(0, 1_000)));
+        assert_eq!(
+            tracker.weight_limit.load(Ordering::Relaxed),
+            SPOT_REQUEST_WEIGHT_PER_MINUTE
+        );
+        assert!(!waits(&tracker, RequestKind::Query).await);
+
+        tracker.observe_ws_api(Some(&ws_weight(1_100, 1_000)));
+        assert_eq!(tracker.weight_limit.load(Ordering::Relaxed), 1_100);
+        assert!(waits(&tracker, RequestKind::Query).await);
+    }
+
+    /// A response without the weight-per-minute entry changes nothing.
+    #[tokio::test]
+    async fn a_response_without_weight_changes_nothing() {
+        tokio::time::pause();
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
+        tracker.observe_ws_api(None);
+        tracker.observe_ws_api(Some(&ws_weight(1_000, 1_000)[..1]));
+        assert_eq!(
+            tracker.weight_limit.load(Ordering::Relaxed),
+            SPOT_REQUEST_WEIGHT_PER_MINUTE
+        );
+        assert!(!waits(&tracker, RequestKind::Query).await);
+    }
+
+    /// A handshake Binance refused with 429 or 418 is a rate limit; other failures are not.
+    #[test]
+    fn handshake_rate_limit_is_recognised() {
+        let handshake = |msg: &str| anyhow::Error::new(WebsocketError::Handshake(msg.into()));
+        assert!(is_handshake_rate_limit(&handshake(
+            "HTTP error: 429 Too Many Requests"
+        )));
+        assert!(is_handshake_rate_limit(&handshake(
+            "HTTP error: 418 I'm a teapot"
+        )));
+        assert!(is_handshake_rate_limit(
+            &handshake("HTTP error: 429 Too Many Requests").context("connecting")
+        ));
+        assert!(!is_handshake_rate_limit(&handshake(
+            "HTTP error: 503 Service Unavailable"
+        )));
+        assert!(!is_handshake_rate_limit(&anyhow::Error::new(
+            WebsocketError::Timeout
+        )));
+        assert!(!is_handshake_rate_limit(&anyhow::anyhow!(
+            "HTTP error: 429 Too Many Requests"
+        )));
     }
 }

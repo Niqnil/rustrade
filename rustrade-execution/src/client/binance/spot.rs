@@ -14,7 +14,9 @@
 //   duplicate processing after reconnect + fill recovery
 // - Rate limit handling: detects HTTP 429 / Binance -1015, retries with exponential
 //   backoff (Retry-After header is not accessible through the SDK's anyhow::Error
-//   chain, so computed delays are used), blocks further REST calls until cooldown expires
+//   chain, so computed delays are used), blocks further REST calls until cooldown expires,
+//   and does not open a WS-API session during it. Separately, pauses REST queries until the
+//   next minute once responses report >= 90% of the request-weight limit used
 // - Reconnection: account_stream auto-reconnects on WS disconnect/error with
 //   exponential backoff (1s → 30s, max 10 attempts)
 // - Heartbeat monitoring: tracks WS activity via AtomicBool flag; forces reconnect
@@ -34,12 +36,13 @@
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
-    MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, RateLimitTracker,
-    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UserDataFrame, classify_order_kind_tif,
-    classify_rest_query_error, classify_ws_order_error, convert_execution_report,
-    convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event,
-    is_duplicate, log_unrecognised_frame, new_dedup_cache, parse_user_data_frame,
-    recovered_order_totals, response_decode_error, rest_call_with_retry, unrecovered_instruments,
+    MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, RateLimitTracker, RequestKind,
+    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UserDataFrame, WeightPool,
+    classify_order_kind_tif, classify_rest_query_error, classify_ws_order_error,
+    convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
+    dedup_key_from_event, is_duplicate, is_handshake_rate_limit, log_unrecognised_frame,
+    new_dedup_cache, parse_user_data_frame, recovered_order_totals, response_decode_error,
+    rest_call_with_retry, unrecovered_instruments,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
@@ -252,10 +255,43 @@ pub enum BinanceSpotConfigError {
 // BinanceSpot client
 // ---------------------------------------------------------------------------
 
+/// Why [`BinanceSpot::get_ws_api`] has no WS-API session to hand out. Either way, nothing was
+/// sent.
+#[derive(Debug)]
+enum WsApiUnavailable {
+    /// A rate-limit cooldown is active, or Binance refused the handshake with 429 or 418.
+    RateLimited(String),
+    /// Any other connect failure.
+    Connect(String),
+}
+
+impl WsApiUnavailable {
+    /// The error an order or cancel that could not be sent fails with. A rate limit is a
+    /// rejection, which tells the caller the request was not sent and to back off.
+    fn into_order_error(self) -> UnindexedOrderError {
+        match self {
+            Self::RateLimited(msg) => {
+                warn!(%msg, "BinanceSpot WS-API rate-limited, request not sent");
+                UnindexedOrderError::Rejected(ApiError::RateLimit)
+            }
+            Self::Connect(msg) => UnindexedOrderError::Connectivity(ConnectivityError::Socket(msg)),
+        }
+    }
+}
+
 /// BinanceSpot execution client using the official binance-sdk.
 ///
 /// - REST API: account snapshot, balance/order/trade queries (startup/cold paths)
 /// - WebSocket API: order placement, order cancellation, user data stream (hot paths)
+///
+/// # Rate limits
+/// REST and the WebSocket API share one per-IP request-weight limit per minute. Its value comes
+/// from each WebSocket API response, and is Binance's documented 6000 until the first one. Once
+/// a response reports at least 90% of it used, REST queries wait for the next minute, so the
+/// rest is left for orders and cancels, which never wait for it. A query can therefore take up to
+/// about a minute longer. After Binance answers with a rate-limit error, REST calls wait out a
+/// cooldown, and an order or cancel that would have to open a new WebSocket API session fails
+/// with [`ApiError::RateLimit`] instead, unsent.
 #[derive(Clone)]
 pub struct BinanceSpot {
     config: Arc<BinanceSpotConfig>,
@@ -318,7 +354,12 @@ impl BinanceSpot {
     /// Returns the shared WebSocket session, connecting on the first call.
     /// If the previous session was cleared (due to a connectivity error),
     /// establishes a new connection.
-    async fn get_ws_api(&self) -> anyhow::Result<WebsocketApi> {
+    ///
+    /// Does not connect during a rate-limit cooldown: a handshake then counts against the limit
+    /// that set it, and repeated refusals can escalate to an IP ban (418). A handshake Binance
+    /// refuses with 429 or 418 starts a cooldown, so REST calls back off too. An existing session
+    /// is handed out regardless, since orders do not wait on the cooldown.
+    async fn get_ws_api(&self) -> Result<WebsocketApi, WsApiUnavailable> {
         // Fast path: read lock to check if already connected
         {
             let guard = self.ws_api.read().await;
@@ -337,14 +378,29 @@ impl BinanceSpot {
         if let Some(ref ws) = *guard {
             return Ok(ws.clone());
         }
-        let ws = tokio::time::timeout(
+        if self.rate_limiter.is_blocked() {
+            return Err(WsApiUnavailable::RateLimited(
+                "rate-limit cooldown active, not connecting the WS-API session".into(),
+            ));
+        }
+        let ws = match tokio::time::timeout(
             Duration::from_secs(CONNECT_TIMEOUT_SECS),
             self.ws_handle.connect(),
         )
         .await
-        .map_err(|_| {
-            anyhow::anyhow!("BinanceSpot WS connect timed out after {CONNECT_TIMEOUT_SECS}s")
-        })??;
+        {
+            Ok(Ok(ws)) => ws,
+            Ok(Err(e)) if is_handshake_rate_limit(&e) => {
+                self.rate_limiter.on_rate_limited(None);
+                return Err(WsApiUnavailable::RateLimited(format!("{e:#}")));
+            }
+            Ok(Err(e)) => return Err(WsApiUnavailable::Connect(format!("{e:#}"))),
+            Err(_) => {
+                return Err(WsApiUnavailable::Connect(format!(
+                    "BinanceSpot WS connect timed out after {CONNECT_TIMEOUT_SECS}s"
+                )));
+            }
+        };
         *guard = Some(ws.clone());
         Ok(ws)
     }
@@ -389,7 +445,7 @@ async fn fetch_open_orders_for_instrument(
 ) -> Result<(InstrumentNameExchange, OpenOrderListing), UnindexedClientError> {
     // Convert once before the retry closure to avoid a String allocation on every retry.
     let symbol_str = instrument.name().to_string();
-    let response = rest_call_with_retry(&rest, &rate_limiter, |rest| {
+    let response = rest_call_with_retry(&rest, &rate_limiter, RequestKind::Query, |rest| {
         let sym = symbol_str.clone();
         Box::pin(async move {
             let params = GetOpenOrdersParams::builder().symbol(sym).build()?;
@@ -414,7 +470,7 @@ async fn fetch_all_open_orders(
     rest: Arc<RestApi>,
     rate_limiter: Arc<RateLimitTracker>,
 ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError> {
-    let response = rest_call_with_retry(&rest, &rate_limiter, |rest| {
+    let response = rest_call_with_retry(&rest, &rate_limiter, RequestKind::Query, |rest| {
         Box::pin(async move {
             let params = GetOpenOrdersParams::builder().build()?;
             rest.get_open_orders(params).await
@@ -458,7 +514,7 @@ async fn paginate_my_trades(
     let mut cursor: Option<i64> = None;
     loop {
         let fid = cursor; // Option<i64> is Copy
-        let response = rest_call_with_retry(rest, rate_limiter, |rest| {
+        let response = rest_call_with_retry(rest, rate_limiter, RequestKind::Query, |rest| {
             let sym = symbol_str.clone();
             Box::pin(async move {
                 // const_assert! above guarantees BINANCE_MAX_TRADES fits in i32
@@ -531,7 +587,7 @@ impl ExecutionClient for BinanceSpot {
             rest,
             ws_handle,
             ws_api: Arc::new(RwLock::new(None)),
-            rate_limiter: Arc::new(RateLimitTracker::new()),
+            rate_limiter: Arc::new(RateLimitTracker::new(WeightPool::Spot)),
         }
     }
 
@@ -541,14 +597,15 @@ impl ExecutionClient for BinanceSpot {
         instruments: &[InstrumentNameExchange],
     ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
         // Fetch account info via REST (with rate-limit retry)
-        let response = rest_call_with_retry(&self.rest, &self.rate_limiter, |rest| {
-            Box::pin(async move {
-                let params = GetAccountParams::builder().build()?;
-                rest.get_account(params).await
+        let response =
+            rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+                Box::pin(async move {
+                    let params = GetAccountParams::builder().build()?;
+                    rest.get_account(params).await
+                })
             })
-        })
-        .await
-        .map_err(|e| classify_rest_query_error(&e, None))?;
+            .await
+            .map_err(|e| classify_rest_query_error(&e, None))?;
 
         let account = response.data().await.map_err(response_decode_error)?;
 
@@ -748,12 +805,10 @@ impl ExecutionClient for BinanceSpot {
 
         let ws = match self.get_ws_api().await {
             Ok(ws) => ws,
-            Err(e) => {
+            Err(unavailable) => {
                 return Some(UnindexedOrderResponseCancel {
                     key,
-                    state: Err(UnindexedOrderError::Connectivity(
-                        ConnectivityError::Socket(format!("{e:#}")),
-                    )),
+                    state: Err(unavailable.into_order_error()),
                 });
             }
         };
@@ -795,7 +850,13 @@ impl ExecutionClient for BinanceSpot {
             }
         };
 
-        match ws.order_cancel(params).await {
+        let result = ws.order_cancel(params).await;
+        // A WS-API response reports the shared spot pool's weight limit and usage.
+        if let Ok(response) = &result {
+            self.rate_limiter
+                .observe_ws_api(response.rate_limits.as_deref());
+        }
+        match result {
             Ok(response) => match response.data() {
                 Ok(data) => {
                     let time_exchange = data
@@ -896,7 +957,7 @@ impl ExecutionClient for BinanceSpot {
 
         let ws = match self.get_ws_api().await {
             Ok(ws) => ws,
-            Err(e) => {
+            Err(unavailable) => {
                 return Some(Order {
                     key: order_key,
                     side,
@@ -904,9 +965,7 @@ impl ExecutionClient for BinanceSpot {
                     quantity,
                     kind,
                     time_in_force,
-                    state: OrderState::inactive(OrderError::Connectivity(
-                        ConnectivityError::Socket(format!("{e:#}")),
-                    )),
+                    state: OrderState::inactive(unavailable.into_order_error()),
                 });
             }
         };
@@ -1050,7 +1109,13 @@ impl ExecutionClient for BinanceSpot {
             }
         };
 
-        match ws.order_place(params).await {
+        let result = ws.order_place(params).await;
+        // A WS-API response reports the shared spot pool's weight limit and usage.
+        if let Ok(response) = &result {
+            self.rate_limiter
+                .observe_ws_api(response.rate_limits.as_deref());
+        }
+        match result {
             Ok(response) => match response.data() {
                 Ok(data) => {
                     let time_exchange = data
@@ -1178,14 +1243,15 @@ impl ExecutionClient for BinanceSpot {
         &self,
         assets: &[AssetNameExchange],
     ) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError> {
-        let response = rest_call_with_retry(&self.rest, &self.rate_limiter, |rest| {
-            Box::pin(async move {
-                let params = GetAccountParams::builder().build()?;
-                rest.get_account(params).await
+        let response =
+            rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+                Box::pin(async move {
+                    let params = GetAccountParams::builder().build()?;
+                    rest.get_account(params).await
+                })
             })
-        })
-        .await
-        .map_err(|e| classify_rest_query_error(&e, None))?;
+            .await
+            .map_err(|e| classify_rest_query_error(&e, None))?;
 
         let account = response.data().await.map_err(response_decode_error)?;
 
@@ -4162,11 +4228,11 @@ mod tests {
     #[tokio::test]
     async fn test_rate_limit_tracker_not_blocked_initially() {
         tokio::time::pause();
-        let tracker = RateLimitTracker::new();
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
         // wait_if_blocked should return immediately (no cooldown set)
         tokio::time::timeout(
             std::time::Duration::from_millis(1),
-            tracker.wait_if_blocked(),
+            tracker.wait_if_blocked(RequestKind::Order),
         )
         .await
         .expect("wait_if_blocked should return immediately when not blocked");
@@ -4175,29 +4241,35 @@ mod tests {
     #[tokio::test]
     async fn test_rate_limit_tracker_blocks_until_deadline() {
         tokio::time::pause();
-        let tracker = RateLimitTracker::new();
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
         let delay = Duration::from_secs(5);
         tracker.on_rate_limited(Some(delay));
 
         // Should not complete immediately
         assert!(
-            tokio::time::timeout(Duration::from_millis(1), tracker.wait_if_blocked())
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                Duration::from_millis(1),
+                tracker.wait_if_blocked(RequestKind::Order)
+            )
+            .await
+            .is_err(),
             "wait_if_blocked should block while cooldown is active"
         );
 
         // Advance past cooldown
         tokio::time::advance(delay + Duration::from_millis(1)).await;
-        tokio::time::timeout(Duration::from_millis(1), tracker.wait_if_blocked())
-            .await
-            .expect("wait_if_blocked should return after cooldown expires");
+        tokio::time::timeout(
+            Duration::from_millis(1),
+            tracker.wait_if_blocked(RequestKind::Order),
+        )
+        .await
+        .expect("wait_if_blocked should return after cooldown expires");
     }
 
     #[tokio::test]
     async fn test_rate_limit_tracker_cooldown_extends_to_max() {
         tokio::time::pause();
-        let tracker = RateLimitTracker::new();
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
 
         // Set initial 5s cooldown
         tracker.on_rate_limited(Some(Duration::from_secs(5)));
@@ -4207,23 +4279,29 @@ mod tests {
         // Advance past the initial 5s — should still be blocked
         tokio::time::advance(Duration::from_secs(6)).await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(1), tracker.wait_if_blocked())
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                Duration::from_millis(1),
+                tracker.wait_if_blocked(RequestKind::Order)
+            )
+            .await
+            .is_err(),
             "cooldown should have been extended to 10s"
         );
 
         // Advance past the extended 10s deadline
         tokio::time::advance(Duration::from_secs(5)).await;
-        tokio::time::timeout(Duration::from_millis(1), tracker.wait_if_blocked())
-            .await
-            .expect("wait_if_blocked should return after extended cooldown expires");
+        tokio::time::timeout(
+            Duration::from_millis(1),
+            tracker.wait_if_blocked(RequestKind::Order),
+        )
+        .await
+        .expect("wait_if_blocked should return after extended cooldown expires");
     }
 
     #[tokio::test]
     async fn test_rate_limit_tracker_shorter_cooldown_does_not_shorten() {
         tokio::time::pause();
-        let tracker = RateLimitTracker::new();
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
 
         // Set 10s cooldown then try to shorten with 2s — deadline should stay at 10s
         tracker.on_rate_limited(Some(Duration::from_secs(10)));
@@ -4232,9 +4310,12 @@ mod tests {
         // Advance past 2s — should still be blocked
         tokio::time::advance(Duration::from_secs(3)).await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(1), tracker.wait_if_blocked())
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                Duration::from_millis(1),
+                tracker.wait_if_blocked(RequestKind::Order)
+            )
+            .await
+            .is_err(),
             "shorter on_rate_limited must not shorten existing cooldown"
         );
     }
@@ -4287,6 +4368,92 @@ mod tests {
         assert!(
             classify_ws_order_error(&wrapped, &instrument).is_some(),
             "context-wrapped ResponseError must still be detected — anyhow::downcast_ref searches the full chain"
+        );
+    }
+
+    /// A spot REST response reporting `x-mbx-used-weight-1m` at 90% of the default limit pauses
+    /// later queries but not orders; under it, nothing pauses.
+    #[tokio::test]
+    async fn rest_used_weight_near_the_limit_pauses_queries() {
+        for (used, pauses) in [(5_399, false), (5_400, true)] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/v3/openOrders"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .insert_header("x-mbx-used-weight-1m", used.to_string())
+                        .set_body_json(serde_json::json!([])),
+                )
+                .mount(&server)
+                .await;
+            let rest = Arc::new(SpotRestApi::from_config(
+                ConfigurationRestApi::builder()
+                    .api_key("key")
+                    .api_secret("secret")
+                    .base_path(server.uri())
+                    .build()
+                    .unwrap(),
+            ));
+            let tracker = Arc::new(RateLimitTracker::new(WeightPool::Spot));
+
+            fetch_all_open_orders(rest, Arc::clone(&tracker))
+                .await
+                .unwrap();
+
+            let query_waits = tokio::time::timeout(
+                Duration::from_millis(50),
+                tracker.wait_if_blocked(RequestKind::Query),
+            )
+            .await
+            .is_err();
+            assert_eq!(query_waits, pauses, "used weight {used}");
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                tracker.wait_if_blocked(RequestKind::Order),
+            )
+            .await
+            .expect("orders never wait on the pause");
+        }
+    }
+
+    /// During a rate-limit cooldown a cancel with no WS-API session is not sent: it fails as a
+    /// rate-limit rejection, without a handshake.
+    #[tokio::test]
+    async fn cancel_without_a_session_during_a_cooldown_is_rejected_unsent() {
+        use crate::order::{OrderEvent, request::RequestCancel};
+
+        let client = <BinanceSpot as ExecutionClient>::new(BinanceSpotConfig::new(
+            "key".into(),
+            "secret".into(),
+        ));
+        client
+            .rate_limiter
+            .on_rate_limited(Some(Duration::from_secs(60)));
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+        let response = client
+            .cancel_order(OrderEvent {
+                key: OrderKey {
+                    exchange: ExchangeId::BinanceSpot,
+                    instrument: &instrument,
+                    strategy: StrategyId::new("strategy"),
+                    cid: ClientOrderId::new("cid"),
+                },
+                state: RequestCancel { id: None },
+            })
+            .await
+            .expect("a cancel always answers");
+
+        assert!(
+            matches!(
+                response.state,
+                Err(UnindexedOrderError::Rejected(ApiError::RateLimit))
+            ),
+            "{:?}",
+            response.state
+        );
+        assert!(
+            client.ws_api.read().await.is_none(),
+            "no session was opened"
         );
     }
 }
