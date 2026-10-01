@@ -289,7 +289,20 @@ jobs:
             -D rustdoc::broken_intra_doc_links
             -D rustdoc::private_intra_doc_links
             -D rustdoc::redundant_explicit_links
+            -D rustdoc::invalid_html_tags
         run: cargo doc --locked --workspace --all-features --no-deps
+
+      # The public build above renders no private item's docs, so a broken link in one ships green.
+      # This second pass documents private items too. It cannot replace the first:
+      # `private_intra_doc_links` fires only without `--document-private-items`, so only the first
+      # catches a public doc linking to a private item.
+      - name: Check rustdoc links on private items
+        env:
+          RUSTDOCFLAGS: >-
+            -D rustdoc::broken_intra_doc_links
+            -D rustdoc::redundant_explicit_links
+            -D rustdoc::invalid_html_tags
+        run: cargo doc --locked --workspace --all-features --no-deps --document-private-items
 
   audit:
     name: cargo audit

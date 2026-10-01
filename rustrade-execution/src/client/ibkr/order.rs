@@ -557,7 +557,7 @@ pub fn build_ib_order(
     Ok(order)
 }
 
-/// Format a DateTime<Utc> for IB's good_till_date field.
+/// Format a `DateTime<Utc>` for IB's good_till_date field.
 ///
 /// IB accepts format: "yyyyMMdd HH:mm:ss" with optional timezone suffix.
 /// We use UTC format "yyyyMMdd-HH:mm:ss" which IB interprets as UTC.

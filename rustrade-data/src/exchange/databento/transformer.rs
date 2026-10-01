@@ -188,7 +188,7 @@ fn ohlcv_conversion_error(message: String) -> DataError {
 /// Databento stamps OHLCV `ts_event` at the bar's **open** instant. This function
 /// normalises it to the exclusive `close_time` boundary
 /// (`close_time = open + interval`) via the shared
-/// [`close_time_from_open`](crate::subscription::candle::close_time_from_open)
+/// [`close_time_from_open`]
 /// helper, exactly as the Binance and Hyperliquid candle paths do, so the
 /// [`Candle::close_time`](crate::subscription::candle::Candle::close_time)
 /// contract holds. `time_exchange` is set equal to `close_time`.

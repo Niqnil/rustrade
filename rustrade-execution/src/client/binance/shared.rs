@@ -48,7 +48,10 @@ use smol_str::format_smolstr;
 use std::{
     pin::Pin,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -147,13 +150,125 @@ pub(crate) const DEFAULT_RATE_LIMIT_DELAY_SECS: u64 = 10;
 pub(crate) const MAX_RATE_LIMIT_RETRIES: u32 = 3;
 
 // ---------------------------------------------------------------------------
+// WS-API user-data frames
+// ---------------------------------------------------------------------------
+
+/// A text frame from a WS-API user-data subscription (`userDataStream.subscribe*`), as
+/// binance-sdk hands it to a `subscribe_on_ws_events` callback: the raw frame, unchanged.
+#[derive(Debug, PartialEq)]
+pub(crate) enum UserDataFrame<'a> {
+    /// An RPC response, such as the subscribe acknowledgement: it carries a top-level `id`.
+    Response,
+    /// A pushed event, which Binance wraps as `{ "subscriptionId", "event": { "e", .. } }`.
+    Event {
+        /// The subscription the event belongs to; it routes isolated-margin events.
+        subscription_id: Option<i64>,
+        /// The inner event's `e` tag.
+        event_type: &'a str,
+        /// The inner event, unparsed, for the matched branch's one typed pass.
+        event: &'a str,
+    },
+    /// A frame shape this client does not know: neither of the above, or an event whose `e` tag
+    /// is missing or not a plain string. Its caller logs it through [`log_unrecognised_frame`],
+    /// since a change in how Binance delivers events would otherwise drop every event silently.
+    Unrecognised,
+}
+
+/// Split a WS-API user-data frame into a [`UserDataFrame`].
+///
+/// Reads borrowed views only, with no `serde_json::Value` DOM: this runs on every inbound frame.
+/// The inner event stays an unparsed slice, and only its `e` tag is read here.
+pub(crate) fn parse_user_data_frame(frame: &str) -> UserDataFrame<'_> {
+    use serde_json::value::RawValue;
+
+    #[derive(serde::Deserialize)]
+    struct Envelope<'a> {
+        #[serde(borrow, default)]
+        id: Option<&'a RawValue>,
+        #[serde(borrow, default)]
+        event: Option<&'a RawValue>,
+        #[serde(rename = "subscriptionId", default)]
+        subscription_id: Option<i64>,
+    }
+    // Discriminator-only view of the inner event: reads `e` without materialising the payload.
+    // Binance places `e` first, so this is cheap next to the typed pass the caller then makes on
+    // the matched branch only. A manual byte scan for `"e"` would be fragile to whitespace,
+    // escaping and key order, so keep the typed two-pass read.
+    #[derive(serde::Deserialize)]
+    struct EventTag<'a> {
+        #[serde(borrow, default)]
+        e: Option<&'a str>,
+    }
+
+    let Ok(envelope) = serde_json::from_str::<Envelope<'_>>(frame) else {
+        return UserDataFrame::Unrecognised;
+    };
+    if envelope.id.is_some() {
+        return UserDataFrame::Response;
+    }
+    let Some(event) = envelope.event else {
+        return UserDataFrame::Unrecognised;
+    };
+    let event = event.get();
+    // A missing tag, or one that cannot be borrowed (escaped, or not a string), is unrecognised
+    // rather than an empty type: an unknown type is ignored quietly, and this must not be.
+    let Some(event_type) = serde_json::from_str::<EventTag<'_>>(event)
+        .ok()
+        .and_then(|tag| tag.e)
+    else {
+        return UserDataFrame::Unrecognised;
+    };
+    UserDataFrame::Event {
+        subscription_id: envelope.subscription_id,
+        event_type,
+        event,
+    }
+}
+
+/// Log an [`UserDataFrame::Unrecognised`] frame: at `warn` for the first, and for every 1000th
+/// after it with the running count, and at `trace` otherwise. So a change in delivery that makes
+/// every frame unrecognised is seen at once, without a warning per frame.
+///
+/// `seen` is the caller's process-wide counter, one per venue: it is shared by every stream of
+/// that venue and never resets, so a later stream or outage warns again only at the next
+/// thousandth frame, not on its first.
+pub(crate) fn log_unrecognised_frame(venue: &'static str, seen: &AtomicU64, frame: &str) {
+    let count = seen.fetch_add(1, Ordering::Relaxed) + 1;
+    if count == 1 || count.is_multiple_of(1000) {
+        warn!(
+            venue,
+            count,
+            frame = frame_excerpt(frame),
+            "Binance WS: unrecognised user-data frame (not an RPC response, nor an event envelope \
+             with a readable `e` tag), ignoring it; further ones are logged at trace, with a \
+             warning every 1000th"
+        );
+    } else {
+        trace!(
+            venue,
+            count,
+            frame = frame_excerpt(frame),
+            "Binance WS: unrecognised user-data frame, ignoring it"
+        );
+    }
+}
+
+/// The first 200 characters of a frame, for a log line about it.
+fn frame_excerpt(frame: &str) -> &str {
+    frame
+        .char_indices()
+        .nth(200)
+        .map_or(frame, |(end, _)| &frame[..end])
+}
+
+// ---------------------------------------------------------------------------
 // Rate limit tracker
 // ---------------------------------------------------------------------------
 
 /// Tracks rate-limit state across REST API calls.
 ///
 /// Thread-safe: inner state is behind a Mutex so clones of the client (which
-/// share the same Arc<RateLimitTracker>) all respect the same cooldown.
+/// share the same `Arc<RateLimitTracker>`) all respect the same cooldown.
 pub(crate) struct RateLimitTracker {
     /// If set, REST calls should wait until this instant before proceeding.
     // parking_lot::Mutex — never poisons, consistent with SharedDedupCache
@@ -1889,6 +2004,54 @@ fn order_error_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_user_data_frame_splits_responses_events_and_unknown_shapes() {
+        assert_eq!(
+            parse_user_data_frame(r#"{"id":"abc","status":200,"result":{"subscriptionId":0}}"#),
+            UserDataFrame::Response
+        );
+        assert_eq!(
+            parse_user_data_frame(
+                r#"{"subscriptionId":4,"event":{"e":"outboundAccountPosition","E":1}}"#
+            ),
+            UserDataFrame::Event {
+                subscription_id: Some(4),
+                event_type: "outboundAccountPosition",
+                event: r#"{"e":"outboundAccountPosition","E":1}"#,
+            }
+        );
+        // A frame with both `id` and `event` is a response.
+        assert_eq!(
+            parse_user_data_frame(r#"{"id":1,"subscriptionId":4,"event":{"e":"x"}}"#),
+            UserDataFrame::Response
+        );
+        for frame in [
+            // A bare event: the shape the spot converter used to assume.
+            r#"{"e":"executionReport","i":1}"#,
+            // An envelope whose event has no `e`, a non-string `e`, or an escaped one.
+            r#"{"subscriptionId":4,"event":{"E":1}}"#,
+            r#"{"subscriptionId":4,"event":{"e":7}}"#,
+            r#"{"subscriptionId":4,"event":{"e":"executionRep\u006frt"}}"#,
+            "not json",
+            "[]",
+        ] {
+            assert_eq!(
+                parse_user_data_frame(frame),
+                UserDataFrame::Unrecognised,
+                "{frame}"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_excerpt_cuts_at_200_characters_on_a_char_boundary() {
+        assert_eq!(frame_excerpt("short"), "short");
+        let exact = "a".repeat(200);
+        assert_eq!(frame_excerpt(&exact), exact);
+        let long = "é".repeat(300);
+        assert_eq!(frame_excerpt(&long).chars().count(), 200);
+    }
 
     /// A `myTrades` execution reduced to the three fields recovery reads.
     #[derive(Debug, Clone, Copy)]
