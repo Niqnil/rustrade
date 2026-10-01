@@ -102,6 +102,7 @@ pub struct ClientInstrument<'a> {
 }
 
 impl<'a> ClientInstrument<'a> {
+    /// The view of an instrument named `name_exchange`, of kind `kind`.
     pub fn new(
         name_exchange: &'a InstrumentNameExchange,
         kind: InstrumentKindDiscriminant,

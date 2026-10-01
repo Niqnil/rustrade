@@ -229,6 +229,9 @@ impl ContractConfig {
     ///   `right` is absent on an `OPT` contract.
     /// - [`UnrecognizedOptionRight`](contract::ContractConfigError::UnrecognizedOptionRight)
     ///   — `right` is present but not one of `C`/`CALL`/`P`/`PUT` (case-insensitive).
+    ///
+    /// A security type added here must also be added to `security_types_of`, or every entry naming
+    /// it fails `validate_config`; `security_types_cover_every_type_to_contract_builds` checks it.
     fn to_contract(&self) -> Result<ibapi::contracts::Contract, contract::ContractConfigError> {
         use contract::ContractConfigError as E;
         Ok(match self.security_type.as_str() {
@@ -1507,6 +1510,9 @@ impl ExecutionClient for IbkrClient {
     /// `STK` or `CASH` for a `Spot`, `FUT` for a `Future`, `OPT` for an `Option`. Every problem
     /// found is reported, not just the first.
     ///
+    /// `Spot` covers both a stock and a currency pair, so `STK` and `CASH` cannot be told apart
+    /// here: either is accepted for any `Spot` instrument.
+    ///
     /// An entry keyed to no instrument on this exchange, and an instrument with no entry, are both
     /// accepted: a contract can also be registered later with
     /// [`register_contract`](Self::register_contract), which this cannot see.
@@ -1525,6 +1531,15 @@ impl ExecutionClient for IbkrClient {
                     .iter()
                     .find(|instrument| instrument.name_exchange.as_ref() == contract.name)?;
                 let expected = security_types_of(instrument.kind);
+                if expected.is_empty() {
+                    // Unreachable through `ExecutionBuilder`, which checks `SUPPORTED_KINDS` first,
+                    // but a direct caller can pass any kind.
+                    return Some(format!(
+                        "contract {:?} is for an instrument of kind {}, which this client cannot \
+                         trade",
+                        contract.name, instrument.kind,
+                    ));
+                }
                 (!expected.contains(&contract.security_type.as_str())).then(|| {
                     format!(
                         "contract {:?} names security type {:?}, but its instrument's kind is \
@@ -2810,6 +2825,51 @@ mod contract_config_tests {
         let error = IbkrClient::validate_config(&config, &instruments).unwrap_err();
         assert!(error.contains("\"ES\""), "{error}");
         assert!(error.contains("\"NQ\""), "{error}");
+    }
+
+    /// Every (kind, security type) pair: accepted exactly where `security_types_of` lists it, and
+    /// a kind this client cannot trade rejected whatever the type.
+    #[test]
+    fn validate_config_checks_every_kind_against_every_security_type() {
+        use InstrumentKindDiscriminant as K;
+        let accepted = [
+            (K::Spot, "STK"),
+            (K::Spot, "CASH"),
+            (K::Future, "FUT"),
+            (K::Option, "OPT"),
+        ];
+        let name = InstrumentNameExchange::new("X");
+        for kind in [K::Spot, K::Perpetual, K::Future, K::Option, K::Cfd] {
+            for security_type in ["STK", "CASH", "FUT", "OPT"] {
+                let instruments = [ClientInstrument::new(&name, kind)];
+                let config = ibkr_config(vec![named("X", security_type)]);
+                assert_eq!(
+                    IbkrClient::validate_config(&config, &instruments).is_ok(),
+                    accepted.contains(&(kind, security_type)),
+                    "{kind} with {security_type}"
+                );
+            }
+        }
+    }
+
+    /// `security_types_of` is written separately from `to_contract`'s match, so a type added
+    /// there must be added here too: an entry naming a type no kind lists fails every check.
+    #[test]
+    fn security_types_cover_every_type_to_contract_builds() {
+        use InstrumentKindDiscriminant as K;
+        let listed = [K::Spot, K::Perpetual, K::Future, K::Option, K::Cfd]
+            .into_iter()
+            .flat_map(security_types_of)
+            .copied()
+            .collect::<Vec<_>>();
+        // Every type `to_contract` builds; `BOND` stands for one it does not.
+        for security_type in ["STK", "CASH", "FUT", "OPT", "BOND"] {
+            assert_eq!(
+                full_config(security_type).to_contract().is_ok(),
+                listed.contains(&security_type),
+                "{security_type}"
+            );
+        }
     }
 
     /// A contract can also be registered later with `register_contract`, so neither side of an
