@@ -94,7 +94,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -291,9 +291,9 @@ impl WsApiUnavailable {
 /// rest is left for orders and cancels, which never wait for it. A query, including a
 /// [`fetch_open_orders`](Self::fetch_open_orders) after a reconnect, can therefore take up to
 /// about a minute longer. A reconnect's fill recovery does not wait for it either, since a pause
-/// could outlast the recovery's 30 s and delay its fills to a retry. After Binance answers with a rate-limit error, REST calls wait out a
-/// cooldown, and an order or cancel that would have to open a new WebSocket API session fails
-/// with [`ApiError::RateLimit`] instead, unsent.
+/// could outlast the recovery's 30 s and delay its fills to a retry. After Binance answers with a
+/// rate-limit error, REST calls wait out a cooldown, and an order or cancel that would have to
+/// open a new WebSocket API session fails with [`ApiError::RateLimit`] instead, unsent.
 #[derive(Clone)]
 pub struct BinanceSpot {
     config: Arc<BinanceSpotConfig>,
@@ -494,10 +494,10 @@ async fn fetch_all_open_orders(
 /// Paginate `GET /api/v3/myTrades` for a single instrument, from `from`.
 ///
 /// Uses cursor-based pagination: the first page queries by `start_time`, or by `order_id` for a
-/// single order's executions; a [`MyTradesFrom::Span`] stops at the first page reaching past its
-/// end and drops the executions after it; subsequent pages use `from_id = last_id + 1` (Binance ignores
+/// single order's executions; subsequent pages use `from_id = last_id + 1` (Binance ignores
 /// `start_time` when `from_id` is set), keeping `order_id` alongside it, a combination Binance
-/// documents as supported. Trade IDs are monotonically increasing per symbol, so this produces a
+/// documents as supported. A [`MyTradesFrom::Span`] stops at the first page reaching past its end
+/// and drops the executions after it. Trade IDs are monotonically increasing per symbol, so this produces a
 /// gapless result.
 ///
 /// Returns raw response items. Callers decide how to handle `Err` (propagate vs. log-skip).
@@ -700,10 +700,10 @@ impl ExecutionClient for BinanceSpot {
     /// fail. Each instrument's gap, from the disconnect to just after the recovery began, is kept
     /// until its fills are forwarded. A gap not read is retried after 1, 2, 4, 8 and 16 minutes,
     /// whether the stream stays connected or reconnects in between. A retry reads only the gap,
-    /// never fills the stream delivered live, so it cannot deliver a fill twice. Each failed
-    /// read is logged at `warn` with the instrument and the gap. After five failed retries the gap
-    /// is given up, logged at `error`, and its fills are not delivered: read them with
-    /// [`ExecutionClient::fetch_trades`].
+    /// not fills the stream delivered live after it; the few seconds at its end that overlap live
+    /// delivery are deduplicated. Each failed read is logged at `warn` with the instrument and the
+    /// gap. After five failed retries the gap is given up, logged at `error`, and its fills are not
+    /// delivered: read them with [`ExecutionClient::fetch_trades`].
     ///
     /// A recovered gap counts as read even when a fill in it could not be converted, which is
     /// logged, or its order's cumulative could not be looked up (see below).
@@ -1457,7 +1457,7 @@ async fn connection_manager(
 ) {
     let mut backoff = ExponentialBackoff::new();
     let mut disconnect_time: Option<DateTime<Utc>> = None;
-    // Gaps a recovery did not finish, read again by the next one.
+    // Gaps not yet recovered: read at reconnect, and retried on a timer while connected, once due.
     let mut unrecovered = UnrecoveredFills::default();
     let mut current_ws = initial_ws;
 
@@ -1621,11 +1621,12 @@ async fn connection_manager(
             tokio::pin!(retry_gaps);
             loop {
                 tokio::select! {
+                    // Biased: a consumer drop is terminal and wins; the gap retry is polled last.
+                    biased;
                     _ = tx.closed() => {
                         debug!("BinanceSpot account_stream consumer dropped, terminating");
                         break DisconnectReason::ConsumerDropped;
                     }
-                    () = &mut retry_gaps => {}
                     _ = &mut signal_rx => {
                         warn!("BinanceSpot WS disconnected, will attempt reconnect");
                         break DisconnectReason::Signal;
@@ -1647,6 +1648,8 @@ async fn connection_manager(
                         warn!("BinanceSpot heartbeat timeout ({}s), will attempt reconnect", HEARTBEAT_TIMEOUT_SECS);
                         break DisconnectReason::HeartbeatTimeout;
                     }
+                    // Last: the arms above end the monitor and win when ready together.
+                    () = &mut retry_gaps => {}
                 }
             }
         };
@@ -1747,8 +1750,10 @@ async fn recover_fills(
         "BinanceSpot recovering fills missed while disconnected"
     );
 
-    // Which gaps of `due` have been settled, recovered or failed.
+    // Which gaps of `due` have been settled, recovered or failed, and how many have started: the
+    // stream starts them in order, eight at a time, so those from `started` on were never read.
     let mut settled = vec![false; due.len()];
+    let started = AtomicUsize::new(0);
     let recovery = async {
         let order_executions_deadline = tokio::time::Instant::now() + ORDER_EXECUTIONS_BUDGET;
         let mut recovered = 0u32;
@@ -1761,6 +1766,7 @@ async fn recover_fills(
         // fetch_trades.
         let mut stream =
             futures::stream::iter(due.iter().cloned().enumerate().map(|(index, (inst, gap))| {
+                started.store(index + 1, Ordering::Relaxed);
                 let rest = rest.clone();
                 let rl = rate_limiter.clone();
                 async move {
@@ -1851,12 +1857,18 @@ async fn recover_fills(
         info!(recovered, duplicates, "BinanceSpot fill recovery complete");
     };
     // A timeout drops `recovery` at an await, between gaps: one gap's fills are sent without
-    // awaiting, so each is either fully forwarded and settled, or not forwarded at all.
+    // awaiting, so each is either fully forwarded and settled, or not forwarded at all. A gap
+    // whose read started and did not finish has failed; one never started stays due as it was.
     if tokio::time::timeout(Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS), recovery)
         .await
         .is_err()
     {
-        for ((inst, gap), _) in due.iter().zip(&settled).filter(|(_, settled)| !**settled) {
+        let started = started.load(Ordering::Relaxed);
+        for ((inst, gap), _) in due[..started]
+            .iter()
+            .zip(&settled)
+            .filter(|(_, settled)| !**settled)
+        {
             gap_failed(
                 unrecovered,
                 ExchangeId::BinanceSpot,
@@ -4794,5 +4806,120 @@ mod tests {
             .collect();
         let start = disconnect.timestamp_millis().to_string();
         assert_eq!(start_times, [start.clone(), start]);
+    }
+
+    /// A span walk reads on by id through a full page inside the span, and stops at the page that
+    /// reaches past its end, without the executions after it.
+    #[tokio::test]
+    async fn a_span_walk_pages_by_id_and_stops_past_the_end() {
+        let start = Utc::now().timestamp_millis() - 600_000;
+        let end = start + 10_000;
+        let trade = |id: i64, time: i64| {
+            serde_json::json!({
+                "symbol": "BTCUSDT", "id": id, "orderId": id, "price": "100", "qty": "1",
+                "commission": "0", "commissionAsset": "USDT", "time": time,
+                "isBuyer": true, "isMaker": false, "isBestMatch": true,
+            })
+        };
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/myTrades"))
+            .and(wiremock::matchers::query_param("fromId", "1001"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([trade(1001, end), trade(1002, end + 1),])),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let full_page: Vec<_> = (1..=1_000).map(|id| trade(id, start + id)).collect();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/myTrades"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(full_page))
+            .mount(&server)
+            .await;
+        let rest = Arc::new(SpotRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server.uri())
+                .build()
+                .unwrap(),
+        ));
+
+        let read = paginate_my_trades(
+            &rest,
+            &Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+            &InstrumentNameExchange::new("BTCUSDT"),
+            MyTradesFrom::Span { start, end },
+            RequestKind::Query,
+        )
+        .await
+        .unwrap();
+
+        let ids: Vec<_> = read.iter().filter_map(|t| t.id).collect();
+        assert_eq!(ids, (1..=1_001).collect::<Vec<_>>());
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    /// When recovery times out, a gap whose read started has failed and waits for its retry, but
+    /// one never started (eight are read at a time) is not charged and stays due.
+    #[tokio::test]
+    async fn a_timed_out_recovery_charges_only_the_gaps_it_started() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/myTrades"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([]))
+                    .set_delay(Duration::from_secs(3_600)),
+            )
+            .mount(&server)
+            .await;
+        let rest = Arc::new(SpotRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server.uri())
+                .timeout(3_600_000_u64)
+                .retries(0_u32)
+                .build()
+                .unwrap(),
+        ));
+        let instruments: Vec<_> = (0..9)
+            .map(|i| InstrumentNameExchange::new(format!("SYM{i}USDT")))
+            .collect();
+        let mut unrecovered = UnrecoveredFills::default();
+        unrecovered.open(
+            &instruments,
+            Utc::now() - chrono::Duration::minutes(10),
+            Utc::now(),
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        // Paused: once every read is waiting, the clock jumps to the recovery timeout.
+        tokio::time::pause();
+
+        recover_fills(
+            &rest,
+            &Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+            &mut unrecovered,
+            &tx,
+            &new_dedup_cache(),
+        )
+        .await;
+
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            unrecovered.due(now).len(),
+            1,
+            "the gap never started stays due"
+        );
+        assert_eq!(
+            unrecovered
+                .due(now + Duration::from_secs(GAP_RETRY_BASE_SECS))
+                .len(),
+            9,
+            "the eight started wait for their first retry"
+        );
     }
 }

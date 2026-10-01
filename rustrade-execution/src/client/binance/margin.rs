@@ -122,7 +122,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -381,8 +381,8 @@ impl BinanceMarginConfig {
 /// which never wait for it. A query, including a [`fetch_open_orders`](Self::fetch_open_orders)
 /// after a reconnect, can therefore take up to about a minute longer. A reconnect's fill recovery
 /// and its `userListenToken` request do not wait for it either, since a pause could outlast the
-/// recovery's 30 s and delay its fills to a retry. The per-UID `/sapi` limit is not tracked. After Binance answers with a rate-limit error,
-/// every REST call waits out a cooldown.
+/// recovery's 30 s and delay its fills to a retry. The per-UID `/sapi` limit is not tracked.
+/// After Binance answers with a rate-limit error, every REST call waits out a cooldown.
 ///
 /// # One client per engine (`ExchangeId`)
 /// All emitted events — cross and isolated alike — are stamped [`ExchangeId::BinanceMargin`], and
@@ -1171,9 +1171,8 @@ impl ExecutionClient for BinanceMargin {
     ///
     /// As on spot, each instrument's gap after a reconnect is kept until its fills are forwarded:
     /// a gap whose read failed or timed out is retried after 1, 2, 4, 8 and 16 minutes, connected
-    /// or not in between, reading only the gap. After five failed retries
-    /// it is given up, logged at `error`; [`ExecutionClient::fetch_trades`] can still read its
-    /// fills.
+    /// or not in between, reading only the gap. After five failed retries it is given up, logged
+    /// at `error`; [`ExecutionClient::fetch_trades`] can still read its fills.
     ///
     /// # Debt cold-start
     /// This method does **not** seed balances. Margin debt (`borrowed`/`interest`) is correct only
@@ -1983,8 +1982,10 @@ async fn recover_margin_fills(
         "BinanceMargin recovering fills missed while disconnected"
     );
 
-    // Which gaps of `due` have been settled, recovered or failed.
+    // Which gaps of `due` have been settled, recovered or failed, and how many have started: the
+    // stream starts them in order, eight at a time, so those from `started` on were never read.
     let mut settled = vec![false; due.len()];
+    let started = AtomicUsize::new(0);
     let recovery = async {
         let order_executions_deadline = tokio::time::Instant::now() + ORDER_EXECUTIONS_BUDGET;
         let mut recovered = 0u32;
@@ -1992,6 +1993,7 @@ async fn recover_margin_fills(
 
         let mut stream =
             futures::stream::iter(due.iter().cloned().enumerate().map(|(index, (inst, gap))| {
+                started.store(index + 1, Ordering::Relaxed);
                 let rest = rest.clone();
                 let rl = rate_limiter.clone();
                 async move {
@@ -2086,12 +2088,18 @@ async fn recover_margin_fills(
         );
     };
     // A timeout drops `recovery` at an await, between gaps: one gap's fills are sent without
-    // awaiting, so each is either fully forwarded and settled, or not forwarded at all.
+    // awaiting, so each is either fully forwarded and settled, or not forwarded at all. A gap
+    // whose read started and did not finish has failed; one never started stays due as it was.
     if tokio::time::timeout(Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS), recovery)
         .await
         .is_err()
     {
-        for ((inst, gap), _) in due.iter().zip(&settled).filter(|(_, settled)| !**settled) {
+        let started = started.load(Ordering::Relaxed);
+        for ((inst, gap), _) in due[..started]
+            .iter()
+            .zip(&settled)
+            .filter(|(_, settled)| !**settled)
+        {
             gap_failed(
                 unrecovered,
                 ExchangeId::BinanceMargin,
@@ -2133,7 +2141,7 @@ async fn margin_connection_manager(
 
     let mut backoff = ExponentialBackoff::new();
     let mut disconnect_time: Option<DateTime<Utc>> = None;
-    // Gaps a recovery did not finish, read again by the next one.
+    // Gaps not yet recovered: read at reconnect, and retried on a timer while connected, once due.
     let mut unrecovered = UnrecoveredFills::default();
     let (mut current_ws, mut current_token) = match initial {
         Some((ws, token)) => (Some(ws), Some(token)),
@@ -2570,7 +2578,7 @@ async fn isolated_connection_manager(
 
     let mut backoff = ExponentialBackoff::new();
     let mut disconnect_time: Option<DateTime<Utc>> = None;
-    // Gaps a recovery did not finish, read again by the next one.
+    // Gaps not yet recovered: read at reconnect, and retried on a timer while connected, once due.
     let mut unrecovered = UnrecoveredFills::default();
     let mut current = initial;
 

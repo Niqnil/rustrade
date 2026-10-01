@@ -119,8 +119,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     REST queries wait for the next minute. Orders and cancels never wait for it, so they can use
     the rest. A reconnect's fill recovery never waits for it either, since a pause could outlast
     its 30 s budget and leave its fills to a later retry, and neither does margin's
-    `userListenToken` request, which that recovery depends on. Spot reads the weight used from REST and WebSocket API responses,
-    and the limit from WebSocket API responses, falling back to Binance's documented 6000.
+    `userListenToken` request, which that recovery depends on. Spot reads the weight used from
+    REST and WebSocket API responses, and the limit from WebSocket API responses, falling back to
+    Binance's documented 6000.
     Margin reads `x-sapi-used-ip-weight-1m` against the documented `/sapi` IP limit of 12000; the
     per-UID limit is not tracked.
 
@@ -136,8 +137,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disconnect to just after its recovery began, is now kept until its fills are forwarded. A gap
   not read is retried after 1, 2, 4, 8 and 16 minutes, whether the stream stays connected or
   reconnects in between. A retry reads only the gap, not the fills the stream has delivered
-  live since, so it cannot deliver a fill twice. After five failed retries the gap is given up
-  and logged at `error`; its fills can still be read with `fetch_trades`.
+  live since; the few seconds at its end that overlap live delivery are deduplicated. After five
+  failed retries the gap is given up and logged at `error`; its fills can still be read with
+  `fetch_trades`.
 
 - **Binance spot reopened its WebSocket API session during a rate-limit cooldown**
   (`rustrade-execution`, feature `binance`). An order or cancel with no open session ran a new

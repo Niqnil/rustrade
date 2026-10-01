@@ -127,7 +127,8 @@ pub(crate) const FILL_RECOVERY_TIMEOUT_SECS: u64 = 30;
 /// Binance stamps fills by its own clock, which may run ahead of this host's. Binance rejects a
 /// signed request stamped more than `recvWindow` (5 s by default) from its clock, so a skew past
 /// this margin would already fail every REST call. The overlap with live delivery it leaves is
-/// seconds long, and the dedup cache absorbs it.
+/// seconds long, and the dedup cache absorbs it, as long as those fills have not left it by the
+/// time the gap is read.
 pub(crate) const GAP_END_SLACK_SECS: i64 = 10;
 /// How many times a [`FillGap`] is retried after its first read fails before it is given up.
 pub(crate) const MAX_GAP_RETRIES: u32 = 5;
@@ -181,8 +182,13 @@ pub(crate) struct UnrecoveredFills(fnv::FnvHashMap<InstrumentNameExchange, Vec<F
 
 impl UnrecoveredFills {
     /// Open a gap for each of `instruments`, from `disconnect_time` to just after `now`, the start
-    /// of the recovery that will read it, due at once. A gap that overlaps one the instrument
-    /// already has is merged into it, so no span is read twice.
+    /// of the recovery that will read it, due at once.
+    ///
+    /// Where the new gap overlaps one the instrument already has, it starts after it instead: the
+    /// kept gap covers that part and keeps its retry schedule, so no span is read twice and a
+    /// reconnect never brings a retry forward. Disconnects come in time order, so an earlier part
+    /// of the new gap that no kept gap covers is from before the previous disconnect, when the
+    /// stream was live.
     pub(crate) fn open(
         &mut self,
         instruments: &[InstrumentNameExchange],
@@ -194,21 +200,18 @@ impl UnrecoveredFills {
         let due = tokio::time::Instant::now();
         for instrument in instruments {
             let gaps = self.0.entry(instrument.clone()).or_default();
-            match gaps
-                .iter_mut()
-                .find(|gap| gap.start_ms <= end_ms && start_ms <= gap.end_ms)
-            {
-                Some(gap) => {
-                    gap.start_ms = gap.start_ms.min(start_ms);
-                    gap.end_ms = gap.end_ms.max(end_ms);
-                    gap.due = due;
-                }
-                None => gaps.push(FillGap {
+            let start_ms = gaps
+                .iter()
+                .filter(|kept| kept.start_ms <= end_ms && start_ms <= kept.end_ms)
+                .map(|kept| kept.end_ms + 1)
+                .fold(start_ms, i64::max);
+            if start_ms <= end_ms {
+                gaps.push(FillGap {
                     start_ms,
                     end_ms,
                     failures: 0,
                     due,
-                }),
+                });
             }
         }
     }
@@ -2522,10 +2525,10 @@ mod tests {
         );
     }
 
-    /// A new gap that overlaps a kept one is merged into it and due at once; a separate one is
-    /// kept beside it.
+    /// A new gap that overlaps a kept one starts after it, so the kept one keeps its retry
+    /// schedule and no span is read twice; a gap wholly covered is not opened.
     #[tokio::test]
-    async fn an_overlapping_fill_gap_is_merged() {
+    async fn an_overlapping_fill_gap_starts_after_the_kept_one() {
         tokio::time::pause();
         let btc = InstrumentNameExchange::new("BTCUSDT");
         let at = |secs: i64| Utc.timestamp_millis_opt(secs * 1_000).unwrap();
@@ -2534,15 +2537,17 @@ mod tests {
         let (_, first) = unrecovered.due(tokio::time::Instant::now())[0].clone();
         unrecovered.failed(&btc, &first, tokio::time::Instant::now());
 
-        // Disconnected again within the first gap's slack: one merged gap, due now.
+        // Disconnected again within the first gap's slack: only the rest is a new gap, due now.
         unrecovered.open(std::slice::from_ref(&btc), at(1_105), at(1_200));
         let due = unrecovered.due(tokio::time::Instant::now());
-        assert_eq!(due.len(), 1);
-        assert_eq!(due[0].1.start_ms, 1_000_000);
+        assert_eq!(due.len(), 1, "the failed gap waits for its retry");
+        assert_eq!(due[0].1.start_ms, first.end_ms + 1);
         assert_eq!(due[0].1.end_ms, (1_200 + GAP_END_SLACK_SECS) * 1_000);
 
-        // A later, separate gap is its own.
-        unrecovered.open(std::slice::from_ref(&btc), at(5_000), at(5_100));
+        // A gap wholly inside kept ones adds nothing.
+        unrecovered.open(std::slice::from_ref(&btc), at(1_150), at(1_150));
+        assert_eq!(unrecovered.due(tokio::time::Instant::now()).len(), 1);
+        tokio::time::advance(Duration::from_secs(GAP_RETRY_BASE_SECS)).await;
         assert_eq!(unrecovered.due(tokio::time::Instant::now()).len(), 2);
     }
 
