@@ -53,8 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`EngineOutput::ContractExpiryNotSettled`** (`rustrade`), emitted when a `ContractExpiry` does
   not settle its instrument. Its `ContractExpiryNotSettledReason` is `InstrumentNeverExpires` for
   a `Spot`, `Perpetual` or `Cfd` instrument (see Fixed), `SettlementPriceUnavailable` when the
-  price settlement needs has not arrived, or `UnknownInstrument` (see Fixed). The second case was
-  only logged before; the event stays retryable. Both enums are `#[non_exhaustive]`, so no downstream `match` breaks.
+  price settlement needs has not arrived, or `UnknownInstrument` (see Fixed).
+  `SettlementPriceUnavailable` was only logged before; the event stays retryable. Both enums are
+  `#[non_exhaustive]`, so no downstream `match` breaks.
 
 - **`ApiError::RequestRejected`** (`rustrade-execution`): the venue refused the request itself,
   such as a missing, malformed or out-of-range parameter, as opposed to an order failing a
@@ -173,8 +174,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state: a `ContractExpiry` with `EngineOutput::ContractExpiryNotSettled`, a `CorporateAction`
   with `EngineOutput::UnsupportedCorporateAction` and its `id` unrecorded, each with a new
   `UnknownInstrument` reason. Both reason enums are `#[non_exhaustive]`, so no downstream `match`
-  breaks. The audit replica does the same. `InstrumentStates::contains_index` tells whether an
-  index is one the engine holds. A valid index for the wrong instrument still cannot be detected.
+  breaks. The audit replica does the same. New `InstrumentStates::get_index` and `get_index_mut`
+  look an index up without panicking. A valid index for the wrong instrument still cannot be
+  detected.
 
 - **The audit replica left a settled contract expiry out of its tear sheet** (`rustrade`). When a
   `ContractExpiry` closed positions, the live engine added each closed position to the

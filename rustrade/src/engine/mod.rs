@@ -523,9 +523,9 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
         InstrumentData: InstrumentDataState + InFlightRequestRecorder,
         ExecutionTxs: ExecutionTxMap,
     {
-        // Step 1: reject an index this engine was not built with. The event is built by the
+        // Step 1a: reject an index this engine was not built with. The event is built by the
         // caller, so a stale or foreign index must not panic a running engine.
-        if !self.state.instruments.contains_index(key) {
+        let Some(instrument_state) = self.state.instruments.get_index_mut(key) else {
             warn!(
                 instrument = ?key,
                 "ContractExpiry targets an instrument this engine was not built with — rejected, \
@@ -535,11 +535,9 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 instrument: *key,
                 reason: ContractExpiryNotSettledReason::UnknownInstrument,
             }];
-        }
+        };
 
-        let instrument_state = self.state.instruments.instrument_index_mut(key);
-
-        // Step 1, continued: reject an instrument that never expires, before anything is touched. Settling it
+        // Step 1b: reject an instrument that never expires, before anything is touched. Settling it
         // would close every position at the last price and set `expiration_processed` for good,
         // so the instrument could never trade again in this run.
         let Some((expiry, settlement)) = ExpirySettlement::of(&instrument_state.instrument) else {
@@ -883,7 +881,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
 
         // Step 0: reject an index this engine was not built with. The event is built by the
         // caller, so a stale or foreign index must not panic a running engine. Do NOT record `id`.
-        if !self.state.instruments.contains_index(key) {
+        let Some(instrument_state) = self.state.instruments.get_index(key) else {
             warn!(
                 %id,
                 instrument = ?key,
@@ -896,9 +894,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 reason: UnsupportedCorporateActionReason::UnknownInstrument,
             });
             return outputs;
-        }
-
-        let instrument_state = self.state.instruments.instrument_index(key);
+        };
 
         // Step 1: idempotency guard (keyed on `id` alone). Warn on suppression — a wrapper-reused
         // `id` would otherwise silently drop a real action.
@@ -1855,6 +1851,9 @@ pub enum ContractExpiryNotSettledReason {
     /// The event's `InstrumentIndex` is not an instrument this engine was built with: for
     /// example one taken from another `IndexedInstruments`. It was rejected before anything was
     /// touched. **Not** retryable — the same event is rejected every time.
+    ///
+    /// The output's `instrument` is that unresolved index: do not look it up in the engine's
+    /// state, where the panicking accessors would panic on it.
     UnknownInstrument,
 }
 
@@ -1970,6 +1969,9 @@ pub enum UnsupportedCorporateActionReason {
     /// example one taken from another `IndexedInstruments`. It was rejected before anything was
     /// touched and the `id` is not recorded. **Not** self-healing on retry: the same event is
     /// rejected every time.
+    ///
+    /// The output's `instrument` is that unresolved index: do not look it up in the engine's
+    /// state, where the panicking accessors would panic on it.
     UnknownInstrument,
 }
 

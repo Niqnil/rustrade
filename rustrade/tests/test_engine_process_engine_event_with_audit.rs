@@ -2027,7 +2027,7 @@ fn test_unknown_instrument_index_is_rejected_not_panicked() {
     let mut replica = StateReplicaManager::new(seed_tick, dummy_updates);
 
     let unknown = InstrumentIndex(pre_state.instruments.0.len());
-    assert!(!pre_state.instruments.contains_index(&unknown));
+    assert!(pre_state.instruments.get_index(&unknown).is_none());
 
     let outputs =
         process_live_and_replica!(&mut engine, replica, EngineEvent::ContractExpiry(unknown));

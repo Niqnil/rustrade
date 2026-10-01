@@ -32,12 +32,11 @@ pub const AUDIT_REPLICA_STATE_UPDATE_SPAN_NAME: &str = "audit_replica_state_upda
 ///
 /// The live engine records each open and cancel request it sends as in flight, on its orders and
 /// in its instrument data, before the venue has answered. The replica records none of them,
-/// whichever path sent them: a command, the algo strategy, a position close, a disconnect or
-/// trading-disabled strategy, or the order cancels a `ContractExpiry` sends (also when the expiry
-/// then fails to settle for want of a price). So until the venue answers, the replica can lack an
-/// order the engine has just opened and still show as open an order the engine is cancelling.
-/// It catches up from the venue's answer on the account stream: an active order snapshot inserts
-/// an order it does not hold, and a cancel confirmation or fill updates it as on the live engine.
+/// whatever sent them; that includes the cancels a `ContractExpiry` sends before it fails to
+/// settle for want of a price. So until the venue answers, the replica can lack an order the
+/// engine has just opened and still show as open an order the engine is cancelling. It catches up
+/// from the venue's answer on the account stream: an active order snapshot inserts an order it
+/// does not hold, and a cancel confirmation or fill updates it as on the live engine.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct StateReplicaManager<State, Updates> {
     pub meta_start: EngineMeta,
@@ -151,13 +150,15 @@ where
     ///
     /// - **`ContractExpiry`**: consults `outputs` from the live engine rather than replaying
     ///   the event. This is necessary because `process_contract_expiry` is *conditional*: it
-    ///   declines to settle (emitting `ContractExpiryNotSettled` and no exits) when the instrument
-    ///   never expires or the settlement price is unavailable. The replica mirrors the decision
+    ///   declines to settle (emitting `ContractExpiryNotSettled` and no exits) when the event names
+    ///   an instrument the engine was not built with, the instrument never expires, or the
+    ///   settlement price is unavailable. The replica mirrors the decision
     ///   by inspecting the `ContractExpiryNotSettled` and `PositionExit` outputs.
     ///
     /// - **`CorporateAction`**: a *hybrid*. `Position::apply_split` is deterministic, so the
     ///   adjustment (quantity / basis / unrealised PnL) is **event-replayed** for every position
-    ///   from the payload — after re-running the same guards (idempotency / non-`Spot` /
+    ///   from the payload — after re-running the same guards (unknown instrument / idempotency /
+    ///   non-`Spot` /
     ///   unsupported-kind, plus the ambiguous-target and pre-validation guards inside the shared
     ///   prepare pass, all of which skip without mutating). The Floor-to-zero **close** is
     ///   **output-mirrored** (like `ContractExpiry`): the live handler stamps the closing
@@ -217,10 +218,11 @@ where
                 // to settle, closing no position and leaving `expiration_processed` unset. The
                 // replica mirrors this by deciding from the outputs of *this* audit tick:
                 //
-                // - `ContractExpiryNotSettled` for this instrument → the instrument never
-                //   expires, or the settlement price was unavailable → leave state untouched.
-                //   Checked first: a never-expiring instrument with no position must not fall
-                //   through to the empty-branch arm below and be marked processed.
+                // - `ContractExpiryNotSettled` for this instrument → the instrument is unknown to
+                //   the engine, never expires, or the settlement price was unavailable → leave
+                //   state untouched. Checked first: an unknown index must not reach the lookup
+                //   below, and a never-expiring instrument with no position must not fall through
+                //   to the empty-branch arm below and be marked processed.
                 // - Already `expiration_processed` → the live engine skipped the duplicate
                 //   without touching state → neither does the replica.
                 // - Any `PositionExit` output → live engine processed expiry → clear
@@ -310,15 +312,11 @@ where
                 // handler does, so the replica never applies an action the live engine rejected.
                 let instruments = &self.replica_engine_state().instruments;
                 // An index this engine was not built with: the live engine rejected it untouched.
-                if !instruments.contains_index(&instrument) {
+                let Some(instrument_state) = instruments.get_index(&instrument) else {
                     return;
-                }
+                };
                 // Idempotency: already applied (the set mirrors the live engine's).
-                if instruments
-                    .instrument_index(&instrument)
-                    .corporate_actions_processed
-                    .contains(&id)
-                {
+                if instrument_state.corporate_actions_processed.contains(&id) {
                     return;
                 }
                 // Unsupported instrument kind (checked first, like the live handler): equity
