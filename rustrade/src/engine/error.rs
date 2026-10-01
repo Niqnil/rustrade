@@ -19,11 +19,20 @@ pub enum EngineError {
 
 /// Represents temporary error conditions that the [`Engine`](super::Engine) can recover from.
 ///
-/// These errors typically represent transient issues like network problems.
+/// These errors typically represent transient issues like network problems, or a single request
+/// the `Engine` refused without touching its state.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]
+#[non_exhaustive]
 pub enum RecoverableEngineError {
     #[error("ExecutionRequest channel unhealthy: {0}")]
     ExecutionChannelUnhealthy(String),
+
+    /// An order request named an instrument the `Engine` state does not track, so it was not
+    /// sent. Holds the instrument key, `Debug`-formatted.
+    ///
+    /// See [`TracksInstrument`](crate::engine::state::TracksInstrument).
+    #[error("order request for an instrument the Engine does not track: {0}")]
+    UnknownInstrument(String),
 }
 
 /// Represents fatal error conditions that the [`Engine`](super::Engine) cannot recover from.

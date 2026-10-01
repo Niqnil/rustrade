@@ -229,6 +229,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   look an index up without panicking. A valid index for the wrong instrument still cannot be
   detected.
 
+- **An order request naming an unknown instrument panicked the engine** (`rustrade`). Requests
+  from a `Command::SendOpenRequests` or `SendCancelRequests`, an `AlgoStrategy` or a
+  `ClosePositionsStrategy` are built by caller code, and an `InstrumentIndex` the engine was not
+  built with panicked it. An open panicked before it was sent. A cancel panicked after it had
+  already gone to the venue, so the venue acted on a request the engine never recorded. The
+  engine now checks every request before sending it. It rejects one for an unknown instrument
+  unsent, reports it in its action output's `errors` as the new
+  `RecoverableEngineError::UnknownInstrument`, logs a warning, and keeps running.
+  - New `TracksInstrument` trait, implemented for `EngineState`. The engine's `GenerateAlgoOrders`
+    and `ClosePositions` implementations now require it of their `State`, so a custom `State`
+    used with them must implement it.
+  - `RecoverableEngineError` is now `#[non_exhaustive]`, so a downstream `match` on it needs a
+    wildcard arm.
+  - `MarketSnapshotSource::market_snapshot` on `EngineState` returns `None` for an unknown
+    instrument instead of panicking.
+
 - **The audit replica left a settled contract expiry out of its tear sheet** (`rustrade`). When a
   `ContractExpiry` closed positions, the live engine added each closed position to the
   instrument's tear sheet, but the replica only removed the position, so its statistics drifted

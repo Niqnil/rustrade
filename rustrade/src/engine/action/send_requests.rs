@@ -3,6 +3,10 @@ use crate::{
         Engine,
         error::{EngineError, RecoverableEngineError, UnrecoverableEngineError},
         execution_tx::ExecutionTxMap,
+        state::{
+            MarketSnapshotSource, TracksInstrument,
+            order::in_flight_recorder::InFlightRequestRecorder,
+        },
     },
     execution::request::ExecutionRequest,
 };
@@ -10,7 +14,7 @@ use derive_more::Constructor;
 use itertools::Itertools;
 use rustrade_execution::order::{
     OrderEvent,
-    request::{RequestCancel, RequestOpen},
+    request::{OrderRequestCancel, OrderRequestOpen, RequestCancel, RequestOpen},
 };
 use rustrade_instrument::{exchange::ExchangeIndex, instrument::InstrumentIndex};
 use rustrade_integration::{
@@ -18,9 +22,13 @@ use rustrade_integration::{
 };
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
-use tracing::error;
+use tracing::{error, warn};
 
 /// Trait that defines how the [`Engine`] sends order requests.
+///
+/// It sends exactly what it is given. The `Engine`'s own actions first reject any request for an
+/// instrument the state does not track (see [`TracksInstrument`]) and stamp each open with the
+/// market, then send through it and record what was sent as in flight.
 ///
 /// # Type Parameters
 /// * `ExchangeKey` - Type used to identify an exchange (defaults to [`ExchangeIndex`]).
@@ -121,6 +129,97 @@ where
                 ))
             }
         }
+    }
+}
+
+impl<Clock, State, ExecutionTxs, Strategy, Risk>
+    Engine<Clock, State, ExecutionTxs, Strategy, Risk>
+{
+    /// Send open requests on behalf of an `Engine` action: reject any for an untracked instrument,
+    /// stamp the rest with the market the state holds now (see [`MarketSnapshotSource`]), send
+    /// them, and record those sent as in flight.
+    pub(crate) fn send_open_requests<ExchangeKey, InstrumentKey>(
+        &mut self,
+        requests: impl IntoIterator<Item = OrderRequestOpen<ExchangeKey, InstrumentKey>>,
+    ) -> SendRequestsOutput<RequestOpen, ExchangeKey, InstrumentKey>
+    where
+        State: TracksInstrument<InstrumentKey>
+            + MarketSnapshotSource<InstrumentKey>
+            + InFlightRequestRecorder<ExchangeKey, InstrumentKey>,
+        ExecutionTxs: ExecutionTxMap<ExchangeKey, InstrumentKey>,
+        ExchangeKey: Debug + Clone,
+        InstrumentKey: Debug + Clone,
+    {
+        let output = self.send_tracked_requests(requests, |state, open| {
+            open.state.market = state.market_snapshot(&open.key.instrument);
+        });
+        self.state.record_in_flight_opens(output.sent_iter());
+        output
+    }
+
+    /// Send cancel requests on behalf of an `Engine` action: reject any for an untracked
+    /// instrument, send the rest, and record those sent as in flight.
+    pub(crate) fn send_cancel_requests<ExchangeKey, InstrumentKey>(
+        &mut self,
+        requests: impl IntoIterator<Item = OrderRequestCancel<ExchangeKey, InstrumentKey>>,
+    ) -> SendRequestsOutput<RequestCancel, ExchangeKey, InstrumentKey>
+    where
+        State:
+            TracksInstrument<InstrumentKey> + InFlightRequestRecorder<ExchangeKey, InstrumentKey>,
+        ExecutionTxs: ExecutionTxMap<ExchangeKey, InstrumentKey>,
+        ExchangeKey: Debug + Clone,
+        InstrumentKey: Debug + Clone,
+    {
+        let output = self.send_tracked_requests(requests, |_, _| {});
+        self.state.record_in_flight_cancels(output.sent_iter());
+        output
+    }
+
+    /// Send each request whose instrument the state tracks, after `prepare` has adjusted it, and
+    /// reject the others unsent as [`RecoverableEngineError::UnknownInstrument`]. Errors keep the
+    /// input order, whichever step produced them.
+    fn send_tracked_requests<Kind, ExchangeKey, InstrumentKey>(
+        &self,
+        requests: impl IntoIterator<Item = OrderEvent<Kind, ExchangeKey, InstrumentKey>>,
+        prepare: impl Fn(&State, &mut OrderEvent<Kind, ExchangeKey, InstrumentKey>),
+    ) -> SendRequestsOutput<Kind, ExchangeKey, InstrumentKey>
+    where
+        State: TracksInstrument<InstrumentKey>,
+        ExecutionTxs: ExecutionTxMap<ExchangeKey, InstrumentKey>,
+        Kind: Debug + Clone,
+        ExchangeKey: Debug + Clone,
+        InstrumentKey: Debug + Clone,
+        ExecutionRequest<ExchangeKey, InstrumentKey>:
+            From<OrderEvent<Kind, ExchangeKey, InstrumentKey>>,
+    {
+        let (sent, errors): (Vec<_>, Vec<_>) = requests
+            .into_iter()
+            .map(|mut request| {
+                if !self.state.tracks_instrument(&request.key.instrument) {
+                    // The whole request is returned in `errors`; the log names what finds it.
+                    warn!(
+                        instrument = ?request.key.instrument,
+                        strategy = %request.key.strategy,
+                        cid = %request.key.cid,
+                        "order request for an instrument the Engine does not track -- rejected, \
+                         not sent"
+                    );
+                    let error =
+                        EngineError::Recoverable(RecoverableEngineError::UnknownInstrument(
+                            format!("{:?}", request.key.instrument),
+                        ));
+                    return Err(Box::new((request, error)));
+                }
+
+                prepare(&self.state, &mut request);
+                match self.send_request(&request) {
+                    Ok(()) => Ok(Box::new(request)),
+                    Err(error) => Err(Box::new((request, error))),
+                }
+            })
+            .partition_result();
+
+        SendRequestsOutput::new(sent.into_iter().collect(), errors.into_iter().collect())
     }
 }
 

@@ -1,10 +1,13 @@
 use crate::{
     engine::{
         Engine,
-        action::send_requests::{SendCancelsAndOpensOutput, SendRequests, SendRequestsOutput},
+        action::send_requests::{SendCancelsAndOpensOutput, SendRequestsOutput},
         error::UnrecoverableEngineError,
         execution_tx::ExecutionTxMap,
-        state::{MarketSnapshotSource, order::in_flight_recorder::InFlightRequestRecorder},
+        state::{
+            MarketSnapshotSource, TracksInstrument,
+            order::in_flight_recorder::InFlightRequestRecorder,
+        },
     },
     risk::{RiskApproved, RiskManager, RiskRefused},
     strategy::algo::AlgoStrategy,
@@ -36,8 +39,9 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk, ExchangeKey, InstrumentKey>
     GenerateAlgoOrders<ExchangeKey, InstrumentKey>
     for Engine<Clock, State, ExecutionTxs, Strategy, Risk>
 where
-    State:
-        InFlightRequestRecorder<ExchangeKey, InstrumentKey> + MarketSnapshotSource<InstrumentKey>,
+    State: InFlightRequestRecorder<ExchangeKey, InstrumentKey>
+        + MarketSnapshotSource<InstrumentKey>
+        + TracksInstrument<InstrumentKey>,
     ExecutionTxs: ExecutionTxMap<ExchangeKey, InstrumentKey>,
     Strategy: AlgoStrategy<ExchangeKey, InstrumentKey, State = State>,
     Risk: RiskManager<ExchangeKey, InstrumentKey, State = State>,
@@ -52,24 +56,24 @@ where
         let (cancels, opens, refused_cancels, refused_opens) =
             self.risk.check(&self.state, cancels, opens);
 
+        // Collect every Iterator, since the strategy and risk manager may have borrowed the state
+        // to build them, and sending records in-flight requests on it. An empty Vec does not
+        // allocate.
+        let cancels: Vec<_> = cancels
+            .into_iter()
+            .map(|RiskApproved(cancel)| cancel)
+            .collect();
+        let opens: Vec<_> = opens.into_iter().map(|RiskApproved(open)| open).collect();
+        let cancels_refused = refused_cancels.into_iter().map(Box::new).collect();
+        let opens_refused = refused_opens.into_iter().map(Box::new).collect();
+
         // Send risk approved order requests.
         //
         // Each open is stamped with the market this state holds *now*, before it goes out. This is
         // the request's decision point, and the only instant with a well-defined position on a
         // simulated timeline -- see `MarketSnapshotSource`.
-        let cancels = self.send_requests(cancels.into_iter().map(|RiskApproved(cancel)| cancel));
-        let opens = self.send_requests(opens.into_iter().map(|RiskApproved(mut open)| {
-            open.state.market = self.state.market_snapshot(&open.key.instrument);
-            open
-        }));
-
-        // Collect remaining Iterators (so we can access &mut self)
-        let cancels_refused = refused_cancels.into_iter().map(Box::new).collect();
-        let opens_refused = refused_opens.into_iter().map(Box::new).collect();
-
-        // Record in flight order requests
-        self.state.record_in_flight_cancels(cancels.sent_iter());
-        self.state.record_in_flight_opens(opens.sent_iter());
+        let cancels = self.send_cancel_requests(cancels);
+        let opens = self.send_open_requests(opens);
 
         GenerateAlgoOrdersOutput::new(cancels, opens, cancels_refused, opens_refused)
     }

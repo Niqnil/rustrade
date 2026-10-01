@@ -1303,8 +1303,8 @@ mod tests {
         }
 
         /// Stand in for the `Engine`: queue a market buy on the venue's channel, stamped with the
-        /// price the strategy saw. `Engine::send_requests` does this synchronously inside `process`,
-        /// which is why the runner observes it on the very next poll.
+        /// price the strategy saw. The `Engine`'s send path does this synchronously inside
+        /// `process`, which is why the runner observes it on the very next poll.
         ///
         /// The stamp is decision-time provenance only. This runner drives a market-driven venue,
         /// which prices the fill from its own book — so `price` is what the strategy was looking
