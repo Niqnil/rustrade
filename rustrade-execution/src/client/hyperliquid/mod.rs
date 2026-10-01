@@ -118,7 +118,7 @@ use crate::{
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Filled, Open, OrderState, UnindexedOrderState},
     },
-    position::Position,
+    position::{Position, PositionReport},
     trade::{AssetFees, Trade, TradeId},
 };
 use chrono::{DateTime, Utc};
@@ -279,6 +279,14 @@ impl ExecutionClient for HyperliquidClient {
         }
     }
 
+    /// The USDC collateral balance, and each perpetual's open orders and position.
+    ///
+    /// # Positions
+    ///
+    /// Every requested perpetual is listed. Its position is [`PositionReport::Open`] when
+    /// Hyperliquid reports a non-zero size for it, and [`PositionReport::Flat`] otherwise, since
+    /// the user state holds every open perpetual position. A size that does not parse is
+    /// [`PositionReport::Unreported`], with a warning.
     async fn account_snapshot(
         &self,
         _assets: &[AssetNameExchange],
@@ -347,32 +355,7 @@ impl ExecutionClient for HyperliquidClient {
                 continue;
             }
 
-            let quantity = parse_decimal(&pos.szi, "szi").unwrap_or(Decimal::ZERO);
-            let entry_price = pos
-                .entry_px
-                .as_ref()
-                .and_then(|p| parse_decimal(p, "entry_px"));
-            let unrealized_pnl = parse_decimal(&pos.unrealized_pnl, "unrealized_pnl");
-            let margin_used = parse_decimal(&pos.margin_used, "margin_used");
-            let liquidation_price = pos
-                .liquidation_px
-                .as_ref()
-                .and_then(|p| parse_decimal(p, "liquidation_px"));
-            let leverage = Some(Decimal::from(pos.leverage.value));
-
-            let position = if quantity.is_zero() {
-                None
-            } else {
-                Some(Position::new(
-                    quantity,
-                    entry_price,
-                    unrealized_pnl,
-                    margin_used,
-                    liquidation_price,
-                    leverage,
-                    now,
-                ))
-            };
+            let position = perp_position_report(pos, now);
 
             let (orders, orders_complete) = match listing.remove(&instrument) {
                 Some(listed) => (listed.orders, listed.orders_complete),
@@ -391,7 +374,11 @@ impl ExecutionClient for HyperliquidClient {
         }
 
         // Every other instrument listed: open orders but no position, or requested with neither.
-        instrument_snapshots.extend(listing.into_snapshots());
+        // `asset_positions` holds every open perp position, so these are flat.
+        instrument_snapshots.extend(listing.into_snapshots().map(|mut snapshot| {
+            snapshot.position = PositionReport::Flat;
+            snapshot
+        }));
 
         Ok(AccountSnapshot {
             exchange: ExchangeId::HyperliquidPerp,
@@ -1123,6 +1110,35 @@ impl ExecutionClient for HyperliquidClient {
     }
 }
 
+/// Report one perpetual position from Hyperliquid's user state.
+///
+/// [`PositionReport::Open`] for a non-zero size, [`PositionReport::Flat`] for zero, and
+/// [`PositionReport::Unreported`] when the size does not parse (with a warning): an unreadable
+/// size establishes nothing, so it must not read as flat.
+fn perp_position_report(
+    position: &hyperliquid_rust_sdk::PositionData,
+    now: DateTime<Utc>,
+) -> PositionReport {
+    let Some(quantity) = parse_decimal(&position.szi, "szi") else {
+        return PositionReport::Unreported;
+    };
+    PositionReport::from_position(Position::new(
+        quantity,
+        position
+            .entry_px
+            .as_ref()
+            .and_then(|p| parse_decimal(p, "entry_px")),
+        parse_decimal(&position.unrealized_pnl, "unrealized_pnl"),
+        parse_decimal(&position.margin_used, "margin_used"),
+        position
+            .liquidation_px
+            .as_ref()
+            .and_then(|p| parse_decimal(p, "liquidation_px")),
+        Some(Decimal::from(position.leverage.value)),
+        now,
+    ))
+}
+
 /// Convert SDK TradeInfo (fill) to AccountEvent::Trade.
 fn fill_to_account_event(fill: &hyperliquid_rust_sdk::TradeInfo) -> Option<UnindexedAccountEvent> {
     let side = parse_side(&fill.side)?;
@@ -1176,6 +1192,42 @@ mod tests {
     use super::*;
     use rust_decimal_macros::dec;
     use rustrade_integration::collection::snapshot::Snapshot;
+
+    fn perp_position(szi: &str) -> hyperliquid_rust_sdk::PositionData {
+        serde_json::from_value(serde_json::json!({
+            "coin": "BTC",
+            "entryPx": "50000.0",
+            "leverage": {"type": "cross", "value": 5},
+            "liquidationPx": null,
+            "marginUsed": "100.0",
+            "positionValue": "500.0",
+            "returnOnEquity": "0.0",
+            "szi": szi,
+            "unrealizedPnl": "1.5",
+            "maxLeverage": 50,
+            "cumFunding": {"allTime": "0", "sinceOpen": "0", "sinceChange": "0"}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn perp_position_report_is_open_flat_or_unreported() {
+        let now = Utc::now();
+        let open = perp_position_report(&perp_position("-0.01"), now);
+        let position = open.open().unwrap();
+        assert_eq!(
+            (position.quantity, position.entry_price, position.leverage),
+            (dec!(-0.01), Some(dec!(50000.0)), Some(dec!(5)))
+        );
+        assert_eq!(
+            perp_position_report(&perp_position("0.0"), now),
+            PositionReport::Flat
+        );
+        assert_eq!(
+            perp_position_report(&perp_position("not a number"), now),
+            PositionReport::Unreported
+        );
+    }
 
     #[test]
     fn test_fill_to_account_event() {

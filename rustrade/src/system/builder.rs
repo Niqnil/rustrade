@@ -585,7 +585,10 @@ mod tests {
     fn venue_snapshot_positions_seed_the_engine_state() {
         use crate::engine::state::position::VenuePositionSeeds;
         use rust_decimal_macros::dec;
-        use rustrade_execution::{InstrumentAccountSnapshot, position::Position as VenuePosition};
+        use rustrade_execution::{
+            InstrumentAccountSnapshot,
+            position::{Position as VenuePosition, PositionReport},
+        };
 
         let instruments = IndexedInstruments::new([instrument(EXECUTION, "btc", "usdt")]);
         let name = instruments.instruments()[0].value.name_internal.clone();
@@ -605,7 +608,7 @@ mod tests {
                 "btc_usdt".into(),
                 vec![],
                 false,
-                Some(position),
+                PositionReport::from_position(position),
                 None,
             )],
         );

@@ -18,6 +18,7 @@ use crate::{
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Cancelled, Expired, Filled, Open, OrderState, UnindexedOrderState},
     },
+    position::PositionReport,
     trade::{AssetFees, Trade, TradeId},
 };
 use chrono::{DateTime, Utc};
@@ -933,7 +934,7 @@ impl SimulatedVenue {
                 // placed with. Cancelled and expired orders are listed too, which only adds to what
                 // a consumer can see.
                 orders_complete: true,
-                position: None,
+                position: PositionReport::Unreported,
                 isolated: None,
             })
             .collect();
@@ -3174,7 +3175,7 @@ mod tests {
             instrument: instrument_name(),
             orders: CIDS.into_iter().map(resting).collect(),
             orders_complete: true,
-            position: None,
+            position: PositionReport::Unreported,
             isolated: None,
         }];
 

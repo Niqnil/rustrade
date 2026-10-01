@@ -8,7 +8,7 @@ use crate::engine::{
             InstrumentStates, data::InstrumentDataState, filter::InstrumentFilter,
             generate_unindexed_instrument_account_snapshot,
         },
-        position::PositionExited,
+        position::{PositionDrift, PositionExited},
         trading::TradingState,
     },
 };
@@ -16,8 +16,8 @@ use derive_more::Constructor;
 use fnv::FnvHashMap;
 use rustrade_data::event::MarketEvent;
 use rustrade_execution::{
-    AccountEvent, AccountEventKind, UnindexedAccountSnapshot, balance::AssetBalance,
-    market::MarketSnapshot,
+    AccountEvent, AccountEventKind, AccountSnapshot, UnindexedAccountSnapshot,
+    balance::AssetBalance, market::MarketSnapshot,
 };
 use rustrade_instrument::{
     Keyed,
@@ -195,6 +195,51 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
         }
 
         Ok(())
+    }
+
+    /// Each instrument whose position `snapshot` reports and differs from this state's.
+    ///
+    /// Only an instrument the venue reported as
+    /// [`Flat`](rustrade_execution::position::PositionReport::Flat) or
+    /// [`Open`](rustrade_execution::position::PositionReport::Open) is compared:
+    /// [`Unreported`](rustrade_execution::position::PositionReport::Unreported), and an instrument
+    /// the snapshot does not list, say nothing about the venue's position. The venue's signed quantity
+    /// is compared with [`PositionManager::quantity_net`](position::PositionManager::quantity_net)
+    /// and must match exactly; entry prices are carried in each [`PositionDrift`] but not
+    /// compared.
+    ///
+    /// A difference is not necessarily a fault. A fill the venue has applied but whose trade the
+    /// engine has not yet processed, such as one made while the snapshot was being fetched, shows
+    /// as drift until the trade arrives.
+    ///
+    /// # Panics
+    /// Panics if the snapshot names an instrument this state does not track, as
+    /// [`InstrumentStates::instrument_index`] does.
+    pub fn position_drift(&self, snapshot: &AccountSnapshot) -> Vec<PositionDrift> {
+        snapshot
+            .instruments
+            .iter()
+            .filter_map(|instrument| {
+                let quantity_venue = instrument.position.quantity()?;
+                let manager = &self
+                    .instruments
+                    .instrument_index(&instrument.instrument)
+                    .position;
+                let quantity_engine = manager.quantity_net();
+                (quantity_engine != quantity_venue).then(|| {
+                    PositionDrift::new(
+                        instrument.instrument,
+                        quantity_engine,
+                        quantity_venue,
+                        manager.price_entry_single(),
+                        instrument
+                            .position
+                            .open()
+                            .and_then(|position| position.entry_price),
+                    )
+                })
+            })
+            .collect()
     }
 
     /// Updates the internal state from an `AccountEvent`.

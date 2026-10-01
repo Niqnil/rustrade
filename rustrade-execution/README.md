@@ -15,8 +15,11 @@ Execution client library for streaming private account data and executing orders
 
 **Positions** means `account_snapshot` reports each open position in
 `InstrumentAccountSnapshot::position`: signed quantity, entry price and unrealised PnL, plus
-margin, liquidation price and leverage where the venue has them. On Binance (Spot and Margin) and
-Hyperliquid Spot a holding is an asset balance instead.
+margin, liquidation price and leverage where the venue has them, as `PositionReport::Open`. Each
+requested instrument whose position the client can establish is listed, as
+`PositionReport::Flat` when it holds none; an instrument left out is unknown, never flat. On Binance (Spot and
+Margin) and Hyperliquid Spot a holding is an asset balance instead, and `position` is
+`PositionReport::Unreported`.
 
 - **Hyperliquid** reports every field for its perpetuals.
 - **Alpaca** reports equity and option holdings as positions, each with its entry price (for an

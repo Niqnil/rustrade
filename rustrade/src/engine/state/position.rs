@@ -15,7 +15,9 @@ use std::fmt::Debug;
 use thiserror::Error;
 use tracing::{error, warn};
 
+mod drift;
 mod venue;
+pub use drift::PositionDrift;
 pub use venue::{SkippedVenuePosition, VenuePositionSeeds, VenuePositionSkipReason};
 
 /// Order Management System mode governing how positions are tracked.

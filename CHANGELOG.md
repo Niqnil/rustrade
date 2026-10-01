@@ -34,6 +34,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     includes commissions in it, Alpaca does not), no entry fees, and the time the position was
     read as its entry time, since venues report none.
 
+- **`EngineOutput::PositionDrift`: the engine reports where a venue's positions differ from its
+  own** (`rustrade`). The engine checks each account snapshot it processes, the one sent when an
+  execution link connects and again after every reconnect, against its own positions. For every
+  instrument the venue reports as `PositionReport::Flat` or `Open` (see Changed) whose signed
+  quantity differs from the engine's net quantity, it logs a warning and emits one
+  `PositionDrift`: the instrument, both quantities, and both entry prices for information.
+  Nothing is corrected, and entry prices are not compared. An unreported position is never
+  compared, so a venue that does not report positions, such as Binance, never drifts. Drift can be
+  transient, when a fill reaches the venue's position before its trade reaches the engine.
+  - `EngineState::position_drift` runs the same check on any indexed `AccountSnapshot`, for a
+    caller that fetches snapshots itself.
+  - `PositionManager::quantity_net` gives an instrument's signed net quantity; under
+    `OmsMode::Hedging` longs and shorts offset.
+  - `UpdateFromAccountOutput` gains a matching `PositionDrift` variant. Both enums are
+    `#[non_exhaustive]`.
+
 - **`EngineOutput::ContractExpiryNotSettled`** (`rustrade`), emitted when a `ContractExpiry` does
   not settle its instrument. Its `ContractExpiryNotSettledReason` is `InstrumentNeverExpires` for
   a `Spot`, `Perpetual` or `Cfd` instrument (see Fixed), or `SettlementPriceUnavailable` when the
@@ -46,6 +62,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   code where there is one. `ApiError` is `#[non_exhaustive]`, so no downstream `match` breaks.
 
 ### Changed
+
+- **`InstrumentAccountSnapshot::position` is a `PositionReport`, not an `Option<Position>`**
+  (`rustrade-execution`). **Breaking.** `None` used to mean flat, not reported, or held as a
+  balance, so a consumer could not tell an instrument the venue holds nothing in from one it says
+  nothing about. `PositionReport` is `Unreported` (the default), `Flat`, or `Open(Position)`, and
+  only `Flat` and `Open` are claims about the venue's position. A client that reports positions
+  now lists every requested instrument whose position it reports, flat ones included:
+  - Alpaca: every requested equity and option, `Flat` when Alpaca lists no position for it.
+    Requested names now match Alpaca's symbols ignoring case. Crypto pairs, recognised by the `/`
+    in `BTC/USD`, are `Unreported`, since their holdings are balances.
+  - Hyperliquid perpetuals: every requested perpetual, `Flat` when the user state holds no
+    position in it. A size that does not parse is `Unreported`; it used to read as zero.
+  - IBKR: a zero quantity is `Flat`, and so is a requested instrument registered with its
+    contract ID that IB did not list, but only when the read ended on IB's end-of-listing marker
+    (a stale listing's marker does not count) and the ID resolves back to that instrument.
+    Otherwise it is left out, with a warning when the listing was incomplete.
+  - Binance, Hyperliquid spot and the mock exchange: `Unreported`.
+
+  Replace `position.as_ref()` with `position.open()`; `PositionReport::quantity` gives the signed
+  quantity, zero when flat and `None` when unreported. `PositionReport::from_position` reports a
+  zero quantity as `Flat`. In JSON the field is `"Flat"` or `{"Open": {...}}`, and absent when
+  unreported; a snapshot serialised by an earlier version, with a bare position object there, no
+  longer deserialises.
 
 - **`Engine::process_contract_expiry` returns `Vec<EngineOutput>`** (`rustrade`), like
   `process_corporate_action`, instead of `Vec<PositionExited>`. **Breaking** for code that calls
@@ -142,7 +181,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every `position` as `None`. Each now carries the signed quantity (negative for a short) and the
   entry price: IB's average cost divided by the contract multiplier, so a future or an option is
   quoted as its orders are priced, commissions included. A zero quantity, reported for a position
-  closed today, still gives `None`. With several accounts, the first account to hold an
+  closed today, is `PositionReport::Flat` (see Changed). With several accounts, the first account to hold an
   instrument is kept and the others are dropped with a warning, never summed. For each account,
   IB's latest report now wins; the snapshot used to keep the first one, which after a connection
   drop could be a stale reply to an earlier failed call.

@@ -79,7 +79,7 @@ impl VenuePositionSeeds {
     /// [`SystemBuilder::positions`](crate::system::builder::SystemBuilder::positions) or
     /// [`EngineStateBuilder::positions`](crate::engine::state::builder::EngineStateBuilder::positions).
     ///
-    /// An instrument with no position, or a flat one, yields nothing. An open position yields
+    /// An instrument whose position is unreported or flat yields nothing. An open position yields
     /// either a seed, built by [`PositionSeed::from_venue_position`], or an entry in
     /// [`Self::skipped`]. Check `skipped`: starting with positions left out means the engine
     /// does not know it holds them.
@@ -101,7 +101,7 @@ impl VenuePositionSeeds {
         for instrument_snapshot in &snapshot.instruments {
             let Some(position) = instrument_snapshot
                 .position
-                .as_ref()
+                .open()
                 .filter(|position| !position.is_flat())
             else {
                 continue;
@@ -169,7 +169,9 @@ mod tests {
     use chrono::{DateTime, Utc};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
-    use rustrade_execution::{AccountSnapshot, InstrumentAccountSnapshot};
+    use rustrade_execution::{
+        AccountSnapshot, InstrumentAccountSnapshot, position::PositionReport,
+    };
     use rustrade_instrument::{
         asset::name::AssetNameExchange, exchange::ExchangeId, test_utils::instrument,
     };
@@ -189,6 +191,7 @@ mod tests {
         name: &str,
         position: Option<VenuePosition>,
     ) -> InstrumentAccountSnapshot<ExchangeId, AssetNameExchange, InstrumentNameExchange> {
+        let position = position.map_or(PositionReport::Unreported, PositionReport::from_position);
         InstrumentAccountSnapshot::new(name.into(), vec![], false, position, None)
     }
 

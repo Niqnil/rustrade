@@ -25,6 +25,7 @@ use rustrade_execution::{
         request::OrderResponseCancel,
         state::{ActiveOrderState, InactiveOrderState, OrderState},
     },
+    position::PositionReport,
     trade::Trade,
 };
 use rustrade_instrument::{
@@ -1717,7 +1718,8 @@ where
         // The engine's own record, not a read of the venue: it leaves out orders in flight, and
         // may still hold orders the venue has finished.
         orders_complete: false,
-        position: None,
+        // The engine does not know the venue's position.
+        position: PositionReport::Unreported,
         isolated: None,
     }
 }
@@ -2784,7 +2786,7 @@ mod tests {
             instrument: InstrumentIndex(0),
             orders,
             orders_complete,
-            position: None,
+            position: PositionReport::Unreported,
             isolated: None,
         }
     }

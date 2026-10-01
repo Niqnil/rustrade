@@ -376,6 +376,7 @@ pub(crate) mod fixtures {
             request::{OrderRequestOpen, RequestOpen},
             state::{Open, OrderState},
         },
+        position::PositionReport,
     };
     use chrono::{DateTime, Utc};
     use fnv::FnvHashMap;
@@ -468,7 +469,7 @@ pub(crate) mod fixtures {
                     instrument: instrument_name(),
                     orders: vec![order],
                     orders_complete: true,
-                    position: None,
+                    position: PositionReport::Unreported,
                     isolated: None,
                 }],
             },

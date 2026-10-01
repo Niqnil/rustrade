@@ -12,7 +12,7 @@ use crate::order::{
     id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
     state::{Cancelled, Filled, Open, OrderState},
 };
-use crate::{InstrumentAccountSnapshot, UnindexedAccountEvent};
+use crate::{InstrumentAccountSnapshot, UnindexedAccountEvent, position::PositionReport};
 use chrono::{DateTime, TimeZone, Utc};
 use futures::Stream;
 use rust_decimal::Decimal;
@@ -295,7 +295,7 @@ impl OpenOrderListing {
                     instrument: instrument.clone(),
                     orders: Vec::new(),
                     orders_complete: true,
-                    position: None,
+                    position: PositionReport::Unreported,
                     isolated: None,
                 })
         }

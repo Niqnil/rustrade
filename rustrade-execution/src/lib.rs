@@ -46,7 +46,7 @@ use crate::{
     balance::{AssetBalance, AssetBalanceUpdate},
     error::StreamTerminationReason,
     order::{Order, OrderSnapshot, request::OrderResponseCancel},
-    position::Position,
+    position::PositionReport,
     trade::Trade,
 };
 use chrono::{DateTime, Utc};
@@ -317,14 +317,23 @@ pub struct InstrumentAccountSnapshot<
     /// say.
     #[serde(default)]
     pub orders_complete: bool,
-    /// Open position in this instrument, for any instrument whose holding the venue tracks
-    /// separately from cash balances: perpetuals, futures, options, and equities (e.g. Alpaca).
+    /// The venue's position in this instrument, for any instrument whose holding the venue
+    /// tracks separately from cash balances: perpetuals, futures, options, and equities (e.g.
+    /// Alpaca).
     ///
-    /// `None` when the instrument is flat, when the venue does not report positions, and for
-    /// holdings reported as asset balances instead, such as spot crypto. See each client's
-    /// `account_snapshot` for what it reports.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub position: Option<Position>,
+    /// [`PositionReport::Unreported`] when the venue does not report positions, for holdings
+    /// reported as asset balances instead, such as spot crypto, and when the read could not
+    /// establish the position. [`PositionReport::Flat`] is a claim that the venue holds none, so
+    /// a client reports it only when it read every position the venue has for the instrument. See
+    /// each client's `account_snapshot` for what it reports.
+    ///
+    /// A client that reports positions lists each instrument it was asked for whose position it
+    /// can establish, flat ones included. An instrument it leaves out, like one it reports as
+    /// `Unreported`, is unknown, never flat: a client can be unable to establish a position (see
+    /// its `account_snapshot`). Asked for all instruments (an empty list), it may list only those
+    /// with something to report.
+    #[serde(default, skip_serializing_if = "PositionReport::is_unreported")]
+    pub position: PositionReport,
     /// Per-pair isolated-margin balances and risk, for venues with isolated sub-accounts
     /// (e.g. Binance isolated margin). `None` for cross margin, spot, and all other contexts.
     ///
@@ -336,7 +345,7 @@ pub struct InstrumentAccountSnapshot<
     ///
     // `default = "none_option"` (not a bare `#[serde(default)]`) avoids serde inferring a spurious
     // `AssetKey: Default` bound: a bare default on a generic-typed field conservatively requires the
-    // field type to be `Default` (the `position` field escapes this only because `Position` is
+    // field type to be `Default` (the `position` field escapes this only because `PositionReport` is
     // concrete). Naming a function makes serde *call* it instead, requiring only `AssetKey: Deserialize`.
     #[serde(default = "none_option", skip_serializing_if = "Option::is_none")]
     pub isolated: Option<IsolatedInstrumentState<AssetKey>>,
