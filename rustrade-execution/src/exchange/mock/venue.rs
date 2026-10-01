@@ -2176,8 +2176,9 @@ impl Settlement {
 /// The id a venue seeded with `account` mints its first order with: one past the highest decimal
 /// `OrderId` among the seeded orders, or `0` if none carries one.
 ///
-/// Open, cancelled and expired orders all count. Each was given its id by the venue the state
-/// describes, so reusing one would make two orders indistinguishable to anything keyed on it.
+/// Open and cancelled orders both count, which is everything an account snapshot seeds. Each was
+/// given its id by the venue the state describes, so reusing one would make two orders
+/// indistinguishable to anything keyed on it.
 fn first_unseeded_order_id(account: &AccountState) -> u128 {
     let open = account
         .orders_open()
@@ -2186,10 +2187,8 @@ fn first_unseeded_order_id(account: &AccountState) -> u128 {
             VenueOrderId::ClientAssigned => None,
         });
     let cancelled = account.orders_cancelled().map(|order| &order.state.id);
-    let expired = account.orders_expired().map(|order| &order.state.id);
 
     open.chain(cancelled)
-        .chain(expired)
         .filter_map(|id| id.0.parse::<u64>().ok())
         .max()
         .map_or(0, |highest| u128::from(highest) + 1)
@@ -3257,26 +3256,47 @@ mod tests {
             }),
         };
 
-        let mut config = spot_config("10", "10000000", FeeModelConfig::default());
-        config.initial_state.instruments = vec![InstrumentAccountSnapshot {
-            instrument: instrument_name(),
-            // A non-decimal id can never equal a minted one, however it sorts.
-            orders: vec![resting("a", "3"), resting("b", "1"), resting("c", "zzz")],
-            orders_complete: true,
-            position: PositionReport::Unreported,
-            isolated: None,
-        }];
-        let mut venue = SimulatedVenue::new(&config, spot_instruments());
+        let seeded_venue = |orders| {
+            let mut config = spot_config("10", "10000000", FeeModelConfig::default());
+            config.initial_state.instruments = vec![InstrumentAccountSnapshot {
+                instrument: instrument_name(),
+                orders,
+                orders_complete: true,
+                position: PositionReport::Unreported,
+                isolated: None,
+            }];
+            SimulatedVenue::new(&config, spot_instruments())
+        };
 
+        // A non-decimal id can never equal a minted one, however it sorts.
+        let mut venue = seeded_venue(vec![
+            resting("a", "3"),
+            resting("b", "1"),
+            resting("c", "zzz"),
+        ]);
         assert_eq!(venue.order_id_sequence_fetch_add(), OrderId::new("4"));
         assert_eq!(venue.order_id_sequence_fetch_add(), OrderId::new("5"));
         // Still a count of the orders this venue booked, not an id.
         assert_eq!(venue.order_sequence(), 2);
+
+        // A seeded cancelled order's id is the venue's too, and counts the same way.
+        let mut cancelled = resting("d", "9");
+        cancelled.state = OrderState::inactive(Cancelled::new(
+            OrderId::new("9"),
+            Default::default(),
+            Decimal::ZERO,
+        ));
+        let mut venue = seeded_venue(vec![resting("a", "3"), cancelled]);
+        assert_eq!(venue.order_id_sequence_fetch_add(), OrderId::new("10"));
+
+        // With only a non-decimal id seeded, ids count from zero as they always have.
+        let mut venue = seeded_venue(vec![resting("c", "zzz")]);
+        assert_eq!(venue.order_id_sequence_fetch_add(), OrderId::new("0"));
     }
 
-    /// With nothing seeded, or nothing decimal, ids count from zero as they always have.
+    /// With nothing seeded, ids count from zero as they always have.
     #[test]
-    fn minted_order_ids_start_at_zero_when_no_decimal_id_is_seeded() {
+    fn minted_order_ids_start_at_zero_when_nothing_is_seeded() {
         let config = spot_config("10", "10000000", FeeModelConfig::default());
         let mut venue = SimulatedVenue::new(&config, spot_instruments());
 
