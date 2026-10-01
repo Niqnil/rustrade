@@ -494,6 +494,12 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     /// `expiration_processed` is **not** set, so the event is **retryable**: re-inject
     /// `ContractExpiry` once that price has arrived.
     ///
+    /// If a position is open and more than one `Spot` instrument matches the option's underlying,
+    /// the method emits an [`EngineOutput::ContractExpiryNotSettled`] carrying
+    /// [`ContractExpiryNotSettledReason::AmbiguousUnderlying`] and synthesises no fill, with the
+    /// same effects as above. Re-injecting the event is rejected the same way. With no position
+    /// open, no price is needed, so the expiry completes as usual.
+    ///
     /// # Not modelled (deferred)
     ///
     /// - **Assignment for short writers:** short positions at expiry are closed at intrinsic
@@ -600,9 +606,6 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 // the option's underlying base AND quote. Both are required: without the
                 // quote filter, BTC/USDT and BTC/USDC options on the same exchange would
                 // silently share the same spot price (M3).
-                // Single-pass: collect all matching spot instruments so we can both
-                // warn on ambiguity (visible in production) and use the first match,
-                // without scanning the instrument list twice.
                 //
                 // The rule here is "the settlement reference is the DELIVERABLE underlying" —
                 // `InstrumentKind::Spot` is only its current spelling. An option settles into, or
@@ -617,26 +620,32 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 // deliverable an option settles against" versus "can split arithmetic be applied
                 // to this" — so folding them would tie each one's future to the other's. Widen
                 // either on its own rule, not on the fact that they currently match.
-                let spot_matches: Vec<_> = self
-                    .state
-                    .instruments
-                    .0
-                    .values()
-                    .filter(|s| {
-                        matches!(&s.instrument.kind, InstrumentKind::Spot)
-                            && s.instrument.underlying.base == base_key
-                            && s.instrument.underlying.quote == quote_key
-                            && s.instrument.exchange == exchange
-                    })
-                    .collect();
-                if spot_matches.len() > 1 {
+                let mut spot_matches = self.state.instruments.0.values().filter(|s| {
+                    matches!(&s.instrument.kind, InstrumentKind::Spot)
+                        && s.instrument.underlying.base == base_key
+                        && s.instrument.underlying.quote == quote_key
+                        && s.instrument.exchange == exchange
+                });
+                let first = spot_matches.next();
+                // A second match leaves nothing to say which one the option is written on, so
+                // settling against either would be a guess the caller never learns of. Reject it,
+                // as a split on the same ambiguous identity is rejected (`AmbiguousSplitTarget`).
+                if spot_matches.next().is_some() {
                     warn!(
-                        count = spot_matches.len(),
-                        "process_contract_expiry: multiple Spot instruments match the option \
-                         underlying — using the first. Deduplicate your instrument config."
+                        instrument = ?key,
+                        // The two matches already taken, plus any left.
+                        count = 2 + spot_matches.count(),
+                        "ContractExpiry: more than one Spot instrument matches the option's \
+                         underlying (base, quote, exchange), so its settlement reference is \
+                         ambiguous — not settled. Construct the engine with one Spot instrument \
+                         per underlying. Emitting ContractExpiryNotSettled."
                     );
+                    return vec![EngineOutput::ContractExpiryNotSettled {
+                        instrument: *key,
+                        reason: ContractExpiryNotSettledReason::AmbiguousUnderlying,
+                    }];
                 }
-                spot_matches.into_iter().next().and_then(|s| s.data.price())
+                first.and_then(|s| s.data.price())
             }
             ExpirySettlement::OwnLastPrice => {
                 self.state.instruments.instrument_index(key).data.price()
@@ -1840,6 +1849,20 @@ pub enum ContractExpiryNotSettledReason {
     /// its positions are untouched. **Retryable**: re-inject the `ContractExpiry` once that price
     /// has arrived.
     SettlementPriceUnavailable,
+    /// More than one `Spot` instrument matches the option's underlying `(base, quote, exchange)`,
+    /// so nothing says which one's last price settlement should be computed from. Settling
+    /// against either would be a guess; a [`CorporateAction`](crate::EngineEvent::CorporateAction)
+    /// split on the same identity is rejected for the same reason
+    /// ([`UnsupportedCorporateActionReason::AmbiguousSplitTarget`]).
+    ///
+    /// As for `SettlementPriceUnavailable`, the instrument's open orders **were** cancelled, but
+    /// its positions are untouched and `expiration_processed` stays unset. **Not** retryable: the
+    /// instrument set is fixed at construction, so the same event is rejected every time until
+    /// the engine is constructed with one `Spot` instrument per underlying.
+    ///
+    /// Raised only when a position needs settling. An option expiring with no position open needs
+    /// no price, so its expiry completes whatever the underlying.
+    AmbiguousUnderlying,
     /// The event's `InstrumentIndex` is not an instrument this engine was built with: for
     /// example one taken from another `IndexedInstruments`. It was rejected before anything was
     /// touched. **Not** retryable — the same event is rejected every time.

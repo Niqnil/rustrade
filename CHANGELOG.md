@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An option expiring with two possible underlyings settled against whichever came first**
+  (`rustrade`). When more than one `Spot` instrument matched an option's underlying base, quote
+  and exchange, `process_contract_expiry` logged a warning and settled the open position against
+  the first in the instrument map, that is, in declaration order. If the two listings carried
+  different last prices, the option settled at the wrong intrinsic value. It now emits
+  `ContractExpiryNotSettled` with the new reason
+  `ContractExpiryNotSettledReason::AmbiguousUnderlying`, closes no position and leaves
+  `expiration_processed` unset; the open orders are still cancelled, as for
+  `SettlementPriceUnavailable`. An expiry with no position open needs no price and completes as
+  before. A stock split on the same ambiguous identity was already rejected
+  (`AmbiguousSplitTarget`). The reason enum is `#[non_exhaustive]`.
+
+- **Mock exchanges kept running after an execution build failed** (`rustrade`).
+  `ExecutionBuildFutures::init` spawns the mock exchanges before awaiting the execution managers'
+  build futures. When one of those failed, the error was returned and the mock exchanges' tasks
+  were left running detached, with nothing able to stop them. They are now aborted first.
+
 - **A simulated venue could mint an `OrderId` its seeded account state already used**
   (`rustrade-execution`). `SimulatedVenue` counted its order ids from zero whatever its
   `initial_state` held, so an order seeded with id `3` shared it with the fourth order the venue
