@@ -1680,6 +1680,28 @@ fn test_contract_expiry_ambiguous_underlying_not_settled() {
     }
 }
 
+/// The ambiguity only matters when there is a position to settle: an option expiring with none
+/// open needs no price, so its expiry completes even on an ambiguous underlying.
+#[test]
+fn test_contract_expiry_ambiguous_underlying_without_position_completes() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_ambiguous_underlying_engine(TradingState::Disabled, execution_tx);
+
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+    engine.process(market_event_trade(1, 2, dec!(55_000)));
+
+    let outputs: Vec<EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>> =
+        engine.process_contract_expiry(&InstrumentIndex(0));
+    assert!(outputs.is_empty(), "{outputs:?}");
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .expiration_processed
+    );
+}
+
 #[test]
 fn test_contract_expiry_replica_state_cleared() {
     use rustrade::{

@@ -494,10 +494,11 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     /// `expiration_processed` is **not** set, so the event is **retryable**: re-inject
     /// `ContractExpiry` once that price has arrived.
     ///
-    /// If more than one `Spot` instrument matches an option's underlying, the method emits an
-    /// [`EngineOutput::ContractExpiryNotSettled`] carrying
+    /// If a position is open and more than one `Spot` instrument matches the option's underlying,
+    /// the method emits an [`EngineOutput::ContractExpiryNotSettled`] carrying
     /// [`ContractExpiryNotSettledReason::AmbiguousUnderlying`] and synthesises no fill, with the
-    /// same effects as above. Re-injecting the event is rejected the same way.
+    /// same effects as above. Re-injecting the event is rejected the same way. With no position
+    /// open, no price is needed, so the expiry completes as usual.
     ///
     /// # Not modelled (deferred)
     ///
@@ -632,6 +633,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 if spot_matches.next().is_some() {
                     warn!(
                         instrument = ?key,
+                        // The two matches already taken, plus any left.
                         count = 2 + spot_matches.count(),
                         "ContractExpiry: more than one Spot instrument matches the option's \
                          underlying (base, quote, exchange), so its settlement reference is \
@@ -1857,6 +1859,9 @@ pub enum ContractExpiryNotSettledReason {
     /// its positions are untouched and `expiration_processed` stays unset. **Not** retryable: the
     /// instrument set is fixed at construction, so the same event is rejected every time until
     /// the engine is constructed with one `Spot` instrument per underlying.
+    ///
+    /// Raised only when a position needs settling. An option expiring with no position open needs
+    /// no price, so its expiry completes whatever the underlying.
     AmbiguousUnderlying,
     /// The event's `InstrumentIndex` is not an instrument this engine was built with: for
     /// example one taken from another `IndexedInstruments`. It was rejected before anything was
