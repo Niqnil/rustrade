@@ -153,7 +153,7 @@ pub(crate) const MAX_RATE_LIMIT_RETRIES: u32 = 3;
 /// Tracks rate-limit state across REST API calls.
 ///
 /// Thread-safe: inner state is behind a Mutex so clones of the client (which
-/// share the same Arc<RateLimitTracker>) all respect the same cooldown.
+/// share the same `Arc<RateLimitTracker>`) all respect the same cooldown.
 pub(crate) struct RateLimitTracker {
     /// If set, REST calls should wait until this instant before proceeding.
     // parking_lot::Mutex — never poisons, consistent with SharedDedupCache

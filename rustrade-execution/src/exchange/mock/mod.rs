@@ -170,7 +170,7 @@ impl MockExchange {
     }
 
     /// Sends the provided `Response` via the [`oneshot::Sender`] after waiting for the latency
-    /// [`Duration`].
+    /// [`Duration`](std::time::Duration).
     ///
     /// Used to simulate network latency between the exchange and client.
     fn respond_with_latency<Response>(

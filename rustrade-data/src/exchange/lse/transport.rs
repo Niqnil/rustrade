@@ -1,4 +1,5 @@
-//! Authenticated, rationed REST transport shared by the London Strategic Edge hosts.
+//! Authenticated, rationed REST transport shared by the London Strategic Edge hosts. Internal: the
+//! host clients are the public surface.
 //!
 //! The provider serves from **two hosts** that differ in path, payload shape and symbol key but
 //! agree on everything this module covers: the `x-api-key` header, the `LSE_API_KEY` variable
