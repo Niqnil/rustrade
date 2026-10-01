@@ -378,9 +378,11 @@ impl BinanceMarginConfig {
 /// # Rate limits
 /// Once a `/sapi` response reports at least 90% of the documented per-IP weight limit (12000 per
 /// minute) used, queries wait for the next minute, so the rest is left for orders and cancels,
-/// which never wait for it. A query can therefore take up to about a minute longer. The per-UID
-/// `/sapi` limit is not tracked. After Binance answers with a rate-limit error, every REST call
-/// waits out a cooldown.
+/// which never wait for it. A query, including a [`fetch_open_orders`](Self::fetch_open_orders)
+/// after a reconnect, can therefore take up to about a minute longer. A reconnect's fill recovery
+/// and its `userListenToken` request do not wait for it either: a fill not recovered in time is
+/// lost. The per-UID `/sapi` limit is not tracked. After Binance answers with a rate-limit error,
+/// every REST call waits out a cooldown.
 ///
 /// # One client per engine (`ExchangeId`)
 /// All emitted events — cross and isolated alike — are stamped [`ExchangeId::BinanceMargin`], and
@@ -1138,6 +1140,7 @@ impl ExecutionClient for BinanceMargin {
                     &inst,
                     MyTradesFrom::Time(start_time_ms),
                     is_isolated,
+                    RequestKind::Query,
                 )
                 .await?;
                 Ok::<_, UnindexedClientError>((inst, pages))
@@ -1395,7 +1398,8 @@ struct UserListenTokenResponse {
 /// Routed through [`rest_call_with_retry`] so a transient rate-limit during a *planned* token
 /// renewal retries in place rather than collapsing the stream into the full reconnect+backoff
 /// path. `ConfigurationRestApi` stands in as the retry helper's `R` (it only ever hands back an
-/// `Arc` clone to the per-attempt closure).
+/// `Arc` clone to the per-attempt closure). It is [`RequestKind::Essential`]: the stream cannot
+/// resume without a token, and every second it waits widens the gap fill recovery must cover.
 async fn acquire_user_listen_token(
     rest_config: &Arc<ConfigurationRestApi>,
     rate_limiter: &RateLimitTracker,
@@ -1404,7 +1408,7 @@ async fn acquire_user_listen_token(
     // Cross sends no params; isolated scopes the token to one symbol. Built once and cloned per
     // retry attempt (the closure runs per attempt; mirrors `fetch_isolated_margin_account_info`).
     let query = build_listen_token_query(symbol);
-    let response = rest_call_with_retry(rest_config, rate_limiter, RequestKind::Query, |cfg| {
+    let response = rest_call_with_retry(rest_config, rate_limiter, RequestKind::Essential, |cfg| {
         let query = query.clone();
         Box::pin(async move {
             binance_sdk::common::utils::send_request::<UserListenTokenResponse>(
@@ -1949,7 +1953,8 @@ fn register_user_data_listener(
 ///
 /// Fills forwarded before the deadline stay delivered. The instruments whose fills were not
 /// recovered, because their query failed or had not finished, are named in the warning or error
-/// that ends the recovery.
+/// that ends the recovery. Its reads are [`RequestKind::Essential`]: they wait out a rate-limit
+/// cooldown but not the pause near the weight limit, which could outlast the budget.
 async fn recover_margin_fills(
     rest: &Arc<RestApi>,
     rate_limiter: &Arc<RateLimitTracker>,
@@ -1990,6 +1995,7 @@ async fn recover_margin_fills(
                     &inst,
                     MyTradesFrom::Time(start_time_ms),
                     is_isolated,
+                    RequestKind::Essential,
                 )
                 .await
                 {
@@ -2013,6 +2019,7 @@ async fn recover_margin_fills(
                             &inst,
                             MyTradesFrom::Order(order_id),
                             is_isolated,
+                            RequestKind::Essential,
                         )
                     },
                 )
@@ -2861,6 +2868,7 @@ async fn paginate_margin_my_trades(
     instrument: &InstrumentNameExchange,
     from: MyTradesFrom,
     is_isolated: bool,
+    kind: RequestKind,
 ) -> Result<Vec<QueryMarginAccountsTradeListResponseInner>, UnindexedClientError> {
     // Convert once before the retry closure to avoid a String allocation on every retry.
     let symbol_str = instrument.name().to_string();
@@ -2879,7 +2887,7 @@ async fn paginate_margin_my_trades(
     let mut next = MarginTradesQuery::first(from, now_ms);
     while let Some(query) = next {
         requests += 1;
-        let response = rest_call_with_retry(rest, rate_limiter, RequestKind::Query, |rest| {
+        let response = rest_call_with_retry(rest, rate_limiter, kind, |rest| {
             let sym = symbol_str.clone();
             let isolated = isolated.clone();
             Box::pin(async move {
@@ -5282,6 +5290,7 @@ mod tests {
             &InstrumentNameExchange::new("BTCUSDT"),
             from,
             true,
+            RequestKind::Query,
         )
         .await
         .unwrap();
@@ -5480,6 +5489,7 @@ mod tests {
             &InstrumentNameExchange::new("BTCUSDT"),
             MyTradesFrom::Time(Utc::now().timestamp_millis() - HOUR_MS),
             true,
+            RequestKind::Query,
         )
         .await
         .unwrap_err()
@@ -5560,5 +5570,44 @@ mod tests {
             .await
             .expect("orders never wait on the pause");
         }
+    }
+
+    /// Margin fill recovery does not wait for the pause near the weight limit either.
+    #[tokio::test]
+    async fn margin_fill_recovery_does_not_wait_for_the_weight_pause() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/myTrades"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rest = Arc::new(MarginTradingRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server.uri())
+                .build()
+                .unwrap(),
+        ));
+        let tracker = Arc::new(RateLimitTracker::new(WeightPool::Sapi));
+        tracker.throttle(Duration::from_secs(60));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Well under the shortest pause, which is at least a second.
+        tokio::time::timeout(
+            Duration::from_millis(800),
+            recover_margin_fills(
+                &rest,
+                &tracker,
+                &[InstrumentNameExchange::new("BTCUSDT")],
+                Utc::now() - chrono::Duration::minutes(1),
+                &tx,
+                &new_dedup_cache(),
+                false,
+            ),
+        )
+        .await
+        .expect("recovery does not wait for the pause");
     }
 }

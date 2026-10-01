@@ -322,6 +322,11 @@ pub(crate) enum RequestKind {
     Order,
     /// Reads account or order state. Also waits while the weight used is near the limit.
     Query,
+    /// Reads state that cannot be fetched again later, such as the fills a reconnect's recovery
+    /// forwards, or what that recovery depends on. Like [`Order`](Self::Order), waits only for a
+    /// rate-limit cooldown: the pause near the limit can outlast the recovery's time budget, and
+    /// fills it does not recover are lost, not delayed.
+    Essential,
 }
 
 #[derive(Default)]
@@ -338,7 +343,7 @@ struct Deadlines {
 /// - a cooldown after Binance answered with a rate-limit error, which every request honours;
 /// - a pause until the next minute once the weight used reaches [`WEIGHT_PAUSE_PERCENT`] of the
 ///   per-minute limit, which only [`RequestKind::Query`] requests honour, so the weight left
-///   stays free for orders and cancels. The weight used comes from successful responses
+///   stays free for orders, cancels and [`RequestKind::Essential`] reads. The weight used comes from successful responses
 ///   ([`observe_rest`](Self::observe_rest), [`observe_ws_api`](Self::observe_ws_api)); a
 ///   rejected request's response is not observed, so usage can only be under-counted.
 pub(crate) struct RateLimitTracker {
@@ -367,7 +372,7 @@ impl RateLimitTracker {
             let deadline = {
                 let deadlines = self.deadlines.lock();
                 match kind {
-                    RequestKind::Order => deadlines.blocked_until,
+                    RequestKind::Order | RequestKind::Essential => deadlines.blocked_until,
                     // `None` orders below `Some`, so this is whichever deadline is later.
                     RequestKind::Query => deadlines.blocked_until.max(deadlines.throttled_until),
                 }
@@ -396,6 +401,13 @@ impl RateLimitTracker {
     #[cfg(test)]
     pub(crate) fn weight_limit(&self) -> u32 {
         self.weight_limit.load(Ordering::Relaxed)
+    }
+
+    /// Pause queries for `pause`, as a response near the weight limit would.
+    #[cfg(test)]
+    pub(crate) fn throttle(&self, pause: Duration) {
+        let now = tokio::time::Instant::now();
+        extend_deadline(&mut self.deadlines.lock().throttled_until, now, pause);
     }
 
     /// Whether a rate-limit cooldown is active now.
@@ -3089,6 +3101,19 @@ mod tests {
 
         tokio::time::advance(Duration::from_millis(60_000 + MINUTE_BOUNDARY_SLACK_MS)).await;
         assert!(!waits(&tracker, RequestKind::Query).await, "the pause ends");
+    }
+
+    /// Essential reads skip the pause near the limit, like orders, but wait out a cooldown.
+    #[tokio::test]
+    async fn essential_reads_skip_the_pause_but_not_a_cooldown() {
+        tokio::time::pause();
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
+        tracker.throttle(Duration::from_secs(30));
+        assert!(waits(&tracker, RequestKind::Query).await);
+        assert!(!waits(&tracker, RequestKind::Essential).await);
+
+        tracker.on_rate_limited(Some(Duration::from_secs(5)));
+        assert!(waits(&tracker, RequestKind::Essential).await);
     }
 
     /// A rate-limit cooldown holds back orders as well as queries.

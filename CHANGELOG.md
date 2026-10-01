@@ -117,7 +117,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `X-Ratelimit-Reset`, at most a minute, logged at `info`, where a 429 logs at `warn`.
   - Binance: once a response reports at least 90% of the per-minute request-weight limit used,
     REST queries wait for the next minute. Orders and cancels never wait for it, so they can use
-    the rest. Spot reads the weight used from REST and WebSocket API responses, and the limit from
+    the rest, and neither do the reads of a reconnect's fill recovery, nor margin's
+    `userListenToken` request, since a fill not recovered within the recovery's 30 s is lost. Spot reads the weight used from REST and WebSocket API responses, and the limit from
     WebSocket API responses, falling back to Binance's documented 6000. Margin reads
     `x-sapi-used-ip-weight-1m` against the documented `/sapi` IP limit of 12000; the per-UID
     limit is not tracked.

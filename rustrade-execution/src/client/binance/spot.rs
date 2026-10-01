@@ -288,8 +288,10 @@ impl WsApiUnavailable {
 /// REST and the WebSocket API share one per-IP request-weight limit per minute. Its value comes
 /// from each WebSocket API response, and is Binance's documented 6000 until the first one. Once
 /// a response reports at least 90% of it used, REST queries wait for the next minute, so the
-/// rest is left for orders and cancels, which never wait for it. A query can therefore take up to
-/// about a minute longer. After Binance answers with a rate-limit error, REST calls wait out a
+/// rest is left for orders and cancels, which never wait for it. A query, including a
+/// [`fetch_open_orders`](Self::fetch_open_orders) after a reconnect, can therefore take up to
+/// about a minute longer. A reconnect's fill recovery does not wait for it either: a fill not
+/// recovered in time is lost. After Binance answers with a rate-limit error, REST calls wait out a
 /// cooldown, and an order or cancel that would have to open a new WebSocket API session fails
 /// with [`ApiError::RateLimit`] instead, unsent.
 #[derive(Clone)]
@@ -503,6 +505,7 @@ async fn paginate_my_trades(
     rate_limiter: &Arc<RateLimitTracker>,
     instrument: &InstrumentNameExchange,
     from: MyTradesFrom,
+    kind: RequestKind,
 ) -> Result<Vec<binance_sdk::spot::rest_api::MyTradesResponseInner>, UnindexedClientError> {
     // Convert once before the retry closure to avoid a String allocation on every retry.
     let symbol_str = instrument.name().to_string();
@@ -514,7 +517,7 @@ async fn paginate_my_trades(
     let mut cursor: Option<i64> = None;
     loop {
         let fid = cursor; // Option<i64> is Copy
-        let response = rest_call_with_retry(rest, rate_limiter, RequestKind::Query, |rest| {
+        let response = rest_call_with_retry(rest, rate_limiter, kind, |rest| {
             let sym = symbol_str.clone();
             Box::pin(async move {
                 // const_assert! above guarantees BINANCE_MAX_TRADES fits in i32
@@ -1334,6 +1337,7 @@ impl ExecutionClient for BinanceSpot {
                     &rate_limiter,
                     &inst,
                     MyTradesFrom::Time(start_time_ms),
+                    RequestKind::Query,
                 )
                 .await?;
                 Ok::<_, UnindexedClientError>((inst, pages))
@@ -1673,7 +1677,9 @@ async fn connection_manager(
 ///
 /// The whole recovery is bounded by [`FILL_RECOVERY_TIMEOUT_SECS`]. Fills forwarded before the
 /// deadline stay delivered. The instruments whose fills were not recovered, because their query
-/// failed or had not finished, are named in the warning or error that ends the recovery.
+/// failed or had not finished, are named in the warning or error that ends the recovery. Its reads
+/// are [`RequestKind::Essential`]: they wait out a rate-limit cooldown but not the pause near the
+/// weight limit, which could outlast the budget.
 // `.iter().cloned()` is required: Rust async closures cannot satisfy the HRTB
 // `for<'a> FnMut(&'a InstrumentNameExchange) -> impl Future + 'static` needed by
 // the iterator machinery, even when the clone is moved inside the closure body.
@@ -1719,16 +1725,21 @@ async fn recover_fills(
             let rest = rest.clone();
             let rl = rate_limiter.clone();
             async move {
-                let raw =
-                    match paginate_my_trades(&rest, &rl, &inst, MyTradesFrom::Time(start_time_ms))
-                        .await
-                    {
-                        Ok(pages) => pages,
-                        Err(e) => {
-                            warn!(%e, %inst, "BinanceSpot fill recovery: REST request failed");
-                            return (inst, None);
-                        }
-                    };
+                let raw = match paginate_my_trades(
+                    &rest,
+                    &rl,
+                    &inst,
+                    MyTradesFrom::Time(start_time_ms),
+                    RequestKind::Essential,
+                )
+                .await
+                {
+                    Ok(pages) => pages,
+                    Err(e) => {
+                        warn!(%e, %inst, "BinanceSpot fill recovery: REST request failed");
+                        return (inst, None);
+                    }
+                };
                 // `myTrades` carries no cumulative, so each recovered fill's is rebuilt from its
                 // order's executions; without it the fill advances the position but not the order.
                 let totals = recovered_order_totals(
@@ -1736,7 +1747,15 @@ async fn recover_fills(
                     &inst,
                     &raw,
                     order_executions_deadline,
-                    |order_id| paginate_my_trades(&rest, &rl, &inst, MyTradesFrom::Order(order_id)),
+                    |order_id| {
+                        paginate_my_trades(
+                            &rest,
+                            &rl,
+                            &inst,
+                            MyTradesFrom::Order(order_id),
+                            RequestKind::Essential,
+                        )
+                    },
                 )
                 .await;
                 let trades: Vec<_> = raw
@@ -4599,5 +4618,44 @@ mod tests {
         )
         .await
         .expect("orders never wait on the pause");
+    }
+
+    /// Fill recovery does not wait for the pause near the weight limit, which could outlast its
+    /// budget and lose the fills: with queries paused, it still reads the trades at once.
+    #[tokio::test]
+    async fn fill_recovery_does_not_wait_for_the_weight_pause() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/myTrades"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let rest = Arc::new(SpotRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server.uri())
+                .build()
+                .unwrap(),
+        ));
+        let tracker = Arc::new(RateLimitTracker::new(WeightPool::Spot));
+        tracker.throttle(Duration::from_secs(60));
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        // Well under the shortest pause, which is at least a second.
+        tokio::time::timeout(
+            Duration::from_millis(800),
+            recover_fills(
+                &rest,
+                &tracker,
+                &[InstrumentNameExchange::new("BTCUSDT")],
+                Utc::now() - chrono::Duration::minutes(1),
+                &tx,
+                &new_dedup_cache(),
+            ),
+        )
+        .await
+        .expect("recovery does not wait for the pause");
     }
 }
