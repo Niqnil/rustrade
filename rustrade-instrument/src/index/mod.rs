@@ -75,11 +75,12 @@ impl IndexedInstruments {
     ///
     /// # Errors
     /// Returns [`IndexError::DuplicateInstrumentNameInternal`] if two `Instrument`s share an
-    /// [`InstrumentNameInternal`], [`IndexError::DuplicateAssetNameInternal`] if two distinct
-    /// assets on one exchange share an [`AssetNameInternal`], or
-    /// [`IndexError::InvalidContractSize`] if an `Instrument` carries a non-positive
-    /// `contract_size` — see [`IndexedInstrumentsBuilder::try_build`] for why each invariant
-    /// exists.
+    /// [`InstrumentNameInternal`], [`IndexError::DuplicateInstrumentNameExchange`] if two on one
+    /// exchange share an [`InstrumentNameExchange`](crate::instrument::name::InstrumentNameExchange),
+    /// [`IndexError::DuplicateAssetNameInternal`] if two distinct assets on one exchange share an
+    /// [`AssetNameInternal`], or [`IndexError::InvalidContractSize`] if an `Instrument` carries a
+    /// non-positive `contract_size` — see [`IndexedInstrumentsBuilder::try_build`] for why each
+    /// invariant exists.
     pub fn try_new<Iter, I>(instruments: Iter) -> Result<Self, IndexError>
     where
         Iter: IntoIterator<Item = I>,

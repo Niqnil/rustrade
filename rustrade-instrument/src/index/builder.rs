@@ -109,7 +109,9 @@ impl IndexedInstrumentsBuilder {
     ///
     /// # Panics
     /// Panics if two added `Instrument`s share an
-    /// [`InstrumentNameInternal`](crate::instrument::name::InstrumentNameInternal), if two distinct
+    /// [`InstrumentNameInternal`](crate::instrument::name::InstrumentNameInternal), if two on one
+    /// exchange share an
+    /// [`InstrumentNameExchange`](crate::instrument::name::InstrumentNameExchange), if two distinct
     /// assets on one exchange share an
     /// [`AssetNameInternal`](crate::asset::name::AssetNameInternal), or if any added `Instrument`
     /// carries a non-positive `contract_size` — see [`Self::try_build`], which returns each as an
@@ -130,6 +132,8 @@ impl IndexedInstrumentsBuilder {
     /// # Errors
     /// Returns [`IndexError::DuplicateInstrumentNameInternal`] if two added `Instrument`s share an
     /// [`InstrumentNameInternal`](crate::instrument::name::InstrumentNameInternal),
+    /// [`IndexError::DuplicateInstrumentNameExchange`] if two on one exchange share an
+    /// [`InstrumentNameExchange`](crate::instrument::name::InstrumentNameExchange),
     /// [`IndexError::DuplicateAssetNameInternal`] if two distinct assets on one exchange share an
     /// [`AssetNameInternal`](crate::asset::name::AssetNameInternal), or
     /// [`IndexError::InvalidContractSize`] if any added `Instrument` carries a non-positive
@@ -142,6 +146,11 @@ impl IndexedInstrumentsBuilder {
     /// place, with no error until the final index panics. Note that the `Instrument` dedup below
     /// does **not** cover this: it removes only instruments that are equal in *every* field, so
     /// two genuinely different instruments that merely share a name survive it.
+    ///
+    /// `(exchange, name_exchange)` must be unique too: it is how a venue names an instrument, so it
+    /// is what every venue-sourced order, fill and position is resolved by. Two instruments
+    /// sharing it, such as a spot and a CFD both named `AAPL` on one venue, would leave each of
+    /// those lookups to pick one of the two arbitrarily.
     pub fn try_build(mut self) -> Result<IndexedInstruments, IndexError> {
         // Sort & dedup
         self.exchanges.sort();
@@ -183,12 +192,31 @@ impl IndexedInstrumentsBuilder {
                 // is the collision this check most plausibly catches, and reporting it as
                 // "AAPL and AAPL" asserts they are distinct while printing nothing that
                 // distinguishes them. `describe_collision` is what does.
+                let [previous, instrument_desc] = describe_collision(previous, instrument);
                 return Err(IndexError::DuplicateInstrumentNameInternal(format!(
-                    "{} is shared by the distinct instruments {} and {} on {} - \
-                     every Instrument requires a unique name_internal",
+                    "{} is shared by the distinct instruments {previous} and {instrument_desc} on \
+                     {} - every Instrument requires a unique name_internal",
                     instrument.name_internal,
-                    describe_collision(previous),
-                    describe_collision(instrument),
+                    // `as_str`, not `Display`: the canonical snake_case spelling users write in
+                    // configs, rather than the bare variant name.
+                    instrument.exchange.as_str(),
+                )));
+            }
+        }
+
+        // Enforce `(exchange, name_exchange)` uniqueness: it is the key every venue-sourced order,
+        // fill and position is resolved by (see `try_build`'s rustdoc). Checked after the
+        // `name_internal` pass, so a pair reaching it always differs in `name_internal`.
+        let mut exchange_names = HashMap::with_capacity(self.instruments.len());
+        for instrument in &self.instruments {
+            let key = (instrument.exchange, &instrument.name_exchange);
+            if let Some(previous) = exchange_names.insert(key, instrument) {
+                let [previous, instrument_desc] = describe_collision(previous, instrument);
+                return Err(IndexError::DuplicateInstrumentNameExchange(format!(
+                    "{} on {} is shared by the distinct instruments {previous} and \
+                     {instrument_desc} - every Instrument on an exchange requires a unique \
+                     name_exchange, since that is the name the exchange reports it by",
+                    instrument.name_exchange,
                     // `as_str`, not `Display`: the canonical snake_case spelling users write in
                     // configs, rather than the bare variant name.
                     instrument.exchange.as_str(),
@@ -276,23 +304,57 @@ impl IndexedInstrumentsBuilder {
     }
 }
 
-/// Renders the axes two `Instrument`s sharing a `name_internal` can legitimately differ on while
-/// still sharing a `name_exchange`: `kind` (a spot and a CFD on one symbol) and `data_venue` (one
-/// symbol priced on two venues). Both are compared by the full-equality dedup, so a pair differing
-/// only in one of them survives it and reaches the uniqueness check — where naming neither reads as
-/// "AAPL and AAPL".
-fn describe_collision(instrument: &Instrument<ExchangeId, Asset>) -> String {
-    match &instrument.data_venue {
-        // `as_str`, not `Display`: the canonical snake_case spelling users write in configs,
-        // rather than the bare variant name.
-        Some(data_venue) => format!(
-            "{} ({:?}, priced on {})",
-            instrument.name_exchange,
-            instrument.kind,
-            data_venue.exchange.as_str(),
-        ),
-        None => format!("{} ({:?})", instrument.name_exchange, instrument.kind),
-    }
+/// Renders each of two colliding `Instrument`s as its `name_exchange` followed by every field on
+/// which it differs from the other, so that a message naming both says which configured entry is
+/// which.
+///
+/// A fixed subset of fields would not do: the full-equality dedup lets through a pair that differs
+/// in any one field, so a pair differing only in, say, `underlying` would read "AAPL and AAPL".
+fn describe_collision(
+    a: &Instrument<ExchangeId, Asset>,
+    b: &Instrument<ExchangeId, Asset>,
+) -> [String; 2] {
+    let describe = |this: &Instrument<ExchangeId, Asset>, other: &Instrument<ExchangeId, Asset>| {
+        let mut differences = Vec::new();
+        if this.name_internal != other.name_internal {
+            differences.push(format!("name_internal {}", this.name_internal));
+        }
+        if this.exchange != other.exchange {
+            // `as_str`, not `Display`: the canonical snake_case spelling users write in configs,
+            // rather than the bare variant name.
+            differences.push(format!("on {}", this.exchange.as_str()));
+        }
+        if this.kind != other.kind {
+            differences.push(format!("{:?}", this.kind));
+        }
+        if this.underlying != other.underlying {
+            differences.push(format!("underlying {:?}", this.underlying));
+        }
+        if this.quote != other.quote {
+            differences.push(format!("quote {:?}", this.quote));
+        }
+        if this.spec != other.spec {
+            differences.push(format!("spec {:?}", this.spec));
+        }
+        if this.data_venue != other.data_venue {
+            differences.push(match &this.data_venue {
+                Some(data_venue) => format!(
+                    "priced on {} as {}",
+                    data_venue.exchange.as_str(),
+                    this.data_name_exchange(),
+                ),
+                None => "priced on its own venue".to_owned(),
+            });
+        }
+
+        if differences.is_empty() {
+            this.name_exchange.to_string()
+        } else {
+            format!("{} ({})", this.name_exchange, differences.join(", "))
+        }
+    };
+
+    [describe(a, b), describe(b, a)]
 }
 
 #[cfg(test)]
@@ -496,6 +558,125 @@ mod tests {
         // tells the operator which of the two configured entries to change.
         assert!(message.contains("lse_equities"), "{message}");
         assert!(message.contains("binance_spot"), "{message}");
+    }
+
+    #[test]
+    fn test_duplicate_name_internal_message_distinguishes_instruments_differing_only_in_underlying()
+    {
+        // Neither `kind` nor `data_venue` differs here, so a message built from those alone would
+        // read "BTCUSD (Spot) and BTCUSD (Spot)". The underlying is the field that tells them apart.
+        let build = |quote| {
+            Instrument::new(
+                ExchangeId::BinanceSpot,
+                "binance_spot-btc_usd",
+                "BTCUSD",
+                Underlying::new(
+                    Asset::new_from_exchange("btc"),
+                    Asset::new_from_exchange(quote),
+                ),
+                InstrumentQuoteAsset::UnderlyingQuote,
+                InstrumentKind::Spot,
+                None,
+            )
+        };
+
+        let error = IndexedInstrumentsBuilder::default()
+            .add_instrument(build("usdt"))
+            .add_instrument(build("usdc"))
+            .try_build()
+            .expect_err("duplicate name_internal must be rejected");
+
+        let IndexError::DuplicateInstrumentNameInternal(message) = &error else {
+            panic!("unexpected error variant: {error:?}")
+        };
+
+        assert!(message.contains("usdt"), "{message}");
+        assert!(message.contains("usdc"), "{message}");
+    }
+
+    /// A spot and a CFD named `AAPL` on one venue, with distinct internal names: the
+    /// `name_internal` check passes them, but every fill the venue reports for `AAPL` could resolve
+    /// to either.
+    fn aapl_on_ibkr(
+        name_internal: &str,
+        kind: InstrumentKind<Asset>,
+    ) -> Instrument<ExchangeId, Asset> {
+        Instrument::new(
+            ExchangeId::Ibkr,
+            name_internal,
+            "AAPL",
+            Underlying::new(
+                Asset::new_from_exchange("aapl"),
+                Asset::new_from_exchange("usd"),
+            ),
+            InstrumentQuoteAsset::UnderlyingQuote,
+            kind,
+            None,
+        )
+    }
+
+    fn aapl_cfd() -> InstrumentKind<Asset> {
+        InstrumentKind::Cfd(CfdContract {
+            contract_size: Decimal::ONE,
+            settlement_asset: Asset::new_from_exchange("usd"),
+        })
+    }
+
+    #[test]
+    fn two_instruments_sharing_a_name_exchange_on_one_exchange_are_rejected() {
+        let error = IndexedInstrumentsBuilder::default()
+            .add_instrument(aapl_on_ibkr("ibkr-aapl", InstrumentKind::Spot))
+            .add_instrument(aapl_on_ibkr("ibkr-aapl-cfd", aapl_cfd()))
+            .try_build()
+            .expect_err("a duplicate (exchange, name_exchange) must be rejected");
+
+        let IndexError::DuplicateInstrumentNameExchange(message) = &error else {
+            panic!("unexpected error variant: {error:?}")
+        };
+
+        // The shared name, the exchange, and what tells the two entries apart.
+        assert!(message.contains("AAPL on ibkr"), "{message}");
+        assert!(message.contains("name_internal ibkr-aapl,"), "{message}");
+        assert!(message.contains("ibkr-aapl-cfd"), "{message}");
+        assert!(message.contains("Spot"), "{message}");
+        assert!(message.contains("Cfd"), "{message}");
+    }
+
+    #[test]
+    fn one_name_exchange_on_two_exchanges_is_not_a_collision() {
+        let on_alpaca = Instrument::new(
+            ExchangeId::AlpacaBroker,
+            "alpaca-aapl",
+            "AAPL",
+            Underlying::new(
+                Asset::new_from_exchange("aapl"),
+                Asset::new_from_exchange("usd"),
+            ),
+            InstrumentQuoteAsset::UnderlyingQuote,
+            InstrumentKind::Spot,
+            None,
+        );
+
+        let instruments = IndexedInstrumentsBuilder::default()
+            .add_instrument(aapl_on_ibkr("ibkr-aapl", InstrumentKind::Spot))
+            .add_instrument(on_alpaca)
+            .try_build()
+            .expect("the same symbol on two exchanges must build");
+
+        assert_eq!(instruments.instruments().len(), 2);
+    }
+
+    #[test]
+    fn try_new_rejects_a_duplicate_name_exchange_too() {
+        let result = IndexedInstruments::try_new([
+            aapl_on_ibkr("ibkr-aapl", InstrumentKind::Spot),
+            aapl_on_ibkr("ibkr-aapl-cfd", aapl_cfd()),
+        ]);
+
+        assert!(
+            matches!(result, Err(IndexError::DuplicateInstrumentNameExchange(_))),
+            "{result:?}"
+        );
     }
 
     /// One exchange spelling a quote asset two ways, both normalising to `usdt`.
