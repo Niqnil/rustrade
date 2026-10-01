@@ -473,10 +473,14 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     /// fold into the audit.
     ///
     /// # Algorithm
-    /// 1. Rejects an instrument that never expires (`Spot`, `Perpetual`, `Cfd`) with an
-    ///    [`EngineOutput::ContractExpiryNotSettled`] carrying
-    ///    [`ContractExpiryNotSettledReason::InstrumentNeverExpires`]. Nothing is mutated: no order
-    ///    is cancelled, no position is closed, and `expiration_processed` stays unset.
+    /// 1. Rejects the event, mutating nothing, with an [`EngineOutput::ContractExpiryNotSettled`]
+    ///    carrying:
+    ///    - [`ContractExpiryNotSettledReason::UnknownInstrument`] when `key` is not an instrument
+    ///      this engine was built with;
+    ///    - [`ContractExpiryNotSettledReason::InstrumentNeverExpires`] when the instrument never
+    ///      expires (`Spot`, `Perpetual`, `Cfd`).
+    ///
+    ///    No order is cancelled, no position is closed, and `expiration_processed` stays unset.
     /// 2. Guards on `expiration_processed` (idempotent).
     /// 3. Cancels all open orders for the instrument by sending `ExecutionRequest::Cancel` for each.
     /// 4. Derives the settlement price from instrument data and the contract specification:
@@ -519,9 +523,23 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
         InstrumentData: InstrumentDataState + InFlightRequestRecorder,
         ExecutionTxs: ExecutionTxMap,
     {
+        // Step 1: reject an index this engine was not built with. The event is built by the
+        // caller, so a stale or foreign index must not panic a running engine.
+        if !self.state.instruments.contains_index(key) {
+            warn!(
+                instrument = ?key,
+                "ContractExpiry targets an instrument this engine was not built with — rejected, \
+                 nothing mutated. Emitting ContractExpiryNotSettled."
+            );
+            return vec![EngineOutput::ContractExpiryNotSettled {
+                instrument: *key,
+                reason: ContractExpiryNotSettledReason::UnknownInstrument,
+            }];
+        }
+
         let instrument_state = self.state.instruments.instrument_index_mut(key);
 
-        // Step 1: reject an instrument that never expires, before anything is touched. Settling it
+        // Step 1, continued: reject an instrument that never expires, before anything is touched. Settling it
         // would close every position at the last price and set `expiration_processed` for good,
         // so the instrument could never trade again in this run.
         let Some((expiry, settlement)) = ExpirySettlement::of(&instrument_state.instrument) else {
@@ -787,6 +805,8 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     /// adjustment happens now — but worth noting if you compare live and replayed stamps).
     ///
     /// # Algorithm
+    /// 0. Rejects a `key` this engine was not built with, mutating nothing and recording no `id`,
+    ///    with [`UnsupportedCorporateActionReason::UnknownInstrument`].
     /// 1. Idempotency guard on `id` (per-instrument `corporate_actions_processed` set). A
     ///    duplicate `id` is skipped with a warning. This holds within a live session but does **not**
     ///    survive a snapshot taken before the set existed; see the `corporate_actions_processed`
@@ -860,6 +880,23 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
         // Engine clock time for deterministic stamping (the clock was already advanced to the
         // event's `effective_time` before this handler runs).
         let engine_time = self.time();
+
+        // Step 0: reject an index this engine was not built with. The event is built by the
+        // caller, so a stale or foreign index must not panic a running engine. Do NOT record `id`.
+        if !self.state.instruments.contains_index(key) {
+            warn!(
+                %id,
+                instrument = ?key,
+                "CorporateAction targets an instrument this engine was not built with — rejected, \
+                 nothing mutated. Emitting UnsupportedCorporateAction; id NOT recorded."
+            );
+            outputs.push(EngineOutput::UnsupportedCorporateAction {
+                instrument: *key,
+                kind: kind.clone(),
+                reason: UnsupportedCorporateActionReason::UnknownInstrument,
+            });
+            return outputs;
+        }
 
         let instrument_state = self.state.instruments.instrument_index(key);
 
@@ -1815,6 +1852,10 @@ pub enum ContractExpiryNotSettledReason {
     /// its positions are untouched. **Retryable**: re-inject the `ContractExpiry` once that price
     /// has arrived.
     SettlementPriceUnavailable,
+    /// The event's `InstrumentIndex` is not an instrument this engine was built with: for
+    /// example one taken from another `IndexedInstruments`. It was rejected before anything was
+    /// touched. **Not** retryable — the same event is rejected every time.
+    UnknownInstrument,
 }
 
 /// How a [`ContractExpiry`](crate::EngineEvent::ContractExpiry) settles an expiring contract.
@@ -1925,6 +1966,11 @@ pub enum UnsupportedCorporateActionReason {
     /// means constructing the engine with one deliverable instrument per underlying identity — the
     /// registry is wrong, not the action.
     AmbiguousSplitTarget,
+    /// The action's `InstrumentIndex` is not an instrument this engine was built with: for
+    /// example one taken from another `IndexedInstruments`. It was rejected before anything was
+    /// touched and the `id` is not recorded. **Not** self-healing on retry: the same event is
+    /// rejected every time.
+    UnknownInstrument,
 }
 
 /// Output produced by the [`Engine`] updating from an [`TradingState`], used to construct

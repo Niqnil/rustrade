@@ -1928,6 +1928,12 @@ fn test_contract_expiry_replica_parity_price_bail_then_settle_then_duplicate() {
 
     // 2. The underlying price arrives and the retry settles on both sides.
     process_live_and_replica!(&mut engine, replica, market_event_trade(2, 1, dec!(45_000)));
+    let pre_settle_tear_sheet = engine
+        .state
+        .instruments
+        .instrument_index(&option)
+        .tear_sheet
+        .clone();
     let outputs =
         process_live_and_replica!(&mut engine, replica, EngineEvent::ContractExpiry(option));
     assert!(
@@ -1943,6 +1949,9 @@ fn test_contract_expiry_replica_parity_price_bail_then_settle_then_duplicate() {
     assert!(live.position.positions.is_empty());
     assert_eq!(mirrored.position.positions, live.position.positions);
     assert!(live.expiration_processed && mirrored.expiration_processed);
+    // The settlement's exit reaches the tear sheet on both sides.
+    assert_ne!(live.tear_sheet, pre_settle_tear_sheet);
+    assert_eq!(mirrored.tear_sheet, live.tear_sheet);
 
     // 3. An order snapshot lands after settlement and both sides track it. A repeated expiry is a
     //    no-op on the live engine, so the replica must keep that order too.
@@ -1992,6 +2001,76 @@ fn test_contract_expiry_replica_parity_price_bail_then_settle_then_duplicate() {
     assert_eq!(live.orders.0.len(), 1);
     assert_eq!(mirrored.orders, live.orders);
     assert_eq!(mirrored.exchange_id_to_cid, live.exchange_id_to_cid);
+}
+
+/// A `ContractExpiry` or `CorporateAction` is built by the caller, so its `InstrumentIndex` can
+/// name no instrument the engine was built with. It is rejected observably and touches nothing,
+/// on the live engine and on the audit replica, instead of panicking either.
+#[test]
+fn test_unknown_instrument_index_is_rejected_not_panicked() {
+    use rustrade::engine::audit::{context::EngineContext, state_replica::StateReplicaManager};
+
+    let (execution_tx, mut execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    send_spot_price(&mut engine, 1, dec!(45_000));
+    open_option_position(&mut engine, dec!(1), dec!(1_000));
+    let pre_state = engine.state.clone();
+
+    let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+        event: pre_state.clone(),
+        context: EngineContext {
+            time: STARTING_TIMESTAMP,
+            sequence: Sequence(0),
+        },
+    };
+    let dummy_updates: DummyAuditUpdates = std::iter::empty();
+    let mut replica = StateReplicaManager::new(seed_tick, dummy_updates);
+
+    let unknown = InstrumentIndex(pre_state.instruments.0.len());
+    assert!(!pre_state.instruments.contains_index(&unknown));
+
+    let outputs =
+        process_live_and_replica!(&mut engine, replica, EngineEvent::ContractExpiry(unknown));
+    assert_eq!(
+        outputs,
+        NoneOneOrMany::One(EngineOutput::ContractExpiryNotSettled {
+            instrument: unknown,
+            reason: ContractExpiryNotSettledReason::UnknownInstrument,
+        })
+    );
+
+    let kind = CorporateActionKind::StockSplit {
+        ratio: SplitRatio::new(dec!(2)).unwrap(),
+    };
+    let outputs = process_live_and_replica!(
+        &mut engine,
+        replica,
+        EngineEvent::CorporateAction {
+            id: "unknown-split".into(),
+            instrument: unknown,
+            kind: kind.clone(),
+            policy: SplitRoundingPolicy::Floor,
+            effective_time: STARTING_TIMESTAMP,
+        }
+    );
+    assert_eq!(
+        outputs,
+        NoneOneOrMany::One(EngineOutput::UnsupportedCorporateAction {
+            instrument: unknown,
+            kind,
+            reason: UnsupportedCorporateActionReason::UnknownInstrument,
+        })
+    );
+
+    assert_eq!(engine.state.instruments, pre_state.instruments);
+    assert_eq!(
+        replica.replica_engine_state().instruments,
+        pre_state.instruments
+    );
+    assert!(
+        execution_rx.rx.try_recv().is_err(),
+        "a rejected event must send no request"
+    );
 }
 
 /// A future settles at its own last price, not at an option's intrinsic value, and — unlike an

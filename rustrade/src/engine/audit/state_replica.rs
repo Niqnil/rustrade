@@ -27,6 +27,17 @@ pub const AUDIT_REPLICA_STATE_UPDATE_SPAN_NAME: &str = "audit_replica_state_upda
 /// the `Engine`.
 ///
 /// Useful for supporting non-hot path trading system components such as UIs, web apps, etc.
+///
+/// # In-flight requests are not mirrored
+///
+/// The live engine records each open and cancel request it sends as in flight, on its orders and
+/// in its instrument data, before the venue has answered. The replica records none of them,
+/// whichever path sent them: a command, the algo strategy, a position close, a disconnect or
+/// trading-disabled strategy, or the order cancels a `ContractExpiry` sends (also when the expiry
+/// then fails to settle for want of a price). So until the venue answers, the replica can lack an
+/// order the engine has just opened and still show as open an order the engine is cancelling.
+/// It catches up from the venue's answer on the account stream: an active order snapshot inserts
+/// an order it does not hold, and a cancel confirmation or fill updates it as on the live engine.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct StateReplicaManager<State, Updates> {
     pub meta_start: EngineMeta,
@@ -253,6 +264,8 @@ where
                                     .position
                                     .positions
                                     .shift_remove(&exit.position_id);
+                                // Fold the live exit into the tear sheet, as the live handler does.
+                                instrument_state.tear_sheet.update_from_position(exit);
                             }
                         }
                     }
@@ -296,6 +309,10 @@ where
                 // Guards — each skips WITHOUT mutating or recording `id`, exactly as the live
                 // handler does, so the replica never applies an action the live engine rejected.
                 let instruments = &self.replica_engine_state().instruments;
+                // An index this engine was not built with: the live engine rejected it untouched.
+                if !instruments.contains_index(&instrument) {
+                    return;
+                }
                 // Idempotency: already applied (the set mirrors the live engine's).
                 if instruments
                     .instrument_index(&instrument)

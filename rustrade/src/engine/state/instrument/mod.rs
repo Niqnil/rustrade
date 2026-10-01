@@ -109,6 +109,12 @@ pub(crate) struct OptionSplitPlan {
 }
 
 impl<InstrumentData> InstrumentStates<InstrumentData> {
+    /// Whether an `InstrumentState` exists for this `InstrumentIndex`, ie/ whether
+    /// [`Self::instrument_index`] would return rather than panic.
+    pub fn contains_index(&self, key: &InstrumentIndex) -> bool {
+        key.index() < self.0.len()
+    }
+
     /// Return a reference to the `InstrumentState` associated with an `InstrumentIndex`.
     ///
     /// Panics if `InstrumentState` associated with the `InstrumentIndex` does not exist.
