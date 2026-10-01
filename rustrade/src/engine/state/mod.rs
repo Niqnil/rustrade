@@ -90,20 +90,45 @@ impl<GlobalData, InstrumentData> MarketSnapshotSource<InstrumentIndex>
 where
     InstrumentData: InstrumentDataState,
 {
-    /// Delegates to the instrument's own [`InstrumentDataState::market_snapshot`].
+    /// Delegates to the instrument's own [`InstrumentDataState::market_snapshot`], or returns
+    /// `None` if `key` is not a tracked instrument.
     ///
-    /// # Panics
-    /// Panics if `key` is not a tracked instrument, as
-    /// [`InstrumentStates::instrument_index`] does. Every key reaching here came off an order the
-    /// `Engine` generated from this same state, so an untracked one is a corrupted index rather
-    /// than ordinary input.
+    /// The `Engine` never asks for an untracked one: it rejects an order request for an instrument
+    /// this state does not track before stamping it (see [`TracksInstrument`]).
     fn market_snapshot(&self, key: &InstrumentIndex) -> Option<MarketSnapshot> {
-        Some(
-            self.instruments
-                .instrument_index(key)
-                .data
-                .market_snapshot(),
-        )
+        self.instruments
+            .get_index(key)
+            .map(|state| state.data.market_snapshot())
+    }
+}
+
+/// Reports whether a `State` tracks an instrument.
+///
+/// Order requests reach the `Engine` from code it does not control — an
+/// [`AlgoStrategy`](crate::strategy::algo::AlgoStrategy), a
+/// [`ClosePositionsStrategy`](crate::strategy::close_positions::ClosePositionsStrategy), or a
+/// [`Command`](crate::engine::command::Command) — and any of them can carry a key the `Engine` was
+/// not built with. The `Engine` checks each request against this before sending it, and rejects
+/// one for an untracked instrument as
+/// [`RecoverableEngineError::UnknownInstrument`](crate::engine::error::RecoverableEngineError::UnknownInstrument)
+/// in the action output's `errors`, so nothing reaches the venue that the state could not record.
+///
+/// # Type Parameters
+/// * `InstrumentKey` - Type used to identify an instrument (defaults to [`InstrumentIndex`]).
+pub trait TracksInstrument<InstrumentKey = InstrumentIndex> {
+    /// Whether this state holds `key`.
+    fn tracks_instrument(&self, key: &InstrumentKey) -> bool;
+}
+
+impl<GlobalData, InstrumentData> TracksInstrument<InstrumentIndex>
+    for EngineState<GlobalData, InstrumentData>
+{
+    /// Whether `key` resolves through [`InstrumentStates::get_index`].
+    ///
+    /// An index from another `IndexedInstruments` set can resolve to a different instrument here,
+    /// which no lookup can detect.
+    fn tracks_instrument(&self, key: &InstrumentIndex) -> bool {
+        self.instruments.get_index(key).is_some()
     }
 }
 

@@ -17,6 +17,7 @@ use rustrade::{
         audit::{AuditTick, EngineAudit},
         clock::HistoricalClock,
         command::Command,
+        error::{EngineError, RecoverableEngineError},
         execution_tx::MultiExchangeTxMap,
         process_with_audit,
         state::{
@@ -54,7 +55,9 @@ use rustrade_execution::{
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, OrderId, PositionId, StrategyId, VenueOrderId},
-        request::{OrderRequestCancel, OrderRequestOpen, OrderResponseCancel, RequestOpen},
+        request::{
+            OrderRequestCancel, OrderRequestOpen, OrderResponseCancel, RequestCancel, RequestOpen,
+        },
         state::{ActiveOrderState, Cancelled, Filled, Open, OrderState},
     },
     position::{Position, PositionReport},
@@ -2071,6 +2074,260 @@ fn test_unknown_instrument_index_is_rejected_not_panicked() {
         execution_rx.rx.try_recv().is_err(),
         "a rejected event must send no request"
     );
+}
+
+fn open_request(instrument: InstrumentIndex, cid: &str) -> OrderRequestOpen {
+    OrderRequestOpen {
+        key: OrderKey {
+            exchange: ExchangeIndex(0),
+            instrument,
+            strategy: strategy_id(),
+            cid: ClientOrderId::new(cid),
+        },
+        state: RequestOpen {
+            side: Side::Buy,
+            kind: OrderKind::Limit,
+            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+            price: Some(dec!(45_000)),
+            quantity: dec!(1),
+            position_id: None,
+            reduce_only: false,
+            market: None,
+        },
+    }
+}
+
+fn cancel_request(instrument: InstrumentIndex, cid: &str) -> OrderRequestCancel {
+    OrderRequestCancel {
+        key: OrderKey {
+            exchange: ExchangeIndex(0),
+            instrument,
+            strategy: strategy_id(),
+            cid: ClientOrderId::new(cid),
+        },
+        state: RequestCancel { id: None },
+    }
+}
+
+fn unknown_instrument_error(instrument: InstrumentIndex) -> EngineError {
+    EngineError::Recoverable(RecoverableEngineError::UnknownInstrument(format!(
+        "{instrument:?}"
+    )))
+}
+
+/// A `Command` naming an instrument the engine was not built with is rejected before anything is
+/// sent — the open before it is stamped, the cancel before it reaches the venue — and reported as a
+/// recoverable error beside the requests that did go out. The engine keeps running.
+#[test]
+fn test_command_send_requests_unknown_instrument_rejected_before_send() {
+    let (execution_tx, mut execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    send_spot_price(&mut engine, 1, dec!(45_000));
+    let pre_instruments = engine.state.instruments.clone();
+
+    let unknown = InstrumentIndex(pre_instruments.0.len());
+    let known = InstrumentIndex(1);
+    assert!(pre_instruments.get_index(&unknown).is_none());
+
+    // Opens: the unknown one is rejected, the known one is stamped, sent and recorded in flight.
+    let unknown_open = open_request(unknown, "unknown-open");
+    let known_open = open_request(known, "known-open");
+    let audit = process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendOpenRequests(OneOrMany::Many(vec![
+            unknown_open.clone(),
+            known_open.clone(),
+        ]))),
+    );
+    let EngineAudit::Process(audit) = audit.event else {
+        panic!("expected EngineAudit::Process");
+    };
+    assert!(
+        audit.errors.is_empty(),
+        "an unknown instrument must not stop the engine"
+    );
+    let NoneOneOrMany::One(EngineOutput::Commanded(ActionOutput::OpenOrders(output))) =
+        audit.outputs
+    else {
+        panic!("expected one OpenOrders output, got {:?}", audit.outputs);
+    };
+    assert_eq!(
+        output.errors,
+        NoneOneOrMany::One(Box::new((unknown_open, unknown_instrument_error(unknown))))
+    );
+    let sent: Vec<_> = output.sent_iter().collect();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].key, known_open.key);
+    assert!(sent[0].state.market.is_some(), "a known open is stamped");
+
+    match execution_rx.rx.try_recv() {
+        Ok(ExecutionRequest::Open(request)) => assert_eq!(request.key, known_open.key),
+        other => panic!("expected the known open to be sent, got {other:?}"),
+    }
+    assert!(
+        execution_rx.rx.try_recv().is_err(),
+        "the unknown open must not be sent"
+    );
+    assert_eq!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&known)
+            .orders
+            .0
+            .len(),
+        1,
+        "the sent open is recorded in flight"
+    );
+
+    // Cancels: rejected before the send, so nothing reaches the venue and nothing is recorded.
+    let instruments_before_cancel = engine.state.instruments.clone();
+    let unknown_cancel = cancel_request(unknown, "unknown-cancel");
+    let audit = process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendCancelRequests(OneOrMany::One(
+            unknown_cancel.clone(),
+        ))),
+    );
+    let EngineAudit::Process(audit) = audit.event else {
+        panic!("expected EngineAudit::Process");
+    };
+    assert!(
+        audit.errors.is_empty(),
+        "an unknown instrument must not stop the engine"
+    );
+    assert_eq!(
+        audit.outputs,
+        NoneOneOrMany::One(EngineOutput::Commanded(ActionOutput::CancelOrders(
+            SendRequestsOutput {
+                sent: NoneOneOrMany::None,
+                errors: NoneOneOrMany::One(Box::new((
+                    unknown_cancel,
+                    unknown_instrument_error(unknown)
+                ))),
+            }
+        )))
+    );
+    assert!(
+        execution_rx.rx.try_recv().is_err(),
+        "the unknown cancel must not be sent"
+    );
+    assert_eq!(engine.state.instruments, instruments_before_cancel);
+}
+
+/// Emits one cancel and one open for a fixed instrument, from both the algo and the
+/// close-positions hooks, regardless of state — standing in for user strategy code that holds an
+/// index the engine was not built with.
+struct FixedInstrumentStrategy {
+    instrument: InstrumentIndex,
+}
+
+impl AlgoStrategy for FixedInstrumentStrategy {
+    type State = EngineState<DefaultGlobalData, DefaultInstrumentMarketData>;
+
+    fn generate_algo_orders(
+        &self,
+        _: &Self::State,
+    ) -> (
+        impl IntoIterator<Item = OrderRequestCancel<ExchangeIndex, InstrumentIndex>>,
+        impl IntoIterator<Item = OrderRequestOpen<ExchangeIndex, InstrumentIndex>>,
+    ) {
+        (
+            [cancel_request(self.instrument, "algo-cancel")],
+            [open_request(self.instrument, "algo-open")],
+        )
+    }
+}
+
+impl ClosePositionsStrategy for FixedInstrumentStrategy {
+    type State = EngineState<DefaultGlobalData, DefaultInstrumentMarketData>;
+
+    fn close_positions_requests<'a>(
+        &'a self,
+        _: &'a Self::State,
+        _: &'a InstrumentFilter<ExchangeIndex, AssetIndex, InstrumentIndex>,
+    ) -> (
+        impl IntoIterator<Item = OrderRequestCancel<ExchangeIndex, InstrumentIndex>> + 'a,
+        impl IntoIterator<Item = OrderRequestOpen<ExchangeIndex, InstrumentIndex>> + 'a,
+    )
+    where
+        ExchangeIndex: 'a,
+        AssetIndex: 'a,
+        InstrumentIndex: 'a,
+    {
+        (
+            [cancel_request(self.instrument, "close-cancel")],
+            [open_request(self.instrument, "close-open")],
+        )
+    }
+}
+
+/// Strategy code is user code too: an algo or close-positions strategy that emits an unknown
+/// instrument has its requests rejected unsent, exactly as a `Command` does.
+#[test]
+fn test_strategy_requests_unknown_instrument_rejected_before_send() {
+    use rustrade::engine::action::{
+        close_positions::ClosePositions, generate_algo_orders::GenerateAlgoOrders,
+    };
+
+    let (execution_tx, mut execution_rx) = mpsc_unbounded();
+    let built = build_option_engine(TradingState::Enabled, execution_tx);
+    let unknown = InstrumentIndex(built.state.instruments.0.len());
+    let mut engine = Engine {
+        clock: built.clock,
+        meta: built.meta,
+        state: built.state,
+        execution_txs: built.execution_txs,
+        strategy: FixedInstrumentStrategy {
+            instrument: unknown,
+        },
+        risk: built.risk,
+    };
+    let pre_instruments = engine.state.instruments.clone();
+
+    let output = engine.generate_algo_orders();
+    let output = output.cancels_and_opens;
+    assert_eq!(output.cancels.sent, NoneOneOrMany::None);
+    assert_eq!(output.opens.sent, NoneOneOrMany::None);
+    assert_eq!(
+        output.cancels.errors,
+        NoneOneOrMany::One(Box::new((
+            cancel_request(unknown, "algo-cancel"),
+            unknown_instrument_error(unknown)
+        )))
+    );
+    assert_eq!(
+        output.opens.errors,
+        NoneOneOrMany::One(Box::new((
+            open_request(unknown, "algo-open"),
+            unknown_instrument_error(unknown)
+        )))
+    );
+    assert!(output.unrecoverable_errors().is_none());
+
+    let output = engine.close_positions(&InstrumentFilter::None);
+    assert_eq!(output.cancels.sent, NoneOneOrMany::None);
+    assert_eq!(output.opens.sent, NoneOneOrMany::None);
+    assert_eq!(
+        output.cancels.errors,
+        NoneOneOrMany::One(Box::new((
+            cancel_request(unknown, "close-cancel"),
+            unknown_instrument_error(unknown)
+        )))
+    );
+    assert_eq!(
+        output.opens.errors,
+        NoneOneOrMany::One(Box::new((
+            open_request(unknown, "close-open"),
+            unknown_instrument_error(unknown)
+        )))
+    );
+
+    assert!(
+        execution_rx.rx.try_recv().is_err(),
+        "no request for an unknown instrument may be sent"
+    );
+    assert_eq!(engine.state.instruments, pre_instruments);
 }
 
 /// A future settles at its own last price, not at an option's intrinsic value, and — unlike an
