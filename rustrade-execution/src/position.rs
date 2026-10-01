@@ -47,12 +47,13 @@ impl Position {
 
     /// Returns true if this is a long position (positive quantity).
     pub fn is_long(&self) -> bool {
-        self.quantity.is_sign_positive() && !self.quantity.is_zero()
+        self.quantity > Decimal::ZERO
     }
 
-    /// Returns true if this is a short position (negative quantity).
+    /// Returns true if this is a short position (negative quantity). A negative zero is flat, not
+    /// short.
     pub fn is_short(&self) -> bool {
-        self.quantity.is_sign_negative()
+        self.quantity < Decimal::ZERO
     }
 
     /// Returns the absolute position size.
@@ -182,10 +183,13 @@ mod tests {
         assert!(short.is_short());
         assert!(!short.is_flat());
 
-        let flat = Position::new(dec!(0), None, None, None, None, None, now);
-        assert!(!flat.is_long());
-        assert!(!flat.is_short());
-        assert!(flat.is_flat());
+        // Negative zero, as `Decimal` can produce from arithmetic or parsing "-0", is flat too.
+        for zero in [dec!(0), -dec!(0)] {
+            let flat = Position::new(zero, None, None, None, None, None, now);
+            assert!(!flat.is_long(), "{zero:?}");
+            assert!(!flat.is_short(), "{zero:?}");
+            assert!(flat.is_flat(), "{zero:?}");
+        }
     }
 
     #[test]

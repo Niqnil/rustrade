@@ -55,7 +55,7 @@ use super::shared::{
     classify_rest_order_error, classify_rest_query_error, convert_execution_report,
     convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event,
     is_duplicate, log_unrecognised_frame, new_dedup_cache, parse_user_data_frame,
-    recovered_order_totals, response_decode_error, rest_call_with_retry,
+    recovered_order_totals, response_decode_error, rest_call_with_retry, unrecovered_instruments,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, InstrumentBalanceUpdate,
@@ -1934,6 +1934,10 @@ fn register_user_data_listener(
 /// [`paginate_margin_my_trades`]), so each day of outage before an instrument's first missed fill
 /// costs one sequential request. An outage of weeks across many instruments can therefore run into
 /// [`FILL_RECOVERY_TIMEOUT_SECS`], which bounds the whole recovery.
+///
+/// Fills forwarded before the deadline stay delivered. The instruments whose fills were not
+/// recovered, because their query failed or had not finished, are named in the warning or error
+/// that ends the recovery.
 async fn recover_margin_fills(
     rest: &Arc<RestApi>,
     rate_limiter: &Arc<RateLimitTracker>,
@@ -1955,99 +1959,120 @@ async fn recover_margin_fills(
         "BinanceMargin recovering fills after reconnect"
     );
 
-    let start_time_ms = disconnect_time.timestamp_millis();
-    let order_executions_deadline = tokio::time::Instant::now() + ORDER_EXECUTIONS_BUDGET;
-    let mut recovered = 0u32;
-    let mut duplicates = 0u32;
-    let mut failed_instruments = 0u32;
+    // Instruments whose fills have all been forwarded; the rest are named if recovery fails.
+    let mut recovered_instruments = Vec::with_capacity(instruments.len());
+    let recovery = async {
+        let start_time_ms = disconnect_time.timestamp_millis();
+        let order_executions_deadline = tokio::time::Instant::now() + ORDER_EXECUTIONS_BUDGET;
+        let mut recovered = 0u32;
+        let mut duplicates = 0u32;
+        let mut failed_instruments = 0u32;
 
-    let mut stream = futures::stream::iter(instruments.iter().cloned().map(|inst| {
-        let rest = rest.clone();
-        let rl = rate_limiter.clone();
-        async move {
-            let raw = match paginate_margin_my_trades(
-                &rest,
-                &rl,
-                &inst,
-                MyTradesFrom::Time(start_time_ms),
-                is_isolated,
-            )
-            .await
-            {
-                Ok(pages) => pages,
-                Err(e) => {
-                    warn!(%e, %inst, "BinanceMargin fill recovery: REST request failed");
-                    return None;
-                }
-            };
-            // `myTrades` carries no cumulative, so each recovered fill's is rebuilt from its
-            // order's executions; without it the fill advances the position but not the order.
-            let totals = recovered_order_totals(
-                ExchangeId::BinanceMargin,
-                &inst,
-                &raw,
-                order_executions_deadline,
-                |order_id| {
-                    paginate_margin_my_trades(
-                        &rest,
-                        &rl,
-                        &inst,
-                        MyTradesFrom::Order(order_id),
-                        is_isolated,
-                    )
-                },
-            )
-            .await;
-            Some(
-                raw.iter()
+        let mut stream = futures::stream::iter(instruments.iter().cloned().map(|inst| {
+            let rest = rest.clone();
+            let rl = rate_limiter.clone();
+            async move {
+                let raw = match paginate_margin_my_trades(
+                    &rest,
+                    &rl,
+                    &inst,
+                    MyTradesFrom::Time(start_time_ms),
+                    is_isolated,
+                )
+                .await
+                {
+                    Ok(pages) => pages,
+                    Err(e) => {
+                        warn!(%e, %inst, "BinanceMargin fill recovery: REST request failed");
+                        return (inst, None);
+                    }
+                };
+                // `myTrades` carries no cumulative, so each recovered fill's is rebuilt from its
+                // order's executions; without it the fill advances the position but not the order.
+                let totals = recovered_order_totals(
+                    ExchangeId::BinanceMargin,
+                    &inst,
+                    &raw,
+                    order_executions_deadline,
+                    |order_id| {
+                        paginate_margin_my_trades(
+                            &rest,
+                            &rl,
+                            &inst,
+                            MyTradesFrom::Order(order_id),
+                            is_isolated,
+                        )
+                    },
+                )
+                .await;
+                let trades = raw
+                    .iter()
                     .filter_map(|t| {
                         let mut trade = convert_margin_trade(t, &inst)?;
                         trade.order_filled_quantity = t.id.and_then(|id| totals.get(&id).copied());
                         Some(trade)
                     })
-                    .collect::<Vec<_>>(),
-            )
+                    .collect::<Vec<_>>();
+                (inst, Some(trades))
+            }
+        }))
+        .buffer_unordered(8);
+        while let Some((inst, result)) = stream.next().await {
+            let trades = match result {
+                Some(t) => t,
+                None => {
+                    failed_instruments += 1;
+                    continue;
+                }
+            };
+            for trade in trades {
+                let event = UnindexedAccountEvent::new(
+                    ExchangeId::BinanceMargin,
+                    AccountEventKind::Trade(trade),
+                );
+                if let Some(key) = dedup_key_from_event(&event)
+                    && is_duplicate(dedup, key)
+                {
+                    duplicates += 1;
+                    continue;
+                }
+                if tx.send(event).is_err() {
+                    debug!("BinanceMargin fill recovery: consumer dropped during recovery");
+                    return;
+                }
+                recovered += 1;
+            }
+            recovered_instruments.push(inst);
         }
-    }))
-    .buffer_unordered(8);
-    while let Some(result) = stream.next().await {
-        let trades = match result {
-            Some(t) => t,
-            None => {
-                failed_instruments += 1;
-                continue;
-            }
-        };
-        for trade in trades {
-            let event = UnindexedAccountEvent::new(
-                ExchangeId::BinanceMargin,
-                AccountEventKind::Trade(trade),
-            );
-            if let Some(key) = dedup_key_from_event(&event)
-                && is_duplicate(dedup, key)
-            {
-                duplicates += 1;
-                continue;
-            }
-            if tx.send(event).is_err() {
-                debug!("BinanceMargin fill recovery: consumer dropped during recovery");
-                return;
-            }
-            recovered += 1;
-        }
-    }
 
-    if failed_instruments > 0 {
-        error!(
-            recovered,
-            duplicates,
-            failed_instruments,
-            "BinanceMargin fill recovery complete with failures — some fills may be permanently missed"
-        );
-    } else {
-        info!(
-            recovered,
-            duplicates, "BinanceMargin fill recovery complete"
+        if failed_instruments > 0 {
+            error!(
+                recovered,
+                duplicates,
+                failed_instruments,
+                is_isolated,
+                unrecovered = ?unrecovered_instruments(instruments, &recovered_instruments),
+                "BinanceMargin fill recovery complete with failures — fills since the disconnect may be permanently missed for the unrecovered instruments"
+            );
+        } else {
+            info!(
+                recovered,
+                duplicates, "BinanceMargin fill recovery complete"
+            );
+        }
+    };
+    // A timeout drops `recovery` at an await, between instruments: one instrument's fills are sent
+    // without awaiting, so each is either fully forwarded and listed, or not forwarded at all.
+    if tokio::time::timeout(Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS), recovery)
+        .await
+        .is_err()
+    {
+        warn!(
+            timeout_secs = FILL_RECOVERY_TIMEOUT_SECS,
+            is_isolated,
+            unrecovered = ?unrecovered_instruments(instruments, &recovered_instruments),
+            "BinanceMargin fill recovery timed out — fills since the disconnect were not recovered \
+             for the unrecovered instruments (failed or still pending)"
         );
     }
 }
@@ -2185,20 +2210,10 @@ async fn margin_connection_manager(
             tokio::time::Instant::now() + token_renew_after(token.expiration_time_ms);
 
         // --- Fill recovery after a reconnect (bounded) ---
-        if let Some(dt) = disconnect_time.take()
-            && tokio::time::timeout(
-                Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS),
-                // This is the cross manager (account-wide); fill recovery is always cross-scoped.
-                // The isolated manager (a separate path) passes `true`.
-                recover_margin_fills(&rest, &rate_limiter, &instruments, dt, &tx, &dedup, false),
-            )
-            .await
-            .is_err()
-        {
-            warn!(
-                timeout_secs = FILL_RECOVERY_TIMEOUT_SECS,
-                "BinanceMargin fill recovery timed out — remaining instruments not queried"
-            );
+        if let Some(dt) = disconnect_time.take() {
+            // This is the cross manager (account-wide); fill recovery is always cross-scoped.
+            // The isolated manager (a separate path) passes `true`.
+            recover_margin_fills(&rest, &rate_limiter, &instruments, dt, &tx, &dedup, false).await;
         }
 
         // --- Monitor: disconnect signal, heartbeat timeout, token refresh, or consumer drop ---
@@ -2580,19 +2595,9 @@ async fn isolated_connection_manager(
         let token_deadline = tokio::time::Instant::now() + token_renew_after(earliest_expiry_ms);
 
         // --- Fill recovery after a reconnect (isolated-scoped over the full symbol set) ---
-        if let Some(dt) = disconnect_time.take()
-            && tokio::time::timeout(
-                Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS),
-                // is_isolated = true: paginate_margin_my_trades must query isolated trades.
-                recover_margin_fills(&rest, &rate_limiter, &symbols, dt, &tx, &dedup, true),
-            )
-            .await
-            .is_err()
-        {
-            warn!(
-                timeout_secs = FILL_RECOVERY_TIMEOUT_SECS,
-                "BinanceMargin isolated fill recovery timed out — remaining instruments not queried"
-            );
+        if let Some(dt) = disconnect_time.take() {
+            // is_isolated = true: paginate_margin_my_trades must query isolated trades.
+            recover_margin_fills(&rest, &rate_limiter, &symbols, dt, &tx, &dedup, true).await;
         }
 
         // --- Monitor: disconnect signal, heartbeat timeout, token refresh, or consumer drop ---

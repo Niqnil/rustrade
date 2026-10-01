@@ -199,6 +199,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   engine has just sent, or a cancel it is waiting on, shows in the replica only once the venue
   answers.
 
+- **Alpaca reported a response it could not decode as a transient connectivity error**
+  (`rustrade-execution`, feature `alpaca`). A 2xx response whose body did not fit the expected
+  model became `ClientError::Connectivity`, so `is_transient()` told a caller to retry a request
+  that returns the same body every time. It is now `ClientError::Internal`, as for Binance, on
+  `account_snapshot`, `fetch_balances`, `fetch_open_orders` and `fetch_trades`; a caller that
+  matched `Connectivity` for these failures must handle `Internal`. An order whose 2xx response
+  does not decode stays `OrderError::Connectivity`: Alpaca accepted it, so it may be live, and its
+  status is unknown rather than rejected. Reconcile it through `fetch_open_orders` before
+  resubmitting.
+
+- **`Position::is_short` reported a negative zero quantity as short** (`rustrade-execution`).
+  `Decimal` keeps a sign on zero, so a `-0` quantity, as from parsing `"-0"`, was short while
+  `is_flat` also held. It is now flat only.
+
+- **A timed-out fill recovery did not say whose fills it missed** (`rustrade-execution`, features
+  `binance` and `alpaca`). When reconnect fill recovery hit its 30-second limit, the warning
+  said only that some fills may be missing. Binance spot and margin now name the instruments
+  whose fills were not recovered, because their query failed or had not finished, both on a
+  timeout and when recovery ends with failed queries. Alpaca, which recovers every instrument
+  with one query, names the requested instruments.
+
 - **Alpaca's `account_snapshot` did not report equity and option positions**
   (`rustrade-execution`, feature `alpaca`). Every `InstrumentAccountSnapshot::position` was
   `None`, so a caller could not see what the account held, or which way. Each equity and option
