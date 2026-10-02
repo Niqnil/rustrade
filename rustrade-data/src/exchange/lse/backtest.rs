@@ -33,9 +33,10 @@ use std::sync::Arc;
 /// - `instrument` is the [`InstrumentIndex`] the instrument received in `IndexedInstruments`.
 ///   Positions and unrealised PnL are strictly index-scoped, so a wrong index attributes this
 ///   symbol's prices to a different instrument — silently.
-/// - `exchange` must be the [`ExchangeId`] that instrument was registered under, since engine state
-///   panics on a market event from an exchange it does not know. [`LseDataset::exchange_id`] gives
-///   the variant a given dataset belongs to.
+/// - `exchange` must be the [`ExchangeId`] the instrument is priced on: its `DataVenue`'s exchange
+///   if it declares one, otherwise the exchange it was registered under. Either is one the engine
+///   knows, and engine state panics on a market event from an exchange it does not.
+///   [`LseDataset::exchange_id`] gives the variant a given dataset belongs to.
 ///
 /// [`LseDataset::exchange_id`]: super::market::LseDataset::exchange_id
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -44,7 +45,8 @@ pub struct LseCandleSource {
     pub symbol: SmolStr,
     /// The engine-side key for this instrument.
     pub instrument: InstrumentIndex,
-    /// The exchange this instrument was registered under.
+    /// The exchange this instrument is priced on: its `DataVenue`'s exchange if it declares one,
+    /// otherwise the exchange it is registered under.
     pub exchange: ExchangeId,
 }
 
@@ -77,9 +79,12 @@ impl LseCandleSource {
     /// nothing downstream able to notice. See
     /// [`market::instrument_index_for`].
     ///
+    /// The symbol is matched on the data side, so an instrument executed on one venue and priced
+    /// here through a `DataVenue` resolves as well as one registered on `exchange` directly.
+    ///
     /// # Errors
-    /// - [`LseError::UnknownInstrument`] if no instrument on `exchange` is registered under
-    ///   `symbol` as its exchange-side name.
+    /// - [`LseError::UnknownInstrument`] if no instrument is priced on `exchange` under `symbol`.
+    /// - [`LseError::AmbiguousInstrument`] if more than one is.
     /// - [`LseError::QuoteAssetMismatch`] if one is, but prices it in a different asset than the
     ///   provider quotes that symbol in.
     pub fn resolve(
@@ -413,5 +418,82 @@ mod tests {
             .expect_err("an unregistered symbol must not build a source");
         assert!(matches!(error, LseError::UnknownInstrument { .. }));
         assert!(error.to_string().contains("BP.L"));
+    }
+
+    /// An instrument executed on one venue and priced on LSE through a `DataVenue` resolves by its
+    /// data-side symbol, which is the configuration `DataVenue` exists for. Two instruments priced
+    /// under one LSE symbol are refused, since a source feeds one.
+    #[test]
+    fn resolve_matches_the_data_venue_and_rejects_a_symbol_pricing_two_instruments() {
+        use rustrade_instrument::Underlying;
+        use rustrade_instrument::index::builder::IndexedInstrumentsBuilder;
+        use rustrade_instrument::instrument::Instrument;
+        use rustrade_instrument::instrument::data_venue::DataVenue;
+        use rustrade_instrument::instrument::name::InstrumentNameExchange;
+
+        let priced_on_lse = |exchange, name_internal: &str| {
+            Instrument::spot(
+                exchange,
+                name_internal,
+                "BP",
+                Underlying::new("bp", "gbx"),
+                None,
+            )
+            .with_data_venue(DataVenue::new(
+                ExchangeId::LseEquities,
+                Some(InstrumentNameExchange::new("BP.L")),
+            ))
+        };
+
+        let instruments = IndexedInstrumentsBuilder::default()
+            .add_instrument(priced_on_lse(ExchangeId::Ibkr, "ibkr-bp"))
+            .build();
+        let source =
+            LseCandleSource::resolve(&instruments, ExchangeId::LseEquities, "BP.L").unwrap();
+        assert_eq!(
+            instruments.instruments()[source.instrument.index()]
+                .value
+                .name_internal
+                .as_ref(),
+            "ibkr-bp"
+        );
+        assert_eq!(source.exchange, ExchangeId::LseEquities);
+
+        // The execution-side symbol is not what LSE publishes, so it does not resolve.
+        let error = LseCandleSource::resolve(&instruments, ExchangeId::LseEquities, "BP")
+            .expect_err("the execution-side symbol is not priced on LSE");
+        assert!(matches!(error, LseError::UnknownInstrument { .. }));
+
+        // The ambiguity spans both ways of being priced on LSE: one registered there directly,
+        // with no `DataVenue`, and one priced there through its `DataVenue`.
+        let registered_on_lse = Instrument::spot(
+            ExchangeId::LseEquities,
+            "lse-bp",
+            "BP.L",
+            Underlying::new("bp", "gbx"),
+            None,
+        );
+        let instruments = IndexedInstrumentsBuilder::default()
+            .add_instrument(priced_on_lse(ExchangeId::Ibkr, "ibkr-bp"))
+            .add_instrument(registered_on_lse)
+            .build();
+        let error = LseCandleSource::resolve(&instruments, ExchangeId::LseEquities, "BP.L")
+            .expect_err("one symbol pricing two instruments must not build a source");
+        assert!(
+            matches!(error, LseError::AmbiguousInstrument { .. }),
+            "{error:?}"
+        );
+
+        let instruments = IndexedInstrumentsBuilder::default()
+            .add_instrument(priced_on_lse(ExchangeId::Ibkr, "ibkr-bp"))
+            .add_instrument(priced_on_lse(ExchangeId::AlpacaBroker, "alpaca-bp"))
+            .build();
+        let error = LseCandleSource::resolve(&instruments, ExchangeId::LseEquities, "BP.L")
+            .expect_err("one symbol pricing two instruments must not build a source");
+        let LseError::AmbiguousInstrument { instruments, .. } = &error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert!(instruments.contains("ibkr-bp"), "{instruments}");
+        assert!(instruments.contains("alpaca-bp"), "{instruments}");
     }
 }

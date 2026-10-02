@@ -42,8 +42,7 @@ pub trait InFlightRequestRecorder<ExchangeKey = ExchangeIndex, InstrumentKey = I
 /// [`InstrumentStates::instrument_index_mut`](crate::engine::state::instrument::InstrumentStates::instrument_index_mut)
 /// does. The `Engine` never records one: it rejects a request for an untracked instrument before
 /// sending it (see [`TracksInstrument`](crate::engine::state::TracksInstrument)). A caller that
-/// sends through [`SendRequests`](crate::engine::action::send_requests::SendRequests) and records
-/// here itself must check first.
+/// records here itself must check first.
 impl<GlobalData, InstrumentData> InFlightRequestRecorder<ExchangeIndex, InstrumentIndex>
     for EngineState<GlobalData, InstrumentData>
 where

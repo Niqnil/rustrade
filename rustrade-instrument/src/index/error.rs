@@ -43,6 +43,19 @@ pub enum IndexError {
     #[error("duplicate InstrumentNameInternal: {0}")]
     DuplicateInstrumentNameInternal(String),
 
+    /// Two or more [`Instrument`](crate::instrument::Instrument)s on one exchange share an
+    /// [`InstrumentNameExchange`](crate::instrument::name::InstrumentNameExchange).
+    ///
+    /// The exchange-side name is how a venue reports an instrument, so every order, fill and
+    /// position it sends is resolved back to an instrument by `(exchange, name_exchange)`. With two
+    /// candidates, each lookup would pick one arbitrarily: a fill for a spot `AAPL` could land on a
+    /// CFD named `AAPL` on the same venue, with that CFD's contract size and settlement asset.
+    ///
+    /// Contains a description naming the duplicated name, the exchange, and the instruments that
+    /// share it.
+    #[error("duplicate InstrumentNameExchange: {0}")]
+    DuplicateInstrumentNameExchange(String),
+
     /// An [`Instrument`](crate::instrument::Instrument)'s `contract_size` is not a positive
     /// multiplier.
     ///
