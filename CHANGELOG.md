@@ -37,15 +37,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cancelled during it. `MockExecution` implements it from the simulated venue's ledger. No live
   client implements it yet.
   - `Order::map_state`, which replaces an order's state and keeps every other field, and the
-    `UnindexedInactiveOrderState` alias.
+    `UnindexedInactiveOrder` and `UnindexedInactiveOrderState` aliases.
 
 ### Changed
 
 - **`SimulatedVenue` keeps each filled order whole** (`rustrade-execution`). **Breaking.**
   `AccountState::ack_filled` takes the filled `Order` instead of its client order id, so that
   `AccountState::order_ended` and `SimulatedVenue::orders_ended` can report a fill's total and
-  average price. `MockExchangeRequestKind` gains `FetchOrdersEnded`, so an exhaustive match on it
-  needs a new arm.
+  average price. `MockExchangeRequestKind` gains `FetchOrdersEnded` and is now
+  `#[non_exhaustive]`, since only the venue's own driver matches on it, so a later request kind is
+  not another break.
 
 - **`System::feed_tx` is now a `FeedTx`** (`rustrade`, new module `system::feed`). **Breaking**
   for code that named its type `UnboundedTx` or reached its inner sender through the public `tx`

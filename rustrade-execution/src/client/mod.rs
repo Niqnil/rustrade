@@ -49,10 +49,10 @@ use crate::{
     balance::AssetBalance,
     error::UnindexedClientError,
     order::{
-        Order, UnindexedOrderKey,
+        Order, UnindexedInactiveOrder, UnindexedOrderKey,
         bracket::{BracketOrderRequest, BracketOrderResult},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::{Open, UnindexedInactiveOrderState, UnindexedOrderState},
+        state::{Open, UnindexedOrderState},
     },
     trade::Trade,
 };
@@ -470,14 +470,19 @@ pub trait OrderStatusClient: ExecutionClient {
     ///   [`Cancelled`](crate::order::state::InactiveOrderState::Cancelled) carrying what filled
     ///   before it, [`Expired`](crate::order::state::InactiveOrderState::Expired), or
     ///   [`OpenFailed`](crate::order::state::InactiveOrderState::OpenFailed) for an order the venue
-    ///   accepted the request for and then rejected.
+    ///   accepted for processing and later rejected (Binance `REJECTED`, Alpaca `rejected`). An
+    ///   order rejected in the response to its open request was answered there and is not expected
+    ///   here.
     /// - An order still live is **omitted**, and so is one the venue does not know. Neither is an
     ///   error. A caller compares the result with what it asked for.
     /// - An empty `orders` returns an empty list. Unlike
     ///   [`ExecutionClient::fetch_open_orders`]'s empty slice, it does not mean "all".
-    /// - An order is found by its [`cid`](crate::order::OrderKey::cid); its `instrument` is there
-    ///   for venues that look orders up per instrument. Each returned order carries the key it was
-    ///   asked for.
+    /// - An order is found by its [`cid`](crate::order::OrderKey::cid), and each returned order
+    ///   carries the key it was asked for, so a `strategy` the venue does not record survives.
+    /// - A key whose `instrument` is not the one the order traded is treated as unknown. The
+    ///   `exchange` is not checked: a client answers for its own venue.
+    /// - A `cid` asked about more than once is reported at most once, under the first key that
+    ///   names it.
     ///
     /// # Errors
     ///
@@ -486,12 +491,7 @@ pub trait OrderStatusClient: ExecutionClient {
     fn fetch_order_states(
         &self,
         orders: &[UnindexedOrderKey],
-    ) -> impl Future<
-        Output = Result<
-            Vec<Order<ExchangeId, InstrumentNameExchange, UnindexedInactiveOrderState>>,
-            UnindexedClientError,
-        >,
-    > + Send;
+    ) -> impl Future<Output = Result<Vec<UnindexedInactiveOrder>, UnindexedClientError>> + Send;
 }
 
 /// The capability table, pinned.

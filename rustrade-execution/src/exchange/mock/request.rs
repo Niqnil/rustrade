@@ -2,9 +2,9 @@ use crate::{
     UnindexedAccountSnapshot,
     balance::AssetBalance,
     order::{
-        Order, UnindexedOrderKey,
+        Order, UnindexedInactiveOrder, UnindexedOrderKey,
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::{Open, UnindexedInactiveOrderState, UnindexedOrderState},
+        state::{Open, UnindexedOrderState},
     },
     trade::Trade,
 };
@@ -66,9 +66,7 @@ impl MockExchangeRequest {
     pub fn fetch_orders_ended(
         time_request: DateTime<Utc>,
         orders: Vec<UnindexedOrderKey>,
-        response_tx: oneshot::Sender<
-            Vec<Order<ExchangeId, InstrumentNameExchange, UnindexedInactiveOrderState>>,
-        >,
+        response_tx: oneshot::Sender<Vec<UnindexedInactiveOrder>>,
     ) -> Self {
         Self::new(
             time_request,
@@ -124,7 +122,12 @@ impl MockExchangeRequest {
     }
 }
 
+/// What a [`MockExchangeRequest`] asks the venue for.
+///
+/// Non-exhaustive: requests are built through [`MockExchangeRequest`]'s constructors and matched only
+/// by the venue's own driver, so a new request kind is not a breaking change.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum MockExchangeRequestKind {
     FetchAccountSnapshot {
         response_tx: oneshot::Sender<UnindexedAccountSnapshot>,
@@ -139,9 +142,7 @@ pub enum MockExchangeRequestKind {
     },
     FetchOrdersEnded {
         orders: Vec<UnindexedOrderKey>,
-        response_tx: oneshot::Sender<
-            Vec<Order<ExchangeId, InstrumentNameExchange, UnindexedInactiveOrderState>>,
-        >,
+        response_tx: oneshot::Sender<Vec<UnindexedInactiveOrder>>,
     },
     FetchTrades {
         response_tx: oneshot::Sender<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>>,

@@ -3,12 +3,9 @@ use crate::{
     balance::AssetBalance,
     exchange::mock::orders::{OpenOrders, as_open},
     order::{
-        Order,
+        Order, UnindexedInactiveOrder,
         id::ClientOrderId,
-        state::{
-            Cancelled, Expired, Filled, InactiveOrderState, Open, OrderState,
-            UnindexedInactiveOrderState,
-        },
+        state::{Cancelled, Expired, Filled, InactiveOrderState, Open, OrderState},
     },
     trade::Trade,
 };
@@ -86,6 +83,9 @@ impl AccountState {
 
     /// Records that `order` filled, so a cancel that loses the race to it can say so and an
     /// order-state lookup can report it.
+    ///
+    /// Keyed on the client order id, which this venue assumes is never reused: a second fill under
+    /// the same id would replace the first.
     pub fn ack_filled(&mut self, order: Order<ExchangeId, InstrumentNameExchange, Filled>) {
         self.orders_filled.insert(order.key.cid.clone(), order);
     }
@@ -99,10 +99,11 @@ impl AccountState {
     ///
     /// An order a configured `initial_state` reported as cancelled is found too; one it reported
     /// in any other inactive state is not, because a snapshot seeds only open and cancelled orders.
-    pub fn order_ended(
-        &self,
-        cid: &ClientOrderId,
-    ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedInactiveOrderState>> {
+    ///
+    /// Each ledger an order can end in is checked in turn and the open book is not, which is sound
+    /// because this venue assumes a client order id is never reused: an order leaves the book
+    /// before it is recorded as ended, so it is in at most one of these places.
+    pub fn order_ended(&self, cid: &ClientOrderId) -> Option<UnindexedInactiveOrder> {
         if let Some(filled) = self.orders_filled.get(cid) {
             Some(filled.clone().map_state(InactiveOrderState::FullyFilled))
         } else if let Some(cancelled) = self.orders_cancelled.get(cid) {

@@ -41,6 +41,11 @@ pub type UnindexedOrder = Order<ExchangeId, InstrumentNameExchange, UnindexedOrd
 /// and [`InstrumentNameExchange`].
 pub type UnindexedOrderKey = OrderKey<ExchangeId, InstrumentNameExchange>;
 
+/// Convenient type alias for an [`Order`] that has ended, keyed with [`ExchangeId`] and
+/// [`InstrumentNameExchange`].
+pub type UnindexedInactiveOrder =
+    Order<ExchangeId, InstrumentNameExchange, state::UnindexedInactiveOrderState>;
+
 /// Convenient type alias for an [`OrderSnapshot`] keyed with [`ExchangeId`], [`AssetNameExchange`],
 /// and [`InstrumentNameExchange`].
 pub type UnindexedOrderSnapshot = Order<

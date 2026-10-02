@@ -10,9 +10,9 @@ use crate::{
     fee::FeeModelConfig,
     fill::SimFillConfig,
     order::{
-        Order, OrderKey, UnindexedOrderKey,
+        Order, OrderKey, UnindexedInactiveOrder, UnindexedOrderKey,
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::{Open, OrderState, UnindexedInactiveOrderState, UnindexedOrderState},
+        state::{Open, OrderState, UnindexedOrderState},
     },
     trade::Trade,
 };
@@ -373,10 +373,7 @@ where
     async fn fetch_order_states(
         &self,
         orders: &[UnindexedOrderKey],
-    ) -> Result<
-        Vec<Order<ExchangeId, InstrumentNameExchange, UnindexedInactiveOrderState>>,
-        UnindexedClientError,
-    > {
+    ) -> Result<Vec<UnindexedInactiveOrder>, UnindexedClientError> {
         let (response_tx, response_rx) = oneshot::channel();
 
         self.request_tx
