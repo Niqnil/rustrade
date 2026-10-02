@@ -34,10 +34,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that recovering order lifecycle events after a reconnect needs (#370). It is by order rather
   than by time because Binance's `allOrders` and Alpaca's closed-order list both filter on
   creation time, so a window opening at a disconnect cannot see an order placed before it and
-  cancelled during it. `MockExecution` implements it from the simulated venue's ledger. No live
-  client implements it yet.
+  cancelled during it. `MockExecution` implements it from the simulated venue's ledger, and
+  `BinanceSpot` by client order id (below).
   - `Order::map_state`, which replaces an order's state and keeps every other field, and the
     `UnindexedInactiveOrder` and `UnindexedInactiveOrderState` aliases.
+- **Binance Spot reports how orders ended while its account stream was disconnected**
+  (`rustrade-execution`). Until now a reconnect recovered the missed fills only, so an order
+  cancelled, expired or rejected meanwhile stayed live in engine state until a complete snapshot
+  dropped it, and even then nobody learned how it ended. `BinanceSpot` now holds the orders it has
+  seen live: from placing them, from `account_snapshot` and `fetch_open_orders`, and from the
+  stream, until it sees them end. It holds up to 4,096. After a reconnect, for each instrument the
+  stream was opened with, and once that instrument's missed fills are recovered, it lists the
+  instrument's open orders. It then looks
+  up each held order the listing no longer shows with `GET /api/v3/order` by client order id, and
+  sends each that ended as an `OrderSnapshot` of its inactive state, under `StrategyId::unknown()`.
+  Each instrument is settled as its check ends, and one that fails is retried on the fill gaps'
+  schedule. An order Binance does not know stops being held. `BinanceSpot` also implements
+  `OrderStatusClient` with the same lookup: `FILLED` with its average price, `CANCELED` and
+  `EXPIRED`/`EXPIRED_IN_MATCH` with what filled before, `REJECTED` as `OpenFailed`, and an order
+  unknown under the key's symbol (`-2013`, `-1121`) omitted. Refs #370. Binance Margin and the
+  other live clients follow.
 
 ### Changed
 

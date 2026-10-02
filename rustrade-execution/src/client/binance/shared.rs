@@ -21,10 +21,11 @@ use crate::{
     AccountEventKind, UnindexedAccountEvent,
     error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
     order::{
-        Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
+        Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType, UnindexedInactiveOrder,
+        UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         request::UnindexedOrderResponseCancel,
-        state::{Cancelled, Open, OrderState},
+        state::{Cancelled, Expired, Filled, InactiveOrderState, Open, OrderState},
     },
     trade::{AssetFees, Trade, TradeId},
 };
@@ -160,7 +161,8 @@ impl FillGap {
     }
 }
 
-/// What became of a [`FillGap`] whose read failed or did not finish.
+/// What became of a [`FillGap`], or of a reconnect's check of how orders ended, whose read failed
+/// or did not finish.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GapFailure {
     /// It is read again after this delay.
@@ -226,6 +228,11 @@ impl UnrecoveredFills {
                     .map(move |gap| (instrument.clone(), *gap))
             })
             .collect()
+    }
+
+    /// Whether a gap is left on `instrument`.
+    pub(crate) fn covers(&self, instrument: &InstrumentNameExchange) -> bool {
+        self.0.contains_key(instrument)
     }
 
     /// When the next gap is due, or `None` when there is none.
@@ -945,14 +952,15 @@ pub(crate) fn parse_time_in_force(tif: &str) -> TimeInForce {
 // Order-response conversion (REST open-order / all-order endpoints)
 // ---------------------------------------------------------------------------
 
-/// The subset of a Binance order-response struct that [`convert_open_order`] reads.
+/// The subset of a Binance order-response struct that [`convert_open_order`] and
+/// [`convert_ended_order`] read.
 ///
 /// binance-sdk generates a *distinct* response type per endpoint, with no shared trait:
-/// `AllOrdersResponseInner` and `GetOpenOrdersResponseInner` on spot,
+/// `AllOrdersResponseInner`, `GetOpenOrdersResponseInner` and `GetOrderResponse` on spot,
 /// `QueryMarginAccountsOpenOrdersResponseInner` on margin. Those structs are emphatically not
 /// interchangeable -- the spot family carries substantially more fields than the margin one, and
-/// several fields share a name while differing in type -- but the twelve named here are identical
-/// in name and type across all of them.
+/// several fields share a name while differing in type -- but the thirteen named here are
+/// identical in name and type across all of them.
 ///
 /// Naming that read subset is what makes a single converter safe to share. The dependency surface
 /// is explicit, so an SDK change to any *other* field cannot silently alter order parsing, and a
@@ -975,11 +983,13 @@ pub(crate) trait BinanceOrderFields {
     /// cancelled, expired and filled ones through the same accessors, so [`convert_open_order`]
     /// reads it rather than trusting the endpoint.
     fn status(&self) -> Option<&str>;
+    /// The quote quantity the order has traded so far, spelled `cummulativeQuoteQty` by Binance.
+    fn cumulative_quote_qty(&self) -> Option<&str>;
 }
 
 /// Implement [`BinanceOrderFields`] for SDK response types that share these field names.
 ///
-/// Every struct listed below declares these twelve fields with the same types, so the accessors
+/// Every struct listed below declares these thirteen fields with the same types, so the accessors
 /// are identical; a macro keeps them from drifting apart under hand-editing.
 macro_rules! impl_binance_order_fields {
     ($($t:ty),* $(,)?) => {
@@ -997,6 +1007,9 @@ macro_rules! impl_binance_order_fields {
                 fn update_time(&self) -> Option<i64> { self.update_time }
                 fn symbol(&self) -> Option<&str> { self.symbol.as_deref() }
                 fn status(&self) -> Option<&str> { self.status.as_deref() }
+                fn cumulative_quote_qty(&self) -> Option<&str> {
+                    self.cummulative_quote_qty.as_deref()
+                }
             }
         )*
     };
@@ -1005,6 +1018,7 @@ macro_rules! impl_binance_order_fields {
 impl_binance_order_fields!(
     binance_sdk::spot::rest_api::AllOrdersResponseInner,
     binance_sdk::spot::rest_api::GetOpenOrdersResponseInner,
+    binance_sdk::spot::rest_api::GetOrderResponse,
     binance_sdk::margin_trading::rest_api::QueryMarginAccountsOpenOrdersResponseInner,
 );
 
@@ -1028,9 +1042,8 @@ fn rest_order_is_open(status: &str) -> bool {
 ///
 /// Returns `None`, with a warning, for an order whose status is not live (see
 /// [`rest_order_is_open`]) or is missing, whichever endpoint served it. `openOrders` serves only
-/// live orders, so there this never fires in practice. An `allOrders` row for a finished order
-/// cannot be expressed as `Open` at all; reading that endpoint needs a conversion to
-/// [`OrderState`], which this is not.
+/// live orders, so there this never fires in practice. An order that has ended is read with
+/// [`convert_ended_order`] instead.
 ///
 /// `exchange` stamps the resulting [`OrderKey`] and every diagnostic below, so one
 /// implementation serves each Binance client without a venue name baked into its warnings.
@@ -1039,27 +1052,116 @@ pub(crate) fn convert_open_order<T: BinanceOrderFields>(
     exchange: ExchangeId,
     instrument: &InstrumentNameExchange,
 ) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
-    let order_id_raw = match o.order_id() {
-        Some(id) => id,
-        None => {
-            warn!(%exchange, %instrument, "Binance open order missing orderId");
-            return None;
-        }
-    };
     match o.status() {
         Some(status) if rest_order_is_open(status) => {}
         Some(status) => {
-            warn!(%exchange, %instrument, order_id = %order_id_raw, status, "Binance order is not live, not converting it to an open order");
+            warn!(%exchange, %instrument, order_id = ?o.order_id(), status, "Binance order is not live, not converting it to an open order");
             return None;
         }
         None => {
-            warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance open order missing status");
+            warn!(%exchange, %instrument, order_id = ?o.order_id(), "Binance open order missing status");
             return None;
         }
     }
+    let row = convert_order_row(o, exchange, instrument)?;
+    Some(row.map_state(|row| {
+        Open::new(
+            VenueOrderId::Assigned(row.order_id),
+            row.time_exchange,
+            row.filled_qty,
+        )
+    }))
+}
+
+/// How an order that has ended did end, from a REST order row such as `GET /api/v3/order`'s, under
+/// `key`, the key it was asked for.
+///
+/// `FILLED` becomes [`InactiveOrderState::FullyFilled`], with the average price worked out from
+/// `cummulativeQuoteQty`; `CANCELED` becomes [`InactiveOrderState::Cancelled`], `EXPIRED` and
+/// `EXPIRED_IN_MATCH` (self-trade prevention) [`InactiveOrderState::Expired`], each with what
+/// filled before; and `REJECTED` becomes [`InactiveOrderState::OpenFailed`].
+///
+/// Returns `None` for an order still live, and, with a warning, for a row whose status is missing
+/// or unknown or that cannot be converted. A caller reads `None` as "not ended", so such an order
+/// is asked about again later rather than retired on a guess.
+pub(crate) fn convert_ended_order<T: BinanceOrderFields>(
+    o: &T,
+    exchange: ExchangeId,
+    key: &UnindexedOrderKey,
+) -> Option<UnindexedInactiveOrder> {
+    let instrument = &key.instrument;
+    let Some(status) = o.status() else {
+        warn!(%exchange, %instrument, cid = %key.cid, "Binance order missing status");
+        return None;
+    };
+    if rest_order_is_open(status) {
+        return None;
+    }
+    if !matches!(
+        status,
+        "FILLED" | "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH" | "REJECTED"
+    ) {
+        warn!(%exchange, %instrument, cid = %key.cid, status, "Binance order has a status this version does not know, treating it as not ended");
+        return None;
+    }
+    let row = convert_order_row(o, exchange, instrument)?;
+    // The average over every execution: the quote traded over the base traded.
+    let avg_price = o
+        .cumulative_quote_qty()
+        .and_then(|quote| Decimal::from_str(quote).ok())
+        .and_then(|quote| quote.checked_div(row.state.filled_qty));
+    let mut order = row.map_state(|row| match status {
+        "FILLED" => InactiveOrderState::FullyFilled(Filled::new(
+            row.order_id,
+            row.time_exchange,
+            row.filled_qty,
+            avg_price,
+        )),
+        "CANCELED" => InactiveOrderState::Cancelled(Cancelled::new(
+            row.order_id,
+            row.time_exchange,
+            row.filled_qty,
+        )),
+        "REJECTED" => {
+            InactiveOrderState::OpenFailed(OrderError::Rejected(ApiError::OrderRejected(format!(
+                "Binance rejected order {} after accepting it",
+                row.order_id
+            ))))
+        }
+        _ => InactiveOrderState::Expired(Expired::new(
+            row.order_id,
+            row.time_exchange,
+            row.filled_qty,
+        )),
+    });
+    order.key = key.clone();
+    Some(order)
+}
+
+/// What a REST order row says about the order's state, whatever its status.
+#[derive(Debug)]
+struct OrderRow {
+    order_id: OrderId,
+    /// When the order last changed state.
+    time_exchange: DateTime<Utc>,
+    filled_qty: Decimal,
+}
+
+/// Convert the fields of a REST order row that do not depend on its status, shared by
+/// [`convert_open_order`] and [`convert_ended_order`]. Returns `None`, with a warning, when a field
+/// the order cannot be described without is missing or unparseable.
+fn convert_order_row<T: BinanceOrderFields>(
+    o: &T,
+    exchange: ExchangeId,
+    instrument: &InstrumentNameExchange,
+) -> Option<Order<ExchangeId, InstrumentNameExchange, OrderRow>> {
+    let Some(order_id_raw) = o.order_id() else {
+        warn!(%exchange, %instrument, "Binance order missing orderId");
+        return None;
+    };
     let order_id = OrderId(format_smolstr!("{}", order_id_raw));
     if o.client_order_id().is_none() {
-        warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance open order missing clientOrderId, using orderId as fallback — order may not reconcile with engine state");
+        warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance order missing clientOrderId, using orderId as fallback — order may not reconcile with engine state");
     }
     let cid = ClientOrderId::new(
         o.client_order_id()
@@ -1069,7 +1171,7 @@ pub(crate) fn convert_open_order<T: BinanceOrderFields>(
         // parse_side already logs a warning on unknown values
         Some(s) => parse_side(s)?,
         None => {
-            warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance open order missing side");
+            warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance order missing side");
             return None;
         }
     };
@@ -1077,7 +1179,7 @@ pub(crate) fn convert_open_order<T: BinanceOrderFields>(
     let quantity = match o.orig_qty().and_then(|s| Decimal::from_str(s).ok()) {
         Some(v) => v,
         None => {
-            warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance open order missing/unparseable origQty");
+            warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance order missing/unparseable origQty");
             return None;
         }
     };
@@ -1085,7 +1187,7 @@ pub(crate) fn convert_open_order<T: BinanceOrderFields>(
         Some(s) => match Decimal::from_str(s) {
             Ok(v) => v,
             Err(_) => {
-                warn!(%exchange, %instrument, order_id = %order_id_raw, executed_qty = s, "Binance open order unparseable executedQty, defaulting to 0");
+                warn!(%exchange, %instrument, order_id = %order_id_raw, executed_qty = s, "Binance order unparseable executedQty, defaulting to 0");
                 Decimal::ZERO
             }
         },
@@ -1095,7 +1197,7 @@ pub(crate) fn convert_open_order<T: BinanceOrderFields>(
         // parse_order_kind already logs a warning on unknown values
         Some(t) => parse_order_kind(t)?,
         None => {
-            warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance open order missing type");
+            warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance order missing type");
             return None;
         }
     };
@@ -1104,7 +1206,8 @@ pub(crate) fn convert_open_order<T: BinanceOrderFields>(
     // discards a snapshot older than the state it already tracks. `time` is the creation stamp and
     // is identical across every snapshot of one order, so a snapshot carrying it is discarded the
     // moment a WebSocket fill has advanced the tracked order past creation -- which is exactly the
-    // partially-filled order this fetch exists to reconcile.
+    // partially-filled order this fetch exists to reconcile. For an order that has ended it is
+    // when it ended.
     let time_exchange = match o
         .update_time()
         .or_else(|| o.time())
@@ -1112,7 +1215,7 @@ pub(crate) fn convert_open_order<T: BinanceOrderFields>(
     {
         Some(ts) => ts,
         None => {
-            warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance open order missing/unparseable time, using now");
+            warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance order missing/unparseable time, using now");
             Utc::now()
         }
     };
@@ -1131,7 +1234,11 @@ pub(crate) fn convert_open_order<T: BinanceOrderFields>(
         quantity,
         kind,
         time_in_force,
-        state: Open::new(VenueOrderId::Assigned(order_id), time_exchange, filled_qty),
+        state: OrderRow {
+            order_id,
+            time_exchange,
+            filled_qty,
+        },
     })
 }
 
@@ -2072,6 +2179,27 @@ pub(crate) fn classify_rest_query_error(
     }
 
     UnindexedClientError::Internal(msg)
+}
+
+/// Whether a REST query for one order failed because Binance does not know the order under the
+/// symbol it named: `-2013` (the order does not exist) or `-1121` (the symbol does not). Either way
+/// the venue has answered, and its answer is that there is no such order.
+pub(crate) fn is_unknown_order(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<ConnectorError>(),
+        Some(
+            ConnectorError::BadRequestError {
+                code: Some(-2013 | -1121),
+                ..
+            } | ConnectorError::NotFoundError {
+                code: Some(-2013 | -1121),
+                ..
+            } | ConnectorError::ConnectorClientError {
+                code: Some(-2013 | -1121),
+                ..
+            }
+        )
+    )
 }
 
 /// Map a failed `RestApiResponse::data()` into [`UnindexedClientError::Internal`].
