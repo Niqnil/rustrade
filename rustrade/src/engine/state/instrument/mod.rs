@@ -643,9 +643,9 @@ pub struct InstrumentState<
     /// carries the `id` is skipped and reported with
     /// `EngineOutput::CorporateActionAlreadyProcessed`, so the equity and its option chain can
     /// then disagree about whether the action was applied.
-    /// A non-standard split records nothing on the options and signals their identity change
-    /// again. Restore or pre-populate the target's record; an option's record does not stand in
-    /// for it.
+    /// A non-standard split records nothing on the options, and signals the identity change again
+    /// for every option that still holds a position. Restore or pre-populate the target's record;
+    /// an option's record does not stand in for it.
     #[serde(default)]
     pub corporate_actions_processed: FnvHashSet<SmolStr>,
 
