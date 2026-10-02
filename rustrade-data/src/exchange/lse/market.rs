@@ -304,6 +304,13 @@ pub fn underlying(symbol: &str) -> Underlying<AssetNameExchange> {
 
 /// Resolve the [`InstrumentIndex`] a display symbol was registered under.
 ///
+/// Matched on the data side — each instrument's
+/// [`data_exchange`](rustrade_instrument::instrument::Instrument::data_exchange) and
+/// [`data_name_exchange`](rustrade_instrument::instrument::Instrument::data_name_exchange) — since
+/// `exchange` names where the prices come from. An instrument executed on another venue and priced
+/// here through a `DataVenue` therefore resolves; one with no `DataVenue` is priced where it is
+/// executed, so it resolves by its own exchange and name.
+///
 /// # Why derive it rather than accept one
 /// [`InstrumentIndex`] is a public, unbounded `usize`, and engine state indexes positionally — a
 /// fabricated index attributes a symbol's prices to a different instrument, or panics. Deriving it
@@ -336,8 +343,11 @@ pub fn underlying(symbol: &str) -> Underlying<AssetNameExchange> {
 /// build.
 ///
 /// # Errors
-/// - [`LseError::UnknownInstrument`] if no instrument on `exchange` carries `symbol` as its
-///   exchange-side name, listing what is registered there.
+/// - [`LseError::UnknownInstrument`] if no instrument is priced on `exchange` under `symbol`,
+///   listing the symbols that are.
+/// - [`LseError::AmbiguousInstrument`] if more than one is, such as one listing executed on two
+///   venues and priced here for both. A candle source feeds a single instrument, so nothing here
+///   can choose between them.
 /// - [`LseError::QuoteAssetMismatch`] if it does, but prices it in a different asset than the
 ///   provider quotes that symbol in.
 pub fn instrument_index_for(
@@ -347,21 +357,33 @@ pub fn instrument_index_for(
 ) -> Result<InstrumentIndex, LseError> {
     let wanted = InstrumentNameExchange::new(symbol);
 
-    let instrument = instruments
-        .instruments()
-        .iter()
-        .find(|keyed| keyed.value.exchange.value == exchange && keyed.value.name_exchange == wanted)
-        .ok_or_else(|| LseError::UnknownInstrument {
+    let priced_here = || {
+        instruments
+            .instruments()
+            .iter()
+            .filter(move |keyed| keyed.value.data_exchange().value == exchange)
+    };
+
+    let mut matches = priced_here().filter(|keyed| *keyed.value.data_name_exchange() == wanted);
+    let instrument = matches.next().ok_or_else(|| LseError::UnknownInstrument {
+        symbol: symbol.to_owned(),
+        exchange,
+        registered: priced_here()
+            .map(|keyed| keyed.value.data_name_exchange().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+    })?;
+    if matches.next().is_some() {
+        return Err(LseError::AmbiguousInstrument {
             symbol: symbol.to_owned(),
             exchange,
-            registered: instruments
-                .instruments()
-                .iter()
-                .filter(|keyed| keyed.value.exchange.value == exchange)
-                .map(|keyed| keyed.value.name_exchange.to_string())
+            instruments: priced_here()
+                .filter(|keyed| *keyed.value.data_name_exchange() == wanted)
+                .map(|keyed| keyed.value.name_internal.to_string())
                 .collect::<Vec<_>>()
                 .join(", "),
-        })?;
+        });
+    }
 
     let pricing_asset = match instrument.value.quote {
         InstrumentQuoteAsset::UnderlyingQuote => instrument.value.underlying.quote,

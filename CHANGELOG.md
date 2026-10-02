@@ -21,6 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DEFAULT_BLOCKING_CHANNEL_CAPACITY` is renamed `DEFAULT_BLOCKING_CHUNK_SIZE`, keeping its value of
   1024. A dropped stream finishes the chunk in progress, rather than stopping at the next item.
 
+### Removed
+
+- **The public `SendRequests` trait** (`rustrade`). **Breaking.** Its two methods,
+  `send_requests` and `send_request`, sent order requests exactly as given: without the engine's
+  rejection of a request for an instrument it does not track, without stamping an open with the
+  current market, and without recording the request as in flight, so the engine's own state did
+  not know the order existed. The engine no longer used either internally. Send orders through the
+  engine's actions instead, such as `Command::SendOpenRequests` and `Command::SendCancelRequests`,
+  which reject an untracked instrument, stamp each open with the current market, and record each
+  request they send as in flight. `SendRequestsOutput` and `SendCancelsAndOpensOutput` are unchanged.
+
 ### Fixed
 
 - **Merging more `stream_blocking_iter` streams than Tokio has blocking threads deadlocked**
@@ -46,6 +57,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ExecutionBuildFutures::init` spawns the mock exchanges before awaiting the execution managers'
   build futures. When one of those failed, the error was returned and the mock exchanges' tasks
   were left running detached, with nothing able to stop them. They are now aborted first.
+
+- **Two instruments on one exchange could share an exchange-side name** (`rustrade-instrument`).
+  Every order, fill and position a venue reports is resolved back to an instrument by its exchange
+  and `name_exchange`, but only `name_internal` was checked for uniqueness. A spot and a CFD both
+  named `AAPL` on one venue, with distinct internal names, therefore built, and each venue-sourced
+  fill went to whichever of the two a lookup reached first, with that instrument's contract size
+  and settlement asset. `IndexedInstrumentsBuilder::try_build` and `IndexedInstruments::try_new`
+  now return the new `IndexError::DuplicateInstrumentNameExchange` (`build` and `new` panic with
+  it). **Breaking:** a programmatic instrument set that shares a `name_exchange` on one exchange
+  built before and is now rejected; register each instrument under the name its venue tells it
+  apart by (IBKR's `AAPL` and `AAPL.CFD`, say). Instruments built from a `SystemConfig` were not
+  affected, since their `name_internal` is derived from `name_exchange`. `IndexError` is
+  `#[non_exhaustive]`.
+  - A collision error now names every field on which the two instruments differ, so two that
+    differ only in, say, their underlying no longer read as `BTCUSD (Spot) and BTCUSD (Spot)`.
+
+- **An LSE candle source could not resolve an instrument priced on LSE through a `DataVenue`**
+  (`rustrade-data`, feature `lse`). `LseCandleSource::resolve` and `instrument_index_for` matched
+  the symbol against each instrument's execution venue and name, so an instrument executed on IBKR
+  as `BP` and priced on LSE as `BP.L` failed with `LseError::UnknownInstrument`. They now match the
+  data venue and its symbol, falling back to the execution venue's for an instrument with no
+  `DataVenue`, which keeps every single-venue setup resolving as before. Two instruments priced
+  under one LSE symbol, such as one listing executed on two brokers, now fail with the new
+  `LseError::AmbiguousInstrument`, since a candle source feeds a single instrument. `LseError` is
+  `#[non_exhaustive]`. The LSE data terms still apply to anything a source retrieves: see
+  <https://londonstrategicedge.com/terms>; redistribution is prohibited.
 
 ## [0.8.0] - 2026-10-01
 
