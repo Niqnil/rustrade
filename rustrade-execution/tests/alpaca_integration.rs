@@ -440,24 +440,36 @@ async fn assert_snapshot_lists_the_order_then_drops_it(
     );
     await_no_open_orders(&client, &instrument).await;
 
-    let listed = client
-        .account_snapshot(&[], &instruments)
-        .await
-        .expect("account_snapshot failed");
-    let snapshot = listed
-        .instruments
-        .iter()
-        .find(|snapshot| snapshot.instrument == instrument)
-        .expect("a requested instrument always has an entry");
-    assert!(
-        snapshot.orders_complete,
-        "{instrument}'s order list is not declared complete"
-    );
-    assert!(
-        snapshot.orders.iter().all(|order| order.key.cid != cid),
-        "the cancelled {instrument} order is still listed: {:?}",
-        snapshot.orders
-    );
+    // Alpaca's order listing is eventually consistent: one empty read does not stop the next
+    // from still returning the cancelled order, so poll the snapshot itself.
+    const POLL: Duration = Duration::from_millis(250);
+    const DEADLINE: Duration = Duration::from_secs(15);
+    let started = tokio::time::Instant::now();
+    loop {
+        let listed = client
+            .account_snapshot(&[], &instruments)
+            .await
+            .expect("account_snapshot failed");
+        let snapshot = listed
+            .instruments
+            .iter()
+            .find(|snapshot| snapshot.instrument == instrument)
+            .expect("a requested instrument always has an entry");
+        assert!(
+            snapshot.orders_complete,
+            "{instrument}'s order list is not declared complete"
+        );
+        if snapshot.orders.iter().all(|order| order.key.cid != cid) {
+            return;
+        }
+        let waited = started.elapsed();
+        assert!(
+            waited < DEADLINE,
+            "the cancelled {instrument} order is still listed {waited:?} after the cancel: {:?}",
+            snapshot.orders
+        );
+        tokio::time::sleep(POLL).await;
+    }
 }
 
 #[tokio::test]
