@@ -937,20 +937,20 @@ impl SimulatedVenue {
     /// Each order is found by its client order id, which this venue keys every order on, and is
     /// returned under the key it was asked for. A key naming a different instrument from the one
     /// the order traded is treated as unknown, and an id asked about more than once is reported
-    /// once, under the first key that names it.
+    /// once, under the first key that finds it.
     pub fn orders_ended(&self, orders: &[UnindexedOrderKey]) -> Vec<UnindexedInactiveOrder> {
-        let mut asked = FnvHashSet::default();
+        let mut reported = FnvHashSet::default();
         orders
             .iter()
-            .filter(|key| asked.insert(&key.cid))
             .filter_map(|key| {
-                self.account
+                let order = self
+                    .account
                     .order_ended(&key.cid)
-                    .filter(|order| order.key.instrument == key.instrument)
-                    .map(|order| Order {
-                        key: key.clone(),
-                        ..order
-                    })
+                    .filter(|order| order.key.instrument == key.instrument)?;
+                reported.insert(&key.cid).then(|| Order {
+                    key: key.clone(),
+                    ..order
+                })
             })
             .collect()
     }
@@ -6548,8 +6548,8 @@ mod tests {
         }
     }
 
-    /// An id asked about twice is reported once, under the first key, and a key naming another
-    /// instrument does not find the order.
+    /// An id asked about twice is reported once, under the first key that finds it, and a key
+    /// naming another instrument does not find the order or stop a later key from finding it.
     #[test]
     fn orders_ended_reports_an_id_once_and_only_for_its_own_instrument() {
         let mut venue = venue_offering(sized("0.4"));
@@ -6568,7 +6568,13 @@ mod tests {
         let [order] = ended.as_slice() else {
             panic!("one entry for one id: {ended:?}");
         };
-        assert_eq!(order.key, key, "the first key that names it");
+        assert_eq!(order.key, key, "the first key that finds it");
+
+        let ended = venue.orders_ended(&[other_instrument.clone(), key.clone()]);
+        let [order] = ended.as_slice() else {
+            panic!("a key that finds nothing does not stop a later one: {ended:?}");
+        };
+        assert_eq!(order.key, key);
 
         assert!(
             venue.orders_ended(&[other_instrument]).is_empty(),

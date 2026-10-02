@@ -482,7 +482,7 @@ pub trait OrderStatusClient: ExecutionClient {
     /// - A key whose `instrument` is not the one the order traded is treated as unknown. The
     ///   `exchange` is not checked: a client answers for its own venue.
     /// - A `cid` asked about more than once is reported at most once, under the first key that
-    ///   names it.
+    ///   finds it.
     ///
     /// # Errors
     ///
