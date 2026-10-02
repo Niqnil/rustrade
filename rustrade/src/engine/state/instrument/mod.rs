@@ -632,9 +632,17 @@ pub struct InstrumentState<
     /// `#[serde(default)]` lets snapshots taken before this field existed deserialize with an empty
     /// set. Consequence: a consumer that snapshots an `InstrumentState` **after** applying a
     /// corporate action, then reloads it and re-injects the **same** action `id`, finds the set
-    /// empty and applies the action twice (quantity doubled again, basis halved again). Idempotency
-    /// holds within a live session; deduping replay across a pre-field snapshot is the consumer's
-    /// responsibility (e.g. pre-populate this set with already-applied ids on upgrade).
+    /// empty and applies the action again. Idempotency holds within a live session; deduping replay
+    /// across a pre-field snapshot is the consumer's responsibility (e.g. pre-populate this set
+    /// with already-applied ids on upgrade).
+    ///
+    /// What applies again depends on which record is missing, because each record guards only its
+    /// own instrument. The **target's** set is the only guard on the equity leg: with it missing,
+    /// every position on the target is split again (quantity multiplied and basis divided a second
+    /// time). An **option** that still carries the `id` is skipped and reported with
+    /// `EngineOutput::CorporateActionAlreadyProcessed`, so the equity and its option chain can
+    /// then disagree about whether the action was applied. Restore or pre-populate the target's
+    /// record; an option's record does not stand in for it.
     #[serde(default)]
     pub corporate_actions_processed: FnvHashSet<SmolStr>,
 
