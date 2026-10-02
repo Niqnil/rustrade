@@ -119,11 +119,11 @@ fn asset_fees(instrument: usize, amount: Decimal) -> AssetFees<AssetIndex> {
 }
 
 // Type alias to avoid clippy::type_complexity warnings in test helper functions
-type TestEngine = Engine<
+type TestEngine<Strategy = TestBuyAndHoldStrategy> = Engine<
     HistoricalClock,
     EngineState<DefaultGlobalData, DefaultInstrumentMarketData>,
     MultiExchangeTxMap<UnboundedTx<ExecutionRequest>>,
-    TestBuyAndHoldStrategy,
+    Strategy,
     DefaultRiskManager<EngineState<DefaultGlobalData, DefaultInstrumentMarketData>>,
 >;
 
@@ -1307,6 +1307,20 @@ fn build_option_engine_with_oms(
     execution_tx: UnboundedTx<ExecutionRequest>,
     oms_mode: OmsMode,
 ) -> TestEngine {
+    build_option_engine_with_strategy(
+        trading_state,
+        execution_tx,
+        oms_mode,
+        TestBuyAndHoldStrategy { id: strategy_id() },
+    )
+}
+
+fn build_option_engine_with_strategy<Strategy>(
+    trading_state: TradingState,
+    execution_tx: UnboundedTx<ExecutionRequest>,
+    oms_mode: OmsMode,
+    strategy: Strategy,
+) -> TestEngine<Strategy> {
     let expiry = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
         .unwrap()
         .with_timezone(&Utc);
@@ -1373,7 +1387,7 @@ fn build_option_engine_with_oms(
         clock,
         state,
         execution_txs,
-        TestBuyAndHoldStrategy { id: strategy_id() },
+        strategy,
         DefaultRiskManager::default(),
     )
 }
@@ -2352,18 +2366,17 @@ fn test_strategy_requests_unknown_instrument_rejected_before_send() {
     };
 
     let (execution_tx, mut execution_rx) = mpsc_unbounded();
-    let built = build_option_engine(TradingState::Enabled, execution_tx);
-    let unknown = InstrumentIndex(built.state.instruments.0.len());
-    let mut engine = Engine {
-        clock: built.clock,
-        meta: built.meta,
-        state: built.state,
-        execution_txs: built.execution_txs,
-        strategy: FixedInstrumentStrategy {
+    // The fixture has three instruments (indices 0..=2), so index 3 is unknown.
+    let unknown = InstrumentIndex(3);
+    let mut engine = build_option_engine_with_strategy(
+        TradingState::Enabled,
+        execution_tx,
+        OmsMode::Netting,
+        FixedInstrumentStrategy {
             instrument: unknown,
         },
-        risk: built.risk,
-    };
+    );
+    assert_eq!(engine.state.instruments.0.len(), 3);
     let pre_instruments = engine.state.instruments.clone();
 
     let output = engine.generate_algo_orders();

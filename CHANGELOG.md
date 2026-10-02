@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`Engine::execution_txs` is private** (`rustrade`). **Breaking.** The public field let a caller
+  send an order request straight to an exchange, for example
+  `engine.execution_txs.find(..)?.send(..)`, without the engine rejecting an untracked instrument,
+  stamping an open with the current market, or recording the request as in flight. The engine's
+  state then did not know the order existed. Construct an `Engine` with `Engine::new`, which
+  already takes the transmitters, and send orders through the engine's actions such as
+  `Command::SendOpenRequests` and `Command::SendCancelRequests`. Code that built an `Engine` with
+  a struct literal must switch to `Engine::new`.
+
 ### Fixed
 
 - **An option expiring with two possible underlyings settled against whichever came first**

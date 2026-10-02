@@ -120,12 +120,17 @@ where
 /// * `ExecutionTxs` - [`ExecutionTxMap`] implementation for sending execution requests.
 /// * `Strategy` - Trading Strategy implementation (see [`super::strategy`]).
 /// * `Risk` - [`RiskManager`] implementation.
+///
+/// The execution transmitters are private: every request reaches an exchange through the
+/// engine's own actions, which validate it and record it as in flight. Construct an `Engine`
+/// with [`Engine::new`].
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Engine<Clock, State, ExecutionTxs, Strategy, Risk> {
     pub clock: Clock,
     pub meta: EngineMeta,
     pub state: State,
-    pub execution_txs: ExecutionTxs,
+    /// Private so that no request can bypass the engine's in-flight tracking.
+    execution_txs: ExecutionTxs,
     pub strategy: Strategy,
     pub risk: Risk,
 }
