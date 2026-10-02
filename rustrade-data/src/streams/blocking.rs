@@ -587,11 +587,12 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_the_stream_stops_the_producer() {
+        const CHUNK: usize = 2;
         const ITEMS: usize = 10_000;
         let produced = Arc::new(AtomicUsize::new(0));
 
         let counter = Arc::clone(&produced);
-        let mut stream = Box::pin(stream_blocking_iter(2, move || {
+        let mut stream = Box::pin(stream_blocking_iter(CHUNK, move || {
             Ok((0..ITEMS).map(move |index| {
                 counter.fetch_add(1, Ordering::SeqCst);
                 Ok::<usize, Error>(index)
@@ -624,15 +625,15 @@ mod tests {
         );
         // The property that matters, and the one a "count stopped changing" assertion alone does
         // not establish: it stopped *early*, rather than decoding the whole iterator for a consumer
-        // that was gone. The tight bound belongs to the sibling two-chunk test; here the question is
-        // only whether the drop was observed at all.
+        // that was gone. Checked on its own first so that a drop never observed at all fails with
+        // that message, rather than as a bound exceeded.
         assert!(
             settled < ITEMS,
             "the producer ran to completion ({settled} items) despite the stream being dropped"
         );
         // Tighter: the first chunk and the one started ahead of it, and nothing after the drop.
         assert!(
-            settled <= 2 * 2,
+            settled <= 2 * CHUNK,
             "{settled} items were decoded, more than the two chunks started before the drop"
         );
     }
