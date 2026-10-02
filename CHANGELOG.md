@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`Engine::execution_txs` is private** (`rustrade`). **Breaking.** The public field let a caller
+  send an order request straight to an exchange, for example
+  `engine.execution_txs.find(..)?.send(..)`, without the engine rejecting an untracked instrument,
+  stamping an open with the current market, or recording the request as in flight. The engine's
+  state then did not know the order existed. Construct an `Engine` with `Engine::new`, which
+  already takes the transmitters, and send orders through the engine's actions such as
+  `Command::SendOpenRequests` and `Command::SendCancelRequests`. Code that built an `Engine` with
+  a struct literal must switch to `Engine::new`.
 - **`stream_blocking_iter` decodes in chunks and needs a `Send + 'static` iterator**
   (`rustrade-data`). **Breaking.** Each chunk of up to `chunk_size` items is decoded on its own
   `spawn_blocking` task, which returns and gives its thread back. The stream starts the next chunk
@@ -100,6 +108,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kind (`STK` or `CASH` for spot, `FUT` for a future, `OPT` for an option), and when an entry is
   invalid, such as a `FUT` with no `last_trade_date`, which `connect_sync` only logs and skips.
   Every problem is reported at once. An entry naming no configured instrument is still accepted.
+- **A simulated venue could mint an `OrderId` its seeded account state already used**
+  (`rustrade-execution`). `SimulatedVenue` counted its order ids from zero whatever its
+  `initial_state` held, so an order seeded with id `3` shared it with the fourth order the venue
+  minted, and anything keyed on the id alone, such as a position under `OmsMode::Hedging`, merged
+  the two. Minted ids now start one past the highest decimal id among the seeded open and
+  cancelled orders. A venue seeded with no decimal id counts from zero as before, and
+  `order_sequence` still counts the orders booked. `OrderId`'s rustdoc now states that ids are
+  unique per venue, not across the venues of a multi-exchange backtest, so the key is
+  `(exchange, OrderId)`.
 
 ## [0.8.0] - 2026-10-01
 
