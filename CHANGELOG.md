@@ -15,8 +15,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ClientInstrument`s carrying each one's `name_exchange` and kind, and fails the build with
   `BarterError::ExecutionBuilder` on an `Err`. The default accepts every config, so existing
   implementations are unaffected. A client constructed by calling `new` directly is not checked.
+- **`System::feed_depth`: how many events wait in the engine's feed** (`rustrade`). The feed is
+  unbounded, so a live venue's read loop never waits on the engine, but an engine slower than its
+  inputs fell behind with no signal. `feed_depth` returns a cloneable `FeedDepth` handle whose
+  `current()` counts the events sent by the market and account forwarders and through `feed_tx`
+  that the engine has not yet taken. It can be polled from another task and outlives the `System`.
+  What depth calls for action is left to the caller. For the lag in time, compare an audit tick's
+  `EngineContext::time` with the event's `time_received`. Closes #220.
+  - `UnboundedRx::len` and `is_empty` (`rustrade-integration`), approximate while senders run.
+    For a receiver the caller holds itself, such as the audit updates `System::take_audit` hands
+    out, these read the backlog directly.
 
 ### Changed
+
+- **`System::feed_tx` is now a `FeedTx`** (`rustrade`, new module `system::feed`). **Breaking**
+  for code that named its type `UnboundedTx` or reached its inner sender through the public `tx`
+  field. That field is gone, so that no send bypasses the count in `feed_depth`. `FeedTx`
+  implements `Tx` and `Sink` as `UnboundedTx` did, both counted, so `send` and `forward` are
+  unchanged.
 
 - **`Engine::execution_txs` is private** (`rustrade`). **Breaking.** The public field let a caller
   send an order request straight to an exchange, for example
@@ -66,6 +82,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so a misrouted market event, or a venue with the wrong role, left
   `ConnectivityState::market_data` at `Reconnecting` after convergence and the mistake went
   unseen. It is now recorded as `Healthy` whatever `global()` reads.
+- **A simulated CFD round trip needed twice its notional funded** (`rustrade-execution`).
+  `SimulatedVenue` debited a CFD fill's full notional in both directions, with no credit path, so a
+  strategy that opened a position with its balance could not close it: the close was refused for
+  insufficient balance and the run ended holding the position, with no error. The venue now keeps
+  a net position per CFD instrument and splits each fill against it. The part that closes the
+  position is credited the margin back plus the realised PnL, the rest posts its notional as margin
+  (leverage 1, as before), and the fee is charged on the whole quantity. A round trip therefore
+  moves the balance by the realised PnL less fees, as the engine's own `Position` books it.
+  - A resting CFD order holds only its fill's cost net of what the fill pays back, so an order
+    that only reduces holds nothing. It is costed again when it fills, and is **cancelled** if the
+    position has moved so far that the account can no longer afford it.
+  - `account_snapshot` reports each CFD's position, `Flat` when it holds none, instead of
+    `Unreported`, and a CFD position in `initial_state` is where the venue starts. It panics if
+    that position has no entry price.
+  - Not modelled: funding, financing and liquidation. A short that loses more than its margin pays
+    the shortfall.
+  - **Breaking:** `AccountState::commit` takes the fill's `credit: Decimal`, paid into the debit's
+    asset and zero for spot. A fixture or assertion that relied on a CFD close debiting the
+    notional again now sees a credit.
 - **Merging more `stream_blocking_iter` streams than Tokio has blocking threads deadlocked**
   (`rustrade-data`). Each stream held a blocking-pool thread for its whole decode, parked while its
   consumer had not drained it. `merge_time_sorted` cannot emit until every input has buffered an

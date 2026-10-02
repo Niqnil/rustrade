@@ -21,12 +21,16 @@ pub type OpenOrder = Order<ExchangeId, InstrumentNameExchange, Open>;
 ///
 /// Recorded so the venue settles on a fill, and releases on a cancel, **exactly** what it took when
 /// the order rested — rather than recomputing an amount that a changed fee model or contract size
-/// could make disagree with the one the client was told about.
+/// could make disagree with the one the client was told about. A CFD fill is the exception: what
+/// it costs depends on the position it trades against, which can move while the order rests, so
+/// its hold is released and the fill costed afresh (see `SimulatedVenue`'s reserved balances).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reservation {
     /// The asset the order pays with: quote for a buy or a CFD, base for a spot sell.
     pub asset: AssetNameExchange,
-    /// How much of it is held, inclusive of the fee the fill will charge.
+    /// How much of it is held, inclusive of the fee the fill will charge. For a CFD, net of what
+    /// the fill will pay back by closing a position, so an order that only reduces one holds
+    /// nothing.
     ///
     /// Held against the order's **unfilled** quantity alone — its whole quantity for an order that
     /// rested without trading, and the remainder alone for one the book filled in part before it
