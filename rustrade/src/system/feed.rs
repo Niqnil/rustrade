@@ -56,7 +56,7 @@ impl FeedDepth {
 
 /// Transmitter into the engine feed, counting each event into its [`FeedDepth`].
 ///
-/// Sends through [`Tx`] or [`Sink`], and both count. The inner channel is private, so no send
+/// Sends through either [`Tx`] or [`Sink`] are counted. The inner channel is private, so no send
 /// bypasses the count.
 #[derive(Debug, Clone)]
 pub struct FeedTx<Event> {
@@ -245,6 +245,17 @@ mod tests {
         drop(rx);
 
         assert!(tx.send(1).is_err());
+        assert_eq!(tx.depth().current(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_sink_send_is_not_counted() {
+        use futures::SinkExt;
+
+        let (mut tx, rx) = feed::<u8>();
+        drop(rx);
+
+        assert!(SinkExt::send(&mut tx, 1).await.is_err());
         assert_eq!(tx.depth().current(), 0);
     }
 }
