@@ -235,6 +235,27 @@ impl KnownLiveOrders {
         self.orders.contains_key(cid)
     }
 
+    /// Panic unless the indexes agree with the orders held.
+    #[cfg(test)]
+    fn assert_consistent(&self) {
+        assert_eq!(self.by_age.len(), self.orders.len(), "by_age");
+        for (seq, cid) in &self.by_age {
+            assert_eq!(self.orders.get(cid).map(|known| known.seq), Some(*seq));
+        }
+        for ((instrument, order_id), cid) in &self.by_order_id {
+            let known = &self.orders[cid];
+            assert_eq!(
+                (&known.instrument, known.order_id.as_ref()),
+                (instrument, Some(order_id))
+            );
+        }
+        let with_ids = self
+            .orders
+            .values()
+            .filter(|known| known.order_id.is_some());
+        assert_eq!(with_ids.count(), self.by_order_id.len(), "by_order_id");
+    }
+
     /// Those of `instruments` with an order held as live.
     pub(crate) fn instruments_among(
         &self,
@@ -329,19 +350,23 @@ impl UncheckedOrders {
         }
     }
 
-    /// The instruments fill recovery has no gap left on whose check is due at `now`.
+    /// The instruments fill recovery has no gap left on whose check is due at `now`, in name
+    /// order, so they are checked in a stable order.
     pub(crate) fn ready(
         &self,
         unrecovered: &UnrecoveredFills,
         now: tokio::time::Instant,
     ) -> Vec<InstrumentNameExchange> {
-        self.0
+        let mut ready: Vec<_> = self
+            .0
             .iter()
             .filter(|(instrument, check)| {
                 !unrecovered.covers(instrument) && check.retry_at.is_none_or(|at| at <= now)
             })
             .map(|(instrument, _)| instrument.clone())
-            .collect()
+            .collect();
+        ready.sort_unstable();
+        ready
     }
 
     /// When an instrument fill recovery has no gap left on is next due, or `None` when there is
@@ -787,8 +812,10 @@ mod tests {
         assert!(known.contains(&order.cid), "half filled is still live");
         known.observe(&fill("8", Some(dec!(2))));
         assert!(known.contains(&order.cid), "another order's fill");
+        known.assert_consistent();
         known.observe(&fill("7", Some(dec!(2))));
         assert!(!known.contains(&order.cid), "filled");
+        known.assert_consistent();
     }
 
     #[test]
@@ -802,8 +829,10 @@ mod tests {
             &Open::new(VenueOrderId::ClientAssigned, Utc::now(), dec!(1)),
         );
 
+        known.assert_consistent();
         known.observe(&fill("7", Some(dec!(2))));
         assert!(!known.contains(&order.cid), "still found by its venue id");
+        known.assert_consistent();
     }
 
     #[test]
@@ -849,6 +878,7 @@ mod tests {
             !known.contains(&ClientOrderId::new("1")),
             "then the oldest again"
         );
+        known.assert_consistent();
         assert!(known.contains(&ClientOrderId::new(MAX_KNOWN_LIVE_ORDERS.to_string())));
         assert_eq!(
             known
@@ -1079,5 +1109,103 @@ mod tests {
         .await
         .unwrap();
         assert!(ended.is_empty());
+    }
+
+    /// One order held on each of `instruments`, all due for a check.
+    fn held_on(instruments: &[&str]) -> (SharedKnownLiveOrders, UncheckedOrders) {
+        let known = KnownLiveOrders::shared();
+        let mut unchecked = UncheckedOrders::default();
+        for (n, instrument) in instruments.iter().enumerate() {
+            known.lock().live(
+                &key(instrument, instrument),
+                dec!(1),
+                &open(&n.to_string(), Decimal::ZERO),
+            );
+            unchecked.open([InstrumentNameExchange::new(*instrument)]);
+        }
+        (known, unchecked)
+    }
+
+    /// Run a check whose listing never answers on an instrument named `SLOW…`, and lists nothing
+    /// open on the others, whose orders have all ended.
+    async fn check_with_slow_instruments(
+        known: &SharedKnownLiveOrders,
+        unchecked: &mut UncheckedOrders,
+    ) -> Vec<UnindexedAccountEvent> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        recover_ended_orders(
+            ExchangeId::BinanceSpot,
+            known,
+            unchecked,
+            &UnrecoveredFills::default(),
+            &tx,
+            |instrument: InstrumentNameExchange| async move {
+                if instrument.name().starts_with("SLOW") {
+                    std::future::pending::<()>().await;
+                }
+                Ok(FnvHashSet::default())
+            },
+            |key: UnindexedOrderKey| async move {
+                Ok(OrderLookup::Ended(Box::new(cancelled_order(&key))))
+            },
+        )
+        .await;
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// Two instruments are checked at a time, in name order. When the pass times out, the two
+    /// started and unfinished have failed once, and the one never started stays due as it was.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_pass_charges_only_the_instruments_it_started() {
+        let (known, mut unchecked) = held_on(&["SLOWA", "SLOWB", "XFAST"]);
+        let start = tokio::time::Instant::now();
+
+        let sent = check_with_slow_instruments(&known, &mut unchecked).await;
+
+        assert!(sent.is_empty(), "XFAST never started: {sent:?}");
+        let unrecovered = UnrecoveredFills::default();
+        let after = start + Duration::from_secs(ORDER_CHECK_TIMEOUT_SECS);
+        assert_eq!(
+            unchecked.ready(&unrecovered, after),
+            [InstrumentNameExchange::new("XFAST")],
+            "only the one never started is due at once"
+        );
+        let retry = after + Duration::from_secs(GAP_RETRY_BASE_SECS);
+        assert_eq!(unchecked.ready(&unrecovered, retry).len(), 3);
+        for instrument in ["SLOWA", "SLOWB"] {
+            assert_eq!(
+                unchecked.failed(&InstrumentNameExchange::new(instrument), retry),
+                Some(GapFailure::Retry(Duration::from_secs(
+                    GAP_RETRY_BASE_SECS * 2
+                ))),
+                "{instrument} has failed once already"
+            );
+        }
+        assert!(known.lock().contains(&ClientOrderId::new("XFAST")));
+    }
+
+    /// An instrument settled before the pass times out keeps its result.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_pass_keeps_what_it_finished() {
+        let (known, mut unchecked) = held_on(&["AFAST", "SLOWB", "SLOWC"]);
+
+        let sent = check_with_slow_instruments(&known, &mut unchecked).await;
+
+        let [event] = sent.as_slice() else {
+            panic!("AFAST's order: {sent:?}");
+        };
+        let AccountEventKind::OrderSnapshot(Snapshot(order)) = &event.kind else {
+            panic!("an order snapshot: {event:?}");
+        };
+        assert_eq!(order.key.cid, ClientOrderId::new("AFAST"));
+        assert!(!unchecked.contains(&InstrumentNameExchange::new("AFAST")));
+        assert!(!known.lock().contains(&ClientOrderId::new("AFAST")));
+        assert!(
+            unchecked
+                .ready(&UnrecoveredFills::default(), tokio::time::Instant::now())
+                .is_empty(),
+            "SLOWB and SLOWC both started, so both wait for a retry"
+        );
+        known.lock().assert_consistent();
     }
 }

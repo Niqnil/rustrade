@@ -1804,8 +1804,8 @@ async fn connection_manager(
             // Gaps and order checks a recovery did not finish are retried as they fall due,
             // alongside the monitor, so a disconnect is still seen at once. An order check waiting
             // on a gap runs right after the gap's retry. It never completes; dropping it when the
-            // monitor ends loses nothing, since each gap is settled as soon as its read ends, and a
-            // check sends nothing until it has its answer.
+            // monitor ends loses nothing, since each gap, and each instrument's order check, is
+            // settled in one step as soon as its read ends.
             let retry_gaps = async {
                 loop {
                     let next_check = unchecked.next_due(&unrecovered);
