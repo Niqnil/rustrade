@@ -94,6 +94,13 @@ pub trait Route: InstrumentData + Ord + Display + Send + Sync + Sized + 'static 
     /// Route one group — every subscription in it shares `exchange` and `sub_kind` — to the
     /// connector serving it, returning the future that initialises its stream without polling it.
     ///
+    /// The arms here and
+    /// [`exchange_supports_instrument_kind_sub_kind`](crate::subscription::exchange_supports_instrument_kind_sub_kind)
+    /// must agree. Two tests in this module's parent hold them together, one per direction:
+    /// `every_pair_the_support_matrix_accepts_is_routed` and
+    /// `every_pair_the_router_serves_is_accepted_by_the_support_matrix`. The router has no
+    /// instrument-kind dimension and its candle arms take every interval; the matrix narrows both.
+    ///
     /// # Errors
     /// - [`DataError::Unsupported`] if no connector serves the pair.
     /// - [`DataError::SubscriberRequired`] if its connector needs a subscriber `subscribers` lacks.

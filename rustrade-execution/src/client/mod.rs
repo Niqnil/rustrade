@@ -87,6 +87,33 @@ pub mod ibkr;
 
 pub mod mock;
 
+/// An instrument an [`ExecutionClient`] is about to be built to trade, as
+/// [`ExecutionClient::validate_config`] sees it.
+///
+/// `#[non_exhaustive]`, so further detail can be added without breaking an implementation that
+/// reads these fields; construct one with [`Self::new`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct ClientInstrument<'a> {
+    /// The name the venue knows the instrument by, which is what a client's requests carry.
+    pub name_exchange: &'a InstrumentNameExchange,
+    /// The instrument's kind.
+    pub kind: InstrumentKindDiscriminant,
+}
+
+impl<'a> ClientInstrument<'a> {
+    /// The view of an instrument named `name_exchange`, of kind `kind`.
+    pub fn new(
+        name_exchange: &'a InstrumentNameExchange,
+        kind: InstrumentKindDiscriminant,
+    ) -> Self {
+        Self {
+            name_exchange,
+            kind,
+        }
+    }
+}
+
 // `+ Send` bounds on async method return types required for multi-threaded
 // Tokio runtime. This is a breaking change vs upstream — any `!Send` executor
 // implementation would fail to compile.
@@ -122,6 +149,32 @@ where
     const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant];
 
     type Config: Clone;
+
+    /// Checks `config` against the instruments this client is about to be built to trade, before
+    /// [`Self::new`] is called. `Err` names what is wrong.
+    ///
+    /// [`SUPPORTED_KINDS`](Self::SUPPORTED_KINDS) rejects a kind the client cannot route at all.
+    /// This catches what only the config knows: a per-instrument entry that is invalid, or that
+    /// disagrees with the instrument it is keyed to, such as a contract registered as a stock for
+    /// an instrument modelled as an option. Each such entry would otherwise be skipped or acted on
+    /// silently once the client runs.
+    ///
+    /// The default accepts every config. Override it when `Self::Config` carries per-instrument
+    /// detail.
+    ///
+    /// [`ExecutionBuilder`] calls it, after checking `SUPPORTED_KINDS`, with the instruments
+    /// registered on this client's exchange. A client constructed by calling `new` directly is not
+    /// checked; call this first to get the same check.
+    ///
+    /// [`ExecutionBuilder`]: https://docs.rs/rustrade/latest/rustrade/execution/builder/struct.ExecutionBuilder.html
+    fn validate_config(
+        config: &Self::Config,
+        instruments: &[ClientInstrument<'_>],
+    ) -> Result<(), String> {
+        let _ = (config, instruments);
+        Ok(())
+    }
+
     // `+ Send` required so generic code (e.g. ExecutionManager) can pass
     // the stream to tokio::spawn, which requires Send.
     type AccountStream: Stream<Item = UnindexedAccountEvent> + Send;
