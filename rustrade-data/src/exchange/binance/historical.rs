@@ -26,7 +26,7 @@
 //! # Two surfaces, one mapping
 //!
 //! Spot and futures return the **same** array-of-arrays row shape and share one
-//! row→[`Candle`](crate::subscription::candle::Candle) mapping. They differ only on host, page cap, and URL params:
+//! row→[`Candle`] mapping. They differ only on host, page cap, and URL params:
 //!
 //! | Surface | Endpoint | Host | Page cap | Market param |
 //! |---|---|---|---|---|
