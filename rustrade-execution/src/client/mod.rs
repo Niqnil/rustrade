@@ -488,7 +488,7 @@ pub trait OrderStatusClient: ExecutionClient {
     ///
     /// `Err` if the venue could not answer for every order. A partial list is never returned,
     /// because an order missing from it would read as still live.
-    fn fetch_order_states(
+    fn fetch_ended_orders(
         &self,
         orders: &[UnindexedOrderKey],
     ) -> impl Future<Output = Result<Vec<UnindexedInactiveOrder>, UnindexedClientError>> + Send;

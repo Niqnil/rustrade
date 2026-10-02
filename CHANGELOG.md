@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     out, these read the backlog directly.
 - **`OrderStatusClient`: how an order ended at the venue** (`rustrade-execution`). A new
   supertrait of `ExecutionClient`, implemented only by clients that can do the lookup.
-  `fetch_order_states(&[UnindexedOrderKey])` returns how each order that has ended did end
+  `fetch_ended_orders(&[UnindexedOrderKey])` returns how each order that has ended did end
   (filled, cancelled with what filled before, expired, or rejected after acceptance), under the
   key it was asked for. It omits an order still live or unknown to the venue, and returns `Err`
   rather than a partial list. An empty slice returns nothing, not every order. It is the lookup

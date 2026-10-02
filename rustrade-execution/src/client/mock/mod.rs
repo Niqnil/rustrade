@@ -370,7 +370,7 @@ impl<FnTime> OrderStatusClient for MockExecution<FnTime>
 where
     FnTime: Fn() -> DateTime<Utc> + Clone + Send + Sync,
 {
-    async fn fetch_order_states(
+    async fn fetch_ended_orders(
         &self,
         orders: &[UnindexedOrderKey],
     ) -> Result<Vec<UnindexedInactiveOrder>, UnindexedClientError> {

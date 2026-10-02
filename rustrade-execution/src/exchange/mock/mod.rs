@@ -922,7 +922,7 @@ mod tests {
             ..open.key.clone()
         };
         let ended = client
-            .fetch_order_states(&[open.key.clone(), unknown])
+            .fetch_ended_orders(&[open.key.clone(), unknown])
             .await
             .expect("the venue is running");
 
