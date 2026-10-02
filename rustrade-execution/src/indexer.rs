@@ -27,6 +27,7 @@ use rustrade_integration::{
     stream::ext::indexed::{IndexedStream, Indexer},
 };
 use std::sync::Arc;
+use tracing::warn;
 
 pub type IndexedAccountStream<St> = IndexedStream<St, AccountEventIndexer>;
 
@@ -230,7 +231,7 @@ impl AccountEventIndexer {
         } = order;
 
         let key = self.order_key(key)?;
-        let state = self.order_state(state)?;
+        let state = self.order_state(state);
 
         Ok(Order {
             key,
@@ -253,7 +254,7 @@ impl AccountEventIndexer {
             key: self.order_key(key)?,
             state: match state {
                 Ok(cancelled) => Ok(cancelled),
-                Err(error) => Err(self.order_error(error)?),
+                Err(error) => Err(self.order_error(error)),
             },
         })
     }
@@ -276,48 +277,110 @@ impl AccountEventIndexer {
 
     /// Index an [`UnindexedOrderState`] to an [`OrderState`].
     ///
-    /// Used by `ExecutionManager` to index `open_order` responses.
-    pub fn order_state(&self, state: UnindexedOrderState) -> Result<OrderState, IndexError> {
-        Ok(match state {
+    /// Used by `ExecutionManager` to index `open_order` responses. Never fails: an order state
+    /// carries no key, and the error of a failed open is indexed by [`Self::order_error`].
+    pub fn order_state(&self, state: UnindexedOrderState) -> OrderState {
+        match state {
             UnindexedOrderState::Active(active) => OrderState::Active(active),
             UnindexedOrderState::Inactive(inactive) => match inactive {
-                InactiveOrderState::OpenFailed(failed) => match failed {
-                    OrderError::Rejected(rejected) => {
-                        OrderState::inactive(OrderError::Rejected(self.api_error(rejected)?))
-                    }
-                    OrderError::Connectivity(error) => {
-                        OrderState::inactive(OrderError::Connectivity(error))
-                    }
-                    OrderError::UnsupportedOrderType(msg) => {
-                        OrderState::inactive(OrderError::UnsupportedOrderType(msg))
-                    }
-                },
+                InactiveOrderState::OpenFailed(failed) => {
+                    OrderState::inactive(self.order_error(failed))
+                }
                 InactiveOrderState::Cancelled(cancelled) => OrderState::inactive(cancelled),
                 InactiveOrderState::FullyFilled(filled) => OrderState::fully_filled(filled),
                 InactiveOrderState::Expired(expired) => OrderState::expired(expired),
             },
-        })
+        }
     }
 
-    pub fn api_error(&self, error: UnindexedApiError) -> Result<ApiError, IndexError> {
-        Ok(match error {
+    /// Index an [`UnindexedApiError`] returned for an order request (open or cancel).
+    ///
+    /// Never fails. An error carries the venue's answer to a request, and the caller must
+    /// receive that answer, so a name the [`ExecutionInstrumentMap`] does not hold degrades the
+    /// error instead of discarding it (and the order response or client error carrying it). Each
+    /// degrade logs a `warn!` naming what was dropped:
+    /// - [`ApiError::BalanceInsufficient`] keeps its variant, with the asset `None`.
+    /// - [`ApiError::AssetInvalid`] and [`ApiError::InstrumentInvalid`] have no index to carry,
+    ///   so they become [`ApiError::OrderRejected`] holding their own message, which keeps the
+    ///   name and the venue's text.
+    ///
+    /// For an error from any other request, use [`Self::client_error`], which degrades to
+    /// [`ApiError::RequestRejected`] instead.
+    pub fn api_error(&self, error: UnindexedApiError) -> ApiError {
+        self.index_api_error(error, ApiError::OrderRejected)
+    }
+
+    /// Index an [`UnindexedApiError`], degrading a name the map does not hold as
+    /// [`Self::api_error`] describes. `rejected` builds the rejection that an unresolvable
+    /// [`ApiError::AssetInvalid`] or [`ApiError::InstrumentInvalid`] becomes, which depends on
+    /// whether the request was an order.
+    fn index_api_error(
+        &self,
+        error: UnindexedApiError,
+        rejected: fn(String) -> ApiError,
+    ) -> ApiError {
+        match error {
             UnindexedApiError::RateLimit => ApiError::RateLimit,
             UnindexedApiError::Unauthenticated(msg) => ApiError::Unauthenticated(msg),
             UnindexedApiError::AssetInvalid(asset, value) => {
-                ApiError::AssetInvalid(self.map.find_asset_index(&asset)?, value)
+                match self.map.find_asset_index(&asset) {
+                    Ok(asset) => ApiError::AssetInvalid(asset, value),
+                    Err(_) => self.degrade_unresolvable(
+                        UnindexedApiError::AssetInvalid(asset, value),
+                        rejected,
+                    ),
+                }
             }
             UnindexedApiError::InstrumentInvalid(instrument, value) => {
-                ApiError::InstrumentInvalid(self.map.find_instrument_index(&instrument)?, value)
+                match self.map.find_instrument_index(&instrument) {
+                    Ok(instrument) => ApiError::InstrumentInvalid(instrument, value),
+                    Err(_) => self.degrade_unresolvable(
+                        UnindexedApiError::InstrumentInvalid(instrument, value),
+                        rejected,
+                    ),
+                }
             }
             UnindexedApiError::BalanceInsufficient(asset, value) => {
-                ApiError::BalanceInsufficient(self.map.find_asset_index(&asset)?, value)
+                let asset = asset.and_then(|asset| {
+                    self.map
+                        .find_asset_index(&asset)
+                        .inspect_err(|_| {
+                            warn!(
+                                exchange = %self.map.exchange.value,
+                                %asset,
+                                message = %value,
+                                "AccountEventIndexer dropping the asset of a BalanceInsufficient \
+                                 error: the instrument map does not hold it"
+                            )
+                        })
+                        .ok()
+                });
+                ApiError::BalanceInsufficient(asset, value)
             }
             UnindexedApiError::OrderRejected(reason) => ApiError::OrderRejected(reason),
             UnindexedApiError::OrderAlreadyCancelled => ApiError::OrderAlreadyCancelled,
             UnindexedApiError::OrderAlreadyFullyFilled => ApiError::OrderAlreadyFullyFilled,
             UnindexedApiError::OrderAlreadyExpired => ApiError::OrderAlreadyExpired,
             UnindexedApiError::RequestRejected(reason) => ApiError::RequestRejected(reason),
-        })
+        }
+    }
+
+    /// Degrade an error naming an asset or instrument the map does not hold to the rejection
+    /// `rejected` builds, carrying the error's own message so neither the name nor the venue's
+    /// text is lost.
+    fn degrade_unresolvable(
+        &self,
+        error: UnindexedApiError,
+        rejected: fn(String) -> ApiError,
+    ) -> ApiError {
+        let error = error.to_string();
+        warn!(
+            exchange = %self.map.exchange.value,
+            %error,
+            "AccountEventIndexer degrading an API error to a rejection: the instrument map does \
+             not hold the asset or instrument it names"
+        );
+        rejected(error)
     }
 
     pub fn order_request<Kind>(
@@ -352,25 +415,31 @@ impl AccountEventIndexer {
         })
     }
 
-    pub fn order_error(&self, error: UnindexedOrderError) -> Result<OrderError, IndexError> {
-        Ok(match error {
+    /// Index an [`UnindexedOrderError`]. Never fails: see [`Self::api_error`].
+    pub fn order_error(&self, error: UnindexedOrderError) -> OrderError {
+        match error {
             UnindexedOrderError::Connectivity(error) => OrderError::Connectivity(error),
-            UnindexedOrderError::Rejected(error) => OrderError::Rejected(self.api_error(error)?),
+            UnindexedOrderError::Rejected(error) => OrderError::Rejected(self.api_error(error)),
             UnindexedOrderError::UnsupportedOrderType(msg) => OrderError::UnsupportedOrderType(msg),
-        })
+        }
     }
 
-    pub fn client_error(&self, error: UnindexedClientError) -> Result<ClientError, IndexError> {
-        Ok(match error {
+    /// Index an [`UnindexedClientError`]. Never fails: like [`Self::api_error`], but an
+    /// unresolvable [`ApiError::AssetInvalid`] or [`ApiError::InstrumentInvalid`] becomes
+    /// [`ApiError::RequestRejected`], since the request need not have been an order.
+    pub fn client_error(&self, error: UnindexedClientError) -> ClientError {
+        match error {
             UnindexedClientError::Connectivity(error) => ClientError::Connectivity(error),
-            UnindexedClientError::Api(error) => ClientError::Api(self.api_error(error)?),
+            UnindexedClientError::Api(error) => {
+                ClientError::Api(self.index_api_error(error, ApiError::RequestRejected))
+            }
             UnindexedClientError::TaskFailed(value) => ClientError::TaskFailed(value),
             UnindexedClientError::Internal(value) => ClientError::Internal(value),
             UnindexedClientError::Truncated { limit } => ClientError::Truncated { limit },
             UnindexedClientError::TruncatedSnapshot { limit } => {
                 ClientError::TruncatedSnapshot { limit }
             }
-        })
+        }
     }
 
     /// Index a trade, converting fee asset and computing `fees_quote`.
@@ -480,5 +549,107 @@ mod tests {
             matches!(indexed.kind, AccountEventKind::StreamTerminated(r) if r == reason),
             "expected StreamTerminated to pass through unchanged",
         );
+    }
+    fn btc_usdt() -> InstrumentNameExchange {
+        binance_indexer()
+            .map
+            .exchange_instruments()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| panic!("the map holds one instrument"))
+    }
+
+    #[test]
+    fn balance_insufficient_keeps_a_held_asset_and_drops_an_unheld_one() {
+        let indexer = binance_indexer();
+        let btc = indexer
+            .map
+            .find_asset_index(&AssetNameExchange::new("BTC"))
+            .unwrap();
+
+        for (asset, expected) in [
+            (Some("BTC"), Some(btc)),
+            // An instrument name, as Binance's error mapping once put there.
+            (Some("ETH_USDT"), None),
+            (None, None),
+        ] {
+            assert_eq!(
+                indexer.api_error(ApiError::BalanceInsufficient(
+                    asset.map(AssetNameExchange::new),
+                    "low".to_string()
+                )),
+                ApiError::BalanceInsufficient(expected, "low".to_string()),
+                "{asset:?}"
+            );
+        }
+    }
+
+    /// An invalid asset or instrument the map does not hold has no index to carry, so it becomes
+    /// a rejection keeping its own message: `OrderRejected` for an order, `RequestRejected` for
+    /// any other request.
+    #[test]
+    fn an_unresolvable_invalid_name_degrades_to_a_rejection_keeping_its_text() {
+        let indexer = binance_indexer();
+        for (error, text) in [
+            (
+                ApiError::AssetInvalid(AssetNameExchange::new("XYZ"), "bad".to_string()),
+                "asset XYZ invalid: bad",
+            ),
+            (
+                ApiError::InstrumentInvalid(
+                    InstrumentNameExchange::new("XYZUSDT"),
+                    "bad".to_string(),
+                ),
+                "instrument XYZUSDT invalid: bad",
+            ),
+        ] {
+            assert_eq!(
+                indexer.api_error(error.clone()),
+                ApiError::OrderRejected(text.to_string())
+            );
+            assert_eq!(
+                indexer.client_error(ClientError::Api(error)),
+                ClientError::Api(ApiError::RequestRejected(text.to_string()))
+            );
+        }
+
+        // A name the map holds still indexes.
+        assert!(matches!(
+            indexer.api_error(ApiError::InstrumentInvalid(btc_usdt(), "bad".to_string())),
+            ApiError::InstrumentInvalid(_, _)
+        ));
+    }
+
+    /// A response whose rejection names something the map does not hold still indexes, so the
+    /// order is settled rather than left in flight.
+    #[test]
+    fn a_response_whose_rejection_names_an_unresolvable_asset_still_indexes() {
+        let indexer = binance_indexer();
+        let rejection = || {
+            OrderError::Rejected(ApiError::BalanceInsufficient(
+                Some(AssetNameExchange::new("ETH_USDT")),
+                "low".to_string(),
+            ))
+        };
+        let indexed = OrderError::Rejected(ApiError::BalanceInsufficient(None, "low".to_string()));
+
+        assert_eq!(
+            indexer.order_state(OrderState::inactive(rejection())),
+            OrderState::inactive(indexed.clone())
+        );
+
+        let key = OrderKey {
+            exchange: ExchangeId::BinanceSpot,
+            instrument: btc_usdt(),
+            strategy: crate::order::id::StrategyId::new("test"),
+            cid: crate::order::id::ClientOrderId::random(),
+        };
+        let cancel = indexer
+            .order_response_cancel(OrderResponseCancel {
+                key,
+                state: Err(rejection()),
+            })
+            .unwrap();
+        assert_eq!(cancel.state, Err(indexed));
     }
 }

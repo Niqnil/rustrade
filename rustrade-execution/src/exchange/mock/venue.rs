@@ -1590,7 +1590,7 @@ impl SimulatedVenue {
                     build_open_order_err_response(
                         request,
                         ApiError::BalanceInsufficient(
-                            debit.asset,
+                            Some(debit.asset),
                             format!(
                                 "Available Balance: {}, Required Balance inc. fees: {}",
                                 insufficient.free, insufficient.required
@@ -1852,7 +1852,7 @@ impl SimulatedVenue {
                         build_open_order_err_response(
                             request,
                             ApiError::BalanceInsufficient(
-                                settlement.asset,
+                                Some(settlement.asset),
                                 format!(
                                     "Available Balance: {}, Required Balance inc. fees: {}",
                                     insufficient.free, insufficient.required
@@ -3126,7 +3126,7 @@ mod tests {
         assert!(outcome.events.is_empty());
         match outcome.response.state {
             OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
-                ApiError::BalanceInsufficient(ref asset, _),
+                ApiError::BalanceInsufficient(Some(ref asset), _),
             ))) => {
                 assert_eq!(*asset, AssetNameExchange::new("usd"));
             }
@@ -3761,7 +3761,7 @@ mod tests {
         );
         match outcome.response.state {
             OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
-                ApiError::BalanceInsufficient(ref asset, _),
+                ApiError::BalanceInsufficient(Some(ref asset), _),
             ))) => {
                 assert_eq!(
                     *asset,

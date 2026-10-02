@@ -113,6 +113,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An order rejected for insufficient balance on Binance stayed in flight forever**
+  (`rustrade-execution`, `rustrade`). Binance's error mapping put the *instrument* name where
+  `ApiError::BalanceInsufficient` expects an asset. The indexer could not resolve it, so
+  `ExecutionManager` discarded the whole open or cancel response ("filtering … response due to
+  unrecognised index"). The engine never learned that the request failed, and kept the order
+  `OpenInFlight` or `CancelInFlight` for good. In Hedging mode, fills on that instrument that
+  matched no order were also held back while it stayed. Binance Spot and Margin opens and cancels
+  were affected, and Alpaca's error mapping named `"usd"` whatever the map called it.
+  - The indexer no longer fails on what an error names. A response always reaches the engine, and
+    each degrade below logs a `warn!` naming what was dropped:
+    - `BalanceInsufficient` with an asset the map does not hold keeps its variant, with no asset.
+    - `AssetInvalid` and `InstrumentInvalid` with a name it does not hold have no index to carry.
+      They become `OrderRejected` (from an order request) or `RequestRejected` (from any other
+      request), keeping their own message.
+  - Binance reads `-2010` by its message. It is the generic NEW_ORDER_REJECTED code, shared by
+    reasons such as "Order would trigger immediately.", and all of them were reported as
+    `BalanceInsufficient`. Only a balance message is now; the rest are `OrderRejected`.
+  - `ExecutionManager` logs an `error!` when it discards a response whose order key it cannot
+    index. That remains possible only if a client returns a key unlike its request's.
+  - **Breaking:**
+    - `ApiError::BalanceInsufficient` is `(Option<AssetKey>, String)`. Binance and Alpaca leave
+      the asset `None`, since their rejections do not name it.
+    - `AccountEventIndexer::api_error`, `order_error`, `order_state` and `client_error` return
+      their value instead of a `Result`.
 - **A market event for an `ExecutionOnly` venue was dropped once every venue was healthy**
   (`rustrade`). `update_from_market_event` returned early while the cached `global` was `Healthy`,
   so a misrouted market event, or a venue with the wrong role, left

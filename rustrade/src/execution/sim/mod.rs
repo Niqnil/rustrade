@@ -1079,9 +1079,7 @@ fn step<MarketKind>(
                     "SimRunner venue returned an open response for a non-configured key: {error}"
                 )
             });
-            let state = slot.indexer.order_state(state).unwrap_or_else(|error| {
-                panic!("SimRunner venue returned an unindexable open response state: {error}")
-            });
+            let state = slot.indexer.order_state(state);
 
             EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
                 exchange: key.exchange,

@@ -3829,8 +3829,10 @@ fn parse_api_error(status: reqwest::StatusCode, message: &str) -> crate::error::
         // funds. 403 is *Forbidden* — auth/permission failure — and must NOT be
         // mapped to BalanceInsufficient even if the body happens to contain the
         // substring "insufficient".
+        // The body says what ran short ("insufficient buying power", or "insufficient qty
+        // available" on a sell) but names no asset, so none is guessed.
         422 if lower.contains("insufficient") => {
-            ApiError::BalanceInsufficient(AssetNameExchange::new("usd"), message.to_owned())
+            ApiError::BalanceInsufficient(None, message.to_owned())
         }
         401 => ApiError::Unauthenticated(format!("unauthorized: {message}")),
         403 => ApiError::Unauthenticated(format!("forbidden: {message}")),
@@ -5652,7 +5654,7 @@ mod tests {
                 reqwest::StatusCode::UNPROCESSABLE_ENTITY,
                 "insufficient funds for this order"
             ),
-            UnindexedOrderError::Rejected(ApiError::BalanceInsufficient(_, _))
+            UnindexedOrderError::Rejected(ApiError::BalanceInsufficient(None, _))
         ));
     }
 
