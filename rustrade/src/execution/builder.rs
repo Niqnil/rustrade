@@ -15,7 +15,7 @@ use rustrade_data::streams::{
 use rustrade_execution::{
     UnindexedAccountEvent,
     client::{
-        ExecutionClient,
+        ClientInstrument, ExecutionClient,
         mock::{MockExecution, MockExecutionClientConfig, MockExecutionConfig},
     },
     exchange::mock::{MockExchange, request::MockExchangeRequest},
@@ -180,6 +180,9 @@ impl<'a> ExecutionBuilder<'a> {
         Client::Config: Send,
     {
         validate_supported_instrument_kinds(self.instruments, exchange, Client::SUPPORTED_KINDS)?;
+        validate_client_config(self.instruments, exchange, |instruments| {
+            Client::validate_config(&config, instruments)
+        })?;
 
         let instrument_map = generate_execution_instrument_map(self.instruments, exchange)?;
 
@@ -620,6 +623,29 @@ pub(crate) fn validate_supported_instrument_kinds(
     )))
 }
 
+/// Runs a client's own check of its config (see [`ExecutionClient::validate_config`]) against the
+/// instruments registered on `exchange`.
+fn validate_client_config(
+    instruments: &IndexedInstruments,
+    exchange: ExchangeId,
+    validate: impl FnOnce(&[ClientInstrument<'_>]) -> Result<(), String>,
+) -> Result<(), BarterError> {
+    let instruments = instruments
+        .instruments()
+        .iter()
+        .filter(|keyed| keyed.value.exchange.value == exchange)
+        .map(|keyed| {
+            ClientInstrument::new(&keyed.value.name_exchange, keyed.value.kind.discriminant())
+        })
+        .collect::<Vec<_>>();
+
+    validate(&instruments).map_err(|error| {
+        BarterError::ExecutionBuilder(format!(
+            "{exchange} execution client config is invalid: {error}"
+        ))
+    })
+}
+
 fn join_kinds(kinds: impl Iterator<Item = InstrumentKindDiscriminant>) -> String {
     kinds
         .map(|kind| kind.to_string())
@@ -901,6 +927,51 @@ mod tests {
             1,
             "the offending kind must be deduplicated, got: {message}"
         );
+    }
+
+    /// A client's config check sees the instruments it executes, with their kinds, and not one
+    /// that is merely priced on its venue.
+    #[test]
+    fn client_config_validation_sees_the_instruments_executed_on_its_exchange() {
+        let instruments = instruments_priced_on_another_venue(future());
+
+        let mut seen = Vec::new();
+        validate_client_config(&instruments, EXCHANGE, |instruments| {
+            seen.extend(
+                instruments
+                    .iter()
+                    .map(|instrument| (instrument.name_exchange.clone(), instrument.kind)),
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            seen,
+            [(
+                InstrumentNameExchange::new("spx500_usd"),
+                InstrumentKindDiscriminant::Future
+            )]
+        );
+
+        validate_client_config(&instruments, DATA_VENUE, |instruments| {
+            assert!(instruments.is_empty(), "{instruments:?}");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_rejected_client_config_fails_the_build_naming_the_exchange() {
+        let error = validate_client_config(&instruments(InstrumentKind::Spot), EXCHANGE, |_| {
+            Err("contract \"X\" is wrong".to_owned())
+        })
+        .unwrap_err();
+
+        let BarterError::ExecutionBuilder(message) = error else {
+            panic!("expected an ExecutionBuilder error, got {error:?}")
+        };
+        assert!(message.contains(EXCHANGE.as_str()), "{message}");
+        assert!(message.contains("contract \"X\" is wrong"), "{message}");
     }
 
     /// A failed `ExecutionManager` build aborts the mock exchanges spawned before it, rather than
