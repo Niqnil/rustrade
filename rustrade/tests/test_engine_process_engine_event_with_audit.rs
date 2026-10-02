@@ -6792,6 +6792,136 @@ fn test_corporate_action_option_replica_parity_suppressed_readjust() {
     assert_eq!(contract.strike, dec!(25_000));
 }
 
+/// Pins the contract that each `corporate_actions_processed` record guards only its own instrument:
+/// with the **target's** record lost, a re-delivered standard split applies to the equity leg
+/// again, while an option still carrying the `id` is skipped. The live engine and the audit
+/// replica agree on that outcome. A change to either half of this behaviour must be deliberate and
+/// fail here first.
+#[test]
+fn test_corporate_action_equity_leg_depends_solely_on_the_targets_record() {
+    use rustrade::engine::audit::{
+        AuditTick, EngineAudit, context::EngineContext, state_replica::StateReplicaManager,
+    };
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx); // Netting
+
+    engine.process(market_event_trade(1, 0, dec!(1200)));
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+    open_option_position(&mut engine, dec!(2), dec!(1_000));
+    open_position_via_trade(
+        &mut engine,
+        1,
+        1,
+        Side::Buy,
+        dec!(60_000),
+        dec!(2),
+        "equity-open",
+    );
+
+    let pre_split_state = engine.state.clone();
+
+    let effective_time = time_plus_days(STARTING_TIMESTAMP, 10);
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSD-2-1-split".into(),
+        instrument: InstrumentIndex(1),
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(2)).unwrap(),
+        },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time,
+    };
+
+    let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+        event: pre_split_state,
+        context: EngineContext {
+            time: effective_time,
+            sequence: Sequence(0),
+        },
+    };
+    let dummy_updates: DummyAuditUpdates = std::iter::empty();
+    let mut replica_manager = StateReplicaManager::new(seed_tick, dummy_updates);
+
+    let first_tick = process_with_audit(&mut engine, ca_event.clone());
+    let first_outputs = match &first_tick.event {
+        EngineAudit::Process(audit) => audit.outputs.clone(),
+        _ => panic!("expected EngineAudit::Process"),
+    };
+    replica_manager.update_from_event(ca_event.clone(), &first_outputs);
+
+    let equity_position = |state: &EngineState<DefaultGlobalData, DefaultInstrumentMarketData>| {
+        let position = state
+            .instruments
+            .instrument_index(&InstrumentIndex(1))
+            .position
+            .positions
+            .values()
+            .next()
+            .cloned();
+        let Some(position) = position else {
+            panic!("the equity position must stay open");
+        };
+        (position.quantity_abs, position.price_entry_average)
+    };
+    assert_eq!(equity_position(&engine.state), (dec!(4), dec!(30_000)));
+
+    // Lose the TARGET's record only, on both sides, as a snapshot taken before the field existed
+    // would. Every option keeps its own record.
+    engine
+        .state
+        .instruments
+        .instrument_index_mut(&InstrumentIndex(1))
+        .corporate_actions_processed
+        .clear();
+    replica_manager
+        .state_replica
+        .event
+        .instruments
+        .instrument_index_mut(&InstrumentIndex(1))
+        .corporate_actions_processed
+        .clear();
+
+    let second_tick = process_with_audit(&mut engine, ca_event.clone());
+    let second_outputs = match &second_tick.event {
+        EngineAudit::Process(audit) => audit.outputs.clone(),
+        _ => panic!("expected EngineAudit::Process"),
+    };
+    replica_manager.update_from_event(ca_event, &second_outputs);
+
+    // The equity leg applied again: quantity multiplied and basis divided a second time.
+    assert_eq!(equity_position(&engine.state), (dec!(8), dec!(15_000)));
+
+    // The option was skipped, and the skip was reported for it alone.
+    let InstrumentKind::Option(contract) = &engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0))
+        .instrument
+        .kind
+    else {
+        panic!("instrument 0 must be an option");
+    };
+    assert_eq!(contract.strike, dec!(25_000));
+    let skipped: Vec<_> = second_outputs
+        .iter()
+        .filter_map(|output| match output {
+            EngineOutput::CorporateActionAlreadyProcessed { instrument, .. } => Some(*instrument),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(skipped, vec![InstrumentIndex(0)]);
+
+    // The replica reaches the same, asymmetric, state.
+    for idx in [InstrumentIndex(0), InstrumentIndex(1)] {
+        let live = engine.state.instruments.instrument_index(&idx);
+        let replica = replica_manager
+            .replica_engine_state()
+            .instruments
+            .instrument_index(&idx);
+        assert_eq!(replica, live, "replica/live divergence at {idx:?}");
+    }
+}
+
 /// A market `Item` from an exchange the engine was never built against is **reported**, and its
 /// `InstrumentIndex` is never dereferenced.
 ///

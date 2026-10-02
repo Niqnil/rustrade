@@ -125,7 +125,7 @@ use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, Snapshot, UnindexedAccountEvent,
     UnindexedAccountSnapshot,
     balance::AssetBalance,
-    client::{BracketOrderClient, ExecutionClient, dedup::new_dedup_cache},
+    client::{BracketOrderClient, ClientInstrument, ExecutionClient, dedup::new_dedup_cache},
     error::{
         ApiError, ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
     },
@@ -229,6 +229,10 @@ impl ContractConfig {
     ///   `right` is absent on an `OPT` contract.
     /// - [`UnrecognizedOptionRight`](contract::ContractConfigError::UnrecognizedOptionRight)
     ///   — `right` is present but not one of `C`/`CALL`/`P`/`PUT` (case-insensitive).
+    ///
+    /// A security type added here must also be added to `security_types_of`, or every entry naming
+    /// it fails `validate_config`. Nothing enforces that: add the type to
+    /// `security_types_cover_every_type_to_contract_builds` too.
     fn to_contract(&self) -> Result<ibapi::contracts::Contract, contract::ContractConfigError> {
         use contract::ContractConfigError as E;
         Ok(match self.security_type.as_str() {
@@ -258,6 +262,18 @@ impl ContractConfig {
                 });
             }
         })
+    }
+}
+
+/// The `ContractConfig::security_type`s that describe an instrument of `kind`: the inverse of the
+/// mapping `SUPPORTED_KINDS` states. Empty for a kind this client cannot trade, which
+/// `SUPPORTED_KINDS` rejects before any config is checked.
+fn security_types_of(kind: InstrumentKindDiscriminant) -> &'static [&'static str] {
+    match kind {
+        InstrumentKindDiscriminant::Spot => &["STK", "CASH"],
+        InstrumentKindDiscriminant::Future => &["FUT"],
+        InstrumentKindDiscriminant::Option => &["OPT"],
+        InstrumentKindDiscriminant::Perpetual | InstrumentKindDiscriminant::Cfd => &[],
     }
 }
 
@@ -1479,12 +1495,8 @@ impl ExecutionClient for IbkrClient {
     // for them, so a CFD instrument would fail `to_contract` with `UnrecognizedSecurityType` at
     // registration rather than trade.
     //
-    // Scope: this declares which `InstrumentKind`s the client can represent AT ALL, and is checked
-    // against `Instrument::kind`. It is NOT a check that a registered `ContractConfig` describes
-    // the instrument it is keyed to -- `security_type` is a caller-populated `String` registered
-    // independently into `ContractRegistry` and never compared against `Instrument::kind`. A
-    // registry entry naming `STK` for an instrument modelled as `Option` still builds a stock
-    // contract; this gate does not catch it.
+    // Scope: this declares which `InstrumentKind`s the client can represent AT ALL. Whether each
+    // `ContractConfig` describes the instrument it is keyed to is `validate_config`'s check.
     const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant] = &[
         InstrumentKindDiscriminant::Spot,
         InstrumentKindDiscriminant::Future,
@@ -1493,6 +1505,61 @@ impl ExecutionClient for IbkrClient {
 
     type Config = IbkrConfig;
     type AccountStream = BoxStream<'static, UnindexedAccountEvent>;
+
+    /// Rejects a `ContractConfig` that [`connect_sync`](Self::connect_sync) would skip as invalid,
+    /// or whose `security_type` contradicts the kind of the instrument it is keyed to by `name`:
+    /// `STK` or `CASH` for a `Spot`, `FUT` for a `Future`, `OPT` for an `Option`. Every problem
+    /// found is reported, not just the first.
+    ///
+    /// `Spot` covers both a stock and a currency pair, so `STK` and `CASH` cannot be told apart
+    /// here: either is accepted for any `Spot` instrument.
+    ///
+    /// An entry keyed to no instrument on this exchange, and an instrument with no entry, are both
+    /// accepted: a contract can also be registered later with
+    /// [`register_contract`](Self::register_contract), which this cannot see.
+    fn validate_config(
+        config: &Self::Config,
+        instruments: &[ClientInstrument<'_>],
+    ) -> Result<(), String> {
+        let problems = config
+            .contracts
+            .iter()
+            .filter_map(|contract| {
+                if let Err(error) = contract.to_contract() {
+                    return Some(format!("contract {:?}: {error}", contract.name));
+                }
+                let instrument = instruments
+                    .iter()
+                    .find(|instrument| instrument.name_exchange.as_ref() == contract.name)?;
+                let expected = security_types_of(instrument.kind);
+                if expected.is_empty() {
+                    // Unreachable through `ExecutionBuilder`, which checks `SUPPORTED_KINDS` first,
+                    // but a direct caller can pass any kind.
+                    return Some(format!(
+                        "contract {:?} is for an instrument of kind {}, which this client cannot \
+                         trade",
+                        contract.name, instrument.kind,
+                    ));
+                }
+                (!expected.contains(&contract.security_type.as_str())).then(|| {
+                    format!(
+                        "contract {:?} names security type {:?}, but its instrument's kind is \
+                         {}, which takes {}",
+                        contract.name,
+                        contract.security_type,
+                        instrument.kind,
+                        expected.join(" or "),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems.join("; "))
+        }
+    }
 
     /// Create a new IBKR client by connecting to TWS/Gateway.
     ///
@@ -2688,6 +2755,163 @@ mod contract_config_tests {
                 security_type: "BOND".to_string()
             }
         );
+    }
+
+    fn ibkr_config(contracts: Vec<ContractConfig>) -> IbkrConfig {
+        IbkrConfig {
+            host: "127.0.0.1".to_string(),
+            port: 4002,
+            client_id: 1,
+            account: String::new(),
+            contracts,
+        }
+    }
+
+    fn named(name: &str, security_type: &str) -> ContractConfig {
+        ContractConfig {
+            name: name.to_string(),
+            ..full_config(security_type)
+        }
+    }
+
+    #[test]
+    fn validate_config_accepts_each_security_type_its_kind_takes() {
+        let names = ["STOCK", "FX", "FUTURE", "OPTION"].map(InstrumentNameExchange::new);
+        let instruments = [
+            ClientInstrument::new(&names[0], InstrumentKindDiscriminant::Spot),
+            ClientInstrument::new(&names[1], InstrumentKindDiscriminant::Spot),
+            ClientInstrument::new(&names[2], InstrumentKindDiscriminant::Future),
+            ClientInstrument::new(&names[3], InstrumentKindDiscriminant::Option),
+        ];
+        let config = ibkr_config(vec![
+            named("STOCK", "STK"),
+            named("FX", "CASH"),
+            named("FUTURE", "FUT"),
+            named("OPTION", "OPT"),
+        ]);
+
+        assert_eq!(IbkrClient::validate_config(&config, &instruments), Ok(()));
+    }
+
+    /// The disagreement the kind gate cannot see: a stock contract registered for an instrument
+    /// the engine models as an option would route option orders as stock orders.
+    #[test]
+    fn validate_config_rejects_a_security_type_its_instrument_kind_contradicts() {
+        let name = InstrumentNameExchange::new("AAPL-C150");
+        let instruments = [ClientInstrument::new(
+            &name,
+            InstrumentKindDiscriminant::Option,
+        )];
+        let config = ibkr_config(vec![named("AAPL-C150", "STK")]);
+
+        let error = IbkrClient::validate_config(&config, &instruments).unwrap_err();
+        assert!(error.contains("AAPL-C150"), "{error}");
+        assert!(error.contains("STK"), "{error}");
+        assert!(error.contains("OPT"), "{error}");
+    }
+
+    /// `connect_sync` only logs and skips an invalid entry; built through `ExecutionBuilder`, it
+    /// fails the build instead. Every problem is reported, not just the first.
+    #[test]
+    fn validate_config_reports_every_invalid_or_contradicting_entry() {
+        let name = InstrumentNameExchange::new("ES");
+        let instruments = [ClientInstrument::new(
+            &name,
+            InstrumentKindDiscriminant::Future,
+        )];
+        let mut missing_date = named("NQ", "FUT");
+        missing_date.last_trade_date = None;
+        let config = ibkr_config(vec![named("ES", "STK"), missing_date]);
+
+        let error = IbkrClient::validate_config(&config, &instruments).unwrap_err();
+        assert!(error.contains("\"ES\""), "{error}");
+        assert!(error.contains("\"NQ\""), "{error}");
+    }
+
+    /// Every (kind, security type) pair: accepted exactly where `security_types_of` lists it, and
+    /// a kind this client cannot trade rejected whatever the type.
+    #[test]
+    fn validate_config_checks_every_kind_against_every_security_type() {
+        use InstrumentKindDiscriminant as K;
+        let accepted = [
+            (K::Spot, "STK"),
+            (K::Spot, "CASH"),
+            (K::Future, "FUT"),
+            (K::Option, "OPT"),
+        ];
+        let name = InstrumentNameExchange::new("X");
+        for kind in [K::Spot, K::Perpetual, K::Future, K::Option, K::Cfd] {
+            for security_type in ["STK", "CASH", "FUT", "OPT"] {
+                let instruments = [ClientInstrument::new(&name, kind)];
+                let config = ibkr_config(vec![named("X", security_type)]);
+                assert_eq!(
+                    IbkrClient::validate_config(&config, &instruments).is_ok(),
+                    accepted.contains(&(kind, security_type)),
+                    "{kind} with {security_type}"
+                );
+            }
+        }
+    }
+
+    /// `security_types_of` is written separately from `to_contract`'s match, so a type added
+    /// there must be added here too: an entry naming a type no kind lists fails every check.
+    #[test]
+    fn security_types_cover_every_type_to_contract_builds() {
+        use InstrumentKindDiscriminant as K;
+        let listed = [K::Spot, K::Perpetual, K::Future, K::Option, K::Cfd]
+            .into_iter()
+            .flat_map(security_types_of)
+            .copied()
+            .collect::<Vec<_>>();
+
+        // Every type listed must be one `to_contract` can build.
+        for security_type in &listed {
+            assert!(
+                full_config(security_type).to_contract().is_ok(),
+                "{security_type}"
+            );
+        }
+
+        // Every type `to_contract` builds must be listed. A `match` cannot be enumerated, so this
+        // names them by hand, and a type added to `to_contract` must be added here as well.
+        // `BOND` stands for a type it does not build.
+        for security_type in ["STK", "CASH", "FUT", "OPT", "BOND"] {
+            assert_eq!(
+                full_config(security_type).to_contract().is_ok(),
+                listed.contains(&security_type),
+                "{security_type}"
+            );
+        }
+    }
+
+    /// A kind this client cannot trade is named as such, rather than as a mismatch with no
+    /// security type to expect.
+    #[test]
+    fn validate_config_names_a_kind_this_client_cannot_trade() {
+        let name = InstrumentNameExchange::new("X");
+        let instruments = [ClientInstrument::new(
+            &name,
+            InstrumentKindDiscriminant::Perpetual,
+        )];
+        let config = ibkr_config(vec![named("X", "STK")]);
+
+        let error = IbkrClient::validate_config(&config, &instruments).unwrap_err();
+        assert!(error.contains("perpetual"), "{error}");
+        assert!(error.contains("cannot trade"), "{error}");
+    }
+
+    /// A contract can also be registered later with `register_contract`, so neither side of an
+    /// unmatched pair is an error here.
+    #[test]
+    fn validate_config_accepts_entries_and_instruments_without_a_counterpart() {
+        let name = InstrumentNameExchange::new("MSFT");
+        let instruments = [ClientInstrument::new(
+            &name,
+            InstrumentKindDiscriminant::Spot,
+        )];
+        let config = ibkr_config(vec![named("SOMETHING-ELSE", "OPT")]);
+
+        assert_eq!(IbkrClient::validate_config(&config, &instruments), Ok(()));
     }
 }
 
