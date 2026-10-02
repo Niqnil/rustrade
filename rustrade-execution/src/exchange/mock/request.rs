@@ -2,9 +2,9 @@ use crate::{
     UnindexedAccountSnapshot,
     balance::AssetBalance,
     order::{
-        Order,
+        Order, UnindexedOrderKey,
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::{Open, UnindexedOrderState},
+        state::{Open, UnindexedInactiveOrderState, UnindexedOrderState},
     },
     trade::Trade,
 };
@@ -59,6 +59,22 @@ impl MockExchangeRequest {
             MockExchangeRequestKind::FetchOrdersOpen {
                 response_tx,
                 instruments,
+            },
+        )
+    }
+
+    pub fn fetch_orders_ended(
+        time_request: DateTime<Utc>,
+        orders: Vec<UnindexedOrderKey>,
+        response_tx: oneshot::Sender<
+            Vec<Order<ExchangeId, InstrumentNameExchange, UnindexedInactiveOrderState>>,
+        >,
+    ) -> Self {
+        Self::new(
+            time_request,
+            MockExchangeRequestKind::FetchOrdersEnded {
+                orders,
+                response_tx,
             },
         )
     }
@@ -120,6 +136,12 @@ pub enum MockExchangeRequestKind {
     FetchOrdersOpen {
         instruments: Vec<InstrumentNameExchange>,
         response_tx: oneshot::Sender<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>>,
+    },
+    FetchOrdersEnded {
+        orders: Vec<UnindexedOrderKey>,
+        response_tx: oneshot::Sender<
+            Vec<Order<ExchangeId, InstrumentNameExchange, UnindexedInactiveOrderState>>,
+        >,
     },
     FetchTrades {
         response_tx: oneshot::Sender<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>>,

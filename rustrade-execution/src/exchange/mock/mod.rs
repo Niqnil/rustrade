@@ -107,6 +107,13 @@ impl MockExchange {
                     let orders_open = self.venue.orders_open(&instruments);
                     self.respond_with_latency(response_tx, orders_open);
                 }
+                MockExchangeRequestKind::FetchOrdersEnded {
+                    response_tx,
+                    orders,
+                } => {
+                    let orders_ended = self.venue.orders_ended(&orders);
+                    self.respond_with_latency(response_tx, orders_ended);
+                }
                 MockExchangeRequestKind::FetchTrades {
                     response_tx,
                     time_since,
@@ -673,7 +680,12 @@ mod tests {
     use crate::{
         AccountEventKind,
         fee::FeeModelConfig,
-        order::{OrderEvent, id::ClientOrderId, request::RequestCancel, state::OrderState},
+        order::{
+            OrderEvent, OrderKey,
+            id::ClientOrderId,
+            request::RequestCancel,
+            state::{InactiveOrderState, OrderState},
+        },
     };
     use rust_decimal::Decimal;
 
@@ -864,6 +876,63 @@ mod tests {
             "this venue rests no orders, so a cancel must be rejected: {response:?}"
         );
 
+        drop(request_tx);
+        driver.await.unwrap();
+    }
+
+    /// The mock client's order-state lookup reaches the venue's ledger and back: an order that
+    /// filled is reported, and one the venue never held is omitted.
+    #[tokio::test]
+    async fn an_order_state_lookup_is_answered_from_the_ledger() {
+        use crate::client::{OrderStatusClient, mock::MockExecution};
+
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = broadcast::channel(16);
+        let exchange = MockExchange::new(
+            spot_config("100", "10000000", FeeModelConfig::default()),
+            request_rx,
+            event_tx,
+            spot_instruments(),
+        );
+        let driver = tokio::spawn(exchange.run());
+
+        let open = buy_request("1", market_prices("50000"));
+        let (response_tx, response_rx) = oneshot::channel();
+        request_tx
+            .send(MockExchangeRequest::open_order(
+                Utc::now(),
+                response_tx,
+                open.clone(),
+            ))
+            .unwrap();
+        let opened = response_rx.await.expect("an open must be answered");
+        assert!(matches!(
+            opened.state,
+            OrderState::Inactive(InactiveOrderState::FullyFilled(_))
+        ));
+
+        let client = MockExecution {
+            mocked_exchange: EXCHANGE,
+            clock: Utc::now,
+            request_tx: request_tx.clone(),
+            event_rx,
+        };
+        let unknown = OrderKey {
+            cid: ClientOrderId::new("never-opened"),
+            ..open.key.clone()
+        };
+        let ended = client
+            .fetch_order_states(&[open.key.clone(), unknown])
+            .await
+            .expect("the venue is running");
+
+        let [order] = ended.as_slice() else {
+            panic!("only the filled order is reported: {ended:?}");
+        };
+        assert_eq!(order.key, open.key);
+        assert!(matches!(order.state, InactiveOrderState::FullyFilled(_)));
+
+        drop(client);
         drop(request_tx);
         driver.await.unwrap();
     }

@@ -13,10 +13,13 @@ use crate::{
     fill::{FillContext, FillModel, SimFillConfig},
     market::{MarketDepth, MarketSnapshot},
     order::{
-        Order, OrderKind, TimeInForce, UnindexedOrder,
+        Order, OrderKind, TimeInForce, UnindexedOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, VenueOrderId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::{Cancelled, Expired, Filled, Open, OrderState, UnindexedOrderState},
+        state::{
+            Cancelled, Expired, Filled, Open, OrderState, UnindexedInactiveOrderState,
+            UnindexedOrderState,
+        },
     },
     position::{Position, PositionReport},
     trade::{AssetFees, Trade, TradeId},
@@ -740,7 +743,6 @@ impl SimulatedVenue {
             };
 
             self.account.ack_trade(trade.clone());
-            self.account.ack_filled(cid);
 
             // The order is terminal, and says so as `Inactive(FullyFilled)` rather than as an
             // `Open` carrying a complete fill. Both denote the same fact, but only this one can
@@ -759,13 +761,15 @@ impl SimulatedVenue {
                 quantity: order.quantity,
                 kind: order.kind,
                 time_in_force: order.time_in_force,
-                state: OrderState::fully_filled(Filled::new(
+                state: Filled::new(
                     order_id,
                     time_exchange,
                     order.quantity,
                     order.state.filled_quantity.is_zero().then_some(limit),
-                )),
+                ),
             };
+            self.account.ack_filled(filled.clone());
+            let filled = filled.map_state(OrderState::fully_filled);
 
             events.push(self.build_account_event(Snapshot(balance)));
             events.push(self.build_account_event(trade));
@@ -923,6 +927,28 @@ impl SimulatedVenue {
             .orders_open()
             .filter(|order| instruments.is_empty() || instruments.contains(&order.key.instrument))
             .cloned()
+            .collect()
+    }
+
+    /// How each of `orders` ended, for those that have: filled, cancelled (including the
+    /// unfilled remainder of a market order) or expired at its own deadline.
+    ///
+    /// An order still open is omitted, and so is one this venue never held, including one it
+    /// rejected on arrival, whose rejection was the answer to its open request. An empty `orders`
+    /// returns nothing, not every ended order. Each order is found by its client order id, which
+    /// this venue keys every order on, and is returned under the key it was asked for.
+    pub fn orders_ended(
+        &self,
+        orders: &[UnindexedOrderKey],
+    ) -> Vec<Order<ExchangeId, InstrumentNameExchange, UnindexedInactiveOrderState>> {
+        orders
+            .iter()
+            .filter_map(|key| {
+                self.account.order_ended(&key.cid).map(|order| Order {
+                    key: key.clone(),
+                    ..order
+                })
+            })
             .collect()
     }
 
@@ -1690,7 +1716,15 @@ impl SimulatedVenue {
                     request.state.quantity,
                     Some(fill.price),
                 );
-                self.account.ack_filled(request.key.cid.clone());
+                self.account.ack_filled(Order {
+                    key: request.key.clone(),
+                    side: request.state.side,
+                    price: request.state.price,
+                    quantity: request.state.quantity,
+                    kind: request.state.kind,
+                    time_in_force: request.state.time_in_force,
+                    state: filled.clone(),
+                });
 
                 (OrderState::fully_filled(filled), None)
             }
@@ -6303,5 +6337,115 @@ mod tests {
             "nothing settled: a replaced order traded nothing"
         );
         drop(first);
+    }
+
+    // --- How an order ended -------------------------------------------------------------------
+
+    fn key_of(cid: &str) -> UnindexedOrderKey {
+        OrderKey {
+            exchange: EXCHANGE,
+            instrument: instrument_name(),
+            strategy: StrategyId::new("asker"),
+            cid: ClientOrderId::new(cid),
+        }
+    }
+
+    /// Every way an order can end on this venue is reported, under the key it was asked for, and
+    /// an order still working or never held is left out.
+    #[test]
+    fn orders_ended_reports_each_ended_order_and_omits_the_rest() {
+        let mut venue = make_market_venue("10", "1000000");
+        advance(&mut venue, time(1));
+        assert!(
+            venue
+                .apply_market(
+                    &instrument_name(),
+                    book("49000", "49100"),
+                    MarketDepth::UNKNOWN,
+                    time(1)
+                )
+                .is_empty()
+        );
+
+        let filled = venue.open_order(limit_request("filled", Side::Buy, "1", "49100", gtc()));
+        assert!(
+            matches!(
+                filled.response.state,
+                OrderState::Inactive(InactiveOrderState::FullyFilled(_))
+            ),
+            "crosses the ask, so fills on arrival"
+        );
+        let _ = venue.open_order(limit_request("working", Side::Buy, "1", "48000", gtc()));
+        let _ = venue.open_order(limit_request("cancelled", Side::Buy, "1", "47500", gtc()));
+        let _ = venue.cancel_order(OrderEvent {
+            key: key_of("cancelled"),
+            state: RequestCancel { id: None },
+        });
+        let _ = venue.open_order(limit_request(
+            "expired",
+            Side::Buy,
+            "1",
+            "47000",
+            TimeInForce::GoodTillDate { expiry: time(9) },
+        ));
+        assert_eq!(
+            venue.advance_time(time(9)).len(),
+            2,
+            "the deadline retires it"
+        );
+
+        let asked = ["filled", "working", "cancelled", "expired", "unknown"].map(key_of);
+        let mut ended = venue.orders_ended(&asked);
+        ended.sort_by(|a, b| a.key.cid.cmp(&b.key.cid));
+
+        let [cancelled, expired, filled] = ended.as_slice() else {
+            panic!("exactly the three ended orders are reported: {ended:?}");
+        };
+        assert!(
+            ended
+                .iter()
+                .all(|order| order.key.strategy == StrategyId::new("asker")),
+            "each comes back under the key it was asked for"
+        );
+        match &filled.state {
+            InactiveOrderState::FullyFilled(state) => {
+                assert_eq!(state.filled_quantity, d("1"));
+                assert_eq!(state.avg_price, Some(d("49100")));
+            }
+            other => panic!("filled, got {other:?}"),
+        }
+        match &cancelled.state {
+            InactiveOrderState::Cancelled(state) => {
+                assert_eq!(state.filled_quantity, Decimal::ZERO)
+            }
+            other => panic!("cancelled, got {other:?}"),
+        }
+        match &expired.state {
+            InactiveOrderState::Expired(state) => assert_eq!(state.time_exchange, time(9)),
+            other => panic!("expired, got {other:?}"),
+        }
+
+        assert!(
+            venue.orders_ended(&[]).is_empty(),
+            "an empty request asks about nothing, not about everything"
+        );
+    }
+
+    /// A market order's unfillable remainder retires as a cancel carrying what did trade, and a
+    /// lookup reports it so.
+    #[test]
+    fn orders_ended_reports_a_market_remainder_as_cancelled_with_its_fill() {
+        let mut venue = venue_offering(sized("0.4"));
+        let outcome = venue.open_order(buy_request("1", None));
+
+        let ended = venue.orders_ended(std::slice::from_ref(&outcome.response.key));
+
+        let [order] = ended.as_slice() else {
+            panic!("the remainder's order is reported: {ended:?}");
+        };
+        match &order.state {
+            InactiveOrderState::Cancelled(state) => assert_eq!(state.filled_quantity, d("0.4")),
+            other => panic!("cancelled carrying its fill, got {other:?}"),
+        }
     }
 }
