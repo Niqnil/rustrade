@@ -639,10 +639,13 @@ pub struct InstrumentState<
     /// What applies again depends on which record is missing, because each record guards only its
     /// own instrument. The **target's** set is the only guard on the equity leg: with it missing,
     /// every position on the target is split again (quantity multiplied and basis divided a second
-    /// time). An **option** that still carries the `id` is skipped and reported with
+    /// time). For a standard split, which adjusts the options in place, an **option** that still
+    /// carries the `id` is skipped and reported with
     /// `EngineOutput::CorporateActionAlreadyProcessed`, so the equity and its option chain can
-    /// then disagree about whether the action was applied. Restore or pre-populate the target's
-    /// record; an option's record does not stand in for it.
+    /// then disagree about whether the action was applied.
+    /// A non-standard split records nothing on the options and signals their identity change
+    /// again. Restore or pre-populate the target's record; an option's record does not stand in
+    /// for it.
     #[serde(default)]
     pub corporate_actions_processed: FnvHashSet<SmolStr>,
 

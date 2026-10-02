@@ -808,9 +808,10 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     ///    with [`UnsupportedCorporateActionReason::UnknownInstrument`].
     /// 1. Idempotency guard on `id` (per-instrument `corporate_actions_processed` set). A
     ///    duplicate `id` is skipped with a warning. The target's set is the only guard on the equity
-    ///    leg; each option's own set guards that option (step 5). This holds within a live session
-    ///    but does **not** survive a snapshot taken before the set existed: with the target's record
-    ///    missing, its positions are split again while options still carrying the `id` are skipped.
+    ///    leg; on a standard split, each option's own set guards that option (step 5). This holds
+    ///    within a live session but does **not** survive a snapshot taken before the set existed:
+    ///    with the target's record missing, its positions are split again while options a standard
+    ///    split already adjusted are skipped.
     ///    See the `corporate_actions_processed` field on
     ///    [`InstrumentState`](crate::engine::state::instrument::InstrumentState) for the migration
     ///    caveat.

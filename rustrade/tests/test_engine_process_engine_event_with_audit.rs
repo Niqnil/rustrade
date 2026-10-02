@@ -6793,9 +6793,10 @@ fn test_corporate_action_option_replica_parity_suppressed_readjust() {
 }
 
 /// Pins the contract that each `corporate_actions_processed` record guards only its own instrument:
-/// with the **target's** record lost, a re-delivered split applies to the equity leg again, while
-/// an option still carrying the `id` is skipped. The live engine and the audit replica agree on
-/// that outcome. A change to either half of this behaviour must be deliberate and fail here first.
+/// with the **target's** record lost, a re-delivered standard split applies to the equity leg
+/// again, while an option still carrying the `id` is skipped. The live engine and the audit
+/// replica agree on that outcome. A change to either half of this behaviour must be deliberate and
+/// fail here first.
 #[test]
 fn test_corporate_action_equity_leg_depends_solely_on_the_targets_record() {
     use rustrade::engine::audit::{
