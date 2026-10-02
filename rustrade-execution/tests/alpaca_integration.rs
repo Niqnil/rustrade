@@ -441,32 +441,34 @@ async fn assert_snapshot_lists_the_order_then_drops_it(
     await_no_open_orders(&client, &instrument).await;
 
     // Alpaca's order listing is eventually consistent: one empty read does not stop the next
-    // from still returning the cancelled order, so poll the snapshot itself.
+    // from still returning the cancelled order, so poll the snapshot itself. Like
+    // `await_no_open_orders`, a failed read is retried until the deadline.
     const POLL: Duration = Duration::from_millis(250);
     const DEADLINE: Duration = Duration::from_secs(15);
     let started = tokio::time::Instant::now();
     loop {
-        let listed = client
-            .account_snapshot(&[], &instruments)
-            .await
-            .expect("account_snapshot failed");
-        let snapshot = listed
-            .instruments
-            .iter()
-            .find(|snapshot| snapshot.instrument == instrument)
-            .expect("a requested instrument always has an entry");
-        assert!(
-            snapshot.orders_complete,
-            "{instrument}'s order list is not declared complete"
-        );
-        if snapshot.orders.iter().all(|order| order.key.cid != cid) {
-            return;
-        }
+        let last = match client.account_snapshot(&[], &instruments).await {
+            Ok(listed) => {
+                let snapshot = listed
+                    .instruments
+                    .iter()
+                    .find(|snapshot| snapshot.instrument == instrument)
+                    .expect("a requested instrument always has an entry");
+                assert!(
+                    snapshot.orders_complete,
+                    "{instrument}'s order list is not declared complete"
+                );
+                if snapshot.orders.iter().all(|order| order.key.cid != cid) {
+                    return;
+                }
+                format!("still listed: {:?}", snapshot.orders)
+            }
+            Err(error) => format!("account_snapshot failed: {error:?}"),
+        };
         let waited = started.elapsed();
         assert!(
             waited < DEADLINE,
-            "the cancelled {instrument} order is still listed {waited:?} after the cancel: {:?}",
-            snapshot.orders
+            "the cancelled {instrument} order did not drop out {waited:?} after the cancel; {last}"
         );
         tokio::time::sleep(POLL).await;
     }
