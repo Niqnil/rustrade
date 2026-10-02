@@ -5,24 +5,26 @@ use rustrade_instrument::{
     index::IndexedInstruments,
 };
 use rustrade_integration::collection::FnvIndexMap;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, ser::SerializeStruct};
 use tracing::{debug, info, warn};
 
 /// Maintains a global connection [`Health`], as well as the connection status of market data
 /// and account connections for each exchange.
 ///
-/// Read-only outside this crate. Every change goes through an update method, which keeps
-/// [`Self::global()`] in step with the per-venue states it summarises. An account disconnect in
-/// particular must also arm the account resync, so it is reached only through
+/// Read-only outside this crate. Every change goes through an update method. An account disconnect
+/// in particular must also arm the account resync, so it is reached only through
 /// [`EngineState::update_from_account_reconnecting`]; a direct write to a venue's account health
-/// would skip both.
+/// would skip it.
+///
+/// # Serialisation
+/// [`Self::global()`] is computed, not stored, but the serialised form still carries it as a
+/// `global` field next to `exchanges`, so a reader of the serialised state keeps it. Deserialising
+/// ignores that field and computes it again from `exchanges`, so a payload cannot carry a `global`
+/// that disagrees with the venues it summarises.
 ///
 /// [`EngineState::update_from_account_reconnecting`]: crate::engine::state::EngineState::update_from_account_reconnecting
-#[derive(Debug, Clone, Eq, PartialEq, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Default, Deserialize)]
 pub struct ConnectivityStates {
-    /// See [`Self::global()`].
-    global: Health,
-
     /// See [`Self::exchanges()`].
     ///
     /// Fnv-hashed: this is read on every market event, and `ExchangeId` is a fieldless enum — a key
@@ -35,8 +37,37 @@ impl ConnectivityStates {
     ///
     /// `Healthy` iff at least one venue is tracked and every tracked venue is
     /// [`ConnectivityState::all_healthy`] under its own [`VenueRole`].
+    ///
+    /// Computed on each call rather than cached, so it cannot disagree with the per-venue states
+    /// it summarises. That costs one pass over the venues, which stops at the first unhealthy one.
+    ///
+    /// # No venues
+    /// An empty collection is [`Health::Reconnecting`], although `all` is vacuously true over zero
+    /// venues: no connection backs a `Healthy` there. Neither value is honest about an empty
+    /// configuration, and this is a convention on a degenerate input, not a safety property. A
+    /// venue-less state holds no instruments, so no position exists for either value to protect.
+    /// The misconfiguration itself is reported by [`generate_empty_indexed_connectivity_states`],
+    /// which `warn!`s on an empty venue set.
     pub fn global(&self) -> Health {
-        self.global
+        if !self.exchanges.is_empty() && self.exchange_states().all(ConnectivityState::all_healthy)
+        {
+            Health::Healthy
+        } else {
+            Health::Reconnecting
+        }
+    }
+
+    /// Logs a change of [`Self::global()`] from `previous`. Called after each health update, so
+    /// the transition is still logged now that nothing is cached.
+    fn log_global_transition(&self, previous: Health) {
+        let global = self.global();
+        if global != previous {
+            info!(
+                ?previous,
+                ?global,
+                "EngineState updating global connectivity"
+            );
+        }
     }
 
     /// Connectivity of market data and account connections by exchange, in [`ExchangeIndex`]
@@ -48,7 +79,7 @@ impl ConnectivityStates {
     /// Updates from an exchange AccountStream disconnection.
     ///
     /// Sets the account `ConnectivityState` for the provided `ExchangeId`
-    /// to [`Health::Reconnecting`], then re-derives [`Self::global()`]. Returns the [`ExchangeIndex`]
+    /// to [`Health::Reconnecting`]. Returns the [`ExchangeIndex`]
     /// the exchange resolved to, for the caller's own updates on that exchange. The index is the
     /// entry's position in [`Self::exchanges()`], which is built in `ExchangeIndex` order, as
     /// [`Self::connectivity_index_mut`] already relies on.
@@ -58,21 +89,21 @@ impl ConnectivityStates {
     ///
     /// # A venue whose role declares no account
     /// Reaching this for a [`VenueRole::DataOnly`] venue means the role is wrong or the event is
-    /// misrouted, and it is `warn!`ed. [`Self::global()`] is unaffected, because it is re-derived
-    /// through [`ConnectivityState::all_healthy`], which does not consult a dimension the venue does
-    /// not provide. Degrading it here would be **unrecoverable**: no account event can arrive for a
-    /// venue with no execution client, and every other update path short-circuits once its own
-    /// dimension is [`Health::Healthy`], so nothing would ever re-run the convergence check.
+    /// misrouted, and it is `warn!`ed. [`Self::global()`] is unaffected, because
+    /// [`ConnectivityState::all_healthy`] does not consult a dimension the venue does not provide.
+    /// Degrading it would be **unrecoverable**: no account event can arrive for a venue with no
+    /// execution client.
     ///
     /// # Errors
     /// Returns [`UntrackedExchange`] if the `ExchangeId` has no `ConnectivityState`, having mutated
-    /// nothing — including [`Self::global()`].
+    /// nothing, so [`Self::global()`] is unchanged.
     ///
     /// [`EngineState::update_from_account_reconnecting`]: crate::engine::state::EngineState::update_from_account_reconnecting
     pub(crate) fn update_from_account_reconnecting(
         &mut self,
         exchange: &ExchangeId,
     ) -> Result<ExchangeIndex, UntrackedExchange> {
+        let previous = self.global();
         let Some((index, _, state)) = self.exchanges.get_full_mut(exchange) else {
             // `warn!` here, unlike the `debug!` on the market *event* path: a disconnect notice
             // arrives once per disconnect, so there is no volume to bound — and the routine,
@@ -108,23 +139,15 @@ impl ConnectivityStates {
             );
         }
 
-        self.re_derive_global();
+        self.log_global_transition(previous);
 
         Ok(ExchangeIndex(index))
     }
 
     /// Updates from an exchange AccountStream event, setting the `ConnectivityState` account
     /// connection to [`Health::Healthy`] if it was not previously.
-    ///
-    /// If after the update all `ConnectivityState`s are healthy, the global health is set to
-    /// `Health::Healthy`.
     pub fn update_from_account_event(&mut self, exchange: &ExchangeIndex) {
-        if self.global == Health::Healthy {
-            return;
-        }
-
-        let state = self.connectivity_index_mut(exchange);
-        if state.account == Health::Healthy {
+        if self.connectivity_index(exchange).account == Health::Healthy {
             return;
         }
 
@@ -132,15 +155,15 @@ impl ConnectivityStates {
             %exchange,
             "EngineState received AccountStream event - setting connection to Healthy"
         );
-        state.account = Health::Healthy;
-
-        self.re_derive_global();
+        let previous = self.global();
+        self.connectivity_index_mut(exchange).account = Health::Healthy;
+        self.log_global_transition(previous);
     }
 
     /// Updates from an exchange MarketStream disconnection.
     ///
     /// Sets the market data `ConnectivityState` for the provided `ExchangeId`
-    /// to [`Health::Reconnecting`], then re-derives [`Self::global()`].
+    /// to [`Health::Reconnecting`].
     ///
     /// # A venue whose role declares no market data
     /// The mirror of the account twin above: reaching this for a [`VenueRole::ExecutionOnly`] venue
@@ -150,11 +173,12 @@ impl ConnectivityStates {
     ///
     /// # Errors
     /// Returns [`UntrackedExchange`] if the `ExchangeId` has no `ConnectivityState`, having mutated
-    /// nothing — including [`Self::global()`].
+    /// nothing, so [`Self::global()`] is unchanged.
     pub fn update_from_market_reconnecting(
         &mut self,
         exchange: &ExchangeId,
     ) -> Result<(), UntrackedExchange> {
+        let previous = self.global();
         let Some(state) = self.exchanges.get_mut(exchange) else {
             // `warn!` for the same reason as the account twin above: bounded by the disconnect
             // rate, and level-matched to the tracked-venue line below.
@@ -185,7 +209,7 @@ impl ConnectivityStates {
             );
         }
 
-        self.re_derive_global();
+        self.log_global_transition(previous);
 
         Ok(())
     }
@@ -193,26 +217,21 @@ impl ConnectivityStates {
     /// Updates from an exchange MarketStream event, setting the `ConnectivityState` market data
     /// connection to [`Health::Healthy`] if it was not previously.
     ///
-    /// If after the update all `ConnectivityState`s are healthy, the global health is set to
-    /// `Health::Healthy`.
-    ///
     /// # Errors
     /// Returns [`UntrackedExchange`] if the `ExchangeId` has no `ConnectivityState`. The exchange is
-    /// resolved on **every** call, including the already-globally-healthy fast path, so this is
-    /// reported deterministically on the first event from that exchange — see the note at the
-    /// lookup for why that matters.
+    /// resolved on **every** call, so this is reported deterministically on the first event from
+    /// that exchange — see the note at the lookup for why that matters.
     pub fn update_from_market_event(
         &mut self,
         exchange: &ExchangeId,
     ) -> Result<(), UntrackedExchange> {
-        // Resolved BEFORE the `global == Healthy` short-circuit below, deliberately. Skipping the
-        // lookup while global health held is what made an untracked exchange an *intermittent*
-        // fault: its events were silently ignored for as long as everything else was healthy, and
-        // the misconfiguration only surfaced once something dragged `global` back to `Reconnecting`
-        // -- in practice a reconnect, hours into a run. Resolving unconditionally costs one
-        // `IndexMap` get per market event and makes the report fire on the first event from that
-        // exchange, in every run.
-        let Some(state) = self.exchanges.get_mut(exchange) else {
+        // Resolved on every call, deliberately. Skipping the lookup while global health held is what
+        // once made an untracked exchange an *intermittent* fault: its events were silently ignored
+        // for as long as everything else was healthy, and the misconfiguration only surfaced once
+        // something dragged `global` back to `Reconnecting` -- in practice a reconnect, hours into a
+        // run. Resolving unconditionally costs one `IndexMap` get per market event and makes the
+        // report fire on the first event from that exchange, in every run.
+        let Some(index) = self.exchanges.get_index_of(exchange) else {
             // `debug!`, and deliberately not `warn!` like the two disconnect paths: this fires once
             // per market event from that venue, so a stream wired up for an unconfigured exchange
             // emits at tick rate. A `warn!` here would bury every other warning in the process
@@ -232,7 +251,7 @@ impl ConnectivityStates {
             ));
         };
 
-        if self.global == Health::Healthy || state.market_data == Health::Healthy {
+        if self.exchanges[index].market_data == Health::Healthy {
             return Ok(());
         }
 
@@ -240,38 +259,11 @@ impl ConnectivityStates {
             %exchange,
             "EngineState received MarketStream event - setting connection to Healthy"
         );
-        state.market_data = Health::Healthy;
-
-        self.re_derive_global();
+        let previous = self.global();
+        self.exchanges[index].market_data = Health::Healthy;
+        self.log_global_transition(previous);
 
         Ok(())
-    }
-
-    /// Re-derives the cached [`Self::global()`] aggregate from the per-venue states it summarises.
-    ///
-    /// `global` is [`Health::Healthy`] iff at least one venue is tracked and every tracked venue is
-    /// [`ConnectivityState::all_healthy`] under its own [`VenueRole`]. **Every** site that changes a
-    /// connection `Health` or a role goes through here, so the cached value cannot disagree with the
-    /// states it aggregates — which is what stops a disconnect on a dimension a venue does not
-    /// provide from degrading `global` into a state no later event could repair.
-    ///
-    /// The empty case fails closed, for the reason given in full on [`reconcile_venue_roles`]: `all`
-    /// is vacuously true over zero venues, and no connection backs that `Healthy`. It is
-    /// unreachable from the update paths, which resolve a venue before reaching here, and load
-    /// bearing for `reconcile_venue_roles`, which does not.
-    fn re_derive_global(&mut self) {
-        let global = if !self.exchanges.is_empty()
-            && self.exchange_states().all(ConnectivityState::all_healthy)
-        {
-            Health::Healthy
-        } else {
-            Health::Reconnecting
-        };
-
-        if global != self.global {
-            info!(previous = ?self.global, ?global, "EngineState updating global connectivity");
-            self.global = global;
-        }
     }
 
     /// Returns a reference to the `ConnectivityState` associated with the
@@ -332,6 +324,20 @@ impl ConnectivityStates {
     /// Return an `Iterator` of all `ConnectivityState`s being tracked.
     pub fn exchange_states(&self) -> impl Iterator<Item = &ConnectivityState> {
         self.exchanges.values()
+    }
+}
+
+impl Serialize for ConnectivityStates {
+    /// Emits the computed [`ConnectivityStates::global()`] next to `exchanges`, so the serialised
+    /// form keeps the field it carried when `global` was stored.
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("ConnectivityStates", 2)?;
+        state.serialize_field("global", &self.global())?;
+        state.serialize_field("exchanges", &self.exchanges)?;
+        state.end()
     }
 }
 
@@ -504,14 +510,9 @@ impl ConnectivityState {
     /// [`Self::all_healthy`], or consult the role first, rather than this alone.
     ///
     /// That is an expectation, not an invariant: [`ConnectivityStates::update_from_market_event`]
-    /// sets this `Healthy` for any *tracked* exchange, role notwithstanding. A market event arriving
-    /// for a venue declared `ExecutionOnly` means the role is wrong.
-    ///
-    /// This reports that only while [`ConnectivityStates::global()`] has not yet reached
-    /// [`Health::Healthy`]. Once it has, `update_from_market_event` short-circuits on the cached
-    /// aggregate and returns before writing, so a role error that first produces a market event
-    /// after convergence leaves this `Reconnecting` and is not observable here. Do not treat it as a
-    /// reliable role-mismatch detector.
+    /// sets this `Healthy` for any *tracked* exchange, role notwithstanding, whatever
+    /// [`ConnectivityStates::global()`] reads. A market event arriving for a venue declared
+    /// `ExecutionOnly` means the role is wrong, and a `Healthy` here on such a venue shows it.
     pub fn market_data(&self) -> Health {
         self.market_data
     }
@@ -636,10 +637,7 @@ pub fn generate_empty_indexed_connectivity_states(
         );
     }
 
-    ConnectivityStates {
-        global: Health::Reconnecting,
-        exchanges,
-    }
+    ConnectivityStates { exchanges }
 }
 
 /// Which connection dimensions a venue provides, as `(has_market_data, has_account)`.
@@ -683,40 +681,9 @@ fn derive_venue_dimensions(
 /// is keyed positionally by [`ExchangeIndex`], so inserting one here would renumber every venue
 /// after it and silently re-point the instruments indexed against them.
 ///
-/// # `global` is re-derived, not preserved
-/// Per-venue `Health` is left alone, but the cached [`ConnectivityStates::global()`] aggregate is
-/// recomputed from the corrected roles before returning. It has to be:
-/// [`ConnectivityState::all_healthy`] is a *function of* [`ConnectivityState::role()`], so changing a
-/// role changes what `global` should already have been — and the event paths that normally maintain
-/// it cannot repair the difference, since each short-circuits once its own dimension is
-/// [`Health::Healthy`]. On a state whose connections had already reported in, a role change would
-/// otherwise strand `global` wrong in whichever direction it moved: stale-`Healthy` when a role
-/// widened (a consumer gating on `global` trades against a link that never came up), or
-/// stuck-`Reconnecting` when one narrowed (every health-gated strategy stays gated for the whole
-/// run, which is the footgun this function exists to remove).
-///
-/// This is a no-op for the ordinary freshly-built state, where every connection is
-/// `Reconnecting` and `global` already is too.
-///
-/// An **empty** `states` re-derives to [`Health::Reconnecting`] regardless of what it arrived with.
-/// Neither variant is honest over zero venues: `all` is vacuously true, which argues for `Healthy`,
-/// while [`Health::Reconnecting`] documents a reconnection in progress that is equally not
-/// happening. `Reconnecting` is chosen because
-/// [`generate_empty_indexed_connectivity_states`] — the only constructor of this type — already
-/// returns it for a zero-exchange collection, and two entry points disagreeing on the same input
-/// would be worse than either answer; and because it leaves the postcondition below total, with no
-/// boundary a caller has to special-case.
-///
-/// That is a convention on a degenerate input, not a safety property. A venue-less state holds no
-/// instruments, so no position exists for either value to protect — do not read `Reconnecting` here
-/// as the library taking a position on what a consumer should do about an empty configuration. The
-/// misconfiguration itself is reported by
-/// [`generate_empty_indexed_connectivity_states`], which `warn!`s on an empty venue set.
-///
-/// # Postcondition
-/// On return, `global` is [`Health::Healthy`] iff `states` is non-empty and every venue in it is
-/// [`ConnectivityState::all_healthy`] under its corrected role. This holds unconditionally — it does
-/// not depend on whether any role actually changed, or on `global`'s incoming value.
+/// [`ConnectivityStates::global()`] is computed from the roles, so it follows a corrected role at
+/// once, in either direction. A role that widens makes a dimension newly required, and one that
+/// narrows drops one that was holding `global` down.
 ///
 /// # Caller obligation
 /// `instruments` must be the collection `states` was built from. A mismatched pair derives every
@@ -747,7 +714,7 @@ pub fn reconcile_venue_roles(
     // (a library-usage bug) rather than a handleable input. A hard panic in all builds — not
     // `debug_assert!` — because the failure it guards is silent, exactly like the non-monotonic
     // timeline `assert_aux_events_sorted` rejects: every venue is handed a plausible but wrong role
-    // in release, `global` is then re-derived from those roles, and a health-gated strategy trades
+    // in release, `global` is then computed from those roles, and a health-gated strategy trades
     // against a link that never came up. The comparison is one pass over a handful of venues, off
     // the event path, once per engine build.
     assert!(
@@ -796,14 +763,6 @@ pub fn reconcile_venue_roles(
         );
         state.role = role;
     }
-
-    // Re-derive the cached aggregate against the corrected roles — see `# global is re-derived, not
-    // preserved`. Unconditional rather than gated on "did any role change", because the incoming
-    // `global` is a caller-supplied value that may disagree with the roles it arrived with. Shared
-    // with the update paths so there is exactly one definition of the aggregate; the empty-set
-    // conjunct it applies is load-bearing here and only here, since this is the one caller that can
-    // reach it. Costs one pass over a handful of venues, once per engine build, off the event path.
-    states.re_derive_global();
 }
 
 #[cfg(test)]
@@ -911,13 +870,13 @@ mod tests {
         states.update_from_market_event(&DATA).unwrap();
         states.update_from_market_event(&EXECUTION).unwrap();
         assert_eq!(
-            states.global,
+            states.global(),
             Health::Reconnecting,
             "the execution venue's account has not reported yet"
         );
         states.update_from_account_event(&execution_index);
 
-        assert_eq!(states.global, Health::Healthy);
+        assert_eq!(states.global(), Health::Healthy);
         assert_eq!(
             states.connectivity(&DATA).account,
             Health::Reconnecting,
@@ -1006,12 +965,12 @@ mod tests {
             let execution = instruments.find_exchange_index(EXECUTION).unwrap();
             let mut states = generate_empty_indexed_connectivity_states(&instruments, None);
 
-            assert_eq!(states.global, Health::Reconnecting);
+            assert_eq!(states.global(), Health::Reconnecting);
 
             if market_data_first {
                 states.update_from_market_event(&DATA).unwrap();
                 assert_eq!(
-                    states.global,
+                    states.global(),
                     Health::Reconnecting,
                     "the execution venue has not reported yet"
                 );
@@ -1019,14 +978,14 @@ mod tests {
             } else {
                 states.update_from_account_event(&execution);
                 assert_eq!(
-                    states.global,
+                    states.global(),
                     Health::Reconnecting,
                     "the data venue has not reported yet"
                 );
                 states.update_from_market_event(&DATA).unwrap();
             }
 
-            assert_eq!(states.global, Health::Healthy, "{market_data_first}");
+            assert_eq!(states.global(), Health::Healthy, "{market_data_first}");
         }
     }
 
@@ -1042,7 +1001,7 @@ mod tests {
         let execution = instruments.find_exchange_index(EXECUTION).unwrap();
         states.update_from_market_event(&EXECUTION).unwrap();
         states.update_from_account_event(&execution);
-        assert_eq!(states.global, Health::Healthy);
+        assert_eq!(states.global(), Health::Healthy);
 
         let error = states.update_from_market_event(&DATA).unwrap_err();
 
@@ -1050,7 +1009,11 @@ mod tests {
             error,
             UntrackedExchange::new(DATA, ConnectivityDimension::MarketData)
         );
-        assert_eq!(states.global, Health::Healthy, "the report must not mutate");
+        assert_eq!(
+            states.global(),
+            Health::Healthy,
+            "the report must not mutate"
+        );
         assert_eq!(states.exchanges.len(), 1, "no state may be created for it");
     }
 
@@ -1065,7 +1028,7 @@ mod tests {
         let execution = instruments.find_exchange_index(EXECUTION).unwrap();
         states.update_from_market_event(&EXECUTION).unwrap();
         states.update_from_account_event(&execution);
-        assert_eq!(states.global, Health::Healthy);
+        assert_eq!(states.global(), Health::Healthy);
 
         assert_eq!(
             states.update_from_market_reconnecting(&DATA).unwrap_err(),
@@ -1076,7 +1039,7 @@ mod tests {
             UntrackedExchange::new(DATA, ConnectivityDimension::Account)
         );
 
-        assert_eq!(states.global, Health::Healthy);
+        assert_eq!(states.global(), Health::Healthy);
     }
 
     #[test]
@@ -1087,11 +1050,11 @@ mod tests {
         let execution = instruments.find_exchange_index(EXECUTION).unwrap();
         states.update_from_market_event(&EXECUTION).unwrap();
         states.update_from_account_event(&execution);
-        assert_eq!(states.global, Health::Healthy);
+        assert_eq!(states.global(), Health::Healthy);
 
         states.update_from_market_reconnecting(&EXECUTION).unwrap();
 
-        assert_eq!(states.global, Health::Reconnecting);
+        assert_eq!(states.global(), Health::Reconnecting);
         assert_eq!(
             states.connectivity(&EXECUTION).market_data,
             Health::Reconnecting
@@ -1109,7 +1072,7 @@ mod tests {
         let execution = instruments.find_exchange_index(EXECUTION).unwrap();
         states.update_from_market_event(&EXECUTION).unwrap();
         states.update_from_account_event(&execution);
-        assert_eq!(states.global, Health::Healthy);
+        assert_eq!(states.global(), Health::Healthy);
 
         states.update_from_account_reconnecting(&EXECUTION).unwrap();
 
@@ -1122,7 +1085,7 @@ mod tests {
             Health::Healthy,
             "an account disconnect says nothing about the market data connection"
         );
-        assert_eq!(states.global, Health::Reconnecting);
+        assert_eq!(states.global(), Health::Reconnecting);
     }
 
     #[test]
@@ -1147,7 +1110,7 @@ mod tests {
             // Converge: each split venue reports the one dimension it actually provides.
             states.update_from_market_event(&DATA).unwrap();
             states.update_from_account_event(&execution_index);
-            assert_eq!(states.global, Health::Healthy);
+            assert_eq!(states.global(), Health::Healthy);
 
             // Both venues are TRACKED, so neither disconnect is an `UntrackedExchange` -- that
             // report covers the unknown-venue case, and never fires here.
@@ -1163,7 +1126,7 @@ mod tests {
             }
 
             assert_eq!(
-                states.global,
+                states.global(),
                 Health::Healthy,
                 "{dimension:?}: a disconnect on a dimension the role does not own must not degrade \
                  global health"
@@ -1183,17 +1146,17 @@ mod tests {
         );
         states.update_from_market_event(&DATA).unwrap();
         states.update_from_account_event(&execution_index);
-        assert_eq!(states.global, Health::Healthy);
+        assert_eq!(states.global(), Health::Healthy);
 
         states.update_from_market_reconnecting(&DATA).unwrap();
         assert_eq!(
-            states.global,
+            states.global(),
             Health::Reconnecting,
             "the data venue's own dimension still counts"
         );
 
         states.update_from_market_event(&DATA).unwrap();
-        assert_eq!(states.global, Health::Healthy, "and still recovers");
+        assert_eq!(states.global(), Health::Healthy, "and still recovers");
     }
 
     #[test]
@@ -1286,12 +1249,11 @@ mod tests {
     }
 
     #[test]
-    fn reconciling_roles_re_derives_a_global_left_stale_healthy_by_a_widened_role() {
-        // `global` is a cached aggregate over `all_healthy`, which is a function of `role` -- so a
-        // role that WIDENS invalidates a `Healthy` global by making a dimension newly required.
-        // Nothing on the event paths can repair it: both short-circuit while `global == Healthy`,
-        // so without the re-derive below a consumer gating on `global` would trade for the rest of
-        // the run against an account link that never came up.
+    fn global_follows_a_role_widened_by_reconciliation() {
+        // `global` is a function of `all_healthy`, which is a function of `role` -- so a role that
+        // WIDENS must take a `Healthy` global back to `Reconnecting` by making a dimension newly
+        // required. Otherwise a consumer gating on `global` would trade for the rest of the run
+        // against an account link that never came up.
         let instruments = two_instrument_pattern();
         let mut states = generate_empty_indexed_connectivity_states(&instruments, None);
 
@@ -1301,7 +1263,7 @@ mod tests {
         assert_eq!(states.connectivity(&EXECUTION).role, VenueRole::DataOnly);
         states.update_from_market_event(&DATA).unwrap();
         states.update_from_market_event(&EXECUTION).unwrap();
-        assert_eq!(states.global, Health::Healthy);
+        assert_eq!(states.global(), Health::Healthy);
 
         // Now reconcile against a client set that DOES execute on EXECUTION: its role widens to
         // `Both`, and the account connection it now demands has never reported.
@@ -1314,19 +1276,18 @@ mod tests {
         assert_eq!(states.connectivity(&EXECUTION).role, VenueRole::Both);
         assert!(!states.connectivity(&EXECUTION).all_healthy());
         assert_eq!(
-            states.global,
+            states.global(),
             Health::Reconnecting,
             "global must follow the role that invalidated it"
         );
     }
 
     #[test]
-    fn reconciling_roles_re_derives_a_global_left_stuck_reconnecting_by_a_narrowed_role() {
+    fn global_follows_a_role_narrowed_by_reconciliation() {
         // The mirror direction, and the one that fails *closed*: a role that NARROWS drops a
-        // dimension that was holding `global` down. This is unrepairable for the opposite reason --
-        // every connection that exists has already reported `Healthy`, so each update path returns
-        // early on its own dimension and never re-runs the convergence check. Without the
-        // re-derive, every health-gated strategy stays gated for the whole run.
+        // dimension that was holding `global` down. Every connection that exists has already
+        // reported `Healthy`, so no later event would change anything -- if `global` did not follow
+        // the role, every health-gated strategy would stay gated for the whole run.
         let instruments = two_instrument_pattern();
         let mut states = generate_empty_indexed_connectivity_states(&instruments, None);
         assert_eq!(states.connectivity(&DATA).role, VenueRole::Both);
@@ -1336,7 +1297,7 @@ mod tests {
         states.update_from_market_event(&DATA).unwrap();
         states.update_from_market_event(&EXECUTION).unwrap();
         states.connectivity_mut(&EXECUTION).account = Health::Healthy;
-        states.global = Health::Reconnecting;
+        assert_eq!(states.global(), Health::Reconnecting);
 
         reconcile_venue_roles(
             &mut states,
@@ -1346,7 +1307,7 @@ mod tests {
 
         assert_eq!(states.connectivity(&DATA).role, VenueRole::DataOnly);
         assert_eq!(
-            states.global,
+            states.global(),
             Health::Healthy,
             "the dimension that was holding global down is no longer demanded"
         );
@@ -1354,33 +1315,16 @@ mod tests {
 
     #[test]
     fn reconciling_roles_fails_global_closed_when_no_venue_is_tracked() {
-        // `all` is vacuously true over no venues, so an unguarded re-derive would promote an
-        // instrument-less state to `Healthy` -- a claim no connection backs, and one
-        // `generate_empty_indexed_connectivity_states` declines to make.
+        // `all` is vacuously true over no venues, so an unguarded computation would promote an
+        // instrument-less state to `Healthy` -- a claim no connection backs.
         let instruments = IndexedInstruments::new(Vec::<Instrument<ExchangeId, Asset>>::new());
         let mut states = generate_empty_indexed_connectivity_states(&instruments, None);
         assert!(states.exchanges.is_empty());
-        assert_eq!(states.global, Health::Reconnecting);
+        assert_eq!(states.global(), Health::Reconnecting);
 
         reconcile_venue_roles(&mut states, &instruments, &FnvHashSet::default());
 
-        assert_eq!(states.global, Health::Reconnecting);
-
-        // The direction that actually distinguishes "fails closed" from "preserves what it was
-        // handed": the assertion above passes under either, since it starts from the answer it
-        // expects. `global` is a `pub` field on a `Deserialize` struct, so a caller-supplied or
-        // deserialised `Healthy` over an empty venue set is reachable -- and is exactly as unbacked
-        // by any connection as the vacuous one the guard exists to reject. Preserving it would
-        // reintroduce, on this boundary, the stale-`Healthy` gap the re-derive was added to close.
-        states.global = Health::Healthy;
-
-        reconcile_venue_roles(&mut states, &instruments, &FnvHashSet::default());
-
-        assert_eq!(
-            states.global,
-            Health::Reconnecting,
-            "an empty venue set must not carry a `Healthy` no connection backs, whatever its source"
-        );
+        assert_eq!(states.global(), Health::Reconnecting);
     }
 
     #[test]
@@ -1390,5 +1334,64 @@ mod tests {
 
         assert_eq!(state.role, VenueRole::Both);
         assert!(!state.all_healthy());
+    }
+
+    #[test]
+    fn serialising_emits_the_computed_global_and_deserialising_recomputes_it() {
+        let instruments = two_instrument_pattern();
+        let mut states = generate_empty_indexed_connectivity_states(&instruments, None);
+        reconcile_venue_roles(&mut states, &instruments, &FnvHashSet::default());
+        states.update_from_market_event(&DATA).unwrap();
+        states.update_from_market_event(&EXECUTION).unwrap();
+        assert_eq!(states.global(), Health::Healthy);
+
+        let json = serde_json::to_value(&states).unwrap();
+        assert_eq!(json["global"], serde_json::json!("Healthy"));
+        assert!(json["exchanges"].is_object());
+
+        let round_tripped: ConnectivityStates = serde_json::from_value(json).unwrap();
+        assert_eq!(round_tripped, states);
+        assert_eq!(round_tripped.global(), Health::Healthy);
+    }
+
+    #[test]
+    fn a_serialised_global_that_disagrees_with_the_venues_is_ignored() {
+        // A payload can claim any `global`; the deserialised state answers from its venues.
+        let healthy_over_nothing: ConnectivityStates =
+            serde_json::from_str(r#"{"global":"Healthy","exchanges":{}}"#).unwrap();
+        assert_eq!(healthy_over_nothing.global(), Health::Reconnecting);
+
+        let healthy_over_reconnecting: ConnectivityStates = serde_json::from_str(
+            r#"{"global":"Healthy","exchanges":{"binance_spot":{"market_data":"Reconnecting","account":"Reconnecting","role":"Both"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(healthy_over_reconnecting.global(), Health::Reconnecting);
+    }
+
+    #[test]
+    fn a_market_event_for_an_execution_only_venue_is_recorded_after_global_converges() {
+        // A market event tagged with an `ExecutionOnly` venue means its role is wrong, and
+        // `ConnectivityState::market_data` reports that as `Healthy`. It must still do so once
+        // `global` has converged, rather than being skipped because everything is healthy.
+        let instruments = split_venue_instruments();
+        let mut states = generate_empty_indexed_connectivity_states(&instruments, None);
+        assert_eq!(
+            states.connectivity(&EXECUTION).role,
+            VenueRole::ExecutionOnly
+        );
+
+        states.update_from_market_event(&DATA).unwrap();
+        let execution_index = ExchangeIndex(states.exchanges.get_index_of(&EXECUTION).unwrap());
+        states.update_from_account_event(&execution_index);
+        assert_eq!(states.global(), Health::Healthy);
+
+        states.update_from_market_event(&EXECUTION).unwrap();
+
+        assert_eq!(
+            states.connectivity(&EXECUTION).market_data(),
+            Health::Healthy,
+            "the misrouted market event is observable after convergence"
+        );
+        assert_eq!(states.global(), Health::Healthy);
     }
 }

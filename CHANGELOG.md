@@ -7,7 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`ConnectivityStates::global()` is computed instead of cached** (`rustrade`). It was a stored
+  aggregate over the per-venue states, kept in step by every update path, and each new path was a
+  chance for the two to disagree. It is now computed on each call, with the same rule: `Healthy`
+  iff at least one venue is tracked and every venue is healthy on the dimensions its role
+  declares. The serialised form still carries `global` next to `exchanges`. Deserialising ignores
+  a `global` in the payload and computes it from `exchanges`, so a payload whose `global`
+  disagrees with its venues now reads as its venues say.
+
 ### Fixed
+
+- **A market event for an `ExecutionOnly` venue was dropped once every venue was healthy**
+  (`rustrade`). `update_from_market_event` returned early while the cached `global` was `Healthy`,
+  so a misrouted market event, or a venue with the wrong role, left
+  `ConnectivityState::market_data` at `Reconnecting` after convergence and the mistake went
+  unseen. It is now recorded as `Healthy` whatever `global()` reads.
 
 - **An option expiring with two possible underlyings settled against whichever came first**
   (`rustrade`). When more than one `Spot` instrument matched an option's underlying base, quote
