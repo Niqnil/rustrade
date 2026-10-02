@@ -13,9 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   aggregate over the per-venue states, kept in step by every update path, and each new path was a
   chance for the two to disagree. It is now computed on each call, with the same rule: `Healthy`
   iff at least one venue is tracked and every venue is healthy on the dimensions its role
-  declares. The serialised form still carries `global` next to `exchanges`. Deserialising ignores
-  a `global` in the payload and computes it from `exchanges`, so a payload whose `global`
-  disagrees with its venues now reads as its venues say.
+  declares. The serialised form is unchanged, `global` and then `exchanges`, in self-describing
+  and positional formats alike. Deserialising reads the payload's `global` and discards it,
+  computing it from `exchanges`, so a payload whose `global` disagrees with its venues now reads as
+  its venues say. `update_from_account_event` no longer returns early while `global` is `Healthy`,
+  so an out-of-range `ExchangeIndex` now panics on every call rather than only while some venue is
+  unhealthy.
 
 ### Fixed
 

@@ -5,7 +5,7 @@ use rustrade_instrument::{
     index::IndexedInstruments,
 };
 use rustrade_integration::collection::FnvIndexMap;
-use serde::{Deserialize, Serialize, ser::SerializeStruct};
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 /// Maintains a global connection [`Health`], as well as the connection status of market data
@@ -18,12 +18,14 @@ use tracing::{debug, info, warn};
 ///
 /// # Serialisation
 /// [`Self::global()`] is computed, not stored, but the serialised form still carries it as a
-/// `global` field next to `exchanges`, so a reader of the serialised state keeps it. Deserialising
-/// ignores that field and computes it again from `exchanges`, so a payload cannot carry a `global`
-/// that disagrees with the venues it summarises.
+/// `global` field before `exchanges`, the shape it had when `global` was stored, so a reader of the
+/// serialised state keeps it. Deserialising reads that field and discards it, computing `global`
+/// again from `exchanges`, so a payload cannot carry a `global` that disagrees with the venues it
+/// summarises.
 ///
 /// [`EngineState::update_from_account_reconnecting`]: crate::engine::state::EngineState::update_from_account_reconnecting
 #[derive(Debug, Clone, Eq, PartialEq, Default, Deserialize)]
+#[serde(from = "ConnectivityStatesWire")]
 pub struct ConnectivityStates {
     /// See [`Self::exchanges()`].
     ///
@@ -103,8 +105,7 @@ impl ConnectivityStates {
         &mut self,
         exchange: &ExchangeId,
     ) -> Result<ExchangeIndex, UntrackedExchange> {
-        let previous = self.global();
-        let Some((index, _, state)) = self.exchanges.get_full_mut(exchange) else {
+        let Some(index) = self.exchanges.get_index_of(exchange) else {
             // `warn!` here, unlike the `debug!` on the market *event* path: a disconnect notice
             // arrives once per disconnect, so there is no volume to bound — and the routine,
             // tracked-venue case two lines below logs at this same level. Logging the anomaly more
@@ -122,6 +123,8 @@ impl ConnectivityStates {
         };
 
         warn!(%exchange, "EngineState received AccountStream disconnected event");
+        let previous = self.global();
+        let state = &mut self.exchanges[index];
         state.account = Health::Reconnecting;
         let role = state.role;
 
@@ -146,6 +149,12 @@ impl ConnectivityStates {
 
     /// Updates from an exchange AccountStream event, setting the `ConnectivityState` account
     /// connection to [`Health::Healthy`] if it was not previously.
+    ///
+    /// # Panics
+    /// Panics if no `ConnectivityState` is associated with the `ExchangeIndex`, on every call, as
+    /// [`Self::connectivity_index`] does. The index is derived from the same
+    /// [`IndexedInstruments`] this collection was built from, so an out-of-range one is a library
+    /// bug.
     pub fn update_from_account_event(&mut self, exchange: &ExchangeIndex) {
         if self.connectivity_index(exchange).account == Health::Healthy {
             return;
@@ -178,8 +187,7 @@ impl ConnectivityStates {
         &mut self,
         exchange: &ExchangeId,
     ) -> Result<(), UntrackedExchange> {
-        let previous = self.global();
-        let Some(state) = self.exchanges.get_mut(exchange) else {
+        let Some(index) = self.exchanges.get_index_of(exchange) else {
             // `warn!` for the same reason as the account twin above: bounded by the disconnect
             // rate, and level-matched to the tracked-venue line below.
             warn!(
@@ -195,6 +203,8 @@ impl ConnectivityStates {
         };
 
         warn!(%exchange, "EngineState received MarketStream disconnect event");
+        let previous = self.global();
+        let state = &mut self.exchanges[index];
         state.market_data = Health::Reconnecting;
         let role = state.role;
 
@@ -327,17 +337,45 @@ impl ConnectivityStates {
     }
 }
 
+/// The serialised shape of [`ConnectivityStates`]: `global` and then `exchanges`, as when `global`
+/// was a stored field. Both directions go through it, so a positional format such as bincode reads
+/// back the same two fields it wrote.
+#[derive(Deserialize)]
+#[serde(rename = "ConnectivityStates")]
+struct ConnectivityStatesWire {
+    /// Read so the shape matches what is written, then discarded: [`ConnectivityStates::global()`]
+    /// is computed from `exchanges`.
+    #[serde(rename = "global")]
+    _global: Health,
+    exchanges: FnvIndexMap<ExchangeId, ConnectivityState>,
+}
+
+/// The borrowing twin of [`ConnectivityStatesWire`], for serialising without a clone.
+#[derive(Serialize)]
+#[serde(rename = "ConnectivityStates")]
+struct ConnectivityStatesWireRef<'a> {
+    global: Health,
+    exchanges: &'a FnvIndexMap<ExchangeId, ConnectivityState>,
+}
+
+impl From<ConnectivityStatesWire> for ConnectivityStates {
+    fn from(wire: ConnectivityStatesWire) -> Self {
+        Self {
+            exchanges: wire.exchanges,
+        }
+    }
+}
+
 impl Serialize for ConnectivityStates {
-    /// Emits the computed [`ConnectivityStates::global()`] next to `exchanges`, so the serialised
-    /// form keeps the field it carried when `global` was stored.
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        let mut state = serializer.serialize_struct("ConnectivityStates", 2)?;
-        state.serialize_field("global", &self.global())?;
-        state.serialize_field("exchanges", &self.exchanges)?;
-        state.end()
+        ConnectivityStatesWireRef {
+            global: self.global(),
+            exchanges: &self.exchanges,
+        }
+        .serialize(serializer)
     }
 }
 
@@ -732,6 +770,7 @@ pub fn reconcile_venue_roles(
             .collect::<Vec<_>>(),
     );
 
+    let previous = states.global();
     for (exchange, state) in &mut states.exchanges {
         let (has_market_data, has_account) =
             derive_venue_dimensions(instruments, *exchange, Some(execution_venues));
@@ -763,6 +802,7 @@ pub fn reconcile_venue_roles(
         );
         state.role = role;
     }
+    states.log_global_transition(previous);
 }
 
 #[cfg(test)]
@@ -1352,6 +1392,31 @@ mod tests {
         let round_tripped: ConnectivityStates = serde_json::from_value(json).unwrap();
         assert_eq!(round_tripped, states);
         assert_eq!(round_tripped.global(), Health::Healthy);
+    }
+
+    #[test]
+    fn an_empty_collection_serialises_a_reconnecting_global() {
+        let instruments = IndexedInstruments::new(Vec::<Instrument<ExchangeId, Asset>>::new());
+        let states = generate_empty_indexed_connectivity_states(&instruments, None);
+
+        assert_eq!(
+            serde_json::to_string(&states).unwrap(),
+            r#"{"global":"Reconnecting","exchanges":{}}"#
+        );
+    }
+
+    #[test]
+    fn the_positional_form_reads_back_both_fields_it_writes() {
+        // A format such as bincode reads a struct as a sequence of its fields, by position.
+        // serde_json accepts that form too, as an array, so it stands in for one here: the
+        // deserialiser must expect `global` first, exactly as `Serialize` writes it.
+        let states: ConnectivityStates = serde_json::from_str(
+            r#"["Healthy",{"binance_spot":{"market_data":"Healthy","account":"Healthy","role":"Both"}}]"#,
+        )
+        .unwrap();
+
+        assert_eq!(states.exchanges.len(), 1);
+        assert_eq!(states.global(), Health::Healthy);
     }
 
     #[test]
