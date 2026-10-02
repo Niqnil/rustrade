@@ -20,6 +20,10 @@
 // documentation-bearing alias bounds kept intentionally. Denying these adds churn without improving
 // the API.
 #![allow(clippy::type_complexity, clippy::too_many_arguments, type_alias_bounds)]
+// Clippy 1.99 checks each field's span rather than the whole expression's, so the
+// `Self { field: field }` that `derive_more::Constructor` expands to is reported at our own
+// field declarations. Remove once rust-lang/rust-clippy#17525 is fixed in a stable release.
+#![allow(clippy::redundant_field_names)]
 
 //! # Barter-Execution
 //! Stream private account data from financial venues, and execute (live or mock) orders. Also provides
