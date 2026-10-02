@@ -33,9 +33,6 @@ pub mod channel;
 mod error;
 pub use error::BinanceDataError;
 
-/// Historical klines (OHLCV candles) via Binance's public, unauthenticated REST
-/// endpoints — spot (`/api/v3/klines`) and futures continuous
-/// (`/fapi/v1/continuousKlines`).
 pub mod historical;
 pub use historical::BinanceHistoricalClient;
 
@@ -43,8 +40,6 @@ pub use historical::BinanceHistoricalClient;
 /// [`BinanceFuturesUsd`].
 pub mod futures;
 
-/// Live kline (candle) wire models common to [`BinanceSpot`] (`@kline_`)
-/// and [`BinanceFuturesUsd`] (`@continuousKline_`).
 pub mod kline;
 
 /// Defines the type that translates a Barter [`Subscription`](crate::subscription::Subscription)
