@@ -288,22 +288,57 @@ impl AccountState {
     /// settle and the hold would report a balance the account never held — for the same reason a
     /// conservative reservation that had to be released and re-debited would.
     ///
+    /// # A credit funds the debit it arrives with
+    /// A fill that closes a cash-settled position pays proceeds back (see [`Credit`]). They are
+    /// part of the same fill, so they count towards what `free` must cover: a CFD flip, closing a
+    /// long and opening a short in one order, is funded by the long it closes. The credit is
+    /// applied only once the whole requirement is known to be covered, so a refusal still leaves
+    /// the ledger exactly as it was.
+    ///
     /// # Errors
-    /// [`BalanceInsufficient`] if `free` does not cover
+    /// [`BalanceInsufficient`] if `free` plus the credit does not cover
     /// [`settled`](Debit::settled) + [`reserved`](Debit::reserved), leaving the ledger untouched.
     ///
     /// # Panics
-    /// Panics if the asset has no balance — see [`reserve`](Self::reserve).
+    /// Panics if the asset has no balance — see [`reserve`](Self::reserve). Debug-asserts that a
+    /// credit names the debit's asset: one fill moves one asset.
     pub fn commit(
         &mut self,
         debit: &Debit,
+        credit: Option<&Credit>,
         time_exchange: DateTime<Utc>,
     ) -> Result<AssetBalance<AssetNameExchange>, BalanceInsufficient> {
-        // Asked for as one requirement, so a refusal refuses the arrival rather than half of it.
-        self.reserve(&debit.asset, debit.settled + debit.reserved, time_exchange)?;
+        let credit = credit.map_or(Decimal::ZERO, |credit| {
+            debug_assert!(
+                credit.asset == debit.asset,
+                "one fill debits {} and credits {}: a fill moves one asset",
+                debit.asset,
+                credit.asset
+            );
+            credit.amount
+        });
 
-        // Infallible: `total` cannot fall below `free`, which the reserve above has already taken
-        // the whole requirement out of. Whatever was reserved and not settled stays held.
+        // Asked for as one requirement, so a refusal refuses the arrival rather than half of it.
+        let required = debit.settled + debit.reserved;
+        let free = self.balance_expect(&debit.asset).balance.free;
+        if free + credit < required {
+            return Err(BalanceInsufficient {
+                free: free + credit,
+                required,
+            });
+        }
+
+        // Applied only now that the whole requirement is covered, so a refusal moves nothing.
+        if !credit.is_zero() {
+            let balance = self.balance_expect(&debit.asset);
+            balance.balance.total += credit;
+            balance.balance.free += credit;
+        }
+
+        // Infallible: `free` now covers the whole requirement. `total` cannot fall below `free`,
+        // which the reserve takes the whole requirement out of, and whatever was reserved and not
+        // settled stays held.
+        self.reserve(&debit.asset, required, time_exchange)?;
         Ok(self.settle(&debit.asset, debit.settled, time_exchange))
     }
 
@@ -345,6 +380,21 @@ pub struct Debit {
     /// Held against a remainder that is still working. Lowers `free` and leaves `total`, so it is
     /// still the account's until whatever it is held against settles or is released.
     pub reserved: Decimal,
+}
+
+/// What one fill pays back into one asset's balance: the proceeds of closing a cash-settled
+/// position.
+///
+/// Separate from [`Debit`] rather than a negative amount in it, because one fill can carry both
+/// at once. A CFD flip closes a position, which pays its margin and realised PnL back, and opens
+/// one, which posts margin and the fee. A signed amount would net the two before the ledger saw
+/// either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Credit {
+    /// The asset paid back into, which is the asset the fill's [`Debit`] names.
+    pub asset: AssetNameExchange,
+    /// Added to `free` and `total` alike. Never negative.
+    pub amount: Decimal,
 }
 
 /// A ledger operation asked for more of an asset than `free` covers.
