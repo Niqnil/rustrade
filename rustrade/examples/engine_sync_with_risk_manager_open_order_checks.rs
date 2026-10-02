@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)] // Example code: panics acceptable for demonstration
+// Example code: panics acceptable for demonstration
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+// Clippy 1.99 checks each field's span rather than the whole expression's, so the
+// `Self { field: field }` that `derive_more::Constructor` expands to is reported at our own
+// field declarations. Remove once rust-lang/rust-clippy#17525 is fixed in a stable release.
+#![allow(clippy::redundant_field_names)]
 
 use derive_more::Constructor;
 use rust_decimal::Decimal;
