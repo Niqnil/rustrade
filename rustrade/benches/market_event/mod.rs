@@ -8,13 +8,13 @@
 #![allow(clippy::unwrap_used)] // Benchmark setup: a panic on bad fixture data is acceptable
 
 use chrono::{DateTime, Utc};
-use criterion::{BenchmarkId, Criterion, Throughput};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use rustrade::engine::state::{
     EngineState,
     global::DefaultGlobalData,
-    instrument::data::DefaultInstrumentMarketData,
+    instrument::data::{DefaultInstrumentMarketData, InstrumentDataState},
     position::{OmsMode, Position},
 };
 use rustrade_data::{
@@ -56,23 +56,53 @@ fn bench_update_from_market(c: &mut Criterion) {
 
     for price in [Price::Changing, Price::Constant] {
         let events = market_events(price);
+        assert_prices_reach_the_state(price, &events);
+
         for positions in POSITIONS {
             group.bench_with_input(
                 BenchmarkId::new(price.label(), positions),
                 &positions,
                 |b, &positions| {
-                    let mut state = state_with_positions(positions);
-                    b.iter(|| {
-                        for event in &events {
-                            state.update_from_market(black_box(event)).unwrap();
-                        }
-                    });
+                    // A fresh state per iteration, built outside the timing. Replaying the same
+                    // events into one state would measure the first pass only: from then on every
+                    // event is no newer than the trade already held, so the instrument's recency
+                    // guard skips it and the price never changes again.
+                    let state = state_with_positions(positions);
+                    b.iter_batched_ref(
+                        || state.clone(),
+                        |state| {
+                            for event in &events {
+                                state.update_from_market(black_box(event)).unwrap();
+                            }
+                        },
+                        BatchSize::SmallInput,
+                    );
                 },
             );
         }
     }
 
     group.finish();
+}
+
+/// Panics unless each event's price is what the instrument holds after it, so a mode cannot
+/// silently measure a different workload from the one it is named for.
+fn assert_prices_reach_the_state(price: Price, events: &[MarketEvent<InstrumentIndex, DataKind>]) {
+    let mut state = state_with_positions(1);
+    for (index, event) in events.iter().take(4).enumerate() {
+        state.update_from_market(event).unwrap();
+        let held = state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .data
+            .price();
+        assert_eq!(
+            held,
+            Some(price.at(index)),
+            "{} event {index}",
+            price.label()
+        );
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
