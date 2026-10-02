@@ -29,6 +29,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A simulated CFD round trip needed twice its notional funded** (`rustrade-execution`).
+  `SimulatedVenue` debited a CFD fill's full notional in both directions, with no credit path, so a
+  strategy that opened a position with its balance could not close it: the close was refused for
+  insufficient balance and the run ended holding the position, with no error. The venue now keeps
+  a net position per CFD instrument and splits each fill against it. The part that closes the
+  position is credited the margin back plus the realised PnL, the rest posts its notional as margin
+  (leverage 1, as before), and the fee is charged on the whole quantity. A round trip therefore
+  moves the balance by the realised PnL less fees, as the engine's own `Position` books it.
+  - A resting CFD order holds only its fill's cost net of what the fill pays back, so an order
+    that only reduces holds nothing. It is costed again when it fills, and is **cancelled** if the
+    position has moved so far that the account can no longer afford it.
+  - `account_snapshot` reports each CFD's position, `Flat` when it holds none, instead of
+    `Unreported`, and a CFD position in `initial_state` is where the venue starts. It panics if
+    that position has no entry price.
+  - Not modelled: funding, financing and liquidation. A short that loses more than its margin pays
+    the shortfall.
+  - **Breaking:** `AccountState::commit` takes the fill's `Option<&Credit>` (new type). A fixture
+    or assertion that relied on a CFD close debiting the notional again now sees a credit.
+
 - **An option expiring with two possible underlyings settled against whichever came first**
   (`rustrade`). When more than one `Spot` instrument matched an option's underlying base, quote
   and exchange, `process_contract_expiry` logged a warning and settled the open position against
