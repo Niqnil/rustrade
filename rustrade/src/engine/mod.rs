@@ -121,7 +121,7 @@ where
 /// * `Strategy` - Trading Strategy implementation (see [`super::strategy`]).
 /// * `Risk` - [`RiskManager`] implementation.
 ///
-/// The execution transmitters are private: every request reaches an exchange through the
+/// The execution transmitters are private: every order request reaches an exchange through the
 /// engine's own actions, which validate it and record it as in flight. Construct an `Engine`
 /// with [`Engine::new`].
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -129,7 +129,7 @@ pub struct Engine<Clock, State, ExecutionTxs, Strategy, Risk> {
     pub clock: Clock,
     pub meta: EngineMeta,
     pub state: State,
-    /// Private so that no request can bypass the engine's in-flight tracking.
+    /// Private so that no order request can be sent without the engine's in-flight tracking.
     execution_txs: ExecutionTxs,
     pub strategy: Strategy,
     pub risk: Risk,
@@ -1521,7 +1521,10 @@ where
 {
     /// Construct a new `Engine`.
     ///
-    /// An initial [`EngineMeta`] is constructed form the provided `clock` and `Sequence(0)`.
+    /// An initial [`EngineMeta`] is constructed from the provided `clock` and `Sequence(0)`.
+    ///
+    /// This is the only way to construct an `Engine` outside this crate, as the execution
+    /// transmitters are private.
     pub fn new(
         clock: Clock,
         state: State,
