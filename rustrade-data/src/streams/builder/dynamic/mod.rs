@@ -822,7 +822,8 @@ mod tests {
             MassiveOptions,
         ];
 
-        // Exhaustive, so a new variant fails to compile here until it is added to the list too.
+        // Exhaustive, so a new variant fails to compile here. The compiler cannot see the list
+        // above, so add the variant there too when adding it to this match.
         for exchange in &every {
             match exchange {
                 Other
@@ -908,7 +909,8 @@ mod tests {
             option(),
         ];
 
-        // Exhaustive, so a new variant fails to compile here until it is added to the list too.
+        // Exhaustive, so a new variant fails to compile here. The compiler cannot see the list
+        // above, so add the variant there too when adding it to this match.
         for kind in &every {
             match kind {
                 MarketDataInstrumentKind::Spot
@@ -940,7 +942,8 @@ mod tests {
         )
         .collect();
 
-        // Exhaustive, so a new variant fails to compile here until it is added to the list too.
+        // Exhaustive, so a new variant fails to compile here. The compiler cannot see the list
+        // above, so add the variant there too when adding it to this match.
         for sub_kind in &every {
             match sub_kind {
                 SubKind::PublicTrades
