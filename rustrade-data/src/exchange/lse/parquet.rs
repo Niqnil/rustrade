@@ -698,7 +698,7 @@ pub fn symbols_in_export(path: impl AsRef<Path>) -> Result<Vec<String>, LseError
 /// thousands of rows. Called directly from an async task, it stalls that runtime worker for the
 /// whole decode. Drive it from
 /// [`stream_blocking_iter`](crate::streams::blocking::stream_blocking_iter), which moves the decode
-/// onto a blocking thread **and** bounds how far it may run ahead of whatever polls it — that being
+/// onto the blocking pool **and** bounds how far it may run ahead of whatever polls it — that being
 /// the merge, not the engine, so it is not an end-to-end memory bound. See below.
 ///
 /// # Combining artifacts
@@ -712,14 +712,14 @@ pub fn symbols_in_export(path: impl AsRef<Path>) -> Result<Vec<String>, LseError
 /// # use futures::StreamExt;
 /// # use rustrade_data::exchange::lse::export::LseExport;
 /// # use rustrade_data::exchange::lse::parquet::read_export;
-/// # use rustrade_data::streams::blocking::{stream_blocking_iter, DEFAULT_BLOCKING_CHANNEL_CAPACITY};
+/// # use rustrade_data::streams::blocking::{stream_blocking_iter, DEFAULT_BLOCKING_CHUNK_SIZE};
 /// # use rustrade_data::streams::consumer::MarketStreamEvent;
 /// # use rustrade_data::streams::merge::merge_time_sorted;
 /// # use rustrade_instrument::instrument::InstrumentIndex;
 /// # fn merge(artifacts: Vec<(LseExport, InstrumentIndex)>) {
 /// let streams = artifacts.into_iter().map(|(export, instrument)| {
 ///     // 1. blocking iterator -> bounded stream, off the runtime's workers.
-///     stream_blocking_iter(DEFAULT_BLOCKING_CHANNEL_CAPACITY, move || {
+///     stream_blocking_iter(DEFAULT_BLOCKING_CHUNK_SIZE, move || {
 ///         read_export(&export, instrument)
 ///     })
 ///     // 2. bare event -> the merge's reconnect-aware item.

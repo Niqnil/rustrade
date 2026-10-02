@@ -7,7 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`stream_blocking_iter` decodes in chunks and needs a `Send + 'static` iterator**
+  (`rustrade-data`). **Breaking.** Each chunk of up to `chunk_size` items is decoded on its own
+  `spawn_blocking` task, which returns and gives its thread back. The stream starts the next chunk
+  when one arrives, and no further chunk until it is drained, so the decoder runs at most two chunks
+  ahead of its consumer (it was one channel's capacity). Nothing starts until the first poll, which
+  now needs a Tokio runtime where the call used to. The iterator moves between tasks, so it must be
+  `Send + 'static`, and a decoder with `!Send` internals is no longer accepted.
+  `DEFAULT_BLOCKING_CHANNEL_CAPACITY` is renamed `DEFAULT_BLOCKING_CHUNK_SIZE`, keeping its value of
+  1024. A dropped stream finishes the chunk in progress, rather than stopping at the next item.
+
 ### Fixed
+
+- **Merging more `stream_blocking_iter` streams than Tokio has blocking threads deadlocked**
+  (`rustrade-data`). Each stream held a blocking-pool thread for its whole decode, parked while its
+  consumer had not drained it. `merge_time_sorted` cannot emit until every input has buffered an
+  event, so past `max_blocking_threads` (512 by default) the inputs left without a thread held the
+  merge, and so the running decodes, forever, with no error or log. A thread is now held only while
+  a chunk is decoded, so any number of these streams can be merged (#231).
 
 - **An option expiring with two possible underlyings settled against whichever came first**
   (`rustrade`). When more than one `Spot` instrument matched an option's underlying base, quote
