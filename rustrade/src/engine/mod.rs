@@ -807,10 +807,14 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     /// 0. Rejects a `key` this engine was not built with, mutating nothing and recording no `id`,
     ///    with [`UnsupportedCorporateActionReason::UnknownInstrument`].
     /// 1. Idempotency guard on `id` (per-instrument `corporate_actions_processed` set). A
-    ///    duplicate `id` is skipped with a warning. This holds within a live session but does **not**
-    ///    survive a snapshot taken before the set existed; see the `corporate_actions_processed`
-    ///    field on [`InstrumentState`](crate::engine::state::instrument::InstrumentState) for the
-    ///    migration caveat.
+    ///    duplicate `id` is skipped with a warning. The target's set is the only guard on the equity
+    ///    leg; on a standard split, each option's own set guards that option (step 5). This holds
+    ///    within a live session but does **not** survive a snapshot taken before the set existed:
+    ///    with the target's record missing, its positions are split again while options a standard
+    ///    split already adjusted are skipped.
+    ///    See the `corporate_actions_processed` field on
+    ///    [`InstrumentState`](crate::engine::state::instrument::InstrumentState) for the migration
+    ///    caveat.
     /// 2. **Unsupported guards (no silent no-op, `id` not recorded ⇒ retryable).** The
     ///    instrument-kind check runs **first** so a split on an option is attributed to the
     ///    instrument, not the (supported) kind:

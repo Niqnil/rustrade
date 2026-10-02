@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`ExecutionClient::validate_config`** (`rustrade-execution`). A client can now check its config
+  against the instruments it is about to trade before it is constructed. `ExecutionBuilder` calls
+  it after `SUPPORTED_KINDS`, with the instruments executed on the client's exchange, as
+  `ClientInstrument`s carrying each one's `name_exchange` and kind, and fails the build with
+  `BarterError::ExecutionBuilder` on an `Err`. The default accepts every config, so existing
+  implementations are unaffected. A client constructed by calling `new` directly is not checked.
+
 ### Removed
 
 - **The public `SendRequests` trait** (`rustrade`). **Breaking.** Its two methods,
@@ -62,6 +71,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `LseError::AmbiguousInstrument`, since a candle source feeds a single instrument. `LseError` is
   `#[non_exhaustive]`. The LSE data terms still apply to anything a source retrieves: see
   <https://londonstrategicedge.com/terms>; redistribution is prohibited.
+- **An IBKR contract config could contradict the instrument it was keyed to** (`rustrade-execution`,
+  feature `ibkr`). Nothing compared a `ContractConfig`'s `security_type` with the kind of the
+  instrument named by its `name`, so a contract registered as `STK` for an instrument modelled as
+  an option routed that instrument's orders as stock orders. Built through `ExecutionBuilder`,
+  `IbkrClient` now fails the build when an entry's `security_type` contradicts its instrument's
+  kind (`STK` or `CASH` for spot, `FUT` for a future, `OPT` for an option), and when an entry is
+  invalid, such as a `FUT` with no `last_trade_date`, which `connect_sync` only logs and skips.
+  Every problem is reported at once. An entry naming no configured instrument is still accepted.
 - **A simulated venue could mint an `OrderId` its seeded account state already used**
   (`rustrade-execution`). `SimulatedVenue` counted its order ids from zero whatever its
   `initial_state` held, so an order seeded with id `3` shared it with the fourth order the venue

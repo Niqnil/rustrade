@@ -822,7 +822,8 @@ mod tests {
             MassiveOptions,
         ];
 
-        // Exhaustive, so a new variant fails to compile here until it is added to the list too.
+        // Exhaustive, so a new variant fails to compile here. The compiler cannot see the list
+        // above, so add the variant there too when adding it to this match.
         for exchange in &every {
             match exchange {
                 Other
@@ -897,19 +898,35 @@ mod tests {
         every
     }
 
+    /// One [`MarketDataInstrumentKind`] per variant.
     fn instrument_kinds() -> [MarketDataInstrumentKind; 5] {
         let expiry = Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap();
-        [
+        let every = [
             MarketDataInstrumentKind::Spot,
             MarketDataInstrumentKind::Perpetual,
             MarketDataInstrumentKind::Cfd,
             MarketDataInstrumentKind::Future(MarketDataFutureContract { expiry }),
             option(),
-        ]
+        ];
+
+        // Exhaustive, so a new variant fails to compile here. The compiler cannot see the list
+        // above, so add the variant there too when adding it to this match.
+        for kind in &every {
+            match kind {
+                MarketDataInstrumentKind::Spot
+                | MarketDataInstrumentKind::Perpetual
+                | MarketDataInstrumentKind::Cfd
+                | MarketDataInstrumentKind::Future(_)
+                | MarketDataInstrumentKind::Option(_) => {}
+            }
+        }
+
+        every
     }
 
+    /// Every [`SubKind`] variant, with [`SubKind::Candles`] at every [`CandleInterval`].
     fn sub_kinds() -> Vec<SubKind> {
-        [
+        let every: Vec<SubKind> = [
             SubKind::PublicTrades,
             SubKind::OrderBooksL1,
             SubKind::OrderBooksL2,
@@ -923,7 +940,23 @@ mod tests {
                 .into_iter()
                 .map(|interval| SubKind::Candles { interval }),
         )
-        .collect()
+        .collect();
+
+        // Exhaustive, so a new variant fails to compile here. The compiler cannot see the list
+        // above, so add the variant there too when adding it to this match.
+        for sub_kind in &every {
+            match sub_kind {
+                SubKind::PublicTrades
+                | SubKind::OrderBooksL1
+                | SubKind::OrderBooksL2
+                | SubKind::OrderBooksL3
+                | SubKind::Liquidations
+                | SubKind::Candles { .. }
+                | SubKind::Quotes => {}
+            }
+        }
+
+        every
     }
 
     fn subscription(
@@ -1036,6 +1069,58 @@ mod tests {
 
         // Guards against the loop passing vacuously.
         assert!(routed > 30, "only {routed} pairs were routed");
+    }
+
+    #[test]
+    fn every_pair_the_router_serves_is_accepted_by_the_support_matrix() {
+        let subscribers = every_subscriber();
+        let mut served = 0;
+
+        for exchange in every_exchange() {
+            for sub_kind in sub_kinds() {
+                // The router has no instrument-kind dimension, so any kind stands in for all.
+                // The futures are dropped unpolled, so nothing connects.
+                match route(
+                    vec![vec![subscription(
+                        exchange,
+                        MarketDataInstrumentKind::Spot,
+                        sub_kind,
+                    )]],
+                    &subscribers,
+                ) {
+                    Err(DataError::Unsupported { .. }) => continue,
+                    Ok(_) | Err(DataError::FeatureDisabled { .. }) => {}
+                    Err(error) => panic!(
+                        "routing {exchange} ({sub_kind}) failed with neither a route nor \
+                         Unsupported: {error}"
+                    ),
+                }
+                served += 1;
+
+                // The router's candle arms take every interval and the matrix narrows them per
+                // exchange, so a candle pair needs the matrix to accept only some interval.
+                let candidates = match sub_kind {
+                    SubKind::Candles { .. } => CandleInterval::ALL
+                        .into_iter()
+                        .map(|interval| SubKind::Candles { interval })
+                        .collect(),
+                    other => vec![other],
+                };
+                let accepted = instrument_kinds().iter().any(|kind| {
+                    candidates.iter().any(|candidate| {
+                        exchange_supports_instrument_kind_sub_kind(&exchange, kind, *candidate)
+                    })
+                });
+                assert!(
+                    accepted,
+                    "the router serves {exchange} ({sub_kind}), but the support matrix accepts \
+                     it for no instrument kind"
+                );
+            }
+        }
+
+        // Guards against the loop passing vacuously.
+        assert!(served > 30, "only {served} pairs were served");
     }
 
     #[test]
