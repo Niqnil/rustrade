@@ -5,13 +5,15 @@ use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::task::JoinHandle;
+use tracing::warn;
 
 /// Chunk size [`stream_blocking_iter`] is documented for, and a sensible default for a decoder
 /// feeding a backtest.
 ///
 /// Large enough that a blocking task is started once per thousand items rather than per item, small
 /// enough that the buffered events are an accounting rounding error next to the dataset. At ~160
-/// bytes per market event, the two chunks a stream can hold are ~320 KiB.
+/// bytes per market event, the two chunks one stream can hold are ~320 KiB. That is per stream: a
+/// merge of N streams holds up to N times as much, see [`stream_blocking_iter`].
 pub const DEFAULT_BLOCKING_CHUNK_SIZE: usize = 1024;
 
 /// Bridge a **blocking**, fallible iterator into a bounded [`Stream`], decoding on Tokio's blocking
@@ -42,6 +44,10 @@ pub const DEFAULT_BLOCKING_CHUNK_SIZE: usize = 1024;
 /// guarantees is "the decoder will not get more than two chunks ahead of its own consumer", not an
 /// end-to-end memory bound for whatever pipeline it is embedded in.
 ///
+/// The bound is also **per stream**. A [`merge_time_sorted`](super::merge::merge_time_sorted) of N
+/// of these polls every input until each has delivered a chunk, so it holds up to
+/// `2 × N × chunk_size` decoded items. For a merge of thousands of inputs, lower `chunk_size`.
+///
 /// # No thread is held while waiting, so any number of these can be merged
 /// A blocking thread is held only while a chunk is being decoded, never while the stream waits for
 /// its consumer. Building a stream starts nothing: the first chunk is started on first poll. Any
@@ -61,19 +67,21 @@ pub const DEFAULT_BLOCKING_CHUNK_SIZE: usize = 1024;
 /// truncated decode indistinguishable from a source that finished, and drive a backtest to a
 /// normal-looking summary over partial data.
 ///
-/// A [`tokio::task::JoinError`] that is *not* a panic ends the stream as a clean `None`. A
-/// `spawn_blocking` task cannot be aborted and this one's handle is never exposed, so the only way
-/// to reach that is runtime shutdown — where the consumer is being torn down for the same reason and
-/// has nothing left to do with the news.
+/// A [`tokio::task::JoinError`] that is *not* a panic ends the stream with `None`, after a `warn!`.
+/// This one's handle is never exposed, so nothing aborts the task, and the only way to reach that is
+/// runtime shutdown cancelling a chunk still queued for a thread. The consumer is normally being torn
+/// down for the same reason; the `warn!` says the decode was cut short in case it is not.
 ///
 /// # Cancellation
-/// Dropping the returned stream starts no further chunk. A chunk already being decoded cannot be
-/// pre-empted, so it runs to its end, at most `chunk_size` items, and its result is discarded with
-/// the iterator.
+/// Dropping the returned stream starts no further chunk. The chunk already started is not
+/// cancelled, whether it is being decoded or still waiting for a thread: it runs to its end, at most
+/// `chunk_size` items, and its result is discarded with the iterator. Letting it run keeps the
+/// iterator, and whatever its `Drop` does, on the blocking pool.
 ///
 /// # Panics
 /// Panics if `chunk_size` is zero (a chunk must deliver at least one item), and, when first polled,
-/// outside a Tokio runtime, like any [`tokio::task::spawn_blocking`] caller.
+/// outside a Tokio runtime, like any [`tokio::task::spawn_blocking`] caller. `chunk_size` bounds the
+/// items per chunk and is not allocated up front, so a large value such as `usize::MAX` is safe.
 ///
 /// **A panic in `init` or in the iterator is re-raised on the task that polls this stream**, with
 /// the original payload, at the point the stream would otherwise have ended. This mirrors
@@ -163,7 +171,9 @@ where
     Init: FnOnce() -> Result<Iter, Error>,
     Iter: Iterator<Item = Result<Item, Error>>,
 {
-    let mut items = Vec::with_capacity(chunk_size);
+    // Capped: `chunk_size` bounds the chunk, but a source may yield far fewer items, and a huge
+    // value would otherwise fail the allocation before decoding anything.
+    let mut items = Vec::with_capacity(chunk_size.min(DEFAULT_BLOCKING_CHUNK_SIZE));
 
     // `AssertUnwindSafe`: after a panic, the only state used again is `items`, which holds whole
     // items pushed before it. The iterator, the one value a panic could leave half-updated, is
@@ -278,9 +288,16 @@ where
                 // `decode_chunk` catches panics in the decode itself, so this is a panic outside
                 // it, still re-raised rather than lost.
                 Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-                // `spawn_blocking` tasks cannot be aborted, so the only way to reach this is
-                // runtime shutdown, where the consumer is going away too.
-                Err(_) => return Poll::Ready(None),
+                // Nothing aborts the task, so this is runtime shutdown cancelling a chunk still
+                // queued for a thread. The consumer is normally going away too.
+                Err(error) => {
+                    warn!(
+                        %error,
+                        "stream_blocking_iter: the runtime cancelled a decode chunk - ending the \
+                         stream early"
+                    );
+                    return Poll::Ready(None);
+                }
             };
 
             // Start the next chunk before yielding this one, so decoding overlaps consumption. No
@@ -444,15 +461,83 @@ mod tests {
             }))
         }));
 
-        // Take one item, then give the next chunk's task ample time to finish.
+        // Take one item, then wait for the next chunk, which starts as soon as the first arrives
+        // so that decoding overlaps consumption.
         assert_eq!(stream.next().await.unwrap().unwrap(), 0);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut waited = 0;
+        while produced.load(Ordering::SeqCst) < 2 * CHUNK {
+            assert!(
+                waited < 500,
+                "the next chunk was not started ahead of the consumer"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            waited += 1;
+        }
 
-        // The chunk being drained and the one decoded after it, and no third.
+        // Then give a third chunk every chance to appear: it must not.
+        tokio::time::sleep(Duration::from_millis(50)).await;
         let produced = produced.load(Ordering::SeqCst);
-        assert!(
-            produced <= 2 * CHUNK,
+        assert_eq!(
+            produced,
+            2 * CHUNK,
             "producer ran {produced} items ahead with chunks of {CHUNK}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "non-zero chunk size")]
+    fn a_zero_chunk_size_is_rejected() {
+        let _stream = stream_blocking_iter(0, || ok_iter(1));
+    }
+
+    /// Every chunk size delivers every item once, in order, including sizes that divide the item
+    /// count exactly and a size far larger than the source.
+    #[tokio::test]
+    async fn every_chunk_size_forwards_every_item_in_order() {
+        for chunk_size in [1, 2, 3, 5, 10, usize::MAX] {
+            let items = stream_blocking_iter(chunk_size, || ok_iter(10))
+                .map(|item| item.unwrap())
+                .collect::<Vec<_>>()
+                .await;
+            assert_eq!(
+                items,
+                (0..10).collect::<Vec<_>>(),
+                "chunk size {chunk_size}"
+            );
+        }
+
+        let empty = stream_blocking_iter(4, || ok_iter(0))
+            .collect::<Vec<_>>()
+            .await;
+        assert!(empty.is_empty());
+    }
+
+    /// A panic after earlier chunks were handed over arrives after all of their items, and the
+    /// stream then reads as ended.
+    #[tokio::test]
+    async fn a_panic_in_a_later_chunk_follows_every_earlier_item() {
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+
+        let sink = Arc::clone(&delivered);
+        let mut stream = Box::pin(stream_blocking_iter(2, || {
+            Ok((0..10).map(|index: usize| {
+                assert!(index < 5, "boom");
+                Ok::<usize, Error>(index)
+            }))
+        }));
+        let collect = std::panic::AssertUnwindSafe(async {
+            while let Some(item) = stream.next().await {
+                sink.lock().unwrap().push(item.unwrap());
+            }
+        });
+
+        let outcome = futures::FutureExt::catch_unwind(collect).await;
+
+        assert!(outcome.is_err(), "the panic must not be swallowed");
+        assert_eq!(*delivered.lock().unwrap(), vec![0, 1, 2, 3, 4]);
+        assert!(
+            stream.next().await.is_none(),
+            "polled again after the panic, the stream reads as ended"
         );
     }
 
@@ -544,6 +629,11 @@ mod tests {
         assert!(
             settled < ITEMS,
             "the producer ran to completion ({settled} items) despite the stream being dropped"
+        );
+        // Tighter: the first chunk and the one started ahead of it, and nothing after the drop.
+        assert!(
+            settled <= 2 * 2,
+            "{settled} items were decoded, more than the two chunks started before the drop"
         );
     }
 }

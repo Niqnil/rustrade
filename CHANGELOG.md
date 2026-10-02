@@ -13,8 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`rustrade-data`). **Breaking.** Each chunk of up to `chunk_size` items is decoded on its own
   `spawn_blocking` task, which returns and gives its thread back. The stream starts the next chunk
   when one arrives, and no further chunk until it is drained, so the decoder runs at most two chunks
-  ahead of its consumer (it was one channel's capacity). Nothing starts until the first poll, which
-  now needs a Tokio runtime where the call used to. The iterator moves between tasks, so it must be
+  ahead of its consumer (it was one channel's capacity); a merge of N streams holds up to N times
+  that. Nothing starts until the first poll, so `init`, and an error opening the source, now happen
+  then rather than at the call, and the first poll needs a Tokio runtime where the call used to. The
+  iterator moves between tasks, so it must be
   `Send + 'static`, and a decoder with `!Send` internals is no longer accepted.
   `DEFAULT_BLOCKING_CHANNEL_CAPACITY` is renamed `DEFAULT_BLOCKING_CHUNK_SIZE`, keeping its value of
   1024. A dropped stream finishes the chunk in progress, rather than stopping at the next item.
