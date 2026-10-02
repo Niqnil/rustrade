@@ -43,11 +43,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cancelled, expired or rejected meanwhile stayed live in engine state until a complete snapshot
   dropped it, and even then nobody learned how it ended. `BinanceSpot` now holds the orders it has
   seen live: from placing them, from `account_snapshot` and `fetch_open_orders`, and from the
-  stream, until it sees them end. It holds up to 4,096. After a reconnect, and once an
-  instrument's missed fills are recovered, it lists that instrument's open orders. It then looks
+  stream, until it sees them end. It holds up to 4,096. After a reconnect, for each instrument the
+  stream was opened with, and once that instrument's missed fills are recovered, it lists the
+  instrument's open orders. It then looks
   up each held order the listing no longer shows with `GET /api/v3/order` by client order id, and
   sends each that ended as an `OrderSnapshot` of its inactive state, under `StrategyId::unknown()`.
-  A check that fails is retried on the fill gaps' schedule. `BinanceSpot` also implements
+  Each instrument is settled as its check ends, and one that fails is retried on the fill gaps'
+  schedule. An order Binance does not know stops being held. `BinanceSpot` also implements
   `OrderStatusClient` with the same lookup: `FILLED` with its average price, `CANCELED` and
   `EXPIRED`/`EXPIRED_IN_MATCH` with what filled before, `REJECTED` as `OpenFailed`, and an order
   unknown under the key's symbol (`-2013`, `-1121`) omitted. Refs #370. Binance Margin and the

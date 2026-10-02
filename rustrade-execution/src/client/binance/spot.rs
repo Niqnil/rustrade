@@ -34,20 +34,20 @@
 //   quantity is settled instead by the terminal report's own z, or by fetch_open_orders.
 
 use super::order_recovery::{
-    KnownLiveOrders, ORDER_CHECK_TIMEOUT_SECS, SharedKnownLiveOrders, UncheckedOrders,
-    fetch_ended_by_key,
+    KnownLiveOrders, OrderLookup, SharedKnownLiveOrders, UncheckedOrders, fetch_ended_by_key,
+    recover_ended_orders,
 };
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
-    CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, GapFailure,
-    HEARTBEAT_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing,
-    RateLimitTracker, RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnrecoveredFills,
-    UserDataFrame, WeightPool, classify_order_kind_tif, classify_rest_query_error,
-    classify_ws_order_error, convert_ended_order, convert_execution_report,
-    convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event, drop_after,
-    gap_failed, gap_time, is_duplicate, is_handshake_rate_limit, is_unknown_order,
-    log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, recovered_order_totals,
-    response_decode_error, rest_call_with_retry, unix_ms,
+    CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
+    MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, RateLimitTracker, RequestKind,
+    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnrecoveredFills, UserDataFrame, WeightPool,
+    classify_order_kind_tif, classify_rest_query_error, classify_ws_order_error,
+    convert_ended_order, convert_execution_report, convert_open_order_listing,
+    convert_open_order_owned_symbol, dedup_key_from_event, drop_after, gap_failed, gap_time,
+    is_duplicate, is_handshake_rate_limit, is_unknown_order, log_unrecognised_frame,
+    new_dedup_cache, parse_user_data_frame, recovered_order_totals, response_decode_error,
+    rest_call_with_retry, unix_ms,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
@@ -515,14 +515,13 @@ async fn fetch_all_open_orders(
     Ok(orders)
 }
 
-/// How the order under `key` ended, from `GET /api/v3/order` by its client order id (weight 4), or
-/// `None` when it is still live or Binance does not know it under `key`'s symbol.
-async fn fetch_ended_order(
+/// Look the order under `key` up with `GET /api/v3/order` by its client order id (weight 4).
+async fn fetch_order_lookup(
     rest: Arc<RestApi>,
     rate_limiter: Arc<RateLimitTracker>,
     key: UnindexedOrderKey,
     kind: RequestKind,
-) -> Result<Option<UnindexedInactiveOrder>, UnindexedClientError> {
+) -> Result<OrderLookup, UnindexedClientError> {
     // Convert once before the retry closure to avoid a String allocation on every retry.
     let symbol = key.instrument.name().to_string();
     let cid = key.cid.0.to_string();
@@ -540,14 +539,63 @@ async fn fetch_ended_order(
         Ok(response) => response,
         Err(e) if is_unknown_order(&e) => {
             debug!(instrument = %key.instrument, cid = %key.cid, error = %e, "BinanceSpot does not know this order");
-            return Ok(None);
+            return Ok(OrderLookup::Unknown);
         }
         Err(e) => return Err(classify_rest_query_error(&e, Some(&key.instrument))),
     };
 
     let row = response.data().await.map_err(response_decode_error)?;
 
-    Ok(convert_ended_order(&row, ExchangeId::BinanceSpot, &key))
+    Ok(convert_ended_order(&row, ExchangeId::BinanceSpot, &key)
+        .map_or(OrderLookup::NotEnded, |order| {
+            OrderLookup::Ended(Box::new(order))
+        }))
+}
+
+/// The client order ids `GET /api/v3/openOrders` lists on `instrument` (weight 6), for a
+/// reconnect's check of the orders held as live.
+async fn listed_open_cids(
+    rest: Arc<RestApi>,
+    rate_limiter: Arc<RateLimitTracker>,
+    instrument: InstrumentNameExchange,
+) -> Result<FnvHashSet<ClientOrderId>, UnindexedClientError> {
+    let (_, listing) =
+        fetch_open_orders_for_instrument(rest, rate_limiter, instrument, RequestKind::Essential)
+            .await?;
+    Ok(listing
+        .orders
+        .into_iter()
+        .map(|order| order.key.cid)
+        .collect())
+}
+
+/// [`recover_ended_orders`] on Binance Spot: listings by [`listed_open_cids`] and lookups by
+/// [`fetch_order_lookup`], both [`RequestKind::Essential`], as fill recovery's reads are.
+async fn recover_spot_ended_orders(
+    rest: &Arc<RestApi>,
+    rate_limiter: &Arc<RateLimitTracker>,
+    known: &SharedKnownLiveOrders,
+    unchecked: &mut UncheckedOrders,
+    unrecovered: &UnrecoveredFills,
+    tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
+) {
+    recover_ended_orders(
+        ExchangeId::BinanceSpot,
+        known,
+        unchecked,
+        unrecovered,
+        tx,
+        |instrument| listed_open_cids(rest.clone(), rate_limiter.clone(), instrument),
+        |key| {
+            fetch_order_lookup(
+                rest.clone(),
+                rate_limiter.clone(),
+                key,
+                RequestKind::Essential,
+            )
+        },
+    )
+    .await;
 }
 
 /// Paginate `GET /api/v3/myTrades` for a single instrument, from `from`.
@@ -784,9 +832,10 @@ impl ExecutionClient for BinanceSpot {
     ///
     /// # Orders that ended while disconnected
     ///
-    /// A reconnect also reports how each order the client holds as live ended, where it did,
-    /// as an [`AccountEventKind::OrderSnapshot`] of its inactive state: filled, cancelled with
-    /// what filled before, expired, or rejected. Binance's order history filters on when an
+    /// A reconnect also reports how each order the client holds as live on one of `instruments`
+    /// ended, where it did, as an [`AccountEventKind::OrderSnapshot`] of its inactive state:
+    /// filled, cancelled with what filled before, expired, or rejected. Like fill recovery, it
+    /// covers only the instruments the stream was opened with. Binance's order history filters on when an
     /// order was created, so such an order is found by asking about it, not by time.
     ///
     /// - **Which orders.** The client holds an order as live from the response to placing it,
@@ -802,10 +851,11 @@ impl ExecutionClient for BinanceSpot {
     ///   its full quantity ends it, and that order is not reported again.
     /// - **Keys.** Each snapshot carries [`StrategyId::unknown`], since Binance records no
     ///   strategy. The engine matches it to the order it tracks by client order id.
-    /// - **Failures.** A check that fails or outlasts 30 s is retried on the fill gaps' schedule
-    ///   (1, 2, 4, 8 and 16 minutes), then given up, logged at `error`. An order not reported then
-    ///   is asked about again at the next reconnect. An order Binance no longer lists and does
-    ///   not report as ended (unknown to it) stops being held, logged at `warn`.
+    /// - **Failures.** Each instrument is settled as soon as its check ends. One whose check fails,
+    ///   or is still running when a pass reaches 30 s, is retried on the fill gaps' schedule (1, 2,
+    ///   4, 8 and 16 minutes), then given up, logged at `error`. Its orders are asked about again
+    ///   at the next reconnect. An order Binance does not know (`-2013`) stops being held, logged
+    ///   at `warn`; one it still reports live, or in a state this version cannot read, stays held.
     ///
     /// The same lookup is public as [`OrderStatusClient::fetch_ended_orders`].
     async fn account_stream(
@@ -1486,15 +1536,13 @@ impl ExecutionClient for BinanceSpot {
 // Connection manager (reconnection, heartbeat, fill recovery)
 // ---------------------------------------------------------------------------
 
-/// Connect to Binance WS and subscribe to the user data stream.
-/// On failure, disconnects the WS to avoid leaking the TCP connection.
 /// Looks each order up with `GET /api/v3/order` by symbol and client order id, weight 4 each, up
 /// to eight at a time. Binance's `FILLED` is reported with its average price, `CANCELED` with
 /// what filled before it, `EXPIRED` and `EXPIRED_IN_MATCH` (self-trade prevention) as expired, and
 /// `REJECTED` as [`OpenFailed`](crate::order::state::InactiveOrderState::OpenFailed). An order
 /// Binance does not know under the key's symbol (`-2013`, or `-1121` for a symbol that does not
 /// exist) is omitted. A row whose status this version does not know is omitted too, with a
-/// warning.
+/// warning, as is a `PENDING_CANCEL` one, which Binance does not use.
 ///
 /// The account stream runs the same lookup itself after a reconnect; see
 /// [`account_stream`](ExecutionClient::account_stream).
@@ -1504,7 +1552,7 @@ impl OrderStatusClient for BinanceSpot {
         orders: &[UnindexedOrderKey],
     ) -> Result<Vec<UnindexedInactiveOrder>, UnindexedClientError> {
         fetch_ended_by_key(orders, |key| {
-            fetch_ended_order(
+            fetch_order_lookup(
                 self.rest.clone(),
                 self.rate_limiter.clone(),
                 key,
@@ -1515,6 +1563,8 @@ impl OrderStatusClient for BinanceSpot {
     }
 }
 
+/// Connect to Binance WS and subscribe to the user data stream.
+/// On failure, disconnects the WS to avoid leaking the TCP connection.
 async fn connect_and_subscribe(ws_handle: &WebsocketApiHandle) -> anyhow::Result<WebsocketApi> {
     let ws = ws_handle.connect().await?;
     #[allow(clippy::expect_used)] // Builder has no required fields; infallible
@@ -1670,9 +1720,13 @@ async fn connection_manager(
                         // Held across the send, so an order this reports ending and a reconnect's
                         // check of it reach the stream in the order they were decided, and the
                         // check reports only an order not already reported.
-                        let mut known = known_callback.lock();
-                        known.observe(&ev);
+                        let known = KnownLiveOrders::observes(&ev.kind).then(|| {
+                            let mut known = known_callback.lock();
+                            known.observe(&ev);
+                            known
+                        });
                         if sender.send(ev).is_err() {
+                            drop(known);
                             warn!("BinanceSpot account_stream receiver dropped, suppressing further sends");
                             event_tx.take();
                             if let Some(s) = signal_tx_opt.take() {
@@ -1724,11 +1778,12 @@ async fn connection_manager(
         // that fails or times out is kept for a retry.
         if let Some(dt) = disconnect_time.take() {
             unrecovered.open(&instruments, dt, Utc::now());
-            let held = known.lock().instruments();
+            // Only the instruments this stream recovers fills for, so fills-first holds for each.
+            let held = known.lock().instruments_among(&instruments);
             unchecked.open(held);
         }
         recover_fills(&rest, &rate_limiter, &mut unrecovered, &tx, &dedup, &known).await;
-        recover_ended_orders(
+        recover_spot_ended_orders(
             &rest,
             &rate_limiter,
             &known,
@@ -1753,18 +1808,14 @@ async fn connection_manager(
             // check sends nothing until it has its answer.
             let retry_gaps = async {
                 loop {
-                    match unrecovered
-                        .next_due()
-                        .into_iter()
-                        .chain(unchecked.retry_at())
-                        .min()
-                    {
+                    let next_check = unchecked.next_due(&unrecovered);
+                    match unrecovered.next_due().into_iter().chain(next_check).min() {
                         Some(due) => tokio::time::sleep_until(due).await,
                         None => std::future::pending::<()>().await,
                     }
                     recover_fills(&rest, &rate_limiter, &mut unrecovered, &tx, &dedup, &known)
                         .await;
-                    recover_ended_orders(
+                    recover_spot_ended_orders(
                         &rest,
                         &rate_limiter,
                         &known,
@@ -2042,170 +2093,6 @@ async fn recover_fills(
                 "fill recovery timed out",
             );
         }
-    }
-}
-
-/// Report how each order held as live ended, where it has, on every instrument due for a check:
-/// the order lifecycle events missed while the stream was disconnected.
-///
-/// Checks only an instrument [`recover_fills`] has no gap left on (see [`UncheckedOrders`]), so an
-/// order's recovered fills reach the stream before how it ended. For each, it lists the open orders
-/// and looks up by client order id ([`fetch_ended_order`]) each order held as live that the listing
-/// no longer shows: one request per instrument plus one per order that ended, rather than one per
-/// order held. The orders held are read before the listings, so one placed after a listing cannot
-/// be taken for one that ended.
-///
-/// Each order that has ended is sent as an [`AccountEventKind::OrderSnapshot`] of its inactive
-/// state, under [`StrategyId::unknown`], and leaves the set. One the stream reported ending in the
-/// meantime has left it already, and is not sent twice. An order a complete listing does not show
-/// and the lookup does not report ended is unknown to Binance, or ended in a way this version
-/// cannot read; asking again cannot change that, so it leaves the set, with a warning.
-///
-/// A check sends nothing until every request has answered, so dropping it part-way loses nothing.
-/// One that fails or outlasts [`ORDER_CHECK_TIMEOUT_SECS`] is retried later. Its requests are
-/// [`RequestKind::Essential`], as fill recovery's are.
-async fn recover_ended_orders(
-    rest: &Arc<RestApi>,
-    rate_limiter: &Arc<RateLimitTracker>,
-    known: &SharedKnownLiveOrders,
-    unchecked: &mut UncheckedOrders,
-    unrecovered: &UnrecoveredFills,
-    tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
-) {
-    use futures::{StreamExt as _, TryStreamExt as _};
-
-    let ready = unchecked.ready(unrecovered, tokio::time::Instant::now());
-    if ready.is_empty() {
-        return;
-    }
-    let held: Vec<(InstrumentNameExchange, Vec<UnindexedOrderKey>)> = {
-        let known = known.lock();
-        ready
-            .iter()
-            .map(|instrument| {
-                let keys = known.keys_on(ExchangeId::BinanceSpot, instrument);
-                (instrument.clone(), keys)
-            })
-            .filter(|(_, keys)| !keys.is_empty())
-            .collect()
-    };
-    if held.is_empty() {
-        unchecked.checked(&ready);
-        return;
-    }
-    info!(
-        instruments = held.len(),
-        orders = held.iter().map(|(_, keys)| keys.len()).sum::<usize>(),
-        "BinanceSpot checking how the orders held as live ended while disconnected"
-    );
-
-    let check = async {
-        // Per instrument: the orders held that its listing no longer shows, and whether the listing
-        // was complete, so that one it does not show is known not to be live.
-        let unlisted: Vec<(Vec<UnindexedOrderKey>, bool)> =
-            futures::stream::iter(held.into_iter().map(|(instrument, keys)| async move {
-                let (_, listing) = fetch_open_orders_for_instrument(
-                    rest.clone(),
-                    rate_limiter.clone(),
-                    instrument,
-                    RequestKind::Essential,
-                )
-                .await?;
-                let listed: FnvHashSet<&ClientOrderId> =
-                    listing.orders.iter().map(|order| &order.key.cid).collect();
-                let unlisted = keys
-                    .into_iter()
-                    .filter(|key| !listed.contains(&key.cid))
-                    .collect();
-                Ok::<_, UnindexedClientError>((unlisted, listing.complete))
-            }))
-            .buffer_unordered(8)
-            .try_collect()
-            .await?;
-        let lookups: Vec<UnindexedOrderKey> = unlisted
-            .iter()
-            .flat_map(|(keys, _)| keys.iter().cloned())
-            .collect();
-        let ended = fetch_ended_by_key(&lookups, |key| {
-            fetch_ended_order(
-                rest.clone(),
-                rate_limiter.clone(),
-                key,
-                RequestKind::Essential,
-            )
-        })
-        .await?;
-        Ok::<_, UnindexedClientError>((unlisted, ended))
-    };
-    let (unlisted, ended) =
-        match tokio::time::timeout(Duration::from_secs(ORDER_CHECK_TIMEOUT_SECS), check).await {
-            Ok(Ok(found)) => found,
-            Ok(Err(e)) => return order_check_failed(unchecked, &ready, &e.to_string()),
-            Err(_) => return order_check_failed(unchecked, &ready, "order check timed out"),
-        };
-
-    let mut known = known.lock();
-    let ended_cids: FnvHashSet<ClientOrderId> =
-        ended.iter().map(|order| order.key.cid.clone()).collect();
-    let mut reported = 0u32;
-    for order in ended {
-        if !known.ended(&order.key.cid) {
-            continue;
-        }
-        let event = UnindexedAccountEvent::new(
-            ExchangeId::BinanceSpot,
-            AccountEventKind::OrderSnapshot(
-                rustrade_integration::collection::snapshot::Snapshot::new(
-                    order.map_state(OrderState::Inactive),
-                ),
-            ),
-        );
-        if tx.send(event).is_err() {
-            debug!("BinanceSpot order check: consumer dropped during recovery");
-            return;
-        }
-        reported += 1;
-    }
-    for key in unlisted
-        .iter()
-        .filter(|(_, complete)| *complete)
-        .flat_map(|(keys, _)| keys)
-        .filter(|key| !ended_cids.contains(&key.cid))
-    {
-        if known.ended(&key.cid) {
-            warn!(
-                instrument = %key.instrument,
-                cid = %key.cid,
-                "BinanceSpot no longer lists this order as open and does not say how it ended; \
-                 a reconnect no longer asks about it"
-            );
-        }
-    }
-    unchecked.checked(&ready);
-    info!(reported, "BinanceSpot order check complete");
-}
-
-/// Record that a check of how the orders held as live on `instruments` ended did not finish,
-/// because of `reason`, and log what follows: a retry, or giving the check up.
-fn order_check_failed(
-    unchecked: &mut UncheckedOrders,
-    instruments: &[InstrumentNameExchange],
-    reason: &str,
-) {
-    match unchecked.failed(tokio::time::Instant::now()) {
-        GapFailure::Retry(delay) => warn!(
-            ?instruments,
-            retry_in_secs = delay.as_secs(),
-            reason,
-            "BinanceSpot could not check how the orders held as live ended, retrying later"
-        ),
-        GapFailure::GivenUp => error!(
-            ?instruments,
-            reason,
-            "BinanceSpot gave up checking how the orders held as live ended: an order that ended \
-             while disconnected stays live in engine state until the next reconnect checks it; \
-             reconcile with fetch_open_orders"
-        ),
     }
 }
 
@@ -5574,7 +5461,7 @@ mod tests {
         let mut unchecked = btcusdt_unchecked();
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        recover_ended_orders(
+        recover_spot_ended_orders(
             &rest_at(&server),
             &Arc::new(RateLimitTracker::new(WeightPool::Spot)),
             &known,
@@ -5627,7 +5514,7 @@ mod tests {
         let unrecovered = UnrecoveredFills::default();
 
         tokio::join!(
-            recover_ended_orders(&rest, &tracker, &known, &mut unchecked, &unrecovered, &tx,),
+            recover_spot_ended_orders(&rest, &tracker, &known, &mut unchecked, &unrecovered, &tx,),
             async {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 known.lock().ended(&ClientOrderId::new("gone"));
@@ -5651,7 +5538,7 @@ mod tests {
         );
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        recover_ended_orders(
+        recover_spot_ended_orders(
             &rest_at(&server),
             &Arc::new(RateLimitTracker::new(WeightPool::Spot)),
             &known,
@@ -5664,7 +5551,7 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert!(server.received_requests().await.unwrap().is_empty());
         assert!(!unchecked.is_empty(), "it waits for its fills");
-        assert_eq!(unchecked.retry_at(), None);
+        assert_eq!(unchecked.next_due(&unrecovered), None, "woken by the gap");
     }
 
     #[tokio::test]
@@ -5680,7 +5567,7 @@ mod tests {
         let mut unchecked = btcusdt_unchecked();
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        recover_ended_orders(
+        recover_spot_ended_orders(
             &server_rest,
             &Arc::new(RateLimitTracker::new(WeightPool::Spot)),
             &known,
@@ -5692,10 +5579,131 @@ mod tests {
 
         assert!(rx.try_recv().is_err());
         assert!(!unchecked.is_empty());
-        assert!(unchecked.retry_at().is_some(), "retried after a backoff");
+        assert!(
+            unchecked
+                .next_due(&UnrecoveredFills::default())
+                .is_some_and(|due| due > tokio::time::Instant::now()),
+            "retried after a backoff"
+        );
         assert!(
             known.lock().contains(&ClientOrderId::new("gone")),
             "still held"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unlisted_order_the_lookup_finds_live_stays_held() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/openOrders"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        for (cid, status) in [
+            ("live", "NEW"),
+            ("gone", "PENDING_CANCEL"),
+            ("unknown", "WHAT"),
+        ] {
+            mount_order(&server, cid, row_response(cid, status)).await;
+        }
+        let known = held_orders();
+        let mut unchecked = btcusdt_unchecked();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        recover_spot_ended_orders(
+            &rest_at(&server),
+            &Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+            &known,
+            &mut unchecked,
+            &UnrecoveredFills::default(),
+            &tx,
+        )
+        .await;
+
+        assert!(rx.try_recv().is_err(), "none has ended");
+        let known = known.lock();
+        for cid in ["live", "gone", "unknown"] {
+            assert!(
+                known.contains(&ClientOrderId::new(cid)),
+                "{cid}: only an order Binance does not know is dropped"
+            );
+        }
+        assert!(unchecked.is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_instrument_failing_does_not_hold_up_another() {
+        let server = venue_after_a_disconnect(Duration::ZERO).await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/openOrders"))
+            .and(wiremock::matchers::query_param("symbol", "ETHUSDT"))
+            .respond_with(venue_error(-1100))
+            .mount(&server)
+            .await;
+        let known = held_orders();
+        let eth = spot_key("ETHUSDT", "eth");
+        known.lock().live(
+            &eth,
+            Decimal::TWO,
+            &Open::new(
+                VenueOrderId::Assigned(OrderId::new("9")),
+                Utc::now(),
+                Decimal::ZERO,
+            ),
+        );
+        let mut unchecked = btcusdt_unchecked();
+        unchecked.open([eth.instrument.clone()]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        recover_spot_ended_orders(
+            &rest_at(&server),
+            &Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+            &known,
+            &mut unchecked,
+            &UnrecoveredFills::default(),
+            &tx,
+        )
+        .await;
+
+        let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(sent.len(), 1, "BTCUSDT's ended order: {sent:?}");
+        assert!(!unchecked.contains(&InstrumentNameExchange::new("BTCUSDT")));
+        assert!(
+            unchecked.contains(&eth.instrument),
+            "ETHUSDT waits for its retry"
+        );
+        assert!(known.lock().contains(&eth.cid));
+    }
+
+    #[tokio::test]
+    async fn a_check_dropped_part_way_changes_nothing() {
+        let server = venue_after_a_disconnect(Duration::from_millis(500)).await;
+        let known = held_orders();
+        let mut unchecked = btcusdt_unchecked();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(100),
+            recover_spot_ended_orders(
+                &rest_at(&server),
+                &Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+                &known,
+                &mut unchecked,
+                &UnrecoveredFills::default(),
+                &tx,
+            ),
+        )
+        .await;
+
+        assert!(dropped.is_err(), "the lookup of `gone` was still waiting");
+        assert!(rx.try_recv().is_err());
+        assert!(known.lock().contains(&ClientOrderId::new("gone")));
+        assert!(unchecked.contains(&InstrumentNameExchange::new("BTCUSDT")));
+        assert!(
+            unchecked
+                .next_due(&UnrecoveredFills::default())
+                .is_some_and(|due| due <= tokio::time::Instant::now()),
+            "still due, not charged a failure"
         );
     }
 }
