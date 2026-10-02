@@ -45,8 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     that position has no entry price.
   - Not modelled: funding, financing and liquidation. A short that loses more than its margin pays
     the shortfall.
-  - **Breaking:** `AccountState::commit` takes the fill's `Option<&Credit>` (new type). A fixture
-    or assertion that relied on a CFD close debiting the notional again now sees a credit.
+  - **Breaking:** `AccountState::commit` takes the fill's `credit: Decimal`, paid into the debit's
+    asset and zero for spot. A fixture or assertion that relied on a CFD close debiting the
+    notional again now sees a credit.
 
 - **An option expiring with two possible underlyings settled against whichever came first**
   (`rustrade`). When more than one `Spot` instrument matched an option's underlying base, quote

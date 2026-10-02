@@ -289,34 +289,34 @@ impl AccountState {
     /// conservative reservation that had to be released and re-debited would.
     ///
     /// # A credit funds the debit it arrives with
-    /// A fill that closes a cash-settled position pays proceeds back (see [`Credit`]). They are
-    /// part of the same fill, so they count towards what `free` must cover: a CFD flip, closing a
-    /// long and opening a short in one order, is funded by the long it closes. The credit is
-    /// applied only once the whole requirement is known to be covered, so a refusal still leaves
-    /// the ledger exactly as it was.
+    /// A fill that closes a cash-settled position pays proceeds back: `credit`, the margin and
+    /// realised PnL of what it closes, paid into the debit's own asset, since one fill moves one
+    /// asset. A spot fill, or a CFD fill that closes nothing, passes zero. The credit is separate
+    /// from the debit rather than netted into it, because one fill can carry both: a CFD flip,
+    /// closing a long and opening a short in one order, is paid back for the long and posts margin
+    /// for the short. Both are part of the same fill, so the credit counts towards what `free` must
+    /// cover, and the flip is funded by the long it closes. The credit is applied only once the
+    /// whole requirement is known to be covered, so a refusal still leaves the ledger exactly as it
+    /// was.
     ///
     /// # Errors
     /// [`BalanceInsufficient`] if `free` plus the credit does not cover
     /// [`settled`](Debit::settled) + [`reserved`](Debit::reserved), leaving the ledger untouched.
     ///
     /// # Panics
-    /// Panics if the asset has no balance — see [`reserve`](Self::reserve). Debug-asserts that a
-    /// credit names the debit's asset: one fill moves one asset.
+    /// Panics if the asset has no balance — see [`reserve`](Self::reserve). Debug-asserts that
+    /// `credit` is not negative: a loss beyond the margin is part of the debit, not a credit.
     pub fn commit(
         &mut self,
         debit: &Debit,
-        credit: Option<&Credit>,
+        credit: Decimal,
         time_exchange: DateTime<Utc>,
     ) -> Result<AssetBalance<AssetNameExchange>, BalanceInsufficient> {
-        let credit = credit.map_or(Decimal::ZERO, |credit| {
-            debug_assert!(
-                credit.asset == debit.asset,
-                "one fill debits {} and credits {}: a fill moves one asset",
-                debit.asset,
-                credit.asset
-            );
-            credit.amount
-        });
+        debug_assert!(
+            !credit.is_sign_negative(),
+            "a credit of {credit} {} is negative: a loss beyond the margin is debited",
+            debit.asset
+        );
 
         // Asked for as one requirement, so a refusal refuses the arrival rather than half of it.
         let required = debit.settled + debit.reserved;
@@ -380,21 +380,6 @@ pub struct Debit {
     /// Held against a remainder that is still working. Lowers `free` and leaves `total`, so it is
     /// still the account's until whatever it is held against settles or is released.
     pub reserved: Decimal,
-}
-
-/// What one fill pays back into one asset's balance: the proceeds of closing a cash-settled
-/// position.
-///
-/// Separate from [`Debit`] rather than a negative amount in it, because one fill can carry both
-/// at once. A CFD flip closes a position, which pays its margin and realised PnL back, and opens
-/// one, which posts margin and the fee. A signed amount would net the two before the ledger saw
-/// either.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Credit {
-    /// The asset paid back into, which is the asset the fill's [`Debit`] names.
-    pub asset: AssetNameExchange,
-    /// Added to `free` and `total` alike. Never negative.
-    pub amount: Decimal,
 }
 
 /// A ledger operation asked for more of an asset than `free` covers.
@@ -476,5 +461,75 @@ impl From<UnindexedAccountSnapshot> for AccountState {
             orders_expired: FnvHashMap::default(),
             trades: vec![],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{balance::Balance, exchange::mock::fixtures::funded};
+    use rust_decimal_macros::dec;
+
+    fn usd() -> AssetNameExchange {
+        AssetNameExchange::new("usd")
+    }
+
+    fn account_with_usd(amount: Decimal) -> AccountState {
+        AccountState::new(
+            FnvHashMap::from_iter([(usd(), funded(usd(), amount))]),
+            OpenOrders::default(),
+            FnvHashMap::default(),
+            vec![],
+        )
+    }
+
+    fn usd_balance(account: &AccountState) -> Balance {
+        let Some(balance) = account.balances().find(|balance| balance.asset == usd()) else {
+            panic!("the account holds usd");
+        };
+        balance.balance
+    }
+
+    /// A CFD flip: what closing the old position pays back funds the margin the new one posts,
+    /// so a requirement above `free` alone is met, and the remainder's hold stays held.
+    #[test]
+    fn a_credit_counts_towards_the_requirement_it_arrives_with() {
+        let mut account = account_with_usd(dec!(100));
+        let debit = Debit {
+            asset: usd(),
+            settled: dec!(250),
+            reserved: dec!(40),
+        };
+
+        let Ok(balance) = account.commit(&debit, dec!(200), DateTime::<Utc>::MIN_UTC) else {
+            panic!("100 free plus a 200 credit covers 290");
+        };
+
+        // total: 100 + 200 credited - 250 settled; free: that, less the 40 still held.
+        assert_eq!(balance.balance, Balance::new(dec!(50), dec!(10)));
+        assert_eq!(usd_balance(&account), Balance::new(dec!(50), dec!(10)));
+    }
+
+    #[test]
+    fn a_refused_commit_applies_none_of_its_credit() {
+        let mut account = account_with_usd(dec!(100));
+        let debit = Debit {
+            asset: usd(),
+            settled: dec!(250),
+            reserved: dec!(60),
+        };
+
+        let Err(insufficient) = account.commit(&debit, dec!(200), DateTime::<Utc>::MIN_UTC) else {
+            panic!("100 free plus a 200 credit does not cover 310");
+        };
+
+        assert_eq!(
+            insufficient,
+            BalanceInsufficient {
+                free: dec!(300),
+                required: dec!(310),
+            }
+        );
+        assert_eq!(usd_balance(&account), Balance::new(dec!(100), dec!(100)));
     }
 }

@@ -6,7 +6,7 @@ use crate::{
     client::mock::MockExecutionConfig,
     error::{ApiError, UnindexedApiError, UnindexedOrderError},
     exchange::mock::{
-        account::{AccountState, Credit, Debit},
+        account::{AccountState, Debit},
         orders::{OpenOrder, Reservation, RestingOrder},
     },
     fee::{FeeModel, FeeModelConfig, Liquidity},
@@ -173,14 +173,18 @@ pub enum VenueRegime {
 ///   it.** An account snapshot says an order is resting and says what the balances are, but not
 ///   which order any held portion belongs to. Such an order still matches, and its fill debits the
 ///   ledger then — so the seeded balances must cover it, exactly as they must cover a market order.
-///   They cannot? That is a mis-specified fixture, and it **panics**, in the same class as an
-///   absent balance. Cancelling one releases nothing and restates no balance, and neither does
+///   They cannot? For spot that is a mis-specified fixture, and it **panics**, in the same class
+///   as an absent balance; a CFD order is instead cancelled at fill, as described under the
+///   reserved balances below. Cancelling one releases nothing and restates no balance, and neither does
 ///   retiring one at its deadline. Such an order may also arrive **part-filled**, carrying an
 ///   [`Open::filled_quantity`] this venue did not produce: only the remainder ever trades here,
 ///   and a fill that completes it reports no `avg_price`, because the price of the part that
 ///   traded elsewhere is not something this venue can know. An order **this** venue part-filled
 ///   before resting is the same shape, and reports no `avg_price` for the same reason — the two
 ///   fills were struck at different prices and this state carries one of them.
+/// - **A CFD position seeded by `initial_state` is where the venue's ledger starts, and must carry
+///   an entry price.** Closing it credits the margin and realised PnL measured from that price, so
+///   a position with `entry_price: None` is a mis-specified fixture, and construction **panics**.
 ///
 /// # How an order is priced
 ///
@@ -308,11 +312,10 @@ pub enum VenueRegime {
 ///
 /// For spot, the reservation is **exactly** what the fill will settle, not a conservative
 /// over-estimate: both come from one computation at the order's own limit and its own liquidity
-/// side. A conservative
-/// reservation would have to be released and re-debited on the fill, producing two or three
-/// restatements for one fill and reporting balances the account never held, while
-/// [`Balance::used`](crate::balance::Balance::used) misreported for the order's whole life.
-///
+/// side. A conservative reservation would have to be released and re-debited on the fill,
+/// producing two or three restatements for one fill and reporting balances the account never
+/// held, while [`Balance::used`](crate::balance::Balance::used) misreported for the order's whole
+/// life.
 ///
 /// A resting CFD order holds only what its fill would cost **net of what the fill pays back**,
 /// computed against the position when it rests. An order that only reduces a position therefore
@@ -372,6 +375,10 @@ impl SimulatedVenue {
     ///
     /// See [`VenueRegime::RequestPriced`], and [`new_market_driven`](Self::new_market_driven) for
     /// the regime that accepts limits.
+    ///
+    /// # Panics
+    /// If `initial_state` holds an open CFD position with no entry price: see the caller
+    /// obligations on [`SimulatedVenue`].
     pub fn new(
         config: &MockExecutionConfig,
         instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
@@ -387,6 +394,10 @@ impl SimulatedVenue {
     /// constructor is a driver's assertion that it will feed the venue, not a configuration knob.
     ///
     /// See [`VenueRegime::MarketDriven`].
+    ///
+    /// # Panics
+    /// If `initial_state` holds an open CFD position with no entry price: see the caller
+    /// obligations on [`SimulatedVenue`].
     pub fn new_market_driven(
         config: &MockExecutionConfig,
         instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
@@ -671,7 +682,7 @@ impl SimulatedVenue {
             // stands now, which may not be the one it rested against.
             let settlement = self.settlement(
                 &terms,
-                self.net_position(instrument),
+                self.net_position(&terms, instrument),
                 order.side,
                 remaining,
                 limit,
@@ -783,7 +794,7 @@ impl SimulatedVenue {
 
             return match self.account.commit(
                 &settlement.settled(),
-                settlement.credit().as_ref(),
+                settlement.credit,
                 time_exchange,
             ) {
                 Ok(balance) => RestingSettlement::Settled(balance),
@@ -797,7 +808,7 @@ impl SimulatedVenue {
             // class as an absent balance, and gets the same treatment.
             return RestingSettlement::Settled(
                 self.account
-                    .commit(&settlement.settled(), None, time_exchange)
+                    .commit(&settlement.settled(), Decimal::ZERO, time_exchange)
                     .unwrap_or_else(|insufficient| {
                         panic!(
                             "SimulatedVenue cannot afford the fill of resting order {}, which was \
@@ -1128,7 +1139,7 @@ impl SimulatedVenue {
             return PositionReport::Unreported;
         }
 
-        let position = self.net_position(name);
+        let position = self.positions.get(name).copied().unwrap_or_default();
         PositionReport::from_position(Position::new(
             position.quantity,
             (!position.quantity.is_zero()).then_some(position.entry),
@@ -1495,7 +1506,7 @@ impl SimulatedVenue {
         }
 
         // Marketable on arrival, so this fill takes liquidity and is charged the taker rate.
-        let position = self.net_position(&request.key.instrument);
+        let position = self.net_position(terms, &request.key.instrument);
         let fill = self.settlement(
             terms,
             position,
@@ -1529,10 +1540,7 @@ impl SimulatedVenue {
             None => fill.settled(),
         };
 
-        let balance = match self
-            .account
-            .commit(&debit, fill.credit().as_ref(), time_exchange)
-        {
+        let balance = match self.account.commit(&debit, fill.credit, time_exchange) {
             Ok(balance) => balance,
             Err(insufficient) => {
                 return (
@@ -1775,7 +1783,7 @@ impl SimulatedVenue {
         // own limit, as the maker, against the position as it stands now.
         let settlement = self.settlement(
             terms,
-            self.net_position(&request.key.instrument),
+            self.net_position(terms, &request.key.instrument),
             request.state.side,
             request.state.quantity - filled_quantity,
             limit,
@@ -1785,7 +1793,7 @@ impl SimulatedVenue {
         let balance_snapshot =
             match self
                 .account
-                .commit(&settlement.reserved(), None, time_exchange)
+                .commit(&settlement.reserved(), Decimal::ZERO, time_exchange)
             {
                 Ok(balance_snapshot) => balance_snapshot,
                 Err(insufficient) => {
@@ -1865,9 +1873,17 @@ impl SimulatedVenue {
         })
     }
 
-    /// The net position an order on `instrument` trades against. Flat for an instrument this
-    /// account holds no cash-settled position in, which includes every spot instrument.
-    fn net_position(&self, instrument: &InstrumentNameExchange) -> NetPosition {
+    /// The net position an order on `instrument` trades against. Flat for a cash-settled
+    /// instrument this account holds no position in, and for every spot instrument, which skips
+    /// the lookup: a spot settlement never reads it.
+    fn net_position(
+        &self,
+        terms: &InstrumentTerms,
+        instrument: &InstrumentNameExchange,
+    ) -> NetPosition {
+        if !terms.cash_settled {
+            return NetPosition::default();
+        }
         self.positions.get(instrument).copied().unwrap_or_default()
     }
 
@@ -1884,13 +1900,20 @@ impl SimulatedVenue {
             return;
         }
 
-        let position = self
-            .net_position(instrument)
-            .after(side, fill.quantity, fill.price);
-        if position.quantity.is_zero() {
-            self.positions.remove(instrument);
-        } else {
-            self.positions.insert(instrument.clone(), position);
+        // One lookup for a position already held, and the name cloned only to open one.
+        match self.positions.get_mut(instrument) {
+            Some(position) => {
+                *position = position.after(side, fill.quantity, fill.price);
+                if position.quantity.is_zero() {
+                    self.positions.remove(instrument);
+                }
+            }
+            None => {
+                let position = NetPosition::default().after(side, fill.quantity, fill.price);
+                if !position.quantity.is_zero() {
+                    self.positions.insert(instrument.clone(), position);
+                }
+            }
         }
     }
 
@@ -2110,13 +2133,6 @@ impl SimulatedVenue {
     }
 }
 
-/// Whether the market has moved to or through `limit` for an order resting on `side`.
-///
-/// Judged on the far side of the book -- an offer for a buy, a bid for a sell -- because that is
-/// what an order on this side trades against. A feed supplying no book at all falls back to
-/// `last_price`, which is what makes a trades-only feed able to match anything; a feed that does
-/// supply a book is never second-guessed by it, since a price *between* the two sides crosses
-/// neither.
 /// The net positions an `initial_state` opens a venue with: one for each cash-settled instrument
 /// the snapshot reports an open position in.
 ///
@@ -2160,6 +2176,13 @@ fn seeded_positions(
         .collect()
 }
 
+/// Whether the market has moved to or through `limit` for an order resting on `side`.
+///
+/// Judged on the far side of the book -- an offer for a buy, a bid for a sell -- because that is
+/// what an order on this side trades against. A feed supplying no book at all falls back to
+/// `last_price`, which is what makes a trades-only feed able to match anything; a feed that does
+/// supply a book is never second-guessed by it, since a price *between* the two sides crosses
+/// neither.
 fn crosses(side: Side, limit: Decimal, market: &MarketSnapshot) -> bool {
     match side {
         Side::Buy => match market.best_ask {
@@ -2461,14 +2484,6 @@ struct Settlement {
 }
 
 impl Settlement {
-    /// What the fill pays back, if anything.
-    fn credit(&self) -> Option<Credit> {
-        (!self.credit.is_zero()).then(|| Credit {
-            asset: self.asset.clone(),
-            amount: self.credit,
-        })
-    }
-
     /// What must be held for this settlement while the order it belongs to is still working.
     ///
     /// The amount net of what the fill will pay back, and never negative. An order that only
@@ -2536,6 +2551,9 @@ struct NetPosition {
     /// Signed quantity in contracts: positive long, negative short, zero flat.
     quantity: Decimal,
     /// Volume-weighted average price the open `quantity` was entered at. Zero while flat.
+    ///
+    /// Rounded to `Decimal` precision when an average does not terminate, so a later close can
+    /// return a margin that differs from the one posted in the last of its 28 digits.
     entry: Decimal,
 }
 
@@ -3316,6 +3334,37 @@ mod tests {
         assert_eq!(free_usd(&venue), d("10000") + d("130000"));
     }
 
+    #[test]
+    #[should_panic(expected = "no entry price")]
+    fn a_cfd_position_in_the_initial_state_without_an_entry_price_panics() {
+        let config = MockExecutionConfig::new(
+            EXCHANGE,
+            UnindexedAccountSnapshot {
+                exchange: EXCHANGE,
+                balances: vec![funded(usd(), d("10000"))],
+                instruments: vec![InstrumentAccountSnapshot {
+                    instrument: cfd_instrument_name(),
+                    orders: vec![],
+                    orders_complete: true,
+                    position: PositionReport::from_position(Position::new(
+                        d("-1"),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        time(0),
+                    )),
+                    isolated: None,
+                }],
+            },
+            0,
+            FeeModelConfig::default(),
+            SimFillConfig::default(),
+        );
+        let _ = SimulatedVenue::new(&config, instruments_of(cfd_instrument()));
+    }
+
     // --- A resting CFD order holds only what it opens ------------------------------------------
 
     fn make_cfd_market_venue(usd: &str) -> SimulatedVenue {
@@ -3475,6 +3524,54 @@ mod tests {
         assert_eq!(free_usd(&venue), d("126000"), "nothing moved");
         assert_eq!(cfd_position(&venue), None);
         assert!(venue.account.is_cancelled(&ClientOrderId::new("close")));
+    }
+
+    /// The same, for an order that holds something: its hold is given back before the order is
+    /// cancelled, and nothing else moves. The resting sell of 3 closes the long of 1 and opens a
+    /// short of 2, so it holds the 2's margin net of the 1's proceeds. Once a market sell has
+    /// closed the long, its fill would open a short of 3, which the account cannot cover.
+    #[test]
+    fn a_resting_cfd_order_cancelled_as_unaffordable_releases_its_hold() {
+        let mut venue = make_cfd_market_venue("260000");
+        assert!(cfd_market(&mut venue, "5000", "5000", "5000").is_empty());
+        cfd_market_fill(&mut venue, Side::Buy, "1"); // posts 125,000
+
+        let _ = venue.open_order(cfd_limit("flip", Side::Sell, "3", "5200"));
+        assert_eq!(
+            free_usd(&venue),
+            d("260000") - d("125000") - (d("260000") - d("130000")),
+            "holds the short's 260,000 net of the long's 130,000"
+        );
+
+        cfd_market_fill(&mut venue, Side::Sell, "1"); // closes the long at 5,000
+        assert_eq!(free_usd(&venue), d("130000"));
+        assert_eq!(total_usd(&venue), d("260000"));
+
+        let events = cfd_market(&mut venue, "5200", "5210", "5200");
+
+        let Some((last, released)) = events.split_last() else {
+            panic!("an unaffordable fill reports its cancelled order");
+        };
+        assert!(
+            matches!(
+                order_of(last).state,
+                OrderState::Inactive(InactiveOrderState::Cancelled(_))
+            ),
+            "{:?}",
+            order_of(last).state
+        );
+        let [released] = released else {
+            panic!("exactly the released hold restates: {released:?}");
+        };
+        assert_eq!(
+            balance_of(released).balance.free,
+            d("260000"),
+            "the hold is given back"
+        );
+        assert_eq!(free_usd(&venue), d("260000"));
+        assert_eq!(total_usd(&venue), d("260000"), "nothing settled");
+        assert_eq!(cfd_position(&venue), None);
+        assert!(venue.account.is_cancelled(&ClientOrderId::new("flip")));
     }
 
     #[test]
