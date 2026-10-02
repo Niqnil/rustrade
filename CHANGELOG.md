@@ -26,6 +26,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already takes the transmitters, and send orders through the engine's actions such as
   `Command::SendOpenRequests` and `Command::SendCancelRequests`. Code that built an `Engine` with
   a struct literal must switch to `Engine::new`.
+- **`ConnectivityStates::global()` is computed instead of cached** (`rustrade`). It was a stored
+  aggregate over the per-venue states, kept in step by every update path, and each new path was a
+  chance for the two to disagree. It is now computed on each call, with the same rule: `Healthy`
+  iff at least one venue is tracked and every venue is healthy on the dimensions its role
+  declares. The serialised form is unchanged, `global` and then `exchanges`, in self-describing
+  and positional formats alike. Deserialising reads the payload's `global` and discards it,
+  computing it from `exchanges`, so a payload whose `global` disagrees with its venues now reads as
+  its venues say. `update_from_account_event` no longer returns early while `global` is `Healthy`,
+  so an out-of-range `ExchangeIndex` now panics on every call rather than only while some venue is
+  unhealthy.
 - **`stream_blocking_iter` decodes in chunks and needs a `Send + 'static` iterator**
   (`rustrade-data`). **Breaking.** Each chunk of up to `chunk_size` items is decoded on its own
   `spawn_blocking` task, which returns and gives its thread back. The stream starts the next chunk
@@ -51,6 +61,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A market event for an `ExecutionOnly` venue was dropped once every venue was healthy**
+  (`rustrade`). `update_from_market_event` returned early while the cached `global` was `Healthy`,
+  so a misrouted market event, or a venue with the wrong role, left
+  `ConnectivityState::market_data` at `Reconnecting` after convergence and the mistake went
+  unseen. It is now recorded as `Healthy` whatever `global()` reads.
 - **Merging more `stream_blocking_iter` streams than Tokio has blocking threads deadlocked**
   (`rustrade-data`). Each stream held a blocking-pool thread for its whole decode, parked while its
   consumer had not drained it. `merge_time_sorted` cannot emit until every input has buffered an
