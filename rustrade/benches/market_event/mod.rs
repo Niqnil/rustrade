@@ -86,10 +86,11 @@ fn bench_update_from_market(c: &mut Criterion) {
 }
 
 /// Panics unless each event's price is what the instrument holds after it, so a mode cannot
-/// silently measure a different workload from the one it is named for.
+/// silently measure a different workload from the one it is named for. The state is a clone, as
+/// in the bench, so a clone that carried a trade over would be caught too.
 fn assert_prices_reach_the_state(price: Price, events: &[MarketEvent<InstrumentIndex, DataKind>]) {
-    let mut state = state_with_positions(1);
-    for (index, event) in events.iter().take(4).enumerate() {
+    let mut state = state_with_positions(1).clone();
+    for (index, event) in events.iter().enumerate() {
         state.update_from_market(event).unwrap();
         let held = state
             .instruments
@@ -107,7 +108,7 @@ fn assert_prices_reach_the_state(price: Price, events: &[MarketEvent<InstrumentI
 
 #[derive(Debug, Copy, Clone)]
 enum Price {
-    /// Alternates between two prices, so every event moves the mark.
+    /// Alternates between two prices, so every event after the first moves the mark.
     Changing,
     /// One price throughout, so every recompute produces the value it already held.
     Constant,
