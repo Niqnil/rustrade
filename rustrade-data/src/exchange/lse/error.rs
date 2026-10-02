@@ -554,7 +554,9 @@ pub enum LseError {
     #[error("price {value} is not representable as a decimal: {message}")]
     PriceNotRepresentable { value: f64, message: String },
 
-    /// No registered instrument on this exchange carries the requested display symbol.
+    /// No registered instrument is priced on this exchange under the requested display symbol:
+    /// none has it as its data-side name there (its `DataVenue`'s, or its own when it declares
+    /// none).
     ///
     /// Raised when deriving an [`InstrumentIndex`] from the caller's registry rather than
     /// accepting one. That derivation is what makes a fabricated index unrepresentable — the index
@@ -564,12 +566,26 @@ pub enum LseError {
     ///
     /// [`InstrumentIndex`]: rustrade_instrument::instrument::InstrumentIndex
     #[error(
-        "no instrument registered on {exchange} with exchange name {symbol:?}; registered there: [{registered}]"
+        "no registered instrument is priced on {exchange} under {symbol:?}; symbols priced there: [{registered}]"
     )]
     UnknownInstrument {
         symbol: String,
         exchange: rustrade_instrument::exchange::ExchangeId,
         registered: String,
+    },
+
+    /// More than one registered instrument is priced on this exchange under the requested display
+    /// symbol, such as one listing executed on two venues with both priced here.
+    ///
+    /// A candle source delivers its symbol's prices to a single instrument, so picking one would
+    /// leave the other silently unpriced. `instruments` lists the `name_internal` of each.
+    #[error(
+        "{symbol:?} on {exchange} prices more than one registered instrument: [{instruments}]; a candle source feeds one"
+    )]
+    AmbiguousInstrument {
+        symbol: String,
+        exchange: rustrade_instrument::exchange::ExchangeId,
+        instruments: String,
     },
 
     /// The registered instrument prices this symbol in a different asset than the provider quotes
@@ -704,6 +720,7 @@ impl LseError {
             | Self::UnknownDataset(_)
             | Self::AmbiguousSlug { .. }
             | Self::UnknownInstrument { .. }
+            | Self::AmbiguousInstrument { .. }
             | Self::QuoteAssetMismatch { .. }
             | Self::UnknownBondYieldCountry { .. }
             | Self::UnknownBondYieldMaturity { .. }
