@@ -111,6 +111,18 @@ impl<T> Iterator for UnboundedRx<T> {
 }
 
 impl<T> UnboundedRx<T> {
+    /// Number of messages waiting in the channel.
+    ///
+    /// Approximate while senders run: a snapshot that may be stale by the time it is read.
+    pub fn len(&self) -> usize {
+        self.rx.len()
+    }
+
+    /// Whether no message waits in the channel. Approximate, like [`len`](Self::len).
+    pub fn is_empty(&self) -> bool {
+        self.rx.is_empty()
+    }
+
     pub fn into_stream(self) -> tokio_stream::wrappers::UnboundedReceiverStream<T> {
         tokio_stream::wrappers::UnboundedReceiverStream::new(self.rx)
     }

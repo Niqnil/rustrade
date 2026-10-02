@@ -385,7 +385,7 @@ where
             .await?;
 
         // Initialise central Engine channel
-        let (feed_tx, mut feed_rx) = mpsc_unbounded();
+        let (feed_tx, mut feed_rx) = super::feed::feed();
 
         // Forward MarketStreamEvents to Engine feed
         let market_to_engine = runtime
@@ -666,5 +666,42 @@ mod tests {
             connectivity.connectivity(&EXECUTION).role(),
             VenueRole::Both
         );
+    }
+
+    /// [`System::feed_depth`] counts what every sender puts in the feed and what the `Engine`
+    /// takes out of it.
+    ///
+    /// On a current-thread runtime the spawned `Engine` task cannot run until this test yields, so
+    /// the events sent before that are all still queued.
+    #[tokio::test]
+    async fn feed_depth_counts_queued_events_until_the_engine_takes_them() {
+        use crate::engine::state::trading::TradingState;
+
+        let instruments = IndexedInstruments::new([instrument(EXECUTION, "btc", "usdt")]);
+        let system = SystemBuilder::new(system_args(&instruments))
+            .engine_feed_mode(EngineFeedMode::Stream)
+            .build::<EngineEvent, _>()
+            .unwrap()
+            .init()
+            .await
+            .unwrap();
+
+        let depth = system.feed_depth();
+        let queued_by_forwarders = depth.current();
+        system.trading_state(TradingState::Disabled);
+        system.trading_state(TradingState::Disabled);
+        assert_eq!(depth.current(), queued_by_forwarders + 2);
+
+        let mut drained = false;
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if depth.current() == 0 {
+                drained = true;
+                break;
+            }
+        }
+        assert!(drained, "{} events were never taken", depth.current());
+
+        system.abort().await.unwrap();
     }
 }

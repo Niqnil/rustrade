@@ -65,7 +65,7 @@ use rustrade::{
     split_effective_instant,
     statistic::time::Daily,
     strategy::DefaultStrategy,
-    system::config::SystemConfig,
+    system::{config::SystemConfig, feed::FeedTx},
 };
 use rustrade_data::{
     event::{DataKind, MarketEvent},
@@ -78,10 +78,7 @@ use rustrade_data::{
 use rustrade_instrument::{
     exchange::ExchangeId, index::IndexedInstruments, instrument::InstrumentIndex,
 };
-use rustrade_integration::{
-    channel::{Tx, UnboundedTx},
-    collection::one_or_many::OneOrMany,
-};
+use rustrade_integration::{channel::Tx, collection::one_or_many::OneOrMany};
 use serde::Deserialize;
 
 const CONFIG_PATH: &str = "rustrade/examples/config/backtest_config.json";
@@ -188,7 +185,7 @@ async fn main() {
 ///
 /// In a live `System` (built via `SystemBuilder`, e.g.
 /// `examples/engine_sync_with_live_market_data_and_mock_execution_and_audit.rs`), `system.feed_tx`
-/// is a public [`UnboundedTx`] of `EngineEvent`. Once the wrapper has confirmed the broker applied a
+/// is a public [`FeedTx`] of `EngineEvent`. Once the wrapper has confirmed the broker applied a
 /// split, it constructs the *same* event as above and sends it directly. There is no `From`
 /// shortcut — the variant is `#[from(skip)]` precisely so every field (`id`, `policy`,
 /// `effective_time`) is supplied consciously.
@@ -199,7 +196,7 @@ async fn main() {
 // example), so it would otherwise trip `dead_code`.
 #[allow(dead_code)]
 fn live_injection_sketch(
-    feed_tx: &UnboundedTx<EngineEvent>,
+    feed_tx: &FeedTx<EngineEvent>,
     instrument: InstrumentIndex,
     ratio: SplitRatio,
     effective_date: NaiveDate,

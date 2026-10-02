@@ -14,9 +14,10 @@ use crate::{
     execution::builder::ExecutionHandles,
     shutdown::{AsyncShutdown, Shutdown},
 };
+use feed::{FeedDepth, FeedTx};
 use rustrade_execution::order::request::{OrderRequestCancel, OrderRequestOpen};
 use rustrade_integration::{
-    channel::{Tx, UnboundedRx, UnboundedTx},
+    channel::{Tx, UnboundedRx},
     collection::{one_or_many::OneOrMany, snapshot::SnapUpdates},
 };
 use std::{fmt::Debug, time::Duration};
@@ -37,6 +38,9 @@ pub mod builder;
 
 /// Provides a convenient `SystemConfig` used for defining a Barter trading system.
 pub mod config;
+
+/// The channel every event reaches a [`System`]'s `Engine` through, with an observable depth.
+pub mod feed;
 
 /// Initialised and running Barter trading system.
 ///
@@ -71,7 +75,10 @@ where
     /// the clock forward (observably, via out-of-order logs) and subsequent earlier events will then
     /// not advance it. A [`LiveClock`](crate::engine::clock::LiveClock) is unaffected (it reads
     /// `Utc::now()`).
-    pub feed_tx: UnboundedTx<Event>,
+    ///
+    /// Every event sent here is counted in [`feed_depth`](Self::feed_depth), like those the
+    /// market and account forwarders send.
+    pub feed_tx: FeedTx<Event>,
 
     /// Optional audit snapshot with updates (present when audit sending is enabled).
     pub audit:
@@ -242,6 +249,17 @@ where
         Event: From<TradingState>,
     {
         self.send(trading_state)
+    }
+
+    /// Handle reading how many events wait in the `Engine`'s feed, from every source: the market
+    /// stream, the account stream and [`feed_tx`](Self::feed_tx).
+    ///
+    /// The feed is unbounded, so an `Engine` slower than its inputs falls behind without blocking
+    /// them. This makes that observable; what depth calls for action is the caller's policy. The
+    /// handle is cheap to clone and can be polled from another task, and it outlives the `System`.
+    /// See [`FeedDepth`] for how to measure the lag in time instead.
+    pub fn feed_depth(&self) -> FeedDepth {
+        self.feed_tx.depth()
     }
 
     /// Take ownership of the audit snapshot with updates if present.

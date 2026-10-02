@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`System::feed_depth`: how many events wait in the engine's feed** (`rustrade`). The feed is
+  unbounded, so a live venue's read loop never waits on the engine, but an engine slower than its
+  inputs fell behind with no signal. `feed_depth` returns a cloneable `FeedDepth` handle whose
+  `current()` counts the events sent by the market and account forwarders and through `feed_tx`
+  that the engine has not yet taken. It can be polled from another task and outlives the `System`.
+  What depth calls for action is left to the caller. For the lag in time, compare an audit tick's
+  `EngineContext::time` with the event's `time_received`. Closes #220.
+  - `UnboundedRx::len` and `is_empty` (`rustrade-integration`), approximate while senders run.
+
+### Changed
+
+- **`System::feed_tx` is now a `FeedTx`** (`rustrade`, new module `system::feed`). **Breaking**
+  for code that named its type `UnboundedTx`. It implements `Tx` as before, so `send` is
+  unchanged; the inner channel is private, so every send is counted in `feed_depth`.
+
 ### Removed
 
 - **The public `SendRequests` trait** (`rustrade`). **Breaking.** Its two methods,
