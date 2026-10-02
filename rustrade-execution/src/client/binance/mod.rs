@@ -44,6 +44,7 @@
 //! an explicit request.
 
 mod margin;
+mod order_recovery;
 mod shared;
 mod spot;
 
