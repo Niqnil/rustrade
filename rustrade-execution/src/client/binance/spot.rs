@@ -1085,10 +1085,6 @@ impl ExecutionClient for BinanceSpot {
                     if matches!(order_err, OrderError::Rejected(ApiError::RateLimit)) {
                         self.rate_limiter.on_rate_limited(None);
                     }
-                    // if this is BalanceInsufficient, its AssetNameExchange field
-                    // holds the instrument name ("BTCUSDT"), not an asset name — see
-                    // parse_binance_api_error for details. Do not match on that field
-                    // to identify the low-balance asset.
                     Some(UnindexedOrderResponseCancel {
                         key,
                         state: Err(order_err),
@@ -1381,10 +1377,6 @@ impl ExecutionClient for BinanceSpot {
                     if matches!(order_err, OrderError::Rejected(ApiError::RateLimit)) {
                         self.rate_limiter.on_rate_limited(None);
                     }
-                    // if this is BalanceInsufficient, its AssetNameExchange field
-                    // holds the instrument name ("BTCUSDT"), not an asset name — see
-                    // parse_binance_api_error for details. Do not match on that field
-                    // to identify the low-balance asset.
                     Some(Order {
                         key: order_key,
                         side,
@@ -2780,11 +2772,11 @@ mod tests {
 
         assert!(matches!(
             parse_binance_api_error("Insufficient balance".into(), &instrument),
-            ApiError::BalanceInsufficient(_, _)
+            ApiError::BalanceInsufficient(None, _)
         ));
         assert!(matches!(
             parse_binance_api_error("Not enough funds".into(), &instrument),
-            ApiError::BalanceInsufficient(_, _)
+            ApiError::BalanceInsufficient(None, _)
         ));
         assert_eq!(
             parse_binance_api_error("Rate limit exceeded".into(), &instrument),
@@ -2823,13 +2815,20 @@ mod tests {
             parse_binance_api_error("Invalid symbol -1121".into(), &instrument),
             ApiError::InstrumentInvalid(_, _)
         ));
-        // -2010 matched by numeric code (not text heuristic)
+        // -2010 is read by its text: Binance gives it for many reasons besides balance
         assert!(matches!(
             parse_binance_api_error(
                 "Server-side response error (code -2010): Account has insufficient balance".into(),
                 &instrument
             ),
-            ApiError::BalanceInsufficient(_, _)
+            ApiError::BalanceInsufficient(None, _)
+        ));
+        assert!(matches!(
+            parse_binance_api_error(
+                "Server-side response error (code -2010): Order would trigger immediately.".into(),
+                &instrument
+            ),
+            ApiError::OrderRejected(_)
         ));
         assert!(matches!(
             parse_binance_api_error("Some other error".into(), &instrument),
@@ -3097,7 +3096,7 @@ mod tests {
         assert!(
             matches!(
                 classify_ws_order_error(&rejection, &instrument),
-                Some(OrderError::Rejected(ApiError::BalanceInsufficient(..)))
+                Some(OrderError::Rejected(ApiError::BalanceInsufficient(None, _)))
             ),
             "ResponseError should be classified as a venue response"
         );
@@ -4604,29 +4603,6 @@ mod tests {
             .is_err(),
             "shorter on_rate_limited must not shorten existing cooldown"
         );
-    }
-
-    // ---------------------------------------------------------------------------
-    // M1: BalanceInsufficient type confusion — explicit field value test
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn test_parse_binance_api_error_balance_insufficient_holds_instrument_name() {
-        let instrument = InstrumentNameExchange::new("BTCUSDT");
-        match parse_binance_api_error("Insufficient balance".into(), &instrument) {
-            ApiError::BalanceInsufficient(asset_field, _) => {
-                // documented known-wrong value — the AssetNameExchange field holds
-                // the *instrument* name ("BTCUSDT"), not an asset name ("BTC" or "USDT").
-                // Splitting the instrument into base/quote requires symbol-info metadata.
-                // Do NOT pattern-match on this field to identify the low-balance asset.
-                assert_eq!(
-                    asset_field.name().as_str(),
-                    "BTCUSDT",
-                    "BalanceInsufficient.0 holds the instrument name, not an asset name"
-                );
-            }
-            other => panic!("expected BalanceInsufficient, got {other:?}"),
-        }
     }
 
     // ---------------------------------------------------------------------------

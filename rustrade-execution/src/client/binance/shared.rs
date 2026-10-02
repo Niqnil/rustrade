@@ -2038,29 +2038,18 @@ pub(crate) fn parse_binance_api_error(
     if contains_error_code(&error_msg, "-1121") {
         return ApiError::InstrumentInvalid(instrument.clone(), error_msg);
     }
-    if contains_error_code(&error_msg, "-2010") {
-        // -2010: "Account has insufficient balance for requested action"
-        // same limitation as text heuristic below — the AssetNameExchange field
-        // holds the instrument name, not an asset name. See parse_binance_api_error.
-        return ApiError::BalanceInsufficient(
-            AssetNameExchange::new(instrument.name().as_str()),
-            error_msg,
-        );
-    }
+    // -2010 (NEW_ORDER_REJECTED) is deliberately not matched by code: Binance gives it for dozens
+    // of reasons ("Account has insufficient balance for requested action.", "Order would trigger
+    // immediately.", "Trailing stop orders are not supported for this symbol.", ...), so only the
+    // text tells a balance shortfall from the rest.
 
     // Fall back to case-insensitive message text heuristics (avoid to_lowercase allocation)
     if contains_ignore_case(&error_msg, "insufficient")
         || contains_ignore_case(&error_msg, "not enough")
     {
-        // the AssetNameExchange field here holds the *instrument* name (e.g.
-        // "BTCUSDT"), NOT an actual asset name ("BTC" or "USDT"). Splitting the pair
-        // into base/quote is unreliable without exchange symbol-info metadata.
-        // WARNING: do NOT pattern-match on the AssetNameExchange value to identify
-        // a specific asset — use the error_msg string for diagnostics only.
-        ApiError::BalanceInsufficient(
-            AssetNameExchange::new(instrument.name().as_str()),
-            error_msg,
-        )
+        // Binance does not name the asset that ran short, so it is left unnamed rather than
+        // guessed from the order.
+        ApiError::BalanceInsufficient(None, error_msg)
     } else if contains_ignore_case(&error_msg, "rate limit") {
         ApiError::RateLimit
     } else if contains_ignore_case(&error_msg, "unknown order") {
@@ -3344,9 +3333,50 @@ mod tests {
             code: Some(-2010),
         });
         assert!(
-            matches!(err, OrderError::Rejected(ApiError::BalanceInsufficient(..))),
+            matches!(
+                err,
+                OrderError::Rejected(ApiError::BalanceInsufficient(None, _))
+            ),
             "got {err:?}"
         );
+    }
+
+    /// `-2010` is Binance's generic NEW_ORDER_REJECTED, so only its text says whether the balance
+    /// ran short, and Binance never names the asset. Margin reaches the venue over REST, Spot over
+    /// the WS API; both must read it the same way.
+    #[test]
+    fn a_2010_rejection_is_read_by_its_message() {
+        let cases: [(&str, fn(&UnindexedOrderError) -> bool); 3] = [
+            (
+                "Account has insufficient balance for requested action.",
+                |err| {
+                    matches!(
+                        err,
+                        OrderError::Rejected(ApiError::BalanceInsufficient(None, _))
+                    )
+                },
+            ),
+            ("Order would trigger immediately.", |err| {
+                matches!(err, OrderError::Rejected(ApiError::OrderRejected(_)))
+            }),
+            (
+                "Trailing stop orders are not supported for this symbol.",
+                |err| matches!(err, OrderError::Rejected(ApiError::OrderRejected(_))),
+            ),
+        ];
+        for (msg, expected) in cases {
+            let rest = classify_err(ConnectorError::BadRequestError {
+                msg: msg.to_string(),
+                code: Some(-2010),
+            });
+            assert!(expected(&rest), "REST {msg:?}: got {rest:?}");
+
+            let ws = classify_ws(-2010, msg);
+            assert!(
+                ws.as_ref().is_some_and(expected),
+                "WS API {msg:?}: got {ws:?}"
+            );
+        }
     }
 
     #[test]

@@ -189,6 +189,15 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// - The [`AssetNameExchange`] was an invalid format.
     ///
     /// Not transient — do not retry. The asset identifier must be corrected.
+    ///
+    /// Indexed only when the [`ExecutionInstrumentMap`] holds the asset. Otherwise there is no
+    /// index to carry, and [`AccountEventIndexer`] reports it as
+    /// [`OrderRejected`](Self::OrderRejected) (from an order request) or
+    /// [`RequestRejected`](Self::RequestRejected) (from any other request), holding this error's
+    /// own message.
+    ///
+    /// [`ExecutionInstrumentMap`]: crate::map::ExecutionInstrumentMap
+    /// [`AccountEventIndexer`]: crate::indexer::AccountEventIndexer
     #[error("asset {0} invalid: {1}")]
     AssetInvalid(AssetKey, String),
 
@@ -199,6 +208,11 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// - The [`InstrumentNameExchange`] was an invalid format.
     ///
     /// Not transient — do not retry. The instrument identifier must be corrected.
+    ///
+    /// Indexed only when the [`ExecutionInstrumentMap`] holds the instrument; otherwise reported
+    /// as [`AssetInvalid`](Self::AssetInvalid) describes.
+    ///
+    /// [`ExecutionInstrumentMap`]: crate::map::ExecutionInstrumentMap
     #[error("instrument {0} invalid: {1}")]
     InstrumentInvalid(InstrumentKey, String),
 
@@ -225,20 +239,24 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
 
     /// Balance of an asset is insufficient to execute the requested operation.
     ///
-    /// # Warning: `AssetKey` field may hold an instrument name, not an asset name
+    /// The asset is `None` when it is not known which asset ran short:
+    /// - the venue's rejection does not name it (e.g. Binance's "Account has insufficient
+    ///   balance for requested action"), and a client does not guess it from the order;
+    /// - the venue named an asset that the [`ExecutionInstrumentMap`] does not hold, so it has no
+    ///   index. [`AccountEventIndexer::api_error`] logs the name it dropped.
     ///
-    /// Some `ExecutionClient` implementations (e.g. `BinanceSpot`) populate the
-    /// `AssetKey` field with the **instrument name** (e.g. `"BTCUSDT"`) rather than
-    /// the specific low-balance asset (e.g. `"BTC"` or `"USDT"`), because splitting
-    /// a symbol into base/quote requires exchange symbol-info metadata not available
-    /// at error-parse time. Do **not** pattern-match on the `AssetKey` value to
-    /// identify the specific low-balance asset — use the `String` field for
-    /// diagnostics only.
+    /// The `String` carries the venue's message.
     ///
     /// Not transient — do not retry the same request. Reduce order size or
     /// deposit additional funds.
-    #[error("asset {0} balance insufficient: {1}")]
-    BalanceInsufficient(AssetKey, String),
+    ///
+    /// [`ExecutionInstrumentMap`]: crate::map::ExecutionInstrumentMap
+    /// [`AccountEventIndexer::api_error`]: crate::indexer::AccountEventIndexer::api_error
+    #[error(
+        "balance insufficient{asset}: {1}",
+        asset = .0.as_ref().map(|asset| format!(" for asset {asset}")).unwrap_or_default()
+    )]
+    BalanceInsufficient(Option<AssetKey>, String),
 
     /// Order was rejected by the exchange for a business rule violation.
     ///
@@ -439,8 +457,10 @@ mod tests {
             ClientError::Api(ApiError::AssetInvalid(AssetIndex(0), "bad".into()));
         assert!(!err.is_transient(), "expected non-transient for {:?}", err);
 
-        let err: ClientError =
-            ClientError::Api(ApiError::BalanceInsufficient(AssetIndex(0), "low".into()));
+        let err: ClientError = ClientError::Api(ApiError::BalanceInsufficient(
+            Some(AssetIndex(0)),
+            "low".into(),
+        ));
         assert!(!err.is_transient(), "expected non-transient for {:?}", err);
 
         let err: ClientError = ClientError::Api(ApiError::InstrumentInvalid(
@@ -465,6 +485,16 @@ mod tests {
         let err: ClientError =
             ClientError::Api(ApiError::RequestRejected("-1127 More than 24 hours".into()));
         assert!(!err.is_transient(), "expected non-transient for {:?}", err);
+    }
+
+    #[test]
+    fn balance_insufficient_names_its_asset_only_when_known() {
+        let named: UnindexedApiError =
+            ApiError::BalanceInsufficient(Some(AssetNameExchange::new("BTC")), "low".to_string());
+        assert_eq!(named.to_string(), "balance insufficient for asset BTC: low");
+
+        let unnamed: UnindexedApiError = ApiError::BalanceInsufficient(None, "low".to_string());
+        assert_eq!(unnamed.to_string(), "balance insufficient: low");
     }
 
     #[test]
@@ -525,7 +555,7 @@ mod tests {
         assert!(!err.is_transient(), "expected non-transient for {:?}", err);
 
         let err: UnindexedOrderError = OrderError::Rejected(ApiError::BalanceInsufficient(
-            AssetNameExchange::from("BTC"),
+            Some(AssetNameExchange::from("BTC")),
             "insufficient".into(),
         ));
         assert!(!err.is_transient(), "expected non-transient for {:?}", err);
