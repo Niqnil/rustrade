@@ -550,6 +550,7 @@ mod tests {
             "expected StreamTerminated to pass through unchanged",
         );
     }
+
     /// Run `index`, returning its value and the number of `WARN` events it emitted on this
     /// thread. A degrade is reported only by its log line, so asserting on the value alone could
     /// not tell a logged degrade from a silent one.
