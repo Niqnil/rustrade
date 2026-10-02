@@ -188,3 +188,23 @@ pub fn mpsc_unbounded<T>() -> (UnboundedTx<T>, UnboundedRx<T>) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     (UnboundedTx::new(tx), UnboundedRx::new(rx))
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panicking on a failed send is the assertion
+mod tests {
+    use super::*;
+
+    #[test]
+    fn len_counts_messages_waiting_in_the_channel() {
+        let (tx, mut rx) = mpsc_unbounded::<u8>();
+        assert!(rx.is_empty());
+
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        assert_eq!(rx.len(), 2);
+
+        assert_eq!(Iterator::next(&mut rx), Some(1));
+        assert_eq!(rx.len(), 1);
+        assert!(!rx.is_empty());
+    }
+}

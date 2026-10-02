@@ -2,7 +2,7 @@
 //! that an `Engine` slower than its inputs falls behind silently. [`FeedDepth`] makes that
 //! observable without changing the delivery: what to do about a deep feed is the caller's policy.
 
-use futures::Stream;
+use futures::{Sink, Stream};
 use rustrade_integration::channel::{Tx, UnboundedRx, UnboundedTx, mpsc_unbounded};
 use std::{
     fmt::Debug,
@@ -32,8 +32,9 @@ pub fn feed<Event>() -> (FeedTx<Event>, FeedRx<Event>) {
 /// Cloneable handle reading how many events wait in the engine feed.
 ///
 /// A count, not an age. To see how far behind the `Engine` is in time, compare each audit tick's
-/// [`EngineContext::time`](crate::engine::audit::context::EngineContext) with the processed
-/// event's receive time (`MarketEvent::time_received` for market data). A caller driving
+/// [`EngineContext::time`](crate::engine::audit::context::EngineContext::time) with the processed
+/// event's receive time. A market event carries one (`MarketEvent::time_received`); an account
+/// event or a command does not. A caller driving
 /// [`Engine::new`](crate::engine::Engine::new) directly feeds the events itself, so it already
 /// knows its own queue.
 ///
@@ -55,7 +56,8 @@ impl FeedDepth {
 
 /// Transmitter into the engine feed, counting each event into its [`FeedDepth`].
 ///
-/// The inner channel is private, so every send is counted.
+/// Sends through [`Tx`] or [`Sink`], and both count. The inner channel is private, so no send
+/// bypasses the count.
 #[derive(Debug, Clone)]
 pub struct FeedTx<Event> {
     tx: UnboundedTx<Event>,
@@ -83,6 +85,32 @@ where
         self.tx.send(item).inspect_err(|_| {
             self.depth.0.fetch_sub(1, Ordering::Relaxed);
         })
+    }
+}
+
+impl<Event> Sink<Event> for FeedTx<Event> {
+    type Error = SendError<Event>;
+
+    fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // Unbounded, so always ready.
+        Poll::Ready(Ok(()))
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Event) -> Result<(), Self::Error> {
+        // Same counting as `Tx::send`, which needs bounds this impl does not.
+        self.depth.0.fetch_add(1, Ordering::Relaxed);
+        self.tx.tx.send(item).inspect_err(|_| {
+            self.depth.0.fetch_sub(1, Ordering::Relaxed);
+        })
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // Nothing is buffered.
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -159,6 +187,55 @@ mod tests {
         drop(tx);
         assert_eq!(StreamExt::next(&mut rx).await, Some(2));
         assert_eq!(StreamExt::next(&mut rx).await, None);
+        assert_eq!(depth.current(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_sink_send_is_counted_like_a_tx_send() {
+        use futures::SinkExt;
+
+        let (mut tx, mut rx) = feed::<u8>();
+        let depth = tx.depth();
+
+        SinkExt::send(&mut tx, 1).await.unwrap();
+        assert_eq!(depth.current(), 1);
+        assert_eq!(StreamExt::next(&mut rx).await, Some(1));
+        assert_eq!(depth.current(), 0);
+    }
+
+    /// Many senders on other threads while the receiver drains: the count never wraps below zero
+    /// and returns to exactly zero once everything sent has been taken.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_senders_and_a_draining_receiver_settle_at_zero() {
+        const SENDERS: usize = 4;
+        const SENDS: usize = 10_000;
+
+        let (tx, mut rx) = feed::<usize>();
+        let depth = tx.depth();
+
+        let senders: Vec<_> = (0..SENDERS)
+            .map(|_| {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    for index in 0..SENDS {
+                        Tx::send(&tx, index).unwrap();
+                    }
+                })
+            })
+            .collect();
+        drop(tx);
+
+        let mut taken = 0;
+        while StreamExt::next(&mut rx).await.is_some() {
+            taken += 1;
+            // A wrap below zero would read as a value near `usize::MAX`.
+            assert!(depth.current() <= SENDERS * SENDS);
+        }
+        for sender in senders {
+            sender.await.unwrap();
+        }
+
+        assert_eq!(taken, SENDERS * SENDS);
         assert_eq!(depth.current(), 0);
     }
 

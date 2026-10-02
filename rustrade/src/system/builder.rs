@@ -668,17 +668,36 @@ mod tests {
         );
     }
 
-    /// [`System::feed_depth`] counts what every sender puts in the feed and what the `Engine`
-    /// takes out of it.
+    /// [`System::feed_depth`] counts what the market forwarder and `feed_tx` put in the feed, and
+    /// what the `Engine` takes out of it.
     ///
-    /// On a current-thread runtime the spawned `Engine` task cannot run until this test yields, so
-    /// the events sent before that are all still queued.
+    /// Relies on `EngineFeedMode::Stream` on `#[tokio::test]`'s current-thread runtime: the spawned
+    /// forwarder and `Engine` tasks cannot run until this test yields, so the two direct sends are
+    /// the only events queued when it first reads the depth. (`EngineFeedMode::Iterator` would run
+    /// the `Engine` on a blocking thread at once.) A send that bypassed the count would make the
+    /// `Engine`'s take wrap the count below zero, so it could never settle at zero.
     #[tokio::test]
     async fn feed_depth_counts_queued_events_until_the_engine_takes_them() {
         use crate::engine::state::trading::TradingState;
 
+        const MARKET_EVENTS: usize = 3;
+
         let instruments = IndexedInstruments::new([instrument(EXECUTION, "btc", "usdt")]);
-        let system = SystemBuilder::new(system_args(&instruments))
+        let args = system_args(&instruments);
+        let args = SystemArgs::new(
+            args.instruments,
+            args.executions,
+            args.clock,
+            args.strategy,
+            args.risk,
+            futures::stream::iter(vec![
+                EngineEvent::from(TradingState::Disabled);
+                MARKET_EVENTS
+            ]),
+            args.global_data,
+            args.instrument_data_init,
+        );
+        let system = SystemBuilder::new(args)
             .engine_feed_mode(EngineFeedMode::Stream)
             .build::<EngineEvent, _>()
             .unwrap()
@@ -687,15 +706,15 @@ mod tests {
             .unwrap();
 
         let depth = system.feed_depth();
-        let queued_by_forwarders = depth.current();
         system.trading_state(TradingState::Disabled);
         system.trading_state(TradingState::Disabled);
-        assert_eq!(depth.current(), queued_by_forwarders + 2);
+        assert_eq!(depth.current(), 2);
 
+        // Settles once the forwarder has sent every market event and the `Engine` has taken them.
         let mut drained = false;
         for _ in 0..100 {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            if depth.current() == 0 {
+            if system.handles.market_to_engine.is_finished() && depth.current() == 0 {
                 drained = true;
                 break;
             }

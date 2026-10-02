@@ -17,12 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   What depth calls for action is left to the caller. For the lag in time, compare an audit tick's
   `EngineContext::time` with the event's `time_received`. Closes #220.
   - `UnboundedRx::len` and `is_empty` (`rustrade-integration`), approximate while senders run.
+    For a receiver the caller holds itself, such as the audit updates `System::take_audit` hands
+    out, these read the backlog directly.
 
 ### Changed
 
 - **`System::feed_tx` is now a `FeedTx`** (`rustrade`, new module `system::feed`). **Breaking**
-  for code that named its type `UnboundedTx`. It implements `Tx` as before, so `send` is
-  unchanged; the inner channel is private, so every send is counted in `feed_depth`.
+  for code that named its type `UnboundedTx` or reached its inner sender through the public `tx`
+  field. That field is gone, so that no send bypasses the count in `feed_depth`. `FeedTx`
+  implements `Tx` and `Sink` as `UnboundedTx` did, both counted, so `send` and `forward` are
+  unchanged.
 
 ### Removed
 
