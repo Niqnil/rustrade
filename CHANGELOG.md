@@ -137,6 +137,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       the asset `None`, since their rejections do not name it.
     - `AccountEventIndexer::api_error`, `order_error`, `order_state` and `client_error` return
       their value instead of a `Result`.
+    - `BalanceInsufficient` displays as "balance insufficient for asset {asset}: {message}", or
+      "balance insufficient: {message}" with no asset, instead of "asset {asset} balance
+      insufficient: {message}".
 - **A market event for an `ExecutionOnly` venue was dropped once every venue was healthy**
   (`rustrade`). `update_from_market_event` returned early while the cached `global` was `Healthy`,
   so a misrouted market event, or a venue with the wrong role, left

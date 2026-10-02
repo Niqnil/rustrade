@@ -550,6 +550,36 @@ mod tests {
             "expected StreamTerminated to pass through unchanged",
         );
     }
+    /// Run `index`, returning its value and the number of `WARN` events it emitted on this
+    /// thread. A degrade is reported only by its log line, so asserting on the value alone could
+    /// not tell a logged degrade from a silent one.
+    fn count_warnings<T>(index: impl FnOnce() -> T) -> (T, usize) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Default)]
+        struct CountWarnings(Arc<AtomicUsize>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountWarnings {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let layer = CountWarnings::default();
+        let count = Arc::clone(&layer.0);
+        // Thread-local, so other tests running in parallel are not counted.
+        let value =
+            tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), index);
+        (value, count.load(Ordering::Relaxed))
+    }
+
     fn btc_usdt() -> InstrumentNameExchange {
         binance_indexer()
             .map
@@ -567,20 +597,24 @@ mod tests {
             .find_asset_index(&AssetNameExchange::new("BTC"))
             .unwrap();
 
-        for (asset, expected) in [
-            (Some("BTC"), Some(btc)),
+        for (asset, expected, warnings) in [
+            (Some("BTC"), Some(btc), 0),
             // An instrument name, as Binance's error mapping once put there.
-            (Some("ETH_USDT"), None),
-            (None, None),
+            (Some("ETH_USDT"), None, 1),
+            (None, None, 0),
         ] {
-            assert_eq!(
+            let (indexed, warned) = count_warnings(|| {
                 indexer.api_error(ApiError::BalanceInsufficient(
                     asset.map(AssetNameExchange::new),
-                    "low".to_string()
-                )),
+                    "low".to_string(),
+                ))
+            });
+            assert_eq!(
+                indexed,
                 ApiError::BalanceInsufficient(expected, "low".to_string()),
                 "{asset:?}"
             );
+            assert_eq!(warned, warnings, "{asset:?}: a dropped asset is logged");
         }
     }
 
@@ -603,21 +637,25 @@ mod tests {
                 "instrument XYZUSDT invalid: bad",
             ),
         ] {
+            let (indexed, warned) = count_warnings(|| indexer.api_error(error.clone()));
+            assert_eq!(indexed, ApiError::OrderRejected(text.to_string()));
+            assert_eq!(warned, 1, "{text}: a degrade is logged");
+
+            let (indexed, warned) =
+                count_warnings(|| indexer.client_error(ClientError::Api(error)));
             assert_eq!(
-                indexer.api_error(error.clone()),
-                ApiError::OrderRejected(text.to_string())
-            );
-            assert_eq!(
-                indexer.client_error(ClientError::Api(error)),
+                indexed,
                 ClientError::Api(ApiError::RequestRejected(text.to_string()))
             );
+            assert_eq!(warned, 1, "{text}: a degrade is logged");
         }
 
-        // A name the map holds still indexes.
-        assert!(matches!(
-            indexer.api_error(ApiError::InstrumentInvalid(btc_usdt(), "bad".to_string())),
-            ApiError::InstrumentInvalid(_, _)
-        ));
+        // A name the map holds still indexes, and nothing is logged.
+        let (indexed, warned) = count_warnings(|| {
+            indexer.api_error(ApiError::InstrumentInvalid(btc_usdt(), "bad".to_string()))
+        });
+        assert!(matches!(indexed, ApiError::InstrumentInvalid(_, _)));
+        assert_eq!(warned, 0);
     }
 
     /// A response whose rejection names something the map does not hold still indexes, so the

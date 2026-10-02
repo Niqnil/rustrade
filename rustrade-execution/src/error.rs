@@ -189,6 +189,15 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// - The [`AssetNameExchange`] was an invalid format.
     ///
     /// Not transient — do not retry. The asset identifier must be corrected.
+    ///
+    /// Indexed only when the [`ExecutionInstrumentMap`] holds the asset. Otherwise there is no
+    /// index to carry, and [`AccountEventIndexer`] reports it as
+    /// [`OrderRejected`](Self::OrderRejected) (from an order request) or
+    /// [`RequestRejected`](Self::RequestRejected) (from any other request), holding this error's
+    /// own message.
+    ///
+    /// [`ExecutionInstrumentMap`]: crate::map::ExecutionInstrumentMap
+    /// [`AccountEventIndexer`]: crate::indexer::AccountEventIndexer
     #[error("asset {0} invalid: {1}")]
     AssetInvalid(AssetKey, String),
 
@@ -199,6 +208,11 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// - The [`InstrumentNameExchange`] was an invalid format.
     ///
     /// Not transient — do not retry. The instrument identifier must be corrected.
+    ///
+    /// Indexed only when the [`ExecutionInstrumentMap`] holds the instrument; otherwise reported
+    /// as [`AssetInvalid`](Self::AssetInvalid) describes.
+    ///
+    /// [`ExecutionInstrumentMap`]: crate::map::ExecutionInstrumentMap
     #[error("instrument {0} invalid: {1}")]
     InstrumentInvalid(InstrumentKey, String),
 
@@ -471,6 +485,16 @@ mod tests {
         let err: ClientError =
             ClientError::Api(ApiError::RequestRejected("-1127 More than 24 hours".into()));
         assert!(!err.is_transient(), "expected non-transient for {:?}", err);
+    }
+
+    #[test]
+    fn balance_insufficient_names_its_asset_only_when_known() {
+        let named: UnindexedApiError =
+            ApiError::BalanceInsufficient(Some(AssetNameExchange::new("BTC")), "low".to_string());
+        assert_eq!(named.to_string(), "balance insufficient for asset BTC: low");
+
+        let unnamed: UnindexedApiError = ApiError::BalanceInsufficient(None, "low".to_string());
+        assert_eq!(unnamed.to_string(), "balance insufficient: low");
     }
 
     #[test]
