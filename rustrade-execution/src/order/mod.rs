@@ -41,6 +41,11 @@ pub type UnindexedOrder = Order<ExchangeId, InstrumentNameExchange, UnindexedOrd
 /// and [`InstrumentNameExchange`].
 pub type UnindexedOrderKey = OrderKey<ExchangeId, InstrumentNameExchange>;
 
+/// Convenient type alias for an [`Order`] that has ended, keyed with [`ExchangeId`] and
+/// [`InstrumentNameExchange`].
+pub type UnindexedInactiveOrder =
+    Order<ExchangeId, InstrumentNameExchange, state::UnindexedInactiveOrderState>;
+
 /// Convenient type alias for an [`OrderSnapshot`] keyed with [`ExchangeId`], [`AssetNameExchange`],
 /// and [`InstrumentNameExchange`].
 pub type UnindexedOrderSnapshot = Order<
@@ -131,6 +136,34 @@ pub struct Order<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex, S
     pub kind: OrderKind,
     pub time_in_force: TimeInForce,
     pub state: State,
+}
+
+impl<ExchangeKey, InstrumentKey, State> Order<ExchangeKey, InstrumentKey, State> {
+    /// This order with its state replaced by `f` of it, every other field unchanged.
+    pub fn map_state<NewState>(
+        self,
+        f: impl FnOnce(State) -> NewState,
+    ) -> Order<ExchangeKey, InstrumentKey, NewState> {
+        let Order {
+            key,
+            side,
+            price,
+            quantity,
+            kind,
+            time_in_force,
+            state,
+        } = self;
+
+        Order {
+            key,
+            side,
+            price,
+            quantity,
+            kind,
+            time_in_force,
+            state: f(state),
+        }
+    }
 }
 
 impl<ExchangeKey, AssetKey, InstrumentKey>
@@ -324,25 +357,7 @@ impl<ExchangeKey, InstrumentKey> From<Order<ExchangeKey, InstrumentKey, Open>>
     for Order<ExchangeKey, InstrumentKey, ActiveOrderState>
 {
     fn from(value: Order<ExchangeKey, InstrumentKey, Open>) -> Self {
-        let Order {
-            key,
-            side,
-            price,
-            quantity,
-            kind,
-            time_in_force,
-            state,
-        } = value;
-
-        Self {
-            key,
-            side,
-            price,
-            quantity,
-            kind,
-            time_in_force,
-            state: ActiveOrderState::Open(state),
-        }
+        value.map_state(ActiveOrderState::Open)
     }
 }
 
@@ -350,25 +365,7 @@ impl<ExchangeKey, AssetKey, InstrumentKey> From<Order<ExchangeKey, InstrumentKey
     for Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>
 {
     fn from(value: Order<ExchangeKey, InstrumentKey, Open>) -> Self {
-        let Order {
-            key,
-            side,
-            price,
-            quantity,
-            kind,
-            time_in_force,
-            state,
-        } = value;
-
-        Self {
-            key,
-            side,
-            price,
-            quantity,
-            kind,
-            time_in_force,
-            state: OrderState::Active(ActiveOrderState::Open(state)),
-        }
+        value.map_state(|state| OrderState::Active(ActiveOrderState::Open(state)))
     }
 }
 
@@ -376,25 +373,7 @@ impl<ExchangeKey, AssetKey, InstrumentKey> From<Order<ExchangeKey, InstrumentKey
     for Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>
 {
     fn from(value: Order<ExchangeKey, InstrumentKey, Cancelled>) -> Self {
-        let Order {
-            key,
-            side,
-            price,
-            quantity,
-            kind,
-            time_in_force,
-            state,
-        } = value;
-
-        Self {
-            key,
-            side,
-            price,
-            quantity,
-            kind,
-            time_in_force,
-            state: OrderState::Inactive(InactiveOrderState::Cancelled(state)),
-        }
+        value.map_state(|state| OrderState::Inactive(InactiveOrderState::Cancelled(state)))
     }
 }
 
@@ -402,25 +381,7 @@ impl<ExchangeKey, AssetKey, InstrumentKey> From<Order<ExchangeKey, InstrumentKey
     for Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>
 {
     fn from(value: Order<ExchangeKey, InstrumentKey, Expired>) -> Self {
-        let Order {
-            key,
-            side,
-            price,
-            quantity,
-            kind,
-            time_in_force,
-            state,
-        } = value;
-
-        Self {
-            key,
-            side,
-            price,
-            quantity,
-            kind,
-            time_in_force,
-            state: OrderState::Inactive(InactiveOrderState::Expired(state)),
-        }
+        value.map_state(|state| OrderState::Inactive(InactiveOrderState::Expired(state)))
     }
 }
 

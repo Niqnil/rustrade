@@ -25,8 +25,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `UnboundedRx::len` and `is_empty` (`rustrade-integration`), approximate while senders run.
     For a receiver the caller holds itself, such as the audit updates `System::take_audit` hands
     out, these read the backlog directly.
+- **`OrderStatusClient`: how an order ended at the venue** (`rustrade-execution`). A new
+  supertrait of `ExecutionClient`, implemented only by clients that can do the lookup.
+  `fetch_ended_orders(&[UnindexedOrderKey])` returns how each order that has ended did end
+  (filled, cancelled with what filled before, expired, or rejected after acceptance), under the
+  key it was asked for. It omits an order still live or unknown to the venue, and returns `Err`
+  rather than a partial list. An empty slice returns nothing, not every order. It is the lookup
+  that recovering order lifecycle events after a reconnect needs (#370). It is by order rather
+  than by time because Binance's `allOrders` and Alpaca's closed-order list both filter on
+  creation time, so a window opening at a disconnect cannot see an order placed before it and
+  cancelled during it. `MockExecution` implements it from the simulated venue's ledger. No live
+  client implements it yet.
+  - `Order::map_state`, which replaces an order's state and keeps every other field, and the
+    `UnindexedInactiveOrder` and `UnindexedInactiveOrderState` aliases.
 
 ### Changed
+
+- **`SimulatedVenue` keeps each filled order whole** (`rustrade-execution`). **Breaking.**
+  `AccountState::ack_filled` takes the filled `Order` instead of its client order id, so that
+  `AccountState::order_ended` and `SimulatedVenue::orders_ended` can report a fill's total and
+  average price. `MockExchangeRequestKind` gains `FetchOrdersEnded` and is now
+  `#[non_exhaustive]`, since only the venue's own driver matches on it, so a later request kind is
+  not another break.
 
 - **`System::feed_tx` is now a `FeedTx`** (`rustrade`, new module `system::feed`). **Breaking**
   for code that named its type `UnboundedTx` or reached its inner sender through the public `tx`

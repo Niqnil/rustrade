@@ -33,7 +33,9 @@
 //! # Known Limitations
 //!
 //! No connector recovers the **order lifecycle events** (NEW, CANCELED, EXPIRED) it missed while
-//! disconnected; only fills are recovered (#370).
+//! disconnected; only fills are recovered (#370). [`OrderStatusClient`] is the lookup a recovery
+//! is built on: given the orders a caller still holds as live, it says how each that has ended
+//! did end. Only the mock client implements it so far.
 //!
 //! The engine closes part of that gap from the account snapshot each reconnect produces: an order a
 //! complete list no longer shows is retired (see [`ExecutionClient::account_snapshot`]). That covers
@@ -47,7 +49,7 @@ use crate::{
     balance::AssetBalance,
     error::UnindexedClientError,
     order::{
-        Order,
+        Order, UnindexedInactiveOrder, UnindexedOrderKey,
         bracket::{BracketOrderRequest, BracketOrderResult},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Open, UnindexedOrderState},
@@ -433,6 +435,63 @@ pub trait BracketOrderClient: ExecutionClient {
         &self,
         request: BracketOrderRequest<ExchangeId, &InstrumentNameExchange>,
     ) -> impl Future<Output = BracketOrderResult> + Send;
+}
+
+/// Extension trait for clients that can say how an order ended at the venue.
+///
+/// A client that loses its account stream recovers the fills it missed when it reconnects, but not
+/// an order that was cancelled, expired or rejected in the meantime: the event that said so went
+/// out while nothing was listening. The engine then keeps such an order as live until a complete
+/// account snapshot no longer lists it, and even then cannot tell how it ended. This trait is the
+/// lookup that answers that: given the orders a caller still holds as live, it returns how each one
+/// that has ended did end.
+///
+/// # By order, not by time
+///
+/// The obvious alternative, asking the venue for every order closed since the disconnect, does not
+/// work. Binance's `allOrders` and Alpaca's `GET /v2/orders?status=closed` both filter their time
+/// window on when an order was **created**, so a window opening at the disconnect cannot see an
+/// order placed before it and cancelled during it — which is the order that matters, because the
+/// caller is tracking it. Looking each order up by its client order id finds it whenever it was
+/// placed.
+///
+/// # Type-Level Capability
+///
+/// A supertrait of [`ExecutionClient`], for the reason [`BracketOrderClient`] is one: a client that
+/// cannot look orders up does not implement it, rather than carrying a method that fails at run
+/// time. A caller that needs the lookup bounds on `ExecutionClient + OrderStatusClient`.
+pub trait OrderStatusClient: ExecutionClient {
+    /// How each of `orders` ended, for those that have.
+    ///
+    /// # Contract
+    ///
+    /// - One entry per order that has ended, in no particular order:
+    ///   [`FullyFilled`](crate::order::state::InactiveOrderState::FullyFilled),
+    ///   [`Cancelled`](crate::order::state::InactiveOrderState::Cancelled) carrying what filled
+    ///   before it, [`Expired`](crate::order::state::InactiveOrderState::Expired), or
+    ///   [`OpenFailed`](crate::order::state::InactiveOrderState::OpenFailed) for an order the venue
+    ///   accepted for processing and later rejected (Binance `REJECTED`, Alpaca `rejected`). An
+    ///   order rejected in the response to its open request was answered there and is not expected
+    ///   here.
+    /// - An order still live is **omitted**, and so is one the venue does not know. Neither is an
+    ///   error. A caller compares the result with what it asked for.
+    /// - An empty `orders` returns an empty list. Unlike
+    ///   [`ExecutionClient::fetch_open_orders`]'s empty slice, it does not mean "all".
+    /// - An order is found by its [`cid`](crate::order::OrderKey::cid), and each returned order
+    ///   carries the key it was asked for, so a `strategy` the venue does not record survives.
+    /// - A key whose `instrument` is not the one the order traded is treated as unknown. The
+    ///   `exchange` is not checked: a client answers for its own venue.
+    /// - A `cid` asked about more than once is reported at most once, under the first key that
+    ///   finds it.
+    ///
+    /// # Errors
+    ///
+    /// `Err` if the venue could not answer for every order. A partial list is never returned,
+    /// because an order missing from it would read as still live.
+    fn fetch_ended_orders(
+        &self,
+        orders: &[UnindexedOrderKey],
+    ) -> impl Future<Output = Result<Vec<UnindexedInactiveOrder>, UnindexedClientError>> + Send;
 }
 
 /// The capability table, pinned.

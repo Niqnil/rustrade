@@ -15,6 +15,11 @@ use serde::{Deserialize, Serialize};
 /// and [`InstrumentNameExchange`].
 pub type UnindexedOrderState = OrderState<AssetNameExchange, InstrumentNameExchange>;
 
+/// Convenient type alias for an [`InactiveOrderState`] keyed with [`AssetNameExchange`] and
+/// [`InstrumentNameExchange`].
+pub type UnindexedInactiveOrderState =
+    InactiveOrderState<AssetNameExchange, InstrumentNameExchange>;
+
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, From)]
 pub enum OrderState<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     Active(ActiveOrderState),

@@ -1,7 +1,7 @@
 use crate::{
     UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::AssetBalance,
-    client::ExecutionClient,
+    client::{ExecutionClient, OrderStatusClient},
     error::{
         ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
         UnindexedOrderError,
@@ -10,7 +10,7 @@ use crate::{
     fee::FeeModelConfig,
     fill::SimFillConfig,
     order::{
-        Order, OrderKey,
+        Order, OrderKey, UnindexedInactiveOrder, UnindexedOrderKey,
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Open, OrderState, UnindexedOrderState},
     },
@@ -348,6 +348,39 @@ where
                 self.time_request(),
                 response_tx,
                 time_since,
+            ))
+            .map_err(|_| {
+                UnindexedClientError::Connectivity(ConnectivityError::ExchangeOffline(
+                    self.mocked_exchange,
+                ))
+            })?;
+
+        response_rx.await.map_err(|_| {
+            UnindexedClientError::Connectivity(ConnectivityError::ExchangeOffline(
+                self.mocked_exchange,
+            ))
+        })
+    }
+}
+
+/// Answered from the venue's own ledger: an order it filled, cancelled or retired at its deadline
+/// is reported, and one still open or never held is omitted. The venue rejects an order only on
+/// arrival, in the response to its open request, so it never reports `OpenFailed`.
+impl<FnTime> OrderStatusClient for MockExecution<FnTime>
+where
+    FnTime: Fn() -> DateTime<Utc> + Clone + Send + Sync,
+{
+    async fn fetch_ended_orders(
+        &self,
+        orders: &[UnindexedOrderKey],
+    ) -> Result<Vec<UnindexedInactiveOrder>, UnindexedClientError> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        self.request_tx
+            .send(MockExchangeRequest::fetch_orders_ended(
+                self.time_request(),
+                orders.to_vec(),
+                response_tx,
             ))
             .map_err(|_| {
                 UnindexedClientError::Connectivity(ConnectivityError::ExchangeOffline(

@@ -3,14 +3,14 @@ use crate::{
     balance::AssetBalance,
     exchange::mock::orders::{OpenOrders, as_open},
     order::{
-        Order,
+        Order, UnindexedInactiveOrder,
         id::ClientOrderId,
-        state::{Cancelled, Expired, InactiveOrderState, Open, OrderState},
+        state::{Cancelled, Expired, Filled, InactiveOrderState, Open, OrderState},
     },
     trade::Trade,
 };
 use chrono::{DateTime, Utc};
-use fnv::{FnvHashMap, FnvHashSet};
+use fnv::FnvHashMap;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
     asset::name::AssetNameExchange, exchange::ExchangeId, instrument::name::InstrumentNameExchange,
@@ -22,12 +22,14 @@ pub struct AccountState {
     orders_open: OpenOrders,
     orders_cancelled:
         FnvHashMap<ClientOrderId, Order<ExchangeId, InstrumentNameExchange, Cancelled>>,
-    /// Orders that filled, kept only so a cancel arriving after one can say *why* it failed.
+    /// Orders that filled, kept so a cancel arriving after one can say *why* it failed, and so an
+    /// order-state lookup can report how it ended.
     ///
-    /// Ids alone: nothing reads the order back, and the fill itself is already in
-    /// [`trades`](Self::trades). Grows with the run, like `trades` and `orders_cancelled` — a
-    /// simulated venue's ledgers are bounded by the dataset, not reaped.
-    orders_filled: FnvHashSet<ClientOrderId>,
+    /// Whole orders, like `orders_cancelled`: the fill's total and average price are not
+    /// recoverable from [`trades`](Self::trades) alone, which records each cross separately. Grows
+    /// with the run, like `trades` and `orders_cancelled` — a simulated venue's ledgers are bounded
+    /// by the dataset, not reaped.
+    orders_filled: FnvHashMap<ClientOrderId, Order<ExchangeId, InstrumentNameExchange, Filled>>,
     /// Orders retired by their own deadline, kept so they reach a later account snapshot and so a
     /// cancel arriving after one can say *why* it failed.
     ///
@@ -52,7 +54,7 @@ impl AccountState {
             balances,
             orders_open,
             orders_cancelled,
-            orders_filled: FnvHashSet::default(),
+            orders_filled: FnvHashMap::default(),
             orders_expired: FnvHashMap::default(),
             trades,
         }
@@ -79,14 +81,38 @@ impl AccountState {
         self.orders_cancelled.contains_key(cid)
     }
 
-    /// Records that `cid` filled, so a cancel that loses the race to it can say so.
-    pub fn ack_filled(&mut self, cid: ClientOrderId) {
-        self.orders_filled.insert(cid);
+    /// Records that `order` filled, so a cancel that loses the race to it can say so and an
+    /// order-state lookup can report it.
+    ///
+    /// Keyed on the client order id, which this venue assumes is never reused: a second fill under
+    /// the same id would replace the first.
+    pub fn ack_filled(&mut self, order: Order<ExchangeId, InstrumentNameExchange, Filled>) {
+        self.orders_filled.insert(order.key.cid.clone(), order);
     }
 
     /// Whether `cid` names an order this account filled.
     pub fn is_filled(&self, cid: &ClientOrderId) -> bool {
-        self.orders_filled.contains(cid)
+        self.orders_filled.contains_key(cid)
+    }
+
+    /// How the order `cid` ended, or `None` if it is still open or this account never held it.
+    ///
+    /// An order a configured `initial_state` reported as cancelled is found too; one it reported
+    /// in any other inactive state is not, because a snapshot seeds only open and cancelled orders.
+    ///
+    /// Each ledger an order can end in is checked in turn and the open book is not, which is sound
+    /// because this venue assumes a client order id is never reused: an order leaves the book
+    /// before it is recorded as ended, so it is in at most one of these places.
+    pub fn order_ended(&self, cid: &ClientOrderId) -> Option<UnindexedInactiveOrder> {
+        if let Some(filled) = self.orders_filled.get(cid) {
+            Some(filled.clone().map_state(InactiveOrderState::FullyFilled))
+        } else if let Some(cancelled) = self.orders_cancelled.get(cid) {
+            Some(cancelled.clone().map_state(InactiveOrderState::Cancelled))
+        } else {
+            self.orders_expired
+                .get(cid)
+                .map(|expired| expired.clone().map_state(InactiveOrderState::Expired))
+        }
     }
 
     /// Records that `order` reached its own deadline, so it is reported by a later account snapshot
@@ -457,7 +483,7 @@ impl From<UnindexedAccountSnapshot> for AccountState {
             balances,
             orders_open,
             orders_cancelled,
-            orders_filled: FnvHashSet::default(),
+            orders_filled: FnvHashMap::default(),
             orders_expired: FnvHashMap::default(),
             trades: vec![],
         }

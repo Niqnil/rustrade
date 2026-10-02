@@ -13,7 +13,7 @@ use crate::{
     fill::{FillContext, FillModel, SimFillConfig},
     market::{MarketDepth, MarketSnapshot},
     order::{
-        Order, OrderKind, TimeInForce, UnindexedOrder,
+        Order, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, VenueOrderId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Cancelled, Expired, Filled, Open, OrderState, UnindexedOrderState},
@@ -22,7 +22,7 @@ use crate::{
     trade::{AssetFees, Trade, TradeId},
 };
 use chrono::{DateTime, Utc};
-use fnv::FnvHashMap;
+use fnv::{FnvHashMap, FnvHashSet};
 use itertools::Itertools;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
@@ -740,7 +740,6 @@ impl SimulatedVenue {
             };
 
             self.account.ack_trade(trade.clone());
-            self.account.ack_filled(cid);
 
             // The order is terminal, and says so as `Inactive(FullyFilled)` rather than as an
             // `Open` carrying a complete fill. Both denote the same fact, but only this one can
@@ -759,13 +758,15 @@ impl SimulatedVenue {
                 quantity: order.quantity,
                 kind: order.kind,
                 time_in_force: order.time_in_force,
-                state: OrderState::fully_filled(Filled::new(
+                state: Filled::new(
                     order_id,
                     time_exchange,
                     order.quantity,
                     order.state.filled_quantity.is_zero().then_some(limit),
-                )),
+                ),
             };
+            self.account.ack_filled(filled.clone());
+            let filled = filled.map_state(OrderState::fully_filled);
 
             events.push(self.build_account_event(Snapshot(balance)));
             events.push(self.build_account_event(trade));
@@ -923,6 +924,34 @@ impl SimulatedVenue {
             .orders_open()
             .filter(|order| instruments.is_empty() || instruments.contains(&order.key.instrument))
             .cloned()
+            .collect()
+    }
+
+    /// How each of `orders` ended, for those that have: filled, cancelled (including the
+    /// unfilled remainder of a market order) or expired at its own deadline.
+    ///
+    /// An order still open is omitted, and so is one this venue never held, including one it
+    /// rejected on arrival, whose rejection was the answer to its open request. An empty `orders`
+    /// returns nothing, not every ended order.
+    ///
+    /// Each order is found by its client order id, which this venue keys every order on, and is
+    /// returned under the key it was asked for. A key naming a different instrument from the one
+    /// the order traded is treated as unknown, and an id asked about more than once is reported
+    /// once, under the first key that finds it.
+    pub fn orders_ended(&self, orders: &[UnindexedOrderKey]) -> Vec<UnindexedInactiveOrder> {
+        let mut reported = FnvHashSet::default();
+        orders
+            .iter()
+            .filter_map(|key| {
+                let order = self
+                    .account
+                    .order_ended(&key.cid)
+                    .filter(|order| order.key.instrument == key.instrument)?;
+                reported.insert(&key.cid).then(|| Order {
+                    key: key.clone(),
+                    ..order
+                })
+            })
             .collect()
     }
 
@@ -1690,7 +1719,15 @@ impl SimulatedVenue {
                     request.state.quantity,
                     Some(fill.price),
                 );
-                self.account.ack_filled(request.key.cid.clone());
+                self.account.ack_filled(Order {
+                    key: request.key.clone(),
+                    side: request.state.side,
+                    price: request.state.price,
+                    quantity: request.state.quantity,
+                    kind: request.state.kind,
+                    time_in_force: request.state.time_in_force,
+                    state: filled.clone(),
+                });
 
                 (OrderState::fully_filled(filled), None)
             }
@@ -6303,5 +6340,245 @@ mod tests {
             "nothing settled: a replaced order traded nothing"
         );
         drop(first);
+    }
+
+    // --- How an order ended -------------------------------------------------------------------
+
+    fn key_of(cid: &str) -> UnindexedOrderKey {
+        OrderKey {
+            exchange: EXCHANGE,
+            instrument: instrument_name(),
+            strategy: StrategyId::new("asker"),
+            cid: ClientOrderId::new(cid),
+        }
+    }
+
+    /// Every way an order can end on this venue is reported, under the key it was asked for, and
+    /// an order still working or never held is left out.
+    #[test]
+    fn orders_ended_reports_each_ended_order_and_omits_the_rest() {
+        let mut venue = make_market_venue("10", "1000000");
+        advance(&mut venue, time(1));
+        assert!(
+            venue
+                .apply_market(
+                    &instrument_name(),
+                    book("49000", "49100"),
+                    MarketDepth::UNKNOWN,
+                    time(1)
+                )
+                .is_empty()
+        );
+
+        let filled = venue.open_order(limit_request("filled", Side::Buy, "1", "49100", gtc()));
+        assert!(
+            matches!(
+                filled.response.state,
+                OrderState::Inactive(InactiveOrderState::FullyFilled(_))
+            ),
+            "crosses the ask, so fills on arrival"
+        );
+        let _ = venue.open_order(limit_request("working", Side::Buy, "1", "48000", gtc()));
+        let _ = venue.open_order(limit_request("cancelled", Side::Buy, "1", "47500", gtc()));
+        let _ = venue.cancel_order(OrderEvent {
+            key: key_of("cancelled"),
+            state: RequestCancel { id: None },
+        });
+        let _ = venue.open_order(limit_request(
+            "expired",
+            Side::Buy,
+            "1",
+            "47000",
+            TimeInForce::GoodTillDate { expiry: time(9) },
+        ));
+        assert_eq!(
+            venue.advance_time(time(9)).len(),
+            2,
+            "the deadline retires it"
+        );
+
+        let asked = ["filled", "working", "cancelled", "expired", "unknown"].map(key_of);
+        let ended = venue.orders_ended(&asked);
+
+        assert_eq!(ended.len(), 3, "exactly the three ended orders: {ended:?}");
+        assert!(
+            ended
+                .iter()
+                .all(|order| order.key.strategy == StrategyId::new("asker")),
+            "each comes back under the key it was asked for"
+        );
+        let ended_as = |cid: &str| {
+            let Some(order) = ended
+                .iter()
+                .find(|order| order.key.cid == ClientOrderId::new(cid))
+            else {
+                panic!("{cid} is reported: {ended:?}");
+            };
+            order
+        };
+        let (filled, cancelled, expired) = (
+            ended_as("filled"),
+            ended_as("cancelled"),
+            ended_as("expired"),
+        );
+        match &filled.state {
+            InactiveOrderState::FullyFilled(state) => {
+                assert_eq!(state.filled_quantity, d("1"));
+                assert_eq!(state.avg_price, Some(d("49100")));
+            }
+            other => panic!("filled, got {other:?}"),
+        }
+        match &cancelled.state {
+            InactiveOrderState::Cancelled(state) => {
+                assert_eq!(state.filled_quantity, Decimal::ZERO)
+            }
+            other => panic!("cancelled, got {other:?}"),
+        }
+        match &expired.state {
+            InactiveOrderState::Expired(state) => assert_eq!(state.time_exchange, time(9)),
+            other => panic!("expired, got {other:?}"),
+        }
+
+        assert!(
+            venue.orders_ended(&[]).is_empty(),
+            "an empty request asks about nothing, not about everything"
+        );
+    }
+
+    /// A market order's unfillable remainder retires as a cancel carrying what did trade, and a
+    /// lookup reports it so.
+    #[test]
+    fn orders_ended_reports_a_market_remainder_as_cancelled_with_its_fill() {
+        let mut venue = venue_offering(sized("0.4"));
+        let outcome = venue.open_order(buy_request("1", None));
+
+        let ended = venue.orders_ended(std::slice::from_ref(&outcome.response.key));
+
+        let [order] = ended.as_slice() else {
+            panic!("the remainder's order is reported: {ended:?}");
+        };
+        match &order.state {
+            InactiveOrderState::Cancelled(state) => assert_eq!(state.filled_quantity, d("0.4")),
+            other => panic!("cancelled carrying its fill, got {other:?}"),
+        }
+    }
+
+    /// A resting order filled from the book is reported with the price it filled at, and one that
+    /// reached the book part-filled with no average, as its own fill reported.
+    #[test]
+    fn orders_ended_reports_a_resting_fill_and_its_average_price_as_the_fill_did() {
+        let (mut venue, _) = venue_resting_one_buy("48000");
+        assert!(
+            venue
+                .account
+                .orders_mut()
+                .insert(seeded_part_filled("48000", "1", "0.4"), None)
+                .is_none(),
+            "nothing is displaced"
+        );
+        advance(&mut venue, time(2));
+        let events = venue.apply_market(
+            &instrument_name(),
+            book("47800", "47900"),
+            MarketDepth::UNKNOWN,
+            time(2),
+        );
+        assert_eq!(
+            events.len(),
+            6,
+            "two fills, each a balance, a trade and an order"
+        );
+
+        let ended = venue.orders_ended(&[key_of("resting"), key_of("part_filled")]);
+
+        let avg_price_of = |cid: &str| {
+            let Some(order) = ended
+                .iter()
+                .find(|order| order.key.cid == ClientOrderId::new(cid))
+            else {
+                panic!("{cid} is reported: {ended:?}");
+            };
+            match &order.state {
+                InactiveOrderState::FullyFilled(filled) => {
+                    assert_eq!(filled.filled_quantity, d("1"));
+                    filled.avg_price
+                }
+                other => panic!("{cid} filled, got {other:?}"),
+            }
+        };
+        assert_eq!(avg_price_of("resting"), Some(d("48000")));
+        assert_eq!(
+            avg_price_of("part_filled"),
+            None,
+            "this venue saw only one of the two fills behind it"
+        );
+    }
+
+    /// An order the configured `initial_state` reports as cancelled is reported as such.
+    #[test]
+    fn orders_ended_reports_an_order_the_initial_state_seeded_as_cancelled() {
+        let seeded = Order {
+            key: key_of("seeded"),
+            side: Side::Buy,
+            price: Some(d("48000")),
+            quantity: d("1"),
+            kind: OrderKind::Limit,
+            time_in_force: gtc(),
+            state: OrderState::inactive(Cancelled {
+                id: OrderId::new("seeded"),
+                time_exchange: time(0),
+                filled_quantity: d("0.25"),
+            }),
+        };
+        let venue = SimulatedVenue::new(
+            &spot_config_holding("10", "1000000", seeded),
+            spot_instruments(),
+        );
+
+        let ended = venue.orders_ended(&[key_of("seeded")]);
+
+        let [order] = ended.as_slice() else {
+            panic!("the seeded cancel is reported: {ended:?}");
+        };
+        match &order.state {
+            InactiveOrderState::Cancelled(cancelled) => {
+                assert_eq!(cancelled.filled_quantity, d("0.25"))
+            }
+            other => panic!("cancelled, got {other:?}"),
+        }
+    }
+
+    /// An id asked about twice is reported once, under the first key that finds it, and a key
+    /// naming another instrument does not find the order or stop a later key from finding it.
+    #[test]
+    fn orders_ended_reports_an_id_once_and_only_for_its_own_instrument() {
+        let mut venue = venue_offering(sized("0.4"));
+        let outcome = venue.open_order(buy_request("1", None));
+        let key = outcome.response.key.clone();
+        let other_instrument = OrderKey {
+            instrument: InstrumentNameExchange::new("ETHUSDT"),
+            ..key.clone()
+        };
+        let second_ask = OrderKey {
+            strategy: StrategyId::new("second"),
+            ..key.clone()
+        };
+
+        let ended = venue.orders_ended(&[key.clone(), second_ask]);
+        let [order] = ended.as_slice() else {
+            panic!("one entry for one id: {ended:?}");
+        };
+        assert_eq!(order.key, key, "the first key that finds it");
+
+        let ended = venue.orders_ended(&[other_instrument.clone(), key.clone()]);
+        let [order] = ended.as_slice() else {
+            panic!("a key that finds nothing does not stop a later one: {ended:?}");
+        };
+        assert_eq!(order.key, key);
+
+        assert!(
+            venue.orders_ended(&[other_instrument]).is_empty(),
+            "a key for another instrument does not find it"
+        );
     }
 }
