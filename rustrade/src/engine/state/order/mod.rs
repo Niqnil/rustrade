@@ -55,8 +55,10 @@ pub mod manager;
 /// track it again: a live order the venue no longer has.
 ///
 /// So `Orders` remembers the [`ClientOrderId`]s of the last [`MAX_RECENTLY_RETIRED_ORDERS`]
-/// orders it retired, oldest forgotten first, and ignores an active snapshot for one of them.
-/// This relies on what the engine already assumes, that a client order id names one order for
+/// orders that ended, oldest forgotten first, and ignores an active snapshot for one of them. An
+/// order counts as ended when `Orders` retires it, when [`Orders::clear`] drops it, or when a
+/// snapshot reports it ended while it is not tracked, which includes an order this engine never
+/// placed: each takes a place in the same window. This relies on what the engine already assumes, that a client order id names one order for
 /// good. Recording a new open request under a remembered id forgets it, since that request is a
 /// new order by the engine's own hand.
 ///
@@ -77,8 +79,8 @@ pub struct Orders<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex>(
     #[serde(skip)] RecentlyRetired,
 );
 
-/// How many retired orders' [`ClientOrderId`]s an [`Orders`] remembers, so that a late active
-/// snapshot cannot track one again.
+/// How many ended orders' [`ClientOrderId`]s an [`Orders`] remembers, so that a late active
+/// snapshot cannot track one again (see "Retired orders stay retired" on [`Orders`]).
 ///
 /// The bound has to span the orders that retire between an order's end and the last stale report
 /// of it: a placement response the account stream outran, or a listing fetched just before the
@@ -88,7 +90,7 @@ pub struct Orders<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex>(
 /// instrument, allocated only as orders retire.
 pub const MAX_RECENTLY_RETIRED_ORDERS: usize = 64;
 
-/// The [`ClientOrderId`]s of the orders an [`Orders`] most recently retired, at most
+/// The [`ClientOrderId`]s of the orders an [`Orders`] most recently saw end, at most
 /// [`MAX_RECENTLY_RETIRED_ORDERS`], oldest forgotten first.
 ///
 /// A plain list: it is searched only for a snapshot of an untracked order, and a scan of so few
