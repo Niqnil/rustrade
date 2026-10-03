@@ -53,8 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `OrderStatusClient` with the same lookup: `FILLED` with its average price (none where Binance
   reports the quote traded as negative, its sign for "not available"), `CANCELED` and
   `EXPIRED`/`EXPIRED_IN_MATCH` with what filled before, `REJECTED` as `OpenFailed`, and an order
-  unknown under the key's symbol (`-2013`, `-1121`) omitted. Refs #370. Binance Margin does the
-  same (below); the other live clients follow.
+  unknown under the key's symbol (`-2013`, `-1121`) omitted. Refs #370. Binance Margin and Alpaca
+  do the same (below).
 - **Binance Margin reports how orders ended while its account stream was disconnected**
   (`rustrade-execution`), as Binance Spot does (above), on both the cross and the isolated
   stream. `BinanceMargin` holds the orders it has seen live: from placing them, from
@@ -68,6 +68,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BinanceMargin` also implements `OrderStatusClient` with the same lookup, read as on spot.
   `account_stream` no longer tells callers they must call `fetch_open_orders` after each
   reconnect; that stays the way to reconcile orders placed outside the client. Refs #370.
+- **Alpaca reports how orders ended while its account stream was disconnected**
+  (`rustrade-execution`), as Binance does (above). `AlpacaClient` holds the orders it has seen
+  live: from placing them (bracket parents included), from `account_snapshot` and
+  `fetch_open_orders`, and from the stream. A cancel Alpaca has only accepted (its 204) does not
+  end one. After a reconnect, once fill recovery has finished or given up, it lists the open
+  orders of every instrument it holds one on, among the stream's `instruments` (all of them when
+  that list is empty), in one `GET /v2/orders?status=open&symbols=…`. It then looks up each held
+  order the listing no longer shows with `GET /v2/orders:by_client_order_id`, and sends each that
+  ended as an `OrderSnapshot` of its inactive state, under `StrategyId::unknown()`. A failed check
+  is retried while connected 1, 2, 4, 8 and 16 minutes later, then given up with an `error!`.
+  `AlpacaClient` also implements `OrderStatusClient` with the same lookup: `filled` with
+  `filled_avg_price`, `canceled` and `replaced` as cancelled with what filled before, `expired`,
+  `rejected` as `OpenFailed`, and a 404 or an order on another symbol than the key's omitted.
+  `done_for_day` and the other working statuses are not ended. Refs #370.
 
 ### Changed
 
@@ -127,6 +141,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Alpaca retired an order that was only done for the day** (`rustrade-execution`). A
+  `done_for_day` event on the account stream was delivered as `OrderCancelled`, so the engine
+  dropped an order that Alpaca keeps and works again the next trading day ("will not receive
+  further updates until the next trading day"), and any later fill on it matched no order. It is
+  now delivered as an `OrderSnapshot` of the order as open, with what it has filled.
 - **An order rejected for insufficient balance on Binance stayed in flight forever**
   (`rustrade-execution`, `rustrade`). Binance's error mapping put the *instrument* name where
   `ApiError::BalanceInsufficient` expects an asset. The indexer could not resolve it, so

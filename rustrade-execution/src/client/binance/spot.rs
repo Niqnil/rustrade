@@ -33,10 +33,6 @@
 //   report cannot resurrect a retired order as a resting one. That order's filled
 //   quantity is settled instead by the terminal report's own z, or by fetch_open_orders.
 
-use super::order_recovery::{
-    KnownLiveOrders, OrderLookup, SharedKnownLiveOrders, UncheckedOrders, fetch_ended_by_key,
-    recover_ended_orders,
-};
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
@@ -53,7 +49,13 @@ use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
     UnindexedAccountSnapshot,
     balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate},
-    client::{ExecutionClient, OrderStatusClient},
+    client::{
+        ExecutionClient, OrderStatusClient,
+        order_recovery::{
+            KnownLiveOrders, OpenListing, OrderLookup, SharedKnownLiveOrders, UncheckedOrders,
+            fetch_ended_by_key, recover_ended_orders,
+        },
+    },
     emit_stream_terminated,
     error::{
         ApiError, ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
@@ -552,21 +554,25 @@ async fn fetch_order_lookup(
         }))
 }
 
-/// The client order ids `GET /api/v3/openOrders` lists on `instrument` (weight 6), for a
-/// reconnect's check of the orders held as live.
+/// The client order ids `GET /api/v3/openOrders` lists on `instruments` (weight 6 each, one at a
+/// time), for a reconnect's check of the orders held as live.
 async fn listed_open_cids(
     rest: Arc<RestApi>,
     rate_limiter: Arc<RateLimitTracker>,
-    instrument: InstrumentNameExchange,
+    instruments: Vec<InstrumentNameExchange>,
 ) -> Result<FnvHashSet<ClientOrderId>, UnindexedClientError> {
-    let (_, listing) =
-        fetch_open_orders_for_instrument(rest, rate_limiter, instrument, RequestKind::Essential)
-            .await?;
-    Ok(listing
-        .orders
-        .into_iter()
-        .map(|order| order.key.cid)
-        .collect())
+    let mut listed = FnvHashSet::default();
+    for instrument in instruments {
+        let (_, listing) = fetch_open_orders_for_instrument(
+            rest.clone(),
+            rate_limiter.clone(),
+            instrument,
+            RequestKind::Essential,
+        )
+        .await?;
+        listed.extend(listing.orders.into_iter().map(|order| order.key.cid));
+    }
+    Ok(listed)
 }
 
 /// [`recover_ended_orders`] on Binance Spot: listings by [`listed_open_cids`] and lookups by
@@ -585,7 +591,8 @@ async fn recover_spot_ended_orders(
         unchecked,
         unrecovered,
         tx,
-        |instrument| listed_open_cids(rest.clone(), rate_limiter.clone(), instrument),
+        OpenListing::PerInstrument,
+        |instruments| listed_open_cids(rest.clone(), rate_limiter.clone(), instruments),
         |key| {
             fetch_order_lookup(
                 rest.clone(),
@@ -713,7 +720,7 @@ impl ExecutionClient for BinanceSpot {
             ws_handle,
             ws_api: Arc::new(RwLock::new(None)),
             rate_limiter: Arc::new(RateLimitTracker::new(WeightPool::Spot)),
-            known_live: KnownLiveOrders::shared(),
+            known_live: KnownLiveOrders::shared(ExchangeId::BinanceSpot),
         }
     }
 
@@ -851,10 +858,11 @@ impl ExecutionClient for BinanceSpot {
     ///   its full quantity ends it, and that order is not reported again.
     /// - **Keys.** Each snapshot carries [`StrategyId::unknown`], since Binance records no
     ///   strategy. The engine matches it to the order it tracks by client order id.
-    /// - **Failures.** Each instrument is settled as soon as its check ends. One whose check fails,
-    ///   or is still running when a pass reaches 30 s, is retried on the fill gaps' schedule (1, 2,
-    ///   4, 8 and 16 minutes), then given up, logged at `error`. Its orders are asked about again
-    ///   at the next reconnect. An order Binance does not know (`-2013`) stops being held, logged
+    /// - **Failures.** Each order's lookup is settled as it ends, and each instrument as soon as its
+    ///   check ends. One whose listing or any lookup fails, or whose check is still running when a
+    ///   pass reaches 30 s, is retried on the fill gaps' schedule (1, 2, 4, 8 and 16 minutes),
+    ///   asking only about the orders still held, then given up, logged at `error`. Its orders are
+    ///   asked about again at the next reconnect. An order Binance does not know (`-2013`) stops being held, logged
     ///   at `warn`; one it still reports live, or in a state this version cannot read, stays held.
     ///
     /// The same lookup is public as [`OrderStatusClient::fetch_ended_orders`].
@@ -4913,7 +4921,7 @@ mod tests {
                 &mut unrecovered,
                 &tx,
                 &new_dedup_cache(),
-                &KnownLiveOrders::shared(),
+                &KnownLiveOrders::shared(ExchangeId::BinanceSpot),
             ),
         )
         .await
@@ -4978,7 +4986,7 @@ mod tests {
             &mut unrecovered,
             &tx,
             &dedup,
-            &KnownLiveOrders::shared(),
+            &KnownLiveOrders::shared(ExchangeId::BinanceSpot),
         )
         .await;
         assert!(!unrecovered.is_empty(), "the failed gap is kept");
@@ -4995,7 +5003,7 @@ mod tests {
             &mut unrecovered,
             &tx,
             &dedup,
-            &KnownLiveOrders::shared(),
+            &KnownLiveOrders::shared(ExchangeId::BinanceSpot),
         )
         .await;
         assert!(unrecovered.is_empty(), "the retry recovered it");
@@ -5124,7 +5132,7 @@ mod tests {
             &mut unrecovered,
             &tx,
             &new_dedup_cache(),
-            &KnownLiveOrders::shared(),
+            &KnownLiveOrders::shared(ExchangeId::BinanceSpot),
         )
         .await;
 
@@ -5136,7 +5144,7 @@ mod tests {
         );
         assert_eq!(
             unrecovered
-                .due(now + Duration::from_secs(GAP_RETRY_BASE_SECS))
+                .due(now + Duration::from_secs(crate::client::order_recovery::GAP_RETRY_BASE_SECS))
                 .len(),
             9,
             "the eight started wait for their first retry"
@@ -5409,7 +5417,7 @@ mod tests {
 
     /// `live`, `gone` and `unknown`, all held as live on BTCUSDT.
     fn held_orders() -> SharedKnownLiveOrders {
-        let known = KnownLiveOrders::shared();
+        let known = KnownLiveOrders::shared(ExchangeId::BinanceSpot);
         for (n, cid) in ["live", "gone", "unknown"].into_iter().enumerate() {
             known.lock().live(
                 &spot_key("BTCUSDT", cid),

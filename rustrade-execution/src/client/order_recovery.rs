@@ -1,17 +1,17 @@
-//! Learning how orders ended while a Binance account stream was disconnected.
+//! Learning how orders ended while an account stream was disconnected.
 //!
 //! A reconnect recovers the fills it missed by time, but an order cancelled, expired or rejected in
-//! the meantime cannot be found that way: Binance filters its order history on when an order was
-//! created, so a window opening at the disconnect misses an order placed before it. So the client
-//! keeps the orders it knows to be live ([`KnownLiveOrders`]), and after a reconnect lists each
-//! instrument's open orders and asks about each held order no longer listed, by client order id
-//! ([`recover_ended_orders`]). [`UncheckedOrders`] holds which instruments still need that check,
-//! and when a failed one is retried. [`fetch_ended_by_key`] answers
-//! [`OrderStatusClient`](crate::client::OrderStatusClient) with the same lookup.
+//! the meantime cannot be found that way: Binance and Alpaca both filter their order history on
+//! when an order was created, so a window opening at the disconnect misses an order placed before
+//! it. So the client keeps the orders it knows to be live ([`KnownLiveOrders`]), and after a
+//! reconnect lists the open orders of each instrument it holds one on and asks about each held
+//! order no longer listed, by client order id ([`recover_ended_orders`]). [`UncheckedOrders`] holds
+//! which instruments still need that check, and when a failed one is retried. [`fetch_ended_by_key`]
+//! answers [`OrderStatusClient`](crate::client::OrderStatusClient) with the same lookup.
 //!
-//! Nothing here names a Binance endpoint: each client passes in its own listing and lookup.
+//! Nothing here names a venue's endpoint: each client passes in its own listing and lookup, and
+//! says through [`PendingFills`] which instruments still wait for fills it has to recover.
 
-use super::shared::{GAP_RETRY_BASE_SECS, GapFailure, MAX_GAP_RETRIES, UnrecoveredFills};
 use crate::{
     AccountEventKind, UnindexedAccountEvent,
     error::UnindexedClientError,
@@ -39,11 +39,48 @@ use std::{
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+/// How many times a failed read is retried after its first failure before it is given up: a
+/// reconnect's check of how orders ended here, and a Binance fill gap.
+pub(crate) const MAX_GAP_RETRIES: u32 = 5;
+/// The wait before a failed read's first retry. It doubles after each failure, so the retries come
+/// 1, 2, 4, 8 and 16 minutes apart, about half an hour in all.
+pub(crate) const GAP_RETRY_BASE_SECS: u64 = 60;
+
+/// What became of a read that failed or did not finish: a reconnect's check of how orders ended,
+/// or a Binance fill gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GapFailure {
+    /// It is read again after this delay.
+    Retry(Duration),
+    /// It has failed [`MAX_GAP_RETRIES`] retries and is dropped.
+    GivenUp,
+}
+
+/// Which instruments still have fills a reconnect has to recover, so that how an order ended is
+/// not reported before its fills.
+pub(crate) trait PendingFills {
+    /// Whether fills on `instrument` are still to be recovered.
+    fn pending(&self, instrument: &InstrumentNameExchange) -> bool;
+}
+
+/// No fills left to recover, as for a client whose fill recovery is done, or given up, before its
+/// order check starts.
+#[derive(Debug, Clone, Copy, Default)]
+#[cfg_attr(not(feature = "alpaca"), allow(dead_code))] // Only Alpaca recovers fills before its check.
+pub(crate) struct NoPendingFills;
+
+impl PendingFills for NoPendingFills {
+    fn pending(&self, _: &InstrumentNameExchange) -> bool {
+        false
+    }
+}
+
 /// How many live orders [`KnownLiveOrders`] holds before it forgets the oldest.
 ///
-/// Binance caps an account at 1,000 open orders on spot (`EXCHANGE_MAX_NUM_ORDERS`), and every
-/// order leaves the set when it ends, so a full set means orders whose end was never seen, such as
-/// a terminal report that could not be converted. The oldest is the likeliest to be one of those.
+/// Venues cap an account's open orders well below this (Binance at 1,000 on spot,
+/// `EXCHANGE_MAX_NUM_ORDERS`), and every order leaves the set when it ends, so a full set means
+/// orders whose end was never seen, such as a terminal report that could not be converted. The
+/// oldest is the likeliest to be one of those.
 pub(crate) const MAX_KNOWN_LIVE_ORDERS: usize = 4_096;
 
 /// How many recently ended client order ids [`KnownLiveOrders`] remembers, so that a late report
@@ -53,13 +90,13 @@ const RECENTLY_ENDED: NonZeroUsize = match NonZeroUsize::new(1_024) {
     None => panic!("a non-zero literal"),
 };
 
-/// How many order lookups run at once: in [`fetch_ended_by_key`], and per instrument in
+/// How many order lookups run at once: in [`fetch_ended_by_key`], and per listing in
 /// [`recover_ended_orders`].
 pub(crate) const ORDER_LOOKUPS_IN_FLIGHT: usize = 8;
 
-/// How many instruments [`recover_ended_orders`] checks at once. With
-/// [`ORDER_LOOKUPS_IN_FLIGHT`] lookups each, at most 16 requests are in flight.
-const INSTRUMENT_CHECKS_IN_FLIGHT: usize = 2;
+/// How many listings [`recover_ended_orders`] checks at once. With [`ORDER_LOOKUPS_IN_FLIGHT`]
+/// lookups each, at most 16 requests are in flight.
+const LISTINGS_IN_FLIGHT: usize = 2;
 
 /// The time budget for one pass of [`recover_ended_orders`].
 pub(crate) const ORDER_CHECK_TIMEOUT_SECS: u64 = 30;
@@ -90,6 +127,8 @@ struct KnownLive {
 /// placing an order that has already filled, does not add it back.
 #[derive(Debug)]
 pub(crate) struct KnownLiveOrders {
+    /// The venue, named in what the set logs.
+    exchange: ExchangeId,
     orders: FnvHashMap<ClientOrderId, KnownLive>,
     by_order_id: FnvHashMap<(InstrumentNameExchange, OrderId), ClientOrderId>,
     /// Every held order by when it was added, oldest first.
@@ -100,9 +139,11 @@ pub(crate) struct KnownLiveOrders {
     forgetting: bool,
 }
 
-impl Default for KnownLiveOrders {
-    fn default() -> Self {
+impl KnownLiveOrders {
+    /// A new, empty set of `exchange`'s orders.
+    pub(crate) fn new(exchange: ExchangeId) -> Self {
         Self {
+            exchange,
             orders: FnvHashMap::default(),
             by_order_id: FnvHashMap::default(),
             by_age: BTreeMap::new(),
@@ -111,12 +152,10 @@ impl Default for KnownLiveOrders {
             forgetting: false,
         }
     }
-}
 
-impl KnownLiveOrders {
-    /// A new, empty set to share.
-    pub(crate) fn shared() -> SharedKnownLiveOrders {
-        Arc::new(parking_lot::Mutex::new(Self::default()))
+    /// A new, empty set of `exchange`'s orders, to share.
+    pub(crate) fn shared(exchange: ExchangeId) -> SharedKnownLiveOrders {
+        Arc::new(parking_lot::Mutex::new(Self::new(exchange)))
     }
 
     /// Record that the order under `key`, of `quantity`, is live as `open` says. An `open` with
@@ -256,16 +295,18 @@ impl KnownLiveOrders {
         assert_eq!(with_ids.count(), self.by_order_id.len(), "by_order_id");
     }
 
+    /// Every instrument with an order held as live.
+    #[cfg_attr(not(feature = "alpaca"), allow(dead_code))] // Only Alpaca streams every instrument.
+    pub(crate) fn instruments(&self) -> Vec<InstrumentNameExchange> {
+        self.held_instruments().into_iter().cloned().collect()
+    }
+
     /// Those of `instruments` with an order held as live.
     pub(crate) fn instruments_among(
         &self,
         instruments: &[InstrumentNameExchange],
     ) -> Vec<InstrumentNameExchange> {
-        let held: FnvHashSet<&InstrumentNameExchange> = self
-            .orders
-            .values()
-            .map(|known| &known.instrument)
-            .collect();
+        let held = self.held_instruments();
         instruments
             .iter()
             .filter(|instrument| held.contains(instrument))
@@ -273,7 +314,7 @@ impl KnownLiveOrders {
             .collect()
     }
 
-    /// The keys of the orders held as live on `instrument`, under `exchange`. Binance records no
+    /// The keys of the orders held as live on `instrument`, under `exchange`. Venues record no
     /// strategy, so each carries [`StrategyId::unknown`].
     pub(crate) fn keys_on(
         &self,
@@ -292,6 +333,14 @@ impl KnownLiveOrders {
             .collect()
     }
 
+    /// Each instrument with an order held as live, once.
+    fn held_instruments(&self) -> FnvHashSet<&InstrumentNameExchange> {
+        self.orders
+            .values()
+            .map(|known| &known.instrument)
+            .collect()
+    }
+
     fn remove(&mut self, cid: &ClientOrderId) -> bool {
         let Some(known) = self.orders.remove(cid) else {
             return false;
@@ -307,16 +356,18 @@ impl KnownLiveOrders {
         let Some((_, cid)) = self.by_age.pop_first() else {
             return;
         };
+        let exchange = self.exchange;
         if self.forgetting {
-            debug!(%cid, "Binance forgets the oldest order it holds as live");
+            debug!(%exchange, %cid, "Forgetting the oldest order held as live");
         } else {
             self.forgetting = true;
             warn!(
+                %exchange,
                 %cid,
                 held = MAX_KNOWN_LIVE_ORDERS,
-                "Binance holds the most orders as live it can, and forgets the oldest as more \
-                 arrive: if one ended while the stream was disconnected, a reconnect will not \
-                 report it. Further orders forgotten are logged at debug"
+                "Holding the most orders as live the client can, and forgetting the oldest as \
+                 more arrive: if one ended while the stream was disconnected, a reconnect will \
+                 not report it. Further orders forgotten are logged at debug"
             );
         }
         self.remove(&cid);
@@ -334,9 +385,10 @@ struct InstrumentCheck {
 /// check of it is retried.
 ///
 /// A reconnect adds every instrument it recovers fills for that has an order held as live
-/// ([`open`](Self::open)). An instrument is checked only once fill recovery has no gap left on it,
-/// so the fills of an order reach the stream before how it ended ([`ready`](Self::ready)). A check
-/// that fails is retried after the same backoff as a fill gap, until it has failed
+/// ([`open`](Self::open)). An instrument is checked only once it has no fills pending
+/// ([`PendingFills`]), so the fills of an order reach the stream before how it ended
+/// ([`ready`](Self::ready)). A check that fails is retried after the same backoff as a Binance
+/// fill gap, until it has failed
 /// [`MAX_GAP_RETRIES`] retries ([`failed`](Self::failed)); a reconnect does not bring a retry
 /// forward.
 #[derive(Debug, Default)]
@@ -350,18 +402,18 @@ impl UncheckedOrders {
         }
     }
 
-    /// The instruments fill recovery has no gap left on whose check is due at `now`, in name
-    /// order, so they are checked in a stable order.
+    /// The instruments with no fills pending whose check is due at `now`, in name order, so they
+    /// are checked in a stable order.
     pub(crate) fn ready(
         &self,
-        unrecovered: &UnrecoveredFills,
+        pending: &impl PendingFills,
         now: tokio::time::Instant,
     ) -> Vec<InstrumentNameExchange> {
         let mut ready: Vec<_> = self
             .0
             .iter()
             .filter(|(instrument, check)| {
-                !unrecovered.covers(instrument) && check.retry_at.is_none_or(|at| at <= now)
+                !pending.pending(instrument) && check.retry_at.is_none_or(|at| at <= now)
             })
             .map(|(instrument, _)| instrument.clone())
             .collect();
@@ -369,14 +421,14 @@ impl UncheckedOrders {
         ready
     }
 
-    /// When an instrument fill recovery has no gap left on is next due, or `None` when there is
-    /// none. One still on a gap is due only once the gap is settled, which fill recovery's own
-    /// schedule wakes for, so it never makes this a time already past that [`ready`](Self::ready)
-    /// would answer with nothing.
-    pub(crate) fn next_due(&self, unrecovered: &UnrecoveredFills) -> Option<tokio::time::Instant> {
+    /// When an instrument with no fills pending is next due, or `None` when there is none. One
+    /// with fills pending is due only once they are settled, which fill recovery's own schedule
+    /// wakes for, so it never makes this a time already past that [`ready`](Self::ready) would
+    /// answer with nothing.
+    pub(crate) fn next_due(&self, pending: &impl PendingFills) -> Option<tokio::time::Instant> {
         self.0
             .iter()
-            .filter(|(instrument, _)| !unrecovered.covers(instrument))
+            .filter(|(instrument, _)| !pending.pending(instrument))
             .map(|(_, check)| check.retry_at.unwrap_or_else(tokio::time::Instant::now))
             .min()
     }
@@ -477,15 +529,32 @@ where
         .collect())
 }
 
+/// How [`recover_ended_orders`] lists the open orders it compares the held ones with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenListing {
+    /// One listing per instrument, as on a venue that lists the open orders of one symbol at a
+    /// time. A listing that fails charges only its own instrument.
+    // Only Binance lists by one symbol.
+    #[cfg_attr(not(feature = "binance"), allow(dead_code))]
+    PerInstrument,
+    /// One listing of every instrument due, as on a venue that lists several symbols in one
+    /// request. A listing that fails charges every instrument in it. Either way, a lookup that
+    /// fails charges only the instrument of the order it asked about.
+    // Only Alpaca lists several symbols.
+    #[cfg_attr(not(feature = "alpaca"), allow(dead_code))]
+    Batched,
+}
+
 /// Report how each order held as live ended, where it has, on every instrument due for a check:
 /// the order lifecycle events missed while the stream was disconnected.
 ///
-/// Checks only an instrument fill recovery has no gap left on (see [`UncheckedOrders`]), so an
-/// order's recovered fills reach the stream before how it ended. For each, it lists the open
-/// orders with `list_open`, which returns the client order ids listed, and looks up with `lookup`
-/// each order held as live that the listing no longer shows: one request per instrument plus one
-/// per order that ended, rather than one per order held. The orders held are read before the
-/// listings, so one placed after a listing cannot be taken for one that ended.
+/// Checks only an instrument with no fills pending (see [`UncheckedOrders`]), so an order's
+/// recovered fills reach the stream before how it ended. It lists the open orders with
+/// `list_open`, which returns the client order ids listed on the instruments it is given, one
+/// instrument or all of them at a time as `listing` says, and looks up with `lookup` each order
+/// held as live that the listing no longer shows: one request per listing plus one per order that
+/// ended, rather than one per order held. The orders held are read before the listings, so one
+/// placed after a listing cannot be taken for one that ended.
 ///
 /// Each order that has ended is sent as an [`AccountEventKind::OrderSnapshot`] of its inactive
 /// state, under [`StrategyId::unknown`], and leaves the set. One the stream reported ending in the
@@ -493,27 +562,29 @@ where
 /// with a warning, since asking again cannot change that. One still live, or in a state this
 /// version cannot read, stays.
 ///
-/// Each instrument is settled as soon as its check ends, so dropping this part-way, as a
-/// disconnect during a retry does, loses nothing, and a pass that outlasts
-/// [`ORDER_CHECK_TIMEOUT_SECS`] keeps what it finished. An instrument whose check fails or does not
-/// finish is retried later; one never started stays due as it was.
+/// Each lookup is settled as soon as it ends, and the instruments of each listing as soon as its
+/// check ends, so dropping this part-way, as a disconnect during a retry does, loses nothing, and a
+/// pass that outlasts [`ORDER_CHECK_TIMEOUT_SECS`] keeps what it finished. An instrument whose
+/// listing or any lookup fails, or whose check does not finish, is retried later, asking only about
+/// the orders still held; one never started stays due as it was.
 pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
     exchange: ExchangeId,
     known: &SharedKnownLiveOrders,
     unchecked: &mut UncheckedOrders,
-    unrecovered: &UnrecoveredFills,
+    pending: &impl PendingFills,
     tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
+    listing: OpenListing,
     list_open: L,
     lookup: Q,
 ) where
-    L: Fn(InstrumentNameExchange) -> LFut,
+    L: Fn(Vec<InstrumentNameExchange>) -> LFut,
     LFut: Future<Output = Result<FnvHashSet<ClientOrderId>, UnindexedClientError>>,
     Q: Fn(UnindexedOrderKey) -> QFut,
     QFut: Future<Output = Result<OrderLookup, UnindexedClientError>>,
 {
-    use futures::{StreamExt as _, TryStreamExt as _};
+    use futures::StreamExt as _;
 
-    let ready = unchecked.ready(unrecovered, tokio::time::Instant::now());
+    let ready = unchecked.ready(pending, tokio::time::Instant::now());
     if ready.is_empty() {
         return;
     }
@@ -540,121 +611,173 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
         %exchange,
         instruments = held.len(),
         orders = held.iter().map(|(_, keys)| keys.len()).sum::<usize>(),
-        "Binance checking how the orders held as live ended while disconnected"
+        "Checking how the orders held as live ended while disconnected"
     );
 
-    // Which instruments have been settled, and how many have started: the stream starts them in
-    // order, so those from `started` on were never read. The stream owns what it reads, so no
-    // future it builds borrows from a closure argument, which `tokio::spawn` cannot prove `Send`.
-    let instruments: Vec<InstrumentNameExchange> = held
+    // One check per listing.
+    let checks: Vec<Vec<(InstrumentNameExchange, Vec<UnindexedOrderKey>)>> = match listing {
+        OpenListing::PerInstrument => held.into_iter().map(|one| vec![one]).collect(),
+        OpenListing::Batched => vec![held],
+    };
+    // Which checks have been settled, and how many have started: the stream starts them in order,
+    // so those from `started` on were never read. The stream owns what it reads, so no future it
+    // builds borrows from a closure argument, which `tokio::spawn` cannot prove `Send`.
+    let instruments: Vec<Vec<InstrumentNameExchange>> = checks
         .iter()
-        .map(|(instrument, _)| instrument.clone())
+        .map(|check| {
+            check
+                .iter()
+                .map(|(instrument, _)| instrument.clone())
+                .collect()
+        })
         .collect();
-    let mut settled = vec![false; held.len()];
+    let mut settled = vec![false; checks.len()];
     let started = AtomicUsize::new(0);
     let (list_open, lookup) = (&list_open, &lookup);
     let recovery = async {
         let mut reported = 0u32;
-        let mut checks = futures::stream::iter(held.into_iter().enumerate().map(
-            |(index, (instrument, keys))| {
+        let mut runs =
+            futures::stream::iter(checks.into_iter().enumerate().map(|(index, check)| {
                 started.store(index + 1, Ordering::Relaxed);
                 async move {
-                    let found = async {
-                        let listed = list_open(instrument).await?;
-                        let unlisted: Vec<UnindexedOrderKey> = keys
-                            .into_iter()
-                            .filter(|key| !listed.contains(&key.cid))
-                            .collect();
-                        futures::stream::iter(unlisted)
-                            .map(|key| async move {
-                                let found = lookup(key.clone()).await?;
-                                Ok::<_, UnindexedClientError>((key, found))
-                            })
-                            .buffered(ORDER_LOOKUPS_IN_FLIGHT)
-                            .try_collect::<Vec<_>>()
-                            .await
+                    let (listed_on, keys): (Vec<_>, Vec<_>) = check.into_iter().unzip();
+                    let listed = match list_open(listed_on).await {
+                        Ok(listed) => listed,
+                        Err(e) => return (index, Err(e)),
                     };
-                    (index, found.await)
+                    let unlisted: Vec<UnindexedOrderKey> = keys
+                        .into_iter()
+                        .flatten()
+                        .filter(|key| !listed.contains(&key.cid))
+                        .collect();
+                    // Each lookup is settled as it ends, so one that fails, or a pass that times
+                    // out, loses none of those already answered.
+                    let mut lookups = futures::stream::iter(unlisted)
+                        .map(|key| async move {
+                            let found = lookup(key.clone()).await;
+                            (key, found)
+                        })
+                        .buffered(ORDER_LOOKUPS_IN_FLIGHT);
+                    let mut checked = CheckedListing::default();
+                    while let Some((key, found)) = lookups.next().await {
+                        match found {
+                            Ok(found) => match settle(exchange, known, key, found, tx) {
+                                Some(sent) => checked.sent += sent,
+                                None => {
+                                    checked.consumer_gone = true;
+                                    break;
+                                }
+                            },
+                            Err(e) => {
+                                checked
+                                    .failed
+                                    .entry(key.instrument)
+                                    .or_insert_with(|| e.to_string());
+                            }
+                        }
+                    }
+                    (index, Ok(checked))
                 }
-            },
-        ))
-        .buffer_unordered(INSTRUMENT_CHECKS_IN_FLIGHT);
-        while let Some((index, found)) = checks.next().await {
+            }))
+            .buffer_unordered(LISTINGS_IN_FLIGHT);
+        while let Some((index, checked)) = runs.next().await {
             settled[index] = true;
-            let instrument = &instruments[index];
-            match found {
-                Ok(found) => {
-                    let Some(sent) = settle(exchange, known, found, tx) else {
-                        debug!(%exchange, "Binance order check: consumer dropped during recovery");
+            match checked {
+                Ok(checked) => {
+                    if checked.consumer_gone {
+                        debug!(%exchange, "Order check: consumer dropped during recovery");
                         return;
-                    };
-                    reported += sent;
-                    unchecked.checked(instrument);
+                    }
+                    reported += checked.sent;
+                    for instrument in &instruments[index] {
+                        match checked.failed.get(instrument) {
+                            Some(reason) => {
+                                order_check_failed(exchange, unchecked, instrument, reason);
+                            }
+                            None => unchecked.checked(instrument),
+                        }
+                    }
                 }
-                Err(e) => order_check_failed(exchange, unchecked, instrument, &e.to_string()),
+                Err(e) => {
+                    let reason = e.to_string();
+                    for instrument in &instruments[index] {
+                        order_check_failed(exchange, unchecked, instrument, &reason);
+                    }
+                }
             }
         }
-        info!(%exchange, reported, "Binance order check complete");
+        info!(%exchange, reported, "Order check complete");
     };
     if tokio::time::timeout(Duration::from_secs(ORDER_CHECK_TIMEOUT_SECS), recovery)
         .await
         .is_err()
     {
         let started = started.load(Ordering::Relaxed);
-        for (instrument, _) in instruments[..started]
+        for (check, _) in instruments[..started]
             .iter()
             .zip(&settled)
             .filter(|(_, settled)| !**settled)
         {
-            order_check_failed(exchange, unchecked, instrument, "order check timed out");
+            for instrument in check {
+                order_check_failed(exchange, unchecked, instrument, "order check timed out");
+            }
         }
     }
 }
 
-/// Apply one instrument's lookups to the set and send each order that ended. Returns how many were
-/// sent, or `None` if the consumer has gone.
+/// What one listing's lookups came to, once each has been settled.
+#[derive(Debug, Default)]
+struct CheckedListing {
+    /// How many orders that ended were sent.
+    sent: u32,
+    /// The instruments a lookup failed on, each with the first failure's reason.
+    failed: FnvHashMap<InstrumentNameExchange, String>,
+    /// Whether the consumer has gone, so the check stopped.
+    consumer_gone: bool,
+}
+
+/// Apply one lookup to the set and send the order if it ended. Returns how many were sent (none or
+/// one), or `None` if the consumer has gone.
 ///
-/// The set's lock is held across the sends, as the stream holds it across its own, so an order the
+/// The set's lock is held across the send, as the stream holds it across its own, so an order the
 /// stream reports ending and this check reach the consumer in the order they were decided, and an
 /// order is reported once.
 fn settle(
     exchange: ExchangeId,
     known: &SharedKnownLiveOrders,
-    found: Vec<(UnindexedOrderKey, OrderLookup)>,
+    key: UnindexedOrderKey,
+    found: OrderLookup,
     tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
 ) -> Option<u32> {
     let mut known = known.lock();
-    let mut sent = 0;
-    for (key, found) in found {
-        match found {
-            OrderLookup::Ended(order) => {
-                if !known.ended(&order.key.cid) {
-                    continue;
-                }
-                let event = UnindexedAccountEvent::new(
-                    exchange,
-                    AccountEventKind::OrderSnapshot(Snapshot::new(
-                        (*order).map_state(OrderState::Inactive),
-                    )),
-                );
-                tx.send(event).ok()?;
-                sent += 1;
+    match found {
+        OrderLookup::Ended(order) => {
+            if !known.ended(&order.key.cid) {
+                return Some(0);
             }
-            OrderLookup::Unknown => {
-                if known.ended(&key.cid) {
-                    warn!(
-                        %exchange,
-                        instrument = %key.instrument,
-                        cid = %key.cid,
-                        "Binance does not know an order held as live; a reconnect no longer asks \
-                         about it"
-                    );
-                }
-            }
-            OrderLookup::NotEnded => {}
+            let event = UnindexedAccountEvent::new(
+                exchange,
+                AccountEventKind::OrderSnapshot(Snapshot::new(
+                    (*order).map_state(OrderState::Inactive),
+                )),
+            );
+            tx.send(event).ok()?;
+            Some(1)
         }
+        OrderLookup::Unknown => {
+            if known.ended(&key.cid) {
+                warn!(
+                    %exchange,
+                    instrument = %key.instrument,
+                    cid = %key.cid,
+                    "The venue does not know an order held as live; a reconnect no longer asks \
+                     about it"
+                );
+            }
+            Some(0)
+        }
+        OrderLookup::NotEnded => Some(0),
     }
-    Some(sent)
 }
 
 /// Record that the check of how the orders held as live on `instrument` ended did not finish,
@@ -671,14 +794,14 @@ fn order_check_failed(
             %instrument,
             retry_in_secs = delay.as_secs(),
             reason,
-            "Binance could not check how the orders held as live ended, retrying later"
+            "Could not check how the orders held as live ended, retrying later"
         ),
         Some(GapFailure::GivenUp) => error!(
             %exchange,
             %instrument,
             retries = MAX_GAP_RETRIES,
             reason,
-            "Binance gave up checking how the orders held as live ended: an order that ended \
+            "Gave up checking how the orders held as live ended: an order that ended \
              while disconnected stays live in engine state until the next reconnect checks it; \
              reconcile with fetch_open_orders"
         ),
@@ -703,6 +826,17 @@ mod tests {
     use chrono::Utc;
     use rust_decimal_macros::dec;
     use rustrade_instrument::{Side, asset::name::AssetNameExchange};
+
+    /// Fills pending on `instrument` alone.
+    fn pending_on(instrument: &InstrumentNameExchange) -> FnvHashSet<InstrumentNameExchange> {
+        FnvHashSet::from_iter([instrument.clone()])
+    }
+
+    impl PendingFills for FnvHashSet<InstrumentNameExchange> {
+        fn pending(&self, instrument: &InstrumentNameExchange) -> bool {
+            self.contains(instrument)
+        }
+    }
 
     fn key(instrument: &str, cid: &str) -> UnindexedOrderKey {
         OrderKey::new(
@@ -759,7 +893,7 @@ mod tests {
 
     #[test]
     fn the_stream_adds_a_live_order_and_drops_it_at_each_kind_of_end() {
-        let mut known = KnownLiveOrders::default();
+        let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
         let cancelled = key("BTCUSDT", "cancelled");
         let rejected = key("BTCUSDT", "rejected");
         let inactive = key("BTCUSDT", "inactive");
@@ -802,7 +936,7 @@ mod tests {
 
     #[test]
     fn a_fill_drops_its_order_only_once_it_reports_the_whole_quantity() {
-        let mut known = KnownLiveOrders::default();
+        let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
         let order = key("BTCUSDT", "a");
         known.live(&order, dec!(2), &open("7", Decimal::ZERO));
 
@@ -820,7 +954,7 @@ mod tests {
 
     #[test]
     fn a_report_without_the_venue_id_keeps_the_one_known() {
-        let mut known = KnownLiveOrders::default();
+        let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
         let order = key("BTCUSDT", "a");
         known.live(&order, dec!(2), &open("7", Decimal::ZERO));
         known.live(
@@ -837,7 +971,7 @@ mod tests {
 
     #[test]
     fn an_order_with_nothing_left_or_already_ended_is_not_added() {
-        let mut known = KnownLiveOrders::default();
+        let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
         let filled = key("BTCUSDT", "filled");
         known.live(&filled, dec!(2), &open("1", dec!(2)));
         assert!(!known.contains(&filled.cid));
@@ -855,7 +989,7 @@ mod tests {
 
     #[test]
     fn a_full_set_forgets_its_oldest_order() {
-        let mut known = KnownLiveOrders::default();
+        let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
         for n in 0..=MAX_KNOWN_LIVE_ORDERS {
             known.live(
                 &key("BTCUSDT", &n.to_string()),
@@ -893,7 +1027,7 @@ mod tests {
 
     #[test]
     fn keys_on_names_only_that_instrument() {
-        let mut known = KnownLiveOrders::default();
+        let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
         known.live(&key("BTCUSDT", "a"), dec!(1), &open("1", Decimal::ZERO));
         known.live(&key("ETHUSDT", "b"), dec!(1), &open("2", Decimal::ZERO));
 
@@ -921,34 +1055,28 @@ mod tests {
     fn an_instrument_with_a_fill_gap_waits_for_it() {
         let btc = InstrumentNameExchange::new("BTCUSDT");
         let eth = InstrumentNameExchange::new("ETHUSDT");
-        let mut unrecovered = UnrecoveredFills::default();
-        let now = Utc::now();
-        unrecovered.open(
-            std::slice::from_ref(&btc),
-            now - chrono::Duration::minutes(1),
-            now,
-        );
+        let pending = pending_on(&btc);
         let mut unchecked = UncheckedOrders::default();
         unchecked.open([btc.clone(), eth.clone()]);
 
         assert_eq!(
-            unchecked.ready(&unrecovered, tokio::time::Instant::now()),
+            unchecked.ready(&pending, tokio::time::Instant::now()),
             std::slice::from_ref(&eth)
         );
         unchecked.checked(&eth);
         assert!(unchecked.contains(&btc), "BTCUSDT still waits");
         assert_eq!(
-            unchecked.next_due(&unrecovered),
+            unchecked.next_due(&pending),
             None,
             "on its gap, not on a timer"
         );
 
-        let unrecovered = UnrecoveredFills::default();
+        let pending = NoPendingFills;
         assert_eq!(
-            unchecked.ready(&unrecovered, tokio::time::Instant::now()),
+            unchecked.ready(&pending, tokio::time::Instant::now()),
             std::slice::from_ref(&btc)
         );
-        assert!(unchecked.next_due(&unrecovered).is_some(), "due now");
+        assert!(unchecked.next_due(&pending).is_some(), "due now");
         unchecked.checked(&btc);
         assert!(unchecked.is_empty());
     }
@@ -962,19 +1090,13 @@ mod tests {
         unchecked.open([btc.clone()]);
         let start = tokio::time::Instant::now();
         unchecked.failed(&btc, start);
-        let mut unrecovered = UnrecoveredFills::default();
-        let now = Utc::now();
-        unrecovered.open(
-            std::slice::from_ref(&btc),
-            now - chrono::Duration::minutes(1),
-            now,
-        );
+        let pending = pending_on(&btc);
         let later = start + Duration::from_secs(GAP_RETRY_BASE_SECS * 2);
 
-        assert!(unchecked.ready(&unrecovered, later).is_empty());
-        assert_eq!(unchecked.next_due(&unrecovered), None);
+        assert!(unchecked.ready(&pending, later).is_empty());
+        assert_eq!(unchecked.next_due(&pending), None);
         assert_eq!(
-            unchecked.ready(&UnrecoveredFills::default(), later),
+            unchecked.ready(&NoPendingFills, later),
             std::slice::from_ref(&btc),
             "due again once the gap is settled"
         );
@@ -992,20 +1114,20 @@ mod tests {
         unchecked.failed(&btc, now);
         unchecked.failed(&btc, now);
         unchecked.failed(&eth, now);
-        let unrecovered = UnrecoveredFills::default();
+        let pending = NoPendingFills;
 
         let base = Duration::from_secs(GAP_RETRY_BASE_SECS);
         assert_eq!(
-            unchecked.ready(&unrecovered, now + base),
+            unchecked.ready(&pending, now + base),
             std::slice::from_ref(&eth)
         );
-        assert_eq!(unchecked.next_due(&unrecovered), Some(now + base));
+        assert_eq!(unchecked.next_due(&pending), Some(now + base));
         unchecked.open([btc.clone()]);
         assert!(
-            unchecked.ready(&unrecovered, now + base).len() == 1,
+            unchecked.ready(&pending, now + base).len() == 1,
             "a reconnect does not bring BTCUSDT's retry forward"
         );
-        assert_eq!(unchecked.ready(&unrecovered, now + base * 2).len(), 2);
+        assert_eq!(unchecked.ready(&pending, now + base * 2).len(), 2);
     }
 
     #[test]
@@ -1013,19 +1135,19 @@ mod tests {
         let mut unchecked = UncheckedOrders::default();
         unchecked.open([InstrumentNameExchange::new("BTCUSDT")]);
         let btc = InstrumentNameExchange::new("BTCUSDT");
-        let unrecovered = UnrecoveredFills::default();
+        let pending = NoPendingFills;
         let now = tokio::time::Instant::now();
 
         for retry in 0..MAX_GAP_RETRIES {
             let delay = Duration::from_secs(GAP_RETRY_BASE_SECS << retry);
             assert_eq!(unchecked.failed(&btc, now), Some(GapFailure::Retry(delay)));
-            assert_eq!(unchecked.next_due(&unrecovered), Some(now + delay));
-            assert!(unchecked.ready(&unrecovered, now).is_empty(), "waits");
-            assert_eq!(unchecked.ready(&unrecovered, now + delay).len(), 1);
+            assert_eq!(unchecked.next_due(&pending), Some(now + delay));
+            assert!(unchecked.ready(&pending, now).is_empty(), "waits");
+            assert_eq!(unchecked.ready(&pending, now + delay).len(), 1);
         }
         assert_eq!(unchecked.failed(&btc, now), Some(GapFailure::GivenUp));
         assert!(unchecked.is_empty());
-        assert_eq!(unchecked.next_due(&unrecovered), None);
+        assert_eq!(unchecked.next_due(&pending), None);
         assert_eq!(unchecked.failed(&btc, now), None, "no longer waiting");
     }
 
@@ -1113,7 +1235,7 @@ mod tests {
 
     /// One order held on each of `instruments`, all due for a check.
     fn held_on(instruments: &[&str]) -> (SharedKnownLiveOrders, UncheckedOrders) {
-        let known = KnownLiveOrders::shared();
+        let known = KnownLiveOrders::shared(ExchangeId::BinanceSpot);
         let mut unchecked = UncheckedOrders::default();
         for (n, instrument) in instruments.iter().enumerate() {
             known.lock().live(
@@ -1137,10 +1259,14 @@ mod tests {
             ExchangeId::BinanceSpot,
             known,
             unchecked,
-            &UnrecoveredFills::default(),
+            &NoPendingFills,
             &tx,
-            |instrument: InstrumentNameExchange| async move {
-                if instrument.name().starts_with("SLOW") {
+            OpenListing::PerInstrument,
+            |instruments: Vec<InstrumentNameExchange>| async move {
+                if instruments
+                    .iter()
+                    .any(|instrument| instrument.name().starts_with("SLOW"))
+                {
                     std::future::pending::<()>().await;
                 }
                 Ok(FnvHashSet::default())
@@ -1163,15 +1289,15 @@ mod tests {
         let sent = check_with_slow_instruments(&known, &mut unchecked).await;
 
         assert!(sent.is_empty(), "XFAST never started: {sent:?}");
-        let unrecovered = UnrecoveredFills::default();
+        let pending = NoPendingFills;
         let after = start + Duration::from_secs(ORDER_CHECK_TIMEOUT_SECS);
         assert_eq!(
-            unchecked.ready(&unrecovered, after),
+            unchecked.ready(&pending, after),
             [InstrumentNameExchange::new("XFAST")],
             "only the one never started is due at once"
         );
         let retry = after + Duration::from_secs(GAP_RETRY_BASE_SECS);
-        assert_eq!(unchecked.ready(&unrecovered, retry).len(), 3);
+        assert_eq!(unchecked.ready(&pending, retry).len(), 3);
         for instrument in ["SLOWA", "SLOWB"] {
             assert_eq!(
                 unchecked.failed(&InstrumentNameExchange::new(instrument), retry),
@@ -1202,10 +1328,121 @@ mod tests {
         assert!(!known.lock().contains(&ClientOrderId::new("AFAST")));
         assert!(
             unchecked
-                .ready(&UnrecoveredFills::default(), tokio::time::Instant::now())
+                .ready(&NoPendingFills, tokio::time::Instant::now())
                 .is_empty(),
             "SLOWB and SLOWC both started, so both wait for a retry"
         );
         known.lock().assert_consistent();
+    }
+
+    /// A batch's lookup that fails charges only its own instrument, and every lookup that was
+    /// answered, on that instrument too, is kept.
+    #[tokio::test]
+    async fn a_failed_lookup_in_a_batch_charges_only_its_instrument() {
+        let known = KnownLiveOrders::shared(ExchangeId::BinanceSpot);
+        for (instrument, cid, id) in [
+            ("BTCUSDT", "btc-ended", "1"),
+            ("BTCUSDT", "btc-failing", "2"),
+            ("ETHUSDT", "eth-ended", "3"),
+        ] {
+            known
+                .lock()
+                .live(&key(instrument, cid), dec!(1), &open(id, Decimal::ZERO));
+        }
+        let mut unchecked = UncheckedOrders::default();
+        unchecked.open(known.lock().instruments());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let listings = AtomicUsize::new(0);
+
+        recover_ended_orders(
+            ExchangeId::BinanceSpot,
+            &known,
+            &mut unchecked,
+            &NoPendingFills,
+            &tx,
+            OpenListing::Batched,
+            |instruments: Vec<InstrumentNameExchange>| {
+                listings.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(instruments.len(), 2, "one listing of both");
+                async { Ok(FnvHashSet::default()) }
+            },
+            |key: UnindexedOrderKey| async move {
+                if key.cid.0 == "btc-failing" {
+                    Err(UnindexedClientError::Api(ApiError::RateLimit))
+                } else {
+                    Ok(OrderLookup::Ended(Box::new(cancelled_order(&key))))
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(listings.load(Ordering::Relaxed), 1);
+        let mut sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|event| match event.kind {
+                AccountEventKind::OrderSnapshot(Snapshot(order)) => order.key.cid,
+                other => panic!("an order snapshot: {other:?}"),
+            })
+            .collect();
+        sent.sort();
+        assert_eq!(
+            sent,
+            [
+                ClientOrderId::new("btc-ended"),
+                ClientOrderId::new("eth-ended")
+            ]
+        );
+        let btc = InstrumentNameExchange::new("BTCUSDT");
+        assert!(!unchecked.contains(&InstrumentNameExchange::new("ETHUSDT")));
+        assert!(unchecked.contains(&btc), "BTCUSDT waits for a retry");
+        assert_eq!(
+            unchecked.failed(&btc, tokio::time::Instant::now()),
+            Some(GapFailure::Retry(Duration::from_secs(
+                GAP_RETRY_BASE_SECS * 2
+            ))),
+            "and has failed once already"
+        );
+        let known = known.lock();
+        assert!(known.contains(&ClientOrderId::new("btc-failing")));
+        assert!(!known.contains(&ClientOrderId::new("btc-ended")));
+        known.assert_consistent();
+    }
+
+    /// A batch whose listing never answers charges every instrument in it once when the pass
+    /// times out.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_batch_charges_every_instrument_in_it() {
+        let (known, mut unchecked) = held_on(&["AAA", "BBB"]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        recover_ended_orders(
+            ExchangeId::BinanceSpot,
+            &known,
+            &mut unchecked,
+            &NoPendingFills,
+            &tx,
+            OpenListing::Batched,
+            |_: Vec<InstrumentNameExchange>| async {
+                std::future::pending::<()>().await;
+                Ok(FnvHashSet::default())
+            },
+            |_: UnindexedOrderKey| async { Ok(OrderLookup::NotEnded) },
+        )
+        .await;
+
+        assert!(rx.try_recv().is_err(), "nothing reported");
+        let now = tokio::time::Instant::now();
+        assert!(
+            unchecked.ready(&NoPendingFills, now).is_empty(),
+            "both wait"
+        );
+        for instrument in ["AAA", "BBB"] {
+            assert_eq!(
+                unchecked.failed(&InstrumentNameExchange::new(instrument), now),
+                Some(GapFailure::Retry(Duration::from_secs(
+                    GAP_RETRY_BASE_SECS * 2
+                ))),
+                "{instrument} has failed once"
+            );
+        }
     }
 }
