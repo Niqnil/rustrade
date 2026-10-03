@@ -1036,24 +1036,6 @@ impl AlpacaClient {
             known.live(&order.key, order.quantity, &order.state);
         }
     }
-
-    /// Record what the response to placing the order under `key`, of `quantity`, said: live, or
-    /// already filled.
-    fn remember_placed(
-        &self,
-        key: &UnindexedOrderKey,
-        quantity: Decimal,
-        state: &UnindexedOrderState,
-    ) {
-        let mut known = self.known_live.lock();
-        match state {
-            OrderState::Active(ActiveOrderState::Open(open)) => known.live(key, quantity, open),
-            OrderState::Active(_) => {}
-            OrderState::Inactive(_) => {
-                known.ended(&key.cid);
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2049,7 +2031,9 @@ impl AlpacaClient {
                         filled_qty,
                     ))
                 };
-                self.remember_placed(&order_key, request.quantity, &state);
+                self.known_live
+                    .lock()
+                    .placed(&order_key, request.quantity, &state);
 
                 AlpacaBracketOrderResult {
                     parent: Order {
@@ -2252,7 +2236,7 @@ impl AlpacaClient {
                         filled_qty,
                     ))
                 };
-                self.remember_placed(&order_key, quantity, &state);
+                self.known_live.lock().placed(&order_key, quantity, &state);
 
                 Some(Order {
                     key: order_key,

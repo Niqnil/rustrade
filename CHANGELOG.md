@@ -141,6 +141,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Binance reported an order that ended in its placement response as open** (`rustrade-execution`).
+  `BinanceSpot::open_order` and `BinanceMargin::open_order` read the returned state from
+  `executedQty` alone, so an IOC or FOK order that found no liquidity, or partly filled and
+  expired the rest (`EXPIRED`), or was expired by self-trade prevention (`EXPIRED_IN_MATCH`), came
+  back `Active(Open)` and was held as live for a reconnect to ask about. Both now read the
+  response's `status`: `EXPIRED`/`EXPIRED_IN_MATCH` return `Inactive(Expired)` and `CANCELED`
+  `Inactive(Cancelled)`, each with what filled, and `REJECTED` returns `OpenFailed`. Neither is
+  held as live. A live status, or none (an `ACK` response), reads as before. Binance Spot's
+  `FullyFilled` now carries the average price from `cummulativeQuoteQty`, as Margin's did. The
+  status mapping is shared with the lookup of how an order ended. Closes #467.
 - **Alpaca retired an order that was only done for the day** (`rustrade-execution`). A
   `done_for_day` event on the account stream was delivered as `OrderCancelled`, so the engine
   dropped an order that Alpaca keeps and works again the next trading day ("will not receive

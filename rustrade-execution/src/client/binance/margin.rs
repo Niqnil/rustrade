@@ -52,13 +52,13 @@
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
-    MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, RateLimitTracker, RequestKind,
-    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnrecoveredFills, UserDataFrame, WeightPool,
-    classify_order_kind_tif, classify_rest_order_error, classify_rest_query_error,
+    MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, PlacementResponse, RateLimitTracker,
+    RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnrecoveredFills, UserDataFrame,
+    WeightPool, classify_order_kind_tif, classify_rest_order_error, classify_rest_query_error,
     convert_ended_order, convert_execution_report, convert_open_order_listing,
     convert_open_order_owned_symbol, dedup_key_from_event, drop_after, gap_failed, gap_time,
     is_duplicate, is_unknown_order, log_unrecognised_frame, new_dedup_cache, parse_user_data_frame,
-    recovered_order_totals, response_decode_error, rest_call_with_retry,
+    placed_order_state, recovered_order_totals, response_decode_error, rest_call_with_retry,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, InstrumentBalanceUpdate,
@@ -79,7 +79,7 @@ use crate::{
         Order, OrderKey, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
+        state::{Cancelled, Open, OrderState, UnindexedOrderState},
     },
     position::PositionReport,
     trade::{AssetFees, Trade, TradeId},
@@ -784,25 +784,21 @@ impl ExecutionClient for BinanceMargin {
             }
         };
 
-        let state = if filled_qty >= quantity {
-            // Fully filled on placement — derive avg price from cumulative quote qty (margin's
-            // REST response exposes this; spot's WS response does not, hence spot passes None).
-            let avg_price = margin_avg_price(data.cummulative_quote_qty.as_deref(), filled_qty);
-            OrderState::fully_filled(Filled::new(
-                exchange_order_id,
+        // Read from the response's status, so an order that ended in it (an IOC or FOK order
+        // that expired) is not reported, or held, as live.
+        let state = placed_order_state(
+            ExchangeId::BinanceMargin,
+            &instrument,
+            quantity,
+            PlacementResponse {
+                status: data.status.as_deref(),
+                order_id: exchange_order_id,
                 time_exchange,
                 filled_qty,
-                avg_price,
-            ))
-        } else {
-            let open = Open::new(
-                VenueOrderId::Assigned(exchange_order_id),
-                time_exchange,
-                filled_qty,
-            );
-            self.known_live.lock().live(&order_key, quantity, &open);
-            OrderState::active(open)
-        };
+                cumulative_quote_qty: data.cummulative_quote_qty.as_deref(),
+            },
+        );
+        self.known_live.lock().placed(&order_key, quantity, &state);
 
         Some(Order {
             key: order_key,
@@ -3917,30 +3913,6 @@ fn convert_order_kind_tif_margin(
     Some((margin_type, margin_tif))
 }
 
-/// Volume-weighted average fill price from a margin order response's cumulative quote quantity.
-///
-/// `avg_price = cummulative_quote_qty / executed_qty`. Returns `None` when `filled_qty` is zero
-/// (no fills, or division would be undefined) or the quote quantity is missing/unparseable.
-// `cummulative_quote_qty` keeps Binance's own field-name typo (sic, double-m) to mirror the SDK.
-fn margin_avg_price(cummulative_quote_qty: Option<&str>, filled_qty: Decimal) -> Option<Decimal> {
-    if filled_qty.is_zero() {
-        return None;
-    }
-    let s = cummulative_quote_qty?;
-    match Decimal::from_str(s) {
-        Ok(cumulative) => cumulative.checked_div(filled_qty),
-        Err(_) => {
-            // A filled order with an unparseable cumulative quote qty is corrupt data, not an
-            // expected absence — log it rather than silently returning a price-less Filled.
-            warn!(
-                cummulative_quote_qty = s,
-                "BinanceMargin: failed to parse cummulativeQuoteQty; avg price unavailable"
-            );
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
@@ -4442,23 +4414,6 @@ mod tests {
             .expect("build");
             assert_eq!(p.time_in_force.as_ref().map(|t| t.as_str()), Some(expected));
         }
-    }
-
-    #[test]
-    fn avg_price_from_cumulative_quote_qty() {
-        // 100 quote / 4 base = 25.
-        assert_eq!(
-            margin_avg_price(Some("100"), Decimal::from(4)),
-            Some(Decimal::from(25))
-        );
-        // Zero fill → no average (avoids division by zero).
-        assert_eq!(margin_avg_price(Some("100"), Decimal::ZERO), None);
-        // Missing / unparseable quote qty → None.
-        assert_eq!(margin_avg_price(None, Decimal::from(4)), None);
-        assert_eq!(
-            margin_avg_price(Some("not-a-number"), Decimal::from(4)),
-            None
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -6684,5 +6639,53 @@ mod tests {
         let known = known.lock();
         assert!(!known.contains(&ClientOrderId::new("one")), "completed");
         assert!(known.contains(&ClientOrderId::new("two")), "part-filled");
+    }
+
+    /// An IOC order that ended in its placement response is reported as expired with what
+    /// filled, and is not held as live, so a late report of it as live cannot bring it back.
+    #[tokio::test]
+    async fn a_margin_order_that_expired_on_placement_is_not_reported_or_held_open() {
+        use rust_decimal_macros::dec;
+
+        for (cid, filled, quote) in [("unfilled", "0", "0"), ("partly", "1", "100")] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/sapi/v1/margin/order"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "symbol": "BTCUSDT", "orderId": 7, "clientOrderId": cid,
+                        "transactTime": 1_700_000_000_000_i64, "price": "100", "origQty": "2",
+                        "executedQty": filled, "cummulativeQuoteQty": quote,
+                        "status": "EXPIRED", "timeInForce": "IOC", "type": "LIMIT", "side": "BUY",
+                    }),
+                ))
+                .mount(&server)
+                .await;
+            let client = margin_client_at(&server, false);
+            let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+
+            let placed = client
+                .open_order(margin_open_request(&btcusdt, cid))
+                .await
+                .unwrap();
+
+            let OrderState::Inactive(crate::order::state::InactiveOrderState::Expired(expired)) =
+                &placed.state
+            else {
+                panic!("{cid}: expired, not open: {placed:?}");
+            };
+            assert_eq!(expired.filled_quantity, Decimal::from_str(filled).unwrap());
+            let late = Open::new(
+                VenueOrderId::Assigned(OrderId::new("7")),
+                Utc::now(),
+                Decimal::ZERO,
+            );
+            let mut known = client.known_live.lock();
+            known.live(&placed.key, dec!(2), &late);
+            assert!(
+                !known.contains(&ClientOrderId::new(cid)),
+                "{cid}: not held, even after a late live report"
+            );
+        }
     }
 }
