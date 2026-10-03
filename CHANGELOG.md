@@ -141,6 +141,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A late order snapshot re-opened an order the engine had retired** (`rustrade`). **Breaking**
+  for code that builds or destructures `Orders` as a tuple: use `Orders::new`, which keeps its
+  signature. The account stream and an open request's response travel on different connections,
+  so the stream can report how an order ended before the response, which carries the order's
+  state at placement, arrives. That response, or a stale listing of an order that had just
+  ended, found the order untracked and tracked it again as a live order the venue no longer had,
+  until a complete account snapshot dropped it. `Orders` now remembers the client order ids of
+  the last `MAX_RECENTLY_RETIRED_ORDERS` (256) orders it retired, per instrument, and ignores an
+  active snapshot for one with a `debug!`. A repeated terminal report for one is also logged at
+  `debug!` rather than `warn!`, since a venue that reports the end in both the response and the
+  stream sends two. Recording a new open request under a remembered id forgets it. The audit
+  replica sees no open requests, so it ignores an order under an id reused within the window,
+  where the engine tracks it. The memory is not serialised, and `Orders` equality compares the
+  tracked orders only. Closes #471.
 - **Binance reported an order that ended in its placement response as open** (`rustrade-execution`).
   `BinanceSpot::open_order` and `BinanceMargin::open_order` read the returned state from
   `executedQty` alone, so an IOC or FOK order that found no liquidity, or partly filled and
