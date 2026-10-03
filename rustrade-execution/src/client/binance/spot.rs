@@ -858,10 +858,11 @@ impl ExecutionClient for BinanceSpot {
     ///   its full quantity ends it, and that order is not reported again.
     /// - **Keys.** Each snapshot carries [`StrategyId::unknown`], since Binance records no
     ///   strategy. The engine matches it to the order it tracks by client order id.
-    /// - **Failures.** Each instrument is settled as soon as its check ends. One whose check fails,
-    ///   or is still running when a pass reaches 30 s, is retried on the fill gaps' schedule (1, 2,
-    ///   4, 8 and 16 minutes), then given up, logged at `error`. Its orders are asked about again
-    ///   at the next reconnect. An order Binance does not know (`-2013`) stops being held, logged
+    /// - **Failures.** Each order's lookup is settled as it ends, and each instrument as soon as its
+    ///   check ends. One whose listing or any lookup fails, or whose check is still running when a
+    ///   pass reaches 30 s, is retried on the fill gaps' schedule (1, 2, 4, 8 and 16 minutes),
+    ///   asking only about the orders still held, then given up, logged at `error`. Its orders are
+    ///   asked about again at the next reconnect. An order Binance does not know (`-2013`) stops being held, logged
     ///   at `warn`; one it still reports live, or in a state this version cannot read, stays held.
     ///
     /// The same lookup is public as [`OrderStatusClient::fetch_ended_orders`].

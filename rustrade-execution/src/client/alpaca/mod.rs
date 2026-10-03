@@ -7711,7 +7711,11 @@ mod tests {
                 unchecked.contains(&InstrumentNameExchange::new("SPY")),
                 "SPY waits for its retry"
             );
-            // The mock's `expect(1)` checks, on drop, that the failure was not retried at once.
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                1,
+                "the failed check is not run again at once"
+            );
         }
 
         /// Once the consumer has gone, the loop asks nothing.
@@ -7749,6 +7753,10 @@ mod tests {
             .await;
 
             assert!(ran.is_err(), "the loop never completes");
+            assert!(
+                server.received_requests().await.unwrap().is_empty(),
+                "nothing asked once the consumer has gone"
+            );
         }
     }
 }
