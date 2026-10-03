@@ -35,6 +35,9 @@ use crate::{
 pub(crate) use crate::client::dedup::{
     SharedDedupCache, dedup_key_from_event, is_duplicate, new_dedup_cache,
 };
+use crate::client::order_recovery::{
+    GAP_RETRY_BASE_SECS, GapFailure, MAX_GAP_RETRIES, PendingFills,
+};
 use binance_sdk::common::{
     errors::{ConnectorError, WebsocketError},
     models::{Interval, ParamBuildError, RateLimitType, RestApiResponse, WebsocketApiRateLimit},
@@ -131,11 +134,6 @@ pub(crate) const FILL_RECOVERY_TIMEOUT_SECS: u64 = 30;
 /// seconds long, and the dedup cache absorbs it, as long as those fills have not left it by the
 /// time the gap is read.
 pub(crate) const GAP_END_SLACK_SECS: i64 = 10;
-/// How many times a [`FillGap`] is retried after its first read fails before it is given up.
-pub(crate) const MAX_GAP_RETRIES: u32 = 5;
-/// The wait before a [`FillGap`]'s first retry. It doubles after each failure, so the retries
-/// come 1, 2, 4, 8 and 16 minutes apart, about half an hour in all.
-pub(crate) const GAP_RETRY_BASE_SECS: u64 = 60;
 
 /// A span of one instrument's fills that a reconnect's recovery has not yet forwarded.
 ///
@@ -161,16 +159,6 @@ impl FillGap {
     }
 }
 
-/// What became of a [`FillGap`], or of a reconnect's check of how orders ended, whose read failed
-/// or did not finish.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GapFailure {
-    /// It is read again after this delay.
-    Retry(Duration),
-    /// It has failed [`MAX_GAP_RETRIES`] retries and is dropped: its fills are not delivered.
-    GivenUp,
-}
-
 /// The fills a reconnect's recovery has not yet forwarded, as [`FillGap`]s per instrument.
 ///
 /// A reconnect opens a gap for every instrument ([`open`](Self::open)) before reading any, so a
@@ -181,6 +169,12 @@ pub(crate) enum GapFailure {
 /// connection cannot use the retries up.
 #[derive(Debug, Default)]
 pub(crate) struct UnrecoveredFills(fnv::FnvHashMap<InstrumentNameExchange, Vec<FillGap>>);
+
+impl PendingFills for UnrecoveredFills {
+    fn pending(&self, instrument: &InstrumentNameExchange) -> bool {
+        self.covers(instrument)
+    }
+}
 
 impl UnrecoveredFills {
     /// Open a gap for each of `instruments`, from `disconnect_time` to just after `now`, the start

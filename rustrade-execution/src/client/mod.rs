@@ -5,7 +5,7 @@
 //! | Connector | Reconnect | Dedup | Fill Recovery | Ended-order Recovery | Heartbeat | Cancel answers once |
 //! |-----------|-----------|-------|---------------|----------------------|-----------|---------------------|
 //! | [`binance`] | Auto (1s→30s backoff) | 10k LRU | REST after reconnect | REST after reconnect | 30s | cancelled |
-//! | [`alpaca`] | Auto (1s→30s backoff) | 2k LRU | REST after reconnect | None | 35s | accepted |
+//! | [`alpaca`] | Auto (1s→30s backoff) | 2k LRU | REST after reconnect | REST after reconnect | 35s | accepted |
 //! | [`ibkr`] | ibapi-managed | 10k LRU, fills only | Executions request after reconnect | None | N/A | submitted |
 //! | [`hyperliquid`] | SDK-managed | 10k LRU, fills only | Caller responsibility | None | SDK-managed | cancelled |
 //!
@@ -34,11 +34,12 @@
 //!
 //! # Known Limitations
 //!
-//! Only Binance (Spot and Margin) recovers the **order lifecycle events** (CANCELED, EXPIRED,
-//! REJECTED, a fill that completes an order) it missed while disconnected; the other connectors
-//! recover fills only (#370). [`OrderStatusClient`] is the lookup that recovery is built on: given
-//! the orders a caller still holds as live, it says how each that has ended did end. Binance Spot,
-//! Binance Margin and the mock client implement it.
+//! Only Binance (Spot and Margin) and Alpaca recover the **order lifecycle events** (cancelled,
+//! expired, rejected, a fill that completes an order) they missed while disconnected, and only for
+//! the orders the client holds as live; IBKR and Hyperliquid recover fills only (#370).
+//! [`OrderStatusClient`] is the lookup that recovery is built on: given the orders a caller still
+//! holds as live, it says how each that has ended did end. Binance Spot, Binance Margin, Alpaca and
+//! the mock client implement it.
 //!
 //! The engine closes part of that gap from the account snapshot each reconnect produces: an order a
 //! complete list no longer shows is retired (see [`ExecutionClient::account_snapshot`]). That covers
@@ -73,6 +74,11 @@ use std::future::Future;
 // against a raw `SmolStr` fill key rather than this cache, so it is deliberately not in this list.
 #[cfg(any(feature = "binance", feature = "hyperliquid", feature = "ibkr"))]
 pub(crate) mod dedup;
+
+// What a client knows of its live orders, and the reconnect check of how those orders ended while
+// its account stream was down. Gated on the clients that use it, like `dedup`.
+#[cfg(any(feature = "alpaca", feature = "binance"))]
+pub(crate) mod order_recovery;
 
 // Alpaca ExecutionClient implementation (options, equities, crypto — single unified API)
 #[cfg(feature = "alpaca")]

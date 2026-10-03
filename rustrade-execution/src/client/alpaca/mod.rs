@@ -26,11 +26,14 @@
 // - Dedup cache: LRU keyed on "{order_id}:{cumulative_filled_qty}" prevents
 //   duplicate fills arising from the overlap between WS events before disconnect
 //   and the fill-recovery REST window
+// - Ended-order recovery: after the fills, each order held as live that one listing of the open
+//   orders no longer shows is looked up by client order id (GET /v2/orders:by_client_order_id),
+//   and how it ended is reported; a failed check is retried on a backoff while connected
 //
 // Known limitations:
-// - Only FILL activities are recovered after reconnect; order lifecycle events
-//   (new, cancelled, expired) are not — callers must call fetch_open_orders after
-//   each reconnect to reconcile open-order state.
+// - Order lifecycle events missed while disconnected are recovered only for orders the client
+//   holds as live (placed through it, listed by it, or seen on its stream); an order placed
+//   elsewhere and ended during the outage is not reported.
 // - A fill frame whose order status is neither partially_filled nor filled emits the
 //   execution but no order snapshot, so a fill arriving after its order's terminal frame
 //   cannot resurrect a retired order as a resting one. That order's filled quantity is
@@ -40,28 +43,38 @@ use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
     UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance},
-    client::{BracketOrderClient, ExecutionClient},
+    client::{
+        BracketOrderClient, ExecutionClient, OrderStatusClient,
+        order_recovery::{
+            KnownLiveOrders, NoPendingFills, OpenListing, OrderLookup, SharedKnownLiveOrders,
+            UncheckedOrders, fetch_ended_by_key, recover_ended_orders,
+        },
+    },
     emit_stream_terminated,
     error::{
         ApiError, ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
         UnindexedOrderError,
     },
     order::{
-        Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType, UnindexedOrderSnapshot,
+        Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType, UnindexedInactiveOrder,
+        UnindexedOrderKey, UnindexedOrderSnapshot,
         bracket::{
             BracketOrderRequest as UnifiedBracketOrderRequest,
             BracketOrderResult as UnifiedBracketOrderResult,
         },
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
+        state::{
+            ActiveOrderState, Cancelled, Expired, Filled, InactiveOrderState, Open, OrderState,
+            UnindexedOrderState,
+        },
     },
     parse_env_bool,
     position::{Position, PositionReport},
     trade::{AssetFees, Trade, TradeId},
 };
 use chrono::{DateTime, Utc};
-use fnv::FnvHashMap;
+use fnv::{FnvHashMap, FnvHashSet};
 use futures::{SinkExt as _, StreamExt as _, stream::BoxStream};
 use indexmap::IndexMap;
 use itertools::Itertools as _;
@@ -626,6 +639,13 @@ struct AlpacaOrderResponse {
     symbol: String,
     qty: Option<String>,
     filled_qty: String,
+    /// The average price of the order's fills, when any filled.
+    #[serde(default)]
+    filled_avg_price: Option<String>,
+    /// The order's status: `new`, `filled`, `canceled`, and so on. Read only by the lookup of how
+    /// an order ended, so a response without it still decodes.
+    #[serde(default)]
+    status: Option<String>,
     side: String,
     #[serde(rename = "type")]
     order_type: String,
@@ -961,6 +981,9 @@ pub struct AlpacaClient {
     rate_limiter: Arc<RateLimitTracker>,
     /// Pre-allocated `/v2/orders` endpoint URL to avoid allocation per request.
     orders_url: String,
+    /// The orders seen live and not yet seen end, which a reconnect asks about. Shared by every
+    /// clone and every account stream, since an order placed through one ends on any of them.
+    known_live: SharedKnownLiveOrders,
 }
 
 impl std::fmt::Debug for AlpacaClient {
@@ -1001,6 +1024,35 @@ impl AlpacaClient {
 
     fn base_url(&self) -> &str {
         self.config.rest_base_url()
+    }
+
+    /// Hold each of `orders` as live, for a reconnect to ask about if the stream misses its end.
+    fn remember_live<'a>(
+        &self,
+        orders: impl IntoIterator<Item = &'a Order<ExchangeId, InstrumentNameExchange, Open>>,
+    ) {
+        let mut known = self.known_live.lock();
+        for order in orders {
+            known.live(&order.key, order.quantity, &order.state);
+        }
+    }
+
+    /// Record what the response to placing the order under `key`, of `quantity`, said: live, or
+    /// already filled.
+    fn remember_placed(
+        &self,
+        key: &UnindexedOrderKey,
+        quantity: Decimal,
+        state: &UnindexedOrderState,
+    ) {
+        let mut known = self.known_live.lock();
+        match state {
+            OrderState::Active(ActiveOrderState::Open(open)) => known.live(key, quantity, open),
+            OrderState::Active(_) => {}
+            OrderState::Inactive(_) => {
+                known.ended(&key.cid);
+            }
+        }
     }
 }
 
@@ -1077,8 +1129,48 @@ fn observe_rate_limit_remaining(
 ///   call that expects a body. Retrying returns the same answer.
 async fn rest_with_retry<T>(
     rate_limiter: &RateLimitTracker,
-    mut build_request: impl FnMut() -> reqwest::RequestBuilder,
+    build_request: impl FnMut() -> reqwest::RequestBuilder,
 ) -> Result<T, UnindexedClientError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    rest_request(rate_limiter, build_request, NotFound::IsError)
+        .await?
+        .ok_or_else(|| {
+            UnindexedClientError::Internal(
+                "Alpaca REST: a 404 read as absent on a call that does not allow it".to_string(),
+            )
+        })
+}
+
+/// [`rest_with_retry`] for a lookup by id: a 404 is `Ok(None)`, Alpaca knowing nothing under the
+/// id asked for, rather than an error.
+async fn rest_lookup_with_retry<T>(
+    rate_limiter: &RateLimitTracker,
+    build_request: impl FnMut() -> reqwest::RequestBuilder,
+) -> Result<Option<T>, UnindexedClientError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    rest_request(rate_limiter, build_request, NotFound::IsAbsent).await
+}
+
+/// How [`rest_request`] reads a 404.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotFound {
+    /// As an error, classified like any other 4xx.
+    IsError,
+    /// As `Ok(None)`.
+    IsAbsent,
+}
+
+/// [`rest_with_retry`] and [`rest_lookup_with_retry`]: returns `Ok(None)` only for a 404 under
+/// [`NotFound::IsAbsent`].
+async fn rest_request<T>(
+    rate_limiter: &RateLimitTracker,
+    mut build_request: impl FnMut() -> reqwest::RequestBuilder,
+    not_found: NotFound,
+) -> Result<Option<T>, UnindexedClientError>
 where
     T: for<'de> Deserialize<'de>,
 {
@@ -1114,6 +1206,10 @@ where
 
         observe_rate_limit_remaining(rate_limiter, response.headers());
 
+        if status == reqwest::StatusCode::NOT_FOUND && not_found == NotFound::IsAbsent {
+            return Ok(None);
+        }
+
         // 204 No Content is only valid for DELETE endpoints; use rest_delete_with_retry
         // for those. Reaching here for a 204 indicates API misuse — return a clear error
         // rather than a misleading "EOF while parsing" JSON failure. A retry cannot fix it.
@@ -1132,7 +1228,7 @@ where
         // A 2xx body that does not fit the model is not transient: retrying returns the same
         // body. An order path must still treat it as status unknown; see `order_post_error`.
         if status.is_success() {
-            return serde_json::from_slice::<T>(&bytes).map_err(|e| {
+            return serde_json::from_slice::<T>(&bytes).map(Some).map_err(|e| {
                 UnindexedClientError::Internal(format!(
                     "Alpaca REST JSON parse error ({status}): {e} | body: {}",
                     String::from_utf8_lossy(&bytes)
@@ -1260,6 +1356,7 @@ impl ExecutionClient for AlpacaClient {
             http,
             rate_limiter: Arc::new(RateLimitTracker::new()),
             orders_url,
+            known_live: KnownLiveOrders::shared(ExchangeId::AlpacaBroker),
         }
     }
 
@@ -1357,6 +1454,17 @@ impl ExecutionClient for AlpacaClient {
         // Group open orders and positions by instrument symbol.
         let instrument_snapshots =
             build_instrument_snapshots(open_orders, converted_positions, instruments);
+        {
+            let mut known = self.known_live.lock();
+            for order in instrument_snapshots
+                .iter()
+                .flat_map(|snapshot| &snapshot.orders)
+            {
+                if let OrderState::Active(ActiveOrderState::Open(open)) = &order.state {
+                    known.live(&order.key, order.quantity, open);
+                }
+            }
+        }
 
         Ok(AccountSnapshot::new(
             ExchangeId::AlpacaBroker,
@@ -1379,9 +1487,9 @@ impl ExecutionClient for AlpacaClient {
     /// This gap also applies on every **reconnect**: during the auth+subscribe handshake
     /// (`connect_and_subscribe`), any `trade_updates` messages that arrive are consumed
     /// by the handshake loop and not forwarded. Fill events in this window are recovered
-    /// via the REST activities endpoint (anchored to `disconnect_time`). Lifecycle events
-    /// (`new`, `canceled`, `rejected`) consumed during the handshake are **not** recovered
-    /// — callers must call `fetch_open_orders` after each reconnect to reconcile order state.
+    /// via the REST activities endpoint (anchored to `disconnect_time`). How an order held as live
+    /// ended in this window is recovered too (see below); a lifecycle event of any other order,
+    /// such as `new` for one placed elsewhere, is not.
     ///
     /// # Fill recovery ordering
     ///
@@ -1410,11 +1518,50 @@ impl ExecutionClient for AlpacaClient {
     /// [`AccountEventKind::OrderCancelled`] processing idempotent, or call
     /// [`ExecutionClient::fetch_open_orders`] after each reconnect to reconcile state.
     ///
+    /// # Orders that ended while disconnected
+    ///
+    /// A reconnect also reports how each order the client holds as live ended, where it did, as an
+    /// [`AccountEventKind::OrderSnapshot`] of its inactive state: filled (with the average fill
+    /// price), cancelled or replaced (as cancelled, with what filled before), expired, or rejected.
+    /// Like fill recovery, it covers only the instruments the stream was opened with, or every
+    /// instrument when that list is empty. Alpaca's closed-order list filters on when an order was
+    /// submitted, so such an order is found by asking about it, not by time.
+    ///
+    /// - **Which orders.** The client holds an order as live from the response to placing it,
+    ///   from a listing of open orders ([`account_snapshot`](ExecutionClient::account_snapshot),
+    ///   [`fetch_open_orders`](ExecutionClient::fetch_open_orders)), and from its live reports on
+    ///   any of its account streams, until it sees the order end; a cancel Alpaca has only
+    ///   accepted does not end it. It holds up to 4,096 orders and forgets the oldest past that,
+    ///   logged at `warn`. An order placed outside this client and never listed or reported to it
+    ///   is not covered.
+    /// - **Cost.** One `GET /v2/orders?status=open` request listing every instrument with an
+    ///   order held, then one `GET /v2/orders:by_client_order_id` for each held order the listing
+    ///   no longer shows.
+    /// - **Fills first.** The check runs after fill recovery has finished or given up, so an
+    ///   order's recovered fills arrive before how it ended. A fill that brings an order to its
+    ///   full quantity ends it, and that order is not reported again.
+    /// - **Keys.** Each snapshot carries [`StrategyId::unknown`], since Alpaca records no
+    ///   strategy. The engine matches it to the order it tracks by client order id.
+    /// - **Failures.** A check that fails, or is still running after 30 s, is retried while
+    ///   connected 1, 2, 4, 8 and 16 minutes later, then given up, logged at `error`. Its orders
+    ///   are asked about again at the next reconnect. A listing of 500 orders may be truncated, so
+    ///   it fails the check. An order Alpaca does not know (404) stops being held, logged at
+    ///   `warn`; one still live, `done_for_day`, or in a state this version cannot read stays
+    ///   held.
+    ///
+    /// The same lookup is public as [`OrderStatusClient::fetch_ended_orders`].
+    ///
     /// # Rejected orders
     ///
     /// Alpaca `rejected` events are delivered as `AccountEventKind::OrderCancelled` with
     /// `state: Err(OrderRejected(...))`. Match on `response.state.is_err()` to distinguish
     /// rejections from true cancels — do not call `.unwrap()` on `OrderCancelled.state`.
+    ///
+    /// # Orders done for the day
+    ///
+    /// A `done_for_day` event is delivered as an [`AccountEventKind::OrderSnapshot`] of the order
+    /// as open, with what it has filled: Alpaca stops working the order until the next trading
+    /// day but has not ended it.
     ///
     /// # Stream drop behaviour
     ///
@@ -1445,6 +1592,7 @@ impl ExecutionClient for AlpacaClient {
         let config = self.config.clone();
         let http = self.http.clone();
         let rate_limiter = self.rate_limiter.clone();
+        let known = self.known_live.clone();
         let instruments = instruments.to_vec();
 
         let cm_handle = tokio::spawn(connection_manager(
@@ -1453,6 +1601,7 @@ impl ExecutionClient for AlpacaClient {
             config,
             http,
             rate_limiter,
+            known,
             instruments,
             Some(initial_ws),
         ));
@@ -1473,6 +1622,10 @@ impl ExecutionClient for AlpacaClient {
     ///
     /// The 204 has no body, so `filled_quantity` is zero whatever the order filled, and
     /// `time_exchange` is the local time the answer arrived.
+    ///
+    /// The client keeps holding the order as live until the stream reports how it ended, so if the
+    /// stream is down when it does, a reconnect still finds out (see
+    /// [`account_stream`](ExecutionClient::account_stream)).
     ///
     /// Needs the venue order id. A request without one is refused, since Alpaca cancels by that
     /// id only; resolve it through [`ExecutionClient::fetch_open_orders`].
@@ -1610,10 +1763,11 @@ impl ExecutionClient for AlpacaClient {
         let open_orders =
             fetch_raw_open_orders(&http, &self.rate_limiter, base, instruments).await?;
 
-        let result = open_orders
+        let result: Vec<_> = open_orders
             .into_iter()
             .filter_map(|o| convert_open_order(&o))
             .collect();
+        self.remember_live(&result);
         Ok(result)
     }
 
@@ -1885,6 +2039,7 @@ impl AlpacaClient {
                         filled_qty,
                     ))
                 };
+                self.remember_placed(&order_key, request.quantity, &state);
 
                 AlpacaBracketOrderResult {
                     parent: Order {
@@ -2087,6 +2242,7 @@ impl AlpacaClient {
                         filled_qty,
                     ))
                 };
+                self.remember_placed(&order_key, quantity, &state);
 
                 Some(Order {
                     key: order_key,
@@ -2275,9 +2431,9 @@ async fn paginate_activities(
 
 /// Long-running task managing the WebSocket lifecycle for account_stream.
 ///
-/// Loop: connect → auth → subscribe → stream events → on disconnect → backoff
-/// → fill recovery → reconnect. The `tx` channel persists across reconnections
-/// so the consumer sees a seamless event stream.
+/// Loop: connect → auth → subscribe → fill recovery → ended-order check → stream events → on
+/// disconnect → backoff → reconnect. The `tx` channel persists across reconnections so the
+/// consumer sees a seamless event stream.
 ///
 /// Terminates when the consumer drops the stream or max reconnect attempts are
 /// exhausted.
@@ -2290,11 +2446,15 @@ async fn connection_manager(
     config: Arc<AlpacaConfig>,
     http: reqwest::Client,
     rate_limiter: Arc<RateLimitTracker>,
+    known: SharedKnownLiveOrders,
     instruments: Vec<InstrumentNameExchange>,
     initial_ws: Option<WebSocket>,
 ) {
     let mut backoff = ExponentialBackoff::new();
     let mut disconnect_time: Option<DateTime<Utc>> = None;
+    // Instruments whose known-live orders a reconnect has yet to check: checked after the fills,
+    // and retried on a timer while connected, once due.
+    let mut unchecked = UncheckedOrders::default();
     let mut current_ws = initial_ws;
 
     'outer: loop {
@@ -2352,6 +2512,7 @@ async fn connection_manager(
                     &after_str,
                     &tx,
                     &dedup,
+                    &known,
                 ),
             )
             .await
@@ -2369,7 +2530,22 @@ async fn connection_manager(
                      for any of the instruments (every instrument when the list is empty)"
                 ),
             }
+            // Only the instruments this stream recovers fills for, every one when none is named.
+            let held = {
+                let known = known.lock();
+                if instruments.is_empty() {
+                    known.instruments()
+                } else {
+                    known.instruments_among(&instruments)
+                }
+            };
+            unchecked.open(held);
         }
+
+        // --- How the orders held as live ended, after the fills ---
+        // Alpaca's fill recovery is finished or given up by now, so no fills are pending.
+        recover_alpaca_ended_orders(&http, &rate_limiter, &config, &known, &mut unchecked, &tx)
+            .await;
 
         // --- Stream events ---
         // Each iteration of the inner loop polls ws.next(), a heartbeat timer,
@@ -2386,6 +2562,29 @@ async fn connection_manager(
         let mut last_message_time = Utc::now();
         let heartbeat = tokio::time::sleep(Duration::from_secs(HEARTBEAT_TIMEOUT_SECS));
         tokio::pin!(heartbeat);
+
+        // Order checks a recovery did not finish are retried as they fall due, alongside the
+        // stream, so a disconnect is still seen at once. It never completes; dropping it when the
+        // stream loop ends loses nothing, since each check is settled in one step as soon as it
+        // ends.
+        let order_check_retries = async {
+            loop {
+                match unchecked.next_due(&NoPendingFills) {
+                    Some(due) => tokio::time::sleep_until(due).await,
+                    None => std::future::pending::<()>().await,
+                }
+                recover_alpaca_ended_orders(
+                    &http,
+                    &rate_limiter,
+                    &config,
+                    &known,
+                    &mut unchecked,
+                    &tx,
+                )
+                .await;
+            }
+        };
+        tokio::pin!(order_check_retries);
 
         // Resets the rolling heartbeat deadline and records the wall-clock receive time.
         // Pin<&mut Sleep> cannot be passed to a regular function, so a macro avoids
@@ -2417,14 +2616,14 @@ async fn connection_manager(
                             reset_heartbeat!();
                         }
                         Some(Ok(WsMessage::Text(text))) => {
-                            process_ws_text(text.as_str(), &tx, &dedup, &mut backoff);
+                            process_ws_text(text.as_str(), &tx, &dedup, &known, &mut backoff);
                             reset_heartbeat!();
                         }
                         Some(Ok(WsMessage::Binary(bytes))) => {
                             // Alpaca paper trading sends binary-framed JSON.
                             match std::str::from_utf8(&bytes) {
                                 Ok(text) => {
-                                    process_ws_text(text, &tx, &dedup, &mut backoff);
+                                    process_ws_text(text, &tx, &dedup, &known, &mut backoff);
                                     // Only reset heartbeat for valid UTF-8 frames that may carry
                                     // real events. A corrupt binary frame (e.g. from a proxy)
                                     // must not keep the watchdog from firing.
@@ -2448,6 +2647,7 @@ async fn connection_manager(
                         }
                     }
                 }
+                () = &mut order_check_retries => {}
                 _ = &mut heartbeat => {
                     warn!(
                         timeout_secs = HEARTBEAT_TIMEOUT_SECS,
@@ -2638,13 +2838,14 @@ async fn ws_handshake(ws: &mut WebSocket, config: &AlpacaConfig) -> Result<(), H
                     break;
                 }
                 // Other messages in this window are NOT buffered and are permanently
-                // dropped — callers must reconcile order state via fetch_open_orders
-                // after each (re)connect, as documented in account_stream's doc comment.
+                // dropped. On a reconnect, REST recovers the fills and how each order held
+                // as live ended; any other lifecycle event is lost, as documented in
+                // account_stream's doc comment.
                 // Log at warn! for trade_updates (fill/lifecycle events) to ensure
                 // production operators see dropped events; trace! for other streams.
                 if let Ok(msg) = serde_json::from_str::<AlpacaStreamMessage<'_>>(text.as_str()) {
                     if msg.stream == "trade_updates" {
-                        warn!(stream = %msg.stream, "WS trade_updates event dropped during listen-ack handshake — will be recovered via REST for fills, but lifecycle events (new/canceled) are lost");
+                        warn!(stream = %msg.stream, "WS trade_updates event dropped during listen-ack handshake — on a reconnect, fills and how orders held as live ended are recovered via REST; other lifecycle events are lost");
                     } else {
                         trace!(stream = %msg.stream, "WS message dropped during listen-ack handshake");
                     }
@@ -2735,10 +2936,15 @@ fn check_listen_ack(text: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Parse a raw WS text message and forward relevant account events to `tx`.
+///
+/// Each event is applied to `known` before it is sent, under the lock, so an order this reports
+/// ending and a reconnect's check of it reach the consumer in the order they were decided, and the
+/// check reports only an order not already reported.
 fn process_ws_text(
     text: &str,
     tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
     dedup: &SharedDedupCache,
+    known: &SharedKnownLiveOrders,
     backoff: &mut ExponentialBackoff,
 ) {
     let msg: AlpacaStreamMessage<'_> = match serde_json::from_str(text) {
@@ -2787,9 +2993,15 @@ fn process_ws_text(
             }
 
             for event in convert_trade_update(update).into_iter().flatten() {
+                let known = KnownLiveOrders::observes(&event.kind).then(|| {
+                    let mut known = known.lock();
+                    known.observe(&event);
+                    known
+                });
                 // Consumer dropped errors are benign; connection_manager will detect
                 // tx.closed() on the next select! poll and exit cleanly.
                 let _ = tx.send(event);
+                drop(known);
             }
         }
         "authorization" | "listening" => {
@@ -2847,6 +3059,9 @@ fn early_dedup_key(update: &AlpacaTradeUpdate<'_>) -> SmolStr {
 // ---------------------------------------------------------------------------
 
 /// Fetch fills missed during a WS disconnect and forward through the dedup cache.
+///
+/// A fill that brings an order to its full quantity ends it in `known`, so a reconnect's check
+/// does not report it again.
 async fn recover_fills(
     http: &reqwest::Client,
     rate_limiter: &RateLimitTracker,
@@ -2855,6 +3070,7 @@ async fn recover_fills(
     after: &str,
     tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
     dedup: &SharedDedupCache,
+    known: &SharedKnownLiveOrders,
 ) {
     // Empty `instruments` means "recover for all subscribed symbols" (same convention as
     // `fetch_trades` / `fetch_open_orders`). Skip the set allocation when not filtering.
@@ -2972,7 +3188,11 @@ async fn recover_fills(
             duplicates += 1;
             continue;
         }
-        if tx.send(event).is_err() {
+        let mut held = known.lock();
+        held.observe(&event);
+        let sent = tx.send(event);
+        drop(held);
+        if sent.is_err() {
             debug!("Alpaca fill recovery: consumer dropped during recovery");
             return;
         }
@@ -2980,6 +3200,168 @@ async fn recover_fills(
     }
 
     info!(recovered, duplicates, "Alpaca fill recovery complete");
+}
+
+// ---------------------------------------------------------------------------
+// Ended-order recovery
+// ---------------------------------------------------------------------------
+
+/// Look the order under `key` up with `GET /v2/orders:by_client_order_id`.
+///
+/// A 404 is [`OrderLookup::Unknown`], and so is an order on another symbol than the key's (ignoring
+/// case, as Alpaca's symbols are upper case).
+async fn fetch_order_lookup(
+    http: reqwest::Client,
+    rate_limiter: Arc<RateLimitTracker>,
+    config: Arc<AlpacaConfig>,
+    key: UnindexedOrderKey,
+) -> Result<OrderLookup, UnindexedClientError> {
+    let url = format!("{}/v2/orders:by_client_order_id", config.rest_base_url());
+    let cid = key.cid.0.as_str();
+    let found: Option<AlpacaOrderResponse> = rest_lookup_with_retry(&rate_limiter, || {
+        http.get(&url).query(&[("client_order_id", cid)])
+    })
+    .await?;
+    let Some(order) = found else {
+        debug!(instrument = %key.instrument, cid = %key.cid, "Alpaca does not know this order");
+        return Ok(OrderLookup::Unknown);
+    };
+    if !order
+        .symbol
+        .eq_ignore_ascii_case(key.instrument.name().as_str())
+    {
+        debug!(
+            instrument = %key.instrument,
+            cid = %key.cid,
+            symbol = %order.symbol,
+            "Alpaca knows this client order id on another symbol"
+        );
+        return Ok(OrderLookup::Unknown);
+    }
+    Ok(
+        convert_ended_order(&order, &key).map_or(OrderLookup::NotEnded, |order| {
+            OrderLookup::Ended(Box::new(order))
+        }),
+    )
+}
+
+/// The client order ids one `GET /v2/orders?status=open` lists on `instruments`, for a
+/// reconnect's check of the orders held as live. A listing of 500 may be truncated, so it fails.
+async fn listed_open_cids(
+    http: reqwest::Client,
+    rate_limiter: Arc<RateLimitTracker>,
+    config: Arc<AlpacaConfig>,
+    instruments: Vec<InstrumentNameExchange>,
+) -> Result<FnvHashSet<ClientOrderId>, UnindexedClientError> {
+    let orders =
+        fetch_raw_open_orders(&http, &rate_limiter, config.rest_base_url(), &instruments).await?;
+    Ok(orders
+        .iter()
+        .map(|order| alpaca_cid(order.client_order_id.as_deref(), &order.id))
+        .collect())
+}
+
+/// [`recover_ended_orders`] on Alpaca: one listing of every instrument due by
+/// [`listed_open_cids`], and lookups by [`fetch_order_lookup`]. Fill recovery has finished or been
+/// given up before it runs, so no fills are pending.
+async fn recover_alpaca_ended_orders(
+    http: &reqwest::Client,
+    rate_limiter: &Arc<RateLimitTracker>,
+    config: &Arc<AlpacaConfig>,
+    known: &SharedKnownLiveOrders,
+    unchecked: &mut UncheckedOrders,
+    tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
+) {
+    recover_ended_orders(
+        ExchangeId::AlpacaBroker,
+        known,
+        unchecked,
+        &NoPendingFills,
+        tx,
+        OpenListing::Batched,
+        |instruments| {
+            listed_open_cids(
+                http.clone(),
+                rate_limiter.clone(),
+                config.clone(),
+                instruments,
+            )
+        },
+        |key| fetch_order_lookup(http.clone(), rate_limiter.clone(), config.clone(), key),
+    )
+    .await;
+}
+
+/// How an order that has ended did end, from its REST order under `key`, the key it was asked for.
+///
+/// `filled` becomes [`InactiveOrderState::FullyFilled`] with `filled_avg_price`; `canceled`
+/// becomes [`InactiveOrderState::Cancelled`], and so does `replaced`, since the order replacing it
+/// has an id and client order id of its own; `expired` becomes [`InactiveOrderState::Expired`],
+/// each with what filled before; and `rejected` becomes [`InactiveOrderState::OpenFailed`].
+///
+/// Returns `None` for an order still live, including `done_for_day`, which Alpaca works again the
+/// next trading day, and, with a warning, for an order whose status is missing or unknown or that
+/// cannot be converted. A caller reads `None` as "not ended", so such an order is asked about again
+/// later rather than retired on a guess.
+fn convert_ended_order(
+    o: &AlpacaOrderResponse,
+    key: &UnindexedOrderKey,
+) -> Option<UnindexedInactiveOrder> {
+    let instrument = &key.instrument;
+    let Some(status) = o.status.as_deref() else {
+        warn!(%instrument, cid = %key.cid, order_id = %o.id, "Alpaca order missing status");
+        return None;
+    };
+    match status {
+        "filled" | "canceled" | "replaced" | "expired" | "rejected" => {}
+        "new"
+        | "partially_filled"
+        | "done_for_day"
+        | "pending_cancel"
+        | "pending_replace"
+        | "accepted"
+        | "pending_new"
+        | "accepted_for_bidding"
+        | "stopped"
+        | "suspended"
+        | "calculated"
+        | "held" => return None,
+        other => {
+            warn!(%instrument, cid = %key.cid, order_id = %o.id, status = other, "Alpaca order has a status this version does not know, treating it as not ended");
+            return None;
+        }
+    }
+    let Some(order) = convert_representable_open_order(o) else {
+        warn!(%instrument, cid = %key.cid, order_id = %o.id, status, "Alpaca ended order cannot be represented, treating it as not ended");
+        return None;
+    };
+    let order_id = OrderId(SmolStr::new(&o.id));
+    let filled_qty = order.state.filled_quantity;
+    let time_exchange = order.state.time_exchange;
+    let state = match status {
+        "filled" => {
+            let avg_price = o
+                .filled_avg_price
+                .as_deref()
+                .and_then(|price| Decimal::from_str(price).ok());
+            InactiveOrderState::FullyFilled(Filled::new(
+                order_id,
+                time_exchange,
+                filled_qty,
+                avg_price,
+            ))
+        }
+        "canceled" | "replaced" => {
+            InactiveOrderState::Cancelled(Cancelled::new(order_id, time_exchange, filled_qty))
+        }
+        "expired" => InactiveOrderState::Expired(Expired::new(order_id, time_exchange, filled_qty)),
+        _ => InactiveOrderState::OpenFailed(OrderError::Rejected(ApiError::OrderRejected(
+            format!("Alpaca rejected order {order_id} after accepting it"),
+        ))),
+    };
+    let mut order = order.map_state(|_| state);
+    order.key = key.clone();
+    Some(order)
 }
 
 // ---------------------------------------------------------------------------
@@ -3560,8 +3942,10 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
             [Some(trade_event), snapshot_event]
         }
 
-        "new" | "accepted" | "pending_new" => {
-            // Order acknowledged by Alpaca — emit an OrderSnapshot.
+        "new" | "accepted" | "pending_new" | "done_for_day" => {
+            // Order acknowledged by Alpaca, or done for the day: Alpaca stops working a
+            // `done_for_day` order until the next trading day but has not ended it, so it is
+            // reported open with what it has filled, never retired.
             let time_exchange = update
                 .timestamp
                 .and_then(parse_timestamp)
@@ -3573,7 +3957,7 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
             ]
         }
 
-        "canceled" | "expired" | "replaced" | "done_for_day" => {
+        "canceled" | "expired" | "replaced" => {
             // Order no longer active.
             //
             // NOTE on "replaced": Alpaca's replace operation cancels the original order
@@ -3871,6 +4255,34 @@ fn order_post_error(error: UnindexedClientError) -> UnindexedOrderError {
         | UnindexedClientError::TruncatedSnapshot { .. }) => OrderError::Connectivity(
             ConnectivityError::Socket(format!("Alpaca order status unknown: {other}")),
         ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OrderStatusClient implementation
+// ---------------------------------------------------------------------------
+
+impl OrderStatusClient for AlpacaClient {
+    /// Looks each order up with `GET /v2/orders:by_client_order_id`, up to 8 at a time.
+    ///
+    /// `filled` is reported as fully filled with `filled_avg_price`, `canceled` and `replaced` as
+    /// cancelled (the order replacing one has its own client order id, which the caller must
+    /// learn from [`ExecutionClient::fetch_open_orders`]), `expired` as expired and `rejected` as
+    /// open failed. `done_for_day` is not ended: Alpaca works the order again the next trading day.
+    /// A 404, or an order on another symbol than the key's (ignoring case), is unknown.
+    async fn fetch_ended_orders(
+        &self,
+        orders: &[UnindexedOrderKey],
+    ) -> Result<Vec<UnindexedInactiveOrder>, UnindexedClientError> {
+        fetch_ended_by_key(orders, |key| {
+            fetch_order_lookup(
+                self.http.clone(),
+                self.rate_limiter.clone(),
+                self.config.clone(),
+                key,
+            )
+        })
+        .await
     }
 }
 
@@ -4908,6 +5320,8 @@ mod tests {
             symbol: "SPY".to_string(),
             qty: None,
             filled_qty: "0".to_string(),
+            filled_avg_price: None,
+            status: None,
             side: "buy".to_string(),
             order_type: "market".to_string(),
             time_in_force: "day".to_string(),
@@ -5154,6 +5568,8 @@ mod tests {
             symbol: symbol.to_string(),
             qty: Some("1".to_string()),
             filled_qty: "0".to_string(),
+            filled_avg_price: None,
+            status: None,
             side: "buy".to_string(),
             order_type: "limit".to_string(),
             time_in_force: "day".to_string(),
@@ -5533,7 +5949,8 @@ mod tests {
         // Minimal rejected-event JSON — no `filled_qty` field in the order object.
         let json = r#"{"stream":"trade_updates","data":{"event":"rejected","order":{"id":"test-rej-id","client_order_id":"test-cid","symbol":"AAPL","qty":"10","side":"buy","type":"limit","time_in_force":"day","limit_price":"100.00","status":"rejected"}}}"#;
 
-        process_ws_text(json, &tx, &dedup, &mut backoff);
+        let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+        process_ws_text(json, &tx, &dedup, &known, &mut backoff);
 
         // The event must NOT be silently dropped — an OrderCancelled must be emitted.
         let event = rx.try_recv()
@@ -6597,6 +7014,7 @@ mod tests {
         async fn drive_recover_fills_with(
             activities: Vec<serde_json::Value>,
             dedup: SharedDedupCache,
+            known: &SharedKnownLiveOrders,
         ) -> Vec<UnindexedAccountEvent> {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
@@ -6618,6 +7036,7 @@ mod tests {
                 "2025-01-01T00:00:00Z",
                 &tx,
                 &dedup,
+                known,
             )
             .await;
             drop(tx);
@@ -6632,7 +7051,12 @@ mod tests {
         async fn drive_recover_fills(
             activities: Vec<serde_json::Value>,
         ) -> Vec<UnindexedAccountEvent> {
-            drive_recover_fills_with(activities, new_dedup_cache()).await
+            drive_recover_fills_with(
+                activities,
+                new_dedup_cache(),
+                &KnownLiveOrders::shared(ExchangeId::AlpacaBroker),
+            )
+            .await
         }
 
         fn trade_of(
@@ -6714,6 +7138,7 @@ mod tests {
             let events = drive_recover_fills_with(
                 vec![activity_json("act-1", "ord-1", "2", Some("5"))],
                 dedup,
+                &KnownLiveOrders::shared(ExchangeId::AlpacaBroker),
             )
             .await;
 
@@ -6746,6 +7171,489 @@ mod tests {
                     .all(|e| trade_of(e).order_filled_quantity.is_none()),
                 "a venue that reported no cumulative must not have one invented for it"
             );
+        }
+
+        // --- How orders ended: fetch_ended_orders, the reconnect check, and what is held ---
+
+        /// An order as `GET /v2/orders` and `GET /v2/orders:by_client_order_id` serve it, of
+        /// quantity 2.
+        fn order_json(cid: &str, symbol: &str, status: &str, filled: &str) -> serde_json::Value {
+            serde_json::json!({
+                "id": format!("id-{cid}"),
+                "client_order_id": cid,
+                "symbol": symbol,
+                "qty": "2",
+                "filled_qty": filled,
+                "filled_avg_price": if filled == "0" { None } else { Some("101.5") },
+                "status": status,
+                "side": "buy",
+                "type": "limit",
+                "time_in_force": "gtc",
+                "limit_price": "100",
+                "created_at": "2026-10-01T14:30:00Z",
+                "updated_at": "2026-10-01T15:00:00Z"
+            })
+        }
+
+        /// Serve `order` as the lookup of client order id `cid`, expecting `calls` lookups.
+        async fn mount_lookup(server: &MockServer, cid: &str, order: ResponseTemplate, calls: u64) {
+            use wiremock::matchers::query_param;
+            Mock::given(method("GET"))
+                .and(path("/v2/orders:by_client_order_id"))
+                .and(query_param("client_order_id", cid))
+                .respond_with(order)
+                .expect(calls)
+                .mount(server)
+                .await;
+        }
+
+        fn ok(body: serde_json::Value) -> ResponseTemplate {
+            ResponseTemplate::new(200).set_body_json(body)
+        }
+
+        fn alpaca_key(instrument: &str, cid: &str) -> UnindexedOrderKey {
+            OrderKey::new(
+                ExchangeId::AlpacaBroker,
+                InstrumentNameExchange::new(instrument),
+                StrategyId::new("strategy"),
+                ClientOrderId::new(cid),
+            )
+        }
+
+        fn hold(known: &SharedKnownLiveOrders, key: &UnindexedOrderKey) {
+            let open = Open::new(
+                VenueOrderId::Assigned(OrderId::new(format!("id-{}", key.cid))),
+                Utc::now(),
+                Decimal::ZERO,
+            );
+            known.lock().live(key, Decimal::TWO, &open);
+        }
+
+        #[tokio::test]
+        async fn fetch_ended_orders_reads_each_end_alpaca_reports() {
+            use rust_decimal_macros::dec;
+
+            let server = MockServer::start().await;
+            for (cid, status, filled) in [
+                ("filled", "filled", "2"),
+                ("canceled", "canceled", "1"),
+                ("replaced", "replaced", "0"),
+                ("expired", "expired", "1"),
+                ("rejected", "rejected", "0"),
+                ("done", "done_for_day", "1"),
+                ("live", "new", "0"),
+                ("unknown-status", "frozen", "0"),
+            ] {
+                mount_lookup(&server, cid, ok(order_json(cid, "SPY", status, filled)), 1).await;
+            }
+            mount_lookup(
+                &server,
+                "elsewhere",
+                ok(order_json("elsewhere", "QQQ", "canceled", "0")),
+                1,
+            )
+            .await;
+            mount_lookup(
+                &server,
+                "gone",
+                ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "code": 40410000,
+                    "message": "order not found for gone"
+                })),
+                1,
+            )
+            .await;
+
+            let keys: Vec<_> = [
+                "filled",
+                "canceled",
+                "replaced",
+                "expired",
+                "rejected",
+                "done",
+                "live",
+                "unknown-status",
+                "elsewhere",
+                "gone",
+            ]
+            .into_iter()
+            .map(|cid| alpaca_key("spy", cid))
+            .collect();
+            let ended = client_for(&server).fetch_ended_orders(&keys).await.unwrap();
+
+            let mut found: Vec<_> = ended
+                .iter()
+                .map(|order| (order.key.cid.0.as_str(), &order.state))
+                .collect();
+            found.sort_by_key(|(cid, _)| *cid);
+            let [
+                (canceled, InactiveOrderState::Cancelled(cancelled)),
+                (expired, InactiveOrderState::Expired(expiry)),
+                (filled, InactiveOrderState::FullyFilled(fill)),
+                (rejected, InactiveOrderState::OpenFailed(failed)),
+                (replaced, InactiveOrderState::Cancelled(replacement)),
+            ] = found.as_slice()
+            else {
+                panic!("filled, canceled, replaced, expired and rejected: {found:?}");
+            };
+            assert_eq!(
+                [*canceled, *expired, *filled, *rejected, *replaced],
+                ["canceled", "expired", "filled", "rejected", "replaced"]
+            );
+            assert_eq!(
+                (fill.filled_quantity, fill.avg_price),
+                (dec!(2), Some(dec!(101.5)))
+            );
+            assert_eq!(cancelled.filled_quantity, dec!(1), "what filled before");
+            assert_eq!(expiry.filled_quantity, dec!(1));
+            assert_eq!(replacement.filled_quantity, Decimal::ZERO);
+            assert_eq!(
+                cancelled.time_exchange,
+                parse_timestamp("2026-10-01T15:00:00Z").unwrap(),
+                "stamped when the order last changed"
+            );
+            assert!(matches!(
+                failed,
+                OrderError::Rejected(ApiError::OrderRejected(message))
+                    if message.contains("id-rejected")
+            ));
+            assert!(
+                ended
+                    .iter()
+                    .all(|order| order.key.strategy == StrategyId::new("strategy")
+                        && order.key.instrument == InstrumentNameExchange::new("spy")),
+                "each carries the key it was asked for"
+            );
+        }
+
+        #[tokio::test]
+        async fn fetch_ended_orders_fails_when_a_lookup_fails() {
+            let server = MockServer::start().await;
+            mount_lookup(&server, "a", ok(order_json("a", "SPY", "canceled", "0")), 1).await;
+            mount_lookup(&server, "b", ResponseTemplate::new(500), 1).await;
+
+            let result = client_for(&server)
+                .fetch_ended_orders(&[alpaca_key("SPY", "a"), alpaca_key("SPY", "b")])
+                .await;
+
+            assert!(
+                matches!(result, Err(UnindexedClientError::Connectivity(_))),
+                "{result:?}"
+            );
+        }
+
+        /// One listing covers every instrument due; only the held orders it no longer shows are
+        /// looked up, and only those that ended are reported and stop being held.
+        #[tokio::test]
+        async fn a_reconnect_check_lists_once_and_reports_the_orders_that_ended() {
+            use wiremock::matchers::query_param;
+
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/orders"))
+                .and(query_param("status", "open"))
+                .and(query_param("symbols", "QQQ,SPY"))
+                .respond_with(ok(serde_json::json!([order_json(
+                    "spy-listed",
+                    "SPY",
+                    "new",
+                    "0"
+                )])))
+                .expect(1)
+                .mount(&server)
+                .await;
+            mount_lookup(&server, "spy-listed", ResponseTemplate::new(500), 0).await;
+            mount_lookup(
+                &server,
+                "spy-cancelled",
+                ok(order_json("spy-cancelled", "SPY", "canceled", "1")),
+                1,
+            )
+            .await;
+            mount_lookup(
+                &server,
+                "spy-done",
+                ok(order_json("spy-done", "SPY", "done_for_day", "1")),
+                1,
+            )
+            .await;
+            mount_lookup(
+                &server,
+                "qqq-filled",
+                ok(order_json("qqq-filled", "QQQ", "filled", "2")),
+                1,
+            )
+            .await;
+
+            let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+            let [listed, cancelled, done, filled] = [
+                ("SPY", "spy-listed"),
+                ("SPY", "spy-cancelled"),
+                ("SPY", "spy-done"),
+                ("QQQ", "qqq-filled"),
+            ]
+            .map(|(instrument, cid)| alpaca_key(instrument, cid));
+            for key in [&listed, &cancelled, &done, &filled] {
+                hold(&known, key);
+            }
+            let mut unchecked = UncheckedOrders::default();
+            unchecked.open(known.lock().instruments());
+            let config = Arc::new(AlpacaConfig::with_base_url(
+                "test-key".into(),
+                "test-secret".into(),
+                server.uri(),
+            ));
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            recover_alpaca_ended_orders(
+                &reqwest::Client::new(),
+                &Arc::new(RateLimitTracker::new()),
+                &config,
+                &known,
+                &mut unchecked,
+                &tx,
+            )
+            .await;
+
+            let mut reported: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+                .map(|event| {
+                    let AccountEventKind::OrderSnapshot(
+                        rustrade_integration::collection::snapshot::Snapshot(order),
+                    ) = event.kind
+                    else {
+                        panic!("an order snapshot: {event:?}");
+                    };
+                    assert!(matches!(order.state, OrderState::Inactive(_)), "{order:?}");
+                    order.key.cid
+                })
+                .collect();
+            reported.sort();
+            assert_eq!(reported, [filled.cid.clone(), cancelled.cid.clone()]);
+            let known = known.lock();
+            assert!(known.contains(&listed.cid) && known.contains(&done.cid));
+            assert!(!known.contains(&cancelled.cid) && !known.contains(&filled.cid));
+            assert!(unchecked.is_empty(), "both instruments checked");
+        }
+
+        /// A listing that fails charges every instrument in it, which then waits for a retry.
+        #[tokio::test]
+        async fn a_failed_listing_is_retried_for_every_instrument_in_it() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/orders"))
+                .respond_with(ResponseTemplate::new(503))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+            hold(&known, &alpaca_key("SPY", "a"));
+            hold(&known, &alpaca_key("QQQ", "b"));
+            let mut unchecked = UncheckedOrders::default();
+            unchecked.open(known.lock().instruments());
+            let config = Arc::new(AlpacaConfig::with_base_url(
+                "test-key".into(),
+                "test-secret".into(),
+                server.uri(),
+            ));
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            recover_alpaca_ended_orders(
+                &reqwest::Client::new(),
+                &Arc::new(RateLimitTracker::new()),
+                &config,
+                &known,
+                &mut unchecked,
+                &tx,
+            )
+            .await;
+
+            assert!(rx.try_recv().is_err(), "nothing reported");
+            let now = tokio::time::Instant::now();
+            assert!(
+                unchecked.ready(&NoPendingFills, now).is_empty(),
+                "both wait"
+            );
+            for instrument in ["QQQ", "SPY"] {
+                assert_eq!(
+                    unchecked.failed(&InstrumentNameExchange::new(instrument), now),
+                    Some(crate::client::order_recovery::GapFailure::Retry(
+                        Duration::from_secs(crate::client::order_recovery::GAP_RETRY_BASE_SECS * 2)
+                    )),
+                    "{instrument} has failed once already"
+                );
+            }
+            assert_eq!(known.lock().instruments().len(), 2, "both still held");
+        }
+
+        #[tokio::test]
+        async fn placing_listing_and_cancelling_keep_the_held_orders_in_step() {
+            use crate::order::request::{OrderRequestCancel, RequestCancel, RequestOpen};
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v2/orders"))
+                .respond_with(ok(order_json("resting", "SPY", "new", "0")))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/v2/orders"))
+                .respond_with(ok(order_json("filled", "SPY", "filled", "2")))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/v2/orders"))
+                .respond_with(ok(serde_json::json!([order_json(
+                    "listed", "QQQ", "new", "0"
+                )])))
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE"))
+                .and(path("/v2/orders/id-resting"))
+                .respond_with(ResponseTemplate::new(204))
+                .mount(&server)
+                .await;
+            let client = client_for(&server);
+            let spy = InstrumentNameExchange::new("SPY");
+
+            for cid in ["resting", "filled"] {
+                let request = OrderRequestOpen {
+                    key: OrderKey::new(
+                        ExchangeId::AlpacaBroker,
+                        &spy,
+                        StrategyId::new("strategy"),
+                        ClientOrderId::new(cid),
+                    ),
+                    state: RequestOpen {
+                        side: Side::Buy,
+                        price: Some(Decimal::ONE_HUNDRED),
+                        quantity: Decimal::TWO,
+                        kind: OrderKind::Limit,
+                        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                        position_id: None,
+                        reduce_only: false,
+                        market: None,
+                    },
+                };
+                client.open_order(request).await.unwrap();
+            }
+            client.fetch_open_orders(&[]).await.unwrap();
+            {
+                let known = client.known_live.lock();
+                assert!(known.contains(&ClientOrderId::new("resting")));
+                assert!(
+                    !known.contains(&ClientOrderId::new("filled")),
+                    "filled in its placement response"
+                );
+                assert!(known.contains(&ClientOrderId::new("listed")));
+            }
+
+            let cancel = client
+                .cancel_order(OrderRequestCancel {
+                    key: OrderKey::new(
+                        ExchangeId::AlpacaBroker,
+                        &spy,
+                        StrategyId::new("strategy"),
+                        ClientOrderId::new("resting"),
+                    ),
+                    state: RequestCancel {
+                        id: Some(VenueOrderId::Assigned(OrderId::new("id-resting"))),
+                    },
+                })
+                .await
+                .unwrap();
+            assert!(cancel.state.is_ok());
+            assert!(
+                client
+                    .known_live
+                    .lock()
+                    .contains(&ClientOrderId::new("resting")),
+                "a cancel Alpaca has only accepted has not ended the order"
+            );
+        }
+
+        /// The stream holds an acknowledged order, keeps holding one done for the day (reported
+        /// open, not retired), and drops one cancelled.
+        #[test]
+        fn the_stream_keeps_the_held_orders_in_step() {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let dedup = new_dedup_cache();
+            let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+            let mut backoff = ExponentialBackoff::new();
+            let frame = |event: &str, filled: &str| {
+                format!(
+                    r#"{{"stream":"trade_updates","data":{{"event":"{event}","order":{{"id":"id-a","client_order_id":"a","symbol":"SPY","qty":"2","filled_qty":"{filled}","side":"buy","type":"limit","time_in_force":"gtc","limit_price":"100","status":"{event}"}}}}}}"#
+                )
+            };
+            let cid = ClientOrderId::new("a");
+
+            process_ws_text(&frame("new", "0"), &tx, &dedup, &known, &mut backoff);
+            assert!(known.lock().contains(&cid), "acknowledged");
+
+            process_ws_text(
+                &frame("done_for_day", "1"),
+                &tx,
+                &dedup,
+                &known,
+                &mut backoff,
+            );
+            assert!(known.lock().contains(&cid), "done for the day is not ended");
+
+            process_ws_text(&frame("canceled", "1"), &tx, &dedup, &known, &mut backoff);
+            assert!(!known.lock().contains(&cid), "cancelled");
+
+            let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            let [_, done, cancelled] = events.as_slice() else {
+                panic!("three events: {events:?}");
+            };
+            let AccountEventKind::OrderSnapshot(
+                rustrade_integration::collection::snapshot::Snapshot(order),
+            ) = &done.kind
+            else {
+                panic!("done_for_day reports an order snapshot: {done:?}");
+            };
+            let OrderState::Active(ActiveOrderState::Open(open)) = &order.state else {
+                panic!("open: {order:?}");
+            };
+            assert_eq!(open.filled_quantity, Decimal::ONE, "with what it filled");
+            assert!(matches!(
+                cancelled.kind,
+                AccountEventKind::OrderCancelled(_)
+            ));
+        }
+
+        /// A recovered fill that brings an order to its full quantity ends it, so a reconnect's
+        /// check does not ask about it.
+        #[tokio::test]
+        async fn a_recovered_fill_that_completes_an_order_stops_it_being_held() {
+            let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+            let key = alpaca_key("SPY", "a");
+            known.lock().live(
+                &key,
+                Decimal::TWO,
+                &Open::new(
+                    VenueOrderId::Assigned(OrderId::new("ord-1")),
+                    Utc::now(),
+                    Decimal::ZERO,
+                ),
+            );
+
+            drive_recover_fills_with(
+                vec![activity_json("act-1", "ord-1", "1", Some("1"))],
+                new_dedup_cache(),
+                &known,
+            )
+            .await;
+            assert!(known.lock().contains(&key.cid), "half filled");
+
+            drive_recover_fills_with(
+                vec![activity_json("act-2", "ord-1", "1", Some("2"))],
+                new_dedup_cache(),
+                &known,
+            )
+            .await;
+            assert!(!known.lock().contains(&key.cid), "filled");
         }
     }
 }

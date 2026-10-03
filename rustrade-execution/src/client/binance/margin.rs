@@ -49,10 +49,6 @@
 //!   instead by the terminal report's own `z`, or by
 //!   [`ExecutionClient::fetch_open_orders`].
 
-use super::order_recovery::{
-    KnownLiveOrders, OrderLookup, SharedKnownLiveOrders, UncheckedOrders, fetch_ended_by_key,
-    recover_ended_orders,
-};
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
@@ -68,7 +64,13 @@ use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, InstrumentBalanceUpdate,
     IsolatedInstrumentState, IsolatedMarginRisk, UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate},
-    client::{ExecutionClient, OrderStatusClient},
+    client::{
+        ExecutionClient, OrderStatusClient,
+        order_recovery::{
+            KnownLiveOrders, OpenListing, OrderLookup, SharedKnownLiveOrders, UncheckedOrders,
+            fetch_ended_by_key, recover_ended_orders,
+        },
+    },
     emit_stream_terminated,
     error::{
         ApiError, ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
@@ -644,7 +646,7 @@ impl ExecutionClient for BinanceMargin {
             rest_config,
             ws_config,
             rate_limiter: Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
-            known_live: KnownLiveOrders::shared(),
+            known_live: KnownLiveOrders::shared(ExchangeId::BinanceMargin),
         }
     }
 
@@ -3109,27 +3111,27 @@ async fn fetch_margin_order_lookup(
         }))
 }
 
-/// The client order ids `GET /sapi/v1/margin/openOrders` lists on `instrument` (weight 10), for a
-/// reconnect's check of the orders held as live.
+/// The client order ids `GET /sapi/v1/margin/openOrders` lists on `instruments` (weight 10 each,
+/// one at a time), for a reconnect's check of the orders held as live.
 async fn listed_margin_open_cids(
     rest: Arc<RestApi>,
     rate_limiter: Arc<RateLimitTracker>,
-    instrument: InstrumentNameExchange,
+    instruments: Vec<InstrumentNameExchange>,
     is_isolated: bool,
 ) -> Result<FnvHashSet<ClientOrderId>, UnindexedClientError> {
-    let (_, listing) = fetch_margin_open_orders_for_instrument(
-        rest,
-        rate_limiter,
-        instrument,
-        is_isolated,
-        RequestKind::Essential,
-    )
-    .await?;
-    Ok(listing
-        .orders
-        .into_iter()
-        .map(|order| order.key.cid)
-        .collect())
+    let mut listed = FnvHashSet::default();
+    for instrument in instruments {
+        let (_, listing) = fetch_margin_open_orders_for_instrument(
+            rest.clone(),
+            rate_limiter.clone(),
+            instrument,
+            is_isolated,
+            RequestKind::Essential,
+        )
+        .await?;
+        listed.extend(listing.orders.into_iter().map(|order| order.key.cid));
+    }
+    Ok(listed)
 }
 
 /// [`recover_ended_orders`] on Binance Margin: listings by [`listed_margin_open_cids`] and lookups
@@ -3149,8 +3151,9 @@ async fn recover_margin_ended_orders(
         unchecked,
         unrecovered,
         tx,
-        |instrument| {
-            listed_margin_open_cids(rest.clone(), rate_limiter.clone(), instrument, is_isolated)
+        OpenListing::PerInstrument,
+        |instruments| {
+            listed_margin_open_cids(rest.clone(), rate_limiter.clone(), instruments, is_isolated)
         },
         |key| {
             fetch_margin_order_lookup(
@@ -6029,7 +6032,7 @@ mod tests {
                 &mut unrecovered,
                 &tx,
                 &new_dedup_cache(),
-                &KnownLiveOrders::shared(),
+                &KnownLiveOrders::shared(ExchangeId::BinanceMargin),
                 false,
             ),
         )
@@ -6114,7 +6117,7 @@ mod tests {
             &mut unrecovered,
             &tx,
             &dedup,
-            &KnownLiveOrders::shared(),
+            &KnownLiveOrders::shared(ExchangeId::BinanceMargin),
             false,
         )
         .await;
@@ -6128,7 +6131,7 @@ mod tests {
             &mut unrecovered,
             &tx,
             &dedup,
-            &KnownLiveOrders::shared(),
+            &KnownLiveOrders::shared(ExchangeId::BinanceMargin),
             false,
         )
         .await;
@@ -6184,7 +6187,7 @@ mod tests {
             &mut unrecovered,
             &tx,
             &new_dedup_cache(),
-            &KnownLiveOrders::shared(),
+            &KnownLiveOrders::shared(ExchangeId::BinanceMargin),
             false,
         )
         .await;
@@ -6197,7 +6200,7 @@ mod tests {
         );
         assert_eq!(
             unrecovered
-                .due(now + Duration::from_secs(crate::client::binance::shared::GAP_RETRY_BASE_SECS))
+                .due(now + Duration::from_secs(crate::client::order_recovery::GAP_RETRY_BASE_SECS))
                 .len(),
             9,
             "the eight started wait for their first retry"
@@ -6395,7 +6398,7 @@ mod tests {
 
     /// `live`, `gone` and `unknown`, all held as live on BTCUSDT.
     fn held_margin_orders() -> SharedKnownLiveOrders {
-        let known = KnownLiveOrders::shared();
+        let known = KnownLiveOrders::shared(ExchangeId::BinanceMargin);
         for (n, cid) in ["live", "gone", "unknown"].into_iter().enumerate() {
             known.lock().live(
                 &margin_key("BTCUSDT", cid),
@@ -6589,7 +6592,7 @@ mod tests {
     #[test]
     fn a_reconnect_opens_a_gap_on_each_stream_instrument_and_checks_those_with_orders_held() {
         let [btc, eth, xrp] = ["BTCUSDT", "ETHUSDT", "XRPUSDT"].map(InstrumentNameExchange::new);
-        let known = KnownLiveOrders::shared();
+        let known = KnownLiveOrders::shared(ExchangeId::BinanceMargin);
         for (instrument, cid) in [(&btc, "btc"), (&xrp, "xrp")] {
             known.lock().live(
                 &margin_key(instrument.name(), cid),
@@ -6641,7 +6644,7 @@ mod tests {
             .await;
         // Each venue trade is 0.01 of an order of its own id: order 1 is complete at 0.01, order 2
         // is of 0.02 and part-filled.
-        let known = KnownLiveOrders::shared();
+        let known = KnownLiveOrders::shared(ExchangeId::BinanceMargin);
         for (cid, order_id, quantity) in [("one", "1", "0.01"), ("two", "2", "0.02")] {
             known.lock().live(
                 &margin_key("BTCUSDT", cid),
