@@ -3277,7 +3277,7 @@ fn convert_ended_order(
         return None;
     }
     let Some(order) = convert_representable_open_order(o) else {
-        warn!(%instrument, cid = %key.cid, order_id = %o.id, status, "Alpaca order that is not live cannot be represented, treating it as not ended");
+        warn!(%instrument, cid = %key.cid, order_id = %o.id, status, "Alpaca order cannot be represented, treating it as not ended");
         return None;
     };
     // Read again rather than from the open order, which reads an unknown fill as zero; that
@@ -5706,6 +5706,30 @@ mod tests {
         );
     }
 
+    /// A placement response without a status reads from what filled, as one with a live status
+    /// does.
+    #[test]
+    fn a_placement_response_without_a_status_reads_from_what_filled() {
+        let instrument = InstrumentNameExchange::new("SPY");
+        let mut resp = make_order_response("ord-1", "SPY");
+        resp.filled_qty = "0.4".to_string();
+        let OrderState::Active(ActiveOrderState::Open(open)) =
+            placed_order_state(&resp, &instrument, Decimal::ONE)
+        else {
+            panic!("expected Open");
+        };
+        assert_eq!(open.filled_quantity, Decimal::new(4, 1));
+
+        resp.filled_qty = "1".to_string();
+        resp.filled_avg_price = Some("100.5".to_string());
+        let state = placed_order_state(&resp, &instrument, Decimal::ONE);
+        let OrderState::Inactive(InactiveOrderState::FullyFilled(filled)) = state else {
+            panic!("expected FullyFilled, got {state:?}");
+        };
+        assert_eq!(filled.filled_quantity, Decimal::ONE);
+        assert_eq!(filled.avg_price, Some(Decimal::new(1005, 1)));
+    }
+
     fn make_order_response(id: &str, symbol: &str) -> AlpacaOrderResponse {
         AlpacaOrderResponse {
             id: id.to_string(),
@@ -7730,9 +7754,10 @@ mod tests {
 
         /// An order that ended in its placement response is reported as it ended, on both
         /// placement paths, and is not held as live: an IOC that found no liquidity or partly
-        /// filled and expired the rest, one cancelled, one rejected after Alpaca accepted it, and
-        /// one filled. A live status is reported open, with what filled, and held, as is one this
-        /// version does not know.
+        /// filled and expired the rest, one cancelled or replaced, one rejected after Alpaca
+        /// accepted it, and one filled. A live status is reported open, with what filled (zero
+        /// when that is unknown), and held, as is one this version does not know; one whose fill
+        /// covers the quantity is reported filled.
         #[tokio::test]
         async fn an_order_that_ended_in_its_placement_response_is_reported_as_it_ended() {
             use crate::order::request::RequestOpen;
@@ -7744,7 +7769,7 @@ mod tests {
             let open = |cid: &str, filled| {
                 OrderState::active(Open::new(VenueOrderId::Assigned(id(cid)), time, filled))
             };
-            let cases: [(&str, &str, &str, UnindexedOrderState, bool); 10] = [
+            let cases: [(&str, &str, &str, UnindexedOrderState, bool); 13] = [
                 (
                     "ioc-unfilled",
                     "expired",
@@ -7798,7 +7823,33 @@ mod tests {
                     )),
                     false,
                 ),
+                (
+                    "replaced",
+                    "replaced",
+                    "0",
+                    OrderState::inactive(Cancelled::new(id("replaced"), time, Some(Decimal::ZERO))),
+                    false,
+                ),
+                (
+                    "live-covered",
+                    "partially_filled",
+                    "2",
+                    OrderState::fully_filled(Filled::new(
+                        id("live-covered"),
+                        time,
+                        Decimal::TWO,
+                        Some(Decimal::new(1015, 1)),
+                    )),
+                    false,
+                ),
                 ("new", "new", "0", open("new", Decimal::ZERO), true),
+                (
+                    "live-fill-unknown",
+                    "new",
+                    "not-a-number",
+                    open("live-fill-unknown", Decimal::ZERO),
+                    true,
+                ),
                 (
                     "partial",
                     "partially_filled",
