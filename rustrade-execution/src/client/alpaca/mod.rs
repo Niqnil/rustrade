@@ -642,8 +642,9 @@ struct AlpacaOrderResponse {
     /// The average price of the order's fills, when any filled.
     #[serde(default)]
     filled_avg_price: Option<String>,
-    /// The order's status: `new`, `filled`, `canceled`, and so on. Read only by the lookup of how
-    /// an order ended, so a response without it still decodes.
+    /// The order's status: `new`, `filled`, `canceled`, and so on. Read by the lookup of how an
+    /// order ended and from the response to placing one. Optional so that a response without it
+    /// still decodes.
     #[serde(default)]
     status: Option<String>,
     side: String,
@@ -2014,25 +2015,7 @@ impl AlpacaClient {
 
         match result {
             Ok(resp) => {
-                let exchange_order_id = OrderId(SmolStr::new(&resp.id));
-                let time_exchange = order_state_time(&resp);
-                let filled_qty =
-                    alpaca_filled_qty(&resp.id, Some(&resp.filled_qty)).unwrap_or(Decimal::ZERO);
-
-                let state = if filled_qty >= request.quantity {
-                    OrderState::fully_filled(Filled::new(
-                        exchange_order_id,
-                        time_exchange,
-                        filled_qty,
-                        None,
-                    ))
-                } else {
-                    OrderState::active(Open::new(
-                        VenueOrderId::Assigned(exchange_order_id),
-                        time_exchange,
-                        filled_qty,
-                    ))
-                };
+                let state = placed_order_state(&resp, &order_key.instrument, request.quantity);
                 self.known_live
                     .lock()
                     .placed(&order_key, request.quantity, &state);
@@ -2218,27 +2201,7 @@ impl AlpacaClient {
 
         match result {
             Ok(resp) => {
-                let exchange_order_id = OrderId(SmolStr::new(&resp.id));
-                let time_exchange = order_state_time(&resp);
-                let filled_qty =
-                    alpaca_filled_qty(&resp.id, Some(&resp.filled_qty)).unwrap_or(Decimal::ZERO);
-
-                let state = if filled_qty >= quantity {
-                    // Order was fully filled immediately (market order or aggressive limit)
-                    OrderState::fully_filled(Filled::new(
-                        exchange_order_id,
-                        time_exchange,
-                        filled_qty,
-                        None, // Alpaca order response doesn't include avg_price
-                    ))
-                } else {
-                    // Order is resting on the order book (partially filled or unfilled)
-                    OrderState::active(Open::new(
-                        VenueOrderId::Assigned(exchange_order_id),
-                        time_exchange,
-                        filled_qty,
-                    ))
-                };
+                let state = placed_order_state(&resp, &order_key.instrument, quantity);
                 self.known_live.lock().placed(&order_key, quantity, &state);
 
                 Some(Order {
@@ -3294,15 +3257,11 @@ async fn run_order_checks(
     }
 }
 
-/// How an order that has ended did end, from its REST order under `key`, the key it was asked for.
+/// How an order that has ended did end, from its REST order under `key`, the key it was asked for
+/// (see [`ended_order_state`]).
 ///
-/// `filled` becomes [`InactiveOrderState::FullyFilled`] with `filled_avg_price`; `canceled`
-/// becomes [`InactiveOrderState::Cancelled`], and so does `replaced`, since the order replacing it
-/// has an id and client order id of its own; `expired` becomes [`InactiveOrderState::Expired`],
-/// each with what filled before; and `rejected` becomes [`InactiveOrderState::OpenFailed`].
-///
-/// Returns `None` for an order still live, including `done_for_day`, which Alpaca works again the
-/// next trading day, and, with a warning, for an order whose status is missing or unknown or that
+/// Returns `None` for an order still live (see [`order_status_is_live`]), including
+/// `done_for_day`, and, with a warning, for an order whose status is missing or unknown or that
 /// cannot be converted. A caller reads `None` as "not ended", so such an order is asked about again
 /// later rather than retired on a guess.
 fn convert_ended_order(
@@ -3314,59 +3273,152 @@ fn convert_ended_order(
         warn!(%instrument, cid = %key.cid, order_id = %o.id, "Alpaca order missing status");
         return None;
     };
-    match status {
-        "filled" | "canceled" | "replaced" | "expired" | "rejected" => {}
-        "new"
-        | "partially_filled"
-        | "done_for_day"
-        | "pending_cancel"
-        | "pending_replace"
-        | "accepted"
-        | "pending_new"
-        | "accepted_for_bidding"
-        | "stopped"
-        | "suspended"
-        | "calculated"
-        | "held" => return None,
-        other => {
-            warn!(%instrument, cid = %key.cid, order_id = %o.id, status = other, "Alpaca order has a status this version does not know, treating it as not ended");
-            return None;
-        }
+    if order_status_is_live(status) {
+        return None;
     }
     let Some(order) = convert_representable_open_order(o) else {
-        warn!(%instrument, cid = %key.cid, order_id = %o.id, status, "Alpaca ended order cannot be represented, treating it as not ended");
+        warn!(%instrument, cid = %key.cid, order_id = %o.id, status, "Alpaca order cannot be represented, treating it as not ended");
         return None;
     };
-    let order_id = OrderId(SmolStr::new(&o.id));
     // Read again rather than from the open order, which reads an unknown fill as zero; that
     // conversion has already warned of it.
     let filled_qty = Decimal::from_str(&o.filled_qty).ok();
-    let time_exchange = order.state.time_exchange;
-    let state = match status {
-        "filled" => {
-            let avg_price = o
-                .filled_avg_price
-                .as_deref()
-                .and_then(|price| Decimal::from_str(price).ok());
-            // A filled order filled its whole quantity, whether or not `filled_qty` parsed.
-            InactiveOrderState::FullyFilled(Filled::new(
-                order_id,
-                time_exchange,
-                filled_qty.unwrap_or(order.quantity),
-                avg_price,
-            ))
-        }
-        "canceled" | "replaced" => {
-            InactiveOrderState::Cancelled(Cancelled::new(order_id, time_exchange, filled_qty))
-        }
-        "expired" => InactiveOrderState::Expired(Expired::new(order_id, time_exchange, filled_qty)),
-        _ => InactiveOrderState::OpenFailed(OrderError::Rejected(ApiError::OrderRejected(
-            format!("Alpaca rejected order {order_id} after accepting it"),
-        ))),
+    let Some(state) = ended_order_state(
+        status,
+        OrderId(SmolStr::new(&o.id)),
+        order.state.time_exchange,
+        order.quantity,
+        filled_qty,
+        o.filled_avg_price.as_deref(),
+    ) else {
+        warn!(%instrument, cid = %key.cid, order_id = %o.id, status, "Alpaca order has a status this version does not know, treating it as not ended");
+        return None;
     };
     let mut order = order.map_state(|_| state);
     order.key = key.clone();
     Some(order)
+}
+
+/// Whether an Alpaca order in `status` is still live, so may yet fill or be cancelled.
+///
+/// `done_for_day` is live: Alpaca works the order again the next trading day. The rest are
+/// Alpaca's working and pending statuses. Every other status has ended the order (see
+/// [`ended_order_state`]) or is unknown to this version.
+fn order_status_is_live(status: &str) -> bool {
+    matches!(
+        status,
+        "new"
+            | "partially_filled"
+            | "done_for_day"
+            | "pending_cancel"
+            | "pending_replace"
+            | "accepted"
+            | "pending_new"
+            | "accepted_for_bidding"
+            | "stopped"
+            | "suspended"
+            | "calculated"
+            | "held"
+    )
+}
+
+/// How an order ended, from its Alpaca `status`, or `None` for a status that does not end it.
+///
+/// `filled` becomes [`InactiveOrderState::FullyFilled`] with the reported fill, or the whole
+/// `quantity` when that is unknown, and `filled_avg_price`; `canceled` becomes
+/// [`InactiveOrderState::Cancelled`], and so does `replaced`, since the order replacing it has an
+/// id and client order id of its own; `expired` becomes [`InactiveOrderState::Expired`], each with
+/// what filled before, `None` when that is unknown; and `rejected` becomes
+/// [`InactiveOrderState::OpenFailed`]. Shared by the lookup of an order that ended
+/// ([`convert_ended_order`]) and the response to placing one ([`placed_order_state`]).
+fn ended_order_state<AssetKey, InstrumentKey>(
+    status: &str,
+    order_id: OrderId,
+    time_exchange: DateTime<Utc>,
+    quantity: Decimal,
+    filled_qty: Option<Decimal>,
+    filled_avg_price: Option<&str>,
+) -> Option<InactiveOrderState<AssetKey, InstrumentKey>> {
+    Some(match status {
+        // A filled order filled its whole quantity, whether or not `filled_qty` said so.
+        "filled" => InactiveOrderState::FullyFilled(Filled::new(
+            order_id,
+            time_exchange,
+            filled_qty.unwrap_or(quantity),
+            alpaca_avg_price(filled_avg_price),
+        )),
+        "canceled" | "replaced" => {
+            InactiveOrderState::Cancelled(Cancelled::new(order_id, time_exchange, filled_qty))
+        }
+        "expired" => InactiveOrderState::Expired(Expired::new(order_id, time_exchange, filled_qty)),
+        "rejected" => {
+            InactiveOrderState::OpenFailed(OrderError::Rejected(ApiError::OrderRejected(format!(
+                "Alpaca rejected order {order_id} after accepting it"
+            ))))
+        }
+        _ => return None,
+    })
+}
+
+/// The state that `resp`, Alpaca's response to placing an order of `quantity`, reports.
+///
+/// An order that ended in the response itself is reported as it ended (see
+/// [`ended_order_state`]): an IOC or FOK order that found no liquidity, or partly filled and had
+/// the rest cancelled, is `Cancelled` or `Expired` with what filled, not `Open`, and one Alpaca
+/// rejected after accepting it is `OpenFailed`. A live status (see [`order_status_is_live`]) reads
+/// from what filled: `FullyFilled`, with `filled_avg_price`, once it covers `quantity`, otherwise
+/// `Open`. So does a status that is missing or that this version does not know, with a warning,
+/// since the account stream reports the order's next state either way.
+fn placed_order_state(
+    resp: &AlpacaOrderResponse,
+    instrument: &InstrumentNameExchange,
+    quantity: Decimal,
+) -> UnindexedOrderState {
+    let order_id = OrderId(SmolStr::new(&resp.id));
+    let time_exchange = order_state_time(resp);
+    let filled_qty = alpaca_filled_qty(&resp.id, Some(&resp.filled_qty));
+    let filled_avg_price = resp.filled_avg_price.as_deref();
+    match resp.status.as_deref() {
+        Some(status) => {
+            if let Some(ended) = ended_order_state(
+                status,
+                order_id.clone(),
+                time_exchange,
+                quantity,
+                filled_qty,
+                filled_avg_price,
+            ) {
+                return OrderState::Inactive(ended);
+            }
+            if !order_status_is_live(status) {
+                warn!(%instrument, %order_id, status, "Alpaca placed an order with a status this version does not know, reading it from what filled");
+            }
+        }
+        None => {
+            warn!(%instrument, %order_id, "Alpaca placed an order without a status, reading it from what filled");
+        }
+    }
+    match filled_qty {
+        Some(filled_qty) if filled_qty >= quantity => OrderState::fully_filled(Filled::new(
+            order_id,
+            time_exchange,
+            filled_qty,
+            alpaca_avg_price(filled_avg_price),
+        )),
+        // A live order's fill only grows, so an unknown one reads as nothing filled until the
+        // account stream reports more.
+        _ => OrderState::active(Open::new(
+            VenueOrderId::Assigned(order_id),
+            time_exchange,
+            filled_qty.unwrap_or(Decimal::ZERO),
+        )),
+    }
+}
+
+/// The average price of an Alpaca order's fills, from its `filled_avg_price`: `None` when no
+/// price is reported or it does not parse.
+fn alpaca_avg_price(filled_avg_price: Option<&str>) -> Option<Decimal> {
+    filled_avg_price.and_then(|price| Decimal::from_str(price).ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -5654,6 +5706,30 @@ mod tests {
         );
     }
 
+    /// A placement response without a status reads from what filled, as one with a live status
+    /// does.
+    #[test]
+    fn a_placement_response_without_a_status_reads_from_what_filled() {
+        let instrument = InstrumentNameExchange::new("SPY");
+        let mut resp = make_order_response("ord-1", "SPY");
+        resp.filled_qty = "0.4".to_string();
+        let OrderState::Active(ActiveOrderState::Open(open)) =
+            placed_order_state(&resp, &instrument, Decimal::ONE)
+        else {
+            panic!("expected Open");
+        };
+        assert_eq!(open.filled_quantity, Decimal::new(4, 1));
+
+        resp.filled_qty = "1".to_string();
+        resp.filled_avg_price = Some("100.5".to_string());
+        let state = placed_order_state(&resp, &instrument, Decimal::ONE);
+        let OrderState::Inactive(InactiveOrderState::FullyFilled(filled)) = state else {
+            panic!("expected FullyFilled, got {state:?}");
+        };
+        assert_eq!(filled.filled_quantity, Decimal::ONE);
+        assert_eq!(filled.avg_price, Some(Decimal::new(1005, 1)));
+    }
+
     fn make_order_response(id: &str, symbol: &str) -> AlpacaOrderResponse {
         AlpacaOrderResponse {
             id: id.to_string(),
@@ -7674,6 +7750,191 @@ mod tests {
                     .contains(&ClientOrderId::new("resting")),
                 "a cancel Alpaca has only accepted has not ended the order"
             );
+        }
+
+        /// An order that ended in its placement response is reported as it ended, on both
+        /// placement paths, and is not held as live: an IOC that found no liquidity or partly
+        /// filled and expired the rest, one cancelled or replaced, one rejected after Alpaca
+        /// accepted it, and one filled. A live status is reported open, with what filled (zero
+        /// when that is unknown), and held, as is one this version does not know; one whose fill
+        /// covers the quantity is reported filled.
+        #[tokio::test]
+        async fn an_order_that_ended_in_its_placement_response_is_reported_as_it_ended() {
+            use crate::order::request::RequestOpen;
+
+            let Some(time) = parse_timestamp("2026-10-01T15:00:00Z") else {
+                panic!("order_json's updated_at parses");
+            };
+            let id = |cid: &str| OrderId::new(format!("id-{cid}"));
+            let open = |cid: &str, filled| {
+                OrderState::active(Open::new(VenueOrderId::Assigned(id(cid)), time, filled))
+            };
+            let cases: [(&str, &str, &str, UnindexedOrderState, bool); 13] = [
+                (
+                    "ioc-unfilled",
+                    "expired",
+                    "0",
+                    OrderState::expired(Expired::new(
+                        id("ioc-unfilled"),
+                        time,
+                        Some(Decimal::ZERO),
+                    )),
+                    false,
+                ),
+                (
+                    "ioc-partial",
+                    "expired",
+                    "1",
+                    OrderState::expired(Expired::new(id("ioc-partial"), time, Some(Decimal::ONE))),
+                    false,
+                ),
+                (
+                    "fill-unknown",
+                    "expired",
+                    "not-a-number",
+                    OrderState::expired(Expired::new(id("fill-unknown"), time, None)),
+                    false,
+                ),
+                (
+                    "cancelled",
+                    "canceled",
+                    "1",
+                    OrderState::inactive(Cancelled::new(id("cancelled"), time, Some(Decimal::ONE))),
+                    false,
+                ),
+                (
+                    "rejected",
+                    "rejected",
+                    "0",
+                    OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
+                        "Alpaca rejected order id-rejected after accepting it".to_string(),
+                    ))),
+                    false,
+                ),
+                (
+                    "filled",
+                    "filled",
+                    "2",
+                    OrderState::fully_filled(Filled::new(
+                        id("filled"),
+                        time,
+                        Decimal::TWO,
+                        Some(Decimal::new(1015, 1)),
+                    )),
+                    false,
+                ),
+                (
+                    "replaced",
+                    "replaced",
+                    "0",
+                    OrderState::inactive(Cancelled::new(id("replaced"), time, Some(Decimal::ZERO))),
+                    false,
+                ),
+                (
+                    "live-covered",
+                    "partially_filled",
+                    "2",
+                    OrderState::fully_filled(Filled::new(
+                        id("live-covered"),
+                        time,
+                        Decimal::TWO,
+                        Some(Decimal::new(1015, 1)),
+                    )),
+                    false,
+                ),
+                ("new", "new", "0", open("new", Decimal::ZERO), true),
+                (
+                    "live-fill-unknown",
+                    "new",
+                    "not-a-number",
+                    open("live-fill-unknown", Decimal::ZERO),
+                    true,
+                ),
+                (
+                    "partial",
+                    "partially_filled",
+                    "1",
+                    open("partial", Decimal::ONE),
+                    true,
+                ),
+                (
+                    "for-the-day",
+                    "done_for_day",
+                    "1",
+                    open("for-the-day", Decimal::ONE),
+                    true,
+                ),
+                (
+                    "unknown",
+                    "a_status_not_yet_documented",
+                    "0",
+                    open("unknown", Decimal::ZERO),
+                    true,
+                ),
+            ];
+
+            for (cid, status, filled, expected, held) in cases {
+                for bracket in [false, true] {
+                    let server = MockServer::start().await;
+                    Mock::given(method("POST"))
+                        .and(path("/v2/orders"))
+                        .respond_with(ok(order_json(cid, "SPY", status, filled)))
+                        .expect(1)
+                        .mount(&server)
+                        .await;
+                    let client = client_for(&server);
+                    let spy = InstrumentNameExchange::new("SPY");
+                    let time_in_force = TimeInForce::GoodUntilCancelled { post_only: false };
+
+                    let state = if bracket {
+                        client
+                            .open_bracket_order(AlpacaBracketOrderRequest::new(
+                                spy,
+                                StrategyId::new("strategy"),
+                                ClientOrderId::new(cid),
+                                Side::Buy,
+                                Decimal::TWO,
+                                Decimal::ONE_HUNDRED,
+                                Decimal::new(120, 0),
+                                Decimal::new(90, 0),
+                                time_in_force,
+                            ))
+                            .await
+                            .parent
+                            .state
+                    } else {
+                        let request = OrderRequestOpen {
+                            key: OrderKey::new(
+                                ExchangeId::AlpacaBroker,
+                                &spy,
+                                StrategyId::new("strategy"),
+                                ClientOrderId::new(cid),
+                            ),
+                            state: RequestOpen {
+                                side: Side::Buy,
+                                price: Some(Decimal::ONE_HUNDRED),
+                                quantity: Decimal::TWO,
+                                kind: OrderKind::Limit,
+                                time_in_force,
+                                position_id: None,
+                                reduce_only: false,
+                                market: None,
+                            },
+                        };
+                        let Some(order) = client.open_order(request).await else {
+                            panic!("open_order returns the order");
+                        };
+                        order.state
+                    };
+
+                    assert_eq!(state, expected, "{status} {filled}, bracket: {bracket}");
+                    assert_eq!(
+                        client.known_live.lock().contains(&ClientOrderId::new(cid)),
+                        held,
+                        "{status} {filled}, bracket: {bracket}"
+                    );
+                }
+            }
         }
 
         /// The stream holds an acknowledged order, keeps holding one done for the day (reported
