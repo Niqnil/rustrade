@@ -1,7 +1,6 @@
 use crate::engine::state::order::{
     in_flight_recorder::InFlightRequestRecorder, manager::OrderManager,
 };
-use derive_more::Constructor;
 use fnv::FnvHashMap;
 use rust_decimal::Decimal;
 use rustrade_execution::order::{
@@ -13,7 +12,13 @@ use rustrade_execution::order::{
 use rustrade_instrument::{exchange::ExchangeIndex, instrument::InstrumentIndex};
 use rustrade_integration::collection::snapshot::Snapshot;
 use serde::{Deserialize, Serialize};
-use std::{collections::hash_map::Entry, fmt::Debug};
+use std::{
+    collections::{
+        VecDeque,
+        hash_map::{Entry, VacantEntry},
+    },
+    fmt::Debug,
+};
 use tracing::{debug, error, warn};
 
 pub mod in_flight_recorder;
@@ -40,26 +45,115 @@ pub mod manager;
 /// A venue need not use a distinct state to report completion: an `Open` snapshot with no quantity
 /// remaining is terminal too, and is untracked on the same rule. Every arm that accepts an `Open`
 /// update applies it, so an order cannot be retained as active once it has nothing left to fill.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Constructor)]
+///
+/// # Retired orders stay retired
+///
+/// The account stream and the response to an open request travel on different connections, so
+/// the stream can report how an order ended before the response, which carries the order's state
+/// *at placement*, arrives. A stale listing can likewise still show an order that has just
+/// ended. Applied as it stands, such a late active snapshot would find the order untracked and
+/// track it again: a live order the venue no longer has.
+///
+/// So `Orders` remembers the [`ClientOrderId`]s of the last [`MAX_RECENTLY_RETIRED_ORDERS`]
+/// orders that ended, oldest forgotten first, and ignores an active snapshot for one of them. An
+/// order counts as ended when `Orders` retires it, when [`Orders::clear`] drops it, or when a
+/// snapshot reports it ended while it is not tracked, which includes an order this engine never
+/// placed: each takes a place in the same window. This relies on what the engine already assumes,
+/// that a client order id names one order for good. Recording a new open request under a
+/// remembered id forgets it, since that request is a new order by the engine's own hand.
+///
+/// The memory is bookkeeping, not order state: `Orders` serialises as its tracked orders alone,
+/// and two `Orders` that track the same orders are equal whatever each remembers.
+///
+/// **Known limitations:**
+/// - The audit replica sees no open requests, only the venue's reports, so it cannot tell an id
+///   reused within the window from a late report. It ignores the new order where the engine
+///   tracks it, until the id has left the window.
+/// - A deserialised `Orders`, such as a restored engine's or a replica seeded from a snapshot,
+///   remembers nothing. A late report of an order that retired before the snapshot is tracked
+///   again, as before this memory existed.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(transparent)]
 pub struct Orders<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex>(
     pub FnvHashMap<ClientOrderId, Order<ExchangeKey, InstrumentKey, ActiveOrderState>>,
+    #[serde(skip)] RecentlyRetired,
 );
+
+/// How many ended orders' [`ClientOrderId`]s an [`Orders`] remembers, so that a late active
+/// snapshot cannot track one again (see "Retired orders stay retired" on [`Orders`]).
+///
+/// The bound has to span the orders that retire between an order's end and the last stale report
+/// of it: a placement response the account stream outran, or a listing fetched just before the
+/// order ended. That is a few orders in practice; the bound matches
+/// [`MAX_RETIRED_ROUTING`](crate::engine::state::instrument::MAX_RETIRED_ROUTING), which spans
+/// the same kind of gap for a late fill. It costs at most this many client order ids per
+/// instrument, allocated only as orders retire.
+pub const MAX_RECENTLY_RETIRED_ORDERS: usize = 64;
+
+/// The [`ClientOrderId`]s of the orders an [`Orders`] most recently saw end, at most
+/// [`MAX_RECENTLY_RETIRED_ORDERS`], oldest forgotten first.
+///
+/// A plain list: it is searched only for a snapshot of an untracked order, and a scan of so few
+/// ids costs about what hashing one would.
+#[derive(Debug, Clone, Default)]
+struct RecentlyRetired(VecDeque<ClientOrderId>);
+
+impl RecentlyRetired {
+    fn insert(&mut self, cid: ClientOrderId) {
+        if self.contains(&cid) {
+            return;
+        }
+        if self.0.len() == MAX_RECENTLY_RETIRED_ORDERS {
+            self.0.pop_front();
+        }
+        self.0.push_back(cid);
+    }
+
+    fn contains(&self, cid: &ClientOrderId) -> bool {
+        self.0.contains(cid)
+    }
+
+    fn forget(&mut self, cid: &ClientOrderId) {
+        self.0.retain(|retired| retired != cid);
+    }
+}
 
 impl<ExchangeKey, InstrumentKey> Default for Orders<ExchangeKey, InstrumentKey> {
     fn default() -> Self {
-        Self(FnvHashMap::default())
+        Self::new(FnvHashMap::default())
+    }
+}
+
+/// Compares the tracked orders only; see [Retired orders stay retired](Orders#retired-orders-stay-retired).
+impl<ExchangeKey, InstrumentKey> PartialEq for Orders<ExchangeKey, InstrumentKey>
+where
+    ExchangeKey: PartialEq,
+    InstrumentKey: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
     }
 }
 
 impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
-    /// Remove all tracked orders, discarding any pending state.
+    /// Track `orders`, remembering no retired ones.
+    pub fn new(
+        orders: FnvHashMap<ClientOrderId, Order<ExchangeKey, InstrumentKey, ActiveOrderState>>,
+    ) -> Self {
+        Self(orders, RecentlyRetired::default())
+    }
+
+    /// Remove all tracked orders, discarding any pending state, and remember each as retired.
     ///
     /// Used during contract expiry cleanup where the exchange silently voids all
     /// open and cancel-in-flight orders at expiry. The normal `cleanup_routing_tables`
     /// path cannot remove `CancelInFlight` entries because their cancel acks may
     /// never arrive after expiry, causing unbounded accumulation in a long-running engine.
+    /// Remembering them keeps a late report of a voided order from tracking it again.
     pub fn clear(&mut self) {
-        self.0.clear();
+        for (cid, _) in self.0.drain() {
+            self.1.insert(cid);
+        }
     }
 
     /// Whether any tracked order is awaiting a response from the exchange.
@@ -93,7 +187,10 @@ impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
         id: &VenueOrderId,
     ) -> Option<Order<ExchangeKey, InstrumentKey, ActiveOrderState>> {
         match &self.0.get(cid)?.state {
-            ActiveOrderState::Open(open) if open.id.is_same_order_as(id) => self.0.remove(cid),
+            ActiveOrderState::Open(open) if open.id.is_same_order_as(id) => {
+                self.1.insert(cid.clone());
+                self.0.remove(cid)
+            }
             _ => None,
         }
     }
@@ -169,6 +266,7 @@ impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
                 "OrderManager removing an Open order a fill reports as fully filled"
             );
             self.0.remove(cid);
+            self.1.insert(cid.clone());
             return true;
         }
 
@@ -200,70 +298,31 @@ where
     {
         let Snapshot(snapshot) = snapshot;
 
-        let (mut current_entry, update) = match (
-            self.0.entry(snapshot.key.cid.clone()),
-            snapshot.to_active(),
-        ) {
-            // Order untracked, input Snapshot is InactiveOrderState (ie/ finished), so ignore
-            (Entry::Vacant(_), None) => {
-                warn!(
-                    exchange = ?snapshot.key.exchange,
-                    instrument = ?snapshot.key.instrument,
-                    strategy = %snapshot.key.strategy,
-                    cid = %snapshot.key.cid,
-                    update = ?snapshot,
-                    "OrderManager received inactive order snapshot for untracked order - ignoring"
-                );
-                return;
-            }
-
-            // Order untracked, input Snapshot is ActiveOrderState, so insert
-            (Entry::Vacant(entry), Some(update)) => {
-                match &update.state {
-                    ActiveOrderState::Open(open)
-                        if open.quantity_remaining(update.quantity).is_zero() =>
-                    {
-                        debug!(
-                            exchange = ?snapshot.key.exchange,
-                            instrument = ?snapshot.key.instrument,
-                            strategy = %snapshot.key.strategy,
-                            cid = %snapshot.key.cid,
-                            update = ?snapshot,
-                            "OrderManager ignoring new Open order which is actually FulledFilled"
-                        );
-                    }
-                    _active_order => {
-                        debug!(
-                            exchange = ?snapshot.key.exchange,
-                            instrument = ?snapshot.key.instrument,
-                            strategy = %snapshot.key.strategy,
-                            cid = %snapshot.key.cid,
-                            update = ?snapshot,
-                            "OrderManager tracking new order"
-                        );
-                        entry.insert(update);
-                    }
+        let (mut current_entry, update) =
+            match (self.0.entry(snapshot.key.cid.clone()), snapshot.to_active()) {
+                // Order untracked: track it, or ignore it
+                (Entry::Vacant(entry), update) => {
+                    update_untracked(entry, &mut self.1, snapshot, update);
+                    return;
                 }
-                return;
-            }
 
-            // Order tracked, input Snapshot is InactiveOrderState (ie/ finished), so remove
-            (Entry::Occupied(entry), None) => {
-                debug!(
-                    exchange = ?snapshot.key.exchange,
-                    instrument = ?snapshot.key.instrument,
-                    strategy = %snapshot.key.strategy,
-                    cid = %snapshot.key.cid,
-                    update = ?snapshot,
-                    "OrderManager received inactive order snapshot for tracked order - removing"
-                );
-                entry.remove();
-                return;
-            }
+                // Order tracked, input Snapshot is InactiveOrderState (ie/ finished), so remove
+                (Entry::Occupied(entry), None) => {
+                    debug!(
+                        exchange = ?snapshot.key.exchange,
+                        instrument = ?snapshot.key.instrument,
+                        strategy = %snapshot.key.strategy,
+                        cid = %snapshot.key.cid,
+                        update = ?snapshot,
+                        "OrderManager received inactive order snapshot for tracked order - removing"
+                    );
+                    self.1.insert(entry.remove().key.cid);
+                    return;
+                }
 
-            // Order tracked, input Snapshot is ActiveOrderState, so forward for further processing
-            (Entry::Occupied(entry), Some(update)) => (entry, update),
-        };
+                // Order tracked, input Snapshot is ActiveOrderState, so forward for further processing
+                (Entry::Occupied(entry), Some(update)) => (entry, update),
+            };
 
         match (&current_entry.get().state, update.state) {
             (ActiveOrderState::OpenInFlight(_), ActiveOrderState::OpenInFlight(_)) => {
@@ -286,7 +345,7 @@ where
                     "OrderManager transitioned an OpenInFlight order to Open"
                 );
                 if open.quantity_remaining(update.quantity).is_zero() {
-                    current_entry.remove();
+                    self.1.insert(current_entry.remove().key.cid);
                 } else {
                     current_entry.get_mut().state = ActiveOrderState::Open(open);
                 }
@@ -356,7 +415,7 @@ where
                             update = ?snapshot,
                             "OrderManager removing an Open order a more recent snapshot reports as fully filled"
                         );
-                        current_entry.remove();
+                        self.1.insert(current_entry.remove().key.cid);
                         return;
                     }
 
@@ -499,7 +558,7 @@ where
                     update = ?response,
                     "OrderManager received Ok(Cancelled) for tracked order not CancelInFlight - removing"
                 );
-                order.remove();
+                self.1.insert(order.remove().key.cid);
             }
             (ActiveOrderState::CancelInFlight(_), Ok(_)) => {
                 debug!(
@@ -510,7 +569,7 @@ where
                     update = ?response,
                     "OrderManager received Ok(Cancelled) for tracked order CancelInFlight - removing"
                 );
-                order.remove();
+                self.1.insert(order.remove().key.cid);
             }
             (ActiveOrderState::OpenInFlight(_) | ActiveOrderState::Open(_), Err(error)) => {
                 warn!(
@@ -547,11 +606,103 @@ where
                         "OrderManager received Err(Cancelled) for previously non-Open order - removing"
                     );
                     // Likely previously OpenInFlight, and attempted cancel before Open snapshot
-                    // -> it's expected that an Order snapshot is inbound
+                    // -> it's expected that an Order snapshot is inbound. Not retired, so that
+                    // snapshot is still applied when it arrives.
                     order.remove();
                 }
             }
         }
+    }
+}
+
+/// Apply `snapshot` (`update` being its active state, if it has one) to an order `Orders` does
+/// not track: track it, unless it has ended or `retired` remembers it.
+///
+/// `OpenInFlight` is only ever the engine's own record of an open request, never a venue's report,
+/// so a remembered id is forgotten and tracked again, as [`Orders`]'s `record_in_flight_open`
+/// does. Any other active state for a remembered id is a late report and is ignored. A snapshot
+/// saying the order has ended is remembered, so a late report of it cannot track it either.
+fn update_untracked<ExchangeKey, AssetKey, InstrumentKey>(
+    entry: VacantEntry<'_, ClientOrderId, Order<ExchangeKey, InstrumentKey, ActiveOrderState>>,
+    retired: &mut RecentlyRetired,
+    snapshot: &Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>,
+    update: Option<Order<ExchangeKey, InstrumentKey, ActiveOrderState>>,
+) where
+    ExchangeKey: Debug,
+    AssetKey: Debug,
+    InstrumentKey: Debug,
+{
+    let cid = &snapshot.key.cid;
+    match update {
+        // Input Snapshot is InactiveOrderState (ie/ finished), so ignore
+        None if retired.contains(cid) => {
+            // Expected: a venue that reports an order's end in the open response and on the
+            // account stream reports it twice.
+            debug!(
+                exchange = ?snapshot.key.exchange,
+                instrument = ?snapshot.key.instrument,
+                strategy = %snapshot.key.strategy,
+                %cid,
+                update = ?snapshot,
+                "OrderManager received inactive order snapshot for an order already retired - ignoring"
+            );
+        }
+        None => {
+            warn!(
+                exchange = ?snapshot.key.exchange,
+                instrument = ?snapshot.key.instrument,
+                strategy = %snapshot.key.strategy,
+                %cid,
+                update = ?snapshot,
+                "OrderManager received inactive order snapshot for untracked order - ignoring"
+            );
+            retired.insert(cid.clone());
+        }
+
+        // Input Snapshot is a venue's report of an order already retired, so ignore: it is late
+        // (see "Retired orders stay retired" on `Orders`)
+        Some(update)
+            if !matches!(update.state, ActiveOrderState::OpenInFlight(_))
+                && retired.contains(cid) =>
+        {
+            debug!(
+                exchange = ?snapshot.key.exchange,
+                instrument = ?snapshot.key.instrument,
+                strategy = %snapshot.key.strategy,
+                %cid,
+                update = ?snapshot,
+                "OrderManager received active order snapshot for an order already retired - ignoring"
+            );
+        }
+
+        // Input Snapshot is ActiveOrderState, so insert
+        Some(update) => match &update.state {
+            ActiveOrderState::Open(open) if open.quantity_remaining(update.quantity).is_zero() => {
+                debug!(
+                    exchange = ?snapshot.key.exchange,
+                    instrument = ?snapshot.key.instrument,
+                    strategy = %snapshot.key.strategy,
+                    %cid,
+                    update = ?snapshot,
+                    "OrderManager ignoring new Open order which is actually FulledFilled"
+                );
+                retired.insert(cid.clone());
+            }
+            _active_order => {
+                debug!(
+                    exchange = ?snapshot.key.exchange,
+                    instrument = ?snapshot.key.instrument,
+                    strategy = %snapshot.key.strategy,
+                    %cid,
+                    update = ?snapshot,
+                    "OrderManager tracking new order"
+                );
+                if matches!(update.state, ActiveOrderState::OpenInFlight(_)) {
+                    retired.forget(cid);
+                }
+                entry.insert(update);
+            }
+        },
     }
 }
 
@@ -580,6 +731,9 @@ where
     }
 
     fn record_in_flight_open(&mut self, request: &OrderRequestOpen<ExchangeKey, InstrumentKey>) {
+        // A new order by the engine's own hand, so its snapshots apply even under a client id
+        // that named a retired order.
+        self.1.forget(&request.key.cid);
         if let Some(duplicate_cid_order) =
             self.0.insert(request.key.cid.clone(), Order::from(request))
         {
@@ -615,7 +769,7 @@ mod tests {
     fn orders(
         orders: impl IntoIterator<Item = Order<ExchangeId, u64, ActiveOrderState>>,
     ) -> Orders<ExchangeId, u64> {
-        Orders(
+        Orders::new(
             orders
                 .into_iter()
                 .map(|order| (order.key.cid.clone(), order))
@@ -1781,19 +1935,19 @@ mod tests {
                 // TC0: Insert unseen InFlight
                 state: Orders::default(),
                 input: vec![request_open(cid_1.clone())],
-                expected: Orders(request_opens([request_open(cid_1.clone())])),
+                expected: Orders::new(request_opens([request_open(cid_1.clone())])),
             },
             TestCase {
                 // TC1: Insert InFlight that is already tracked
-                state: Orders(request_opens([request_open(cid_1.clone())])),
+                state: Orders::new(request_opens([request_open(cid_1.clone())])),
                 input: vec![request_open(cid_1.clone())],
-                expected: Orders(request_opens([request_open(cid_1.clone())])),
+                expected: Orders::new(request_opens([request_open(cid_1.clone())])),
             },
             TestCase {
                 // TC2: Insert one untracked InFlight, and one already tracked
-                state: Orders(request_opens([request_open(cid_1.clone())])),
+                state: Orders::new(request_opens([request_open(cid_1.clone())])),
                 input: vec![request_open(cid_1.clone()), request_open(cid_2.clone())],
-                expected: Orders(request_opens([request_open(cid_1), request_open(cid_2)])),
+                expected: Orders::new(request_opens([request_open(cid_1), request_open(cid_2)])),
             },
         ];
 
@@ -1802,6 +1956,222 @@ mod tests {
                 test.state.record_in_flight_open(&in_flight);
             }
             assert_eq!(test.state, test.expected, "TC{index} failed")
+        }
+    }
+
+    /// The race the memory exists for: the account stream reports how an order ended before the
+    /// response to placing it arrives, carrying the order's state at placement.
+    #[test]
+    fn a_late_open_response_does_not_track_an_order_the_stream_retired() {
+        let time = DateTime::<Utc>::MIN_UTC;
+        let cid = ClientOrderId::new("raced");
+        let mut state = Orders::<ExchangeId, u64>::default();
+        state.record_in_flight_open(&request_open(cid.clone()));
+
+        state.update_from_order_snapshot(order_snapshot_open(cid.clone(), time).as_ref());
+        state.update_from_order_snapshot(order_snapshot_fully_filled(cid.clone()).as_ref());
+        assert!(!state.0.contains_key(&cid), "precondition: retired");
+
+        state.update_from_order_snapshot(order_snapshot_open(cid.clone(), time).as_ref());
+        assert!(
+            !state.0.contains_key(&cid),
+            "the late response leaves it retired"
+        );
+        state.update_from_order_snapshot(order_snapshot_fully_filled(cid.clone()).as_ref());
+        assert!(!state.0.contains_key(&cid));
+    }
+
+    /// Every way `Orders` retires an order is remembered, so a stale listing that still shows
+    /// the order cannot track it again.
+    #[test]
+    fn a_stale_snapshot_does_not_track_an_order_retired_any_way() {
+        let time = DateTime::<Utc>::MIN_UTC;
+        let open_order = |cid: &ClientOrderId| {
+            order(
+                cid.clone(),
+                ActiveOrderState::Open(open_assigned("A", time)),
+            )
+        };
+        let cids = [
+            "snapshot",
+            "cancelled",
+            "cancel-in-flight",
+            "filled",
+            "absent",
+            "acked-filled",
+            "reported-filled",
+        ]
+        .map(ClientOrderId::new);
+        let [
+            snapshot,
+            cancelled,
+            cancel_in_flight,
+            filled,
+            absent,
+            acked_filled,
+            reported_filled,
+        ] = &cids;
+        let mut state = orders(cids.iter().map(open_order));
+        state.0.insert(
+            acked_filled.clone(),
+            order(
+                acked_filled.clone(),
+                ActiveOrderState::OpenInFlight(OpenInFlight),
+            ),
+        );
+
+        // An `Open` with nothing left to fill, acknowledging an open request and updating an open
+        // order.
+        let complete = |cid: &ClientOrderId| {
+            let mut snapshot = order_snapshot_open(cid.clone(), time_plus_secs(time, 1));
+            snapshot.0.state = OrderState::active(Open {
+                id: VenueOrderId::Assigned(OrderId::new("A")),
+                ..open_filled(time_plus_secs(time, 1), dec!(1))
+            });
+            snapshot
+        };
+        state.update_from_order_snapshot(complete(acked_filled).as_ref());
+        state.update_from_order_snapshot(complete(reported_filled).as_ref());
+
+        state.update_from_order_snapshot(order_snapshot_expired(snapshot.clone()).as_ref());
+        state.update_from_cancel_response(&response_cancel_ok(cancelled.clone()));
+        state.record_in_flight_cancel(&request_cancel(cancel_in_flight.clone()));
+        state.update_from_cancel_response(&response_cancel_ok(cancel_in_flight.clone()));
+        assert!(state.update_from_fill(filled, &OrderId::new("A"), dec!(1)));
+        assert!(
+            state
+                .remove_open(absent, &VenueOrderId::Assigned(OrderId::new("A")))
+                .is_some()
+        );
+        assert!(state.0.is_empty(), "precondition: every order retired");
+
+        for cid in &cids {
+            state.update_from_order_snapshot(order_snapshot_open(cid.clone(), time).as_ref());
+            assert!(!state.0.contains_key(cid), "{cid}: stays retired");
+        }
+    }
+
+    /// An order removed only because a cancel failed before its open was answered is not
+    /// retired: the open response it still waits for must track it.
+    #[test]
+    fn an_order_whose_cancel_failed_before_its_open_was_answered_is_not_retired() {
+        let cid = ClientOrderId::new("unanswered");
+        let mut state = Orders::<ExchangeId, u64>::default();
+        state.record_in_flight_open(&request_open(cid.clone()));
+        state.record_in_flight_cancel(&request_cancel(cid.clone()));
+        state.update_from_cancel_response(&response_cancel_err(cid.clone()));
+        assert!(!state.0.contains_key(&cid), "precondition: untracked");
+
+        state.update_from_order_snapshot(
+            order_snapshot_open(cid.clone(), DateTime::<Utc>::MIN_UTC).as_ref(),
+        );
+        assert!(state.0.contains_key(&cid));
+    }
+
+    #[test]
+    fn a_retired_order_is_forgotten_after_the_window_or_a_new_open_under_its_id() {
+        let time = DateTime::<Utc>::MIN_UTC;
+        let retire = |state: &mut Orders<ExchangeId, u64>, cid: &ClientOrderId| {
+            state.record_in_flight_open(&request_open(cid.clone()));
+            state.update_from_order_snapshot(order_snapshot_cancelled(cid.clone()).as_ref());
+        };
+        let mut state = Orders::<ExchangeId, u64>::default();
+
+        let reused = ClientOrderId::new("reused");
+        retire(&mut state, &reused);
+        state.record_in_flight_open(&request_open(reused.clone()));
+        state.update_from_order_snapshot(order_snapshot_open(reused.clone(), time).as_ref());
+        assert!(
+            matches!(
+                state.0.get(&reused).map(|order| &order.state),
+                Some(ActiveOrderState::Open(_))
+            ),
+            "a new open request under the id is a new order"
+        );
+
+        let oldest = ClientOrderId::new("oldest");
+        retire(&mut state, &oldest);
+        for index in 0..MAX_RECENTLY_RETIRED_ORDERS {
+            retire(&mut state, &ClientOrderId::new(format!("later-{index}")));
+        }
+        assert_eq!(state.1.0.len(), MAX_RECENTLY_RETIRED_ORDERS);
+
+        state.update_from_order_snapshot(order_snapshot_open(oldest.clone(), time).as_ref());
+        assert!(state.0.contains_key(&oldest), "forgotten beyond the window");
+        let newest = ClientOrderId::new(format!("later-{}", MAX_RECENTLY_RETIRED_ORDERS - 1));
+        state.update_from_order_snapshot(order_snapshot_open(newest.clone(), time).as_ref());
+        assert!(!state.0.contains_key(&newest), "still remembered");
+    }
+
+    #[test]
+    fn the_retired_memory_is_neither_compared_nor_serialised() {
+        let retired = ClientOrderId::new("retired");
+        let live = ClientOrderId::new("live");
+        let mut state = orders([order(
+            live.clone(),
+            ActiveOrderState::Open(open(DateTime::<Utc>::MIN_UTC)),
+        )]);
+        state.record_in_flight_open(&request_open(retired.clone()));
+        state.update_from_order_snapshot(order_snapshot_cancelled(retired.clone()).as_ref());
+
+        assert!(state.1.contains(&retired));
+        assert_eq!(state, orders(state.0.values().cloned()));
+
+        let (Ok(json), Ok(map_json)) =
+            (serde_json::to_value(&state), serde_json::to_value(&state.0))
+        else {
+            panic!("serialising failed")
+        };
+        assert_eq!(json, map_json, "serialised as the tracked orders alone");
+        let Ok(restored) = serde_json::from_value::<Orders<ExchangeId, u64>>(map_json) else {
+            panic!("a bare map of orders did not deserialise")
+        };
+        assert_eq!(restored, state);
+        assert!(!restored.1.contains(&retired));
+    }
+
+    /// Contract expiry voids every order at once; a late report of one must not track it again.
+    #[test]
+    fn clearing_remembers_every_order_it_drops() {
+        let time = DateTime::<Utc>::MIN_UTC;
+        let cids = ["open", "cancelling"].map(ClientOrderId::new);
+        let [open_cid, cancelling] = &cids;
+        let mut state = orders([
+            order(open_cid.clone(), ActiveOrderState::Open(open(time))),
+            order_cancel_in_flight(cancelling.clone()),
+        ]);
+
+        state.clear();
+        assert!(state.0.is_empty());
+        for cid in &cids {
+            state.update_from_order_snapshot(order_snapshot_open(cid.clone(), time).as_ref());
+            assert!(!state.0.contains_key(cid), "{cid}: stays retired");
+        }
+    }
+
+    /// An order the engine no longer tracks can still be reported ended, as when a cancel failed
+    /// before its open was answered and the stream then reports the end; and a venue can report a
+    /// new order already complete as an `Open` with nothing left. Either is remembered, so the
+    /// open response that follows cannot track the order.
+    #[test]
+    fn an_untracked_order_reported_ended_is_remembered() {
+        let time = DateTime::<Utc>::MIN_UTC;
+        let mut state = Orders::<ExchangeId, u64>::default();
+
+        let cancel_failed = ClientOrderId::new("cancel-failed");
+        state.record_in_flight_open(&request_open(cancel_failed.clone()));
+        state.record_in_flight_cancel(&request_cancel(cancel_failed.clone()));
+        state.update_from_cancel_response(&response_cancel_err(cancel_failed.clone()));
+        state.update_from_order_snapshot(order_snapshot_cancelled(cancel_failed.clone()).as_ref());
+
+        let complete = ClientOrderId::new("complete");
+        let mut reported_complete = order_snapshot_open(complete.clone(), time);
+        reported_complete.0.state = OrderState::active(open_filled(time, dec!(1)));
+        state.update_from_order_snapshot(reported_complete.as_ref());
+
+        for cid in [&cancel_failed, &complete] {
+            state.update_from_order_snapshot(order_snapshot_open(cid.clone(), time).as_ref());
+            assert!(!state.0.contains_key(cid), "{cid}: stays retired");
         }
     }
 }
