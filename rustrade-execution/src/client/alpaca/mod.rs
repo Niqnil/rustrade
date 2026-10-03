@@ -1134,13 +1134,13 @@ async fn rest_with_retry<T>(
 where
     T: for<'de> Deserialize<'de>,
 {
-    rest_request(rate_limiter, build_request, NotFound::IsError)
-        .await?
-        .ok_or_else(|| {
-            UnindexedClientError::Internal(
-                "Alpaca REST: a 404 read as absent on a call that does not allow it".to_string(),
-            )
-        })
+    match rest_request(rate_limiter, build_request).await? {
+        Fetched::Found(value) => Ok(value),
+        Fetched::NotFound(message) => Err(UnindexedClientError::Api(parse_api_error(
+            reqwest::StatusCode::NOT_FOUND,
+            &message,
+        ))),
+    }
 }
 
 /// [`rest_with_retry`] for a lookup by id: a 404 is `Ok(None)`, Alpaca knowing nothing under the
@@ -1152,25 +1152,26 @@ async fn rest_lookup_with_retry<T>(
 where
     T: for<'de> Deserialize<'de>,
 {
-    rest_request(rate_limiter, build_request, NotFound::IsAbsent).await
+    match rest_request(rate_limiter, build_request).await? {
+        Fetched::Found(value) => Ok(Some(value)),
+        Fetched::NotFound(_) => Ok(None),
+    }
 }
 
-/// How [`rest_request`] reads a 404.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NotFound {
-    /// As an error, classified like any other 4xx.
-    IsError,
-    /// As `Ok(None)`.
-    IsAbsent,
+/// What [`rest_request`] got back from a request that did not fail.
+#[derive(Debug)]
+enum Fetched<T> {
+    /// A 2xx body, decoded.
+    Found(T),
+    /// A 404, with Alpaca's message.
+    NotFound(String),
 }
 
-/// [`rest_with_retry`] and [`rest_lookup_with_retry`]: returns `Ok(None)` only for a 404 under
-/// [`NotFound::IsAbsent`].
+/// [`rest_with_retry`] and [`rest_lookup_with_retry`], which differ only in how they read a 404.
 async fn rest_request<T>(
     rate_limiter: &RateLimitTracker,
     mut build_request: impl FnMut() -> reqwest::RequestBuilder,
-    not_found: NotFound,
-) -> Result<Option<T>, UnindexedClientError>
+) -> Result<Fetched<T>, UnindexedClientError>
 where
     T: for<'de> Deserialize<'de>,
 {
@@ -1206,10 +1207,6 @@ where
 
         observe_rate_limit_remaining(rate_limiter, response.headers());
 
-        if status == reqwest::StatusCode::NOT_FOUND && not_found == NotFound::IsAbsent {
-            return Ok(None);
-        }
-
         // 204 No Content is only valid for DELETE endpoints; use rest_delete_with_retry
         // for those. Reaching here for a 204 indicates API misuse — return a clear error
         // rather than a misleading "EOF while parsing" JSON failure. A retry cannot fix it.
@@ -1228,21 +1225,27 @@ where
         // A 2xx body that does not fit the model is not transient: retrying returns the same
         // body. An order path must still treat it as status unknown; see `order_post_error`.
         if status.is_success() {
-            return serde_json::from_slice::<T>(&bytes).map(Some).map_err(|e| {
-                UnindexedClientError::Internal(format!(
-                    "Alpaca REST JSON parse error ({status}): {e} | body: {}",
-                    String::from_utf8_lossy(&bytes)
-                        .chars()
-                        .take(200)
-                        .collect::<String>()
-                ))
-            });
+            return serde_json::from_slice::<T>(&bytes)
+                .map(Fetched::Found)
+                .map_err(|e| {
+                    UnindexedClientError::Internal(format!(
+                        "Alpaca REST JSON parse error ({status}): {e} | body: {}",
+                        String::from_utf8_lossy(&bytes)
+                            .chars()
+                            .take(200)
+                            .collect::<String>()
+                    ))
+                });
         }
 
         // Parse API error body for a better error message.
         let api_err = serde_json::from_slice::<AlpacaApiError>(&bytes)
             .map(|e| e.message)
             .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned());
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(Fetched::NotFound(api_err));
+        }
 
         // 4xx = API-level rejection (wrong parameters, auth failure, insufficient funds).
         // 5xx / other = server-side failure treated as connectivity error.
@@ -1531,23 +1534,30 @@ impl ExecutionClient for AlpacaClient {
     ///   from a listing of open orders ([`account_snapshot`](ExecutionClient::account_snapshot),
     ///   [`fetch_open_orders`](ExecutionClient::fetch_open_orders)), and from its live reports on
     ///   any of its account streams, until it sees the order end; a cancel Alpaca has only
-    ///   accepted does not end it. It holds up to 4,096 orders and forgets the oldest past that,
-    ///   logged at `warn`. An order placed outside this client and never listed or reported to it
-    ///   is not covered.
+    ///   accepted does not end it. A bracket's take-profit and stop-loss legs carry client order
+    ///   ids Alpaca assigns, so they are held only once a listing or the stream reports them. It
+    ///   holds up to 4,096 orders and forgets the oldest past that, logged at `warn`. An order
+    ///   placed outside this client and never listed or reported to it is not covered.
     /// - **Cost.** One `GET /v2/orders?status=open` request listing every instrument with an
     ///   order held, then one `GET /v2/orders:by_client_order_id` for each held order the listing
-    ///   no longer shows.
-    /// - **Fills first.** The check runs after fill recovery has finished or given up, so an
-    ///   order's recovered fills arrive before how it ended. A fill that brings an order to its
-    ///   full quantity ends it, and that order is not reported again.
+    ///   no longer shows, 8 at a time. These share the account's rate limit with orders, so after
+    ///   an outage in which many held orders ended, the check can hold orders back until the
+    ///   window resets (see [Rate limits](AlpacaClient#rate-limits)).
+    /// - **Fills first.** The check starts once fill recovery has finished or given up, so an
+    ///   order's recovered fills arrive before how it ended. It runs alongside the stream, which
+    ///   is read from the start. A fill that brings an order to its full quantity ends it, and
+    ///   that order is not reported again.
     /// - **Keys.** Each snapshot carries [`StrategyId::unknown`], since Alpaca records no
     ///   strategy. The engine matches it to the order it tracks by client order id.
-    /// - **Failures.** A check that fails, or is still running after 30 s, is retried while
-    ///   connected 1, 2, 4, 8 and 16 minutes later, then given up, logged at `error`. Its orders
-    ///   are asked about again at the next reconnect. A listing of 500 orders may be truncated, so
-    ///   it fails the check. An order Alpaca does not know (404) stops being held, logged at
-    ///   `warn`; one still live, `done_for_day`, or in a state this version cannot read stays
-    ///   held.
+    /// - **Failures.** Each order's lookup is settled as it ends. An instrument whose listing or
+    ///   lookup fails, or whose check is still running after 30 s, is retried while connected 1,
+    ///   2, 4, 8 and 16 minutes later, asking only about the orders still held, then given up,
+    ///   logged at `error`; its orders are asked about again at the next reconnect. A listing that
+    ///   fails charges every instrument in it. Alpaca lists at most 500 open orders and has no
+    ///   pagination for them, so a listing of 500 may be truncated and fails: an account with 500
+    ///   or more open orders on the held instruments is not covered. An order Alpaca does not know
+    ///   (404) stops being held, logged at `warn`; one still live, `done_for_day`, or in a state
+    ///   this version cannot read stays held.
     ///
     /// The same lookup is public as [`OrderStatusClient::fetch_ended_orders`].
     ///
@@ -2542,11 +2552,6 @@ async fn connection_manager(
             unchecked.open(held);
         }
 
-        // --- How the orders held as live ended, after the fills ---
-        // Alpaca's fill recovery is finished or given up by now, so no fills are pending.
-        recover_alpaca_ended_orders(&http, &rate_limiter, &config, &known, &mut unchecked, &tx)
-            .await;
-
         // --- Stream events ---
         // Each iteration of the inner loop polls ws.next(), a heartbeat timer,
         // and tx.closed() simultaneously via select!. The heartbeat deadline is
@@ -2563,28 +2568,13 @@ async fn connection_manager(
         let heartbeat = tokio::time::sleep(Duration::from_secs(HEARTBEAT_TIMEOUT_SECS));
         tokio::pin!(heartbeat);
 
-        // Order checks a recovery did not finish are retried as they fall due, alongside the
-        // stream, so a disconnect is still seen at once. It never completes; dropping it when the
-        // stream loop ends loses nothing, since each check is settled in one step as soon as it
-        // ends.
-        let order_check_retries = async {
-            loop {
-                match unchecked.next_due(&NoPendingFills) {
-                    Some(due) => tokio::time::sleep_until(due).await,
-                    None => std::future::pending::<()>().await,
-                }
-                recover_alpaca_ended_orders(
-                    &http,
-                    &rate_limiter,
-                    &config,
-                    &known,
-                    &mut unchecked,
-                    &tx,
-                )
-                .await;
-            }
-        };
-        tokio::pin!(order_check_retries);
+        // How the orders held as live ended: checked alongside the stream, so it is read, and a
+        // disconnect seen, from the start. Fill recovery has finished or given up above, so the
+        // fills come first. Dropping this when the stream loop ends loses nothing, since each
+        // lookup and each check is settled in one step as soon as it ends.
+        let order_checks =
+            run_order_checks(&http, &rate_limiter, &config, &known, &mut unchecked, &tx);
+        tokio::pin!(order_checks);
 
         // Resets the rolling heartbeat deadline and records the wall-clock receive time.
         // Pin<&mut Sleep> cannot be passed to a regular function, so a macro avoids
@@ -2647,7 +2637,7 @@ async fn connection_manager(
                         }
                     }
                 }
-                () = &mut order_check_retries => {}
+                () = &mut order_checks => {}
                 _ = &mut heartbeat => {
                     warn!(
                         timeout_secs = HEARTBEAT_TIMEOUT_SECS,
@@ -3290,6 +3280,31 @@ async fn recover_alpaca_ended_orders(
         |key| fetch_order_lookup(http.clone(), rate_limiter.clone(), config.clone(), key),
     )
     .await;
+}
+
+/// Run every order check as it falls due, the first at once and a failed one after its backoff,
+/// for as long as it is polled. It never completes, and once the consumer has gone it only waits.
+///
+/// Fill recovery has finished or been given up before this starts, so no fills are pending.
+async fn run_order_checks(
+    http: &reqwest::Client,
+    rate_limiter: &Arc<RateLimitTracker>,
+    config: &Arc<AlpacaConfig>,
+    known: &SharedKnownLiveOrders,
+    unchecked: &mut UncheckedOrders,
+    tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
+) {
+    loop {
+        // A check stops at a gone consumer before settling, so its instruments stay due.
+        if tx.is_closed() {
+            return std::future::pending().await;
+        }
+        match unchecked.next_due(&NoPendingFills) {
+            Some(due) => tokio::time::sleep_until(due).await,
+            None => return std::future::pending().await,
+        }
+        recover_alpaca_ended_orders(http, rate_limiter, config, known, unchecked, tx).await;
+    }
 }
 
 /// How an order that has ended did end, from its REST order under `key`, the key it was asked for.
@@ -7654,6 +7669,86 @@ mod tests {
             )
             .await;
             assert!(!known.lock().contains(&key.cid), "filled");
+        }
+
+        /// The first check runs as soon as the loop is polled, and a failed one waits for its
+        /// backoff rather than running again at once.
+        #[tokio::test]
+        async fn the_check_loop_runs_at_once_then_waits_out_a_failure() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/orders"))
+                .respond_with(ResponseTemplate::new(503))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+            hold(&known, &alpaca_key("SPY", "a"));
+            let mut unchecked = UncheckedOrders::default();
+            unchecked.open(known.lock().instruments());
+            let config = Arc::new(AlpacaConfig::with_base_url(
+                "test-key".into(),
+                "test-secret".into(),
+                server.uri(),
+            ));
+            let (tx, _rx) = mpsc::unbounded_channel();
+
+            let ran = tokio::time::timeout(
+                Duration::from_secs(1),
+                run_order_checks(
+                    &reqwest::Client::new(),
+                    &Arc::new(RateLimitTracker::new()),
+                    &config,
+                    &known,
+                    &mut unchecked,
+                    &tx,
+                ),
+            )
+            .await;
+
+            assert!(ran.is_err(), "the loop never completes");
+            assert!(
+                unchecked.contains(&InstrumentNameExchange::new("SPY")),
+                "SPY waits for its retry"
+            );
+            // The mock's `expect(1)` checks, on drop, that the failure was not retried at once.
+        }
+
+        /// Once the consumer has gone, the loop asks nothing.
+        #[tokio::test]
+        async fn the_check_loop_waits_once_the_consumer_has_gone() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(503))
+                .expect(0)
+                .mount(&server)
+                .await;
+            let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+            hold(&known, &alpaca_key("SPY", "a"));
+            let mut unchecked = UncheckedOrders::default();
+            unchecked.open(known.lock().instruments());
+            let config = Arc::new(AlpacaConfig::with_base_url(
+                "test-key".into(),
+                "test-secret".into(),
+                server.uri(),
+            ));
+            let (tx, rx) = mpsc::unbounded_channel();
+            drop(rx);
+
+            let ran = tokio::time::timeout(
+                Duration::from_millis(200),
+                run_order_checks(
+                    &reqwest::Client::new(),
+                    &Arc::new(RateLimitTracker::new()),
+                    &config,
+                    &known,
+                    &mut unchecked,
+                    &tx,
+                ),
+            )
+            .await;
+
+            assert!(ran.is_err(), "the loop never completes");
         }
     }
 }

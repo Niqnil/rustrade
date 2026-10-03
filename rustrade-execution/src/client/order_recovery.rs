@@ -298,12 +298,7 @@ impl KnownLiveOrders {
     /// Every instrument with an order held as live.
     #[cfg_attr(not(feature = "alpaca"), allow(dead_code))] // Only Alpaca streams every instrument.
     pub(crate) fn instruments(&self) -> Vec<InstrumentNameExchange> {
-        let held: FnvHashSet<&InstrumentNameExchange> = self
-            .orders
-            .values()
-            .map(|known| &known.instrument)
-            .collect();
-        held.into_iter().cloned().collect()
+        self.held_instruments().into_iter().cloned().collect()
     }
 
     /// Those of `instruments` with an order held as live.
@@ -311,11 +306,7 @@ impl KnownLiveOrders {
         &self,
         instruments: &[InstrumentNameExchange],
     ) -> Vec<InstrumentNameExchange> {
-        let held: FnvHashSet<&InstrumentNameExchange> = self
-            .orders
-            .values()
-            .map(|known| &known.instrument)
-            .collect();
+        let held = self.held_instruments();
         instruments
             .iter()
             .filter(|instrument| held.contains(instrument))
@@ -339,6 +330,14 @@ impl KnownLiveOrders {
                 strategy: StrategyId::unknown(),
                 cid: cid.clone(),
             })
+            .collect()
+    }
+
+    /// Each instrument with an order held as live, once.
+    fn held_instruments(&self) -> FnvHashSet<&InstrumentNameExchange> {
+        self.orders
+            .values()
+            .map(|known| &known.instrument)
             .collect()
     }
 
@@ -534,14 +533,15 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpenListing {
     /// One listing per instrument, as on a venue that lists the open orders of one symbol at a
-    /// time. A listing or lookup that fails charges only its own instrument.
-    #[cfg_attr(not(feature = "binance"), allow(dead_code))]
+    /// time. A listing that fails charges only its own instrument.
     // Only Binance lists by one symbol.
+    #[cfg_attr(not(feature = "binance"), allow(dead_code))]
     PerInstrument,
     /// One listing of every instrument due, as on a venue that lists several symbols in one
-    /// request. A listing or lookup that fails charges every instrument in it.
-    #[cfg_attr(not(feature = "alpaca"), allow(dead_code))]
+    /// request. A listing that fails charges every instrument in it. Either way, a lookup that
+    /// fails charges only the instrument of the order it asked about.
     // Only Alpaca lists several symbols.
+    #[cfg_attr(not(feature = "alpaca"), allow(dead_code))]
     Batched,
 }
 
@@ -562,10 +562,11 @@ pub(crate) enum OpenListing {
 /// with a warning, since asking again cannot change that. One still live, or in a state this
 /// version cannot read, stays.
 ///
-/// The instruments of each listing are settled as soon as its check ends, so dropping this
-/// part-way, as a disconnect during a retry does, loses nothing, and a pass that outlasts
-/// [`ORDER_CHECK_TIMEOUT_SECS`] keeps what it finished. An instrument whose check fails or does not
-/// finish is retried later; one never started stays due as it was.
+/// Each lookup is settled as soon as it ends, and the instruments of each listing as soon as its
+/// check ends, so dropping this part-way, as a disconnect during a retry does, loses nothing, and a
+/// pass that outlasts [`ORDER_CHECK_TIMEOUT_SECS`] keeps what it finished. An instrument whose
+/// listing or any lookup fails, or whose check does not finish, is retried later, asking only about
+/// the orders still held; one never started stays due as it was.
 pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
     exchange: ExchangeId,
     known: &SharedKnownLiveOrders,
@@ -581,7 +582,7 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
     Q: Fn(UnindexedOrderKey) -> QFut,
     QFut: Future<Output = Result<OrderLookup, UnindexedClientError>>,
 {
-    use futures::{StreamExt as _, TryStreamExt as _};
+    use futures::StreamExt as _;
 
     let ready = unchecked.ready(pending, tokio::time::Instant::now());
     if ready.is_empty() {
@@ -639,38 +640,62 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
             futures::stream::iter(checks.into_iter().enumerate().map(|(index, check)| {
                 started.store(index + 1, Ordering::Relaxed);
                 async move {
-                    let found = async {
-                        let (listed_on, keys): (Vec<_>, Vec<_>) = check.into_iter().unzip();
-                        let listed = list_open(listed_on).await?;
-                        let unlisted: Vec<UnindexedOrderKey> = keys
-                            .into_iter()
-                            .flatten()
-                            .filter(|key| !listed.contains(&key.cid))
-                            .collect();
-                        futures::stream::iter(unlisted)
-                            .map(|key| async move {
-                                let found = lookup(key.clone()).await?;
-                                Ok::<_, UnindexedClientError>((key, found))
-                            })
-                            .buffered(ORDER_LOOKUPS_IN_FLIGHT)
-                            .try_collect::<Vec<_>>()
-                            .await
+                    let (listed_on, keys): (Vec<_>, Vec<_>) = check.into_iter().unzip();
+                    let listed = match list_open(listed_on).await {
+                        Ok(listed) => listed,
+                        Err(e) => return (index, Err(e)),
                     };
-                    (index, found.await)
+                    let unlisted: Vec<UnindexedOrderKey> = keys
+                        .into_iter()
+                        .flatten()
+                        .filter(|key| !listed.contains(&key.cid))
+                        .collect();
+                    // Each lookup is settled as it ends, so one that fails, or a pass that times
+                    // out, loses none of those already answered.
+                    let mut lookups = futures::stream::iter(unlisted)
+                        .map(|key| async move {
+                            let found = lookup(key.clone()).await;
+                            (key, found)
+                        })
+                        .buffered(ORDER_LOOKUPS_IN_FLIGHT);
+                    let mut checked = CheckedListing::default();
+                    while let Some((key, found)) = lookups.next().await {
+                        match found {
+                            Ok(found) => match settle(exchange, known, key, found, tx) {
+                                Some(sent) => checked.sent += sent,
+                                None => {
+                                    checked.consumer_gone = true;
+                                    break;
+                                }
+                            },
+                            Err(e) => {
+                                checked
+                                    .failed
+                                    .entry(key.instrument)
+                                    .or_insert_with(|| e.to_string());
+                            }
+                        }
+                    }
+                    (index, Ok(checked))
                 }
             }))
             .buffer_unordered(LISTINGS_IN_FLIGHT);
-        while let Some((index, found)) = runs.next().await {
+        while let Some((index, checked)) = runs.next().await {
             settled[index] = true;
-            match found {
-                Ok(found) => {
-                    let Some(sent) = settle(exchange, known, found, tx) else {
+            match checked {
+                Ok(checked) => {
+                    if checked.consumer_gone {
                         debug!(%exchange, "Order check: consumer dropped during recovery");
                         return;
-                    };
-                    reported += sent;
+                    }
+                    reported += checked.sent;
                     for instrument in &instruments[index] {
-                        unchecked.checked(instrument);
+                        match checked.failed.get(instrument) {
+                            Some(reason) => {
+                                order_check_failed(exchange, unchecked, instrument, reason);
+                            }
+                            None => unchecked.checked(instrument),
+                        }
                     }
                 }
                 Err(e) => {
@@ -700,50 +725,59 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
     }
 }
 
-/// Apply one listing's lookups to the set and send each order that ended. Returns how many were
-/// sent, or `None` if the consumer has gone.
+/// What one listing's lookups came to, once each has been settled.
+#[derive(Debug, Default)]
+struct CheckedListing {
+    /// How many orders that ended were sent.
+    sent: u32,
+    /// The instruments a lookup failed on, each with the first failure's reason.
+    failed: FnvHashMap<InstrumentNameExchange, String>,
+    /// Whether the consumer has gone, so the check stopped.
+    consumer_gone: bool,
+}
+
+/// Apply one lookup to the set and send the order if it ended. Returns how many were sent (none or
+/// one), or `None` if the consumer has gone.
 ///
-/// The set's lock is held across the sends, as the stream holds it across its own, so an order the
+/// The set's lock is held across the send, as the stream holds it across its own, so an order the
 /// stream reports ending and this check reach the consumer in the order they were decided, and an
 /// order is reported once.
 fn settle(
     exchange: ExchangeId,
     known: &SharedKnownLiveOrders,
-    found: Vec<(UnindexedOrderKey, OrderLookup)>,
+    key: UnindexedOrderKey,
+    found: OrderLookup,
     tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
 ) -> Option<u32> {
     let mut known = known.lock();
-    let mut sent = 0;
-    for (key, found) in found {
-        match found {
-            OrderLookup::Ended(order) => {
-                if !known.ended(&order.key.cid) {
-                    continue;
-                }
-                let event = UnindexedAccountEvent::new(
-                    exchange,
-                    AccountEventKind::OrderSnapshot(Snapshot::new(
-                        (*order).map_state(OrderState::Inactive),
-                    )),
-                );
-                tx.send(event).ok()?;
-                sent += 1;
+    match found {
+        OrderLookup::Ended(order) => {
+            if !known.ended(&order.key.cid) {
+                return Some(0);
             }
-            OrderLookup::Unknown => {
-                if known.ended(&key.cid) {
-                    warn!(
-                        %exchange,
-                        instrument = %key.instrument,
-                        cid = %key.cid,
-                        "The venue does not know an order held as live; a reconnect no longer \
-                         asks about it"
-                    );
-                }
-            }
-            OrderLookup::NotEnded => {}
+            let event = UnindexedAccountEvent::new(
+                exchange,
+                AccountEventKind::OrderSnapshot(Snapshot::new(
+                    (*order).map_state(OrderState::Inactive),
+                )),
+            );
+            tx.send(event).ok()?;
+            Some(1)
         }
+        OrderLookup::Unknown => {
+            if known.ended(&key.cid) {
+                warn!(
+                    %exchange,
+                    instrument = %key.instrument,
+                    cid = %key.cid,
+                    "The venue does not know an order held as live; a reconnect no longer asks \
+                     about it"
+                );
+            }
+            Some(0)
+        }
+        OrderLookup::NotEnded => Some(0),
     }
-    Some(sent)
 }
 
 /// Record that the check of how the orders held as live on `instrument` ended did not finish,
@@ -1299,5 +1333,116 @@ mod tests {
             "SLOWB and SLOWC both started, so both wait for a retry"
         );
         known.lock().assert_consistent();
+    }
+
+    /// A batch's lookup that fails charges only its own instrument, and every lookup that was
+    /// answered, on that instrument too, is kept.
+    #[tokio::test]
+    async fn a_failed_lookup_in_a_batch_charges_only_its_instrument() {
+        let known = KnownLiveOrders::shared(ExchangeId::BinanceSpot);
+        for (instrument, cid, id) in [
+            ("BTCUSDT", "btc-ended", "1"),
+            ("BTCUSDT", "btc-failing", "2"),
+            ("ETHUSDT", "eth-ended", "3"),
+        ] {
+            known
+                .lock()
+                .live(&key(instrument, cid), dec!(1), &open(id, Decimal::ZERO));
+        }
+        let mut unchecked = UncheckedOrders::default();
+        unchecked.open(known.lock().instruments());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let listings = AtomicUsize::new(0);
+
+        recover_ended_orders(
+            ExchangeId::BinanceSpot,
+            &known,
+            &mut unchecked,
+            &NoPendingFills,
+            &tx,
+            OpenListing::Batched,
+            |instruments: Vec<InstrumentNameExchange>| {
+                listings.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(instruments.len(), 2, "one listing of both");
+                async { Ok(FnvHashSet::default()) }
+            },
+            |key: UnindexedOrderKey| async move {
+                if key.cid.0 == "btc-failing" {
+                    Err(UnindexedClientError::Api(ApiError::RateLimit))
+                } else {
+                    Ok(OrderLookup::Ended(Box::new(cancelled_order(&key))))
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(listings.load(Ordering::Relaxed), 1);
+        let mut sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|event| match event.kind {
+                AccountEventKind::OrderSnapshot(Snapshot(order)) => order.key.cid,
+                other => panic!("an order snapshot: {other:?}"),
+            })
+            .collect();
+        sent.sort();
+        assert_eq!(
+            sent,
+            [
+                ClientOrderId::new("btc-ended"),
+                ClientOrderId::new("eth-ended")
+            ]
+        );
+        let btc = InstrumentNameExchange::new("BTCUSDT");
+        assert!(!unchecked.contains(&InstrumentNameExchange::new("ETHUSDT")));
+        assert!(unchecked.contains(&btc), "BTCUSDT waits for a retry");
+        assert_eq!(
+            unchecked.failed(&btc, tokio::time::Instant::now()),
+            Some(GapFailure::Retry(Duration::from_secs(
+                GAP_RETRY_BASE_SECS * 2
+            ))),
+            "and has failed once already"
+        );
+        let known = known.lock();
+        assert!(known.contains(&ClientOrderId::new("btc-failing")));
+        assert!(!known.contains(&ClientOrderId::new("btc-ended")));
+        known.assert_consistent();
+    }
+
+    /// A batch whose listing never answers charges every instrument in it once when the pass
+    /// times out.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_batch_charges_every_instrument_in_it() {
+        let (known, mut unchecked) = held_on(&["AAA", "BBB"]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        recover_ended_orders(
+            ExchangeId::BinanceSpot,
+            &known,
+            &mut unchecked,
+            &NoPendingFills,
+            &tx,
+            OpenListing::Batched,
+            |_: Vec<InstrumentNameExchange>| async {
+                std::future::pending::<()>().await;
+                Ok(FnvHashSet::default())
+            },
+            |_: UnindexedOrderKey| async { Ok(OrderLookup::NotEnded) },
+        )
+        .await;
+
+        assert!(rx.try_recv().is_err(), "nothing reported");
+        let now = tokio::time::Instant::now();
+        assert!(
+            unchecked.ready(&NoPendingFills, now).is_empty(),
+            "both wait"
+        );
+        for instrument in ["AAA", "BBB"] {
+            assert_eq!(
+                unchecked.failed(&InstrumentNameExchange::new(instrument), now),
+                Some(GapFailure::Retry(Duration::from_secs(
+                    GAP_RETRY_BASE_SECS * 2
+                ))),
+                "{instrument} has failed once"
+            );
+        }
     }
 }
