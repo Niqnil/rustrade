@@ -10,7 +10,9 @@
 //! [`BinanceMarginConfig`], [`MarginSideEffect`]) and a full [`ExecutionClient`] implementation:
 //! order submission/cancel and account snapshot / balance / open-order / trade queries over REST,
 //! plus a live account event stream ([`ExecutionClient::account_stream`]) over the hand-rolled
-//! `userListenToken` user-data WebSocket (the SDK's retired listen-key path is not used). Both
+//! `userListenToken` user-data WebSocket (the SDK's retired listen-key path is not used), which
+//! after a reconnect recovers missed fills and reports how orders ended meanwhile. It also
+//! implements [`OrderStatusClient`], looking orders up by client order id. Both
 //! **cross** (`isIsolated = "FALSE"`, account-wide collateral) and **isolated** (`isIsolated =
 //! "TRUE"`, per-pair sub-accounts) margin are supported, selected by
 //! [`BinanceMarginConfig::is_isolated`].
@@ -2234,6 +2236,22 @@ async fn recover_margin_fills(
     }
 }
 
+/// Open what a reconnect after a disconnect at `disconnected` recovers: a fill gap on each of the
+/// stream's `instruments`, and a check of how the orders held as live ended on each of them that
+/// has one. Only the stream's instruments are checked, since only their fills are recovered, and
+/// an instrument is checked once its fills are.
+fn open_reconnect_recovery(
+    unrecovered: &mut UnrecoveredFills,
+    unchecked: &mut UncheckedOrders,
+    known: &SharedKnownLiveOrders,
+    instruments: &[InstrumentNameExchange],
+    disconnected: DateTime<Utc>,
+) {
+    unrecovered.open(instruments, disconnected, Utc::now());
+    let held = known.lock().instruments_among(instruments);
+    unchecked.open(held);
+}
+
 /// Long-running task driving the `account_stream` WebSocket lifecycle.
 ///
 /// Reconnect loop: acquire token → connect → register listener → subscribe → stream events → on
@@ -2377,10 +2395,7 @@ async fn margin_connection_manager(
         // recovered is not checked yet. Each gap and check is opened before it is read, so one that
         // fails or times out is kept for a retry.
         if let Some(dt) = disconnect_time.take() {
-            unrecovered.open(&instruments, dt, Utc::now());
-            // Only the instruments this stream recovers fills for, so fills-first holds for each.
-            let held = known.lock().instruments_among(&instruments);
-            unchecked.open(held);
+            open_reconnect_recovery(&mut unrecovered, &mut unchecked, &known, &instruments, dt);
         }
         // This is the cross manager (account-wide); recovery is always cross-scoped. The isolated
         // manager (a separate path) passes `true`.
@@ -2837,9 +2852,7 @@ async fn isolated_connection_manager(
         // --- Recovery after a reconnect (isolated-scoped over the full symbol set) ---
         // Fills first, then how the orders held as live ended, as on cross.
         if let Some(dt) = disconnect_time.take() {
-            unrecovered.open(&symbols, dt, Utc::now());
-            let held = known.lock().instruments_among(&symbols);
-            unchecked.open(held);
+            open_reconnect_recovery(&mut unrecovered, &mut unchecked, &known, &symbols, dt);
         }
         // is_isolated = true: every margin read must query the isolated accounts.
         recover_margin_fills(
@@ -6571,5 +6584,101 @@ mod tests {
                 .lock()
                 .contains(&ClientOrderId::new("placed"))
         );
+    }
+
+    #[test]
+    fn a_reconnect_opens_a_gap_on_each_stream_instrument_and_checks_those_with_orders_held() {
+        let [btc, eth, xrp] = ["BTCUSDT", "ETHUSDT", "XRPUSDT"].map(InstrumentNameExchange::new);
+        let known = KnownLiveOrders::shared();
+        for (instrument, cid) in [(&btc, "btc"), (&xrp, "xrp")] {
+            known.lock().live(
+                &margin_key(instrument.name(), cid),
+                Decimal::TWO,
+                &Open::new(
+                    VenueOrderId::Assigned(OrderId::new(cid)),
+                    Utc::now(),
+                    Decimal::ZERO,
+                ),
+            );
+        }
+        let mut unrecovered = UnrecoveredFills::default();
+        let mut unchecked = UncheckedOrders::default();
+
+        open_reconnect_recovery(
+            &mut unrecovered,
+            &mut unchecked,
+            &known,
+            &[btc.clone(), eth.clone()],
+            Utc::now() - chrono::Duration::minutes(1),
+        );
+
+        assert!(unrecovered.covers(&btc) && unrecovered.covers(&eth));
+        assert!(!unrecovered.covers(&xrp), "not the stream's");
+        assert!(unchecked.contains(&btc));
+        assert!(!unchecked.contains(&eth), "no order held");
+        assert!(!unchecked.contains(&xrp), "its fills are not recovered");
+    }
+
+    /// Margin fill recovery ends a held order that a recovered fill completes, and keeps one it
+    /// only part-fills, so a later check does not report the completed one again.
+    #[tokio::test]
+    async fn a_recovered_margin_fill_that_completes_a_held_order_ends_it() {
+        let disconnect = Utc::now() - chrono::Duration::minutes(10);
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/myTrades"))
+            .respond_with(venue(vec![
+                (
+                    1,
+                    (disconnect + chrono::Duration::minutes(1)).timestamp_millis(),
+                ),
+                (
+                    2,
+                    (disconnect + chrono::Duration::minutes(2)).timestamp_millis(),
+                ),
+            ]))
+            .mount(&server)
+            .await;
+        // Each venue trade is 0.01 of an order of its own id: order 1 is complete at 0.01, order 2
+        // is of 0.02 and part-filled.
+        let known = KnownLiveOrders::shared();
+        for (cid, order_id, quantity) in [("one", "1", "0.01"), ("two", "2", "0.02")] {
+            known.lock().live(
+                &margin_key("BTCUSDT", cid),
+                Decimal::from_str(quantity).unwrap(),
+                &Open::new(
+                    VenueOrderId::Assigned(OrderId::new(order_id)),
+                    Utc::now(),
+                    Decimal::ZERO,
+                ),
+            );
+        }
+        let mut unrecovered = UnrecoveredFills::default();
+        unrecovered.open(
+            &[InstrumentNameExchange::new("BTCUSDT")],
+            disconnect,
+            Utc::now(),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        recover_margin_fills(
+            &margin_rest_at(&server),
+            &Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
+            &mut unrecovered,
+            &tx,
+            &new_dedup_cache(),
+            &known,
+            false,
+        )
+        .await;
+
+        assert_eq!(
+            std::iter::from_fn(|| rx.try_recv().ok()).count(),
+            2,
+            "both fills"
+        );
+        let known = known.lock();
+        assert!(!known.contains(&ClientOrderId::new("one")), "completed");
+        assert!(known.contains(&ClientOrderId::new("two")), "part-filled");
     }
 }
