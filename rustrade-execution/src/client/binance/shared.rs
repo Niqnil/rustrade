@@ -1096,22 +1096,23 @@ pub(crate) fn convert_ended_order<T: BinanceOrderFields>(
     if rest_order_is_open(status) {
         return None;
     }
-    if !matches!(
-        status,
-        "FILLED" | "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH" | "REJECTED"
-    ) {
-        warn!(%exchange, %instrument, cid = %key.cid, status, "Binance order has a status this version does not know, treating it as not ended");
-        return None;
-    }
     let row = convert_order_row(o, exchange, instrument)?;
-    let avg_price = binance_avg_price(exchange, o.cumulative_quote_qty(), row.state.filled_qty);
-    let state = ended_order_state(
+    let avg_price = binance_avg_price(
+        exchange,
+        &row.state.order_id,
+        o.cumulative_quote_qty(),
+        row.state.filled_qty,
+    );
+    let Some(state) = ended_order_state(
         status,
         row.state.order_id.clone(),
         row.state.time_exchange,
         row.state.filled_qty,
         avg_price,
-    )?;
+    ) else {
+        warn!(%exchange, %instrument, cid = %key.cid, status, "Binance order has a status this version does not know, treating it as not ended");
+        return None;
+    };
     let mut order = row.map_state(|_| state);
     order.key = key.clone();
     Some(order)
@@ -1151,8 +1152,20 @@ pub(crate) fn ended_order_state<AssetKey, InstrumentKey>(
     })
 }
 
-/// The state the response to placing an order reports, from its `status`, `executedQty`
-/// (`filled_qty`) and `cummulativeQuoteQty`.
+/// The fields of Binance's response to placing an order that say what became of it.
+#[derive(Debug, Clone)]
+pub(crate) struct PlacementResponse<'a> {
+    /// `status`; absent from an `ACK` response.
+    pub(crate) status: Option<&'a str>,
+    pub(crate) order_id: OrderId,
+    pub(crate) time_exchange: DateTime<Utc>,
+    /// `executedQty`.
+    pub(crate) filled_qty: Decimal,
+    /// `cummulativeQuoteQty`.
+    pub(crate) cumulative_quote_qty: Option<&'a str>,
+}
+
+/// The state that `response`, to placing an order of `quantity`, reports.
 ///
 /// An order that ended in the response itself is reported as it ended (see
 /// [`ended_order_state`]): an IOC or FOK order that found no liquidity, or partly filled and
@@ -1160,18 +1173,20 @@ pub(crate) fn ended_order_state<AssetKey, InstrumentKey>(
 /// `PARTIALLY_FILLED`, `PENDING_NEW`), or none, as in an `ACK` response, reads from what filled:
 /// `FullyFilled` once it covers `quantity`, otherwise `Open`. So does a status this version does
 /// not know, with a warning, since the account stream reports the order's next state either way.
-#[allow(clippy::too_many_arguments)] // Each is a distinct field of the response; a struct would only rename them.
 pub(crate) fn placed_order_state(
     exchange: ExchangeId,
     instrument: &InstrumentNameExchange,
-    status: Option<&str>,
-    order_id: OrderId,
-    time_exchange: DateTime<Utc>,
-    filled_qty: Decimal,
     quantity: Decimal,
-    cumulative_quote_qty: Option<&str>,
+    response: PlacementResponse<'_>,
 ) -> UnindexedOrderState {
-    let avg_price = || binance_avg_price(exchange, cumulative_quote_qty, filled_qty);
+    let PlacementResponse {
+        status,
+        order_id,
+        time_exchange,
+        filled_qty,
+        cumulative_quote_qty,
+    } = response;
+    let avg_price = || binance_avg_price(exchange, &order_id, cumulative_quote_qty, filled_qty);
     if let Some(status) = status {
         if let Some(ended) = ended_order_state(
             status,
@@ -1187,12 +1202,8 @@ pub(crate) fn placed_order_state(
         }
     }
     if filled_qty >= quantity {
-        OrderState::fully_filled(Filled::new(
-            order_id,
-            time_exchange,
-            filled_qty,
-            avg_price(),
-        ))
+        let avg_price = avg_price();
+        OrderState::fully_filled(Filled::new(order_id, time_exchange, filled_qty, avg_price))
     } else {
         OrderState::active(Open::new(
             VenueOrderId::Assigned(order_id),
@@ -1202,13 +1213,14 @@ pub(crate) fn placed_order_state(
     }
 }
 
-/// The average price of an order's fills: the quote traded (`cummulativeQuoteQty`) over the base
-/// traded (`filled_qty`).
+/// The average price of the fills of order `order_id`: the quote traded (`cummulativeQuoteQty`)
+/// over the base traded (`filled_qty`).
 ///
 /// `None` when nothing filled or the quote is missing, when Binance reports it negative (its
 /// "not available", for some historical orders), and, with a warning, when it does not parse.
 pub(crate) fn binance_avg_price(
     exchange: ExchangeId,
+    order_id: &OrderId,
     cumulative_quote_qty: Option<&str>,
     filled_qty: Decimal,
 ) -> Option<Decimal> {
@@ -1220,7 +1232,7 @@ pub(crate) fn binance_avg_price(
         Ok(quote) if quote.is_sign_negative() => None,
         Ok(quote) => quote.checked_div(filled_qty),
         Err(_) => {
-            warn!(%exchange, cummulative_quote_qty = quote, "Binance: failed to parse cummulativeQuoteQty; average price unavailable");
+            warn!(%exchange, %order_id, cummulative_quote_qty = quote, "Binance: failed to parse cummulativeQuoteQty; average price unavailable");
             None
         }
     }
@@ -3771,12 +3783,14 @@ mod tests {
             placed_order_state(
                 ExchangeId::BinanceSpot,
                 &btc,
-                status,
-                OrderId::new("7"),
-                time,
-                filled,
                 dec!(2),
-                quote,
+                PlacementResponse {
+                    status,
+                    order_id: OrderId::new("7"),
+                    time_exchange: time,
+                    filled_qty: filled,
+                    cumulative_quote_qty: quote,
+                },
             )
         };
         let expired = |filled| {
@@ -3858,7 +3872,8 @@ mod tests {
     fn the_average_price_is_the_quote_traded_over_the_base() {
         use rust_decimal_macros::dec;
 
-        let avg = |quote, filled| binance_avg_price(ExchangeId::BinanceSpot, quote, filled);
+        let id = OrderId::new("7");
+        let avg = |quote, filled| binance_avg_price(ExchangeId::BinanceSpot, &id, quote, filled);
         assert_eq!(avg(Some("100"), dec!(4)), Some(dec!(25)));
         assert_eq!(avg(Some("100"), Decimal::ZERO), None, "nothing filled");
         assert_eq!(avg(None, dec!(4)), None, "no quote");

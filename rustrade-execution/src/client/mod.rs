@@ -291,12 +291,17 @@ where
     /// Returns `OrderState` directly rather than `Result<Open, OrderError>`:
     /// - `OrderState::Active(Open)` - order is resting on the order book
     /// - `OrderState::Inactive(FullyFilled)` - order was immediately filled (includes `avg_price` when available)
-    /// - `OrderState::Inactive(Expired)` or `Inactive(Cancelled)` - order ended in the response
-    ///   itself without filling completely, carrying what filled: an IOC or FOK order that found
-    ///   too little liquidity, or one expired by self-trade prevention. Only a client whose venue
-    ///   reports the order's status in the response returns these (Binance Spot and Margin); the
-    ///   others return `Open`, and the account stream reports the end
-    /// - `OrderState::Inactive(OpenFailed)` - order placement failed (API error, connectivity, etc.)
+    /// - `OrderState::Inactive(Expired)` - order ended in the response itself without filling
+    ///   completely, carrying what filled: an IOC or FOK order that found too little liquidity,
+    ///   or one expired by self-trade prevention
+    /// - `OrderState::Inactive(Cancelled)` - order the venue reports cancelled in the response
+    ///   itself, carrying what filled
+    /// - `OrderState::Inactive(OpenFailed)` - order placement failed (API error, connectivity, a
+    ///   rejection the venue reports in the response, etc.)
+    ///
+    /// An implementation returns `Expired` or `Cancelled` only when its venue reports the order's
+    /// status in the placement response (currently Binance Spot and Margin). The others return
+    /// `Open` for such an order, and their account stream reports how it ended.
     ///
     /// This design allows immediate fills to carry metadata (e.g., `avg_price`) that
     /// would be lost if we had to infer terminal state from `Open::filled_quantity`.

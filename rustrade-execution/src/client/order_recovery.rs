@@ -836,7 +836,7 @@ mod tests {
             Order, OrderKey, OrderKind, TimeInForce,
             id::VenueOrderId,
             request::UnindexedOrderResponseCancel,
-            state::{Cancelled, InactiveOrderState},
+            state::{Cancelled, Expired, Filled, InactiveOrderState, OpenInFlight},
         },
         trade::{AssetFees, Trade, TradeId},
     };
@@ -1002,6 +1002,50 @@ mod tests {
             "a late live report does not bring it back"
         );
         assert!(!known.ended(&late.cid), "and it is no longer held");
+    }
+
+    #[test]
+    fn a_placement_holds_an_open_order_and_settles_an_ended_one() {
+        let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
+        let open_order = key("BTCUSDT", "open");
+        known.placed(
+            &open_order,
+            dec!(2),
+            &OrderState::active(open("1", Decimal::ZERO)),
+        );
+        assert!(known.contains(&open_order.cid));
+
+        let in_flight = key("BTCUSDT", "in-flight");
+        known.placed(&in_flight, dec!(2), &OrderState::active(OpenInFlight));
+        assert!(
+            !known.contains(&in_flight.cid),
+            "not yet known to the venue"
+        );
+
+        let ended = [
+            (
+                "filled",
+                OrderState::fully_filled(Filled::new(OrderId::new("2"), Utc::now(), dec!(2), None)),
+            ),
+            (
+                "expired",
+                OrderState::inactive(Expired::new(OrderId::new("3"), Utc::now(), dec!(1))),
+            ),
+            (
+                "failed",
+                OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected("no".into()))),
+            ),
+        ];
+        for (cid, state) in ended {
+            let order = key("BTCUSDT", cid);
+            known.placed(&order, dec!(2), &state);
+            known.live(&order, dec!(2), &open("9", Decimal::ZERO));
+            assert!(
+                !known.contains(&order.cid),
+                "{cid}: a late live report does not bring it back"
+            );
+        }
+        known.assert_consistent();
     }
 
     #[test]

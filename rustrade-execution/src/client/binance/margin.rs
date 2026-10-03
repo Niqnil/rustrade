@@ -52,9 +52,9 @@
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
-    MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, RateLimitTracker, RequestKind,
-    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnrecoveredFills, UserDataFrame, WeightPool,
-    classify_order_kind_tif, classify_rest_order_error, classify_rest_query_error,
+    MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, PlacementResponse, RateLimitTracker,
+    RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnrecoveredFills, UserDataFrame,
+    WeightPool, classify_order_kind_tif, classify_rest_order_error, classify_rest_query_error,
     convert_ended_order, convert_execution_report, convert_open_order_listing,
     convert_open_order_owned_symbol, dedup_key_from_event, drop_after, gap_failed, gap_time,
     is_duplicate, is_unknown_order, log_unrecognised_frame, new_dedup_cache, parse_user_data_frame,
@@ -789,12 +789,14 @@ impl ExecutionClient for BinanceMargin {
         let state = placed_order_state(
             ExchangeId::BinanceMargin,
             &instrument,
-            data.status.as_deref(),
-            exchange_order_id,
-            time_exchange,
-            filled_qty,
             quantity,
-            data.cummulative_quote_qty.as_deref(),
+            PlacementResponse {
+                status: data.status.as_deref(),
+                order_id: exchange_order_id,
+                time_exchange,
+                filled_qty,
+                cumulative_quote_qty: data.cummulative_quote_qty.as_deref(),
+            },
         );
         self.known_live.lock().placed(&order_key, quantity, &state);
 
