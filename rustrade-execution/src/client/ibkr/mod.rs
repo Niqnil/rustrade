@@ -2554,7 +2554,10 @@ fn make_order_from_status(
 
     // `None` when IB reports a fill that is not a number, so that an ended order does not report
     // an unknown fill as zero.
-    let reported_fill = try_decimal_or_warn(status.filled, "status.filled");
+    let reported_fill = try_decimal_or_warn(
+        status.filled,
+        format_args!("status.filled of order {ib_id}"),
+    );
     // A live order's fill only grows, so an unknown one reads as nothing filled until IB reports
     // more.
     let filled_qty = reported_fill.unwrap_or(Decimal::ZERO);

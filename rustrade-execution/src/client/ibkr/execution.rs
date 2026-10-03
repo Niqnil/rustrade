@@ -207,13 +207,16 @@ fn build_trade(
 ///
 /// Where zero would be read as a real value, such as an ended order's fill, use
 /// [`try_decimal_or_warn`] and keep it unknown instead.
-pub fn parse_decimal_or_warn(value: f64, field_name: &str) -> Decimal {
+pub fn parse_decimal_or_warn(value: f64, field_name: impl std::fmt::Display) -> Decimal {
     try_decimal_or_warn(value, field_name).unwrap_or(Decimal::ZERO)
 }
 
 /// Convert an IB `f64` to a `Decimal`: `None`, with a warning, when it is not a finite number
 /// that fits, so that a caller can keep it unknown rather than read it as zero.
-pub fn try_decimal_or_warn(value: f64, field_name: &str) -> Option<Decimal> {
+///
+/// `field_name` names the value in the warning; a `format_args!` can add context, such as the
+/// order, without formatting it unless the warning fires.
+pub fn try_decimal_or_warn(value: f64, field_name: impl std::fmt::Display) -> Option<Decimal> {
     Decimal::try_from(value)
         .map_err(
             |e| warn!(field = %field_name, value = %value, error = %e, "Invalid f64 for Decimal"),

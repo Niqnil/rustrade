@@ -1099,20 +1099,20 @@ pub(crate) fn convert_ended_order<T: BinanceOrderFields>(
         return None;
     }
     let row = convert_order_row(o, exchange, instrument)?;
-    // Only `FILLED` reports an average price, and a filled order filled its whole quantity.
-    let avg_price = binance_avg_price(
-        exchange,
-        &row.state.order_id,
-        o.cumulative_quote_qty(),
-        row.state.filled_qty.unwrap_or(row.quantity),
-    );
     let Some(state) = ended_order_state(
         status,
         row.state.order_id.clone(),
         row.state.time_exchange,
         row.quantity,
         row.state.filled_qty,
-        avg_price,
+        |filled_qty| {
+            binance_avg_price(
+                exchange,
+                &row.state.order_id,
+                o.cumulative_quote_qty(),
+                filled_qty,
+            )
+        },
     ) else {
         warn!(%exchange, %instrument, cid = %key.cid, status, "Binance order has a status this version does not know, treating it as not ended");
         return None;
@@ -1124,8 +1124,9 @@ pub(crate) fn convert_ended_order<T: BinanceOrderFields>(
 
 /// How an order ended, from its Binance `status`, or `None` for a status that does not end it.
 ///
-/// `FILLED` becomes [`InactiveOrderState::FullyFilled`] with `avg_price` and the reported fill,
-/// or the whole `quantity` when that is unknown; `CANCELED` becomes [`InactiveOrderState::Cancelled`], `EXPIRED` and
+/// `FILLED` becomes [`InactiveOrderState::FullyFilled`] with the reported fill, or the whole
+/// `quantity` when that is unknown, and the average price `avg_price` works out for that fill
+/// (asked only then); `CANCELED` becomes [`InactiveOrderState::Cancelled`], `EXPIRED` and
 /// `EXPIRED_IN_MATCH` (self-trade prevention) [`InactiveOrderState::Expired`], each with what
 /// filled before, `None` when that is unknown; and `REJECTED` becomes
 /// [`InactiveOrderState::OpenFailed`]. Shared by the lookup of an order that ended
@@ -1136,16 +1137,19 @@ pub(crate) fn ended_order_state<AssetKey, InstrumentKey>(
     time_exchange: DateTime<Utc>,
     quantity: Decimal,
     filled_qty: Option<Decimal>,
-    avg_price: Option<Decimal>,
+    avg_price: impl FnOnce(Decimal) -> Option<Decimal>,
 ) -> Option<InactiveOrderState<AssetKey, InstrumentKey>> {
     Some(match status {
         // A filled order filled its whole quantity, whether or not `executedQty` said so.
-        "FILLED" => InactiveOrderState::FullyFilled(Filled::new(
-            order_id,
-            time_exchange,
-            filled_qty.unwrap_or(quantity),
-            avg_price,
-        )),
+        "FILLED" => {
+            let filled_qty = filled_qty.unwrap_or(quantity);
+            InactiveOrderState::FullyFilled(Filled::new(
+                order_id,
+                time_exchange,
+                filled_qty,
+                avg_price(filled_qty),
+            ))
+        }
         "CANCELED" => {
             InactiveOrderState::Cancelled(Cancelled::new(order_id, time_exchange, filled_qty))
         }
@@ -1198,15 +1202,8 @@ pub(crate) fn placed_order_state(
         (None, None) => None,
         _ => binance_filled_qty(exchange, &order_id, executed_qty),
     };
-    // Only a filled order reports an average price, and it filled its whole quantity.
-    let avg_price = || {
-        binance_avg_price(
-            exchange,
-            &order_id,
-            cumulative_quote_qty,
-            filled_qty.unwrap_or(quantity),
-        )
-    };
+    let avg_price =
+        |filled_qty| binance_avg_price(exchange, &order_id, cumulative_quote_qty, filled_qty);
     if let Some(status) = status {
         if let Some(ended) = ended_order_state(
             status,
@@ -1214,7 +1211,7 @@ pub(crate) fn placed_order_state(
             time_exchange,
             quantity,
             filled_qty,
-            avg_price(),
+            avg_price,
         ) {
             return OrderState::Inactive(ended);
         }
@@ -1224,7 +1221,7 @@ pub(crate) fn placed_order_state(
     }
     match filled_qty {
         Some(filled_qty) if filled_qty >= quantity => {
-            let avg_price = avg_price();
+            let avg_price = avg_price(filled_qty);
             OrderState::fully_filled(Filled::new(order_id, time_exchange, filled_qty, avg_price))
         }
         // A live order's fill only grows, so an unknown one reads as nothing filled until the
