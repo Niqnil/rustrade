@@ -957,7 +957,8 @@ pub(crate) fn parse_time_in_force(tif: &str) -> TimeInForce {
 ///
 /// binance-sdk generates a *distinct* response type per endpoint, with no shared trait:
 /// `AllOrdersResponseInner`, `GetOpenOrdersResponseInner` and `GetOrderResponse` on spot,
-/// `QueryMarginAccountsOpenOrdersResponseInner` on margin. Those structs are emphatically not
+/// `QueryMarginAccountsOpenOrdersResponseInner` and `QueryMarginAccountsOrderResponse` on margin.
+/// Those structs are emphatically not
 /// interchangeable -- the spot family carries substantially more fields than the margin one, and
 /// several fields share a name while differing in type -- but the thirteen named here are
 /// identical in name and type across all of them.
@@ -1020,6 +1021,7 @@ impl_binance_order_fields!(
     binance_sdk::spot::rest_api::GetOpenOrdersResponseInner,
     binance_sdk::spot::rest_api::GetOrderResponse,
     binance_sdk::margin_trading::rest_api::QueryMarginAccountsOpenOrdersResponseInner,
+    binance_sdk::margin_trading::rest_api::QueryMarginAccountsOrderResponse,
 );
 
 /// Whether a REST order response's status says the order is resting at the exchange, and may
@@ -1073,11 +1075,12 @@ pub(crate) fn convert_open_order<T: BinanceOrderFields>(
     }))
 }
 
-/// How an order that has ended did end, from a REST order row such as `GET /api/v3/order`'s, under
-/// `key`, the key it was asked for.
+/// How an order that has ended did end, from a REST order row such as `GET /api/v3/order`'s or
+/// `GET /sapi/v1/margin/order`'s, under `key`, the key it was asked for.
 ///
 /// `FILLED` becomes [`InactiveOrderState::FullyFilled`], with the average price worked out from
-/// `cummulativeQuoteQty`; `CANCELED` becomes [`InactiveOrderState::Cancelled`], `EXPIRED` and
+/// `cummulativeQuoteQty`, or none where Binance reports that negative (not available for some
+/// historical orders); `CANCELED` becomes [`InactiveOrderState::Cancelled`], `EXPIRED` and
 /// `EXPIRED_IN_MATCH` (self-trade prevention) [`InactiveOrderState::Expired`], each with what
 /// filled before; and `REJECTED` becomes [`InactiveOrderState::OpenFailed`].
 ///
@@ -1105,10 +1108,12 @@ pub(crate) fn convert_ended_order<T: BinanceOrderFields>(
         return None;
     }
     let row = convert_order_row(o, exchange, instrument)?;
-    // The average over every execution: the quote traded over the base traded.
+    // The average over every execution: the quote traded over the base traded. Binance reports a
+    // negative `cummulativeQuoteQty` for some historical orders, meaning it does not have it.
     let avg_price = o
         .cumulative_quote_qty()
         .and_then(|quote| Decimal::from_str(quote).ok())
+        .filter(|quote| !quote.is_sign_negative())
         .and_then(|quote| quote.checked_div(row.state.filled_qty));
     let mut order = row.map_state(|row| match status {
         "FILLED" => InactiveOrderState::FullyFilled(Filled::new(

@@ -4,7 +4,7 @@
 //!
 //! | Connector | Reconnect | Dedup | Fill Recovery | Ended-order Recovery | Heartbeat | Cancel answers once |
 //! |-----------|-----------|-------|---------------|----------------------|-----------|---------------------|
-//! | [`binance`] | Auto (1s→30s backoff) | 10k LRU | REST after reconnect | Spot: REST after reconnect; Margin: none | 30s | cancelled |
+//! | [`binance`] | Auto (1s→30s backoff) | 10k LRU | REST after reconnect | REST after reconnect | 30s | cancelled |
 //! | [`alpaca`] | Auto (1s→30s backoff) | 2k LRU | REST after reconnect | None | 35s | accepted |
 //! | [`ibkr`] | ibapi-managed | 10k LRU, fills only | Executions request after reconnect | None | N/A | submitted |
 //! | [`hyperliquid`] | SDK-managed | 10k LRU, fills only | Caller responsibility | None | SDK-managed | cancelled |
@@ -34,11 +34,11 @@
 //!
 //! # Known Limitations
 //!
-//! Only Binance Spot recovers the **order lifecycle events** (CANCELED, EXPIRED, REJECTED, a fill
-//! that completes an order) it missed while disconnected; the other connectors recover fills only
-//! (#370). [`OrderStatusClient`] is the lookup that recovery is built on: given the orders a
-//! caller still holds as live, it says how each that has ended did end. Binance Spot and the mock
-//! client implement it.
+//! Only Binance (Spot and Margin) recovers the **order lifecycle events** (CANCELED, EXPIRED,
+//! REJECTED, a fill that completes an order) it missed while disconnected; the other connectors
+//! recover fills only (#370). [`OrderStatusClient`] is the lookup that recovery is built on: given
+//! the orders a caller still holds as live, it says how each that has ended did end. Binance Spot,
+//! Binance Margin and the mock client implement it.
 //!
 //! The engine closes part of that gap from the account snapshot each reconnect produces: an order a
 //! complete list no longer shows is retired (see [`ExecutionClient::account_snapshot`]). That covers
