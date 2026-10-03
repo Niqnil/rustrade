@@ -131,6 +131,7 @@ pub(crate) struct KnownLiveOrders {
     exchange: ExchangeId,
     orders: FnvHashMap<ClientOrderId, KnownLive>,
     by_order_id: FnvHashMap<(InstrumentNameExchange, OrderId), ClientOrderId>,
+    by_instrument: OrdersByInstrument,
     /// Every held order by when it was added, oldest first.
     by_age: BTreeMap<u64, ClientOrderId>,
     recently_ended: LruCache<ClientOrderId, ()>,
@@ -146,6 +147,7 @@ impl KnownLiveOrders {
             exchange,
             orders: FnvHashMap::default(),
             by_order_id: FnvHashMap::default(),
+            by_instrument: OrdersByInstrument::default(),
             by_age: BTreeMap::new(),
             recently_ended: LruCache::new(RECENTLY_ENDED),
             next_seq: 0,
@@ -177,7 +179,11 @@ impl KnownLiveOrders {
                 self.by_order_id
                     .remove(&(known.instrument.clone(), stale.clone()));
             }
-            known.instrument = key.instrument.clone();
+            if known.instrument != key.instrument {
+                self.by_instrument.remove(&known.instrument, cid);
+                self.by_instrument.insert(&key.instrument, cid);
+                known.instrument = key.instrument.clone();
+            }
             known.quantity = quantity;
             known.order_id = order_id.or(previous);
             known.order_id.clone()
@@ -190,6 +196,7 @@ impl KnownLiveOrders {
             let seq = self.next_seq;
             self.next_seq += 1;
             self.by_age.insert(seq, cid.clone());
+            self.by_instrument.insert(&key.instrument, cid);
             self.orders.insert(
                 cid.clone(),
                 KnownLive {
@@ -310,12 +317,20 @@ impl KnownLiveOrders {
             .values()
             .filter(|known| known.order_id.is_some());
         assert_eq!(with_ids.count(), self.by_order_id.len(), "by_order_id");
+        for (instrument, cids) in &self.by_instrument.0 {
+            assert!(!cids.is_empty(), "by_instrument keeps no empty entry");
+            for cid in cids {
+                assert_eq!(&self.orders[cid].instrument, instrument);
+            }
+        }
+        let indexed: usize = self.by_instrument.0.values().map(FnvHashSet::len).sum();
+        assert_eq!(indexed, self.orders.len(), "by_instrument");
     }
 
     /// Every instrument with an order held as live.
     #[cfg_attr(not(feature = "alpaca"), allow(dead_code))] // Only Alpaca streams every instrument.
     pub(crate) fn instruments(&self) -> Vec<InstrumentNameExchange> {
-        self.held_instruments().into_iter().cloned().collect()
+        self.by_instrument.0.keys().cloned().collect()
     }
 
     /// Those of `instruments` with an order held as live.
@@ -323,10 +338,9 @@ impl KnownLiveOrders {
         &self,
         instruments: &[InstrumentNameExchange],
     ) -> Vec<InstrumentNameExchange> {
-        let held = self.held_instruments();
         instruments
             .iter()
-            .filter(|instrument| held.contains(instrument))
+            .filter(|instrument| self.by_instrument.0.contains_key(*instrument))
             .cloned()
             .collect()
     }
@@ -338,23 +352,17 @@ impl KnownLiveOrders {
         exchange: ExchangeId,
         instrument: &InstrumentNameExchange,
     ) -> Vec<UnindexedOrderKey> {
-        self.orders
-            .iter()
-            .filter(|(_, known)| known.instrument == *instrument)
-            .map(|(cid, known)| UnindexedOrderKey {
+        self.by_instrument
+            .0
+            .get(instrument)
+            .into_iter()
+            .flatten()
+            .map(|cid| UnindexedOrderKey {
                 exchange,
-                instrument: known.instrument.clone(),
+                instrument: instrument.clone(),
                 strategy: StrategyId::unknown(),
                 cid: cid.clone(),
             })
-            .collect()
-    }
-
-    /// Each instrument with an order held as live, once.
-    fn held_instruments(&self) -> FnvHashSet<&InstrumentNameExchange> {
-        self.orders
-            .values()
-            .map(|known| &known.instrument)
             .collect()
     }
 
@@ -363,6 +371,7 @@ impl KnownLiveOrders {
             return false;
         };
         self.by_age.remove(&known.seq);
+        self.by_instrument.remove(&known.instrument, cid);
         if let Some(order_id) = known.order_id {
             self.by_order_id.remove(&(known.instrument, order_id));
         }
@@ -388,6 +397,29 @@ impl KnownLiveOrders {
             );
         }
         self.remove(&cid);
+    }
+}
+
+/// The client order ids of the orders [`KnownLiveOrders`] holds, by instrument. An instrument is
+/// present only while it has an order held, so its keys are the instruments with one.
+#[derive(Debug, Default)]
+struct OrdersByInstrument(FnvHashMap<InstrumentNameExchange, FnvHashSet<ClientOrderId>>);
+
+impl OrdersByInstrument {
+    fn insert(&mut self, instrument: &InstrumentNameExchange, cid: &ClientOrderId) {
+        self.0
+            .entry(instrument.clone())
+            .or_default()
+            .insert(cid.clone());
+    }
+
+    fn remove(&mut self, instrument: &InstrumentNameExchange, cid: &ClientOrderId) {
+        if let Some(cids) = self.0.get_mut(instrument) {
+            cids.remove(cid);
+            if cids.is_empty() {
+                self.0.remove(instrument);
+            }
+        }
     }
 }
 
@@ -1051,15 +1083,21 @@ mod tests {
     #[test]
     fn a_full_set_forgets_its_oldest_order() {
         let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
+        // The oldest is alone on its instrument, so forgetting it stops holding that instrument.
         for n in 0..=MAX_KNOWN_LIVE_ORDERS {
+            let instrument = if n == 0 { "ETHUSDT" } else { "BTCUSDT" };
             known.live(
-                &key("BTCUSDT", &n.to_string()),
+                &key(instrument, &n.to_string()),
                 dec!(1),
                 &open(&n.to_string(), Decimal::ZERO),
             );
         }
         assert!(!known.contains(&ClientOrderId::new("0")));
         assert!(known.contains(&ClientOrderId::new("1")));
+        assert_eq!(
+            known.instruments(),
+            [InstrumentNameExchange::new("BTCUSDT")]
+        );
         // An order that ends frees its place, so the next one forgets nothing.
         assert!(known.ended(&ClientOrderId::new("2")));
         known.live(&key("BTCUSDT", "new"), dec!(1), &open("new", Decimal::ZERO));
@@ -1110,6 +1148,44 @@ mod tests {
             "only those asked about that hold an order"
         );
         assert_eq!(known.instruments_among(std::slice::from_ref(&btc)), [btc]);
+        known.assert_consistent();
+    }
+
+    #[test]
+    fn an_instrument_stops_being_held_with_its_last_order() {
+        let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
+        let (btc, eth) = (
+            InstrumentNameExchange::new("BTCUSDT"),
+            InstrumentNameExchange::new("ETHUSDT"),
+        );
+        known.live(&key("BTCUSDT", "a"), dec!(1), &open("1", Decimal::ZERO));
+        known.live(&key("BTCUSDT", "b"), dec!(1), &open("2", Decimal::ZERO));
+
+        known.ended(&ClientOrderId::new("a"));
+        assert_eq!(
+            known.instruments(),
+            std::slice::from_ref(&btc),
+            "b still holds it"
+        );
+        known.assert_consistent();
+
+        known.live(&key("ETHUSDT", "b"), dec!(1), &open("2", Decimal::ZERO));
+        assert_eq!(
+            known.instruments(),
+            std::slice::from_ref(&eth),
+            "b moved instrument"
+        );
+        assert!(known.keys_on(ExchangeId::BinanceSpot, &btc).is_empty());
+        assert_eq!(
+            known.keys_on(ExchangeId::BinanceSpot, &eth),
+            [key("ETHUSDT", "b")]
+        );
+        known.assert_consistent();
+
+        known.ended(&ClientOrderId::new("b"));
+        assert!(known.instruments().is_empty());
+        assert!(known.instruments_among(&[btc, eth]).is_empty());
+        known.assert_consistent();
     }
 
     #[test]
