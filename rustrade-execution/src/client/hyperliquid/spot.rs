@@ -581,7 +581,8 @@ impl ExecutionClient for HyperliquidSpotClient {
                         cancelled_id.clone(),
                         // SDK cancel response omits server timestamp; use local clock.
                         Utc::now(),
-                        Decimal::ZERO,
+                        // Nor does it carry the filled quantity.
+                        None,
                     )),
                 })
             }

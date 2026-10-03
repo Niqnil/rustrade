@@ -54,11 +54,12 @@ use super::shared::{
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
     MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, PlacementResponse, RateLimitTracker,
     RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnrecoveredFills, UserDataFrame,
-    WeightPool, classify_order_kind_tif, classify_rest_order_error, classify_rest_query_error,
-    convert_ended_order, convert_execution_report, convert_open_order_listing,
-    convert_open_order_owned_symbol, dedup_key_from_event, drop_after, gap_failed, gap_time,
-    is_duplicate, is_unknown_order, log_unrecognised_frame, new_dedup_cache, parse_user_data_frame,
-    placed_order_state, recovered_order_totals, response_decode_error, rest_call_with_retry,
+    WeightPool, binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
+    classify_rest_query_error, convert_ended_order, convert_execution_report,
+    convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event, drop_after,
+    gap_failed, gap_time, is_duplicate, is_unknown_order, log_unrecognised_frame, new_dedup_cache,
+    parse_user_data_frame, placed_order_state, recovered_order_totals, response_decode_error,
+    rest_call_with_retry,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, InstrumentBalanceUpdate,
@@ -765,25 +766,6 @@ impl ExecutionClient for BinanceMargin {
             }
         };
 
-        let filled_qty = match data.executed_qty.as_deref() {
-            Some(q) => Decimal::from_str(q).unwrap_or_else(|_| {
-                // Present-but-unparseable executedQty is corrupt data, not an expected
-                // absence: silently defaulting to zero could misreport a filled order as
-                // Open. Surface it (mirrors margin_avg_price).
-                warn!(
-                    executed_qty = q,
-                    "BinanceMargin: failed to parse executedQty; treating as zero"
-                );
-                Decimal::ZERO
-            }),
-            None => {
-                // executedQty is expected on margin's REST order/cancel responses; its absence is
-                // anomalous (not the expected-empty case), so surface it rather than silently zero.
-                warn!("BinanceMargin: executedQty missing in response; treating as zero");
-                Decimal::ZERO
-            }
-        };
-
         // Read from the response's status, so an order that ended in it (an IOC or FOK order
         // that expired) is not reported, or held, as live.
         let state = placed_order_state(
@@ -794,7 +776,7 @@ impl ExecutionClient for BinanceMargin {
                 status: data.status.as_deref(),
                 order_id: exchange_order_id,
                 time_exchange,
-                filled_qty,
+                executed_qty: data.executed_qty.as_deref(),
                 cumulative_quote_qty: data.cummulative_quote_qty.as_deref(),
             },
         );
@@ -894,24 +876,11 @@ impl ExecutionClient for BinanceMargin {
             }
         };
 
-        let filled_qty = match data.executed_qty.as_deref() {
-            Some(q) => Decimal::from_str(q).unwrap_or_else(|_| {
-                // Present-but-unparseable executedQty is corrupt data, not an expected
-                // absence: silently defaulting to zero could misreport a filled order as
-                // Open. Surface it (mirrors margin_avg_price).
-                warn!(
-                    executed_qty = q,
-                    "BinanceMargin: failed to parse executedQty; treating as zero"
-                );
-                Decimal::ZERO
-            }),
-            None => {
-                // executedQty is expected on margin's REST order/cancel responses; its absence is
-                // anomalous (not the expected-empty case), so surface it rather than silently zero.
-                warn!("BinanceMargin: executedQty missing in response; treating as zero");
-                Decimal::ZERO
-            }
-        };
+        let filled_qty = binance_filled_qty(
+            ExchangeId::BinanceMargin,
+            &exchange_order_id,
+            data.executed_qty.as_deref(),
+        );
 
         self.known_live.lock().ended(&key.cid);
         Some(UnindexedOrderResponseCancel {
@@ -6205,7 +6174,7 @@ mod tests {
         assert_eq!(filled.avg_price, Some(Decimal::from(105)));
         assert!(matches!(
             ended(margin_order_row("a", "CANCELED")),
-            Some(InactiveOrderState::Cancelled(cancelled)) if cancelled.filled_quantity == Decimal::ONE
+            Some(InactiveOrderState::Cancelled(cancelled)) if cancelled.filled_quantity == Some(Decimal::ONE)
         ));
         assert_eq!(ended(margin_order_row("a", "NEW")), None);
 
@@ -6674,7 +6643,7 @@ mod tests {
             else {
                 panic!("{cid}: expired, not open: {placed:?}");
             };
-            assert_eq!(expired.filled_quantity, Decimal::from_str(filled).unwrap());
+            assert_eq!(expired.filled_quantity, Decimal::from_str(filled).ok());
             let late = Open::new(
                 VenueOrderId::Assigned(OrderId::new("7")),
                 Utc::now(),

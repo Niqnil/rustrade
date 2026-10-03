@@ -1659,11 +1659,11 @@ impl ExecutionClient for AlpacaClient {
         match rest_delete_with_retry(&self.rate_limiter, || http.delete(&url)).await {
             Ok(()) => {
                 let exchange_order_id = OrderId(order_id);
-                // REST DELETE returns no response body, so filled_qty unavailable.
-                // Use ZERO; downstream can reconcile via WS events or fetch_open_orders.
+                // REST DELETE returns no response body, so the filled quantity is unknown
+                // here; the account stream's `canceled` update reports it.
                 Some(crate::order::request::OrderResponseCancel {
                     key,
-                    state: Ok(Cancelled::new(exchange_order_id, Utc::now(), Decimal::ZERO)),
+                    state: Ok(Cancelled::new(exchange_order_id, Utc::now(), None)),
                 })
             }
             Err(e) => Some(crate::order::request::OrderResponseCancel { key, state: Err(e) }),
@@ -2015,7 +2015,8 @@ impl AlpacaClient {
             Ok(resp) => {
                 let exchange_order_id = OrderId(SmolStr::new(&resp.id));
                 let time_exchange = order_state_time(&resp);
-                let filled_qty = Decimal::from_str(&resp.filled_qty).unwrap_or(Decimal::ZERO);
+                let filled_qty =
+                    alpaca_filled_qty(&resp.id, Some(&resp.filled_qty)).unwrap_or(Decimal::ZERO);
 
                 let state = if filled_qty >= request.quantity {
                     OrderState::fully_filled(Filled::new(
@@ -2218,7 +2219,8 @@ impl AlpacaClient {
             Ok(resp) => {
                 let exchange_order_id = OrderId(SmolStr::new(&resp.id));
                 let time_exchange = order_state_time(&resp);
-                let filled_qty = Decimal::from_str(&resp.filled_qty).unwrap_or(Decimal::ZERO);
+                let filled_qty =
+                    alpaca_filled_qty(&resp.id, Some(&resp.filled_qty)).unwrap_or(Decimal::ZERO);
 
                 let state = if filled_qty >= quantity {
                     // Order was fully filled immediately (market order or aggressive limit)
@@ -3335,7 +3337,9 @@ fn convert_ended_order(
         return None;
     };
     let order_id = OrderId(SmolStr::new(&o.id));
-    let filled_qty = order.state.filled_quantity;
+    // Read again rather than from the open order, which reads an unknown fill as zero; that
+    // conversion has already warned of it.
+    let filled_qty = Decimal::from_str(&o.filled_qty).ok();
     let time_exchange = order.state.time_exchange;
     let state = match status {
         "filled" => {
@@ -3343,10 +3347,11 @@ fn convert_ended_order(
                 .filled_avg_price
                 .as_deref()
                 .and_then(|price| Decimal::from_str(price).ok());
+            // A filled order filled its whole quantity, whether or not `filled_qty` parsed.
             InactiveOrderState::FullyFilled(Filled::new(
                 order_id,
                 time_exchange,
-                filled_qty,
+                filled_qty.unwrap_or(order.quantity),
                 avg_price,
             ))
         }
@@ -3688,7 +3693,7 @@ fn convert_representable_open_order(
         .limit_price
         .as_deref()
         .and_then(|s| Decimal::from_str(s).ok());
-    let filled_qty = Decimal::from_str(&o.filled_qty).unwrap_or(Decimal::ZERO);
+    let filled_qty = alpaca_filled_qty(&o.id, Some(&o.filled_qty)).unwrap_or(Decimal::ZERO);
     let kind = parse_order_kind(
         &o.order_type,
         o.stop_price.as_deref(),
@@ -3778,7 +3783,7 @@ fn ws_order_snapshot(
         return None;
     }
     let price = order.limit_price.and_then(|s| Decimal::from_str(s).ok());
-    let filled_qty = Decimal::from_str(order.filled_qty.unwrap_or("0")).unwrap_or(Decimal::ZERO);
+    let filled_qty = alpaca_filled_qty(&order.id, order.filled_qty).unwrap_or(Decimal::ZERO);
     let kind = parse_order_kind(
         &order.order_type,
         order.stop_price,
@@ -3968,8 +3973,7 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
                 .timestamp
                 .and_then(parse_timestamp)
                 .unwrap_or_else(Utc::now);
-            let filled_qty =
-                Decimal::from_str(order.filled_qty.unwrap_or("0")).unwrap_or(Decimal::ZERO);
+            let filled_qty = alpaca_filled_qty(&order.id, order.filled_qty);
             let cancelled = Cancelled::new(order_id, time_exchange, filled_qty);
             let response = crate::order::request::OrderResponseCancel {
                 key: OrderKey::new(
@@ -4101,6 +4105,22 @@ fn order_state_time(order: &AlpacaOrderResponse) -> DateTime<Utc> {
         .and_then(parse_timestamp)
         .or_else(|| parse_timestamp(&order.created_at))
         .unwrap_or_else(Utc::now)
+}
+
+/// The quantity Alpaca order `order_id` has filled, from its `filled_qty`: `None`, with a
+/// warning, when it is missing or does not parse, so that an unknown fill is not read as zero.
+fn alpaca_filled_qty(order_id: &str, filled_qty: Option<&str>) -> Option<Decimal> {
+    let Some(raw) = filled_qty else {
+        warn!(%order_id, "Alpaca did not report how much the order filled");
+        return None;
+    };
+    match Decimal::from_str(raw) {
+        Ok(filled_qty) => Some(filled_qty),
+        Err(_) => {
+            warn!(%order_id, filled_qty = raw, "Alpaca reported an unparseable filled_qty, treating it as unknown");
+            None
+        }
+    }
 }
 
 fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
@@ -5290,6 +5310,74 @@ mod tests {
             panic!("expected OrderCancelled, got {:?}", event.kind);
         };
         assert!(response.state.is_ok());
+    }
+
+    /// A `canceled` update carries what filled, and an unknown fill stays unknown, not zero.
+    #[test]
+    fn a_canceled_update_carries_its_fill_or_none() {
+        let cancelled = |filled_qty: Option<&'static str>| {
+            let mut order = make_order_ws("ord-3", "AAPL", "sell", "0");
+            order.filled_qty = filled_qty;
+            let update = AlpacaTradeUpdate {
+                event: SmolStr::new("canceled"),
+                order,
+                price: None,
+                qty: None,
+                timestamp: Some("2025-04-18T14:30:00Z"),
+            };
+            let event =
+                sole_event(convert_trade_update(update)).expect("canceled should produce an event");
+            let AccountEventKind::OrderCancelled(response) = event.kind else {
+                panic!("expected OrderCancelled, got {:?}", event.kind);
+            };
+            let Ok(cancelled) = response.state else {
+                panic!("expected Ok, got {:?}", response.state);
+            };
+            cancelled.filled_quantity
+        };
+
+        assert_eq!(cancelled(Some("1")), Some(Decimal::ONE));
+        assert_eq!(cancelled(Some("0")), Some(Decimal::ZERO));
+        assert_eq!(cancelled(None), None);
+        assert_eq!(cancelled(Some("not a number")), None);
+    }
+
+    /// An ended order whose `filled_qty` does not parse reports its fill unknown, not zero; a
+    /// filled one filled its whole quantity regardless.
+    #[test]
+    fn an_ended_order_with_an_unparseable_fill_reports_it_unknown() {
+        let key = OrderKey::new(
+            ExchangeId::AlpacaBroker,
+            InstrumentNameExchange::new("AAPL"),
+            StrategyId::new("strategy"),
+            ClientOrderId::new("c"),
+        );
+        let ended = |status: &str| {
+            let mut order = make_order_response("o1", "AAPL");
+            order.status = Some(status.to_string());
+            order.filled_qty = "not a number".to_string();
+            convert_ended_order(&order, &key).map(|order| order.state)
+        };
+
+        assert!(matches!(
+            ended("canceled"),
+            Some(InactiveOrderState::Cancelled(Cancelled {
+                filled_quantity: None,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            ended("expired"),
+            Some(InactiveOrderState::Expired(Expired {
+                filled_quantity: None,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            ended("filled"),
+            Some(InactiveOrderState::FullyFilled(Filled { filled_quantity, .. }))
+                if filled_quantity == Decimal::ONE
+        ));
     }
 
     #[test]
@@ -7303,9 +7391,13 @@ mod tests {
                 (fill.filled_quantity, fill.avg_price),
                 (dec!(2), Some(dec!(101.5)))
             );
-            assert_eq!(cancelled.filled_quantity, dec!(1), "what filled before");
-            assert_eq!(expiry.filled_quantity, dec!(1));
-            assert_eq!(replacement.filled_quantity, Decimal::ZERO);
+            assert_eq!(
+                cancelled.filled_quantity,
+                Some(dec!(1)),
+                "what filled before"
+            );
+            assert_eq!(expiry.filled_quantity, Some(dec!(1)));
+            assert_eq!(replacement.filled_quantity, Some(Decimal::ZERO));
             assert_eq!(
                 cancelled.time_exchange,
                 parse_timestamp("2026-10-01T15:00:00Z").unwrap(),

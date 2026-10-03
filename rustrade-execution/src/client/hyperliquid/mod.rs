@@ -700,7 +700,7 @@ impl ExecutionClient for HyperliquidClient {
                     state: Ok(Cancelled::new(
                         cancelled_id.clone(),
                         Utc::now(),
-                        Decimal::ZERO, // Cancel response doesn't include filled quantity
+                        None, // Cancel response doesn't include filled quantity
                     )),
                 })
             }

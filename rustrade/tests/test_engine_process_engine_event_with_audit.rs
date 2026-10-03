@@ -5390,7 +5390,7 @@ fn send_cancel_ack(engine: &mut TestEngine, cid: ClientOrderId, exchange_order_i
             state: Ok(Cancelled {
                 id: exchange_order_id,
                 time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
-                filled_quantity: dec!(0),
+                filled_quantity: Some(dec!(0)),
             }),
         }),
     }));

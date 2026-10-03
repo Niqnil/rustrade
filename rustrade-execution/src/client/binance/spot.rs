@@ -38,12 +38,12 @@ use super::shared::{
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
     MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, PlacementResponse, RateLimitTracker,
     RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnrecoveredFills, UserDataFrame,
-    WeightPool, classify_order_kind_tif, classify_rest_query_error, classify_ws_order_error,
-    convert_ended_order, convert_execution_report, convert_open_order_listing,
-    convert_open_order_owned_symbol, dedup_key_from_event, drop_after, gap_failed, gap_time,
-    is_duplicate, is_handshake_rate_limit, is_unknown_order, log_unrecognised_frame,
-    new_dedup_cache, parse_user_data_frame, placed_order_state, recovered_order_totals,
-    response_decode_error, rest_call_with_retry, unix_ms,
+    WeightPool, binance_filled_qty, classify_order_kind_tif, classify_rest_query_error,
+    classify_ws_order_error, convert_ended_order, convert_execution_report,
+    convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event, drop_after,
+    gap_failed, gap_time, is_duplicate, is_handshake_rate_limit, is_unknown_order,
+    log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, placed_order_state,
+    recovered_order_totals, response_decode_error, rest_call_with_retry, unix_ms,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
@@ -1056,11 +1056,11 @@ impl ExecutionClient for BinanceSpot {
                         }
                     };
 
-                    let filled_qty = data
-                        .executed_qty
-                        .as_deref()
-                        .and_then(|q| Decimal::from_str(q).ok())
-                        .unwrap_or(Decimal::ZERO);
+                    let filled_qty = binance_filled_qty(
+                        ExchangeId::BinanceSpot,
+                        &exchange_order_id,
+                        data.executed_qty.as_deref(),
+                    );
 
                     self.known_live.lock().ended(&key.cid);
                     Some(UnindexedOrderResponseCancel {
@@ -1320,12 +1320,6 @@ impl ExecutionClient for BinanceSpot {
                         }
                     };
 
-                    let filled_qty = data
-                        .executed_qty
-                        .as_deref()
-                        .and_then(|q| Decimal::from_str(q).ok())
-                        .unwrap_or(Decimal::ZERO);
-
                     // Read from the response's status, so an order that ended in it (an IOC or
                     // FOK order that expired) is not reported, or held, as live. An `ACK`
                     // response, the default for order types other than MARKET and LIMIT, carries
@@ -1338,7 +1332,7 @@ impl ExecutionClient for BinanceSpot {
                             status: data.status.as_deref(),
                             order_id: exchange_order_id,
                             time_exchange,
-                            filled_qty,
+                            executed_qty: data.executed_qty.as_deref(),
                             cumulative_quote_qty: data.cummulative_quote_qty.as_deref(),
                         },
                     );
@@ -3616,6 +3610,31 @@ mod tests {
         );
     }
 
+    /// A cancel report carries what filled (`z`), and an unknown one stays unknown, not zero.
+    #[test]
+    fn a_cancel_report_carries_its_fill_or_none() {
+        let cancelled = |z: Option<&str>| {
+            let report = binance_sdk::spot::websocket_api::ExecutionReport {
+                x: Some("CANCELED".to_string()),
+                z: z.map(str::to_string),
+                ..make_base_report()
+            };
+            let event = sole_event(convert(report)).expect("CANCELED should produce Some");
+            let AccountEventKind::OrderCancelled(response) = event.kind else {
+                panic!("expected OrderCancelled, got {:?}", event.kind);
+            };
+            let Ok(cancelled) = response.state else {
+                panic!("expected Ok, got {:?}", response.state);
+            };
+            cancelled.filled_quantity
+        };
+
+        assert_eq!(cancelled(Some("0.5")), Some(Decimal::new(5, 1)));
+        assert_eq!(cancelled(Some("0")), Some(Decimal::ZERO));
+        assert_eq!(cancelled(None), None);
+        assert_eq!(cancelled(Some("not a number")), None);
+    }
+
     #[test]
     fn test_convert_execution_report_expired() {
         let report = binance_sdk::spot::websocket_api::ExecutionReport {
@@ -5187,6 +5206,50 @@ mod tests {
         Some(order.state)
     }
 
+    /// An ended order row that does not say what filled leaves the fill unknown, not zero; a
+    /// filled one filled its whole quantity regardless.
+    #[test]
+    fn an_ended_order_row_without_a_fill_reports_it_unknown() {
+        use crate::order::state::{Expired, Filled, InactiveOrderState};
+        let key = spot_key("BTCUSDT", "a");
+        let ended = Utc.timestamp_millis_opt(1_700_000_060_000).unwrap();
+        let id = OrderId::new("7");
+        let row = |status: &str, executed_qty: Option<&str>| {
+            let mut row = order_row("a", status);
+            row["executedQty"] = executed_qty.map_or(serde_json::Value::Null, Into::into);
+            row
+        };
+
+        for executed_qty in [None, Some("not a number")] {
+            assert_eq!(
+                ended_state(&key, row("CANCELED", executed_qty)),
+                Some(InactiveOrderState::Cancelled(Cancelled::new(
+                    id.clone(),
+                    ended,
+                    None
+                ))),
+                "{executed_qty:?}"
+            );
+            assert_eq!(
+                ended_state(&key, row("EXPIRED", executed_qty)),
+                Some(InactiveOrderState::Expired(Expired::new(
+                    id.clone(),
+                    ended,
+                    None
+                ))),
+                "{executed_qty:?}"
+            );
+            assert!(
+                matches!(
+                    ended_state(&key, row("FILLED", executed_qty)),
+                    Some(InactiveOrderState::FullyFilled(Filled { filled_quantity, .. }))
+                        if filled_quantity == Decimal::TWO
+                ),
+                "{executed_qty:?}"
+            );
+        }
+    }
+
     #[test]
     fn an_ended_order_row_says_how_the_order_ended() {
         use crate::order::state::{Expired, Filled, InactiveOrderState};
@@ -5211,7 +5274,7 @@ mod tests {
             Some(InactiveOrderState::Cancelled(Cancelled::new(
                 id.clone(),
                 ended,
-                Decimal::ONE
+                Some(Decimal::ONE)
             )))
         );
         for status in ["EXPIRED", "EXPIRED_IN_MATCH"] {
@@ -5220,7 +5283,7 @@ mod tests {
                 Some(InactiveOrderState::Expired(Expired::new(
                     id.clone(),
                     ended,
-                    Decimal::ONE
+                    Some(Decimal::ONE)
                 ))),
                 "{status}"
             );
