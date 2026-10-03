@@ -189,6 +189,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   held as live. A live status, or none (an `ACK` response), reads as before. Binance Spot's
   `FullyFilled` now carries the average price from `cummulativeQuoteQty`, as Margin's did. The
   status mapping is shared with the lookup of how an order ended. Closes #467.
+- **Alpaca reported an order that ended in its placement response as open** (`rustrade-execution`).
+  `AlpacaClient::open_order` and `open_bracket_order` read the returned state from `filled_qty`
+  alone, never from the response's `status`, so an IOC or FOK order that found no liquidity, or
+  partly filled and had the rest cancelled (`canceled`, `expired`), or that Alpaca rejected after
+  accepting it (`rejected`), came back `Active(Open)` and was held as live for a reconnect to ask
+  about. Both now return `Inactive(Cancelled)` or `Inactive(Expired)`, each with what filled
+  (`None` when unknown), and `OpenFailed` for `rejected`. Neither is held as live. A live status,
+  including `done_for_day`, reads as before, and so does a missing or unknown one, with a warning.
+  `FullyFilled` from a placement now carries the response's `filled_avg_price`. The status mapping
+  is shared with the lookup of how an order ended. Closes #477.
 - **Alpaca retired an order that was only done for the day** (`rustrade-execution`). A
   `done_for_day` event on the account stream was delivered as `OrderCancelled`, so the engine
   dropped an order that Alpaca keeps and works again the next trading day ("will not receive
