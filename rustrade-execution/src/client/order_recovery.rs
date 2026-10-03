@@ -1083,15 +1083,21 @@ mod tests {
     #[test]
     fn a_full_set_forgets_its_oldest_order() {
         let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
+        // The oldest is alone on its instrument, so forgetting it stops holding that instrument.
         for n in 0..=MAX_KNOWN_LIVE_ORDERS {
+            let instrument = if n == 0 { "ETHUSDT" } else { "BTCUSDT" };
             known.live(
-                &key("BTCUSDT", &n.to_string()),
+                &key(instrument, &n.to_string()),
                 dec!(1),
                 &open(&n.to_string(), Decimal::ZERO),
             );
         }
         assert!(!known.contains(&ClientOrderId::new("0")));
         assert!(known.contains(&ClientOrderId::new("1")));
+        assert_eq!(
+            known.instruments(),
+            [InstrumentNameExchange::new("BTCUSDT")]
+        );
         // An order that ends frees its place, so the next one forgets nothing.
         assert!(known.ended(&ClientOrderId::new("2")));
         known.live(&key("BTCUSDT", "new"), dec!(1), &open("new", Decimal::ZERO));
