@@ -1063,10 +1063,12 @@ pub(crate) fn convert_open_order<T: BinanceOrderFields>(
     }
     let row = convert_order_row(o, exchange, instrument)?;
     Some(row.map_state(|row| {
+        // A live order's fill only grows, so an unknown one reads as nothing filled until the
+        // account stream reports more.
         Open::new(
             VenueOrderId::Assigned(row.order_id),
             row.time_exchange,
-            row.filled_qty,
+            row.filled_qty.unwrap_or(Decimal::ZERO),
         )
     }))
 }
@@ -1097,18 +1099,20 @@ pub(crate) fn convert_ended_order<T: BinanceOrderFields>(
         return None;
     }
     let row = convert_order_row(o, exchange, instrument)?;
-    let avg_price = binance_avg_price(
-        exchange,
-        &row.state.order_id,
-        o.cumulative_quote_qty(),
-        row.state.filled_qty,
-    );
     let Some(state) = ended_order_state(
         status,
         row.state.order_id.clone(),
         row.state.time_exchange,
+        row.quantity,
         row.state.filled_qty,
-        avg_price,
+        |filled_qty| {
+            binance_avg_price(
+                exchange,
+                &row.state.order_id,
+                o.cumulative_quote_qty(),
+                filled_qty,
+            )
+        },
     ) else {
         warn!(%exchange, %instrument, cid = %key.cid, status, "Binance order has a status this version does not know, treating it as not ended");
         return None;
@@ -1120,25 +1124,32 @@ pub(crate) fn convert_ended_order<T: BinanceOrderFields>(
 
 /// How an order ended, from its Binance `status`, or `None` for a status that does not end it.
 ///
-/// `FILLED` becomes [`InactiveOrderState::FullyFilled`] with `avg_price`; `CANCELED` becomes
-/// [`InactiveOrderState::Cancelled`], `EXPIRED` and `EXPIRED_IN_MATCH` (self-trade prevention)
-/// [`InactiveOrderState::Expired`], each with what filled before; and `REJECTED` becomes
+/// `FILLED` becomes [`InactiveOrderState::FullyFilled`] with the reported fill, or the whole
+/// `quantity` when that is unknown, and the average price `avg_price` works out for that fill
+/// (asked only then); `CANCELED` becomes [`InactiveOrderState::Cancelled`], `EXPIRED` and
+/// `EXPIRED_IN_MATCH` (self-trade prevention) [`InactiveOrderState::Expired`], each with what
+/// filled before, `None` when that is unknown; and `REJECTED` becomes
 /// [`InactiveOrderState::OpenFailed`]. Shared by the lookup of an order that ended
 /// ([`convert_ended_order`]) and the response to placing one ([`placed_order_state`]).
 pub(crate) fn ended_order_state<AssetKey, InstrumentKey>(
     status: &str,
     order_id: OrderId,
     time_exchange: DateTime<Utc>,
-    filled_qty: Decimal,
-    avg_price: Option<Decimal>,
+    quantity: Decimal,
+    filled_qty: Option<Decimal>,
+    avg_price: impl FnOnce(Decimal) -> Option<Decimal>,
 ) -> Option<InactiveOrderState<AssetKey, InstrumentKey>> {
     Some(match status {
-        "FILLED" => InactiveOrderState::FullyFilled(Filled::new(
-            order_id,
-            time_exchange,
-            filled_qty,
-            avg_price,
-        )),
+        // A filled order filled its whole quantity, whether or not `executedQty` said so.
+        "FILLED" => {
+            let filled_qty = filled_qty.unwrap_or(quantity);
+            InactiveOrderState::FullyFilled(Filled::new(
+                order_id,
+                time_exchange,
+                filled_qty,
+                avg_price(filled_qty),
+            ))
+        }
         "CANCELED" => {
             InactiveOrderState::Cancelled(Cancelled::new(order_id, time_exchange, filled_qty))
         }
@@ -1159,8 +1170,8 @@ pub(crate) struct PlacementResponse<'a> {
     pub(crate) status: Option<&'a str>,
     pub(crate) order_id: OrderId,
     pub(crate) time_exchange: DateTime<Utc>,
-    /// `executedQty`.
-    pub(crate) filled_qty: Decimal,
+    /// `executedQty`; absent from an `ACK` response.
+    pub(crate) executed_qty: Option<&'a str>,
     /// `cummulativeQuoteQty`.
     pub(crate) cumulative_quote_qty: Option<&'a str>,
 }
@@ -1183,17 +1194,24 @@ pub(crate) fn placed_order_state(
         status,
         order_id,
         time_exchange,
-        filled_qty,
+        executed_qty,
         cumulative_quote_qty,
     } = response;
-    let avg_price = || binance_avg_price(exchange, &order_id, cumulative_quote_qty, filled_qty);
+    // An `ACK` response reports neither, which is expected, so only that does not warn.
+    let filled_qty = match (status, executed_qty) {
+        (None, None) => None,
+        _ => binance_filled_qty(exchange, &order_id, executed_qty),
+    };
+    let avg_price =
+        |filled_qty| binance_avg_price(exchange, &order_id, cumulative_quote_qty, filled_qty);
     if let Some(status) = status {
         if let Some(ended) = ended_order_state(
             status,
             order_id.clone(),
             time_exchange,
+            quantity,
             filled_qty,
-            avg_price(),
+            avg_price,
         ) {
             return OrderState::Inactive(ended);
         }
@@ -1201,15 +1219,39 @@ pub(crate) fn placed_order_state(
             warn!(%exchange, %instrument, %order_id, status, "Binance placed an order with a status this version does not know, reading it from what filled");
         }
     }
-    if filled_qty >= quantity {
-        let avg_price = avg_price();
-        OrderState::fully_filled(Filled::new(order_id, time_exchange, filled_qty, avg_price))
-    } else {
-        OrderState::active(Open::new(
+    match filled_qty {
+        Some(filled_qty) if filled_qty >= quantity => {
+            let avg_price = avg_price(filled_qty);
+            OrderState::fully_filled(Filled::new(order_id, time_exchange, filled_qty, avg_price))
+        }
+        // A live order's fill only grows, so an unknown one reads as nothing filled until the
+        // account stream reports more.
+        _ => OrderState::active(Open::new(
             VenueOrderId::Assigned(order_id),
             time_exchange,
-            filled_qty,
-        ))
+            filled_qty.unwrap_or(Decimal::ZERO),
+        )),
+    }
+}
+
+/// The quantity order `order_id` has filled, from Binance's cumulative filled quantity (REST
+/// `executedQty`, the execution report's `z`): `None`, with a warning, when it is missing or does
+/// not parse, so that an unknown fill is not read as zero.
+pub(crate) fn binance_filled_qty(
+    exchange: ExchangeId,
+    order_id: &OrderId,
+    filled_qty: Option<&str>,
+) -> Option<Decimal> {
+    let Some(raw) = filled_qty else {
+        warn!(%exchange, %order_id, "Binance did not report how much the order filled");
+        return None;
+    };
+    match Decimal::from_str(raw) {
+        Ok(filled_qty) => Some(filled_qty),
+        Err(_) => {
+            warn!(%exchange, %order_id, filled_qty = raw, "Binance reported an unparseable filled quantity, treating it as unknown");
+            None
+        }
     }
 }
 
@@ -1244,7 +1286,8 @@ struct OrderRow {
     order_id: OrderId,
     /// When the order last changed state.
     time_exchange: DateTime<Utc>,
-    filled_qty: Decimal,
+    /// `None` when Binance did not report it.
+    filled_qty: Option<Decimal>,
 }
 
 /// Convert the fields of a REST order row that do not depend on its status, shared by
@@ -1283,16 +1326,7 @@ fn convert_order_row<T: BinanceOrderFields>(
             return None;
         }
     };
-    let filled_qty = match o.executed_qty() {
-        Some(s) => match Decimal::from_str(s) {
-            Ok(v) => v,
-            Err(_) => {
-                warn!(%exchange, %instrument, order_id = %order_id_raw, executed_qty = s, "Binance order unparseable executedQty, defaulting to 0");
-                Decimal::ZERO
-            }
-        },
-        None => Decimal::ZERO,
-    };
+    let filled_qty = binance_filled_qty(exchange, &order_id, o.executed_qty());
     let kind = match o.order_type() {
         // parse_order_kind already logs a warning on unknown values
         Some(t) => parse_order_kind(t)?,
@@ -1914,10 +1948,7 @@ fn cancelled_event<T: BinanceExecutionReportFields>(
     order_id: OrderId,
     time_exchange: DateTime<Utc>,
 ) -> UnindexedAccountEvent {
-    let filled_qty = report
-        .cumulative_filled_quantity()
-        .and_then(|s| Decimal::from_str(s).ok())
-        .unwrap_or(Decimal::ZERO);
+    let filled_qty = binance_filled_qty(exchange, &order_id, report.cumulative_filled_quantity());
     let response = UnindexedOrderResponseCancel {
         key: OrderKey::new(exchange, symbol, StrategyId::unknown(), cid),
         state: Ok(Cancelled::new(order_id, time_exchange, filled_qty)),
@@ -3779,7 +3810,7 @@ mod tests {
 
         let btc = InstrumentNameExchange::new("BTCUSDT");
         let time = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
-        let placed = |status: Option<&str>, filled: Decimal, quote: Option<&str>| {
+        let placed = |status: Option<&str>, filled: Option<&str>, quote: Option<&str>| {
             placed_order_state(
                 ExchangeId::BinanceSpot,
                 &btc,
@@ -3788,7 +3819,7 @@ mod tests {
                     status,
                     order_id: OrderId::new("7"),
                     time_exchange: time,
-                    filled_qty: filled,
+                    executed_qty: filled,
                     cumulative_quote_qty: quote,
                 },
             )
@@ -3809,22 +3840,22 @@ mod tests {
         };
 
         assert_eq!(
-            placed(Some("EXPIRED"), Decimal::ZERO, Some("0")),
-            expired(Decimal::ZERO),
+            placed(Some("EXPIRED"), Some("0"), Some("0")),
+            expired(Some(Decimal::ZERO)),
             "an IOC or FOK order that found no liquidity"
         );
         assert_eq!(
-            placed(Some("EXPIRED"), dec!(1), Some("100")),
-            expired(dec!(1)),
+            placed(Some("EXPIRED"), Some("1"), Some("100")),
+            expired(Some(dec!(1))),
             "an IOC order that partly filled and expired the rest"
         );
         assert_eq!(
-            placed(Some("EXPIRED_IN_MATCH"), Decimal::ZERO, None),
-            expired(Decimal::ZERO),
+            placed(Some("EXPIRED_IN_MATCH"), Some("0"), None),
+            expired(Some(Decimal::ZERO)),
             "expired by self-trade prevention"
         );
         assert_eq!(
-            placed(Some("FILLED"), dec!(2), Some("201")),
+            placed(Some("FILLED"), Some("2"), Some("201")),
             OrderState::fully_filled(Filled::new(
                 OrderId::new("7"),
                 time,
@@ -3833,15 +3864,15 @@ mod tests {
             ))
         );
         assert_eq!(
-            placed(Some("CANCELED"), dec!(1), None),
+            placed(Some("CANCELED"), Some("1"), None),
             OrderState::Inactive(InactiveOrderState::Cancelled(Cancelled::new(
                 OrderId::new("7"),
                 time,
-                dec!(1)
+                Some(dec!(1))
             )))
         );
         assert!(matches!(
-            placed(Some("REJECTED"), Decimal::ZERO, None),
+            placed(Some("REJECTED"), Some("0"), None),
             OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
                 ApiError::OrderRejected(_)
             )))
@@ -3854,17 +3885,74 @@ mod tests {
             Some("FROZEN"),
         ] {
             assert_eq!(
-                placed(status, dec!(1), Some("100")),
+                placed(status, Some("1"), Some("100")),
                 open(dec!(1)),
                 "{status:?} reads as open from what filled"
             );
         }
         assert!(
             matches!(
-                placed(None, dec!(2), None),
+                placed(None, Some("2"), None),
                 OrderState::Inactive(InactiveOrderState::FullyFilled(_))
             ),
             "an ACK that somehow reports everything filled"
+        );
+    }
+
+    /// A placement response that does not say what filled leaves an ended order's fill unknown,
+    /// not zero.
+    #[test]
+    fn a_placement_response_without_a_fill_reports_it_unknown() {
+        use rust_decimal_macros::dec;
+
+        let btc = InstrumentNameExchange::new("BTCUSDT");
+        let time = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+        let placed = |status: Option<&str>, filled: Option<&str>| {
+            placed_order_state(
+                ExchangeId::BinanceSpot,
+                &btc,
+                dec!(2),
+                PlacementResponse {
+                    status,
+                    order_id: OrderId::new("7"),
+                    time_exchange: time,
+                    executed_qty: filled,
+                    cumulative_quote_qty: Some("201"),
+                },
+            )
+        };
+        let id = || OrderId::new("7");
+
+        for filled in [None, Some("not a number")] {
+            assert_eq!(
+                placed(Some("EXPIRED"), filled),
+                OrderState::Inactive(InactiveOrderState::Expired(Expired::new(id(), time, None))),
+                "{filled:?}"
+            );
+            assert_eq!(
+                placed(Some("CANCELED"), filled),
+                OrderState::Inactive(InactiveOrderState::Cancelled(Cancelled::new(
+                    id(),
+                    time,
+                    None
+                ))),
+                "{filled:?}"
+            );
+            assert_eq!(
+                placed(Some("FILLED"), filled),
+                OrderState::fully_filled(Filled::new(id(), time, dec!(2), Some(dec!(100.5)))),
+                "a filled order filled its whole quantity, at the quote over it: {filled:?}"
+            );
+            assert_eq!(
+                placed(Some("NEW"), filled),
+                OrderState::active(Open::new(VenueOrderId::Assigned(id()), time, Decimal::ZERO)),
+                "a live order's unknown fill reads as nothing filled yet: {filled:?}"
+            );
+        }
+        assert_eq!(
+            placed(None, None),
+            OrderState::active(Open::new(VenueOrderId::Assigned(id()), time, Decimal::ZERO)),
+            "an ACK reports neither status nor fill"
         );
     }
 

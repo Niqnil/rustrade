@@ -145,7 +145,7 @@ use crate::{
 };
 use account::{BalanceAggregator, PositionAggregator};
 use chrono::{DateTime, Utc};
-use execution::{ExecutionBuffer, parse_decimal_or_warn};
+use execution::{ExecutionBuffer, parse_decimal_or_warn, try_decimal_or_warn};
 use futures::stream::BoxStream;
 use ibapi::{
     accounts::{AccountSummaryResult, types::AccountGroup},
@@ -1973,14 +1973,14 @@ impl ExecutionClient for IbkrClient {
                 // correlate any fill events that arrive between now and when IB
                 // confirms the cancel. Removal happens in account_stream when
                 // OrderStatus::Cancelled is received.
-                // IBKR cancel_order returns no filled qty; use ZERO and let
-                // subsequent OrderStatus events provide accurate fill info.
+                // IBKR cancel_order returns no filled qty, so it is unknown here; the
+                // subsequent OrderStatus events report it.
                 Some(OrderResponseCancel {
                     key,
                     state: Ok(Cancelled::new(
                         OrderId::new(format_smolstr!("{}", ib_order_id)),
                         Utc::now(),
-                        Decimal::ZERO,
+                        None,
                     )),
                 })
             }
@@ -2552,7 +2552,15 @@ fn make_order_from_status(
     let ib_id = status.order_id;
     let order_id = OrderId::new(format_smolstr!("{}", ib_id));
 
-    let filled_qty = parse_decimal_or_warn(status.filled, "status.filled");
+    // `None` when IB reports a fill that is not a number, so that an ended order does not report
+    // an unknown fill as zero.
+    let reported_fill = try_decimal_or_warn(
+        status.filled,
+        format_args!("status.filled of order {ib_id}"),
+    );
+    // A live order's fill only grows, so an unknown one reads as nothing filled until IB reports
+    // more.
+    let filled_qty = reported_fill.unwrap_or(Decimal::ZERO);
     let state = match status.status {
         OrderStatusKind::Inactive => {
             // "Inactive" means the order was accepted by IB but is not working:
@@ -2568,16 +2576,18 @@ fn make_order_from_status(
 
             if was_user_cancel {
                 // User called cancel_order() — definitely a cancellation
-                OrderState::inactive(Cancelled::new(order_id, Utc::now(), filled_qty))
+                OrderState::inactive(Cancelled::new(order_id, Utc::now(), reported_fill))
             } else if matches!(ctx.time_in_force, TimeInForce::GoodUntilEndOfDay) {
                 // DAY order without pending cancel — expired at market close
-                OrderState::inactive(Expired::new(order_id, Utc::now(), filled_qty))
+                OrderState::inactive(Expired::new(order_id, Utc::now(), reported_fill))
             } else {
                 // GTC/IOC/FOK without pending cancel — broker or exchange cancelled
-                OrderState::inactive(Cancelled::new(order_id, Utc::now(), filled_qty))
+                OrderState::inactive(Cancelled::new(order_id, Utc::now(), reported_fill))
             }
         }
         OrderStatusKind::Filled => {
+            // A filled order filled its whole quantity, whether or not IB's figure parsed.
+            let filled_qty = reported_fill.unwrap_or(ctx.quantity);
             OrderState::fully_filled(Filled::new(order_id, Utc::now(), filled_qty, None))
         }
         // Working states (Submitted/PreSubmitted/PendingSubmit) and the
@@ -3103,6 +3113,47 @@ mod order_status_tests {
             "unmodelled status must stay active, got {:?}",
             order.state
         );
+    }
+
+    /// A cancelled order carries what IB reports filled, and a fill that is not a number stays
+    /// unknown rather than reading as zero; a filled order filled its whole quantity regardless.
+    #[test]
+    fn an_ended_status_carries_its_fill_or_none() {
+        let ended = |status: OrderStatusKind, filled: f64| {
+            let raw = OrderStatus {
+                order_id: 42,
+                status,
+                filled,
+                ..OrderStatus::default()
+            };
+            make_order_from_status(
+                &raw,
+                ClientOrderId::new("cid-1"),
+                &ctx(),
+                &PendingCancels::new(),
+            )
+            .state
+        };
+        let cancelled_fill = |state: OrderState<_, _>| match state {
+            OrderState::Inactive(crate::order::state::InactiveOrderState::Cancelled(cancelled)) => {
+                cancelled.filled_quantity
+            }
+            other => panic!("expected Cancelled, got {other:?}"),
+        };
+
+        assert_eq!(
+            cancelled_fill(ended(OrderStatusKind::Cancelled, 3.0)),
+            Some(Decimal::from(3))
+        );
+        assert_eq!(
+            cancelled_fill(ended(OrderStatusKind::Cancelled, f64::NAN)),
+            None
+        );
+        assert!(matches!(
+            ended(OrderStatusKind::Filled, f64::NAN),
+            OrderState::Inactive(crate::order::state::InactiveOrderState::FullyFilled(Filled { filled_quantity, .. }))
+                if filled_quantity == ctx().quantity
+        ));
     }
 
     /// An unmodelled status must not consume a pending cancel: the entry has to

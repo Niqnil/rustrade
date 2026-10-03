@@ -525,7 +525,7 @@ impl SimulatedVenue {
                 state: Expired {
                     id: expired_id,
                     time_exchange,
-                    filled_quantity: order.state.filled_quantity,
+                    filled_quantity: Some(order.state.filled_quantity),
                 },
             };
 
@@ -879,7 +879,7 @@ impl SimulatedVenue {
             state: Cancelled {
                 id,
                 time_exchange,
-                filled_quantity: order.state.filled_quantity,
+                filled_quantity: Some(order.state.filled_quantity),
             },
         };
         self.account.ack_cancelled(cancelled.clone());
@@ -1049,7 +1049,7 @@ impl SimulatedVenue {
         let cancelled = Cancelled {
             id: order.state.id.or_client_id(&order.key.cid),
             time_exchange,
-            filled_quantity: order.state.filled_quantity,
+            filled_quantity: Some(order.state.filled_quantity),
         };
 
         self.account.ack_cancelled(Order {
@@ -1356,7 +1356,7 @@ impl SimulatedVenue {
         let cancelled = Cancelled {
             id: self.order_id_sequence_fetch_add(),
             time_exchange: now,
-            filled_quantity: Decimal::ZERO,
+            filled_quantity: Some(Decimal::ZERO),
         };
 
         self.account.ack_cancelled(Order {
@@ -1407,7 +1407,7 @@ impl SimulatedVenue {
         let expired = Expired {
             id: self.order_id_sequence_fetch_add(),
             time_exchange: now,
-            filled_quantity: Decimal::ZERO,
+            filled_quantity: Some(Decimal::ZERO),
         };
 
         self.account.ack_expired(Order {
@@ -1739,7 +1739,7 @@ impl SimulatedVenue {
                 let cancelled = Cancelled {
                     id: order_id,
                     time_exchange,
-                    filled_quantity: fill.quantity,
+                    filled_quantity: Some(fill.quantity),
                 };
                 self.account.ack_cancelled(Order {
                     key: request.key.clone(),
@@ -4224,7 +4224,7 @@ mod tests {
         cancelled.state = OrderState::inactive(Cancelled::new(
             OrderId::new("9"),
             Default::default(),
-            Decimal::ZERO,
+            Some(Decimal::ZERO),
         ));
         let mut venue = seeded_venue(vec![resting("a", "3"), cancelled]);
         assert_eq!(venue.order_id_sequence_fetch_add(), OrderId::new("10"));
@@ -5167,7 +5167,7 @@ mod tests {
         );
 
         let cancelled = outcome.response.state.expect("the order was on the book");
-        assert_eq!(cancelled.filled_quantity, Decimal::ZERO);
+        assert_eq!(cancelled.filled_quantity, Some(Decimal::ZERO));
         assert_eq!(cancelled.time_exchange, time(2));
         assert!(venue.orders_open(&[]).is_empty());
     }
@@ -5409,7 +5409,7 @@ mod tests {
 
         match outcome.response.state {
             OrderState::Inactive(InactiveOrderState::Cancelled(ref cancelled)) => {
-                assert_eq!(cancelled.filled_quantity, Decimal::ZERO)
+                assert_eq!(cancelled.filled_quantity, Some(Decimal::ZERO))
             }
             ref other => panic!("a marketable post-only order must be cancelled, got: {other:?}"),
         }
@@ -5483,7 +5483,7 @@ mod tests {
             match outcome.response.state {
                 OrderState::Inactive(InactiveOrderState::Cancelled(ref cancelled)) => assert_eq!(
                     cancelled.filled_quantity,
-                    Decimal::ZERO,
+                    Some(Decimal::ZERO),
                     "{time_in_force} traded nothing"
                 ),
                 ref other => panic!("{time_in_force} must be cancelled, got: {other:?}"),
@@ -5573,7 +5573,7 @@ mod tests {
         match order.state {
             OrderState::Inactive(InactiveOrderState::Expired(ref expired)) => {
                 assert_eq!(expired.time_exchange, time(9));
-                assert_eq!(expired.filled_quantity, Decimal::ZERO);
+                assert_eq!(expired.filled_quantity, Some(Decimal::ZERO));
             }
             ref other => panic!("the order must be reported expired, got: {other:?}"),
         }
@@ -5666,7 +5666,7 @@ mod tests {
         match outcome.response.state {
             OrderState::Inactive(InactiveOrderState::Expired(ref expired)) => {
                 assert_eq!(expired.time_exchange, time(9), "stamped when it was found");
-                assert_eq!(expired.filled_quantity, Decimal::ZERO);
+                assert_eq!(expired.filled_quantity, Some(Decimal::ZERO));
             }
             ref other => panic!("a stale deadline must expire, not {other:?}"),
         }
@@ -6013,7 +6013,7 @@ mod tests {
         match &outcome.response.state {
             OrderState::Inactive(InactiveOrderState::Cancelled(cancelled)) => assert_eq!(
                 cancelled.filled_quantity,
-                d("0.4"),
+                Some(d("0.4")),
                 "the remainder retires carrying what did trade"
             ),
             other => panic!("a market order's unfillable remainder is cancelled, got: {other:?}"),
@@ -6430,7 +6430,7 @@ mod tests {
         }
         match &cancelled.state {
             InactiveOrderState::Cancelled(state) => {
-                assert_eq!(state.filled_quantity, Decimal::ZERO)
+                assert_eq!(state.filled_quantity, Some(Decimal::ZERO))
             }
             other => panic!("cancelled, got {other:?}"),
         }
@@ -6458,7 +6458,9 @@ mod tests {
             panic!("the remainder's order is reported: {ended:?}");
         };
         match &order.state {
-            InactiveOrderState::Cancelled(state) => assert_eq!(state.filled_quantity, d("0.4")),
+            InactiveOrderState::Cancelled(state) => {
+                assert_eq!(state.filled_quantity, Some(d("0.4")))
+            }
             other => panic!("cancelled carrying its fill, got {other:?}"),
         }
     }
@@ -6527,7 +6529,7 @@ mod tests {
             state: OrderState::inactive(Cancelled {
                 id: OrderId::new("seeded"),
                 time_exchange: time(0),
-                filled_quantity: d("0.25"),
+                filled_quantity: Some(d("0.25")),
             }),
         };
         let venue = SimulatedVenue::new(
@@ -6542,7 +6544,7 @@ mod tests {
         };
         match &order.state {
             InactiveOrderState::Cancelled(cancelled) => {
-                assert_eq!(cancelled.filled_quantity, d("0.25"))
+                assert_eq!(cancelled.filled_quantity, Some(d("0.25")))
             }
             other => panic!("cancelled, got {other:?}"),
         }

@@ -957,7 +957,11 @@ mod tests {
         known.observe(&event(AccountEventKind::OrderCancelled(
             UnindexedOrderResponseCancel {
                 key: cancelled.clone(),
-                state: Ok(Cancelled::new(OrderId::new("1"), Utc::now(), Decimal::ZERO)),
+                state: Ok(Cancelled::new(
+                    OrderId::new("1"),
+                    Utc::now(),
+                    Some(Decimal::ZERO),
+                )),
             },
         )));
         known.observe(&event(AccountEventKind::OrderCancelled(
@@ -971,7 +975,7 @@ mod tests {
             OrderState::Inactive(InactiveOrderState::Cancelled(Cancelled::new(
                 OrderId::new("3"),
                 Utc::now(),
-                Decimal::ZERO,
+                Some(Decimal::ZERO),
             ))),
         ));
 
@@ -1061,7 +1065,7 @@ mod tests {
             ),
             (
                 "expired",
-                OrderState::inactive(Expired::new(OrderId::new("3"), Utc::now(), dec!(1))),
+                OrderState::inactive(Expired::new(OrderId::new("3"), Utc::now(), Some(dec!(1)))),
             ),
             (
                 "failed",
@@ -1299,7 +1303,7 @@ mod tests {
             state: InactiveOrderState::Cancelled(Cancelled::new(
                 OrderId::new("1"),
                 Utc::now(),
-                Decimal::ZERO,
+                Some(Decimal::ZERO),
             )),
         }
     }

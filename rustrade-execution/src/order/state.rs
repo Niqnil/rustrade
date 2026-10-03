@@ -250,11 +250,19 @@ pub struct Cancelled {
     /// back to the local receive time, which can differ from the true venue cancel time by network
     /// latency. Consumers building fill ledgers or P&L should not assume sub-second venue accuracy.
     pub time_exchange: DateTime<Utc>,
-    /// Quantity filled before the order was cancelled.
+    /// Quantity filled before the order was cancelled, or `None` when the venue did not report
+    /// it.
     ///
-    /// Zero for orders cancelled with no fills (e.g., GTC limit order cancelled by user).
+    /// `Some(0)` for an order cancelled with no fills (e.g., GTC limit order cancelled by user).
     /// Non-zero for IOC orders that partially filled before cancellation.
-    pub filled_quantity: Decimal,
+    ///
+    /// `None` is not zero: it means the fill is unknown, so the order may have partly filled.
+    /// Some venues never report it in the response to a cancel request (Alpaca, Hyperliquid,
+    /// IBKR), though their account streams may, and others omit it rarely.
+    /// To learn it, read the order's fills from the account stream, or ask the venue through
+    /// [`OrderStatusClient::fetch_ended_orders`](crate::client::OrderStatusClient::fetch_ended_orders)
+    /// where the client implements it.
+    pub filled_quantity: Option<Decimal>,
 }
 
 /// Metadata for an expired order.
@@ -267,8 +275,10 @@ pub struct Cancelled {
 pub struct Expired {
     pub id: OrderId,
     pub time_exchange: DateTime<Utc>,
-    /// Quantity filled before the order expired.
-    pub filled_quantity: Decimal,
+    /// Quantity filled before the order expired, or `None` when the venue did not report it.
+    ///
+    /// `None` is not zero: see [`Cancelled::filled_quantity`].
+    pub filled_quantity: Option<Decimal>,
 }
 
 #[cfg(test)]

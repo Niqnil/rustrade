@@ -141,6 +141,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An ended order reported an unknown fill quantity as zero** (`rustrade-execution`).
+  **Breaking:** `Cancelled::filled_quantity` and `Expired::filled_quantity` are now
+  `Option<Decimal>`. `None` means the venue did not report how much filled, and it is not zero:
+  the order may have partly filled. Until now these cases read as `0`, which a consumer could not
+  tell from an order that filled nothing:
+  - every Alpaca cancel, whose `DELETE` returns no body;
+  - Hyperliquid cancels (perp and spot), whose response carries no fill;
+  - an IBKR cancel request's response;
+  - a Binance cancel, placement, order listing, or execution report missing or garbling its
+    cumulative filled quantity (`executedQty`, `z`), and the same in Alpaca's `filled_qty` and
+    IBKR's order status.
+
+  These now report `None`, with a warning where the venue normally sends the figure. A Binance
+  `ACK` placement response, which never carries it, still reads as `Open`. To learn an unknown
+  fill, read the order's fills from the account stream, or ask the venue with
+  `OrderStatusClient::fetch_ended_orders`; the client does not look it up itself. `Filled` is
+  unchanged: a filled order filled its whole quantity, which is used when the venue's figure is
+  missing. `Open` is unchanged too: a live order's fill only grows, so an unknown one still reads
+  as `0`, now with a warning, until the venue reports more. Serialised, an unknown fill is
+  `null`; a state serialised before this change still deserialises, its fill as `Some`.
+  Closes #475.
 - **A late order snapshot re-opened an order the engine had retired** (`rustrade`). **Breaking**
   for code that builds `Orders` as a tuple, `Orders(map)`, or matches it with that pattern: use
   `Orders::new`, which keeps its signature, and `.0`, which is unchanged. The serialised form is

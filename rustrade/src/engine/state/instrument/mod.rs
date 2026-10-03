@@ -2570,7 +2570,11 @@ mod tests {
     ) {
         state.update_from_order_snapshot(Snapshot(&order(
             cid.clone(),
-            OrderState::inactive(Cancelled::new(exchange_id.clone(), TIME, Decimal::ZERO)),
+            OrderState::inactive(Cancelled::new(
+                exchange_id.clone(),
+                TIME,
+                Some(Decimal::ZERO),
+            )),
         )));
     }
 

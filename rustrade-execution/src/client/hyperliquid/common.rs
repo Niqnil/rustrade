@@ -413,8 +413,9 @@ pub(super) fn order_update_to_account_event(
             orig_sz,
             None, // The update does not carry the average price.
         )),
+        // An unparseable remaining size leaves the fill unknown, not the cancel.
         OrderStatus::Cancelled => {
-            OrderState::inactive(Cancelled::new(order_id, time_exchange, filled_quantity()?))
+            OrderState::inactive(Cancelled::new(order_id, time_exchange, filled_quantity()))
         }
         OrderStatus::Rejected => OrderState::inactive(OrderError::Rejected(
             ApiError::OrderRejected(update.status.clone()),
@@ -1091,7 +1092,23 @@ mod info_tests {
         );
         match order.state {
             OrderState::Inactive(crate::order::state::InactiveOrderState::Cancelled(cancelled)) => {
-                assert_eq!(cancelled.filled_quantity, dec!(0.0025));
+                assert_eq!(cancelled.filled_quantity, Some(dec!(0.0025)));
+            }
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+    }
+
+    /// A cancellation whose remaining size does not parse still ends the order, with its fill
+    /// unknown rather than the update dropped.
+    #[test]
+    fn a_cancellation_with_an_unparseable_size_ends_the_order_with_its_fill_unknown() {
+        let update = order_update("canceled", &format!(r#""{CLOID}""#), "not a number");
+        let order = snapshot_of(
+            order_update_to_account_event(&update, ExchangeId::HyperliquidPerp, eth()).unwrap(),
+        );
+        match order.state {
+            OrderState::Inactive(crate::order::state::InactiveOrderState::Cancelled(cancelled)) => {
+                assert_eq!(cancelled.filled_quantity, None);
             }
             other => panic!("expected Cancelled, got {other:?}"),
         }
