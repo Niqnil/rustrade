@@ -25,7 +25,9 @@ use crate::{
         UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         request::UnindexedOrderResponseCancel,
-        state::{Cancelled, Expired, Filled, InactiveOrderState, Open, OrderState},
+        state::{
+            Cancelled, Expired, Filled, InactiveOrderState, Open, OrderState, UnindexedOrderState,
+        },
     },
     trade::{AssetFees, Trade, TradeId},
 };
@@ -1102,39 +1104,126 @@ pub(crate) fn convert_ended_order<T: BinanceOrderFields>(
         return None;
     }
     let row = convert_order_row(o, exchange, instrument)?;
-    // The average over every execution: the quote traded over the base traded. Binance reports a
-    // negative `cummulativeQuoteQty` for some historical orders, meaning it does not have it.
-    let avg_price = o
-        .cumulative_quote_qty()
-        .and_then(|quote| Decimal::from_str(quote).ok())
-        .filter(|quote| !quote.is_sign_negative())
-        .and_then(|quote| quote.checked_div(row.state.filled_qty));
-    let mut order = row.map_state(|row| match status {
-        "FILLED" => InactiveOrderState::FullyFilled(Filled::new(
-            row.order_id,
-            row.time_exchange,
-            row.filled_qty,
-            avg_price,
-        )),
-        "CANCELED" => InactiveOrderState::Cancelled(Cancelled::new(
-            row.order_id,
-            row.time_exchange,
-            row.filled_qty,
-        )),
-        "REJECTED" => {
-            InactiveOrderState::OpenFailed(OrderError::Rejected(ApiError::OrderRejected(format!(
-                "Binance rejected order {} after accepting it",
-                row.order_id
-            ))))
-        }
-        _ => InactiveOrderState::Expired(Expired::new(
-            row.order_id,
-            row.time_exchange,
-            row.filled_qty,
-        )),
-    });
+    let avg_price = binance_avg_price(exchange, o.cumulative_quote_qty(), row.state.filled_qty);
+    let state = ended_order_state(
+        status,
+        row.state.order_id.clone(),
+        row.state.time_exchange,
+        row.state.filled_qty,
+        avg_price,
+    )?;
+    let mut order = row.map_state(|_| state);
     order.key = key.clone();
     Some(order)
+}
+
+/// How an order ended, from its Binance `status`, or `None` for a status that does not end it.
+///
+/// `FILLED` becomes [`InactiveOrderState::FullyFilled`] with `avg_price`; `CANCELED` becomes
+/// [`InactiveOrderState::Cancelled`], `EXPIRED` and `EXPIRED_IN_MATCH` (self-trade prevention)
+/// [`InactiveOrderState::Expired`], each with what filled before; and `REJECTED` becomes
+/// [`InactiveOrderState::OpenFailed`]. Shared by the lookup of an order that ended
+/// ([`convert_ended_order`]) and the response to placing one ([`placed_order_state`]).
+pub(crate) fn ended_order_state<AssetKey, InstrumentKey>(
+    status: &str,
+    order_id: OrderId,
+    time_exchange: DateTime<Utc>,
+    filled_qty: Decimal,
+    avg_price: Option<Decimal>,
+) -> Option<InactiveOrderState<AssetKey, InstrumentKey>> {
+    Some(match status {
+        "FILLED" => InactiveOrderState::FullyFilled(Filled::new(
+            order_id,
+            time_exchange,
+            filled_qty,
+            avg_price,
+        )),
+        "CANCELED" => {
+            InactiveOrderState::Cancelled(Cancelled::new(order_id, time_exchange, filled_qty))
+        }
+        "EXPIRED" | "EXPIRED_IN_MATCH" => {
+            InactiveOrderState::Expired(Expired::new(order_id, time_exchange, filled_qty))
+        }
+        "REJECTED" => InactiveOrderState::OpenFailed(OrderError::Rejected(
+            ApiError::OrderRejected(format!("Binance rejected order {order_id}")),
+        )),
+        _ => return None,
+    })
+}
+
+/// The state the response to placing an order reports, from its `status`, `executedQty`
+/// (`filled_qty`) and `cummulativeQuoteQty`.
+///
+/// An order that ended in the response itself is reported as it ended (see
+/// [`ended_order_state`]): an IOC or FOK order that found no liquidity, or partly filled and
+/// expired the rest, is `Expired` with what filled, not `Open`. A live status (`NEW`,
+/// `PARTIALLY_FILLED`, `PENDING_NEW`), or none, as in an `ACK` response, reads from what filled:
+/// `FullyFilled` once it covers `quantity`, otherwise `Open`. So does a status this version does
+/// not know, with a warning, since the account stream reports the order's next state either way.
+#[allow(clippy::too_many_arguments)] // Each is a distinct field of the response; a struct would only rename them.
+pub(crate) fn placed_order_state(
+    exchange: ExchangeId,
+    instrument: &InstrumentNameExchange,
+    status: Option<&str>,
+    order_id: OrderId,
+    time_exchange: DateTime<Utc>,
+    filled_qty: Decimal,
+    quantity: Decimal,
+    cumulative_quote_qty: Option<&str>,
+) -> UnindexedOrderState {
+    let avg_price = || binance_avg_price(exchange, cumulative_quote_qty, filled_qty);
+    if let Some(status) = status {
+        if let Some(ended) = ended_order_state(
+            status,
+            order_id.clone(),
+            time_exchange,
+            filled_qty,
+            avg_price(),
+        ) {
+            return OrderState::Inactive(ended);
+        }
+        if !rest_order_is_open(status) {
+            warn!(%exchange, %instrument, %order_id, status, "Binance placed an order with a status this version does not know, reading it from what filled");
+        }
+    }
+    if filled_qty >= quantity {
+        OrderState::fully_filled(Filled::new(
+            order_id,
+            time_exchange,
+            filled_qty,
+            avg_price(),
+        ))
+    } else {
+        OrderState::active(Open::new(
+            VenueOrderId::Assigned(order_id),
+            time_exchange,
+            filled_qty,
+        ))
+    }
+}
+
+/// The average price of an order's fills: the quote traded (`cummulativeQuoteQty`) over the base
+/// traded (`filled_qty`).
+///
+/// `None` when nothing filled or the quote is missing, when Binance reports it negative (its
+/// "not available", for some historical orders), and, with a warning, when it does not parse.
+pub(crate) fn binance_avg_price(
+    exchange: ExchangeId,
+    cumulative_quote_qty: Option<&str>,
+    filled_qty: Decimal,
+) -> Option<Decimal> {
+    if filled_qty.is_zero() {
+        return None;
+    }
+    let quote = cumulative_quote_qty?;
+    match Decimal::from_str(quote) {
+        Ok(quote) if quote.is_sign_negative() => None,
+        Ok(quote) => quote.checked_div(filled_qty),
+        Err(_) => {
+            warn!(%exchange, cummulative_quote_qty = quote, "Binance: failed to parse cummulativeQuoteQty; average price unavailable");
+            None
+        }
+    }
 }
 
 /// What a REST order row says about the order's state, whatever its status.
@@ -3668,5 +3757,116 @@ mod tests {
         assert!(!is_handshake_rate_limit(&anyhow::anyhow!(
             "HTTP error: 429 Too Many Requests"
         )));
+    }
+
+    /// What placing an order reports, by the response's status: an order that ended in the
+    /// response is reported as it ended, not as open.
+    #[test]
+    fn a_placement_response_is_read_from_its_status() {
+        use rust_decimal_macros::dec;
+
+        let btc = InstrumentNameExchange::new("BTCUSDT");
+        let time = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+        let placed = |status: Option<&str>, filled: Decimal, quote: Option<&str>| {
+            placed_order_state(
+                ExchangeId::BinanceSpot,
+                &btc,
+                status,
+                OrderId::new("7"),
+                time,
+                filled,
+                dec!(2),
+                quote,
+            )
+        };
+        let expired = |filled| {
+            OrderState::Inactive(InactiveOrderState::Expired(Expired::new(
+                OrderId::new("7"),
+                time,
+                filled,
+            )))
+        };
+        let open = |filled| {
+            OrderState::active(Open::new(
+                VenueOrderId::Assigned(OrderId::new("7")),
+                time,
+                filled,
+            ))
+        };
+
+        assert_eq!(
+            placed(Some("EXPIRED"), Decimal::ZERO, Some("0")),
+            expired(Decimal::ZERO),
+            "an IOC or FOK order that found no liquidity"
+        );
+        assert_eq!(
+            placed(Some("EXPIRED"), dec!(1), Some("100")),
+            expired(dec!(1)),
+            "an IOC order that partly filled and expired the rest"
+        );
+        assert_eq!(
+            placed(Some("EXPIRED_IN_MATCH"), Decimal::ZERO, None),
+            expired(Decimal::ZERO),
+            "expired by self-trade prevention"
+        );
+        assert_eq!(
+            placed(Some("FILLED"), dec!(2), Some("201")),
+            OrderState::fully_filled(Filled::new(
+                OrderId::new("7"),
+                time,
+                dec!(2),
+                Some(dec!(100.5))
+            ))
+        );
+        assert_eq!(
+            placed(Some("CANCELED"), dec!(1), None),
+            OrderState::Inactive(InactiveOrderState::Cancelled(Cancelled::new(
+                OrderId::new("7"),
+                time,
+                dec!(1)
+            )))
+        );
+        assert!(matches!(
+            placed(Some("REJECTED"), Decimal::ZERO, None),
+            OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                ApiError::OrderRejected(_)
+            )))
+        ));
+        for status in [
+            Some("NEW"),
+            Some("PARTIALLY_FILLED"),
+            Some("PENDING_NEW"),
+            None,
+            Some("FROZEN"),
+        ] {
+            assert_eq!(
+                placed(status, dec!(1), Some("100")),
+                open(dec!(1)),
+                "{status:?} reads as open from what filled"
+            );
+        }
+        assert!(
+            matches!(
+                placed(None, dec!(2), None),
+                OrderState::Inactive(InactiveOrderState::FullyFilled(_))
+            ),
+            "an ACK that somehow reports everything filled"
+        );
+    }
+
+    #[test]
+    fn the_average_price_is_the_quote_traded_over_the_base() {
+        use rust_decimal_macros::dec;
+
+        let avg = |quote, filled| binance_avg_price(ExchangeId::BinanceSpot, quote, filled);
+        assert_eq!(avg(Some("100"), dec!(4)), Some(dec!(25)));
+        assert_eq!(avg(Some("100"), Decimal::ZERO), None, "nothing filled");
+        assert_eq!(avg(None, dec!(4)), None, "no quote");
+        assert_eq!(
+            avg(Some("-1"), dec!(4)),
+            None,
+            "Binance's \"not available\""
+        );
+        assert_eq!(avg(Some("not-a-number"), dec!(4)), None);
     }
 }

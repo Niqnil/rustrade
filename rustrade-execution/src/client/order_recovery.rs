@@ -18,7 +18,7 @@ use crate::{
     order::{
         UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId},
-        state::{ActiveOrderState, Open, OrderState},
+        state::{ActiveOrderState, Open, OrderState, UnindexedOrderState},
     },
 };
 use fnv::{FnvHashMap, FnvHashSet};
@@ -204,6 +204,23 @@ impl KnownLiveOrders {
         if let Some(order_id) = indexed {
             self.by_order_id
                 .insert((key.instrument.clone(), order_id), cid.clone());
+        }
+    }
+
+    /// Record what the response to placing the order under `key`, of `quantity`, said: live, or
+    /// already ended, which a later report of it as live then cannot undo.
+    pub(crate) fn placed(
+        &mut self,
+        key: &UnindexedOrderKey,
+        quantity: Decimal,
+        state: &UnindexedOrderState,
+    ) {
+        match state {
+            OrderState::Active(ActiveOrderState::Open(open)) => self.live(key, quantity, open),
+            OrderState::Active(_) => {}
+            OrderState::Inactive(_) => {
+                self.ended(&key.cid);
+            }
         }
     }
 

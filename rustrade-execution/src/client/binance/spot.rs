@@ -42,8 +42,8 @@ use super::shared::{
     convert_ended_order, convert_execution_report, convert_open_order_listing,
     convert_open_order_owned_symbol, dedup_key_from_event, drop_after, gap_failed, gap_time,
     is_duplicate, is_handshake_rate_limit, is_unknown_order, log_unrecognised_frame,
-    new_dedup_cache, parse_user_data_frame, recovered_order_totals, response_decode_error,
-    rest_call_with_retry, unix_ms,
+    new_dedup_cache, parse_user_data_frame, placed_order_state, recovered_order_totals,
+    response_decode_error, rest_call_with_retry, unix_ms,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
@@ -66,7 +66,7 @@ use crate::{
         UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
+        state::{Cancelled, Open, OrderState, UnindexedOrderState},
     },
     parse_env_bool,
     position::PositionReport,
@@ -1326,24 +1326,21 @@ impl ExecutionClient for BinanceSpot {
                         .and_then(|q| Decimal::from_str(q).ok())
                         .unwrap_or(Decimal::ZERO);
 
-                    let state = if filled_qty >= quantity {
-                        // Order was fully filled immediately
-                        OrderState::fully_filled(Filled::new(
-                            exchange_order_id,
-                            time_exchange,
-                            filled_qty,
-                            None, // Binance SDK response doesn't expose avg_price directly
-                        ))
-                    } else {
-                        // Order is resting on the order book
-                        let open = Open::new(
-                            VenueOrderId::Assigned(exchange_order_id),
-                            time_exchange,
-                            filled_qty,
-                        );
-                        self.known_live.lock().live(&order_key, quantity, &open);
-                        OrderState::active(open)
-                    };
+                    // Read from the response's status, so an order that ended in it (an IOC or
+                    // FOK order that expired) is not reported, or held, as live. An `ACK`
+                    // response, the default for order types other than MARKET and LIMIT, carries
+                    // no status and reads as open.
+                    let state = placed_order_state(
+                        ExchangeId::BinanceSpot,
+                        &instrument,
+                        data.status.as_deref(),
+                        exchange_order_id,
+                        time_exchange,
+                        filled_qty,
+                        quantity,
+                        data.cummulative_quote_qty.as_deref(),
+                    );
+                    self.known_live.lock().placed(&order_key, quantity, &state);
 
                     Some(Order {
                         key: order_key,
@@ -5200,12 +5197,14 @@ mod tests {
         filled["cummulativeQuoteQty"] = "210".into();
         assert_eq!(
             ended_state(&key, filled),
-            Some(InactiveOrderState::FullyFilled(Filled::new(
-                id.clone(),
-                ended,
-                Decimal::TWO,
-                Some(Decimal::from(105)),
-            )))
+            Some(InactiveOrderState::FullyFilled(
+                crate::order::state::Filled::new(
+                    id.clone(),
+                    ended,
+                    Decimal::TWO,
+                    Some(Decimal::from(105)),
+                )
+            ))
         );
         assert_eq!(
             ended_state(&key, order_row("a", "CANCELED")),

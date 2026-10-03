@@ -291,6 +291,11 @@ where
     /// Returns `OrderState` directly rather than `Result<Open, OrderError>`:
     /// - `OrderState::Active(Open)` - order is resting on the order book
     /// - `OrderState::Inactive(FullyFilled)` - order was immediately filled (includes `avg_price` when available)
+    /// - `OrderState::Inactive(Expired)` or `Inactive(Cancelled)` - order ended in the response
+    ///   itself without filling completely, carrying what filled: an IOC or FOK order that found
+    ///   too little liquidity, or one expired by self-trade prevention. Only a client whose venue
+    ///   reports the order's status in the response returns these (Binance Spot and Margin); the
+    ///   others return `Open`, and the account stream reports the end
     /// - `OrderState::Inactive(OpenFailed)` - order placement failed (API error, connectivity, etc.)
     ///
     /// This design allows immediate fills to carry metadata (e.g., `avg_price`) that
