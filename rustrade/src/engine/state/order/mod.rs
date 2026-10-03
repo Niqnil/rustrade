@@ -58,9 +58,9 @@ pub mod manager;
 /// orders that ended, oldest forgotten first, and ignores an active snapshot for one of them. An
 /// order counts as ended when `Orders` retires it, when [`Orders::clear`] drops it, or when a
 /// snapshot reports it ended while it is not tracked, which includes an order this engine never
-/// placed: each takes a place in the same window. This relies on what the engine already assumes, that a client order id names one order for
-/// good. Recording a new open request under a remembered id forgets it, since that request is a
-/// new order by the engine's own hand.
+/// placed: each takes a place in the same window. This relies on what the engine already assumes,
+/// that a client order id names one order for good. Recording a new open request under a
+/// remembered id forgets it, since that request is a new order by the engine's own hand.
 ///
 /// The memory is bookkeeping, not order state: `Orders` serialises as its tracked orders alone,
 /// and two `Orders` that track the same orders are equal whatever each remembers.
