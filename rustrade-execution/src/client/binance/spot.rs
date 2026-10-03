@@ -5239,13 +5239,15 @@ mod tests {
                 ))),
                 "{executed_qty:?}"
             );
-            assert!(
-                matches!(
-                    ended_state(&key, row("FILLED", executed_qty)),
-                    Some(InactiveOrderState::FullyFilled(Filled { filled_quantity, .. }))
-                        if filled_quantity == Decimal::TWO
-                ),
-                "{executed_qty:?}"
+            assert_eq!(
+                ended_state(&key, row("FILLED", executed_qty)),
+                Some(InactiveOrderState::FullyFilled(Filled::new(
+                    id.clone(),
+                    ended,
+                    Decimal::TWO,
+                    Some(Decimal::new(525, 1)),
+                ))),
+                "the whole quantity, at the quote over it: {executed_qty:?}"
             );
         }
     }

@@ -205,12 +205,20 @@ fn build_trade(
 /// - If it does, something is fundamentally broken and the warning log surfaces it
 /// - Callers processing trades in bulk shouldn't abort on one corrupted record
 ///
-/// For stricter handling, callers can check for zero in critical fields.
+/// Where zero would be read as a real value, such as an ended order's fill, use
+/// [`try_decimal_or_warn`] and keep it unknown instead.
 pub fn parse_decimal_or_warn(value: f64, field_name: &str) -> Decimal {
-    Decimal::try_from(value).unwrap_or_else(|e| {
-        warn!(field = %field_name, value = %value, error = %e, "Invalid f64 for Decimal, using zero");
-        Decimal::ZERO
-    })
+    try_decimal_or_warn(value, field_name).unwrap_or(Decimal::ZERO)
+}
+
+/// Convert an IB `f64` to a `Decimal`: `None`, with a warning, when it is not a finite number
+/// that fits, so that a caller can keep it unknown rather than read it as zero.
+pub fn try_decimal_or_warn(value: f64, field_name: &str) -> Option<Decimal> {
+    Decimal::try_from(value)
+        .map_err(
+            |e| warn!(field = %field_name, value = %value, error = %e, "Invalid f64 for Decimal"),
+        )
+        .ok()
 }
 
 /// Parse IB timestamp format (YYYYMMDD HH:MM:SS timezone).

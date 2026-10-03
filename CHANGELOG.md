@@ -159,7 +159,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `OrderStatusClient::fetch_ended_orders`; the client does not look it up itself. `Filled` is
   unchanged: a filled order filled its whole quantity, which is used when the venue's figure is
   missing. `Open` is unchanged too: a live order's fill only grows, so an unknown one still reads
-  as `0`, now with a warning, until the venue reports more. Closes #475.
+  as `0`, now with a warning, until the venue reports more. Serialised, an unknown fill is
+  `null`; a state serialised before this change still deserialises, its fill as `Some`.
+  Closes #475.
 - **A late order snapshot re-opened an order the engine had retired** (`rustrade`). **Breaking**
   for code that builds `Orders` as a tuple, `Orders(map)`, or matches it with that pattern: use
   `Orders::new`, which keeps its signature, and `.0`, which is unchanged. The serialised form is

@@ -1099,11 +1099,12 @@ pub(crate) fn convert_ended_order<T: BinanceOrderFields>(
         return None;
     }
     let row = convert_order_row(o, exchange, instrument)?;
+    // Only `FILLED` reports an average price, and a filled order filled its whole quantity.
     let avg_price = binance_avg_price(
         exchange,
         &row.state.order_id,
         o.cumulative_quote_qty(),
-        row.state.filled_qty.unwrap_or(Decimal::ZERO),
+        row.state.filled_qty.unwrap_or(row.quantity),
     );
     let Some(state) = ended_order_state(
         status,
@@ -1123,8 +1124,8 @@ pub(crate) fn convert_ended_order<T: BinanceOrderFields>(
 
 /// How an order ended, from its Binance `status`, or `None` for a status that does not end it.
 ///
-/// `FILLED` becomes [`InactiveOrderState::FullyFilled`] with `avg_price`, its whole `quantity`
-/// filled; `CANCELED` becomes [`InactiveOrderState::Cancelled`], `EXPIRED` and
+/// `FILLED` becomes [`InactiveOrderState::FullyFilled`] with `avg_price` and the reported fill,
+/// or the whole `quantity` when that is unknown; `CANCELED` becomes [`InactiveOrderState::Cancelled`], `EXPIRED` and
 /// `EXPIRED_IN_MATCH` (self-trade prevention) [`InactiveOrderState::Expired`], each with what
 /// filled before, `None` when that is unknown; and `REJECTED` becomes
 /// [`InactiveOrderState::OpenFailed`]. Shared by the lookup of an order that ended
@@ -1197,12 +1198,13 @@ pub(crate) fn placed_order_state(
         (None, None) => None,
         _ => binance_filled_qty(exchange, &order_id, executed_qty),
     };
+    // Only a filled order reports an average price, and it filled its whole quantity.
     let avg_price = || {
         binance_avg_price(
             exchange,
             &order_id,
             cumulative_quote_qty,
-            filled_qty.unwrap_or(Decimal::ZERO),
+            filled_qty.unwrap_or(quantity),
         )
     };
     if let Some(status) = status {
@@ -3918,7 +3920,7 @@ mod tests {
                     order_id: OrderId::new("7"),
                     time_exchange: time,
                     executed_qty: filled,
-                    cumulative_quote_qty: None,
+                    cumulative_quote_qty: Some("201"),
                 },
             )
         };
@@ -3941,8 +3943,8 @@ mod tests {
             );
             assert_eq!(
                 placed(Some("FILLED"), filled),
-                OrderState::fully_filled(Filled::new(id(), time, dec!(2), None)),
-                "a filled order filled its whole quantity: {filled:?}"
+                OrderState::fully_filled(Filled::new(id(), time, dec!(2), Some(dec!(100.5)))),
+                "a filled order filled its whole quantity, at the quote over it: {filled:?}"
             );
             assert_eq!(
                 placed(Some("NEW"), filled),

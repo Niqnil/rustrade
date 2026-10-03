@@ -6514,6 +6514,43 @@ mod tests {
         );
     }
 
+    /// A cancel response that does not say what filled reports the fill unknown, not zero.
+    #[tokio::test]
+    async fn a_cancel_response_without_executed_qty_reports_the_fill_unknown() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/order"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "symbol": "BTCUSDT", "orderId": "7", "origClientOrderId": "placed",
+                    "clientOrderId": "cancel", "price": "100", "origQty": "2",
+                    "status": "CANCELED", "timeInForce": "GTC", "type": "LIMIT", "side": "BUY",
+                })),
+            )
+            .mount(&server)
+            .await;
+        let client = margin_client_at(&server, false);
+
+        let cancelled = client
+            .cancel_order(OrderRequestCancel {
+                key: OrderKey::new(
+                    ExchangeId::BinanceMargin,
+                    &InstrumentNameExchange::new("BTCUSDT"),
+                    StrategyId::new("strategy"),
+                    ClientOrderId::new("placed"),
+                ),
+                state: crate::order::request::RequestCancel {
+                    id: Some(VenueOrderId::Assigned(OrderId::new("7"))),
+                },
+            })
+            .await
+            .unwrap();
+        let Ok(cancelled) = cancelled.state else {
+            panic!("expected Ok, got {cancelled:?}");
+        };
+        assert_eq!(cancelled.filled_quantity, None);
+    }
+
     #[test]
     fn a_reconnect_opens_a_gap_on_each_stream_instrument_and_checks_those_with_orders_held() {
         let [btc, eth, xrp] = ["BTCUSDT", "ETHUSDT", "XRPUSDT"].map(InstrumentNameExchange::new);

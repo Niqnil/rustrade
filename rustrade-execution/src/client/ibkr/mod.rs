@@ -145,7 +145,7 @@ use crate::{
 };
 use account::{BalanceAggregator, PositionAggregator};
 use chrono::{DateTime, Utc};
-use execution::{ExecutionBuffer, parse_decimal_or_warn};
+use execution::{ExecutionBuffer, parse_decimal_or_warn, try_decimal_or_warn};
 use futures::stream::BoxStream;
 use ibapi::{
     accounts::{AccountSummaryResult, types::AccountGroup},
@@ -2554,9 +2554,7 @@ fn make_order_from_status(
 
     // `None` when IB reports a fill that is not a number, so that an ended order does not report
     // an unknown fill as zero.
-    let reported_fill = Decimal::try_from(status.filled)
-        .map_err(|e| warn!(order_id = ib_id, filled = status.filled, error = %e, "IB reported a fill that is not a number, treating it as unknown"))
-        .ok();
+    let reported_fill = try_decimal_or_warn(status.filled, "status.filled");
     // A live order's fill only grows, so an unknown one reads as nothing filled until IB reports
     // more.
     let filled_qty = reported_fill.unwrap_or(Decimal::ZERO);

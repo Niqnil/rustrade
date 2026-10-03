@@ -932,7 +932,8 @@ struct AlpacaOrderWs<'a> {
     // Alpaca guarantees `filled_qty` for fill/partial_fill and most lifecycle
     // events, but some event types (e.g. `rejected`) may omit the field.
     // Using Option avoids a deserialization failure that would silently drop
-    // the event. Call sites use `.unwrap_or("0")`.
+    // the event. A snapshot of a live order reads its absence as nothing filled
+    // yet; a cancel reads it as unknown; the dedup and trade ids read it as "0".
     #[serde(borrow)]
     filled_qty: Option<&'a str>,
     // Short enums ("buy"/"sell", "market"/"limit"/..., "day"/"gtc"/..., status)
@@ -3783,7 +3784,12 @@ fn ws_order_snapshot(
         return None;
     }
     let price = order.limit_price.and_then(|s| Decimal::from_str(s).ok());
-    let filled_qty = alpaca_filled_qty(&order.id, order.filled_qty).unwrap_or(Decimal::ZERO);
+    // A live order's fill only grows, so a frame that omits it (some lifecycle events may) reads
+    // as nothing filled yet, without a warning; one that garbles it is still reported.
+    let filled_qty = order
+        .filled_qty
+        .and_then(|_| alpaca_filled_qty(&order.id, order.filled_qty))
+        .unwrap_or(Decimal::ZERO);
     let kind = parse_order_kind(
         &order.order_type,
         order.stop_price,
@@ -7654,7 +7660,13 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert!(cancel.state.is_ok());
+            let Ok(cancelled) = &cancel.state else {
+                panic!("expected Ok, got {cancel:?}");
+            };
+            assert_eq!(
+                cancelled.filled_quantity, None,
+                "the DELETE response has no body, so what filled is unknown"
+            );
             assert!(
                 client
                     .known_live
