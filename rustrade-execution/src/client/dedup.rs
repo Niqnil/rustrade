@@ -136,8 +136,10 @@ pub(crate) fn dedup_key_from_event(event: &UnindexedAccountEvent) -> Option<Dedu
             Err(_) => None, // error responses don't need dedup
         },
         // FillRecoveryGaveUp has no key either: two give-ups of one span are two failed reads.
-        // TradeAmended has none yet: whether its only producer, Alpaca, can send one twice is
-        // unknown, and TradeAmendment tells the consumer to apply it idempotently.
+        // TradeAmended has none. Alpaca's amendments are not deduplicated: whether Alpaca can send
+        // one twice is unknown, and TradeAmendment tells the consumer to apply it idempotently.
+        // IBKR's EventSink tracks each execution's revisions itself, which also keeps an
+        // execution from going out after its correction.
         _ => None, // BalanceSnapshot, BalanceStreamUpdate, InstrumentBalanceUpdate, Snapshot, StreamTerminated, FillRecoveryGaveUp, TradeAmended — no dedup needed
     }
 }

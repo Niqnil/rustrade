@@ -11,9 +11,9 @@ use rust_decimal::Decimal;
 use rustrade_instrument::{
     Side, asset::name::AssetNameExchange, instrument::name::InstrumentNameExchange,
 };
-use smol_str::SmolStr;
-use std::{cell::RefCell, sync::Arc};
-use tracing::warn;
+use smol_str::{SmolStr, format_smolstr};
+use std::{cell::RefCell, collections::hash_map::Entry, sync::Arc};
+use tracing::{debug, warn};
 
 // Thread-local cache for parsed IANA timezones. IB uses per-exchange timezones,
 // but most portfolios only see a handful (US/Eastern, Europe/London, etc.).
@@ -153,6 +153,110 @@ impl Default for ExecutionBuffer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// An IB execution id, read as the execution it reports and that execution's revision.
+///
+/// IB reports a correction as a further execution whose id differs from the one it corrects only
+/// in the digits after the final period: `0000e0d5.5f8b1c2a.01.02` corrects
+/// `0000e0d5.5f8b1c2a.01.01`. IB's documentation gives that example rather than a rule, but every
+/// execution IB first reports ends in `01`, so a higher revision is read as a correction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ExecutionRevision<'a> {
+    /// The id up to its final period, which every revision of the execution shares.
+    pub(super) execution: &'a str,
+    /// The digits after the final period, kept to write the previous revision's id at the same
+    /// width.
+    digits: &'a str,
+    pub(super) revision: u32,
+}
+
+impl<'a> ExecutionRevision<'a> {
+    /// `None` when `execution_id` does not end in a period followed by digits. Such an id is read
+    /// as an execution that has not been corrected.
+    pub(super) fn parse(execution_id: &'a str) -> Option<Self> {
+        let (execution, digits) = execution_id.rsplit_once('.')?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        Some(Self {
+            execution,
+            digits,
+            revision: digits.parse().ok()?,
+        })
+    }
+
+    /// Whether this revision corrects an earlier one.
+    pub(super) fn is_correction(&self) -> bool {
+        self.revision > 1
+    }
+
+    /// The id of the revision this one corrects, or `None` if it is not a correction.
+    pub(super) fn previous_id(&self) -> Option<TradeId> {
+        self.is_correction().then(|| {
+            TradeId(format_smolstr!(
+                "{}.{:0width$}",
+                self.execution,
+                self.revision - 1,
+                width = self.digits.len()
+            ))
+        })
+    }
+}
+
+/// The revision of the execution `id` names, `0` when it names none. Sorting by it puts each
+/// execution ahead of its corrections.
+pub(super) fn revision_of(id: &TradeId) -> u32 {
+    ExecutionRevision::parse(&id.0).map_or(0, |revision| revision.revision)
+}
+
+/// `trades` with each execution only at its latest revision, in the order the executions first
+/// appear, so that a corrected execution is read as corrected rather than twice. An execution
+/// read twice at one revision is kept once.
+pub(super) fn keep_latest_revisions(
+    trades: Vec<Trade<AssetNameExchange, InstrumentNameExchange>>,
+) -> Vec<Trade<AssetNameExchange, InstrumentNameExchange>> {
+    // The kept position and revision of each execution with a revision.
+    let mut latest = FnvHashMap::<SmolStr, (usize, u32)>::with_capacity_and_hasher(
+        trades.len(),
+        Default::default(),
+    );
+    let mut kept = Vec::with_capacity(trades.len());
+    for trade in trades {
+        let Some(revision) = ExecutionRevision::parse(&trade.id.0) else {
+            kept.push(trade);
+            continue;
+        };
+        let (execution, revision) = (SmolStr::new(revision.execution), revision.revision);
+        match latest.entry(execution) {
+            Entry::Vacant(entry) => {
+                entry.insert((kept.len(), revision));
+                kept.push(trade);
+            }
+            Entry::Occupied(mut entry) => {
+                let (position, kept_revision) = *entry.get();
+                if revision == kept_revision {
+                    debug!(exec_id = %trade.id, "IBKR execution read twice; keeping one");
+                    continue;
+                }
+                let (older, newer) = if revision > kept_revision {
+                    entry.insert((position, revision));
+                    (
+                        std::mem::replace(&mut kept[position], trade),
+                        &kept[position],
+                    )
+                } else {
+                    (trade, &kept[position])
+                };
+                debug!(
+                    corrected = %older.id,
+                    correction = %newer.id,
+                    "IBKR execution corrected; keeping the correction"
+                );
+            }
+        }
+    }
+    kept
 }
 
 /// Build a rustrade Trade from IB execution + commission data.
@@ -329,6 +433,83 @@ mod tests {
         assert_eq!(source.drain_into(&target), 2);
         assert_eq!(source.pending_count(), 0);
         assert_eq!(target.pending_count(), 3);
+    }
+
+    #[test]
+    fn execution_revision_reads_the_digits_after_the_final_period() {
+        let original = ExecutionRevision::parse("0000e0d5.5f8b1c2a.01.01").unwrap();
+        assert_eq!(original.execution, "0000e0d5.5f8b1c2a.01");
+        assert_eq!(original.revision, 1);
+        assert!(!original.is_correction());
+        assert_eq!(original.previous_id(), None);
+
+        let correction = ExecutionRevision::parse("0000e0d5.5f8b1c2a.01.02").unwrap();
+        assert_eq!(correction.execution, "0000e0d5.5f8b1c2a.01");
+        assert!(correction.is_correction());
+        assert_eq!(
+            correction.previous_id(),
+            Some(TradeId::new("0000e0d5.5f8b1c2a.01.01"))
+        );
+
+        // The previous revision keeps the width of the digits.
+        assert_eq!(
+            ExecutionRevision::parse("x.10").unwrap().previous_id(),
+            Some(TradeId::new("x.09"))
+        );
+        assert_eq!(
+            ExecutionRevision::parse("x.3").unwrap().previous_id(),
+            Some(TradeId::new("x.2"))
+        );
+    }
+
+    #[test]
+    fn execution_id_without_a_revision_is_never_a_correction() {
+        for id in ["e1", "abc.", "abc.0x", "abc.1a", "", ".", "abc.99999999999"] {
+            assert_eq!(ExecutionRevision::parse(id), None, "{id:?}");
+        }
+        assert_eq!(revision_of(&TradeId::new("e1")), 0);
+        assert_eq!(revision_of(&TradeId::new("a.b.02")), 2);
+    }
+
+    fn trade(id: &str, price: i64) -> Trade<AssetNameExchange, InstrumentNameExchange> {
+        Trade {
+            id: TradeId::new(id),
+            order_id: crate::order::id::OrderId::new("cid"),
+            instrument: InstrumentNameExchange::new("AAPL"),
+            strategy: StrategyId::unknown(),
+            time_exchange: DateTime::<Utc>::MIN_UTC,
+            side: Side::Buy,
+            price: Decimal::from(price),
+            quantity: Decimal::ONE,
+            order_filled_quantity: Some(Decimal::ONE),
+            fees: AssetFees::new(AssetNameExchange::from("USD"), Decimal::ZERO, None),
+        }
+    }
+
+    #[test]
+    fn keep_latest_revisions_reads_a_corrected_execution_once() {
+        let kept = keep_latest_revisions(vec![
+            trade("a.01.01", 100),
+            trade("b.01.01", 200),
+            trade("a.01.02", 101),
+            trade("a.01.02", 101),
+            trade("plain", 300),
+            // An earlier revision after a later one is still the earlier one.
+            trade("b.01.03", 202),
+            trade("b.01.02", 201),
+        ]);
+        let read: Vec<_> = kept
+            .iter()
+            .map(|trade| (trade.id.0.as_str(), trade.price))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("a.01.02", Decimal::from(101)),
+                ("b.01.03", Decimal::from(202)),
+                ("plain", Decimal::from(300)),
+            ]
+        );
     }
 
     #[test]

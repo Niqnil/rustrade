@@ -45,9 +45,10 @@
 //!
 //! [`ExecutionClient::account_stream`] stays open across a successful reconnect. It
 //! detects the gap and, once delivery is restored, recovers the fills TWS sent while
-//! the socket was down, emitting each as a `Trade` exactly once. The same applies when
-//! TWS loses its own link to IB's servers (notice 1100) and later restores it (1101/1102).
-//! See that method for the details.
+//! the socket was down, emitting each exactly once: as a `Trade`, or as a
+//! `TradeAmended` when it corrects an earlier execution. The same applies when TWS
+//! loses its own link to IB's servers (notice 1100) and later restores it
+//! (1101/1102). See that method for the details.
 //!
 //! # Caller Responsibilities
 //!
@@ -145,7 +146,7 @@ use crate::{
 };
 use account::{BalanceAggregator, PositionAggregator};
 use chrono::{DateTime, Utc};
-use execution::{ExecutionBuffer, parse_decimal_or_warn, try_decimal_or_warn};
+use execution::{ExecutionBuffer, ExecutionRevision, parse_decimal_or_warn, try_decimal_or_warn};
 use futures::stream::BoxStream;
 use ibapi::{
     accounts::{AccountSummaryResult, types::AccountGroup},
@@ -500,13 +501,27 @@ fn forward_order_updates(
                 else {
                     continue;
                 };
+                // Logged on arrival, so the correction is seen even if no commission report
+                // ever completes it.
+                if ExecutionRevision::parse(&exec.execution.execution_id)
+                    .is_some_and(|revision| revision.is_correction())
+                {
+                    warn!(
+                        exec_id = %exec.execution.execution_id,
+                        %instrument,
+                        price = exec.execution.price,
+                        shares = exec.execution.shares,
+                        "IBKR corrected an execution; it will be reported as TradeAmended if its \
+                         commission report arrives"
+                    );
+                }
 
                 exec_buffer.add_execution(exec, instrument, client_id);
                 None
             }
             OrderUpdate::CommissionReport(report) => {
                 if let Some(trade) = exec_buffer.complete_with_commission(&report)
-                    && !sink.send_trade(trade)
+                    && !sink.send_execution(trade)
                 {
                     return;
                 }
@@ -1827,6 +1842,32 @@ impl ExecutionClient for IbkrClient {
     /// executions request, such as [`ExecutionClient::fetch_trades`], are not
     /// reported here as fills.
     ///
+    /// # Corrections
+    ///
+    /// IB reports a corrected execution as a further execution whose id differs
+    /// only in the digits after the final period (`….01.02` corrects `….01.01`).
+    /// It is sent as `AccountEventKind::TradeAmended`, `Corrected`, with the
+    /// correction as the replacement `Trade`, once its commission report arrives.
+    /// Its `original` is the revision this stream delivered before, or, for an
+    /// execution from before the stream, the revision the correction's id says
+    /// it corrects. A revision older than one already delivered is dropped.
+    /// Fills recovered after a gap are delivered originals first, so a
+    /// correction recovered with them comes after every original in the gap,
+    /// not in time order.
+    /// Each correction is logged at `warn!` when it arrives, so one that never
+    /// gets a commission report is still seen. IB documents no busts.
+    ///
+    /// The revisions delivered are remembered in a bounded cache, like the dedup
+    /// cache. A correction of an execution the cache has forgotten names the
+    /// previous revision by its id, which is the original unless an
+    /// intermediate revision was delivered and forgotten too.
+    ///
+    /// One case loses a fill: a correction that arrives live after a reconnect,
+    /// before recovery has delivered its original from the gap. The correction
+    /// is sent naming the original, and recovery then drops the original as
+    /// older than a revision already delivered, so the trade reaches the stream
+    /// only as the amendment.
+    ///
     /// # Filter Parameters
     ///
     /// The `assets` and `instruments` parameters are currently ignored. IB's
@@ -2405,6 +2446,13 @@ impl ExecutionClient for IbkrClient {
     ///   `ExecutionData` with `CommissionReport` events.
     /// - This method blocks on IB's executions subscription until IB sends an
     ///   end-of-data marker. If IB is stalled, this will block indefinitely.
+    ///
+    /// # Corrections
+    ///
+    /// IB reports a corrected execution as a further execution whose id differs
+    /// only in the digits after the final period. Each execution is returned
+    /// once, at its latest revision, under that revision's id: the replacement a
+    /// `TradeAmended` on [`ExecutionClient::account_stream`] names.
     async fn fetch_trades(
         &self,
         start: DateTime<Utc>,
@@ -2503,7 +2551,9 @@ impl ExecutionClient for IbkrClient {
                 });
             }
 
-            Ok(TradesRead::complete(trades))
+            Ok(TradesRead::complete(execution::keep_latest_revisions(
+                trades,
+            )))
         })
         .await
         .map_err(|e| UnindexedClientError::TaskFailed(format!("task join: {e}")))?
@@ -3373,6 +3423,102 @@ mod order_reader_tests {
         drop(rx);
 
         assert_eq!(run(&sink, unforwarded(3)), 1);
+    }
+
+    /// An execution and its correction, each completed by its commission report, reach the
+    /// stream as a trade and an amendment of it, never as two trades.
+    #[test]
+    fn a_corrected_execution_is_reported_as_an_amendment() {
+        use crate::trade::TradeAmendmentKind;
+        use ibapi::{
+            contracts::Contract,
+            orders::{CommissionReport, Execution, ExecutionData},
+        };
+
+        let contracts = ContractRegistry::new();
+        contracts.register(
+            InstrumentNameExchange::new("AAPL"),
+            Contract {
+                contract_id: 265598,
+                ..Contract::default()
+            },
+        );
+        let order_ids = OrderIdMap::new();
+        order_ids.register(
+            ClientOrderId::new("cid-7"),
+            7,
+            OrderContext {
+                instrument: InstrumentNameExchange::new("AAPL"),
+                side: Side::Buy,
+                price: Some(Decimal::from(100)),
+                quantity: Decimal::ONE,
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+            },
+        );
+        let execution = |exec_id: &str, price: f64| {
+            Ok(OrderUpdate::ExecutionData(ExecutionData {
+                // TWS tags an execution happening now with -1.
+                request_id: -1,
+                contract: Contract {
+                    contract_id: 265598,
+                    ..Contract::default()
+                },
+                execution: Execution {
+                    order_id: 7,
+                    execution_id: exec_id.to_string(),
+                    time: "20261005 14:00:00 UTC".to_string(),
+                    shares: 1.0,
+                    price,
+                    cumulative_quantity: 1.0,
+                    ..Execution::default()
+                },
+            }))
+        };
+        let commission = |exec_id: &str| {
+            Ok(OrderUpdate::CommissionReport(CommissionReport {
+                execution_id: exec_id.to_string(),
+                commission: 1.0,
+                currency: "USD".to_string(),
+                ..CommissionReport::default()
+            }))
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = recovery::EventSink::new(tx, new_dedup_cache());
+        forward_order_updates(
+            [
+                execution("0000e0d5.5f8b1c2a.01.01", 100.0),
+                commission("0000e0d5.5f8b1c2a.01.01"),
+                execution("0000e0d5.5f8b1c2a.01.02", 100.5),
+                commission("0000e0d5.5f8b1c2a.01.02"),
+            ],
+            &sink,
+            &contracts,
+            &order_ids,
+            &PendingCancels::new(),
+            &ExecutionBuffer::new(),
+        );
+
+        let AccountEventKind::Trade(original) = rx.try_recv().unwrap().kind else {
+            panic!("expected the original as a trade");
+        };
+        assert_eq!(original.id, TradeId::new("0000e0d5.5f8b1c2a.01.01"));
+        let AccountEventKind::TradeAmended(amendment) = rx.try_recv().unwrap().kind else {
+            panic!("expected the correction as an amendment");
+        };
+        assert_eq!(amendment.original, Some(original.id));
+        assert_eq!(amendment.order_id, OrderId::new("cid-7"));
+        let TradeAmendmentKind::Corrected { replacement } = amendment.kind else {
+            panic!("expected a resolved correction, got {:?}", amendment.kind);
+        };
+        assert_eq!(replacement.id, TradeId::new("0000e0d5.5f8b1c2a.01.02"));
+        assert_eq!(replacement.price, Decimal::new(1005, 1));
+        assert_eq!(replacement.fees.fees, Decimal::ONE);
+        assert!(matches!(
+            rx.try_recv().unwrap().kind,
+            AccountEventKind::StreamTerminated(_)
+        ));
     }
 
     #[test]
