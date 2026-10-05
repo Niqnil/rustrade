@@ -294,11 +294,15 @@ async fn test_fetch_trades() {
     let since = chrono::Utc::now() - chrono::Duration::days(7);
     let instruments: Vec<InstrumentNameExchange> = vec![];
 
-    let result = client.fetch_trades(since, &instruments).await;
+    let result = client
+        .fetch_trades(since, chrono::Utc::now(), &instruments)
+        .await;
 
     assert!(result.is_ok(), "fetch_trades failed: {:?}", result.err());
 
-    let trades = result.unwrap();
+    let read = result.unwrap();
+    assert_eq!(read.resume, None, "the venue reads a span whole");
+    let trades = read.trades;
     println!("Trades in last 7 days: {}", trades.len());
     for trade in trades.iter().take(10) {
         println!(

@@ -22,18 +22,14 @@ use thiserror::Error;
 ///
 /// Read the span with
 /// [`ExecutionClient::fetch_trades`](crate::client::ExecutionClient::fetch_trades), passing
-/// `start` and [`FillRecoveryScope::instrument_filter`]:
-/// - The span can overlap fills that were delivered, before the read failed or live around the
-///   reconnect, so match what it returns against the fills already seen by
-///   [`TradeId`](crate::trade::TradeId): a fill has one `TradeId` whether the stream or
-///   `fetch_trades` delivers it.
-/// - Fills after `end` arrived live, so a read that runs past `end`, as `fetch_trades` does,
-///   returns them again.
-/// - A span can hold more fills than `fetch_trades` can return. Alpaca's `fetch_trades` reads
-///   every fill from `start` to now, with no end bound. When there are more than 5,000, it returns
-///   [`Truncated`](crate::error::ClientError::Truncated) with none of them, so a span with more
-///   fills than that after its `start` cannot be read with it. This is a known limitation:
-///   reconcile such a span another way, for example from the venue's own account activity.
+/// `start`, `end` and [`FillRecoveryScope::instrument_filter`], and read on from each call's
+/// [`resume`](crate::trade::TradesRead::resume) until it is `None`: a busy span can take more
+/// than one call.
+///
+/// The span can overlap fills that were delivered, before the read failed or live around the
+/// reconnect, so match what the reads return against the fills already seen by instrument and
+/// [`TradeId`](crate::trade::TradeId). A fill has one `TradeId` whether the stream or
+/// `fetch_trades` delivers it.
 ///
 /// # Delivery
 ///
@@ -96,8 +92,8 @@ pub enum FillRecoveryFailure {
     },
 
     /// The read stopped at the venue integration's cap on how many fills one read returns. The
-    /// fills it read were delivered, and the span starts just before the last of them, so fills
-    /// sharing its time that the read cut off are inside it.
+    /// fills it read were delivered, and the span starts at the last of them (at its millisecond,
+    /// on Alpaca), so fills sharing its time that the read cut off are inside it.
     #[error("truncated after {fills_read} fills")]
     Truncated {
         /// How many fills the read returned before it stopped, counted across the account,

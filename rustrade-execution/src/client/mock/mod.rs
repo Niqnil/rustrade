@@ -14,7 +14,7 @@ use crate::{
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Open, OrderState, UnindexedOrderState},
     },
-    trade::Trade,
+    trade::TradesRead,
 };
 use chrono::{DateTime, Utc};
 use derive_more::Constructor;
@@ -335,19 +335,22 @@ where
         })
     }
 
+    /// The mock venue holds every trade and answers a span whole, so the read is always
+    /// complete.
     async fn fetch_trades(
         &self,
-        time_since: DateTime<Utc>,
-        // MockExchange fetch_trades doesn't filter by instrument
-        _instruments: &[InstrumentNameExchange],
-    ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError> {
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        instruments: &[InstrumentNameExchange],
+    ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError> {
         let (response_tx, response_rx) = oneshot::channel();
 
         self.request_tx
             .send(MockExchangeRequest::fetch_trades(
                 self.time_request(),
                 response_tx,
-                time_since,
+                start,
+                end,
             ))
             .map_err(|_| {
                 UnindexedClientError::Connectivity(ConnectivityError::ExchangeOffline(
@@ -355,11 +358,15 @@ where
                 ))
             })?;
 
-        response_rx.await.map_err(|_| {
+        let mut trades = response_rx.await.map_err(|_| {
             UnindexedClientError::Connectivity(ConnectivityError::ExchangeOffline(
                 self.mocked_exchange,
             ))
-        })
+        })?;
+        if !instruments.is_empty() {
+            trades.retain(|trade| instruments.contains(&trade.instrument));
+        }
+        Ok(TradesRead::complete(trades))
     }
 }
 
@@ -415,6 +422,60 @@ mod tests {
                 time_exchange: Utc::now(),
             })),
         )
+    }
+
+    /// `fetch_trades` asks the mock exchange for its span and keeps the requested instruments'
+    /// trades, reading the span whole.
+    #[tokio::test]
+    async fn fetch_trades_reads_the_span_for_the_requested_instruments() {
+        use crate::{
+            order::id::{OrderId, StrategyId},
+            trade::{AssetFees, Trade, TradeId},
+        };
+        use rustrade_instrument::Side;
+
+        let (_event_tx, event_rx) = broadcast::channel::<UnindexedAccountEvent>(1);
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+        let client = MockExecution::new(ExchangeId::Mock, Utc::now, request_tx, event_rx);
+        let start = Utc::now() - chrono::TimeDelta::hours(1);
+        let end = Utc::now();
+
+        let trade = move |instrument: &str| {
+            Trade::new(
+                TradeId::new(instrument),
+                OrderId::new("order"),
+                InstrumentNameExchange::new(instrument),
+                StrategyId::unknown(),
+                start,
+                Side::Buy,
+                Decimal::ONE,
+                Decimal::ONE,
+                None,
+                AssetFees::new(AssetNameExchange::new("usdt"), Decimal::ZERO, None),
+            )
+        };
+        let exchange = tokio::spawn(async move {
+            let request = request_rx.recv().await.expect("a request");
+            let crate::exchange::mock::request::MockExchangeRequestKind::FetchTrades {
+                response_tx,
+                start: asked_start,
+                end: asked_end,
+            } = request.kind
+            else {
+                panic!("expected FetchTrades, got {:?}", request.kind);
+            };
+            assert_eq!((asked_start, asked_end), (start, end));
+            response_tx
+                .send(vec![trade("btc_usdt"), trade("eth_usdt")])
+                .expect("the client awaits the answer");
+        });
+
+        let read = client
+            .fetch_trades(start, end, &[InstrumentNameExchange::new("eth_usdt")])
+            .await
+            .unwrap();
+        exchange.await.unwrap();
+        assert_eq!(read, TradesRead::complete(vec![trade("eth_usdt")]));
     }
 
     /// Broadcast lag is a terminal stream death: the account stream must deliver an in-band

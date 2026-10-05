@@ -477,7 +477,7 @@ impl AccountEventIndexer {
             }
             UnindexedClientError::TaskFailed(value) => ClientError::TaskFailed(value),
             UnindexedClientError::Internal(value) => ClientError::Internal(value),
-            UnindexedClientError::Truncated { limit } => ClientError::Truncated { limit },
+            UnindexedClientError::Truncated { fills_read } => ClientError::Truncated { fills_read },
             UnindexedClientError::TruncatedSnapshot { limit } => {
                 ClientError::TruncatedSnapshot { limit }
             }

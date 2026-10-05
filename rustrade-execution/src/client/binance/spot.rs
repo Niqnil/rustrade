@@ -70,7 +70,7 @@ use crate::{
     },
     parse_env_bool,
     position::PositionReport,
-    trade::{AssetFees, Trade, TradeId},
+    trade::{AssetFees, Trade, TradeId, TradesRead},
 };
 use binance_sdk::{
     common::{
@@ -639,17 +639,8 @@ async fn paginate_my_trades(
                 #[allow(clippy::cast_possible_truncation)]
                 let builder = MyTradesParams::builder(sym).limit(BINANCE_MAX_TRADES as i32);
                 let params = match (from, fid) {
-                    (
-                        MyTradesFrom::Time(start_time_ms)
-                        | MyTradesFrom::Span {
-                            start: start_time_ms,
-                            ..
-                        },
-                        None,
-                    ) => builder.start_time(start_time_ms),
-                    (MyTradesFrom::Time(_) | MyTradesFrom::Span { .. }, Some(id)) => {
-                        builder.from_id(id)
-                    }
+                    (MyTradesFrom::Span { start, .. }, None) => builder.start_time(start),
+                    (MyTradesFrom::Span { .. }, Some(id)) => builder.from_id(id),
                     (MyTradesFrom::Order(order_id), None) => builder.order_id(order_id),
                     (MyTradesFrom::Order(order_id), Some(id)) => {
                         builder.order_id(order_id).from_id(id)
@@ -669,7 +660,7 @@ async fn paginate_my_trades(
         // A span ends once a page reaches past it.
         let past_end = match from {
             MyTradesFrom::Span { end, .. } => drop_after(&mut page, end),
-            MyTradesFrom::Time(_) | MyTradesFrom::Order(_) => false,
+            MyTradesFrom::Order(_) => false,
         };
         all_pages.extend(page);
 
@@ -1472,25 +1463,36 @@ impl ExecutionClient for BinanceSpot {
     /// **Documented deviation from the `ExecutionClient::fetch_trades` "return all" contract:**
     /// Binance's `myTrades` endpoint requires a symbol — there is no no-symbol "all trades" query
     /// (unlike open orders). An empty `instruments` slice therefore has nothing to query and
-    /// returns an empty `Vec`; callers wanting all trades must enumerate instruments explicitly.
+    /// reads nothing; callers wanting all trades must enumerate instruments explicitly.
+    ///
+    /// Each instrument is paged by trade id to the span's end within the call, with no page cap,
+    /// so the read is always complete (`resume: None`).
     // `.iter().cloned()` is required: Rust async closures cannot satisfy the HRTB
     // `for<'a> FnMut(&'a InstrumentNameExchange) -> impl Future + 'static` needed by
     // the iterator machinery, even when the clone is moved inside the closure body.
     #[allow(clippy::redundant_iter_cloned)]
     async fn fetch_trades(
         &self,
-        time_since: DateTime<Utc>,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
         instruments: &[InstrumentNameExchange],
-    ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError> {
+    ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError> {
         use futures::StreamExt;
 
         if instruments.is_empty() {
             debug!(
                 "BinanceSpot fetch_trades called with empty instruments slice — returning empty result"
             );
-            return Ok(Vec::new());
+            return Ok(TradesRead::complete(Vec::new()));
         }
-        let start_time_ms = time_since.timestamp_millis();
+        if start > end {
+            return Ok(TradesRead::complete(Vec::new()));
+        }
+        // Binance stamps trades in whole milliseconds; the exact span is applied after the read.
+        let span = MyTradesFrom::Span {
+            start: start.timestamp_millis(),
+            end: end.timestamp_millis(),
+        };
         // Vec::new() — capacity(instruments.len()) would be misleading since this accumulates
         // up to BINANCE_MAX_TRADES * instruments.len() trades total.
         let mut all_trades = Vec::new();
@@ -1502,14 +1504,9 @@ impl ExecutionClient for BinanceSpot {
             let rest = self.rest.clone();
             let rate_limiter = self.rate_limiter.clone();
             async move {
-                let pages = paginate_my_trades(
-                    &rest,
-                    &rate_limiter,
-                    &inst,
-                    MyTradesFrom::Time(start_time_ms),
-                    RequestKind::Query,
-                )
-                .await?;
+                let pages =
+                    paginate_my_trades(&rest, &rate_limiter, &inst, span, RequestKind::Query)
+                        .await?;
                 Ok::<_, UnindexedClientError>((inst, pages))
             }
         }))
@@ -1517,13 +1514,15 @@ impl ExecutionClient for BinanceSpot {
         while let Some(result) = stream.next().await {
             let (instrument, trades_data) = result?;
             for t in trades_data {
-                if let Some(trade) = convert_my_trade(&t, &instrument) {
+                if let Some(trade) = convert_my_trade(&t, &instrument)
+                    && (start..=end).contains(&trade.time_exchange)
+                {
                     all_trades.push(trade);
                 }
             }
         }
 
-        Ok(all_trades)
+        Ok(TradesRead::complete(all_trades))
     }
 }
 
@@ -5181,6 +5180,64 @@ mod tests {
         let ids: Vec<_> = read.iter().filter_map(|t| t.id).collect();
         assert_eq!(ids, (1..=1_001).collect::<Vec<_>>());
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    /// `fetch_trades` reads its span's milliseconds and returns only the trades inside the span:
+    /// not one earlier in `start`'s millisecond, nor one after `end`. An empty span reads nothing.
+    #[tokio::test]
+    async fn fetch_trades_returns_only_the_span() {
+        // Half a millisecond in, so a trade at the start of its millisecond is before it.
+        let start = DateTime::from_timestamp_millis(
+            (Utc::now() - chrono::Duration::minutes(10)).timestamp_millis(),
+        )
+        .unwrap()
+            + chrono::Duration::microseconds(500);
+        let end = start + chrono::Duration::seconds(10);
+        let (start_ms, end_ms) = (start.timestamp_millis(), end.timestamp_millis());
+        let trade = |id: i64, time: i64| {
+            serde_json::json!({
+                "symbol": "BTCUSDT", "id": id, "orderId": id, "price": "100", "qty": "1",
+                "commission": "0", "commissionAsset": "USDT", "time": time,
+                "isBuyer": true, "isMaker": false, "isBestMatch": true,
+            })
+        };
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/myTrades"))
+            .and(wiremock::matchers::query_param(
+                "startTime",
+                start_ms.to_string(),
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(vec![
+                trade(1, start_ms),
+                trade(2, start_ms + 1),
+                trade(3, end_ms),
+                trade(4, end_ms + 1),
+            ]))
+            .mount(&server)
+            .await;
+        let mut client = <BinanceSpot as ExecutionClient>::new(BinanceSpotConfig::new(
+            "key".into(),
+            "secret".into(),
+        ));
+        client.rest = Arc::new(SpotRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server.uri())
+                .build()
+                .unwrap(),
+        ));
+        let btc = [InstrumentNameExchange::new("BTCUSDT")];
+
+        let read = client.fetch_trades(start, end, &btc).await.unwrap();
+        let ids: Vec<_> = read.trades.iter().map(|t| t.id.0.as_str()).collect();
+        assert_eq!(ids, ["2", "3"]);
+        assert_eq!(read.resume, None, "spot reads a span whole");
+
+        let empty = client.fetch_trades(end, start, &btc).await.unwrap();
+        assert!(empty.trades.is_empty() && empty.resume.is_none());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     /// A gap whose every read times out is given up, and reported with the recovery's time budget.

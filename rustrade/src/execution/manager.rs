@@ -603,7 +603,7 @@ mod tests {
             request::{RequestCancel, RequestOpen},
             state::Open,
         },
-        trade::Trade,
+        trade::TradesRead,
     };
     use rustrade_instrument::{
         Side, index::IndexedInstruments, instrument::kind::InstrumentKindDiscriminant,
@@ -706,8 +706,9 @@ mod tests {
         async fn fetch_trades(
             &self,
             _: DateTime<Utc>,
+            _: DateTime<Utc>,
             _: &[InstrumentNameExchange],
-        ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError>
+        ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError>
         {
             unreachable!("ExecutionManager::run does not fetch trades")
         }

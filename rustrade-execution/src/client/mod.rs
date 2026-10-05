@@ -58,7 +58,7 @@ use crate::{
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Open, UnindexedOrderState},
     },
-    trade::Trade,
+    trade::TradesRead,
 };
 use chrono::{DateTime, Utc};
 use futures::Stream;
@@ -343,23 +343,48 @@ where
         Output = Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError>,
     > + Send;
 
-    /// Fetch trades (fills) since `time_since`, optionally filtered by instrument.
+    /// Read the trades (fills) from `start` to `end`, both inclusive, optionally filtered by
+    /// instrument.
     ///
     /// An empty `instruments` slice is the "return all" sentinel: implementations must
     /// return trades across all instruments. When non-empty, only trades for the listed
     /// instruments are returned.
     ///
+    /// # Bounded, resumable reads
+    ///
+    /// One call is bounded by the venue's limits, so it may stop before `end`.
+    /// [`TradesRead::resume`] says whether it did:
+    /// - `None`: every fill in the span the venue still holds was read.
+    /// - `Some(t)`: call again with `start = t` and the same `end` to read on. That read can
+    ///   return again fills the previous one returned, so match them by instrument and
+    ///   [`TradeId`](crate::trade::TradeId).
+    ///
+    /// The caller owns the loop, and with it how many calls, and how long, it spends on a span.
+    /// A `start` after `end` is an empty span, read as no trades and `resume: None`.
+    ///
+    /// # Venue limits
+    ///
+    /// `resume: None` covers what the venue still holds, which can be less than the span:
+    /// - IBKR returns the current trading day's executions only.
+    /// - Hyperliquid keeps only each wallet's 10,000 most recent fills.
+    ///
+    /// Binance needs instruments: an empty slice reads nothing. Each client documents its limits.
+    ///
+    /// # Errors
+    ///
+    /// [`Truncated`](crate::error::ClientError::Truncated) when a read cannot advance, because
+    /// more fills share the span's first moment than one call can read past.
+    ///
     /// The fee asset (`AssetNameExchange`) may be quote, base, or third-party (e.g., BNB).
     /// Use `fees.fees_quote` for quote-equivalent value when available.
-    ///
-    /// Note: `MockExecution` currently ignores `instruments` and always returns all trades.
     fn fetch_trades(
         &self,
-        time_since: DateTime<Utc>,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
         instruments: &[InstrumentNameExchange],
     ) -> impl Future<
         Output = Result<
-            Vec<Trade<AssetNameExchange, InstrumentNameExchange>>,
+            TradesRead<AssetNameExchange, InstrumentNameExchange>,
             UnindexedClientError,
         >,
     > + Send;

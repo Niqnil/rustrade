@@ -16,8 +16,9 @@
 //! # Architecture
 //!
 //! - REST (`InfoClient`): account_snapshot, fetch_balances, fetch_open_orders, fetch_trades.
-//!   `fetch_trades` posts to `/info` through the SDK's HTTP client but parses the response into
-//!   [`common::UserFill`] rather than the SDK's type, which drops `tid` and `feeToken`.
+//!   `fetch_trades` posts `userFillsByTime` to `/info` through the SDK's HTTP client but parses
+//!   the response into [`common::UserFill`] rather than the SDK's type, which drops `tid` and
+//!   `feeToken`.
 //! - REST (`ExchangeClient`): open_order, cancel_order
 //! - WebSocket (`InfoClient` with `with_reconnect`): account_stream via UserFills + OrderUpdates subscriptions
 //!
@@ -119,13 +120,13 @@ use crate::{
         state::{Filled, Open, OrderState, UnindexedOrderState},
     },
     position::{Position, PositionReport},
-    trade::{AssetFees, Trade, TradeId},
+    trade::{AssetFees, Trade, TradeId, TradesRead},
 };
 use chrono::{DateTime, Utc};
 use common::{
     CLOID_REQUIRED, CancelOnDropStream, OpenOrderListing, cid_to_cloid, instrument_to_perp_coin,
     map_tif, millis_to_datetime, open_order_to_order, open_orders, parse_decimal, parse_side,
-    perp_coin_to_instrument, round_to_5_sig_figs, user_fills,
+    perp_coin_to_instrument, round_to_5_sig_figs, span_millis, user_fills_by_time,
 };
 pub use config::{HyperliquidConfig, HyperliquidConfigError};
 use error::{map_order_error, map_sdk_error};
@@ -1033,18 +1034,21 @@ impl ExecutionClient for HyperliquidClient {
             .collect())
     }
 
+    /// Reads the span with `userFillsByTime`, to its end within the call, so the read is always
+    /// complete (`resume: None`). Hyperliquid keeps only each wallet's 10,000 most recent fills,
+    /// so a span reaching further back is read only as far as those go.
     async fn fetch_trades(
         &self,
-        time_since: DateTime<Utc>,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
         instruments: &[InstrumentNameExchange],
-    ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError> {
+    ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError> {
+        let Some((start_ms, end_ms)) = span_millis(start, end) else {
+            return Ok(TradesRead::complete(Vec::new()));
+        };
         let address = self.wallet_h160();
 
-        let fills = user_fills(&self.info_client, address).await?;
-
-        // Clamp to 0 for dates before epoch (shouldn't happen in practice)
-        #[allow(clippy::cast_sign_loss)] // timestamp_millis >= 0 after max(0)
-        let time_since_ms = time_since.timestamp_millis().max(0) as u64;
+        let fills = user_fills_by_time(&self.info_client, address, start_ms, end_ms).await?;
 
         let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
             None
@@ -1056,11 +1060,6 @@ impl ExecutionClient for HyperliquidClient {
 
         let mut result = Vec::new();
         for fill in fills {
-            // Filter by time
-            if fill.time < time_since_ms {
-                continue;
-            }
-
             let instrument = perp_coin_to_instrument(&fill.coin);
 
             if instrument_filter
@@ -1085,6 +1084,9 @@ impl ExecutionClient for HyperliquidClient {
                 warn!(time = fill.time, "Invalid fill timestamp, skipping");
                 continue;
             };
+            if !(start..=end).contains(&time_exchange) {
+                continue;
+            }
 
             result.push(Trade {
                 id: TradeId(format_smolstr!("{}", fill.tid)),
@@ -1106,7 +1108,7 @@ impl ExecutionClient for HyperliquidClient {
             });
         }
 
-        Ok(result)
+        Ok(TradesRead::complete(result))
     }
 }
 

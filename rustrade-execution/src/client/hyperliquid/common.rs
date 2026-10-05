@@ -111,21 +111,83 @@ pub struct UserFill {
     pub fee_token: Option<String>,
 }
 
-/// Fetch `userFills` for `address`, parsing it into [`UserFill`] rather than the SDK's lossy type.
+/// The span `start..=end` in epoch milliseconds, as `userFillsByTime` takes it, or `None` when it
+/// is empty or ends before the epoch. Fill times are whole milliseconds, read from the
+/// millisecond holding `start`; the caller applies the exact span to the fills it reads.
+pub(super) fn span_millis(start: DateTime<Utc>, end: DateTime<Utc>) -> Option<(u64, u64)> {
+    if start > end {
+        return None;
+    }
+    let end_ms = u64::try_from(end.timestamp_millis()).ok()?;
+    let start_ms = u64::try_from(start.timestamp_millis()).unwrap_or(0);
+    Some((start_ms, end_ms))
+}
+
+/// The most fills one `userFillsByTime` response holds.
+const USER_FILLS_PER_RESPONSE: usize = 2_000;
+
+/// Read every fill `address` made from `start_ms` to `end_ms`, both inclusive, in epoch
+/// milliseconds, parsed into [`UserFill`] rather than the SDK's lossy type.
 ///
-/// Issued through the SDK's own [`HttpClient`](hyperliquid_rust_sdk::InfoClient::http_client), so
-/// base URL, TLS configuration and error type are exactly those of every other info request this
-/// client makes — only the response type differs.
+/// `userFillsByTime` returns at most 2,000 fills per response, oldest
+/// first, with both bounds inclusive (observed on mainnet, 2026-10-05). A full response is
+/// followed by a read from its last fill's time, which returns again the fills at that
+/// millisecond already read; those are dropped by coin and `tid`. Hyperliquid keeps only each
+/// wallet's 10,000 most recent fills, so the whole read is a handful of requests, and it cannot
+/// reach a fill older than those.
+///
+/// `userFills`, which takes no span, is not used: it returns only the 2,000 most recent fills, so
+/// a span holding more would come back short without saying so.
 ///
 /// # Errors
 ///
-/// Returns a transport error if the POST fails, or a parse error if the response does not match
+/// Returns a transport error if a POST fails, or a parse error if a response does not match
 /// [`UserFill`] — which includes the case where `tid` has stopped being sent.
-pub async fn user_fills(
+/// [`Truncated`](UnindexedClientError::Truncated) when a full response holds only fills at the
+/// millisecond it was read from, so the read cannot advance.
+pub async fn user_fills_by_time(
     info_client: &hyperliquid_rust_sdk::InfoClient,
     address: ethers::types::H160,
+    start_ms: u64,
+    end_ms: u64,
 ) -> Result<Vec<UserFill>, UnindexedClientError> {
-    user_info(info_client, "userFills", address).await
+    let mut fills: Vec<UserFill> = Vec::new();
+    let mut from = start_ms;
+    loop {
+        // `{:?}` on H160 renders the full checksummed form; see `user_info`.
+        let body = format!(
+            r#"{{"type":"userFillsByTime","user":"{address:?}","startTime":{from},"endTime":{end_ms}}}"#
+        );
+        let page: Vec<UserFill> = info(info_client, "userFillsByTime", body).await?;
+        let full = page.len() >= USER_FILLS_PER_RESPONSE;
+        let Some(last_time) = page.last().map(|fill| fill.time) else {
+            break;
+        };
+        // The fills at `from` that the previous response already returned: a few at most, since
+        // they share one millisecond.
+        let seen: Vec<(String, u64)> = fills
+            .iter()
+            .rev()
+            .take_while(|fill| fill.time == from)
+            .map(|fill| (fill.coin.clone(), fill.tid))
+            .collect();
+        fills.extend(page.into_iter().filter(|fill| {
+            fill.time != from
+                || !seen
+                    .iter()
+                    .any(|(coin, tid)| *tid == fill.tid && *coin == fill.coin)
+        }));
+        if !full {
+            break;
+        }
+        if last_time <= from {
+            return Err(UnindexedClientError::Truncated {
+                fills_read: fills.len(),
+            });
+        }
+        from = last_time;
+    }
+    Ok(fills)
 }
 
 /// One order from the `openOrders` info endpoint, as the venue actually returns it.
@@ -188,8 +250,20 @@ async fn user_info<T: DeserializeOwned>(
 ) -> Result<T, UnindexedClientError> {
     // `{:?}` on H160 renders the checksummed 0x-prefixed form the endpoint expects. `Display`
     // abbreviates the middle of the address ("0x1234…5678"), so it must not be used here.
-    let body = format!(r#"{{"type":"{kind}","user":"{address:?}"}}"#);
+    info(
+        info_client,
+        kind,
+        format!(r#"{{"type":"{kind}","user":"{address:?}"}}"#),
+    )
+    .await
+}
 
+/// POST the info request `body`, of type `kind`, and parse the response as `T`.
+async fn info<T: DeserializeOwned>(
+    info_client: &hyperliquid_rust_sdk::InfoClient,
+    kind: &str,
+    body: String,
+) -> Result<T, UnindexedClientError> {
     let raw = info_client
         .http_client
         .post("/info", body)
@@ -831,7 +905,7 @@ mod info_tests {
     async fn a_fill_carries_the_tid_and_fee_token_the_sdk_type_drops() {
         let (_server, client) = serve(format!("[{DOCUMENTED_FILL}]")).await;
 
-        let fills = user_fills(&client, ethers::types::H160::zero())
+        let fills = user_fills_by_time(&client, ethers::types::H160::zero(), 0, u64::MAX)
             .await
             .unwrap();
 
@@ -859,7 +933,7 @@ mod info_tests {
         ]"#;
         let (_server, client) = serve(sweep.to_string()).await;
 
-        let fills = user_fills(&client, ethers::types::H160::zero())
+        let fills = user_fills_by_time(&client, ethers::types::H160::zero(), 0, u64::MAX)
             .await
             .unwrap();
 
@@ -874,7 +948,7 @@ mod info_tests {
         let without = DOCUMENTED_FILL.replace(r#""feeToken": "USDC","#, "");
         let (_server, client) = serve(format!("[{without}]")).await;
 
-        let fills = user_fills(&client, ethers::types::H160::zero())
+        let fills = user_fills_by_time(&client, ethers::types::H160::zero(), 0, u64::MAX)
             .await
             .unwrap();
 
@@ -889,7 +963,7 @@ mod info_tests {
         let without = DOCUMENTED_FILL.replace(r#""tid": 118906512037719"#, r#""unused": 0"#);
         let (_server, client) = serve(format!("[{without}]")).await;
 
-        let error = user_fills(&client, ethers::types::H160::zero())
+        let error = user_fills_by_time(&client, ethers::types::H160::zero(), 0, u64::MAX)
             .await
             .unwrap_err();
 
@@ -921,7 +995,119 @@ mod info_tests {
 
         // The mock only answers a body carrying the full address, so reaching `Ok` is the
         // assertion.
-        assert!(user_fills(&client, address).await.unwrap().is_empty());
+        assert!(
+            user_fills_by_time(&client, address, 0, u64::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// `userFillsByTime` over `fills`, which are sorted by time, as observed on mainnet: both
+    /// bounds inclusive, oldest first, at most [`USER_FILLS_PER_RESPONSE`] per response.
+    struct FillsByTime {
+        fills: Vec<serde_json::Value>,
+    }
+
+    impl wiremock::Respond for FillsByTime {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["type"], "userFillsByTime");
+            let bound = |name: &str| body[name].as_u64().unwrap();
+            let (start, end) = (bound("startTime"), bound("endTime"));
+            let page: Vec<_> = self
+                .fills
+                .iter()
+                .filter(|fill| (start..=end).contains(&fill["time"].as_u64().unwrap()))
+                .take(USER_FILLS_PER_RESPONSE)
+                .cloned()
+                .collect();
+            ResponseTemplate::new(200).set_body_json(page)
+        }
+    }
+
+    /// `DOCUMENTED_FILL` with `tid` at `time`.
+    fn fill(tid: u64, time: u64) -> serde_json::Value {
+        let mut fill: serde_json::Value = serde_json::from_str(DOCUMENTED_FILL).unwrap();
+        fill["tid"] = tid.into();
+        fill["time"] = time.into();
+        fill
+    }
+
+    async fn serve_fills_by_time(
+        fills: Vec<serde_json::Value>,
+    ) -> (MockServer, hyperliquid_rust_sdk::InfoClient) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/info"))
+            .respond_with(FillsByTime { fills })
+            .mount(&server)
+            .await;
+        let client = info_client_against(server.uri()).await;
+        (server, client)
+    }
+
+    /// A span holding more fills than one response is read completely, each fill once. Three
+    /// fills share each millisecond, so a response ends inside one, and the next, read from that
+    /// millisecond, returns again the fills of it already read.
+    #[tokio::test]
+    async fn a_span_with_more_fills_than_one_response_is_read_whole() {
+        let fills = (0..4_500).map(|tid| fill(tid, 1_000 + tid / 3)).collect();
+        let (server, client) = serve_fills_by_time(fills).await;
+
+        let read = user_fills_by_time(&client, ethers::types::H160::zero(), 0, u64::MAX)
+            .await
+            .unwrap();
+        let tids: Vec<u64> = read.iter().map(|fill| fill.tid).collect();
+        assert_eq!(tids, (0..4_500).collect::<Vec<_>>());
+        assert_eq!(server.received_requests().await.map(|r| r.len()), Some(3));
+
+        // Both bounds are inclusive.
+        let read = user_fills_by_time(&client, ethers::types::H160::zero(), 1_010, 1_019)
+            .await
+            .unwrap();
+        assert_eq!(read.len(), 30);
+    }
+
+    /// A full response of fills all at the millisecond it was read from cannot be read past.
+    #[tokio::test]
+    async fn a_read_that_cannot_advance_is_truncated() {
+        let fills = (0..USER_FILLS_PER_RESPONSE as u64)
+            .map(|tid| fill(tid, 5))
+            .collect();
+        let (_server, client) = serve_fills_by_time(fills).await;
+
+        let error = user_fills_by_time(&client, ethers::types::H160::zero(), 0, u64::MAX)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, UnindexedClientError::Truncated { fills_read: 2_000 }),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_span_is_read_in_whole_milliseconds_and_an_empty_one_not_at_all() {
+        let at = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            span_millis(
+                at("1970-01-01T00:00:01.000900Z"),
+                at("1970-01-01T00:00:02.000900Z")
+            ),
+            Some((1_000, 2_000))
+        );
+        assert_eq!(
+            span_millis(at("1969-12-31T23:59:59Z"), at("1970-01-01T00:00:01Z")),
+            Some((0, 1_000))
+        );
+        assert_eq!(
+            span_millis(at("1970-01-01T00:00:02Z"), at("1970-01-01T00:00:01Z")),
+            None
+        );
+        assert_eq!(
+            span_millis(at("1969-01-01T00:00:00Z"), at("1969-12-31T23:59:59Z")),
+            None
+        );
     }
 
     // ---- client order ids -------------------------------------------------------------------

@@ -116,9 +116,11 @@ impl MockExchange {
                 }
                 MockExchangeRequestKind::FetchTrades {
                     response_tx,
-                    time_since,
+                    start,
+                    end,
                 } => {
-                    let trades = self.venue.trades(time_since);
+                    let mut trades = self.venue.trades(start);
+                    trades.retain(|trade| trade.time_exchange <= end);
                     self.respond_with_latency(response_tx, trades);
                 }
                 MockExchangeRequestKind::CancelOrder {

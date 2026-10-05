@@ -96,11 +96,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retries have failed. Alpaca sends one per failed recovery read, since its read covers the
   whole account. It names the stream's instruments, or `AllInstruments` when the stream was
   opened without a list. A read truncated at 5,000 fills delivers what it read first and
-  reports only the span from just before the last fill read. The engine logs the event at
-  `error!` and changes no state. Reconcile with `fetch_trades(start, scope.instrument_filter())`,
-  matching the result against fills already seen by `TradeId`. Known limitation:
-  Alpaca's `fetch_trades` returns `Truncated` with no fills when more than 5,000 lie after
-  `start`, so such a span has to be reconciled another way. Closes #470.
+  reports only the span from the millisecond of the last fill read. The engine logs the event at
+  `error!` and changes no state. Reconcile with
+  `fetch_trades(start, end, scope.instrument_filter())`, reading on from each call's `resume`
+  until it is `None`, and match the result against fills already seen by instrument and
+  `TradeId`. Closes #470.
 
 ### Changed
 
@@ -113,6 +113,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   old form and logs a warning. Anyone who stored Alpaca `TradeId`s must re-key them. The dedup key that keeps the
   stream and recovery from delivering one fill twice is unchanged and no longer read from
   `TradeId`. Closes #479.
+
+- **`ExecutionClient::fetch_trades` reads a span, in bounded calls the caller resumes**
+  (`rustrade-execution`). **Breaking.** It took `time_since` and returned `Vec<Trade>`. It now
+  takes `start` and `end`, both inclusive, and returns `TradesRead { trades, resume }`:
+  - `resume: None` means the span was read to its end.
+  - `Some(t)` means the call stopped at the venue's bound. Read on with `start = t`, and match
+    the fills read again by instrument and `TradeId`.
+
+  Alpaca's `fetch_trades` failed with `ClientError::Truncated` and returned no fills when more
+  than 5,000 lay after `time_since`, so a busy span could not be read at all. It now returns up
+  to 5,000 per call with a `resume`. `ClientError::Truncated { limit }`, which counted pages,
+  becomes `Truncated { fills_read }`, returned only when a read cannot get past its start.
+  Binance, IBKR, Hyperliquid and the mock client read a span whole, so they always return
+  `resume: None`. The mock client now honours `instruments`, and
+  `MockExchangeRequestKind::FetchTrades` and `MockExchangeRequest::fetch_trades` carry `start` and
+  `end` instead of `time_since`. `hyperliquid::common::user_fills` is replaced by
+  `user_fills_by_time`. To migrate, pass an `end` such as `Utc::now()`, and call again while
+  `resume` is `Some`. Closes #481.
 
 - **`SimulatedVenue` keeps each filled order whole** (`rustrade-execution`). **Breaking.**
   `AccountState::ack_filled` takes the filled `Order` instead of its client order id, so that
@@ -170,6 +188,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Hyperliquid's `fetch_trades` returned at most the 2,000 most recent fills**
+  (`rustrade-execution`). Perp and spot read `userFills`, which holds only a wallet's 2,000 most
+  recent fills, and filtered it by time. So a span with more fills than that came back short, with
+  no error. Both now read the span with `userFillsByTime`, paging past its 2,000-fill responses.
+  Hyperliquid keeps only a wallet's 10,000 most recent fills, so older fills still cannot be read.
+  Closes #484.
+- **Alpaca fill recovery and `fetch_trades` could miss fills in the millisecond they read from**
+  (`rustrade-execution`). Alpaca's account-activities `after` filter compares at millisecond
+  precision, so a read from a time inside a millisecond skipped every later fill in it. Recovery
+  reads from the disconnect, so a fill up to 1 ms after a disconnect could be lost. Reads now start
+  at the beginning of their first millisecond, and the dedup cache absorbs the fills read twice.
+  A read that stops at its page cap resumes from the millisecond of its last fill, since Alpaca
+  orders a millisecond's fills by id rather than by time. Closes #485.
 - **An ended order reported an unknown fill quantity as zero** (`rustrade-execution`).
   **Breaking:** `Cancelled::filled_quantity` and `Expired::filled_quantity` are now
   `Option<Decimal>`. `None` means the venue did not report how much filled, and it is not zero:
