@@ -511,7 +511,7 @@ fn forward_order_updates(
                         %instrument,
                         price = exec.execution.price,
                         shares = exec.execution.shares,
-                        "IBKR corrected an execution; it is reported as TradeAmended once its \
+                        "IBKR corrected an execution; it will be reported as TradeAmended if its \
                          commission report arrives"
                     );
                 }
@@ -1851,6 +1851,9 @@ impl ExecutionClient for IbkrClient {
     /// Its `original` is the revision this stream delivered before, or, for an
     /// execution from before the stream, the revision the correction's id says
     /// it corrects. A revision older than one already delivered is dropped.
+    /// Fills recovered after a gap are delivered originals first, so a
+    /// correction recovered with them comes after every original in the gap,
+    /// not in time order.
     /// Each correction is logged at `warn!` when it arrives, so one that never
     /// gets a commission report is still seen. IB documents no busts.
     ///

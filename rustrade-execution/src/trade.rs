@@ -175,8 +175,8 @@ where
 ///
 /// Apply an amendment idempotently: reverse a given `original` once, and apply a replacement
 /// once by its [`TradeId`]. Whether a venue can send one amendment twice, such as around a
-/// reconnect, is not known for every producer. The library delivers each IBKR correction once,
-/// but does not deduplicate Alpaca's amendments.
+/// reconnect, is not known for every producer. The library delivers each IBKR correction once
+/// per account stream, but does not deduplicate Alpaca's amendments.
 ///
 /// Known producers, as of writing:
 /// - Alpaca's `trade_updates` `trade_bust` and `trade_correct`;

@@ -57,6 +57,13 @@ use std::{
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
+/// How many executions an [`EventSink`] remembers the latest delivered revision of: as many as
+/// the dedup cache remembers fills.
+const REVISIONS_REMEMBERED: NonZeroUsize = match NonZeroUsize::new(DEDUP_CACHE_SIZE) {
+    Some(capacity) => capacity,
+    None => panic!("the dedup cache size is non-zero"),
+};
+
 /// How often the watcher samples the transport state and drains notices.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -212,6 +219,9 @@ pub(super) struct EventSink {
     dedup: SharedDedupCache,
     /// The latest revision delivered of each execution, by [`ExecutionRevision::execution`].
     /// Bounded like the dedup cache, so it forgets the oldest execution rather than grow.
+    ///
+    /// Lock order: `revisions`, then `dedup`, then `tx`. Nothing takes `revisions` while holding
+    /// either of the others.
     revisions: Arc<Mutex<LruCache<SmolStr, DeliveredRevision>>>,
 }
 
@@ -227,13 +237,10 @@ impl EventSink {
         tx: mpsc::UnboundedSender<UnindexedAccountEvent>,
         dedup: SharedDedupCache,
     ) -> Self {
-        // allow(clippy::unwrap_used) — NonZeroUsize::new on a non-zero constant cannot fail.
-        #[allow(clippy::unwrap_used)]
-        let capacity = NonZeroUsize::new(DEDUP_CACHE_SIZE).unwrap();
         Self {
             tx: Arc::new(Mutex::new(Some(tx))),
             dedup,
-            revisions: Arc::new(Mutex::new(LruCache::new(capacity))),
+            revisions: Arc::new(Mutex::new(LruCache::new(REVISIONS_REMEMBERED))),
         }
     }
 
@@ -263,7 +270,7 @@ impl EventSink {
             return self.send_trade(trade);
         };
         let execution = SmolStr::new(revision.execution);
-        let (number, previous) = (revision.revision, revision.previous_id());
+        let number = revision.revision;
 
         // Held through the send, so the stream worker and the recovery watcher cannot interleave
         // two revisions of one execution.
@@ -278,7 +285,7 @@ impl EventSink {
                 return true;
             }
             Some(delivered) => Some(delivered.id.clone()),
-            None => previous,
+            None => revision.previous_id(),
         };
         let id = trade.id.clone();
         let sent = match original {
@@ -423,6 +430,10 @@ impl<'a> RecoveredFills<'a> {
     /// The recovered trades, each execution ahead of its corrections. Executions still without a
     /// commission report move to `pending`, the stream's own buffer, where a report arriving on
     /// the stream later completes them.
+    ///
+    /// The trades are ordered by revision, then by arrival. An execution IB has not corrected is
+    /// revision `01`, so in practice only the corrections move: to the end, after every original
+    /// in the gap, rather than among them in time order.
     pub(super) fn finish(
         self,
         pending: &ExecutionBuffer,
@@ -444,7 +455,7 @@ impl<'a> RecoveredFills<'a> {
         }
         let mut trades = self.trades;
         // Stable, so the executions of each revision keep the order they arrived in.
-        trades.sort_by_key(|trade| revision_of(&trade.id));
+        trades.sort_by_cached_key(|trade| revision_of(&trade.id));
         trades
     }
 }

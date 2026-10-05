@@ -211,12 +211,16 @@ pub(super) fn revision_of(id: &TradeId) -> u32 {
 }
 
 /// `trades` with each execution only at its latest revision, in the order the executions first
-/// appear, so that a corrected execution is read as corrected rather than twice.
+/// appear, so that a corrected execution is read as corrected rather than twice. An execution
+/// read twice at one revision is kept once.
 pub(super) fn keep_latest_revisions(
     trades: Vec<Trade<AssetNameExchange, InstrumentNameExchange>>,
 ) -> Vec<Trade<AssetNameExchange, InstrumentNameExchange>> {
     // The kept position and revision of each execution with a revision.
-    let mut latest = FnvHashMap::<SmolStr, (usize, u32)>::default();
+    let mut latest = FnvHashMap::<SmolStr, (usize, u32)>::with_capacity_and_hasher(
+        trades.len(),
+        Default::default(),
+    );
     let mut kept = Vec::with_capacity(trades.len());
     for trade in trades {
         let Some(revision) = ExecutionRevision::parse(&trade.id.0) else {
@@ -231,21 +235,24 @@ pub(super) fn keep_latest_revisions(
             }
             Entry::Occupied(mut entry) => {
                 let (position, kept_revision) = *entry.get();
-                if revision > kept_revision {
-                    debug!(
-                        corrected = %kept[position].id,
-                        correction = %trade.id,
-                        "IBKR execution corrected; keeping the correction"
-                    );
-                    entry.insert((position, revision));
-                    kept[position] = trade;
-                } else {
-                    debug!(
-                        corrected = %trade.id,
-                        correction = %kept[position].id,
-                        "IBKR execution corrected; keeping the correction"
-                    );
+                if revision == kept_revision {
+                    debug!(exec_id = %trade.id, "IBKR execution read twice; keeping one");
+                    continue;
                 }
+                let (older, newer) = if revision > kept_revision {
+                    entry.insert((position, revision));
+                    (
+                        std::mem::replace(&mut kept[position], trade),
+                        &kept[position],
+                    )
+                } else {
+                    (trade, &kept[position])
+                };
+                debug!(
+                    corrected = %older.id,
+                    correction = %newer.id,
+                    "IBKR execution corrected; keeping the correction"
+                );
             }
         }
     }
@@ -484,6 +491,7 @@ mod tests {
         let kept = keep_latest_revisions(vec![
             trade("a.01.01", 100),
             trade("b.01.01", 200),
+            trade("a.01.02", 101),
             trade("a.01.02", 101),
             trade("plain", 300),
             // An earlier revision after a later one is still the earlier one.
