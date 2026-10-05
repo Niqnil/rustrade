@@ -152,6 +152,72 @@ where
     }
 }
 
+/// A venue's notice that a trade it reported earlier was busted or corrected.
+///
+/// Sent as [`AccountEventKind::TradeAmended`](crate::AccountEventKind::TradeAmended). The
+/// [`Trade`] it amends was delivered as reported and is not withdrawn: positions, PnL and fees
+/// built on it stay wrong until the consumer applies this. Find it by instrument and
+/// [`original`](Self::original), reverse it, and apply the [`kind`](Self::kind)'s replacement, if
+/// any. The library does not act on it beyond reporting it, and the engine only logs it.
+///
+/// A replacement can itself be amended later. That amendment names the replacement's id as its
+/// `original`, so follow amendments by id, one at a time.
+///
+/// # Known limitations
+///
+/// - An order's cumulative filled quantity is not lowered by a bust:
+///   [`Open::is_superseded_by`](crate::order::state::Open::is_superseded_by) refuses a lower
+///   cumulative, so the order stays on what it reported before.
+/// - A venue that recovers missed fills after a reconnect reads fills only, so an amendment sent
+///   while the stream was disconnected is not reported.
+///
+/// Known producers, as of writing: Alpaca's `trade_updates` `trade_bust` and `trade_correct`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Constructor)]
+pub struct TradeAmendment<AssetKey, InstrumentKey> {
+    pub instrument: InstrumentKey,
+    /// The order whose trade was amended.
+    pub order_id: OrderId,
+    /// When the venue amended the trade, or when it was received where the venue does not say.
+    pub time_exchange: DateTime<Utc>,
+    /// The [`TradeId`] of the trade amended, as the venue named it. `None` when the venue's notice
+    /// did not name it: match it to a trade of [`order_id`](Self::order_id) yourself, or
+    /// reconcile with
+    /// [`ExecutionClient::fetch_trades`](crate::client::ExecutionClient::fetch_trades).
+    pub original: Option<TradeId>,
+    pub kind: TradeAmendmentKind<AssetKey, InstrumentKey>,
+}
+
+/// What a [`TradeAmendment`] did to the trade.
+#[non_exhaustive]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize)]
+pub enum TradeAmendmentKind<AssetKey, InstrumentKey> {
+    /// The trade was cancelled: it did not happen.
+    Busted {
+        /// The quantity busted, as a magnitude, when the venue said. A venue that reports it as
+        /// a negative reversal is read as its absolute value.
+        quantity: Option<Decimal>,
+    },
+    /// The trade was replaced, in full.
+    Corrected {
+        /// The trade as corrected: its price and quantity are the corrected values, not
+        /// differences from the original's. It has its own [`TradeId`], which a later amendment
+        /// of it names.
+        replacement: Trade<AssetKey, InstrumentKey>,
+    },
+    /// The trade was corrected, but the venue's notice lacked what a replacement [`Trade`] needs.
+    /// What it did carry is here. Reconcile the trade with
+    /// [`ExecutionClient::fetch_trades`](crate::client::ExecutionClient::fetch_trades).
+    CorrectedUnresolved {
+        /// The id of the replacement, which a later amendment of it names.
+        id: Option<TradeId>,
+        /// The corrected price, if the notice had one.
+        price: Option<Decimal>,
+        /// The corrected quantity, if the notice had one.
+        quantity: Option<Decimal>,
+    },
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct AssetFees<AssetKey> {
     pub asset: AssetKey,

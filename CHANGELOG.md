@@ -102,6 +102,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   until it is `None`, and match the result against fills already seen by instrument and
   `TradeId`. Closes #470.
 
+- **A busted or corrected trade is reported on the account stream** (`rustrade-execution`,
+  `rustrade`). Before, Alpaca's `trade_bust` and `trade_correct` events were dropped at `trace!`,
+  so a busted fill stayed on the stream as a `Trade` and a corrected one stayed at its first price
+  and quantity. The new `AccountEventKind::TradeAmended(TradeAmendment)` carries:
+  - `instrument`, `order_id` and `time_exchange`;
+  - `original`: the `TradeId` of the trade amended, or `None` when the venue did not name it;
+  - `kind`: a `TradeAmendmentKind`, which is `Busted { quantity }`, `Corrected { replacement }`
+    (a full replacement `Trade` with its own `TradeId`), or `CorrectedUnresolved` when the
+    venue's notice lacked what a replacement needs.
+
+  The earlier `Trade` is not withdrawn: find it by instrument and `original`, reverse it, and
+  apply any replacement. The engine logs the event at `error!` and changes no state. Alpaca's
+  frames are read per its Broker API schema (`previous_execution_id` names the fill amended),
+  since the Trading API documents neither event; each is also logged whole at `warn!`. Known
+  limitations: an order's cumulative fill is not lowered by a bust, and an amendment sent while
+  the stream was disconnected is not reported, as fill recovery reads fills only. Alpaca also
+  no longer drops a fill that, after a bust, takes its order back to a cumulative an earlier
+  fill reached: the stream and recovery now recognise a fill by its execution id. Closes #483.
+
 ### Changed
 
 - **An Alpaca fill's `TradeId` is Alpaca's execution id on every path** (`rustrade-execution`).
@@ -110,9 +129,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consumer reconciling with `fetch_trades` could not match fills by `TradeId`. Every path now uses
   the execution id: the stream's `execution_id`, and the part of the activity `id` after `::`,
   which is the same id. A stream fill whose `execution_id` is missing, null or empty keeps the
-  old form and logs a warning. Anyone who stored Alpaca `TradeId`s must re-key them. The dedup key that keeps the
-  stream and recovery from delivering one fill twice is unchanged and no longer read from
-  `TradeId`. Closes #479.
+  old form and logs a warning. Anyone who stored Alpaca `TradeId`s must re-key them. Closes #479.
 
 - **`ExecutionClient::fetch_trades` reads a span, in bounded calls the caller resumes**
   (`rustrade-execution`). **Breaking.** It took `time_since` and returned `Vec<Trade>`. It now

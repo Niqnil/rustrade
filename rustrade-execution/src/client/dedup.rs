@@ -136,7 +136,8 @@ pub(crate) fn dedup_key_from_event(event: &UnindexedAccountEvent) -> Option<Dedu
             Err(_) => None, // error responses don't need dedup
         },
         // FillRecoveryGaveUp has no key either: two give-ups of one span are two failed reads.
-        _ => None, // BalanceSnapshot, BalanceStreamUpdate, InstrumentBalanceUpdate, Snapshot, StreamTerminated, FillRecoveryGaveUp — no dedup needed
+        // TradeAmended has none yet: its only producer, Alpaca, does not replay its stream.
+        _ => None, // BalanceSnapshot, BalanceStreamUpdate, InstrumentBalanceUpdate, Snapshot, StreamTerminated, FillRecoveryGaveUp, TradeAmended — no dedup needed
     }
 }
 
