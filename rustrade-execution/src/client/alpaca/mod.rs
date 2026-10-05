@@ -902,7 +902,8 @@ struct AlpacaStreamMessage<'a> {
 /// Numeric and timestamp fields borrow directly from the `RawValue` input buffer
 /// (`#[serde(borrow)]`), propagating the zero-copy design of `AlpacaStreamMessage`.
 /// This eliminates 4–6 heap allocations per fill event. The borrow is valid because
-/// Alpaca's numeric and timestamp strings contain no JSON escape sequences.
+/// Alpaca's numeric and timestamp strings, and its execution ids (UUIDs), contain no JSON escape
+/// sequences.
 #[derive(Debug, Deserialize)]
 struct AlpacaTradeUpdate<'a> {
     // Short event tag ("fill", "partial_fill", "new", ...) — fits inline.
@@ -940,7 +941,8 @@ struct AlpacaOrderWs<'a> {
     // events, but some event types (e.g. `rejected`) may omit the field.
     // Using Option avoids a deserialization failure that would silently drop
     // the event. A snapshot of a live order reads its absence as nothing filled
-    // yet; a cancel reads it as unknown; the dedup and trade ids read it as "0".
+    // yet; a cancel reads it as unknown; the dedup key, and a fill's fallback trade id, read it
+    // as "0".
     #[serde(borrow)]
     filled_qty: Option<&'a str>,
     // Short enums ("buy"/"sell", "market"/"limit"/..., "day"/"gtc"/..., status)
@@ -2959,7 +2961,9 @@ fn process_ws_text(
 /// order (the WS frame's `order.filled_qty`, the FILL activity's `cum_qty`), so one fill
 /// delivered by both is recognised. It is kept apart from the fill's [`TradeId`], the venue's
 /// execution id: if the two paths ever disagreed on that id, fills would still not be delivered
-/// twice. `normalize` strips trailing zeros, so `"1.00"` and `"1"` give one key.
+/// twice. `normalize` strips trailing zeros, so `"1.00"` and `"1"` give one key. A WS fill whose
+/// `filled_qty` does not parse is keyed at zero, so a second such fill on the same order is taken
+/// for a duplicate even though its execution id differs; `convert_trade_update` warns of it.
 ///
 /// The `format_smolstr!` call heap-allocates for UUID-length order ids (36 chars exceeds
 /// SmolStr's inline limit), which is unavoidable given the key length.
@@ -2986,11 +2990,13 @@ fn early_dedup_key(update: &AlpacaTradeUpdate<'_>) -> SmolStr {
 
 /// The execution id in a FILL activity's `id`, `"{time}::{execution id}"`: the same id the WS
 /// fill carries as `execution_id`. The time prefix is US Eastern local time, so it is never read.
-/// An id without `::` is taken whole.
+/// An id without `::`, or with nothing after it, is taken whole, so it stays unique.
 fn activity_execution_id(activity_id: &str) -> &str {
     activity_id
         .split_once("::")
-        .map_or(activity_id, |(_, execution_id)| execution_id)
+        .map(|(_, execution_id)| execution_id)
+        .filter(|execution_id| !execution_id.is_empty())
+        .unwrap_or(activity_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -4071,7 +4077,7 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
             // The execution id, which the FILL activity for this fill carries too, so the fill has
             // one TradeId however it is delivered. Without it, fall back to the dedup key, which
             // is unique per fill but matches nothing a REST read returns.
-            let trade_id = match update.execution_id {
+            let trade_id = match update.execution_id.filter(|id| !id.is_empty()) {
                 Some(execution_id) => TradeId::new(execution_id),
                 None => {
                     warn!(
@@ -6266,6 +6272,45 @@ mod tests {
         );
     }
 
+    /// A `trade_updates` fill frame as Alpaca sends it: its `execution_id` is the trade's id. One
+    /// that is null, empty or absent falls back to the dedup key.
+    #[test]
+    fn process_ws_text_identifies_a_fill_by_its_execution_id() {
+        let frame = |execution_id: &str| {
+            format!(
+                r#"{{"stream":"trade_updates","data":{{"event":"fill",{execution_id}"order":{{"id":"ord-1","client_order_id":"cid-1","symbol":"SPY","qty":"2","filled_qty":"2","side":"buy","type":"market","time_in_force":"day","status":"filled"}},"price":"100.00","qty":"2","timestamp":"2025-04-18T14:30:00Z"}}}}"#
+            )
+        };
+        let cases = [
+            (
+                r#""execution_id":"524b1902-817e-446c-825b-a9fcfebbc17e","#,
+                "524b1902-817e-446c-825b-a9fcfebbc17e",
+            ),
+            (r#""execution_id":null,"#, "ord-1:2"),
+            (r#""execution_id":"","#, "ord-1:2"),
+            ("", "ord-1:2"),
+        ];
+        for (field, expected) in cases {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+            process_ws_text(
+                &frame(field),
+                &tx,
+                &new_dedup_cache(),
+                &known,
+                &mut ExponentialBackoff::new(),
+            );
+            let Ok(UnindexedAccountEvent {
+                kind: AccountEventKind::Trade(trade),
+                ..
+            }) = rx.try_recv()
+            else {
+                panic!("the fill frame {field:?} produces a Trade");
+            };
+            assert_eq!(trade.id.0.as_str(), expected, "frame {field:?}");
+        }
+    }
+
     /// Pins the string representation of `Decimal::ZERO.normalize()`, which is used
     /// as the dedup key fallback when `filled_qty` is unparseable: `"{order_id}:0"`.
     #[test]
@@ -7614,6 +7659,10 @@ mod tests {
                 "524b1902-817e-446c-825b-a9fcfebbc17e"
             );
             assert_eq!(activity_execution_id("act-1"), "act-1");
+            assert_eq!(
+                activity_execution_id("20261005041849348::"),
+                "20261005041849348::"
+            );
         }
 
         /// One fill carries one `TradeId` however it is delivered: over the account stream, by
@@ -7747,10 +7796,13 @@ mod tests {
         async fn a_fill_already_delivered_over_websocket_is_not_recovered_twice() {
             let dedup = new_dedup_cache();
 
-            // The same execution as it arrived over WebSocket: 2 lots, leaving the order at 5.
+            // The same execution as it arrived over WebSocket: 2 lots, leaving the order at 5. Its
+            // execution id differs from the activity's, so this also pins that dedup does not
+            // rest on the TradeId: were the two ids ever to disagree, the fill is still not
+            // delivered twice.
             let update = AlpacaTradeUpdate {
                 event: SmolStr::new("partial_fill"),
-                execution_id: None,
+                execution_id: Some("exec-a"),
                 order: super::make_order_ws("ord-1", "SPY", "buy", "5"),
                 price: Some("100.00"),
                 qty: Some("2"),
@@ -7763,7 +7815,12 @@ mod tests {
             );
 
             let events = drive_recover_fills_with(
-                vec![activity_json("act-1", "ord-1", "2", Some("5"))],
+                vec![activity_json(
+                    "20250418103000000::exec-b",
+                    "ord-1",
+                    "2",
+                    Some("5"),
+                )],
                 dedup,
                 &KnownLiveOrders::shared(ExchangeId::AlpacaBroker),
             )
