@@ -3074,16 +3074,17 @@ fn process_ws_text(
                     raw = %msg.data.get(),
                     "Alpaca WS: a fill reported earlier was amended — reporting it as TradeAmended"
                 );
-                // A correction delivers its execution as the replacement trade. Should Alpaca
-                // also list it as a FILL activity, recovery must not deliver it again.
-                if update.event == "trade_correct"
-                    && let Some(execution_id) = ws_execution_id(&update)
-                {
-                    record_execution(dedup, execution_id);
-                }
             }
 
             for event in convert_trade_update(update).into_iter().flatten() {
+                // A resolved correction delivers its execution as the replacement trade. Should
+                // Alpaca also list it as a FILL activity, recovery must not deliver it again. An
+                // unresolved one delivered no trade, so recovery may.
+                if let AccountEventKind::TradeAmended(amendment) = &event.kind
+                    && let TradeAmendmentKind::Corrected { replacement } = &amendment.kind
+                {
+                    record_execution(dedup, &replacement.id.0);
+                }
                 let known = KnownLiveOrders::observes(&event.kind).then(|| {
                     let mut known = known.lock();
                     known.observe(&event);
@@ -8663,25 +8664,21 @@ mod tests {
             }
         }
 
-        /// A correction's execution was delivered as the replacement trade, so recovery does not
-        /// deliver it again should Alpaca list it as a FILL activity.
-        #[tokio::test]
-        async fn a_corrected_execution_is_not_recovered_again() {
+        /// Streams a `trade_correct` with `fields` (its execution id `exec-c`), then recovers the
+        /// FILL activity of `exec-c` through the same dedup cache.
+        async fn recover_after_correction(fields: &str) -> Vec<UnindexedAccountEvent> {
             let (tx, _rx) = mpsc::unbounded_channel();
             let dedup = new_dedup_cache();
             let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
             process_ws_text(
-                &super::amendment_frame(
-                    "trade_correct",
-                    r#""execution_id":"exec-c","previous_execution_id":"exec-a","price":"101.50","qty":"2","#,
-                ),
+                &super::amendment_frame("trade_correct", fields),
                 &tx,
                 &dedup,
                 &known,
                 &mut ExponentialBackoff::new(),
             );
 
-            let events = drive_recover_fills_with(
+            drive_recover_fills_with(
                 vec![activity_json(
                     "20250418103100000::exec-c",
                     "ord-1",
@@ -8691,12 +8688,32 @@ mod tests {
                 dedup,
                 &known,
             )
-            .await;
+            .await
+        }
 
+        /// A correction's execution was delivered as the replacement trade, so recovery does not
+        /// deliver it again should Alpaca list it as a FILL activity.
+        #[tokio::test]
+        async fn a_corrected_execution_is_not_recovered_again() {
+            let events = recover_after_correction(
+                r#""execution_id":"exec-c","previous_execution_id":"exec-a","price":"101.50","qty":"2","#,
+            )
+            .await;
             assert!(
                 events.is_empty(),
                 "the corrected execution was delivered as the replacement, got {events:?}"
             );
+        }
+
+        /// An unresolved correction delivered no trade, so recovery still delivers its execution.
+        #[tokio::test]
+        async fn an_unresolved_correction_does_not_keep_its_execution_from_recovery() {
+            let events = recover_after_correction(
+                r#""execution_id":"exec-c","previous_execution_id":"exec-a","qty":"2","#,
+            )
+            .await;
+            let ids: Vec<_> = events.iter().map(|e| trade_of(e).id.0.as_str()).collect();
+            assert_eq!(ids, vec!["exec-c"]);
         }
 
         /// A different execution that takes the order to a cumulative already seen, as after a
