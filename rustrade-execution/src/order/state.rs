@@ -186,7 +186,9 @@ impl Open {
     ///
     /// A venue that *reduces* a reported cumulative -- busting or correcting an execution -- has
     /// its correction refused, since a decrease is indistinguishable from out-of-sequence
-    /// delivery. The order is left on the higher cumulative until a later snapshot moves it.
+    /// delivery. The order is left on the higher cumulative until a later snapshot moves it. A
+    /// venue that reports the bust or correction itself does so as
+    /// [`AccountEventKind::TradeAmended`](crate::AccountEventKind::TradeAmended).
     ///
     /// A caller replacing `self` with `update` wholesale adopts `update`'s `time_exchange` too,
     /// which may be the earlier of the two. That is deliberate: an `Open` is one state the venue

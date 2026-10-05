@@ -382,6 +382,21 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                 );
                 None
             }
+            AccountEventKind::TradeAmended(amendment) => {
+                // The amended trade was applied as first reported, so positions and PnL built on
+                // it are wrong until it is reversed. Reversing it is the consumer's policy (the
+                // engine holds no ledger of trades by id to reverse); the engine only makes it
+                // loud.
+                error!(
+                    exchange = ?event.exchange,
+                    instrument = ?amendment.instrument,
+                    order_id = %amendment.order_id,
+                    original = ?amendment.original,
+                    kind = ?amendment.kind,
+                    "venue amended a trade it reported earlier — state built on that trade is stale",
+                );
+                None
+            }
             _ => None,
         };
 
@@ -565,6 +580,46 @@ mod tests {
                 DateTime::<Utc>::MAX_UTC,
                 6,
                 FillRecoveryFailure::TimedOut { timeout_secs: 30 },
+            )),
+        );
+
+        assert_eq!(state.update_from_account(&event), None);
+        assert_eq!(state.assets, before.assets);
+        assert_eq!(state.instruments, before.instruments);
+        assert_eq!(state.trading, before.trading);
+    }
+
+    /// A trade amendment is reported, not acted on: no position exits and the account state is
+    /// unchanged. Reversing the trade is the consumer's policy.
+    #[test]
+    fn a_trade_amendment_changes_no_account_state() {
+        use crate::engine::state::{
+            global::DefaultGlobalData, instrument::data::DefaultInstrumentMarketData,
+        };
+        use chrono::{DateTime, Utc};
+        use rust_decimal::Decimal;
+        use rustrade_execution::{
+            order::id::OrderId,
+            trade::{TradeAmendment, TradeAmendmentKind, TradeId},
+        };
+
+        let instruments = IndexedInstruments::new([test_instrument(EXECUTION, "btc", "usdt")]);
+        let mut state: EngineState<DefaultGlobalData, DefaultInstrumentMarketData> =
+            EngineState::builder(&instruments, DefaultGlobalData, |_| {
+                DefaultInstrumentMarketData::default()
+            })
+            .build();
+        let before = state.clone();
+        let event = AccountEvent::new(
+            ExchangeIndex::new(0),
+            AccountEventKind::TradeAmended(TradeAmendment::new(
+                InstrumentIndex::new(0),
+                OrderId::new("ord-1"),
+                DateTime::<Utc>::MIN_UTC,
+                Some(TradeId::new("t-1")),
+                TradeAmendmentKind::Busted {
+                    quantity: Some(Decimal::ONE),
+                },
             )),
         );
 

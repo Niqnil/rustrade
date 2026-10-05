@@ -14,7 +14,7 @@ use crate::{
         request::OrderResponseCancel,
         state::{InactiveOrderState, OrderState, UnindexedOrderState},
     },
-    trade::{AssetFees, Trade},
+    trade::{AssetFees, Trade, TradeAmendment, TradeAmendmentKind},
 };
 use derive_more::Constructor;
 use rustrade_instrument::{
@@ -80,6 +80,9 @@ impl AccountEventIndexer {
             }
             AccountEventKind::FillRecoveryGaveUp(gap) => {
                 AccountEventKind::FillRecoveryGaveUp(self.fill_recovery_gap(gap)?)
+            }
+            AccountEventKind::TradeAmended(amendment) => {
+                AccountEventKind::TradeAmended(self.trade_amendment(amendment)?)
             }
         };
 
@@ -484,6 +487,46 @@ impl AccountEventIndexer {
         }
     }
 
+    /// Index a [`TradeAmendment`]. A replacement trade is indexed as [`trade`](Self::trade) indexes
+    /// one, so an amendment fails where its trade would.
+    pub fn trade_amendment(
+        &self,
+        amendment: TradeAmendment<AssetNameExchange, InstrumentNameExchange>,
+    ) -> Result<TradeAmendment<AssetIndex, InstrumentIndex>, IndexError> {
+        let TradeAmendment {
+            instrument,
+            order_id,
+            time_exchange,
+            original,
+            kind,
+        } = amendment;
+
+        let instrument = self.map.find_instrument_index(&instrument)?;
+        let kind = match kind {
+            TradeAmendmentKind::Busted { quantity } => TradeAmendmentKind::Busted { quantity },
+            TradeAmendmentKind::Corrected { replacement } => TradeAmendmentKind::Corrected {
+                replacement: self.trade(replacement)?,
+            },
+            TradeAmendmentKind::CorrectedUnresolved {
+                id,
+                price,
+                quantity,
+            } => TradeAmendmentKind::CorrectedUnresolved {
+                id,
+                price,
+                quantity,
+            },
+        };
+
+        Ok(TradeAmendment {
+            instrument,
+            order_id,
+            time_exchange,
+            original,
+            kind,
+        })
+    }
+
     /// Index a trade, converting fee asset and computing `fees_quote`.
     ///
     /// Computes `fees_quote` based on fee asset relationship to instrument:
@@ -654,6 +697,103 @@ mod tests {
             ]))
             .is_err(),
             "an unmapped instrument fails the whole give-up"
+        );
+    }
+
+    /// A trade amendment indexes its instrument, and a corrected one its replacement as a trade
+    /// is indexed. An unmapped instrument fails it.
+    #[test]
+    fn account_event_indexes_a_trade_amendment() {
+        use crate::{
+            order::id::{OrderId, StrategyId},
+            trade::TradeId,
+        };
+        use rust_decimal::Decimal;
+        use rustrade_instrument::Side;
+
+        let indexer = binance_indexer();
+        let time = DateTime::<Utc>::MIN_UTC;
+        let amended = |instrument: &str, kind| {
+            UnindexedAccountEvent::new(
+                ExchangeId::BinanceSpot,
+                AccountEventKind::TradeAmended(TradeAmendment::new(
+                    InstrumentNameExchange::new(instrument),
+                    OrderId::new("ord-1"),
+                    time,
+                    Some(TradeId::new("t-1")),
+                    kind,
+                )),
+            )
+        };
+        let index_of = |event| match indexer.account_event(event) {
+            Ok(AccountEvent {
+                kind: AccountEventKind::TradeAmended(amendment),
+                ..
+            }) => Ok(amendment),
+            Ok(other) => panic!("expected TradeAmended, got {other:?}"),
+            Err(error) => Err(error),
+        };
+        let Ok(btc) = indexer
+            .map
+            .find_instrument_index(&InstrumentNameExchange::new("BTC_USDT"))
+        else {
+            panic!("BTC_USDT is mapped");
+        };
+
+        assert_eq!(
+            index_of(amended(
+                "BTC_USDT",
+                TradeAmendmentKind::Busted {
+                    quantity: Some(Decimal::ONE)
+                }
+            )),
+            Ok(TradeAmendment::new(
+                btc,
+                OrderId::new("ord-1"),
+                time,
+                Some(TradeId::new("t-1")),
+                TradeAmendmentKind::Busted {
+                    quantity: Some(Decimal::ONE)
+                },
+            ))
+        );
+
+        let replacement = Trade::new(
+            TradeId::new("t-2"),
+            OrderId::new("ord-1"),
+            InstrumentNameExchange::new("BTC_USDT"),
+            StrategyId::unknown(),
+            time,
+            Side::Buy,
+            Decimal::TEN,
+            Decimal::ONE,
+            None,
+            AssetFees::new(AssetNameExchange::new("USDT"), Decimal::ONE, None),
+        );
+        let Ok(TradeAmendment {
+            kind: TradeAmendmentKind::Corrected { replacement },
+            ..
+        }) = index_of(amended(
+            "BTC_USDT",
+            TradeAmendmentKind::Corrected { replacement },
+        ))
+        else {
+            panic!("a correction indexes to a correction");
+        };
+        assert_eq!(replacement.instrument, btc);
+        assert_eq!(
+            replacement.fees.fees_quote,
+            Some(Decimal::ONE),
+            "indexed as a trade is, fees and all"
+        );
+
+        assert!(
+            index_of(amended(
+                "ETHUSDT",
+                TradeAmendmentKind::Busted { quantity: None }
+            ))
+            .is_err(),
+            "an unmapped instrument fails the amendment"
         );
     }
 

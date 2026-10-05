@@ -264,6 +264,13 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
     /// The engine logs it and changes no state; reconciling is the consumer's policy. See
     /// [`FillRecoveryGap`] for what the span covers and how to read it again.
     FillRecoveryGaveUp(FillRecoveryGap<InstrumentKey>),
+
+    /// A trade delivered earlier was busted or corrected by the venue.
+    ///
+    /// The earlier [`Trade`](Self::Trade) is not withdrawn, so state built on it is wrong until
+    /// the consumer applies this. The engine logs it and changes no state; reversing the trade is
+    /// the consumer's policy. See [`TradeAmendment`](trade::TradeAmendment).
+    TradeAmended(trade::TradeAmendment<AssetKey, InstrumentKey>),
 }
 
 impl<ExchangeKey, AssetKey, InstrumentKey> AccountEvent<ExchangeKey, AssetKey, InstrumentKey>
