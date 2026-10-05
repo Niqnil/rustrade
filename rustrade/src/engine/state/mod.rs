@@ -540,4 +540,37 @@ mod tests {
         assert_eq!(execution.exchange, EXECUTION);
         assert_eq!(execution.instruments.len(), 1);
     }
+    /// A given-up fill recovery is reported, not acted on: no position exits and the account
+    /// state is unchanged. What to do about the missing fills is the consumer's policy.
+    #[test]
+    fn a_fill_recovery_give_up_changes_no_account_state() {
+        use crate::engine::state::{
+            global::DefaultGlobalData, instrument::data::DefaultInstrumentMarketData,
+        };
+        use chrono::{DateTime, Utc};
+        use rustrade_execution::{FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope};
+
+        let instruments = IndexedInstruments::new([test_instrument(EXECUTION, "btc", "usdt")]);
+        let mut state: EngineState<DefaultGlobalData, DefaultInstrumentMarketData> =
+            EngineState::builder(&instruments, DefaultGlobalData, |_| {
+                DefaultInstrumentMarketData::default()
+            })
+            .build();
+        let before = state.clone();
+        let event = AccountEvent::new(
+            ExchangeIndex::new(0),
+            AccountEventKind::FillRecoveryGaveUp(FillRecoveryGap::new(
+                FillRecoveryScope::Instruments(vec![InstrumentIndex::new(0)]),
+                DateTime::<Utc>::MIN_UTC,
+                DateTime::<Utc>::MAX_UTC,
+                6,
+                FillRecoveryFailure::TimedOut { timeout_secs: 30 },
+            )),
+        );
+
+        assert_eq!(state.update_from_account(&event), None);
+        assert_eq!(state.assets, before.assets);
+        assert_eq!(state.instruments, before.instruments);
+        assert_eq!(state.trading, before.trading);
+    }
 }

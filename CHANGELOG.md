@@ -96,10 +96,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retries have failed. Alpaca sends one per failed recovery read, since its read covers the
   whole account. It names the stream's instruments, or `AllInstruments` when the stream was
   opened without a list. A read truncated at 5,000 fills delivers what it read first and
-  reports only the span from the last fill read. The engine logs the event at `error!` and
-  changes no state. Reconcile with `fetch_trades(start, scope.instrument_filter())`, matching the
-  result against fills already seen: on Alpaca by order and quantity until #479, since there
-  `fetch_trades` and the stream give a fill different `TradeId`s. Closes #470.
+  reports only the span from just before the last fill read. The engine logs the event at
+  `error!` and changes no state. Reconcile with `fetch_trades(start, scope.instrument_filter())`,
+  matching the result against fills already seen: on Alpaca by order and quantity until #479,
+  since there `fetch_trades` and the stream give a fill different `TradeId`s. Known limitation:
+  Alpaca's `fetch_trades` returns `Truncated` with no fills when more than 5,000 lie after
+  `start`, so such a span has to be reconciled another way. Closes #470.
 
 ### Changed
 

@@ -31,9 +31,11 @@ use thiserror::Error;
 ///   instead.
 /// - Fills after `end` arrived live, so a read that runs past `end`, as `fetch_trades` does,
 ///   returns them again.
-/// - A span can hold more fills than one `fetch_trades` call returns. Alpaca's read stops at
-///   5,000 fills and returns [`Truncated`](crate::error::ClientError::Truncated); read on from the
-///   last fill returned.
+/// - A span can hold more fills than `fetch_trades` can return. Alpaca's `fetch_trades` reads
+///   every fill from `start` to now, with no end bound. When there are more than 5,000, it returns
+///   [`Truncated`](crate::error::ClientError::Truncated) with none of them, so a span with more
+///   fills than that after its `start` cannot be read with it. This is a known limitation:
+///   reconcile such a span another way, for example from the venue's own account activity.
 ///
 /// # Delivery
 ///
@@ -49,7 +51,8 @@ pub struct FillRecoveryGap<InstrumentKey> {
     pub start: DateTime<Utc>,
     /// The last moment of the span, inclusive.
     pub end: DateTime<Utc>,
-    /// How many times the span was read before it was given up: 1 when the venue does not retry.
+    /// How many times the span was read before it was given up: 1 when the venue does not retry
+    /// it. Retries within one read, such as after a rate limit, are not counted.
     pub attempts: u32,
     /// Why the last read failed.
     pub reason: FillRecoveryFailure,
@@ -59,7 +62,8 @@ pub struct FillRecoveryGap<InstrumentKey> {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub enum FillRecoveryScope<InstrumentKey> {
-    /// These instruments, never an empty list.
+    /// These instruments. A venue never sends an empty list; note that
+    /// [`instrument_filter`](Self::instrument_filter) would pass one on as every instrument.
     Instruments(Vec<InstrumentKey>),
     /// Every instrument on the account: the read covered all of them, as Alpaca's does for a
     /// stream opened without an instrument list.
@@ -94,7 +98,8 @@ pub enum FillRecoveryFailure {
     },
 
     /// The read stopped at the venue integration's cap on how many fills one read returns. The
-    /// fills it read were delivered, and the span starts at the last of them.
+    /// fills it read were delivered, and the span starts just before the last of them, so fills
+    /// sharing its time that the read cut off are inside it.
     #[error("truncated after {fills_read} fills")]
     Truncated {
         /// How many fills the read returned before it stopped, counted across the account,

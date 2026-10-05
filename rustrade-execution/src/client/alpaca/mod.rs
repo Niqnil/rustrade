@@ -1498,7 +1498,7 @@ impl ExecutionClient for AlpacaClient {
     /// The read is made once, with no retry. When it fails, times out, or stops at 5,000 fills,
     /// the stream sends one [`AccountEventKind::FillRecoveryGaveUp`] covering the stream's
     /// `instruments`, or every instrument when that list is empty. A truncated read delivers the
-    /// fills it read first, and the event's span starts at the last of them.
+    /// fills it read first, and the event's span starts just before the last of them.
     ///
     /// # Lifecycle event deduplication
     ///
@@ -2466,53 +2466,18 @@ async fn connection_manager(
         // captured by the already-connected WS session. The dedup cache prevents
         // duplicates between recovered REST fills and live WS events.
         if let Some(dt) = disconnect_time.take() {
-            let base = config.rest_base_url();
-            // The live stream is already subscribed, so every fill after this arrives live.
-            let recovery_start = Utc::now();
-            let outcome = match tokio::time::timeout(
+            recover_fills_or_report(
+                &http,
+                &rate_limiter,
+                &instruments,
+                config.rest_base_url(),
+                dt,
                 Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS),
-                recover_fills(
-                    &http,
-                    &rate_limiter,
-                    &instruments,
-                    base,
-                    dt,
-                    &tx,
-                    &dedup,
-                    &known,
-                ),
+                &tx,
+                &dedup,
+                &known,
             )
-            .await
-            {
-                Ok(outcome) => outcome,
-                // One account-wide activities query serves every instrument, so a timeout can
-                // have missed fills in any of them: name the requested set. Nothing was forwarded,
-                // since recovery sends its fills only after the read has finished.
-                Err(_) => {
-                    warn!(
-                        timeout_secs = FILL_RECOVERY_TIMEOUT_SECS,
-                        instruments = ?instruments
-                            .iter()
-                            .map(|instrument| instrument.name().as_str())
-                            .collect::<Vec<_>>(),
-                        "Alpaca fill recovery timed out — fills since the disconnect may be \
-                         missing for any of the instruments (every instrument when the list is \
-                         empty)"
-                    );
-                    Err(UnreadFills {
-                        start: dt,
-                        reason: FillRecoveryFailure::TimedOut {
-                            timeout_secs: FILL_RECOVERY_TIMEOUT_SECS,
-                        },
-                    })
-                }
-            };
-            if let Err(unread) = outcome
-                && let Some(gave_up) = fill_recovery_gave_up(&instruments, unread, recovery_start)
-                && tx.send(gave_up).is_err()
-            {
-                debug!("Alpaca fill recovery: consumer dropped before the give-up was sent");
-            }
+            .await;
             // Only the instruments this stream recovers fills for, every one when none is named.
             let held = {
                 let known = known.lock();
@@ -3028,32 +2993,98 @@ struct UnreadFills {
     reason: FillRecoveryFailure,
 }
 
+/// Recover the fills missed since `disconnect` ([`recover_fills`]) within `timeout`, and send an
+/// [`AccountEventKind::FillRecoveryGaveUp`] for those the read did not deliver, after the fills
+/// it did.
+async fn recover_fills_or_report(
+    http: &reqwest::Client,
+    rate_limiter: &RateLimitTracker,
+    instruments: &[InstrumentNameExchange],
+    base: &str,
+    disconnect: DateTime<Utc>,
+    timeout: Duration,
+    tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
+    dedup: &SharedDedupCache,
+    known: &SharedKnownLiveOrders,
+) {
+    // The live stream is already subscribed, so every fill after this arrives live.
+    let recovery_start = Utc::now();
+    let outcome = match tokio::time::timeout(
+        timeout,
+        recover_fills(
+            http,
+            rate_limiter,
+            instruments,
+            base,
+            disconnect,
+            tx,
+            dedup,
+            known,
+        ),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        // One account-wide activities query serves every instrument, so a timeout can have missed
+        // fills in any of them: name the requested set. Nothing was forwarded, since recovery
+        // sends its fills only after the read has finished.
+        Err(_) => {
+            warn!(
+                timeout_secs = timeout.as_secs(),
+                instruments = ?instruments
+                    .iter()
+                    .map(|instrument| instrument.name().as_str())
+                    .collect::<Vec<_>>(),
+                "Alpaca fill recovery timed out — fills since the disconnect may be missing for \
+                 any of the instruments (every instrument when the list is empty)"
+            );
+            Err(UnreadFills {
+                start: disconnect,
+                reason: FillRecoveryFailure::TimedOut {
+                    timeout_secs: timeout.as_secs(),
+                },
+            })
+        }
+    };
+    if let Err(unread) = outcome
+        && tx
+            .send(fill_recovery_gave_up(instruments, unread, recovery_start))
+            .is_err()
+    {
+        debug!("Alpaca fill recovery: consumer dropped before the give-up was sent");
+    }
+}
+
 /// The [`AccountEventKind::FillRecoveryGaveUp`] for `unread`, whose recovery began at `end`,
 /// on a stream opened with `instruments`, every instrument when empty. Alpaca does not retry the
 /// read, so it was read once.
 ///
-/// `None` when the read reached past `end`: a truncated read can return fills from after the
-/// recovery began, and every fill after `end` arrived live, so nothing is missing.
+/// A truncated read can return fills stamped after `end`, by Alpaca's clock, which may run ahead
+/// of this host's. The span then ends at its start rather than before it: the event is still
+/// sent, since a report with nothing left to read costs the consumer one read, while a report
+/// withheld on a clock comparison would be a silent loss.
 fn fill_recovery_gave_up(
     instruments: &[InstrumentNameExchange],
     unread: UnreadFills,
     end: DateTime<Utc>,
-) -> Option<UnindexedAccountEvent> {
+) -> UnindexedAccountEvent {
     let UnreadFills { start, reason } = unread;
-    if start > end {
-        info!(%start, %end, "Alpaca fill recovery read past the recovery start; nothing is missing");
-        return None;
-    }
     // One account-wide read serves every instrument, so one event covers them all.
     let scope = if instruments.is_empty() {
         FillRecoveryScope::AllInstruments
     } else {
         FillRecoveryScope::Instruments(instruments.to_vec())
     };
-    Some(UnindexedAccountEvent::new(
+    UnindexedAccountEvent::new(
         ExchangeId::AlpacaBroker,
-        AccountEventKind::FillRecoveryGaveUp(FillRecoveryGap::new(scope, start, end, 1, reason)),
-    ))
+        AccountEventKind::FillRecoveryGaveUp(FillRecoveryGap::new(
+            scope,
+            start,
+            end.max(start),
+            1,
+            reason,
+        )),
+    )
 }
 
 /// Fetch fills missed during a WS disconnect, since `after`, and forward through the dedup cache.
@@ -3061,8 +3092,8 @@ fn fill_recovery_gave_up(
 /// A fill that brings an order to its full quantity ends it in `known`, so a reconnect's check
 /// does not report it again.
 ///
-/// Returns the fills it did not deliver: all of them when the read fails, and those after the
-/// last one read when the read stops at [`MAX_ACTIVITY_PAGES`]. The fills it read are sent
+/// Returns the fills it did not deliver: all of them when the read fails, and those from just
+/// before the last one read when the read stops at [`MAX_ACTIVITY_PAGES`]. The fills it read are sent
 /// first. A consumer that drops the stream part-way gets `Ok`, as there is no one to report to.
 async fn recover_fills(
     http: &reqwest::Client,
@@ -3098,13 +3129,14 @@ async fn recover_fills(
 
     // The read is account-wide and ascending, so a truncated one has every fill up to its last
     // one, whatever the instrument. Fills sharing that last time may be cut, so the unread span
-    // starts at it, inclusive; the dedup cache absorbs those read twice. A time that does not
-    // parse widens the span back to the disconnect, never narrows it.
+    // starts just before it: a microsecond earlier, so a read from there with Alpaca's `after`
+    // reaches them whether `after` is inclusive or exclusive. The dedup cache absorbs those read
+    // twice. A time that does not parse widens the span back to the disconnect, never narrows it.
     let unread = page.truncated.then(|| {
         let start = activities
             .last()
             .and_then(|activity| parse_timestamp(&activity.transaction_time))
-            .unwrap_or(after);
+            .map_or(after, |last| last - chrono::Duration::microseconds(1));
         error!(
             max_pages = MAX_ACTIVITY_PAGES,
             fills_read = activities.len(),
@@ -7359,14 +7391,15 @@ mod tests {
         }
 
         /// A recovery read that stops at the page cap delivers the fills it read, then leaves
-        /// those from the last one's time on unread. A last time that does not parse leaves
-        /// everything from the disconnect unread instead.
+        /// those from just before the last one's time on unread. A last time that does not parse
+        /// leaves everything from the disconnect unread instead.
         #[tokio::test]
         async fn a_truncated_recovery_read_delivers_what_it_read_and_leaves_the_rest_unread() {
+            let last: DateTime<Utc> = "2025-04-18T14:30:00Z".parse().expect("valid time");
             let cases = [
                 (
                     "2025-04-18T14:30:00Z",
-                    "2025-04-18T14:30:00Z".parse().expect("valid time"),
+                    last - chrono::Duration::microseconds(1),
                 ),
                 ("not a time", recovery_after()),
             ];
@@ -7420,26 +7453,132 @@ mod tests {
                 };
                 assert_eq!(
                     fill_recovery_gave_up(&instruments, unread, end),
-                    Some(UnindexedAccountEvent::new(
+                    UnindexedAccountEvent::new(
                         ExchangeId::AlpacaBroker,
                         AccountEventKind::FillRecoveryGaveUp(FillRecoveryGap::new(
                             scope, start, end, 1, reason,
                         )),
-                    ))
+                    )
                 );
             }
         }
 
-        /// A truncated read can reach past the moment recovery began. Every fill after that
-        /// arrived live, so nothing is missing and nothing is reported.
+        /// A truncated read can return fills stamped after the moment recovery began, by a venue
+        /// clock ahead of this host's. The give-up is still sent, its span ending at its start
+        /// rather than before it.
         #[test]
-        fn a_read_that_reached_past_the_recovery_start_reports_nothing() {
+        fn a_read_that_reached_past_the_recovery_start_still_reports() {
             let end = recovery_after();
+            let start = end + chrono::Duration::seconds(1);
             let unread = UnreadFills {
-                start: end + chrono::Duration::seconds(1),
+                start,
                 reason: FillRecoveryFailure::Truncated { fills_read: 5_000 },
             };
-            assert_eq!(fill_recovery_gave_up(&[], unread, end), None);
+            let event = fill_recovery_gave_up(&[], unread, end);
+            let AccountEventKind::FillRecoveryGaveUp(gave_up) = event.kind else {
+                panic!("expected FillRecoveryGaveUp, got {event:?}");
+            };
+            assert_eq!((gave_up.start, gave_up.end), (start, start));
+        }
+
+        /// Run `recover_fills_or_report` for `instruments` against `server` within `timeout`,
+        /// returning every event it sent.
+        async fn recover_fills_or_report_from(
+            server: &MockServer,
+            instruments: &[InstrumentNameExchange],
+            timeout: Duration,
+        ) -> Vec<UnindexedAccountEvent> {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            recover_fills_or_report(
+                &reqwest::Client::new(),
+                &RateLimitTracker::new(),
+                instruments,
+                &server.uri(),
+                recovery_after(),
+                timeout,
+                &tx,
+                &new_dedup_cache(),
+                &KnownLiveOrders::shared(ExchangeId::AlpacaBroker),
+            )
+            .await;
+            drop(tx);
+            std::iter::from_fn(|| rx.try_recv().ok()).collect()
+        }
+
+        /// A recovery that times out forwards nothing and reports every fill since the disconnect,
+        /// for the stream's instruments.
+        #[tokio::test]
+        async fn a_timed_out_recovery_reports_every_fill_since_the_disconnect() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!([]))
+                        .set_delay(Duration::from_secs(3_600)),
+                )
+                .mount(&server)
+                .await;
+            let spy = InstrumentNameExchange::new("SPY");
+
+            let events = recover_fills_or_report_from(
+                &server,
+                std::slice::from_ref(&spy),
+                Duration::from_millis(50),
+            )
+            .await;
+
+            let [event] = events.as_slice() else {
+                panic!("only the give-up is sent: {events:?}");
+            };
+            let AccountEventKind::FillRecoveryGaveUp(gave_up) = &event.kind else {
+                panic!("expected FillRecoveryGaveUp, got {event:?}");
+            };
+            assert_eq!(gave_up.scope, FillRecoveryScope::Instruments(vec![spy]));
+            assert_eq!(gave_up.start, recovery_after(), "from the disconnect");
+            assert!(gave_up.end >= gave_up.start);
+            assert_eq!(gave_up.attempts, 1);
+            assert!(
+                matches!(gave_up.reason, FillRecoveryFailure::TimedOut { .. }),
+                "{:?}",
+                gave_up.reason
+            );
+        }
+
+        /// A truncated recovery sends every fill it read before the give-up, so a consumer sees the
+        /// report after what was delivered.
+        #[tokio::test]
+        async fn a_truncated_recovery_reports_after_the_fills_it_read() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(make_activities_json(ALPACA_MAX_ACTIVITIES, "act")),
+                )
+                .mount(&server)
+                .await;
+
+            let events = recover_fills_or_report_from(&server, &[], Duration::from_secs(30)).await;
+
+            let Some((last, fills)) = events.split_last() else {
+                panic!("events are sent");
+            };
+            assert_eq!(fills.len(), MAX_ACTIVITY_PAGES * ALPACA_MAX_ACTIVITIES);
+            assert!(
+                fills
+                    .iter()
+                    .all(|event| matches!(event.kind, AccountEventKind::Trade(_))),
+                "every fill comes first"
+            );
+            let AccountEventKind::FillRecoveryGaveUp(gave_up) = &last.kind else {
+                panic!("the give-up comes last, got {last:?}");
+            };
+            assert_eq!(gave_up.scope, FillRecoveryScope::AllInstruments);
+            assert!(matches!(
+                gave_up.reason,
+                FillRecoveryFailure::Truncated { .. }
+            ));
         }
 
         fn trade_of(

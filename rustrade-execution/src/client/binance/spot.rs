@@ -5183,6 +5183,73 @@ mod tests {
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
+    /// A gap whose every read times out is given up, and reported with the recovery's time budget.
+    #[tokio::test]
+    async fn a_gap_whose_every_read_times_out_is_reported_when_given_up() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/myTrades"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([]))
+                    .set_delay(Duration::from_secs(3_600)),
+            )
+            .mount(&server)
+            .await;
+        let rest = Arc::new(SpotRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server.uri())
+                .timeout(3_600_000_u64)
+                .retries(0_u32)
+                .build()
+                .expect("valid config"),
+        ));
+        let btc = InstrumentNameExchange::new("BTCUSDT");
+        let mut unrecovered = UnrecoveredFills::default();
+        unrecovered.open(
+            std::slice::from_ref(&btc),
+            Utc::now() - chrono::Duration::minutes(10),
+            Utc::now(),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // Paused: once the read is waiting, the clock jumps to the recovery timeout.
+        tokio::time::pause();
+
+        for _ in 0..=crate::client::order_recovery::MAX_GAP_RETRIES {
+            recover_fills(
+                &rest,
+                &Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+                &mut unrecovered,
+                &tx,
+                &new_dedup_cache(),
+                &KnownLiveOrders::shared(ExchangeId::BinanceSpot),
+            )
+            .await;
+            unrecovered.make_due();
+        }
+
+        assert!(unrecovered.is_empty(), "the gap is given up");
+        let Ok(event) = rx.try_recv() else {
+            panic!("the given-up gap is reported");
+        };
+        let AccountEventKind::FillRecoveryGaveUp(gave_up) = &event.kind else {
+            panic!("expected FillRecoveryGaveUp, got {event:?}");
+        };
+        assert_eq!(
+            gave_up.scope,
+            crate::FillRecoveryScope::Instruments(vec![btc])
+        );
+        assert_eq!(
+            gave_up.reason,
+            FillRecoveryFailure::TimedOut {
+                timeout_secs: FILL_RECOVERY_TIMEOUT_SECS
+            }
+        );
+        assert!(rx.try_recv().is_err(), "reported once");
+    }
+
     /// When recovery times out, a gap whose read started has failed and waits for its retry, but
     /// one never started (eight are read at a time) is not charged and stays due.
     #[tokio::test]
