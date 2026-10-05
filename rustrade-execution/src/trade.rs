@@ -171,10 +171,17 @@ where
 /// - A venue that recovers missed fills after a reconnect reads fills only, so an amendment sent
 ///   while the stream was disconnected is not reported.
 ///
+/// # Delivery
+///
+/// Apply an amendment idempotently: reverse a given `original` once, and apply a replacement
+/// once by its [`TradeId`]. Whether a venue can send one amendment twice, such as around a
+/// reconnect, is not known for every producer, and the library does not deduplicate amendments.
+///
 /// Known producers, as of writing: Alpaca's `trade_updates` `trade_bust` and `trade_correct`.
 #[non_exhaustive]
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Constructor)]
 pub struct TradeAmendment<AssetKey, InstrumentKey> {
+    /// The instrument of the trade amended.
     pub instrument: InstrumentKey,
     /// The order whose trade was amended.
     pub order_id: OrderId,
@@ -185,6 +192,7 @@ pub struct TradeAmendment<AssetKey, InstrumentKey> {
     /// reconcile with
     /// [`ExecutionClient::fetch_trades`](crate::client::ExecutionClient::fetch_trades).
     pub original: Option<TradeId>,
+    /// What the venue did to the trade.
     pub kind: TradeAmendmentKind<AssetKey, InstrumentKey>,
 }
 

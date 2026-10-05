@@ -113,7 +113,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     venue's notice lacked what a replacement needs.
 
   The earlier `Trade` is not withdrawn: find it by instrument and `original`, reverse it, and
-  apply any replacement. The engine logs the event at `error!` and changes no state. Alpaca's
+  apply any replacement, idempotently, as the library does not deduplicate amendments. The engine logs the event at `error!` and changes no state. Alpaca's
   frames are read per its Broker API schema (`previous_execution_id` names the fill amended),
   since the Trading API documents neither event; each is also logged whole at `warn!`. Known
   limitations: an order's cumulative fill is not lowered by a bust, and an amendment sent while

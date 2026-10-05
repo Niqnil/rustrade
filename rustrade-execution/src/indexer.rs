@@ -487,17 +487,6 @@ impl AccountEventIndexer {
         }
     }
 
-    /// Index a trade, converting fee asset and computing `fees_quote`.
-    ///
-    /// Computes `fees_quote` based on fee asset relationship to instrument:
-    /// - Fee in quote asset: `fees_quote = Some(fees)`
-    /// - Fee in base asset: `fees_quote = Some(fees * price)`
-    /// - Fee in third-party asset (e.g., BNB): `fees_quote = None`
-    ///
-    /// # Errors
-    /// Returns `IndexError` if fee asset is not in the map. Some integrations use
-    /// "UNKNOWN" as a placeholder when fee data is unavailable (e.g., IBKR `fetch_trades`,
-    /// Binance when API omits `commission_asset`). These trades will fail indexing.
     /// Index a [`TradeAmendment`]. A replacement trade is indexed as [`trade`](Self::trade) indexes
     /// one, so an amendment fails where its trade would.
     pub fn trade_amendment(
@@ -538,6 +527,17 @@ impl AccountEventIndexer {
         })
     }
 
+    /// Index a trade, converting fee asset and computing `fees_quote`.
+    ///
+    /// Computes `fees_quote` based on fee asset relationship to instrument:
+    /// - Fee in quote asset: `fees_quote = Some(fees)`
+    /// - Fee in base asset: `fees_quote = Some(fees * price)`
+    /// - Fee in third-party asset (e.g., BNB): `fees_quote = None`
+    ///
+    /// # Errors
+    /// Returns `IndexError` if fee asset is not in the map. Some integrations use
+    /// "UNKNOWN" as a placeholder when fee data is unavailable (e.g., IBKR `fetch_trades`,
+    /// Binance when API omits `commission_asset`). These trades will fail indexing.
     pub fn trade(
         &self,
         trade: Trade<AssetNameExchange, InstrumentNameExchange>,

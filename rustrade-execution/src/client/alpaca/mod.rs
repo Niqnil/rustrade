@@ -383,18 +383,23 @@ fn new_dedup_cache() -> SharedDedupCache {
 /// A fill without an execution id is recognised by its cumulative key instead. So that it still
 /// matches the same fill delivered *with* an id by the other path, every fill records its
 /// cumulative key, and a fill with an id is also checked against the cumulative keys of fills
-/// recorded without one. Only two id-less fills can still collide after a bust; an id-less WS fill
-/// is logged at `warn!` by [`convert_trade_update`].
+/// recorded without one.
+///
+/// So after a bust, a new fill can still be taken for an earlier one at the same cumulative when
+/// either lacks an execution id: a fill without one matches any earlier fill's cumulative key,
+/// and a fill with one matches an earlier id-less fill's. An id-less WS fill is logged at `warn!`
+/// by [`convert_trade_update`].
 fn is_duplicate_fill(
     cache: &SharedDedupCache,
     execution_id: Option<&str>,
     cumulative: SmolStr,
 ) -> bool {
+    // Built before locking, so the lock is not held across the allocation.
+    let execution = execution_id.map(|id| FillKey::Execution(SmolStr::new(id)));
     let mut guard = cache.lock();
     // peek avoids promoting to MRU on the duplicate (discard) path
-    match execution_id {
-        Some(execution_id) => {
-            let execution = FillKey::Execution(SmolStr::new(execution_id));
+    match execution {
+        Some(execution) => {
             if guard.peek(&execution).is_some()
                 || guard
                     .peek(&FillKey::CumulativeWithoutId(cumulative.clone()))
@@ -417,6 +422,13 @@ fn is_duplicate_fill(
         }
     }
     false
+}
+
+/// Record an execution delivered other than as a fill, so that fill recovery does not deliver it
+/// again as one.
+fn record_execution(cache: &SharedDedupCache, execution_id: &str) {
+    let execution = FillKey::Execution(SmolStr::new(execution_id));
+    cache.lock().put(execution, ());
 }
 
 // ---------------------------------------------------------------------------
@@ -3062,6 +3074,13 @@ fn process_ws_text(
                     raw = %msg.data.get(),
                     "Alpaca WS: a fill reported earlier was amended — reporting it as TradeAmended"
                 );
+                // A correction delivers its execution as the replacement trade. Should Alpaca
+                // also list it as a FILL activity, recovery must not deliver it again.
+                if update.event == "trade_correct"
+                    && let Some(execution_id) = ws_execution_id(&update)
+                {
+                    record_execution(dedup, execution_id);
+                }
             }
 
             for event in convert_trade_update(update).into_iter().flatten() {
@@ -8642,6 +8661,42 @@ mod tests {
                      re-delivered by recovery ({activity_id}), got {events:?}"
                 );
             }
+        }
+
+        /// A correction's execution was delivered as the replacement trade, so recovery does not
+        /// deliver it again should Alpaca list it as a FILL activity.
+        #[tokio::test]
+        async fn a_corrected_execution_is_not_recovered_again() {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let dedup = new_dedup_cache();
+            let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+            process_ws_text(
+                &super::amendment_frame(
+                    "trade_correct",
+                    r#""execution_id":"exec-c","previous_execution_id":"exec-a","price":"101.50","qty":"2","#,
+                ),
+                &tx,
+                &dedup,
+                &known,
+                &mut ExponentialBackoff::new(),
+            );
+
+            let events = drive_recover_fills_with(
+                vec![activity_json(
+                    "20250418103100000::exec-c",
+                    "ord-1",
+                    "2",
+                    Some("2"),
+                )],
+                dedup,
+                &known,
+            )
+            .await;
+
+            assert!(
+                events.is_empty(),
+                "the corrected execution was delivered as the replacement, got {events:?}"
+            );
         }
 
         /// A different execution that takes the order to a cumulative already seen, as after a
