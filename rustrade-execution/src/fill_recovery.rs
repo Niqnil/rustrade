@@ -25,10 +25,8 @@ use thiserror::Error;
 /// `start` and [`FillRecoveryScope::instrument_filter`]:
 /// - The span can overlap fills that were delivered, before the read failed or live around the
 ///   reconnect, so match what it returns against the fills already seen by
-///   [`TradeId`](crate::trade::TradeId). On Alpaca, `fetch_trades` gives a fill a different
-///   `TradeId` from the account stream's
-///   ([#479](https://github.com/Niqnil/rustrade/issues/479)), so match by order and quantity there
-///   instead.
+///   [`TradeId`](crate::trade::TradeId): a fill has one `TradeId` whether the stream or
+///   `fetch_trades` delivers it.
 /// - Fills after `end` arrived live, so a read that runs past `end`, as `fetch_trades` does,
 ///   returns them again.
 /// - A span can hold more fills than `fetch_trades` can return. Alpaca's `fetch_trades` reads
