@@ -1801,7 +1801,8 @@ impl ExecutionClient for AlpacaClient {
         end: DateTime<Utc>,
         instruments: &[InstrumentNameExchange],
     ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError> {
-        if start > end {
+        // An empty span, or one ending before the epoch, holds nothing Alpaca has.
+        if start > end || end < DateTime::UNIX_EPOCH {
             return Ok(TradesRead::complete(Vec::new()));
         }
         let page = paginate_activities(
@@ -8043,8 +8044,9 @@ mod tests {
             assert_eq!(read, TradesRead::complete(Vec::new()));
         }
 
-        /// The extreme times are valid bounds: a start before the epoch asks from the epoch, and
-        /// an end not yet reached sends no `until` rather than overflowing.
+        /// The extreme times are valid bounds: a start before the epoch asks from the epoch, an
+        /// end not yet reached sends no `until` rather than overflowing, and a span ending before
+        /// the epoch reads nothing.
         #[tokio::test]
         async fn fetch_trades_accepts_the_extreme_times() {
             use crate::client::ExecutionClient;
@@ -8077,6 +8079,17 @@ mod tests {
                 Some("1970-01-01T00:00:00.000Z")
             );
             assert!(!query.contains_key("until"), "{query:?}");
+
+            // A span ending before the epoch holds nothing, and is not requested.
+            let before_epoch = DateTime::UNIX_EPOCH - TimeDelta::days(1);
+            let Ok(read) = client_for(&server)
+                .fetch_trades(DateTime::<Utc>::MIN_UTC, before_epoch, &[])
+                .await
+            else {
+                panic!("the read succeeds");
+            };
+            assert_eq!(read, TradesRead::complete(Vec::new()));
+            assert_eq!(server.received_requests().await.map(|r| r.len()), Some(1));
         }
 
         /// A span whose start is after its end is empty: nothing is requested.
