@@ -109,8 +109,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `"{order_id}:{cumulative filled}"`, while `fetch_trades` gave it the FILL activity's `id`, so a
   consumer reconciling with `fetch_trades` could not match fills by `TradeId`. Every path now uses
   the execution id: the stream's `execution_id`, and the part of the activity `id` after `::`,
-  which is the same id. A stream fill without an `execution_id` keeps the old form and logs a
-  warning. Anyone who stored Alpaca `TradeId`s must re-key them. The dedup key that keeps the
+  which is the same id. A stream fill whose `execution_id` is missing, null or empty keeps the
+  old form and logs a warning. Anyone who stored Alpaca `TradeId`s must re-key them. The dedup key that keeps the
   stream and recovery from delivering one fill twice is unchanged and no longer read from
   `TradeId`. Closes #479.
 

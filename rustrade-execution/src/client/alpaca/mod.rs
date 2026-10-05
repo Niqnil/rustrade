@@ -1504,8 +1504,8 @@ impl ExecutionClient for AlpacaClient {
     ///
     /// Every fill's [`TradeId`] is Alpaca's execution id, whether the stream, recovery, or
     /// [`ExecutionClient::fetch_trades`] delivers it, so a fill read again by `fetch_trades`
-    /// matches the one the stream delivered. A stream fill that arrives without an
-    /// `execution_id` is logged and identified by `"{order_id}:{filled_qty}"` instead.
+    /// matches the one the stream delivered. A stream fill whose `execution_id` is missing, null
+    /// or empty is logged and identified by `"{order_id}:{filled_qty}"` instead.
     ///
     /// The read is made once, with no retry. When it fails, times out, or stops at 5,000 fills,
     /// the stream sends one [`AccountEventKind::FillRecoveryGaveUp`] covering the stream's
@@ -4082,7 +4082,7 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
                 None => {
                     warn!(
                         order_id = %order.id,
-                        "Alpaca WS: fill without an execution_id — its TradeId is \
+                        "Alpaca WS: fill without a usable execution_id — its TradeId is \
                          \"{{order_id}}:{{filled_qty}}\", which fetch_trades will not match"
                     );
                     TradeId(fill_dedup_key(&order.id, cum_qty))
