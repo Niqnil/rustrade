@@ -98,12 +98,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   opened without a list. A read truncated at 5,000 fills delivers what it read first and
   reports only the span from just before the last fill read. The engine logs the event at
   `error!` and changes no state. Reconcile with `fetch_trades(start, scope.instrument_filter())`,
-  matching the result against fills already seen: on Alpaca by order and quantity until #479,
-  since there `fetch_trades` and the stream give a fill different `TradeId`s. Known limitation:
+  matching the result against fills already seen by `TradeId`. Known limitation:
   Alpaca's `fetch_trades` returns `Truncated` with no fills when more than 5,000 lie after
   `start`, so such a span has to be reconciled another way. Closes #470.
 
 ### Changed
+
+- **An Alpaca fill's `TradeId` is Alpaca's execution id on every path** (`rustrade-execution`).
+  **Breaking.** The account stream and reconnect recovery gave a fill the id
+  `"{order_id}:{cumulative filled}"`, while `fetch_trades` gave it the FILL activity's `id`, so a
+  consumer reconciling with `fetch_trades` could not match fills by `TradeId`. Every path now uses
+  the execution id: the stream's `execution_id`, and the part of the activity `id` after `::`,
+  which is the same id. A stream fill without an `execution_id` keeps the old form and logs a
+  warning. Anyone who stored Alpaca `TradeId`s must re-key them. The dedup key that keeps the
+  stream and recovery from delivering one fill twice is unchanged and no longer read from
+  `TradeId`. Closes #479.
 
 - **`SimulatedVenue` keeps each filled order whole** (`rustrade-execution`). **Breaking.**
   `AccountState::ack_filled` takes the filled `Order` instead of its client order id, so that

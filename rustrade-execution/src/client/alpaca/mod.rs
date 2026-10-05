@@ -338,16 +338,16 @@ impl ExponentialBackoff {
 // Dedup cache
 // ---------------------------------------------------------------------------
 
-/// LRU cache keyed on `trade.id`, which both paths synthesise as
-/// `"{order_id}:{cumulative_filled_qty}"`.
+/// LRU cache of fill dedup keys, `"{order_id}:{cumulative_filled_qty}"` ([`fill_dedup_key`]).
+/// The key is not the fill's `TradeId`, which is the venue's execution id.
 ///
-/// WS fills: `convert_trade_update` sets `trade_id = order.id + ":" + order.filled_qty`
-/// (cumulative from the order update payload).
+/// WS fills: `early_dedup_key` builds it from `order.id` and `order.filled_qty` (the cumulative
+/// from the order update payload).
 ///
-/// REST fills: `recover_fills` reads the activity's own `cum_qty` -- the same figure the WS path
-/// reads -- and overrides `trade.id` to the same format before inserting into the cache. Where
-/// Alpaca omits `cum_qty` it falls back to accumulating per-execution qty within the batch, which
-/// is correct only for an order whose fills lie wholly inside the recovery window.
+/// REST fills: `recover_fills` builds it from the activity's own `cum_qty`, the same figure the WS
+/// path reads. Where Alpaca omits `cum_qty` it falls back to accumulating per-execution qty within
+/// the batch, which is correct only for an order whose fills lie wholly inside the recovery
+/// window.
 ///
 /// Using cumulative qty (not per-execution qty) means two equal-size partial fills
 /// on the same order produce distinct keys (`order:1` and `order:2`), preventing
@@ -917,6 +917,11 @@ struct AlpacaTradeUpdate<'a> {
     qty: Option<&'a str>,
     #[serde(borrow)]
     timestamp: Option<&'a str>,
+    /// Alpaca's id for this event. On a fill it is the execution's id, the same as the UUID after
+    /// `::` in that fill's FILL activity id (see [`activity_execution_id`]), so it is the fill's
+    /// [`TradeId`] on every path.
+    #[serde(borrow)]
+    execution_id: Option<&'a str>,
 }
 
 /// Order state embedded in a `trade_updates` WebSocket event.
@@ -1494,6 +1499,11 @@ impl ExecutionClient for AlpacaClient {
     ///
     /// A recovered fill also carries the order's cumulative filled quantity, so it advances the
     /// order's `filled_quantity` without waiting for a `fetch_open_orders` reconciliation.
+    ///
+    /// Every fill's [`TradeId`] is Alpaca's execution id, whether the stream, recovery, or
+    /// [`ExecutionClient::fetch_trades`] delivers it, so a fill read again by `fetch_trades`
+    /// matches the one the stream delivered. A stream fill that arrives without an
+    /// `execution_id` is logged and identified by `"{order_id}:{filled_qty}"` instead.
     ///
     /// The read is made once, with no retry. When it fails, times out, or stops at 5,000 fills,
     /// the stream sends one [`AccountEventKind::FillRecoveryGaveUp`] covering the stream's
@@ -2943,18 +2953,18 @@ fn process_ws_text(
     }
 }
 
-/// Extract a dedup key from an account event, if applicable.
+/// The dedup key for a fill that took order `order_id` to `cumulative` filled.
 ///
-/// Uses `trade.id` as the key. Both the WS path (`convert_trade_update`) and the
-/// REST recovery path (`recover_fills`) synthesise `TradeId` as
-/// `"{order_id}:{cumulative_filled_qty}"`, ensuring the same fill produces the
-/// same key regardless of which path delivered it.
-fn fill_dedup_key_from_event(event: &UnindexedAccountEvent) -> Option<&SmolStr> {
-    match &event.kind {
-        // Return a reference to avoid cloning the SmolStr; is_duplicate takes &SmolStr.
-        AccountEventKind::Trade(trade) => Some(&trade.id.0),
-        _ => None,
-    }
+/// The account stream and fill recovery both build it, from the cumulative each reports for the
+/// order (the WS frame's `order.filled_qty`, the FILL activity's `cum_qty`), so one fill
+/// delivered by both is recognised. It is kept apart from the fill's [`TradeId`], the venue's
+/// execution id: if the two paths ever disagreed on that id, fills would still not be delivered
+/// twice. `normalize` strips trailing zeros, so `"1.00"` and `"1"` give one key.
+///
+/// The `format_smolstr!` call heap-allocates for UUID-length order ids (36 chars exceeds
+/// SmolStr's inline limit), which is unavoidable given the key length.
+fn fill_dedup_key(order_id: &str, cumulative: Decimal) -> SmolStr {
+    format_smolstr!("{}:{}", order_id, cumulative.normalize())
 }
 
 /// Returns `true` if this event type produces a fill (Trade) event.
@@ -2965,21 +2975,22 @@ fn is_fill_event(update: &AlpacaTradeUpdate<'_>) -> bool {
     matches!(update.event.as_str(), "fill" | "partial_fill")
 }
 
-/// Construct the dedup key from raw WS update fields without allocating the full event.
+/// The [`fill_dedup_key`] of a WS fill, from its raw fields, before the full event is built.
 ///
-/// Key format: `"{order_id}:{cumulative_filled_qty}"` — same as `convert_trade_update`
-/// and `recover_fills` produce, ensuring cross-source dedup works correctly.
-///
-/// Note: The `format_smolstr!` call heap-allocates for UUID-length order IDs (36 chars
-/// exceeds SmolStr's 22-byte inline limit). This is unavoidable given the key length.
-/// Passing the Decimal directly to format_smolstr! (rather than via intermediate String)
-/// lets Decimal's Display impl write directly into the buffer, eliminating one allocation.
+/// An unparseable `filled_qty` reads as zero, as `convert_trade_update` reports it.
 fn early_dedup_key(update: &AlpacaTradeUpdate<'_>) -> SmolStr {
     let filled_qty = update.order.filled_qty.unwrap_or("0");
-    // Parse and normalize to match convert_trade_update's key format exactly.
-    // Decimal::from_str + normalize() are stack-only; no heap allocation until format_smolstr!.
     let qty = Decimal::from_str(filled_qty).unwrap_or(Decimal::ZERO);
-    format_smolstr!("{}:{}", update.order.id, qty.normalize())
+    fill_dedup_key(&update.order.id, qty)
+}
+
+/// The execution id in a FILL activity's `id`, `"{time}::{execution id}"`: the same id the WS
+/// fill carries as `execution_id`. The time prefix is US Eastern local time, so it is never read.
+/// An id without `::` is taken whole.
+fn activity_execution_id(activity_id: &str) -> &str {
+    activity_id
+        .split_once("::")
+        .map_or(activity_id, |(_, execution_id)| execution_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -3202,7 +3213,7 @@ async fn recover_fills(
         *cum += exec_qty;
         let cumulative = *cum;
 
-        let mut trade = match convert_activity_to_trade(activity) {
+        let trade = match convert_activity_to_trade(activity) {
             Some(t) => t,
             None => {
                 warn!(id = %activity.id, symbol = %activity.symbol, "Alpaca: skipping activity with unparseable fields");
@@ -3210,34 +3221,26 @@ async fn recover_fills(
             }
         };
 
-        // Override trade.id to match the WS synthesised format so that
-        // fill_dedup_key_from_event produces the same key for both sources.
-        // Normalise the cumulative Decimal to strip trailing zeros so the string
-        // representation matches the WS path (e.g. "1" == "1.00" after normalize).
-        //
-        // `order_filled_quantity` holds the venue's own cumulative, parsed by
-        // `convert_activity_to_trade`; `cumulative` is the intra-batch fallback described above.
+        // The dedup key, which matches the WS path's for the same fill. `order_filled_quantity`
+        // holds the venue's own cumulative, parsed by `convert_activity_to_trade`; `cumulative`
+        // is the intra-batch fallback described above. The trade keeps its execution id.
         //
         // The counter is advanced for every activity, including those that carry `cum_qty` and so
         // never consult it. That is deliberate: it keeps the fallback usable for a later activity
         // on the same order that omits the field. A batch mixing both therefore interleaves two
         // key schemes, and the fallback keys in it remain offset by whatever the order filled
         // before the window -- the field's presence rescues an activity, not an order.
-        let key_cumulative = trade.order_filled_quantity.unwrap_or(cumulative);
-        trade.id = TradeId(format_smolstr!(
-            "{}:{}",
-            activity.order_id,
-            key_cumulative.normalize()
-        ));
-
-        let event =
-            UnindexedAccountEvent::new(ExchangeId::AlpacaBroker, AccountEventKind::Trade(trade));
-
-        // Re-use fill_dedup_key_from_event so the key logic is in one place.
-        if fill_dedup_key_from_event(&event).is_some_and(|k| is_duplicate(dedup, k)) {
+        let key = fill_dedup_key(
+            &activity.order_id,
+            trade.order_filled_quantity.unwrap_or(cumulative),
+        );
+        if is_duplicate(dedup, &key) {
             duplicates += 1;
             continue;
         }
+
+        let event =
+            UnindexedAccountEvent::new(ExchangeId::AlpacaBroker, AccountEventKind::Trade(trade));
         let mut held = known.lock();
         held.observe(&event);
         let sent = tx.send(event);
@@ -3888,7 +3891,7 @@ fn convert_representable_open_order(
 fn convert_activity_to_trade(
     a: &AlpacaActivity,
 ) -> Option<Trade<AssetNameExchange, InstrumentNameExchange>> {
-    let trade_id = TradeId::new(&a.id);
+    let trade_id = TradeId::new(activity_execution_id(&a.id));
     let order_id = OrderId(SmolStr::new(&a.order_id));
     let instrument = InstrumentNameExchange::new(&a.symbol);
     let side = parse_side(&a.side)?;
@@ -4050,11 +4053,6 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
                 .and_then(parse_timestamp)
                 .unwrap_or_else(Utc::now);
 
-            // Trade ID: synthesise from order_id + cumulative filled qty since
-            // Alpaca WS trade_updates don't include an activity ID.
-            // Normalise via Decimal to strip trailing zeros so the key matches the
-            // REST recovery path (e.g. "1.00" and "1" both normalise to "1").
-            //
             // If filled_qty is unparseable (API regression), cum_qty falls back to
             // zero. Two consecutive bad fills on the same order would produce the same
             // dedup key ("order_id:0"), causing the second fill to be silently dropped.
@@ -4070,7 +4068,20 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
                     );
                 })
                 .unwrap_or(Decimal::ZERO);
-            let trade_id = TradeId(format_smolstr!("{}:{}", order.id, cum_qty.normalize()));
+            // The execution id, which the FILL activity for this fill carries too, so the fill has
+            // one TradeId however it is delivered. Without it, fall back to the dedup key, which
+            // is unique per fill but matches nothing a REST read returns.
+            let trade_id = match update.execution_id {
+                Some(execution_id) => TradeId::new(execution_id),
+                None => {
+                    warn!(
+                        order_id = %order.id,
+                        "Alpaca WS: fill without an execution_id — its TradeId is \
+                         \"{{order_id}}:{{filled_qty}}\", which fetch_trades will not match"
+                    );
+                    TradeId(fill_dedup_key(&order.id, cum_qty))
+                }
+            };
 
             // Alpaca equities and options are commission-free. Crypto trades incur
             // maker/taker fees (currently 0.15–0.25%) in the credited asset, but
@@ -5300,17 +5311,18 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_trade_update_fill_produces_trade_with_dedup_key() {
+    fn test_convert_trade_update_fill_produces_trade_with_execution_id() {
         let update = AlpacaTradeUpdate {
             event: SmolStr::new("fill"),
+            execution_id: Some("exec-1"),
             order: make_order_ws("ord-1", "SPY", "buy", "1"),
             price: Some("150.00"),
             qty: Some("1"),
             timestamp: Some("2025-04-18T14:30:00Z"),
         };
         let (trade, order) = fill_events(convert_trade_update(update));
-        // Trade ID must be "{order_id}:{cumulative_filled_qty}" for dedup to match REST path.
-        assert_eq!(trade.id.0.as_str(), "ord-1:1");
+        // The venue's execution id, which the fill's FILL activity carries too.
+        assert_eq!(trade.id.0.as_str(), "exec-1");
         assert_eq!(trade.price, Decimal::from_str("150.00").unwrap());
         assert_eq!(trade.quantity, Decimal::from_str("1").unwrap());
 
@@ -5328,6 +5340,7 @@ mod tests {
     fn test_convert_trade_update_partial_fill() {
         let update = AlpacaTradeUpdate {
             event: SmolStr::new("partial_fill"),
+            execution_id: None,
             order: make_order_ws("ord-2", "AAPL", "sell", "0.5"),
             price: Some("200.00"),
             qty: Some("0.5"),
@@ -5356,6 +5369,7 @@ mod tests {
     fn a_full_fill_snapshot_reports_nothing_left_to_fill() {
         let update = AlpacaTradeUpdate {
             event: SmolStr::new("fill"),
+            execution_id: None,
             // make_order_ws reports qty=2; a cumulative filled of 2 completes it.
             order: AlpacaOrderWs {
                 status: SmolStr::new("filled"),
@@ -5391,6 +5405,7 @@ mod tests {
         ] {
             let update = AlpacaTradeUpdate {
                 event: SmolStr::new("partial_fill"),
+                execution_id: None,
                 order: AlpacaOrderWs {
                     status: SmolStr::new(status),
                     ..make_order_ws("ord-late", "SPY", "buy", "1")
@@ -5417,6 +5432,7 @@ mod tests {
     fn a_notional_order_fill_emits_the_execution_without_a_snapshot() {
         let update = AlpacaTradeUpdate {
             event: SmolStr::new("partial_fill"),
+            execution_id: None,
             order: AlpacaOrderWs {
                 qty: None,
                 ..make_order_ws("ord-notional-ws", "SPY", "buy", "1")
@@ -5440,6 +5456,7 @@ mod tests {
     fn test_convert_trade_update_new_order_produces_snapshot() {
         let update = AlpacaTradeUpdate {
             event: SmolStr::new("new"),
+            execution_id: None,
             order: AlpacaOrderWs {
                 id: SmolStr::new("ord-new"),
                 client_order_id: Some(SmolStr::new("cid-1")),
@@ -5468,6 +5485,7 @@ mod tests {
     fn test_convert_trade_update_canceled_produces_cancel() {
         let update = AlpacaTradeUpdate {
             event: SmolStr::new("canceled"),
+            execution_id: None,
             order: make_order_ws("ord-3", "AAPL", "sell", "0"),
             price: None,
             qty: None,
@@ -5489,6 +5507,7 @@ mod tests {
             order.filled_qty = filled_qty;
             let update = AlpacaTradeUpdate {
                 event: SmolStr::new("canceled"),
+                execution_id: None,
                 order,
                 price: None,
                 qty: None,
@@ -5553,6 +5572,7 @@ mod tests {
     fn test_convert_trade_update_rejected_produces_error() {
         let update = AlpacaTradeUpdate {
             event: SmolStr::new("rejected"),
+            execution_id: None,
             order: make_order_ws("ord-4", "SPY", "buy", "0"),
             price: None,
             qty: None,
@@ -6071,17 +6091,15 @@ mod tests {
         // Two partial fills of 1 lot each → filled_qty "1" then "2".
         let ws_keys: Vec<SmolStr> = ["1", "2"]
             .iter()
-            .filter_map(|filled_qty| {
-                let update = AlpacaTradeUpdate {
+            .map(|filled_qty| {
+                early_dedup_key(&AlpacaTradeUpdate {
                     event: SmolStr::new("partial_fill"),
+                    execution_id: None,
                     order: make_order_ws(order_id, "SPY", "buy", filled_qty),
                     price: Some("150.00"),
                     qty: Some("1"),
                     timestamp: None,
-                };
-                let [event, _snapshot] = convert_trade_update(update);
-                let event = event?;
-                fill_dedup_key_from_event(&event).cloned()
+                })
             })
             .collect();
 
@@ -6092,7 +6110,7 @@ mod tests {
             .iter()
             .map(|exec_qty| {
                 cumulative += Decimal::from_str(exec_qty).unwrap();
-                format_smolstr!("{}:{}", order_id, cumulative.normalize())
+                fill_dedup_key(order_id, cumulative)
             })
             .collect();
 
@@ -6106,13 +6124,13 @@ mod tests {
 
     /// Verifies that `early_dedup_key` produces the same key as the full event path.
     ///
-    /// The early dedup check (M-1 optimization) extracts the key from raw WS fields
-    /// before constructing the full event. This test ensures both paths produce
-    /// identical keys, otherwise duplicate detection would fail.
+    /// A fill without an `execution_id` falls back to its dedup key for its `TradeId`, the key the
+    /// early dedup check reads from the raw WS fields before the event is built.
     #[test]
-    fn early_dedup_key_matches_full_event_path() {
+    fn a_ws_fill_without_an_execution_id_is_identified_by_its_dedup_key() {
         let update = AlpacaTradeUpdate {
             event: SmolStr::new("fill"),
+            execution_id: None,
             order: make_order_ws("ord-abc", "SPY", "buy", "5"),
             price: Some("150.00"),
             qty: Some("5"),
@@ -6122,17 +6140,20 @@ mod tests {
         // Early path: extract key before full event construction
         let early_key = early_dedup_key(&update);
 
-        // Full path: construct event then extract key. A fill frame also carries the order
-        // snapshot; the dedup key lives on the execution, which is always the first slot.
+        // A fill frame also carries the order snapshot; the execution is always the first slot.
         let [event, _snapshot] = convert_trade_update(update);
-        let event = event.expect("fill should produce an execution");
-        let full_key =
-            fill_dedup_key_from_event(&event).expect("fill event should have a dedup key");
+        let Some(UnindexedAccountEvent {
+            kind: AccountEventKind::Trade(trade),
+            ..
+        }) = event
+        else {
+            panic!("fill should produce an execution");
+        };
 
         assert_eq!(
+            trade.id.0.as_str(),
             early_key.as_str(),
-            full_key.as_str(),
-            "early_dedup_key must produce the same key as the full event path"
+            "without an execution_id the TradeId is the dedup key"
         );
         assert_eq!(early_key.as_str(), "ord-abc:5");
     }
@@ -6146,6 +6167,7 @@ mod tests {
         // Test with trailing zeros: "1.00" should normalize to "1"
         let update1 = AlpacaTradeUpdate {
             event: SmolStr::new("fill"),
+            execution_id: None,
             order: AlpacaOrderWs {
                 id: SmolStr::new("ord-x"),
                 client_order_id: Some(SmolStr::new("cid")),
@@ -6170,6 +6192,7 @@ mod tests {
         // Test already normalized: "1" stays "1"
         let update2 = AlpacaTradeUpdate {
             event: SmolStr::new("fill"),
+            execution_id: None,
             order: AlpacaOrderWs {
                 id: SmolStr::new("ord-x"),
                 client_order_id: Some(SmolStr::new("cid")),
@@ -6194,6 +6217,7 @@ mod tests {
         // Test single trailing zero: "1.0" normalizes to "1"
         let update3 = AlpacaTradeUpdate {
             event: SmolStr::new("fill"),
+            execution_id: None,
             order: AlpacaOrderWs {
                 id: SmolStr::new("ord-x"),
                 client_order_id: Some(SmolStr::new("cid")),
@@ -7581,6 +7605,85 @@ mod tests {
             ));
         }
 
+        /// A FILL activity's execution id is the part of its `id` after `::`; an id without one is
+        /// taken whole.
+        #[test]
+        fn an_activity_id_names_its_execution_after_the_separator() {
+            assert_eq!(
+                activity_execution_id("20261005041849348::524b1902-817e-446c-825b-a9fcfebbc17e"),
+                "524b1902-817e-446c-825b-a9fcfebbc17e"
+            );
+            assert_eq!(activity_execution_id("act-1"), "act-1");
+        }
+
+        /// One fill carries one `TradeId` however it is delivered: over the account stream, by
+        /// reconnect recovery, and by `fetch_trades`. So a consumer reconciling with `fetch_trades`
+        /// matches what the stream already delivered.
+        #[tokio::test]
+        async fn a_fill_has_one_trade_id_on_the_stream_in_recovery_and_from_fetch_trades() {
+            use crate::client::ExecutionClient;
+
+            let execution_id = "524b1902-817e-446c-825b-a9fcfebbc17e";
+            let activity = activity_json(
+                &format!("20250418103000000::{execution_id}"),
+                "ord-1",
+                "2",
+                Some("2"),
+            );
+
+            let [streamed, _snapshot] = convert_trade_update(AlpacaTradeUpdate {
+                event: SmolStr::new("fill"),
+                execution_id: Some(execution_id),
+                order: super::make_order_ws("ord-1", "SPY", "buy", "2"),
+                price: Some("100.00"),
+                qty: Some("2"),
+                timestamp: Some("2025-04-18T14:30:00Z"),
+            });
+            let Some(streamed) = streamed else {
+                panic!("a fill converts to a Trade");
+            };
+
+            let recovered = drive_recover_fills(vec![activity.clone()]).await;
+            let [recovered] = recovered.as_slice() else {
+                panic!("one fill recovered: {recovered:?}");
+            };
+
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::Value::Array(vec![activity])),
+                )
+                .mount(&server)
+                .await;
+            let Ok(fetched) = client_for(&server)
+                .fetch_trades(recovery_after(), &[])
+                .await
+            else {
+                panic!("fetch_trades reads the activity");
+            };
+            let [fetched] = fetched.as_slice() else {
+                panic!("one fill fetched: {fetched:?}");
+            };
+
+            assert_eq!(trade_of(&streamed).id.0.as_str(), execution_id);
+            assert_eq!(trade_of(recovered).id.0.as_str(), execution_id);
+            assert_eq!(fetched.id.0.as_str(), execution_id);
+        }
+
+        /// The dedup keys `dedup` holds, oldest first.
+        fn dedup_keys(dedup: &SharedDedupCache) -> Vec<String> {
+            let mut keys: Vec<_> = dedup
+                .lock()
+                .iter()
+                .map(|(key, _)| key.to_string())
+                .collect();
+            // The LRU iterates most recent first.
+            keys.reverse();
+            keys
+        }
+
         fn trade_of(
             event: &UnindexedAccountEvent,
         ) -> &Trade<AssetNameExchange, InstrumentNameExchange> {
@@ -7622,12 +7725,17 @@ mod tests {
         #[tokio::test]
         async fn the_dedup_key_uses_the_venue_cumulative_not_an_intra_batch_count() {
             // Three lots filled before the window; the recovered 2-lot fill takes the order to 5.
-            let events =
-                drive_recover_fills(vec![activity_json("act-1", "ord-1", "2", Some("5"))]).await;
+            let dedup = new_dedup_cache();
+            drive_recover_fills_with(
+                vec![activity_json("act-1", "ord-1", "2", Some("5"))],
+                dedup.clone(),
+                &KnownLiveOrders::shared(ExchangeId::AlpacaBroker),
+            )
+            .await;
 
             assert_eq!(
-                trade_of(&events[0]).id.0.as_str(),
-                "ord-1:5",
+                dedup_keys(&dedup),
+                vec!["ord-1:5"],
                 "counting executions within the batch would key this as ord-1:2"
             );
         }
@@ -7642,16 +7750,13 @@ mod tests {
             // The same execution as it arrived over WebSocket: 2 lots, leaving the order at 5.
             let update = AlpacaTradeUpdate {
                 event: SmolStr::new("partial_fill"),
+                execution_id: None,
                 order: super::make_order_ws("ord-1", "SPY", "buy", "5"),
                 price: Some("100.00"),
                 qty: Some("2"),
                 timestamp: None,
             };
-            let [ws_event, _snapshot] = convert_trade_update(update);
-            let ws_event = ws_event.expect("a partial_fill converts to a Trade");
-            let ws_key = fill_dedup_key_from_event(&ws_event)
-                .expect("a Trade carries a dedup key")
-                .clone();
+            let ws_key = early_dedup_key(&update);
             assert!(
                 !is_duplicate(&dedup, &ws_key),
                 "precondition: first sighting"
@@ -7675,17 +7780,24 @@ mod tests {
         /// shipped before -- and the fill reports no cumulative rather than a fabricated one.
         #[tokio::test]
         async fn without_a_reported_cumulative_the_previous_behaviour_is_preserved() {
-            let events = drive_recover_fills(vec![
-                activity_json("act-1", "ord-1", "2", None),
-                activity_json("act-2", "ord-1", "3", None),
-            ])
+            let dedup = new_dedup_cache();
+            let events = drive_recover_fills_with(
+                vec![
+                    activity_json("act-1", "ord-1", "2", None),
+                    activity_json("act-2", "ord-1", "3", None),
+                ],
+                dedup.clone(),
+                &KnownLiveOrders::shared(ExchangeId::AlpacaBroker),
+            )
             .await;
 
-            let keys: Vec<_> = events
-                .iter()
-                .map(|e| trade_of(e).id.0.as_str().to_owned())
-                .collect();
-            assert_eq!(keys, vec!["ord-1:2", "ord-1:5"], "intra-batch accumulation");
+            assert_eq!(
+                dedup_keys(&dedup),
+                vec!["ord-1:2", "ord-1:5"],
+                "intra-batch accumulation"
+            );
+            let ids: Vec<_> = events.iter().map(|e| trade_of(e).id.0.as_str()).collect();
+            assert_eq!(ids, vec!["act-1", "act-2"], "each keeps its activity's id");
 
             assert!(
                 events
