@@ -168,16 +168,20 @@ where
 /// - An order's cumulative filled quantity is not lowered by a bust:
 ///   [`Open::is_superseded_by`](crate::order::state::Open::is_superseded_by) refuses a lower
 ///   cumulative, so the order stays on what it reported before.
-/// - A venue that recovers missed fills after a reconnect reads fills only, so an amendment sent
-///   while the stream was disconnected is not reported.
+/// - Alpaca's fill recovery after a reconnect reads fills only, so an Alpaca amendment sent while
+///   the stream was disconnected is not reported. IBKR's recovery reads corrections too.
 ///
 /// # Delivery
 ///
 /// Apply an amendment idempotently: reverse a given `original` once, and apply a replacement
 /// once by its [`TradeId`]. Whether a venue can send one amendment twice, such as around a
-/// reconnect, is not known for every producer, and the library does not deduplicate amendments.
+/// reconnect, is not known for every producer. The library delivers each IBKR correction once,
+/// but does not deduplicate Alpaca's amendments.
 ///
-/// Known producers, as of writing: Alpaca's `trade_updates` `trade_bust` and `trade_correct`.
+/// Known producers, as of writing:
+/// - Alpaca's `trade_updates` `trade_bust` and `trade_correct`;
+/// - IBKR's corrected executions, as [`Corrected`](TradeAmendmentKind::Corrected) only. IB
+///   documents no busts.
 #[non_exhaustive]
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Constructor)]
 pub struct TradeAmendment<AssetKey, InstrumentKey> {

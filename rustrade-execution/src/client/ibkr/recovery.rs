@@ -13,7 +13,8 @@
 //! 2. When the gap closes, meaning `ibapi`'s [`TRANSPORT_RECONNECT_CODE`] notice or TWS's
 //!    1101/1102, it asks TWS for the day's executions and keeps those from the start of the gap
 //!    on ([`RecoveredFills`]).
-//! 3. It emits them through the stream's [`EventSink`], which drops every trade already delivered.
+//! 3. It emits them through the stream's [`EventSink`], which drops every trade already delivered
+//!    and reports a correction as one.
 //!
 //! The watcher also ends the stream when the client shuts down for good. `ibapi` never closes the
 //! order update stream, so the reader cannot see that happen, but it does close every notice
@@ -22,13 +23,17 @@
 //! Only fills are recovered. An order that was cancelled, expired or rejected during the gap is
 //! not reported.
 
-use super::{execution::ExecutionBuffer, order::OrderIdMap, resolve_execution};
+use super::{
+    execution::{ExecutionBuffer, ExecutionRevision, revision_of},
+    order::OrderIdMap,
+    resolve_execution,
+};
 use crate::{
     AccountEventKind, UnindexedAccountEvent,
-    client::dedup::{SharedDedupCache, dedup_key_from_event, is_duplicate},
+    client::dedup::{DEDUP_CACHE_SIZE, SharedDedupCache, dedup_key_from_event, is_duplicate},
     emit_stream_terminated,
     error::StreamTerminationReason,
-    trade::Trade,
+    trade::{Trade, TradeAmendment, TradeAmendmentKind, TradeId},
 };
 use chrono::{DateTime, Utc};
 use ibapi::{
@@ -37,12 +42,15 @@ use ibapi::{
     orders::{ExecutionData, ExecutionFilter, Executions},
     subscriptions::SubscriptionItem,
 };
+use lru::LruCache;
 use parking_lot::Mutex;
 use rustrade_instrument::{
     asset::name::AssetNameExchange, exchange::ExchangeId, ibkr::ContractRegistry,
     instrument::name::InstrumentNameExchange,
 };
+use smol_str::SmolStr;
 use std::{
+    num::NonZeroUsize,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -196,11 +204,22 @@ impl GapTracker {
 ///
 /// Sending and ending the stream go through one lock. So once [`terminate`](Self::terminate) has
 /// emitted `StreamTerminated`, nothing can follow it, whichever thread sends next. Trades pass
-/// through a dedup cache, so a fill that recovery reads again is delivered once.
+/// through a dedup cache, so a fill that recovery reads again is delivered once, and a correction
+/// is reported as one (see [`send_execution`](Self::send_execution)).
 #[derive(Debug, Clone)]
 pub(super) struct EventSink {
     tx: Arc<Mutex<Option<mpsc::UnboundedSender<UnindexedAccountEvent>>>>,
     dedup: SharedDedupCache,
+    /// The latest revision delivered of each execution, by [`ExecutionRevision::execution`].
+    /// Bounded like the dedup cache, so it forgets the oldest execution rather than grow.
+    revisions: Arc<Mutex<LruCache<SmolStr, DeliveredRevision>>>,
+}
+
+/// The latest revision of an execution an [`EventSink`] delivered.
+#[derive(Debug)]
+struct DeliveredRevision {
+    revision: u32,
+    id: TradeId,
 }
 
 impl EventSink {
@@ -208,9 +227,13 @@ impl EventSink {
         tx: mpsc::UnboundedSender<UnindexedAccountEvent>,
         dedup: SharedDedupCache,
     ) -> Self {
+        // allow(clippy::unwrap_used) — NonZeroUsize::new on a non-zero constant cannot fail.
+        #[allow(clippy::unwrap_used)]
+        let capacity = NonZeroUsize::new(DEDUP_CACHE_SIZE).unwrap();
         Self {
             tx: Arc::new(Mutex::new(Some(tx))),
             dedup,
+            revisions: Arc::new(Mutex::new(LruCache::new(capacity))),
         }
     }
 
@@ -222,12 +245,74 @@ impl EventSink {
             .is_some_and(|tx| tx.send(event).is_ok())
     }
 
-    /// Send `trade` unless it was already delivered. Returns `false` once the stream has ended or
-    /// the consumer has gone.
-    pub(super) fn send_trade(
+    /// Send `trade`, an execution completed by its commission report, unless it or a later
+    /// revision of it was already delivered. Returns `false` once the stream has ended or the
+    /// consumer has gone.
+    ///
+    /// A correction (see [`ExecutionRevision`]) is sent as [`AccountEventKind::TradeAmended`],
+    /// [`Corrected`](TradeAmendmentKind::Corrected) with `trade` as the replacement. It names as
+    /// the original the latest revision this stream delivered. When it delivered none, because
+    /// the execution predates the stream or has dropped out of what this sink remembers, it names
+    /// the revision the correction's id says it corrects. Recovery passes an execution ahead of
+    /// its corrections, so an original that fell in a gap is still delivered first.
+    pub(super) fn send_execution(
         &self,
         trade: Trade<AssetNameExchange, InstrumentNameExchange>,
     ) -> bool {
+        let Some(revision) = ExecutionRevision::parse(&trade.id.0) else {
+            return self.send_trade(trade);
+        };
+        let execution = SmolStr::new(revision.execution);
+        let (number, previous) = (revision.revision, revision.previous_id());
+
+        // Held through the send, so the stream worker and the recovery watcher cannot interleave
+        // two revisions of one execution.
+        let mut revisions = self.revisions.lock();
+        let original = match revisions.peek(&execution) {
+            Some(delivered) if delivered.revision >= number => {
+                trace!(
+                    exec_id = %trade.id,
+                    delivered = %delivered.id,
+                    "IBKR execution already delivered at this revision or a later one, skipping"
+                );
+                return true;
+            }
+            Some(delivered) => Some(delivered.id.clone()),
+            None => previous,
+        };
+        let id = trade.id.clone();
+        let sent = match original {
+            None => self.send_trade(trade),
+            Some(original) => {
+                debug!(%original, correction = %id, "IBKR execution corrected, reporting it");
+                self.send(UnindexedAccountEvent {
+                    exchange: ExchangeId::Ibkr,
+                    kind: AccountEventKind::TradeAmended(TradeAmendment::new(
+                        trade.instrument.clone(),
+                        trade.order_id.clone(),
+                        // IB does not say when it corrected the execution.
+                        Utc::now(),
+                        Some(original),
+                        TradeAmendmentKind::Corrected { replacement: trade },
+                    )),
+                })
+            }
+        };
+        if sent {
+            revisions.put(
+                execution,
+                DeliveredRevision {
+                    revision: number,
+                    id,
+                },
+            );
+        }
+        sent
+    }
+
+    /// Send `trade` unless it was already delivered. Returns `false` once the stream has ended or
+    /// the consumer has gone.
+    fn send_trade(&self, trade: Trade<AssetNameExchange, InstrumentNameExchange>) -> bool {
         let event = UnindexedAccountEvent {
             exchange: ExchangeId::Ibkr,
             kind: AccountEventKind::Trade(trade),
@@ -335,8 +420,9 @@ impl<'a> RecoveredFills<'a> {
         }
     }
 
-    /// The recovered trades. Executions still without a commission report move to `pending`, the
-    /// stream's own buffer, where a report arriving on the stream later completes them.
+    /// The recovered trades, each execution ahead of its corrections. Executions still without a
+    /// commission report move to `pending`, the stream's own buffer, where a report arriving on
+    /// the stream later completes them.
     pub(super) fn finish(
         self,
         pending: &ExecutionBuffer,
@@ -356,7 +442,10 @@ impl<'a> RecoveredFills<'a> {
                  delivered only if the report reaches the account stream later"
             );
         }
-        self.trades
+        let mut trades = self.trades;
+        // Stable, so the executions of each revision keep the order they arrived in.
+        trades.sort_by_key(|trade| revision_of(&trade.id));
+        trades
     }
 }
 
@@ -480,7 +569,7 @@ impl RecoveryWatcher {
                     "Recovered IBKR fills after a gap in event delivery"
                 );
                 for trade in trades {
-                    if !self.sink.send_trade(trade) {
+                    if !self.sink.send_execution(trade) {
                         return false;
                     }
                 }
@@ -744,6 +833,98 @@ mod tests {
         assert_eq!(ids[1].0.as_str(), "e2");
     }
 
+    /// What `event` delivered: a trade's id, or an amendment's original and replacement ids.
+    fn delivered(event: UnindexedAccountEvent) -> String {
+        match event.kind {
+            AccountEventKind::Trade(trade) => trade.id.0.to_string(),
+            AccountEventKind::TradeAmended(amendment) => match amendment.kind {
+                TradeAmendmentKind::Corrected { replacement } => format!(
+                    "{} corrected by {}",
+                    amendment
+                        .original
+                        .expect("an IBKR correction names its original"),
+                    replacement.id
+                ),
+                other => panic!("expected a correction, got {other:?}"),
+            },
+            other => panic!("expected a trade or an amendment, got {other:?}"),
+        }
+    }
+
+    fn delivered_all(rx: &mut mpsc::UnboundedReceiver<UnindexedAccountEvent>) -> Vec<String> {
+        drain(rx).into_iter().map(delivered).collect()
+    }
+
+    #[test]
+    fn sink_reports_a_correction_of_a_delivered_execution() {
+        let (sink, mut rx) = sink();
+        let mut correction = trade("x.01.02");
+        correction.price = Decimal::from(101);
+        assert!(sink.send_execution(trade("x.01.01")));
+        assert!(sink.send_execution(correction.clone()));
+
+        let events = drain(&mut rx);
+        assert_eq!(events.len(), 2, "{events:?}");
+        let AccountEventKind::TradeAmended(amendment) = &events[1].kind else {
+            panic!("expected an amendment, got {:?}", events[1]);
+        };
+        assert_eq!(amendment.instrument, correction.instrument);
+        assert_eq!(amendment.order_id, correction.order_id);
+        assert_eq!(amendment.original, Some(TradeId::new("x.01.01")));
+        assert_eq!(
+            amendment.kind,
+            TradeAmendmentKind::Corrected {
+                replacement: correction
+            }
+        );
+    }
+
+    /// The original predates the stream, so the snapshot the consumer started from counts it.
+    /// Sent as a trade, the correction would count it twice.
+    #[test]
+    fn sink_reports_a_correction_of_an_execution_it_did_not_deliver() {
+        let (sink, mut rx) = sink();
+        assert!(sink.send_execution(trade("x.01.02")));
+        assert_eq!(delivered_all(&mut rx), ["x.01.01 corrected by x.01.02"]);
+    }
+
+    #[test]
+    fn sink_names_the_latest_revision_it_delivered() {
+        let (sink, mut rx) = sink();
+        for id in ["x.01.01", "x.01.02", "x.01.04"] {
+            assert!(sink.send_execution(trade(id)));
+        }
+        assert_eq!(
+            delivered_all(&mut rx),
+            [
+                "x.01.01",
+                "x.01.01 corrected by x.01.02",
+                "x.01.02 corrected by x.01.04"
+            ]
+        );
+    }
+
+    #[test]
+    fn sink_drops_a_revision_older_than_one_delivered() {
+        let (sink, mut rx) = sink();
+        for id in ["x.01.02", "x.01.01", "x.01.02", "y"] {
+            assert!(sink.send_execution(trade(id)));
+        }
+        assert_eq!(
+            delivered_all(&mut rx),
+            ["x.01.01 corrected by x.01.02", "y"]
+        );
+    }
+
+    #[test]
+    fn sink_delivers_an_execution_without_a_revision_once() {
+        let (sink, mut rx) = sink();
+        for id in ["e1", "e1", "x.01.01", "x.01.01"] {
+            assert!(sink.send_execution(trade(id)));
+        }
+        assert_eq!(delivered_all(&mut rx), ["e1", "x.01.01"]);
+    }
+
     #[test]
     fn nothing_follows_stream_terminated() {
         let (sink, mut rx) = sink();
@@ -872,6 +1053,35 @@ mod tests {
         let trades = fills.finish(&pending);
         assert_eq!(trades.len(), 1, "{trades:?}");
         assert_eq!(trades[0].id.0.as_str(), "garbled");
+    }
+
+    /// TWS can answer with a correction ahead of the execution it corrects. Both fell in the gap,
+    /// so the consumer has neither: the original must go first, or the sink would report the
+    /// correction of an execution the consumer never saw and then drop that execution as older.
+    #[test]
+    fn recovered_fills_put_an_execution_ahead_of_its_corrections() {
+        let (contracts, order_ids) = tracked();
+        let pending = ExecutionBuffer::new();
+        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), &contracts, &order_ids);
+        for item in [
+            execution("x.01.02", IB_ORDER_ID, "20260929 14:00:00 UTC"),
+            commission("x.01.02"),
+            execution("x.01.01", IB_ORDER_ID, "20260929 14:00:00 UTC"),
+            commission("x.01.01"),
+            execution("y.01.01", IB_ORDER_ID, "20260929 14:00:01 UTC"),
+            commission("y.01.01"),
+        ] {
+            fills.push(item);
+        }
+
+        let (sink, mut rx) = sink();
+        for trade in fills.finish(&pending) {
+            assert!(sink.send_execution(trade));
+        }
+        assert_eq!(
+            delivered_all(&mut rx),
+            ["x.01.01", "y.01.01", "x.01.01 corrected by x.01.02"]
+        );
     }
 
     #[test]

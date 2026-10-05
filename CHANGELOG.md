@@ -113,11 +113,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     venue's notice lacked what a replacement needs.
 
   The earlier `Trade` is not withdrawn: find it by instrument and `original`, reverse it, and
-  apply any replacement, idempotently, as the library does not deduplicate amendments. The engine logs the event at `error!` and changes no state. Alpaca's
+  apply any replacement, idempotently, as the library does not deduplicate Alpaca's amendments.
+  The engine logs the event at `error!` and changes no state. IBKR reports its corrected
+  executions with this event too (see Fixed). Alpaca's
   frames are read per its Broker API schema (`previous_execution_id` names the fill amended),
   since the Trading API documents neither event; each is also logged whole at `warn!`. Known
-  limitations: an order's cumulative fill is not lowered by a bust, and an amendment sent while
-  the stream was disconnected is not reported, as fill recovery reads fills only. Alpaca also
+  limitations: an order's cumulative fill is not lowered by a bust, and an Alpaca amendment sent
+  while the stream was disconnected is not reported, as its fill recovery reads fills only. Alpaca also
   no longer drops a fill that, after a bust, takes its order back to a cumulative an earlier
   fill reached: the stream and recovery now recognise a fill by its execution id. Closes #483.
 
@@ -205,6 +207,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **IBKR delivered a corrected execution as a second fill** (`rustrade-execution`, feature
+  `ibkr`). IB reports a correction as a further execution whose id differs only in the digits
+  after the final period (`….01.02` corrects `….01.01`). The account stream and fill recovery
+  sent it as another `Trade`, so a consumer building positions from fills counted the execution
+  twice, and `fetch_trades` returned both. Now:
+  - the account stream sends a correction as `AccountEventKind::TradeAmended`, `Corrected`, with
+    the correction as the replacement `Trade`, once its commission report arrives. Its `original`
+    is the revision the stream delivered before, or, for an execution from before the stream,
+    the revision the correction's id says it corrects. A correction is logged at `warn!` when it
+    arrives, so one that never gets a commission report is still seen;
+  - a revision older than one already delivered is dropped, and fill recovery delivers an
+    execution ahead of its corrections;
+  - `fetch_trades` returns each execution once, at its latest revision.
+
+  A revision above `01` is read as a correction: IB's documentation gives `.02` correcting `.01`
+  as an example, and every execution IB first reports ends in `01`. IB documents no busts.
+  Known limitation: a correction that arrives live after a reconnect, before recovery has
+  delivered its original from the gap, is sent as an amendment, and recovery then drops the
+  original, so that trade reaches the stream only as the amendment. Closes #487.
 - **Hyperliquid's `fetch_trades` returned at most the 2,000 most recent fills**
   (`rustrade-execution`). Perp and spot read `userFills`, which holds only a wallet's 2,000 most
   recent fills, and filtered it by time. So a span with more fills than that came back short, with
