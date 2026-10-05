@@ -82,6 +82,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `filled_avg_price`, `canceled` and `replaced` as cancelled with what filled before, `expired`,
   `rejected` as `OpenFailed`, and a 404 or an order on another symbol than the key's omitted.
   `done_for_day` and the other working statuses are not ended. Refs #370.
+- **A given-up fill recovery is reported on the account stream, not only in the log**
+  (`rustrade-execution`). Before, when fill recovery gave up on a span of fills, those fills never
+  reached the consumer and the only trace was an `error!` line. The new
+  `AccountEventKind::FillRecoveryGaveUp(FillRecoveryGap)` is sent once per failed read and the
+  stream carries on. The event carries:
+  - `scope`: a `FillRecoveryScope`, either `Instruments(..)` or `AllInstruments`;
+  - `start` and `end`, both inclusive;
+  - `attempts`;
+  - `reason`: a `FillRecoveryFailure`, which is `Request`, `TimedOut` or `Truncated`.
+
+  Binance Spot and Margin send it for each instrument's gap once its first read and five
+  retries have failed. Alpaca sends one per failed recovery read, since its read covers the
+  whole account. It names the stream's instruments, or `AllInstruments` when the stream was
+  opened without a list. A read truncated at 5,000 fills delivers what it read first and
+  reports only the span from just before the last fill read. The engine logs the event at
+  `error!` and changes no state. Reconcile with `fetch_trades(start, scope.instrument_filter())`,
+  matching the result against fills already seen: on Alpaca by order and quantity until #479,
+  since there `fetch_trades` and the stream give a fill different `TradeId`s. Known limitation:
+  Alpaca's `fetch_trades` returns `Truncated` with no fills when more than 5,000 lie after
+  `start`, so such a span has to be reconciled another way. Closes #470.
 
 ### Changed
 

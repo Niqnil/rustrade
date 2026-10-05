@@ -86,6 +86,8 @@ pub mod fill;
 pub use fill::{
     BidAskFillModel, FillContext, FillModel, LastPriceFillModel, MidpointFillModel, SimFillConfig,
 };
+pub mod fill_recovery;
+pub use fill_recovery::{FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope};
 pub mod indexer;
 pub mod map;
 pub mod market;
@@ -254,6 +256,14 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
     /// consumer-initiated drop closes the receiver, so there is no one left to deliver to (see
     /// [`StreamTerminationReason`] for the deliverable-only rationale).
     StreamTerminated(StreamTerminationReason),
+
+    /// Fill recovery gave up on a span of fills: fills in it may not have been delivered.
+    ///
+    /// Sent by venues that recover missed fills after a reconnect (Binance Spot and Margin,
+    /// Alpaca) when a recovery read fails for good, once per failed read. The stream carries on.
+    /// The engine logs it and changes no state; reconciling is the consumer's policy. See
+    /// [`FillRecoveryGap`] for what the span covers and how to read it again.
+    FillRecoveryGaveUp(FillRecoveryGap<InstrumentKey>),
 }
 
 impl<ExchangeKey, AssetKey, InstrumentKey> AccountEvent<ExchangeKey, AssetKey, InstrumentKey>

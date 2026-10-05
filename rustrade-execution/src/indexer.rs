@@ -7,6 +7,7 @@ use crate::{
         ApiError, ClientError, KeyError, OrderError, UnindexedApiError, UnindexedClientError,
         UnindexedOrderError,
     },
+    fill_recovery::{FillRecoveryGap, FillRecoveryScope},
     map::ExecutionInstrumentMap,
     order::{
         Order, OrderEvent, OrderKey, OrderSnapshot, UnindexedOrderKey, UnindexedOrderSnapshot,
@@ -76,6 +77,9 @@ impl AccountEventIndexer {
             // Termination reason carries no exchange/asset/instrument keys — pass through verbatim.
             AccountEventKind::StreamTerminated(reason) => {
                 AccountEventKind::StreamTerminated(reason)
+            }
+            AccountEventKind::FillRecoveryGaveUp(gap) => {
+                AccountEventKind::FillRecoveryGaveUp(self.fill_recovery_gap(gap)?)
             }
         };
 
@@ -192,6 +196,44 @@ impl AccountEventIndexer {
             base: self.asset_balance(base)?,
             quote: self.asset_balance(quote)?,
             risk,
+        })
+    }
+
+    /// Index a [`FillRecoveryGap`]'s instruments.
+    ///
+    /// # Errors
+    /// Returns `IndexError` if any instrument is not registered in the map. The whole gap fails
+    /// rather than dropping that instrument, which would understate what is missing. A venue names
+    /// only the instruments its stream was opened with, so this fails only for a stream opened
+    /// with an instrument the map does not hold.
+    pub fn fill_recovery_gap(
+        &self,
+        gap: FillRecoveryGap<InstrumentNameExchange>,
+    ) -> Result<FillRecoveryGap<InstrumentIndex>, IndexError> {
+        let FillRecoveryGap {
+            scope,
+            start,
+            end,
+            attempts,
+            reason,
+        } = gap;
+
+        let scope = match scope {
+            FillRecoveryScope::Instruments(instruments) => FillRecoveryScope::Instruments(
+                instruments
+                    .iter()
+                    .map(|instrument| self.map.find_instrument_index(instrument))
+                    .collect::<Result<_, _>>()?,
+            ),
+            FillRecoveryScope::AllInstruments => FillRecoveryScope::AllInstruments,
+        };
+
+        Ok(FillRecoveryGap {
+            scope,
+            start,
+            end,
+            attempts,
+            reason,
         })
     }
 
@@ -514,7 +556,11 @@ impl AccountEventIndexer {
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
-    use crate::{error::StreamTerminationReason, map::generate_execution_instrument_map};
+    use crate::{
+        error::StreamTerminationReason, fill_recovery::FillRecoveryFailure,
+        map::generate_execution_instrument_map,
+    };
+    use chrono::{DateTime, Utc};
     use rustrade_instrument::{index::IndexedInstruments, test_utils};
 
     fn binance_indexer() -> AccountEventIndexer {
@@ -548,6 +594,66 @@ mod tests {
         assert!(
             matches!(indexed.kind, AccountEventKind::StreamTerminated(r) if r == reason),
             "expected StreamTerminated to pass through unchanged",
+        );
+    }
+
+    /// A fill recovery give-up indexes each instrument it names, and fails as a whole when one
+    /// is not in the map rather than understating what is missing. `AllInstruments` names none.
+    #[test]
+    fn account_event_indexes_a_fill_recovery_give_up_by_its_instruments() {
+        let indexer = binance_indexer();
+        let start = DateTime::<Utc>::MIN_UTC;
+        let end = DateTime::<Utc>::MAX_UTC;
+        let give_up = |scope| {
+            UnindexedAccountEvent::new(
+                ExchangeId::BinanceSpot,
+                AccountEventKind::FillRecoveryGaveUp(FillRecoveryGap::new(
+                    scope,
+                    start,
+                    end,
+                    6,
+                    FillRecoveryFailure::TimedOut { timeout_secs: 30 },
+                )),
+            )
+        };
+        let index_of = |scope| match indexer.account_event(give_up(scope)) {
+            Ok(AccountEvent {
+                kind: AccountEventKind::FillRecoveryGaveUp(gap),
+                ..
+            }) => Ok(gap),
+            Ok(other) => panic!("expected FillRecoveryGaveUp, got {other:?}"),
+            Err(error) => Err(error),
+        };
+        let Ok(btc) = indexer
+            .map
+            .find_instrument_index(&InstrumentNameExchange::new("BTC_USDT"))
+        else {
+            panic!("BTC_USDT is mapped");
+        };
+
+        assert_eq!(
+            index_of(FillRecoveryScope::Instruments(vec![
+                InstrumentNameExchange::new("BTC_USDT")
+            ])),
+            Ok(FillRecoveryGap::new(
+                FillRecoveryScope::Instruments(vec![btc]),
+                start,
+                end,
+                6,
+                FillRecoveryFailure::TimedOut { timeout_secs: 30 },
+            ))
+        );
+        assert_eq!(
+            index_of(FillRecoveryScope::AllInstruments).map(|gap| gap.scope),
+            Ok(FillRecoveryScope::AllInstruments)
+        );
+        assert!(
+            index_of(FillRecoveryScope::Instruments(vec![
+                InstrumentNameExchange::new("BTC_USDT"),
+                InstrumentNameExchange::new("ETHUSDT"),
+            ]))
+            .is_err(),
+            "an unmapped instrument fails the whole give-up"
         );
     }
 
