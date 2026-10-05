@@ -62,8 +62,9 @@ use super::shared::{
     rest_call_with_retry,
 };
 use crate::{
-    AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, InstrumentBalanceUpdate,
-    IsolatedInstrumentState, IsolatedMarginRisk, UnindexedAccountEvent, UnindexedAccountSnapshot,
+    AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
+    InstrumentBalanceUpdate, IsolatedInstrumentState, IsolatedMarginRisk, UnindexedAccountEvent,
+    UnindexedAccountSnapshot,
     balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate},
     client::{
         ExecutionClient, OrderStatusClient,
@@ -1172,7 +1173,8 @@ impl ExecutionClient for BinanceMargin {
     /// As on spot, each instrument's gap after a reconnect is kept until its fills are forwarded:
     /// a gap whose read failed or timed out is retried after 1, 2, 4, 8 and 16 minutes, connected
     /// or not in between, reading only the gap. After five failed retries it is given up, logged
-    /// at `error`; [`ExecutionClient::fetch_trades`] can still read its fills.
+    /// at `error` and reported as an [`AccountEventKind::FillRecoveryGaveUp`];
+    /// [`ExecutionClient::fetch_trades`] can still read its fills.
     ///
     /// # Debt cold-start
     /// This method does **not** seed balances. Margin debt (`borrowed`/`interest`) is correct only
@@ -2141,10 +2143,11 @@ async fn recover_margin_fills(
                 Err(e) => {
                     gap_failed(
                         unrecovered,
+                        tx,
                         ExchangeId::BinanceMargin,
                         inst,
                         gap,
-                        &e.to_string(),
+                        FillRecoveryFailure::Request(e.to_string()),
                     );
                     continue;
                 }
@@ -2195,10 +2198,13 @@ async fn recover_margin_fills(
         {
             gap_failed(
                 unrecovered,
+                tx,
                 ExchangeId::BinanceMargin,
                 inst,
                 gap,
-                "fill recovery timed out",
+                FillRecoveryFailure::TimedOut {
+                    timeout_secs: FILL_RECOVERY_TIMEOUT_SECS,
+                },
             );
         }
     }
@@ -5985,6 +5991,78 @@ mod tests {
         .await;
 
         assert_eq!(ids, vec![1, 2]);
+    }
+
+    /// A margin gap whose every read fails is given up, and reported on the stream with the last read's
+    /// error.
+    #[tokio::test]
+    async fn a_margin_gap_whose_every_read_fails_is_reported_when_given_up() {
+        let disconnect = Utc::now() - chrono::Duration::minutes(10);
+        let reconnect = Utc::now() - chrono::Duration::minutes(5);
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/myTrades"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({"code": -1100, "msg": "rejected"})),
+            )
+            .mount(&server)
+            .await;
+        let rest = Arc::new(MarginTradingRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server.uri())
+                .build()
+                .expect("valid config"),
+        ));
+        let tracker = Arc::new(RateLimitTracker::new(WeightPool::Sapi));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let dedup = new_dedup_cache();
+        let btc = InstrumentNameExchange::new("BTCUSDT");
+        let mut unrecovered = UnrecoveredFills::default();
+        unrecovered.open(std::slice::from_ref(&btc), disconnect, reconnect);
+
+        for _ in 0..=crate::client::order_recovery::MAX_GAP_RETRIES {
+            recover_margin_fills(
+                &rest,
+                &tracker,
+                &mut unrecovered,
+                &tx,
+                &dedup,
+                &KnownLiveOrders::shared(ExchangeId::BinanceMargin),
+                false,
+            )
+            .await;
+            unrecovered.make_due();
+        }
+
+        assert!(unrecovered.is_empty(), "the gap is given up");
+        let forwarded: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let [event] = forwarded.as_slice() else {
+            panic!("only the give-up is sent: {forwarded:?}");
+        };
+        let AccountEventKind::FillRecoveryGaveUp(gave_up) = &event.kind else {
+            panic!("expected FillRecoveryGaveUp, got {event:?}");
+        };
+        assert_eq!(event.exchange, ExchangeId::BinanceMargin);
+        assert_eq!(
+            gave_up.scope,
+            crate::FillRecoveryScope::Instruments(vec![btc])
+        );
+        assert_eq!(
+            gave_up.start.timestamp_millis(),
+            disconnect.timestamp_millis()
+        );
+        assert_eq!(
+            gave_up.attempts,
+            crate::client::order_recovery::MAX_GAP_RETRIES + 1
+        );
+        assert!(
+            matches!(&gave_up.reason, FillRecoveryFailure::Request(reason) if reason.contains("rejected")),
+            "the last read's error: {:?}",
+            gave_up.reason
+        );
     }
 
     /// A margin recovery that fails keeps its gap, closed at its own start; the retry reads only

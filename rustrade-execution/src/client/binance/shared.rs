@@ -20,6 +20,7 @@
 use crate::{
     AccountEventKind, UnindexedAccountEvent,
     error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
+    fill_recovery::{FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope},
     order::{
         Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType, UnindexedInactiveOrder,
         UnindexedOrderKey,
@@ -61,6 +62,7 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
 // ---------------------------------------------------------------------------
@@ -300,14 +302,16 @@ pub(crate) fn gap_time(ms: i64) -> DateTime<Utc> {
 }
 
 /// Record that fill recovery on `venue` did not read `gap` of `instrument`, because of `reason`,
-/// and log what follows: a retry, or, once it has failed [`MAX_GAP_RETRIES`] retries, giving the
-/// gap up, which leaves its fills undelivered.
+/// and report what follows: a retry, logged, or, once it has failed [`MAX_GAP_RETRIES`] retries,
+/// giving the gap up, which leaves its fills undelivered. A given-up gap is logged and sent on `tx`
+/// as [`AccountEventKind::FillRecoveryGaveUp`].
 pub(crate) fn gap_failed(
     unrecovered: &mut UnrecoveredFills,
+    tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
     venue: ExchangeId,
     instrument: &InstrumentNameExchange,
     gap: &FillGap,
-    reason: &str,
+    reason: FillRecoveryFailure,
 ) {
     let (start, end) = (gap_time(gap.start_ms), gap_time(gap.end_ms));
     match unrecovered.failed(instrument, gap, tokio::time::Instant::now()) {
@@ -317,19 +321,38 @@ pub(crate) fn gap_failed(
             %start,
             %end,
             retry_in_secs = delay.as_secs(),
-            reason,
+            %reason,
             "Binance fill recovery did not read this gap, retrying it later"
         ),
-        Some(GapFailure::GivenUp) => error!(
-            %venue,
-            %instrument,
-            %start,
-            %end,
-            retries = MAX_GAP_RETRIES,
-            reason,
-            "Binance fill recovery gave up on this gap: its fills are not delivered; read them \
-             with fetch_trades"
-        ),
+        Some(GapFailure::GivenUp) => {
+            error!(
+                %venue,
+                %instrument,
+                %start,
+                %end,
+                retries = MAX_GAP_RETRIES,
+                %reason,
+                "Binance fill recovery gave up on this gap: its fills are not delivered; read them \
+                 with fetch_trades"
+            );
+            let gave_up = FillRecoveryGap::new(
+                FillRecoveryScope::Instruments(vec![instrument.clone()]),
+                start,
+                end,
+                // The first read and every retry failed.
+                MAX_GAP_RETRIES + 1,
+                reason,
+            );
+            if tx
+                .send(UnindexedAccountEvent::new(
+                    venue,
+                    AccountEventKind::FillRecoveryGaveUp(gave_up),
+                ))
+                .is_err()
+            {
+                debug!(%venue, "Binance fill recovery: consumer dropped before the give-up was sent");
+            }
+        }
         None => {}
     }
 }
@@ -2771,6 +2794,63 @@ mod tests {
             unrecovered.failed(&btc, &gap, tokio::time::Instant::now()),
             None
         );
+    }
+
+    /// A gap is reported on the stream only when it is given up, after its first read and every
+    /// retry failed, with its instrument, its span, how many reads failed and the last failure.
+    #[tokio::test]
+    async fn a_given_up_fill_gap_is_reported_on_the_stream() {
+        tokio::time::pause();
+        let btc = InstrumentNameExchange::new("BTCUSDT");
+        let disconnect = Utc.timestamp_millis_opt(1_000_000).unwrap();
+        let reconnect = Utc.timestamp_millis_opt(2_000_000).unwrap();
+        let mut unrecovered = UnrecoveredFills::default();
+        unrecovered.open(std::slice::from_ref(&btc), disconnect, reconnect);
+        let Some((_, gap)) = unrecovered.due(tokio::time::Instant::now()).pop() else {
+            panic!("the gap is due");
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        for _ in 0..MAX_GAP_RETRIES {
+            gap_failed(
+                &mut unrecovered,
+                &tx,
+                ExchangeId::BinanceSpot,
+                &btc,
+                &gap,
+                FillRecoveryFailure::Request("rejected".to_string()),
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "a gap left to retry is not reported"
+            );
+            unrecovered.make_due();
+        }
+        gap_failed(
+            &mut unrecovered,
+            &tx,
+            ExchangeId::BinanceSpot,
+            &btc,
+            &gap,
+            FillRecoveryFailure::TimedOut { timeout_secs: 30 },
+        );
+
+        let Ok(event) = rx.try_recv() else {
+            panic!("the given-up gap is reported");
+        };
+        assert_eq!(event.exchange, ExchangeId::BinanceSpot);
+        assert_eq!(
+            event.kind,
+            AccountEventKind::FillRecoveryGaveUp(FillRecoveryGap::new(
+                FillRecoveryScope::Instruments(vec![btc]),
+                disconnect,
+                reconnect + chrono::Duration::seconds(GAP_END_SLACK_SECS),
+                MAX_GAP_RETRIES + 1,
+                FillRecoveryFailure::TimedOut { timeout_secs: 30 },
+            ))
+        );
+        assert!(rx.try_recv().is_err(), "reported once");
+        assert!(unrecovered.is_empty(), "and no longer kept");
     }
 
     /// A new gap that overlaps a kept one starts after it, so the kept one keeps its retry

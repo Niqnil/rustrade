@@ -46,8 +46,8 @@ use super::shared::{
     recovered_order_totals, response_decode_error, rest_call_with_retry, unix_ms,
 };
 use crate::{
-    AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
-    UnindexedAccountSnapshot,
+    AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
+    UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate},
     client::{
         ExecutionClient, OrderStatusClient,
@@ -817,7 +817,9 @@ impl ExecutionClient for BinanceSpot {
     /// not fills the stream delivered live after it; the few seconds at its end that overlap live
     /// delivery are deduplicated. Each failed read is logged at `warn` with the instrument and the
     /// gap. After five failed retries the gap is given up, logged at `error`, and its fills are not
-    /// delivered: read them with [`ExecutionClient::fetch_trades`].
+    /// delivered. The stream says so with an
+    /// [`AccountEventKind::FillRecoveryGaveUp`] naming the instrument and the gap: read its fills
+    /// with [`ExecutionClient::fetch_trades`].
     ///
     /// A recovered gap counts as read even when a fill in it could not be converted, which is
     /// logged, or its order's cumulative could not be looked up (see below).
@@ -2023,10 +2025,11 @@ async fn recover_fills(
                 Err(e) => {
                     gap_failed(
                         unrecovered,
+                        tx,
                         ExchangeId::BinanceSpot,
                         inst,
                         gap,
-                        &e.to_string(),
+                        FillRecoveryFailure::Request(e.to_string()),
                     );
                     continue;
                 }
@@ -2080,10 +2083,13 @@ async fn recover_fills(
         {
             gap_failed(
                 unrecovered,
+                tx,
                 ExchangeId::BinanceSpot,
                 inst,
                 gap,
-                "fill recovery timed out",
+                FillRecoveryFailure::TimedOut {
+                    timeout_secs: FILL_RECOVERY_TIMEOUT_SECS,
+                },
             );
         }
     }
@@ -4944,6 +4950,76 @@ mod tests {
         )
         .await
         .expect("recovery does not wait for the pause");
+    }
+
+    /// A gap whose every read fails is given up, and reported on the stream with the last read's error.
+    #[tokio::test]
+    async fn a_gap_whose_every_read_fails_is_reported_when_given_up() {
+        let disconnect = Utc::now() - chrono::Duration::minutes(10);
+        let reconnect = Utc::now() - chrono::Duration::minutes(5);
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/myTrades"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({"code": -1100, "msg": "rejected"})),
+            )
+            .mount(&server)
+            .await;
+        let rest = Arc::new(SpotRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server.uri())
+                .build()
+                .expect("valid config"),
+        ));
+        let tracker = Arc::new(RateLimitTracker::new(WeightPool::Spot));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let dedup = new_dedup_cache();
+        let btc = InstrumentNameExchange::new("BTCUSDT");
+        let mut unrecovered = UnrecoveredFills::default();
+        unrecovered.open(std::slice::from_ref(&btc), disconnect, reconnect);
+
+        for _ in 0..=crate::client::order_recovery::MAX_GAP_RETRIES {
+            recover_fills(
+                &rest,
+                &tracker,
+                &mut unrecovered,
+                &tx,
+                &dedup,
+                &KnownLiveOrders::shared(ExchangeId::BinanceSpot),
+            )
+            .await;
+            unrecovered.make_due();
+        }
+
+        assert!(unrecovered.is_empty(), "the gap is given up");
+        let forwarded: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let [event] = forwarded.as_slice() else {
+            panic!("only the give-up is sent: {forwarded:?}");
+        };
+        let AccountEventKind::FillRecoveryGaveUp(gave_up) = &event.kind else {
+            panic!("expected FillRecoveryGaveUp, got {event:?}");
+        };
+        assert_eq!(event.exchange, ExchangeId::BinanceSpot);
+        assert_eq!(
+            gave_up.scope,
+            crate::FillRecoveryScope::Instruments(vec![btc])
+        );
+        assert_eq!(
+            gave_up.start.timestamp_millis(),
+            disconnect.timestamp_millis()
+        );
+        assert_eq!(
+            gave_up.attempts,
+            crate::client::order_recovery::MAX_GAP_RETRIES + 1
+        );
+        assert!(
+            matches!(&gave_up.reason, FillRecoveryFailure::Request(reason) if reason.contains("rejected")),
+            "the last read's error: {:?}",
+            gave_up.reason
+        );
     }
 
     /// A recovery that fails keeps its gap, closed at its own start; the retry reads exactly that

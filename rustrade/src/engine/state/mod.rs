@@ -29,7 +29,7 @@ use rustrade_instrument::{
 use rustrade_integration::collection::{one_or_many::OneOrMany, snapshot::Snapshot};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
-use tracing::warn;
+use tracing::{error, warn};
 
 /// Asset-centric state and associated state management logic.
 pub mod asset;
@@ -364,6 +364,21 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                     exchange = ?event.exchange,
                     %reason,
                     "account event stream terminated — no further account events will arrive on it",
+                );
+                None
+            }
+            AccountEventKind::FillRecoveryGaveUp(gap) => {
+                // Fills in the span may never arrive, so positions and orders may be stale. What to
+                // do (reconcile with fetch_trades, alert, halt) is the consumer's policy; the engine
+                // only makes it loud.
+                error!(
+                    exchange = ?event.exchange,
+                    scope = ?gap.scope,
+                    start = %gap.start,
+                    end = %gap.end,
+                    attempts = gap.attempts,
+                    reason = %gap.reason,
+                    "account stream fill recovery gave up — fills in this span may be missing",
                 );
                 None
             }
