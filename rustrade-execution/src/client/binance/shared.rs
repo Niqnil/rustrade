@@ -1458,10 +1458,8 @@ pub(crate) fn convert_open_order_owned_symbol<T: BinanceOrderFields>(
 /// Where a `myTrades` walk starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MyTradesFrom {
-    /// Every execution on the instrument at or after this time, in epoch milliseconds.
-    Time(i64),
     /// Every execution on the instrument from `start` to `end`, both included, in epoch
-    /// milliseconds: a [`FillGap`].
+    /// milliseconds: a [`FillGap`], or a `fetch_trades` span.
     Span { start: i64, end: i64 },
     /// Every execution of this one order, from its first.
     ///

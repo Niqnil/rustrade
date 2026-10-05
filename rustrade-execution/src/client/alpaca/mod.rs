@@ -72,9 +72,9 @@ use crate::{
     },
     parse_env_bool,
     position::{Position, PositionReport},
-    trade::{AssetFees, Trade, TradeId},
+    trade::{AssetFees, Trade, TradeId, TradesRead},
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use fnv::{FnvHashMap, FnvHashSet};
 use futures::{SinkExt as _, StreamExt as _, stream::BoxStream};
 use indexmap::IndexMap;
@@ -1783,43 +1783,58 @@ impl ExecutionClient for AlpacaClient {
         Ok(result)
     }
 
+    /// Reads at most 50 pages of FILL activities per call, 5,000 fills counted across the whole
+    /// account before the instrument filter, and returns `resume` when it stops there. So a call for one instrument can return no trades with `resume: Some`.
     async fn fetch_trades(
         &self,
-        time_since: DateTime<Utc>,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
         instruments: &[InstrumentNameExchange],
-    ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError> {
-        let after_str = time_since.to_rfc3339();
-        let base = self.base_url();
-        let http = self.http.clone();
+    ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError> {
+        if start > end {
+            return Ok(TradesRead::complete(Vec::new()));
+        }
+        let page = paginate_activities(
+            &self.http,
+            &self.rate_limiter,
+            self.base_url(),
+            start,
+            Some(end),
+        )
+        .await?;
 
-        let page = paginate_activities(&http, &self.rate_limiter, base, &after_str).await?;
-
-        // Propagate truncation as an error so callers can detect incomplete results.
-        // A caller can match on `Truncated` and alert rather than act on a partial page.
-        if page.truncated {
+        // A resume past `end` means the read went beyond the span: nothing in it is left.
+        let resume = page.resume.filter(|resume| *resume <= end);
+        // A read from `resume` would stop where this one did, so it cannot advance.
+        if resume.is_some_and(|resume| resume <= floor_millis(start)) {
+            error!(
+                %start,
+                fills_read = page.activities.len(),
+                "Alpaca fetch_trades: a full read did not advance past the span's first millisecond"
+            );
             return Err(UnindexedClientError::Truncated {
-                limit: MAX_ACTIVITY_PAGES,
+                fills_read: page.activities.len(),
             });
         }
 
         // Empty instruments slice means "all instruments" — same convention as
-        // fetch_open_orders. Build a set only when filtering is needed.
-        let trades = if instruments.is_empty() {
-            page.activities
-                .into_iter()
-                .filter_map(|a| convert_activity_to_trade(&a))
-                .collect()
-        } else {
-            let instrument_set: fnv::FnvHashSet<&str> =
-                instruments.iter().map(|i| i.name().as_str()).collect();
-            page.activities
-                .into_iter()
-                .filter(|a| instrument_set.contains(a.symbol.as_str()))
-                .filter_map(|a| convert_activity_to_trade(&a))
-                .collect()
-        };
+        // fetch_open_orders.
+        let instrument_set: fnv::FnvHashSet<&str> =
+            instruments.iter().map(|i| i.name().as_str()).collect();
+        let trades = page
+            .activities
+            .iter()
+            .filter(|a| instrument_set.is_empty() || instrument_set.contains(a.symbol.as_str()))
+            // Alpaca's bounds are not exact (see `paginate_activities`), so the span is applied
+            // here. An activity whose time does not parse is kept: Alpaca placed it in the span.
+            .filter(|a| {
+                parse_timestamp(&a.transaction_time)
+                    .is_none_or(|time| (start..=end).contains(&time))
+            })
+            .filter_map(convert_activity_to_trade)
+            .collect();
 
-        Ok(trades)
+        Ok(TradesRead::new(trades, resume))
     }
 }
 
@@ -2304,31 +2319,52 @@ async fn fetch_raw_open_orders(
 // Activity pagination
 // ---------------------------------------------------------------------------
 
-/// Maximum number of pages fetched by [`paginate_activities`].
+/// Maximum number of pages fetched by one [`paginate_activities`] call.
 ///
-/// 50 pages × 100 items = 5 000 fills. Exceeding this during recovery indicates
-/// an unusually long outage; we warn and truncate rather than looping forever.
+/// 50 pages × 100 items = 5 000 fills. It bounds how long one read, such as a reconnect's
+/// recovery, can take; a read that reaches it says where to read on from.
 const MAX_ACTIVITY_PAGES: usize = 50;
 
-/// Result of [`paginate_activities`] including truncation status.
-///
-/// When `truncated` is true, the `activities` vector contains a partial result
-/// capped at [`MAX_ACTIVITY_PAGES`] pages. Callers should handle this case
-/// appropriately — typically by alerting operators about potential data loss.
+/// What one [`paginate_activities`] call read.
 struct ActivityPage {
+    /// Every FILL activity read, in Alpaca's ascending order.
     activities: Vec<AlpacaActivity>,
-    truncated: bool,
+    /// Set when the read stopped at [`MAX_ACTIVITY_PAGES`]: every activity before this time was
+    /// read, and some from it on may not have been.
+    resume: Option<DateTime<Utc>>,
 }
 
-/// Fetch all FILL activities since `after` using token-based pagination.
+/// `time` rounded down to the millisecond.
+fn floor_millis(time: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::from_timestamp_millis(time.timestamp_millis()).unwrap_or(time)
+}
+
+/// Fetch the FILL activities from `start`, and up to `end` if given, using token-based
+/// pagination.
 ///
 /// Alpaca returns up to `ALPACA_MAX_ACTIVITIES` per page. If a full page is
 /// returned, the next request uses the last item's `id` as the `page_token`.
 /// Pagination terminates when a page has fewer items than `page_size`, or after
 /// [`MAX_ACTIVITY_PAGES`] pages (whichever comes first).
 ///
-/// Returns [`ActivityPage`] with `truncated = true` if the page limit was reached,
-/// allowing callers to detect and handle partial results.
+/// # Bounds
+///
+/// Alpaca's `after` and `until` are not exact. Observed on paper (2026-10-05):
+/// - `after` matches an activity whose time, rounded down to the millisecond, is at or after it.
+///   So a microsecond `after` drops the rest of its own millisecond. It is sent rounded down to
+///   the millisecond, which reads the whole of `start`'s.
+/// - `until` matched no single rule: exact to the microsecond for one fill, yet including a fill
+///   15 µs past it for two that shared a millisecond. It is sent as the millisecond after
+///   `end`'s, and callers apply `end` to what is read.
+///
+/// So the activities read can begin before `start` and end after `end`, within their
+/// milliseconds.
+///
+/// # Resuming
+///
+/// Within one millisecond Alpaca orders activities by id, not by time, so a read cut inside a
+/// millisecond may not have reached an earlier fill in it. [`ActivityPage::resume`] is therefore
+/// the millisecond of the last activity read, and a read from it reads that millisecond again.
 // Compile-time string form of ALPACA_MAX_ACTIVITIES (avoids runtime to_string() allocation).
 const PAGE_SIZE_STR: &str = "100"; // must match ALPACA_MAX_ACTIVITIES
 const _: () = assert!(
@@ -2340,8 +2376,14 @@ async fn paginate_activities(
     http: &reqwest::Client,
     rate_limiter: &RateLimitTracker,
     base: &str,
-    after: &str,
+    start: DateTime<Utc>,
+    end: Option<DateTime<Utc>>,
 ) -> Result<ActivityPage, UnindexedClientError> {
+    let after = floor_millis(start).to_rfc3339_opts(SecondsFormat::Millis, true);
+    let until = end.map(|end| {
+        (floor_millis(end) + TimeDelta::milliseconds(1))
+            .to_rfc3339_opts(SecondsFormat::Millis, true)
+    });
     let mut all = Vec::with_capacity(ALPACA_MAX_ACTIVITIES);
     let mut page_token: Option<String> = None;
     let mut pages = 0usize;
@@ -2358,10 +2400,13 @@ async fn paginate_activities(
         let activities: Vec<AlpacaActivity> = rest_with_retry(rate_limiter, || {
             let mut req = http.get(format!("{base}/v2/account/activities")).query(&[
                 ("activity_type", "FILL"),
-                ("after", after),
+                ("after", after.as_str()),
                 ("page_size", PAGE_SIZE_STR),
                 ("direction", "asc"),
             ]);
+            if let Some(until) = until.as_deref() {
+                req = req.query(&[("until", until)]);
+            }
             if let Some(token) = page_token_ref {
                 req = req.query(&[("page_token", token)]);
             }
@@ -2397,9 +2442,19 @@ async fn paginate_activities(
         }
     }
 
+    // Activities are ascending by millisecond, so the last one whose time parses bounds what is
+    // left. None parsing leaves everything from `start`.
+    let resume = truncated.then(|| {
+        floor_millis(
+            all.iter()
+                .rev()
+                .find_map(|activity| parse_timestamp(&activity.transaction_time))
+                .unwrap_or(start),
+        )
+    });
     Ok(ActivityPage {
         activities: all,
-        truncated,
+        resume,
     })
 }
 
@@ -3109,8 +3164,8 @@ fn fill_recovery_gave_up(
 /// A fill that brings an order to its full quantity ends it in `known`, so a reconnect's check
 /// does not report it again.
 ///
-/// Returns the fills it did not deliver: all of them when the read fails, and those from just
-/// before the last one read when the read stops at [`MAX_ACTIVITY_PAGES`]. The fills it read are sent
+/// Returns the fills it did not deliver: all of them when the read fails, and those from the
+/// millisecond of the last one read when the read stops at [`MAX_ACTIVITY_PAGES`]. The fills it read are sent
 /// first. A consumer that drops the stream part-way gets `Ok`, as there is no one to report to.
 async fn recover_fills(
     http: &reqwest::Client,
@@ -3131,7 +3186,7 @@ async fn recover_fills(
         instruments.iter().map(|i| i.name().as_str()).collect()
     };
 
-    let page = match paginate_activities(http, rate_limiter, base, &after.to_rfc3339()).await {
+    let page = match paginate_activities(http, rate_limiter, base, after, None).await {
         Ok(p) => p,
         Err(e) => {
             error!(%e, "Alpaca fill recovery: REST request failed");
@@ -3144,16 +3199,10 @@ async fn recover_fills(
 
     let activities = page.activities;
 
-    // The read is account-wide and ascending, so a truncated one has every fill up to its last
-    // one, whatever the instrument. Fills sharing that last time may be cut, so the unread span
-    // starts just before it: a microsecond earlier, so a read from there with Alpaca's `after`
-    // reaches them whether `after` is inclusive or exclusive. The dedup cache absorbs those read
-    // twice. A time that does not parse widens the span back to the disconnect, never narrows it.
-    let unread = page.truncated.then(|| {
-        let start = activities
-            .last()
-            .and_then(|activity| parse_timestamp(&activity.transaction_time))
-            .map_or(after, |last| last - chrono::Duration::microseconds(1));
+    // The read is account-wide, so one that stopped at the page cap has every fill before its
+    // resume point, whatever the instrument: the millisecond of its last fill, which a read from
+    // there reads again. The dedup cache absorbs the fills read twice.
+    let unread = page.resume.map(|start| {
         error!(
             max_pages = MAX_ACTIVITY_PAGES,
             fills_read = activities.len(),
@@ -6576,12 +6625,12 @@ mod tests {
 
             let http = reqwest::Client::new();
             let rl = RateLimitTracker::new();
-            let result = paginate_activities(&http, &rl, &server.uri(), "2025-01-01T00:00:00Z")
+            let result = paginate_activities(&http, &rl, &server.uri(), recovery_after(), None)
                 .await
                 .unwrap();
 
             assert_eq!(result.activities.len(), 5);
-            assert!(!result.truncated);
+            assert_eq!(result.resume, None);
             assert_eq!(server.received_requests().await.unwrap().len(), 1);
         }
 
@@ -6601,12 +6650,12 @@ mod tests {
 
             let http = reqwest::Client::new();
             let rl = RateLimitTracker::new();
-            let result = paginate_activities(&http, &rl, &server.uri(), "2025-01-01T00:00:00Z")
+            let result = paginate_activities(&http, &rl, &server.uri(), recovery_after(), None)
                 .await
                 .unwrap();
 
             assert_eq!(result.activities.len(), ALPACA_MAX_ACTIVITIES);
-            assert!(!result.truncated);
+            assert_eq!(result.resume, None);
             assert_eq!(
                 server.received_requests().await.unwrap().len(),
                 2,
@@ -6630,12 +6679,12 @@ mod tests {
 
             let http = reqwest::Client::new();
             let rl = RateLimitTracker::new();
-            let result = paginate_activities(&http, &rl, &server.uri(), "2025-01-01T00:00:00Z")
+            let result = paginate_activities(&http, &rl, &server.uri(), recovery_after(), None)
                 .await
                 .unwrap();
 
             assert_eq!(result.activities.len(), ALPACA_MAX_ACTIVITIES + 37);
-            assert!(!result.truncated);
+            assert_eq!(result.resume, None);
             assert_eq!(server.received_requests().await.unwrap().len(), 2);
         }
 
@@ -6658,13 +6707,13 @@ mod tests {
 
             let http = reqwest::Client::new();
             let rl = RateLimitTracker::new();
-            let result = paginate_activities(&http, &rl, &server.uri(), "2025-01-01T00:00:00Z")
+            let result = paginate_activities(&http, &rl, &server.uri(), recovery_after(), None)
                 .await
                 .unwrap();
 
             assert!(
-                result.truncated,
-                "must be truncated after MAX_ACTIVITY_PAGES pages"
+                result.resume.is_some(),
+                "must say where to read on after MAX_ACTIVITY_PAGES pages"
             );
             assert_eq!(
                 result.activities.len(),
@@ -7460,22 +7509,39 @@ mod tests {
         }
 
         /// A recovery read that stops at the page cap delivers the fills it read, then leaves
-        /// those from just before the last one's time on unread. A last time that does not parse
-        /// leaves everything from the disconnect unread instead.
+        /// those from the millisecond of the last one on unread: Alpaca orders a millisecond's
+        /// fills by id, so the cut may have passed over an earlier one in it. A last time that
+        /// does not parse falls back to the latest that does, and none parsing to the disconnect.
         #[tokio::test]
         async fn a_truncated_recovery_read_delivers_what_it_read_and_leaves_the_rest_unread() {
-            let last: DateTime<Utc> = "2025-04-18T14:30:00Z".parse().expect("valid time");
+            let time = |s: &str| s.parse::<DateTime<Utc>>().expect("valid time");
+            // The page's other activities are at 14:30:00.
             let cases = [
                 (
-                    "2025-04-18T14:30:00Z",
-                    last - chrono::Duration::microseconds(1),
+                    Some("2025-04-18T14:30:01.234567Z"),
+                    time("2025-04-18T14:30:01.234Z"),
                 ),
-                ("not a time", recovery_after()),
+                (Some("not a time"), time("2025-04-18T14:30:00Z")),
+                (None, recovery_after()),
             ];
             for (last_time, expected_start) in cases {
                 let mut page = make_activities_json(ALPACA_MAX_ACTIVITIES, "act");
-                if let Some(last) = page.as_array_mut().and_then(|page| page.last_mut()) {
-                    last["transaction_time"] = serde_json::Value::String(last_time.to_string());
+                let Some(activities) = page.as_array_mut() else {
+                    panic!("an array of activities");
+                };
+                match last_time {
+                    Some(last_time) => {
+                        if let Some(last) = activities.last_mut() {
+                            last["transaction_time"] =
+                                serde_json::Value::String(last_time.to_string());
+                        }
+                    }
+                    None => {
+                        for activity in activities.iter_mut() {
+                            activity["transaction_time"] =
+                                serde_json::Value::String("not a time".to_string());
+                        }
+                    }
                 }
                 let server = MockServer::start().await;
                 Mock::given(method("GET"))
@@ -7707,18 +7773,281 @@ mod tests {
                 .mount(&server)
                 .await;
             let Ok(fetched) = client_for(&server)
-                .fetch_trades(recovery_after(), &[])
+                .fetch_trades(recovery_after(), Utc::now(), &[])
                 .await
             else {
                 panic!("fetch_trades reads the activity");
             };
-            let [fetched] = fetched.as_slice() else {
+            let [fetched] = fetched.trades.as_slice() else {
                 panic!("one fill fetched: {fetched:?}");
             };
 
             assert_eq!(trade_of(&streamed).id.0.as_str(), execution_id);
             assert_eq!(trade_of(recovered).id.0.as_str(), execution_id);
             assert_eq!(fetched.id.0.as_str(), execution_id);
+        }
+
+        // -----------------------------------------------------------------------
+        // fetch_trades — bounded reads of a span, resumed by the caller
+        // -----------------------------------------------------------------------
+
+        fn time(s: &str) -> DateTime<Utc> {
+            s.parse().expect("valid time")
+        }
+
+        /// Alpaca's activities endpoint over `activities`, which are sorted by id, as observed on
+        /// paper: `after` matches an activity whose time, rounded down to the millisecond, is at
+        /// or after it, `until` one whose rounded time is before it, and `page_token` resumes
+        /// after the activity it names.
+        struct ActivitiesVenue {
+            activities: Vec<serde_json::Value>,
+        }
+
+        impl Respond for ActivitiesVenue {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let query: std::collections::HashMap<String, String> =
+                    request.url.query_pairs().into_owned().collect();
+                let bound = |name: &str| query.get(name).map(|s| time(s));
+                let (after, until) = (bound("after"), bound("until"));
+                let size: usize = query
+                    .get("page_size")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(ALPACA_MAX_ACTIVITIES);
+                let in_bounds = self.activities.iter().filter(|activity| {
+                    let at =
+                        floor_millis(time(activity["transaction_time"].as_str().expect("a time")));
+                    after.is_none_or(|after| at >= after) && until.is_none_or(|until| at < until)
+                });
+                let page: Vec<_> = match query.get("page_token") {
+                    Some(token) => in_bounds
+                        .skip_while(|activity| activity["id"] != token.as_str())
+                        .skip(1)
+                        .take(size)
+                        .cloned()
+                        .collect(),
+                    None => in_bounds.take(size).cloned().collect(),
+                };
+                ResponseTemplate::new(200).set_body_json(page)
+            }
+        }
+
+        /// A FILL activity on `symbol` with id `id` at `transaction_time`.
+        fn fill_at(id: &str, symbol: &str, transaction_time: DateTime<Utc>) -> serde_json::Value {
+            serde_json::json!({
+                "id": id,
+                "order_id": format!("ord-{id}"),
+                "symbol": symbol,
+                "side": "buy",
+                "price": "100.00",
+                "qty": "1",
+                "cum_qty": "1",
+                "transaction_time": transaction_time.to_rfc3339_opts(SecondsFormat::Micros, true),
+            })
+        }
+
+        async fn serve_activities(activities: Vec<serde_json::Value>) -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .respond_with(ActivitiesVenue { activities })
+                .mount(&server)
+                .await;
+            server
+        }
+
+        /// Read `start..=end` to its end, from each call's `resume`, returning the trade ids
+        /// read and how many calls it took.
+        async fn read_span(
+            client: &AlpacaClient,
+            start: DateTime<Utc>,
+            end: DateTime<Utc>,
+            instruments: &[InstrumentNameExchange],
+        ) -> (std::collections::HashSet<String>, usize) {
+            use crate::client::ExecutionClient;
+
+            let mut ids = std::collections::HashSet::new();
+            let mut from = start;
+            for calls in 1..=10 {
+                let read = match client.fetch_trades(from, end, instruments).await {
+                    Ok(read) => read,
+                    Err(error) => panic!("call {calls} failed: {error:?}"),
+                };
+                ids.extend(read.trades.iter().map(|trade| trade.id.0.to_string()));
+                match read.resume {
+                    Some(resume) => from = resume,
+                    None => return (ids, calls),
+                }
+            }
+            panic!("the reads did not reach the span's end");
+        }
+
+        /// A span holding more fills than one call reads is read completely across calls, each
+        /// resumed from the last. Three fills share each millisecond, ordered by id against
+        /// their times, so a call's cut falls inside one: its last fill read is later than an
+        /// unread one in the same millisecond, which a resume from the last fill's exact time
+        /// would lose.
+        #[tokio::test]
+        async fn fetch_trades_reads_a_busy_span_completely_across_calls() {
+            let base = time("2025-04-18T14:30:00Z");
+            let mut activities = Vec::new();
+            for ms in 0..4_000_i64 {
+                let symbol = if ms % 2 == 0 { "SPY" } else { "QQQ" };
+                for (k, micros) in [("a", 900), ("b", 500), ("c", 100)] {
+                    let at = base + TimeDelta::milliseconds(ms) + TimeDelta::microseconds(micros);
+                    activities.push(fill_at(&format!("{ms:017}::{ms}-{k}"), symbol, at));
+                }
+            }
+            let server = serve_activities(activities).await;
+            let client = client_for(&server);
+            let end = time("2025-04-18T15:00:00Z");
+
+            let (ids, calls) = read_span(&client, recovery_after(), end, &[]).await;
+            assert_eq!(ids.len(), 12_000, "every fill is read once or more");
+            assert_eq!(calls, 3, "5,000 activities per call");
+
+            let spy = [InstrumentNameExchange::new("SPY")];
+            let (ids, _) = read_span(&client, recovery_after(), end, &spy).await;
+            assert_eq!(ids.len(), 6_000, "every SPY fill, and only those");
+
+            let Some(requests) = server.received_requests().await else {
+                panic!("requests are recorded");
+            };
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.url.query_pairs().any(
+                        |(name, value)| name == "until" && value == "2025-04-18T15:00:00.001Z"
+                    )),
+                "every request is bounded by the span's end"
+            );
+        }
+
+        /// A call can spend its whole bound on other instruments' fills: it returns none, and
+        /// says where to read on from.
+        #[tokio::test]
+        async fn fetch_trades_says_where_to_read_on_after_a_call_without_matches() {
+            use crate::client::ExecutionClient;
+
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(make_activities_json(ALPACA_MAX_ACTIVITIES, "act")),
+                )
+                .mount(&server)
+                .await;
+
+            let qqq = [InstrumentNameExchange::new("QQQ")];
+            let Ok(read) = client_for(&server)
+                .fetch_trades(recovery_after(), Utc::now(), &qqq)
+                .await
+            else {
+                panic!("the read succeeds");
+            };
+            assert!(read.trades.is_empty(), "every fill read is SPY's");
+            assert_eq!(read.resume, Some(time("2025-04-18T14:30:00Z")));
+        }
+
+        /// A full read that does not get past the span's first millisecond cannot advance, so it
+        /// is an error rather than a resume that would loop.
+        #[tokio::test]
+        async fn fetch_trades_that_cannot_advance_is_truncated() {
+            use crate::client::ExecutionClient;
+
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(make_activities_json(ALPACA_MAX_ACTIVITIES, "act")),
+                )
+                .mount(&server)
+                .await;
+
+            let result = client_for(&server)
+                .fetch_trades(time("2025-04-18T14:30:00.000500Z"), Utc::now(), &[])
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(UnindexedClientError::Truncated { fills_read: 5_000 })
+                ),
+                "got {result:?}"
+            );
+        }
+
+        /// The span is applied exactly, although Alpaca's bounds reach the whole of the
+        /// milliseconds holding `start` and `end`.
+        #[tokio::test]
+        async fn fetch_trades_returns_only_the_span() {
+            let (start, end) = (
+                time("2025-04-18T14:30:00.123456Z"),
+                time("2025-04-18T14:30:05.678901Z"),
+            );
+            let micro = TimeDelta::microseconds(1);
+            let server = serve_activities(vec![
+                fill_at("1::before", "SPY", start - micro),
+                fill_at("2::start", "SPY", start),
+                fill_at("3::end", "SPY", end),
+                fill_at("4::after", "SPY", end + micro),
+            ])
+            .await;
+
+            let (ids, calls) = read_span(&client_for(&server), start, end, &[]).await;
+            assert_eq!(calls, 1);
+            let mut ids: Vec<_> = ids.into_iter().collect();
+            ids.sort();
+            assert_eq!(ids, ["end", "start"]);
+        }
+
+        /// A span whose start is after its end is empty: nothing is requested.
+        #[tokio::test]
+        async fn fetch_trades_reads_nothing_for_an_empty_span() {
+            use crate::client::ExecutionClient;
+
+            let server = MockServer::start().await;
+            let start = recovery_after();
+            let Ok(read) = client_for(&server)
+                .fetch_trades(start, start - TimeDelta::seconds(1), &[])
+                .await
+            else {
+                panic!("an empty span reads");
+            };
+            assert_eq!(read, TradesRead::complete(Vec::new()));
+            assert_eq!(server.received_requests().await.map(|r| r.len()), Some(0));
+        }
+
+        /// Alpaca's `after` compares at millisecond precision, so a recovery from mid-millisecond
+        /// asks from that millisecond's start, or it would miss a fill later in it.
+        #[tokio::test]
+        async fn recovery_reads_from_the_start_of_the_disconnects_millisecond() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .and(wiremock::matchers::query_param(
+                    "after",
+                    "2025-01-01T00:00:00.123Z",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let outcome = recover_fills(
+                &reqwest::Client::new(),
+                &RateLimitTracker::new(),
+                &[],
+                &server.uri(),
+                time("2025-01-01T00:00:00.123456Z"),
+                &tx,
+                &new_dedup_cache(),
+                &KnownLiveOrders::shared(ExchangeId::AlpacaBroker),
+            )
+            .await;
+            assert_eq!(outcome, Ok(()));
+            server.verify().await;
         }
 
         /// The dedup keys `dedup` holds, oldest first.

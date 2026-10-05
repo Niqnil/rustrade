@@ -70,7 +70,7 @@ use crate::{
     },
     parse_env_bool,
     position::PositionReport,
-    trade::{AssetFees, Trade, TradeId},
+    trade::{AssetFees, Trade, TradeId, TradesRead},
 };
 use binance_sdk::{
     common::{
@@ -639,17 +639,8 @@ async fn paginate_my_trades(
                 #[allow(clippy::cast_possible_truncation)]
                 let builder = MyTradesParams::builder(sym).limit(BINANCE_MAX_TRADES as i32);
                 let params = match (from, fid) {
-                    (
-                        MyTradesFrom::Time(start_time_ms)
-                        | MyTradesFrom::Span {
-                            start: start_time_ms,
-                            ..
-                        },
-                        None,
-                    ) => builder.start_time(start_time_ms),
-                    (MyTradesFrom::Time(_) | MyTradesFrom::Span { .. }, Some(id)) => {
-                        builder.from_id(id)
-                    }
+                    (MyTradesFrom::Span { start, .. }, None) => builder.start_time(start),
+                    (MyTradesFrom::Span { .. }, Some(id)) => builder.from_id(id),
                     (MyTradesFrom::Order(order_id), None) => builder.order_id(order_id),
                     (MyTradesFrom::Order(order_id), Some(id)) => {
                         builder.order_id(order_id).from_id(id)
@@ -669,7 +660,7 @@ async fn paginate_my_trades(
         // A span ends once a page reaches past it.
         let past_end = match from {
             MyTradesFrom::Span { end, .. } => drop_after(&mut page, end),
-            MyTradesFrom::Time(_) | MyTradesFrom::Order(_) => false,
+            MyTradesFrom::Order(_) => false,
         };
         all_pages.extend(page);
 
@@ -1472,25 +1463,36 @@ impl ExecutionClient for BinanceSpot {
     /// **Documented deviation from the `ExecutionClient::fetch_trades` "return all" contract:**
     /// Binance's `myTrades` endpoint requires a symbol — there is no no-symbol "all trades" query
     /// (unlike open orders). An empty `instruments` slice therefore has nothing to query and
-    /// returns an empty `Vec`; callers wanting all trades must enumerate instruments explicitly.
+    /// reads nothing; callers wanting all trades must enumerate instruments explicitly.
+    ///
+    /// Each instrument is paged by trade id to the span's end within the call, with no page cap,
+    /// so the read is always complete (`resume: None`).
     // `.iter().cloned()` is required: Rust async closures cannot satisfy the HRTB
     // `for<'a> FnMut(&'a InstrumentNameExchange) -> impl Future + 'static` needed by
     // the iterator machinery, even when the clone is moved inside the closure body.
     #[allow(clippy::redundant_iter_cloned)]
     async fn fetch_trades(
         &self,
-        time_since: DateTime<Utc>,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
         instruments: &[InstrumentNameExchange],
-    ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError> {
+    ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError> {
         use futures::StreamExt;
 
         if instruments.is_empty() {
             debug!(
                 "BinanceSpot fetch_trades called with empty instruments slice — returning empty result"
             );
-            return Ok(Vec::new());
+            return Ok(TradesRead::complete(Vec::new()));
         }
-        let start_time_ms = time_since.timestamp_millis();
+        if start > end {
+            return Ok(TradesRead::complete(Vec::new()));
+        }
+        // Binance stamps trades in whole milliseconds; the exact span is applied after the read.
+        let span = MyTradesFrom::Span {
+            start: start.timestamp_millis(),
+            end: end.timestamp_millis(),
+        };
         // Vec::new() — capacity(instruments.len()) would be misleading since this accumulates
         // up to BINANCE_MAX_TRADES * instruments.len() trades total.
         let mut all_trades = Vec::new();
@@ -1502,14 +1504,9 @@ impl ExecutionClient for BinanceSpot {
             let rest = self.rest.clone();
             let rate_limiter = self.rate_limiter.clone();
             async move {
-                let pages = paginate_my_trades(
-                    &rest,
-                    &rate_limiter,
-                    &inst,
-                    MyTradesFrom::Time(start_time_ms),
-                    RequestKind::Query,
-                )
-                .await?;
+                let pages =
+                    paginate_my_trades(&rest, &rate_limiter, &inst, span, RequestKind::Query)
+                        .await?;
                 Ok::<_, UnindexedClientError>((inst, pages))
             }
         }))
@@ -1517,13 +1514,15 @@ impl ExecutionClient for BinanceSpot {
         while let Some(result) = stream.next().await {
             let (instrument, trades_data) = result?;
             for t in trades_data {
-                if let Some(trade) = convert_my_trade(&t, &instrument) {
+                if let Some(trade) = convert_my_trade(&t, &instrument)
+                    && (start..=end).contains(&trade.time_exchange)
+                {
                     all_trades.push(trade);
                 }
             }
         }
 
-        Ok(all_trades)
+        Ok(TradesRead::complete(all_trades))
     }
 }
 

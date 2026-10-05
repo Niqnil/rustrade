@@ -105,6 +105,37 @@ impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
     }
 }
 
+/// What one [`ExecutionClient::fetch_trades`](crate::client::ExecutionClient::fetch_trades) call
+/// read of the span it was asked for.
+///
+/// A venue reads a span in bounded calls, so one call may stop before the span's end. `resume`
+/// says whether this one did:
+/// - `None`: every fill in the span the venue still holds is in `trades`.
+/// - `Some(t)`: the call stopped at its bound, and fills from `t` on may be missing from
+///   `trades`. Read on from `start = t` with the same end. That read can return again fills this
+///   one returned at or after `t`, so match them by instrument and [`TradeId`].
+///
+/// `trades` can be empty while `resume` is `Some`: a venue that reads every instrument's fills
+/// and filters them afterwards can spend a whole call on other instruments'.
+#[non_exhaustive]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Constructor)]
+pub struct TradesRead<AssetKey, InstrumentKey> {
+    /// The fills read, in the span and for the requested instruments.
+    pub trades: Vec<Trade<AssetKey, InstrumentKey>>,
+    /// Where to read on from, or `None` when the read reached the span's end.
+    pub resume: Option<DateTime<Utc>>,
+}
+
+impl<AssetKey, InstrumentKey> TradesRead<AssetKey, InstrumentKey> {
+    /// A read that reached the span's end.
+    pub fn complete(trades: Vec<Trade<AssetKey, InstrumentKey>>) -> Self {
+        Self {
+            trades,
+            resume: None,
+        }
+    }
+}
+
 impl<AssetKey, InstrumentKey> Display for Trade<AssetKey, InstrumentKey>
 where
     AssetKey: Display,

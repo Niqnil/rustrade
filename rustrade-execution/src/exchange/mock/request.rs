@@ -80,13 +80,15 @@ impl MockExchangeRequest {
     pub fn fetch_trades(
         time_request: DateTime<Utc>,
         response_tx: oneshot::Sender<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>>,
-        time_since: DateTime<Utc>,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
     ) -> Self {
         Self::new(
             time_request,
             MockExchangeRequestKind::FetchTrades {
                 response_tx,
-                time_since,
+                start,
+                end,
             },
         )
     }
@@ -144,9 +146,11 @@ pub enum MockExchangeRequestKind {
         orders: Vec<UnindexedOrderKey>,
         response_tx: oneshot::Sender<Vec<UnindexedInactiveOrder>>,
     },
+    /// Every trade from `start` to `end`, both inclusive.
     FetchTrades {
         response_tx: oneshot::Sender<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>>,
-        time_since: DateTime<Utc>,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
     },
     CancelOrder {
         response_tx: oneshot::Sender<UnindexedOrderResponseCancel>,

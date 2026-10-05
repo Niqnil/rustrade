@@ -68,21 +68,22 @@ pub enum ClientError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     #[error("internal error: {0}")]
     Internal(String),
 
-    /// Activity pagination was truncated at the page limit.
+    /// A bounded read of fills could not advance past its start: more fills share the span's
+    /// first moment than one call can read, so a read from the same start would stop at the same
+    /// place.
     ///
-    /// The returned data from the underlying call is a partial result. This error
-    /// indicates that more activities exist beyond the safety limit, typically due
-    /// to a very long outage (>5000 fills). Callers should alert operators and
-    /// consider manual reconciliation.
-    #[error("activity pagination truncated at {limit} pages — data may be incomplete")]
+    /// [`ExecutionClient::fetch_trades`](crate::client::ExecutionClient::fetch_trades) returns it
+    /// rather than a [`TradesRead`](crate::trade::TradesRead) whose `resume` could only loop.
+    /// Callers should alert operators and reconcile the span another way.
+    #[error("trade read stopped after {fills_read} fills without advancing past its start")]
     Truncated {
-        /// Maximum number of pages that were fetched before truncation.
-        limit: usize,
+        /// How many fills the read returned before it stopped.
+        fills_read: usize,
     },
 
     /// Open orders snapshot was truncated at the API's row limit.
     ///
-    /// Unlike [`Self::Truncated`] (which applies to paginated activity fetches), this
+    /// Unlike [`Self::Truncated`] (which applies to paginated fill reads), this
     /// error indicates a single-request endpoint hit its maximum row count.
     /// Alpaca's `/v2/orders` endpoint caps results at 500; accounts with more
     /// concurrent open orders will have an incomplete snapshot.
@@ -511,7 +512,7 @@ mod tests {
 
     #[test]
     fn test_client_error_not_transient_truncated() {
-        let err: ClientError = ClientError::Truncated { limit: 100 };
+        let err: ClientError = ClientError::Truncated { fills_read: 5_000 };
         assert!(!err.is_transient(), "expected non-transient for {:?}", err);
 
         let err: ClientError = ClientError::TruncatedSnapshot { limit: 500 };

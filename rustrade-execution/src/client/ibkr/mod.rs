@@ -141,7 +141,7 @@ use crate::{
         },
         state::{Cancelled, Expired, Filled, Open, OrderState, UnindexedOrderState},
     },
-    trade::{AssetFees, Trade, TradeId},
+    trade::{AssetFees, Trade, TradeId, TradesRead},
 };
 use account::{BalanceAggregator, PositionAggregator};
 use chrono::{DateTime, Utc};
@@ -2395,9 +2395,11 @@ impl ExecutionClient for IbkrClient {
     ///
     /// # Limitations
     ///
-    /// - IB only returns executions from the current trading day. The `time_since`
-    ///   parameter is applied client-side to filter within that day. For historical
-    ///   executions beyond today, use IB's Flex Query or Activity Statements.
+    /// - IB only returns executions from the current trading day. The span is applied
+    ///   client-side to filter within that day, and the read is always complete
+    ///   (`resume: None`) for what IB returned: a span reaching before today is not read
+    ///   before today. For historical executions beyond today, use IB's Flex Query or
+    ///   Activity Statements.
     /// - **Fees are always zero.** IB's executions endpoint doesn't include commission
     ///   data. For trades with accurate fees, use `account_stream()` which pairs
     ///   `ExecutionData` with `CommissionReport` events.
@@ -2405,9 +2407,13 @@ impl ExecutionClient for IbkrClient {
     ///   end-of-data marker. If IB is stalled, this will block indefinitely.
     async fn fetch_trades(
         &self,
-        time_since: DateTime<Utc>,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
         instruments: &[InstrumentNameExchange],
-    ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError> {
+    ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError> {
+        if start > end {
+            return Ok(TradesRead::complete(Vec::new()));
+        }
         let client = self.client.clone();
         let contracts = self.contracts.clone();
         let order_ids = self.order_ids.clone();
@@ -2463,7 +2469,7 @@ impl ExecutionClient for IbkrClient {
                     }
                 };
 
-                if exec_time < time_since {
+                if exec_time < start || exec_time > end {
                     continue;
                 }
 
@@ -2497,7 +2503,7 @@ impl ExecutionClient for IbkrClient {
                 });
             }
 
-            Ok(trades)
+            Ok(TradesRead::complete(trades))
         })
         .await
         .map_err(|e| UnindexedClientError::TaskFailed(format!("task join: {e}")))?
