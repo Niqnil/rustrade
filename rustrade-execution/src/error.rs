@@ -73,8 +73,9 @@ pub enum ClientError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// place.
     ///
     /// [`ExecutionClient::fetch_trades`](crate::client::ExecutionClient::fetch_trades) returns it
-    /// rather than a [`TradesRead`](crate::trade::TradesRead) whose `resume` could only loop.
-    /// Callers should alert operators and reconcile the span another way.
+    /// rather than a [`TradesRead`](crate::trade::TradesRead) whose `resume` could only loop. The
+    /// fills it read are not returned. Callers should alert operators and reconcile the span
+    /// another way.
     #[error("trade read stopped after {fills_read} fills without advancing past its start")]
     Truncated {
         /// How many fills the read returned before it stopped.

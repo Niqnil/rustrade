@@ -1783,8 +1783,18 @@ impl ExecutionClient for AlpacaClient {
         Ok(result)
     }
 
-    /// Reads at most 50 pages of FILL activities per call, 5,000 fills counted across the whole
-    /// account before the instrument filter, and returns `resume` when it stops there. So a call for one instrument can return no trades with `resume: Some`.
+    /// # Cost
+    ///
+    /// One call sends up to 50 requests, reading at most 5,000 FILL activities, and returns
+    /// `resume` when it stops there. The limit counts every activity on the account, before the
+    /// instrument filter, so a call for one instrument can spend all 50 requests and return no
+    /// trades with `resume: Some`.
+    ///
+    /// # Times
+    ///
+    /// An activity whose `transaction_time` does not parse is still returned, since Alpaca placed
+    /// it in the span. Its `time_exchange` is then the local clock at the read, which can lie
+    /// outside the span, and a warning names it.
     async fn fetch_trades(
         &self,
         start: DateTime<Utc>,
@@ -1803,7 +1813,9 @@ impl ExecutionClient for AlpacaClient {
         )
         .await?;
 
-        // A resume past `end` means the read went beyond the span: nothing in it is left.
+        // Alpaca's `until` is not exact, and is not sent for an `end` not yet reached, so the
+        // read can run past `end`. Activities are ascending by millisecond, so a resume past `end`
+        // means every activity in the span was read.
         let resume = page.resume.filter(|resume| *resume <= end);
         // A read from `resume` would stop where this one did, so it cannot advance.
         if resume.is_some_and(|resume| resume <= floor_millis(start)) {
@@ -2355,7 +2367,8 @@ fn floor_millis(time: DateTime<Utc>) -> DateTime<Utc> {
 ///   the millisecond, which reads the whole of `start`'s.
 /// - `until` matched no single rule: exact to the microsecond for one fill, yet including a fill
 ///   15 µs past it for two that shared a millisecond. It is sent as the millisecond after
-///   `end`'s, and callers apply `end` to what is read.
+///   `end`'s, or not at all for an `end` not yet reached, and callers apply `end` to what is
+///   read.
 ///
 /// So the activities read can begin before `start` and end after `end`, within their
 /// milliseconds.
@@ -2379,8 +2392,11 @@ async fn paginate_activities(
     start: DateTime<Utc>,
     end: Option<DateTime<Utc>>,
 ) -> Result<ActivityPage, UnindexedClientError> {
-    let after = floor_millis(start).to_rfc3339_opts(SecondsFormat::Millis, true);
-    let until = end.map(|end| {
+    // Clamped to the epoch so a far-past `start` still formats as RFC 3339; Alpaca holds nothing
+    // older. An `end` not yet reached sends no `until`, so a far-future one cannot overflow.
+    let after =
+        floor_millis(start.max(DateTime::UNIX_EPOCH)).to_rfc3339_opts(SecondsFormat::Millis, true);
+    let until = end.filter(|end| *end < Utc::now()).map(|end| {
         (floor_millis(end) + TimeDelta::milliseconds(1))
             .to_rfc3339_opts(SecondsFormat::Millis, true)
     });
@@ -7999,6 +8015,68 @@ mod tests {
             let mut ids: Vec<_> = ids.into_iter().collect();
             ids.sort();
             assert_eq!(ids, ["end", "start"]);
+        }
+
+        /// Alpaca's `until` is not exact, so a capped read can return activities past `end`. Every
+        /// activity before them was read, so the span is complete.
+        #[tokio::test]
+        async fn fetch_trades_that_read_past_the_end_is_complete() {
+            use crate::client::ExecutionClient;
+
+            let server = MockServer::start().await;
+            // Full pages at 14:30:00, whatever `until` asks for.
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(make_activities_json(ALPACA_MAX_ACTIVITIES, "act")),
+                )
+                .mount(&server)
+                .await;
+
+            let Ok(read) = client_for(&server)
+                .fetch_trades(recovery_after(), time("2025-04-18T14:29:00Z"), &[])
+                .await
+            else {
+                panic!("the read succeeds");
+            };
+            assert_eq!(read, TradesRead::complete(Vec::new()));
+        }
+
+        /// The extreme times are valid bounds: a start before the epoch asks from the epoch, and
+        /// an end not yet reached sends no `until` rather than overflowing.
+        #[tokio::test]
+        async fn fetch_trades_accepts_the_extreme_times() {
+            use crate::client::ExecutionClient;
+
+            let server = serve_activities(vec![fill_at(
+                "1::fill",
+                "SPY",
+                time("2025-04-18T14:30:00Z"),
+            )])
+            .await;
+            let Ok(read) = client_for(&server)
+                .fetch_trades(DateTime::<Utc>::MIN_UTC, DateTime::<Utc>::MAX_UTC, &[])
+                .await
+            else {
+                panic!("the read succeeds");
+            };
+            assert_eq!(read.trades.len(), 1);
+            assert_eq!(read.resume, None);
+
+            let Some(requests) = server.received_requests().await else {
+                panic!("requests are recorded");
+            };
+            let [request] = requests.as_slice() else {
+                panic!("one request: {requests:?}");
+            };
+            let query: std::collections::HashMap<_, _> =
+                request.url.query_pairs().into_owned().collect();
+            assert_eq!(
+                query.get("after").map(String::as_str),
+                Some("1970-01-01T00:00:00.000Z")
+            );
+            assert!(!query.contains_key("until"), "{query:?}");
         }
 
         /// A span whose start is after its end is empty: nothing is requested.

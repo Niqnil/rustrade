@@ -5182,6 +5182,64 @@ mod tests {
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
+    /// `fetch_trades` reads its span's milliseconds and returns only the trades inside the span:
+    /// not one earlier in `start`'s millisecond, nor one after `end`. An empty span reads nothing.
+    #[tokio::test]
+    async fn fetch_trades_returns_only_the_span() {
+        // Half a millisecond in, so a trade at the start of its millisecond is before it.
+        let start = DateTime::from_timestamp_millis(
+            (Utc::now() - chrono::Duration::minutes(10)).timestamp_millis(),
+        )
+        .unwrap()
+            + chrono::Duration::microseconds(500);
+        let end = start + chrono::Duration::seconds(10);
+        let (start_ms, end_ms) = (start.timestamp_millis(), end.timestamp_millis());
+        let trade = |id: i64, time: i64| {
+            serde_json::json!({
+                "symbol": "BTCUSDT", "id": id, "orderId": id, "price": "100", "qty": "1",
+                "commission": "0", "commissionAsset": "USDT", "time": time,
+                "isBuyer": true, "isMaker": false, "isBestMatch": true,
+            })
+        };
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/myTrades"))
+            .and(wiremock::matchers::query_param(
+                "startTime",
+                start_ms.to_string(),
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(vec![
+                trade(1, start_ms),
+                trade(2, start_ms + 1),
+                trade(3, end_ms),
+                trade(4, end_ms + 1),
+            ]))
+            .mount(&server)
+            .await;
+        let mut client = <BinanceSpot as ExecutionClient>::new(BinanceSpotConfig::new(
+            "key".into(),
+            "secret".into(),
+        ));
+        client.rest = Arc::new(SpotRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server.uri())
+                .build()
+                .unwrap(),
+        ));
+        let btc = [InstrumentNameExchange::new("BTCUSDT")];
+
+        let read = client.fetch_trades(start, end, &btc).await.unwrap();
+        let ids: Vec<_> = read.trades.iter().map(|t| t.id.0.as_str()).collect();
+        assert_eq!(ids, ["2", "3"]);
+        assert_eq!(read.resume, None, "spot reads a span whole");
+
+        let empty = client.fetch_trades(end, start, &btc).await.unwrap();
+        assert!(empty.trades.is_empty() && empty.resume.is_none());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
     /// A gap whose every read times out is given up, and reported with the recovery's time budget.
     #[tokio::test]
     async fn a_gap_whose_every_read_times_out_is_reported_when_given_up() {

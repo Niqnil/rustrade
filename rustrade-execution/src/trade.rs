@@ -116,8 +116,10 @@ impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
 ///   one returned at or after `t`, so match them by instrument and [`TradeId`].
 ///
 /// `trades` can be empty while `resume` is `Some`: a venue that reads every instrument's fills
-/// and filters them afterwards can spend a whole call on other instruments'.
+/// and filters them afterwards can spend a whole call on other instruments'. A caller that takes
+/// `trades` without reading on from `resume` can miss fills.
 #[non_exhaustive]
+#[must_use = "`resume` says whether the span was read to its end"]
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Constructor)]
 pub struct TradesRead<AssetKey, InstrumentKey> {
     /// The fills read, in the span and for the requested instruments.
