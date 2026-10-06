@@ -59,6 +59,19 @@
 //! and its results reach the caller rather than the stream. A caller feeding both into one consumer
 //! should expect overlap and reconcile on the trade id.
 //!
+//! # Perpetual and spot coins
+//!
+//! Hyperliquid reports every market a wallet trades through the same account streams and
+//! open-order and fill endpoints, each order and fill under its *coin*. Each client keeps only its
+//! own, judged by [`CoinKind::of`](rustrade_instrument::hyperliquid::CoinKind::of):
+//! - [`HyperliquidClient`] keeps perpetuals (`BTC`, `kPEPE`, and HIP-3 perpetuals such as
+//!   `xyz:TSLA`), named `{coin}-USD-PERP`;
+//! - [`spot::HyperliquidSpotClient`] keeps spot pairs (`@107`, `PURR/USDC`), named from their
+//!   tokens; see its [Spot coins](spot#spot-coins).
+//!
+//! A coin of a kind neither recognises, such as an outcome coin (`#12`), is left out by both, and
+//! logged with `warn!` by the perpetuals client.
+//!
 //! # Client order ids
 //!
 //! **Every order must be placed under a client id in
@@ -101,6 +114,7 @@ pub mod common;
 pub mod config;
 pub mod error;
 pub mod spot;
+mod spot_coins;
 
 use crate::client::dedup::{dedup_key_from_event, is_duplicate, new_dedup_cache};
 use crate::{
@@ -126,7 +140,7 @@ use chrono::{DateTime, Utc};
 use common::{
     CLOID_REQUIRED, CancelOnDropStream, OpenOrderListing, cid_to_cloid, instrument_to_perp_coin,
     map_tif, millis_to_datetime, open_order_to_order, open_orders, parse_decimal, parse_side,
-    perp_coin_to_instrument, round_to_5_sig_figs, span_millis, user_fills_by_time,
+    perp_coin_to_instrument, perp_instrument, round_to_5_sig_figs, span_millis, user_fills_by_time,
 };
 pub use config::{HyperliquidConfig, HyperliquidConfigError};
 use error::{map_order_error, map_sdk_error};
@@ -340,7 +354,7 @@ impl ExecutionClient for HyperliquidClient {
             &open_orders,
             ExchangeId::HyperliquidPerp,
             instruments,
-            |coin| Some(perp_coin_to_instrument(coin)),
+            perp_instrument,
         );
 
         // Build positions from asset_positions
@@ -1022,7 +1036,7 @@ impl ExecutionClient for HyperliquidClient {
         Ok(open_orders
             .iter()
             .filter_map(|order| {
-                let instrument = perp_coin_to_instrument(&order.coin);
+                let instrument = perp_instrument(&order.coin)?;
                 if instrument_filter
                     .as_ref()
                     .is_some_and(|f| !f.contains(&instrument))
@@ -1060,7 +1074,9 @@ impl ExecutionClient for HyperliquidClient {
 
         let mut result = Vec::new();
         for fill in fills {
-            let instrument = perp_coin_to_instrument(&fill.coin);
+            let Some(instrument) = perp_instrument(&fill.coin) else {
+                continue;
+            };
 
             if instrument_filter
                 .as_ref()
@@ -1141,14 +1157,14 @@ fn perp_position_report(
     ))
 }
 
-/// Convert SDK TradeInfo (fill) to AccountEvent::Trade.
+/// Convert SDK TradeInfo (fill) to AccountEvent::Trade, `None` if its coin names no perpetual.
 fn fill_to_account_event(fill: &hyperliquid_rust_sdk::TradeInfo) -> Option<UnindexedAccountEvent> {
+    let instrument = perp_instrument(&fill.coin)?;
     let side = parse_side(&fill.side)?;
     let price = parse_decimal(&fill.px, "fill.px")?;
     let quantity = parse_decimal(&fill.sz, "fill.sz")?;
     let fee = parse_decimal(&fill.fee, "fill.fee").unwrap_or(Decimal::ZERO);
     let time_exchange = millis_to_datetime(fill.time)?;
-    let instrument = perp_coin_to_instrument(&fill.coin);
     let order_id = OrderId(format_smolstr!("{}", fill.oid));
 
     let trade = Trade {
@@ -1176,14 +1192,15 @@ fn fill_to_account_event(fill: &hyperliquid_rust_sdk::TradeInfo) -> Option<Unind
     ))
 }
 
-/// Convert SDK OrderUpdate to AccountEvent::OrderSnapshot.
+/// Convert SDK OrderUpdate to AccountEvent::OrderSnapshot, `None` if its coin names no
+/// perpetual.
 fn order_update_to_account_event(
     update: &hyperliquid_rust_sdk::OrderUpdate,
 ) -> Option<UnindexedAccountEvent> {
     common::order_update_to_account_event(
         update,
         ExchangeId::HyperliquidPerp,
-        perp_coin_to_instrument(&update.order.coin),
+        perp_instrument(&update.order.coin)?,
     )
 }
 

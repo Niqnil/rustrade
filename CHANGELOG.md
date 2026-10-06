@@ -322,6 +322,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no error. Both now read the span with `userFillsByTime`, paging past its 2,000-fill responses.
   Hyperliquid keeps only a wallet's 10,000 most recent fills, so older fills still cannot be read.
   Closes #484.
+- **Hyperliquid spot dropped every pair but PURR/USDC, and perpetuals reported spot pairs**
+  (`rustrade-execution` and `rustrade-instrument`, `hyperliquid` features). **Breaking.**
+  Hyperliquid names every spot pair but PURR/USDC by its index (`@107` is HYPE/USDC), but the spot
+  client recognised a spot coin only by a `/` in its name. So for every other pair it silently
+  dropped fills and order updates on the account stream, and rows from `fetch_open_orders`,
+  `fetch_trades` and the account snapshot. The perpetuals client took every coin for a perpetual,
+  so it reported those spot fills and orders, and PURR/USDC's, under instruments such as
+  `@107-USD-PERP`.
+  - The spot client reads Hyperliquid's `spotMeta` when it is created, and names each pair
+    `BASE-QUOTE-SPOT` from its tokens: `@107` is `HYPE-USDC-SPOT`, and `@207`, HYPE quoted in
+    USDT0, is `HYPE-USDT0-SPOT`. `connect` now fails, and `new` panics, if `spotMeta` cannot be
+    read.
+  - A spot coin missing from `spotMeta`, such as a pair listed since, makes the client read it
+    again, at most once every 10 seconds. A coin still missing fails `account_snapshot`,
+    `fetch_open_orders` and `fetch_trades`, whose lists would otherwise be short with nothing to
+    say so. It is left out of the account stream, with `error!` for a fill and `warn!` for an
+    order update.
+  - Orders are still placed through the SDK's `ExchangeClient`, which reads `spotMeta` only when
+    it is created. So a pair listed after the client was created is reported but cannot be traded
+    until the client is created again.
+  - Each client keeps only its own coins, judged by their shape with the new
+    `rustrade_instrument::hyperliquid::CoinKind`: perpetuals (`BTC`, `kPEPE`, and HIP-3
+    perpetuals such as `xyz:TSLA`) or spot pairs (`@107`, `PURR/USDC`). A coin of neither shape,
+    such as an outcome coin, is left out by both, with `warn!` from the perpetuals client.
+  - New in `rustrade-instrument`, behind a new `hyperliquid` feature: `hyperliquid::CoinKind`,
+    `SpotPairs` and `SpotPair`. `SpotPairs` deserializes from the `spotMeta` response.
+  - **Breaking:** `client::hyperliquid::common::is_spot_coin` is removed in favour of
+    `CoinKind::of`, and `spot_coin_to_instrument(&str)` is replaced by
+    `spot_pair_to_instrument(&SpotPair)`.
+
+  Closes #496.
 - **Alpaca fill recovery and `fetch_trades` could miss fills in the millisecond they read from**
   (`rustrade-execution`). Alpaca's account-activities `after` filter compares at millisecond
   precision, so a read from a time inside a millisecond skipped every later fill in it. Recovery

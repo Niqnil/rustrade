@@ -5,7 +5,8 @@
 //!
 //! # Differences from Perpetuals
 //!
-//! - **Coin naming**: Spot uses pair format `"PURR/USDC"` vs symbol-only `"BTC"` for perps
+//! - **Coin naming**: Spot pairs are named `@{index}` (`"@107"` is HYPE/USDC), except
+//!   `"PURR/USDC"`; perps by their asset (`"BTC"`). See [Spot coins](#spot-coins).
 //! - **Asset indices**: Spot uses 10000+ (vs 0-9999 for perps)
 //! - **Balances**: Uses `user_token_balances()` instead of `user_state()` margin summary
 //! - **No positions**: Spot has no margin/leverage concepts
@@ -21,12 +22,30 @@
 //! # WebSocket Events
 //!
 //! `UserFills` and `OrderUpdates` subscriptions deliver **both** spot and perp events,
-//! intermingled in the same stream. Events are filtered by coin name format:
-//! - Spot coins contain `/` (e.g., `"PURR/USDC"`)
-//! - Perp coins are single symbols (e.g., `"BTC"`)
+//! intermingled in the same stream. Events are filtered by the shape of the coin name, with
+//! [`CoinKind::of`]: this client keeps only spot coins (`"@107"`, `"PURR/USDC"`).
 //!
 //! If a user has both perp and spot clients for the same wallet, events will be
 //! duplicated. Consumers should use one client type per account, or deduplicate externally.
+//!
+//! # Spot coins
+//!
+//! Hyperliquid names every spot pair but PURR/USDC by its index (`"@107"`), which does not name
+//! its assets. The client reads Hyperliquid's `spotMeta` when it is created, and fails to be
+//! created if it cannot, and resolves each coin through it to the instrument `BASE-QUOTE-SPOT`,
+//! named from the pair's tokens (`"@107"` is `HYPE-USDC-SPOT`, `"@207"` is `HYPE-USDT0-SPOT`).
+//!
+//! A spot coin missing from `spotMeta`, such as a pair listed after the client was created, makes
+//! it read `spotMeta` again, at most once every ten seconds. A coin still missing after that is:
+//! - an error from [`ExecutionClient::account_snapshot`], [`ExecutionClient::fetch_open_orders`]
+//!   and [`ExecutionClient::fetch_trades`], whose lists would otherwise be short with nothing to
+//!   say so;
+//! - left out of the account stream, with `error!` for a fill and `warn!` for an order update.
+//!   [`ExecutionClient::fetch_trades`] recovers a fill left out once the pair resolves.
+//!
+//! Orders are placed through the SDK's `ExchangeClient`, which reads `spotMeta` once, when it is
+//! created, and is never refreshed. So a pair listed after the client was created can be reported
+//! but not traded until the client is created again.
 //!
 //! # Conditional Orders (Stop, TakeProfit)
 //!
@@ -42,12 +61,14 @@
 //! [`super`] module documentation for why.
 
 use super::common::{
-    CLOID_REQUIRED, CancelOnDropStream, OpenOrderListing, cid_to_cloid, instrument_to_spot_coin,
-    is_spot_coin, map_tif, millis_to_datetime, open_order_to_order, open_orders, parse_decimal,
-    parse_side, round_to_5_sig_figs, span_millis, spot_coin_to_instrument, user_fills_by_time,
+    CLOID_REQUIRED, CancelOnDropStream, OpenOrder, OpenOrderListing, UserFill, cid_to_cloid,
+    instrument_to_spot_coin, map_tif, millis_to_datetime, open_order_to_order, open_orders,
+    parse_decimal, parse_side, round_to_5_sig_figs, span_millis, spot_pair_to_instrument,
+    user_fills_by_time,
 };
 use super::config::HyperliquidConfig;
 use super::error::{map_order_error, map_sdk_error};
+use super::spot_coins::{SpotCoins, spot_pair};
 use crate::client::dedup::{dedup_key_from_event, is_duplicate, new_dedup_cache};
 use crate::{
     AccountEvent, AccountEventKind, AccountSnapshot, UnindexedAccountEvent,
@@ -76,6 +97,7 @@ use rustrade_instrument::{
     Side,
     asset::name::AssetNameExchange,
     exchange::ExchangeId,
+    hyperliquid::{CoinKind, SpotPair, SpotPairs},
     instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use smol_str::format_smolstr;
@@ -99,6 +121,7 @@ pub struct HyperliquidSpotClient {
     config: HyperliquidConfig,
     info_client: Arc<InfoClient>,
     exchange_client: Arc<ExchangeClient>,
+    spot_coins: SpotCoins,
 }
 
 impl HyperliquidSpotClient {
@@ -106,6 +129,11 @@ impl HyperliquidSpotClient {
     ///
     /// Use this when calling from an async context (e.g., tokio tests).
     /// For sync contexts, use `ExecutionClient::new()`.
+    ///
+    /// # Errors
+    ///
+    /// [`ConnectivityError::Socket`] when the SDK clients cannot be created, or Hyperliquid's
+    /// `spotMeta` cannot be read (see [Spot coins](self#spot-coins)).
     pub async fn connect(config: HyperliquidConfig) -> Result<Self, ConnectivityError> {
         let base_url = if config.testnet {
             BaseUrl::Testnet
@@ -122,6 +150,11 @@ impl HyperliquidSpotClient {
             .await
             .map_err(|e| ConnectivityError::Socket(format!("ExchangeClient: {e}")))?;
 
+        let info_client = Arc::new(info_client);
+        let spot_coins = SpotCoins::fetch(Arc::clone(&info_client))
+            .await
+            .map_err(|e| ConnectivityError::Socket(format!("spotMeta: {e}")))?;
+
         info!(
             testnet = config.testnet,
             wallet = %config.wallet_address_hex(),
@@ -130,8 +163,9 @@ impl HyperliquidSpotClient {
 
         Ok(Self {
             config,
-            info_client: Arc::new(info_client),
+            info_client,
             exchange_client: Arc::new(exchange_client),
+            spot_coins,
         })
     }
 
@@ -171,7 +205,8 @@ impl ExecutionClient for HyperliquidSpotClient {
     ///
     /// - If no Tokio runtime is available on the current thread
     /// - If called from within an async context (e.g., inside `async fn`, `spawn`, or `block_on`)
-    /// - If SDK initialization fails (network error, invalid credentials)
+    /// - If SDK initialization fails (network error, invalid credentials), or Hyperliquid's
+    ///   `spotMeta` cannot be read
     ///
     /// # Recommended Usage
     ///
@@ -199,6 +234,13 @@ impl ExecutionClient for HyperliquidSpotClient {
                 .unwrap_or_else(|e| panic!("Failed to create Hyperliquid ExchangeClient: {e}"))
         });
 
+        let info_client = Arc::new(info_client);
+        let spot_coins = handle.block_on(async {
+            SpotCoins::fetch(Arc::clone(&info_client))
+                .await
+                .unwrap_or_else(|e| panic!("Failed to read Hyperliquid spotMeta: {e}"))
+        });
+
         info!(
             testnet = config.testnet,
             wallet = %config.wallet_address_hex(),
@@ -207,8 +249,9 @@ impl ExecutionClient for HyperliquidSpotClient {
 
         Self {
             config,
-            info_client: Arc::new(info_client),
+            info_client,
             exchange_client: Arc::new(exchange_client),
+            spot_coins,
         }
     }
 
@@ -233,12 +276,18 @@ impl ExecutionClient for HyperliquidSpotClient {
         let now = Utc::now();
         let balances = parse_token_balances(&token_balances.balances, now);
 
+        let coins = open_orders.iter().map(|order| order.coin.as_str());
+        let pairs = self.spot_coins.covering(coins.clone()).await;
+        for coin in coins {
+            spot_pair(&pairs, coin)?;
+        }
+
         // Spot has no positions, so the open orders are the whole of each instrument's entry.
         let instrument_snapshots = OpenOrderListing::new(
             &open_orders,
             ExchangeId::HyperliquidSpot,
             instruments,
-            |coin| is_spot_coin(coin).then(|| spot_coin_to_instrument(coin)),
+            |coin| pairs.get(coin).map(spot_pair_to_instrument),
         )
         .into_snapshots()
         .collect();
@@ -256,7 +305,8 @@ impl ExecutionClient for HyperliquidSpotClient {
     ///
     /// The `instruments` parameter is **ignored** — Hyperliquid's WebSocket API does not
     /// support per-instrument subscriptions for user events. All fills and order updates
-    /// are delivered, but we filter client-side to only emit spot events (coins with '/').
+    /// are delivered, but we filter client-side to only emit spot events (see
+    /// [Spot coins](self#spot-coins)).
     ///
     /// # Task lifecycle
     ///
@@ -306,6 +356,7 @@ impl ExecutionClient for HyperliquidSpotClient {
         let fills_event_tx = event_tx.clone();
         let fills_cancel = cancel_token.clone();
         let fills_terminated = terminated.clone();
+        let fills_coins = self.spot_coins.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -346,10 +397,20 @@ impl ExecutionClient for HyperliquidSpotClient {
                                 // dropping one could strand the consumer on stale state.
                                 for fill in fills.data.fills {
                                     // Filter: only spot coins
-                                    if !is_spot_coin(&fill.coin) {
+                                    if CoinKind::of(&fill.coin) != CoinKind::Spot {
                                         continue;
                                     }
-                                    let Some(event) = fill_to_account_event(&fill) else {
+                                    let pairs = fills_coins.covering([fill.coin.as_str()]).await;
+                                    let Some(pair) = pairs.get(&fill.coin) else {
+                                        error!(
+                                            coin = %fill.coin,
+                                            tid = fill.tid,
+                                            "Hyperliquid spot fill on a coin not in spotMeta; \
+                                             leaving it out (fetch_trades recovers it)"
+                                        );
+                                        continue;
+                                    };
+                                    let Some(event) = fill_to_account_event(&fill, pair) else {
                                         continue;
                                     };
                                     if let Some(key) = dedup_key_from_event(&event)
@@ -389,6 +450,7 @@ impl ExecutionClient for HyperliquidSpotClient {
         let orders_event_tx = event_tx;
         let orders_cancel = cancel_token.clone();
         let orders_terminated = terminated;
+        let orders_coins = self.spot_coins.clone();
         tokio::spawn(async move {
             let _ws_client = ws_client;
 
@@ -422,10 +484,21 @@ impl ExecutionClient for HyperliquidSpotClient {
                             Message::OrderUpdates(updates) => {
                                 for update in updates.data {
                                     // Filter: only spot coins
-                                    if !is_spot_coin(&update.order.coin) {
+                                    let coin = update.order.coin.as_str();
+                                    if CoinKind::of(coin) != CoinKind::Spot {
                                         continue;
                                     }
-                                    if let Some(event) = order_update_to_account_event(&update)
+                                    let pairs = orders_coins.covering([coin]).await;
+                                    let Some(pair) = pairs.get(coin) else {
+                                        warn!(
+                                            %coin,
+                                            oid = update.order.oid,
+                                            "Hyperliquid spot order update on a coin not in \
+                                             spotMeta; leaving it out"
+                                        );
+                                        continue;
+                                    };
+                                    if let Some(event) = order_update_to_account_event(&update, pair)
                                         && orders_event_tx.send(event).is_err()
                                     {
                                         debug!("Spot orders event channel closed");
@@ -900,31 +973,12 @@ impl ExecutionClient for HyperliquidSpotClient {
         let address = self.wallet_h160();
 
         let open_orders = open_orders(&self.info_client, address).await?;
+        let pairs = self
+            .spot_coins
+            .covering(open_orders.iter().map(|order| order.coin.as_str()))
+            .await;
 
-        let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
-            None
-        } else {
-            let mut set = HashSet::with_capacity(instruments.len());
-            set.extend(instruments.iter().cloned());
-            Some(set)
-        };
-
-        Ok(open_orders
-            .iter()
-            .filter_map(|order| {
-                if !is_spot_coin(&order.coin) {
-                    return None;
-                }
-                let instrument = spot_coin_to_instrument(&order.coin);
-                if instrument_filter
-                    .as_ref()
-                    .is_some_and(|f| !f.contains(&instrument))
-                {
-                    return None;
-                }
-                open_order_to_order(order, ExchangeId::HyperliquidSpot, instrument)
-            })
-            .collect())
+        spot_open_orders(&open_orders, &pairs, instruments)
     }
 
     /// Reads the span with `userFillsByTime`, to its end within the call, so the read is always
@@ -942,95 +996,154 @@ impl ExecutionClient for HyperliquidSpotClient {
         let address = self.wallet_h160();
 
         let fills = user_fills_by_time(&self.info_client, address, start_ms, end_ms).await?;
+        let pairs = self
+            .spot_coins
+            .covering(fills.iter().map(|fill| fill.coin.as_str()))
+            .await;
 
-        let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
-            None
-        } else {
-            let mut set = HashSet::with_capacity(instruments.len());
-            set.extend(instruments.iter().cloned());
-            Some(set)
+        spot_trades(&fills, &pairs, start, end, instruments).map(TradesRead::complete)
+    }
+}
+
+/// Convert the open-order rows on spot pairs, keeping those on `instruments` (every one when
+/// empty). Rows on other markets are left out.
+///
+/// # Errors
+///
+/// When a row is on a spot coin missing from `pairs` (see [`spot_pair`]).
+fn spot_open_orders(
+    rows: &[OpenOrder],
+    pairs: &SpotPairs,
+    instruments: &[InstrumentNameExchange],
+) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError> {
+    let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
+        None
+    } else {
+        let mut set = HashSet::with_capacity(instruments.len());
+        set.extend(instruments.iter().cloned());
+        Some(set)
+    };
+
+    let mut orders = Vec::new();
+    for order in rows {
+        let Some(pair) = spot_pair(pairs, &order.coin)? else {
+            continue;
         };
+        let instrument = spot_pair_to_instrument(pair);
+        if instrument_filter
+            .as_ref()
+            .is_some_and(|f| !f.contains(&instrument))
+        {
+            continue;
+        }
+        orders.extend(open_order_to_order(
+            order,
+            ExchangeId::HyperliquidSpot,
+            instrument,
+        ));
+    }
+    Ok(orders)
+}
 
-        let mut result = Vec::new();
-        for fill in fills {
-            // Filter: only spot coins (must contain '/') and parse base/quote in one pass
-            let Some((base_asset, quote_asset)) = fill.coin.split_once('/') else {
-                continue;
-            };
+/// Convert the fills on spot pairs within `start..=end`, keeping those on `instruments` (every one
+/// when empty). Fills on other markets, and fills that do not parse, are left out.
+///
+/// # Errors
+///
+/// When a fill is on a spot coin missing from `pairs` (see [`spot_pair`]).
+fn spot_trades(
+    fills: &[UserFill],
+    pairs: &SpotPairs,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    instruments: &[InstrumentNameExchange],
+) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError> {
+    let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
+        None
+    } else {
+        let mut set = HashSet::with_capacity(instruments.len());
+        set.extend(instruments.iter().cloned());
+        Some(set)
+    };
 
-            let instrument = spot_coin_to_instrument(&fill.coin);
+    let mut result = Vec::new();
+    for fill in fills {
+        let Some(pair) = spot_pair(pairs, &fill.coin)? else {
+            continue;
+        };
+        let (base_asset, quote_asset) = (pair.base(), pair.quote());
+        let instrument = spot_pair_to_instrument(pair);
 
-            if instrument_filter
-                .as_ref()
-                .is_some_and(|f| !f.contains(&instrument))
-            {
-                continue;
-            }
-
-            let Some(side) = parse_side(&fill.side) else {
-                continue;
-            };
-            let Some(price) = parse_decimal(&fill.px, "px") else {
-                continue;
-            };
-            let Some(quantity) = parse_decimal(&fill.sz, "sz") else {
-                continue;
-            };
-            let fee = parse_decimal(&fill.fee, "fee").unwrap_or(Decimal::ZERO);
-
-            let Some(time_exchange) = millis_to_datetime(fill.time) else {
-                warn!(time = fill.time, "Invalid fill timestamp, skipping");
-                continue;
-            };
-            if !(start..=end).contains(&time_exchange) {
-                continue;
-            }
-
-            // Prefer what the venue says the fee was charged in. The side-based rule below is
-            // only a guess — spot buys usually pay in base and sells in quote, but a fee can be
-            // charged in a third asset — and it is reachable only if `feeToken` is absent, which
-            // has not been observed.
-            let fee_asset = fill
-                .fee_token
-                .as_deref()
-                .unwrap_or(if matches!(side, Side::Buy) {
-                    base_asset
-                } else {
-                    quote_asset
-                });
-
-            result.push(Trade {
-                id: TradeId(format_smolstr!("{}", fill.tid)),
-                order_id: OrderId(format_smolstr!("{}", fill.oid)),
-                instrument,
-                strategy: StrategyId::unknown(),
-                time_exchange,
-                side,
-                price,
-                quantity,
-                // `TradeInfo` carries no cumulative filled quantity; Hyperliquid reports order
-                // state as its own `OrderUpdate` message.
-                order_filled_quantity: None,
-                fees: AssetFees {
-                    asset: AssetNameExchange::from(fee_asset),
-                    fees: fee,
-                    // Only set quote-equivalent when the fee is actually denominated in
-                    // the quote asset. The downstream indexer recomputes for base-asset fees.
-                    //
-                    // Case-insensitive, matching the stream path: `fee_asset` is now the venue's
-                    // own `feeToken` rather than a substring of `coin`, so it is no longer equal
-                    // to `quote_asset` byte-for-byte by construction.
-                    fees_quote: if fee_asset.eq_ignore_ascii_case(quote_asset) {
-                        Some(fee)
-                    } else {
-                        None
-                    },
-                },
-            });
+        if instrument_filter
+            .as_ref()
+            .is_some_and(|f| !f.contains(&instrument))
+        {
+            continue;
         }
 
-        Ok(TradesRead::complete(result))
+        let Some(side) = parse_side(&fill.side) else {
+            continue;
+        };
+        let Some(price) = parse_decimal(&fill.px, "px") else {
+            continue;
+        };
+        let Some(quantity) = parse_decimal(&fill.sz, "sz") else {
+            continue;
+        };
+        let fee = parse_decimal(&fill.fee, "fee").unwrap_or(Decimal::ZERO);
+
+        let Some(time_exchange) = millis_to_datetime(fill.time) else {
+            warn!(time = fill.time, "Invalid fill timestamp, skipping");
+            continue;
+        };
+        if !(start..=end).contains(&time_exchange) {
+            continue;
+        }
+
+        // Prefer what the venue says the fee was charged in. The side-based rule below is
+        // only a guess — spot buys usually pay in base and sells in quote, but a fee can be
+        // charged in a third asset — and it is reachable only if `feeToken` is absent, which
+        // has not been observed.
+        let fee_asset = fill
+            .fee_token
+            .as_deref()
+            .unwrap_or(if matches!(side, Side::Buy) {
+                base_asset
+            } else {
+                quote_asset
+            });
+
+        result.push(Trade {
+            id: TradeId(format_smolstr!("{}", fill.tid)),
+            order_id: OrderId(format_smolstr!("{}", fill.oid)),
+            instrument,
+            strategy: StrategyId::unknown(),
+            time_exchange,
+            side,
+            price,
+            quantity,
+            // `TradeInfo` carries no cumulative filled quantity; Hyperliquid reports order
+            // state as its own `OrderUpdate` message.
+            order_filled_quantity: None,
+            fees: AssetFees {
+                asset: AssetNameExchange::from(fee_asset),
+                fees: fee,
+                // Only set quote-equivalent when the fee is actually denominated in
+                // the quote asset. The downstream indexer recomputes for base-asset fees.
+                //
+                // Case-insensitive, matching the stream path: `fee_asset` is now the venue's
+                // own `feeToken` rather than a substring of `coin`, so it is no longer equal
+                // to `quote_asset` byte-for-byte by construction.
+                fees_quote: if fee_asset.eq_ignore_ascii_case(quote_asset) {
+                    Some(fee)
+                } else {
+                    None
+                },
+            },
+        });
     }
+
+    Ok(result)
 }
 
 /// Parse spot token balances from SDK response.
@@ -1054,17 +1167,19 @@ fn parse_token_balances(
         .collect()
 }
 
-/// Convert SDK TradeInfo (fill) to AccountEvent::Trade for spot.
-fn fill_to_account_event(fill: &hyperliquid_rust_sdk::TradeInfo) -> Option<UnindexedAccountEvent> {
+/// Convert SDK TradeInfo (fill) on `pair` to AccountEvent::Trade for spot.
+fn fill_to_account_event(
+    fill: &hyperliquid_rust_sdk::TradeInfo,
+    pair: &SpotPair,
+) -> Option<UnindexedAccountEvent> {
     let side = parse_side(&fill.side)?;
     let price = parse_decimal(&fill.px, "fill.px")?;
     let quantity = parse_decimal(&fill.sz, "fill.sz")?;
     let fee = parse_decimal(&fill.fee, "fill.fee").unwrap_or(Decimal::ZERO);
     let time_exchange = millis_to_datetime(fill.time)?;
 
-    // Parse base/quote in one pass to avoid redundant string scan
-    let (_base, quote_asset) = fill.coin.split_once('/').unwrap_or(("", "USDC"));
-    let instrument = spot_coin_to_instrument(&fill.coin);
+    let quote_asset = pair.quote();
+    let instrument = spot_pair_to_instrument(pair);
     let order_id = OrderId(format_smolstr!("{}", fill.oid));
 
     // SDK's `TradeInfo` exposes `fee_token` directly, which is the asset the fee is
@@ -1102,14 +1217,15 @@ fn fill_to_account_event(fill: &hyperliquid_rust_sdk::TradeInfo) -> Option<Unind
     ))
 }
 
-/// Convert SDK OrderUpdate to AccountEvent::OrderSnapshot for spot.
+/// Convert SDK OrderUpdate on `pair` to AccountEvent::OrderSnapshot for spot.
 fn order_update_to_account_event(
     update: &hyperliquid_rust_sdk::OrderUpdate,
+    pair: &SpotPair,
 ) -> Option<UnindexedAccountEvent> {
     super::common::order_update_to_account_event(
         update,
         ExchangeId::HyperliquidSpot,
-        spot_coin_to_instrument(&update.order.coin),
+        spot_pair_to_instrument(pair),
     )
 }
 
@@ -1117,9 +1233,15 @@ fn order_update_to_account_event(
 // Test code: panics on bad input are acceptable
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use super::super::spot_coins::test_spot_pairs;
     use super::*;
     use rust_decimal_macros::dec;
     use rustrade_integration::collection::snapshot::Snapshot;
+
+    /// The pair `coin` names in [`test_spot_pairs`].
+    fn pair(coin: &str) -> SpotPair {
+        test_spot_pairs().get(coin).unwrap().clone()
+    }
 
     #[test]
     fn test_fill_to_account_event_spot() {
@@ -1142,7 +1264,7 @@ mod tests {
         }"#;
 
         let fill: hyperliquid_rust_sdk::TradeInfo = serde_json::from_str(fill_json).unwrap();
-        let event = fill_to_account_event(&fill).unwrap();
+        let event = fill_to_account_event(&fill, &pair("PURR/USDC")).unwrap();
 
         assert_eq!(event.exchange, ExchangeId::HyperliquidSpot);
         match event.kind {
@@ -1177,8 +1299,10 @@ mod tests {
 
     #[test]
     fn a_spot_trade_id_identifies_the_fill_not_the_transaction() {
-        let first = fill_to_account_event(&spot_sweep_fill(111, "0.05")).unwrap();
-        let second = fill_to_account_event(&spot_sweep_fill(222, "0.051")).unwrap();
+        let first =
+            fill_to_account_event(&spot_sweep_fill(111, "0.05"), &pair("PURR/USDC")).unwrap();
+        let second =
+            fill_to_account_event(&spot_sweep_fill(222, "0.051"), &pair("PURR/USDC")).unwrap();
 
         let (AccountEventKind::Trade(first), AccountEventKind::Trade(second)) =
             (first.kind, second.kind)
@@ -1193,13 +1317,16 @@ mod tests {
     #[test]
     fn a_replayed_spot_fill_is_delivered_once() {
         let cache = new_dedup_cache();
-        let event = fill_to_account_event(&spot_sweep_fill(111, "0.05")).unwrap();
-        let replay = fill_to_account_event(&spot_sweep_fill(111, "0.05")).unwrap();
+        let event =
+            fill_to_account_event(&spot_sweep_fill(111, "0.05"), &pair("PURR/USDC")).unwrap();
+        let replay =
+            fill_to_account_event(&spot_sweep_fill(111, "0.05"), &pair("PURR/USDC")).unwrap();
 
         assert!(!is_duplicate(&cache, dedup_key_from_event(&event).unwrap()));
         assert!(is_duplicate(&cache, dedup_key_from_event(&replay).unwrap()));
         // And the sibling fill of the same sweep still gets through.
-        let sibling = fill_to_account_event(&spot_sweep_fill(222, "0.051")).unwrap();
+        let sibling =
+            fill_to_account_event(&spot_sweep_fill(222, "0.051"), &pair("PURR/USDC")).unwrap();
         assert!(!is_duplicate(
             &cache,
             dedup_key_from_event(&sibling).unwrap()
@@ -1210,7 +1337,7 @@ mod tests {
     fn test_order_update_to_account_event_spot() {
         let update_json = r#"{
             "order": {
-                "coin": "HYPE/USDC",
+                "coin": "@107",
                 "side": "A",
                 "limitPx": "25.5",
                 "sz": "10",
@@ -1224,7 +1351,7 @@ mod tests {
         }"#;
 
         let update: hyperliquid_rust_sdk::OrderUpdate = serde_json::from_str(update_json).unwrap();
-        let event = order_update_to_account_event(&update).unwrap();
+        let event = order_update_to_account_event(&update, &pair("@107")).unwrap();
 
         assert_eq!(event.exchange, ExchangeId::HyperliquidSpot);
         match event.kind {
@@ -1240,5 +1367,139 @@ mod tests {
             }
             _ => panic!("Expected OrderSnapshot event"),
         }
+    }
+    /// A stream fill on `coin`, bought, with its fee in `fee_token`.
+    fn stream_fill(coin: &str, fee_token: &str) -> hyperliquid_rust_sdk::TradeInfo {
+        let json = format!(
+            r#"{{
+                "coin": "{coin}", "side": "B", "px": "25.5", "sz": "2",
+                "time": 1714100000000, "hash": "0xindexed", "startPosition": "0",
+                "dir": "Buy", "closedPnl": "0", "oid": 4343, "cloid": null,
+                "crossed": true, "fee": "0.01", "feeToken": "{fee_token}", "tid": 333
+            }}"#
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn a_fill_on_an_indexed_coin_is_named_from_its_tokens() {
+        let event = fill_to_account_event(&stream_fill("@107", "HYPE"), &pair("@107")).unwrap();
+        let AccountEventKind::Trade(trade) = event.kind else {
+            panic!("Expected Trade event");
+        };
+        assert_eq!(trade.instrument.as_ref(), "HYPE-USDC-SPOT");
+        assert_eq!(trade.fees.asset.as_ref(), "HYPE");
+        assert_eq!(
+            trade.fees.fees_quote, None,
+            "a fee in the base asset is not in quote"
+        );
+    }
+
+    #[test]
+    fn a_fill_quoted_in_another_token_takes_its_quote_from_the_pair() {
+        let event = fill_to_account_event(&stream_fill("@207", "USDT0"), &pair("@207")).unwrap();
+        let AccountEventKind::Trade(trade) = event.kind else {
+            panic!("Expected Trade event");
+        };
+        assert_eq!(trade.instrument.as_ref(), "HYPE-USDT0-SPOT");
+        assert_eq!(
+            trade.fees.fees_quote,
+            Some(dec!(0.01)),
+            "USDT0 is this pair's quote, not USDC"
+        );
+    }
+
+    /// Open-order rows on a perpetual, an indexed spot coin, PURR/USDC and an outcome coin, in
+    /// the `openOrders` response's shape. Values are synthetic.
+    fn open_order_rows(spot_coin: &str) -> Vec<OpenOrder> {
+        serde_json::from_value(serde_json::json!([
+            {"coin": "BTC", "side": "B", "limitPx": "50000", "sz": "0.1", "oid": 1,
+             "timestamp": 1714100000000u64},
+            {"coin": spot_coin, "side": "B", "limitPx": "25.5", "sz": "2", "oid": 2,
+             "timestamp": 1714100000000u64},
+            {"coin": "PURR/USDC", "side": "A", "limitPx": "0.05", "sz": "100", "oid": 3,
+             "timestamp": 1714100000000u64},
+            {"coin": "#12", "side": "B", "limitPx": "0.5", "sz": "10", "oid": 4,
+             "timestamp": 1714100000000u64}
+        ]))
+        .unwrap()
+    }
+
+    #[test]
+    fn open_orders_on_indexed_coins_are_listed_and_other_markets_left_out() {
+        let orders = spot_open_orders(&open_order_rows("@107"), &test_spot_pairs(), &[]).unwrap();
+
+        let instruments: Vec<_> = orders.iter().map(|o| o.key.instrument.as_ref()).collect();
+        assert_eq!(instruments, ["HYPE-USDC-SPOT", "PURR-USDC-SPOT"]);
+
+        let hype_only = [InstrumentNameExchange::from("HYPE-USDC-SPOT")];
+        let orders =
+            spot_open_orders(&open_order_rows("@107"), &test_spot_pairs(), &hype_only).unwrap();
+        assert_eq!(orders.len(), 1);
+    }
+
+    #[test]
+    fn an_open_order_on_a_spot_coin_missing_from_spot_meta_fails_the_list() {
+        let result = spot_open_orders(&open_order_rows("@999"), &test_spot_pairs(), &[]);
+        assert!(
+            matches!(&result, Err(UnindexedClientError::Internal(msg)) if msg.contains("@999")),
+            "a list missing an order must not read as complete: {result:?}"
+        );
+    }
+
+    /// `userFillsByTime` rows on a perpetual, an indexed spot coin and PURR/USDC, at
+    /// [`fill_time`].
+    fn user_fills(spot_coin: &str) -> Vec<UserFill> {
+        serde_json::from_value(serde_json::json!([
+            {"coin": "BTC", "side": "B", "px": "50000", "sz": "0.1", "time": 1714100000000u64,
+             "oid": 1, "fee": "0.5", "feeToken": "USDC", "tid": 11},
+            {"coin": spot_coin, "side": "B", "px": "25.5", "sz": "2", "time": 1714100000000u64,
+             "oid": 2, "fee": "0.01", "feeToken": "HYPE", "tid": 12},
+            {"coin": "PURR/USDC", "side": "A", "px": "0.05", "sz": "100",
+             "time": 1714100000000u64, "oid": 3, "fee": "0.002", "tid": 13}
+        ]))
+        .unwrap()
+    }
+
+    fn fill_time() -> DateTime<Utc> {
+        millis_to_datetime(1714100000000).unwrap()
+    }
+
+    #[test]
+    fn trades_on_indexed_coins_are_read_with_assets_from_spot_meta() {
+        let trades = spot_trades(
+            &user_fills("@107"),
+            &test_spot_pairs(),
+            fill_time(),
+            fill_time(),
+            &[],
+        )
+        .unwrap();
+
+        let read: Vec<_> = trades
+            .iter()
+            .map(|t| (t.instrument.as_ref(), t.fees.asset.as_ref()))
+            .collect();
+        assert_eq!(
+            read,
+            [("HYPE-USDC-SPOT", "HYPE"), ("PURR-USDC-SPOT", "USDC")],
+            "the perpetual is left out; PURR/USDC's missing feeToken falls back to the quote, \
+             since it sold"
+        );
+    }
+
+    #[test]
+    fn a_trade_on_a_spot_coin_missing_from_spot_meta_fails_the_read() {
+        let result = spot_trades(
+            &user_fills("@999"),
+            &test_spot_pairs(),
+            fill_time(),
+            fill_time(),
+            &[],
+        );
+        assert!(
+            matches!(&result, Err(UnindexedClientError::Internal(msg)) if msg.contains("@999")),
+            "a read missing a fill must not read as complete: {result:?}"
+        );
     }
 }
