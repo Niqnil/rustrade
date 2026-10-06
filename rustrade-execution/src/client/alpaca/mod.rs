@@ -647,7 +647,7 @@ struct AlpacaAccount {
 /// zero or as a flat position.
 #[derive(Debug, Deserialize)]
 struct AlpacaPosition {
-    /// Exchange symbol (e.g., "BTC/USD" for crypto, "AAPL" for equity, an OCC symbol for an
+    /// Exchange symbol (e.g., "BTCUSD" for crypto, "AAPL" for equity, an OCC symbol for an
     /// option).
     symbol: String,
     /// Asset class: "us_equity", "crypto", "us_option".
@@ -1429,9 +1429,10 @@ impl ExecutionClient for AlpacaClient {
     ///   entry price is the premium per share of the underlying, as quoted and as orders are
     ///   priced, not per contract. Margin, liquidation price and leverage are `None`, and
     ///   `time_exchange` is the time of the call, since Alpaca does not timestamp positions.
-    /// - **Crypto**: each holding is an asset balance of its base asset (e.g. `btc` for
-    ///   `BTC/USD`), in base units. Alpaca crypto is spot-only and cannot be sold short, so there
-    ///   is no position to report: its instruments are [`PositionReport::Unreported`].
+    /// - **Crypto**: each holding is an asset balance of the asset it holds (e.g. `BTC` for the
+    ///   position Alpaca lists as `BTCUSD`), in base units. Alpaca crypto is spot-only and cannot
+    ///   be sold short, so there is no position to report: its instruments are
+    ///   [`PositionReport::Unreported`].
     ///
     /// # Limitations
     ///
@@ -3741,8 +3742,8 @@ fn convert_account_to_balances(
 /// Convert Alpaca positions to crypto asset balance entries.
 ///
 /// Only positions with `asset_class == "crypto"` are included; [`convert_positions`] reports the
-/// rest. The base asset is extracted from the symbol, as Alpaca spells it (e.g., `"BTC/USD"` →
-/// `"BTC"`).
+/// rest. Each is named by the asset it holds, read from its symbol by
+/// [`crypto_position_asset`] as Alpaca spells it (e.g., `"BTCUSD"` → `"BTC"`).
 ///
 /// - `total` = quantity of the holding in base currency units (e.g. 0.5 BTC)
 /// - `free`  = qty_available (base currency units not locked in open orders)
@@ -3758,9 +3759,7 @@ fn convert_positions_to_balances(
         .iter()
         .filter(|p| is_crypto_position(p))
         .filter_map(|p| {
-            // Alpaca crypto symbols are "BASE/QUOTE" (e.g., "BTC/USD").
-            // Extract the base currency as the asset name.
-            let base = p.symbol.split('/').next().unwrap_or(&p.symbol);
+            let base = crypto_position_asset(&p.symbol);
 
             // Apply assets filter if specified.
             if !assets.is_empty()
@@ -3781,6 +3780,36 @@ fn convert_positions_to_balances(
             ))
         })
         .collect()
+}
+
+/// The asset a crypto position holds, read from its symbol.
+///
+/// Alpaca documents that its positions list names a crypto holding by its asset followed by `USD`
+/// (`BTCUSD` holds BTC), while orders and fills name the pair (`BTC/USD`). Both forms are read,
+/// the `USD` suffix ignoring case. A symbol in neither form, or with an empty asset, is returned
+/// whole, with a warning, so its balance is still reported, under a name that fails to index
+/// rather than not at all.
+fn crypto_position_asset(symbol: &str) -> &str {
+    let base = match symbol.split_once('/') {
+        Some((base, _)) => Some(base),
+        None => {
+            let base_len = symbol.len().saturating_sub(USD.len());
+            symbol
+                .get(base_len..)
+                .filter(|suffix| suffix.eq_ignore_ascii_case(USD))
+                .and_then(|_| symbol.get(..base_len))
+        }
+    };
+    match base {
+        Some(base) if !base.is_empty() => base,
+        _ => {
+            warn!(
+                %symbol,
+                "Alpaca crypto position symbol is neither ASSETUSD nor BASE/QUOTE; using it whole"
+            );
+            symbol
+        }
+    }
 }
 
 /// Whether an Alpaca position is a crypto holding, which is reported as an asset balance rather
@@ -5930,10 +5959,12 @@ mod tests {
     #[test]
     fn test_convert_positions_to_balances_crypto() {
         let positions = vec![
+            // The positions list's form: the asset followed by USD.
             AlpacaPosition {
                 qty_available: dec!(0.4),
-                ..alpaca_position("BTC/USD", "crypto", AlpacaPositionSide::Long, dec!(0.5))
+                ..alpaca_position("BTCUSD", "crypto", AlpacaPositionSide::Long, dec!(0.5))
             },
+            // The pair form orders use, read too.
             alpaca_position("ETH/USD", "crypto", AlpacaPositionSide::Long, dec!(2.0)),
             // Equity positions should be filtered out
             alpaca_position("AAPL", "us_equity", AlpacaPositionSide::Long, dec!(10)),
@@ -5943,15 +5974,44 @@ mod tests {
         let balances = convert_positions_to_balances(&positions, &[]);
         assert_eq!(balances.len(), 2, "only crypto positions returned");
         assert_eq!(balances[0].asset.name().as_str(), "BTC");
+        assert_eq!(balances[1].asset.name().as_str(), "ETH");
         // total = qty (0.5 BTC), free = qty_available (0.4 BTC)
         assert_eq!(balances[0].balance.total, dec!(0.5));
         assert_eq!(balances[0].balance.free, dec!(0.4));
 
-        // Filter to BTC only
+        // Filter to BTC only: matches the `BTCUSD` position
         let btc_only = vec![AssetNameExchange::new("btc")];
         let balances = convert_positions_to_balances(&positions, &btc_only);
         assert_eq!(balances.len(), 1);
         assert_eq!(balances[0].asset.name().as_str(), "BTC");
+    }
+
+    #[test]
+    fn test_crypto_position_asset() {
+        assert_eq!(crypto_position_asset("BTCUSD"), "BTC");
+        assert_eq!(
+            crypto_position_asset("btcusd"),
+            "btc",
+            "suffix matched ignoring case"
+        );
+        assert_eq!(
+            crypto_position_asset("USDTUSD"),
+            "USDT",
+            "only one USD is stripped"
+        );
+        assert_eq!(crypto_position_asset("BTC/USD"), "BTC");
+        assert_eq!(crypto_position_asset("BTC/USDT"), "BTC");
+        assert_eq!(crypto_position_asset("€USD"), "€");
+        // Neither form, or an empty asset: used whole rather than dropped.
+        assert_eq!(crypto_position_asset("USD"), "USD");
+        assert_eq!(crypto_position_asset("/USD"), "/USD");
+        assert_eq!(crypto_position_asset("BTCUSDT"), "BTCUSDT");
+        assert_eq!(
+            crypto_position_asset("BTC€é"),
+            "BTC€é",
+            "no char boundary at the suffix"
+        );
+        assert_eq!(crypto_position_asset(""), "");
     }
 
     /// A position as `/v2/positions` reports it, with `qty_available` equal to `qty`.
@@ -7247,7 +7307,7 @@ mod tests {
                         "unrealized_pl": "1.25",
                     },
                     {
-                        "symbol": "BTC/USD",
+                        "symbol": "BTCUSD",
                         "asset_class": "crypto",
                         "side": "long",
                         "qty": "0.75",

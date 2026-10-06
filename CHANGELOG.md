@@ -329,6 +329,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at the beginning of their first millisecond, and the dedup cache absorbs the fills read twice.
   A read that stops at its page cap resumes from the millisecond of its last fill, since Alpaca
   orders a millisecond's fills by id rather than by time. Closes #485.
+- **Alpaca reported a crypto balance under its position symbol, `BTCUSD`** (`rustrade-execution`).
+  Alpaca's positions list names a crypto holding by its asset followed by `USD`, not by the pair
+  (`BTC/USD`) that orders and fills use. The asset was read as the part before a `/`, so a BTC
+  holding was reported as asset `BTCUSD`: an unfiltered `fetch_balances` or `account_snapshot`
+  failed to index it, and one filtered by `BTC` left it out. The asset is now read from either
+  form, and a symbol in neither form is reported whole with a warning. Closes #497.
 - **An ended order reported an unknown fill quantity as zero** (`rustrade-execution`).
   **Breaking:** `Cancelled::filled_quantity` and `Expired::filled_quantity` are now
   `Option<Decimal>`. `None` means the venue did not report how much filled, and it is not zero:
