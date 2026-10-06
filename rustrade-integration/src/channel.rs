@@ -231,6 +231,14 @@ mod tests {
         sender.join().unwrap();
     }
 
+    // A spinning `next` would hang here instead of panicking.
+    #[tokio::test]
+    #[should_panic(expected = "Cannot block the current thread")]
+    async fn next_panics_if_it_must_wait_inside_an_async_context() {
+        let (_tx, mut rx) = mpsc_unbounded::<u8>();
+        let _ = Iterator::next(&mut rx);
+    }
+
     #[test]
     fn next_drains_waiting_messages_after_the_senders_are_dropped() {
         let (tx, mut rx) = mpsc_unbounded::<u8>();
