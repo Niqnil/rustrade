@@ -1168,7 +1168,8 @@ fn perp_position_report(
 /// assumed. Only its absence, which has not been observed, falls back to USDC.
 ///
 /// The quote-equivalent is set only for a USDC fee, the one collateral this client can name
-/// without the deployer's metadata. Otherwise it is left for the indexer to compute.
+/// without the deployer's metadata, and is `None` otherwise. It serves unindexed consumers: the
+/// indexer recomputes it either way, from the instrument's own quote and base.
 fn perp_fill_fees(fee_token: Option<&str>, fee: Decimal) -> AssetFees<AssetNameExchange> {
     let asset = fee_token.unwrap_or(USDC_ASSET);
     let fees_quote = asset.eq_ignore_ascii_case(USDC_ASSET).then_some(fee);
