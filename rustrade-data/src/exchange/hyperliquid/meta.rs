@@ -83,7 +83,8 @@ impl HyperliquidMeta {
     ///
     /// The perpetuals are the default ones plus those of each builder deployer (HIP-3) named in
     /// `deployers` (such as `xyz`), each named in ASCII letters and digits. Hyperliquid has a
-    /// `meta` response per deployer, so only the deployers named are read. The requests run concurrently, each abandoned after 10 seconds.
+    /// `meta` response per deployer, so only the deployers named are read. The requests run
+    /// concurrently, each abandoned after 10 seconds.
     ///
     /// The data streams connect to mainnet only, so a testnet read serves other uses, such as
     /// orders on testnet.
