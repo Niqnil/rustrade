@@ -20,7 +20,7 @@ use rustrade_execution::{
     indexer::{AccountEventIndexer, IndexedAccountStream},
     map::ExecutionInstrumentMap,
     order::{
-        Order,
+        Order, OrderKey, UnindexedOrderKey,
         request::{
             OrderRequestCancel, OrderRequestOpen, OrderResponseCancel, UnindexedOrderResponseCancel,
         },
@@ -30,7 +30,6 @@ use rustrade_execution::{
 use rustrade_instrument::{
     asset::{AssetIndex, name::AssetNameExchange},
     exchange::{ExchangeId, ExchangeIndex},
-    index::error::IndexError,
     instrument::{InstrumentIndex, name::InstrumentNameExchange},
 };
 use rustrade_integration::{
@@ -46,7 +45,9 @@ use tracing::{error, info};
 /// Processes indexed Engine [`ExecutionRequest`]s by:
 /// - Transforming the requests to use the associated exchange's asset and instrument names.
 /// - Issues the request via it's associated exchange [`ExecutionClient`],
-/// - Tracks requests and returns timeouts to the Engine where necessary.
+/// - Answers every request exactly once, keyed by the request: with the client's response, or with
+///   a timeout once `request_timeout` elapses. Only [`ExecutionRequest::Shutdown`] abandons
+///   requests in flight.
 #[derive(Constructor)]
 pub struct ExecutionManager<RequestStream, Client> {
     /// `Stream` of incoming Engine [`ExecutionRequest`]s.
@@ -378,74 +379,26 @@ where
                 },
 
                 // Process next ExecutionRequest::Cancel response
-                response_cancel = next_cancel_response => {
-                    match response_cancel {
-                        Ok(Some(response)) => {
-                            let event = match self.process_cancel_response(response) {
-                                Ok(indexed_event) => indexed_event,
-                                Err(error) => {
-                                    // Only the key can fail to index, and it should echo the
-                                    // request's, so this is a client bug. The order stays
-                                    // CancelInFlight, since nothing else answers the request.
-                                    error!(
-                                        exchange = %self.indexer.map.exchange.value,
-                                        ?error,
-                                        "ExecutionManager discarding a cancel response whose order key it cannot index - the order stays in flight"
-                                    );
-                                    continue
-                                }
-                            };
-
-                            if self.response_tx.send(event).is_err() {
-                                break;
-                            }
-                        }
-                        Err(request) => {
-                            let event = Self::process_cancel_timeout(request);
-
-                            if self.response_tx.send(event).is_err() {
-                                break;
-                            }
-                        }
-                        Ok(None) => {
-                            // Do nothing
-                        }
+                (request, response) = next_cancel_response => {
+                    let event = match response {
+                        Ok(response) => self.process_cancel_response(request, response),
+                        Err(_elapsed) => Self::process_cancel_timeout(request),
                     };
+
+                    if self.response_tx.send(event).is_err() {
+                        break;
+                    }
                 },
 
                 // Process next ExecutionRequest::Open response
-                response_open = next_open_response => {
-                    match response_open {
-                        Ok(Some(response)) => {
-                            let event = match self.process_open_response(response) {
-                                Ok(indexed_event) => indexed_event,
-                                Err(error) => {
-                                    // Only the key can fail to index, and it should echo the
-                                    // request's, so this is a client bug. The order stays
-                                    // OpenInFlight, since nothing else answers the request.
-                                    error!(
-                                        exchange = %self.indexer.map.exchange.value,
-                                        ?error,
-                                        "ExecutionManager discarding an open response whose order key it cannot index - the order stays in flight"
-                                    );
-                                    continue
-                                }
-                            };
+                (request, response) = next_open_response => {
+                    let event = match response {
+                        Ok(response) => self.process_open_response(request, response),
+                        Err(_elapsed) => Self::process_open_timeout(request),
+                    };
 
-                            if self.response_tx.send(event).is_err() {
-                                break;
-                            }
-                        }
-                        Err(request) => {
-                            let event = Self::process_open_timeout(request);
-
-                            if self.response_tx.send(event).is_err() {
-                                break;
-                            }
-                        }
-                        Ok(None) => {
-                            // Do nothing
-                        }
+                    if self.response_tx.send(event).is_err() {
+                        break;
                     }
                 }
             }
@@ -509,16 +462,45 @@ where
         drained
     }
 
+    /// Index a cancel response under the key of the request it answers.
+    ///
+    /// The response's own key should echo the request's. When it does not, or cannot be indexed,
+    /// that is a client bug: it is logged, and the response is still delivered under the request's
+    /// key, since nothing else would ever settle the request.
     fn process_cancel_response(
         &self,
-        order: UnindexedOrderResponseCancel,
-    ) -> Result<AccountStreamEvent, IndexError> {
-        let order = self.indexer.order_response_cancel(order)?;
+        request: OrderRequestCancel<ExchangeIndex, InstrumentIndex>,
+        response: UnindexedOrderResponseCancel,
+    ) -> AccountStreamEvent {
+        let OrderResponseCancel { key, state } = response;
+        self.check_response_key(&request.key, key, "cancel");
 
-        Ok(AccountStreamEvent::Item(AccountEvent {
-            exchange: order.key.exchange,
-            kind: AccountEventKind::OrderCancelled(order),
-        }))
+        AccountStreamEvent::Item(AccountEvent {
+            exchange: request.key.exchange,
+            kind: AccountEventKind::OrderCancelled(OrderResponseCancel {
+                key: request.key,
+                state: state.map_err(|error| self.indexer.order_error(error)),
+            }),
+        })
+    }
+
+    /// Log an `error!` if a response's key does not index to the key of the request it answers.
+    fn check_response_key(
+        &self,
+        request_key: &OrderKey<ExchangeIndex, InstrumentIndex>,
+        response_key: UnindexedOrderKey,
+        kind: &'static str,
+    ) {
+        match self.indexer.order_key(response_key) {
+            Ok(response_key) if response_key == *request_key => {}
+            response_key => error!(
+                exchange = %self.indexer.map.exchange.value,
+                kind,
+                ?request_key,
+                ?response_key,
+                "ExecutionManager received a response whose order key differs from its request's - delivering it under the request's key"
+            ),
+        }
     }
 
     fn process_cancel_timeout(
@@ -535,10 +517,14 @@ where
         })
     }
 
+    /// Index an open response under the key of the request it answers, as
+    /// [`process_cancel_response`](Self::process_cancel_response) does. The rest of the order is
+    /// the venue's answer, taken from the response.
     fn process_open_response(
         &self,
-        order: Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
-    ) -> Result<AccountStreamEvent, IndexError> {
+        request: OrderRequestOpen<ExchangeIndex, InstrumentIndex>,
+        response: Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
+    ) -> AccountStreamEvent {
         let Order {
             key,
             side,
@@ -547,23 +533,21 @@ where
             kind,
             time_in_force,
             state,
-        } = order;
+        } = response;
+        self.check_response_key(&request.key, key, "open");
 
-        let key = self.indexer.order_key(key)?;
-        let state = self.indexer.order_state(state);
-
-        Ok(AccountStreamEvent::Item(AccountEvent {
-            exchange: key.exchange,
+        AccountStreamEvent::Item(AccountEvent {
+            exchange: request.key.exchange,
             kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
-                key,
+                key: request.key,
                 side,
                 price,
                 quantity,
                 kind,
                 time_in_force,
-                state,
+                state: self.indexer.order_state(state),
             })),
-        }))
+        })
     }
 
     fn process_open_timeout(
@@ -623,8 +607,28 @@ mod tests {
 
     /// Answers every open and cancel with [`unresolvable_rejection`]. [`ExecutionManager::run`]
     /// calls nothing else.
-    #[derive(Debug, Clone)]
-    struct RejectingClient;
+    #[derive(Debug, Clone, Default)]
+    struct RejectingClient {
+        /// When set, every response names this instrument instead of echoing the request's.
+        answer_as: Option<InstrumentNameExchange>,
+    }
+
+    impl RejectingClient {
+        fn answer_key(
+            &self,
+            key: OrderKey<ExchangeId, &InstrumentNameExchange>,
+        ) -> OrderKey<ExchangeId, InstrumentNameExchange> {
+            OrderKey {
+                exchange: key.exchange,
+                instrument: self
+                    .answer_as
+                    .clone()
+                    .unwrap_or_else(|| key.instrument.clone()),
+                strategy: key.strategy,
+                cid: key.cid,
+            }
+        }
+    }
 
     impl ExecutionClient for RejectingClient {
         const EXCHANGE: ExchangeId = EXCHANGE;
@@ -633,7 +637,7 @@ mod tests {
         type AccountStream = futures::stream::Empty<UnindexedAccountEvent>;
 
         fn new(_: Self::Config) -> Self {
-            Self
+            Self::default()
         }
 
         async fn account_snapshot(
@@ -655,37 +659,27 @@ mod tests {
         async fn cancel_order(
             &self,
             request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
-        ) -> Option<UnindexedOrderResponseCancel> {
-            Some(OrderResponseCancel {
-                key: OrderKey {
-                    exchange: request.key.exchange,
-                    instrument: request.key.instrument.clone(),
-                    strategy: request.key.strategy,
-                    cid: request.key.cid,
-                },
+        ) -> UnindexedOrderResponseCancel {
+            OrderResponseCancel {
+                key: self.answer_key(request.key),
                 state: Err(unresolvable_rejection()),
-            })
+            }
         }
 
         async fn open_order(
             &self,
             request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
-        ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
+        ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
             let OrderRequestOpen { key, state } = request;
-            Some(Order {
-                key: OrderKey {
-                    exchange: key.exchange,
-                    instrument: key.instrument.clone(),
-                    strategy: key.strategy,
-                    cid: key.cid,
-                },
+            Order {
+                key: self.answer_key(key),
                 side: state.side,
                 price: state.price,
                 quantity: state.quantity,
                 kind: state.kind,
                 time_in_force: state.time_in_force,
                 state: OrderState::inactive(unresolvable_rejection()),
-            })
+            }
         }
 
         async fn fetch_balances(
@@ -714,10 +708,14 @@ mod tests {
         }
     }
 
-    /// A rejection whose error names something the instrument map does not hold must still reach
-    /// the Engine, settling the order, rather than be discarded and leave it in flight for good.
-    #[tokio::test]
-    async fn a_rejection_naming_an_unresolvable_asset_still_reaches_the_engine() {
+    /// Send one open and one cancel for the same order through a manager over `client`, and
+    /// collect everything it forwards once the request stream ends and it drains.
+    async fn run_open_and_cancel(
+        client: RejectingClient,
+    ) -> (
+        OrderKey,
+        Vec<AccountStreamEvent<ExchangeIndex, AssetIndex, InstrumentIndex>>,
+    ) {
         let instruments = IndexedInstruments::new([instrument(EXCHANGE, "btc", "usdt")]);
         let Ok(map) = generate_execution_instrument_map(&instruments, EXCHANGE) else {
             panic!("the instrument map should build");
@@ -755,19 +753,23 @@ mod tests {
             request_stream: requests,
             request_timeout: std::time::Duration::from_secs(5),
             response_tx,
-            client: Arc::new(RejectingClient),
+            client: Arc::new(client),
             indexer,
             account_stream: futures::stream::empty().boxed(),
         }
         .run()
         .await;
 
-        // The asset is dropped, the rejection kept.
-        let rejection = OrderError::Rejected(ApiError::BalanceInsufficient(
-            None,
-            "insufficient balance".to_string(),
-        ));
-        let events = response_rx.into_stream().collect::<Vec<_>>().await;
+        (key, response_rx.into_stream().collect::<Vec<_>>().await)
+    }
+
+    /// Assert `events` holds exactly one open snapshot and one cancel response, both under `key`
+    /// and both carrying `rejection`.
+    fn assert_both_answered(
+        key: &OrderKey,
+        events: &[AccountStreamEvent<ExchangeIndex, AssetIndex, InstrumentIndex>],
+        rejection: &OrderError<AssetIndex, InstrumentIndex>,
+    ) {
         assert_eq!(events.len(), 2, "{events:?}");
         assert!(
             events.iter().any(|event| matches!(
@@ -775,9 +777,9 @@ mod tests {
                 AccountStreamEvent::Item(AccountEvent {
                     kind: AccountEventKind::OrderSnapshot(Snapshot(order)),
                     ..
-                }) if order.key == key && order.state == OrderState::inactive(rejection.clone())
+                }) if order.key == *key && order.state == OrderState::inactive(rejection.clone())
             )),
-            "the open's rejection must reach the Engine: {events:?}"
+            "the open's answer must reach the Engine under the request's key: {events:?}"
         );
         assert!(
             events.iter().any(|event| matches!(
@@ -785,9 +787,40 @@ mod tests {
                 AccountStreamEvent::Item(AccountEvent {
                     kind: AccountEventKind::OrderCancelled(response),
                     ..
-                }) if response.key == key && response.state == Err(rejection.clone())
+                }) if response.key == *key && response.state == Err(rejection.clone())
             )),
-            "the cancel's rejection must reach the Engine: {events:?}"
+            "the cancel's answer must reach the Engine under the request's key: {events:?}"
         );
+    }
+
+    /// A rejection whose error names something the instrument map does not hold must still reach
+    /// the Engine, settling the order, rather than be discarded and leave it in flight for good.
+    #[tokio::test]
+    async fn a_rejection_naming_an_unresolvable_asset_still_reaches_the_engine() {
+        let (key, events) = run_open_and_cancel(RejectingClient::default()).await;
+
+        // The asset is dropped, the rejection kept.
+        let rejection = OrderError::Rejected(ApiError::BalanceInsufficient(
+            None,
+            "insufficient balance".to_string(),
+        ));
+        assert_both_answered(&key, &events, &rejection);
+    }
+
+    /// A response whose own key names an instrument the map does not hold is a client bug, but it
+    /// still answers the request: it must reach the Engine under the request's key, rather than be
+    /// discarded and leave the order in flight for good.
+    #[tokio::test]
+    async fn a_response_keyed_to_an_unknown_instrument_still_answers_its_request() {
+        let client = RejectingClient {
+            answer_as: Some(InstrumentNameExchange::new("not_in_the_map")),
+        };
+        let (key, events) = run_open_and_cancel(client).await;
+
+        let rejection = OrderError::Rejected(ApiError::BalanceInsufficient(
+            None,
+            "insufficient balance".to_string(),
+        ));
+        assert_both_answered(&key, &events, &rejection);
     }
 }

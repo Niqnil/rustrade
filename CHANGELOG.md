@@ -207,6 +207,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An order request could go unanswered, leaving the order in flight forever** (`rustrade`,
+  `rustrade-execution`). `ExecutionManager` indexed each response by the order key the client put
+  in it, and discarded a response whose key it could not resolve. An `ExecutionClient` could also
+  answer `None`, after which the manager reported nothing. Either way the engine kept the order
+  `OpenInFlight` or `CancelInFlight` for good, and in Hedging mode held back fills on that
+  instrument that matched no order. Now every request gets exactly one answer within
+  `request_timeout`, unless the manager is stopped with `ExecutionRequest::Shutdown`:
+  - `ExecutionManager` delivers each response under the key of the request it answers. A response
+    whose own key differs, or cannot be resolved, is a client bug: it is logged at `error!` and
+    still delivered.
+  - **Breaking:** `ExecutionClient::open_order` and `cancel_order` return their answer instead of
+    an `Option`, as do the `open_orders` and `cancel_orders` defaults and Alpaca's
+    `open_order_with_intent`. No client in the workspace returned `None`. An implementation must
+    report a failure to send a request, or to read the venue's answer, as `OpenFailed` or as an
+    `Err` cancel, never by staying silent.
+
 - **A name a venue spelled in another case failed to index** (`rustrade-execution`,
   `rustrade-instrument`, `rustrade`). `ExecutionInstrumentMap` matched asset and instrument names
   exactly, case included, but venues and clients do not always spell a name the way it was
@@ -345,8 +361,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Binance reads `-2010` by its message. It is the generic NEW_ORDER_REJECTED code, shared by
     reasons such as "Order would trigger immediately.", and all of them were reported as
     `BalanceInsufficient`. Only a balance message is now; the rest are `OrderRejected`.
-  - `ExecutionManager` logs an `error!` when it discards a response whose order key it cannot
-    index. That remains possible only if a client returns a key unlike its request's.
+  - A response whose own order key the indexer cannot resolve is no longer discarded either: see
+    the entry on `ExecutionManager` answering every request.
   - **Breaking:**
     - `ApiError::BalanceInsufficient` is `(Option<AssetKey>, String)`. Binance and Alpaca leave
       the asset `None`, since their rejections do not name it.

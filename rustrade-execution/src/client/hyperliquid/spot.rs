@@ -456,7 +456,7 @@ impl ExecutionClient for HyperliquidSpotClient {
     async fn cancel_order(
         &self,
         request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
-    ) -> Option<UnindexedOrderResponseCancel> {
+    ) -> UnindexedOrderResponseCancel {
         use crate::order::{request::OrderResponseCancel, state::Cancelled};
         use hyperliquid_rust_sdk::{
             ClientCancelRequest, ClientCancelRequestCloid, ExchangeResponseStatus,
@@ -470,7 +470,7 @@ impl ExecutionClient for HyperliquidSpotClient {
                     instrument = %request.key.instrument,
                     "Invalid spot instrument format (expected BASE-QUOTE-SPOT)"
                 );
-                return Some(OrderResponseCancel {
+                return OrderResponseCancel {
                     key: OrderKey {
                         exchange: ExchangeId::HyperliquidSpot,
                         instrument: request.key.instrument.clone(),
@@ -483,7 +483,7 @@ impl ExecutionClient for HyperliquidSpotClient {
                             request.key.instrument
                         )),
                     )),
-                });
+                };
             }
         };
 
@@ -515,7 +515,7 @@ impl ExecutionClient for HyperliquidSpotClient {
             Ok(method) => method,
             Err(reason) => {
                 warn!(%reason, cid = %request.key.cid, "Cannot determine how to cancel order");
-                return Some(OrderResponseCancel {
+                return OrderResponseCancel {
                     key: OrderKey {
                         exchange: ExchangeId::HyperliquidSpot,
                         instrument: request.key.instrument.clone(),
@@ -525,7 +525,7 @@ impl ExecutionClient for HyperliquidSpotClient {
                     state: Err(UnindexedOrderError::Rejected(
                         crate::error::ApiError::OrderRejected(reason.to_string()),
                     )),
-                });
+                };
             }
         };
 
@@ -555,7 +555,7 @@ impl ExecutionClient for HyperliquidSpotClient {
             Ok(r) => r,
             Err(e) => {
                 warn!(%e, "Spot cancel order failed (transport)");
-                return Some(OrderResponseCancel {
+                return OrderResponseCancel {
                     key: OrderKey {
                         exchange: ExchangeId::HyperliquidSpot,
                         instrument: request.key.instrument.clone(),
@@ -563,14 +563,14 @@ impl ExecutionClient for HyperliquidSpotClient {
                         cid: request.key.cid.clone(),
                     },
                     state: Err(map_order_error(e, request.key.instrument)),
-                });
+                };
             }
         };
 
         match response {
             ExchangeResponseStatus::Ok(_) => {
                 debug!("Spot cancel order accepted");
-                Some(OrderResponseCancel {
+                OrderResponseCancel {
                     key: OrderKey {
                         exchange: ExchangeId::HyperliquidSpot,
                         instrument: request.key.instrument.clone(),
@@ -584,11 +584,11 @@ impl ExecutionClient for HyperliquidSpotClient {
                         // Nor does it carry the filled quantity.
                         None,
                     )),
-                })
+                }
             }
             ExchangeResponseStatus::Err(msg) => {
                 warn!(%msg, "Spot cancel rejected by exchange");
-                Some(OrderResponseCancel {
+                OrderResponseCancel {
                     key: OrderKey {
                         exchange: ExchangeId::HyperliquidSpot,
                         instrument: request.key.instrument.clone(),
@@ -598,7 +598,7 @@ impl ExecutionClient for HyperliquidSpotClient {
                     state: Err(UnindexedOrderError::Rejected(
                         crate::error::ApiError::OrderRejected(msg),
                     )),
-                })
+                }
             }
         }
     }
@@ -606,7 +606,7 @@ impl ExecutionClient for HyperliquidSpotClient {
     async fn open_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
-    ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
+    ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
         use hyperliquid_rust_sdk::{
             ClientLimit, ClientOrder, ClientOrderRequest, ClientTrigger, ExchangeDataStatus,
             ExchangeResponseStatus,
@@ -657,25 +657,25 @@ impl ExecutionClient for HyperliquidSpotClient {
                     instrument = %request.key.instrument,
                     "Invalid spot instrument format (expected BASE-QUOTE-SPOT)"
                 );
-                return Some(make_rejected(format!(
+                return make_rejected(format!(
                     "Invalid instrument format: {}",
                     request.key.instrument
-                )));
+                ));
             }
         };
         let is_buy = request.state.side == Side::Buy;
 
         match request.state.kind {
             OrderKind::Market => {
-                return Some(make_unsupported(
+                return make_unsupported(
                     "Hyperliquid does not support market orders; use Limit with IOC time-in-force"
                         .to_string(),
-                ));
+                );
             }
             OrderKind::TrailingStop { .. } | OrderKind::TrailingStopLimit { .. } => {
-                return Some(make_unsupported(
+                return make_unsupported(
                     "Hyperliquid does not support trailing stop orders".to_string(),
-                ));
+                );
             }
             OrderKind::Limit
             | OrderKind::Stop { .. }
@@ -687,7 +687,7 @@ impl ExecutionClient for HyperliquidSpotClient {
         // The venue reports every order under its cloid, so an order placed without one could
         // not be matched to the id the caller tracks it by. See the module docs.
         let Some(cloid) = cid_to_cloid(&request.key.cid) else {
-            return Some(make_rejected(CLOID_REQUIRED.to_string()));
+            return make_rejected(CLOID_REQUIRED.to_string());
         };
 
         let limit_px = match request.state.kind {
@@ -698,10 +698,10 @@ impl ExecutionClient for HyperliquidSpotClient {
             _ => match request.state.price {
                 Some(p) => round_to_5_sig_figs(p),
                 None => {
-                    return Some(make_rejected(
+                    return make_rejected(
                         "Hyperliquid requires limit price for Limit/StopLimit/TakeProfitLimit orders"
                             .to_string(),
-                    ));
+                    );
                 }
             },
         };
@@ -723,9 +723,7 @@ impl ExecutionClient for HyperliquidSpotClient {
                 %notional,
                 "Spot order below $10 minimum notional value"
             );
-            return Some(make_rejected(format!(
-                "Spot order notional ${notional} below $10 minimum"
-            )));
+            return make_rejected(format!("Spot order notional ${notional} below $10 minimum"));
         }
 
         if matches!(request.state.time_in_force, TimeInForce::FillOrKill) {
@@ -781,7 +779,7 @@ impl ExecutionClient for HyperliquidSpotClient {
             Ok(r) => r,
             Err(e) => {
                 warn!(%e, "Spot open order failed");
-                return Some(Order {
+                return Order {
                     key: OrderKey {
                         exchange: ExchangeId::HyperliquidSpot,
                         instrument: request.key.instrument.clone(),
@@ -794,7 +792,7 @@ impl ExecutionClient for HyperliquidSpotClient {
                     kind: request.state.kind,
                     time_in_force: request.state.time_in_force,
                     state: OrderState::inactive(map_order_error(e, request.key.instrument)),
-                });
+                };
             }
         };
 
@@ -863,7 +861,7 @@ impl ExecutionClient for HyperliquidSpotClient {
             }
         };
 
-        Some(Order {
+        Order {
             key: OrderKey {
                 exchange: ExchangeId::HyperliquidSpot,
                 instrument: request.key.instrument.clone(),
@@ -876,7 +874,7 @@ impl ExecutionClient for HyperliquidSpotClient {
             kind: request.state.kind,
             time_in_force: request.state.time_in_force,
             state,
-        })
+        }
     }
 
     async fn fetch_balances(

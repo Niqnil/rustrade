@@ -965,7 +965,7 @@ impl ExecutionClient for BinanceSpot {
     async fn cancel_order(
         &self,
         request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
-    ) -> Option<UnindexedOrderResponseCancel> {
+    ) -> UnindexedOrderResponseCancel {
         let instrument = request.key.instrument.clone();
         let key = OrderKey {
             exchange: request.key.exchange,
@@ -977,10 +977,10 @@ impl ExecutionClient for BinanceSpot {
         let ws = match self.get_ws_api().await {
             Ok(ws) => ws,
             Err(unavailable) => {
-                return Some(UnindexedOrderResponseCancel {
+                return UnindexedOrderResponseCancel {
                     key,
                     state: Err(unavailable.into_order_error()),
-                });
+                };
             }
         };
 
@@ -1012,12 +1012,12 @@ impl ExecutionClient for BinanceSpot {
             Ok(p) => p,
             Err(e) => {
                 error!(%e, "BinanceSpot failed to build cancel order params");
-                return Some(UnindexedOrderResponseCancel {
+                return UnindexedOrderResponseCancel {
                     key,
                     state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
                         e.to_string(),
                     ))),
-                });
+                };
             }
         };
 
@@ -1040,12 +1040,12 @@ impl ExecutionClient for BinanceSpot {
                         Some(id) => OrderId(format_smolstr!("{id}")),
                         None => {
                             error!("BinanceSpot cancel response missing orderId");
-                            return Some(UnindexedOrderResponseCancel {
+                            return UnindexedOrderResponseCancel {
                                 key,
                                 state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
                                     "cancel response missing orderId".into(),
                                 ))),
-                            });
+                            };
                         }
                     };
 
@@ -1056,19 +1056,19 @@ impl ExecutionClient for BinanceSpot {
                     );
 
                     self.known_live.lock().ended(&key.cid);
-                    Some(UnindexedOrderResponseCancel {
+                    UnindexedOrderResponseCancel {
                         key,
                         state: Ok(Cancelled::new(exchange_order_id, time_exchange, filled_qty)),
-                    })
+                    }
                 }
                 Err(e) => {
                     // serde_json deserialization failure on a successful response — not an API error
-                    Some(UnindexedOrderResponseCancel {
+                    UnindexedOrderResponseCancel {
                         key,
                         state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
                             e.to_string(),
                         ))),
-                    })
+                    }
                 }
             },
             Err(e) => {
@@ -1086,20 +1086,20 @@ impl ExecutionClient for BinanceSpot {
                     if matches!(order_err, OrderError::Rejected(ApiError::RateLimit)) {
                         self.rate_limiter.on_rate_limited(None);
                     }
-                    Some(UnindexedOrderResponseCancel {
+                    UnindexedOrderResponseCancel {
                         key,
                         state: Err(order_err),
-                    })
+                    }
                 } else {
                     // Transport-level error — clear cached session so next call reconnects.
                     // Order status is unknown (may or may not have reached the matching engine).
                     self.clear_ws_api().await;
-                    Some(UnindexedOrderResponseCancel {
+                    UnindexedOrderResponseCancel {
                         key,
                         state: Err(UnindexedOrderError::Connectivity(
                             ConnectivityError::Socket(format!("{e:#}")),
                         )),
-                    })
+                    }
                 }
             }
         }
@@ -1108,7 +1108,7 @@ impl ExecutionClient for BinanceSpot {
     async fn open_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
-    ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
+    ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
         let instrument = request.key.instrument.clone();
         let side = request.state.side;
         let price = request.state.price;
@@ -1127,7 +1127,7 @@ impl ExecutionClient for BinanceSpot {
         let ws = match self.get_ws_api().await {
             Ok(ws) => ws,
             Err(unavailable) => {
-                return Some(Order {
+                return Order {
                     key: order_key,
                     side,
                     price,
@@ -1135,7 +1135,7 @@ impl ExecutionClient for BinanceSpot {
                     kind,
                     time_in_force,
                     state: OrderState::inactive(unavailable.into_order_error()),
-                });
+                };
             }
         };
 
@@ -1147,7 +1147,7 @@ impl ExecutionClient for BinanceSpot {
         let (binance_type, binance_tif) = match convert_order_kind_tif(kind, time_in_force) {
             Some(converted) => converted,
             None => {
-                return Some(Order {
+                return Order {
                     key: order_key,
                     side,
                     price,
@@ -1157,7 +1157,7 @@ impl ExecutionClient for BinanceSpot {
                     state: OrderState::inactive(OrderError::UnsupportedOrderType(format!(
                         "Binance Spot does not yet support OrderKind::{kind:?}"
                     ))),
-                });
+                };
             }
         };
 
@@ -1193,7 +1193,7 @@ impl ExecutionClient for BinanceSpot {
                 let basis_points: i32 = match offset_type {
                     TrailingOffsetType::BasisPoints => {
                         let Ok(bp) = i32::try_from(offset) else {
-                            return Some(Order {
+                            return Order {
                                 key: order_key,
                                 side,
                                 price,
@@ -1206,13 +1206,13 @@ impl ExecutionClient for BinanceSpot {
                                          (Binance trailingDelta filter typically caps at 2000)"
                                     ),
                                 )),
-                            });
+                            };
                         };
                         bp
                     }
                     TrailingOffsetType::Percentage => {
                         let Ok(bp) = i32::try_from(offset * Decimal::from(100)) else {
-                            return Some(Order {
+                            return Order {
                                 key: order_key,
                                 side,
                                 price,
@@ -1225,7 +1225,7 @@ impl ExecutionClient for BinanceSpot {
                                          after scaling to basis points"
                                     ),
                                 )),
-                            });
+                            };
                         };
                         bp
                     }
@@ -1233,7 +1233,7 @@ impl ExecutionClient for BinanceSpot {
                         // convert_order_kind_tif already rejects Absolute; surface a clean
                         // error here too rather than panic, so a future refactor that
                         // changes that contract still fails observably.
-                        return Some(Order {
+                        return Order {
                             key: order_key,
                             side,
                             price,
@@ -1245,7 +1245,7 @@ impl ExecutionClient for BinanceSpot {
                                  convert to basis points: (absolute / price) * 10000"
                                     .into(),
                             )),
-                        });
+                        };
                     }
                 };
                 params_builder = params_builder.trailing_delta(basis_points);
@@ -1264,7 +1264,7 @@ impl ExecutionClient for BinanceSpot {
             Ok(p) => p,
             Err(e) => {
                 error!(%e, "BinanceSpot failed to build new order params");
-                return Some(Order {
+                return Order {
                     key: order_key,
                     side,
                     price,
@@ -1274,7 +1274,7 @@ impl ExecutionClient for BinanceSpot {
                     state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
                         e.to_string(),
                     ))),
-                });
+                };
             }
         };
 
@@ -1297,7 +1297,7 @@ impl ExecutionClient for BinanceSpot {
                         Some(id) => OrderId(format_smolstr!("{id}")),
                         None => {
                             error!("BinanceSpot open_order response missing orderId");
-                            return Some(Order {
+                            return Order {
                                 key: order_key,
                                 side,
                                 price,
@@ -1309,7 +1309,7 @@ impl ExecutionClient for BinanceSpot {
                                         "open_order response missing orderId".into(),
                                     ),
                                 )),
-                            });
+                            };
                         }
                     };
 
@@ -1331,7 +1331,7 @@ impl ExecutionClient for BinanceSpot {
                     );
                     self.known_live.lock().placed(&order_key, quantity, &state);
 
-                    Some(Order {
+                    Order {
                         key: order_key,
                         side,
                         price,
@@ -1339,11 +1339,11 @@ impl ExecutionClient for BinanceSpot {
                         kind,
                         time_in_force,
                         state,
-                    })
+                    }
                 }
                 Err(e) => {
                     // serde_json deserialization failure on a successful response — not an API error
-                    Some(Order {
+                    Order {
                         key: order_key,
                         side,
                         price,
@@ -1353,7 +1353,7 @@ impl ExecutionClient for BinanceSpot {
                         state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
                             e.to_string(),
                         ))),
-                    })
+                    }
                 }
             },
             Err(e) => {
@@ -1371,7 +1371,7 @@ impl ExecutionClient for BinanceSpot {
                     if matches!(order_err, OrderError::Rejected(ApiError::RateLimit)) {
                         self.rate_limiter.on_rate_limited(None);
                     }
-                    Some(Order {
+                    Order {
                         key: order_key,
                         side,
                         price,
@@ -1379,12 +1379,12 @@ impl ExecutionClient for BinanceSpot {
                         kind,
                         time_in_force,
                         state: OrderState::inactive(order_err),
-                    })
+                    }
                 } else {
                     // Transport-level error — clear cached session so next call reconnects.
                     // Order status is unknown (may or may not have reached the matching engine).
                     self.clear_ws_api().await;
-                    Some(Order {
+                    Order {
                         key: order_key,
                         side,
                         price,
@@ -1394,7 +1394,7 @@ impl ExecutionClient for BinanceSpot {
                         state: OrderState::inactive(OrderError::Connectivity(
                             ConnectivityError::Socket(format!("{e:#}")),
                         )),
-                    })
+                    }
                 }
             }
         }
@@ -4769,10 +4769,7 @@ mod tests {
             .rate_limiter
             .on_rate_limited(Some(Duration::from_secs(60)));
         let instrument = InstrumentNameExchange::new("BTCUSDT");
-        let response = client
-            .cancel_order(cancel_request(&instrument))
-            .await
-            .expect("a cancel always answers");
+        let response = client.cancel_order(cancel_request(&instrument)).await;
 
         assert!(
             matches!(
@@ -4809,10 +4806,7 @@ mod tests {
         let client = client_with_ws_api(url);
         let instrument = InstrumentNameExchange::new("BTCUSDT");
 
-        let response = client
-            .cancel_order(cancel_request(&instrument))
-            .await
-            .expect("a cancel always answers");
+        let response = client.cancel_order(cancel_request(&instrument)).await;
 
         assert!(
             matches!(
@@ -4868,10 +4862,7 @@ mod tests {
         let client = client_with_ws_api(url);
         let instrument = InstrumentNameExchange::new("BTCUSDT");
 
-        let response = client
-            .cancel_order(cancel_request(&instrument))
-            .await
-            .expect("a cancel always answers");
+        let response = client.cancel_order(cancel_request(&instrument)).await;
 
         assert!(response.state.is_ok(), "{:?}", response.state);
         assert_eq!(client.rate_limiter.weight_limit(), 1_000);
