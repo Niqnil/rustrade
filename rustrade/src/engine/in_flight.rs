@@ -91,7 +91,12 @@ impl InFlightDeadlines {
 
     /// Remove the deadline for `exchange`, so it is never checked, returning the one it had.
     pub fn remove(&mut self, exchange: ExchangeIndex) -> Option<Duration> {
-        self.0.get_mut(exchange.index()).and_then(Option::take)
+        let removed = self.0.get_mut(exchange.index()).and_then(Option::take);
+        // Drop trailing empty slots, so equal deadlines compare and hash equal however built.
+        while matches!(self.0.last(), Some(None)) {
+            self.0.pop();
+        }
+        removed
     }
 
     /// The deadline for `exchange`, if it has one.
@@ -449,6 +454,11 @@ mod tests {
         assert_eq!(replaced.remove(ExchangeIndex(2)), None);
         assert_eq!(replaced.remove(ExchangeIndex(9)), None, "beyond the end");
         assert_eq!(replaced.shortest(), Some(Duration::from_secs(3)));
+        assert_eq!(
+            replaced,
+            InFlightDeadlines::default().with(ExchangeIndex(0), Duration::from_secs(3)),
+            "equal to the same deadlines built directly"
+        );
     }
 
     #[test]
