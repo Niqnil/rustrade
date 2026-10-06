@@ -294,9 +294,6 @@ async fn test_spot_place_and_cancel_limit_order() {
 
     let response = client.open_order(open_request).await;
 
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
-
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
             println!("Spot order placed successfully!");
@@ -323,9 +320,6 @@ async fn test_spot_place_and_cancel_limit_order() {
 
             println!("Canceling spot order...");
             let cancel_response = client.cancel_order(cancel_request).await;
-
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            let cancel_response = cancel_response.unwrap();
 
             match &cancel_response.state {
                 Ok(cancelled) => {
@@ -387,8 +381,6 @@ async fn test_spot_minimum_notional_validation() {
     println!("Placing order below $10 minimum (should be rejected locally)");
 
     let response = client.open_order(open_request).await;
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
 
     match &response.state {
         OrderState::Inactive(e) => {
@@ -516,9 +508,7 @@ async fn test_spot_account_stream_with_order() {
     println!("Placing spot order (1 HYPE @ $60) to trigger stream events...");
     let response = client.open_order(open_request).await;
 
-    if let Some(response) = response
-        && let OrderState::Active(ActiveOrderState::Open(open_state)) = &response.state
-    {
+    if let OrderState::Active(ActiveOrderState::Open(open_state)) = &response.state {
         println!("Order placed, waiting for stream events...");
 
         // Wait for order update in stream

@@ -7,6 +7,7 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
+use tokio::time::error::Elapsed;
 
 /// Represents an `Engine` request to the `ExecutionManager`.
 #[derive(Debug, Clone, PartialEq, PartialOrd, Deserialize, Serialize, From)]
@@ -38,26 +39,39 @@ pub enum ExecutionRequest<ExchangeKey = ExchangeIndex, InstrumentKey = Instrumen
     Open(OrderRequestOpen<ExchangeKey, InstrumentKey>),
 }
 
+/// An in-flight request to an [`ExecutionClient`](rustrade_execution::client::ExecutionClient),
+/// bounded by a timeout.
+///
+/// Resolves to the request together with its outcome, so the `ExecutionManager` can key every
+/// answer by the request it answers rather than by whatever the client put in its response.
 #[derive(Debug)]
 #[pin_project::pin_project]
 pub(super) struct RequestFuture<Request, ResponseFut> {
-    request: Request,
+    /// Taken when the future resolves, so the request is handed back without a `Clone`.
+    request: Option<Request>,
     #[pin]
     response_future: tokio::time::Timeout<ResponseFut>,
 }
 
 impl<Request, ResponseFut> Future for RequestFuture<Request, ResponseFut>
 where
-    Request: Clone,
     ResponseFut: Future,
 {
-    type Output = Result<ResponseFut::Output, Request>;
+    /// The request, and the client's response or [`Elapsed`] if the timeout fired first.
+    type Output = (Request, Result<ResponseFut::Output, Elapsed>);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-        this.response_future
-            .poll(cx)
-            .map(|result| result.map_err(|_| this.request.clone()))
+        this.response_future.poll(cx).map(|result| {
+            // `Future`'s contract lets a future panic when polled after it returned `Ready`, and
+            // the manager's `FuturesUnordered` never does so, so `request` is always present here.
+            #[allow(clippy::expect_used)]
+            let request = this
+                .request
+                .take()
+                .expect("RequestFuture polled after it resolved");
+            (request, result)
+        })
     }
 }
 
@@ -67,7 +81,7 @@ where
 {
     pub fn new(future: ResponseFut, timeout: std::time::Duration, request: Request) -> Self {
         Self {
-            request,
+            request: Some(request),
             response_future: tokio::time::timeout(timeout, future),
         }
     }

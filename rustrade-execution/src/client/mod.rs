@@ -240,13 +240,15 @@ where
     ///
     /// # Return value
     ///
-    /// - `Some` with `Ok(Cancelled)`: the venue took the cancel. Whether the order has *ended* by
-    ///   then depends on the venue; see below.
-    /// - `Some` with `Err`: the venue refused the cancel, or it could not be sent or answered. The
-    ///   order may still be open, or may have ended some other way, such as by filling. The account
-    ///   stream reports which.
-    /// - `None`: nothing to report, so the engine's `ExecutionManager` emits nothing for the
-    ///   request. No client in this crate returns it.
+    /// Every request gets exactly one answer, which the engine's `ExecutionManager` forwards as the
+    /// order's response. An implementation must not swallow a request: a failure to send it, or to
+    /// read the venue's answer, is an `Err`.
+    ///
+    /// - `Ok(Cancelled)`: the venue took the cancel. Whether the order has *ended* by then depends
+    ///   on the venue; see below.
+    /// - `Err`: the venue refused the cancel, or it could not be sent or answered. The order may
+    ///   still be open, or may have ended some other way, such as by filling. The account stream
+    ///   reports which.
     ///
     /// # A taken cancel is not always an ended order
     ///
@@ -270,13 +272,13 @@ where
     fn cancel_order(
         &self,
         request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
-    ) -> impl Future<Output = Option<UnindexedOrderResponseCancel>> + Send;
+    ) -> impl Future<Output = UnindexedOrderResponseCancel> + Send;
 
     // `+ Send` on default method return types for multi-threaded Tokio runtime
     fn cancel_orders<'a>(
         &self,
         requests: impl IntoIterator<Item = OrderRequestCancel<ExchangeId, &'a InstrumentNameExchange>>,
-    ) -> impl Stream<Item = Option<UnindexedOrderResponseCancel>> + Send {
+    ) -> impl Stream<Item = UnindexedOrderResponseCancel> + Send {
         futures::stream::FuturesUnordered::from_iter(
             requests
                 .into_iter()
@@ -287,6 +289,10 @@ where
     /// Place an order on the exchange.
     ///
     /// # Return value
+    ///
+    /// Every request gets exactly one answer, which the engine's `ExecutionManager` forwards as the
+    /// order's response. An implementation must not swallow a request: a failure to send it, or to
+    /// read the venue's answer, is `OpenFailed`.
     ///
     /// Returns `OrderState` directly rather than `Result<Open, OrderError>`:
     /// - `OrderState::Active(Open)` - order is resting on the order book
@@ -308,14 +314,13 @@ where
     fn open_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
-    ) -> impl Future<Output = Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>>>
-    + Send;
+    ) -> impl Future<Output = Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> + Send;
 
     // `+ Send` on default method return types for multi-threaded Tokio runtime
     fn open_orders<'a>(
         &self,
         requests: impl IntoIterator<Item = OrderRequestOpen<ExchangeId, &'a InstrumentNameExchange>>,
-    ) -> impl Stream<Item = Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>>> + Send
+    ) -> impl Stream<Item = Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> + Send
     {
         futures::stream::FuturesUnordered::from_iter(
             requests.into_iter().map(|request| self.open_order(request)),

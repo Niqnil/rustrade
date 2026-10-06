@@ -172,61 +172,50 @@ async fn main() {
 
     info!("Placing BUY 0.001 BTC-USDC-SPOT @ $50,000 (won't fill - below market)");
 
-    match client.open_order(open_request).await {
-        Some(response) => {
-            match &response.state {
-                OrderState::Active(ActiveOrderState::Open(open_state)) => {
-                    info!("Order placed successfully!");
-                    info!("  Client Order ID: {}", response.key.cid);
-                    info!("  Exchange Order ID: {}", open_state.id);
+    let response = client.open_order(open_request).await;
+    match &response.state {
+        OrderState::Active(ActiveOrderState::Open(open_state)) => {
+            info!("Order placed successfully!");
+            info!("  Client Order ID: {}", response.key.cid);
+            info!("  Exchange Order ID: {}", open_state.id);
 
-                    // Wait a moment then cancel
-                    info!("");
-                    info!("=== Canceling Order ===");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+            // Wait a moment then cancel
+            info!("");
+            info!("=== Canceling Order ===");
+            tokio::time::sleep(Duration::from_secs(1)).await;
 
-                    let cancel_key = OrderKey {
-                        exchange: ExchangeId::HyperliquidSpot,
-                        instrument: &btc_spot,
-                        strategy: response.key.strategy.clone(),
-                        cid: response.key.cid.clone(),
-                    };
+            let cancel_key = OrderKey {
+                exchange: ExchangeId::HyperliquidSpot,
+                instrument: &btc_spot,
+                strategy: response.key.strategy.clone(),
+                cid: response.key.cid.clone(),
+            };
 
-                    let cancel_request = OrderEvent {
-                        key: cancel_key,
-                        state: RequestCancel {
-                            id: Some(open_state.id.clone()),
-                        },
-                    };
+            let cancel_request = OrderEvent {
+                key: cancel_key,
+                state: RequestCancel {
+                    id: Some(open_state.id.clone()),
+                },
+            };
 
-                    match client.cancel_order(cancel_request).await {
-                        Some(cancel_response) => match &cancel_response.state {
-                            Ok(_cancelled) => {
-                                info!("Order canceled successfully!");
-                            }
-                            Err(e) => {
-                                warn!("Cancel rejected: {e:?}");
-                            }
-                        },
-                        None => {
-                            info!("Cancel request sent (no immediate response)");
-                        }
-                    }
+            match client.cancel_order(cancel_request).await.state {
+                Ok(_cancelled) => {
+                    info!("Order canceled successfully!");
                 }
-                OrderState::Inactive(e) => {
-                    warn!("Order rejected: {e:?}");
-                    warn!("This may be due to:");
-                    warn!("  - Insufficient spot balance");
-                    warn!("  - Order below $10 minimum notional");
-                    warn!("  - Invalid order parameters");
-                }
-                other => {
-                    info!("Unexpected order state: {other:?}");
+                Err(e) => {
+                    warn!("Cancel rejected: {e:?}");
                 }
             }
         }
-        None => {
-            info!("Order request sent (no immediate response)");
+        OrderState::Inactive(e) => {
+            warn!("Order rejected: {e:?}");
+            warn!("This may be due to:");
+            warn!("  - Insufficient spot balance");
+            warn!("  - Order below $10 minimum notional");
+            warn!("  - Invalid order parameters");
+        }
+        other => {
+            info!("Unexpected order state: {other:?}");
         }
     }
 

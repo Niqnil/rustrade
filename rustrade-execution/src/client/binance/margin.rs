@@ -668,7 +668,7 @@ impl ExecutionClient for BinanceMargin {
     async fn open_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
-    ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
+    ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
         let instrument = request.key.instrument.clone();
         let side = request.state.side;
         let price = request.state.price;
@@ -686,16 +686,14 @@ impl ExecutionClient for BinanceMargin {
 
         // Build the returned Order with a given inactive (failure) state, preserving the request
         // fields — keeps the many early-return error paths to one line each.
-        let inactive = |state: UnindexedOrderState| {
-            Some(Order {
-                key: order_key.clone(),
-                side,
-                price,
-                quantity,
-                kind,
-                time_in_force,
-                state,
-            })
+        let inactive = |state: UnindexedOrderState| Order {
+            key: order_key.clone(),
+            side,
+            price,
+            quantity,
+            kind,
+            time_in_force,
+            state,
         };
 
         let params = match build_new_order_params(
@@ -783,7 +781,7 @@ impl ExecutionClient for BinanceMargin {
         );
         self.known_live.lock().placed(&order_key, quantity, &state);
 
-        Some(Order {
+        Order {
             key: order_key,
             side,
             price,
@@ -791,7 +789,7 @@ impl ExecutionClient for BinanceMargin {
             kind,
             time_in_force,
             state,
-        })
+        }
     }
 
     /// Cancel a resting margin order via `DELETE /sapi/v1/margin/order`.
@@ -806,7 +804,7 @@ impl ExecutionClient for BinanceMargin {
     async fn cancel_order(
         &self,
         request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
-    ) -> Option<UnindexedOrderResponseCancel> {
+    ) -> UnindexedOrderResponseCancel {
         let instrument = request.key.instrument.clone();
         let key = OrderKey {
             exchange: request.key.exchange,
@@ -824,10 +822,10 @@ impl ExecutionClient for BinanceMargin {
             Ok(p) => p,
             Err(e) => {
                 error!(%e, "BinanceMargin failed to build cancel order params");
-                return Some(UnindexedOrderResponseCancel {
+                return UnindexedOrderResponseCancel {
                     key,
                     state: Err(OrderError::Rejected(ApiError::OrderRejected(e))),
-                });
+                };
             }
         };
 
@@ -840,10 +838,10 @@ impl ExecutionClient for BinanceMargin {
             {
                 Ok(response) => response,
                 Err(e) => {
-                    return Some(UnindexedOrderResponseCancel {
+                    return UnindexedOrderResponseCancel {
                         key,
                         state: Err(classify_rest_order_error(&e, &instrument)),
-                    });
+                    };
                 }
             };
 
@@ -852,10 +850,10 @@ impl ExecutionClient for BinanceMargin {
             Err(e) => {
                 // Deserialization failure on a 2xx response — surface as a rejection, not a
                 // transport error (the cancel request did reach the venue), mirroring open_order.
-                return Some(UnindexedOrderResponseCancel {
+                return UnindexedOrderResponseCancel {
                     key,
                     state: Err(OrderError::Rejected(ApiError::OrderRejected(e.to_string()))),
-                });
+                };
             }
         };
 
@@ -868,12 +866,12 @@ impl ExecutionClient for BinanceMargin {
             Some(id) => OrderId(SmolStr::new(id)),
             None => {
                 error!("BinanceMargin cancel response missing orderId");
-                return Some(UnindexedOrderResponseCancel {
+                return UnindexedOrderResponseCancel {
                     key,
                     state: Err(OrderError::Rejected(ApiError::OrderRejected(
                         "cancel response missing orderId".into(),
                     ))),
-                });
+                };
             }
         };
 
@@ -884,10 +882,10 @@ impl ExecutionClient for BinanceMargin {
         );
 
         self.known_live.lock().ended(&key.cid);
-        Some(UnindexedOrderResponseCancel {
+        UnindexedOrderResponseCancel {
             key,
             state: Ok(Cancelled::new(exchange_order_id, time_exchange, filled_qty)),
-        })
+        }
     }
 
     /// Fetch a full margin account snapshot: balances plus open orders per instrument.
@@ -6563,8 +6561,7 @@ mod tests {
 
         let placed = client
             .open_order(margin_open_request(&btcusdt, "placed"))
-            .await
-            .unwrap();
+            .await;
         assert!(
             matches!(placed.state, OrderState::Active(ActiveOrderState::Open(_))),
             "{placed:?}"
@@ -6596,8 +6593,7 @@ mod tests {
                     id: Some(VenueOrderId::Assigned(OrderId::new("7"))),
                 },
             })
-            .await
-            .unwrap();
+            .await;
         assert!(cancelled.state.is_ok(), "{cancelled:?}");
         assert!(
             !client
@@ -6636,8 +6632,7 @@ mod tests {
                     id: Some(VenueOrderId::Assigned(OrderId::new("7"))),
                 },
             })
-            .await
-            .unwrap();
+            .await;
         let Ok(cancelled) = cancelled.state else {
             panic!("expected Ok, got {cancelled:?}");
         };
@@ -6763,10 +6758,7 @@ mod tests {
             let client = margin_client_at(&server, false);
             let btcusdt = InstrumentNameExchange::new("BTCUSDT");
 
-            let placed = client
-                .open_order(margin_open_request(&btcusdt, cid))
-                .await
-                .unwrap();
+            let placed = client.open_order(margin_open_request(&btcusdt, cid)).await;
 
             let OrderState::Inactive(crate::order::state::InactiveOrderState::Expired(expired)) =
                 &placed.state

@@ -317,9 +317,6 @@ async fn test_place_and_cancel_limit_order() {
 
     let response = client.open_order(open_request).await;
 
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
-
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
             println!("Order placed successfully!");
@@ -346,9 +343,6 @@ async fn test_place_and_cancel_limit_order() {
 
             println!("Canceling order...");
             let cancel_response = client.cancel_order(cancel_request).await;
-
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            let cancel_response = cancel_response.unwrap();
 
             match &cancel_response.state {
                 Ok(_cancelled) => {
@@ -521,9 +515,6 @@ async fn test_order_without_registered_contract() {
 
     let response = client.open_order(open_request).await;
 
-    assert!(response.is_some());
-    let response = response.unwrap();
-
     assert!(
         response.state.is_failed(),
         "Expected rejection for unregistered contract"
@@ -557,9 +548,6 @@ async fn test_cancel_nonexistent_order() {
     };
 
     let response = client.cancel_order(cancel_request).await;
-
-    assert!(response.is_some());
-    let response = response.unwrap();
 
     assert!(
         response.state.is_err(),
@@ -631,8 +619,6 @@ async fn test_cancel_produces_cancelled_not_expired() {
 
     println!("Placing DAY limit order: BUY 1 AAPL @ $1.00");
     let response = client.open_order(open_request).await;
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
 
     let exchange_order_id = match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
@@ -662,7 +648,7 @@ async fn test_cancel_produces_cancelled_not_expired() {
 
     println!("Cancelling order...");
     let cancel_response = client.cancel_order(cancel_request).await;
-    assert!(cancel_response.is_some(), "Expected cancel response");
+    println!("Cancel response: {:?}", cancel_response.state);
 
     // Collect stream events and find the final order state
     println!("Waiting for stream to emit Cancelled state...");
@@ -764,9 +750,6 @@ async fn test_place_and_cancel_stop_order() {
 
     let response = client.open_order(open_request).await;
 
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
-
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
             println!("Stop order placed successfully!");
@@ -791,9 +774,6 @@ async fn test_place_and_cancel_stop_order() {
 
             println!("Canceling Stop order...");
             let cancel_response = client.cancel_order(cancel_request).await;
-
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            let cancel_response = cancel_response.unwrap();
 
             match &cancel_response.state {
                 Ok(_cancelled) => {
@@ -866,9 +846,6 @@ async fn test_place_and_cancel_stop_limit_order() {
 
     let response = client.open_order(open_request).await;
 
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
-
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
             println!("StopLimit order placed successfully!");
@@ -893,9 +870,6 @@ async fn test_place_and_cancel_stop_limit_order() {
 
             println!("Canceling StopLimit order...");
             let cancel_response = client.cancel_order(cancel_request).await;
-
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            let cancel_response = cancel_response.unwrap();
 
             match &cancel_response.state {
                 Ok(_cancelled) => {
@@ -970,9 +944,6 @@ async fn test_place_and_cancel_trailing_stop_percentage() {
 
     let response = client.open_order(open_request).await;
 
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
-
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
             println!("TrailingStop (percentage) order placed successfully!");
@@ -997,9 +968,6 @@ async fn test_place_and_cancel_trailing_stop_percentage() {
 
             println!("Canceling TrailingStop order...");
             let cancel_response = client.cancel_order(cancel_request).await;
-
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            let cancel_response = cancel_response.unwrap();
 
             match &cancel_response.state {
                 Ok(_cancelled) => {
@@ -1078,9 +1046,6 @@ async fn test_place_and_cancel_trailing_stop_limit_absolute() {
 
     let response = client.open_order(open_request).await;
 
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
-
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
             println!("TrailingStopLimit (absolute) order placed successfully!");
@@ -1105,9 +1070,6 @@ async fn test_place_and_cancel_trailing_stop_limit_absolute() {
 
             println!("Canceling TrailingStopLimit order...");
             let cancel_response = client.cancel_order(cancel_request).await;
-
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            let cancel_response = cancel_response.unwrap();
 
             match &cancel_response.state {
                 Ok(_cancelled) => {
@@ -1241,9 +1203,6 @@ async fn test_place_and_cancel_bracket_order() {
 
         println!("Canceling bracket order (parent)...");
         let cancel_response = client.cancel_order(cancel_request).await;
-
-        assert!(cancel_response.is_some(), "Expected cancel response");
-        let cancel_response = cancel_response.unwrap();
 
         match &cancel_response.state {
             Ok(_cancelled) => {
@@ -1415,9 +1374,6 @@ async fn test_place_and_cancel_gtd_order() {
 
     let response = client.open_order(open_request).await;
 
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
-
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
             println!("GTD order placed successfully!");
@@ -1442,9 +1398,6 @@ async fn test_place_and_cancel_gtd_order() {
 
             println!("Canceling GTD order...");
             let cancel_response = client.cancel_order(cancel_request).await;
-
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            let cancel_response = cancel_response.unwrap();
 
             match &cancel_response.state {
                 Ok(_cancelled) => {
@@ -1517,9 +1470,6 @@ async fn test_place_moo_order_premarket() {
 
     let response = client.open_order(open_request).await;
 
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
-
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
             println!("MOO order placed successfully (pre-market)!");
@@ -1546,8 +1496,7 @@ async fn test_place_moo_order_premarket() {
             println!("Canceling MOO order...");
             let cancel_response = client.cancel_order(cancel_request).await;
 
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            match &cancel_response.unwrap().state {
+            match &cancel_response.state {
                 Ok(_) => println!("MOO order canceled successfully!"),
                 Err(e) => panic!("Cancel rejected: {:?}", e),
             }
@@ -1614,9 +1563,6 @@ async fn test_place_loo_order_premarket() {
 
     let response = client.open_order(open_request).await;
 
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
-
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
             println!("LOO order placed successfully!");
@@ -1642,8 +1588,7 @@ async fn test_place_loo_order_premarket() {
             println!("Canceling LOO order...");
             let cancel_response = client.cancel_order(cancel_request).await;
 
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            match &cancel_response.unwrap().state {
+            match &cancel_response.state {
                 Ok(_) => println!("LOO order canceled successfully!"),
                 Err(e) => panic!("Cancel rejected: {:?}", e),
             }

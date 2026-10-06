@@ -1705,7 +1705,7 @@ impl ExecutionClient for AlpacaClient {
     async fn cancel_order(
         &self,
         request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
-    ) -> Option<UnindexedOrderResponseCancel> {
+    ) -> UnindexedOrderResponseCancel {
         let key = crate::order::OrderKey {
             exchange: request.key.exchange,
             instrument: request.key.instrument.clone(),
@@ -1723,13 +1723,13 @@ impl ExecutionClient for AlpacaClient {
                     instrument = %key.instrument,
                     "Alpaca cancel_order: no exchange order ID available (clientOrderId-only cancel not supported)"
                 );
-                return Some(crate::order::request::OrderResponseCancel {
+                return crate::order::request::OrderResponseCancel {
                     key,
                     state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
                         "exchange order ID required for cancel (fetch_open_orders to resolve)"
                             .into(),
                     ))),
-                });
+                };
             }
         };
 
@@ -1742,12 +1742,12 @@ impl ExecutionClient for AlpacaClient {
                 let exchange_order_id = OrderId(order_id);
                 // REST DELETE returns no response body, so the filled quantity is unknown
                 // here; the account stream's `canceled` update reports it.
-                Some(crate::order::request::OrderResponseCancel {
+                crate::order::request::OrderResponseCancel {
                     key,
                     state: Ok(Cancelled::new(exchange_order_id, Utc::now(), None)),
-                })
+                }
             }
-            Err(e) => Some(crate::order::request::OrderResponseCancel { key, state: Err(e) }),
+            Err(e) => crate::order::request::OrderResponseCancel { key, state: Err(e) },
         }
     }
 
@@ -1774,7 +1774,7 @@ impl ExecutionClient for AlpacaClient {
     async fn open_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
-    ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
+    ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
         let side = request.state.side;
         let reduce_only = request.state.reduce_only;
         self.open_order_inner(request, map_position_intent(side, reduce_only))
@@ -1927,7 +1927,7 @@ impl AlpacaClient {
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
         intent: AlpacaPositionIntent,
-    ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
+    ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
         self.open_order_inner(request, intent).await
     }
 
@@ -2154,7 +2154,7 @@ impl AlpacaClient {
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
         intent: AlpacaPositionIntent,
-    ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
+    ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
         let instrument = request.key.instrument.clone();
         let side = request.state.side;
         let price = request.state.price;
@@ -2174,7 +2174,7 @@ impl AlpacaClient {
         let tif_str = match map_time_in_force(time_in_force) {
             Ok(s) => s,
             Err(msg) => {
-                return Some(Order {
+                return Order {
                     key: order_key,
                     side,
                     price,
@@ -2184,7 +2184,7 @@ impl AlpacaClient {
                     state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
                         msg.to_string(),
                     ))),
-                });
+                };
             }
         };
 
@@ -2192,7 +2192,7 @@ impl AlpacaClient {
         let order_type_str = match map_order_kind(kind) {
             Some(s) => s,
             None => {
-                return Some(Order {
+                return Order {
                     key: order_key,
                     side,
                     price,
@@ -2202,7 +2202,7 @@ impl AlpacaClient {
                     state: OrderState::inactive(OrderError::UnsupportedOrderType(format!(
                         "Alpaca connector does not yet support OrderKind::{kind:?}"
                     ))),
-                });
+                };
             }
         };
 
@@ -2212,7 +2212,7 @@ impl AlpacaClient {
             ..
         } = kind
         {
-            return Some(Order {
+            return Order {
                 key: order_key,
                 side,
                 price,
@@ -2224,13 +2224,13 @@ impl AlpacaClient {
                      use Percentage or Absolute"
                         .to_string(),
                 )),
-            });
+            };
         }
 
         // StopLimit requires Order.price (the limit price applied once trigger fires).
         // Guard locally to avoid a wire round-trip producing a generic 422.
         if matches!(kind, OrderKind::StopLimit { .. }) && price.is_none() {
-            return Some(Order {
+            return Order {
                 key: order_key,
                 side,
                 price,
@@ -2240,7 +2240,7 @@ impl AlpacaClient {
                 state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
                     "StopLimit order requires Order.price (the limit price) to be set".to_string(),
                 ))),
-            });
+            };
         }
 
         // Extract stop/trailing parameters based on order kind.
@@ -2305,7 +2305,7 @@ impl AlpacaClient {
                 let state = placed_order_state(&resp, &order_key.instrument, quantity);
                 self.known_live.lock().placed(&order_key, quantity, &state);
 
-                Some(Order {
+                Order {
                     key: order_key,
                     side,
                     price,
@@ -2313,11 +2313,11 @@ impl AlpacaClient {
                     kind,
                     time_in_force,
                     state,
-                })
+                }
             }
             Err(e) => {
                 let order_err = order_post_error(e);
-                Some(Order {
+                Order {
                     key: order_key,
                     side,
                     price,
@@ -2325,7 +2325,7 @@ impl AlpacaClient {
                     kind,
                     time_in_force,
                     state: OrderState::inactive(order_err),
-                })
+                }
             }
         }
     }
@@ -7455,7 +7455,7 @@ mod tests {
             };
 
             // Call open_order (borrows instrument)
-            let result = client
+            let order = client
                 .open_order(OrderRequestOpen {
                     key: OrderKey {
                         exchange: request.key.exchange,
@@ -7468,8 +7468,6 @@ mod tests {
                 .await;
 
             // Verify the order was accepted
-            assert!(result.is_some(), "open_order should return a result");
-            let order = result.unwrap();
             assert!(
                 order.state.is_accepted(),
                 "order should be accepted: {:?}",
@@ -7553,10 +7551,8 @@ mod tests {
                 },
             };
 
-            let result = client.open_order(request).await;
+            let order = client.open_order(request).await;
 
-            assert!(result.is_some(), "open_order should return a result");
-            let order = result.unwrap();
             assert!(
                 order.state.is_accepted(),
                 "order should be accepted: {:?}",
@@ -7736,8 +7732,7 @@ mod tests {
                         market: None,
                     },
                 })
-                .await
-                .expect("open_order should return a result");
+                .await;
 
             assert!(
                 matches!(
@@ -9120,7 +9115,7 @@ mod tests {
                         market: None,
                     },
                 };
-                client.open_order(request).await.unwrap();
+                client.open_order(request).await;
             }
             client.fetch_open_orders(&[]).await.unwrap();
             {
@@ -9145,8 +9140,7 @@ mod tests {
                         id: Some(VenueOrderId::Assigned(OrderId::new("id-resting"))),
                     },
                 })
-                .await
-                .unwrap();
+                .await;
             let Ok(cancelled) = &cancel.state else {
                 panic!("expected Ok, got {cancel:?}");
             };
@@ -9332,10 +9326,7 @@ mod tests {
                                 market: None,
                             },
                         };
-                        let Some(order) = client.open_order(request).await else {
-                            panic!("open_order returns the order");
-                        };
-                        order.state
+                        client.open_order(request).await.state
                     };
 
                     assert_eq!(state, expected, "{status} {filled}, bracket: {bracket}");

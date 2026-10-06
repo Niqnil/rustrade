@@ -1978,7 +1978,7 @@ impl ExecutionClient for IbkrClient {
     async fn cancel_order(
         &self,
         request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
-    ) -> Option<UnindexedOrderResponseCancel> {
+    ) -> UnindexedOrderResponseCancel {
         let key = OrderKey {
             exchange: request.key.exchange,
             instrument: request.key.instrument.clone(),
@@ -1989,12 +1989,12 @@ impl ExecutionClient for IbkrClient {
         let ib_order_id = match self.order_ids.get_ib_id(&request.key.cid) {
             Some(id) => id,
             None => {
-                return Some(OrderResponseCancel {
+                return OrderResponseCancel {
                     key,
                     state: Err(crate::error::OrderError::Rejected(ApiError::OrderRejected(
                         "order ID not found in map".to_string(),
                     ))),
-                });
+                };
             }
         };
 
@@ -2016,30 +2016,30 @@ impl ExecutionClient for IbkrClient {
                 // OrderStatus::Cancelled is received.
                 // IBKR cancel_order returns no filled qty, so it is unknown here; the
                 // subsequent OrderStatus events report it.
-                Some(OrderResponseCancel {
+                OrderResponseCancel {
                     key,
                     state: Ok(Cancelled::new(
                         OrderId::new(format_smolstr!("{}", ib_order_id)),
                         Utc::now(),
                         None,
                     )),
-                })
+                }
             }
             Ok(Err(e)) => {
                 error!(order_id = ib_order_id, error = %e, "Failed to cancel order");
-                Some(OrderResponseCancel {
+                OrderResponseCancel {
                     key,
                     state: Err(send_error(&e, e.to_string())),
-                })
+                }
             }
             Err(e) => {
                 error!(order_id = ib_order_id, error = %e, "Task join error");
-                Some(OrderResponseCancel {
+                OrderResponseCancel {
                     key,
                     state: Err(crate::error::OrderError::Rejected(ApiError::OrderRejected(
                         e.to_string(),
                     ))),
-                })
+                }
             }
         }
     }
@@ -2061,7 +2061,7 @@ impl ExecutionClient for IbkrClient {
     async fn open_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
-    ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
+    ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
         let key = OrderKey {
             exchange: ExchangeId::Ibkr,
             instrument: request.key.instrument.clone(),
@@ -2072,7 +2072,7 @@ impl ExecutionClient for IbkrClient {
         let contract = match self.contracts.get_contract(request.key.instrument) {
             Some(c) => c,
             None => {
-                return Some(Order {
+                return Order {
                     key,
                     side: request.state.side,
                     price: request.state.price,
@@ -2083,14 +2083,14 @@ impl ExecutionClient for IbkrClient {
                         request.key.instrument.clone(),
                         "contract not registered".to_string(),
                     ))),
-                });
+                };
             }
         };
 
         let quantity: f64 = match request.state.quantity.try_into() {
             Ok(q) => q,
             Err(_) => {
-                return Some(Order {
+                return Order {
                     key,
                     side: request.state.side,
                     price: request.state.price,
@@ -2100,7 +2100,7 @@ impl ExecutionClient for IbkrClient {
                     state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
                         format!("quantity {} exceeds f64 range", request.state.quantity),
                     ))),
-                });
+                };
             }
         };
 
@@ -2113,7 +2113,7 @@ impl ExecutionClient for IbkrClient {
         ) {
             Ok(o) => o,
             Err(e) => {
-                return Some(Order {
+                return Order {
                     key,
                     side: request.state.side,
                     price: request.state.price,
@@ -2123,7 +2123,7 @@ impl ExecutionClient for IbkrClient {
                     state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
                         e.to_string(),
                     ))),
-                });
+                };
             }
         };
 
@@ -2187,7 +2187,7 @@ impl ExecutionClient for IbkrClient {
             Ok(Ok(Some((order_id, filled)))) => {
                 // IB always returns order status via subscription - never immediate fills.
                 // The filled quantity here is from the OrderStatus event, not a complete fill.
-                Some(Order {
+                Order {
                     key,
                     side,
                     price,
@@ -2199,7 +2199,7 @@ impl ExecutionClient for IbkrClient {
                         Utc::now(),
                         filled,
                     )),
-                })
+                }
             }
             Ok(Ok(None)) => {
                 // Subscription exhausted without terminal status. The order WAS submitted
@@ -2209,7 +2209,7 @@ impl ExecutionClient for IbkrClient {
                     ib_order_id,
                     "Order subscription ended without terminal status, returning Open"
                 );
-                Some(Order {
+                Order {
                     key,
                     side,
                     price,
@@ -2221,13 +2221,13 @@ impl ExecutionClient for IbkrClient {
                         Utc::now(),
                         Decimal::ZERO,
                     )),
-                })
+                }
             }
             Ok(Err(error)) => {
                 // Cleanup order_ids: the order was never sent (place_order error)
                 // or TWS rejected it (Cancelled/Inactive or a genuine notice).
                 self.order_ids.remove_by_ib_id(ib_order_id);
-                Some(Order {
+                Order {
                     key,
                     side,
                     price,
@@ -2235,11 +2235,11 @@ impl ExecutionClient for IbkrClient {
                     kind,
                     time_in_force: tif,
                     state: OrderState::inactive(error),
-                })
+                }
             }
             Err(e) => {
                 self.order_ids.remove_by_ib_id(ib_order_id);
-                Some(Order {
+                Order {
                     key,
                     side,
                     price,
@@ -2249,7 +2249,7 @@ impl ExecutionClient for IbkrClient {
                     state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
                         e.to_string(),
                     ))),
-                })
+                }
             }
         }
     }
