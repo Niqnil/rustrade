@@ -382,7 +382,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     mixed-case or HIP-3 perpetual wrong, and names only PURR/USDC among spot pairs unless given an
     `@{index}` base.
   - New in `rustrade-instrument`: `hyperliquid::Perps` (deserializes from a `meta` response) and
-    `PerpCoin`, `SpotPairs::find(base, quote)`, and `hyperliquid::Network`. The `rustrade-data`
+    `PerpCoin`, `SpotPairs::find(base, quote)`, and `hyperliquid::Network` (serialized as
+    `"mainnet"`/`"testnet"`). The `rustrade-data`
     `hyperliquid` feature now enables `rustrade-instrument`'s.
   - **Breaking:** `exchange::hyperliquid::SpotMetaResolver`, `resolve_spot_pair`,
     `spot_meta::mainnet_resolver` and `SpotMetaError` are removed in favour of `HyperliquidMeta`.

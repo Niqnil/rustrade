@@ -25,6 +25,7 @@
 //! let candles = client.fetch_candles(request).await?;
 //! ```
 
+use super::Network;
 use crate::{
     error::DataError,
     subscription::candle::{Candle, CandleInterval, close_time_from_open, open_time_from_close},
@@ -33,7 +34,6 @@ use chrono::{DateTime, TimeZone, Utc};
 use hyperliquid_rust_sdk::{BaseUrl, InfoClient};
 use rust_decimal::Decimal;
 use rustrade_instrument::exchange::ExchangeId;
-use rustrade_instrument::hyperliquid::Network;
 use tracing::debug;
 
 /// Historical data fetcher for Hyperliquid.

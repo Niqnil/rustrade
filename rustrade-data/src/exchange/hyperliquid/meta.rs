@@ -64,7 +64,8 @@ pub enum HyperliquidMetaError {
     #[error("Hyperliquid info request failed: {0}")]
     Http(#[from] reqwest::Error),
 
-    /// Hyperliquid lists no builder deployer by this name.
+    /// Hyperliquid lists no builder deployer by this name. A name that is not one or more ASCII
+    /// letters and digits, as every deployer's is, is rejected before any request is sent.
     #[error("Hyperliquid lists no builder deployer named {0:?}")]
     UnknownDeployer(SmolStr),
 }
@@ -81,8 +82,8 @@ impl HyperliquidMeta {
     /// Read the perpetuals and spot pairs `network` lists.
     ///
     /// The perpetuals are the default ones plus those of each builder deployer (HIP-3) named in
-    /// `deployers` (such as `xyz`). Hyperliquid has a `meta` response per deployer, so only the
-    /// deployers named are read. The requests run concurrently, each abandoned after 10 seconds.
+    /// `deployers` (such as `xyz`), each named in ASCII letters and digits. Hyperliquid has a
+    /// `meta` response per deployer, so only the deployers named are read. The requests run concurrently, each abandoned after 10 seconds.
     ///
     /// The data streams connect to mainnet only, so a testnet read serves other uses, such as
     /// orders on testnet.
@@ -101,6 +102,14 @@ impl HyperliquidMeta {
 
     /// [`Self::fetch`] from the info endpoint at `url`.
     async fn fetch_from(url: &str, deployers: &[&str]) -> Result<Self, HyperliquidMetaError> {
+        // Checked before any request: an empty or malformed name would read some other `meta`,
+        // as an empty `dex` reads the default perpetuals'.
+        if let Some(&malformed) = deployers.iter().find(|deployer| {
+            deployer.is_empty() || !deployer.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        }) {
+            return Err(HyperliquidMetaError::UnknownDeployer(malformed.into()));
+        }
+
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()?;
@@ -108,13 +117,6 @@ impl HyperliquidMeta {
         let deployer_perps = futures::future::try_join_all(deployers.iter().map(|&deployer| {
             let client = &client;
             async move {
-                // An empty or malformed name would read some other `meta`: an empty `dex` is the
-                // default perpetuals'.
-                let named = !deployer.is_empty()
-                    && deployer.bytes().all(|byte| byte.is_ascii_alphanumeric());
-                if !named {
-                    return Err(HyperliquidMetaError::UnknownDeployer(deployer.into()));
-                }
                 // Hyperliquid answers `null` for a deployer it does not list.
                 info::<Option<Perps>>(client, url, json!({"type": "meta", "dex": deployer}))
                     .await?
@@ -267,6 +269,49 @@ mod tests {
             assert!(
                 matches!(&error, HyperliquidMetaError::UnknownDeployer(name) if name == deployer),
                 "{deployer:?}: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_sends_no_request_for_a_malformed_deployer() {
+        let server = MockServer::start().await;
+
+        let error = HyperliquidMeta::fetch_from(&server.uri(), &["xyz", "a-b"])
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, HyperliquidMetaError::UnknownDeployer(name) if name == "a-b"),
+            "{error:?}"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetch_fails_on_a_response_that_is_not_the_metadata() {
+        for body in ["null", "{}"] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_json(json!({"type": "meta"})))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_json(json!({"type": "spotMeta"})))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(SPOT_META, "application/json"),
+                )
+                .mount(&server)
+                .await;
+
+            let error = HyperliquidMeta::fetch_from(&server.uri(), &[])
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(error, HyperliquidMetaError::Http(_)),
+                "{body}: {error:?}"
             );
         }
     }

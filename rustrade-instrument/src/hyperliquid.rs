@@ -15,7 +15,7 @@
 //! Every type here is I/O-free: they deserialize from the info responses, which the data and
 //! execution integrations read.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use std::collections::HashMap;
 
@@ -63,8 +63,12 @@ impl CoinKind {
     }
 }
 
-/// A Hyperliquid network.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// A Hyperliquid network. Serialized in lower case (`"mainnet"`, `"testnet"`).
+///
+/// No default: whether an unset network should mean real funds or test funds is the caller's
+/// choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Network {
     /// Hyperliquid's mainnet, where real funds trade.
     Mainnet,
@@ -77,7 +81,8 @@ pub enum Network {
 /// Deserializes from one `meta` response, `{"universe": [...], ...}`, which lists either the
 /// default perpetuals or, read with a `dex` field, one builder deployer's (HIP-3) perpetuals,
 /// named `deployer:ASSET`. Collect several sets, such as the defaults and each deployer's, into
-/// one with [`FromIterator`].
+/// one with [`FromIterator`]. A coin listed twice keeps the later listing; the default and
+/// deployers' sets cannot share a coin, as a deployer's carry its prefix.
 ///
 /// Delisted perpetuals are kept, marked by [`PerpCoin::is_delisted`]: their names stay taken.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -91,6 +96,8 @@ impl Perps {
     /// An exact match wins. Otherwise a name that matches several perpetuals once case is
     /// ignored matches none of them, rather than one picked arbitrarily. Hyperliquid lists no
     /// such pair today (checked against mainnet, October 2026).
+    ///
+    /// May return a delisted perpetual: check [`PerpCoin::is_delisted`].
     pub fn get(&self, name: &str) -> Option<&PerpCoin> {
         self.0
             .get(name)
@@ -498,6 +505,18 @@ mod tests {
         assert_eq!(perps.get("ABC").unwrap().coin(), "ABC");
         assert_eq!(perps.get("abc").unwrap().coin(), "abc");
         assert_eq!(perps.get("Abc"), None);
+    }
+
+    #[test]
+    fn network_serializes_in_lower_case() {
+        assert_eq!(
+            serde_json::to_string(&Network::Mainnet).unwrap(),
+            r#""mainnet""#
+        );
+        assert_eq!(
+            serde_json::from_str::<Network>(r#""testnet""#).unwrap(),
+            Network::Testnet
+        );
     }
 
     #[test]
