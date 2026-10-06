@@ -669,6 +669,19 @@ databento  # 2026-09-13 | Direct dep (historical + live market data). Meets the 
 #   async-compression 0.4.43 -> 0.4.44 and the lockstep dbn-macros pin; neither crate has a build.rs, and
 #   neither reads env, spawns processes or opens network connections. The PR changes the databento, dbn and
 #   dbn-macros entries in Cargo.lock and nothing else: zero packages added or removed.
+#   Re-verified @ 0.63.0 on 2026-10-06 (databento 0.62.0 -> 0.63.0, dbn + dbn-macros 0.70.0 -> 0.71.0,
+#   databento's zstd requirement 0.13 -> 0.14), against the crates.io sources.
+#   databento: the src/ delta is live/client.rs only. `next_record()`/`try_next_record()` now decode in batches
+#   through `DbnFsm::process_batch()`/`next_buffered_record()` -- the path reviewed at 0.70.0 above, so our
+#   live.rs `next_record()` loop now reaches it too. Same Ok(Some)/Ok(None)/Err contract; the heartbeat timeout
+#   is still applied per socket read. Still zero `unsafe`, no build.rs, the same 16 direct deps, the same
+#   endpoints, and the only env read is still `DATABENTO_API_KEY`.
+#   dbn: the src/ delta is one `#[deprecated]` on `async_decode_record_ref_with_fsm` (unused by us) plus test
+#   edits; fsm.rs is unchanged from 0.70.0. `unsafe` count unchanged (135; 114 excluding python/). No soundness
+#   fixes in this release's changelog.
+#   Cargo.lock adds zero packages. It drops zstd 0.13.3 + zstd-safe 7.2.4 (parquet already uses zstd 0.14),
+#   bumps async-compression 0.4.50 and compression-codecs 0.4.45, and re-points some edges at the
+#   already-present windows-sys 0.61.2, socket2 0.6.3 and getrandom 0.4.2.
 
 # Net-new lockfile entries NOT attributable to a tier-2 crate above, recorded so the
 # "measured by diffing Cargo.lock" claim in the parquet entry stays true of the whole file:
