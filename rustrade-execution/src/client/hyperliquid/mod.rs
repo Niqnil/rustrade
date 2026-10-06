@@ -167,7 +167,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
-/// USDC asset name on Hyperliquid (the only collateral asset for perps).
+/// USDC asset name on Hyperliquid, the collateral of its default perpetuals.
 const USDC_ASSET: &str = "USDC";
 
 /// Hyperliquid perpetual futures execution client.
@@ -323,7 +323,7 @@ impl ExecutionClient for HyperliquidClient {
 
         let now = Utc::now();
 
-        // Build balance from margin summary (USDC is the only collateral)
+        // Build balance from margin summary (USDC is the default perp DEX's only collateral)
         let account_value =
             parse_decimal(&user_state.margin_summary.account_value, "account_value")
                 .unwrap_or(Decimal::ZERO);
@@ -1004,7 +1004,7 @@ impl ExecutionClient for HyperliquidClient {
 
         let now = Utc::now();
 
-        // Hyperliquid perps use USDC as the only collateral
+        // The default perp DEX uses USDC as its only collateral
         let account_value =
             parse_decimal(&user_state.margin_summary.account_value, "account_value")
                 .unwrap_or(Decimal::ZERO);
@@ -1124,11 +1124,7 @@ impl ExecutionClient for HyperliquidClient {
                 // `TradeInfo` carries no cumulative filled quantity; Hyperliquid reports order
                 // state as its own `OrderUpdate` message.
                 order_filled_quantity: None,
-                fees: AssetFees {
-                    asset: AssetNameExchange::from("USDC"),
-                    fees: fee,
-                    fees_quote: Some(fee),
-                },
+                fees: perp_fill_fees(fill.fee_token.as_deref(), fee),
             });
         }
 
@@ -1165,6 +1161,21 @@ fn perp_position_report(
     ))
 }
 
+/// The fee of a perpetual fill, in the asset `fee_token` names.
+///
+/// A default perpetual settles in USDC, but a builder-deployed (HIP-3) one settles in its
+/// deployer's collateral, such as USDH or USDT0, so the venue's `feeToken` is read rather than
+/// assumed. Only its absence, which has not been observed, falls back to USDC.
+///
+/// The quote-equivalent is set only for a USDC fee, the one collateral this client can name
+/// without the deployer's metadata, and is `None` otherwise. It serves unindexed consumers: the
+/// indexer recomputes it either way, from the instrument's own quote and base.
+fn perp_fill_fees(fee_token: Option<&str>, fee: Decimal) -> AssetFees<AssetNameExchange> {
+    let asset = fee_token.unwrap_or(USDC_ASSET);
+    let fees_quote = asset.eq_ignore_ascii_case(USDC_ASSET).then_some(fee);
+    AssetFees::new(AssetNameExchange::from(asset), fee, fees_quote)
+}
+
 /// Convert SDK TradeInfo (fill) to AccountEvent::Trade, `None` if its coin names no perpetual.
 fn fill_to_account_event(fill: &hyperliquid_rust_sdk::TradeInfo) -> Option<UnindexedAccountEvent> {
     let instrument = perp_instrument(&fill.coin)?;
@@ -1187,11 +1198,7 @@ fn fill_to_account_event(fill: &hyperliquid_rust_sdk::TradeInfo) -> Option<Unind
         // `TradeInfo` carries no cumulative filled quantity, so the order's state must be learned
         // from an `OrderUpdate` -- which Hyperliquid sends as its own message.
         order_filled_quantity: None,
-        fees: AssetFees {
-            asset: AssetNameExchange::from("USDC"),
-            fees: fee,
-            fees_quote: Some(fee),
-        },
+        fees: perp_fill_fees(Some(&fill.fee_token), fee),
     };
 
     Some(AccountEvent::new(
@@ -1291,9 +1298,51 @@ mod tests {
                 assert_eq!(trade.price, dec!(65000.5));
                 assert_eq!(trade.quantity, dec!(0.1));
                 assert_eq!(trade.fees.fees, dec!(0.65));
+                assert_eq!(trade.fees.asset.as_ref(), "USDC");
+                assert_eq!(trade.fees.fees_quote, Some(dec!(0.65)));
             }
             _ => panic!("Expected Trade event"),
         }
+    }
+
+    #[test]
+    fn a_builder_deployed_fill_reports_the_fee_token_it_was_charged_in() {
+        // A HIP-3 perpetual settles in its deployer's collateral, which is not always USDC.
+        let fill_json = r#"{
+            "coin": "flx:TSLA", "side": "B", "px": "250", "sz": "2",
+            "time": 1714100000000, "hash": "0xhip3", "startPosition": "0",
+            "dir": "Open Long", "closedPnl": "0", "oid": 7, "cloid": null,
+            "crossed": true, "fee": "0.2", "feeToken": "USDH", "tid": 77
+        }"#;
+        let fill: hyperliquid_rust_sdk::TradeInfo = serde_json::from_str(fill_json).unwrap();
+
+        let AccountEventKind::Trade(trade) = fill_to_account_event(&fill).unwrap().kind else {
+            panic!("Expected Trade event");
+        };
+        assert_eq!(trade.instrument.as_ref(), "flx:TSLA-USD-PERP");
+        assert_eq!(trade.fees.asset.as_ref(), "USDH");
+        assert_eq!(trade.fees.fees, dec!(0.2));
+        assert_eq!(
+            trade.fees.fees_quote, None,
+            "the client cannot tell a non-USDC fee is in the instrument's quote"
+        );
+    }
+
+    #[test]
+    fn perp_fill_fees_reads_the_fee_token_and_falls_back_to_usdc() {
+        assert_eq!(
+            perp_fill_fees(Some("USDT0"), dec!(1.5)),
+            AssetFees::new(AssetNameExchange::from("USDT0"), dec!(1.5), None)
+        );
+        assert_eq!(
+            perp_fill_fees(Some("USDC"), dec!(1.5)),
+            AssetFees::new(AssetNameExchange::from("USDC"), dec!(1.5), Some(dec!(1.5)))
+        );
+        assert_eq!(
+            perp_fill_fees(None, dec!(1.5)),
+            AssetFees::new(AssetNameExchange::from("USDC"), dec!(1.5), Some(dec!(1.5))),
+            "an absent feeToken is the default perpetuals' USDC"
+        );
     }
 
     #[test]
