@@ -299,9 +299,19 @@ impl Processor<&AccountEvent> for MultiStrategyCustomInstrumentData {
 }
 
 impl InFlightRequestRecorder for MultiStrategyCustomInstrumentData {
-    fn record_in_flight_cancel(&mut self, _: &OrderRequestCancel<ExchangeIndex, InstrumentIndex>) {}
+    fn record_in_flight_cancel(
+        &mut self,
+        _: &OrderRequestCancel<ExchangeIndex, InstrumentIndex>,
+        _: DateTime<Utc>,
+    ) {
+    }
 
-    fn record_in_flight_open(&mut self, _: &OrderRequestOpen<ExchangeIndex, InstrumentIndex>) {}
+    fn record_in_flight_open(
+        &mut self,
+        _: &OrderRequestOpen<ExchangeIndex, InstrumentIndex>,
+        _: DateTime<Utc>,
+    ) {
+    }
 }
 
 impl Default for StrategyCustomInstrumentData {

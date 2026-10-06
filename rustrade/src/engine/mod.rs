@@ -11,10 +11,11 @@ use crate::{
         clock::EngineClock,
         command::Command,
         execution_tx::ExecutionTxMap,
+        in_flight::{InFlightDeadlines, InFlightOverdue, InFlightWatch},
         state::{
             EngineState,
             connectivity::UntrackedExchange,
-            instrument::{OptionSplitPlan, data::InstrumentDataState},
+            instrument::{OptionSplitPlan, data::InstrumentDataState, filter::InstrumentFilter},
             order::{Orders, in_flight_recorder::InFlightRequestRecorder, manager::OrderManager},
             position::{Position, PositionDrift, PositionExited, PositionId, SplitRoundingPolicy},
             trading::TradingState,
@@ -79,6 +80,9 @@ pub mod error;
 /// can `ExecutionRequest` to the appropriate `ExecutionManagers`.
 pub mod execution_tx;
 
+// Documented by its own inner doc comment, which rustdoc would merge with an outer one here.
+pub mod in_flight;
+
 /// Defines all state used by the`Engine` to algorithmically trade.
 ///
 /// eg/ `ConnectivityStates`, `AssetStates`, `InstrumentStates`, `Position`, etc.
@@ -124,13 +128,15 @@ where
 /// The execution transmitters are private: every order request reaches an exchange through the
 /// engine's own actions, which validate it and record it as in flight. Construct an `Engine`
 /// with [`Engine::new`].
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Engine<Clock, State, ExecutionTxs, Strategy, Risk> {
     pub clock: Clock,
     pub meta: EngineMeta,
     pub state: State,
     /// Private so that no order request can be sent without the engine's in-flight tracking.
     execution_txs: ExecutionTxs,
+    /// Flags orders in flight past their exchange's deadline (see [`InFlightDeadlines`]).
+    in_flight: InFlightWatch,
     pub strategy: Strategy,
     pub risk: Risk,
 }
@@ -251,6 +257,14 @@ where
             }
         };
 
+        // After the event, so an order the event answered is not flagged; before the drain check,
+        // which returns early, so an order stranded during a drain is still flagged. The arms
+        // that return early above skip the check until the next event.
+        let mut process_audit = process_audit;
+        for overdue in self.flag_overdue_in_flight() {
+            process_audit = process_audit.add_output(EngineOutput::InFlightOverdue(overdue));
+        }
+
         // A drain in progress outranks everything below: no new orders. The run is *not* ended
         // here — see the `Shutdown::AfterDrain` arm above for why the execution side owns that
         // decision.
@@ -291,6 +305,18 @@ where
 impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     Engine<Clock, EngineState<GlobalData, InstrumentData>, ExecutionTxs, Strategy, Risk>
 {
+    /// Flag the orders whose request has newly passed its exchange's in-flight deadline.
+    fn flag_overdue_in_flight(&mut self) -> Vec<InFlightOverdue>
+    where
+        Clock: EngineClock,
+    {
+        let clock = &self.clock;
+        self.in_flight.check(
+            || clock.time(),
+            self.state.instruments.instruments(&InstrumentFilter::None),
+        )
+    }
+
     /// Tell every `ExecutionManager` to finish what it has in flight and then stop.
     ///
     /// Sends [`ExecutionRequest::Drain`], the graceful counterpart to the
@@ -314,6 +340,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     /// Action an `Engine` [`Command`], producing an [`ActionOutput`] of work done.
     pub fn action(&mut self, command: &Command) -> ActionOutput
     where
+        Clock: EngineClock,
         InstrumentData: InstrumentDataState + InFlightRequestRecorder,
         ExecutionTxs: ExecutionTxMap,
         Strategy: ClosePositionsStrategy<State = EngineState<GlobalData, InstrumentData>>,
@@ -1529,10 +1556,18 @@ where
     ///
     /// This is the only way to construct an `Engine` outside this crate, as the execution
     /// transmitters are private.
+    ///
+    /// `in_flight_deadlines` says how long an order's request may stay in flight on each exchange
+    /// before the engine flags it with [`EngineOutput::InFlightOverdue`]. Pass the deadlines
+    /// [`ExecutionBuild`](crate::execution::builder::ExecutionBuild) derived from each
+    /// `ExecutionManager`'s `request_timeout`, or [`InFlightDeadlines::default`] to check nothing.
+    /// The engine checks after each event it processes, except a `Shutdown` and a `Command` whose
+    /// action hit an unrecoverable error.
     pub fn new(
         clock: Clock,
         state: State,
         execution_txs: ExecutionTxs,
+        in_flight_deadlines: InFlightDeadlines,
         strategy: Strategy,
         risk: Risk,
     ) -> Self {
@@ -1545,9 +1580,15 @@ where
             clock,
             state,
             execution_txs,
+            in_flight: InFlightWatch::new(in_flight_deadlines),
             strategy,
             risk,
         }
+    }
+
+    /// The deadlines the engine flags orders in flight by (see [`EngineOutput::InFlightOverdue`]).
+    pub fn in_flight_deadlines(&self) -> &InFlightDeadlines {
+        self.in_flight.deadlines()
     }
 
     /// Return `Engine` clock time.
@@ -1602,6 +1643,10 @@ pub enum EngineOutput<
     /// format is unchanged (a newtype variant serializes its payload identically whether boxed or
     /// not).
     AlgoOrders(GenerateAlgoOrdersOutput<ExchangeKey, InstrumentKey>),
+
+    /// An order whose request has been in flight past its exchange's deadline. The engine leaves
+    /// the order in flight; see [`in_flight`] for why, and [`InFlightOverdue`] for when it fires.
+    InFlightOverdue(InFlightOverdue<ExchangeKey, InstrumentKey>),
 
     /// Cash-in-lieu observable: a corporate-action split disposed a fractional share quantity
     /// (under [`SplitRoundingPolicy::Floor`]) from one open position. Emitted **per position**

@@ -1,4 +1,7 @@
-use crate::{engine::state::position::PositionSeedError, execution::error::ExecutionError};
+use crate::{
+    engine::{in_flight::InFlightDeadlineError, state::position::PositionSeedError},
+    execution::error::ExecutionError,
+};
 use chrono::{DateTime, Utc};
 use rustrade_data::error::DataError;
 use rustrade_instrument::{exchange::ExchangeId, index::error::IndexError};
@@ -104,6 +107,13 @@ pub enum BarterError {
     /// See [`BacktestMarketData`](Self::BacktestMarketData) — new variants belong at the end.
     #[error("position seed: {0}")]
     PositionSeed(#[from] PositionSeedError),
+
+    /// An in-flight deadline override was invalid — see [`InFlightDeadlineError`].
+    ///
+    /// # Appended deliberately
+    /// See [`BacktestMarketData`](Self::BacktestMarketData) — new variants belong at the end.
+    #[error("in-flight deadline: {0}")]
+    InFlightDeadline(#[from] InFlightDeadlineError),
 }
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]
 #[error("RxDropped")]

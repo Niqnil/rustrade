@@ -1,6 +1,7 @@
 use crate::engine::state::order::{
     in_flight_recorder::InFlightRequestRecorder, manager::OrderManager,
 };
+use chrono::{DateTime, Utc};
 use fnv::FnvHashMap;
 use rust_decimal::Decimal;
 use rustrade_execution::order::{
@@ -465,6 +466,7 @@ where
 
                 current_entry.get_mut().state = ActiveOrderState::CancelInFlight(CancelInFlight {
                     order: Some(latest_open),
+                    time_sent: update.time_sent,
                 })
             }
             (ActiveOrderState::CancelInFlight(_), ActiveOrderState::OpenInFlight(_)) => {
@@ -514,6 +516,7 @@ where
                     current_entry.get_mut().state =
                         ActiveOrderState::CancelInFlight(CancelInFlight {
                             order: Some(update),
+                            time_sent: current.time_sent,
                         });
                 }
             }
@@ -715,6 +718,7 @@ where
     fn record_in_flight_cancel(
         &mut self,
         request: &OrderRequestCancel<ExchangeKey, InstrumentKey>,
+        time_sent: DateTime<Utc>,
     ) {
         let Some(order) = self.0.get_mut(&request.key.cid) else {
             error!(
@@ -725,18 +729,36 @@ where
             return;
         };
 
+        // A cancel resent while one is in flight keeps the first one's send time, so a strategy
+        // that re-cancels on every event cannot keep the order from ever passing its in-flight
+        // deadline.
+        if matches!(order.state, ActiveOrderState::CancelInFlight(_)) {
+            debug!(
+                cid = %request.key.cid,
+                event = ?request,
+                "OrderManager recorded a cancel resent while one is in flight - keeping the first"
+            );
+            return;
+        }
+
         order.state = ActiveOrderState::CancelInFlight(CancelInFlight {
             order: order.state.open_meta().cloned(),
+            time_sent,
         });
     }
 
-    fn record_in_flight_open(&mut self, request: &OrderRequestOpen<ExchangeKey, InstrumentKey>) {
+    fn record_in_flight_open(
+        &mut self,
+        request: &OrderRequestOpen<ExchangeKey, InstrumentKey>,
+        time_sent: DateTime<Utc>,
+    ) {
         // A new order by the engine's own hand, so its snapshots apply even under a client id
         // that named a retired order.
         self.1.forget(&request.key.cid);
-        if let Some(duplicate_cid_order) =
-            self.0.insert(request.key.cid.clone(), Order::from(request))
-        {
+        if let Some(duplicate_cid_order) = self.0.insert(
+            request.key.cid.clone(),
+            Order::open_in_flight(request, time_sent),
+        ) {
             error!(
                 cid = %duplicate_cid_order.key.cid,
                 event = ?duplicate_cid_order,
@@ -750,7 +772,6 @@ where
 mod tests {
     use super::*;
     use crate::{engine::state::order::Orders, test_utils::time_plus_secs};
-    use chrono::{DateTime, Utc};
     use rust_decimal_macros::dec;
     use rustrade_execution::{
         error::{ConnectivityError, OrderError},
@@ -765,6 +786,10 @@ mod tests {
     };
     use rustrade_instrument::{Side, exchange::ExchangeId};
     use smol_str::SmolStr;
+
+    /// When a test's in-flight request was sent. Distinct from every `Open::time_exchange` the
+    /// tests use (around `MIN_UTC`), so a transition that took the wrong time would fail.
+    const TIME_SENT: DateTime<Utc> = DateTime::<Utc>::UNIX_EPOCH;
 
     fn orders(
         orders: impl IntoIterator<Item = Order<ExchangeId, u64, ActiveOrderState>>,
@@ -811,7 +836,7 @@ mod tests {
             open("named-now", "oid-now"),
             order(
                 ClientOrderId::new("opening"),
-                ActiveOrderState::OpenInFlight(OpenInFlight),
+                ActiveOrderState::OpenInFlight(OpenInFlight::new(TIME_SENT)),
             ),
             order_cancel_in_flight(ClientOrderId::new("cancelling")),
         ]);
@@ -862,7 +887,10 @@ mod tests {
     fn order_cancel_in_flight(cid: ClientOrderId) -> Order<ExchangeId, u64, ActiveOrderState> {
         order(
             cid,
-            ActiveOrderState::CancelInFlight(CancelInFlight { order: None }),
+            ActiveOrderState::CancelInFlight(CancelInFlight {
+                order: None,
+                time_sent: TIME_SENT,
+            }),
         )
     }
 
@@ -1027,7 +1055,12 @@ mod tests {
     ) -> FnvHashMap<ClientOrderId, Order<ExchangeId, u64, ActiveOrderState>> {
         orders
             .into_iter()
-            .map(|order| (order.key.cid.clone(), Order::from(&order)))
+            .map(|order| {
+                (
+                    order.key.cid.clone(),
+                    Order::open_in_flight(&order, TIME_SENT),
+                )
+            })
             .collect()
     }
 
@@ -1118,7 +1151,7 @@ mod tests {
                 name: "tracked OpenInFlight, Snapshot is inactive cancelled, so remove",
                 state: orders([order(
                     cid.clone(),
-                    ActiveOrderState::OpenInFlight(OpenInFlight),
+                    ActiveOrderState::OpenInFlight(OpenInFlight::new(TIME_SENT)),
                 )]),
                 input: order_snapshot_cancelled(cid.clone()),
                 expected: Orders::default(),
@@ -1127,7 +1160,7 @@ mod tests {
                 name: "tracked OpenInFlight, Snapshot is inactive fully filled, so remove",
                 state: orders([order(
                     cid.clone(),
-                    ActiveOrderState::OpenInFlight(OpenInFlight),
+                    ActiveOrderState::OpenInFlight(OpenInFlight::new(TIME_SENT)),
                 )]),
                 input: order_snapshot_fully_filled(cid.clone()),
                 expected: Orders::default(),
@@ -1136,7 +1169,7 @@ mod tests {
                 name: "tracked OpenInFlight, Snapshot is inactive failed, so remove",
                 state: orders([order(
                     cid.clone(),
-                    ActiveOrderState::OpenInFlight(OpenInFlight),
+                    ActiveOrderState::OpenInFlight(OpenInFlight::new(TIME_SENT)),
                 )]),
                 input: order_snapshot_failed(cid.clone()),
                 expected: Orders::default(),
@@ -1145,7 +1178,7 @@ mod tests {
                 name: "tracked OpenInFlight, Snapshot is inactive expired, so remove",
                 state: orders([order(
                     cid.clone(),
-                    ActiveOrderState::OpenInFlight(OpenInFlight),
+                    ActiveOrderState::OpenInFlight(OpenInFlight::new(TIME_SENT)),
                 )]),
                 input: order_snapshot_expired(cid.clone()),
                 expected: Orders::default(),
@@ -1178,7 +1211,10 @@ mod tests {
                 name: "tracked CancelInFlight, Snapshot is inactive cancelled, so remove",
                 state: orders([order(
                     cid.clone(),
-                    ActiveOrderState::CancelInFlight(CancelInFlight { order: None }),
+                    ActiveOrderState::CancelInFlight(CancelInFlight {
+                        order: None,
+                        time_sent: TIME_SENT,
+                    }),
                 )]),
                 input: order_snapshot_cancelled(cid.clone()),
                 expected: Orders::default(),
@@ -1187,7 +1223,10 @@ mod tests {
                 name: "tracked CancelInFlight, Snapshot is inactive fully filled, so remove",
                 state: orders([order(
                     cid.clone(),
-                    ActiveOrderState::CancelInFlight(CancelInFlight { order: None }),
+                    ActiveOrderState::CancelInFlight(CancelInFlight {
+                        order: None,
+                        time_sent: TIME_SENT,
+                    }),
                 )]),
                 input: order_snapshot_fully_filled(cid.clone()),
                 expected: Orders::default(),
@@ -1196,7 +1235,10 @@ mod tests {
                 name: "tracked CancelInFlight, Snapshot is inactive failed, so remove",
                 state: orders([order(
                     cid.clone(),
-                    ActiveOrderState::CancelInFlight(CancelInFlight { order: None }),
+                    ActiveOrderState::CancelInFlight(CancelInFlight {
+                        order: None,
+                        time_sent: TIME_SENT,
+                    }),
                 )]),
                 input: order_snapshot_failed(cid.clone()),
                 expected: Orders::default(),
@@ -1205,7 +1247,10 @@ mod tests {
                 name: "tracked CancelInFlight, Snapshot is inactive expired, so remove",
                 state: orders([order(
                     cid.clone(),
-                    ActiveOrderState::CancelInFlight(CancelInFlight { order: None }),
+                    ActiveOrderState::CancelInFlight(CancelInFlight {
+                        order: None,
+                        time_sent: TIME_SENT,
+                    }),
                 )]),
                 input: order_snapshot_expired(cid.clone()),
                 expected: Orders::default(),
@@ -1214,19 +1259,22 @@ mod tests {
                 name: "tracked OpenInFlight, Snapshot is active OpenInFlight, so ignore duplicate",
                 state: orders([order(
                     cid.clone(),
-                    ActiveOrderState::OpenInFlight(OpenInFlight),
+                    ActiveOrderState::OpenInFlight(OpenInFlight::new(TIME_SENT)),
                 )]),
-                input: Snapshot(order(cid.clone(), OrderState::active(OpenInFlight))),
+                input: Snapshot(order(
+                    cid.clone(),
+                    OrderState::active(OpenInFlight::new(TIME_SENT)),
+                )),
                 expected: orders([order(
                     cid.clone(),
-                    ActiveOrderState::OpenInFlight(OpenInFlight),
+                    ActiveOrderState::OpenInFlight(OpenInFlight::new(TIME_SENT)),
                 )]),
             },
             TestCase {
                 name: "tracked OpenInFlight, Snapshot is active Open but fully filled, so remove",
                 state: orders([order(
                     cid.clone(),
-                    ActiveOrderState::OpenInFlight(OpenInFlight),
+                    ActiveOrderState::OpenInFlight(OpenInFlight::new(TIME_SENT)),
                 )]),
                 input: Snapshot(order(
                     cid.clone(),
@@ -1238,7 +1286,7 @@ mod tests {
                 name: "tracked OpenInFlight, Snapshot is active Open, so update",
                 state: orders([order(
                     cid.clone(),
-                    ActiveOrderState::OpenInFlight(OpenInFlight),
+                    ActiveOrderState::OpenInFlight(OpenInFlight::new(TIME_SENT)),
                 )]),
                 input: order_snapshot_open(cid.clone(), time_base),
                 expected: orders([order(cid.clone(), ActiveOrderState::Open(open(time_base)))]),
@@ -1247,21 +1295,30 @@ mod tests {
                 name: "tracked OpenInFlight, Snapshot is active CancelInFlight, so update",
                 state: orders([order(
                     cid.clone(),
-                    ActiveOrderState::OpenInFlight(OpenInFlight),
+                    ActiveOrderState::OpenInFlight(OpenInFlight::new(TIME_SENT)),
                 )]),
                 input: Snapshot(order(
                     cid.clone(),
-                    OrderState::active(CancelInFlight { order: None }),
+                    OrderState::active(CancelInFlight {
+                        order: None,
+                        time_sent: time_plus_secs(TIME_SENT, 60),
+                    }),
                 )),
                 expected: orders([order(
                     cid.clone(),
-                    ActiveOrderState::CancelInFlight(CancelInFlight { order: None }),
+                    ActiveOrderState::CancelInFlight(CancelInFlight {
+                        order: None,
+                        time_sent: time_plus_secs(TIME_SENT, 60),
+                    }),
                 )]),
             },
             TestCase {
                 name: "tracked Open, Snapshot is active OpenInFlight, so ignore",
                 state: orders([order(cid.clone(), ActiveOrderState::Open(open(time_base)))]),
-                input: Snapshot(order(cid.clone(), OrderState::active(OpenInFlight))),
+                input: Snapshot(order(
+                    cid.clone(),
+                    OrderState::active(OpenInFlight::new(TIME_SENT)),
+                )),
                 expected: orders([order(cid.clone(), ActiveOrderState::Open(open(time_base)))]),
             },
             TestCase {
@@ -1336,12 +1393,14 @@ mod tests {
                     cid.clone(),
                     OrderState::active(CancelInFlight {
                         order: Some(open(time_plus_secs(time_base, 2))),
+                        time_sent: TIME_SENT,
                     }),
                 )),
                 expected: orders([order(
                     cid.clone(),
                     ActiveOrderState::CancelInFlight(CancelInFlight {
                         order: Some(open(time_plus_secs(time_base, 2))),
+                        time_sent: TIME_SENT,
                     }),
                 )]),
             },
@@ -1355,12 +1414,14 @@ mod tests {
                     cid.clone(),
                     OrderState::active(CancelInFlight {
                         order: Some(open(time_plus_secs(time_base, 1))),
+                        time_sent: TIME_SENT,
                     }),
                 )),
                 expected: orders([order(
                     cid.clone(),
                     ActiveOrderState::CancelInFlight(CancelInFlight {
                         order: Some(open(time_plus_secs(time_base, 2))),
+                        time_sent: TIME_SENT,
                     }),
                 )]),
             },
@@ -1372,12 +1433,16 @@ mod tests {
                 )]),
                 input: Snapshot(order(
                     cid.clone(),
-                    OrderState::active(CancelInFlight { order: None }),
+                    OrderState::active(CancelInFlight {
+                        order: None,
+                        time_sent: TIME_SENT,
+                    }),
                 )),
                 expected: orders([order(
                     cid.clone(),
                     ActiveOrderState::CancelInFlight(CancelInFlight {
                         order: Some(open(time_plus_secs(time_base, 1))),
+                        time_sent: TIME_SENT,
                     }),
                 )]),
             },
@@ -1385,25 +1450,38 @@ mod tests {
                 name: "tracked CancelInFlight, Snapshot is active OpenInFlight, so ignore",
                 state: orders([order(
                     cid.clone(),
-                    ActiveOrderState::CancelInFlight(CancelInFlight { order: None }),
+                    ActiveOrderState::CancelInFlight(CancelInFlight {
+                        order: None,
+                        time_sent: TIME_SENT,
+                    }),
                 )]),
-                input: Snapshot(order(cid.clone(), OrderState::active(OpenInFlight))),
+                input: Snapshot(order(
+                    cid.clone(),
+                    OrderState::active(OpenInFlight::new(TIME_SENT)),
+                )),
                 expected: orders([order(
                     cid.clone(),
-                    ActiveOrderState::CancelInFlight(CancelInFlight { order: None }),
+                    ActiveOrderState::CancelInFlight(CancelInFlight {
+                        order: None,
+                        time_sent: TIME_SENT,
+                    }),
                 )]),
             },
             TestCase {
                 name: "tracked CancelInFlight w/ None Open, Snapshot is active Open, update accordingly",
                 state: orders([order(
                     cid.clone(),
-                    ActiveOrderState::CancelInFlight(CancelInFlight { order: None }),
+                    ActiveOrderState::CancelInFlight(CancelInFlight {
+                        order: None,
+                        time_sent: TIME_SENT,
+                    }),
                 )]),
                 input: order_snapshot_open(cid.clone(), time_base),
                 expected: orders([order(
                     cid.clone(),
                     ActiveOrderState::CancelInFlight(CancelInFlight {
                         order: Some(open(time_plus_secs(time_base, 0))),
+                        time_sent: TIME_SENT,
                     }),
                 )]),
             },
@@ -1413,6 +1491,7 @@ mod tests {
                     cid.clone(),
                     ActiveOrderState::CancelInFlight(CancelInFlight {
                         order: Some(open(time_plus_secs(time_base, 2))),
+                        time_sent: TIME_SENT,
                     }),
                 )]),
                 input: order_snapshot_open(cid.clone(), time_plus_secs(time_base, 1)),
@@ -1420,6 +1499,7 @@ mod tests {
                     cid.clone(),
                     ActiveOrderState::CancelInFlight(CancelInFlight {
                         order: Some(open(time_plus_secs(time_base, 2))),
+                        time_sent: TIME_SENT,
                     }),
                 )]),
             },
@@ -1429,6 +1509,7 @@ mod tests {
                     cid.clone(),
                     ActiveOrderState::CancelInFlight(CancelInFlight {
                         order: Some(open(time_plus_secs(time_base, 1))),
+                        time_sent: TIME_SENT,
                     }),
                 )]),
                 input: order_snapshot_open(cid.clone(), time_plus_secs(time_base, 2)),
@@ -1436,6 +1517,7 @@ mod tests {
                     cid.clone(),
                     ActiveOrderState::CancelInFlight(CancelInFlight {
                         order: Some(open(time_plus_secs(time_base, 2))),
+                        time_sent: TIME_SENT,
                     }),
                 )]),
             },
@@ -1443,15 +1525,24 @@ mod tests {
                 name: "tracked CancelInFlight, Snapshot is active CancelInFlight, so ignore duplicate",
                 state: orders([order(
                     cid.clone(),
-                    ActiveOrderState::CancelInFlight(CancelInFlight { order: None }),
+                    ActiveOrderState::CancelInFlight(CancelInFlight {
+                        order: None,
+                        time_sent: TIME_SENT,
+                    }),
                 )]),
                 input: Snapshot(order(
                     cid.clone(),
-                    OrderState::active(CancelInFlight { order: None }),
+                    OrderState::active(CancelInFlight {
+                        order: None,
+                        time_sent: time_plus_secs(TIME_SENT, 60),
+                    }),
                 )),
                 expected: orders([order(
                     cid.clone(),
-                    ActiveOrderState::CancelInFlight(CancelInFlight { order: None }),
+                    ActiveOrderState::CancelInFlight(CancelInFlight {
+                        order: None,
+                        time_sent: TIME_SENT,
+                    }),
                 )]),
             },
         ];
@@ -1697,6 +1788,7 @@ mod tests {
             cid.clone(),
             OrderState::active(CancelInFlight {
                 order: Some(open_assigned("B", time_plus_secs(time_base, 1))),
+                time_sent: TIME_SENT,
             }),
         ));
         state.update_from_order_snapshot(cancelling.as_ref());
@@ -1707,6 +1799,7 @@ mod tests {
                 cid.clone(),
                 ActiveOrderState::CancelInFlight(CancelInFlight {
                     order: Some(open_assigned("A", time_base)),
+                    time_sent: TIME_SENT,
                 }),
             )]),
             "a CancelInFlight transition adopted an Open naming a different exchange order"
@@ -1726,6 +1819,7 @@ mod tests {
                 cid,
                 ActiveOrderState::CancelInFlight(CancelInFlight {
                     order: Some(open_assigned("A", time_base)),
+                    time_sent: TIME_SENT,
                 }),
             )]),
             "a tracked CancelInFlight adopted an Open naming a different exchange order"
@@ -1820,7 +1914,10 @@ mod tests {
             },
             TestCase {
                 name: "tracked OpenInFlight, response Ok, so remove",
-                state: orders([order(cid.clone(), ActiveOrderState::from(OpenInFlight))]),
+                state: orders([order(
+                    cid.clone(),
+                    ActiveOrderState::from(OpenInFlight::new(TIME_SENT)),
+                )]),
                 input: response_cancel_ok(cid.clone()),
                 expected: Orders::default(),
             },
@@ -1834,16 +1931,25 @@ mod tests {
                 name: "tracked CancelInFlight, response Ok, so remove",
                 state: orders([order(
                     cid.clone(),
-                    ActiveOrderState::from(CancelInFlight { order: None }),
+                    ActiveOrderState::from(CancelInFlight {
+                        order: None,
+                        time_sent: TIME_SENT,
+                    }),
                 )]),
                 input: response_cancel_ok(cid.clone()),
                 expected: Orders::default(),
             },
             TestCase {
                 name: "tracked OpenInFlight, response Err, so ignore",
-                state: orders([order(cid.clone(), ActiveOrderState::from(OpenInFlight))]),
+                state: orders([order(
+                    cid.clone(),
+                    ActiveOrderState::from(OpenInFlight::new(TIME_SENT)),
+                )]),
                 input: response_cancel_err(cid.clone()),
-                expected: orders([order(cid.clone(), ActiveOrderState::from(OpenInFlight))]),
+                expected: orders([order(
+                    cid.clone(),
+                    ActiveOrderState::from(OpenInFlight::new(TIME_SENT)),
+                )]),
             },
             TestCase {
                 name: "tracked Open, response Err, so ignore",
@@ -1857,6 +1963,7 @@ mod tests {
                     cid.clone(),
                     ActiveOrderState::from(CancelInFlight {
                         order: Some(open(time_base)),
+                        time_sent: TIME_SENT,
                     }),
                 )]),
                 input: response_cancel_err(cid.clone()),
@@ -1866,7 +1973,10 @@ mod tests {
                 name: "tracked CancelInFlight w/ None Open, response Err, so remove",
                 state: orders([order(
                     cid.clone(),
-                    ActiveOrderState::from(CancelInFlight { order: None }),
+                    ActiveOrderState::from(CancelInFlight {
+                        order: None,
+                        time_sent: TIME_SENT,
+                    }),
                 )]),
                 input: response_cancel_err(cid),
                 expected: Orders::default(),
@@ -1913,10 +2023,40 @@ mod tests {
 
         for (index, mut test) in cases.into_iter().enumerate() {
             for in_flight in test.input {
-                test.state.record_in_flight_cancel(&in_flight);
+                test.state.record_in_flight_cancel(&in_flight, TIME_SENT);
             }
             assert_eq!(test.state, test.expected, "TC{index} failed")
         }
+    }
+
+    /// A strategy that re-cancels on every event must not keep restarting the order's in-flight
+    /// clock, or it would never pass its deadline.
+    #[test]
+    fn a_resent_cancel_keeps_the_first_cancels_send_time_and_order() {
+        let cid = ClientOrderId::new("resent");
+        let held_open = Open::new(
+            VenueOrderId::Assigned(OrderId::new("venue")),
+            DateTime::<Utc>::MIN_UTC,
+            Decimal::ZERO,
+        );
+        let mut state = orders([order(
+            cid.clone(),
+            ActiveOrderState::Open(held_open.clone()),
+        )]);
+
+        state.record_in_flight_cancel(&request_cancel(cid.clone()), TIME_SENT);
+        state.record_in_flight_cancel(&request_cancel(cid.clone()), time_plus_secs(TIME_SENT, 60));
+
+        assert_eq!(
+            state,
+            orders([order(
+                cid,
+                ActiveOrderState::CancelInFlight(CancelInFlight {
+                    order: Some(held_open),
+                    time_sent: TIME_SENT,
+                }),
+            )])
+        );
     }
 
     #[test]
@@ -1953,7 +2093,7 @@ mod tests {
 
         for (index, mut test) in cases.into_iter().enumerate() {
             for in_flight in test.input {
-                test.state.record_in_flight_open(&in_flight);
+                test.state.record_in_flight_open(&in_flight, TIME_SENT);
             }
             assert_eq!(test.state, test.expected, "TC{index} failed")
         }
@@ -1966,7 +2106,7 @@ mod tests {
         let time = DateTime::<Utc>::MIN_UTC;
         let cid = ClientOrderId::new("raced");
         let mut state = Orders::<ExchangeId, u64>::default();
-        state.record_in_flight_open(&request_open(cid.clone()));
+        state.record_in_flight_open(&request_open(cid.clone()), TIME_SENT);
 
         state.update_from_order_snapshot(order_snapshot_open(cid.clone(), time).as_ref());
         state.update_from_order_snapshot(order_snapshot_fully_filled(cid.clone()).as_ref());
@@ -2016,7 +2156,7 @@ mod tests {
             acked_filled.clone(),
             order(
                 acked_filled.clone(),
-                ActiveOrderState::OpenInFlight(OpenInFlight),
+                ActiveOrderState::OpenInFlight(OpenInFlight::new(TIME_SENT)),
             ),
         );
 
@@ -2035,7 +2175,7 @@ mod tests {
 
         state.update_from_order_snapshot(order_snapshot_expired(snapshot.clone()).as_ref());
         state.update_from_cancel_response(&response_cancel_ok(cancelled.clone()));
-        state.record_in_flight_cancel(&request_cancel(cancel_in_flight.clone()));
+        state.record_in_flight_cancel(&request_cancel(cancel_in_flight.clone()), TIME_SENT);
         state.update_from_cancel_response(&response_cancel_ok(cancel_in_flight.clone()));
         assert!(state.update_from_fill(filled, &OrderId::new("A"), dec!(1)));
         assert!(
@@ -2057,8 +2197,8 @@ mod tests {
     fn an_order_whose_cancel_failed_before_its_open_was_answered_is_not_retired() {
         let cid = ClientOrderId::new("unanswered");
         let mut state = Orders::<ExchangeId, u64>::default();
-        state.record_in_flight_open(&request_open(cid.clone()));
-        state.record_in_flight_cancel(&request_cancel(cid.clone()));
+        state.record_in_flight_open(&request_open(cid.clone()), TIME_SENT);
+        state.record_in_flight_cancel(&request_cancel(cid.clone()), TIME_SENT);
         state.update_from_cancel_response(&response_cancel_err(cid.clone()));
         assert!(!state.0.contains_key(&cid), "precondition: untracked");
 
@@ -2072,14 +2212,14 @@ mod tests {
     fn a_retired_order_is_forgotten_after_the_window_or_a_new_open_under_its_id() {
         let time = DateTime::<Utc>::MIN_UTC;
         let retire = |state: &mut Orders<ExchangeId, u64>, cid: &ClientOrderId| {
-            state.record_in_flight_open(&request_open(cid.clone()));
+            state.record_in_flight_open(&request_open(cid.clone()), TIME_SENT);
             state.update_from_order_snapshot(order_snapshot_cancelled(cid.clone()).as_ref());
         };
         let mut state = Orders::<ExchangeId, u64>::default();
 
         let reused = ClientOrderId::new("reused");
         retire(&mut state, &reused);
-        state.record_in_flight_open(&request_open(reused.clone()));
+        state.record_in_flight_open(&request_open(reused.clone()), TIME_SENT);
         state.update_from_order_snapshot(order_snapshot_open(reused.clone(), time).as_ref());
         assert!(
             matches!(
@@ -2111,7 +2251,7 @@ mod tests {
             live.clone(),
             ActiveOrderState::Open(open(DateTime::<Utc>::MIN_UTC)),
         )]);
-        state.record_in_flight_open(&request_open(retired.clone()));
+        state.record_in_flight_open(&request_open(retired.clone()), TIME_SENT);
         state.update_from_order_snapshot(order_snapshot_cancelled(retired.clone()).as_ref());
 
         assert!(state.1.contains(&retired));
@@ -2159,8 +2299,8 @@ mod tests {
         let mut state = Orders::<ExchangeId, u64>::default();
 
         let cancel_failed = ClientOrderId::new("cancel-failed");
-        state.record_in_flight_open(&request_open(cancel_failed.clone()));
-        state.record_in_flight_cancel(&request_cancel(cancel_failed.clone()));
+        state.record_in_flight_open(&request_open(cancel_failed.clone()), TIME_SENT);
+        state.record_in_flight_cancel(&request_cancel(cancel_failed.clone()), TIME_SENT);
         state.update_from_cancel_response(&response_cancel_err(cancel_failed.clone()));
         state.update_from_order_snapshot(order_snapshot_cancelled(cancel_failed.clone()).as_ref());
 

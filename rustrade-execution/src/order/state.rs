@@ -94,6 +94,17 @@ pub enum ActiveOrderState {
 }
 
 impl ActiveOrderState {
+    /// When the request this order awaits an answer to was sent: `Some` for
+    /// [`OpenInFlight`](Self::OpenInFlight) and [`CancelInFlight`](Self::CancelInFlight), `None`
+    /// for [`Open`](Self::Open).
+    pub fn time_sent(&self) -> Option<DateTime<Utc>> {
+        match self {
+            Self::OpenInFlight(open) => Some(open.time_sent),
+            Self::Open(_) => None,
+            Self::CancelInFlight(cancel) => Some(cancel.time_sent),
+        }
+    }
+
     pub fn open_meta(&self) -> Option<&Open> {
         match self {
             Self::OpenInFlight(_) => None,
@@ -103,8 +114,15 @@ impl ActiveOrderState {
     }
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
-pub struct OpenInFlight;
+/// An open request sent to the exchange that it has not yet answered.
+#[derive(
+    Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
+)]
+pub struct OpenInFlight {
+    /// When the request was sent, by the sender's clock: the engine's `EngineClock`, so a
+    /// backtest stamps the simulated time.
+    pub time_sent: DateTime<Utc>,
+}
 
 /// An order the exchange reports as working, in the state the exchange last reported it.
 ///
@@ -221,11 +239,15 @@ pub struct Filled {
     pub avg_price: Option<Decimal>,
 }
 
+/// A cancel request sent to the exchange that it has not yet answered.
 #[derive(
-    Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Default, Deserialize, Serialize, Constructor,
+    Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
 )]
 pub struct CancelInFlight {
+    /// The order as last reported working, if it was before the cancel was sent.
     pub order: Option<Open>,
+    /// When the cancel was sent, by the sender's clock, as [`OpenInFlight::time_sent`].
+    pub time_sent: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, From)]

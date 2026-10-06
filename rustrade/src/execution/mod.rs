@@ -1,4 +1,7 @@
-use crate::{engine::execution_tx::MultiExchangeTxMap, execution::builder::ExecutionHandles};
+use crate::{
+    engine::{execution_tx::MultiExchangeTxMap, in_flight::InFlightDeadlines},
+    execution::builder::ExecutionHandles,
+};
 use rustrade_data::streams::reconnect;
 use rustrade_execution::AccountEvent;
 use rustrade_instrument::{
@@ -41,6 +44,8 @@ pub type AccountStreamEvent<
 #[allow(missing_debug_implementations)]
 pub struct Execution {
     pub execution_txs: MultiExchangeTxMap,
+    /// See [`ExecutionBuild::in_flight_deadlines`](builder::ExecutionBuild::in_flight_deadlines).
+    pub in_flight_deadlines: InFlightDeadlines,
     pub account_channel: Channel<AccountStreamEvent>,
     pub handles: ExecutionHandles,
 }

@@ -1,6 +1,7 @@
 use crate::{
     engine::{
         Engine,
+        clock::EngineClock,
         error::{EngineError, RecoverableEngineError, UnrecoverableEngineError},
         execution_tx::ExecutionTxMap,
         state::{
@@ -35,6 +36,7 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk>
         requests: impl IntoIterator<Item = OrderRequestOpen<ExchangeKey, InstrumentKey>>,
     ) -> SendRequestsOutput<RequestOpen, ExchangeKey, InstrumentKey>
     where
+        Clock: EngineClock,
         State: TracksInstrument<InstrumentKey>
             + MarketSnapshotSource<InstrumentKey>
             + InFlightRequestRecorder<ExchangeKey, InstrumentKey>,
@@ -45,7 +47,12 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk>
         let output = self.send_tracked_requests(requests, |state, open| {
             open.state.market = state.market_snapshot(&open.key.instrument);
         });
-        self.state.record_in_flight_opens(output.sent_iter());
+        if !output.sent.is_none() {
+            let time_sent = self.clock.time();
+            self.state
+                .record_in_flight_opens(output.sent_iter(), time_sent);
+            self.in_flight.on_sent(time_sent);
+        }
         output
     }
 
@@ -56,6 +63,7 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk>
         requests: impl IntoIterator<Item = OrderRequestCancel<ExchangeKey, InstrumentKey>>,
     ) -> SendRequestsOutput<RequestCancel, ExchangeKey, InstrumentKey>
     where
+        Clock: EngineClock,
         State:
             TracksInstrument<InstrumentKey> + InFlightRequestRecorder<ExchangeKey, InstrumentKey>,
         ExecutionTxs: ExecutionTxMap<ExchangeKey, InstrumentKey>,
@@ -63,7 +71,12 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk>
         InstrumentKey: Debug + Clone,
     {
         let output = self.send_tracked_requests(requests, |_, _| {});
-        self.state.record_in_flight_cancels(output.sent_iter());
+        if !output.sent.is_none() {
+            let time_sent = self.clock.time();
+            self.state
+                .record_in_flight_cancels(output.sent_iter(), time_sent);
+            self.in_flight.on_sent(time_sent);
+        }
         output
     }
 

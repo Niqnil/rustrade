@@ -1,5 +1,5 @@
 use crate::{
-    engine::{clock::EngineClock, execution_tx::MultiExchangeTxMap},
+    engine::{clock::EngineClock, execution_tx::MultiExchangeTxMap, in_flight::InFlightDeadlines},
     error::BarterError,
     execution::{
         AccountStreamEvent, Execution, error::ExecutionError, manager::ExecutionManager,
@@ -69,6 +69,7 @@ pub struct ExecutionBuilder<'a> {
     merged_channel: Channel<AccountStreamEvent<ExchangeIndex, AssetIndex, InstrumentIndex>>,
     mock_exchange_futures: Vec<RunFuture>,
     execution_init_futures: Vec<ExecutionInitFuture>,
+    in_flight_deadlines: InFlightDeadlines,
 }
 
 impl<'a> ExecutionBuilder<'a> {
@@ -80,6 +81,7 @@ impl<'a> ExecutionBuilder<'a> {
             merged_channel: Channel::default(),
             mock_exchange_futures: Vec::default(),
             execution_init_futures: Vec::default(),
+            in_flight_deadlines: InFlightDeadlines::default(),
         }
     }
 
@@ -88,6 +90,13 @@ impl<'a> ExecutionBuilder<'a> {
     ///
     /// The provided [`MockExecutionConfig`] is used to configure the [`MockExchange`] and provide
     /// the initial account state.
+    ///
+    /// The exchange gets no in-flight deadline (see [`ExecutionBuild::in_flight_deadlines`]): the
+    /// engine measures one on its own clock, which in a backtest is simulated time, while the
+    /// mock's `latency_ms` is real time. To check a mock run on a live clock, as in paper trading,
+    /// set one with
+    /// [`SystemBuilder::in_flight_deadline`](crate::system::builder::SystemBuilder::in_flight_deadline),
+    /// or with [`InFlightDeadlines::insert`] before [`Engine::new`](crate::engine::Engine::new).
     ///
     /// # Errors
     /// Returns [`BarterError::ExecutionBuilder`] if any indexed instrument executed on
@@ -134,6 +143,7 @@ impl<'a> ExecutionBuilder<'a> {
             mock_execution_client_config.mocked_exchange,
             mock_execution_client_config,
             DUMMY_EXECUTION_REQUEST_TIMEOUT,
+            None,
         )?;
 
         // Register MockExchange init Future
@@ -155,6 +165,9 @@ impl<'a> ExecutionBuilder<'a> {
     }
 
     /// Adds an [`ExecutionManager`] for a live exchange.
+    ///
+    /// The exchange's in-flight deadline (see [`ExecutionBuild::in_flight_deadlines`]) is derived
+    /// from `request_timeout` by [`InFlightDeadlines::deadline_for_request_timeout`].
     pub fn add_live<Client>(
         self,
         config: Client::Config,
@@ -165,14 +178,23 @@ impl<'a> ExecutionBuilder<'a> {
         Client::AccountStream: Send,
         Client::Config: Send,
     {
-        self.add_execution::<Client>(Client::EXCHANGE, config, request_timeout)
+        self.add_execution::<Client>(
+            Client::EXCHANGE,
+            config,
+            request_timeout,
+            Some(InFlightDeadlines::deadline_for_request_timeout(
+                request_timeout,
+            )),
+        )
     }
 
+    /// Register an [`ExecutionManager`] for `exchange`, and its in-flight deadline if it has one.
     fn add_execution<Client>(
         mut self,
         exchange: ExchangeId,
         config: Client::Config,
         request_timeout: Duration,
+        in_flight_deadline: Option<Duration>,
     ) -> Result<Self, BarterError>
     where
         Client: ExecutionClient + Send + Sync + 'static,
@@ -196,6 +218,11 @@ impl<'a> ExecutionBuilder<'a> {
             return Err(BarterError::ExecutionBuilder(format!(
                 "ExecutionBuilder does not support duplicate mocked ExecutionManagers: {exchange}"
             )));
+        }
+
+        if let Some(deadline) = in_flight_deadline {
+            self.in_flight_deadlines
+                .insert(instrument_map.exchange.key, deadline);
         }
 
         let merged_tx = self.merged_channel.tx.clone();
@@ -256,6 +283,7 @@ impl<'a> ExecutionBuilder<'a> {
 
         ExecutionBuild {
             execution_tx_map,
+            in_flight_deadlines: self.in_flight_deadlines,
             account_channel: self.merged_channel,
             futures: ExecutionBuildFutures {
                 mock_exchange_run_futures: self.mock_exchange_futures,
@@ -273,6 +301,10 @@ impl<'a> ExecutionBuilder<'a> {
 #[allow(missing_debug_implementations)]
 pub struct ExecutionBuild {
     pub execution_tx_map: MultiExchangeTxMap,
+    /// An in-flight deadline for each live exchange, derived from its `request_timeout`, for
+    /// [`Engine::new`](crate::engine::Engine::new). Mock exchanges have none; see
+    /// [`ExecutionBuilder::add_mock`].
+    pub in_flight_deadlines: InFlightDeadlines,
     pub account_channel: Channel<AccountStreamEvent>,
     pub futures: ExecutionBuildFutures,
 }
@@ -312,6 +344,7 @@ impl ExecutionBuild {
 
         Ok(Execution {
             execution_txs: self.execution_tx_map,
+            in_flight_deadlines: self.in_flight_deadlines,
             account_channel: self.account_channel,
             handles,
         })

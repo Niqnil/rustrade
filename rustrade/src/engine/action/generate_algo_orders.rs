@@ -2,6 +2,7 @@ use crate::{
     engine::{
         Engine,
         action::send_requests::{SendCancelsAndOpensOutput, SendRequestsOutput},
+        clock::EngineClock,
         error::UnrecoverableEngineError,
         execution_tx::ExecutionTxMap,
         state::{
@@ -39,6 +40,7 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk, ExchangeKey, InstrumentKey>
     GenerateAlgoOrders<ExchangeKey, InstrumentKey>
     for Engine<Clock, State, ExecutionTxs, Strategy, Risk>
 where
+    Clock: EngineClock,
     State: InFlightRequestRecorder<ExchangeKey, InstrumentKey>
         + MarketSnapshotSource<InstrumentKey>
         + TracksInstrument<InstrumentKey>,

@@ -2,6 +2,7 @@ use crate::{
     Timed,
     engine::{Processor, state::order::in_flight_recorder::InFlightRequestRecorder},
 };
+use chrono::{DateTime, Utc};
 use derive_more::Constructor;
 use rust_decimal::Decimal;
 use rustrade_data::{
@@ -398,9 +399,19 @@ impl<ExchangeKey, AssetKey, InstrumentKey>
 impl<ExchangeKey, InstrumentKey> InFlightRequestRecorder<ExchangeKey, InstrumentKey>
     for DefaultInstrumentMarketData
 {
-    fn record_in_flight_cancel(&mut self, _: &OrderRequestCancel<ExchangeKey, InstrumentKey>) {}
+    fn record_in_flight_cancel(
+        &mut self,
+        _: &OrderRequestCancel<ExchangeKey, InstrumentKey>,
+        _: DateTime<Utc>,
+    ) {
+    }
 
-    fn record_in_flight_open(&mut self, _: &OrderRequestOpen<ExchangeKey, InstrumentKey>) {}
+    fn record_in_flight_open(
+        &mut self,
+        _: &OrderRequestOpen<ExchangeKey, InstrumentKey>,
+        _: DateTime<Utc>,
+    ) {
+    }
 }
 
 /// [`InstrumentDataState`] for an option contract: everything [`DefaultInstrumentMarketData`]
@@ -494,12 +505,17 @@ impl<ExchangeKey, InstrumentKey> InFlightRequestRecorder<ExchangeKey, Instrument
     fn record_in_flight_cancel(
         &mut self,
         request: &OrderRequestCancel<ExchangeKey, InstrumentKey>,
+        time_sent: DateTime<Utc>,
     ) {
-        self.market.record_in_flight_cancel(request);
+        self.market.record_in_flight_cancel(request, time_sent);
     }
 
-    fn record_in_flight_open(&mut self, request: &OrderRequestOpen<ExchangeKey, InstrumentKey>) {
-        self.market.record_in_flight_open(request);
+    fn record_in_flight_open(
+        &mut self,
+        request: &OrderRequestOpen<ExchangeKey, InstrumentKey>,
+        time_sent: DateTime<Utc>,
+    ) {
+        self.market.record_in_flight_open(request, time_sent);
     }
 }
 
@@ -507,7 +523,6 @@ impl<ExchangeKey, InstrumentKey> InFlightRequestRecorder<ExchangeKey, Instrument
 #[allow(clippy::unwrap_used)] // Test code: panicking on a bad fixture is acceptable
 mod tests {
     use super::*;
-    use chrono::{DateTime, Utc};
     use rust_decimal_macros::dec;
     use rustrade_data::{
         books::Level,

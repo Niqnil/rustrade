@@ -1816,6 +1816,9 @@ mod tests {
     };
     use rustrade_instrument::{Side, test_utils::instrument as test_instrument};
 
+    /// When a test's in-flight request was sent; no test here depends on its value.
+    const TIME_SENT: DateTime<Utc> = DateTime::<Utc>::MIN_UTC;
+
     const EXCHANGE: ExchangeId = ExchangeId::BinanceSpot;
     const TIME: DateTime<Utc> = DateTime::<Utc>::MIN_UTC;
 
@@ -2087,7 +2090,7 @@ mod tests {
     ) {
         state.update_from_order_snapshot(Snapshot(&order(
             cid.clone(),
-            OrderState::active(OpenInFlight),
+            OrderState::active(OpenInFlight::new(TIME_SENT)),
         )));
 
         // `record_in_flight_open` writes this when the submitted request carries a `PositionId`.
@@ -2182,6 +2185,7 @@ mod tests {
                     TIME,
                     Decimal::ZERO,
                 )),
+                time_sent: TIME_SENT,
             }),
         )));
 
@@ -2258,7 +2262,7 @@ mod tests {
 
         state.update_from_order_snapshot(Snapshot(&order(
             cid.clone(),
-            OrderState::active(OpenInFlight),
+            OrderState::active(OpenInFlight::new(TIME_SENT)),
         )));
         state.position_ids.insert(cid.clone(), position_id.clone());
 
@@ -2285,7 +2289,7 @@ mod tests {
 
         state.update_from_order_snapshot(Snapshot(&order(
             cid.clone(),
-            OrderState::active(OpenInFlight),
+            OrderState::active(OpenInFlight::new(TIME_SENT)),
         )));
         state.position_ids.insert(cid.clone(), position_id.clone());
         state.update_from_trade(&fill(exchange_id.clone(), Side::Buy, dec!(4)));
@@ -2680,7 +2684,7 @@ mod tests {
         // never be replayed and never dropped.
         state.update_from_order_snapshot(Snapshot(&order(
             ClientOrderId::new("cid-c"),
-            OrderState::active(OpenInFlight),
+            OrderState::active(OpenInFlight::new(TIME_SENT)),
         )));
 
         state.update_from_trade(&fill(oid_a, Side::Buy, dec!(4)));
@@ -2905,7 +2909,7 @@ mod tests {
         let opening = ClientOrderId::new("cid-opening");
         state.update_from_order_snapshot(Snapshot(&order(
             opening.clone(),
-            OrderState::active(OpenInFlight),
+            OrderState::active(OpenInFlight::new(TIME_SENT)),
         )));
 
         // `Open` when the resync began, with a cancel sent before the snapshot arrives: recorded,
@@ -2919,7 +2923,10 @@ mod tests {
         state.begin_account_resync();
         state.update_from_order_snapshot(Snapshot(&order(
             cancelling.clone(),
-            OrderState::active(CancelInFlight { order: None }),
+            OrderState::active(CancelInFlight {
+                order: None,
+                time_sent: TIME_SENT,
+            }),
         )));
         state.update_from_account_snapshot(&account_snapshot(Vec::new(), true));
 
@@ -2959,7 +2966,7 @@ mod tests {
         let cid = ClientOrderId::new("cid-unnamed");
         state.update_from_order_snapshot(Snapshot(&order(
             cid.clone(),
-            OrderState::active(OpenInFlight),
+            OrderState::active(OpenInFlight::new(TIME_SENT)),
         )));
         let resting =
             ActiveOrderState::Open(Open::new(VenueOrderId::ClientAssigned, TIME, Decimal::ZERO));

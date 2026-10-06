@@ -319,13 +319,16 @@ pub enum TimeInForce {
     AtClose,
 }
 
-impl<ExchangeKey, InstrumentKey> From<&OrderRequestOpen<ExchangeKey, InstrumentKey>>
-    for Order<ExchangeKey, InstrumentKey, ActiveOrderState>
+impl<ExchangeKey, InstrumentKey> Order<ExchangeKey, InstrumentKey, ActiveOrderState>
 where
     ExchangeKey: Clone,
     InstrumentKey: Clone,
 {
-    fn from(value: &OrderRequestOpen<ExchangeKey, InstrumentKey>) -> Self {
+    /// The order an open request describes, [`OpenInFlight`] since `time_sent`.
+    pub fn open_in_flight(
+        request: &OrderRequestOpen<ExchangeKey, InstrumentKey>,
+        time_sent: DateTime<Utc>,
+    ) -> Self {
         let OrderRequestOpen {
             key,
             state:
@@ -339,7 +342,7 @@ where
                     reduce_only: _, // used by adapters (e.g., Alpaca) to derive position_intent
                     market: _,      // decision-time provenance; not part of the resulting Order
                 },
-        } = value;
+        } = request;
 
         Self {
             key: key.clone(),
@@ -348,7 +351,7 @@ where
             quantity: *quantity,
             kind: *kind,
             time_in_force: *time_in_force,
-            state: ActiveOrderState::OpenInFlight(OpenInFlight),
+            state: ActiveOrderState::OpenInFlight(OpenInFlight::new(time_sent)),
         }
     }
 }
