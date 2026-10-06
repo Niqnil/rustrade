@@ -729,6 +729,18 @@ where
             return;
         };
 
+        // A cancel resent while one is in flight keeps the first one's send time, so a strategy
+        // that re-cancels on every event cannot keep the order from ever passing its in-flight
+        // deadline.
+        if matches!(order.state, ActiveOrderState::CancelInFlight(_)) {
+            debug!(
+                cid = %request.key.cid,
+                event = ?request,
+                "OrderManager recorded a cancel resent while one is in flight - keeping the first"
+            );
+            return;
+        }
+
         order.state = ActiveOrderState::CancelInFlight(CancelInFlight {
             order: order.state.open_meta().cloned(),
             time_sent,
@@ -775,8 +787,9 @@ mod tests {
     use rustrade_instrument::{Side, exchange::ExchangeId};
     use smol_str::SmolStr;
 
-    /// When a test's in-flight request was sent; no test here depends on its value.
-    const TIME_SENT: DateTime<Utc> = DateTime::<Utc>::MIN_UTC;
+    /// When a test's in-flight request was sent. Distinct from every `Open::time_exchange` the
+    /// tests use (around `MIN_UTC`), so a transition that took the wrong time would fail.
+    const TIME_SENT: DateTime<Utc> = DateTime::<Utc>::UNIX_EPOCH;
 
     fn orders(
         orders: impl IntoIterator<Item = Order<ExchangeId, u64, ActiveOrderState>>,
@@ -1288,14 +1301,14 @@ mod tests {
                     cid.clone(),
                     OrderState::active(CancelInFlight {
                         order: None,
-                        time_sent: TIME_SENT,
+                        time_sent: time_plus_secs(TIME_SENT, 60),
                     }),
                 )),
                 expected: orders([order(
                     cid.clone(),
                     ActiveOrderState::CancelInFlight(CancelInFlight {
                         order: None,
-                        time_sent: TIME_SENT,
+                        time_sent: time_plus_secs(TIME_SENT, 60),
                     }),
                 )]),
             },
@@ -1521,7 +1534,7 @@ mod tests {
                     cid.clone(),
                     OrderState::active(CancelInFlight {
                         order: None,
-                        time_sent: TIME_SENT,
+                        time_sent: time_plus_secs(TIME_SENT, 60),
                     }),
                 )),
                 expected: orders([order(
@@ -2014,6 +2027,36 @@ mod tests {
             }
             assert_eq!(test.state, test.expected, "TC{index} failed")
         }
+    }
+
+    /// A strategy that re-cancels on every event must not keep restarting the order's in-flight
+    /// clock, or it would never pass its deadline.
+    #[test]
+    fn a_resent_cancel_keeps_the_first_cancels_send_time_and_order() {
+        let cid = ClientOrderId::new("resent");
+        let held_open = Open::new(
+            VenueOrderId::Assigned(OrderId::new("venue")),
+            DateTime::<Utc>::MIN_UTC,
+            Decimal::ZERO,
+        );
+        let mut state = orders([order(
+            cid.clone(),
+            ActiveOrderState::Open(held_open.clone()),
+        )]);
+
+        state.record_in_flight_cancel(&request_cancel(cid.clone()), TIME_SENT);
+        state.record_in_flight_cancel(&request_cancel(cid.clone()), time_plus_secs(TIME_SENT, 60));
+
+        assert_eq!(
+            state,
+            orders([order(
+                cid,
+                ActiveOrderState::CancelInFlight(CancelInFlight {
+                    order: Some(held_open),
+                    time_sent: TIME_SENT,
+                }),
+            )])
+        );
     }
 
     #[test]

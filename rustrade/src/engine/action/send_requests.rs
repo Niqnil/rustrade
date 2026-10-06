@@ -47,10 +47,10 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk>
         let output = self.send_tracked_requests(requests, |state, open| {
             open.state.market = state.market_snapshot(&open.key.instrument);
         });
-        let time_sent = self.clock.time();
-        self.state
-            .record_in_flight_opens(output.sent_iter(), time_sent);
-        if output.sent_iter().next().is_some() {
+        if !output.sent.is_none() {
+            let time_sent = self.clock.time();
+            self.state
+                .record_in_flight_opens(output.sent_iter(), time_sent);
             self.in_flight.on_sent(time_sent);
         }
         output
@@ -71,10 +71,10 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk>
         InstrumentKey: Debug + Clone,
     {
         let output = self.send_tracked_requests(requests, |_, _| {});
-        let time_sent = self.clock.time();
-        self.state
-            .record_in_flight_cancels(output.sent_iter(), time_sent);
-        if output.sent_iter().next().is_some() {
+        if !output.sent.is_none() {
+            let time_sent = self.clock.time();
+            self.state
+                .record_in_flight_cancels(output.sent_iter(), time_sent);
             self.in_flight.on_sent(time_sent);
         }
         output

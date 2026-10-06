@@ -7621,6 +7621,33 @@ fn test_in_flight_deadline_ignores_an_answered_order() {
     }
 }
 
+/// An answer arriving in the event that also reaches the deadline settles the order before the
+/// check, so it is not flagged.
+#[test]
+fn test_in_flight_deadline_ignores_an_order_answered_at_its_deadline() {
+    let (mut engine, _execution_rx) = engine_with_two_day_deadline();
+    let mut request = open_request(InstrumentIndex(0), "answered");
+    request.key.cid = gen_cid(0);
+
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendOpenRequests(OneOrMany::One(request))),
+    );
+    let audit = process_with_audit(
+        &mut engine,
+        account_event_order_response(0, 2, Side::Buy, 1.0, 0.0),
+    );
+    assert_eq!(
+        engine.time(),
+        time_plus_days(STARTING_TIMESTAMP, 2),
+        "the answer moved the clock to the deadline"
+    );
+    assert!(in_flight_overdue(audit).is_empty());
+
+    let audit = process_with_audit(&mut engine, market_event_trade(30, 0, dec!(50_000)));
+    assert!(in_flight_overdue(audit).is_empty());
+}
+
 /// With no deadline for the exchange, nothing is ever flagged.
 #[test]
 fn test_in_flight_deadline_absent_flags_nothing() {

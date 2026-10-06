@@ -14,20 +14,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an order still `OpenInFlight` or `CancelInFlight` well after that was stranded some other way, by
   the manager task dying or a bug, and nothing noticed. While it stays, `has_requests_in_flight`
   stays true, and in Hedging mode fills that match no order are held back. Closes #494.
-  - The engine records when it sends each open and cancel, by its `EngineClock`, and checks on
-    every event it processes for an order whose request has passed its exchange's deadline. It
-    logs an `error!` and emits the new `EngineOutput::InFlightOverdue`, naming the order key, which
+  - The engine records when it sends each open and cancel, by its `EngineClock`, and checks after
+    each event it processes, except a `Shutdown` and a `Command` whose action hit an unrecoverable
+    error, for an order whose request has passed its exchange's deadline. With nothing in flight
+    it does not read the clock. It logs an `error!` and emits the new `EngineOutput::InFlightOverdue`, naming the order key, which
     request, when it was sent and how long it has been in flight. It does not settle the order:
     the venue may hold it live, and settling and reconciling are the caller's decision.
   - Each request is flagged once: an order flagged while `OpenInFlight` is flagged again only for a
-    later cancel, from that cancel's own send. A restored engine flags an already-overdue order
+    later cancel, from that cancel's own send. A cancel resent while one is in flight keeps the
+    first one's send time, so re-cancelling on every event cannot keep an order from being
+    flagged. A restored engine flags an already-overdue order
     once more. An order sent during a backward step of the live clock larger than its deadline
     can be missed.
   - Deadlines are per exchange (`InFlightDeadlines`). `ExecutionBuilder::add_live` derives one
     from the `request_timeout` plus `InFlightDeadlines::REQUEST_TIMEOUT_MARGIN` (5 s), exposed as
     `ExecutionBuild::in_flight_deadlines` and `Execution::in_flight_deadlines`. Mock and simulated
     venues get none, since they run on simulated time. `SystemBuilder::in_flight_deadlines`
-    overrides them.
+    overrides them. A deadline must be non-zero: `InFlightDeadlines::insert` and `with` panic on
+    zero, which could never be flagged.
   - **Breaking:**
     - `Engine::new` takes the `InFlightDeadlines` after the execution transmitters. Pass
       `Execution::in_flight_deadlines`, or `InFlightDeadlines::default()` to check nothing.

@@ -136,6 +136,7 @@ impl<'a> ExecutionBuilder<'a> {
             mock_execution_client_config.mocked_exchange,
             mock_execution_client_config,
             DUMMY_EXECUTION_REQUEST_TIMEOUT,
+            None,
         )?;
 
         // Register MockExchange init Future
@@ -170,22 +171,23 @@ impl<'a> ExecutionBuilder<'a> {
         Client::AccountStream: Send,
         Client::Config: Send,
     {
-        let mut this = self.add_execution::<Client>(Client::EXCHANGE, config, request_timeout)?;
-        if let Some((exchange, _)) = this.execution_txs.get(&Client::EXCHANGE) {
-            let exchange = *exchange;
-            this.in_flight_deadlines.insert(
-                exchange,
-                InFlightDeadlines::deadline_for_request_timeout(request_timeout),
-            );
-        }
-        Ok(this)
+        self.add_execution::<Client>(
+            Client::EXCHANGE,
+            config,
+            request_timeout,
+            Some(InFlightDeadlines::deadline_for_request_timeout(
+                request_timeout,
+            )),
+        )
     }
 
+    /// Register an [`ExecutionManager`] for `exchange`, and its in-flight deadline if it has one.
     fn add_execution<Client>(
         mut self,
         exchange: ExchangeId,
         config: Client::Config,
         request_timeout: Duration,
+        in_flight_deadline: Option<Duration>,
     ) -> Result<Self, BarterError>
     where
         Client: ExecutionClient + Send + Sync + 'static,
@@ -209,6 +211,11 @@ impl<'a> ExecutionBuilder<'a> {
             return Err(BarterError::ExecutionBuilder(format!(
                 "ExecutionBuilder does not support duplicate mocked ExecutionManagers: {exchange}"
             )));
+        }
+
+        if let Some(deadline) = in_flight_deadline {
+            self.in_flight_deadlines
+                .insert(instrument_map.exchange.key, deadline);
         }
 
         let merged_tx = self.merged_channel.tx.clone();

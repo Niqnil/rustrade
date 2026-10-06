@@ -26,6 +26,11 @@ use tracing::error;
 /// An exchange with no deadline is never checked. [`InFlightDeadlines::default`] has none, which
 /// turns the check off.
 ///
+/// Keyed by [`ExchangeIndex`], the position of the exchange in the
+/// [`IndexedInstruments`](rustrade_instrument::index::IndexedInstruments) the engine was built
+/// from. To key a deadline by [`ExchangeId`](rustrade_instrument::exchange::ExchangeId), look its
+/// index up there first, with `IndexedInstruments::find_exchange_index`.
+///
 /// # Choosing a deadline
 /// A deadline must exceed the exchange's `ExecutionManager` `request_timeout`, by which the manager
 /// answers every request, plus the time that answer takes to reach the engine. Otherwise orders
@@ -55,13 +60,24 @@ impl InFlightDeadlines {
     }
 
     /// Set the deadline for `exchange`, replacing any it had.
+    ///
+    /// # Panics
+    /// If `deadline` is zero. Such a request would fall due at the moment it is sent, which a
+    /// check made at that same moment has already passed, so it would never be flagged.
     pub fn with(mut self, exchange: ExchangeIndex, deadline: Duration) -> Self {
         self.insert(exchange, deadline);
         self
     }
 
     /// Set the deadline for `exchange`, replacing any it had.
+    ///
+    /// # Panics
+    /// If `deadline` is zero; see [`Self::with`].
     pub fn insert(&mut self, exchange: ExchangeIndex, deadline: Duration) {
+        assert!(
+            !deadline.is_zero(),
+            "InFlightDeadlines: the deadline for {exchange} must be non-zero"
+        );
         let index = exchange.index();
         if self.0.len() <= index {
             self.0.resize(index + 1, None);
@@ -96,7 +112,11 @@ impl FromIterator<(ExchangeIndex, Duration)> for InFlightDeadlines {
 /// Which request an [`InFlightOverdue`] order is awaiting an answer to.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub enum InFlightRequest {
+    /// The open request: the order is
+    /// [`OpenInFlight`](rustrade_execution::order::state::OpenInFlight).
     Open,
+    /// A cancel request: the order is
+    /// [`CancelInFlight`](rustrade_execution::order::state::CancelInFlight).
     Cancel,
 }
 
@@ -104,11 +124,18 @@ pub enum InFlightRequest {
 ///
 /// Emitted as [`EngineOutput::InFlightOverdue`](crate::engine::EngineOutput::InFlightOverdue), once per
 /// request: an order flagged while `OpenInFlight` is flagged again only for a later cancel, with
-/// that cancel's own deadline. A restarted engine flags again, once, an order it restores already
+/// that cancel's own deadline. A cancel resent while one is in flight keeps the first one's send
+/// time. An open sent under a client order id the engine already tracks replaces that order,
+/// starting its time afresh. A restarted engine flags again, once, an order it restores already
 /// overdue. The engine leaves the order as it is; see the [module docs](self).
+///
+/// `#[non_exhaustive]` so that fields can be added without a breaking change.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct InFlightOverdue<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex> {
+    /// The order the request is for.
     pub key: OrderKey<ExchangeKey, InstrumentKey>,
+    /// Which request is awaiting an answer.
     pub request: InFlightRequest,
     /// When the engine sent the request, by its `EngineClock`.
     pub time_sent: DateTime<Utc>,
@@ -118,7 +145,11 @@ pub struct InFlightOverdue<ExchangeKey = ExchangeIndex, InstrumentKey = Instrume
     pub elapsed: Duration,
 }
 
-/// Decides, on each processed event, which in-flight orders have newly passed their deadline.
+/// Decides, after each event the engine processes, which in-flight orders have newly passed their
+/// deadline.
+///
+/// The engine skips the check on a `Shutdown` event, and on a `Command` whose action hit an
+/// unrecoverable error; it checks again on the next event it processes.
 ///
 /// # Once per request, without state on the order
 /// A check flags the orders whose deadline falls after the previous check and at or before now.
@@ -134,12 +165,19 @@ pub struct InFlightOverdue<ExchangeKey = ExchangeIndex, InstrumentKey = Instrume
 ///
 /// # Cheap when nothing is due
 /// The watch keeps the earliest time an in-flight order can fall due, and scans the orders only
-/// once the clock reaches it. A newly sent request lowers it by the shortest deadline of any
-/// exchange, which may be early for its own exchange; the scan then finds nothing and recomputes
-/// it exactly.
+/// once the clock reaches it. With nothing in flight it does not read the clock at all. A newly
+/// sent request lowers it by the shortest deadline of any exchange, which may be early for its own
+/// exchange; the scan then finds nothing and recomputes it exactly.
+///
+/// This relies on every in-flight order having been sent by the engine, which calls
+/// [`Self::on_sent`], or being in the state the engine started from, which the first check scans.
+/// An order that becomes in flight any other way, such as a snapshot carrying an in-flight state,
+/// is found only by a scan some other order prompts.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(crate) struct InFlightWatch {
     deadlines: InFlightDeadlines,
+    /// The shortest of `deadlines`, or `None` if there are none.
+    shortest: Option<Duration>,
     /// When the last scan ran.
     last_scan: Option<DateTime<Utc>>,
     /// The earliest time a scan can find an order newly overdue, or `None` if none can be.
@@ -149,9 +187,11 @@ pub(crate) struct InFlightWatch {
 impl InFlightWatch {
     pub(crate) fn new(deadlines: InFlightDeadlines) -> Self {
         // Scan on the first event: the engine may start from a state that has orders in flight.
-        let next_scan = (!deadlines.is_empty()).then_some(DateTime::<Utc>::MIN_UTC);
+        let shortest = deadlines.shortest();
+        let next_scan = shortest.map(|_| DateTime::<Utc>::MIN_UTC);
         Self {
             deadlines,
+            shortest,
             last_scan: None,
             next_scan,
         }
@@ -159,7 +199,7 @@ impl InFlightWatch {
 
     /// Note that requests were sent at `time_sent`.
     pub(crate) fn on_sent(&mut self, time_sent: DateTime<Utc>) {
-        let Some(shortest) = self.deadlines.shortest() else {
+        let Some(shortest) = self.shortest else {
             return;
         };
         let due = add(time_sent, shortest);
@@ -169,14 +209,21 @@ impl InFlightWatch {
     /// Flag the in-flight orders whose deadline has passed since the last scan, logging an
     /// `error!` for each.
     ///
+    /// `now` is called only if an order may be due, so an engine with nothing in flight never
+    /// reads its clock here.
+    ///
     /// Overdue orders are returned in instrument order, then by send time and client order id, so
     /// a backtest's audit is deterministic.
     pub(crate) fn check<'a, InstrumentData: 'a>(
         &mut self,
-        now: DateTime<Utc>,
+        now: impl FnOnce() -> DateTime<Utc>,
         instruments: impl Iterator<Item = &'a InstrumentState<InstrumentData>>,
     ) -> Vec<InFlightOverdue> {
-        if self.next_scan.is_none_or(|next| now < next) {
+        let Some(next_scan) = self.next_scan else {
+            return Vec::new();
+        };
+        let now = now();
+        if now < next_scan {
             return Vec::new();
         }
 
@@ -213,7 +260,7 @@ impl InFlightWatch {
                 }
             }
             overdue[first..]
-                .sort_by(|a, b| (a.time_sent, &a.key.cid).cmp(&(b.time_sent, &b.key.cid)));
+                .sort_unstable_by(|a, b| (a.time_sent, &a.key.cid).cmp(&(b.time_sent, &b.key.cid)));
         }
 
         self.last_scan = Some(last_scan.map_or(now, |last| last.max(now)));
@@ -245,8 +292,99 @@ fn add(time: DateTime<Utc>, duration: Duration) -> DateTime<Utc> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)] // test code: panics acceptable
 mod tests {
     use super::*;
+    use crate::engine::state::EngineState;
+    use rust_decimal_macros::dec;
+    use rustrade_execution::order::{
+        Order, OrderKind, TimeInForce,
+        id::{ClientOrderId, StrategyId},
+        state::{CancelInFlight, OpenInFlight},
+    };
+    use rustrade_instrument::{
+        Side, exchange::ExchangeId, index::IndexedInstruments,
+        test_utils::instrument as test_instrument,
+    };
+
+    const T: DateTime<Utc> = DateTime::<Utc>::UNIX_EPOCH;
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        T + TimeDelta::seconds(secs)
+    }
+
+    /// Instrument 0 on exchange 0, whose deadline is 10 s, and instrument 1 on exchange 1, whose
+    /// deadline is 60 s.
+    fn two_exchanges() -> (EngineState<(), ()>, InFlightDeadlines) {
+        let instruments = IndexedInstruments::new([
+            test_instrument(ExchangeId::BinanceSpot, "btc", "usdt"),
+            test_instrument(ExchangeId::Kraken, "eth", "usd"),
+        ]);
+        assert_eq!(
+            instruments.find_exchange_index(ExchangeId::Kraken),
+            Ok(ExchangeIndex(1))
+        );
+        let state = EngineState::builder(&instruments, (), |_| ())
+            .time_engine_start(T)
+            .build();
+        let deadlines = InFlightDeadlines::default()
+            .with(ExchangeIndex(0), Duration::from_secs(10))
+            .with(ExchangeIndex(1), Duration::from_secs(60));
+        (state, deadlines)
+    }
+
+    /// Record an order on `instrument` (which trades on the exchange of the same index) as the
+    /// engine would, telling the watch of its send.
+    fn send(
+        state: &mut EngineState<(), ()>,
+        watch: &mut InFlightWatch,
+        instrument: usize,
+        cid: &str,
+        in_flight: ActiveOrderState,
+    ) {
+        let time_sent = in_flight.time_sent().expect("an in-flight state");
+        let cid = ClientOrderId::new(cid);
+        let order = Order {
+            key: OrderKey {
+                exchange: ExchangeIndex(instrument),
+                instrument: InstrumentIndex(instrument),
+                strategy: StrategyId::new("strategy"),
+                cid: cid.clone(),
+            },
+            side: Side::Buy,
+            price: Some(dec!(1)),
+            quantity: dec!(1),
+            kind: OrderKind::Limit,
+            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+            state: in_flight,
+        };
+        state
+            .instruments
+            .0
+            .get_index_mut(instrument)
+            .expect("instrument exists")
+            .1
+            .orders
+            .0
+            .insert(cid, order);
+        watch.on_sent(time_sent);
+    }
+
+    fn open_sent(secs: i64) -> ActiveOrderState {
+        ActiveOrderState::OpenInFlight(OpenInFlight::new(at(secs)))
+    }
+
+    fn check(
+        watch: &mut InFlightWatch,
+        state: &EngineState<(), ()>,
+        now: DateTime<Utc>,
+    ) -> Vec<(String, InFlightRequest)> {
+        watch
+            .check(|| now, state.instruments.0.values())
+            .into_iter()
+            .map(|overdue| (overdue.key.cid.0.to_string(), overdue.request))
+            .collect()
+    }
 
     #[test]
     fn deadlines_are_set_and_read_per_exchange() {
@@ -293,5 +431,112 @@ mod tests {
         let mut watch = watch;
         watch.on_sent(DateTime::<Utc>::MIN_UTC);
         assert_eq!(watch.next_scan, None);
+    }
+
+    #[test]
+    fn an_order_due_exactly_now_is_flagged_and_not_again_at_the_same_time() {
+        let (mut state, deadlines) = two_exchanges();
+        let mut watch = InFlightWatch::new(deadlines);
+        send(&mut state, &mut watch, 0, "a", open_sent(0));
+
+        assert!(check(&mut watch, &state, at(9)).is_empty());
+        assert_eq!(
+            check(&mut watch, &state, at(10)),
+            [("a".to_owned(), InFlightRequest::Open)]
+        );
+        assert!(
+            check(&mut watch, &state, at(10)).is_empty(),
+            "due at the last scan, so that scan flagged it"
+        );
+        assert!(check(&mut watch, &state, at(100)).is_empty());
+        assert_eq!(watch.next_scan, None, "nothing left that can fall due");
+    }
+
+    #[test]
+    fn each_exchange_uses_its_own_deadline() {
+        let (mut state, deadlines) = two_exchanges();
+        let mut watch = InFlightWatch::new(deadlines);
+        send(&mut state, &mut watch, 0, "fast", open_sent(0));
+        send(
+            &mut state,
+            &mut watch,
+            1,
+            "slow",
+            ActiveOrderState::CancelInFlight(CancelInFlight {
+                order: None,
+                time_sent: at(0),
+            }),
+        );
+
+        assert_eq!(
+            check(&mut watch, &state, at(10)),
+            [("fast".to_owned(), InFlightRequest::Open)]
+        );
+        assert_eq!(watch.next_scan, Some(at(60)));
+        assert!(check(&mut watch, &state, at(59)).is_empty());
+        assert_eq!(
+            check(&mut watch, &state, at(60)),
+            [("slow".to_owned(), InFlightRequest::Cancel)]
+        );
+    }
+
+    #[test]
+    fn overdue_orders_come_by_instrument_then_time_sent_then_client_order_id() {
+        let (mut state, deadlines) = two_exchanges();
+        let mut watch = InFlightWatch::new(deadlines);
+        send(&mut state, &mut watch, 1, "a", open_sent(0));
+        for cid in ["e", "c", "d"] {
+            send(&mut state, &mut watch, 0, cid, open_sent(5));
+        }
+        send(&mut state, &mut watch, 0, "z", open_sent(1));
+
+        let overdue = check(&mut watch, &state, at(100));
+        let cids: Vec<&str> = overdue.iter().map(|(cid, _)| cid.as_str()).collect();
+        assert_eq!(cids, ["z", "c", "d", "e", "a"]);
+    }
+
+    /// The documented cost of firing once by time window: an order sent during a backward clock
+    /// step falls due at or before the last scan only if the step exceeds its deadline.
+    #[test]
+    fn a_backward_clock_step_misses_only_an_order_it_moves_past_the_last_scan() {
+        let (mut state, deadlines) = two_exchanges();
+        let mut watch = InFlightWatch::new(deadlines);
+        send(&mut state, &mut watch, 0, "before", open_sent(100));
+        assert!(check(&mut watch, &state, at(100)).is_empty());
+
+        // Stepped back 50 s, more than the 10 s deadline: due at 60, before the scan at 100.
+        send(&mut state, &mut watch, 0, "missed", open_sent(50));
+        // Stepped back 5 s, less than the deadline: due at 105, after the scan at 100.
+        send(&mut state, &mut watch, 0, "caught", open_sent(95));
+
+        assert!(check(&mut watch, &state, at(70)).is_empty());
+        assert_eq!(
+            check(&mut watch, &state, at(105)),
+            [("caught".to_owned(), InFlightRequest::Open)]
+        );
+        assert_eq!(
+            check(&mut watch, &state, at(110)),
+            [("before".to_owned(), InFlightRequest::Open)]
+        );
+        assert!(check(&mut watch, &state, at(1_000)).is_empty());
+    }
+
+    #[test]
+    fn a_watch_with_nothing_due_does_not_read_the_clock() {
+        let (state, deadlines) = two_exchanges();
+        let mut watch = InFlightWatch::new(deadlines);
+        assert!(check(&mut watch, &state, at(0)).is_empty(), "first scan");
+
+        let overdue = watch.check(
+            || -> DateTime<Utc> { panic!("the clock was read with nothing in flight") },
+            state.instruments.0.values(),
+        );
+        assert!(overdue.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "must be non-zero")]
+    fn a_zero_deadline_is_rejected() {
+        let _ = InFlightDeadlines::default().with(ExchangeIndex(0), Duration::ZERO);
     }
 }

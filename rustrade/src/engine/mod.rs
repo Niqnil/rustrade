@@ -258,13 +258,12 @@ where
         };
 
         // After the event, so an order the event answered is not flagged; before the drain check,
-        // since a drain is when a stranded order would otherwise go unnoticed.
-        let process_audit = self
-            .flag_overdue_in_flight()
-            .into_iter()
-            .fold(process_audit, |audit, overdue| {
-                audit.add_output(EngineOutput::InFlightOverdue(overdue))
-            });
+        // which returns early, so an order stranded during a drain is still flagged. The arms
+        // that return early above skip the check until the next event.
+        let mut process_audit = process_audit;
+        for overdue in self.flag_overdue_in_flight() {
+            process_audit = process_audit.add_output(EngineOutput::InFlightOverdue(overdue));
+        }
 
         // A drain in progress outranks everything below: no new orders. The run is *not* ended
         // here — see the `Shutdown::AfterDrain` arm above for why the execution side owns that
@@ -311,8 +310,9 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     where
         Clock: EngineClock,
     {
+        let clock = &self.clock;
         self.in_flight.check(
-            self.clock.time(),
+            || clock.time(),
             self.state.instruments.instruments(&InstrumentFilter::None),
         )
     }
@@ -1561,6 +1561,8 @@ where
     /// before the engine flags it with [`EngineOutput::InFlightOverdue`]. Pass the deadlines
     /// [`ExecutionBuild`](crate::execution::builder::ExecutionBuild) derived from each
     /// `ExecutionManager`'s `request_timeout`, or [`InFlightDeadlines::default`] to check nothing.
+    /// The engine checks after each event it processes, except a `Shutdown` and a `Command` whose
+    /// action hit an unrecoverable error.
     pub fn new(
         clock: Clock,
         state: State,
