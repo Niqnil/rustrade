@@ -11,6 +11,10 @@ documentation = "https://docs.rs/rustrade-instrument"
 readme = "README.md"
 description = "Core Rustrade Exchange, Instrument and Asset data structures and associated utilities."
 
+# docs.rs documents the integration modules; `test-utils` is not part of the supported API.
+[package.metadata.docs.rs]
+features = ["ibkr", "hyperliquid"]
+
 [features]
 default = []
 ibkr = ["dep:ibapi", "dep:fnv", "dep:parking_lot"]

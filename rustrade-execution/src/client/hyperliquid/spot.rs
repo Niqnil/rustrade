@@ -36,12 +36,14 @@
 //! named from the pair's tokens (`"@107"` is `HYPE-USDC-SPOT`, `"@207"` is `HYPE-USDT0-SPOT`).
 //!
 //! A spot coin missing from `spotMeta`, such as a pair listed after the client was created, makes
-//! it read `spotMeta` again, at most once every ten seconds. A coin still missing after that is:
+//! it read `spotMeta` again, at most once every ten seconds and for at most five. A coin still missing after that is:
 //! - an error from [`ExecutionClient::account_snapshot`], [`ExecutionClient::fetch_open_orders`]
 //!   and [`ExecutionClient::fetch_trades`], whose lists would otherwise be short with nothing to
-//!   say so;
-//! - left out of the account stream, with `error!` for a fill and `warn!` for an order update.
-//!   [`ExecutionClient::fetch_trades`] recovers a fill left out once the pair resolves.
+//!   say so. This holds whichever instruments were asked for: the coin's instrument is unknown,
+//!   so it cannot be told apart from them;
+//! - left out of the account stream, logged once per stream and coin, with `error!` for fills
+//!   and `warn!` for order updates. [`ExecutionClient::fetch_trades`] recovers a fill left out
+//!   once the pair resolves.
 //!
 //! Orders are placed through the SDK's `ExchangeClient`, which reads `spotMeta` once, when it is
 //! created, and is never refreshed. So a pair listed after the client was created can be reported
@@ -358,6 +360,8 @@ impl ExecutionClient for HyperliquidSpotClient {
         let fills_terminated = terminated.clone();
         let fills_coins = self.spot_coins.clone();
         tokio::spawn(async move {
+            // Spot coins already logged as missing from spotMeta, so each is logged once.
+            let mut missing_coins = HashSet::new();
             loop {
                 tokio::select! {
                     biased;
@@ -395,19 +399,24 @@ impl ExecutionClient for HyperliquidSpotClient {
                                 // Order updates on the sibling task are deliberately NOT deduped:
                                 // they are absolute state, so a replayed one is idempotent, while
                                 // dropping one could strand the consumer on stale state.
+                                let pairs = fills_coins
+                                    .covering(fills.data.fills.iter().map(|fill| fill.coin.as_str()))
+                                    .await;
                                 for fill in fills.data.fills {
                                     // Filter: only spot coins
                                     if CoinKind::of(&fill.coin) != CoinKind::Spot {
                                         continue;
                                     }
-                                    let pairs = fills_coins.covering([fill.coin.as_str()]).await;
                                     let Some(pair) = pairs.get(&fill.coin) else {
-                                        error!(
-                                            coin = %fill.coin,
-                                            tid = fill.tid,
-                                            "Hyperliquid spot fill on a coin not in spotMeta; \
-                                             leaving it out (fetch_trades recovers it)"
-                                        );
+                                        if missing_coins.insert(fill.coin.clone()) {
+                                            error!(
+                                                coin = %fill.coin,
+                                                tid = fill.tid,
+                                                "Hyperliquid spot fills on a coin not in \
+                                                 spotMeta are left out (fetch_trades recovers \
+                                                 them); logged once per stream"
+                                            );
+                                        }
                                         continue;
                                     };
                                     let Some(event) = fill_to_account_event(&fill, pair) else {
@@ -453,6 +462,8 @@ impl ExecutionClient for HyperliquidSpotClient {
         let orders_coins = self.spot_coins.clone();
         tokio::spawn(async move {
             let _ws_client = ws_client;
+            // Spot coins already logged as missing from spotMeta, so each is logged once.
+            let mut missing_coins = HashSet::new();
 
             loop {
                 tokio::select! {
@@ -482,20 +493,24 @@ impl ExecutionClient for HyperliquidSpotClient {
                         };
                         match msg {
                             Message::OrderUpdates(updates) => {
+                                let pairs = orders_coins
+                                    .covering(updates.data.iter().map(|update| update.order.coin.as_str()))
+                                    .await;
                                 for update in updates.data {
                                     // Filter: only spot coins
                                     let coin = update.order.coin.as_str();
                                     if CoinKind::of(coin) != CoinKind::Spot {
                                         continue;
                                     }
-                                    let pairs = orders_coins.covering([coin]).await;
                                     let Some(pair) = pairs.get(coin) else {
-                                        warn!(
-                                            %coin,
-                                            oid = update.order.oid,
-                                            "Hyperliquid spot order update on a coin not in \
-                                             spotMeta; leaving it out"
-                                        );
+                                        if missing_coins.insert(coin.to_owned()) {
+                                            warn!(
+                                                %coin,
+                                                oid = update.order.oid,
+                                                "Hyperliquid spot order updates on a coin not in \
+                                                 spotMeta are left out; logged once per stream"
+                                            );
+                                        }
                                         continue;
                                     };
                                     if let Some(event) = order_update_to_account_event(&update, pair)

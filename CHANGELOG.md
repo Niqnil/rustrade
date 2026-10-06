@@ -335,19 +335,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     USDT0, is `HYPE-USDT0-SPOT`. `connect` now fails, and `new` panics, if `spotMeta` cannot be
     read.
   - A spot coin missing from `spotMeta`, such as a pair listed since, makes the client read it
-    again, at most once every 10 seconds. A coin still missing fails `account_snapshot`,
-    `fetch_open_orders` and `fetch_trades`, whose lists would otherwise be short with nothing to
-    say so. It is left out of the account stream, with `error!` for a fill and `warn!` for an
-    order update.
+    again, at most once every 10 seconds and for at most 5. A coin still missing fails
+    `account_snapshot`, `fetch_open_orders` and `fetch_trades`, whose lists would otherwise be
+    short with nothing to say so. It is left out of the account stream, logged once per stream
+    and coin, with `error!` for fills and `warn!` for order updates.
   - Orders are still placed through the SDK's `ExchangeClient`, which reads `spotMeta` only when
     it is created. So a pair listed after the client was created is reported but cannot be traded
     until the client is created again.
   - Each client keeps only its own coins, judged by their shape with the new
     `rustrade_instrument::hyperliquid::CoinKind`: perpetuals (`BTC`, `kPEPE`, and HIP-3
     perpetuals such as `xyz:TSLA`) or spot pairs (`@107`, `PURR/USDC`). A coin of neither shape,
-    such as an outcome coin, is left out by both, with `warn!` from the perpetuals client.
-  - New in `rustrade-instrument`, behind a new `hyperliquid` feature: `hyperliquid::CoinKind`,
-    `SpotPairs` and `SpotPair`. `SpotPairs` deserializes from the `spotMeta` response.
+    such as an outcome coin, is left out by both. The perpetuals client logs it with `warn!`, once
+    per read or once per stream.
+  - New in `rustrade-instrument`, behind a new `hyperliquid` feature: `hyperliquid::CoinKind`
+    (non-exhaustive), `SpotPairs` and `SpotPair`. `SpotPairs` deserializes from the `spotMeta`
+    response. docs.rs now documents the crate's `ibkr` and `hyperliquid` modules.
   - **Breaking:** `client::hyperliquid::common::is_spot_coin` is removed in favour of
     `CoinKind::of`, and `spot_coin_to_instrument(&str)` is replaced by
     `spot_pair_to_instrument(&SpotPair)`.

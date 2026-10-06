@@ -16,7 +16,10 @@ use smol_str::SmolStr;
 use std::collections::HashMap;
 
 /// The kind of market a Hyperliquid coin names, judged from the shape of its name alone.
+///
+/// Non-exhaustive: a kind Hyperliquid adds later may get its own variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum CoinKind {
     /// A perpetual: an asset (`BTC`, `kPEPE`), or a builder-deployed (HIP-3) perpetual named
     /// `deployer:ASSET` (`xyz:TSLA`).
@@ -60,6 +63,10 @@ impl CoinKind {
 ///
 /// Deserializes from that response, `{"universe": [...], "tokens": [...]}`. A pair whose tokens
 /// the response does not list is left out, so looking up its coin returns `None`.
+///
+/// Hyperliquid's token names are unique, and so is each pair's base and quote, so a pair's tokens
+/// name it as well as its coin does (checked against mainnet, October 2026). Hyperliquid's SDK
+/// relies on the same when it addresses an order by `BASE/QUOTE`.
 ///
 /// Hyperliquid lists new pairs as they launch, so a set read earlier can lack a pair the account
 /// now trades. A caller that meets a spot coin missing from its set should read `spotMeta` again

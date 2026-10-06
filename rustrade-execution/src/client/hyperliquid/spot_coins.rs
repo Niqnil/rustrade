@@ -1,6 +1,6 @@
 //! Resolution of Hyperliquid spot coins (`@107`) to the pairs they name.
 
-use crate::error::UnindexedClientError;
+use crate::error::{ConnectivityError, UnindexedClientError};
 use hyperliquid_rust_sdk::InfoClient;
 use parking_lot::RwLock;
 use rustrade_instrument::hyperliquid::{CoinKind, SpotPair, SpotPairs};
@@ -14,6 +14,10 @@ use tracing::{info, warn};
 ///
 /// Bounds the reads a coin that never resolves can cause to one per interval.
 const REFETCH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long a read of `spotMeta` may take. The SDK's HTTP client sets no timeout, and an account
+/// stream waits on a read prompted by its own events.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Hyperliquid's spot pairs, read from `spotMeta` and read again when a spot coin is missing.
 ///
@@ -35,7 +39,8 @@ impl SpotCoins {
     ///
     /// # Errors
     ///
-    /// When the request fails or its response does not parse.
+    /// When the request fails, takes longer than [`REQUEST_TIMEOUT`], or its response does not
+    /// parse.
     pub(super) async fn fetch(info_client: Arc<InfoClient>) -> Result<Self, UnindexedClientError> {
         let pairs = fetch_spot_pairs(&info_client).await?;
         Ok(Self(Arc::new(Inner {
@@ -47,9 +52,10 @@ impl SpotCoins {
 
     /// The pairs, read again first if one of `coins` is a spot coin they lack.
     ///
-    /// Reads `spotMeta` at most once per [`REFETCH_INTERVAL`], however many callers miss at once.
-    /// A miss within that interval of the last read, or a read that fails, returns the pairs as
-    /// they are, so a coin can still be missing from the result.
+    /// Reads `spotMeta` at most once per [`REFETCH_INTERVAL`], however many callers miss at once,
+    /// and a read abandoned part way counts. A miss within that interval of the last read, or a
+    /// read that fails or times out, returns the pairs as they are, so a coin can still be missing
+    /// from the result.
     pub(super) async fn covering<'a, Coins>(&self, coins: Coins) -> Arc<SpotPairs>
     where
         Coins: IntoIterator<Item = &'a str> + Clone,
@@ -73,9 +79,9 @@ impl SpotCoins {
             return pairs;
         }
 
-        let result = fetch_spot_pairs(&self.0.info_client).await;
+        // Stamped before the read, so a caller dropped part way through still spends the interval.
         *refetched = Some(Instant::now());
-        match result {
+        match fetch_spot_pairs(&self.0.info_client).await {
             Ok(fetched) => {
                 info!(
                     pairs = fetched.len(),
@@ -119,12 +125,14 @@ pub(super) fn spot_pair<'a>(
 }
 
 async fn fetch_spot_pairs(info_client: &InfoClient) -> Result<SpotPairs, UnindexedClientError> {
-    super::common::info(
+    let request = super::common::info(
         info_client,
         "spotMeta",
         r#"{"type":"spotMeta"}"#.to_string(),
-    )
-    .await
+    );
+    tokio::time::timeout(REQUEST_TIMEOUT, request)
+        .await
+        .map_err(|_| ConnectivityError::Timeout)?
 }
 
 /// A `spotMeta` response in Hyperliquid's shape, with synthetic values: PURR/USDC under its own

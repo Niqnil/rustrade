@@ -25,7 +25,7 @@ use rustrade_instrument::{
 };
 use serde::de::DeserializeOwned;
 use smol_str::format_smolstr;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::task::{Context, Poll};
@@ -671,16 +671,48 @@ pub fn perp_coin_to_instrument(coin: &str) -> InstrumentNameExchange {
 /// The perpetual instrument `coin` names, or `None` when it names a spot pair or a market of a
 /// kind [`CoinKind::of`] does not recognise.
 ///
-/// The account streams and open orders deliver every market's coins together, so a spot pair is
-/// expected here and left to the spot client silently. A coin of an unrecognised kind is logged
-/// with `warn!`, since neither client reports it.
+/// The account streams and open orders deliver every market's coins together, so other markets
+/// are expected here. The perpetuals client logs the unrecognised ones, which neither client
+/// reports, with [`warn_unknown_coins`] or [`UnknownCoins`].
 pub(super) fn perp_instrument(coin: &str) -> Option<InstrumentNameExchange> {
-    match CoinKind::of(coin) {
-        CoinKind::Perp => Some(perp_coin_to_instrument(coin)),
-        CoinKind::Spot => None,
-        CoinKind::Unknown => {
-            warn!(%coin, "Hyperliquid coin names a market of an unrecognised kind; leaving it out");
-            None
+    (CoinKind::of(coin) == CoinKind::Perp).then(|| perp_coin_to_instrument(coin))
+}
+
+/// Whether `coin` names a market of a kind [`CoinKind::of`] does not recognise.
+fn is_unknown_coin(coin: &str) -> bool {
+    !matches!(CoinKind::of(coin), CoinKind::Perp | CoinKind::Spot)
+}
+
+/// Log with one `warn!` the distinct coins among `coins` of a kind [`CoinKind::of`] does not
+/// recognise, which neither client reports. For a read that lists many rows at once.
+pub(super) fn warn_unknown_coins<'a>(coins: impl IntoIterator<Item = &'a str>) {
+    let unknown: BTreeSet<&str> = coins
+        .into_iter()
+        .filter(|coin| is_unknown_coin(coin))
+        .collect();
+    if !unknown.is_empty() {
+        warn!(
+            ?unknown,
+            "Hyperliquid coins name markets of an unrecognised kind; leaving them out"
+        );
+    }
+}
+
+/// The coins of a kind [`CoinKind::of`] does not recognise that an account stream has logged, so
+/// it logs each once rather than on every event.
+#[derive(Debug, Default)]
+pub(super) struct UnknownCoins(HashSet<String>);
+
+impl UnknownCoins {
+    /// Log `coin` with `warn!` if it is of an unrecognised kind and not logged before.
+    pub(super) fn warn_once(&mut self, coin: &str) {
+        if is_unknown_coin(coin) && !self.0.contains(coin) {
+            warn!(
+                %coin,
+                "Hyperliquid coin names a market of an unrecognised kind; leaving it out \
+                 (logged once per stream)"
+            );
+            self.0.insert(coin.to_owned());
         }
     }
 }
@@ -783,6 +815,18 @@ mod tests {
         assert_eq!(instrument("PURR/USDC").as_ref(), "PURR-USDC-SPOT");
         assert_eq!(instrument("@107").as_ref(), "HYPE-USDC-SPOT");
         assert_eq!(instrument("@207").as_ref(), "HYPE-USDT0-SPOT");
+    }
+
+    #[test]
+    fn unknown_coins_are_recorded_once_and_known_ones_never() {
+        let mut unknown = UnknownCoins::default();
+        for coin in ["#12", "#12", "BTC", "@107", "PURR/USDC", "+3"] {
+            unknown.warn_once(coin);
+        }
+        assert_eq!(
+            unknown.0,
+            HashSet::from(["#12".to_owned(), "+3".to_owned()])
+        );
     }
 
     #[test]
