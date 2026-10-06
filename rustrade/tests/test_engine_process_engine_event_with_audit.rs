@@ -19,6 +19,7 @@ use rustrade::{
         command::Command,
         error::{EngineError, RecoverableEngineError},
         execution_tx::MultiExchangeTxMap,
+        in_flight::{InFlightDeadlines, InFlightOverdue, InFlightRequest},
         process_with_audit,
         state::{
             EngineState, MarketSnapshotSource,
@@ -85,9 +86,10 @@ use rustrade_instrument::{
     },
 };
 use rustrade_integration::{
-    channel::{UnboundedTx, mpsc_unbounded},
+    channel::{UnboundedRx, UnboundedTx, mpsc_unbounded},
     collection::{none_one_or_many::NoneOneOrMany, one_or_many::OneOrMany, snapshot::Snapshot},
 };
+use std::time::Duration;
 
 const STARTING_TIMESTAMP: DateTime<Utc> = DateTime::<Utc>::MIN_UTC;
 const RISK_FREE_RETURN: Decimal = dec!(0.05);
@@ -1059,6 +1061,20 @@ fn build_engine_with_oms(
     execution_tx: UnboundedTx<ExecutionRequest>,
     oms_mode: OmsMode,
 ) -> TestEngine {
+    build_engine_with_deadlines(
+        trading_state,
+        execution_tx,
+        oms_mode,
+        InFlightDeadlines::default(),
+    )
+}
+
+fn build_engine_with_deadlines(
+    trading_state: TradingState,
+    execution_tx: UnboundedTx<ExecutionRequest>,
+    oms_mode: OmsMode,
+    in_flight_deadlines: InFlightDeadlines,
+) -> TestEngine {
     let instruments = IndexedInstruments::builder()
         .add_instrument(Instrument::spot(
             ExchangeId::BinanceSpot,
@@ -1113,6 +1129,7 @@ fn build_engine_with_oms(
         clock,
         state,
         execution_txs,
+        in_flight_deadlines,
         TestBuyAndHoldStrategy { id: strategy_id() },
         DefaultRiskManager::default(),
     )
@@ -1387,6 +1404,7 @@ fn build_option_engine_with_strategy<Strategy>(
         clock,
         state,
         execution_txs,
+        InFlightDeadlines::default(),
         strategy,
         DefaultRiskManager::default(),
     )
@@ -1828,6 +1846,7 @@ fn build_single_kind_engine(
         HistoricalClock::new(STARTING_TIMESTAMP),
         state,
         MultiExchangeTxMap::from_iter([(ExchangeId::BinanceSpot, Some(execution_tx))]),
+        InFlightDeadlines::default(),
         TestBuyAndHoldStrategy { id: strategy_id() },
         DefaultRiskManager::default(),
     )
@@ -4064,6 +4083,7 @@ fn build_two_option_engine(
         clock,
         state,
         MultiExchangeTxMap::from_iter([(ExchangeId::BinanceSpot, Some(execution_tx))]),
+        InFlightDeadlines::default(),
         TestBuyAndHoldStrategy { id: strategy_id() },
         DefaultRiskManager::default(),
     )
@@ -4342,6 +4362,7 @@ fn build_put_option_engine(
         clock,
         state,
         MultiExchangeTxMap::from_iter([(ExchangeId::BinanceSpot, Some(execution_tx))]),
+        InFlightDeadlines::default(),
         TestBuyAndHoldStrategy { id: strategy_id() },
         DefaultRiskManager::default(),
     )
@@ -4532,6 +4553,7 @@ fn build_option_spot_engine_with_oms(
         clock,
         state,
         MultiExchangeTxMap::from_iter([(ExchangeId::BinanceSpot, Some(execution_tx))]),
+        InFlightDeadlines::default(),
         TestBuyAndHoldStrategy { id: strategy_id() },
         DefaultRiskManager::default(),
     )
@@ -6104,6 +6126,7 @@ fn build_ambiguous_underlying_engine(
         clock,
         state,
         execution_txs,
+        InFlightDeadlines::default(),
         TestBuyAndHoldStrategy { id: strategy_id() },
         DefaultRiskManager::default(),
     )
@@ -7459,4 +7482,189 @@ fn test_account_snapshot_position_drift() {
             .quantity_net(),
         dec!(1)
     );
+}
+
+/// The in-flight deadline outputs among `audit`'s outputs.
+fn in_flight_overdue(
+    audit: AuditTick<
+        EngineAudit<
+            EngineEvent<DataKind>,
+            EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>,
+        >,
+    >,
+) -> Vec<InFlightOverdue> {
+    let EngineAudit::Process(audit) = audit.event else {
+        panic!("expected EngineAudit::Process");
+    };
+    audit
+        .outputs
+        .into_iter()
+        .filter_map(|output| match output {
+            EngineOutput::InFlightOverdue(overdue) => Some(overdue),
+            _ => None,
+        })
+        .collect()
+}
+
+const TWO_DAYS: Duration = Duration::from_secs(2 * 24 * 60 * 60);
+
+/// The receiver is returned so the engine's requests are sent, and so recorded in flight.
+fn engine_with_two_day_deadline() -> (TestEngine, UnboundedRx<ExecutionRequest>) {
+    let (execution_tx, execution_rx) = mpsc_unbounded();
+    let engine = build_engine_with_deadlines(
+        TradingState::Disabled,
+        execution_tx,
+        OmsMode::Netting,
+        InFlightDeadlines::default().with(ExchangeIndex(0), TWO_DAYS),
+    );
+    (engine, execution_rx)
+}
+
+/// An order left in flight is flagged once its deadline passes, and once only per request: the
+/// open is flagged after its deadline, and the cancel sent later after the cancel's own deadline.
+/// The engine leaves the order in flight throughout.
+#[test]
+fn test_in_flight_deadline_flags_each_request_once() {
+    let (mut engine, _execution_rx) = engine_with_two_day_deadline();
+    let instrument = InstrumentIndex(0);
+    let cid = ClientOrderId::new("stranded");
+
+    // Sent at day 0, the clock's time when the command is processed.
+    let audit = process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendOpenRequests(OneOrMany::One(open_request(
+            instrument, "stranded",
+        )))),
+    );
+    assert!(in_flight_overdue(audit).is_empty());
+
+    let audit = process_with_audit(&mut engine, market_event_trade(1, 0, dec!(50_000)));
+    assert!(
+        in_flight_overdue(audit).is_empty(),
+        "day 1 is before the deadline"
+    );
+
+    let audit = process_with_audit(&mut engine, market_event_trade(2, 0, dec!(50_000)));
+    let overdue = in_flight_overdue(audit);
+    assert_eq!(overdue.len(), 1, "{overdue:?}");
+    assert_eq!(overdue[0].key.cid, cid);
+    assert_eq!(overdue[0].request, InFlightRequest::Open);
+    assert_eq!(overdue[0].time_sent, STARTING_TIMESTAMP);
+    assert_eq!(overdue[0].deadline, TWO_DAYS);
+    assert_eq!(overdue[0].elapsed, TWO_DAYS);
+
+    let audit = process_with_audit(&mut engine, market_event_trade(3, 0, dec!(50_000)));
+    assert!(
+        in_flight_overdue(audit).is_empty(),
+        "the open was already flagged"
+    );
+
+    // A cancel sent at day 3 is a new request, with its own deadline at day 5.
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendCancelRequests(OneOrMany::One(cancel_request(
+            instrument, "stranded",
+        )))),
+    );
+    let audit = process_with_audit(&mut engine, market_event_trade(4, 0, dec!(50_000)));
+    assert!(
+        in_flight_overdue(audit).is_empty(),
+        "day 4 is before the cancel's deadline"
+    );
+
+    let audit = process_with_audit(&mut engine, market_event_trade(5, 0, dec!(50_000)));
+    let overdue = in_flight_overdue(audit);
+    assert_eq!(overdue.len(), 1, "{overdue:?}");
+    assert_eq!(overdue[0].request, InFlightRequest::Cancel);
+    assert_eq!(overdue[0].time_sent, time_plus_days(STARTING_TIMESTAMP, 3));
+
+    let audit = process_with_audit(&mut engine, market_event_trade(9, 0, dec!(50_000)));
+    assert!(
+        in_flight_overdue(audit).is_empty(),
+        "the cancel was already flagged"
+    );
+
+    // Flagging settles nothing.
+    let order = engine
+        .state
+        .instruments
+        .instrument_index(&instrument)
+        .orders
+        .0
+        .get(&cid)
+        .expect("the order is still tracked");
+    assert!(
+        matches!(order.state, ActiveOrderState::CancelInFlight(_)),
+        "{order:?}"
+    );
+}
+
+/// An order the venue answers before its deadline is never flagged.
+#[test]
+fn test_in_flight_deadline_ignores_an_answered_order() {
+    let (mut engine, _execution_rx) = engine_with_two_day_deadline();
+    let mut request = open_request(InstrumentIndex(0), "answered");
+    request.key.cid = gen_cid(0);
+
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendOpenRequests(OneOrMany::One(request))),
+    );
+    process_with_audit(
+        &mut engine,
+        account_event_order_response(0, 1, Side::Buy, 1.0, 0.0),
+    );
+
+    for day in [2, 5, 30] {
+        let audit = process_with_audit(&mut engine, market_event_trade(day, 0, dec!(50_000)));
+        assert!(in_flight_overdue(audit).is_empty(), "day {day}");
+    }
+}
+
+/// With no deadline for the exchange, nothing is ever flagged.
+#[test]
+fn test_in_flight_deadline_absent_flags_nothing() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx);
+
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendOpenRequests(OneOrMany::One(open_request(
+            InstrumentIndex(0),
+            "stranded",
+        )))),
+    );
+    let audit = process_with_audit(&mut engine, market_event_trade(365, 0, dec!(50_000)));
+    assert!(in_flight_overdue(audit).is_empty());
+}
+
+/// A restored engine keeps no record of earlier checks, so it flags an order its state restores
+/// already overdue once more, then not again.
+#[test]
+fn test_in_flight_deadline_reflags_once_after_restore() {
+    let (mut engine, _execution_rx) = engine_with_two_day_deadline();
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendOpenRequests(OneOrMany::One(open_request(
+            InstrumentIndex(0),
+            "stranded",
+        )))),
+    );
+    let audit = process_with_audit(&mut engine, market_event_trade(2, 0, dec!(50_000)));
+    assert_eq!(in_flight_overdue(audit).len(), 1);
+
+    let (execution_tx, _restored_execution_rx) = mpsc_unbounded();
+    let mut restored: TestEngine = Engine::new(
+        engine.clock.clone(),
+        engine.state.clone(),
+        MultiExchangeTxMap::from_iter([(ExchangeId::BinanceSpot, Some(execution_tx))]),
+        InFlightDeadlines::default().with(ExchangeIndex(0), TWO_DAYS),
+        TestBuyAndHoldStrategy { id: strategy_id() },
+        DefaultRiskManager::default(),
+    );
+
+    let audit = process_with_audit(&mut restored, market_event_trade(3, 0, dec!(50_000)));
+    assert_eq!(in_flight_overdue(audit).len(), 1, "flagged once more");
+    let audit = process_with_audit(&mut restored, market_event_trade(4, 0, dec!(50_000)));
+    assert!(in_flight_overdue(audit).is_empty(), "and only once");
 }

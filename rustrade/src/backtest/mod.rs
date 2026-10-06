@@ -31,7 +31,7 @@ use crate::{
     system::config::ExecutionConfig,
 };
 use crate::{
-    engine::Engine,
+    engine::{Engine, in_flight::InFlightDeadlines},
     execution::sim::{
         SimExecutionBuild, SimExecutionBuilder, SimRunner, VenueMarketUpdate, log_venue_summary,
     },
@@ -414,10 +414,13 @@ where
         &execution_venues,
     );
 
+    // No in-flight deadlines: simulated venues have no `request_timeout` to derive one from (see
+    // `InFlightDeadlines`).
     let mut engine = Engine::new(
         clock.clone(),
         engine_state,
         execution_tx_map,
+        InFlightDeadlines::default(),
         args_dynamic.strategy,
         args_dynamic.risk,
     );

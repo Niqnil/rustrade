@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The engine flags an order whose request stays in flight past a deadline** (`rustrade`,
+  `rustrade-execution`). `ExecutionManager` answers every request within its `request_timeout`, so
+  an order still `OpenInFlight` or `CancelInFlight` well after that was stranded some other way, by
+  the manager task dying or a bug, and nothing noticed. While it stays, `has_requests_in_flight`
+  stays true, and in Hedging mode fills that match no order are held back. Closes #494.
+  - The engine records when it sends each open and cancel, by its `EngineClock`, and checks on
+    every event it processes for an order whose request has passed its exchange's deadline. It
+    logs an `error!` and emits the new `EngineOutput::InFlightOverdue`, naming the order key, which
+    request, when it was sent and how long it has been in flight. It does not settle the order:
+    the venue may hold it live, and settling and reconciling are the caller's decision.
+  - Each request is flagged once: an order flagged while `OpenInFlight` is flagged again only for a
+    later cancel, from that cancel's own send. A restored engine flags an already-overdue order
+    once more. An order sent during a backward step of the live clock larger than its deadline
+    can be missed.
+  - Deadlines are per exchange (`InFlightDeadlines`). `ExecutionBuilder::add_live` derives one
+    from the `request_timeout` plus `InFlightDeadlines::REQUEST_TIMEOUT_MARGIN` (5 s), exposed as
+    `ExecutionBuild::in_flight_deadlines` and `Execution::in_flight_deadlines`. Mock and simulated
+    venues get none, since they run on simulated time. `SystemBuilder::in_flight_deadlines`
+    overrides them.
+  - **Breaking:**
+    - `Engine::new` takes the `InFlightDeadlines` after the execution transmitters. Pass
+      `Execution::in_flight_deadlines`, or `InFlightDeadlines::default()` to check nothing.
+    - `OpenInFlight` and `CancelInFlight` carry a `time_sent`, so their serialised form changes,
+      in audit streams and `EngineState` snapshots alike. `CancelInFlight` no longer implements
+      `Default`, and `ActiveOrderState::time_sent` reads either.
+    - `Order::from(&OrderRequestOpen)` is replaced by `Order::open_in_flight(request, time_sent)`.
+    - Every `InFlightRequestRecorder` method takes the `time_sent`, so a custom
+      `InstrumentDataState` implementation must add the parameter.
+    - `Engine` no longer implements `Copy`.
 - **`ExecutionClient::validate_config`** (`rustrade-execution`). A client can now check its config
   against the instruments it is about to trade before it is constructed. `ExecutionBuilder` calls
   it after `SUPPORTED_KINDS`, with the instruments executed on the client's exchange, as

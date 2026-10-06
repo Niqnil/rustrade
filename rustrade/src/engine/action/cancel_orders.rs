@@ -1,6 +1,7 @@
 use crate::engine::{
     Engine,
     action::send_requests::SendRequestsOutput,
+    clock::EngineClock,
     execution_tx::ExecutionTxMap,
     state::{
         EngineState,
@@ -37,6 +38,7 @@ pub trait CancelOrders<
 impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk> CancelOrders
     for Engine<Clock, EngineState<GlobalData, InstrumentData>, ExecutionTxs, Strategy, Risk>
 where
+    Clock: EngineClock,
     InstrumentData: InFlightRequestRecorder,
     ExecutionTxs: ExecutionTxMap,
 {

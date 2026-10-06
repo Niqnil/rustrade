@@ -215,7 +215,17 @@ impl<ExchangeKey, AssetKey, InstrumentKey>
 impl<ExchangeKey, InstrumentKey> InFlightRequestRecorder<ExchangeKey, InstrumentKey>
     for CandleInstrumentData
 {
-    fn record_in_flight_cancel(&mut self, _: &OrderRequestCancel<ExchangeKey, InstrumentKey>) {}
+    fn record_in_flight_cancel(
+        &mut self,
+        _: &OrderRequestCancel<ExchangeKey, InstrumentKey>,
+        _: DateTime<Utc>,
+    ) {
+    }
 
-    fn record_in_flight_open(&mut self, _: &OrderRequestOpen<ExchangeKey, InstrumentKey>) {}
+    fn record_in_flight_open(
+        &mut self,
+        _: &OrderRequestOpen<ExchangeKey, InstrumentKey>,
+        _: DateTime<Utc>,
+    ) {
+    }
 }

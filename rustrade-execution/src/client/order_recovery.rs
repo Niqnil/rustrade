@@ -1052,7 +1052,11 @@ mod tests {
         assert!(known.contains(&open_order.cid));
 
         let in_flight = key("BTCUSDT", "in-flight");
-        known.placed(&in_flight, dec!(2), &OrderState::active(OpenInFlight));
+        known.placed(
+            &in_flight,
+            dec!(2),
+            &OrderState::active(OpenInFlight::new(Utc::now())),
+        );
         assert!(
             !known.contains(&in_flight.cid),
             "not yet known to the venue"

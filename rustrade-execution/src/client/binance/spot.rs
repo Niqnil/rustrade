@@ -4315,7 +4315,7 @@ mod tests {
                 OrderKind::Market,
                 TimeInForce::ImmediateOrCancel,
                 OrderState::<AssetNameExchange, InstrumentNameExchange>::Active(
-                    ActiveOrderState::OpenInFlight(OpenInFlight),
+                    ActiveOrderState::OpenInFlight(OpenInFlight::new(Utc::now())),
                 ),
             ))),
         );
@@ -4335,7 +4335,7 @@ mod tests {
                 OrderKind::Market,
                 TimeInForce::ImmediateOrCancel,
                 OrderState::<AssetNameExchange, InstrumentNameExchange>::Active(
-                    ActiveOrderState::CancelInFlight(CancelInFlight { order: None }),
+                    ActiveOrderState::CancelInFlight(CancelInFlight::new(None, Utc::now())),
                 ),
             ))),
         );

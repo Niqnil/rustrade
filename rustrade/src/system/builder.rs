@@ -4,6 +4,7 @@ use crate::{
         audit::{Auditor, context::EngineContext},
         clock::EngineClock,
         execution_tx::MultiExchangeTxMap,
+        in_flight::InFlightDeadlines,
         run::{async_run, async_run_with_audit, sync_run, sync_run_with_audit},
         state::{
             EngineState, builder::EngineStateBuilder, position::PositionSeed, trading::TradingState,
@@ -105,6 +106,7 @@ pub struct SystemBuilder<'a, Clock, Strategy, Risk, MarketStream, GlobalData, Fn
     engine_feed_mode: Option<EngineFeedMode>,
     audit_mode: Option<AuditMode>,
     trading_state: Option<TradingState>,
+    in_flight_deadlines: Option<InFlightDeadlines>,
     balances: FnvHashMap<ExchangeAsset<AssetNameInternal>, Balance>,
     positions: Vec<PositionSeed>,
 }
@@ -123,6 +125,7 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             engine_feed_mode: None,
             audit_mode: None,
             trading_state: None,
+            in_flight_deadlines: None,
             balances: FnvHashMap::default(),
             positions: Vec::new(),
         }
@@ -154,6 +157,19 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
     pub fn trading_state(self, value: TradingState) -> Self {
         Self {
             trading_state: Some(value),
+            ..self
+        }
+    }
+
+    /// Optionally configure the [`InFlightDeadlines`] the engine flags overdue orders by.
+    ///
+    /// Defaults to the deadlines [`ExecutionBuild`](crate::execution::builder::ExecutionBuild)
+    /// derives, which give mock exchanges none: a mock exchange runs on the engine's clock, which
+    /// in a backtest is simulated time, so set deadlines here only if its simulated answers arrive
+    /// within a bounded simulated time.
+    pub fn in_flight_deadlines(self, value: InFlightDeadlines) -> Self {
+        Self {
+            in_flight_deadlines: Some(value),
             ..self
         }
     }
@@ -235,6 +251,7 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             engine_feed_mode,
             audit_mode,
             trading_state,
+            in_flight_deadlines,
             balances,
             positions,
         } = self;
@@ -277,7 +294,15 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             .try_build()?;
 
         // Construct Engine
-        let engine = Engine::new(clock, state, execution.execution_tx_map, strategy, risk);
+        let in_flight_deadlines = in_flight_deadlines.unwrap_or(execution.in_flight_deadlines);
+        let engine = Engine::new(
+            clock,
+            state,
+            execution.execution_tx_map,
+            in_flight_deadlines,
+            strategy,
+            risk,
+        );
 
         Ok(SystemBuild {
             engine,
