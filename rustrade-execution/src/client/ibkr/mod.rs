@@ -55,18 +55,14 @@
 //! 1. **Order reconciliation**: order lifecycle events sent during a gap are lost. An
 //!    order cancelled, expired or rejected in that window is not reported. After a
 //!    reconnect, call [`ExecutionClient::fetch_open_orders`] to reconcile open-order
-//!    state. The IBKR account snapshot carries no open orders (#371). On `ibapi` 4.2.0
-//!    that call is unreliable, and fails for a while after a reconnect: see
-//!    [Known Issues](#known-issues-ibapi-420-shared-queues).
-//! 2. **Permanent disconnect**: when `ibapi` gives up reconnecting, or fill recovery
-//!    fails repeatedly, `account_stream` ends with `StreamTerminated` within about a
-//!    second. Its reader thread then stays blocked until TWS sends another event, and
-//!    another `account_stream` call on the client fails until the thread exits. After
-//!    recovery fails, the client is still connected, so the reader exits on the next
-//!    TWS event and `account_stream` works again. After a shutdown, no event follows,
-//!    so replace the client. Shutdown is detected only while a stream is open, so
-//!    `account_stream` on a client that has already shut down returns a stream that
-//!    never ends; see [`ExecutionClient::account_stream`]. Replacing the client, by
+//!    state. The IBKR account snapshot carries no open orders (#371).
+//! 2. **Permanent disconnect**: when `ibapi` gives up reconnecting, or
+//!    [`IbkrClient::disconnect`] is called, `account_stream` ends with
+//!    `StreamTerminated`, and `account_stream` on the shut-down client fails, so replace
+//!    the client. When fill recovery fails repeatedly, the stream ends the same way but
+//!    the client is still connected: its reader thread stays blocked until TWS sends
+//!    another event, another `account_stream` call fails until then, and it works again
+//!    after. See [`ExecutionClient::account_stream`]. Replacing the client, by
 //!    reconnecting with [`IbkrClient::connect_sync`] and choosing the client ID, is the
 //!    caller's decision. A new `IbkrClient` does not know the orders the old one
 //!    placed, so their later events are dropped.
@@ -77,39 +73,6 @@
 //! owns the transient reconnect. Replacing a client that is gone for good requires IB
 //! Gateway availability and client ID coordination, decisions that belong in the
 //! caller's wrapper, not the library.
-//!
-//! # Known Issues: `ibapi` 4.2.0 Shared Queues
-//!
-//! `ibapi` 4.2.0 answers the open-orders and positions requests from one queue per
-//! request type. Every call on the client reads from the same queue, and nothing clears
-//! it between calls. Besides each call's own reply, two things land in it:
-//!
-//! - A connection drop queues one `ConnectionReset` per response type: three on the
-//!   open-orders queue, two on the positions queue.
-//! - Every `OpenOrder` and `OrderStatus` message for an order with no live placement
-//!   subscription is copied into `ibapi`'s three open-orders queues. That covers every
-//!   update for an order this client placed, once its placement call has returned, and
-//!   every row of an open-orders reply.
-//!
-//! As a result:
-//!
-//! - [`ExecutionClient::fetch_open_orders`] can report orders that have since filled or
-//!   been cancelled as open. Each connection drop makes three calls fail and adds three
-//!   calls of lag, which never clears. See that method.
-//! - [`ExecutionClient::account_snapshot`] fails twice after each connection drop, then
-//!   recovers.
-//! - This client never reads two of the three open-orders queues, and reads the third
-//!   only when `fetch_open_orders` is called. They keep a copy of every order update
-//!   until read, so the two unread ones grow for the life of the client: `ibapi`'s own
-//!   reconnect does not clear them. `ibapi` logs a warning each time one of them passes a
-//!   multiple of 10,000 queued messages.
-//!
-//! [Account order events](ExecutionClient::account_stream) come through a separate
-//! channel and are unaffected.
-//!
-//! Fixed upstream after 4.2.0 by
-//! [rust-ibapi#836](https://github.com/wboayue/rust-ibapi/pull/836), which gives each
-//! call its own queue and drops messages no call asked for.
 //!
 //! # See Also
 //!
@@ -333,7 +296,10 @@ const PLACEMENT_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// warning band widened to `2100..=2199`, `classify_error`'s predicate became
 /// `is_informational_code`, and 317 joined the data advisories. The change is
 /// strictly additive and 399 is in neither the advisory nor the system list, so
-/// both forms above route exactly as described.
+/// both forms above route exactly as described. Re-verified against ibapi 5.0.0, which
+/// routes an error frame by whether its id is an order's or a request's, and moves 316, 354
+/// and 366 out of the order-rejection category: 399 routes to its order as before, and the
+/// warning predicate is unchanged.
 ///
 /// The list stays load-bearing for the second form. It documents the known gap
 /// between ibapi's range heuristic and IBKR's actual protocol semantics; if
@@ -426,6 +392,9 @@ fn resolve_execution(
 /// A closed stream is noticed on the next update, whether or not that update would be
 /// forwarded, so the thread running this releases `ibapi`'s single order-update slot as soon as
 /// TWS sends anything.
+///
+/// `ibapi` ends the subscription with [`ibapi::Error::Shutdown`] when the client shuts down for
+/// good, and the stream is terminated with [`recovery::CLIENT_SHUT_DOWN`].
 fn forward_order_updates(
     updates: impl IntoIterator<Item = Result<ibapi::orders::OrderUpdate, ibapi::Error>>,
     sink: &recovery::EventSink,
@@ -444,6 +413,13 @@ fn forward_order_updates(
         }
         let update = match update {
             Ok(u) => u,
+            Err(ibapi::Error::Shutdown) => {
+                warn!("IBKR client shut down; terminating the account stream");
+                sink.terminate(StreamTerminationReason::Error(
+                    recovery::CLIENT_SHUT_DOWN.to_string(),
+                ));
+                return;
+            }
             Err(e) => {
                 // ibapi's own reconnect does not surface here (see the
                 // recovery module), so an error on the subscription is terminal.
@@ -894,8 +870,7 @@ impl IbkrClient {
     /// is dropped. Calling `disconnect()` explicitly terminates the connection
     /// **immediately for all clones** sharing this client.
     ///
-    /// Any active `account_stream()` ends with `StreamTerminated` within about a
-    /// second.
+    /// Any active `account_stream()` ends with `StreamTerminated`.
     ///
     /// This is idempotent — calling it multiple times is safe.
     pub fn disconnect(&self) {
@@ -1612,7 +1587,7 @@ impl ExecutionClient for IbkrClient {
     /// when that is not empty), gets an `InstrumentAccountSnapshot`. Its `position` is
     /// [`PositionReport::Open`](crate::position::PositionReport::Open), carrying:
     /// - `quantity`: IB's signed position, negative when short, in shares for a stock and in
-    ///   contracts for a future or an option. `ibapi` 4.2.0 hands it over as an `f64`, converted
+    ///   contracts for a future or an option. `ibapi` hands it over as an `f64`, converted
     ///   with `Decimal::try_from`, which rounds to the float's precision of about 15 significant
     ///   digits (0.1 stays 0.1) rather than keeping its exact binary expansion.
     /// - `entry_price`: IB's average cost divided by the contract multiplier, so a future or an
@@ -1672,12 +1647,6 @@ impl ExecutionClient for IbkrClient {
     /// update. **Every call therefore takes at least 5 seconds**, including for
     /// an account with no positions. If IB stalls mid-stream, the positions
     /// received so far are returned rather than blocking indefinitely.
-    ///
-    /// # Known Issue: Errors After a Connection Drop on `ibapi` 4.2.0
-    ///
-    /// After each connection drop, the next two calls fail with
-    /// [`UnindexedClientError::Internal`]. The third succeeds. See the
-    /// [module's Known Issues](self#known-issues-ibapi-420-shared-queues).
     async fn account_snapshot(
         &self,
         assets: &[AssetNameExchange],
@@ -1794,10 +1763,8 @@ impl ExecutionClient for IbkrClient {
     ///
     /// **Important:** If IB is stalled (no events flowing), the reader thread blocks
     /// on the iterator. Dropping the stream signals termination, but the thread won't
-    /// observe it until the next IB event arrives. Disconnecting does not release
-    /// it either: `ibapi` does not end the order-update subscription when the
-    /// client shuts down (wboayue/rust-ibapi#871), so after a shutdown the thread
-    /// stays blocked until the process exits.
+    /// observe it until the next IB event arrives. A shutdown does end the
+    /// subscription, so the thread exits then.
     ///
     /// # Reconnects and Fill Recovery
     ///
@@ -1813,8 +1780,7 @@ impl ExecutionClient for IbkrClient {
     ///
     /// **Order lifecycle events are not recovered.** An order that was cancelled,
     /// expired or rejected during the gap is not reported here. Reconcile with
-    /// [`ExecutionClient::fetch_open_orders`] after a reconnect, minding its
-    /// known issue on `ibapi` 4.2.0. The log line
+    /// [`ExecutionClient::fetch_open_orders`] after a reconnect. The log line
     /// `Recovered IBKR fills after a gap in event delivery` marks one.
     ///
     /// While TWS reports its link to IB's servers lost (1100), nothing marks the
@@ -1825,19 +1791,12 @@ impl ExecutionClient for IbkrClient {
     /// - recovery fails three times for a reason other than the transport
     ///   dropping again, rather than stay open with a gap;
     /// - the client shuts down for good, because `ibapi` gave up reconnecting or
-    ///   [`IbkrClient::disconnect`] was called. `ibapi` never ends the order
-    ///   update subscription itself, so this is detected from its notice stream,
-    ///   which it does close.
+    ///   [`IbkrClient::disconnect`] was called. Called on a client that has
+    ///   already shut down, this method fails, so replace the client.
     ///
-    /// After either, the reader thread stays blocked on the subscription, and
-    /// holds `ibapi`'s single order-update slot, until TWS sends another event.
-    /// Calling `account_stream` again on the same client fails meanwhile. After a
-    /// shutdown, TWS sends nothing more, so replace the client.
-    ///
-    /// Shutdown is detected only while this stream is open. Called on a client
-    /// that has already shut down, this method still returns a stream, which
-    /// never ends. After a stream ends with a shutdown, replace the client rather
-    /// than resubscribe on it.
+    /// After recovery fails, the reader thread stays blocked on the subscription,
+    /// and holds `ibapi`'s single order-update slot, until TWS sends another
+    /// event. Calling `account_stream` again on the same client fails meanwhile.
     ///
     /// # Duplicate Events
     ///
@@ -2323,23 +2282,6 @@ impl ExecutionClient for IbkrClient {
     ///   does not return the original TIF setting.
     /// - This method blocks on IB's subscription until IB sends an end-of-data marker.
     ///   If IB is stalled, this will block indefinitely.
-    ///
-    /// # Known Issue: Stale Results on `ibapi` 4.2.0
-    ///
-    /// The result may not be this call's answer. See the
-    /// [module's Known Issues](self#known-issues-ibapi-420-shared-queues).
-    ///
-    /// - Order updates received since the previous call are read as part of the
-    ///   result. It can hold the same order more than once, and orders that have
-    ///   since filled or been cancelled, reported as open.
-    /// - After the first connection drop, the next three calls fail with
-    ///   [`UnindexedClientError::Internal`], and every call after them returns
-    ///   the reply to the call three before it. Each later drop adds three more
-    ///   calls of lag, and three more failures, which come once the replies
-    ///   already queued have been read. Retrying does not catch up.
-    ///
-    /// Do not treat the result as authoritative open-order state on 4.2.0. The
-    /// order events from [`ExecutionClient::account_stream`] are unaffected.
     async fn fetch_open_orders(
         &self,
         instruments: &[InstrumentNameExchange],
@@ -3528,6 +3470,27 @@ mod order_reader_tests {
             rx.try_recv().unwrap().kind,
             AccountEventKind::StreamTerminated(_)
         ));
+    }
+
+    #[test]
+    fn a_shutdown_terminates_the_stream_as_one() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = recovery::EventSink::new(tx, new_dedup_cache());
+
+        let mut updates = unforwarded(1);
+        updates.push(Err(ibapi::Error::Shutdown));
+        updates.extend(unforwarded(1));
+
+        assert_eq!(run(&sink, updates), 2, "nothing is read past the shutdown");
+        assert!(matches!(
+            rx.try_recv().unwrap().kind,
+            AccountEventKind::StreamTerminated(StreamTerminationReason::Error(ref reason))
+                if reason == recovery::CLIENT_SHUT_DOWN
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "the stream ends with its termination"
+        );
     }
 
     #[test]

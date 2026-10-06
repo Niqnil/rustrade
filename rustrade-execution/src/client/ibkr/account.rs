@@ -220,7 +220,7 @@ impl PositionAggregator {
 
 /// Convert one IB position report to a [`Position`], or `None` if its quantity is zero.
 ///
-/// - `quantity`: IB's signed position, negative when short. `ibapi` 4.2.0 hands it over as an
+/// - `quantity`: IB's signed position, negative when short. `ibapi` hands it over as an
 ///   `f64`, converted with `Decimal::try_from`, which rounds to the float's precision of about 15
 ///   significant digits (0.1 stays 0.1) rather than keeping its exact binary expansion.
 /// - `entry_price`: see [`entry_price`].
@@ -255,7 +255,7 @@ fn convert_position(
 /// the contract multiplier; it is divided back out here. It also includes commissions.
 ///
 /// `None`, logged unless the cost is simply absent, when:
-/// - the average cost is zero, which is how `ibapi` 4.2.0 decodes an unset one;
+/// - the average cost is zero, which is how `ibapi` decodes an unset one;
 /// - it does not convert to a [`Decimal`];
 /// - IB sends no positive multiplier for a contract other than a stock or a forex pair, whose cost
 ///   is already per unit.
