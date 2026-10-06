@@ -7455,7 +7455,7 @@ mod tests {
             };
 
             // Call open_order (borrows instrument)
-            let result = client
+            let order = client
                 .open_order(OrderRequestOpen {
                     key: OrderKey {
                         exchange: request.key.exchange,
@@ -7468,7 +7468,6 @@ mod tests {
                 .await;
 
             // Verify the order was accepted
-            let order = result;
             assert!(
                 order.state.is_accepted(),
                 "order should be accepted: {:?}",
@@ -7552,9 +7551,8 @@ mod tests {
                 },
             };
 
-            let result = client.open_order(request).await;
+            let order = client.open_order(request).await;
 
-            let order = result;
             assert!(
                 order.state.is_accepted(),
                 "order should be accepted: {:?}",

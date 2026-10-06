@@ -610,7 +610,9 @@ mod tests {
     #[derive(Debug, Clone, Default)]
     struct RejectingClient {
         /// When set, every response names this instrument instead of echoing the request's.
-        answer_as: Option<InstrumentNameExchange>,
+        answer_instrument: Option<InstrumentNameExchange>,
+        /// When set, every response names this client order id instead of echoing the request's.
+        answer_cid: Option<ClientOrderId>,
     }
 
     impl RejectingClient {
@@ -621,11 +623,11 @@ mod tests {
             OrderKey {
                 exchange: key.exchange,
                 instrument: self
-                    .answer_as
+                    .answer_instrument
                     .clone()
                     .unwrap_or_else(|| key.instrument.clone()),
                 strategy: key.strategy,
-                cid: key.cid,
+                cid: self.answer_cid.clone().unwrap_or(key.cid),
             }
         }
     }
@@ -813,7 +815,25 @@ mod tests {
     #[tokio::test]
     async fn a_response_keyed_to_an_unknown_instrument_still_answers_its_request() {
         let client = RejectingClient {
-            answer_as: Some(InstrumentNameExchange::new("not_in_the_map")),
+            answer_instrument: Some(InstrumentNameExchange::new("not_in_the_map")),
+            ..RejectingClient::default()
+        };
+        let (key, events) = run_open_and_cancel(client).await;
+
+        let rejection = OrderError::Rejected(ApiError::BalanceInsufficient(
+            None,
+            "insufficient balance".to_string(),
+        ));
+        assert_both_answered(&key, &events, &rejection);
+    }
+
+    /// A response whose own key resolves, but to a different order, is a client bug too: it must
+    /// reach the Engine under the request's key, not settle the order it names.
+    #[tokio::test]
+    async fn a_response_keyed_to_another_order_still_answers_its_request() {
+        let client = RejectingClient {
+            answer_cid: Some(ClientOrderId::random()),
+            ..RejectingClient::default()
         };
         let (key, events) = run_open_and_cancel(client).await;
 
