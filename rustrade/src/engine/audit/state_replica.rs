@@ -326,7 +326,8 @@ where
                     return;
                 };
                 // Unsupported action kind — the compiler-mandated arm for the `#[non_exhaustive]`
-                // `CorporateActionKind` (runtime-unreachable in this phase). `id` not recorded.
+                // `CorporateActionKind` (unreachable while `StockSplit` is its only variant). `id`
+                // not recorded.
                 let CorporateActionKind::StockSplit { ratio } = kind else {
                     return;
                 };
