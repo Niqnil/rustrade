@@ -79,6 +79,9 @@ impl VenuePositionSeeds {
     /// [`SystemBuilder::positions`](crate::system::builder::SystemBuilder::positions) or
     /// [`EngineStateBuilder::positions`](crate::engine::state::builder::EngineStateBuilder::positions).
     ///
+    /// The venue's instrument name is matched ignoring ASCII case, as the execution map matches
+    /// it.
+    ///
     /// An instrument whose position is unreported or flat yields nothing. An open position yields
     /// either a seed, built by [`PositionSeed::from_venue_position`], or an entry in
     /// [`Self::skipped`]. Check `skipped`: starting with positions left out means the engine
@@ -106,12 +109,17 @@ impl VenuePositionSeeds {
             else {
                 continue;
             };
-            let name_exchange = &instrument_snapshot.instrument;
+            // Ignoring ASCII case, as the execution map resolves a venue's name. The build rejects
+            // two names on one exchange that differ only in case, so at most one matches.
+            let name_exchange = instrument_snapshot.instrument.name().as_str();
             let name_internal = instruments.instruments().iter().find_map(|keyed| {
                 let instrument = &keyed.value;
                 (instrument.exchange.value == snapshot.exchange
-                    && instrument.name_exchange == *name_exchange)
-                    .then_some(&instrument.name_internal)
+                    && instrument
+                        .name_exchange
+                        .name()
+                        .eq_ignore_ascii_case(name_exchange))
+                .then_some(&instrument.name_internal)
             });
 
             let seed = match name_internal {
@@ -125,7 +133,7 @@ impl VenuePositionSeeds {
             match seed {
                 Ok(seed) => out.seeds.push(seed),
                 Err(reason) => out.skipped.push(SkippedVenuePosition {
-                    instrument: name_exchange.clone(),
+                    instrument: instrument_snapshot.instrument.clone(),
                     position: position.clone(),
                     reason,
                 }),
@@ -242,7 +250,8 @@ mod tests {
             EXCHANGE,
             vec![],
             vec![
-                instrument_snapshot("aapl_usd", Some(venue_position(dec!(-4), Some(dec!(100))))),
+                // Spelled as the venue might, not as registered: matched ignoring case.
+                instrument_snapshot("AAPL_USD", Some(venue_position(dec!(-4), Some(dec!(100))))),
                 // No position, and a flat one: nothing to seed or report.
                 instrument_snapshot("msft_usd", None),
                 instrument_snapshot("msft_usd", Some(venue_position(Decimal::ZERO, None))),
