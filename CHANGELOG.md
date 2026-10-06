@@ -355,6 +355,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `spot_pair_to_instrument(&SpotPair)`.
 
   Closes #496.
+- **Hyperliquid perpetual fills reported every fee as USDC** (`rustrade-execution`). The
+  perpetuals client hard-coded the fee asset of fills on the account stream and from
+  `fetch_trades`. A builder-deployed (HIP-3) perpetual settles in its deployer's collateral, so a
+  fee charged in USDH, USDE or USDT0 was reported as USDC. The fee asset now comes from the fill's
+  `feeToken`, falling back to USDC only if it is absent. `fees_quote` is set only for a USDC fee.
+  The client still cannot place orders on HIP-3 perpetuals.
 - **Alpaca fill recovery and `fetch_trades` could miss fills in the millisecond they read from**
   (`rustrade-execution`). Alpaca's account-activities `after` filter compares at millisecond
   precision, so a read from a time inside a millisecond skipped every later fill in it. Recovery
