@@ -56,10 +56,10 @@
 //!    order cancelled, expired or rejected in that window is not reported. After a
 //!    reconnect, call [`ExecutionClient::fetch_open_orders`] to reconcile open-order
 //!    state. The IBKR account snapshot carries no open orders (#371).
-//! 2. **Permanent disconnect**: when `ibapi` gives up reconnecting, or
-//!    [`IbkrClient::disconnect`] is called, `account_stream` ends with
-//!    `StreamTerminated`, and `account_stream` on the shut-down client fails, so replace
-//!    the client. When fill recovery fails repeatedly, the stream ends the same way but
+//! 2. **Permanent disconnect**: when `ibapi` gives up reconnecting,
+//!    [`IbkrClient::disconnect`] is called, or TWS/Gateway ends the API session,
+//!    `account_stream` ends with `StreamTerminated`, and `account_stream` on the
+//!    shut-down client fails, so replace the client. When fill recovery fails repeatedly, the stream ends the same way but
 //!    the client is still connected: its reader thread stays blocked until TWS sends
 //!    another event, another `account_stream` call fails until then, and it works again
 //!    after. See [`ExecutionClient::account_stream`]. Replacing the client, by
@@ -1784,8 +1784,9 @@ impl ExecutionClient for IbkrClient {
     /// The stream ends with `StreamTerminated` when:
     /// - recovery fails three times for a reason other than the transport
     ///   dropping again, rather than stay open with a gap;
-    /// - the client shuts down for good, because `ibapi` gave up reconnecting or
-    ///   [`IbkrClient::disconnect`] was called. Called on a client that has
+    /// - the client shuts down for good, because `ibapi` gave up reconnecting,
+    ///   [`IbkrClient::disconnect`] was called, or TWS/Gateway ended the API
+    ///   session. Called on a client that has
     ///   already shut down, this method fails, so replace the client.
     ///
     /// After recovery fails, the reader thread stays blocked on the subscription,

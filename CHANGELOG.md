@@ -179,6 +179,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     caller driving its own depth loop no longer matches the notice.
   - The orders rustrade sends are unchanged: stop-limit and trailing-stop-limit orders, whose
     `ibapi` builders were removed, are built with the same fields.
+
 - **IBKR `account_snapshot` returns once IB has listed every position** (`rustrade-execution`,
   feature `ibkr`). It waited for 5 s without a position update, so every call took at least
   5 s; it now stops at IB's end-of-listing marker, which took about 130 ms against a paper
@@ -282,11 +283,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream that never ended. With `ibapi` 5 the stream ends with `StreamTerminated` as soon as the
   client shuts down, its thread exits, and `account_stream` on a shut-down client fails. Closes
   #409.
+
 - **IBKR `fetch_open_orders` could return stale orders, and calls failed after a reconnect**
   (`rustrade-execution`, feature `ibkr`). `ibapi` 4.2.0 shared one reply queue per request type
   across calls; `ibapi` 5 gives each call its own.
+
 - **IBKR option greeks IB had not computed came through as `-1` or `-2`** (`rustrade-data`,
   feature `ibkr`). They are now `None`.
+
 - **`rustrade-integration`'s `channel` feature did not build on its own.** It now enables
   `futures`, which the module imports.
 

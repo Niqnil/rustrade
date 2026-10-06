@@ -68,8 +68,8 @@ const REVISIONS_REMEMBERED: NonZeroUsize = match NonZeroUsize::new(DEDUP_CACHE_S
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Why the account stream ends when `ibapi` shuts the client down for good.
-pub(super) const CLIENT_SHUT_DOWN: &str = "IBKR client shut down: ibapi gave up reconnecting to TWS/Gateway, or the client was \
-     disconnected";
+pub(super) const CLIENT_SHUT_DOWN: &str = "IBKR client shut down: ibapi gave up reconnecting \
+     to TWS/Gateway, the client was disconnected, or TWS/Gateway ended the API session";
 
 /// How far before the estimated start of a gap recovery reaches back.
 ///
@@ -527,8 +527,9 @@ pub(super) struct RecoveryWatcher {
 impl RecoveryWatcher {
     /// Watch for gaps and recover their fills until the stream ends or its consumer goes.
     ///
-    /// If recovery keeps failing, or the client shuts down for good, the stream is terminated
-    /// rather than left open with a gap nobody knows about.
+    /// If recovery keeps failing, the stream is terminated rather than left open with a gap nobody
+    /// knows about. If the client shuts down for good, the watcher stops: the order-update reader
+    /// ends the stream then, on the `Error::Shutdown` `ibapi` sends it.
     pub(super) fn run(self) {
         let mut tracker = GapTracker::new(Utc::now());
 
