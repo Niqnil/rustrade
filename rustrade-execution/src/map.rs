@@ -9,7 +9,7 @@ use rustrade_instrument::{
 };
 use rustrade_integration::collection::FnvIndexSet;
 use smol_str::{SmolStr, StrExt};
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Indexed instrument map used to associate the internal Barter representation of instruments and
 /// assets with the [`ExecutionClient`](super::client::ExecutionClient) representation.
@@ -221,8 +221,9 @@ impl ExecutionInstrumentMap {
 
 /// Key each name by its ASCII-lowercased form.
 ///
-/// A key two names share is left out, so a lookup by it misses rather than picks one of them.
-/// [`IndexedInstruments`] rejects such a pair on one exchange, so this guards only an invariant.
+/// A key two names share is left out, with a `warn!`, so a lookup by it misses rather than picks
+/// one of them. [`IndexedInstruments`] rejects such a pair on one exchange, so this guards only an
+/// invariant.
 fn fold_names<'a, Index>(
     names: impl Iterator<Item = (&'a str, Index)>,
 ) -> FnvHashMap<SmolStr, Index> {
@@ -235,6 +236,11 @@ fn fold_names<'a, Index>(
         }
     }
     for key in shared {
+        warn!(
+            name = %key,
+            "ExecutionInstrumentMap holds two names that differ only in case - neither resolves \
+             ignoring case"
+        );
         folded.remove(&key);
     }
     folded
