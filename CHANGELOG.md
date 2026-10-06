@@ -227,8 +227,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       `IndexError::DuplicateAssetNameExchange`). The asset check also rejects two assets sharing a
       `name_exchange` exactly under different `name_internal`s, which built before and left one
       of them unreachable by name.
-    - `ExecutionInstrumentMap` gained private fields, so it can no longer be built with a struct
-      literal: use `ExecutionInstrumentMap::new`. Its public fields keep the registered spellings.
+    - `ExecutionInstrumentMap::asset_names` and `instrument_names` are private, since the
+      case-insensitive index is derived from them, and the map can no longer be built with a struct
+      literal: use `ExecutionInstrumentMap::new`. `exchange_assets()` and `exchange_instruments()`
+      still list the registered names.
     - Alpaca's balance asset names change spelling: `usd` becomes `USD`, `btc` becomes `BTC`.
 
 - **IBKR delivered a corrected execution as a second fill** (`rustrade-execution`, feature

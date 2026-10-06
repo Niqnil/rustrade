@@ -28,9 +28,6 @@ use tracing::{debug, warn};
 /// event carrying it. Ignoring case cannot merge two registered names, because
 /// [`IndexedInstruments`] rejects two on one exchange that differ only in case. The lookups in the
 /// other direction, from an index to a name, return the registered spelling.
-///
-/// The case-insensitive index is built by [`Self::new`] from [`Self::asset_names`] and
-/// [`Self::instrument_names`], so a change made to those fields afterwards is not reflected in it.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ExecutionInstrumentMap {
     /// The exchange associated with this execution map.
@@ -41,12 +38,15 @@ pub struct ExecutionInstrumentMap {
     /// Collection of instruments available by the engine. This holds all
     /// indexed instruments.
     pub instruments: FnvIndexSet<Instrument<Keyed<ExchangeIndex, ExchangeId>, AssetIndex>>,
-    /// Map from exchange-specific asset names to internal asset indices for
-    /// fast lookups.
-    pub asset_names: FnvHashMap<AssetNameExchange, AssetIndex>,
-    /// Map from exchange-specific instrument names to internal instrument
-    /// indices for fast lookups.
-    pub instrument_names: FnvHashMap<InstrumentNameExchange, InstrumentIndex>,
+    /// Map from exchange-specific asset names, as registered, to internal asset indices.
+    ///
+    /// Private, with [`Self::asset_names_folded`], because that index is derived from this map: a
+    /// change to one alone would make the exact and case-insensitive lookups disagree.
+    asset_names: FnvHashMap<AssetNameExchange, AssetIndex>,
+    /// Map from exchange-specific instrument names, as registered, to internal instrument indices.
+    ///
+    /// Private for the reason [`Self::asset_names`] is.
+    instrument_names: FnvHashMap<InstrumentNameExchange, InstrumentIndex>,
     /// [`Self::asset_names`] keyed by the ASCII-lowercased name, for the case-insensitive lookup.
     asset_names_folded: FnvHashMap<SmolStr, AssetIndex>,
     /// [`Self::instrument_names`] keyed by the ASCII-lowercased name, for the case-insensitive
@@ -112,10 +112,12 @@ impl ExecutionInstrumentMap {
         }
     }
 
+    /// The names of this exchange's assets, as registered.
     pub fn exchange_assets(&self) -> impl Iterator<Item = &AssetNameExchange> {
         self.asset_names.keys()
     }
 
+    /// The names of this exchange's instruments, as registered.
     pub fn exchange_instruments(&self) -> impl Iterator<Item = &InstrumentNameExchange> {
         self.instrument_names.keys()
     }
