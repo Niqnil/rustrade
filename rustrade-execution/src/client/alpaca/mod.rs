@@ -647,7 +647,7 @@ struct AlpacaAccount {
 /// zero or as a flat position.
 #[derive(Debug, Deserialize)]
 struct AlpacaPosition {
-    /// Exchange symbol (e.g., "BTC/USD" for crypto, "AAPL" for equity, an OCC symbol for an
+    /// Exchange symbol (e.g., "BTCUSD" for crypto, "AAPL" for equity, an OCC symbol for an
     /// option).
     symbol: String,
     /// Asset class: "us_equity", "crypto", "us_option".
@@ -1430,8 +1430,9 @@ impl ExecutionClient for AlpacaClient {
     ///   priced, not per contract. Margin, liquidation price and leverage are `None`, and
     ///   `time_exchange` is the time of the call, since Alpaca does not timestamp positions.
     /// - **Crypto**: each holding is an asset balance of the asset it holds (e.g. `BTC` for the
-    ///   position Alpaca lists as `BTCUSD`), in base units. Alpaca crypto is spot-only and cannot be sold short, so there
-    ///   is no position to report: its instruments are [`PositionReport::Unreported`].
+    ///   position Alpaca lists as `BTCUSD`), in base units. Alpaca crypto is spot-only and cannot
+    ///   be sold short, so there is no position to report: its instruments are
+    ///   [`PositionReport::Unreported`].
     ///
     /// # Limitations
     ///
@@ -3783,18 +3784,24 @@ fn convert_positions_to_balances(
 
 /// The asset a crypto position holds, read from its symbol.
 ///
-/// Alpaca's positions list names a crypto holding by its asset followed by `USD` (`BTCUSD` holds
-/// BTC), whichever pair bought it; orders and fills name the pair instead (`BTC/USD`). Both forms
-/// are read, the `USD` suffix ignoring case. A symbol in neither form is returned whole, with a
-/// warning, so its balance is still reported, under a name that fails to index rather than not at
-/// all.
+/// Alpaca documents that its positions list names a crypto holding by its asset followed by `USD`
+/// (`BTCUSD` holds BTC), while orders and fills name the pair (`BTC/USD`). Both forms are read,
+/// the `USD` suffix ignoring case. A symbol in neither form, or with an empty asset, is returned
+/// whole, with a warning, so its balance is still reported, under a name that fails to index
+/// rather than not at all.
 fn crypto_position_asset(symbol: &str) -> &str {
-    if let Some((base, _)) = symbol.split_once('/') {
-        return base;
-    }
-    let base_len = symbol.len().saturating_sub(USD.len());
-    match (symbol.get(..base_len), symbol.get(base_len..)) {
-        (Some(base), Some(suffix)) if !base.is_empty() && suffix.eq_ignore_ascii_case(USD) => base,
+    let base = match symbol.split_once('/') {
+        Some((base, _)) => Some(base),
+        None => {
+            let base_len = symbol.len().saturating_sub(USD.len());
+            symbol
+                .get(base_len..)
+                .filter(|suffix| suffix.eq_ignore_ascii_case(USD))
+                .and_then(|_| symbol.get(..base_len))
+        }
+    };
+    match base {
+        Some(base) if !base.is_empty() => base,
         _ => {
             warn!(
                 %symbol,
@@ -5972,7 +5979,7 @@ mod tests {
         assert_eq!(balances[0].balance.total, dec!(0.5));
         assert_eq!(balances[0].balance.free, dec!(0.4));
 
-        // Filter to BTC only
+        // Filter to BTC only: matches the `BTCUSD` position
         let btc_only = vec![AssetNameExchange::new("btc")];
         let balances = convert_positions_to_balances(&positions, &btc_only);
         assert_eq!(balances.len(), 1);
@@ -5982,13 +5989,28 @@ mod tests {
     #[test]
     fn test_crypto_position_asset() {
         assert_eq!(crypto_position_asset("BTCUSD"), "BTC");
-        assert_eq!(crypto_position_asset("btcusd"), "btc", "suffix matched ignoring case");
-        assert_eq!(crypto_position_asset("USDTUSD"), "USDT", "only one USD is stripped");
+        assert_eq!(
+            crypto_position_asset("btcusd"),
+            "btc",
+            "suffix matched ignoring case"
+        );
+        assert_eq!(
+            crypto_position_asset("USDTUSD"),
+            "USDT",
+            "only one USD is stripped"
+        );
         assert_eq!(crypto_position_asset("BTC/USD"), "BTC");
         assert_eq!(crypto_position_asset("BTC/USDT"), "BTC");
-        // Neither form: used whole rather than dropped.
+        assert_eq!(crypto_position_asset("€USD"), "€");
+        // Neither form, or an empty asset: used whole rather than dropped.
         assert_eq!(crypto_position_asset("USD"), "USD");
+        assert_eq!(crypto_position_asset("/USD"), "/USD");
         assert_eq!(crypto_position_asset("BTCUSDT"), "BTCUSDT");
+        assert_eq!(
+            crypto_position_asset("BTC€é"),
+            "BTC€é",
+            "no char boundary at the suffix"
+        );
         assert_eq!(crypto_position_asset(""), "");
     }
 
