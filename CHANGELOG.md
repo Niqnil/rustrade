@@ -295,6 +295,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`rustrade-integration`'s `channel` feature did not build on its own.** It now enables
   `futures`, which the module imports.
 
+- **`UnboundedRx`'s `Iterator` spun a CPU core while its channel was empty**
+  (`rustrade-integration`, `channel` feature). `next` retried `try_recv` in a loop, so an engine run
+  in `EngineFeedMode::Iterator` kept a core busy whenever no event was waiting. `next` now returns
+  a waiting message at once and otherwise blocks the thread until one arrives. Like Tokio's
+  `blocking_recv`, it panics if it has to wait inside an asynchronous context; the system builder
+  already runs the iterator engine on a `spawn_blocking` thread.
+- **docs.rs documented none of `rustrade-data`'s providers, nor `rustrade-integration`'s
+  `channel` and `metric` modules**, which are behind non-default features. Both crates now build
+  their docs with all features, as `rustrade-execution` already did.
 - **An order request could go unanswered, leaving the order in flight forever** (`rustrade`,
   `rustrade-execution`). `ExecutionManager` indexed each response by the order key the client put
   in it, and discarded a response whose key it could not resolve. An `ExecutionClient` could also

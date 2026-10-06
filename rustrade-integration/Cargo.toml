@@ -11,6 +11,11 @@ documentation = "https://docs.rs/rustrade-integration"
 readme = "README.md"
 description = "Low-level framework for composing flexible web integrations, especially with financial exchanges"
 
+# `channel` and `metric` are not default features, so a default-feature docs.rs build would leave
+# their modules out.
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 default = ["collection", "error", "protocol", "serde", "subscription", "socket", "stream", "corporate-action"]
 full = ["collection", "channel", "error", "metric", "protocol", "serde", "subscription", "socket", "stream", "corporate-action"]

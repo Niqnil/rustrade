@@ -11,6 +11,11 @@ documentation = "https://docs.rs/rustrade-data"
 readme = "README.md"
 description = "High performance & normalised WebSocket intergration for leading cryptocurrency exchanges - batteries included."
 
+# Every provider module (alpaca/databento/hyperliquid/ibkr/lse/massive) is feature-gated and
+# `default = []`, so a default-feature docs.rs build would document none of them.
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 default = []
 ibkr = ["dep:ibapi", "dep:time", "dep:quick-xml", "rustrade-instrument/ibkr"]
