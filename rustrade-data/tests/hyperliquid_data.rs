@@ -23,7 +23,7 @@ use futures_util::StreamExt;
 use rust_decimal::Decimal;
 use rustrade_data::{
     exchange::hyperliquid::{
-        Hyperliquid,
+        Hyperliquid, Network,
         historical::{HistoricalRequest, HyperliquidHistoricalData},
     },
     streams::{
@@ -57,7 +57,7 @@ fn init_logging() {
 async fn test_historical_client_creation() {
     init_logging();
 
-    let client = HyperliquidHistoricalData::new(false).await;
+    let client = HyperliquidHistoricalData::new(Network::Mainnet).await;
     assert!(
         client.is_ok(),
         "Failed to create historical client: {:?}",
@@ -70,7 +70,7 @@ async fn test_historical_client_creation() {
 async fn test_historical_candles_hourly() {
     init_logging();
 
-    let client = HyperliquidHistoricalData::new(false)
+    let client = HyperliquidHistoricalData::new(Network::Mainnet)
         .await
         .expect("Failed to create client");
 
@@ -105,7 +105,7 @@ async fn test_historical_candles_hourly() {
 async fn test_historical_candles_daily() {
     init_logging();
 
-    let client = HyperliquidHistoricalData::new(false)
+    let client = HyperliquidHistoricalData::new(Network::Mainnet)
         .await
         .expect("Failed to create client");
 
@@ -129,7 +129,7 @@ async fn test_historical_candles_daily() {
 async fn test_historical_candles_all_intervals() {
     init_logging();
 
-    let client = HyperliquidHistoricalData::new(false)
+    let client = HyperliquidHistoricalData::new(Network::Mainnet)
         .await
         .expect("Failed to create client");
 
@@ -372,7 +372,7 @@ async fn test_multiple_symbols_stream() {
 async fn test_historical_invalid_coin() {
     init_logging();
 
-    let client = HyperliquidHistoricalData::new(false)
+    let client = HyperliquidHistoricalData::new(Network::Mainnet)
         .await
         .expect("Failed to create client");
 
@@ -391,7 +391,7 @@ async fn test_historical_invalid_coin() {
 async fn test_historical_testnet() {
     init_logging();
 
-    let client = HyperliquidHistoricalData::new(true).await;
+    let client = HyperliquidHistoricalData::new(Network::Testnet).await;
     assert!(
         client.is_ok(),
         "Failed to create testnet client: {:?}",

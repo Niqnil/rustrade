@@ -57,6 +57,43 @@ pub struct MarketInstrumentData<InstrumentKey> {
     pub kind: MarketDataInstrumentKind,
 }
 
+#[cfg(feature = "hyperliquid")]
+impl<InstrumentKey> MarketInstrumentData<InstrumentKey> {
+    /// A Hyperliquid perpetual, keyed by `key`, to subscribe to with
+    /// [`Hyperliquid`](crate::exchange::hyperliquid::Hyperliquid).
+    ///
+    /// Find `perp` with
+    /// [`HyperliquidMeta::perp_coin`](crate::exchange::hyperliquid::HyperliquidMeta::perp_coin),
+    /// so the subscription names its coin as Hyperliquid spells it.
+    pub fn hyperliquid_perp(
+        key: InstrumentKey,
+        perp: &rustrade_instrument::hyperliquid::PerpCoin,
+    ) -> Self {
+        Self {
+            key,
+            name_exchange: InstrumentNameExchange::from(perp.coin()),
+            kind: MarketDataInstrumentKind::Perpetual,
+        }
+    }
+
+    /// A Hyperliquid spot pair, keyed by `key`, to subscribe to with
+    /// [`HyperliquidSpot`](crate::exchange::hyperliquid::HyperliquidSpot).
+    ///
+    /// Find `pair` with
+    /// [`HyperliquidMeta::spot_pair`](crate::exchange::hyperliquid::HyperliquidMeta::spot_pair),
+    /// so the subscription names its coin (`@107`) rather than its tokens.
+    pub fn hyperliquid_spot(
+        key: InstrumentKey,
+        pair: &rustrade_instrument::hyperliquid::SpotPair,
+    ) -> Self {
+        Self {
+            key,
+            name_exchange: InstrumentNameExchange::from(pair.coin()),
+            kind: MarketDataInstrumentKind::Spot,
+        }
+    }
+}
+
 impl<InstrumentKey> InstrumentData for MarketInstrumentData<InstrumentKey>
 where
     InstrumentKey: Debug + Clone + Eq + Send + Sync,

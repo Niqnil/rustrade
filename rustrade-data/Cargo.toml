@@ -14,7 +14,7 @@ description = "High performance & normalised WebSocket intergration for leading 
 [features]
 default = []
 ibkr = ["dep:ibapi", "dep:time", "dep:quick-xml", "rustrade-instrument/ibkr"]
-hyperliquid = ["dep:hyperliquid_rust_sdk"]
+hyperliquid = ["dep:hyperliquid_rust_sdk", "rustrade-instrument/hyperliquid"]
 # `serde-with-float` provides the field-level `rust_decimal::serde::float` / `float_option`
 # helpers the clients use to deserialize `new_rate`/`old_rate` (and Massive's price/size) JSON
 # numbers into `Decimal`. It deliberately does NOT enable the global `serde-float` feature, whose
