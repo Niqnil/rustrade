@@ -91,6 +91,13 @@ impl<'a> ExecutionBuilder<'a> {
     /// The provided [`MockExecutionConfig`] is used to configure the [`MockExchange`] and provide
     /// the initial account state.
     ///
+    /// The exchange gets no in-flight deadline (see [`ExecutionBuild::in_flight_deadlines`]): the
+    /// engine measures one on its own clock, which in a backtest is simulated time, while the
+    /// mock's `latency_ms` is real time. To check a mock run on a live clock, as in paper trading,
+    /// set one with
+    /// [`SystemBuilder::in_flight_deadline`](crate::system::builder::SystemBuilder::in_flight_deadline),
+    /// or with [`InFlightDeadlines::insert`] before [`Engine::new`](crate::engine::Engine::new).
+    ///
     /// # Errors
     /// Returns [`BarterError::ExecutionBuilder`] if any indexed instrument executed on
     /// `mocked_exchange` has an [`InstrumentKind`] other than `Spot` or `Cfd`, per
@@ -295,8 +302,8 @@ impl<'a> ExecutionBuilder<'a> {
 pub struct ExecutionBuild {
     pub execution_tx_map: MultiExchangeTxMap,
     /// An in-flight deadline for each live exchange, derived from its `request_timeout`, for
-    /// [`Engine::new`](crate::engine::Engine::new). Mock exchanges have none: their
-    /// `ExecutionManager`'s timeout is a placeholder, and they run on simulated time.
+    /// [`Engine::new`](crate::engine::Engine::new). Mock exchanges have none; see
+    /// [`ExecutionBuilder::add_mock`].
     pub in_flight_deadlines: InFlightDeadlines,
     pub account_channel: Channel<AccountStreamEvent>,
     pub futures: ExecutionBuildFutures,

@@ -15,9 +15,11 @@
 use crate::engine::state::{instrument::InstrumentState, order::manager::OrderManager};
 use chrono::{DateTime, TimeDelta, Utc};
 use rustrade_execution::order::{OrderKey, state::ActiveOrderState};
+use rustrade_instrument::exchange::ExchangeId;
 use rustrade_instrument::{exchange::ExchangeIndex, instrument::InstrumentIndex};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use thiserror::Error;
 use tracing::error;
 
 /// How long an order's request may stay in flight on each exchange before the
@@ -28,8 +30,8 @@ use tracing::error;
 ///
 /// Keyed by [`ExchangeIndex`], the position of the exchange in the
 /// [`IndexedInstruments`](rustrade_instrument::index::IndexedInstruments) the engine was built
-/// from. To key a deadline by [`ExchangeId`](rustrade_instrument::exchange::ExchangeId), look its
-/// index up there first, with `IndexedInstruments::find_exchange_index`.
+/// from. To key a deadline by [`ExchangeId`], look its index up there first, with
+/// `IndexedInstruments::find_exchange_index`.
 ///
 /// # Choosing a deadline
 /// A deadline must exceed the exchange's `ExecutionManager` `request_timeout`, by which the manager
@@ -38,6 +40,8 @@ use tracing::error;
 /// derives one per live exchange with [`Self::deadline_for_request_timeout`], and exposes them on
 /// [`ExecutionBuild`](crate::execution::builder::ExecutionBuild) and
 /// [`Execution`](crate::execution::Execution).
+/// [`SystemBuilder::in_flight_deadline`](crate::system::builder::SystemBuilder::in_flight_deadline)
+/// overrides one exchange's deadline by [`ExchangeId`].
 ///
 /// Deadlines are measured on the engine's `EngineClock`. In a backtest that is simulated time, so
 /// a deadline is only meaningful where the simulated venue answers within a bounded simulated
@@ -85,6 +89,11 @@ impl InFlightDeadlines {
         self.0[index] = Some(deadline);
     }
 
+    /// Remove the deadline for `exchange`, so it is never checked, returning the one it had.
+    pub fn remove(&mut self, exchange: ExchangeIndex) -> Option<Duration> {
+        self.0.get_mut(exchange.index()).and_then(Option::take)
+    }
+
     /// The deadline for `exchange`, if it has one.
     pub fn get(&self, exchange: ExchangeIndex) -> Option<Duration> {
         self.0.get(exchange.index()).copied().flatten()
@@ -107,6 +116,22 @@ impl FromIterator<(ExchangeIndex, Duration)> for InFlightDeadlines {
                 deadlines.with(exchange, deadline)
             })
     }
+}
+
+/// Why an in-flight deadline override was rejected.
+///
+/// Returned by [`SystemBuilder::build`](crate::system::builder::SystemBuilder::build) for an
+/// override set with
+/// [`SystemBuilder::in_flight_deadline`](crate::system::builder::SystemBuilder::in_flight_deadline).
+/// Either would leave the override silently doing nothing.
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]
+pub enum InFlightDeadlineError {
+    /// The exchange has no execution client in the system, so no order request is ever sent to it.
+    #[error("{0} has no execution client, so an in-flight deadline for it would never apply")]
+    NoExecution(ExchangeId),
+    /// The deadline is zero, so it could never be passed; see [`InFlightDeadlines::with`].
+    #[error("the in-flight deadline for {0} is zero, so an order could never be flagged")]
+    Zero(ExchangeId),
 }
 
 /// Which request an [`InFlightOverdue`] order is awaiting an answer to.
@@ -196,6 +221,11 @@ impl InFlightWatch {
             last_scan: None,
             next_scan,
         }
+    }
+
+    /// The deadlines this watch checks against.
+    pub(crate) fn deadlines(&self) -> &InFlightDeadlines {
+        &self.deadlines
     }
 
     /// Note that requests were sent at `time_sent`.
@@ -408,8 +438,17 @@ mod tests {
         assert!(!deadlines.is_empty());
         assert!(InFlightDeadlines::default().is_empty());
 
-        let replaced = deadlines.with(ExchangeIndex(2), Duration::from_secs(1));
+        let mut replaced = deadlines.with(ExchangeIndex(2), Duration::from_secs(1));
         assert_eq!(replaced.get(ExchangeIndex(2)), Some(Duration::from_secs(1)));
+
+        assert_eq!(
+            replaced.remove(ExchangeIndex(2)),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(replaced.get(ExchangeIndex(2)), None);
+        assert_eq!(replaced.remove(ExchangeIndex(2)), None);
+        assert_eq!(replaced.remove(ExchangeIndex(9)), None, "beyond the end");
+        assert_eq!(replaced.shortest(), Some(Duration::from_secs(3)));
     }
 
     #[test]

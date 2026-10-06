@@ -1586,6 +1586,11 @@ where
         }
     }
 
+    /// The deadlines the engine flags orders in flight by (see [`EngineOutput::InFlightOverdue`]).
+    pub fn in_flight_deadlines(&self) -> &InFlightDeadlines {
+        self.in_flight.deadlines()
+    }
+
     /// Return `Engine` clock time.
     pub fn time(&self) -> DateTime<Utc> {
         self.clock.time()

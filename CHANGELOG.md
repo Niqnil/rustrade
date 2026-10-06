@@ -26,12 +26,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     flagged. A restored engine flags an already-overdue order
     once more. An order sent during a backward step of the live clock larger than its deadline
     can be missed.
-  - Deadlines are per exchange (`InFlightDeadlines`). `ExecutionBuilder::add_live` derives one
-    from the `request_timeout` plus `InFlightDeadlines::REQUEST_TIMEOUT_MARGIN` (5 s), exposed as
-    `ExecutionBuild::in_flight_deadlines` and `Execution::in_flight_deadlines`. Mock and simulated
-    venues get none, since they run on simulated time. `SystemBuilder::in_flight_deadlines`
-    overrides them. A deadline must be non-zero: `InFlightDeadlines::insert` and `with` panic on
-    zero, which could never be flagged.
+  - Deadlines are per exchange (`InFlightDeadlines`, keyed by `ExchangeIndex`, with `insert`,
+    `with`, `get` and `remove`). `ExecutionBuilder::add_live` derives one from the
+    `request_timeout` plus `InFlightDeadlines::REQUEST_TIMEOUT_MARGIN` (5 s), exposed as
+    `ExecutionBuild::in_flight_deadlines` and `Execution::in_flight_deadlines`, and
+    `Engine::in_flight_deadlines` reads the ones in use. Mock and simulated venues get none by
+    default: the engine measures a deadline on its own clock, which in a backtest is simulated
+    time. A deadline must be non-zero: `InFlightDeadlines::insert` and `with` panic on zero, which
+    could never be flagged.
+  - `SystemBuilder::in_flight_deadline(ExchangeId, Option<Duration>)` overrides one exchange's
+    deadline over the derived ones: `Some` sets it, for example to check a mock paper-trading on a
+    live clock, and `None` removes it. `build` returns the new
+    `BarterError::InFlightDeadline(InFlightDeadlineError)` for an exchange without an execution
+    client or a zero deadline, rather than letting the override do nothing.
   - **Breaking:**
     - `Engine::new` takes the `InFlightDeadlines` after the execution transmitters. Pass
       `Execution::in_flight_deadlines`, or `InFlightDeadlines::default()` to check nothing.
@@ -42,6 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - Every `InFlightRequestRecorder` method takes the `time_sent`, so a custom
       `InstrumentDataState` implementation must add the parameter.
     - `Engine` no longer implements `Copy`.
+    - `BarterError` gains `InFlightDeadline`, so an exhaustive match needs the arm.
 - **`ExecutionClient::validate_config`** (`rustrade-execution`). A client can now check its config
   against the instruments it is about to trade before it is constructed. `ExecutionBuilder` calls
   it after `SUPPORTED_KINDS`, with the instruments executed on the client's exchange, as
