@@ -9,6 +9,7 @@ use crate::{
     instrument::{Instrument, InstrumentIndex, spec::OrderQuantityUnits},
 };
 use rust_decimal::Decimal;
+use smol_str::StrExt;
 use std::collections::HashMap;
 
 #[derive(Debug, Default)]
@@ -133,9 +134,11 @@ impl IndexedInstrumentsBuilder {
     /// Returns [`IndexError::DuplicateInstrumentNameInternal`] if two added `Instrument`s share an
     /// [`InstrumentNameInternal`](crate::instrument::name::InstrumentNameInternal),
     /// [`IndexError::DuplicateInstrumentNameExchange`] if two on one exchange share an
-    /// [`InstrumentNameExchange`](crate::instrument::name::InstrumentNameExchange),
-    /// [`IndexError::DuplicateAssetNameInternal`] if two distinct assets on one exchange share an
-    /// [`AssetNameInternal`](crate::asset::name::AssetNameInternal), or
+    /// [`InstrumentNameExchange`](crate::instrument::name::InstrumentNameExchange) ignoring ASCII
+    /// case, [`IndexError::DuplicateAssetNameInternal`] if two distinct assets on one exchange share
+    /// an [`AssetNameInternal`](crate::asset::name::AssetNameInternal),
+    /// [`IndexError::DuplicateAssetNameExchange`] if two distinct assets on one exchange share an
+    /// [`AssetNameExchange`](crate::asset::name::AssetNameExchange) ignoring ASCII case, or
     /// [`IndexError::InvalidContractSize`] if any added `Instrument` carries a non-positive
     /// `contract_size`.
     ///
@@ -153,6 +156,12 @@ impl IndexedInstrumentsBuilder {
     /// those lookups to pick one of the two arbitrarily. Register each on the name that venue
     /// distinguishes it by (IBKR's `AAPL` and `AAPL.CFD`, say); two instruments a venue reports
     /// under one name cannot be represented.
+    ///
+    /// Both exchange-side names are unique **ignoring ASCII case**, for instruments and assets
+    /// alike, because the execution lookup that resolves a venue's name ignores case: venues and
+    /// clients do not always spell a name the way it was registered (`usd` against `USD`). Two
+    /// names that differ only in case are therefore one name, and registering both is rejected
+    /// rather than left for a lookup to pick one.
     pub fn try_build(mut self) -> Result<IndexedInstruments, IndexError> {
         // Sort & dedup
         self.exchanges.sort();
@@ -206,19 +215,30 @@ impl IndexedInstrumentsBuilder {
             }
         }
 
-        // Enforce `(exchange, name_exchange)` uniqueness: it is the key every venue-sourced order,
-        // fill and position is resolved by (see `try_build`'s rustdoc). Checked after the
-        // `name_internal` pass, so a pair reaching it always differs in `name_internal`.
+        // Enforce `(exchange, name_exchange)` uniqueness, ignoring ASCII case: it is the key every
+        // venue-sourced order, fill and position is resolved by, and that lookup ignores case (see
+        // `try_build`'s rustdoc). Checked after the `name_internal` pass, so a pair reaching it
+        // always differs in `name_internal`.
         let mut exchange_names = HashMap::with_capacity(self.instruments.len());
         for instrument in &self.instruments {
-            let key = (instrument.exchange, &instrument.name_exchange);
+            let key = (
+                instrument.exchange,
+                instrument.name_exchange.name().to_ascii_lowercase_smolstr(),
+            );
             if let Some(previous) = exchange_names.insert(key, instrument) {
-                let [previous, instrument_desc] = describe_collision(previous, instrument);
+                let [previous_desc, instrument_desc] = describe_collision(previous, instrument);
+                let name = if previous.name_exchange == instrument.name_exchange {
+                    instrument.name_exchange.to_string()
+                } else {
+                    format!(
+                        "{} (as {}, the same name ignoring case)",
+                        instrument.name_exchange, previous.name_exchange
+                    )
+                };
                 return Err(IndexError::DuplicateInstrumentNameExchange(format!(
-                    "{} on {} is shared by the distinct instruments {previous} and \
-                     {instrument_desc} - every Instrument on an exchange requires a unique \
-                     name_exchange, since that is the name the exchange reports it by",
-                    instrument.name_exchange,
+                    "{name} on {} is shared by the distinct instruments {previous_desc} and \
+                     {instrument_desc} - every Instrument on an exchange requires a name_exchange \
+                     unique ignoring ASCII case, since that is the name the exchange reports it by",
                     // `as_str`, not `Display`: the canonical snake_case spelling users write in
                     // configs, rather than the bare variant name.
                     instrument.exchange.as_str(),
@@ -243,6 +263,35 @@ impl IndexedInstrumentsBuilder {
                     exchange_asset.exchange.as_str(),
                     previous.asset.name_exchange,
                     exchange_asset.asset.name_exchange,
+                )));
+            }
+        }
+
+        // Enforce `(exchange, name_exchange)` uniqueness across assets, ignoring ASCII case: it is
+        // the key every venue-sourced balance and fee is resolved by. Checked after the
+        // `name_internal` pass, so a pair reaching it always differs in `name_internal`.
+        let mut asset_exchange_names = HashMap::with_capacity(self.assets.len());
+        for exchange_asset in &self.assets {
+            let key = (
+                exchange_asset.exchange,
+                exchange_asset
+                    .asset
+                    .name_exchange
+                    .name()
+                    .to_ascii_lowercase_smolstr(),
+            );
+            if let Some(previous) = asset_exchange_names.insert(key, exchange_asset) {
+                return Err(IndexError::DuplicateAssetNameExchange(format!(
+                    "{} and {} on {} name the distinct assets with name_internal {} and {} - \
+                     every asset on an exchange requires a name_exchange unique ignoring ASCII \
+                     case, since that is the name the exchange reports it by",
+                    previous.asset.name_exchange,
+                    exchange_asset.asset.name_exchange,
+                    // `as_str`, not `Display`: the canonical snake_case spelling users write in
+                    // configs, rather than the bare variant name.
+                    exchange_asset.exchange.as_str(),
+                    previous.asset.name_internal,
+                    exchange_asset.asset.name_internal,
                 )));
             }
         }
@@ -756,6 +805,76 @@ mod tests {
         // Both spellings are named: they are the only thing telling the operator what collided.
         assert!(message.contains("USDT"), "{message}");
         assert!(message.contains("usdt.e"), "{message}");
+    }
+
+    #[test]
+    fn two_instruments_whose_name_exchange_differs_only_in_case_are_rejected() {
+        let mut lower = aapl_on_ibkr("ibkr-aapl-cfd", aapl_cfd());
+        lower.name_exchange = InstrumentNameExchange::new("aapl");
+
+        let error = IndexedInstrumentsBuilder::default()
+            .add_instrument(aapl_on_ibkr("ibkr-aapl", InstrumentKind::Spot))
+            .add_instrument(lower)
+            .try_build()
+            .expect_err("names that differ only in case are one name to the lookup");
+
+        let IndexError::DuplicateInstrumentNameExchange(message) = &error else {
+            panic!("unexpected error variant: {error:?}")
+        };
+        // Both spellings are named, and the message says why they collide.
+        assert!(message.contains("AAPL"), "{message}");
+        assert!(message.contains("aapl"), "{message}");
+        assert!(message.contains("ignoring case"), "{message}");
+    }
+
+    #[test]
+    fn two_assets_whose_name_exchange_differs_only_in_case_are_rejected() {
+        let error = IndexedInstrumentsBuilder::default()
+            .add_instrument(spot_quoted_in("btc", "USDT"))
+            .add_instrument(Instrument::spot(
+                ExchangeId::BinanceSpot,
+                "binance_spot-eth_tether",
+                "ETHTETHER",
+                Underlying::new(
+                    Asset::new_from_exchange("eth"),
+                    Asset::new("tether", "usdt"),
+                ),
+                None,
+            ))
+            .try_build()
+            .expect_err("an (exchange, name_exchange) asset collision must be rejected");
+
+        let IndexError::DuplicateAssetNameExchange(message) = &error else {
+            panic!("unexpected error variant: {error:?}")
+        };
+        assert!(message.contains("USDT"), "{message}");
+        assert!(message.contains("usdt"), "{message}");
+        assert!(message.contains("tether"), "{message}");
+        assert!(message.contains("binance_spot"), "{message}");
+    }
+
+    #[test]
+    fn two_assets_sharing_a_name_exchange_exactly_are_rejected() {
+        // Before the name_exchange check, this pair built: two AssetIndex slots under one venue
+        // name, of which the execution lookup could resolve only one.
+        let result = IndexedInstruments::try_new([
+            spot_quoted_in("btc", "USDT"),
+            Instrument::spot(
+                ExchangeId::BinanceSpot,
+                "binance_spot-eth_tether",
+                "ETHUSDT",
+                Underlying::new(
+                    Asset::new_from_exchange("eth"),
+                    Asset::new("tether", "USDT"),
+                ),
+                None,
+            ),
+        ]);
+
+        assert!(
+            matches!(result, Err(IndexError::DuplicateAssetNameExchange(_))),
+            "{result:?}"
+        );
     }
 
     #[test]

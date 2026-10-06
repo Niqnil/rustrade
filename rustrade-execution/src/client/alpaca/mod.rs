@@ -121,6 +121,10 @@ const MAX_RATE_LIMIT_ATTEMPTS: u32 = 4;
 /// the last 2,000 fills. Each key is a ~40–70 byte string (a UUID, or a UUID and a decimal):
 /// 4_000 keys ≈ 250 KB — ample for options trading fill rates.
 const DEDUP_CACHE_SIZE: usize = 4_000;
+
+/// The account currency, named as Alpaca spells it. Every USD balance and fee is reported under
+/// it.
+const USD: &str = "USD";
 /// Timeout for the initial WS auth+subscribe handshake.
 const WS_HANDSHAKE_TIMEOUT_SECS: u64 = 15;
 /// Timeout for a graceful WS close. Prevents indefinite blocking when the
@@ -1462,14 +1466,8 @@ impl ExecutionClient for AlpacaClient {
         let http = self.http.clone();
         let rl = &self.rate_limiter;
 
-        let wants_usd = assets.is_empty()
-            || assets
-                .iter()
-                .any(|a| a.name().as_str().eq_ignore_ascii_case("usd"));
-        let wants_non_usd = assets.is_empty()
-            || assets
-                .iter()
-                .any(|a| !a.name().as_str().eq_ignore_ascii_case("usd"));
+        let wants_usd = assets.is_empty() || assets.iter().any(is_usd);
+        let wants_non_usd = assets.is_empty() || assets.iter().any(|a| !is_usd(a));
 
         // URLs are extracted before the closures to avoid re-allocating on each retry attempt.
         let account_url = format!("{base}/v2/account");
@@ -1800,10 +1798,7 @@ impl ExecutionClient for AlpacaClient {
 
         // Only fetch the account (USD balance) when USD is among the requested assets.
         // Crypto-only requests skip this call to conserve rate-limit budget.
-        let wants_usd = assets.is_empty()
-            || assets
-                .iter()
-                .any(|a| a.name().as_str().eq_ignore_ascii_case("usd"));
+        let wants_usd = assets.is_empty() || assets.iter().any(is_usd);
         if wants_usd {
             // Pre-allocate URL to avoid re-allocation on each retry attempt.
             let account_url = format!("{base}/v2/account");
@@ -1813,10 +1808,7 @@ impl ExecutionClient for AlpacaClient {
         }
 
         // Fetch positions for non-USD asset balances (e.g., BTC, ETH from crypto holdings).
-        let wants_non_usd = assets.is_empty()
-            || assets
-                .iter()
-                .any(|a| !a.name().as_str().eq_ignore_ascii_case("usd"));
+        let wants_non_usd = assets.is_empty() || assets.iter().any(|a| !is_usd(a));
         if wants_non_usd {
             // Pre-allocate URL to avoid re-allocation on each retry attempt.
             let positions_url = format!("{base}/v2/positions");
@@ -3705,6 +3697,12 @@ fn alpaca_avg_price(filled_avg_price: Option<&str>) -> Option<Decimal> {
 // Type conversion helpers
 // ---------------------------------------------------------------------------
 
+/// Whether a caller's `asset` names the account currency. A name a caller passes is matched
+/// ignoring case, as the execution map matches the names this client reports.
+fn is_usd(asset: &AssetNameExchange) -> bool {
+    asset.name().as_str().eq_ignore_ascii_case(USD)
+}
+
 /// Convert an Alpaca account response to rustrade balance entries.
 ///
 /// Returns a single USD balance with:
@@ -3719,29 +3717,19 @@ fn alpaca_avg_price(filled_avg_price: Option<&str>) -> Option<Decimal> {
 /// Account equity is not the total: equity and option holdings are reported as positions, and
 /// counting them again here would double them.
 ///
-/// If `assets` is non-empty, only returns the balance if "usd" (case-insensitive)
-/// is in the requested set. An empty `assets` slice returns the USD balance unconditionally.
+/// The balance is named [`USD`], however the caller spelled it. If `assets` is non-empty, it is
+/// returned only when USD is among them, matched ignoring case. An empty `assets` slice returns it
+/// unconditionally.
 fn convert_account_to_balances(
     account: &AlpacaAccount,
     assets: &[AssetNameExchange],
 ) -> Vec<AssetBalance<AssetNameExchange>> {
-    // Preserve the caller's casing for the USD asset name (e.g. "USD" vs "usd").
-    // When no filter is given, fall back to lowercase "usd" as the canonical form.
-    let usd_entry = assets
-        .iter()
-        .find(|a| a.name().as_str().eq_ignore_ascii_case("usd"));
-
-    // Filter check: if assets is specified, only return USD balance if requested.
-    if !assets.is_empty() && usd_entry.is_none() {
+    if !assets.is_empty() && !assets.iter().any(is_usd) {
         return Vec::new();
     }
 
-    let usd_name = usd_entry
-        .cloned()
-        .unwrap_or_else(|| AssetNameExchange::new("usd"));
-
     vec![AssetBalance::new(
-        usd_name,
+        AssetNameExchange::new(USD),
         Balance::new(
             account.cash,
             account.cash.min(account.non_marginable_buying_power),
@@ -3753,7 +3741,8 @@ fn convert_account_to_balances(
 /// Convert Alpaca positions to crypto asset balance entries.
 ///
 /// Only positions with `asset_class == "crypto"` are included; [`convert_positions`] reports the
-/// rest. The base asset is extracted from the symbol (e.g., `"BTC/USD"` → `"btc"`).
+/// rest. The base asset is extracted from the symbol, as Alpaca spells it (e.g., `"BTC/USD"` →
+/// `"BTC"`).
 ///
 /// - `total` = quantity of the holding in base currency units (e.g. 0.5 BTC)
 /// - `free`  = qty_available (base currency units not locked in open orders)
@@ -3771,18 +3760,13 @@ fn convert_positions_to_balances(
         .filter_map(|p| {
             // Alpaca crypto symbols are "BASE/QUOTE" (e.g., "BTC/USD").
             // Extract the base currency as the asset name.
-            let base = p
-                .symbol
-                .split('/')
-                .next()
-                .map(|s| s.to_ascii_lowercase())
-                .unwrap_or_else(|| p.symbol.to_ascii_lowercase());
+            let base = p.symbol.split('/').next().unwrap_or(&p.symbol);
 
             // Apply assets filter if specified.
             if !assets.is_empty()
                 && !assets
                     .iter()
-                    .any(|a| a.name().as_str().eq_ignore_ascii_case(&base))
+                    .any(|a| a.name().as_str().eq_ignore_ascii_case(base))
             {
                 return None;
             }
@@ -4086,7 +4070,7 @@ fn convert_activity_to_trade(
         quantity,
         order_filled_quantity,
         AssetFees::new(
-            AssetNameExchange::from("USD"),
+            AssetNameExchange::from(USD),
             Decimal::ZERO,
             Some(Decimal::ZERO),
         ),
@@ -4220,7 +4204,7 @@ fn trade_amendment_event(
                         None,
                         // As on a fill: no fee info in WebSocket updates.
                         AssetFees::new(
-                            AssetNameExchange::from("USD"),
+                            AssetNameExchange::from(USD),
                             Decimal::ZERO,
                             Some(Decimal::ZERO),
                         ),
@@ -4345,7 +4329,7 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
                 // The venue's own cumulative for this order, as of this execution.
                 Some(cum_qty),
                 AssetFees::new(
-                    AssetNameExchange::from("USD"),
+                    AssetNameExchange::from(USD),
                     Decimal::ZERO,
                     Some(Decimal::ZERO),
                 ),
@@ -5408,7 +5392,7 @@ mod tests {
         .unwrap();
         let balances = convert_account_to_balances(&account, &[]);
         assert_eq!(balances.len(), 1);
-        assert_eq!(balances[0].asset, AssetNameExchange::new("usd"));
+        assert_eq!(balances[0].asset, AssetNameExchange::new("USD"));
         assert_eq!(balances[0].balance.total, dec!(9000.50), "total is cash");
         assert_eq!(
             balances[0].balance.free,
@@ -5492,6 +5476,19 @@ mod tests {
         let non_usd = vec![AssetNameExchange::new("BTC")];
         let balances = convert_account_to_balances(&account, &non_usd);
         assert!(balances.is_empty());
+    }
+
+    /// A caller's filter is matched ignoring case, but the balance keeps Alpaca's spelling, the
+    /// one every USD fee is reported under too.
+    #[test]
+    fn a_usd_balance_is_named_usd_however_the_filter_spells_it() {
+        let account = AlpacaAccount {
+            cash: dec!(12000.00),
+            non_marginable_buying_power: dec!(10000.00),
+        };
+        let balances = convert_account_to_balances(&account, &[AssetNameExchange::new("usd")]);
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].asset, AssetNameExchange::new("USD"));
     }
 
     #[test]
@@ -5945,16 +5942,16 @@ mod tests {
         // All crypto assets
         let balances = convert_positions_to_balances(&positions, &[]);
         assert_eq!(balances.len(), 2, "only crypto positions returned");
-        assert_eq!(balances[0].asset.name().as_str(), "btc");
+        assert_eq!(balances[0].asset.name().as_str(), "BTC");
         // total = qty (0.5 BTC), free = qty_available (0.4 BTC)
         assert_eq!(balances[0].balance.total, dec!(0.5));
         assert_eq!(balances[0].balance.free, dec!(0.4));
 
         // Filter to BTC only
-        let btc_only = vec![AssetNameExchange::new("BTC")];
+        let btc_only = vec![AssetNameExchange::new("btc")];
         let balances = convert_positions_to_balances(&positions, &btc_only);
         assert_eq!(balances.len(), 1);
-        assert_eq!(balances[0].asset.name().as_str(), "btc");
+        assert_eq!(balances[0].asset.name().as_str(), "BTC");
     }
 
     /// A position as `/v2/positions` reports it, with `qty_available` equal to `qty`.
@@ -7298,8 +7295,8 @@ mod tests {
             assert_eq!(
                 balances,
                 vec![
-                    ("usd", dec!(-1500.50), dec!(-1500.50)),
-                    ("btc", dec!(0.75), dec!(0.5)),
+                    ("USD", dec!(-1500.50), dec!(-1500.50)),
+                    ("BTC", dec!(0.75), dec!(0.5)),
                 ],
                 "crypto stays a balance; equities and options do not appear as balances"
             );
@@ -7373,7 +7370,7 @@ mod tests {
                 .unwrap();
 
             assert_eq!(snapshot.balances.len(), 1);
-            assert_eq!(snapshot.balances[0].asset, AssetNameExchange::new("btc"));
+            assert_eq!(snapshot.balances[0].asset, AssetNameExchange::new("BTC"));
             let requests = server.received_requests().await.unwrap();
             assert!(
                 requests.iter().all(|r| r.url.path() != "/v2/account"),

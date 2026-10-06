@@ -8,6 +8,8 @@ use rustrade_instrument::{
     instrument::{Instrument, InstrumentIndex, name::InstrumentNameExchange},
 };
 use rustrade_integration::collection::FnvIndexSet;
+use smol_str::{SmolStr, StrExt};
+use tracing::{debug, warn};
 
 /// Indexed instrument map used to associate the internal Barter representation of instruments and
 /// assets with the [`ExecutionClient`](super::client::ExecutionClient) representation.
@@ -18,6 +20,14 @@ use rustrade_integration::collection::FnvIndexSet;
 ///
 /// eg/ `InstrumentNameExchange("XBT-USDT")` <--> `InstrumentIndex(1)` <br>
 /// eg/ `AssetNameExchange("XBT")` <--> `AssetIndex(1)`
+///
+/// # Names are matched ignoring ASCII case
+/// [`Self::find_asset_index`] and [`Self::find_instrument_index`] resolve a name the way it was
+/// registered first, and failing that ignoring ASCII case. Venues and clients do not always spell a
+/// name the way it was registered (`usd` against `USD`), and a name that fails to resolve loses the
+/// event carrying it. Ignoring case cannot merge two registered names, because
+/// [`IndexedInstruments`] rejects two on one exchange that differ only in case. The lookups in the
+/// other direction, from an index to a name, return the registered spelling.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ExecutionInstrumentMap {
     /// The exchange associated with this execution map.
@@ -28,12 +38,20 @@ pub struct ExecutionInstrumentMap {
     /// Collection of instruments available by the engine. This holds all
     /// indexed instruments.
     pub instruments: FnvIndexSet<Instrument<Keyed<ExchangeIndex, ExchangeId>, AssetIndex>>,
-    /// Map from exchange-specific asset names to internal asset indices for
-    /// fast lookups.
-    pub asset_names: FnvHashMap<AssetNameExchange, AssetIndex>,
-    /// Map from exchange-specific instrument names to internal instrument
-    /// indices for fast lookups.
-    pub instrument_names: FnvHashMap<InstrumentNameExchange, InstrumentIndex>,
+    /// Map from exchange-specific asset names, as registered, to internal asset indices.
+    ///
+    /// Private, with [`Self::asset_names_folded`], because that index is derived from this map: a
+    /// change to one alone would make the exact and case-insensitive lookups disagree.
+    asset_names: FnvHashMap<AssetNameExchange, AssetIndex>,
+    /// Map from exchange-specific instrument names, as registered, to internal instrument indices.
+    ///
+    /// Private for the reason [`Self::asset_names`] is.
+    instrument_names: FnvHashMap<InstrumentNameExchange, InstrumentIndex>,
+    /// [`Self::asset_names`] keyed by the ASCII-lowercased name, for the case-insensitive lookup.
+    asset_names_folded: FnvHashMap<SmolStr, AssetIndex>,
+    /// [`Self::instrument_names`] keyed by the ASCII-lowercased name, for the case-insensitive
+    /// lookup.
+    instrument_names_folded: FnvHashMap<SmolStr, InstrumentIndex>,
 }
 
 impl ExecutionInstrumentMap {
@@ -42,7 +60,7 @@ impl ExecutionInstrumentMap {
         exchange: Keyed<ExchangeIndex, ExchangeId>,
         instruments: &IndexedInstruments,
     ) -> Self {
-        let asset_names = instruments
+        let asset_names: FnvHashMap<AssetNameExchange, AssetIndex> = instruments
             .assets()
             .iter()
             .filter_map(|Keyed { key, value }| {
@@ -57,7 +75,7 @@ impl ExecutionInstrumentMap {
             .map(|Keyed { value, .. }| value.clone())
             .collect();
 
-        let instrument_names = instruments
+        let instrument_names: FnvHashMap<InstrumentNameExchange, InstrumentIndex> = instruments
             .instruments()
             .iter()
             .filter_map(|Keyed { key, value }| {
@@ -65,6 +83,17 @@ impl ExecutionInstrumentMap {
                     .then_some((value.name_exchange.clone(), *key))
             })
             .collect();
+
+        let asset_names_folded = fold_names(
+            asset_names
+                .iter()
+                .map(|(name, index)| (name.name().as_str(), *index)),
+        );
+        let instrument_names_folded = fold_names(
+            instrument_names
+                .iter()
+                .map(|(name, index)| (name.name().as_str(), *index)),
+        );
 
         let instruments = instruments
             .instruments()
@@ -78,13 +107,17 @@ impl ExecutionInstrumentMap {
             instrument_names,
             assets,
             instruments,
+            asset_names_folded,
+            instrument_names_folded,
         }
     }
 
+    /// The names of this exchange's assets, as registered.
     pub fn exchange_assets(&self) -> impl Iterator<Item = &AssetNameExchange> {
         self.asset_names.keys()
     }
 
+    /// The names of this exchange's instruments, as registered.
     pub fn exchange_instruments(&self) -> impl Iterator<Item = &InstrumentNameExchange> {
         self.instrument_names.keys()
     }
@@ -121,10 +154,27 @@ impl ExecutionInstrumentMap {
             .map(|asset| &asset.asset.name_exchange)
     }
 
+    /// Find the [`AssetIndex`] of the asset this exchange reports as `asset`.
+    ///
+    /// Matches the registered spelling first, and failing that ignores ASCII case, logging the
+    /// case-insensitive match at `debug!` with both spellings. See the
+    /// [type-level note](Self#names-are-matched-ignoring-ascii-case).
     pub fn find_asset_index(&self, asset: &AssetNameExchange) -> Result<AssetIndex, IndexError> {
-        self.asset_names.get(asset).copied().ok_or_else(|| {
+        if let Some(index) = self.asset_names.get(asset) {
+            return Ok(*index);
+        }
+
+        let index = find_folded(&self.asset_names_folded, asset.name()).ok_or_else(|| {
             IndexError::AssetIndex(format!("ExecutionInstrumentMap does not contain: {asset}"))
-        })
+        })?;
+
+        debug!(
+            exchange = %self.exchange.value,
+            reported = %asset,
+            registered = ?self.find_asset_name_exchange(index).ok(),
+            "ExecutionInstrumentMap matched an asset name ignoring case"
+        );
+        Ok(index)
     }
 
     pub fn find_instrument_name_exchange(
@@ -141,19 +191,68 @@ impl ExecutionInstrumentMap {
             .map(|instrument| &instrument.name_exchange)
     }
 
+    /// Find the [`InstrumentIndex`] of the instrument this exchange reports as `instrument`.
+    ///
+    /// Matches the registered spelling first, and failing that ignores ASCII case, logging the
+    /// case-insensitive match at `debug!` with both spellings. See the
+    /// [type-level note](Self#names-are-matched-ignoring-ascii-case).
     pub fn find_instrument_index(
         &self,
         instrument: &InstrumentNameExchange,
     ) -> Result<InstrumentIndex, IndexError> {
-        self.instrument_names
-            .get(instrument)
-            .copied()
-            .ok_or_else(|| {
+        if let Some(index) = self.instrument_names.get(instrument) {
+            return Ok(*index);
+        }
+
+        let index =
+            find_folded(&self.instrument_names_folded, instrument.name()).ok_or_else(|| {
                 IndexError::InstrumentIndex(format!(
                     "ExecutionInstrumentMap does not contain: {instrument}"
                 ))
-            })
+            })?;
+
+        debug!(
+            exchange = %self.exchange.value,
+            reported = %instrument,
+            registered = ?self.find_instrument_name_exchange(index).ok(),
+            "ExecutionInstrumentMap matched an instrument name ignoring case"
+        );
+        Ok(index)
     }
+}
+
+/// Key each name by its ASCII-lowercased form.
+///
+/// A key two names share is left out, with a `warn!`, so a lookup by it misses rather than picks
+/// one of them. [`IndexedInstruments`] rejects such a pair on one exchange, so this guards only an
+/// invariant.
+fn fold_names<'a, Index>(
+    names: impl Iterator<Item = (&'a str, Index)>,
+) -> FnvHashMap<SmolStr, Index> {
+    let mut folded = FnvHashMap::default();
+    let mut shared = Vec::new();
+    for (name, index) in names {
+        let key = name.to_ascii_lowercase_smolstr();
+        if folded.insert(key.clone(), index).is_some() {
+            shared.push(key);
+        }
+    }
+    shared.sort_unstable();
+    shared.dedup();
+    for key in shared {
+        warn!(
+            name = %key,
+            "ExecutionInstrumentMap holds names that differ only in case - none resolves \
+             ignoring case"
+        );
+        folded.remove(&key);
+    }
+    folded
+}
+
+/// Look `name` up in a map built by [`fold_names`].
+fn find_folded<Index: Copy>(folded: &FnvHashMap<SmolStr, Index>, name: &str) -> Option<Index> {
+    folded.get(&name.to_ascii_lowercase_smolstr()).copied()
 }
 
 pub fn generate_execution_instrument_map(
@@ -387,5 +486,74 @@ mod tests {
         let result = generate_execution_instrument_map(&instruments, ExchangeId::Bitstamp);
         assert!(result.is_err());
         assert!(matches!(result, Err(IndexError::ExchangeIndex(_))));
+    }
+
+    #[test]
+    fn an_asset_name_in_another_case_resolves_to_the_registered_asset() {
+        let instruments = indexed_instruments();
+        let kraken = generate_execution_instrument_map(&instruments, ExchangeId::Kraken).unwrap();
+
+        let registered = kraken
+            .find_asset_index(&AssetNameExchange::new("USDT"))
+            .unwrap();
+
+        for reported in ["usdt", "Usdt", "uSdT"] {
+            assert_eq!(
+                kraken.find_asset_index(&AssetNameExchange::new(reported)),
+                Ok(registered),
+                "{reported}"
+            );
+        }
+        // The other direction keeps the registered spelling.
+        assert_eq!(
+            kraken.find_asset_name_exchange(registered).unwrap().name(),
+            "USDT"
+        );
+    }
+
+    #[test]
+    fn an_instrument_name_in_another_case_resolves_to_the_registered_instrument() {
+        let instruments = indexed_instruments();
+        let kraken = generate_execution_instrument_map(&instruments, ExchangeId::Kraken).unwrap();
+
+        let registered = kraken
+            .find_instrument_index(&InstrumentNameExchange::new("USDC_USDT"))
+            .unwrap();
+
+        assert_eq!(
+            kraken.find_instrument_index(&InstrumentNameExchange::new("usdc_usdt")),
+            Ok(registered)
+        );
+        assert_eq!(
+            kraken
+                .find_instrument_name_exchange(registered)
+                .unwrap()
+                .name(),
+            "USDC_USDT"
+        );
+    }
+
+    #[test]
+    fn ignoring_case_does_not_reach_another_exchanges_names() {
+        let instruments = indexed_instruments();
+        let kraken = generate_execution_instrument_map(&instruments, ExchangeId::Kraken).unwrap();
+
+        // `BTC` and `BTC_ETH` are registered, but on Binance and Coinbase only.
+        assert!(matches!(
+            kraken.find_asset_index(&AssetNameExchange::new("btc")),
+            Err(IndexError::AssetIndex(_))
+        ));
+        assert!(matches!(
+            kraken.find_instrument_index(&InstrumentNameExchange::new("btc_eth")),
+            Err(IndexError::InstrumentIndex(_))
+        ));
+    }
+
+    #[test]
+    fn a_folded_name_two_names_share_resolves_to_neither() {
+        let folded = fold_names([("USD", 0), ("usd", 1), ("BTC", 2)].into_iter());
+
+        assert_eq!(find_folded(&folded, "Usd"), None);
+        assert_eq!(find_folded(&folded, "btc"), Some(2));
     }
 }

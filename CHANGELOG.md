@@ -207,6 +207,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A name a venue spelled in another case failed to index** (`rustrade-execution`,
+  `rustrade-instrument`, `rustrade`). `ExecutionInstrumentMap` matched asset and instrument names
+  exactly, case included, but venues and clients do not always spell a name the way it was
+  registered. An event naming one in another case was dropped or degraded. Alpaca reported a
+  crypto balance as `btc`, the USD balance as `usd` unless the caller's filter spelled it
+  otherwise, and every USD fee as `USD`, so no registered spelling resolved all three. A registered
+  `spy` failed against Alpaca's `SPY`, and IBKR reports currencies as `USD`. Now:
+  - `find_asset_index` and `find_instrument_index` match the registered spelling first, then
+    ignore ASCII case, logging such a match at `debug!` with both spellings. The lookups from an
+    index to a name still return the registered spelling.
+  - `VenuePositionSeeds::from_account_snapshot` matches a venue's instrument name the same way.
+  - Alpaca names the USD balance `USD`, and a crypto balance by its base as Alpaca spells it
+    (`BTC`), however the caller's filter spelled them.
+  - **Breaking:**
+    - `IndexedInstruments` rejects two instruments on one exchange whose `name_exchange`s differ
+      only in case (`IndexError::DuplicateInstrumentNameExchange`), and two distinct assets on one
+      exchange whose `name_exchange`s match ignoring case (the new
+      `IndexError::DuplicateAssetNameExchange`). The asset check also rejects two assets sharing a
+      `name_exchange` exactly under different `name_internal`s, which built before and left one
+      of them unreachable by name.
+    - `ExecutionInstrumentMap::asset_names` and `instrument_names` are private, since the
+      case-insensitive index is derived from them, and the map can no longer be built with a struct
+      literal: use `ExecutionInstrumentMap::new`. `exchange_assets()` and `exchange_instruments()`
+      still list the registered names.
+    - Alpaca's balance asset names change spelling: `usd` becomes `USD`, `btc` becomes `BTC`.
+
 - **IBKR delivered a corrected execution as a second fill** (`rustrade-execution`, feature
   `ibkr`). IB reports a correction as a further execution whose id differs only in the digits
   after the final period (`….01.02` corrects `….01.01`). The account stream and fill recovery
@@ -388,7 +414,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   built before and is now rejected; register each instrument under the name its venue tells it
   apart by (IBKR's `AAPL` and `AAPL.CFD`, say). Instruments built from a `SystemConfig` were not
   affected, since their `name_internal` is derived from `name_exchange`. `IndexError` is
-  `#[non_exhaustive]`.
+  `#[non_exhaustive]`. Names that differ only in case count as one, since the execution lookup
+  ignores case.
   - A collision error now names every field on which the two instruments differ, so two that
     differ only in, say, their underlying no longer read as `BTCUSD (Spot) and BTCUSD (Spot)`.
 
