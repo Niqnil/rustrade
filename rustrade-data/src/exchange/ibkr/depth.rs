@@ -17,24 +17,6 @@ use super::decimal_from_f64;
 /// IB API depth operation: delete level at price
 const IB_DEPTH_OP_DELETE: i32 = 2;
 
-/// IB notice code 317, "Market depth data has been RESET. Please empty deep book
-/// contents before applying any new entries."
-///
-/// TWS has discarded the book on its side; every level held locally is stale and
-/// must be dropped before the updates that follow are applied. The subscription
-/// stays open — `ibapi` classifies 317 as a data advisory, not an error.
-///
-/// `ibapi` exposes no named constant for it, only membership in
-/// `ibapi::messages::DATA_ADVISORY_CODES`, so the code is spelled out here.
-///
-/// Its sibling 316 ("HALTED") is terminal: the subscription ends with an error
-/// and the caller re-subscribes, which the stream's error arm already handles.
-///
-/// Public because [`DepthAggregator`] is: a caller driving the aggregator from
-/// their own subscription loop must match this code and call
-/// [`DepthAggregator::on_venue_reset`]. The stream in this module already does.
-pub const IB_MARKET_DEPTH_RESET_CODE: i32 = 317;
-
 /// Aggregates IB market depth updates into OrderBook snapshots.
 ///
 /// Maintains local order book state and emits updates on each depth event.
@@ -58,11 +40,9 @@ impl DepthAggregator {
     /// MarketDepthL2 updates (which include market maker attribution that we
     /// don't track — we aggregate into a simple anonymous book).
     ///
-    /// Note: as of ibapi 3.x, server notices are delivered through the
-    /// subscription's `SubscriptionItem::Notice` arm rather than as a variant of
-    /// [`MarketDepths`], so they never reach this method. The venue-reset notice
-    /// is therefore handled by the caller, which calls [`Self::on_venue_reset`];
-    /// see that method for why dropping the notice is not an option.
+    /// [`MarketDepths::Reset`] (IB code 317) empties the book through
+    /// [`Self::on_venue_reset`] and returns the emptied snapshot, which the caller must
+    /// forward at once: see that method for why.
     ///
     /// `time_received` is the local ingestion wall-clock; it is threaded in from
     /// the caller so the emitted book's `time_received` matches the
@@ -81,6 +61,7 @@ impl DepthAggregator {
                 tracing::trace!("Discarding MarketDepthL2 event (market maker data not tracked)");
                 None
             }
+            MarketDepths::Reset => Some(self.on_venue_reset(time_received)),
         }
     }
 
@@ -157,10 +138,10 @@ impl DepthAggregator {
         )
     }
 
-    /// Drop every level in response to IB notice 317 and emit the emptied book.
+    /// Drop every level in response to [`MarketDepths::Reset`] and emit the emptied book.
     ///
-    /// TWS sends [`IB_MARKET_DEPTH_RESET_CODE`] when it discards the book on its
-    /// side. Every level held locally is stale from that moment, so continuing to
+    /// TWS sends the reset (IB code 317, "Market depth data has been RESET") when it
+    /// discards the book on its side, and the subscription stays open. Every level held locally is stale from that moment, so continuing to
     /// apply updates to them produces a book that looks live and is not — the one
     /// failure mode worse than no book at all.
     ///
@@ -412,6 +393,24 @@ mod tests {
         match event {
             OrderBookEvent::Snapshot(book) => assert_eq!(book.sequence(), 4),
             _ => panic!("Expected Snapshot"),
+        }
+    }
+
+    #[test]
+    fn a_reset_update_empties_the_book_like_a_venue_reset() {
+        let mut agg = DepthAggregator::new();
+        agg.update(&depth(1, 0, 100.0, 10.0), tr());
+        agg.update(&depth(0, 0, 101.0, 8.0), tr());
+
+        let event = agg.update(&MarketDepths::Reset, tr());
+
+        assert!(agg.bids.levels().is_empty() && agg.asks.levels().is_empty());
+        match event {
+            Some(OrderBookEvent::Snapshot(book)) => {
+                assert!(book.bids().levels().is_empty() && book.asks().levels().is_empty());
+                assert_eq!(book.sequence(), 3, "the reset advances the sequence");
+            }
+            other => panic!("Expected the emptied Snapshot, got {other:?}"),
         }
     }
 

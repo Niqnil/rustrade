@@ -1056,7 +1056,8 @@ impl IbkrClient {
 
         // Build bracket orders with OCA linking
         let action = side_to_action(request.side);
-        let ib_orders = build_ib_bracket_with_oca(
+        // Nothing has been sent yet, so on an error the three allocated IDs are simply skipped.
+        let ib_orders = match build_ib_bracket_with_oca(
             parent_ib_id,
             action,
             quantity,
@@ -1064,7 +1065,15 @@ impl IbkrClient {
             tp_price,
             sl_price,
             ib_tif,
-        );
+        ) {
+            Ok(orders) => orders,
+            Err(e) => {
+                return make_all_inactive_bracket(
+                    &request,
+                    OrderError::Rejected(ApiError::OrderRejected(e.to_string())),
+                );
+            }
+        };
 
         // Generate client order IDs for children
         let parent_cid = request.parent_cid.clone();
