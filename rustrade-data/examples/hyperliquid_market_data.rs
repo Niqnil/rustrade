@@ -3,6 +3,10 @@
 //! Demonstrates how to subscribe to public trades and L2 order book snapshots
 //! from Hyperliquid perpetual futures. Exits after receiving a few events.
 //!
+//! Trades are subscribed by asset name, which works for an all-capitals coin such as `BTC`.
+//! Books are subscribed by the coins [`HyperliquidMeta`] reads, which also covers a mixed-case
+//! coin (`kPEPE`) and a builder-deployed (HIP-3) one (`xyz:TSLA`).
+//!
 //! Run with: `cargo run --example hyperliquid_market_data --features hyperliquid`
 
 // Example binary: panics are acceptable for demonstration code.
@@ -10,10 +14,11 @@
 
 use futures_util::StreamExt;
 use rustrade_data::{
-    exchange::hyperliquid::Hyperliquid,
+    exchange::hyperliquid::{Hyperliquid, HyperliquidMeta, Network},
+    instrument::MarketInstrumentData,
     streams::{Streams, reconnect::stream::ReconnectingStream},
     subscriber::WebSocketSubscriber,
-    subscription::{book::OrderBooksL2, trade::PublicTrades},
+    subscription::{Subscription, book::OrderBooksL2, trade::PublicTrades},
 };
 use rustrade_instrument::instrument::market_data::kind::MarketDataInstrumentKind;
 use tracing::{info, warn};
@@ -50,26 +55,28 @@ async fn main() {
         .await
         .unwrap();
 
+    // Read the coins, including builder deployer `xyz`'s perpetuals, and find two by name.
+    // `perp_coin` ignores case and returns Hyperliquid's spelling.
+    let meta = HyperliquidMeta::fetch(Network::Mainnet, &["xyz"])
+        .await
+        .expect("Failed to read Hyperliquid market metadata");
+    let book_instruments = [("kpepe", "KPEPE"), ("xyz_tsla", "xyz:TSLA")].map(|(key, name)| {
+        let perp = meta
+            .perp_coin(name)
+            .unwrap_or_else(|| panic!("Hyperliquid lists no perpetual {name}"));
+        info!("{name} is subscribed as {}", perp.coin());
+        MarketInstrumentData::hyperliquid_perp(key, perp)
+    });
+
     // Subscribe to L2 order book snapshots
     let books = Streams::<OrderBooksL2>::builder()
         .subscribe(
             WebSocketSubscriber,
-            [
-                (
-                    Hyperliquid,
-                    "btc",
-                    "usdc",
-                    MarketDataInstrumentKind::Perpetual,
-                    OrderBooksL2,
-                ),
-                (
-                    Hyperliquid,
-                    "eth",
-                    "usdc",
-                    MarketDataInstrumentKind::Perpetual,
-                    OrderBooksL2,
-                ),
-            ],
+            book_instruments.map(|instrument| Subscription {
+                exchange: Hyperliquid,
+                instrument,
+                kind: OrderBooksL2,
+            }),
         )
         .init()
         .await
@@ -84,7 +91,7 @@ async fn main() {
         .select_all()
         .with_error_handler(|error| warn!(?error, "Book stream error"));
 
-    info!("Subscribed to Hyperliquid BTC and ETH trades + L2 books");
+    info!("Subscribed to Hyperliquid BTC and ETH trades, kPEPE and xyz:TSLA L2 books");
     info!("Receiving {} events then exiting...", MAX_EVENTS);
 
     let mut event_count = 0;

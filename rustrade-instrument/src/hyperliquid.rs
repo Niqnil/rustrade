@@ -9,9 +9,13 @@
 //!
 //! [`CoinKind::of`] tells these apart from the name alone. A spot coin such as `@107` does not
 //! name its assets, so [`SpotPairs`], read from Hyperliquid's `spotMeta` info response, resolves
-//! it to its base and quote.
+//! it to its base and quote. [`Perps`], read from its `meta` info responses, lists the
+//! perpetuals and finds one by name whatever its case.
+//!
+//! Every type here is I/O-free: they deserialize from the info responses, which the data and
+//! execution integrations read.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use std::collections::HashMap;
 
@@ -59,6 +63,106 @@ impl CoinKind {
     }
 }
 
+/// A Hyperliquid network. Serialized in lower case (`"mainnet"`, `"testnet"`).
+///
+/// No default: whether an unset network should mean real funds or test funds is the caller's
+/// choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Network {
+    /// Hyperliquid's mainnet, where real funds trade.
+    Mainnet,
+    /// Hyperliquid's testnet. Its markets, and their indexes, differ from mainnet's.
+    Testnet,
+}
+
+/// Hyperliquid's perpetuals, by coin, as its `meta` info responses list them.
+///
+/// Deserializes from one `meta` response, `{"universe": [...], ...}`, which lists either the
+/// default perpetuals or, read with a `dex` field, one builder deployer's (HIP-3) perpetuals,
+/// named `deployer:ASSET`. Collect several sets, such as the defaults and each deployer's, into
+/// one with [`FromIterator`]. A coin listed twice keeps the later listing; the default and
+/// deployers' sets cannot share a coin, as a deployer's carry its prefix.
+///
+/// Delisted perpetuals are kept, marked by [`PerpCoin::is_delisted`]: their names stay taken.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(from = "PerpMeta")]
+pub struct Perps(HashMap<SmolStr, PerpCoin>);
+
+impl Perps {
+    /// The perpetual named `name`, as Hyperliquid spells it (`kPEPE`, `xyz:TSLA`) or differing
+    /// from that only in ASCII case (`KPEPE`, `XYZ:tsla`).
+    ///
+    /// An exact match wins. Otherwise a name that matches several perpetuals once case is
+    /// ignored matches none of them, rather than one picked arbitrarily. Hyperliquid lists no
+    /// such pair today (checked against mainnet, October 2026).
+    ///
+    /// May return a delisted perpetual: check [`PerpCoin::is_delisted`].
+    pub fn get(&self, name: &str) -> Option<&PerpCoin> {
+        self.0
+            .get(name)
+            .or_else(|| unique(self.0.values(), |perp| perp.coin.eq_ignore_ascii_case(name)))
+    }
+
+    /// The number of perpetuals listed, delisted ones included.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether no perpetual is listed.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Every perpetual listed, in no particular order.
+    pub fn iter(&self) -> impl Iterator<Item = &PerpCoin> {
+        self.0.values()
+    }
+}
+
+impl FromIterator<PerpCoin> for Perps {
+    fn from_iter<I: IntoIterator<Item = PerpCoin>>(iter: I) -> Self {
+        Self(
+            iter.into_iter()
+                .map(|perp| (perp.coin.clone(), perp))
+                .collect(),
+        )
+    }
+}
+
+impl FromIterator<Perps> for Perps {
+    fn from_iter<I: IntoIterator<Item = Perps>>(iter: I) -> Self {
+        Self(iter.into_iter().flat_map(|perps| perps.0).collect())
+    }
+}
+
+/// One Hyperliquid perpetual.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PerpCoin {
+    coin: SmolStr,
+    delisted: bool,
+}
+
+impl PerpCoin {
+    /// The coin Hyperliquid names the perpetual by, in its spelling (`BTC`, `kPEPE`, `xyz:TSLA`).
+    /// A subscription or order must use exactly this.
+    pub fn coin(&self) -> &str {
+        &self.coin
+    }
+
+    /// The builder deployer of a HIP-3 perpetual (`xyz` for `xyz:TSLA`), or `None` for a
+    /// default perpetual.
+    pub fn deployer(&self) -> Option<&str> {
+        self.coin.split_once(':').map(|(deployer, _)| deployer)
+    }
+
+    /// Whether Hyperliquid has delisted the perpetual. A delisted perpetual does not trade, so
+    /// a subscription to it receives nothing.
+    pub fn is_delisted(&self) -> bool {
+        self.delisted
+    }
+}
+
 /// Hyperliquid's spot pairs, by coin, as its `spotMeta` info response lists them.
 ///
 /// Deserializes from that response, `{"universe": [...], "tokens": [...]}`. A pair whose tokens
@@ -81,6 +185,23 @@ impl SpotPairs {
     /// Exact: Hyperliquid's coin names are case-sensitive.
     pub fn get(&self, coin: &str) -> Option<&SpotPair> {
         self.0.get(coin)
+    }
+
+    /// The pair of `base` quoted in `quote`, named by their tokens as Hyperliquid spells them
+    /// (`HYPE`, `USDT0`) or differing from that only in ASCII case (`hype`, `usdt0`).
+    ///
+    /// An exact match wins. Otherwise names that match several pairs once case is ignored match
+    /// none of them, rather than one picked arbitrarily. Hyperliquid lists no such pair today
+    /// (checked against mainnet, October 2026).
+    pub fn find(&self, base: &str, quote: &str) -> Option<&SpotPair> {
+        unique(self.0.values(), |pair| {
+            pair.base == base && pair.quote == quote
+        })
+        .or_else(|| {
+            unique(self.0.values(), |pair| {
+                pair.base.eq_ignore_ascii_case(base) && pair.quote.eq_ignore_ascii_case(quote)
+            })
+        })
     }
 
     /// The number of pairs listed.
@@ -128,6 +249,41 @@ impl SpotPair {
     /// The quote token's name, as Hyperliquid spells it (`USDC`).
     pub fn quote(&self) -> &str {
         &self.quote
+    }
+}
+
+/// The one item of `items` that `matches`, or `None` if none or several do.
+fn unique<'a, T>(
+    items: impl IntoIterator<Item = &'a T>,
+    matches: impl Fn(&T) -> bool,
+) -> Option<&'a T> {
+    let mut found = items.into_iter().filter(|item| matches(item));
+    let first = found.next()?;
+    found.next().is_none().then_some(first)
+}
+
+/// A `meta` info response, as far as [`Perps`] reads it.
+#[derive(Deserialize)]
+struct PerpMeta {
+    universe: Vec<PerpMetaAsset>,
+}
+
+#[derive(Deserialize)]
+struct PerpMetaAsset {
+    name: SmolStr,
+    #[serde(default, rename = "isDelisted")]
+    delisted: bool,
+}
+
+impl From<PerpMeta> for Perps {
+    fn from(meta: PerpMeta) -> Self {
+        meta.universe
+            .into_iter()
+            .map(|asset| PerpCoin {
+                coin: asset.name,
+                delisted: asset.delisted,
+            })
+            .collect()
     }
 }
 
@@ -242,6 +398,125 @@ mod tests {
         assert_eq!(pairs.get("@0"), None, "PURR/USDC is named only PURR/USDC");
         assert_eq!(pairs.get("@999"), None);
         assert!(SpotPairs::default().is_empty());
+    }
+
+    #[test]
+    fn spot_pairs_find_a_pair_by_its_tokens_ignoring_case() {
+        let pairs = pairs();
+
+        assert_eq!(pairs.find("HYPE", "USDT0").unwrap().coin(), "@207");
+        assert_eq!(pairs.find("hype", "usdc").unwrap().coin(), "@107");
+        assert_eq!(pairs.find("Purr", "Usdc").unwrap().coin(), "PURR/USDC");
+        assert_eq!(
+            pairs.find("USDC", "HYPE"),
+            None,
+            "base and quote are not interchangeable"
+        );
+        assert_eq!(pairs.find("HYPE", "USDH"), None);
+    }
+
+    #[test]
+    fn spot_pairs_find_no_pair_when_ignoring_case_matches_several() {
+        let pairs: SpotPairs = serde_json::from_str(
+            r#"{
+                "universe": [
+                    {"name": "@1", "tokens": [1, 0], "index": 1},
+                    {"name": "@2", "tokens": [2, 0], "index": 2}
+                ],
+                "tokens": [
+                    {"name": "USDC", "index": 0},
+                    {"name": "ABC", "index": 1},
+                    {"name": "abc", "index": 2}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(pairs.find("ABC", "USDC").unwrap().coin(), "@1");
+        assert_eq!(pairs.find("abc", "USDC").unwrap().coin(), "@2");
+        assert_eq!(pairs.find("Abc", "USDC"), None);
+    }
+
+    /// A default `meta` response in Hyperliquid's shape, with synthetic values: a mixed-case
+    /// coin and a delisted one.
+    const META: &str = r#"{
+        "universe": [
+            {"szDecimals": 5, "name": "BTC", "maxLeverage": 40, "marginTableId": 56},
+            {"szDecimals": 0, "name": "kPEPE", "maxLeverage": 10, "marginTableId": 10},
+            {"szDecimals": 1, "name": "MATIC", "maxLeverage": 20, "marginTableId": 20,
+             "isDelisted": true}
+        ],
+        "marginTables": [],
+        "collateralToken": 0
+    }"#;
+
+    /// A builder deployer's `meta` response, read with `"dex": "xyz"`, with synthetic values.
+    const META_XYZ: &str = r#"{
+        "universe": [
+            {"szDecimals": 3, "name": "xyz:TSLA", "maxLeverage": 20, "marginTableId": 20,
+             "growthMode": "enabled", "deployerFeeScale": "1.0"}
+        ],
+        "marginTables": [],
+        "collateralToken": 0
+    }"#;
+
+    fn perps() -> Perps {
+        [META, META_XYZ]
+            .into_iter()
+            .map(|meta| serde_json::from_str::<Perps>(meta).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn perps_collect_the_default_and_a_deployers_perpetuals() {
+        let perps = perps();
+
+        assert_eq!(perps.len(), 4);
+        assert_eq!(perps.iter().count(), 4);
+        let tsla = perps.get("xyz:TSLA").unwrap();
+        assert_eq!((tsla.coin(), tsla.deployer()), ("xyz:TSLA", Some("xyz")));
+        let btc = perps.get("BTC").unwrap();
+        assert_eq!((btc.deployer(), btc.is_delisted()), (None, false));
+        assert!(perps.get("MATIC").unwrap().is_delisted());
+        assert!(Perps::default().is_empty());
+    }
+
+    #[test]
+    fn perps_get_returns_the_venue_spelling_whatever_the_case_asked() {
+        let perps = perps();
+
+        for name in ["kPEPE", "KPEPE", "kpepe"] {
+            assert_eq!(perps.get(name).unwrap().coin(), "kPEPE", "{name:?}");
+        }
+        assert_eq!(perps.get("XYZ:tsla").unwrap().coin(), "xyz:TSLA");
+        assert_eq!(
+            perps.get("TSLA"),
+            None,
+            "a HIP-3 perpetual is named with its deployer"
+        );
+        assert_eq!(perps.get("ETH"), None);
+    }
+
+    #[test]
+    fn perps_get_prefers_an_exact_match_and_refuses_an_ambiguous_one() {
+        let perps: Perps =
+            serde_json::from_str(r#"{"universe": [{"name": "ABC"}, {"name": "abc"}]}"#).unwrap();
+
+        assert_eq!(perps.get("ABC").unwrap().coin(), "ABC");
+        assert_eq!(perps.get("abc").unwrap().coin(), "abc");
+        assert_eq!(perps.get("Abc"), None);
+    }
+
+    #[test]
+    fn network_serializes_in_lower_case() {
+        assert_eq!(
+            serde_json::to_string(&Network::Mainnet).unwrap(),
+            r#""mainnet""#
+        );
+        assert_eq!(
+            serde_json::from_str::<Network>(r#""testnet""#).unwrap(),
+            Network::Testnet
+        );
     }
 
     #[test]

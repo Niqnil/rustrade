@@ -6,13 +6,14 @@
 //! # Example
 //!
 //! ```ignore
-//! use rustrade_data::exchange::hyperliquid::historical::{
-//!     HyperliquidHistoricalData, HistoricalRequest,
+//! use rustrade_data::exchange::hyperliquid::{
+//!     Network,
+//!     historical::{HyperliquidHistoricalData, HistoricalRequest},
 //! };
 //! use rustrade_data::subscription::candle::CandleInterval;
 //! use chrono::{Duration, Utc};
 //!
-//! let client = HyperliquidHistoricalData::new(false).await?; // mainnet
+//! let client = HyperliquidHistoricalData::new(Network::Mainnet).await?;
 //!
 //! let request = HistoricalRequest {
 //!     coin: "BTC".to_string(),
@@ -24,6 +25,7 @@
 //! let candles = client.fetch_candles(request).await?;
 //! ```
 
+use super::Network;
 use crate::{
     error::DataError,
     subscription::candle::{Candle, CandleInterval, close_time_from_open, open_time_from_close},
@@ -49,22 +51,17 @@ pub struct HyperliquidHistoricalData {
 }
 
 impl HyperliquidHistoricalData {
-    /// Create a new historical data client.
-    ///
-    /// # Arguments
-    ///
-    /// * `testnet` - If true, connect to testnet; otherwise mainnet.
+    /// Create a new historical data client for `network`.
     ///
     /// # Errors
     ///
     /// Returns error if client creation fails.
-    pub async fn new(testnet: bool) -> Result<Self, DataError> {
-        let base_url = if testnet {
-            Some(BaseUrl::Testnet)
-        } else {
-            None
+    pub async fn new(network: Network) -> Result<Self, DataError> {
+        let base_url = match network {
+            Network::Mainnet => BaseUrl::Mainnet,
+            Network::Testnet => BaseUrl::Testnet,
         };
-        let client = InfoClient::new(None, base_url)
+        let client = InfoClient::new(None, Some(base_url))
             .await
             .map_err(|e| DataError::Socket(format!("InfoClient creation: {e}")))?;
         Ok(Self { client })

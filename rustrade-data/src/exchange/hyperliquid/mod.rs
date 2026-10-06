@@ -12,25 +12,49 @@
 //! - [`PublicTrades`](crate::subscription::trade::PublicTrades): Real-time trade feed
 //! - [`OrderBooksL2`](crate::subscription::book::OrderBooksL2): L2 order book snapshots
 //!
-//! # Spot Market Subscriptions
+//! # Coins
 //!
-//! Hyperliquid spot uses `@{index}` format for WebSocket subscriptions.
-//! Use `SpotMetaResolver` to convert pair names to indices:
+//! A subscription names its market by a coin, exactly as Hyperliquid spells it:
+//! - a perpetual by its asset (`BTC`, `kPEPE`), or a builder-deployed (HIP-3) one by its deployer
+//!   and asset (`xyz:TSLA`);
+//! - a spot pair by `@{index}` (`@107` is HYPE/USDC), except PURR/USDC, named `PURR/USDC`.
+//!
+//! A wrong coin gets no data, and the server then closes the connection, ending the other
+//! subscriptions on it as well. So read the coins with
+//! [`HyperliquidMeta`](crate::exchange::hyperliquid::HyperliquidMeta) and subscribe with a
+//! [`MarketInstrumentData`](crate::instrument::MarketInstrumentData) built from them:
 //!
 //! ```ignore
-//! use rustrade_data::exchange::hyperliquid::{HyperliquidSpot, resolve_spot_pair};
+//! use rustrade_data::{
+//!     exchange::hyperliquid::{HyperliquidMeta, HyperliquidSpot, Network},
+//!     instrument::MarketInstrumentData,
+//!     streams::Streams,
+//!     subscriber::WebSocketSubscriber,
+//!     subscription::{Subscription, trade::PublicTrades},
+//! };
 //!
-//! // Resolve pair name to @index format
-//! let coin = resolve_spot_pair("hype", "usdc").await?; // "@107"
+//! let meta = HyperliquidMeta::fetch(Network::Mainnet, &[]).await?;
+//! let hype = meta.spot_pair("HYPE", "USDC").ok_or("no such pair")?; // `@107`
 //!
-//! // Subscribe using resolved index
 //! let streams = Streams::<PublicTrades>::builder()
-//!     .subscribe([(HyperliquidSpot, &coin, "usdc", MarketDataInstrumentKind::Spot, PublicTrades)])
+//!     .subscribe(
+//!         WebSocketSubscriber,
+//!         [Subscription {
+//!             exchange: HyperliquidSpot,
+//!             instrument: MarketInstrumentData::hyperliquid_spot("hype_usdc", hype),
+//!             kind: PublicTrades,
+//!         }],
+//!     )
 //!     .init()
 //!     .await?;
 //! ```
 //!
-//! Or use `@index` directly if you already know the spot pair index.
+//! A [`MarketInstrumentData`](crate::instrument::MarketInstrumentData) is subscribed by its
+//! `name_exchange` verbatim. A subscription built from a
+//! [`MarketDataInstrument`](rustrade_instrument::instrument::market_data::MarketDataInstrument)
+//! instead derives the coin from asset names, which lose their case, and works only for some
+//! markets. See
+//! [`market`](crate::exchange::hyperliquid::market).
 //!
 //! # Notes
 //! - Market data streams are unauthenticated (public data)
@@ -61,11 +85,12 @@ pub mod book;
 pub mod channel;
 pub mod historical;
 pub mod market;
-pub mod spot_meta;
+pub mod meta;
 pub mod subscription;
 pub mod trade;
 
-pub use spot_meta::{SpotMetaResolver, resolve_spot_pair};
+pub use meta::{HyperliquidMeta, HyperliquidMetaError};
+pub use rustrade_instrument::hyperliquid::Network;
 
 /// Hyperliquid mainnet WebSocket URL.
 pub const BASE_URL_HYPERLIQUID: &str = "wss://api.hyperliquid.xyz/ws";
@@ -162,10 +187,10 @@ where
 ///
 /// # Market Format
 ///
-/// Spot markets use `@{index}` format for WebSocket subscriptions (e.g., `"@107"` for HYPE).
-/// Get the spot index from the `spotMeta` API. Exception: PURR uses `"PURR/USDC"` literally.
+/// Spot markets are named `@{index}` (`"@107"` is HYPE/USDC), except PURR/USDC, named
+/// `"PURR/USDC"`. [`HyperliquidMeta::spot_pair`] finds a pair's coin from its tokens.
 ///
-/// Perpetuals use symbol-only format: `"BTC"`, `"ETH"`
+/// Perpetuals, subscribed with [`Hyperliquid`], are named by their asset (`"BTC"`, `"kPEPE"`).
 #[derive(
     Copy,
     Clone,

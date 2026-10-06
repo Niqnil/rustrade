@@ -361,6 +361,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fee charged in USDH, USDE or USDT0 was reported as USDC. The fee asset now comes from the fill's
   `feeToken`, falling back to USDC only if it is absent. `fees_quote` is set only for a USDC fee.
   The client still cannot place orders on HIP-3 perpetuals.
+- **Hyperliquid data subscriptions upper-cased mixed-case perpetuals (`kPEPE` became `KPEPE`),
+  and had no way to find a builder-deployed (HIP-3) perpetual** (`rustrade-data` and
+  `rustrade-instrument`, `hyperliquid` features). **Breaking.** A subscription built from a
+  `MarketDataInstrument` derives the coin from asset names, which are stored lower-cased, so it
+  asked for `KPEPE`. Hyperliquid sends no data for a wrong coin and then closes the connection,
+  ending the other subscriptions on it too.
+  - New `exchange::hyperliquid::HyperliquidMeta` reads the coins from Hyperliquid's info endpoint:
+    `HyperliquidMeta::fetch(network, deployers)` reads the default perpetuals, the spot pairs, and
+    the perpetuals of each HIP-3 deployer named (such as `xyz`). An unlisted deployer fails with
+    `HyperliquidMetaError::UnknownDeployer`.
+  - `perp_coin(name)` finds a perpetual whatever its ASCII case and returns the venue's spelling
+    (`KPEPE` finds `kPEPE`; `xyz:TSLA`). `spot_pair(base, quote)` finds a pair by its tokens
+    (`HYPE`, `USDC` finds `@107`). An exact match wins; a name that matches several once case is
+    ignored matches none.
+  - New `MarketInstrumentData::hyperliquid_perp(key, &PerpCoin)` and
+    `hyperliquid_spot(key, &SpotPair)` build the instruments to subscribe with, named as the
+    venue spells them.
+  - The `MarketDataInstrument` path is unchanged, and its limits are now documented: it gets a
+    mixed-case or HIP-3 perpetual wrong, and names only PURR/USDC among spot pairs unless given an
+    `@{index}` base.
+  - New in `rustrade-instrument`: `hyperliquid::Perps` (deserializes from a `meta` response) and
+    `PerpCoin`, `SpotPairs::find(base, quote)`, and `hyperliquid::Network` (serialized as
+    `"mainnet"`/`"testnet"`). The `rustrade-data`
+    `hyperliquid` feature now enables `rustrade-instrument`'s.
+  - **Breaking:** `exchange::hyperliquid::SpotMetaResolver`, `resolve_spot_pair`,
+    `spot_meta::mainnet_resolver` and `SpotMetaError` are removed in favour of `HyperliquidMeta`.
+    The resolver named PURR/USDC `@0`, which is not its coin.
+  - **Breaking:** `HyperliquidHistoricalData::new` takes a `Network` instead of `testnet: bool`.
+
+  Closes #495.
 - **Alpaca fill recovery and `fetch_trades` could miss fills in the millisecond they read from**
   (`rustrade-execution`). Alpaca's account-activities `after` filter compares at millisecond
   precision, so a read from a time inside a millisecond skipped every later fill in it. Recovery

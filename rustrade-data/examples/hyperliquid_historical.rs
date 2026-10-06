@@ -8,8 +8,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use chrono::{Duration, Utc};
-use rustrade_data::exchange::hyperliquid::historical::{
-    HistoricalRequest, HyperliquidHistoricalData,
+use rustrade_data::exchange::hyperliquid::{
+    Network,
+    historical::{HistoricalRequest, HyperliquidHistoricalData},
 };
 use rustrade_data::subscription::candle::CandleInterval;
 use tracing::info;
@@ -18,8 +19,8 @@ use tracing::info;
 async fn main() {
     init_logging();
 
-    // Create historical data client (mainnet)
-    let client = HyperliquidHistoricalData::new(false)
+    // Create historical data client
+    let client = HyperliquidHistoricalData::new(Network::Mainnet)
         .await
         .expect("Failed to create client");
 
