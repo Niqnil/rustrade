@@ -235,10 +235,12 @@ fn fold_names<'a, Index>(
             shared.push(key);
         }
     }
+    shared.sort_unstable();
+    shared.dedup();
     for key in shared {
         warn!(
             name = %key,
-            "ExecutionInstrumentMap holds two names that differ only in case - neither resolves \
+            "ExecutionInstrumentMap holds names that differ only in case - none resolves \
              ignoring case"
         );
         folded.remove(&key);
