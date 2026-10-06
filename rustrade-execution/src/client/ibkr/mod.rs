@@ -55,18 +55,14 @@
 //! 1. **Order reconciliation**: order lifecycle events sent during a gap are lost. An
 //!    order cancelled, expired or rejected in that window is not reported. After a
 //!    reconnect, call [`ExecutionClient::fetch_open_orders`] to reconcile open-order
-//!    state. The IBKR account snapshot carries no open orders (#371). On `ibapi` 4.2.0
-//!    that call is unreliable, and fails for a while after a reconnect: see
-//!    [Known Issues](#known-issues-ibapi-420-shared-queues).
-//! 2. **Permanent disconnect**: when `ibapi` gives up reconnecting, or fill recovery
-//!    fails repeatedly, `account_stream` ends with `StreamTerminated` within about a
-//!    second. Its reader thread then stays blocked until TWS sends another event, and
-//!    another `account_stream` call on the client fails until the thread exits. After
-//!    recovery fails, the client is still connected, so the reader exits on the next
-//!    TWS event and `account_stream` works again. After a shutdown, no event follows,
-//!    so replace the client. Shutdown is detected only while a stream is open, so
-//!    `account_stream` on a client that has already shut down returns a stream that
-//!    never ends; see [`ExecutionClient::account_stream`]. Replacing the client, by
+//!    state. The IBKR account snapshot carries no open orders (#371).
+//! 2. **Permanent disconnect**: when `ibapi` gives up reconnecting,
+//!    [`IbkrClient::disconnect`] is called, or TWS/Gateway ends the API session,
+//!    `account_stream` ends with `StreamTerminated`, and `account_stream` on the
+//!    shut-down client fails, so replace the client. When fill recovery fails repeatedly, the stream ends the same way but
+//!    the client is still connected: its reader thread stays blocked until TWS sends
+//!    another event, another `account_stream` call fails until then, and it works again
+//!    after. See [`ExecutionClient::account_stream`]. Replacing the client, by
 //!    reconnecting with [`IbkrClient::connect_sync`] and choosing the client ID, is the
 //!    caller's decision. A new `IbkrClient` does not know the orders the old one
 //!    placed, so their later events are dropped.
@@ -77,39 +73,6 @@
 //! owns the transient reconnect. Replacing a client that is gone for good requires IB
 //! Gateway availability and client ID coordination, decisions that belong in the
 //! caller's wrapper, not the library.
-//!
-//! # Known Issues: `ibapi` 4.2.0 Shared Queues
-//!
-//! `ibapi` 4.2.0 answers the open-orders and positions requests from one queue per
-//! request type. Every call on the client reads from the same queue, and nothing clears
-//! it between calls. Besides each call's own reply, two things land in it:
-//!
-//! - A connection drop queues one `ConnectionReset` per response type: three on the
-//!   open-orders queue, two on the positions queue.
-//! - Every `OpenOrder` and `OrderStatus` message for an order with no live placement
-//!   subscription is copied into `ibapi`'s three open-orders queues. That covers every
-//!   update for an order this client placed, once its placement call has returned, and
-//!   every row of an open-orders reply.
-//!
-//! As a result:
-//!
-//! - [`ExecutionClient::fetch_open_orders`] can report orders that have since filled or
-//!   been cancelled as open. Each connection drop makes three calls fail and adds three
-//!   calls of lag, which never clears. See that method.
-//! - [`ExecutionClient::account_snapshot`] fails twice after each connection drop, then
-//!   recovers.
-//! - This client never reads two of the three open-orders queues, and reads the third
-//!   only when `fetch_open_orders` is called. They keep a copy of every order update
-//!   until read, so the two unread ones grow for the life of the client: `ibapi`'s own
-//!   reconnect does not clear them. `ibapi` logs a warning each time one of them passes a
-//!   multiple of 10,000 queued messages.
-//!
-//! [Account order events](ExecutionClient::account_stream) come through a separate
-//! channel and are unaffected.
-//!
-//! Fixed upstream after 4.2.0 by
-//! [rust-ibapi#836](https://github.com/wboayue/rust-ibapi/pull/836), which gives each
-//! call its own queue and drops messages no call asked for.
 //!
 //! # See Also
 //!
@@ -149,7 +112,10 @@ use chrono::{DateTime, Utc};
 use execution::{ExecutionBuffer, ExecutionRevision, parse_decimal_or_warn, try_decimal_or_warn};
 use futures::stream::BoxStream;
 use ibapi::{
-    accounts::{AccountSummaryResult, types::AccountGroup},
+    accounts::{
+        AccountSummaryResult,
+        types::{AccountGroup, AccountId},
+    },
     client::blocking::Client,
 };
 pub use order::{BracketOrderRequest, BracketOrderResult};
@@ -282,17 +248,11 @@ fn security_types_of(kind: InstrumentKindDiscriminant) -> &'static [&'static str
 static ACCOUNT_GROUP_ALL: std::sync::LazyLock<AccountGroup> =
     std::sync::LazyLock::new(|| AccountGroup("All".to_string()));
 
-/// Quiet period that ends the positions read in `account_snapshot`.
+/// How long `account_snapshot` waits for IB's next report of an account's positions before
+/// giving up on that account's listing.
 ///
-/// IB's positions request is a live subscription that keeps streaming after its
-/// `PositionEnd` marker, so the read stops once this long passes without an
-/// update. It does not stop at `PositionEnd`: on `ibapi` 4.2.0 the positions
-/// queue is shared across calls (see the module's Known Issues), so after a
-/// connection drop it may hold the replies to the calls that failed. Stopping at
-/// the first `PositionEnd` would return one of those replies and leave the rest
-/// for the next call, which would lag behind for good. Reading until quiet
-/// drains them.
-const POSITION_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Each account's read ends at IB's end-of-listing marker. This only bounds a stall before it.
+const POSITION_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Maximum time to await an initial `OrderStatus` on an order-placement
 /// subscription before giving up. Bounds the placement loops so a silent TWS
@@ -333,7 +293,10 @@ const PLACEMENT_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// warning band widened to `2100..=2199`, `classify_error`'s predicate became
 /// `is_informational_code`, and 317 joined the data advisories. The change is
 /// strictly additive and 399 is in neither the advisory nor the system list, so
-/// both forms above route exactly as described.
+/// both forms above route exactly as described. Re-verified against ibapi 5.0.0, which
+/// routes an error frame by whether its id is an order's or a request's, and moves 316, 354
+/// and 366 out of the order-rejection category: 399 routes to its order as before, and the
+/// warning predicate is unchanged.
 ///
 /// The list stays load-bearing for the second form. It documents the known gap
 /// between ibapi's range heuristic and IBKR's actual protocol semantics; if
@@ -420,12 +383,65 @@ fn resolve_execution(
     Some((instrument, client_id))
 }
 
+/// Read one account's positions into `positions`, returning whether IB marked the end of the
+/// listing before [`POSITION_STALL_TIMEOUT`] passed without a report.
+///
+/// Positions-multi rather than `positions()`: its replies carry this request's ID, while
+/// `positions()` replies carry none and reach every open positions subscription, so another read's
+/// listing, end marker and all, could end this one early. IB documents the account parameter as
+/// optional only for a login with a single account, so it is always given.
+///
+/// Only reports for a registered instrument, and in `instruments` when that is given, are kept.
+fn read_account_positions(
+    client: &Client,
+    account: AccountId,
+    contracts: &ContractRegistry,
+    instruments: Option<&HashSet<InstrumentNameExchange>>,
+    positions: &mut PositionAggregator,
+) -> Result<bool, UnindexedClientError> {
+    use ibapi::accounts::{Position, PositionUpdateMulti};
+
+    let subscription = client
+        .positions_multi(Some(&account), None)
+        .map_err(|e| UnindexedClientError::Internal(format!("positions of {account}: {e}")))?;
+
+    for update in subscription.timeout_iter_data(POSITION_STALL_TIMEOUT) {
+        // Surface subscription errors rather than returning partial positions
+        // (a truncated snapshot could be misread as positions having closed).
+        let update = update.map_err(|e| {
+            UnindexedClientError::Internal(format!("positions subscription of {account}: {e}"))
+        })?;
+        let position = match update {
+            PositionUpdateMulti::Position(position) => Position {
+                account: position.account,
+                contract: position.contract,
+                position: position.position,
+                average_cost: position.average_cost,
+            },
+            // The subscription stays live after the listing, streaming changes; this read wants
+            // the listing alone. Dropping the subscription cancels it.
+            PositionUpdateMulti::PositionEnd => return Ok(true),
+        };
+        let Some(instrument) = contracts.get_name_by_con_id(position.contract.contract_id) else {
+            continue;
+        };
+        if instruments.is_some_and(|filter| !filter.contains(&instrument)) {
+            continue;
+        }
+        positions.process(instrument, position);
+    }
+    Ok(false)
+}
+
 /// Forward `updates`, from `ibapi`'s order-update subscription, to `sink` as account events,
 /// until the subscription ends or the account stream does.
 ///
 /// A closed stream is noticed on the next update, whether or not that update would be
 /// forwarded, so the thread running this releases `ibapi`'s single order-update slot as soon as
 /// TWS sends anything.
+///
+/// `ibapi` ends the subscription with [`ibapi::Error::Shutdown`] when the client shuts down for
+/// good, and the stream is terminated with [`recovery::CLIENT_SHUT_DOWN`].
 fn forward_order_updates(
     updates: impl IntoIterator<Item = Result<ibapi::orders::OrderUpdate, ibapi::Error>>,
     sink: &recovery::EventSink,
@@ -444,6 +460,13 @@ fn forward_order_updates(
         }
         let update = match update {
             Ok(u) => u,
+            Err(ibapi::Error::Shutdown) => {
+                warn!("IBKR client shut down; terminating the account stream");
+                sink.terminate(StreamTerminationReason::Error(
+                    recovery::CLIENT_SHUT_DOWN.to_string(),
+                ));
+                return;
+            }
             Err(e) => {
                 // ibapi's own reconnect does not surface here (see the
                 // recovery module), so an error on the subscription is terminal.
@@ -894,8 +917,7 @@ impl IbkrClient {
     /// is dropped. Calling `disconnect()` explicitly terminates the connection
     /// **immediately for all clones** sharing this client.
     ///
-    /// Any active `account_stream()` ends with `StreamTerminated` within about a
-    /// second.
+    /// Any active `account_stream()` ends with `StreamTerminated`.
     ///
     /// This is idempotent — calling it multiple times is safe.
     pub fn disconnect(&self) {
@@ -1056,7 +1078,8 @@ impl IbkrClient {
 
         // Build bracket orders with OCA linking
         let action = side_to_action(request.side);
-        let ib_orders = build_ib_bracket_with_oca(
+        // Nothing has been sent yet, so on an error the three allocated IDs are simply skipped.
+        let ib_orders = match build_ib_bracket_with_oca(
             parent_ib_id,
             action,
             quantity,
@@ -1064,7 +1087,15 @@ impl IbkrClient {
             tp_price,
             sl_price,
             ib_tif,
-        );
+        ) {
+            Ok(orders) => orders,
+            Err(e) => {
+                return make_all_inactive_bracket(
+                    &request,
+                    OrderError::Rejected(ApiError::OrderRejected(e.to_string())),
+                );
+            }
+        };
 
         // Generate client order IDs for children
         let parent_cid = request.parent_cid.clone();
@@ -1603,7 +1634,7 @@ impl ExecutionClient for IbkrClient {
     /// when that is not empty), gets an `InstrumentAccountSnapshot`. Its `position` is
     /// [`PositionReport::Open`](crate::position::PositionReport::Open), carrying:
     /// - `quantity`: IB's signed position, negative when short, in shares for a stock and in
-    ///   contracts for a future or an option. `ibapi` 4.2.0 hands it over as an `f64`, converted
+    ///   contracts for a future or an option. `ibapi` hands it over as an `f64`, converted
     ///   with `Decimal::try_from`, which rounds to the float's precision of about 15 significant
     ///   digits (0.1 stays 0.1) rather than keeping its exact binary expansion.
     /// - `entry_price`: IB's average cost divided by the contract multiplier, so a future or an
@@ -1618,25 +1649,17 @@ impl ExecutionClient for IbkrClient {
     /// [`PositionReport::Flat`](crate::position::PositionReport::Flat). So is each instrument in
     /// `instruments` that is registered with its contract ID but that IB did not list, provided IB
     /// marked the end of its listing (`PositionEnd`) during the read. Without that marker such
-    /// instruments are left out, with a warning, since the listing may be incomplete: IB can
-    /// start the read with a stale listing, and only an end marker after the last report counts.
-    /// IB's positions request carries no request ID, so one case cannot be caught: a stale end
-    /// marker on its own, followed by a current listing that does not start within the read's
-    /// 5-second quiet period. It reads as the listing of an account holding nothing, and the
-    /// requested instruments are reported flat.
+    /// instruments are left out, with a warning, since the listing may be incomplete.
     /// A requested instrument registered without a contract ID, or whose ID was registered again
     /// under another name, cannot be matched to IB's reports and is left out too.
     ///
-    /// IB can report the same position more than once during the read, as it changes. The latest
-    /// report for each account is used.
-    ///
-    /// **Several accounts.** IB reports positions per account, and this client does not select
-    /// one. When more than one account holds the same instrument, the first account to report a
+    /// **Several accounts.** This client reads the positions of every account the login manages,
+    /// one account at a time. When more than one account holds the same instrument, the first account to report a
     /// non-zero quantity is kept and the others are dropped with a warning; they are never summed.
     /// A consumer comparing the reported quantity with its own, as the `rustrade` engine's position
     /// drift check does, therefore compares against that one account.
-    /// Which account comes first depends on the order IB reports them in, so a caller holding the
-    /// same instrument in several accounts should not rely on it.
+    /// Which account comes first depends on the order IB lists the login's accounts in, so a
+    /// caller holding the same instrument in several accounts should not rely on it.
     ///
     /// # Limitations
     ///
@@ -1647,7 +1670,8 @@ impl ExecutionClient for IbkrClient {
     /// # Errors
     ///
     /// [`UnindexedClientError::Internal`] if a position quantity does not convert to a
-    /// `Decimal`, or if the positions subscription fails.
+    /// `Decimal`, if the request for the login's accounts fails or yields none (as it does when the
+    /// session ends during it), or if a positions subscription fails.
     ///
     /// # Known Issue: ibapi Decode Errors
     ///
@@ -1658,17 +1682,15 @@ impl ExecutionClient for IbkrClient {
     ///
     /// # Timeout
     ///
-    /// IB's positions request is a live subscription that keeps streaming after
-    /// the initial set, so the read ends once 5 seconds pass without a position
-    /// update. **Every call therefore takes at least 5 seconds**, including for
-    /// an account with no positions. If IB stalls mid-stream, the positions
-    /// received so far are returned rather than blocking indefinitely.
+    /// Each account's positions read ends at IB's end-of-listing marker. If IB sends
+    /// nothing for 5 seconds before it, that account's read gives up and the next
+    /// one starts, so a login with N accounts can wait up to N × 5 seconds. The
+    /// positions received are returned rather than blocking indefinitely, without
+    /// the flat reports that need every account's listing to be complete.
     ///
-    /// # Known Issue: Errors After a Connection Drop on `ibapi` 4.2.0
-    ///
-    /// After each connection drop, the next two calls fail with
-    /// [`UnindexedClientError::Internal`]. The third succeeds. See the
-    /// [module's Known Issues](self#known-issues-ibapi-420-shared-queues).
+    /// Each read uses IB's positions-multi request for that account, whose replies
+    /// carry a request ID, so concurrent calls on clones of this client never read
+    /// each other's listing.
     async fn account_snapshot(
         &self,
         assets: &[AssetNameExchange],
@@ -1685,53 +1707,35 @@ impl ExecutionClient for IbkrClient {
 
         let balances_future = self.fetch_balances(assets);
         let positions_future = tokio::task::spawn_blocking(move || {
-            use ibapi::accounts::PositionUpdate;
-
             // ibapi::Error is unstructured — we cannot distinguish connection failures
             // (transient, should retry) from API errors (e.g., invalid request).
             // Mapped to Internal (non-transient) conservatively; a caller needing reconnect
             // logic should drive it from connection state, not from the error type.
-            let positions_sub = client
-                .positions()
-                .map_err(|e| UnindexedClientError::Internal(format!("positions: {e}")))?;
+            let accounts = client
+                .managed_accounts()
+                .map_err(|e| UnindexedClientError::Internal(format!("managed accounts: {e}")))?;
+            if accounts.is_empty() {
+                // `ibapi` also answers with no accounts when the session ends mid-request.
+                return Err(UnindexedClientError::Internal(
+                    "no managed accounts: IB listed none, or the session ended".to_string(),
+                ));
+            }
 
             let mut positions = PositionAggregator::default();
-
-            // Read until `POSITION_STREAM_TIMEOUT` passes with no update, not until
-            // `PositionEnd`: see that constant for why.
-            for pos_update in positions_sub.timeout_iter_data(POSITION_STREAM_TIMEOUT) {
-                // Surface subscription errors rather than returning partial positions
-                // (a truncated snapshot could be misread as positions having closed).
-                let pos_update = match pos_update {
-                    Ok(p) => p,
-                    Err(e) => {
-                        return Err(UnindexedClientError::Internal(format!(
-                            "positions subscription: {e}"
-                        )));
-                    }
-                };
-                let pos = match pos_update {
-                    PositionUpdate::Position(pos) => {
-                        positions.report_seen();
-                        pos
-                    }
-                    PositionUpdate::PositionEnd => {
-                        positions.listing_ended();
-                        continue;
-                    }
-                };
-                let Some(instrument) = contracts.get_name_by_con_id(pos.contract.contract_id)
-                else {
-                    continue;
-                };
-                if instruments_filter
-                    .as_ref()
-                    .is_some_and(|f| !f.contains(&instrument))
-                {
-                    continue;
-                }
-                positions.process(instrument, pos);
+            let mut listed_all = true;
+            for account in accounts {
+                listed_all &= read_account_positions(
+                    &client,
+                    AccountId(account),
+                    &contracts,
+                    instruments_filter.as_ref(),
+                    &mut positions,
+                )?;
             }
+            if listed_all {
+                positions.listing_ended();
+            }
+
             // IB's reports are attributed by contract ID, so a requested instrument can be
             // reported flat only if its ID is registered and resolves back to it: with no ID, or
             // one another name took over, IB's position in it would be missed.
@@ -1785,10 +1789,8 @@ impl ExecutionClient for IbkrClient {
     ///
     /// **Important:** If IB is stalled (no events flowing), the reader thread blocks
     /// on the iterator. Dropping the stream signals termination, but the thread won't
-    /// observe it until the next IB event arrives. Disconnecting does not release
-    /// it either: `ibapi` does not end the order-update subscription when the
-    /// client shuts down (wboayue/rust-ibapi#871), so after a shutdown the thread
-    /// stays blocked until the process exits.
+    /// observe it until the next IB event arrives. A shutdown does end the
+    /// subscription, so the thread exits then.
     ///
     /// # Reconnects and Fill Recovery
     ///
@@ -1804,8 +1806,7 @@ impl ExecutionClient for IbkrClient {
     ///
     /// **Order lifecycle events are not recovered.** An order that was cancelled,
     /// expired or rejected during the gap is not reported here. Reconcile with
-    /// [`ExecutionClient::fetch_open_orders`] after a reconnect, minding its
-    /// known issue on `ibapi` 4.2.0. The log line
+    /// [`ExecutionClient::fetch_open_orders`] after a reconnect. The log line
     /// `Recovered IBKR fills after a gap in event delivery` marks one.
     ///
     /// While TWS reports its link to IB's servers lost (1100), nothing marks the
@@ -1815,20 +1816,14 @@ impl ExecutionClient for IbkrClient {
     /// The stream ends with `StreamTerminated` when:
     /// - recovery fails three times for a reason other than the transport
     ///   dropping again, rather than stay open with a gap;
-    /// - the client shuts down for good, because `ibapi` gave up reconnecting or
-    ///   [`IbkrClient::disconnect`] was called. `ibapi` never ends the order
-    ///   update subscription itself, so this is detected from its notice stream,
-    ///   which it does close.
+    /// - the client shuts down for good, because `ibapi` gave up reconnecting,
+    ///   [`IbkrClient::disconnect`] was called, or TWS/Gateway ended the API
+    ///   session. Called on a client that has
+    ///   already shut down, this method fails, so replace the client.
     ///
-    /// After either, the reader thread stays blocked on the subscription, and
-    /// holds `ibapi`'s single order-update slot, until TWS sends another event.
-    /// Calling `account_stream` again on the same client fails meanwhile. After a
-    /// shutdown, TWS sends nothing more, so replace the client.
-    ///
-    /// Shutdown is detected only while this stream is open. Called on a client
-    /// that has already shut down, this method still returns a stream, which
-    /// never ends. After a stream ends with a shutdown, replace the client rather
-    /// than resubscribe on it.
+    /// After recovery fails, the reader thread stays blocked on the subscription,
+    /// and holds `ibapi`'s single order-update slot, until TWS sends another
+    /// event. Calling `account_stream` again on the same client fails meanwhile.
     ///
     /// # Duplicate Events
     ///
@@ -2314,23 +2309,6 @@ impl ExecutionClient for IbkrClient {
     ///   does not return the original TIF setting.
     /// - This method blocks on IB's subscription until IB sends an end-of-data marker.
     ///   If IB is stalled, this will block indefinitely.
-    ///
-    /// # Known Issue: Stale Results on `ibapi` 4.2.0
-    ///
-    /// The result may not be this call's answer. See the
-    /// [module's Known Issues](self#known-issues-ibapi-420-shared-queues).
-    ///
-    /// - Order updates received since the previous call are read as part of the
-    ///   result. It can hold the same order more than once, and orders that have
-    ///   since filled or been cancelled, reported as open.
-    /// - After the first connection drop, the next three calls fail with
-    ///   [`UnindexedClientError::Internal`], and every call after them returns
-    ///   the reply to the call three before it. Each later drop adds three more
-    ///   calls of lag, and three more failures, which come once the replies
-    ///   already queued have been read. Retrying does not catch up.
-    ///
-    /// Do not treat the result as authoritative open-order state on 4.2.0. The
-    /// order events from [`ExecutionClient::account_stream`] are unaffected.
     async fn fetch_open_orders(
         &self,
         instruments: &[InstrumentNameExchange],
@@ -3519,6 +3497,27 @@ mod order_reader_tests {
             rx.try_recv().unwrap().kind,
             AccountEventKind::StreamTerminated(_)
         ));
+    }
+
+    #[test]
+    fn a_shutdown_terminates_the_stream_as_one() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = recovery::EventSink::new(tx, new_dedup_cache());
+
+        let mut updates = unforwarded(1);
+        updates.push(Err(ibapi::Error::Shutdown));
+        updates.extend(unforwarded(1));
+
+        assert_eq!(run(&sink, updates), 2, "nothing is read past the shutdown");
+        assert!(matches!(
+            rx.try_recv().unwrap().kind,
+            AccountEventKind::StreamTerminated(StreamTerminationReason::Error(ref reason))
+                if reason == recovery::CLIENT_SHUT_DOWN
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "the stream ends with its termination"
+        );
     }
 
     #[test]

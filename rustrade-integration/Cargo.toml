@@ -25,7 +25,7 @@ collection = ["dep:indexmap", "dep:fnv", "dep:itertools", "dep:derive_more"]
 # derive on `CorporateActionFilter`. `derive_more` also arrives transitively via `stream`, but is
 # listed explicitly so this module's requirement is self-described and survives a `stream` refactor.
 corporate-action = ["stream", "subscription", "dep:derive_more"]
-channel = ["dep:tokio", "dep:tokio-stream", "dep:derive_more", "dep:tracing"]
+channel = ["dep:tokio", "dep:tokio-stream", "dep:futures", "dep:derive_more", "dep:tracing"]
 error = ["dep:url", "dep:serde_qs", "dep:serde_urlencoded", "dep:thiserror"]
 metric = []
 protocol = ["error", "metric", "serde", "dep:tokio-tungstenite", "dep:reqwest", "dep:hmac", "dep:hex", "dep:base64", "dep:tokio", "dep:chrono", "dep:bytes", "dep:tracing"]

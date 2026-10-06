@@ -4,7 +4,9 @@ use crate::order::{
     state::UnindexedOrderState,
 };
 use fnv::FnvHashMap;
-use ibapi::orders::{Action, OcaType, Order, TimeInForce as IbTimeInForce, order_builder};
+use ibapi::orders::{
+    Action, OcaType, Order, TimeInForce as IbTimeInForce, builder::BracketPrices, order_builder,
+};
 use parking_lot::{Mutex, RwLock};
 use rust_decimal::Decimal;
 use rustrade_instrument::{Side, exchange::ExchangeId, instrument::name::InstrumentNameExchange};
@@ -319,6 +321,10 @@ pub enum OrderMappingError {
     /// order TYPE (MOC/LOC), not just the TIF; callers must route through
     /// `build_ib_order` which handles the type promotion.
     AtCloseRequiresOrderTypeChange,
+    /// `ibapi` rejected a bracket's prices: one is not finite, or the take profit or stop loss is
+    /// on the wrong side of the entry (for a buy, the take profit must be above the entry and the
+    /// stop loss below; a sell the reverse).
+    InvalidBracketPrices(String),
 }
 
 impl std::fmt::Display for OrderMappingError {
@@ -346,6 +352,7 @@ impl std::fmt::Display for OrderMappingError {
                 "AtClose TIF must be routed through build_ib_order, which promotes \
                  the order to MOC/LOC; time_in_force_to_ib cannot map it directly"
             ),
+            Self::InvalidBracketPrices(e) => write!(f, "invalid bracket prices: {e}"),
         }
     }
 }
@@ -460,7 +467,16 @@ pub fn build_ib_order(
         OrderKind::StopLimit { trigger_price } => {
             let limit_f64 = require_limit_price(price, *kind)?;
             let trigger_f64 = decimal_to_f64(*trigger_price)?;
-            order_builder::stop_limit(action, quantity, limit_f64, trigger_f64)
+            // Built by hand: `ibapi` 5 removed `order_builder::stop_limit`, and its fluent
+            // replacement adds nothing our checks above have not done. Same fields as before.
+            Order {
+                action,
+                order_type: "STP LMT".to_owned(),
+                total_quantity: quantity,
+                limit_price: Some(limit_f64),
+                aux_price: Some(trigger_f64),
+                ..Order::default()
+            }
         }
 
         OrderKind::TrailingStop {
@@ -510,15 +526,19 @@ pub fn build_ib_order(
             let limit_offset_f64 = decimal_to_f64(*limit_offset)?;
             match offset_type {
                 TrailingOffsetType::Absolute => {
-                    // Use builder for absolute trailing stop-limit.
                     // aux_price = trailing_amount, limit_price_offset = limit offset from stop.
-                    order_builder::trailing_stop_limit(
+                    // The fields `ibapi` 4's removed `order_builder::trailing_stop_limit` set,
+                    // including its `trail_stop_price` of 0.0, so the order IB receives is
+                    // unchanged.
+                    Order {
                         action,
-                        quantity,
-                        limit_offset_f64,
-                        offset_f64,
-                        0.0, // trail_stop_price: let IB derive from market
-                    )
+                        order_type: "TRAIL LIMIT".to_owned(),
+                        total_quantity: quantity,
+                        trail_stop_price: Some(0.0),
+                        limit_price_offset: Some(limit_offset_f64),
+                        aux_price: Some(offset_f64),
+                        ..Order::default()
+                    }
                 }
                 TrailingOffsetType::Percentage => {
                     // Manual construction for percentage-based trailing stop-limit.
@@ -606,6 +626,8 @@ fn build_at_close_order(
 ///
 /// # Returns
 ///
+/// [`OrderMappingError::InvalidBracketPrices`] if `ibapi` rejects the prices: one is not finite,
+/// or the take profit or stop loss is on the wrong side of the entry. Otherwise a
 /// Vec of 3 orders: `[parent, take_profit, stop_loss]` with:
 /// - `parent_id` set on children (IB's bracket linkage)
 /// - `oca_group` set on children (OCA linkage between TP and SL)
@@ -624,15 +646,14 @@ pub fn build_ib_bracket_with_oca(
     take_profit_price: f64,
     stop_loss_price: f64,
     tif: IbTimeInForce,
-) -> Vec<Order> {
-    let mut orders = order_builder::bracket_order(
-        parent_order_id,
-        action,
-        quantity,
-        limit_price,
-        take_profit_price,
-        stop_loss_price,
-    );
+) -> Result<Vec<Order>, OrderMappingError> {
+    let prices = BracketPrices {
+        entry: limit_price,
+        take_profit: take_profit_price,
+        stop_loss: stop_loss_price,
+    };
+    let mut orders = order_builder::bracket_order(parent_order_id, action, quantity, prices)
+        .map_err(|e| OrderMappingError::InvalidBracketPrices(e.to_string()))?;
     assert_eq!(
         orders.len(),
         3,
@@ -653,7 +674,7 @@ pub fn build_ib_bracket_with_oca(
     orders[2].oca_group = oca_group;
     orders[2].oca_type = OcaType::CancelWithBlock;
 
-    orders
+    Ok(orders)
 }
 
 #[cfg(test)]
@@ -1037,6 +1058,7 @@ mod tests {
         assert_eq!(order.aux_price, Some(2.0)); // trailing amount
         assert_eq!(order.limit_price_offset, Some(0.5)); // limit offset from stop
         assert_eq!(order.trailing_percent, None);
+        assert_eq!(order.trail_stop_price, Some(0.0)); // as ibapi 4's builder sent it
     }
 
     #[test]
@@ -1365,7 +1387,8 @@ mod tests {
             160.0,
             140.0,
             IbTimeInForce::Day,
-        );
+        )
+        .unwrap();
 
         assert_eq!(orders.len(), 3);
 
@@ -1392,7 +1415,8 @@ mod tests {
             160.0,
             140.0,
             IbTimeInForce::Day,
-        );
+        )
+        .unwrap();
 
         // Children must reference parent via parent_id
         assert_eq!(orders[1].parent_id, 1000); // TP waits for parent fill
@@ -1412,7 +1436,8 @@ mod tests {
             160.0,
             140.0,
             IbTimeInForce::Day,
-        );
+        )
+        .unwrap();
 
         // Only the last order triggers transmission of all three
         assert!(!orders[0].transmit); // Parent: don't transmit yet
@@ -1430,7 +1455,8 @@ mod tests {
             90.0,
             110.0,
             IbTimeInForce::Day,
-        );
+        )
+        .unwrap();
 
         assert_eq!(orders[0].order_id, 500); // Parent
         assert_eq!(orders[1].order_id, 501); // Take profit
@@ -1438,9 +1464,29 @@ mod tests {
     }
 
     #[test]
+    fn test_build_ib_bracket_with_oca_rejects_prices_on_the_wrong_side_of_the_entry() {
+        // A buy's take profit below its entry.
+        let result =
+            build_ib_bracket_with_oca(7, Action::Buy, 1.0, 10.0, 9.0, 8.0, IbTimeInForce::Day);
+        assert!(matches!(
+            result,
+            Err(OrderMappingError::InvalidBracketPrices(_))
+        ));
+
+        // A sell's stop loss below its entry.
+        let result =
+            build_ib_bracket_with_oca(7, Action::Sell, 1.0, 10.0, 8.0, 9.0, IbTimeInForce::Day);
+        assert!(matches!(
+            result,
+            Err(OrderMappingError::InvalidBracketPrices(_))
+        ));
+    }
+
+    #[test]
     fn test_build_ib_bracket_with_oca_group_name_contains_parent_id() {
         let orders =
-            build_ib_bracket_with_oca(42, Action::Buy, 1.0, 10.0, 12.0, 8.0, IbTimeInForce::Day);
+            build_ib_bracket_with_oca(42, Action::Buy, 1.0, 10.0, 12.0, 8.0, IbTimeInForce::Day)
+                .unwrap();
 
         assert!(orders[1].oca_group.contains("42"));
         assert!(orders[2].oca_group.contains("42"));
@@ -1456,7 +1502,8 @@ mod tests {
             160.0,
             140.0,
             IbTimeInForce::Day,
-        );
+        )
+        .unwrap();
 
         // Parent is limit order
         assert_eq!(orders[0].order_type, "LMT");
@@ -1475,7 +1522,8 @@ mod tests {
     fn test_build_ib_bracket_with_oca_actions_reversed_for_children() {
         // Buy bracket: entry=Buy, exits=Sell
         let buy_orders =
-            build_ib_bracket_with_oca(100, Action::Buy, 10.0, 50.0, 55.0, 45.0, IbTimeInForce::Day);
+            build_ib_bracket_with_oca(100, Action::Buy, 10.0, 50.0, 55.0, 45.0, IbTimeInForce::Day)
+                .unwrap();
         assert_eq!(buy_orders[0].action, Action::Buy);
         assert_eq!(buy_orders[1].action, Action::Sell);
         assert_eq!(buy_orders[2].action, Action::Sell);
@@ -1489,7 +1537,8 @@ mod tests {
             45.0,
             55.0,
             IbTimeInForce::Day,
-        );
+        )
+        .unwrap();
         assert_eq!(sell_orders[0].action, Action::Sell);
         assert_eq!(sell_orders[1].action, Action::Buy);
         assert_eq!(sell_orders[2].action, Action::Buy);
@@ -1505,7 +1554,8 @@ mod tests {
             160.0,
             140.0,
             IbTimeInForce::GoodTillCanceled,
-        );
+        )
+        .unwrap();
 
         assert_eq!(orders[0].tif, IbTimeInForce::GoodTillCanceled);
         assert_eq!(orders[1].tif, IbTimeInForce::GoodTillCanceled);

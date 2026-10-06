@@ -166,6 +166,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`ibapi` 4.2.0 → 5.0.0** (`rustrade-execution`, `rustrade-data`, `rustrade-instrument`,
+  feature `ibkr`). **Breaking.** A caller using `ibapi` types directly meets its own breaking
+  changes; see its [migration guide](https://github.com/wboayue/rust-ibapi/blob/main/docs/migration-5.0.md).
+  In rustrade:
+  - `ibkr::order::build_ib_bracket_with_oca` returns a `Result`. `ibapi` 5 rejects a non-finite
+    price, or a take profit or stop loss on the wrong side of the entry, as the new
+    `OrderMappingError::InvalidBracketPrices`, and the client rejects such a bracket before
+    sending anything to IB.
+  - `IB_MARKET_DEPTH_RESET_CODE` is removed. `ibapi` 5 delivers IB's depth reset (317) as
+    `MarketDepths::Reset` data, which `DepthAggregator::update` turns into the emptied book. A
+    caller driving its own depth loop no longer matches the notice.
+  - The orders rustrade sends are unchanged: stop-limit and trailing-stop-limit orders, whose
+    `ibapi` builders were removed, are built with the same fields.
+
+- **IBKR `account_snapshot` returns once IB has listed every position** (`rustrade-execution`,
+  feature `ibkr`). It waited for 5 s without a position update, so every call took at least
+  5 s; it now stops at IB's end-of-listing marker, which took about 130 ms against a paper
+  gateway. It reads each account the login manages with IB's positions-multi request, whose
+  replies carry their request's ID, so concurrent calls never read each other's listing; IB
+  documents the account as optional only for a single-account login. 5 s without a report before
+  an account's marker still ends that read, without reporting unlisted instruments flat.
+  Closes #408.
+
 - **`binance-sdk` 70.2.0 → 73.0.0** (`rustrade-execution`, `binance` feature). The three
   `binance_sdk::common` internals the margin user-data stream couples to were re-verified before
   merge, and hold by construction: `common/` is byte-identical to 70.2.0. The one change that
@@ -254,6 +277,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request they send as in flight. `SendRequestsOutput` and `SendCancelsAndOpensOutput` are unchanged.
 
 ### Fixed
+
+- **The IBKR account stream did not end when the client shut down** (`rustrade-execution`,
+  feature `ibkr`). Its reader thread stayed blocked until the process exited, holding `ibapi`'s
+  only order-update slot, and `account_stream` on a client that had already shut down returned a
+  stream that never ended. With `ibapi` 5 the stream ends with `StreamTerminated` as soon as the
+  client shuts down, its thread exits, and `account_stream` on a shut-down client fails. Closes
+  #409.
+
+- **IBKR `fetch_open_orders` could return stale orders, and calls failed after a reconnect**
+  (`rustrade-execution`, feature `ibkr`). `ibapi` 4.2.0 shared one reply queue per request type
+  across calls; `ibapi` 5 gives each call its own.
+
+- **IBKR option greeks IB had not computed came through as `-1` or `-2`** (`rustrade-data`,
+  feature `ibkr`). They are now `None`.
+
+- **`rustrade-integration`'s `channel` feature did not build on its own.** It now enables
+  `futures`, which the module imports.
 
 - **`UnboundedRx`'s `Iterator` spun a CPU core while its channel was empty**
   (`rustrade-integration`, `channel` feature). `next` retried `try_recv` in a loop, so an engine run

@@ -67,6 +67,10 @@ const REVISIONS_REMEMBERED: NonZeroUsize = match NonZeroUsize::new(DEDUP_CACHE_S
 /// How often the watcher samples the transport state and drains notices.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Why the account stream ends when `ibapi` shuts the client down for good.
+pub(super) const CLIENT_SHUT_DOWN: &str = "IBKR client shut down: ibapi gave up reconnecting \
+     to TWS/Gateway, the client was disconnected, or TWS/Gateway ended the API session";
+
 /// How far before the estimated start of a gap recovery reaches back.
 ///
 /// The start is taken from the last sample that saw the transport connected, or from the notice
@@ -114,7 +118,7 @@ pub(super) fn classify_notice(code: i32) -> Option<ConnectivityNotice> {
 /// Whether `execution` answers an executions request, rather than reporting a fill as it happens.
 ///
 /// TWS tags a live execution with request id `-1`. `ibapi` numbers its own requests upward from
-/// 9000. `ibapi` also copies every execution it receives to the order update stream, including
+/// 1,500,000,000. `ibapi` also copies every execution it receives to the order update stream, including
 /// those answering [`ExecutionClient::fetch_trades`](crate::client::ExecutionClient::fetch_trades)
 /// and fill recovery, so the stream worker uses this to skip them. Otherwise each such call would
 /// replay the whole day's fills onto the stream.
@@ -523,8 +527,9 @@ pub(super) struct RecoveryWatcher {
 impl RecoveryWatcher {
     /// Watch for gaps and recover their fills until the stream ends or its consumer goes.
     ///
-    /// If recovery keeps failing, or the client shuts down for good, the stream is terminated
-    /// rather than left open with a gap nobody knows about.
+    /// If recovery keeps failing, the stream is terminated rather than left open with a gap nobody
+    /// knows about. If the client shuts down for good, the watcher stops: the order-update reader
+    /// ends the stream then, on the `Error::Shutdown` `ibapi` sends it.
     pub(super) fn run(self) {
         let mut tracker = GapTracker::new(Utc::now());
 
@@ -543,19 +548,14 @@ impl RecoveryWatcher {
             }
 
             // The poll interval's sleep. It ends early on a notice, or at once if `ibapi` closed
-            // the notice stream, which it does only when the client shuts down for good: the
-            // reconnect failed, or `IbkrClient::disconnect` was called. The order update stream
-            // is never closed, so without this the account stream would stay open and silent.
+            // the notice stream, which it does only when the client shuts down for good. Nothing
+            // is left to recover then, so the watcher stops. Ending the stream is left to the
+            // order-update reader, which `ibapi` hands `Error::Shutdown` explicitly.
             let waited = Instant::now();
             match self.notices.next_timeout(POLL_INTERVAL) {
                 Some(notice) => observe_notice(&mut tracker, &notice),
                 None if returned_early(waited.elapsed(), POLL_INTERVAL) => {
-                    warn!("IBKR client shut down; terminating the account stream");
-                    self.sink.terminate(StreamTerminationReason::Error(
-                        "IBKR client shut down: ibapi gave up reconnecting to TWS/Gateway, or \
-                         the client was disconnected"
-                            .to_string(),
-                    ));
+                    debug!("IBKR notice stream closed; fill recovery stops");
                     return;
                 }
                 None => {}
@@ -664,7 +664,7 @@ mod tests {
         assert!(!is_replayed_execution(&with_request_id(-1)));
         // An untagged frame decodes to 0; it is not an answer to any request ibapi made.
         assert!(!is_replayed_execution(&with_request_id(0)));
-        assert!(is_replayed_execution(&with_request_id(9000)));
+        assert!(is_replayed_execution(&with_request_id(1_500_000_000)));
     }
 
     #[test]
