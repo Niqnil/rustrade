@@ -266,6 +266,56 @@ mod tests {
         assert_eq!(requests(&server).await, 2);
     }
 
+    /// A read that does not answer within the tests' lifetime.
+    fn hung() -> ResponseTemplate {
+        new_pair().set_delay(Duration::from_secs(3600))
+    }
+
+    #[tokio::test]
+    async fn a_hung_read_times_out_keeping_the_pairs() {
+        let server = serve(hung()).await;
+        let coins = spot_coins(&server).await;
+        // Paused once the client is created, so the read's timeout fires without waiting.
+        tokio::time::pause();
+
+        assert!(matches!(
+            fetch_spot_pairs(&coins.0.info_client).await,
+            Err(UnindexedClientError::Connectivity(
+                ConnectivityError::Timeout
+            ))
+        ));
+        let pairs = coins.covering(["@300"]).await;
+
+        assert!(pairs.get("@300").is_none());
+        assert!(pairs.get("@107").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_read_abandoned_part_way_still_spends_the_interval() {
+        let server = serve(hung()).await;
+        let coins = spot_coins(&server).await;
+
+        // Drop the read once the server has it, well within the read's own timeout.
+        let reading = tokio::spawn({
+            let coins = coins.clone();
+            async move {
+                coins.covering(["@300"]).await;
+            }
+        });
+        while requests(&server).await < 2 {
+            tokio::task::yield_now().await;
+        }
+        reading.abort();
+        assert!(reading.await.unwrap_err().is_cancelled());
+
+        assert!(coins.covering(["@300"]).await.get("@300").is_none());
+        assert_eq!(
+            requests(&server).await,
+            2,
+            "no second read within the interval"
+        );
+    }
+
     #[test]
     fn spot_pair_tells_other_markets_from_missing_spot_coins() {
         let pairs = test_spot_pairs();

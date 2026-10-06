@@ -36,7 +36,7 @@
 //! named from the pair's tokens (`"@107"` is `HYPE-USDC-SPOT`, `"@207"` is `HYPE-USDT0-SPOT`).
 //!
 //! A spot coin missing from `spotMeta`, such as a pair listed after the client was created, makes
-//! it read `spotMeta` again, at most once every ten seconds and for at most five. A coin still missing after that is:
+//! it read `spotMeta` again, at most once every ten seconds, each read abandoned after five. A coin still missing after that is:
 //! - an error from [`ExecutionClient::account_snapshot`], [`ExecutionClient::fetch_open_orders`]
 //!   and [`ExecutionClient::fetch_trades`], whose lists would otherwise be short with nothing to
 //!   say so. This holds whichever instruments were asked for: the coin's instrument is unknown,

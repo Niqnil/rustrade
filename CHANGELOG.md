@@ -335,7 +335,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     USDT0, is `HYPE-USDT0-SPOT`. `connect` now fails, and `new` panics, if `spotMeta` cannot be
     read.
   - A spot coin missing from `spotMeta`, such as a pair listed since, makes the client read it
-    again, at most once every 10 seconds and for at most 5. A coin still missing fails
+    again, at most once every 10 seconds, each read abandoned after 5. A coin still missing fails
     `account_snapshot`, `fetch_open_orders` and `fetch_trades`, whose lists would otherwise be
     short with nothing to say so. It is left out of the account stream, logged once per stream
     and coin, with `error!` for fills and `warn!` for order updates.
