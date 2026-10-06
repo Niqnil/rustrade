@@ -84,8 +84,7 @@ impl BalanceAggregator {
 /// Collects IB position reports into at most one [`Position`] per instrument.
 ///
 /// IB reports each position per account. For each account and instrument, the latest report
-/// wins: IB streams a new report whenever a position changes, and on `ibapi` 4.2.0 the read can
-/// start with stale replies to earlier failed calls (see `POSITION_STREAM_TIMEOUT`).
+/// wins.
 ///
 /// When more than one account holds the same instrument, the first account to report a non-zero
 /// quantity, in IB's reporting order, is kept and the others are dropped with a warning. Summing them would report a
@@ -95,21 +94,12 @@ pub(crate) struct PositionAggregator {
     /// Latest report per account and instrument, in the order each pair was first reported.
     reports: Vec<(InstrumentNameExchange, ibapi::accounts::Position)>,
     index: FnvHashMap<(String, InstrumentNameExchange), usize>,
-    /// Whether the last thing IB sent was the end of a listing (`PositionEnd`), so every
-    /// position it holds has been reported.
+    /// Whether IB marked the end of its listing (`PositionEnd`), so every position it holds has
+    /// been reported.
     listed_all: bool,
 }
 
 impl PositionAggregator {
-    /// Note that IB sent a position report, whether or not it is for a registered instrument.
-    ///
-    /// A listing is then in progress, and an earlier end marker no longer vouches for it: after
-    /// a connection drop the read can start with a stale listing, complete with its end marker,
-    /// followed by the current one.
-    pub(crate) fn report_seen(&mut self) {
-        self.listed_all = false;
-    }
-
     /// Note that IB marked the end of its listing (`PositionEnd`).
     pub(crate) fn listing_ended(&mut self) {
         self.listed_all = true;
@@ -571,10 +561,7 @@ mod tests {
             for event in events {
                 match *event {
                     "end" => agg.listing_ended(),
-                    // A report IB sends for an instrument that is not registered.
-                    "other" => agg.report_seen(),
                     name => {
-                        agg.report_seen();
                         let quantity = if name == "F" { 0.0 } else { 3.0 };
                         agg.process(
                             instrument(name),
@@ -608,13 +595,6 @@ mod tests {
         assert_eq!(
             reports(&["AAPL", "F"]),
             vec![aapl(), (instrument("F"), PositionReport::Flat)]
-        );
-        // A stale listing's end marker, then a fresh listing that stalls: not complete.
-        assert_eq!(reports(&["AAPL", "end", "other"]), vec![aapl()]);
-        // A stale listing, then the fresh one to its end: complete.
-        assert_eq!(
-            reports(&["other", "end", "AAPL", "end"]),
-            vec![aapl(), (instrument("MSFT"), PositionReport::Flat)]
         );
     }
 }

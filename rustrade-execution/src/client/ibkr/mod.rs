@@ -245,17 +245,11 @@ fn security_types_of(kind: InstrumentKindDiscriminant) -> &'static [&'static str
 static ACCOUNT_GROUP_ALL: std::sync::LazyLock<AccountGroup> =
     std::sync::LazyLock::new(|| AccountGroup("All".to_string()));
 
-/// Quiet period that ends the positions read in `account_snapshot`.
+/// How long the positions read in `account_snapshot` waits for IB's next report before giving
+/// up on the listing.
 ///
-/// IB's positions request is a live subscription that keeps streaming after its
-/// `PositionEnd` marker, so the read stops once this long passes without an
-/// update. It does not stop at `PositionEnd`: on `ibapi` 4.2.0 the positions
-/// queue is shared across calls (see the module's Known Issues), so after a
-/// connection drop it may hold the replies to the calls that failed. Stopping at
-/// the first `PositionEnd` would return one of those replies and leave the rest
-/// for the next call, which would lag behind for good. Reading until quiet
-/// drains them.
-const POSITION_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// The read ends at IB's end-of-listing marker. This only bounds a stall before it.
+const POSITION_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Maximum time to await an initial `OrderStatus` on an order-placement
 /// subscription before giving up. Bounds the placement loops so a silent TWS
@@ -1602,17 +1596,9 @@ impl ExecutionClient for IbkrClient {
     /// [`PositionReport::Flat`](crate::position::PositionReport::Flat). So is each instrument in
     /// `instruments` that is registered with its contract ID but that IB did not list, provided IB
     /// marked the end of its listing (`PositionEnd`) during the read. Without that marker such
-    /// instruments are left out, with a warning, since the listing may be incomplete: IB can
-    /// start the read with a stale listing, and only an end marker after the last report counts.
-    /// IB's positions request carries no request ID, so one case cannot be caught: a stale end
-    /// marker on its own, followed by a current listing that does not start within the read's
-    /// 5-second quiet period. It reads as the listing of an account holding nothing, and the
-    /// requested instruments are reported flat.
+    /// instruments are left out, with a warning, since the listing may be incomplete.
     /// A requested instrument registered without a contract ID, or whose ID was registered again
     /// under another name, cannot be matched to IB's reports and is left out too.
-    ///
-    /// IB can report the same position more than once during the read, as it changes. The latest
-    /// report for each account is used.
     ///
     /// **Several accounts.** IB reports positions per account, and this client does not select
     /// one. When more than one account holds the same instrument, the first account to report a
@@ -1642,11 +1628,14 @@ impl ExecutionClient for IbkrClient {
     ///
     /// # Timeout
     ///
-    /// IB's positions request is a live subscription that keeps streaming after
-    /// the initial set, so the read ends once 5 seconds pass without a position
-    /// update. **Every call therefore takes at least 5 seconds**, including for
-    /// an account with no positions. If IB stalls mid-stream, the positions
-    /// received so far are returned rather than blocking indefinitely.
+    /// The positions read ends at IB's end-of-listing marker. If IB sends nothing
+    /// for 5 seconds before it, the positions received so far are returned rather
+    /// than blocking indefinitely, without the flat reports that need a complete
+    /// listing.
+    ///
+    /// The read uses IB's positions-multi request (all accounts, no model), whose
+    /// replies carry a request ID, so concurrent calls on clones of this client
+    /// never read each other's listing.
     async fn account_snapshot(
         &self,
         assets: &[AssetNameExchange],
@@ -1663,21 +1652,22 @@ impl ExecutionClient for IbkrClient {
 
         let balances_future = self.fetch_balances(assets);
         let positions_future = tokio::task::spawn_blocking(move || {
-            use ibapi::accounts::PositionUpdate;
+            use ibapi::accounts::{Position, PositionUpdateMulti};
 
             // ibapi::Error is unstructured — we cannot distinguish connection failures
             // (transient, should retry) from API errors (e.g., invalid request).
             // Mapped to Internal (non-transient) conservatively; a caller needing reconnect
             // logic should drive it from connection state, not from the error type.
+            // Positions-multi rather than `positions()`: its replies carry this request's ID.
+            // `positions()` replies carry none, so another read's listing, end marker and all,
+            // could end this one early.
             let positions_sub = client
-                .positions()
+                .positions_multi(None, None)
                 .map_err(|e| UnindexedClientError::Internal(format!("positions: {e}")))?;
 
             let mut positions = PositionAggregator::default();
 
-            // Read until `POSITION_STREAM_TIMEOUT` passes with no update, not until
-            // `PositionEnd`: see that constant for why.
-            for pos_update in positions_sub.timeout_iter_data(POSITION_STREAM_TIMEOUT) {
+            for pos_update in positions_sub.timeout_iter_data(POSITION_STALL_TIMEOUT) {
                 // Surface subscription errors rather than returning partial positions
                 // (a truncated snapshot could be misread as positions having closed).
                 let pos_update = match pos_update {
@@ -1689,13 +1679,17 @@ impl ExecutionClient for IbkrClient {
                     }
                 };
                 let pos = match pos_update {
-                    PositionUpdate::Position(pos) => {
-                        positions.report_seen();
-                        pos
-                    }
-                    PositionUpdate::PositionEnd => {
+                    PositionUpdateMulti::Position(pos) => Position {
+                        account: pos.account,
+                        contract: pos.contract,
+                        position: pos.position,
+                        average_cost: pos.average_cost,
+                    },
+                    // The subscription stays live after the listing, streaming changes; this
+                    // read wants the listing alone. Dropping the subscription cancels it.
+                    PositionUpdateMulti::PositionEnd => {
                         positions.listing_ended();
-                        continue;
+                        break;
                     }
                 };
                 let Some(instrument) = contracts.get_name_by_con_id(pos.contract.contract_id)
