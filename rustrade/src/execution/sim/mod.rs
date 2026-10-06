@@ -813,9 +813,9 @@ enum RequestDrain {
 /// interpreted.
 ///
 /// # Why `rx.rx.try_recv()` rather than the receiver's `Iterator`
-/// [`UnboundedRx`]'s `Iterator` impl `continue`s on `TryRecvError::Empty`, so `next()` spins
-/// forever on a channel that is empty but still connected — which is the normal state here, on
-/// every poll, for every venue that was not just sent a request.
+/// [`UnboundedRx`]'s `Iterator` blocks until a message arrives on a channel that is empty but
+/// still connected — which is the normal state here, on every poll, for every venue that was not
+/// just sent a request.
 fn drain_requests(
     venues: &mut FnvIndexMap<ExchangeIndex, SimVenue>,
     pending: &mut BinaryHeap<Reverse<ScheduledEvent>>,

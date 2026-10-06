@@ -738,7 +738,7 @@ impl ExecutionClient for BinanceSpot {
 
         // Fetch open orders for all instruments concurrently (with retry)
         // limit concurrency to avoid bursting Binance's request weight limits
-        // (each GET /api/v3/openOrders costs 3 weight; 8 concurrent = 24 weight).
+        // (each GET /api/v3/openOrders for one symbol costs 6 weight; 8 concurrent = 48 weight).
         // account_snapshot wraps Open orders in OrderState::active(); fetch_open_orders
         // returns them without the wrapper — both use fetch_open_orders_for_instrument.
         use futures::{StreamExt as _, TryStreamExt};
@@ -1439,7 +1439,7 @@ impl ExecutionClient for BinanceSpot {
             return Ok(orders);
         }
         // limit concurrency to avoid bursting Binance's request weight limits
-        // (each GET /api/v3/openOrders costs 3 weight; 8 concurrent = 24 weight).
+        // (each GET /api/v3/openOrders for one symbol costs 6 weight; 8 concurrent = 48 weight).
         // try_fold into a flat Vec avoids the intermediate Vec<Vec<_>> that
         // try_collect().flatten() would allocate.
         use futures::{StreamExt as _, TryStreamExt as _};
