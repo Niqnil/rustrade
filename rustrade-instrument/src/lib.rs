@@ -61,6 +61,11 @@ pub mod corporate_action;
 #[cfg(feature = "ibkr")]
 pub mod ibkr;
 
+// Documented in the module itself: an outer doc comment here would resolve its intra-doc links
+// from the crate root.
+#[cfg(feature = "hyperliquid")]
+pub mod hyperliquid;
+
 /// A keyed value.
 ///
 /// eg/ Keyed<InstrumentIndex, Instrument>

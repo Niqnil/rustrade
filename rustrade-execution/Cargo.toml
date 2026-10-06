@@ -51,6 +51,7 @@ ibkr = [
 ]
 hyperliquid = [
     "dep:hyperliquid_rust_sdk",
+    "rustrade-instrument/hyperliquid",
     "dep:ethers",
     "dep:tokio-util",
     "dep:uuid",

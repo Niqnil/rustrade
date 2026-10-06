@@ -17,12 +17,15 @@ use chrono::{DateTime, TimeZone, Utc};
 use futures::Stream;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
-    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
+    Side,
+    asset::name::AssetNameExchange,
+    exchange::ExchangeId,
+    hyperliquid::{CoinKind, SpotPair},
     instrument::name::InstrumentNameExchange,
 };
 use serde::de::DeserializeOwned;
 use smol_str::format_smolstr;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::task::{Context, Poll};
@@ -259,7 +262,7 @@ async fn user_info<T: DeserializeOwned>(
 }
 
 /// POST the info request `body`, of type `kind`, and parse the response as `T`.
-async fn info<T: DeserializeOwned>(
+pub(super) async fn info<T: DeserializeOwned>(
     info_client: &hyperliquid_rust_sdk::InfoClient,
     kind: &str,
     body: String,
@@ -665,6 +668,55 @@ pub fn perp_coin_to_instrument(coin: &str) -> InstrumentNameExchange {
     InstrumentNameExchange::from(format_smolstr!("{}-USD-PERP", coin))
 }
 
+/// The perpetual instrument `coin` names, or `None` when it names a spot pair or a market of a
+/// kind [`CoinKind::of`] does not recognise.
+///
+/// The account streams and open orders deliver every market's coins together, so other markets
+/// are expected here. The perpetuals client logs the unrecognised ones, which neither client
+/// reports, with [`warn_unknown_coins`] or [`UnknownCoins`].
+pub(super) fn perp_instrument(coin: &str) -> Option<InstrumentNameExchange> {
+    (CoinKind::of(coin) == CoinKind::Perp).then(|| perp_coin_to_instrument(coin))
+}
+
+/// Whether `coin` names a market of a kind [`CoinKind::of`] does not recognise.
+fn is_unknown_coin(coin: &str) -> bool {
+    !matches!(CoinKind::of(coin), CoinKind::Perp | CoinKind::Spot)
+}
+
+/// Log with one `warn!` the distinct coins among `coins` of a kind [`CoinKind::of`] does not
+/// recognise, which neither client reports. For a read that lists many rows at once.
+pub(super) fn warn_unknown_coins<'a>(coins: impl IntoIterator<Item = &'a str>) {
+    let unknown: BTreeSet<&str> = coins
+        .into_iter()
+        .filter(|coin| is_unknown_coin(coin))
+        .collect();
+    if !unknown.is_empty() {
+        warn!(
+            ?unknown,
+            "Hyperliquid coins name markets of an unrecognised kind; leaving them out"
+        );
+    }
+}
+
+/// The coins of a kind [`CoinKind::of`] does not recognise that an account stream has logged, so
+/// it logs each once rather than on every event.
+#[derive(Debug, Default)]
+pub(super) struct UnknownCoins(HashSet<String>);
+
+impl UnknownCoins {
+    /// Log `coin` with `warn!` if it is of an unrecognised kind and not logged before.
+    pub(super) fn warn_once(&mut self, coin: &str) {
+        if is_unknown_coin(coin) && !self.0.contains(coin) {
+            warn!(
+                %coin,
+                "Hyperliquid coin names a market of an unrecognised kind; leaving it out \
+                 (logged once per stream)"
+            );
+            self.0.insert(coin.to_owned());
+        }
+    }
+}
+
 /// Extract coin name from perp instrument (e.g., "BTC-USD-PERP" -> "BTC").
 ///
 /// Returns `String` because Hyperliquid SDK requires `String` for asset fields.
@@ -677,25 +729,10 @@ pub fn instrument_to_perp_coin(instrument: &InstrumentNameExchange) -> String {
     }
 }
 
-/// Build spot instrument name from Hyperliquid coin pair (e.g., "PURR/USDC" -> "PURR-USDC-SPOT").
-///
-/// # Panics (debug builds only)
-///
-/// Debug-asserts if `coin` does not contain '/' — callers must verify `is_spot_coin()`
-/// before calling. The fallback path produces a malformed instrument name.
-pub fn spot_coin_to_instrument(coin: &str) -> InstrumentNameExchange {
-    match coin.split_once('/') {
-        Some((base, quote)) => {
-            InstrumentNameExchange::from(format_smolstr!("{}-{}-SPOT", base, quote))
-        }
-        None => {
-            debug_assert!(
-                false,
-                "spot_coin_to_instrument called with non-spot coin: {coin}"
-            );
-            InstrumentNameExchange::from(format_smolstr!("{}-SPOT", coin))
-        }
-    }
+/// Build the spot instrument name for `pair`, from its tokens: `BASE-QUOTE-SPOT` (e.g.
+/// `HYPE-USDC-SPOT` for the pair Hyperliquid names `@107`).
+pub fn spot_pair_to_instrument(pair: &SpotPair) -> InstrumentNameExchange {
+    InstrumentNameExchange::from(format_smolstr!("{}-{}-SPOT", pair.base(), pair.quote()))
 }
 
 /// Extract coin pair from spot instrument (e.g., "PURR-USDC-SPOT" -> "PURR/USDC").
@@ -703,22 +740,15 @@ pub fn spot_coin_to_instrument(coin: &str) -> InstrumentNameExchange {
 /// Returns `Option<String>` — `None` if the instrument doesn't match expected
 /// `BASE-QUOTE-SPOT` format. Callers should fail fast on `None` rather than
 /// send a malformed asset to the exchange.
+///
+/// The SDK's `ExchangeClient` addresses every spot pair by this `BASE/QUOTE` form as well as by
+/// the coin Hyperliquid names it (`@107`), so orders can be placed with it.
 pub fn instrument_to_spot_coin(instrument: &InstrumentNameExchange) -> Option<String> {
     let s = instrument.as_ref();
     // Expected format: "BASE-QUOTE-SPOT" -> "BASE/QUOTE"
     let without_suffix = s.strip_suffix("-SPOT")?;
     let (base, quote) = without_suffix.split_once('-')?;
     Some(format!("{}/{}", base, quote))
-}
-
-/// Check if a Hyperliquid coin name is a spot pair (contains '/').
-///
-/// Hyperliquid API uses pair format `"BASE/QUOTE"` (e.g., `"PURR/USDC"`) for spot coins
-/// and single symbols (e.g., `"BTC"`) for perpetuals. This naming convention is observed
-/// across all SDK examples and test fixtures. The invariant is validated by our spot
-/// fixture tests in `hyperliquid_spot_execution.rs`.
-pub fn is_spot_coin(coin: &str) -> bool {
-    coin.contains('/')
 }
 
 #[cfg(test)]
@@ -778,12 +808,38 @@ mod tests {
     }
 
     #[test]
-    fn test_spot_coin_to_instrument() {
-        let inst = spot_coin_to_instrument("PURR/USDC");
-        assert_eq!(inst.as_ref(), "PURR-USDC-SPOT");
+    fn test_spot_pair_to_instrument() {
+        let pairs = super::super::spot_coins::test_spot_pairs();
+        let instrument = |coin| spot_pair_to_instrument(pairs.get(coin).unwrap());
 
-        let inst = spot_coin_to_instrument("HYPE/USDC");
-        assert_eq!(inst.as_ref(), "HYPE-USDC-SPOT");
+        assert_eq!(instrument("PURR/USDC").as_ref(), "PURR-USDC-SPOT");
+        assert_eq!(instrument("@107").as_ref(), "HYPE-USDC-SPOT");
+        assert_eq!(instrument("@207").as_ref(), "HYPE-USDT0-SPOT");
+    }
+
+    #[test]
+    fn unknown_coins_are_recorded_once_and_known_ones_never() {
+        let mut unknown = UnknownCoins::default();
+        for coin in ["#12", "#12", "BTC", "@107", "PURR/USDC", "+3"] {
+            unknown.warn_once(coin);
+        }
+        assert_eq!(
+            unknown.0,
+            HashSet::from(["#12".to_owned(), "+3".to_owned()])
+        );
+    }
+
+    #[test]
+    fn test_perp_instrument() {
+        assert_eq!(perp_instrument("BTC"), Some(perp_coin_to_instrument("BTC")));
+        assert_eq!(perp_instrument("kPEPE").unwrap().as_ref(), "kPEPE-USD-PERP");
+        assert_eq!(
+            perp_instrument("xyz:TSLA").unwrap().as_ref(),
+            "xyz:TSLA-USD-PERP"
+        );
+        assert_eq!(perp_instrument("@107"), None, "spot");
+        assert_eq!(perp_instrument("PURR/USDC"), None, "spot");
+        assert_eq!(perp_instrument("#12"), None, "unrecognised");
     }
 
     #[test]
@@ -803,14 +859,6 @@ mod tests {
             instrument_to_spot_coin(&InstrumentNameExchange::from("INVALID")),
             None
         );
-    }
-
-    #[test]
-    fn test_is_spot_coin() {
-        assert!(is_spot_coin("PURR/USDC"));
-        assert!(is_spot_coin("HYPE/USDC"));
-        assert!(!is_spot_coin("BTC"));
-        assert!(!is_spot_coin("ETH"));
     }
 
     #[test]
@@ -851,7 +899,7 @@ mod tests {
 #[cfg(test)]
 // Test code: panics on bad input are acceptable
 #[allow(clippy::unwrap_used)]
-mod info_tests {
+pub(super) mod info_tests {
     use super::*;
     use rust_decimal_macros::dec;
     use wiremock::matchers::{method, path};
@@ -879,7 +927,9 @@ mod info_tests {
 
     /// Build an `InfoClient` pointed at `uri`. `InfoClient::new` opens no connection -- it only
     /// fills in the struct -- so this costs nothing and touches no network.
-    async fn info_client_against(uri: String) -> hyperliquid_rust_sdk::InfoClient {
+    pub(in crate::client::hyperliquid) async fn info_client_against(
+        uri: String,
+    ) -> hyperliquid_rust_sdk::InfoClient {
         let mut client = hyperliquid_rust_sdk::InfoClient::new(
             None,
             Some(hyperliquid_rust_sdk::BaseUrl::Localhost),
@@ -1436,8 +1486,9 @@ mod info_tests {
 
     #[test]
     fn coins_the_client_does_not_trade_are_left_out() {
+        let pairs = super::super::spot_coins::test_spot_pairs();
         let listing = OpenOrderListing::new(&rows(), ExchangeId::HyperliquidSpot, &[], |coin| {
-            is_spot_coin(coin).then(|| spot_coin_to_instrument(coin))
+            pairs.get(coin).map(spot_pair_to_instrument)
         });
         assert_eq!(listing.into_snapshots().count(), 0);
     }
