@@ -183,9 +183,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **IBKR `account_snapshot` returns once IB has listed every position** (`rustrade-execution`,
   feature `ibkr`). It waited for 5 s without a position update, so every call took at least
   5 s; it now stops at IB's end-of-listing marker, which took about 130 ms against a paper
-  gateway. The read uses IB's positions-multi request (all accounts, no model), whose replies
-  carry their request's ID, so concurrent calls never read each other's listing. 5 s without a
-  report before the marker still ends the read, without reporting unlisted instruments flat.
+  gateway. It reads each account the login manages with IB's positions-multi request, whose
+  replies carry their request's ID, so concurrent calls never read each other's listing; IB
+  documents the account as optional only for a single-account login. 5 s without a report before
+  an account's marker still ends that read, without reporting unlisted instruments flat.
   Closes #408.
 
 - **`binance-sdk` 70.2.0 → 73.0.0** (`rustrade-execution`, `binance` feature). The three

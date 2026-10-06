@@ -112,7 +112,10 @@ use chrono::{DateTime, Utc};
 use execution::{ExecutionBuffer, ExecutionRevision, parse_decimal_or_warn, try_decimal_or_warn};
 use futures::stream::BoxStream;
 use ibapi::{
-    accounts::{AccountSummaryResult, types::AccountGroup},
+    accounts::{
+        AccountSummaryResult,
+        types::{AccountGroup, AccountId},
+    },
     client::blocking::Client,
 };
 pub use order::{BracketOrderRequest, BracketOrderResult};
@@ -245,10 +248,10 @@ fn security_types_of(kind: InstrumentKindDiscriminant) -> &'static [&'static str
 static ACCOUNT_GROUP_ALL: std::sync::LazyLock<AccountGroup> =
     std::sync::LazyLock::new(|| AccountGroup("All".to_string()));
 
-/// How long the positions read in `account_snapshot` waits for IB's next report before giving
-/// up on the listing.
+/// How long `account_snapshot` waits for IB's next report of an account's positions before
+/// giving up on that account's listing.
 ///
-/// The read ends at IB's end-of-listing marker. This only bounds a stall before it.
+/// Each account's read ends at IB's end-of-listing marker. This only bounds a stall before it.
 const POSITION_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Maximum time to await an initial `OrderStatus` on an order-placement
@@ -378,6 +381,56 @@ fn resolve_execution(
         return None;
     };
     Some((instrument, client_id))
+}
+
+/// Read one account's positions into `positions`, returning whether IB marked the end of the
+/// listing before [`POSITION_STALL_TIMEOUT`] passed without a report.
+///
+/// Positions-multi rather than `positions()`: its replies carry this request's ID, while
+/// `positions()` replies carry none and reach every open positions subscription, so another read's
+/// listing, end marker and all, could end this one early. IB documents the account parameter as
+/// optional only for a login with a single account, so it is always given.
+///
+/// Only reports for a registered instrument, and in `instruments` when that is given, are kept.
+fn read_account_positions(
+    client: &Client,
+    account: AccountId,
+    contracts: &ContractRegistry,
+    instruments: Option<&HashSet<InstrumentNameExchange>>,
+    positions: &mut PositionAggregator,
+) -> Result<bool, UnindexedClientError> {
+    use ibapi::accounts::{Position, PositionUpdateMulti};
+
+    let subscription = client
+        .positions_multi(Some(&account), None)
+        .map_err(|e| UnindexedClientError::Internal(format!("positions of {account}: {e}")))?;
+
+    for update in subscription.timeout_iter_data(POSITION_STALL_TIMEOUT) {
+        // Surface subscription errors rather than returning partial positions
+        // (a truncated snapshot could be misread as positions having closed).
+        let update = update.map_err(|e| {
+            UnindexedClientError::Internal(format!("positions subscription of {account}: {e}"))
+        })?;
+        let position = match update {
+            PositionUpdateMulti::Position(position) => Position {
+                account: position.account,
+                contract: position.contract,
+                position: position.position,
+                average_cost: position.average_cost,
+            },
+            // The subscription stays live after the listing, streaming changes; this read wants
+            // the listing alone. Dropping the subscription cancels it.
+            PositionUpdateMulti::PositionEnd => return Ok(true),
+        };
+        let Some(instrument) = contracts.get_name_by_con_id(position.contract.contract_id) else {
+            continue;
+        };
+        if instruments.is_some_and(|filter| !filter.contains(&instrument)) {
+            continue;
+        }
+        positions.process(instrument, position);
+    }
+    Ok(false)
 }
 
 /// Forward `updates`, from `ibapi`'s order-update subscription, to `sink` as account events,
@@ -1600,13 +1653,13 @@ impl ExecutionClient for IbkrClient {
     /// A requested instrument registered without a contract ID, or whose ID was registered again
     /// under another name, cannot be matched to IB's reports and is left out too.
     ///
-    /// **Several accounts.** IB reports positions per account, and this client does not select
-    /// one. When more than one account holds the same instrument, the first account to report a
+    /// **Several accounts.** This client reads the positions of every account the login manages,
+    /// one account at a time. When more than one account holds the same instrument, the first account to report a
     /// non-zero quantity is kept and the others are dropped with a warning; they are never summed.
     /// A consumer comparing the reported quantity with its own, as the `rustrade` engine's position
     /// drift check does, therefore compares against that one account.
-    /// Which account comes first depends on the order IB reports them in, so a caller holding the
-    /// same instrument in several accounts should not rely on it.
+    /// Which account comes first depends on the order IB lists the login's accounts in, so a
+    /// caller holding the same instrument in several accounts should not rely on it.
     ///
     /// # Limitations
     ///
@@ -1617,7 +1670,8 @@ impl ExecutionClient for IbkrClient {
     /// # Errors
     ///
     /// [`UnindexedClientError::Internal`] if a position quantity does not convert to a
-    /// `Decimal`, or if the positions subscription fails.
+    /// `Decimal`, if IB lists no accounts for the login or the request for them fails, or if a
+    /// positions subscription fails.
     ///
     /// # Known Issue: ibapi Decode Errors
     ///
@@ -1628,14 +1682,14 @@ impl ExecutionClient for IbkrClient {
     ///
     /// # Timeout
     ///
-    /// The positions read ends at IB's end-of-listing marker. If IB sends nothing
-    /// for 5 seconds before it, the positions received so far are returned rather
-    /// than blocking indefinitely, without the flat reports that need a complete
-    /// listing.
+    /// Each account's positions read ends at IB's end-of-listing marker. If IB sends
+    /// nothing for 5 seconds before it, the positions received so far are returned
+    /// rather than blocking indefinitely, without the flat reports that need every
+    /// account's listing to be complete.
     ///
-    /// The read uses IB's positions-multi request (all accounts, no model), whose
-    /// replies carry a request ID, so concurrent calls on clones of this client
-    /// never read each other's listing.
+    /// Each read uses IB's positions-multi request for that account, whose replies
+    /// carry a request ID, so concurrent calls on clones of this client never read
+    /// each other's listing.
     async fn account_snapshot(
         &self,
         assets: &[AssetNameExchange],
@@ -1652,58 +1706,34 @@ impl ExecutionClient for IbkrClient {
 
         let balances_future = self.fetch_balances(assets);
         let positions_future = tokio::task::spawn_blocking(move || {
-            use ibapi::accounts::{Position, PositionUpdateMulti};
-
             // ibapi::Error is unstructured — we cannot distinguish connection failures
             // (transient, should retry) from API errors (e.g., invalid request).
             // Mapped to Internal (non-transient) conservatively; a caller needing reconnect
             // logic should drive it from connection state, not from the error type.
-            // Positions-multi rather than `positions()`: its replies carry this request's ID.
-            // `positions()` replies carry none, so another read's listing, end marker and all,
-            // could end this one early.
-            let positions_sub = client
-                .positions_multi(None, None)
-                .map_err(|e| UnindexedClientError::Internal(format!("positions: {e}")))?;
+            let accounts = client
+                .managed_accounts()
+                .map_err(|e| UnindexedClientError::Internal(format!("managed accounts: {e}")))?;
+            if accounts.is_empty() {
+                return Err(UnindexedClientError::Internal(
+                    "IB listed no accounts for this login".to_string(),
+                ));
+            }
 
             let mut positions = PositionAggregator::default();
-
-            for pos_update in positions_sub.timeout_iter_data(POSITION_STALL_TIMEOUT) {
-                // Surface subscription errors rather than returning partial positions
-                // (a truncated snapshot could be misread as positions having closed).
-                let pos_update = match pos_update {
-                    Ok(p) => p,
-                    Err(e) => {
-                        return Err(UnindexedClientError::Internal(format!(
-                            "positions subscription: {e}"
-                        )));
-                    }
-                };
-                let pos = match pos_update {
-                    PositionUpdateMulti::Position(pos) => Position {
-                        account: pos.account,
-                        contract: pos.contract,
-                        position: pos.position,
-                        average_cost: pos.average_cost,
-                    },
-                    // The subscription stays live after the listing, streaming changes; this
-                    // read wants the listing alone. Dropping the subscription cancels it.
-                    PositionUpdateMulti::PositionEnd => {
-                        positions.listing_ended();
-                        break;
-                    }
-                };
-                let Some(instrument) = contracts.get_name_by_con_id(pos.contract.contract_id)
-                else {
-                    continue;
-                };
-                if instruments_filter
-                    .as_ref()
-                    .is_some_and(|f| !f.contains(&instrument))
-                {
-                    continue;
-                }
-                positions.process(instrument, pos);
+            let mut listed_all = true;
+            for account in accounts {
+                listed_all &= read_account_positions(
+                    &client,
+                    AccountId(account),
+                    &contracts,
+                    instruments_filter.as_ref(),
+                    &mut positions,
+                )?;
             }
+            if listed_all {
+                positions.listing_ended();
+            }
+
             // IB's reports are attributed by contract ID, so a requested instrument can be
             // reported flat only if its ID is registered and resolves back to it: with no ID, or
             // one another name took over, IB's position in it would be missed.
