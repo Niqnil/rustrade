@@ -311,8 +311,8 @@ ibapi=5.0.0  # 2026-10-06 | Financial protocol, community-maintained, no officia
 #     TWS's replies carry no request id and reach every live positions subscriber -- so `account_snapshot`
 #     now reads positions-multi (request-id scoped) once per managed account (IB documents the account
 #     as optional only for a single-account login) and stops at each end marker. Verified on a paper
-#     gateway (server 225): positions-multi lists exactly what positions() does, and two concurrent
-#     reads each get the full listing.
+#     gateway (server 225, single-account login, read with the account given explicitly): positions-multi
+#     lists exactly what positions() does, and two concurrent reads each get the full listing.
 #   - `order_update_stream` ends with `Error::Shutdown` on shutdown (#871) and is refused on a shut-down
 #     client; the account stream now ends on that signal.
 #   - Depth reset 317 arrives as `MarketDepths::Reset` data, not a notice.

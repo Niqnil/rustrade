@@ -1670,8 +1670,8 @@ impl ExecutionClient for IbkrClient {
     /// # Errors
     ///
     /// [`UnindexedClientError::Internal`] if a position quantity does not convert to a
-    /// `Decimal`, if IB lists no accounts for the login or the request for them fails, or if a
-    /// positions subscription fails.
+    /// `Decimal`, if the request for the login's accounts fails or yields none (as it does when the
+    /// session ends during it), or if a positions subscription fails.
     ///
     /// # Known Issue: ibapi Decode Errors
     ///
@@ -1683,9 +1683,10 @@ impl ExecutionClient for IbkrClient {
     /// # Timeout
     ///
     /// Each account's positions read ends at IB's end-of-listing marker. If IB sends
-    /// nothing for 5 seconds before it, the positions received so far are returned
-    /// rather than blocking indefinitely, without the flat reports that need every
-    /// account's listing to be complete.
+    /// nothing for 5 seconds before it, that account's read gives up and the next
+    /// one starts, so a login with N accounts can wait up to N × 5 seconds. The
+    /// positions received are returned rather than blocking indefinitely, without
+    /// the flat reports that need every account's listing to be complete.
     ///
     /// Each read uses IB's positions-multi request for that account, whose replies
     /// carry a request ID, so concurrent calls on clones of this client never read
@@ -1714,8 +1715,9 @@ impl ExecutionClient for IbkrClient {
                 .managed_accounts()
                 .map_err(|e| UnindexedClientError::Internal(format!("managed accounts: {e}")))?;
             if accounts.is_empty() {
+                // `ibapi` also answers with no accounts when the session ends mid-request.
                 return Err(UnindexedClientError::Internal(
-                    "IB listed no accounts for this login".to_string(),
+                    "no managed accounts: IB listed none, or the session ended".to_string(),
                 ));
             }
 
