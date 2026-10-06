@@ -270,7 +270,7 @@ ibapi=4.2.0  # 2026-09-14 | Financial protocol, community-maintained, no officia
 # NOT VERIFIABLE OFF-GATEWAY, unchanged in force: the ibkr integration tests are all #[ignore]d and CI
 # does not run them. Nothing has exercised 4.2.0's connection-state gate, early reset or strict decode
 # against a real gateway. Do that before relying on 4.2.0 in production.
-binance-sdk=70.2.0  # 2026-09-14 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
+binance-sdk=73.0.0  # 2026-10-06 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
 #   1. common::websocket::WebsocketApi::send_message      — signature + WebsocketMessageSendOptions signing fields (margin WS subscribe send)
 #   2. ws.common.events.subscribe (WebsocketEventEmitter) — receive/event-callback path (margin WS event delivery)
 #   3. common::utils::send_request                        — signature + HMAC signing + X-MBX-APIKEY header (hand-rolled `userListenToken` POST; SDK binds no endpoint for it)
@@ -481,6 +481,59 @@ binance-sdk=70.2.0  # 2026-09-14 | Exchange SDK, signing/IO. PINNED: margin user
 # zero packages added or removed. The vendored Cargo.lock's syn/thiserror/etc. drift is irrelevant.
 # CONSUMER-SIDE API CHURN: NONE -- the new field is builder-defaulted and we construct both configs via
 # the builder, so the crate type-checks unchanged (CI `cargo check --all-features` passed on the bump).
+#
+# Re-verified against the =73.0.0 crates.io source on 2026-10-06 (70.2.0 -> 73.0.0, three majors; PR #492).
+# Published from git 5ff71b43abcbfc1a22530547fa95b97e331c2443 (70.2.0 = 01eaf08eefe7fc99046d5ff2a90b04a7b7c6eed5).
+# THE ENTIRE `src/common/` DIRECTORY IS BYTE-IDENTICAL (all 8 files, `diff -r` empty; websocket.rs md5
+# 367bbb4fe76c40d401ba23bcaba8c08a, utils.rs md5 1541c46b7c5ba4f5f7ef57286c99695d, both unchanged), so all 3
+# internals hold BY CONSTRUCTION. Quoted from 73.0.0 anyway:
+#   1. `send_message(&self, method: &str, payload: BTreeMap<String, Value>,
+#      options: WebsocketMessageSendOptions) -> Result<SendWebsocketMessageResult<R>, WebsocketError>`
+#      (websocket.rs:1667); WebsocketMessageSendOptions (websocket.rs:1439-1444) still carries exactly
+#      with_api_key / is_signed / is_session_logon / is_session_logout. Both margin call sites
+#      (margin.rs:1595, :1635) still pass `WebsocketMessageSendOptions::new()`, i.e. unsigned, no API key.
+#   2. `WebsocketEventEmitter::subscribe` (websocket.rs:128) still spawns ONE task draining one unbounded
+#      channel via a sequential `while let Some(event) = rx.recv().await` (:141). The contract the
+#      non-atomic `Option::take()` calls in the margin `account_stream` callback (registered at
+#      margin.rs:1979) rely on holds.
+#   3. `send_request(configuration, endpoint, method, query_params, body_params, time_unit, is_signed)`
+#      -- 7-arg shape unchanged (utils.rs:951-959). `is_signed` still injects `timestamp` (:967-968), signs
+#      via `configuration.signature_gen.get_signature(...)` (:979-980), appends `signature` to the query
+#      string (:997) and sets `X-MBX-APIKEY` (:1034). The hand-rolled `POST /sapi/v1/userListenToken`
+#      (margin.rs:1510) is still signed as intended.
+# (margin.rs line numbers are as of the PR's base, develop at the time of review; they drift.)
+#
+# What changed outside common/ (108 files differ under src/ + examples/; 20 files added/removed):
+# regenerated spot WS-API models (per-endpoint `rate_limits` inner types, `TickerTradingDayResponse` is now
+# an enum, new tax/special commission models), one new margin REST endpoint
+# (`query_margin_accounts_open_otootoco_order_lists`), and doc rewording. Of the types rustrade reads, ONE
+# field changed type: `spot::websocket_api::ExecutionReport::n_uppercase` (the `N` commission-asset field)
+# went `Option<String>` -> `Option<Option<String>>` with `#[serde(default, with =
+# "::serde_with::rust::double_option")]` (absent -> None, JSON null -> Some(None), "BNB" -> Some(Some)).
+# The same change hit `spot::websocket_streams::ExecutionReport`, which we do not use.
+# `margin_trading::websocket_streams::ExecutionReport` is UNCHANGED (still `Option<String>`), so the shared
+# accessor macro in binance/shared.rs cannot read both with one expression; the fix flattens per type
+# (null and absent both map to None, exactly what the old `Option<String>` deserialisation produced, so
+# behaviour is preserved). All other fields the macro reads (x, X, s, S, i, c, T, t, L, l, n, z, r, o, p, q, f)
+# are identical in type in both versions. The REST models we read (GetOrderResponse,
+# GetOpenOrdersResponseInner, AllOrdersResponseInner, MyTradesResponseInner, GetAccountResponseBalancesInner,
+# the margin REST responses), OutboundAccountPosition(+BInner) and BalanceUpdate are byte-identical.
+#
+# Security: PASS. Real `unsafe`: 10 in BOTH, all `env::set_var`/`remove_var` below the `#[cfg(test)]` at
+# utils.rs:1353 (bare grep 17 -> 17, same over-count caveat as before). Zero `unsafe` outside common/.
+# build.rs identical (md5 32353f57fa3d951fe6be1ce5c5edb33c, 6 lines). NETWORK: zero new hosts; the URL set
+# only LOSES entries (doc links, and `wss://fstream.binance.com/{market,public}/stream`, which are
+# derivatives modules we do not compile). Env reads, filesystem sites, credential handling, process spawn
+# (none) and obfuscation (none) are all in byte-identical files. Both standing caveats carry forward
+# unchanged: the `BINANCE_CONNECTOR_RUST_USER_AGENT` crafted-value panic (utils.rs:437, :1032) and the DEBUG
+# log of the signed WS request (now websocket.rs:1702; same line, file unchanged -- the 1665 recorded
+# earlier was the 69.x line number).
+#
+# Dependency surface: Cargo.toml differs by the version line ALONE (`[dependencies]`, `[dev-dependencies]`,
+# `[build-dependencies]`, `[features]` identical). The PR's Cargo.lock delta is the binance-sdk version +
+# checksum plus 12 one-line re-pointings of EXISTING packages' dependency edges (windows-sys ->0.61.2,
+# socket2 0.5.10 -> 0.6.3, getrandom 0.3.4 -> 0.4.2 for tempfile): zero `[[package]]` entries added or
+# removed, no net-new crates. CONSUMER-SIDE API CHURN: one line, the `commission_asset` accessor above.
 quick-xml  # 2026-07-08 | New direct dep (XML parsing of broker Flex statements). Reviewed @ 0.41.0: #![forbid(unsafe_code)] crate-wide, zero net-new transitive deps (serde+memchr only, both already in tree), no RUSTSEC advisories, de-facto-standard parser. Not pinned — any version bump still needs review.
 #   Re-reviewed @ 0.42.0 (2026-09-16), the review this entry's "any version bump still needs
 #   review" mandates. All four properties recorded at 0.41.0 re-verified and still hold:

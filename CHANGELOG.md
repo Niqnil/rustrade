@@ -125,6 +125,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`binance-sdk` 70.2.0 → 73.0.0** (`rustrade-execution`, `binance` feature). The three
+  `binance_sdk::common` internals the margin user-data stream couples to were re-verified before
+  merge, and hold by construction: `common/` is byte-identical to 70.2.0. The one change that
+  reaches us is that the spot WebSocket API's execution report now declares the commission asset
+  (`N`) nullable, distinguishing an absent key from `null`. Both still read as no commission asset,
+  as before. The margin stream's report is unchanged.
+
 - **An Alpaca fill's `TradeId` is Alpaca's execution id on every path** (`rustrade-execution`).
   **Breaking.** The account stream and reconnect recovery gave a fill the id
   `"{order_id}:{cumulative filled}"`, while `fetch_trades` gave it the FILL activity's `id`, so a
