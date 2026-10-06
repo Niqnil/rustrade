@@ -1693,32 +1693,56 @@ pub(crate) trait BinanceExecutionReportFields {
     fn time_in_force(&self) -> Option<&str>;
 }
 
+/// Read an optional SDK string field as `Option<&str>`, whether the SDK declares it
+/// `Option<String>` or `Option<Option<String>>`.
+///
+/// binance-sdk declares a field it treats as nullable as a double option, so that an absent key
+/// (`None`) and an explicit `null` (`Some(None)`) differ. No accessor here distinguishes them: both
+/// read as `None`. The spot WebSocket API's `ExecutionReport` declares `N` this way and the margin
+/// stream's does not, so the shared macro below reads every string field through this trait.
+trait SdkOptionalStr {
+    fn as_opt_str(&self) -> Option<&str>;
+}
+
+impl SdkOptionalStr for Option<String> {
+    fn as_opt_str(&self) -> Option<&str> {
+        self.as_deref()
+    }
+}
+
+impl SdkOptionalStr for Option<Option<String>> {
+    fn as_opt_str(&self) -> Option<&str> {
+        self.as_ref().and_then(Option::as_deref)
+    }
+}
+
 /// Implement [`BinanceExecutionReportFields`] for SDK types that share these field names.
 ///
-/// Every struct listed below declares these eighteen fields with the same types, so the accessors
-/// are identical; a macro keeps them from drifting apart under hand-editing.
+/// Every struct listed below declares these eighteen fields, so the accessors are identical; a
+/// macro keeps them from drifting apart under hand-editing. String fields are read through
+/// [`SdkOptionalStr`], since the SDK declares some of them nullable on one type and not another.
 macro_rules! impl_binance_execution_report_fields {
     ($($t:ty),* $(,)?) => {
         $(
             impl BinanceExecutionReportFields for $t {
-                fn execution_type(&self) -> Option<&str> { self.x.as_deref() }
-                fn order_status(&self) -> Option<&str> { self.x_uppercase.as_deref() }
-                fn symbol(&self) -> Option<&str> { self.s.as_deref() }
-                fn side(&self) -> Option<&str> { self.s_uppercase.as_deref() }
+                fn execution_type(&self) -> Option<&str> { self.x.as_opt_str() }
+                fn order_status(&self) -> Option<&str> { self.x_uppercase.as_opt_str() }
+                fn symbol(&self) -> Option<&str> { self.s.as_opt_str() }
+                fn side(&self) -> Option<&str> { self.s_uppercase.as_opt_str() }
                 fn order_id(&self) -> Option<i64> { self.i }
-                fn client_order_id(&self) -> Option<&str> { self.c.as_deref() }
+                fn client_order_id(&self) -> Option<&str> { self.c.as_opt_str() }
                 fn transaction_time(&self) -> Option<i64> { self.t_uppercase }
                 fn trade_id(&self) -> Option<i64> { self.t }
-                fn last_executed_price(&self) -> Option<&str> { self.l_uppercase.as_deref() }
-                fn last_executed_quantity(&self) -> Option<&str> { self.l.as_deref() }
-                fn commission_amount(&self) -> Option<&str> { self.n.as_deref() }
-                fn commission_asset(&self) -> Option<&str> { self.n_uppercase.as_deref() }
-                fn cumulative_filled_quantity(&self) -> Option<&str> { self.z.as_deref() }
-                fn reject_reason(&self) -> Option<&str> { self.r.as_deref() }
-                fn order_type(&self) -> Option<&str> { self.o.as_deref() }
-                fn price(&self) -> Option<&str> { self.p.as_deref() }
-                fn order_quantity(&self) -> Option<&str> { self.q.as_deref() }
-                fn time_in_force(&self) -> Option<&str> { self.f.as_deref() }
+                fn last_executed_price(&self) -> Option<&str> { self.l_uppercase.as_opt_str() }
+                fn last_executed_quantity(&self) -> Option<&str> { self.l.as_opt_str() }
+                fn commission_amount(&self) -> Option<&str> { self.n.as_opt_str() }
+                fn commission_asset(&self) -> Option<&str> { self.n_uppercase.as_opt_str() }
+                fn cumulative_filled_quantity(&self) -> Option<&str> { self.z.as_opt_str() }
+                fn reject_reason(&self) -> Option<&str> { self.r.as_opt_str() }
+                fn order_type(&self) -> Option<&str> { self.o.as_opt_str() }
+                fn price(&self) -> Option<&str> { self.p.as_opt_str() }
+                fn order_quantity(&self) -> Option<&str> { self.q.as_opt_str() }
+                fn time_in_force(&self) -> Option<&str> { self.f.as_opt_str() }
             }
         )*
     };
@@ -2744,6 +2768,38 @@ fn order_error_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The spot WebSocket API declares `N` nullable: absent and `null` both read as no commission
+    /// asset, and a value reads as itself. The margin stream's plain `Option` reads the same.
+    #[test]
+    fn commission_asset_reads_absent_null_and_present_alike_on_both_report_types() {
+        type Spot = binance_sdk::spot::websocket_api::ExecutionReport;
+        type Margin = binance_sdk::margin_trading::websocket_streams::ExecutionReport;
+        let parse_spot = |json: &str| match serde_json::from_str::<Spot>(json) {
+            Ok(report) => report,
+            Err(error) => panic!("{json} should parse: {error}"),
+        };
+        let parse_margin = |json: &str| match serde_json::from_str::<Margin>(json) {
+            Ok(report) => report,
+            Err(error) => panic!("{json} should parse: {error}"),
+        };
+
+        assert_eq!(
+            parse_spot(r#"{"e":"executionReport"}"#).commission_asset(),
+            None
+        );
+        assert_eq!(parse_spot(r#"{"N":null}"#).commission_asset(), None);
+        assert_eq!(parse_spot(r#"{"N":"BNB"}"#).commission_asset(), Some("BNB"));
+        assert_eq!(
+            parse_margin(r#"{"e":"executionReport"}"#).commission_asset(),
+            None
+        );
+        assert_eq!(parse_margin(r#"{"N":null}"#).commission_asset(), None);
+        assert_eq!(
+            parse_margin(r#"{"N":"BNB"}"#).commission_asset(),
+            Some("BNB")
+        );
+    }
 
     /// A gap is due once opened, leaves when recovered, and when its read fails is retried with a
     /// doubling delay until it has failed every retry, then given up.
