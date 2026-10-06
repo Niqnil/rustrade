@@ -172,7 +172,8 @@ pub struct InFlightOverdue<ExchangeKey = ExchangeIndex, InstrumentKey = Instrume
 /// This relies on every in-flight order having been sent by the engine, which calls
 /// [`Self::on_sent`], or being in the state the engine started from, which the first check scans.
 /// An order that becomes in flight any other way, such as a snapshot carrying an in-flight state,
-/// is found only by a scan some other order prompts.
+/// is found only by a scan some other order prompts, so with nothing else in flight it may never
+/// be flagged.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(crate) struct InFlightWatch {
     deadlines: InFlightDeadlines,
