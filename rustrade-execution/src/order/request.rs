@@ -50,8 +50,10 @@ pub type UnindexedOrderResponseCancel =
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct RequestOpen {
     pub side: Side,
-    /// Limit price for the order. Required for Limit/StopLimit/TrailingStopLimit orders.
-    /// `None` for Market/Stop/TrailingStop orders (which execute at market price when triggered).
+    /// Limit price for the order. Required for Limit/StopLimit orders.
+    /// `None` for Market/Stop/TrailingStop orders (which execute at market price when triggered),
+    /// and for TrailingStopLimit orders, whose limit price follows from their stop and
+    /// `limit_offset`.
     pub price: Option<Decimal>,
     pub quantity: Decimal,
     pub kind: OrderKind,

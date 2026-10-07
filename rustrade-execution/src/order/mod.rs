@@ -289,10 +289,17 @@ pub enum OrderKind {
         offset_type: TrailingOffsetType,
     },
     /// Trailing stop-limit order - when triggered, submits a limit order offset from the stop.
-    #[display("TrailingStopLimit({offset}, {offset_type}, {limit_offset})")]
+    ///
+    /// The limit price follows from the stop and `limit_offset`, so the order takes no `price`.
+    #[display("TrailingStopLimit({offset}, {offset_type}, {stop_price}, {limit_offset})")]
     TrailingStopLimit {
         offset: Decimal,
         offset_type: TrailingOffsetType,
+        /// The stop price at submission; it then trails the market by `offset`. Must be positive.
+        ///
+        /// An order read back from a venue listing may report the stop after it has trailed,
+        /// not the one it was placed with.
+        stop_price: Decimal,
         /// Offset from the triggered stop price to set the limit price.
         limit_offset: Decimal,
     },

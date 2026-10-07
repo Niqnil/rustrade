@@ -431,6 +431,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **IBKR rejected every trailing stop-limit order: `OrderKind::TrailingStopLimit` had no initial
+  stop** (`rustrade-execution`). Closes #518. **Breaking:** the kind has a new required field,
+  `stop_price: Decimal`.
+  - IB requires a TRAIL LIMIT order's initial stop price. The kind had no field for it, so the
+    IBKR client sent a stop of 0 for an absolute trail, which IB acknowledges and then rejects
+    with `Inactive` ("Invalid Price"), and none for a percentage trail, which IB refuses outright
+    (error 321). No IBKR trailing stop-limit order could work.
+  - `stop_price` is the stop at submission, which then trails the market by `offset`. It must be
+    positive. An order read back from a venue listing may report the stop after it has trailed,
+    not the one it was placed with. The limit price follows from the stop and `limit_offset`.
+  - The IBKR client sends `stop_price` as IB's `trail_stop_price` for both absolute and
+    percentage trails. It refuses a zero or negative stop with the new
+    `OrderMappingError::NonPositiveStopPrice`, and a `RequestOpen::price` given for this kind
+    with the new `OrderMappingError::UnexpectedLimitPrice`, before anything is sent. An order it
+    did not place, or no longer tracks, is read back with its stop from IB's `trail_stop_price`.
+  - The rustdoc of `RequestOpen::price` and of the IBKR order mapping said `TrailingStopLimit`
+    requires a limit price. It takes none.
+  - Binance, Alpaca and Hyperliquid still reject the kind, as before.
+  - An `OrderKind::TrailingStopLimit` serialised without `stop_price` no longer deserialises.
+
 - **A failing account-stream re-initialisation was retried forever in silence, and the engine
   marked an account link up on events that showed it down** (`rustrade`, `rustrade-execution`,
   `rustrade-data`). Closes #515.

@@ -58,6 +58,7 @@
 //! | `test_place_and_cancel_stop_limit_order` | Stop-limit order lifecycle |
 //! | `test_place_and_cancel_trailing_stop_percentage` | Trailing stop (%) lifecycle |
 //! | `test_place_and_cancel_trailing_stop_limit_absolute` | Trailing stop-limit ($) lifecycle |
+//! | `test_place_and_cancel_trailing_stop_limit_percentage` | Trailing stop-limit (%) lifecycle |
 //! | `test_place_and_cancel_bracket_order` | Bracket order with OCA |
 //! | `test_bracket_order_oca_group_linkage` | Verify OCA group linkage |
 //! | `test_place_and_cancel_gtd_order` | Good-Till-Date order |
@@ -1037,24 +1038,26 @@ async fn test_place_and_cancel_trailing_stop_percentage() {
     }
 }
 
-/// Test placing and cancelling a TrailingStopLimit order with absolute offset.
+/// Place a Sell TrailingStopLimit on AAPL with a $200 initial stop and a $1 limit offset, check
+/// IB keeps it working, then cancel it.
 ///
-/// Uses a Sell TrailingStopLimit with $500 absolute trail and $1 limit offset -
-/// the stop price trails $500 below the highest price seen. A $500 trailing
-/// distance is far wider than typical intraday AAPL moves, so the stop won't
-/// trigger and the order remains open for cancellation.
-#[tokio::test]
-#[ignore]
-#[serial]
-async fn test_place_and_cancel_trailing_stop_limit_absolute() {
+/// The stop starts at $200, far below the market, and the trail (`offset`) is wider than the
+/// price, so the stop stays put and the order neither triggers nor fills. IB answers a stop it
+/// will not take with `Inactive` a moment after the order is acknowledged, so the order is left
+/// working for a few seconds before the cancel, and must then end `Cancelled`.
+async fn place_and_cancel_trailing_stop_limit(
+    client_id_offset: i32,
+    offset: rust_decimal::Decimal,
+    offset_type: TrailingOffsetType,
+) {
     init_logging();
 
-    let config = resolved_aapl_config(15);
+    let config = resolved_aapl_config(client_id_offset);
     let client = connect_client(config).await.expect("connection failed");
 
     let aapl_name = aapl_instrument();
 
-    let strategy = StrategyId::new("test-trailing-stop-limit-abs");
+    let strategy = StrategyId::new("test-trailing-stop-limit");
     let order_cid = ClientOrderId::new(format!(
         "trail-stop-limit-{}",
         chrono::Utc::now().timestamp_millis()
@@ -1067,16 +1070,17 @@ async fn test_place_and_cancel_trailing_stop_limit_absolute() {
         cid: order_cid.clone(),
     };
 
-    // Sell TrailingStopLimit: $500 absolute trail, $1 limit offset from stop
+    let kind = OrderKind::TrailingStopLimit {
+        offset,
+        offset_type,
+        stop_price: dec!(200),
+        limit_offset: dec!(1), // Limit price = stop price - $1
+    };
     let request_open = RequestOpen {
         side: Side::Sell,
-        price: None, // Trailing stop limit uses limit_offset, not a fixed price
+        price: None, // The limit follows from the stop and limit_offset
         quantity: dec!(1),
-        kind: OrderKind::TrailingStopLimit {
-            offset: dec!(500), // $500 trailing amount
-            offset_type: TrailingOffsetType::Absolute,
-            limit_offset: dec!(1), // Limit price = stop price - $1
-        },
+        kind,
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
@@ -1088,53 +1092,64 @@ async fn test_place_and_cancel_trailing_stop_limit_absolute() {
         state: request_open,
     };
 
-    println!(
-        "Placing TrailingStopLimit order: SELL 1 AAPL @ $500 trail, $1 limit offset (won't trigger)"
-    );
+    println!("Placing TrailingStopLimit order: SELL 1 AAPL, {kind} (won't trigger)");
 
     let response = client.open_order(open_request).await;
 
-    match &response.state {
-        OrderState::Active(ActiveOrderState::Open(open_state)) => {
-            println!("TrailingStopLimit (absolute) order placed successfully!");
-            println!("  Client Order ID: {}", response.key.cid);
-            println!("  Exchange Order ID: {:?}", open_state.id);
+    let OrderState::Active(ActiveOrderState::Open(open_state)) = &response.state else {
+        panic!("TrailingStopLimit order not open: {:?}", response.state);
+    };
+    println!("TrailingStopLimit order placed: {:?}", open_state.id);
 
-            tokio::time::sleep(Duration::from_millis(100)).await;
+    // Long enough for IB to reject a stop it will not take.
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
-            let cancel_key = OrderKey {
-                exchange: ExchangeId::Ibkr,
-                instrument: &aapl_name,
-                strategy: response.key.strategy.clone(),
-                cid: response.key.cid.clone(),
-            };
+    let cancel_request = rustrade_execution::order::OrderEvent {
+        key: OrderKey {
+            exchange: ExchangeId::Ibkr,
+            instrument: &aapl_name,
+            strategy: strategy.clone(),
+            cid: order_cid.clone(),
+        },
+        state: rustrade_execution::order::request::RequestCancel {
+            id: Some(open_state.id.clone()),
+        },
+    };
+    println!("Canceling TrailingStopLimit order...");
+    let cancel_response = client.cancel_order(cancel_request).await;
+    assert!(cancel_response.state.is_ok(), "{cancel_response:?}");
 
-            let cancel_request = rustrade_execution::order::OrderEvent {
-                key: cancel_key,
-                state: rustrade_execution::order::request::RequestCancel {
-                    id: Some(open_state.id.clone()),
-                },
-            };
+    let ended = ended_eventually(
+        &client,
+        OrderKey {
+            exchange: ExchangeId::Ibkr,
+            instrument: aapl_name.clone(),
+            strategy,
+            cid: order_cid,
+        },
+    )
+    .await;
+    assert!(
+        matches!(ended.state, InactiveOrderState::Cancelled(_)),
+        "not cancelled: {:?}",
+        ended.state
+    );
+}
 
-            println!("Canceling TrailingStopLimit order...");
-            let cancel_response = client.cancel_order(cancel_request).await;
+/// Test placing and cancelling a TrailingStopLimit order with an absolute ($500) trail.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_place_and_cancel_trailing_stop_limit_absolute() {
+    place_and_cancel_trailing_stop_limit(15, dec!(500), TrailingOffsetType::Absolute).await;
+}
 
-            match &cancel_response.state {
-                Ok(_cancelled) => {
-                    println!("TrailingStopLimit (absolute) order canceled successfully!");
-                }
-                Err(e) => {
-                    panic!("Cancel rejected: {:?}", e);
-                }
-            }
-        }
-        OrderState::Inactive(e) => {
-            panic!("TrailingStopLimit order rejected: {:?}", e);
-        }
-        other => {
-            panic!("Unexpected order state: {:?}", other);
-        }
-    }
+/// Test placing and cancelling a TrailingStopLimit order with a percentage (50%) trail.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_place_and_cancel_trailing_stop_limit_percentage() {
+    place_and_cancel_trailing_stop_limit(22, dec!(50), TrailingOffsetType::Percentage).await;
 }
 
 // ============================================================================

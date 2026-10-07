@@ -660,6 +660,7 @@ async fn test_trailing_stop_limit_rejected() {
         kind: OrderKind::TrailingStopLimit {
             offset: dec!(100),
             offset_type: TrailingOffsetType::BasisPoints,
+            stop_price: dec!(98000),
             limit_offset: dec!(50),
         },
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },

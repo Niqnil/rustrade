@@ -594,10 +594,17 @@ pub(crate) fn order_shape_from_ib(order: &Order) -> Result<OrderShape, String> {
         }
         "TRAIL LIMIT" => {
             let (offset, offset_type) = trailing()?;
+            let stop_price = decimal(order.trail_stop_price, "trail_stop_price")?;
+            if stop_price <= Decimal::ZERO {
+                return Err(format!(
+                    "{order_type} order's trail_stop_price {stop_price} is not positive"
+                ));
+            }
             (
                 OrderKind::TrailingStopLimit {
                     offset,
                     offset_type,
+                    stop_price,
                     limit_offset: decimal(order.limit_price_offset, "limit_price_offset")?,
                 },
                 None,
@@ -632,6 +639,11 @@ pub enum OrderMappingError {
     InvalidPrice(String),
     /// Limit price required for this order type but was None.
     MissingLimitPrice(OrderKind),
+    /// A limit price was given for a kind that derives its own, such as `TrailingStopLimit`,
+    /// whose limit follows from its stop and `limit_offset`.
+    UnexpectedLimitPrice(OrderKind),
+    /// The kind's stop price is zero or negative; IB rejects such an order.
+    NonPositiveStopPrice(OrderKind),
     /// Trailing offset type not supported by IBKR.
     UnsupportedOffsetType(TrailingOffsetType),
     /// Order kind not supported by IBKR (e.g., TakeProfit).
@@ -659,6 +671,13 @@ impl std::fmt::Display for OrderMappingError {
             Self::InvalidPrice(p) => write!(f, "invalid price for f64 conversion: {p}"),
             Self::MissingLimitPrice(k) => {
                 write!(f, "limit price required for {k} but was None")
+            }
+            Self::UnexpectedLimitPrice(k) => write!(
+                f,
+                "{k} takes no limit price: it follows from the stop price and limit offset"
+            ),
+            Self::NonPositiveStopPrice(k) => {
+                write!(f, "stop price must be positive for {k}")
             }
             Self::UnsupportedOffsetType(t) => {
                 write!(f, "trailing offset type {t:?} not supported by IBKR")
@@ -768,8 +787,10 @@ fn require_limit_price(
 /// - `StopLimit` → IB "STP LMT" with `aux_price` as trigger, `limit_price` from Order.price
 /// - `TrailingStop` (Percentage) → IB "TRAIL" with `trailing_percent`
 /// - `TrailingStop` (Absolute) → IB "TRAIL" with `aux_price`
-/// - `TrailingStopLimit` (Absolute) → IB "TRAIL LIMIT" with `aux_price`, `limit_price_offset`
-/// - `TrailingStopLimit` (Percentage) → IB "TRAIL LIMIT" with `trailing_percent`, `limit_price_offset`
+/// - `TrailingStopLimit` (Absolute) → IB "TRAIL LIMIT" with `aux_price`, `trail_stop_price`,
+///   `limit_price_offset`
+/// - `TrailingStopLimit` (Percentage) → IB "TRAIL LIMIT" with `trailing_percent`,
+///   `trail_stop_price`, `limit_price_offset`
 /// - `TakeProfit` → `Err(UnsupportedOrderKind)` (IBKR has no native TP; use bracket orders)
 /// - `TakeProfitLimit` → `Err(UnsupportedOrderKind)` (IBKR has no native TP; use bracket orders)
 /// - `BasisPoints` offset type → Error (not supported by IBKR)
@@ -777,7 +798,10 @@ fn require_limit_price(
 /// # Price Requirements
 ///
 /// - `Market`, `Stop`, `TrailingStop`: `price` should be `None` (ignored if provided)
-/// - `Limit`, `StopLimit`, `TrailingStopLimit`: `price` must be `Some(limit_price)`
+/// - `Limit`, `StopLimit`: `price` must be `Some(limit_price)`
+/// - `TrailingStopLimit`: `price` must be `None` (IB derives the limit from the stop and
+///   `limit_offset`), else `Err(UnexpectedLimitPrice)`; `stop_price` must be positive, else
+///   `Err(NonPositiveStopPrice)`. IB requires the initial stop and rejects a zero one.
 ///
 /// # Time-in-Force Special Cases
 ///
@@ -870,43 +894,41 @@ pub fn build_ib_order(
         OrderKind::TrailingStopLimit {
             offset,
             offset_type,
+            stop_price,
             limit_offset,
         } => {
+            // IB sets the limit from the stop and `limit_price_offset`, so a limit price here
+            // would be ignored; refuse it rather than place something other than was asked.
+            if price.is_some() {
+                return Err(OrderMappingError::UnexpectedLimitPrice(*kind));
+            }
+            // IB refuses a TRAIL LIMIT without an initial stop (error 321), and rejects a zero
+            // one as an invalid price once the order reaches the exchange.
+            if *stop_price <= Decimal::ZERO {
+                return Err(OrderMappingError::NonPositiveStopPrice(*kind));
+            }
             let offset_f64 = decimal_to_f64(*offset)?;
+            let stop_price_f64 = decimal_to_f64(*stop_price)?;
             let limit_offset_f64 = decimal_to_f64(*limit_offset)?;
-            match offset_type {
-                TrailingOffsetType::Absolute => {
-                    // aux_price = trailing_amount, limit_price_offset = limit offset from stop.
-                    // The fields `ibapi` 4's removed `order_builder::trailing_stop_limit` set,
-                    // including its `trail_stop_price` of 0.0, so the order IB receives is
-                    // unchanged.
-                    Order {
-                        action,
-                        order_type: "TRAIL LIMIT".to_owned(),
-                        total_quantity: quantity,
-                        trail_stop_price: Some(0.0),
-                        limit_price_offset: Some(limit_offset_f64),
-                        aux_price: Some(offset_f64),
-                        ..Order::default()
-                    }
-                }
-                TrailingOffsetType::Percentage => {
-                    // Manual construction for percentage-based trailing stop-limit.
-                    Order {
-                        action,
-                        order_type: "TRAIL LIMIT".to_owned(),
-                        total_quantity: quantity,
-                        trailing_percent: Some(offset_f64),
-                        limit_price_offset: Some(limit_offset_f64),
-                        trail_stop_price: None,
-                        ..Order::default()
-                    }
-                }
+            // The trail goes in `aux_price` as an amount, or in `trailing_percent`.
+            let (aux_price, trailing_percent) = match offset_type {
+                TrailingOffsetType::Absolute => (Some(offset_f64), None),
+                TrailingOffsetType::Percentage => (None, Some(offset_f64)),
                 TrailingOffsetType::BasisPoints => {
                     return Err(OrderMappingError::UnsupportedOffsetType(
                         TrailingOffsetType::BasisPoints,
                     ));
                 }
+            };
+            Order {
+                action,
+                order_type: "TRAIL LIMIT".to_owned(),
+                total_quantity: quantity,
+                aux_price,
+                trailing_percent,
+                trail_stop_price: Some(stop_price_f64),
+                limit_price_offset: Some(limit_offset_f64),
+                ..Order::default()
             }
         }
 
@@ -1629,6 +1651,7 @@ mod tests {
             &OrderKind::TrailingStopLimit {
                 offset: Decimal::from(2),
                 offset_type: TrailingOffsetType::Absolute,
+                stop_price: Decimal::from(95),
                 limit_offset: Decimal::try_from(0.5).unwrap(),
             },
             None, // Trailing stop limit uses limit_offset, not a fixed price
@@ -1642,7 +1665,8 @@ mod tests {
         assert_eq!(order.aux_price, Some(2.0)); // trailing amount
         assert_eq!(order.limit_price_offset, Some(0.5)); // limit offset from stop
         assert_eq!(order.trailing_percent, None);
-        assert_eq!(order.trail_stop_price, Some(0.0)); // as ibapi 4's builder sent it
+        assert_eq!(order.trail_stop_price, Some(95.0)); // initial stop
+        assert_eq!(order.limit_price, None); // IB derives it from the stop
     }
 
     #[test]
@@ -1653,6 +1677,7 @@ mod tests {
             &OrderKind::TrailingStopLimit {
                 offset: Decimal::from(5),
                 offset_type: TrailingOffsetType::Percentage,
+                stop_price: Decimal::from(95),
                 limit_offset: Decimal::try_from(0.5).unwrap(),
             },
             None, // Trailing stop limit uses limit_offset, not a fixed price
@@ -1666,6 +1691,59 @@ mod tests {
         assert_eq!(order.trailing_percent, Some(5.0));
         assert_eq!(order.limit_price_offset, Some(0.5));
         assert_eq!(order.aux_price, None); // percentage doesn't use aux_price
+        assert_eq!(order.trail_stop_price, Some(95.0)); // initial stop
+        assert_eq!(order.limit_price, None); // IB derives it from the stop
+    }
+
+    /// IB refuses a TRAIL LIMIT without a stop, and rejects a zero one; neither is sent.
+    #[test]
+    fn test_build_trailing_stop_limit_rejects_non_positive_stop_price() {
+        for offset_type in [TrailingOffsetType::Absolute, TrailingOffsetType::Percentage] {
+            for stop_price in [Decimal::ZERO, Decimal::from(-1)] {
+                let kind = OrderKind::TrailingStopLimit {
+                    offset: Decimal::from(2),
+                    offset_type,
+                    stop_price,
+                    limit_offset: Decimal::from(1),
+                };
+                assert_eq!(
+                    build_ib_order(
+                        rustrade_instrument::Side::Sell,
+                        1.0,
+                        &kind,
+                        None,
+                        &TimeInForce::GoodUntilCancelled { post_only: false },
+                    ),
+                    Err(OrderMappingError::NonPositiveStopPrice(kind)),
+                    "{kind}"
+                );
+            }
+        }
+    }
+
+    /// The limit follows from the stop and limit offset, so a limit price is refused, not
+    /// silently dropped.
+    #[test]
+    fn test_build_trailing_stop_limit_rejects_limit_price() {
+        for offset_type in [TrailingOffsetType::Absolute, TrailingOffsetType::Percentage] {
+            let kind = OrderKind::TrailingStopLimit {
+                offset: Decimal::from(2),
+                offset_type,
+                stop_price: Decimal::from(95),
+                limit_offset: Decimal::from(1),
+            };
+            assert_eq!(
+                build_ib_order(
+                    rustrade_instrument::Side::Sell,
+                    1.0,
+                    &kind,
+                    Some(Decimal::from(94)),
+                    &TimeInForce::GoodUntilCancelled { post_only: false },
+                ),
+                Err(OrderMappingError::UnexpectedLimitPrice(kind)),
+                "{kind}"
+            );
+        }
     }
 
     #[test]
@@ -1697,6 +1775,7 @@ mod tests {
             &OrderKind::TrailingStopLimit {
                 offset: Decimal::from(50),
                 offset_type: TrailingOffsetType::BasisPoints,
+                stop_price: Decimal::from(95),
                 limit_offset: Decimal::try_from(0.5).unwrap(),
             },
             None, // Trailing stop limit uses limit_offset, not a fixed price
@@ -1911,6 +1990,7 @@ mod tests {
             &OrderKind::TrailingStopLimit {
                 offset: Decimal::from(5),
                 offset_type: TrailingOffsetType::Absolute,
+                stop_price: Decimal::from(95),
                 limit_offset: Decimal::from(1),
             },
             None, // Trailing stop limit uses limit_offset, not a fixed price
@@ -2211,6 +2291,7 @@ mod tests {
                 OrderKind::TrailingStopLimit {
                     offset: dec!(2),
                     offset_type: TrailingOffsetType::Percentage,
+                    stop_price: dec!(130.5),
                     limit_offset: dec!(0.5),
                 },
                 None,
@@ -2219,6 +2300,7 @@ mod tests {
                 OrderKind::TrailingStopLimit {
                     offset: dec!(1.5),
                     offset_type: TrailingOffsetType::Absolute,
+                    stop_price: dec!(139.75),
                     limit_offset: dec!(0.25),
                 },
                 None,
@@ -2308,6 +2390,23 @@ mod tests {
             ),
             (order("STP", IbTimeInForce::Day), "without aux_price"),
             (order("MKT", IbTimeInForce::GoodTillDate), "good-till-date"),
+            (
+                Order {
+                    aux_price: Some(2.0),
+                    limit_price_offset: Some(0.5),
+                    ..order("TRAIL LIMIT", IbTimeInForce::Day)
+                },
+                "without trail_stop_price",
+            ),
+            (
+                Order {
+                    aux_price: Some(2.0),
+                    trail_stop_price: Some(0.0),
+                    limit_price_offset: Some(0.5),
+                    ..order("TRAIL LIMIT", IbTimeInForce::Day)
+                },
+                "not positive",
+            ),
         ] {
             let error = order_shape_from_ib(&order).unwrap_err();
             assert!(error.contains(reason), "{error:?} should name {reason:?}");
