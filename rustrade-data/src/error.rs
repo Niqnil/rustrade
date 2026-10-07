@@ -2,7 +2,10 @@
 use crate::exchange::databento::DatabentoErrorKind;
 use crate::subscription::{SubKind, candle::CandleInterval};
 use rustrade_instrument::{exchange::ExchangeId, index::error::IndexError};
-use rustrade_integration::{error::SocketError, subscription::SubscriptionId};
+use rustrade_integration::{
+    error::SocketError,
+    subscription::{SubscriptionId, display_subscription_ids},
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -107,6 +110,35 @@ pub enum DataError {
         prev_last_update_id: u64,
         first_update_id: u64,
     },
+
+    /// Subscription validation ended before every subscription in a batch was acknowledged.
+    ///
+    /// `unacknowledged` holds the [`SubscriptionId`]s that received no acknowledgement, sorted.
+    /// They are candidates, not proof of rejection: a venue that closes the connection on one bad
+    /// subscription also leaves those sent after it unanswered. Venues whose acknowledgements
+    /// cannot be matched to subscriptions (one acknowledgement per batch, or one that does not
+    /// echo the subscription) report the whole batch.
+    ///
+    /// A subscription's identifier is `ExchangeSub::new(&subscription).id()` — see
+    /// [`ExchangeSub`](crate::exchange::subscription::ExchangeSub).
+    #[error(
+        "subscriptions not acknowledged ({reason}): {}",
+        display_subscription_ids(unacknowledged)
+    )]
+    SubscriptionsUnacknowledged {
+        reason: String,
+        unacknowledged: Vec<SubscriptionId>,
+    },
+
+    /// A started stream failed to re-initialise after it ended, and will retry after its backoff.
+    ///
+    /// Yielded once per failed attempt. `attempt` counts consecutive failures since the stream
+    /// last initialised, starting at 1, so a caller can tell a slow reconnect from one that keeps
+    /// failing — for example a subscription the venue no longer accepts, reported as
+    /// [`SubscriptionsUnacknowledged`](Self::SubscriptionsUnacknowledged) in `error`. The stream
+    /// keeps retrying; giving up is the caller's decision.
+    #[error("stream re-initialisation attempt {attempt} failed: {error}")]
+    ReinitFailed { attempt: u32, error: Box<DataError> },
 }
 
 impl DataError {
@@ -124,7 +156,16 @@ impl DataError {
 
 impl From<SocketError> for DataError {
     fn from(value: SocketError) -> Self {
-        Self::Socket(value.to_string())
+        match value {
+            SocketError::Unacknowledged {
+                reason,
+                unacknowledged,
+            } => Self::SubscriptionsUnacknowledged {
+                reason,
+                unacknowledged,
+            },
+            other => Self::Socket(other.to_string()),
+        }
     }
 }
 
@@ -141,6 +182,27 @@ impl From<crate::exchange::lse::error::LseError> for DataError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unacknowledged_batch_keeps_its_subscriptions_through_the_conversion() {
+        let error = DataError::from(SocketError::Unacknowledged {
+            reason: "WebSocket stream terminated unexpectedly".to_owned(),
+            unacknowledged: vec!["l2Book|XYZ:TSLA".into(), "trades|@107".into()],
+        });
+
+        assert_eq!(
+            error,
+            DataError::SubscriptionsUnacknowledged {
+                reason: "WebSocket stream terminated unexpectedly".to_owned(),
+                unacknowledged: vec!["l2Book|XYZ:TSLA".into(), "trades|@107".into()],
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "subscriptions not acknowledged (WebSocket stream terminated unexpectedly): \
+             l2Book|XYZ:TSLA, trades|@107"
+        );
+    }
 
     #[test]
     fn test_data_error_is_terminal() {

@@ -6,7 +6,9 @@ use crate::{
     subscription::{Map, SubscriptionKind},
 };
 use rustrade_instrument::exchange::ExchangeId;
-use rustrade_integration::{Validator, error::SocketError, protocol::websocket::WsMessage};
+use rustrade_integration::{
+    Validator, error::SocketError, protocol::websocket::WsMessage, subscription::SubscriptionId,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{fmt::Debug, time::Duration};
 use url::Url;
@@ -164,6 +166,17 @@ where
     /// `Subscription`s were accepted.
     fn expected_responses<InstrumentKey>(map: &Map<InstrumentKey>) -> usize {
         map.0.len()
+    }
+
+    /// The subscription a successful [`Self::SubResponse`] acknowledges, as the [`SubscriptionId`]
+    /// the mapper keyed it under.
+    ///
+    /// Lets a failed validation name the subscriptions left unacknowledged. Defaults to `None`,
+    /// for venues that acknowledge a whole batch at once or do not echo the subscription; the
+    /// failure then names the whole batch. An override must build exactly the identifier the
+    /// mapper produced: one that never matches makes the failure name the whole batch too.
+    fn acknowledged_subscription(_response: &Self::SubResponse) -> Option<SubscriptionId> {
+        None
     }
 
     /// Expected [`Duration`] the [`SubscriptionValidator`] will wait to receive all success

@@ -1,5 +1,6 @@
-use rustrade_integration::{Validator, error::SocketError};
+use rustrade_integration::{Validator, error::SocketError, subscription::SubscriptionId};
 use serde::{Deserialize, Serialize};
+use smol_str::format_smolstr;
 
 /// Hyperliquid WebSocket subscription response.
 ///
@@ -36,6 +37,23 @@ pub enum HyperliquidSubResponse {
 pub struct HyperliquidSubResponseData {
     pub method: String,
     pub subscription: serde_json::Value,
+}
+
+impl HyperliquidSubResponse {
+    /// The subscription a confirmation acknowledges, as `{type}|{coin}` — the identifier the
+    /// subscription was keyed under.
+    ///
+    /// The venue echoes the subscription it accepted, with any optional fields filled in
+    /// (`l2Book` adds `nSigFigs`, `mantissa` and `fast`), so only `type` and `coin` are read.
+    /// `None` for anything but a confirmation carrying both.
+    pub fn subscription_id(&self) -> Option<SubscriptionId> {
+        let Self::SubscriptionResponse { data } = self else {
+            return None;
+        };
+        let kind = data.subscription.get("type")?.as_str()?;
+        let coin = data.subscription.get("coin")?.as_str()?;
+        Some(SubscriptionId(format_smolstr!("{kind}|{coin}")))
+    }
 }
 
 impl Validator for HyperliquidSubResponse {
@@ -85,6 +103,30 @@ mod tests {
                 HyperliquidSubResponse::SubscriptionResponse { .. }
             ));
             assert!(response.validate().is_ok());
+        }
+
+        #[test]
+        fn a_confirmation_names_its_subscription_by_type_and_coin() {
+            // Payload as served by mainnet: `l2Book` echoes its optional fields.
+            let input = r#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"l2Book","coin":"xyz:TSLA","nSigFigs":null,"mantissa":null,"fast":false}}}"#;
+
+            let response: HyperliquidSubResponse = serde_json::from_str(input).unwrap();
+            assert_eq!(
+                response.subscription_id(),
+                Some(SubscriptionId::from("l2Book|xyz:TSLA"))
+            );
+        }
+
+        #[test]
+        fn anything_but_a_complete_confirmation_names_no_subscription() {
+            for input in [
+                r#"{"channel":"pong"}"#,
+                r#"{"channel":"error","data":"invalid subscription"}"#,
+                r#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"allMids"}}}"#,
+            ] {
+                let response: HyperliquidSubResponse = serde_json::from_str(input).unwrap();
+                assert_eq!(response.subscription_id(), None, "{input}");
+            }
         }
 
         #[test]
