@@ -166,6 +166,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A client order id names one live order at a time: an open under one in use is rejected**
+  (`rustrade-execution`, `rustrade`). **Breaking:** the simulated venue's behaviour changes. A
+  venue refuses a second order under an id its live order holds, but `SimulatedVenue` replaced the
+  resting order, the IBKR client overwrote its id mapping, and the engine overwrote its record of
+  the order before the venue's answer arrived. The new `ApiError::DuplicateClientOrderId(String)`
+  reports the refusal, which concerns the request alone: the order holding the id is unaffected.
+  - `SimulatedVenue` rejects an open, of any kind, whose id names a resting order. The check runs
+    after the kind, time-in-force and instrument checks and before the ledger moves. Once an order
+    has ended its id is free, and the venue reports the latest order under each id
+    (`orders_ended`, a cancel's rejection, `account_snapshot`).
+  - The IBKR client refuses such an open, or a bracket any of whose three ids is in use, before
+    anything reaches TWS, which never sees a client order id. An order holds its id until the
+    account stream reports it `Filled`, `Cancelled` or `Inactive`, or `clear_stale_order_ids`
+    reaps it. A `Filled` order frees its id at once and keeps its IB-id entry, so late executions
+    still resolve, and a status IB re-sends for it after its id names a later order is dropped
+    rather than read as that order's. So cancelling a filled order's id is now refused locally as
+    not found, rather than at TWS. Without a running account stream, an id is held until reaped,
+    and so is the id of an `open_order` whose future was dropped mid-flight: retry under a fresh
+    id.
+  - Binance spot and margin report Binance's `"Duplicate order sent."` as the new variant, rather
+    than `OrderRejected`. Alpaca and Hyperliquid still report a duplicate as `OrderRejected`
+    until their messages are confirmed.
+  - The engine rejects an open under an id an order it tracks for that instrument holds, or that
+    an earlier open in the same batch names, before sending it, as the new
+    `RecoverableEngineError::DuplicateClientOrderId` in the action output's `errors`. A
+    `DuplicateClientOrderId` refusal no longer retires the tracked order holding the id, unless
+    that order is the refused request's own, still in flight. `Orders` and `EngineState` keep an
+    order already tracked when an open is recorded under its id, rather than replacing it.
+  - **Breaking:**
+    - `OpenOrders::insert` returns `Result<(), AlreadyResting>`, handing a refused order and its
+      reservation back, instead of replacing the resting order and returning its reservation.
+      `OpenOrders` no longer implements `FromIterator`; `OpenOrders::contains` is new.
+    - `AccountState::orders_mut` is removed, so an order cannot reach the book past the id rule:
+      `AccountState::book` books one and `AccountState::remove_order` takes one off.
+    - `AccountState` converts from an `UnindexedAccountSnapshot` with `TryFrom`, failing with the
+      new `DuplicateSeededOrder` on an id listed twice among the open and cancelled orders it
+      seeds, instead of `From`, where the last such order won in a release build. The
+      `SimulatedVenue` constructors panic on it, as they do on other invalid `initial_state`.
+    - `ibkr::order::OrderIdMap::register` returns `Result<(), ClientOrderIdInUse>`. The new
+      `register_all` registers several orders, all or none, `release_client_id` frees a filled
+      order's id, and `names_other_order` tells whether an id has since been reused. `len` counts
+      live orders only.
+    - The engine's `send_open_requests` callers, `GenerateAlgoOrders` and `ClosePositions`,
+      require the state to implement the new `TracksOrder` and the instrument key `PartialEq`.
+    - `ApiError` and `RecoverableEngineError` gain a variant each; both are `#[non_exhaustive]`.
+
 - **`ibapi` 4.2.0 → 5.0.0** (`rustrade-execution`, `rustrade-data`, `rustrade-instrument`,
   feature `ibkr`). **Breaking.** A caller using `ibapi` types directly meets its own breaking
   changes; see its [migration guide](https://github.com/wboayue/rust-ibapi/blob/main/docs/migration-5.0.md).
@@ -277,6 +323,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request they send as in flight. `SendRequestsOutput` and `SendCancelsAndOpensOutput` are unchanged.
 
 ### Fixed
+
+- **An IBKR order whose id was reused lost its mapping** (`rustrade-execution`, feature `ibkr`).
+  When an earlier order under the id ended, or was reaped by `clear_stale_order_ids`, it removed
+  the id's mapping even though it named the later order, so that order's cancel and status
+  updates no longer resolved. A removal now only removes a mapping that still names the order
+  removed.
 
 - **The IBKR account stream did not end when the client shut down** (`rustrade-execution`,
   feature `ibkr`). Its reader thread stayed blocked until the process exited, holding `ibapi`'s

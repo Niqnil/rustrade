@@ -2,6 +2,7 @@ use crate::engine::state::EngineState;
 use chrono::{DateTime, Utc};
 use rustrade_execution::order::request::{OrderRequestCancel, OrderRequestOpen};
 use rustrade_instrument::{exchange::ExchangeIndex, instrument::InstrumentIndex};
+use tracing::error;
 
 /// Synchronous in-flight open and in-flight cancel order request tracker.
 ///
@@ -43,6 +44,13 @@ pub trait InFlightRequestRecorder<ExchangeKey = ExchangeIndex, InstrumentKey = I
         time_sent: DateTime<Utc>,
     );
 
+    /// Record `request` as an order whose open is in flight.
+    ///
+    /// An implementation that tracks orders by client order id keeps the order it already tracks
+    /// under the request's id, rather than replacing it: a venue refuses such a request and keeps
+    /// that order (see `ApiError::DuplicateClientOrderId`). The `Engine` never records one, because
+    /// it refuses such a request before sending it (see
+    /// [`TracksOrder`](crate::engine::state::TracksOrder)).
     fn record_in_flight_open(
         &mut self,
         request: &OrderRequestOpen<ExchangeKey, InstrumentKey>,
@@ -51,6 +59,10 @@ pub trait InFlightRequestRecorder<ExchangeKey = ExchangeIndex, InstrumentKey = I
 }
 
 /// Records into the request's instrument state.
+///
+/// An open under a client order id the instrument's orders already track is not recorded at all,
+/// in any of the instrument's parts, so the tracked order's routing is kept with it. The `Engine`
+/// never records one (see [`TracksOrder`](crate::engine::state::TracksOrder)).
 ///
 /// # Panics
 /// Each method panics if the request's instrument is not tracked, as
@@ -88,6 +100,15 @@ where
         let instrument_state = self
             .instruments
             .instrument_index_mut(&request.key.instrument);
+
+        if instrument_state.orders.0.contains_key(&request.key.cid) {
+            error!(
+                cid = %request.key.cid,
+                event = ?request,
+                "EngineState received an OpenInFlight under the ClientOrderId of a tracked order - not recording it"
+            );
+            return;
+        }
 
         instrument_state
             .orders

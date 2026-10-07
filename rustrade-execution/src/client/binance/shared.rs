@@ -2220,7 +2220,12 @@ pub(crate) fn parse_binance_api_error(
     // text tells a balance shortfall from the rest.
 
     // Fall back to case-insensitive message text heuristics (avoid to_lowercase allocation)
-    if contains_ignore_case(&error_msg, "insufficient")
+    if contains_ignore_case(&error_msg, "duplicate order sent") {
+        // -2010's "Duplicate order sent.": the `clOrdId` is already in use. Matched on the whole
+        // phrase, since -1102's "Duplicate values for a parameter detected." is a malformed
+        // request, not a taken id.
+        ApiError::DuplicateClientOrderId(error_msg)
+    } else if contains_ignore_case(&error_msg, "insufficient")
         || contains_ignore_case(&error_msg, "not enough")
     {
         // Binance does not name the asset that ran short, so it is left unnamed rather than
@@ -3611,7 +3616,7 @@ mod tests {
     /// the WS API; both must read it the same way.
     #[test]
     fn a_2010_rejection_is_read_by_its_message() {
-        let cases: [(&str, fn(&UnindexedOrderError) -> bool); 3] = [
+        let cases: [(&str, fn(&UnindexedOrderError) -> bool); 4] = [
             (
                 "Account has insufficient balance for requested action.",
                 |err| {
@@ -3623,6 +3628,13 @@ mod tests {
             ),
             ("Order would trigger immediately.", |err| {
                 matches!(err, OrderError::Rejected(ApiError::OrderRejected(_)))
+            }),
+            // The `clOrdId` is already in use.
+            ("Duplicate order sent.", |err| {
+                matches!(
+                    err,
+                    OrderError::Rejected(ApiError::DuplicateClientOrderId(_))
+                )
             }),
             (
                 "Trailing stop orders are not supported for this symbol.",
@@ -3659,6 +3671,13 @@ mod tests {
                 "-1021 Timestamp for this request is outside of the recvWindow.",
                 ApiError::OrderRejected(
                     "-1021 Timestamp for this request is outside of the recvWindow.".to_string(),
+                ),
+            ),
+            // A duplicated parameter is a malformed request, not a client order id in use.
+            (
+                "-1102 Duplicate values for a parameter detected.",
+                ApiError::OrderRejected(
+                    "-1102 Duplicate values for a parameter detected.".to_string(),
                 ),
             ),
             // Auth by wording alone, with no code.

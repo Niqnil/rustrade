@@ -980,18 +980,20 @@ mod tests {
             },
         );
         let order_ids = OrderIdMap::new();
-        order_ids.register(
-            ClientOrderId::new("cid-7"),
-            IB_ORDER_ID,
-            super::super::order::OrderContext {
-                instrument: InstrumentNameExchange::new("AAPL"),
-                side: Side::Buy,
-                price: Some(Decimal::from(100)),
-                quantity: Decimal::from(2),
-                kind: OrderKind::Limit,
-                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-            },
-        );
+        order_ids
+            .register(
+                ClientOrderId::new("cid-7"),
+                IB_ORDER_ID,
+                super::super::order::OrderContext {
+                    instrument: InstrumentNameExchange::new("AAPL"),
+                    side: Side::Buy,
+                    price: Some(Decimal::from(100)),
+                    quantity: Decimal::from(2),
+                    kind: OrderKind::Limit,
+                    time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                },
+            )
+            .unwrap();
         (contracts, order_ids)
     }
 

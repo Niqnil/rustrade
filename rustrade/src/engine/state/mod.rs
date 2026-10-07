@@ -17,7 +17,7 @@ use fnv::FnvHashMap;
 use rustrade_data::event::MarketEvent;
 use rustrade_execution::{
     AccountEvent, AccountEventKind, AccountSnapshot, UnindexedAccountSnapshot,
-    balance::AssetBalance, market::MarketSnapshot,
+    balance::AssetBalance, market::MarketSnapshot, order::id::ClientOrderId,
 };
 use rustrade_instrument::{
     Keyed,
@@ -141,6 +141,44 @@ impl<GlobalData, InstrumentData> TracksInstrument<InstrumentIndex>
     /// which no lookup can detect.
     fn tracks_instrument(&self, key: &InstrumentIndex) -> bool {
         self.instruments.get_index(key).is_some()
+    }
+}
+
+/// Reports whether a `State` tracks an order under a client order id.
+///
+/// A [`ClientOrderId`] names one order at a time, and the `Engine` keys the orders it tracks for an
+/// instrument on it. An open request under an id an order it tracks already holds would make the
+/// engine's record of that order ambiguous, and a venue refuses one anyway (see
+/// [`ApiError::DuplicateClientOrderId`]). So the `Engine` checks each open request against this,
+/// after [`TracksInstrument`], and rejects one under a tracked id as
+/// [`RecoverableEngineError::DuplicateClientOrderId`](crate::engine::error::RecoverableEngineError::DuplicateClientOrderId)
+/// in the action output's `errors`, unsent and unrecorded. It rejects a second open in one batch
+/// under the same instrument and id in the same way.
+///
+/// An id is free again once the `Engine` stops tracking its order, which is when the order ends.
+/// The check is per instrument, as the tracking is: an id in use on another instrument is left to
+/// the venue, which rejects it if it keys ids across instruments.
+///
+/// # Implementing this
+/// Return `true` for every id under which the state's
+/// [`InFlightRequestRecorder`](order::in_flight_recorder::InFlightRequestRecorder) already holds an
+/// order for `instrument`. The `Engine` asks only about an instrument [`TracksInstrument`] reported
+/// as tracked.
+///
+/// [`ApiError::DuplicateClientOrderId`]: rustrade_execution::error::ApiError::DuplicateClientOrderId
+pub trait TracksOrder<InstrumentKey = InstrumentIndex> {
+    /// Whether this state tracks an order for `instrument` under `cid`.
+    fn tracks_order(&self, instrument: &InstrumentKey, cid: &ClientOrderId) -> bool;
+}
+
+impl<GlobalData, InstrumentData> TracksOrder<InstrumentIndex>
+    for EngineState<GlobalData, InstrumentData>
+{
+    /// Whether the instrument's [`Orders`](order::Orders) track an order under `cid`.
+    fn tracks_order(&self, instrument: &InstrumentIndex, cid: &ClientOrderId) -> bool {
+        self.instruments
+            .get_index(instrument)
+            .is_some_and(|state| state.orders.0.contains_key(cid))
     }
 }
 

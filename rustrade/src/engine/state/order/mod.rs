@@ -4,11 +4,14 @@ use crate::engine::state::order::{
 use chrono::{DateTime, Utc};
 use fnv::FnvHashMap;
 use rust_decimal::Decimal;
-use rustrade_execution::order::{
-    Order,
-    id::{ClientOrderId, OrderId, VenueOrderId},
-    request::{OrderRequestCancel, OrderRequestOpen, OrderResponseCancel},
-    state::{ActiveOrderState, CancelInFlight, OrderState},
+use rustrade_execution::{
+    error::{ApiError, OrderError},
+    order::{
+        Order,
+        id::{ClientOrderId, OrderId, VenueOrderId},
+        request::{OrderRequestCancel, OrderRequestOpen, OrderResponseCancel},
+        state::{ActiveOrderState, CancelInFlight, InactiveOrderState, OrderState},
+    },
 };
 use rustrade_instrument::{exchange::ExchangeIndex, instrument::InstrumentIndex};
 use rustrade_integration::collection::snapshot::Snapshot;
@@ -299,31 +302,51 @@ where
     {
         let Snapshot(snapshot) = snapshot;
 
-        let (mut current_entry, update) =
-            match (self.0.entry(snapshot.key.cid.clone()), snapshot.to_active()) {
-                // Order untracked: track it, or ignore it
-                (Entry::Vacant(entry), update) => {
-                    update_untracked(entry, &mut self.1, snapshot, update);
-                    return;
-                }
+        let (mut current_entry, update) = match (
+            self.0.entry(snapshot.key.cid.clone()),
+            snapshot.to_active(),
+        ) {
+            // Order untracked: track it, or ignore it
+            (Entry::Vacant(entry), update) => {
+                update_untracked(entry, &mut self.1, snapshot, update);
+                return;
+            }
 
-                // Order tracked, input Snapshot is InactiveOrderState (ie/ finished), so remove
-                (Entry::Occupied(entry), None) => {
-                    debug!(
-                        exchange = ?snapshot.key.exchange,
-                        instrument = ?snapshot.key.instrument,
-                        strategy = %snapshot.key.strategy,
-                        cid = %snapshot.key.cid,
-                        update = ?snapshot,
-                        "OrderManager received inactive order snapshot for tracked order - removing"
-                    );
-                    self.1.insert(entry.remove().key.cid);
-                    return;
-                }
+            // A refusal of a request under a client order id already in use says nothing about
+            // the order holding it, so it does not end that order. Unless the order tracked is
+            // that request's own, still in flight, which the refusal does end.
+            (Entry::Occupied(entry), None)
+                if is_duplicate_cid_refusal(&snapshot.state)
+                    && !matches!(entry.get().state, ActiveOrderState::OpenInFlight(_)) =>
+            {
+                warn!(
+                    exchange = ?snapshot.key.exchange,
+                    instrument = ?snapshot.key.instrument,
+                    strategy = %snapshot.key.strategy,
+                    cid = %snapshot.key.cid,
+                    update = ?snapshot,
+                    "OrderManager received a duplicate ClientOrderId refusal for a tracked order it did not send - ignoring"
+                );
+                return;
+            }
 
-                // Order tracked, input Snapshot is ActiveOrderState, so forward for further processing
-                (Entry::Occupied(entry), Some(update)) => (entry, update),
-            };
+            // Order tracked, input Snapshot is InactiveOrderState (ie/ finished), so remove
+            (Entry::Occupied(entry), None) => {
+                debug!(
+                    exchange = ?snapshot.key.exchange,
+                    instrument = ?snapshot.key.instrument,
+                    strategy = %snapshot.key.strategy,
+                    cid = %snapshot.key.cid,
+                    update = ?snapshot,
+                    "OrderManager received inactive order snapshot for tracked order - removing"
+                );
+                self.1.insert(entry.remove().key.cid);
+                return;
+            }
+
+            // Order tracked, input Snapshot is ActiveOrderState, so forward for further processing
+            (Entry::Occupied(entry), Some(update)) => (entry, update),
+        };
 
         match (&current_entry.get().state, update.state) {
             (ActiveOrderState::OpenInFlight(_), ActiveOrderState::OpenInFlight(_)) => {
@@ -618,6 +641,18 @@ where
     }
 }
 
+/// Whether `state` is a venue's refusal of an open request because its client order id is in use.
+fn is_duplicate_cid_refusal<AssetKey, InstrumentKey>(
+    state: &OrderState<AssetKey, InstrumentKey>,
+) -> bool {
+    matches!(
+        state,
+        OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+            ApiError::DuplicateClientOrderId(_)
+        )))
+    )
+}
+
 /// Apply `snapshot` (`update` being its active state, if it has one) to an order `Orders` does
 /// not track: track it, unless it has ended or `retired` remembers it.
 ///
@@ -752,18 +787,24 @@ where
         request: &OrderRequestOpen<ExchangeKey, InstrumentKey>,
         time_sent: DateTime<Utc>,
     ) {
-        // A new order by the engine's own hand, so its snapshots apply even under a client id
-        // that named a retired order.
-        self.1.forget(&request.key.cid);
-        if let Some(duplicate_cid_order) = self.0.insert(
-            request.key.cid.clone(),
-            Order::open_in_flight(request, time_sent),
-        ) {
-            error!(
-                cid = %duplicate_cid_order.key.cid,
-                event = ?duplicate_cid_order,
-                "OrderManager upserted Order OpenInFlight with duplicate ClientOrderId"
-            );
+        match self.0.entry(request.key.cid.clone()) {
+            // The order already under the id is the one a venue keeps, refusing this request as a
+            // duplicate, so it is the one kept here. The `Engine` never sends such a request: see
+            // `TracksOrder`.
+            Entry::Occupied(tracked) => {
+                error!(
+                    cid = %request.key.cid,
+                    tracked = ?tracked.get(),
+                    event = ?request,
+                    "OrderManager received an OpenInFlight under the ClientOrderId of a tracked order - keeping the tracked order"
+                );
+            }
+            Entry::Vacant(entry) => {
+                // A new order by the engine's own hand, so its snapshots apply even under a
+                // client id that named a retired order.
+                self.1.forget(&request.key.cid);
+                entry.insert(Order::open_in_flight(request, time_sent));
+            }
         }
     }
 }
@@ -2206,6 +2247,67 @@ mod tests {
             order_snapshot_open(cid.clone(), DateTime::<Utc>::MIN_UTC).as_ref(),
         );
         assert!(state.0.contains_key(&cid));
+    }
+
+    /// An open recorded under the id of an order already tracked keeps that order, as the venue
+    /// refusing the request does, rather than replacing it with an order the venue never held.
+    #[test]
+    fn an_open_recorded_under_a_tracked_id_keeps_the_tracked_order() {
+        let cid = ClientOrderId::new("tracked");
+        let mut state = Orders::<ExchangeId, u64>::default();
+        state.record_in_flight_open(&request_open(cid.clone()), TIME_SENT);
+        state.update_from_order_snapshot(
+            order_snapshot_open(cid.clone(), DateTime::<Utc>::MIN_UTC).as_ref(),
+        );
+
+        state.record_in_flight_open(&request_open(cid.clone()), TIME_SENT);
+
+        assert!(
+            matches!(
+                state.0.get(&cid).map(|order| &order.state),
+                Some(ActiveOrderState::Open(_))
+            ),
+            "the tracked order is still the open one"
+        );
+    }
+
+    /// A refusal of an open as a duplicate client order id ends only the request it refused: it
+    /// retires an order still in flight under the id, which is that request's own, and leaves an
+    /// order the venue already holds working.
+    #[test]
+    fn a_duplicate_cid_refusal_ends_only_the_request_it_refused() {
+        let refusal = |cid: ClientOrderId| {
+            let Snapshot(mut order) = order_snapshot_failed(cid);
+            order.state = OrderState::inactive(OrderError::Rejected(
+                ApiError::DuplicateClientOrderId("in use".into()),
+            ));
+            Snapshot(order)
+        };
+        let mut state = Orders::<ExchangeId, u64>::default();
+        let (working, in_flight) = (
+            ClientOrderId::new("working"),
+            ClientOrderId::new("in_flight"),
+        );
+        state.record_in_flight_open(&request_open(working.clone()), TIME_SENT);
+        state.update_from_order_snapshot(
+            order_snapshot_open(working.clone(), DateTime::<Utc>::MIN_UTC).as_ref(),
+        );
+        state.record_in_flight_open(&request_open(in_flight.clone()), TIME_SENT);
+
+        state.update_from_order_snapshot(refusal(working.clone()).as_ref());
+        state.update_from_order_snapshot(refusal(in_flight.clone()).as_ref());
+
+        assert!(
+            matches!(
+                state.0.get(&working).map(|order| &order.state),
+                Some(ActiveOrderState::Open(_))
+            ),
+            "the order the venue holds keeps working"
+        );
+        assert!(
+            !state.0.contains_key(&in_flight),
+            "the refused request's own order is retired"
+        );
     }
 
     #[test]

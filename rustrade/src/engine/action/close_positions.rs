@@ -5,7 +5,8 @@ use crate::{
         clock::EngineClock,
         execution_tx::ExecutionTxMap,
         state::{
-            MarketSnapshotSource, TracksInstrument, instrument::filter::InstrumentFilter,
+            MarketSnapshotSource, TracksInstrument, TracksOrder,
+            instrument::filter::InstrumentFilter,
             order::in_flight_recorder::InFlightRequestRecorder,
         },
     },
@@ -45,11 +46,12 @@ where
     Clock: EngineClock,
     State: InFlightRequestRecorder<ExchangeKey, InstrumentKey>
         + MarketSnapshotSource<InstrumentKey>
-        + TracksInstrument<InstrumentKey>,
+        + TracksInstrument<InstrumentKey>
+        + TracksOrder<InstrumentKey>,
     ExecutionTxs: ExecutionTxMap<ExchangeKey, InstrumentKey>,
     Strategy: ClosePositionsStrategy<ExchangeKey, AssetKey, InstrumentKey, State = State>,
     ExchangeKey: Debug + Clone,
-    InstrumentKey: Debug + Clone,
+    InstrumentKey: Debug + Clone + PartialEq,
 {
     fn close_positions(
         &mut self,

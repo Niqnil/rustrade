@@ -5,7 +5,7 @@ use crate::{
         error::{EngineError, RecoverableEngineError, UnrecoverableEngineError},
         execution_tx::ExecutionTxMap,
         state::{
-            MarketSnapshotSource, TracksInstrument,
+            MarketSnapshotSource, TracksInstrument, TracksOrder,
             order::in_flight_recorder::InFlightRequestRecorder,
         },
     },
@@ -15,6 +15,7 @@ use derive_more::Constructor;
 use itertools::Itertools;
 use rustrade_execution::order::{
     OrderEvent,
+    id::ClientOrderId,
     request::{OrderRequestCancel, OrderRequestOpen, RequestCancel, RequestOpen},
 };
 use rustrade_instrument::{exchange::ExchangeIndex, instrument::InstrumentIndex};
@@ -29,8 +30,9 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk>
     Engine<Clock, State, ExecutionTxs, Strategy, Risk>
 {
     /// Send open requests on behalf of an `Engine` action: reject any for an untracked instrument,
-    /// stamp the rest with the market the state holds now (see [`MarketSnapshotSource`]), send
-    /// them, and record those sent as in flight.
+    /// and any under a client order id already in use (see [`TracksOrder`]), stamp the rest with
+    /// the market the state holds now (see [`MarketSnapshotSource`]), send them, and record those
+    /// sent as in flight.
     pub(crate) fn send_open_requests<ExchangeKey, InstrumentKey>(
         &mut self,
         requests: impl IntoIterator<Item = OrderRequestOpen<ExchangeKey, InstrumentKey>>,
@@ -38,14 +40,36 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk>
     where
         Clock: EngineClock,
         State: TracksInstrument<InstrumentKey>
+            + TracksOrder<InstrumentKey>
             + MarketSnapshotSource<InstrumentKey>
             + InFlightRequestRecorder<ExchangeKey, InstrumentKey>,
         ExecutionTxs: ExecutionTxMap<ExchangeKey, InstrumentKey>,
         ExchangeKey: Debug + Clone,
-        InstrumentKey: Debug + Clone,
+        InstrumentKey: Debug + Clone + PartialEq,
     {
+        // The ids this batch has already claimed: the state records none of them until the whole
+        // batch is sent. A batch is a handful of requests, so a scan costs about what hashing would.
+        let mut claimed: Vec<(InstrumentKey, ClientOrderId)> = Vec::new();
         let output = self.send_tracked_requests(requests, |state, open| {
-            open.state.market = state.market_snapshot(&open.key.instrument);
+            let (instrument, cid) = (&open.key.instrument, &open.key.cid);
+            if state.tracks_order(instrument, cid)
+                || claimed.iter().any(|(i, c)| i == instrument && c == cid)
+            {
+                // The whole request is returned in `errors`; the log names what finds it.
+                warn!(
+                    instrument = ?instrument,
+                    strategy = %open.key.strategy,
+                    cid = %cid,
+                    "open request under a client order id the Engine already tracks an order \
+                     under -- rejected, not sent"
+                );
+                return Err(EngineError::Recoverable(
+                    RecoverableEngineError::DuplicateClientOrderId(cid.to_string()),
+                ));
+            }
+            claimed.push((instrument.clone(), cid.clone()));
+            open.state.market = state.market_snapshot(instrument);
+            Ok(())
         });
         if !output.sent.is_none() {
             let time_sent = self.clock.time();
@@ -70,7 +94,7 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk>
         ExchangeKey: Debug + Clone,
         InstrumentKey: Debug + Clone,
     {
-        let output = self.send_tracked_requests(requests, |_, _| {});
+        let output = self.send_tracked_requests(requests, |_, _| Ok(()));
         if !output.sent.is_none() {
             let time_sent = self.clock.time();
             self.state
@@ -80,13 +104,18 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk>
         output
     }
 
-    /// Send each request whose instrument the state tracks, after `prepare` has adjusted it, and
-    /// reject the others unsent as [`RecoverableEngineError::UnknownInstrument`]. Errors keep the
-    /// input order, whichever step produced them.
+    /// Send each request whose instrument the state tracks and that `prepare` accepts, after
+    /// `prepare` has adjusted it. Reject the others unsent: one for an untracked instrument as
+    /// [`RecoverableEngineError::UnknownInstrument`], before `prepare` sees it, and one `prepare`
+    /// refuses with the error it returns. Errors keep the input order, whichever step produced
+    /// them.
     fn send_tracked_requests<Kind, ExchangeKey, InstrumentKey>(
         &self,
         requests: impl IntoIterator<Item = OrderEvent<Kind, ExchangeKey, InstrumentKey>>,
-        prepare: impl Fn(&State, &mut OrderEvent<Kind, ExchangeKey, InstrumentKey>),
+        mut prepare: impl FnMut(
+            &State,
+            &mut OrderEvent<Kind, ExchangeKey, InstrumentKey>,
+        ) -> Result<(), EngineError>,
     ) -> SendRequestsOutput<Kind, ExchangeKey, InstrumentKey>
     where
         State: TracksInstrument<InstrumentKey>,
@@ -116,7 +145,9 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk>
                     return Err(Box::new((request, error)));
                 }
 
-                prepare(&self.state, &mut request);
+                if let Err(error) = prepare(&self.state, &mut request) {
+                    return Err(Box::new((request, error)));
+                }
                 match self.send_request(&request) {
                     Ok(()) => Ok(Box::new(request)),
                     Err(error) => Err(Box::new((request, error))),

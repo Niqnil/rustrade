@@ -7,7 +7,7 @@ use crate::{
     error::{ApiError, UnindexedApiError, UnindexedOrderError},
     exchange::mock::{
         account::{AccountState, Debit},
-        orders::{OpenOrder, Reservation, RestingOrder},
+        orders::{AlreadyResting, OpenOrder, Reservation, RestingOrder},
     },
     fee::{FeeModel, FeeModelConfig, Liquidity},
     fill::{FillContext, FillModel, SimFillConfig},
@@ -285,6 +285,20 @@ pub enum VenueRegime {
 /// retired without resting and without trading — otherwise whether an expired order traded would
 /// depend on where the book happened to be.
 ///
+/// # A client order id names one working order at a time
+/// An open request whose [`ClientOrderId`] already names an order resting here is **rejected** with
+/// [`ApiError::DuplicateClientOrderId`], whatever its kind, and the resting order is untouched: its
+/// price, queue position, deadline and reservation stay as they were. Only an order that rests
+/// holds its id; one that fills or is cancelled on arrival never does.
+///
+/// Once an order has ended its id is free, and the next order under it replaces what this venue
+/// remembers of the earlier one. [`orders_ended`](Self::orders_ended), the rejection of a cancel
+/// and [`account_snapshot`](Self::account_snapshot) therefore report the latest order under each
+/// id.
+///
+/// The check follows the static ones on kind, time in force and instrument, so a malformed request
+/// is reported as malformed, and comes before anything that touches the ledger.
+///
 /// [`OpenOrders`]: super::orders::OpenOrders
 ///
 /// # Reserved balances
@@ -384,8 +398,10 @@ impl SimulatedVenue {
     /// the regime that accepts limits.
     ///
     /// # Panics
-    /// If `initial_state` holds an open CFD position with no entry price: see the caller
-    /// obligations on [`SimulatedVenue`].
+    /// - If `initial_state` holds an open CFD position with no entry price: see the caller
+    ///   obligations on [`SimulatedVenue`].
+    /// - If `initial_state` lists one client order id more than once among its open and cancelled
+    ///   orders: see [`DuplicateSeededOrder`](super::account::DuplicateSeededOrder).
     pub fn new(
         config: &MockExecutionConfig,
         instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
@@ -403,8 +419,10 @@ impl SimulatedVenue {
     /// See [`VenueRegime::MarketDriven`].
     ///
     /// # Panics
-    /// If `initial_state` holds an open CFD position with no entry price: see the caller
-    /// obligations on [`SimulatedVenue`].
+    /// - If `initial_state` holds an open CFD position with no entry price: see the caller
+    ///   obligations on [`SimulatedVenue`].
+    /// - If `initial_state` lists one client order id more than once among its open and cancelled
+    ///   orders: see [`DuplicateSeededOrder`](super::account::DuplicateSeededOrder).
     pub fn new_market_driven(
         config: &MockExecutionConfig,
         instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
@@ -418,7 +436,10 @@ impl SimulatedVenue {
         regime: VenueRegime,
     ) -> Self {
         let positions = seeded_positions(&config.initial_state, &instruments);
-        let account = AccountState::from(config.initial_state.clone());
+        let account = match AccountState::try_from(config.initial_state.clone()) {
+            Ok(account) => account,
+            Err(error) => panic!("invalid MockExecutionConfig::initial_state: {error}"),
+        };
         let order_id_start = first_unseeded_order_id(&account);
 
         Self {
@@ -501,8 +522,7 @@ impl SimulatedVenue {
 
         for cid in expired {
             // Collected from this same index with nothing in between, so this always finds it.
-            let Some(RestingOrder { order, reservation }) = self.account.orders_mut().remove(&cid)
-            else {
+            let Some(RestingOrder { order, reservation }) = self.account.remove_order(&cid) else {
                 continue;
             };
 
@@ -667,8 +687,7 @@ impl SimulatedVenue {
 
         for (cid, limit) in crossing {
             // Collected from this same book with nothing in between, so this always finds it.
-            let Some(RestingOrder { order, reservation }) = self.account.orders_mut().remove(&cid)
-            else {
+            let Some(RestingOrder { order, reservation }) = self.account.remove_order(&cid) else {
                 continue;
             };
 
@@ -1024,8 +1043,7 @@ impl SimulatedVenue {
     ) -> CancelOutcome {
         let time_exchange = self.time_exchange();
 
-        let Some(RestingOrder { order, reservation }) =
-            self.account.orders_mut().remove(&request.key.cid)
+        let Some(RestingOrder { order, reservation }) = self.account.remove_order(&request.key.cid)
         else {
             return VenueOutcome {
                 events: Vec::new(),
@@ -1266,6 +1284,19 @@ impl SimulatedVenue {
             Ok(terms) => terms,
             Err(error) => return (build_open_order_err_response(request, error), None),
         };
+
+        // Before anything touches the ledger, and for every kind: see the type's note on client
+        // order ids. It is also what makes a refused booking in `book_rested` unreachable.
+        if self.account.orders().contains(&request.key.cid) {
+            let reason = format!(
+                "{} already names an order resting on {}",
+                request.key.cid, request.key.exchange
+            );
+            return (
+                build_open_order_err_response(request, ApiError::DuplicateClientOrderId(reason)),
+                None,
+            );
+        }
 
         let now = self.time_exchange();
 
@@ -1634,7 +1665,7 @@ impl SimulatedVenue {
         // one place: every other arrival already acknowledges its own outcome.
         self.account.ack_trade(trade.clone());
 
-        let (state, released) = self.retire_filled(
+        let state = self.retire_filled(
             &request,
             order_id,
             Fill {
@@ -1656,9 +1687,7 @@ impl SimulatedVenue {
                 state,
             },
             Some(OpenOrderNotifications::Filled {
-                // A displaced order's hold is given back after this order's own is taken, so the
-                // later restatement is the one that is true.
-                balance: Snapshot(released.unwrap_or(balance)),
+                balance: Snapshot(balance),
                 trade,
             }),
         )
@@ -1667,8 +1696,7 @@ impl SimulatedVenue {
     /// Records what an order that traded on arrival became, and reports the state it answers with.
     ///
     /// The three outcomes are the three things a taker fill can leave behind: nothing, a remainder
-    /// with nowhere to wait, or a remainder on the book. Returns the balance a displaced order's
-    /// released hold restated, if this order replaced one.
+    /// with nowhere to wait, or a remainder on the book.
     fn retire_filled(
         &mut self,
         request: &OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
@@ -1676,7 +1704,7 @@ impl SimulatedVenue {
         fill: Fill,
         held: Option<Settlement>,
         time_exchange: DateTime<Utc>,
-    ) -> (UnindexedOrderState, Option<AssetBalance<AssetNameExchange>>) {
+    ) -> UnindexedOrderState {
         // Spelled out per arm rather than shared: a closure would be monomorphic in the state
         // type, and the two arms that record an order record two different ones.
         match held {
@@ -1689,7 +1717,7 @@ impl SimulatedVenue {
                     time_exchange,
                     fill.quantity,
                 );
-                let released = self.book_rested(
+                self.book_rested(
                     Order {
                         key: request.key.clone(),
                         side: request.state.side,
@@ -1703,10 +1731,9 @@ impl SimulatedVenue {
                         amount: held.requirement(),
                         asset: held.asset,
                     },
-                    time_exchange,
                 );
 
-                (OrderState::active(open), released)
+                OrderState::active(open)
             }
 
             // Either it filled outright, or what is left has nowhere to wait.
@@ -1729,7 +1756,7 @@ impl SimulatedVenue {
                     state: filled.clone(),
                 });
 
-                (OrderState::fully_filled(filled), None)
+                OrderState::fully_filled(filled)
             }
 
             // A market order carries no price, so its remainder has nothing to rest at and retires
@@ -1751,7 +1778,7 @@ impl SimulatedVenue {
                     state: cancelled.clone(),
                 });
 
-                (OrderState::inactive(cancelled), None)
+                OrderState::inactive(cancelled)
             }
         }
     }
@@ -1775,29 +1802,20 @@ impl SimulatedVenue {
         }
     }
 
-    /// Puts `order` on the book holding `reservation`, and gives back whatever it displaced.
+    /// Puts `order` on the book holding `reservation`.
     ///
-    /// Re-opening a [`ClientOrderId`] that is already resting replaces the order under it.
-    /// [`OpenOrders::insert`] hands the displaced order's own reservation back rather than dropping
-    /// it, because it is still held against this account and nothing else will ever release it --
-    /// so it is released here, and the balance that restates is returned. Dropping it instead
-    /// leaves `free` permanently short and
-    /// [`Balance::used`](crate::balance::Balance::used) permanently overstated.
-    ///
-    /// Nothing is displaced until the replacement has been paid for, so an order this account
-    /// could not fund leaves the one already resting exactly where it was.
-    ///
-    /// [`OpenOrders::insert`]: super::orders::OpenOrders::insert
-    fn book_rested(
-        &mut self,
-        order: OpenOrder,
-        reservation: Reservation,
-        time_exchange: DateTime<Utc>,
-    ) -> Option<AssetBalance<AssetNameExchange>> {
-        let Reservation { asset, amount } =
-            self.account.orders_mut().insert(order, Some(reservation))?;
-
-        Some(self.account.release(&asset, amount, time_exchange))
+    /// # Panics
+    /// If an order is already resting under its id. `open_order_inner` refuses such an open before
+    /// anything else, under the same `&mut self`, so the book is vacant under this id by
+    /// construction, and a refusal here would be a bug in this venue with no correct reply left
+    /// to give.
+    fn book_rested(&mut self, order: OpenOrder, reservation: Reservation) {
+        if let Err(AlreadyResting(refused)) = self.account.book(order, Some(reservation)) {
+            unreachable!(
+                "SimulatedVenue booked {} over a resting order: open_order_inner checks first",
+                refused.order.key.cid
+            );
+        }
     }
 
     /// Puts what is left of an order onto the book, holding what that remainder's fill will cost.
@@ -1872,7 +1890,7 @@ impl SimulatedVenue {
             filled_quantity,
         );
 
-        let released = self.book_rested(
+        self.book_rested(
             Order {
                 key: request.key.clone(),
                 side: request.state.side,
@@ -1886,7 +1904,6 @@ impl SimulatedVenue {
                 amount: settlement.requirement(),
                 asset: settlement.asset,
             },
-            time_exchange,
         );
 
         let order_response = Order {
@@ -1902,9 +1919,7 @@ impl SimulatedVenue {
         (
             order_response,
             Some(OpenOrderNotifications::Rested {
-                // A displaced order's hold is given back after this order's own is taken, so the
-                // later restatement is the one that is true.
-                balance: Snapshot(released.unwrap_or(balance_snapshot)),
+                balance: Snapshot(balance_snapshot),
             }),
         )
     }
@@ -2683,7 +2698,10 @@ mod tests {
     use super::*;
     use crate::{
         error::OrderError,
-        exchange::mock::{fixtures::*, orders::as_open},
+        exchange::mock::{
+            fixtures::*,
+            orders::{OpenOrders, as_open},
+        },
         fee::PercentageFeeModel,
         fill::BidAskFillModel,
         order::{
@@ -2936,26 +2954,32 @@ mod tests {
                 .cloned()
                 .map(|balance| (balance.asset.clone(), balance))
                 .collect(),
-            [Order {
-                key: OrderKey {
-                    exchange: EXCHANGE,
-                    instrument: instrument_name(),
-                    strategy: StrategyId::new("test"),
-                    cid: ClientOrderId::new("resting"),
-                },
-                side: Side::Buy,
-                price: Some(d("50000")),
-                quantity: d("1"),
-                kind: OrderKind::Limit,
-                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                state: Open {
-                    id: VenueOrderId::Assigned(OrderId::new("resting")),
-                    time_exchange: arrived,
-                    filled_quantity: Decimal::ZERO,
-                },
-            }]
-            .into_iter()
-            .collect(),
+            {
+                let mut book = OpenOrders::default();
+                book.insert(
+                    Order {
+                        key: OrderKey {
+                            exchange: EXCHANGE,
+                            instrument: instrument_name(),
+                            strategy: StrategyId::new("test"),
+                            cid: ClientOrderId::new("resting"),
+                        },
+                        side: Side::Buy,
+                        price: Some(d("50000")),
+                        quantity: d("1"),
+                        kind: OrderKind::Limit,
+                        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                        state: Open {
+                            id: VenueOrderId::Assigned(OrderId::new("resting")),
+                            time_exchange: arrived,
+                            filled_quantity: Decimal::ZERO,
+                        },
+                    },
+                    None,
+                )
+                .unwrap();
+                book
+            },
             Default::default(),
             Vec::new(),
         );
@@ -4246,14 +4270,15 @@ mod tests {
     /// A seeded `u64::MAX` leaves the next id one past it, rather than overflowing.
     #[test]
     fn a_seeded_u64_max_order_id_does_not_overflow_the_next() {
-        let mut account = AccountState::from(
+        let mut account = AccountState::try_from(
             spot_config("10", "10000000", FeeModelConfig::default()).initial_state,
-        );
+        )
+        .unwrap();
         let mut seeded = seeded_part_filled("48000", "1", "0");
         seeded.state.id = VenueOrderId::Assigned(OrderId::new(u64::MAX.to_string()));
         assert!(
-            account.orders_mut().insert(seeded, None).is_none(),
-            "an empty book displaces nothing"
+            account.book(seeded, None).is_ok(),
+            "the book is vacant under this id"
         );
 
         assert_eq!(first_unseeded_order_id(&account), u128::from(u64::MAX) + 1);
@@ -4539,14 +4564,13 @@ mod tests {
         assert!(
             venue
                 .account
-                .orders_mut()
-                .insert(
+                .book(
                     seeded_part_filled("48000", "1", "0.4"),
                     // As `initial_state` seeds one: the venue never took anything for it.
                     None,
                 )
-                .is_none(),
-            "an empty book displaces nothing"
+                .is_ok(),
+            "the book is vacant under this id"
         );
 
         advance(&mut venue, time(2));
@@ -4599,10 +4623,9 @@ mod tests {
         assert!(
             venue
                 .account
-                .orders_mut()
-                .insert(seeded_part_filled("48000", "1", "0.4"), None)
-                .is_none(),
-            "an empty book displaces nothing"
+                .book(seeded_part_filled("48000", "1", "0.4"), None)
+                .is_ok(),
+            "the book is vacant under this id"
         );
 
         advance(&mut venue, time(2));
@@ -5860,14 +5883,13 @@ mod tests {
         assert!(
             venue
                 .account
-                .orders_mut()
-                .insert(
+                .book(
                     as_open(seeded).expect("the seeded order is Open"),
                     // As `initial_state` seeds one: the venue never took anything for it.
                     None,
                 )
-                .is_none(),
-            "an empty book displaces nothing"
+                .is_ok(),
+            "the book is vacant under this id"
         );
 
         let events = venue.advance_time(expiry);
@@ -6305,41 +6327,171 @@ mod tests {
         assert!(venue.orders_open(&[]).is_empty());
     }
 
-    /// Re-opening a resting `ClientOrderId` replaces the order under it, and what was held against
-    /// the one displaced is given back rather than left held against nothing.
+    fn is_duplicate_cid(state: &UnindexedOrderState) -> bool {
+        matches!(
+            state,
+            OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                ApiError::DuplicateClientOrderId(_)
+            )))
+        )
+    }
+
+    /// An open under the id of a resting order is rejected, and the resting order keeps its size,
+    /// its place and what is held against it.
     #[test]
-    fn replacing_a_resting_order_releases_what_was_held_against_it() {
-        let (mut venue, first) = venue_resting_one_buy("48000");
+    fn an_open_under_a_resting_id_is_rejected_and_the_resting_order_is_untouched() {
+        let (mut venue, _) = venue_resting_one_buy("48000");
+        let free = free_quote(&venue);
+
+        // Same cid, a different size and price.
+        let second = venue.open_order(limit_request("resting", Side::Buy, "0.5", "47000", gtc()));
+
+        assert!(
+            is_duplicate_cid(&second.response.state),
+            "rejected as a duplicate: {:?}",
+            second.response.state
+        );
+        assert!(second.events.is_empty(), "a rejection moves nothing");
+        let [resting] = &venue.orders_open(&[])[..] else {
+            panic!("one cid, one resting order");
+        };
+        assert_eq!(
+            (resting.quantity, resting.price),
+            (d("1"), Some(d("48000"))),
+            "the resting order is the first one"
+        );
         assert_eq!(
             free_quote(&venue),
-            d("1000000") - d("48009.6"),
-            "the first order holds its whole notional plus the maker fee"
+            free,
+            "its hold is still held, and only its"
+        );
+        assert_eq!(total_quote(&venue), d("1000000"));
+    }
+
+    /// The check covers every kind: a market order under a resting id is rejected before it can
+    /// trade, although it would never have rested itself.
+    #[test]
+    fn a_market_order_under_a_resting_id_is_rejected_before_it_trades() {
+        let (mut venue, _) = venue_resting_one_buy("48000");
+        let mut market = buy_request("0.1", None);
+        market.key.cid = ClientOrderId::new("resting");
+
+        let outcome = venue.open_order(market);
+
+        assert!(
+            is_duplicate_cid(&outcome.response.state),
+            "rejected as a duplicate: {:?}",
+            outcome.response.state
+        );
+        assert!(venue.trades(time(0)).is_empty(), "nothing traded");
+        assert_eq!(venue.orders_open(&[]).len(), 1);
+    }
+
+    /// A malformed request is reported as malformed, even under a resting id.
+    #[test]
+    fn a_malformed_open_under_a_resting_id_is_rejected_as_malformed() {
+        let (mut venue, _) = venue_resting_one_buy("48000");
+
+        let outcome = venue.open_order(limit_request(
+            "resting",
+            Side::Buy,
+            "1",
+            "47000",
+            TimeInForce::AtOpen,
+        ));
+
+        assert!(
+            matches!(
+                outcome.response.state,
+                OrderState::Inactive(InactiveOrderState::OpenFailed(_))
+            ) && !is_duplicate_cid(&outcome.response.state),
+            "rejected on its time in force: {:?}",
+            outcome.response.state
+        );
+    }
+
+    /// Once an order is cancelled its id is free, and what the venue reports under the id is the
+    /// latest order: still working while it rests, cancelled once it is.
+    #[test]
+    fn a_cancelled_orders_id_is_free_again_and_the_latest_order_is_reported() {
+        let (mut venue, _) = venue_resting_one_buy("48000");
+        let cancel = |venue: &mut SimulatedVenue| {
+            venue.cancel_order(OrderRequestCancel {
+                key: limit_request("resting", Side::Buy, "1", "48000", gtc()).key,
+                state: RequestCancel { id: None },
+            })
+        };
+        assert!(cancel(&mut venue).response.state.is_ok());
+
+        let second = venue.open_order(limit_request("resting", Side::Buy, "0.5", "47000", gtc()));
+
+        assert!(
+            matches!(
+                second.response.state,
+                OrderState::Active(ActiveOrderState::Open(_))
+            ),
+            "the id is free again: {:?}",
+            second.response.state
+        );
+        assert!(
+            venue.orders_ended(&[key_of("resting")]).is_empty(),
+            "the order under the id is working, whatever became of the one before it"
+        );
+        let snapshot = venue.account_snapshot();
+        let listed = snapshot
+            .instruments
+            .iter()
+            .flat_map(|instrument| &instrument.orders)
+            .filter(|order| order.key.cid == ClientOrderId::new("resting"))
+            .count();
+        assert_eq!(
+            listed, 1,
+            "a snapshot lists the id once, as the working order"
         );
 
-        // Same cid, half the size.
-        let second = venue.open_order(limit_request("resting", Side::Buy, "0.5", "48000", gtc()));
+        assert!(
+            cancel(&mut venue).response.state.is_ok(),
+            "and the cancel reaches it"
+        );
+        let [ended] = &venue.orders_ended(&[key_of("resting")])[..] else {
+            panic!("the second order has ended");
+        };
+        assert_eq!(ended.quantity, d("0.5"), "the latest order under the id");
+    }
 
-        assert_eq!(
-            venue.orders_open(&[]).len(),
-            1,
-            "one cid, one resting order"
+    /// Once an order fills its id is free: an order under it rests, and a cancel reaches that
+    /// order instead of being refused as "already filled".
+    #[test]
+    fn a_filled_orders_id_is_free_again() {
+        let (mut venue, _) = venue_resting_one_buy("48000");
+        let filled = venue.open_order(limit_request("reused", Side::Buy, "1", "49100", gtc()));
+        assert!(
+            matches!(
+                filled.response.state,
+                OrderState::Inactive(InactiveOrderState::FullyFilled(_))
+            ),
+            "crosses the ask, so fills on arrival"
         );
-        assert_eq!(
-            free_quote(&venue),
-            d("1000000") - d("24004.8"),
-            "only the replacement's own reservation is still held"
+
+        let second = venue.open_order(limit_request("reused", Side::Buy, "1", "47000", gtc()));
+        assert!(
+            matches!(
+                second.response.state,
+                OrderState::Active(ActiveOrderState::Open(_))
+            ),
+            "the id is free again: {:?}",
+            second.response.state
         );
-        assert_eq!(
-            balance_of(&second.events[0]).balance.free,
-            free_quote(&venue),
-            "and the balance it restated is the one that is true afterwards"
+
+        let cancelled = venue.cancel_order(OrderRequestCancel {
+            key: limit_request("reused", Side::Buy, "1", "47000", gtc()).key,
+            state: RequestCancel { id: None },
+        });
+        assert!(
+            cancelled.response.state.is_ok(),
+            "the cancel reaches the working order: {:?}",
+            cancelled.response.state
         );
-        assert_eq!(
-            total_quote(&venue),
-            d("1000000"),
-            "nothing settled: a replaced order traded nothing"
-        );
-        drop(first);
     }
 
     // --- How an order ended -------------------------------------------------------------------
@@ -6473,10 +6625,9 @@ mod tests {
         assert!(
             venue
                 .account
-                .orders_mut()
-                .insert(seeded_part_filled("48000", "1", "0.4"), None)
-                .is_none(),
-            "nothing is displaced"
+                .book(seeded_part_filled("48000", "1", "0.4"), None)
+                .is_ok(),
+            "the book is vacant under this id"
         );
         advance(&mut venue, time(2));
         let events = venue.apply_market(

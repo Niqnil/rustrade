@@ -33,6 +33,16 @@ pub enum RecoverableEngineError {
     /// See [`TracksInstrument`](crate::engine::state::TracksInstrument).
     #[error("order request for an instrument the Engine does not track: {0}")]
     UnknownInstrument(String),
+
+    /// An open request named a [`ClientOrderId`] that an order the `Engine` tracks for the same
+    /// instrument already holds, or that an earlier open in the same batch names, so it was not
+    /// sent. The order already under the id is unaffected. Holds the client order id.
+    ///
+    /// See [`TracksOrder`](crate::engine::state::TracksOrder).
+    ///
+    /// [`ClientOrderId`]: rustrade_execution::order::id::ClientOrderId
+    #[error("open request under a client order id the Engine already tracks an order under: {0}")]
+    DuplicateClientOrderId(String),
 }
 
 /// Represents fatal error conditions that the [`Engine`](super::Engine) cannot recover from.
