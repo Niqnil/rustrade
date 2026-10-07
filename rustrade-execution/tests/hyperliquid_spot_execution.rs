@@ -35,6 +35,7 @@
 #![cfg(feature = "hyperliquid")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use rust_decimal::{Decimal, RoundingStrategy};
 use rust_decimal_macros::dec;
 use rustrade_execution::{
     client::{
@@ -64,6 +65,42 @@ fn init_logging() {
                 .from_env_lossy(),
         )
         .try_init();
+}
+
+/// A HYPE/USDC buy price that rests rather than fills: 70% of the testnet mid. Testnet prices
+/// move too far for a fixed price to stay below the market, and Hyperliquid refuses a price too
+/// far from it. Rounded to 4 significant figures, within the venue's 5.
+async fn resting_hype_price() -> Decimal {
+    let info =
+        hyperliquid_rust_sdk::InfoClient::new(None, Some(hyperliquid_rust_sdk::BaseUrl::Testnet))
+            .await
+            .expect("Failed to create InfoClient");
+    let meta = info.spot_meta().await.expect("Failed to read spotMeta");
+    let token = |name: &str| {
+        meta.tokens
+            .iter()
+            .find(|token| token.name == name)
+            .map(|token| token.index)
+            .unwrap_or_else(|| panic!("spotMeta lists no {name} token"))
+    };
+    let tokens = [token("HYPE"), token("USDC")];
+    let pair = meta
+        .universe
+        .iter()
+        .find(|pair| pair.tokens == tokens)
+        .expect("spotMeta lists no HYPE/USDC pair");
+    let mids = info.all_mids().await.expect("Failed to read allMids");
+    let mid: Decimal = mids
+        .get(&pair.name)
+        .expect("allMids has no HYPE/USDC mid")
+        .parse()
+        .expect("HYPE/USDC mid is not a decimal");
+    (mid * dec!(0.7)).round_sf(4).expect("price rounds")
+}
+
+/// A HYPE quantity worth about `notional` USDC at `price`, at HYPE's 2 size decimals, rounded up.
+fn hype_quantity(notional: Decimal, price: Decimal) -> Decimal {
+    (notional / price).round_dp_with_strategy(2, RoundingStrategy::AwayFromZero)
 }
 
 fn test_config() -> HyperliquidConfig {
@@ -279,13 +316,13 @@ async fn test_spot_place_and_cancel_limit_order() {
         cid: order_cid.clone(),
     };
 
-    // Place a limit buy below market price (won't fill)
-    // HYPE on testnet ~$90, place at $60 (within 80% of market, won't fill)
-    // 1 HYPE @ $60 = $60 notional (above $10 minimum)
+    // A limit buy below the market, so it rests, worth about $20 (above the $10 minimum)
+    let price = resting_hype_price().await;
+    let quantity = hype_quantity(dec!(20), price);
     let request_open = RequestOpen {
         side: Side::Buy,
-        price: Some(dec!(60.0)),
-        quantity: dec!(1.0),
+        price: Some(price),
+        quantity,
         kind: OrderKind::Limit,
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
@@ -298,7 +335,7 @@ async fn test_spot_place_and_cancel_limit_order() {
         state: request_open,
     };
 
-    println!("Placing spot limit order: BUY 1 HYPE-USDC-SPOT @ $60 (won't fill)");
+    println!("Placing spot limit order: BUY {quantity} HYPE-USDC-SPOT @ ${price} (won't fill)");
 
     let response = client.open_order(open_request).await;
 
@@ -369,11 +406,12 @@ async fn test_spot_minimum_notional_validation() {
         cid: order_cid.clone(),
     };
 
-    // Order below $10 minimum: 0.1 HYPE @ $60 = $6 notional
+    // An order worth about $5, below the $10 minimum, at a price the venue would otherwise accept
+    let price = resting_hype_price().await;
     let request_open = RequestOpen {
         side: Side::Buy,
-        price: Some(dec!(60.0)),
-        quantity: dec!(0.1),
+        price: Some(price),
+        quantity: hype_quantity(dec!(5), price),
         kind: OrderKind::Limit,
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
@@ -500,11 +538,12 @@ async fn test_spot_account_stream_with_order() {
         cid: order_cid.clone(),
     };
 
-    // 1 HYPE @ $60 = $60 notional (above minimum, within 80% of testnet market ~$90)
+    // A limit buy below the market, so it rests, worth about $20 (above the $10 minimum)
+    let price = resting_hype_price().await;
     let request_open = RequestOpen {
         side: Side::Buy,
-        price: Some(dec!(60.0)),
-        quantity: dec!(1.0),
+        price: Some(price),
+        quantity: hype_quantity(dec!(20), price),
         kind: OrderKind::Limit,
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
@@ -517,7 +556,7 @@ async fn test_spot_account_stream_with_order() {
         state: request_open,
     };
 
-    println!("Placing spot order (1 HYPE @ $60) to trigger stream events...");
+    println!("Placing spot order to trigger stream events...");
     let response = client.open_order(open_request).await;
 
     if let OrderState::Active(ActiveOrderState::Open(open_state)) = &response.state {
