@@ -116,7 +116,9 @@ where
                             continue
                         }
 
-                        // Subscription failure
+                        // Subscription failure: the venue's own message, without the
+                        // `Subscribe` wrapper `Unacknowledged` would repeat
+                        Err(SocketError::Subscribe(message)) => message,
                         Err(error) => error.to_string(),
                     }
                     Some(Err(SocketError::Deserialise { error: _, payload })) => {
@@ -328,8 +330,34 @@ mod tests {
             .unwrap_err();
 
             let (reason, unacknowledged) = unacknowledged(error);
-            assert!(reason.contains("invalid subscription"), "{reason}");
+            assert_eq!(
+                reason,
+                "received failure subscription response: invalid subscription"
+            );
             assert_eq!(unacknowledged, ids(&["l2Book|ETH"]));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_repeated_acknowledgement_names_the_whole_batch() {
+            // Two acknowledgements, one subscription matched: the second answered something else
+            let mut messages = stream::iter([
+                hyperliquid_ack("trades", "BTC"),
+                hyperliquid_ack("trades", "BTC"),
+            ]);
+
+            let error = validate_responses::<Hyperliquid, _, _>(
+                map(&["trades|BTC", "l2Book|ETH", "l2Book|SOL"]),
+                &mut messages,
+                TIMEOUT,
+            )
+            .await
+            .unwrap_err();
+
+            let (_, unacknowledged) = unacknowledged(error);
+            assert_eq!(
+                unacknowledged,
+                ids(&["l2Book|ETH", "l2Book|SOL", "trades|BTC"])
+            );
         }
 
         #[tokio::test(start_paused = true)]

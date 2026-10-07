@@ -130,6 +130,46 @@ mod tests {
         }
 
         #[test]
+        fn an_echoed_subscription_names_the_id_it_was_keyed_under() {
+            use crate::{
+                Identifier,
+                exchange::{
+                    Connector, ExchangeSub,
+                    hyperliquid::{
+                        Hyperliquid, channel::HyperliquidChannel, market::HyperliquidMarket,
+                    },
+                },
+                subscription::{Subscription, book::OrderBooksL2, trade::PublicTrades},
+            };
+            use rustrade_instrument::instrument::market_data::{
+                MarketDataInstrument, kind::MarketDataInstrumentKind::Perpetual,
+            };
+
+            /// Echo the subscription the request carries back as the venue's confirmation, and
+            /// check it names the id the mapper keyed the subscription under.
+            fn round_trip(exchange_sub: ExchangeSub<HyperliquidChannel, HyperliquidMarket>) {
+                let keyed = exchange_sub.id();
+                let request = Hyperliquid::requests(vec![exchange_sub]).remove(0);
+                let request: serde_json::Value =
+                    serde_json::from_str(request.to_text().unwrap()).unwrap();
+                let echoed = serde_json::json!({
+                    "channel": "subscriptionResponse",
+                    "data": {"method": "subscribe", "subscription": request["subscription"]},
+                });
+
+                let response: HyperliquidSubResponse = serde_json::from_value(echoed).unwrap();
+                assert_eq!(response.subscription_id(), Some(keyed));
+            }
+
+            let trades: Subscription<Hyperliquid, MarketDataInstrument, PublicTrades> =
+                (Hyperliquid, "btc", "usdc", Perpetual, PublicTrades).into();
+            let books: Subscription<Hyperliquid, MarketDataInstrument, OrderBooksL2> =
+                (Hyperliquid, "eth", "usdc", Perpetual, OrderBooksL2).into();
+            round_trip(ExchangeSub::new(&trades));
+            round_trip(ExchangeSub::new(&books));
+        }
+
+        #[test]
         fn test_hyperliquid_sub_response_pong() {
             let input = r#"{"channel": "pong"}"#;
 
