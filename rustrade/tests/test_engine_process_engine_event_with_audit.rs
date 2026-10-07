@@ -2421,6 +2421,26 @@ fn test_command_send_open_requests_duplicate_cid_rejected_before_send() {
         dec!(1),
         "and the tracked order is kept"
     );
+
+    use rustrade::engine::state::order::in_flight_recorder::InFlightRequestRecorder;
+
+    // Recorded directly, as a caller of the state's recorder could: none of the instrument's
+    // parts takes it, so the tracked order keeps its routing as well as its state.
+    let mut recorded = open_sized(known, dec!(5));
+    recorded.state.position_id = Some(PositionId::new("other-position"));
+    engine
+        .state
+        .record_in_flight_open(&recorded, DateTime::<Utc>::MIN_UTC);
+    assert_eq!(tracked_quantity(&engine), dec!(1));
+    assert!(
+        !engine
+            .state
+            .instruments
+            .instrument_index(&known)
+            .position_ids
+            .contains_key(&ClientOrderId::new("dup")),
+        "the refused request's position routing is not recorded"
+    );
 }
 
 /// Emits one cancel and one open for a fixed instrument, from both the algo and the
