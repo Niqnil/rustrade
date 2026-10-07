@@ -451,7 +451,7 @@ fn read_listing<T>(
 #[derive(Debug, Error)]
 enum ListingError {
     /// IB answered the request with an error.
-    #[error("{0}")]
+    #[error(transparent)]
     Ibapi(ibapi::Error),
     /// The connection was gone when the listing stopped.
     #[error("the connection dropped before the end of the listing")]
