@@ -459,6 +459,25 @@ pub(super) fn order_update_to_account_event(
     exchange: ExchangeId,
     instrument: InstrumentNameExchange,
 ) -> Option<UnindexedAccountEvent> {
+    let snapshot = order_update_to_order(update, exchange, instrument)?;
+    Some(crate::AccountEvent::new(
+        exchange,
+        crate::AccountEventKind::OrderSnapshot(
+            rustrade_integration::collection::snapshot::Snapshot(snapshot),
+        ),
+    ))
+}
+
+/// Convert an order record, as `orderUpdates` sends it and `orderStatus` answers with it, into the
+/// order it describes on `instrument`, keyed as [`record_cid`] says.
+///
+/// `None`, with a `warn!` naming the cause where the parse helpers do not, when a field does not
+/// parse or the status is not one [`OrderStatus::classify`] recognises.
+pub(super) fn order_update_to_order(
+    update: &hyperliquid_rust_sdk::OrderUpdate,
+    exchange: ExchangeId,
+    instrument: InstrumentNameExchange,
+) -> Option<UnindexedOrderSnapshot> {
     let order = &update.order;
     let Some(status) = OrderStatus::classify(&update.status) else {
         warn!(%exchange, status = %update.status, oid = order.oid, "Unknown Hyperliquid order status - ignoring the update");
@@ -500,7 +519,7 @@ pub(super) fn order_update_to_account_event(
     };
 
     // The update carries neither the order's kind nor its time in force.
-    let snapshot: UnindexedOrderSnapshot = Order {
+    Some(Order {
         key: OrderKey {
             exchange,
             instrument,
@@ -513,14 +532,7 @@ pub(super) fn order_update_to_account_event(
         kind: OrderKind::Limit,
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         state,
-    };
-
-    Some(crate::AccountEvent::new(
-        exchange,
-        crate::AccountEventKind::OrderSnapshot(
-            rustrade_integration::collection::snapshot::Snapshot(snapshot),
-        ),
-    ))
+    })
 }
 
 pub fn parse_decimal(value: &str, field: &str) -> Option<Decimal> {

@@ -7,7 +7,7 @@
 //! | [`binance`] | Auto (1s→30s backoff) | 10k LRU | REST after reconnect | REST after reconnect | 30s | cancelled |
 //! | [`alpaca`] | Auto (1s→30s backoff) | 2k LRU | REST after reconnect | REST after reconnect | 35s | accepted |
 //! | [`ibkr`] | ibapi-managed | 10k LRU, fills only | Executions request after reconnect | None | N/A | submitted |
-//! | [`hyperliquid`] | SDK-managed | 10k LRU, fills only | Caller responsibility | None | SDK-managed | cancelled |
+//! | [`hyperliquid`] | SDK-managed | 10k LRU, fills only | Venue snapshot on resubscribe | REST after reconnect | SDK-managed | cancelled |
 //!
 //! "Ended-order Recovery" is whether a reconnect reports how an order the client held as live
 //! ended while the stream was down, and only those clients implement [`OrderStatusClient`]. The
@@ -28,18 +28,20 @@
 //!
 //! **Hyperliquid** delegates reconnection to the official SDK's `with_reconnect()` mechanism, but
 //! deduplicates fills itself: the SDK resubscribes on reconnect and the venue opens a `userFills`
-//! subscription with a snapshot, so every reconnect redelivers fills already seen. It does not
-//! recover fills missed while disconnected — callers needing that call
-//! [`ExecutionClient::fetch_trades`], whose results are not deduplicated against the stream.
+//! subscription with a snapshot, so every reconnect redelivers fills already seen. That snapshot
+//! is the only fill recovery: it holds recent fills, how many Hyperliquid does not say, so callers
+//! needing older ones call [`ExecutionClient::fetch_trades`], whose results are not deduplicated
+//! against the stream. Once the snapshot has been sent on, a reconnect checks how the orders the
+//! client holds as live ended, like Binance's and Alpaca's.
 //!
 //! # Known Limitations
 //!
-//! Only Binance (Spot and Margin) and Alpaca recover the **order lifecycle events** (cancelled,
-//! expired, rejected, a fill that completes an order) they missed while disconnected, and only for
-//! the orders the client holds as live; IBKR and Hyperliquid recover fills only (#370).
-//! [`OrderStatusClient`] is the lookup that recovery is built on: given the orders a caller still
-//! holds as live, it says how each that has ended did end. Binance Spot, Binance Margin, Alpaca and
-//! the mock client implement it.
+//! Only Binance (Spot and Margin), Alpaca and Hyperliquid (perpetuals and spot) recover the **order
+//! lifecycle events** (cancelled, expired, rejected, a fill that completes an order) they missed
+//! while disconnected, and only for the orders the client holds as live; IBKR recovers fills only
+//! (#370). [`OrderStatusClient`] is the lookup that recovery is built on: given the orders a caller
+//! still holds as live, it says how each that has ended did end. Binance Spot, Binance Margin,
+//! Alpaca, both Hyperliquid clients and the mock client implement it.
 //!
 //! The engine closes part of that gap from the account snapshot each reconnect produces: an order a
 //! complete list no longer shows is retired (see [`ExecutionClient::account_snapshot`]). That covers
@@ -77,7 +79,7 @@ pub(crate) mod dedup;
 
 // What a client knows of its live orders, and the reconnect check of how those orders ended while
 // its account stream was down. Gated on the clients that use it, like `dedup`.
-#[cfg(any(feature = "alpaca", feature = "binance"))]
+#[cfg(any(feature = "alpaca", feature = "binance", feature = "hyperliquid"))]
 pub(crate) mod order_recovery;
 
 // Alpaca ExecutionClient implementation (options, equities, crypto — single unified API)

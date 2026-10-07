@@ -70,21 +70,28 @@ use super::common::{
 };
 use super::config::HyperliquidConfig;
 use super::error::{map_order_error, map_sdk_error};
+use super::order_recovery::{
+    ReconnectWatch, fetch_order_record, listed_cids, lookup_from_record, remember_open,
+    remember_snapshot, send_fills, send_observed, spawn_order_checks,
+};
 use super::spot_coins::{SpotCoins, spot_pair};
-use crate::client::dedup::{dedup_key_from_event, is_duplicate, new_dedup_cache};
+use crate::client::dedup::new_dedup_cache;
+use crate::client::order_recovery::{
+    KnownLiveOrders, OrderLookup, SharedKnownLiveOrders, fetch_ended_by_key,
+};
 use crate::{
     AccountEvent, AccountEventKind, AccountSnapshot, UnindexedAccountEvent,
     UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance},
-    client::ExecutionClient,
+    client::{ExecutionClient, OrderStatusClient},
     emit_stream_terminated,
     error::{
         ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
         UnindexedOrderError,
     },
     order::{
-        Order, OrderKey, OrderKind, TimeInForce,
-        id::{OrderId, StrategyId, VenueOrderId},
+        Order, OrderKey, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrderKey,
+        id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Filled, Open, OrderState, UnindexedOrderState},
     },
@@ -92,6 +99,7 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use ethers::signers::Signer;
+use fnv::FnvHashSet;
 use futures::{StreamExt, stream::BoxStream};
 use hyperliquid_rust_sdk::{BaseUrl, ExchangeClient, InfoClient, Message, Subscription};
 use rust_decimal::Decimal;
@@ -110,9 +118,9 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 /// Hyperliquid spot trading execution client.
 ///
@@ -124,6 +132,9 @@ pub struct HyperliquidSpotClient {
     info_client: Arc<InfoClient>,
     exchange_client: Arc<ExchangeClient>,
     spot_coins: SpotCoins,
+    /// The orders seen live and not yet seen end, which a reconnect asks about. Shared by every
+    /// clone and every account stream, since an order placed through one ends on any of them.
+    known_live: SharedKnownLiveOrders,
 }
 
 impl HyperliquidSpotClient {
@@ -168,6 +179,7 @@ impl HyperliquidSpotClient {
             info_client,
             exchange_client: Arc::new(exchange_client),
             spot_coins,
+            known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidSpot),
         })
     }
 
@@ -254,6 +266,7 @@ impl ExecutionClient for HyperliquidSpotClient {
             info_client,
             exchange_client: Arc::new(exchange_client),
             spot_coins,
+            known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidSpot),
         }
     }
 
@@ -294,11 +307,13 @@ impl ExecutionClient for HyperliquidSpotClient {
         .into_snapshots()
         .collect();
 
-        Ok(AccountSnapshot {
+        let snapshot = AccountSnapshot {
             exchange: ExchangeId::HyperliquidSpot,
             balances,
             instruments: instrument_snapshots,
-        })
+        };
+        remember_snapshot(&self.known_live, &snapshot);
+        Ok(snapshot)
     }
 
     /// Returns a live stream of account events (fills, order updates) for spot orders.
@@ -312,8 +327,17 @@ impl ExecutionClient for HyperliquidSpotClient {
     ///
     /// # Task lifecycle
     ///
-    /// Spawns two background tasks (fills, orders) that are automatically cancelled
-    /// when the returned stream is dropped.
+    /// Spawns three background tasks (fills, orders, and the reconnect's order check) that are
+    /// automatically cancelled when the returned stream is dropped.
+    ///
+    /// # Orders that ended while disconnected
+    ///
+    /// After each reconnect the stream reports how each order the client holds as live ended,
+    /// where it did, exactly as [`HyperliquidClient`](super::HyperliquidClient)'s does; see its
+    /// `account_stream`. The listing leaves out an order on a spot coin missing from `spotMeta`,
+    /// which cannot be on an instrument the client holds an order on, but a lookup that finds an
+    /// order on one, even after `spotMeta` is read again (see [Spot coins](self#spot-coins)),
+    /// fails, and is retried.
     async fn account_stream(
         &self,
         _assets: &[AssetNameExchange],
@@ -354,14 +378,35 @@ impl ExecutionClient for HyperliquidSpotClient {
         // which it does -- the SDK reconnects underneath this task, not around it.
         let fills_dedup = new_dedup_cache();
 
+        // How the orders held as live ended while the socket was down: checked after each
+        // reconnect, once the fills snapshot that opens the resubscription has been sent on. Its
+        // own token also stops it promptly when the stream terminates.
+        let reconnected = Arc::new(Notify::new());
+        let checks_cancel = cancel_token.child_token();
+        let (list_client, list_coins) = (self.info_client.clone(), self.spot_coins.clone());
+        let (lookup_client, lookup_coins) = (self.info_client.clone(), self.spot_coins.clone());
+        spawn_order_checks(
+            ExchangeId::HyperliquidSpot,
+            self.known_live.clone(),
+            reconnected.clone(),
+            checks_cancel.clone(),
+            event_tx.clone(),
+            move |instruments| {
+                spot_listed_cids(list_client.clone(), list_coins.clone(), user, instruments)
+            },
+            move |key| spot_order_lookup(lookup_client.clone(), lookup_coins.clone(), user, key),
+        );
+
         // Spawn task to process fills (filtered to spot only)
         let fills_event_tx = event_tx.clone();
         let fills_cancel = cancel_token.clone();
         let fills_terminated = terminated.clone();
         let fills_coins = self.spot_coins.clone();
+        let fills_checks_cancel = checks_cancel.clone();
         tokio::spawn(async move {
             // Spot coins already logged as missing from spotMeta, so each is logged once.
             let mut missing_coins = HashSet::new();
+            let mut reconnects = ReconnectWatch::new(reconnected);
             loop {
                 tokio::select! {
                     biased;
@@ -372,6 +417,7 @@ impl ExecutionClient for HyperliquidSpotClient {
                     msg = fills_rx.recv() => {
                         let Some(msg) = msg else {
                             debug!("Spot fills receiver closed");
+                            fills_checks_cancel.cancel();
                             // SDK gave up on the stream (channel closed). Emit a single terminal
                             // StreamTerminated across both tasks (guarded by the shared flag).
                             if fills_terminated
@@ -390,22 +436,13 @@ impl ExecutionClient for HyperliquidSpotClient {
                         };
                         match msg {
                             Message::UserFills(fills) => {
-                                // Hyperliquid opens a `userFills` subscription with a snapshot of
-                                // recent fills, and the SDK resubscribes on every reconnect. Each
-                                // reconnect therefore redelivers fills already sent. A trade is a
-                                // delta the consumer accumulates, so redelivering one double-counts
-                                // filled quantity and fees -- hence the dedup cache.
-                                //
-                                // Order updates on the sibling task are deliberately NOT deduped:
-                                // they are absolute state, so a replayed one is idempotent, while
-                                // dropping one could strand the consumer on stale state.
                                 let pairs = fills_coins
                                     .covering(fills.data.fills.iter().map(|fill| fill.coin.as_str()))
                                     .await;
-                                for fill in fills.data.fills {
+                                let convert = |fill: &hyperliquid_rust_sdk::TradeInfo| {
                                     // Filter: only spot coins
                                     if CoinKind::of(&fill.coin) != CoinKind::Spot {
-                                        continue;
+                                        return None;
                                     }
                                     let Some(pair) = pairs.get(&fill.coin) else {
                                         if missing_coins.insert(fill.coin.clone()) {
@@ -417,28 +454,24 @@ impl ExecutionClient for HyperliquidSpotClient {
                                                  them); logged once per stream"
                                             );
                                         }
-                                        continue;
+                                        return None;
                                     };
-                                    let Some(event) = fill_to_account_event(&fill, pair) else {
-                                        continue;
-                                    };
-                                    if let Some(key) = dedup_key_from_event(&event)
-                                        && is_duplicate(&fills_dedup, key)
-                                    {
-                                        trace!(
-                                            tid = fill.tid,
-                                            "Hyperliquid spot dedup: skipping fill already delivered"
-                                        );
-                                        continue;
-                                    }
-                                    if fills_event_tx.send(event).is_err() {
-                                        debug!("Spot fills event channel closed");
-                                        return;
-                                    }
+                                    fill_to_account_event(fill, pair)
+                                };
+                                if !send_fills(
+                                    &fills.data,
+                                    convert,
+                                    &fills_dedup,
+                                    &fills_event_tx,
+                                    &mut reconnects,
+                                ) {
+                                    debug!("Spot fills event channel closed");
+                                    return;
                                 }
                             }
                             Message::NoData => {
                                 warn!("Spot UserFills WebSocket disconnected");
+                                reconnects.dropped();
                             }
                             Message::HyperliquidError(e) => {
                                 // Transient, non-terminal: the loop continues. Log only — no
@@ -460,6 +493,7 @@ impl ExecutionClient for HyperliquidSpotClient {
         let orders_cancel = cancel_token.clone();
         let orders_terminated = terminated;
         let orders_coins = self.spot_coins.clone();
+        let orders_known = self.known_live.clone();
         tokio::spawn(async move {
             let _ws_client = ws_client;
             // Spot coins already logged as missing from spotMeta, so each is logged once.
@@ -475,6 +509,7 @@ impl ExecutionClient for HyperliquidSpotClient {
                     msg = orders_rx.recv() => {
                         let Some(msg) = msg else {
                             debug!("Spot orders receiver closed");
+                            checks_cancel.cancel();
                             // SDK gave up on the stream (channel closed). Emit a single terminal
                             // StreamTerminated across both tasks (guarded by the shared flag).
                             if orders_terminated
@@ -514,7 +549,7 @@ impl ExecutionClient for HyperliquidSpotClient {
                                         continue;
                                     };
                                     if let Some(event) = order_update_to_account_event(&update, pair)
-                                        && orders_event_tx.send(event).is_err()
+                                        && !send_observed(&orders_known, &orders_event_tx, event)
                                     {
                                         debug!("Spot orders event channel closed");
                                         return;
@@ -658,6 +693,8 @@ impl ExecutionClient for HyperliquidSpotClient {
         match response {
             ExchangeResponseStatus::Ok(_) => {
                 debug!("Spot cancel order accepted");
+                // Hyperliquid answers a cancel once the order has left the book.
+                self.known_live.lock().ended(&request.key.cid);
                 OrderResponseCancel {
                     key: OrderKey {
                         exchange: ExchangeId::HyperliquidSpot,
@@ -949,7 +986,7 @@ impl ExecutionClient for HyperliquidSpotClient {
             }
         };
 
-        Order {
+        let order = Order {
             key: OrderKey {
                 exchange: ExchangeId::HyperliquidSpot,
                 instrument: request.key.instrument.clone(),
@@ -962,7 +999,11 @@ impl ExecutionClient for HyperliquidSpotClient {
             kind: request.state.kind,
             time_in_force: request.state.time_in_force,
             state,
-        }
+        };
+        self.known_live
+            .lock()
+            .placed(&order.key, order.quantity, &order.state);
+        order
     }
 
     async fn fetch_balances(
@@ -993,7 +1034,9 @@ impl ExecutionClient for HyperliquidSpotClient {
             .covering(open_orders.iter().map(|order| order.coin.as_str()))
             .await;
 
-        spot_open_orders(&open_orders, &pairs, instruments)
+        let orders = spot_open_orders(&open_orders, &pairs, instruments)?;
+        remember_open(&self.known_live, &orders);
+        Ok(orders)
     }
 
     /// Reads the span with `userFillsByTime`, to its end within the call, so the read is always
@@ -1018,6 +1061,74 @@ impl ExecutionClient for HyperliquidSpotClient {
 
         spot_trades(&fills, &pairs, start, end, instruments).map(TradesRead::complete)
     }
+}
+
+/// Looks each order up with `orderStatus` (weight 2), as
+/// [`HyperliquidClient`](super::HyperliquidClient) does; see its implementation for how each
+/// status is reported. An order on a spot coin missing from `spotMeta` even after it is read again
+/// (see [Spot coins](self#spot-coins)) fails the call, since it cannot be told apart from an order
+/// on the key's instrument.
+///
+/// The account stream runs the same lookup itself after a reconnect; see
+/// [`account_stream`](ExecutionClient::account_stream).
+impl OrderStatusClient for HyperliquidSpotClient {
+    async fn fetch_ended_orders(
+        &self,
+        orders: &[UnindexedOrderKey],
+    ) -> Result<Vec<UnindexedInactiveOrder>, UnindexedClientError> {
+        let address = self.wallet_h160();
+        fetch_ended_by_key(orders, |key| {
+            spot_order_lookup(
+                self.info_client.clone(),
+                self.spot_coins.clone(),
+                address,
+                key,
+            )
+        })
+        .await
+    }
+}
+
+/// Look the order under `key` up with `orderStatus`, on the spot pair its coin names.
+///
+/// # Errors
+///
+/// When the lookup fails, or the order is on a spot coin missing from `spotMeta`.
+async fn spot_order_lookup(
+    info_client: Arc<InfoClient>,
+    spot_coins: SpotCoins,
+    address: ethers::types::H160,
+    key: UnindexedOrderKey,
+) -> Result<OrderLookup, UnindexedClientError> {
+    let Some(record) = fetch_order_record(&info_client, address, &key.cid).await? else {
+        return Ok(OrderLookup::Unknown);
+    };
+    let coin = record.order.coin.as_str();
+    let pairs = spot_coins.covering([coin]).await;
+    let instrument = spot_pair(&pairs, coin)?.map(spot_pair_to_instrument);
+    Ok(lookup_from_record(key, &record, instrument))
+}
+
+/// The client order ids `openOrders` (weight 20) lists on the spot `instruments`, for a
+/// reconnect's check of the orders held as live. An order on a spot coin missing from `spotMeta` is
+/// left out (see `listed_cids`).
+///
+/// # Errors
+///
+/// When the listing fails.
+async fn spot_listed_cids(
+    info_client: Arc<InfoClient>,
+    spot_coins: SpotCoins,
+    address: ethers::types::H160,
+    instruments: Vec<InstrumentNameExchange>,
+) -> Result<FnvHashSet<ClientOrderId>, UnindexedClientError> {
+    let rows = open_orders(&info_client, address).await?;
+    let pairs = spot_coins
+        .covering(rows.iter().map(|row| row.coin.as_str()))
+        .await;
+    Ok(listed_cids(&rows, &instruments, |coin| {
+        pairs.get(coin).map(spot_pair_to_instrument)
+    }))
 }
 
 /// Convert the open-order rows on spot pairs, keeping those on `instruments` (every one when
@@ -1249,6 +1360,136 @@ fn order_update_to_account_event(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::super::spot_coins::test_spot_pairs;
+    use crate::client::dedup::{dedup_key_from_event, is_duplicate};
+
+    mod order_recovery {
+        use super::super::super::common::info_tests::info_client_against;
+        use super::super::super::order_recovery::tests::{CID, CLOID, record_json, row};
+        use super::super::super::spot_coins::TEST_SPOT_META;
+        use super::*;
+        use crate::order::state::InactiveOrderState;
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// A server answering `spotMeta` with [`TEST_SPOT_META`] and every other info request
+        /// with `body`, and the spot coins read from it.
+        async fn serve(body: serde_json::Value) -> (MockServer, Arc<InfoClient>, SpotCoins) {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/info"))
+                .and(body_string_contains("spotMeta"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(TEST_SPOT_META, "application/json"),
+                )
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/info"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .with_priority(2)
+                .mount(&server)
+                .await;
+            let client = Arc::new(info_client_against(server.uri()).await);
+            let coins = SpotCoins::fetch(client.clone()).await.unwrap();
+            (server, client, coins)
+        }
+
+        fn key() -> UnindexedOrderKey {
+            OrderKey {
+                exchange: ExchangeId::HyperliquidSpot,
+                instrument: InstrumentNameExchange::new("HYPE-USDC-SPOT"),
+                strategy: StrategyId::new("strategy"),
+                cid: ClientOrderId::new(CID),
+            }
+        }
+
+        fn order_status(coin: &str) -> serde_json::Value {
+            serde_json::json!({
+                "status": "order",
+                "order": record_json(coin, "canceled", "0.01", Some(CLOID)),
+            })
+        }
+
+        #[tokio::test]
+        async fn a_spot_lookup_names_the_pair_from_spot_meta() {
+            let (_server, client, coins) = serve(order_status("@107")).await;
+
+            let lookup = spot_order_lookup(client, coins, ethers::types::H160::zero(), key())
+                .await
+                .unwrap();
+
+            let OrderLookup::Ended(order) = lookup else {
+                panic!("expected an ended order, got {lookup:?}");
+            };
+            assert_eq!(order.key, key());
+            assert!(matches!(order.state, InactiveOrderState::Cancelled(_)));
+        }
+
+        #[tokio::test]
+        async fn a_spot_lookup_of_a_perp_order_is_unknown() {
+            let (_server, client, coins) = serve(order_status("BTC")).await;
+
+            let lookup = spot_order_lookup(client, coins, ethers::types::H160::zero(), key())
+                .await
+                .unwrap();
+
+            assert!(matches!(lookup, OrderLookup::Unknown));
+        }
+
+        #[tokio::test]
+        async fn a_spot_lookup_fails_on_a_coin_missing_from_spot_meta() {
+            let (_server, client, coins) = serve(order_status("@999")).await;
+
+            let lookup = spot_order_lookup(client, coins, ethers::types::H160::zero(), key()).await;
+
+            assert!(lookup.is_err());
+        }
+
+        #[tokio::test]
+        async fn a_spot_listing_names_only_the_orders_on_the_pairs_asked_about() {
+            let rows = serde_json::json!([
+                row("@107", 1, Some(CLOID)),
+                row("@207", 2, None),
+                row("BTC", 3, None),
+            ]);
+            let (_server, client, coins) = serve(rows).await;
+
+            let listed = spot_listed_cids(
+                client,
+                coins,
+                ethers::types::H160::zero(),
+                vec![InstrumentNameExchange::new("HYPE-USDC-SPOT")],
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                listed.into_iter().collect::<Vec<_>>(),
+                [ClientOrderId::new(CID)]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_spot_listing_leaves_out_a_coin_missing_from_spot_meta() {
+            let rows = serde_json::json!([row("@999", 1, None), row("@107", 2, Some(CLOID))]);
+            let (_server, client, coins) = serve(rows).await;
+
+            let listed = spot_listed_cids(
+                client,
+                coins,
+                ethers::types::H160::zero(),
+                vec![InstrumentNameExchange::new("HYPE-USDC-SPOT")],
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                listed.into_iter().collect::<Vec<_>>(),
+                [ClientOrderId::new(CID)]
+            );
+        }
+    }
     use super::*;
     use rust_decimal_macros::dec;
     use rustrade_integration::collection::snapshot::Snapshot;

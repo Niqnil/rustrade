@@ -21,6 +21,8 @@
 //!   `feeToken`.
 //! - REST (`ExchangeClient`): open_order, cancel_order
 //! - WebSocket (`InfoClient` with `with_reconnect`): account_stream via UserFills + OrderUpdates subscriptions
+//! - REST (`InfoClient`), after each reconnect and through [`OrderStatusClient`]: how the orders
+//!   held as live ended, by `openOrders` and `orderStatus`
 //!
 //! # SDK Delegation Model
 //!
@@ -31,7 +33,8 @@
 //! | **Reconnection** | `InfoClient::with_reconnect()` handles WebSocket reconnection automatically |
 //! | **Heartbeat** | SDK manages WebSocket ping/pong internally |
 //! | **Deduplication** | This client's own, on the fills stream. See below. |
-//! | **Fill recovery** | Not implemented — use [`ExecutionClient::fetch_trades`] after reconnect if needed |
+//! | **Fill recovery** | Only the recent fills the venue's `userFills` snapshot redelivers on each resubscription — use [`ExecutionClient::fetch_trades`] for older ones |
+//! | **Ended-order recovery** | This client's own, after each reconnect: see [`HyperliquidClient`]'s `account_stream` and [`OrderStatusClient`] |
 //!
 //! **Caller responsibilities**:
 //! - If fill recovery is critical, monitor for reconnection events and call `fetch_trades()`
@@ -113,23 +116,27 @@
 pub mod common;
 pub mod config;
 pub mod error;
+mod order_recovery;
 pub mod spot;
 mod spot_coins;
 
-use crate::client::dedup::{dedup_key_from_event, is_duplicate, new_dedup_cache};
+use crate::client::dedup::new_dedup_cache;
+use crate::client::order_recovery::{
+    KnownLiveOrders, OrderLookup, SharedKnownLiveOrders, fetch_ended_by_key,
+};
 use crate::{
     AccountEvent, AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot,
     UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance},
-    client::ExecutionClient,
+    client::{ExecutionClient, OrderStatusClient},
     emit_stream_terminated,
     error::{
         ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
         UnindexedOrderError,
     },
     order::{
-        Order, OrderKey, OrderKind, TimeInForce,
-        id::{OrderId, StrategyId, VenueOrderId},
+        Order, OrderKey, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrderKey,
+        id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Filled, Open, OrderState, UnindexedOrderState},
     },
@@ -146,8 +153,13 @@ use common::{
 pub use config::{HyperliquidConfig, HyperliquidConfigError};
 use error::{map_order_error, map_sdk_error};
 use ethers::signers::Signer;
+use fnv::FnvHashSet;
 use futures::{StreamExt, stream::BoxStream};
 use hyperliquid_rust_sdk::{BaseUrl, ExchangeClient, InfoClient, Message, Subscription};
+use order_recovery::{
+    ReconnectWatch, fetch_order_record, listed_cids, lookup_from_record, remember_open,
+    remember_snapshot, send_fills, send_observed, spawn_order_checks,
+};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
     Side,
@@ -163,9 +175,9 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 /// USDC asset name on Hyperliquid, the collateral of its default perpetuals.
 const USDC_ASSET: &str = "USDC";
@@ -179,6 +191,9 @@ pub struct HyperliquidClient {
     config: HyperliquidConfig,
     info_client: Arc<InfoClient>,
     exchange_client: Arc<ExchangeClient>,
+    /// The orders seen live and not yet seen end, which a reconnect asks about. Shared by every
+    /// clone and every account stream, since an order placed through one ends on any of them.
+    known_live: SharedKnownLiveOrders,
 }
 
 impl HyperliquidClient {
@@ -212,6 +227,7 @@ impl HyperliquidClient {
             config,
             info_client: Arc::new(info_client),
             exchange_client: Arc::new(exchange_client),
+            known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidPerp),
         })
     }
 
@@ -292,6 +308,7 @@ impl ExecutionClient for HyperliquidClient {
             config,
             info_client: Arc::new(info_client),
             exchange_client: Arc::new(exchange_client),
+            known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidPerp),
         }
     }
 
@@ -397,11 +414,13 @@ impl ExecutionClient for HyperliquidClient {
             snapshot
         }));
 
-        Ok(AccountSnapshot {
+        let snapshot = AccountSnapshot {
             exchange: ExchangeId::HyperliquidPerp,
             balances,
             instruments: instrument_snapshots,
-        })
+        };
+        remember_snapshot(&self.known_live, &snapshot);
+        Ok(snapshot)
     }
 
     /// Returns a live stream of account events (fills, order updates).
@@ -415,9 +434,49 @@ impl ExecutionClient for HyperliquidClient {
     ///
     /// # Task lifecycle
     ///
-    /// Spawns two background tasks (fills, orders) that are automatically cancelled
-    /// when the returned stream is dropped. The `ws_client` is held by the orders task;
-    /// when cancelled, both tasks exit and the WebSocket connection closes.
+    /// Spawns three background tasks (fills, orders, and the reconnect's order check below) that
+    /// are automatically cancelled when the returned stream is dropped. The `ws_client` is held by
+    /// the orders task; when cancelled, the tasks exit and the WebSocket connection closes.
+    ///
+    /// # Orders that ended while disconnected
+    ///
+    /// The SDK reconnects the socket underneath this stream and resubscribes, but `orderUpdates`
+    /// opens with no snapshot, so an order that ended while the socket was down is never reported
+    /// on it. After each reconnect the stream therefore reports how each order the client holds as
+    /// live ended, where it did, as an [`AccountEventKind::OrderSnapshot`] of its inactive state,
+    /// read as [`OrderStatusClient::fetch_ended_orders`] reads it: filled (without an average
+    /// price), cancelled (with what filled before) or rejected. Each carries
+    /// [`StrategyId::unknown`], since Hyperliquid records no strategy; the engine matches it to the
+    /// order it tracks by client order id.
+    ///
+    /// - **When.** The SDK tells each subscription that the socket dropped, and the venue opens
+    ///   the resubscribed `userFills` with a snapshot of recent fills. The check starts once that
+    ///   snapshot's fills have been sent on, so the fills of an order that it carries arrive before
+    ///   how the order ended. The snapshot is all the fill recovery there is (see the [module
+    ///   docs](self#sdk-delegation-model)), and Hyperliquid does not document how far back it
+    ///   reaches, so after a long outage an order can be reported filled before, or without, fills
+    ///   older than that. The SDK resubscribes in no fixed order and only logs a resubscription
+    ///   that fails: an order that ends after the check lists the open orders but before
+    ///   `orderUpdates` is subscribed again is missed, and if `userFills` is not subscribed again
+    ///   no check runs until a later reconnect.
+    /// - **Which orders.** The client holds an order as live from the response to placing it,
+    ///   from a listing of open orders ([`account_snapshot`](ExecutionClient::account_snapshot),
+    ///   [`fetch_open_orders`](ExecutionClient::fetch_open_orders)), and from its live reports on
+    ///   any of its account streams, until it sees the order end, which a successful cancel does.
+    ///   It holds up to 4,096 orders and forgets the oldest past that, logged at `warn`. An order
+    ///   placed outside this client and never listed or reported to it is not covered. Every
+    ///   instrument is checked, as the stream ignores `instruments`.
+    /// - **Cost.** One `openOrders` request (weight 20) listing every open order, then one
+    ///   `orderStatus` request (weight 2) for each held order the listing no longer shows, 8 at a
+    ///   time. Both count against Hyperliquid's REST limit of 1,200 a minute per IP address. The
+    ///   cost is per stream: a perpetuals and a spot stream on one wallet each make their own.
+    /// - **Failures.** Each order's lookup is settled as it ends. An instrument whose listing or
+    ///   lookup fails, or whose check is still running after 30 s, is retried while the stream is
+    ///   open 1, 2, 4, 8 and 16 minutes later, asking only about the orders still held, then given
+    ///   up, logged at `error`; its orders are asked about again at the next reconnect. A listing
+    ///   that fails charges every instrument in it. An order Hyperliquid does not know stops being
+    ///   held, logged at `warn`; one still live, or in a state this version cannot read, stays
+    ///   held.
     async fn account_stream(
         &self,
         _assets: &[AssetNameExchange],
@@ -467,12 +526,30 @@ impl ExecutionClient for HyperliquidClient {
         // which it does -- the SDK reconnects underneath this task, not around it.
         let fills_dedup = new_dedup_cache();
 
+        // How the orders held as live ended while the socket was down: checked after each
+        // reconnect, once the fills snapshot that opens the resubscription has been sent on. Its
+        // own token also stops it promptly when the stream terminates.
+        let reconnected = Arc::new(Notify::new());
+        let checks_cancel = cancel_token.child_token();
+        let (list_client, lookup_client) = (self.info_client.clone(), self.info_client.clone());
+        spawn_order_checks(
+            ExchangeId::HyperliquidPerp,
+            self.known_live.clone(),
+            reconnected.clone(),
+            checks_cancel.clone(),
+            event_tx.clone(),
+            move |instruments| perp_listed_cids(list_client.clone(), user, instruments),
+            move |key| perp_order_lookup(lookup_client.clone(), user, key),
+        );
+
         // Spawn task to process fills
         let fills_event_tx = event_tx.clone();
         let fills_cancel = cancel_token.clone();
         let fills_terminated = terminated.clone();
+        let fills_checks_cancel = checks_cancel.clone();
         tokio::spawn(async move {
             let mut unknown_coins = UnknownCoins::default();
+            let mut reconnects = ReconnectWatch::new(reconnected);
             loop {
                 tokio::select! {
                     biased;
@@ -483,6 +560,7 @@ impl ExecutionClient for HyperliquidClient {
                     msg = fills_rx.recv() => {
                         let Some(msg) = msg else {
                             debug!("Fills receiver closed");
+                            fills_checks_cancel.cancel();
                             // SDK gave up on the stream (channel closed). Emit a single terminal
                             // StreamTerminated across both tasks (guarded by the shared flag).
                             if fills_terminated
@@ -501,37 +579,24 @@ impl ExecutionClient for HyperliquidClient {
                         };
                         match msg {
                             Message::UserFills(fills) => {
-                                // Hyperliquid opens a `userFills` subscription with a snapshot of
-                                // recent fills, and the SDK resubscribes on every reconnect. Each
-                                // reconnect therefore redelivers fills already sent. A trade is a
-                                // delta the consumer accumulates, so redelivering one double-counts
-                                // filled quantity and fees -- hence the dedup cache.
-                                //
-                                // Order updates on the sibling task are deliberately NOT deduped:
-                                // they are absolute state, so a replayed one is idempotent, while
-                                // dropping one could strand the consumer on stale state.
-                                for fill in fills.data.fills {
+                                let convert = |fill: &hyperliquid_rust_sdk::TradeInfo| {
                                     unknown_coins.warn_once(&fill.coin);
-                                    let Some(event) = fill_to_account_event(&fill) else {
-                                        continue;
-                                    };
-                                    if let Some(key) = dedup_key_from_event(&event)
-                                        && is_duplicate(&fills_dedup, key)
-                                    {
-                                        trace!(
-                                            tid = fill.tid,
-                                            "Hyperliquid dedup: skipping fill already delivered"
-                                        );
-                                        continue;
-                                    }
-                                    if fills_event_tx.send(event).is_err() {
-                                        debug!("Fills event channel closed");
-                                        return;
-                                    }
+                                    fill_to_account_event(fill)
+                                };
+                                if !send_fills(
+                                    &fills.data,
+                                    convert,
+                                    &fills_dedup,
+                                    &fills_event_tx,
+                                    &mut reconnects,
+                                ) {
+                                    debug!("Fills event channel closed");
+                                    return;
                                 }
                             }
                             Message::NoData => {
                                 warn!("UserFills WebSocket disconnected");
+                                reconnects.dropped();
                             }
                             Message::HyperliquidError(e) => {
                                 // Transient, non-terminal: the loop continues. Log only — no
@@ -552,6 +617,7 @@ impl ExecutionClient for HyperliquidClient {
         let orders_event_tx = event_tx;
         let orders_cancel = cancel_token.clone();
         let orders_terminated = terminated;
+        let orders_known = self.known_live.clone();
         tokio::spawn(async move {
             let _ws_client = ws_client;
             let mut unknown_coins = UnknownCoins::default();
@@ -566,6 +632,7 @@ impl ExecutionClient for HyperliquidClient {
                     msg = orders_rx.recv() => {
                         let Some(msg) = msg else {
                             debug!("Orders receiver closed");
+                            checks_cancel.cancel();
                             // SDK gave up on the stream (channel closed). Emit a single terminal
                             // StreamTerminated across both tasks (guarded by the shared flag).
                             if orders_terminated
@@ -587,7 +654,7 @@ impl ExecutionClient for HyperliquidClient {
                                 for update in updates.data {
                                     unknown_coins.warn_once(&update.order.coin);
                                     if let Some(event) = order_update_to_account_event(&update)
-                                        && orders_event_tx.send(event).is_err()
+                                        && !send_observed(&orders_known, &orders_event_tx, event)
                                     {
                                         debug!("Orders event channel closed");
                                         return;
@@ -710,6 +777,8 @@ impl ExecutionClient for HyperliquidClient {
         match response {
             ExchangeResponseStatus::Ok(_) => {
                 debug!("Cancel order accepted");
+                // Hyperliquid answers a cancel once the order has left the book.
+                self.known_live.lock().ended(&request.key.cid);
                 // Hyperliquid cancel response doesn't include an exchange timestamp
                 OrderResponseCancel {
                     key: OrderKey {
@@ -973,8 +1042,7 @@ impl ExecutionClient for HyperliquidClient {
                 )))
             }
         };
-
-        Order {
+        let order = Order {
             key: OrderKey {
                 exchange: ExchangeId::HyperliquidPerp,
                 instrument: request.key.instrument.clone(),
@@ -987,7 +1055,11 @@ impl ExecutionClient for HyperliquidClient {
             kind: request.state.kind,
             time_in_force: request.state.time_in_force,
             state,
-        }
+        };
+        self.known_live
+            .lock()
+            .placed(&order.key, order.quantity, &order.state);
+        order
     }
 
     async fn fetch_balances(
@@ -1040,7 +1112,7 @@ impl ExecutionClient for HyperliquidClient {
             Some(set)
         };
 
-        Ok(open_orders
+        let orders: Vec<_> = open_orders
             .iter()
             .filter_map(|order| {
                 let instrument = perp_instrument(&order.coin)?;
@@ -1052,7 +1124,9 @@ impl ExecutionClient for HyperliquidClient {
                 }
                 open_order_to_order(order, ExchangeId::HyperliquidPerp, instrument)
             })
-            .collect())
+            .collect();
+        remember_open(&self.known_live, &orders);
+        Ok(orders)
     }
 
     /// Reads the span with `userFillsByTime`, to its end within the call, so the read is always
@@ -1130,6 +1204,57 @@ impl ExecutionClient for HyperliquidClient {
 
         Ok(TradesRead::complete(result))
     }
+}
+
+/// Looks each order up with `orderStatus` (weight 2), by the cloid it was placed with, or by its
+/// `oid` for an order placed without one, which this client reports under its `oid`. Up to 8 run
+/// at once.
+///
+/// `filled` is reported as fully filled, without an average price, which the record does not
+/// carry; every status ending in `Canceled`, and `scheduledCancel`, as cancelled with what filled
+/// before it; and every status ending in `Rejected` as
+/// [`OpenFailed`](crate::order::state::InactiveOrderState::OpenFailed). Hyperliquid has no expiry.
+/// An order the venue does not know, one on another instrument than the key's, and an id that is
+/// neither a canonical UUID nor an `oid` are unknown. An `oid` whose order carries a cloid is
+/// unknown too, since this client reports that order under its cloid.
+///
+/// The account stream runs the same lookup itself after a reconnect; see
+/// [`account_stream`](ExecutionClient::account_stream).
+impl OrderStatusClient for HyperliquidClient {
+    async fn fetch_ended_orders(
+        &self,
+        orders: &[UnindexedOrderKey],
+    ) -> Result<Vec<UnindexedInactiveOrder>, UnindexedClientError> {
+        let address = self.wallet_h160();
+        fetch_ended_by_key(orders, |key| {
+            perp_order_lookup(self.info_client.clone(), address, key)
+        })
+        .await
+    }
+}
+
+/// Look the order under `key` up with `orderStatus`, on the perpetual its coin names.
+async fn perp_order_lookup(
+    info_client: Arc<InfoClient>,
+    address: ethers::types::H160,
+    key: UnindexedOrderKey,
+) -> Result<OrderLookup, UnindexedClientError> {
+    let Some(record) = fetch_order_record(&info_client, address, &key.cid).await? else {
+        return Ok(OrderLookup::Unknown);
+    };
+    let instrument = perp_instrument(&record.order.coin);
+    Ok(lookup_from_record(key, &record, instrument))
+}
+
+/// The client order ids `openOrders` (weight 20) lists on the perpetuals `instruments`, for a
+/// reconnect's check of the orders held as live.
+async fn perp_listed_cids(
+    info_client: Arc<InfoClient>,
+    address: ethers::types::H160,
+    instruments: Vec<InstrumentNameExchange>,
+) -> Result<FnvHashSet<ClientOrderId>, UnindexedClientError> {
+    let rows = open_orders(&info_client, address).await?;
+    Ok(listed_cids(&rows, &instruments, perp_instrument))
 }
 
 /// Report one perpetual position from Hyperliquid's user state.
@@ -1224,8 +1349,160 @@ fn order_update_to_account_event(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::client::dedup::{dedup_key_from_event, is_duplicate};
     use rust_decimal_macros::dec;
     use rustrade_integration::collection::snapshot::Snapshot;
+
+    mod order_recovery {
+        use super::super::common::info_tests::info_client_against;
+        use super::super::order_recovery::tests::{CID, CLOID, record_json, row};
+        use super::*;
+        use crate::order::state::InactiveOrderState;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        async fn serve(body: serde_json::Value) -> (MockServer, Arc<InfoClient>) {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/info"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+            let client = Arc::new(info_client_against(server.uri()).await);
+            (server, client)
+        }
+
+        fn key() -> UnindexedOrderKey {
+            OrderKey {
+                exchange: ExchangeId::HyperliquidPerp,
+                instrument: InstrumentNameExchange::new("BTC-USD-PERP"),
+                strategy: StrategyId::new("strategy"),
+                cid: ClientOrderId::new(CID),
+            }
+        }
+
+        fn order_status(coin: &str) -> serde_json::Value {
+            serde_json::json!({
+                "status": "order",
+                "order": record_json(coin, "canceled", "0.01", Some(CLOID)),
+            })
+        }
+
+        #[test]
+        fn a_reconnect_snapshot_wakes_the_check_once_its_fills_are_sent() {
+            use futures::FutureExt as _;
+            let notified = |reconnected: &Notify| reconnected.notified().now_or_never().is_some();
+            let snapshot = |fills| hyperliquid_rust_sdk::UserFillsData {
+                is_snapshot: Some(true),
+                user: ethers::types::H160::zero(),
+                fills,
+            };
+            let reconnected = Arc::new(Notify::new());
+            let mut reconnects = ReconnectWatch::new(reconnected.clone());
+            let dedup = new_dedup_cache();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let tids = |rx: &mut mpsc::UnboundedReceiver<UnindexedAccountEvent>| {
+                std::iter::from_fn(|| rx.try_recv().ok())
+                    .map(|event| match event.kind {
+                        AccountEventKind::Trade(trade) => trade.id.0.to_string(),
+                        other => panic!("expected a trade, got {other:?}"),
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            // The snapshot opening the first subscription.
+            let first = snapshot(vec![sweep_fill(1, "60000")]);
+            assert!(send_fills(
+                &first,
+                fill_to_account_event,
+                &dedup,
+                &tx,
+                &mut reconnects
+            ));
+            assert_eq!(tids(&mut rx), ["1"]);
+            assert!(!notified(&reconnected));
+
+            // A drop, then the resubscription's snapshot: its new fill is sent, then the check
+            // woken.
+            reconnects.dropped();
+            let resubscribed = snapshot(vec![sweep_fill(1, "60000"), sweep_fill(2, "60001")]);
+            assert!(send_fills(
+                &resubscribed,
+                fill_to_account_event,
+                &dedup,
+                &tx,
+                &mut reconnects
+            ));
+            assert_eq!(
+                tids(&mut rx),
+                ["2"],
+                "the fill already sent is not sent again"
+            );
+            assert!(notified(&reconnected));
+
+            // With the consumer gone the fills cannot be sent, and the check is not woken.
+            drop(rx);
+            reconnects.dropped();
+            let unsent = snapshot(vec![sweep_fill(3, "60002")]);
+            assert!(!send_fills(
+                &unsent,
+                fill_to_account_event,
+                &dedup,
+                &tx,
+                &mut reconnects
+            ));
+            assert!(!notified(&reconnected));
+        }
+
+        #[tokio::test]
+        async fn a_perp_lookup_reads_how_the_order_ended() {
+            let (_server, client) = serve(order_status("BTC")).await;
+
+            let lookup = perp_order_lookup(client, ethers::types::H160::zero(), key())
+                .await
+                .unwrap();
+
+            let OrderLookup::Ended(order) = lookup else {
+                panic!("expected an ended order, got {lookup:?}");
+            };
+            assert_eq!(order.key, key());
+            assert!(matches!(order.state, InactiveOrderState::Cancelled(_)));
+        }
+
+        #[tokio::test]
+        async fn a_perp_lookup_of_a_spot_order_is_unknown() {
+            let (_server, client) = serve(order_status("@107")).await;
+
+            let lookup = perp_order_lookup(client, ethers::types::H160::zero(), key())
+                .await
+                .unwrap();
+
+            assert!(matches!(lookup, OrderLookup::Unknown));
+        }
+
+        #[tokio::test]
+        async fn a_perp_listing_names_only_the_orders_on_the_perpetuals_asked_about() {
+            let rows = serde_json::json!([
+                row("BTC", 1, Some(CLOID)),
+                row("ETH", 2, None),
+                row("@107", 3, None),
+            ]);
+            let (_server, client) = serve(rows).await;
+
+            let listed = perp_listed_cids(
+                client,
+                ethers::types::H160::zero(),
+                vec![InstrumentNameExchange::new("BTC-USD-PERP")],
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                listed.into_iter().collect::<Vec<_>>(),
+                [ClientOrderId::new(CID)]
+            );
+        }
+    }
 
     fn perp_position(szi: &str) -> hyperliquid_rust_sdk::PositionData {
         serde_json::from_value(serde_json::json!({
