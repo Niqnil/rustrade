@@ -2453,7 +2453,8 @@ impl ExecutionClient for IbkrClient {
     /// # Errors
     ///
     /// [`UnindexedClientError::Internal`] if the request fails, IB answers with an
-    /// error, or IB sends nothing for 10 seconds before the end of the listing.
+    /// error, IB sends nothing for 10 seconds before the end of the listing, or the
+    /// connection drops during it.
     async fn fetch_balances(
         &self,
         assets: &[AssetNameExchange],
@@ -2505,7 +2506,8 @@ impl ExecutionClient for IbkrClient {
     /// # Errors
     ///
     /// [`UnindexedClientError::Internal`] if the request fails, IB answers with an
-    /// error, or IB sends nothing for 10 seconds before the end of the listing.
+    /// error, IB sends nothing for 10 seconds before the end of the listing, or the
+    /// connection drops during it.
     ///
     /// # Limitations
     ///
@@ -2569,11 +2571,13 @@ impl ExecutionClient for IbkrClient {
     /// - Each trade's fees come from the commission report IB sends with its
     ///   execution. An execution whose report IB did not send is returned with a zero
     ///   fee in [`UNKNOWN_FEE_ASSET`](execution::UNKNOWN_FEE_ASSET), with a warning.
+    /// - Trades are returned in `time_exchange` order, then by id.
     ///
     /// # Errors
     ///
     /// [`UnindexedClientError::Internal`] if the request fails, IB answers with an
-    /// error, or IB sends nothing for 10 seconds before the end of the listing.
+    /// error, IB sends nothing for 10 seconds before the end of the listing, or the
+    /// connection drops during it.
     ///
     /// # Corrections
     ///
