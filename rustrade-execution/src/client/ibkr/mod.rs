@@ -493,15 +493,30 @@ fn forward_order_updates(
                     _ => order_ids.get_client_id_and_context(ib_id),
                 };
 
-                if let Some((client_id, ctx)) = lookup_result {
-                    let order = make_order_from_status(&status, client_id, &ctx, pending_cancels);
-                    Some(UnindexedAccountEvent {
-                        exchange: ExchangeId::Ibkr,
-                        kind: AccountEventKind::OrderSnapshot(Snapshot::new(order)),
-                    })
-                } else {
-                    debug!(ib_order_id = ib_id, "OrderStatus for unknown order ID");
-                    None
+                match lookup_result {
+                    // An order that already ended, whose id now names a later order: IB re-sent
+                    // a status for it. Forwarded under the id, it would be read as the later
+                    // order's, and a re-sent `Filled` would end that order.
+                    Some((client_id, _)) if order_ids.names_other_order(&client_id, ib_id) => {
+                        debug!(
+                            ib_order_id = ib_id,
+                            cid = %client_id,
+                            "OrderStatus for an ended order whose client order id names a later order, dropping"
+                        );
+                        None
+                    }
+                    Some((client_id, ctx)) => {
+                        let order =
+                            make_order_from_status(&status, client_id, &ctx, pending_cancels);
+                        Some(UnindexedAccountEvent {
+                            exchange: ExchangeId::Ibkr,
+                            kind: AccountEventKind::OrderSnapshot(Snapshot::new(order)),
+                        })
+                    }
+                    None => {
+                        debug!(ib_order_id = ib_id, "OrderStatus for unknown order ID");
+                        None
+                    }
                 }
             }
             OrderUpdate::ExecutionData(exec) => {
@@ -2074,6 +2089,11 @@ impl ExecutionClient for IbkrClient {
     /// - The order may still be submitted to IB
     /// - The order ID mapping will leak (not cleaned up)
     /// - Subsequent fills will be processed via `account_stream`
+    /// - The client order id stays held, so a retry under it is refused as
+    ///   [`ApiError::DuplicateClientOrderId`] until the account stream reports
+    ///   the order ended or `clear_stale_order_ids` reaps it. Retry under a
+    ///   fresh id. The same holds when this returns `Open` without a status
+    ///   from TWS.
     ///
     /// Callers should avoid cancelling this future mid-flight. If timeout
     /// behavior is needed, prefer setting IB's native order timeout via
@@ -3501,6 +3521,78 @@ mod order_reader_tests {
             );
             assert_eq!(order_ids.get_ib_id(&cid).is_some(), id_held, "{kind:?}: id");
         }
+    }
+
+    /// A status IB re-sends for a filled order, after its id names a later order, is dropped
+    /// rather than read as the later order's, which it would end. The later order's own status is
+    /// forwarded.
+    #[test]
+    fn a_resent_status_for_an_ended_order_does_not_reach_a_reused_id() {
+        use ibapi::orders::OrderStatusKind;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = recovery::EventSink::new(tx, new_dedup_cache());
+        let order_ids = OrderIdMap::new();
+        let cid = ClientOrderId::new("reused");
+        let ctx = || OrderContext {
+            instrument: InstrumentNameExchange::new("AAPL"),
+            side: Side::Buy,
+            price: Some(Decimal::from(100)),
+            quantity: Decimal::ONE,
+            kind: OrderKind::Limit,
+            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+        };
+        let status = |order_id, status| {
+            Ok(OrderUpdate::OrderStatus(OrderStatus {
+                order_id,
+                status,
+                ..OrderStatus::default()
+            }))
+        };
+        order_ids.register(cid.clone(), 1, ctx()).unwrap();
+        // One stream, which ends with the updates: the first order fills, its id is registered
+        // again for a second order, then IB re-sends the first order's fill.
+        let updates = [status(1, OrderStatusKind::Filled)]
+            .into_iter()
+            .chain(std::iter::once_with(|| {
+                order_ids.register(cid.clone(), 2, ctx()).unwrap();
+                status(1, OrderStatusKind::Filled)
+            }))
+            .chain([status(2, OrderStatusKind::Submitted)]);
+        forward_order_updates(
+            updates,
+            &sink,
+            &ContractRegistry::new(),
+            &order_ids,
+            &PendingCancels::new(),
+            &ExecutionBuffer::new(),
+        );
+
+        let Ok(first) = rx.try_recv() else {
+            panic!("the first order's fill is forwarded");
+        };
+        assert!(
+            matches!(first.kind, AccountEventKind::OrderSnapshot(Snapshot(ref order)) if !matches!(order.state, OrderState::Active(_))),
+            "{first:?}"
+        );
+        let Ok(event) = rx.try_recv() else {
+            panic!("the later order's status is forwarded");
+        };
+        let AccountEventKind::OrderSnapshot(Snapshot(order)) = event.kind else {
+            panic!("an order snapshot, got {event:?}");
+        };
+        assert!(
+            matches!(order.state, OrderState::Active(_)),
+            "it is the later, working order's: {order:?}"
+        );
+        assert!(
+            matches!(
+                rx.try_recv().map(|event| event.kind),
+                Ok(AccountEventKind::StreamTerminated(_))
+            ),
+            "and the re-sent fill was dropped: nothing else before the stream ended"
+        );
+        assert_eq!(order_ids.get_ib_id(&cid), Some(2));
     }
 
     /// An execution and its correction, each completed by its commission report, reach the

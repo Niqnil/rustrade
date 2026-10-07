@@ -180,8 +180,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     anything reaches TWS, which never sees a client order id. An order holds its id until the
     account stream reports it `Filled`, `Cancelled` or `Inactive`, or `clear_stale_order_ids`
     reaps it. A `Filled` order frees its id at once and keeps its IB-id entry, so late executions
-    still resolve. So cancelling a filled order's id is now refused locally as not found, rather
-    than at TWS. Without a running account stream, an id is held until reaped.
+    still resolve, and a status IB re-sends for it after its id names a later order is dropped
+    rather than read as that order's. So cancelling a filled order's id is now refused locally as
+    not found, rather than at TWS. Without a running account stream, an id is held until reaped,
+    and so is the id of an `open_order` whose future was dropped mid-flight: retry under a fresh
+    id.
   - Binance spot and margin report Binance's `"Duplicate order sent."` as the new variant, rather
     than `OrderRejected`. Alpaca and Hyperliquid still report a duplicate as `OrderRejected`
     until their messages are confirmed.
@@ -194,15 +197,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Breaking:**
     - `OpenOrders::insert` returns `Result<(), AlreadyResting>`, handing a refused order and its
       reservation back, instead of replacing the resting order and returning its reservation.
-      `OpenOrders` no longer implements `FromIterator`; `OpenOrders::contains` and
-      `AccountState::book` are new.
+      `OpenOrders` no longer implements `FromIterator`; `OpenOrders::contains` is new.
+    - `AccountState::orders_mut` is removed, so an order cannot reach the book past the id rule:
+      `AccountState::book` books one and `AccountState::remove_order` takes one off.
     - `AccountState` converts from an `UnindexedAccountSnapshot` with `TryFrom`, failing with the
       new `DuplicateSeededOrder` on an id listed twice among the open and cancelled orders it
       seeds, instead of `From`, where the last such order won in a release build. The
       `SimulatedVenue` constructors panic on it, as they do on other invalid `initial_state`.
     - `ibkr::order::OrderIdMap::register` returns `Result<(), ClientOrderIdInUse>`. The new
-      `register_all` registers several orders, all or none, and `release_client_id` frees a
-      filled order's id. `len` counts live orders only.
+      `register_all` registers several orders, all or none, `release_client_id` frees a filled
+      order's id, and `names_other_order` tells whether an id has since been reused. `len` counts
+      live orders only.
     - The engine's `send_open_requests` callers, `GenerateAlgoOrders` and `ClosePositions`,
       require the state to implement the new `TracksOrder` and the instrument key `PartialEq`.
     - `ApiError` and `RecoverableEngineError` gain a variant each; both are `#[non_exhaustive]`.

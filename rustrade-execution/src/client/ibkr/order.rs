@@ -117,7 +117,9 @@ pub struct OrderContext {
 /// reaped by `clear_stale`.
 ///
 /// Every removal is conditional on the id still naming the order removed, so an earlier order
-/// under a reused id cannot take the mapping of the order now under it.
+/// under a reused id cannot take the mapping of the order now under it. Its late executions and
+/// commissions still resolve to the id, carrying its own IB order ID, while a status IB re-sends
+/// for it is dropped by the account stream ([`names_other_order`](Self::names_other_order)).
 #[derive(Debug, Clone)]
 pub struct OrderIdMap {
     inner: Arc<RwLock<OrderIdMapInner>>,
@@ -222,6 +224,16 @@ impl OrderIdMap {
             .ib_to_entry
             .get(&ib_id)
             .map(|(cid, ctx, _)| (cid.clone(), ctx.clone()))
+    }
+
+    /// Whether `client_id` now names a live order other than `ib_id`: the id was freed when `ib_id`
+    /// ended and has since been registered again.
+    pub fn names_other_order(&self, client_id: &ClientOrderId, ib_id: i32) -> bool {
+        self.inner
+            .read()
+            .cid_to_ib
+            .get(client_id)
+            .is_some_and(|live| *live != ib_id)
     }
 
     /// Free the id of the filled order `ib_id`, keeping its entry, and return both, in a single
