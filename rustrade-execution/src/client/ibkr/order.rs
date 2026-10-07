@@ -3,7 +3,7 @@ use crate::order::{
     id::{ClientOrderId, StrategyId},
     state::UnindexedOrderState,
 };
-use fnv::FnvHashMap;
+use fnv::{FnvHashMap, FnvHashSet};
 use ibapi::orders::{
     Action, OcaType, Order, TimeInForce as IbTimeInForce, builder::BracketPrices, order_builder,
 };
@@ -105,7 +105,8 @@ pub struct OrderContext {
 ///
 /// # A client order id names one live order at a time
 ///
-/// TWS never sees a [`ClientOrderId`], so this map is the only place its uniqueness can be kept.
+/// TWS receives a [`ClientOrderId`] only as the order's reference ([`order_ref`]), whose uniqueness
+/// it does not check, so this map is the only place it can be kept.
 /// An id is held from [`register`](Self::register) until its order ends, and registering an id
 /// already held is refused with [`ClientOrderIdInUse`]. Once its order has ended the id may name a
 /// new order.
@@ -125,6 +126,24 @@ pub struct OrderIdMap {
     inner: Arc<RwLock<OrderIdMapInner>>,
 }
 
+/// When and how an order came to be tracked by an [`OrderIdMap`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Registration {
+    /// How long ago it was registered or adopted.
+    pub(crate) age: std::time::Duration,
+    /// Whether it was adopted from a listing rather than placed through this client.
+    pub(crate) adopted: bool,
+}
+
+/// Why [`OrderIdMap::adopt`] refused to track a listed order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub(crate) enum AdoptionRefused {
+    #[error("its client order id names another live order")]
+    ClientOrderIdInUse,
+    #[error("its IB order id names another tracked order")]
+    IbOrderIdTracked,
+}
+
 /// [`OrderIdMap::register`] refused an id because a live order already holds it.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("client order id {0} already names a live IBKR order")]
@@ -139,14 +158,40 @@ struct OrderIdMapInner {
     ///
     /// Holds the live orders and the filled ones not yet reaped, which no longer hold their id.
     ib_to_entry: FnvHashMap<i32, (ClientOrderId, OrderContext, Instant)>,
+    /// The IB order ids of the entries adopted from a listing ([`OrderIdMap::adopt`]) rather than
+    /// placed through this client, whose registration time says nothing of when they were placed.
+    adopted: FnvHashSet<i32>,
 }
 
 impl OrderIdMapInner {
     /// Removes `ib_id`'s entry, and its id's mapping if that still names `ib_id`.
     fn remove(&mut self, ib_id: i32) -> Option<(ClientOrderId, OrderContext)> {
         let (client_id, ctx, _) = self.ib_to_entry.remove(&ib_id)?;
+        self.adopted.remove(&ib_id);
         self.release(&client_id, ib_id);
         Some((client_id, ctx))
+    }
+
+    /// Whether `client_id` is held by a live order, or named twice among `orders`: the refusal
+    /// [`OrderIdMap::register_all`] and [`OrderIdMap::adopt`] make.
+    fn in_use<'a>(
+        &self,
+        mut orders: impl Iterator<Item = &'a ClientOrderId>,
+        client_id: &ClientOrderId,
+    ) -> bool {
+        orders.any(|earlier| earlier == client_id) || self.cid_to_ib.contains_key(client_id)
+    }
+
+    fn insert(
+        &mut self,
+        client_id: ClientOrderId,
+        ib_id: i32,
+        context: OrderContext,
+        now: Instant,
+    ) {
+        self.adopted.remove(&ib_id);
+        self.cid_to_ib.insert(client_id.clone(), ib_id);
+        self.ib_to_entry.insert(ib_id, (client_id, context, now));
     }
 
     /// Frees `client_id` if it still names `ib_id`, rather than a later order under the same id.
@@ -188,24 +233,64 @@ impl OrderIdMap {
     ) -> Result<(), ClientOrderIdInUse> {
         let mut inner = self.inner.write();
         for (index, (client_id, _, _)) in orders.iter().enumerate() {
-            let repeated = orders[..index]
-                .iter()
-                .any(|(earlier, _, _)| earlier == client_id);
-            if repeated || inner.cid_to_ib.contains_key(client_id) {
+            if inner.in_use(
+                orders[..index].iter().map(|(earlier, _, _)| earlier),
+                client_id,
+            ) {
                 return Err(ClientOrderIdInUse(client_id.clone()));
             }
         }
         let now = Instant::now();
         for (client_id, ib_id, context) in orders {
-            inner.cid_to_ib.insert(client_id.clone(), ib_id);
-            inner.ib_to_entry.insert(ib_id, (client_id, context, now));
+            inner.insert(client_id, ib_id, context, now);
         }
+        Ok(())
+    }
+
+    /// Track an order this client did not place, found in IB's listing under `client_id`, the id
+    /// its order reference carries: one placed before a restart, say. Its
+    /// [`registration`](Self::registration) says it was adopted.
+    ///
+    /// # Errors
+    /// [`AdoptionRefused`] if a live order already holds `client_id`, or `ib_id` already names
+    /// an order here. Nothing is tracked.
+    pub(crate) fn adopt(
+        &self,
+        client_id: ClientOrderId,
+        ib_id: i32,
+        context: OrderContext,
+    ) -> Result<(), AdoptionRefused> {
+        let mut inner = self.inner.write();
+        if inner.ib_to_entry.contains_key(&ib_id) {
+            return Err(AdoptionRefused::IbOrderIdTracked);
+        }
+        if inner.in_use(std::iter::empty(), &client_id) {
+            return Err(AdoptionRefused::ClientOrderIdInUse);
+        }
+        inner.insert(client_id, ib_id, context, Instant::now());
+        inner.adopted.insert(ib_id);
         Ok(())
     }
 
     /// Look up the IB order ID of the live order under `client_id`.
     pub fn get_ib_id(&self, client_id: &ClientOrderId) -> Option<i32> {
         self.inner.read().cid_to_ib.get(client_id).copied()
+    }
+
+    /// How long ago the live order under `client_id` came to be tracked here, and whether it was
+    /// [adopted](Self::adopt) from a listing rather than placed through this client. A placed
+    /// order is registered just before it is sent, so its age is how long ago it was placed; an
+    /// adopted one's says only that it was open by then.
+    ///
+    /// `None` when no live order holds `client_id`.
+    pub(crate) fn registration(&self, client_id: &ClientOrderId) -> Option<Registration> {
+        let inner = self.inner.read();
+        let ib_id = inner.cid_to_ib.get(client_id)?;
+        let (_, _, registered_at) = inner.ib_to_entry.get(ib_id)?;
+        Some(Registration {
+            age: registered_at.elapsed(),
+            adopted: inner.adopted.contains(ib_id),
+        })
     }
 
     /// Whether IB order `ib_id` has an entry: a live order, or a filled one not yet reaped.
@@ -356,6 +441,12 @@ impl PendingCancels {
     #[must_use]
     pub fn remove(&self, ib_id: i32) -> bool {
         self.inner.lock().remove(&ib_id).is_some()
+    }
+
+    /// Whether a cancel of IB order `ib_id` was requested through this client and is still
+    /// tracked: not yet seen to end the order, nor cleared as stale.
+    pub(crate) fn contains(&self, ib_id: i32) -> bool {
+        self.inner.lock().contains_key(&ib_id)
     }
 
     /// Clear entries older than the given duration.
@@ -533,6 +624,7 @@ fn parse_gtd_datetime(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 }
 
 /// Error when mapping rustrade order types to IB.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrderMappingError {
     PostOnlyNotSupported,
@@ -555,6 +647,9 @@ pub enum OrderMappingError {
     /// on the wrong side of the entry (for a buy, the take profit must be above the entry and the
     /// stop loss below; a sell the reverse).
     InvalidBracketPrices(String),
+    /// The client order id cannot be sent as the order's IB order reference, which carries it:
+    /// IB takes at most [`MAX_ORDER_REF_LEN`] ASCII characters there.
+    InvalidClientOrderId(ClientOrderId),
 }
 
 impl std::fmt::Display for OrderMappingError {
@@ -583,8 +678,33 @@ impl std::fmt::Display for OrderMappingError {
                  the order to MOC/LOC; time_in_force_to_ib cannot map it directly"
             ),
             Self::InvalidBracketPrices(e) => write!(f, "invalid bracket prices: {e}"),
+            Self::InvalidClientOrderId(cid) => write!(
+                f,
+                "client order id {cid} is not an IB order reference: at most \
+                 {MAX_ORDER_REF_LEN} ASCII characters"
+            ),
         }
     }
+}
+
+/// The longest order reference IB echoes back whole, verified on paper. The client order id
+/// travels there, so it is limited to this.
+pub const MAX_ORDER_REF_LEN: usize = 128;
+
+/// The IB order reference that carries `cid`: the id itself.
+///
+/// IB echoes the reference on every open-order, completed-order and execution report, so an order
+/// can be named by the id it was placed with even by a client that did not place it.
+///
+/// # Errors
+/// [`OrderMappingError::InvalidClientOrderId`] for an id IB would reject (error 10363 for
+/// non-ASCII text) or not echo whole: empty, longer than [`MAX_ORDER_REF_LEN`], or not ASCII.
+pub fn order_ref(cid: &ClientOrderId) -> Result<String, OrderMappingError> {
+    let id = cid.0.as_str();
+    if id.is_empty() || id.len() > MAX_ORDER_REF_LEN || !id.is_ascii() {
+        return Err(OrderMappingError::InvalidClientOrderId(cid.clone()));
+    }
+    Ok(id.to_owned())
 }
 
 impl std::error::Error for OrderMappingError {}
@@ -1917,6 +2037,30 @@ mod tests {
         assert_eq!(orders[0].tif, IbTimeInForce::GoodTillCanceled);
         assert_eq!(orders[1].tif, IbTimeInForce::GoodTillCanceled);
         assert_eq!(orders[2].tif, IbTimeInForce::GoodTillCanceled);
+    }
+
+    /// A client order id travels as the order reference whole, so one IB would reject or cut is
+    /// refused: empty, longer than IB echoes back, or not ASCII (IB error 10363).
+    #[test]
+    fn order_ref_is_the_client_order_id_when_ib_echoes_it_whole() {
+        let longest = "a".repeat(MAX_ORDER_REF_LEN);
+        assert_eq!(
+            order_ref(&ClientOrderId::new(longest.as_str())).unwrap(),
+            longest
+        );
+        assert_eq!(
+            order_ref(&ClientOrderId::new("cid-1_tp")).unwrap(),
+            "cid-1_tp"
+        );
+
+        let too_long = "a".repeat(MAX_ORDER_REF_LEN + 1);
+        for refused in ["", too_long.as_str(), "ordre-é"] {
+            let cid = ClientOrderId::new(refused);
+            assert_eq!(
+                order_ref(&cid),
+                Err(OrderMappingError::InvalidClientOrderId(cid.clone()))
+            );
+        }
     }
 
     /// Every order this client builds reads back as what it was built from, so an open order it no

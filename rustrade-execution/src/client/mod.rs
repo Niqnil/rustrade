@@ -79,7 +79,12 @@ pub(crate) mod dedup;
 
 // What a client knows of its live orders, and the reconnect check of how those orders ended while
 // its account stream was down. Gated on the clients that use it, like `dedup`.
-#[cfg(any(feature = "alpaca", feature = "binance", feature = "hyperliquid"))]
+#[cfg(any(
+    feature = "alpaca",
+    feature = "binance",
+    feature = "hyperliquid",
+    feature = "ibkr"
+))]
 pub(crate) mod order_recovery;
 
 // Alpaca ExecutionClient implementation (options, equities, crypto — single unified API)
