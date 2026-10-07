@@ -242,10 +242,14 @@ pub(super) fn ended_order<E>(
         && let Ok(age) = chrono::Duration::from_std(tracked.registration.age)
         && completed_at + COMPLETION_CLOCK_SLACK < Utc::now() - age
     {
-        debug!(
+        // A warning, since IB's clock lagging this host's by more than the slack would hold a
+        // genuinely ended order here at every check.
+        warn!(
             cid = %key.cid,
             %completed_at,
-            "Completed IBKR order predates the order now under its client order id"
+            tracked_for_secs = age.num_seconds(),
+            "Completed IBKR order predates the order now under its client order id; taking it as \
+             an earlier order's. If it is this order's, IB's clock lags this host's"
         );
         return Ok(OrderLookup::NotEnded);
     }

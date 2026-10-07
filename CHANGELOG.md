@@ -176,8 +176,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     id, is omitted. IB lists orders completed before a Gateway restart under API client id 0, so
     those count as this client's: client order ids must be unique across the API clients on an
     account. When several completed orders carry one id, the one that completed last is
-    reported, and one that completed before this client began tracking the order now under the
-    id is taken as an earlier order's.
+    reported, and one that completed more than 5 seconds before this client began tracking the
+    order now under the id is taken as an earlier order's, with a warning.
   - IB answers every open-orders and completed-orders request with every listing in flight, so
     the client and its clones now read these listings one at a time. Two `fetch_open_orders`
     calls at once could each stop at the other's end of the listing.
@@ -261,7 +261,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     not ASCII (error 10363) and echoes back whole only up to 128 characters. An open, or a
     bracket any of whose leg ids (the parent's plus `_tp` and `_sl`) is empty, longer, or not
     ASCII, is refused before anything is sent, with the new
-    `OrderMappingError::InvalidClientOrderId`.
+    `OrderMappingError::InvalidClientOrderId`. `OrderMappingError` is now `#[non_exhaustive]`,
+    so a match on it needs a wildcard arm.
   - When reading a gap's fills fails three times, the account stream sends
     `AccountEventKind::FillRecoveryGaveUp` covering every instrument, from the start of the gap
     to when it gave up, and stays open. It ended with `StreamTerminated`, leaving its reader

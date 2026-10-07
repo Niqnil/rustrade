@@ -509,12 +509,11 @@ impl ListingLock {
     }
 
     /// Read IB's listing of the account's completed orders: every API client's, and those
-    /// entered in TWS.
+    /// entered in TWS. Each item is handed to `on_item` as it arrives, since the listing can be
+    /// long and only a few of its orders are wanted.
     ///
     /// # Errors
     /// As [`read_listing`].
-    /// Each item is handed to `on_item` as it arrives, since the listing can be long and only a
-    /// few of its orders are wanted.
     fn completed_orders(
         &self,
         client: &Client,
@@ -3211,15 +3210,6 @@ fn adopt_listed_order(
     ib_id: i32,
     ctx: &OrderContext,
 ) -> bool {
-    if order_ids.contains(ib_id) {
-        warn!(
-            ib_order_id = ib_id,
-            %cid,
-            "Listed IBKR order's IB order id names another tracked order; listing it under its IB \
-             order id"
-        );
-        return false;
-    }
     match order_ids.adopt(cid.clone(), ib_id, ctx.clone()) {
         Ok(()) => {
             info!(
@@ -3230,11 +3220,12 @@ fn adopt_listed_order(
             );
             true
         }
-        Err(in_use) => {
+        Err(refused) => {
             warn!(
                 ib_order_id = ib_id,
-                error = %in_use,
-                "Listed IBKR order's client order id names another live order; listing it under \
+                %cid,
+                reason = %refused,
+                "Listed IBKR order cannot be tracked under its client order id; listing it under \
                  its IB order id"
             );
             false
@@ -3447,8 +3438,9 @@ impl BracketOrderClient for IbkrClient {
 /// under. Client order ids must therefore be unique across the API clients on the account.
 ///
 /// When IB lists several completed orders under one id, the one that completed last is reported.
-/// One that completed before this client began tracking the order now under that id is an
-/// earlier order's, under a reused id, and the order is not reported ended.
+/// One that completed more than 5 seconds before this client began tracking the order now under
+/// that id is an earlier order's, under a reused id, and the order is not reported ended, with a
+/// warning: should IB's clock lag this host's by more, an order that did end is held as live.
 ///
 /// The account stream runs the same lookup itself after a gap in event delivery; see
 /// [`ExecutionClient::account_stream`].

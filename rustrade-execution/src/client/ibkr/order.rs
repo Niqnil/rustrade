@@ -135,6 +135,15 @@ pub(crate) struct Registration {
     pub(crate) adopted: bool,
 }
 
+/// Why [`OrderIdMap::adopt`] refused to track a listed order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub(crate) enum AdoptionRefused {
+    #[error("its client order id names another live order")]
+    ClientOrderIdInUse,
+    #[error("its IB order id names another tracked order")]
+    IbOrderIdTracked,
+}
+
 /// [`OrderIdMap::register`] refused an id because a live order already holds it.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("client order id {0} already names a live IBKR order")]
@@ -243,16 +252,20 @@ impl OrderIdMap {
     /// [`registration`](Self::registration) says it was adopted.
     ///
     /// # Errors
-    /// [`ClientOrderIdInUse`] if a live order already holds `client_id`. Nothing is tracked.
+    /// [`AdoptionRefused`] if a live order already holds `client_id`, or `ib_id` already names
+    /// an order here. Nothing is tracked.
     pub(crate) fn adopt(
         &self,
         client_id: ClientOrderId,
         ib_id: i32,
         context: OrderContext,
-    ) -> Result<(), ClientOrderIdInUse> {
+    ) -> Result<(), AdoptionRefused> {
         let mut inner = self.inner.write();
+        if inner.ib_to_entry.contains_key(&ib_id) {
+            return Err(AdoptionRefused::IbOrderIdTracked);
+        }
         if inner.in_use(std::iter::empty(), &client_id) {
-            return Err(ClientOrderIdInUse(client_id));
+            return Err(AdoptionRefused::ClientOrderIdInUse);
         }
         inner.insert(client_id, ib_id, context, Instant::now());
         inner.adopted.insert(ib_id);
