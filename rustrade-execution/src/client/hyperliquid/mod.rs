@@ -120,7 +120,7 @@ mod order_recovery;
 pub mod spot;
 mod spot_coins;
 
-use crate::client::dedup::{dedup_key_from_event, is_duplicate, new_dedup_cache};
+use crate::client::dedup::new_dedup_cache;
 use crate::client::order_recovery::{
     KnownLiveOrders, OrderLookup, SharedKnownLiveOrders, fetch_ended_by_key,
 };
@@ -158,7 +158,7 @@ use futures::{StreamExt, stream::BoxStream};
 use hyperliquid_rust_sdk::{BaseUrl, ExchangeClient, InfoClient, Message, Subscription};
 use order_recovery::{
     ReconnectWatch, fetch_order_record, listed_cids, lookup_from_record, remember_open,
-    remember_snapshot, send_observed, spawn_order_checks,
+    remember_snapshot, send_fills, send_observed, spawn_order_checks,
 };
 use rust_decimal::Decimal;
 use rustrade_instrument::{
@@ -177,7 +177,7 @@ use std::{
 };
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 /// USDC asset name on Hyperliquid, the collateral of its default perpetuals.
 const USDC_ASSET: &str = "USDC";
@@ -455,7 +455,10 @@ impl ExecutionClient for HyperliquidClient {
     ///   how the order ended. The snapshot is all the fill recovery there is (see the [module
     ///   docs](self#sdk-delegation-model)), and Hyperliquid does not document how far back it
     ///   reaches, so after a long outage an order can be reported filled before, or without, fills
-    ///   older than that.
+    ///   older than that. The SDK resubscribes in no fixed order and only logs a resubscription
+    ///   that fails: an order that ends after the check lists the open orders but before
+    ///   `orderUpdates` is subscribed again is missed, and if `userFills` is not subscribed again
+    ///   no check runs until a later reconnect.
     /// - **Which orders.** The client holds an order as live from the response to placing it,
     ///   from a listing of open orders ([`account_snapshot`](ExecutionClient::account_snapshot),
     ///   [`fetch_open_orders`](ExecutionClient::fetch_open_orders)), and from its live reports on
@@ -465,7 +468,8 @@ impl ExecutionClient for HyperliquidClient {
     ///   instrument is checked, as the stream ignores `instruments`.
     /// - **Cost.** One `openOrders` request (weight 20) listing every open order, then one
     ///   `orderStatus` request (weight 2) for each held order the listing no longer shows, 8 at a
-    ///   time. Both count against Hyperliquid's REST limit of 1,200 a minute per IP address.
+    ///   time. Both count against Hyperliquid's REST limit of 1,200 a minute per IP address. The
+    ///   cost is per stream: a perpetuals and a spot stream on one wallet each make their own.
     /// - **Failures.** Each order's lookup is settled as it ends. An instrument whose listing or
     ///   lookup fails, or whose check is still running after 30 s, is retried while the stream is
     ///   open 1, 2, 4, 8 and 16 minutes later, asking only about the orders still held, then given
@@ -524,7 +528,7 @@ impl ExecutionClient for HyperliquidClient {
 
         // How the orders held as live ended while the socket was down: checked after each
         // reconnect, once the fills snapshot that opens the resubscription has been sent on. Its
-        // own token also ends it when the stream terminates, so nothing follows `StreamTerminated`.
+        // own token also stops it promptly when the stream terminates.
         let reconnected = Arc::new(Notify::new());
         let checks_cancel = cancel_token.child_token();
         let (list_client, lookup_client) = (self.info_client.clone(), self.info_client.clone());
@@ -575,36 +579,20 @@ impl ExecutionClient for HyperliquidClient {
                         };
                         match msg {
                             Message::UserFills(fills) => {
-                                // Hyperliquid opens a `userFills` subscription with a snapshot of
-                                // recent fills, and the SDK resubscribes on every reconnect. Each
-                                // reconnect therefore redelivers fills already sent. A trade is a
-                                // delta the consumer accumulates, so redelivering one double-counts
-                                // filled quantity and fees -- hence the dedup cache.
-                                //
-                                // Order updates on the sibling task are deliberately NOT deduped:
-                                // they are absolute state, so a replayed one is idempotent, while
-                                // dropping one could strand the consumer on stale state.
-                                let is_snapshot = fills.data.is_snapshot;
-                                for fill in fills.data.fills {
+                                let convert = |fill: &hyperliquid_rust_sdk::TradeInfo| {
                                     unknown_coins.warn_once(&fill.coin);
-                                    let Some(event) = fill_to_account_event(&fill) else {
-                                        continue;
-                                    };
-                                    if let Some(key) = dedup_key_from_event(&event)
-                                        && is_duplicate(&fills_dedup, key)
-                                    {
-                                        trace!(
-                                            tid = fill.tid,
-                                            "Hyperliquid dedup: skipping fill already delivered"
-                                        );
-                                        continue;
-                                    }
-                                    if fills_event_tx.send(event).is_err() {
-                                        debug!("Fills event channel closed");
-                                        return;
-                                    }
+                                    fill_to_account_event(fill)
+                                };
+                                if !send_fills(
+                                    &fills.data,
+                                    convert,
+                                    &fills_dedup,
+                                    &fills_event_tx,
+                                    &mut reconnects,
+                                ) {
+                                    debug!("Fills event channel closed");
+                                    return;
                                 }
-                                reconnects.fills_sent(is_snapshot);
                             }
                             Message::NoData => {
                                 warn!("UserFills WebSocket disconnected");
@@ -1266,7 +1254,7 @@ async fn perp_listed_cids(
     instruments: Vec<InstrumentNameExchange>,
 ) -> Result<FnvHashSet<ClientOrderId>, UnindexedClientError> {
     let rows = open_orders(&info_client, address).await?;
-    listed_cids(&rows, &instruments, |coin| Ok(perp_instrument(coin)))
+    Ok(listed_cids(&rows, &instruments, perp_instrument))
 }
 
 /// Report one perpetual position from Hyperliquid's user state.
@@ -1361,6 +1349,7 @@ fn order_update_to_account_event(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::client::dedup::{dedup_key_from_event, is_duplicate};
     use rust_decimal_macros::dec;
     use rustrade_integration::collection::snapshot::Snapshot;
 
@@ -1397,6 +1386,72 @@ mod tests {
                 "status": "order",
                 "order": record_json(coin, "canceled", "0.01", Some(CLOID)),
             })
+        }
+
+        #[test]
+        fn a_reconnect_snapshot_wakes_the_check_once_its_fills_are_sent() {
+            use futures::FutureExt as _;
+            let notified = |reconnected: &Notify| reconnected.notified().now_or_never().is_some();
+            let snapshot = |fills| hyperliquid_rust_sdk::UserFillsData {
+                is_snapshot: Some(true),
+                user: ethers::types::H160::zero(),
+                fills,
+            };
+            let reconnected = Arc::new(Notify::new());
+            let mut reconnects = ReconnectWatch::new(reconnected.clone());
+            let dedup = new_dedup_cache();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let tids = |rx: &mut mpsc::UnboundedReceiver<UnindexedAccountEvent>| {
+                std::iter::from_fn(|| rx.try_recv().ok())
+                    .map(|event| match event.kind {
+                        AccountEventKind::Trade(trade) => trade.id.0.to_string(),
+                        other => panic!("expected a trade, got {other:?}"),
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            // The snapshot opening the first subscription.
+            let first = snapshot(vec![sweep_fill(1, "60000")]);
+            assert!(send_fills(
+                &first,
+                fill_to_account_event,
+                &dedup,
+                &tx,
+                &mut reconnects
+            ));
+            assert_eq!(tids(&mut rx), ["1"]);
+            assert!(!notified(&reconnected));
+
+            // A drop, then the resubscription's snapshot: its new fill is sent, then the check
+            // woken.
+            reconnects.dropped();
+            let resubscribed = snapshot(vec![sweep_fill(1, "60000"), sweep_fill(2, "60001")]);
+            assert!(send_fills(
+                &resubscribed,
+                fill_to_account_event,
+                &dedup,
+                &tx,
+                &mut reconnects
+            ));
+            assert_eq!(
+                tids(&mut rx),
+                ["2"],
+                "the fill already sent is not sent again"
+            );
+            assert!(notified(&reconnected));
+
+            // With the consumer gone the fills cannot be sent, and the check is not woken.
+            drop(rx);
+            reconnects.dropped();
+            let unsent = snapshot(vec![sweep_fill(3, "60002")]);
+            assert!(!send_fills(
+                &unsent,
+                fill_to_account_event,
+                &dedup,
+                &tx,
+                &mut reconnects
+            ));
+            assert!(!notified(&reconnected));
         }
 
         #[tokio::test]

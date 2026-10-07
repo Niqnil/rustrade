@@ -13,6 +13,7 @@
 use super::common::{OpenOrder, cid_to_cloid, info, order_update_to_order, record_cid};
 use crate::{
     UnindexedAccountEvent, UnindexedAccountSnapshot,
+    client::dedup::{SharedDedupCache, dedup_key_from_event, is_duplicate},
     client::order_recovery::{
         KnownLiveOrders, NoPendingFills, OpenListing, OrderLookup, SharedKnownLiveOrders,
         UncheckedOrders, recover_ended_orders,
@@ -26,13 +27,13 @@ use crate::{
 };
 use ethers::types::H160;
 use fnv::FnvHashSet;
-use hyperliquid_rust_sdk::{InfoClient, OrderUpdate};
+use hyperliquid_rust_sdk::{InfoClient, OrderUpdate, TradeInfo, UserFillsData};
 use rustrade_instrument::{exchange::ExchangeId, instrument::name::InstrumentNameExchange};
 use smol_str::format_smolstr;
 use std::{future::Future, sync::Arc};
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, trace};
 use uuid::Uuid;
 
 /// What `orderStatus` answers.
@@ -166,20 +167,21 @@ pub(super) fn lookup_from_record(
 }
 
 /// The client order ids of the open-order `rows` on `instruments`, given by `to_instrument` the
-/// instrument each row's coin names (`None` for a market the client does not trade).
+/// instrument each row's coin names.
 ///
-/// # Errors
-///
-/// The first error `to_instrument` returns.
+/// `to_instrument` answers `None` for a coin it cannot name, whether of a market the client does
+/// not trade or a spot coin missing from `spotMeta`. Neither can be on one of `instruments`, which
+/// are those of orders the client has seen, so such a row is left out. Were it one of the orders
+/// asked about, its lookup is what finds that out.
 pub(super) fn listed_cids(
     rows: &[OpenOrder],
     instruments: &[InstrumentNameExchange],
-    mut to_instrument: impl FnMut(&str) -> Result<Option<InstrumentNameExchange>, UnindexedClientError>,
-) -> Result<FnvHashSet<ClientOrderId>, UnindexedClientError> {
+    mut to_instrument: impl FnMut(&str) -> Option<InstrumentNameExchange>,
+) -> FnvHashSet<ClientOrderId> {
     let wanted: FnvHashSet<&InstrumentNameExchange> = instruments.iter().collect();
     let mut listed = FnvHashSet::default();
     for row in rows {
-        let Some(instrument) = to_instrument(&row.coin)? else {
+        let Some(instrument) = to_instrument(&row.coin) else {
             continue;
         };
         if !wanted.contains(&instrument) {
@@ -188,7 +190,7 @@ pub(super) fn listed_cids(
         // A row whose cloid is malformed names no order of this client's (`record_cid` warns).
         listed.extend(record_cid(row.cloid.as_deref(), row.oid));
     }
-    Ok(listed)
+    listed
 }
 
 /// Hold each open order in `snapshot` as live, for a reconnect to ask about if the stream misses
@@ -240,6 +242,50 @@ pub(super) fn send_observed(
     let sent = tx.send(event).is_ok();
     drop(known);
     sent
+}
+
+/// Send on the fills of one `userFills` message, `fills`, then tell `reconnects` it was sent, so
+/// that the snapshot opening a resubscription reaches the stream before the order check it wakes.
+/// `convert` turns a fill into its event, or `None` for one the client leaves out.
+///
+/// Hyperliquid opens a `userFills` subscription with a snapshot of recent fills, and the SDK
+/// resubscribes on every reconnect, so each reconnect redelivers fills already sent. A trade is a
+/// delta the consumer accumulates, so redelivering one would double-count filled quantity and
+/// fees: each fill is sent once, by `dedup`. Order updates, on the sibling task, are deliberately
+/// not deduplicated: they are absolute state, so a replayed one is idempotent, while dropping one
+/// could strand the consumer on stale state.
+///
+/// Fills are sent plainly rather than through [`send_observed`]: a Hyperliquid fill carries no
+/// cumulative fill of its order, so [`KnownLiveOrders`] learns nothing from one. Its order's
+/// `filled` update ends it there.
+///
+/// Returns whether every event was sent, which it is unless the consumer has gone.
+pub(super) fn send_fills(
+    fills: &UserFillsData,
+    mut convert: impl FnMut(&TradeInfo) -> Option<UnindexedAccountEvent>,
+    dedup: &SharedDedupCache,
+    tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
+    reconnects: &mut ReconnectWatch,
+) -> bool {
+    for fill in &fills.fills {
+        let Some(event) = convert(fill) else {
+            continue;
+        };
+        if let Some(key) = dedup_key_from_event(&event)
+            && is_duplicate(dedup, key)
+        {
+            trace!(
+                tid = fill.tid,
+                "Hyperliquid dedup: skipping fill already delivered"
+            );
+            continue;
+        }
+        if tx.send(event).is_err() {
+            return false;
+        }
+    }
+    reconnects.fills_sent(fills.is_snapshot);
+    true
 }
 
 /// Reads the SDK's reconnects off the account stream's `userFills` subscription, and wakes the
@@ -617,29 +663,16 @@ pub(super) mod tests {
             open_order_row("@107", 5, None),
         ];
         let to_instrument = |coin: &str| {
-            Ok((!coin.starts_with('@'))
-                .then(|| InstrumentNameExchange::new(format!("{coin}-USD-PERP"))))
+            (!coin.starts_with('@'))
+                .then(|| InstrumentNameExchange::new(format!("{coin}-USD-PERP")))
         };
 
-        let listed = listed_cids(&rows, &[btc()], to_instrument).unwrap();
+        let listed = listed_cids(&rows, &[btc()], to_instrument);
 
         let expected: FnvHashSet<_> = [ClientOrderId::new(CID), ClientOrderId::new("2")]
             .into_iter()
             .collect();
         assert_eq!(listed, expected);
-    }
-
-    #[test]
-    fn a_listing_fails_when_a_coin_cannot_be_named() {
-        let rows = [open_order_row("@999", 1, None)];
-
-        let listed = listed_cids(&rows, &[btc()], |_| {
-            Err(UnindexedClientError::Internal(
-                "missing from spotMeta".into(),
-            ))
-        });
-
-        assert!(listed.is_err());
     }
 
     fn notified(reconnected: &Notify) -> bool {
