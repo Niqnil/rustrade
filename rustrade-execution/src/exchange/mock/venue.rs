@@ -33,7 +33,6 @@ use rustrade_instrument::{
 };
 use rustrade_integration::collection::snapshot::Snapshot;
 use smol_str::ToSmolStr;
-use tracing::error;
 
 /// Everything one request obliges a driver to deliver, in the order it must deliver it.
 ///
@@ -523,8 +522,7 @@ impl SimulatedVenue {
 
         for cid in expired {
             // Collected from this same index with nothing in between, so this always finds it.
-            let Some(RestingOrder { order, reservation }) = self.account.orders_mut().remove(&cid)
-            else {
+            let Some(RestingOrder { order, reservation }) = self.account.remove_order(&cid) else {
                 continue;
             };
 
@@ -689,8 +687,7 @@ impl SimulatedVenue {
 
         for (cid, limit) in crossing {
             // Collected from this same book with nothing in between, so this always finds it.
-            let Some(RestingOrder { order, reservation }) = self.account.orders_mut().remove(&cid)
-            else {
+            let Some(RestingOrder { order, reservation }) = self.account.remove_order(&cid) else {
                 continue;
             };
 
@@ -1046,8 +1043,7 @@ impl SimulatedVenue {
     ) -> CancelOutcome {
         let time_exchange = self.time_exchange();
 
-        let Some(RestingOrder { order, reservation }) =
-            self.account.orders_mut().remove(&request.key.cid)
+        let Some(RestingOrder { order, reservation }) = self.account.remove_order(&request.key.cid)
         else {
             return VenueOutcome {
                 events: Vec::new(),
@@ -1290,7 +1286,7 @@ impl SimulatedVenue {
         };
 
         // Before anything touches the ledger, and for every kind: see the type's note on client
-        // order ids. It is also what lets `book_rested` treat a refused booking as unreachable.
+        // order ids. It is also what makes a refused booking in `book_rested` unreachable.
         if self.account.orders().contains(&request.key.cid) {
             let reason = format!(
                 "{} already names an order resting on {}",
@@ -1669,7 +1665,7 @@ impl SimulatedVenue {
         // one place: every other arrival already acknowledges its own outcome.
         self.account.ack_trade(trade.clone());
 
-        let (state, released) = self.retire_filled(
+        let state = self.retire_filled(
             &request,
             order_id,
             Fill {
@@ -1691,9 +1687,7 @@ impl SimulatedVenue {
                 state,
             },
             Some(OpenOrderNotifications::Filled {
-                // A refused booking's hold is given back after it is taken (see `book_rested`), so
-                // the later restatement is the one that is true.
-                balance: Snapshot(released.unwrap_or(balance)),
+                balance: Snapshot(balance),
                 trade,
             }),
         )
@@ -1702,8 +1696,7 @@ impl SimulatedVenue {
     /// Records what an order that traded on arrival became, and reports the state it answers with.
     ///
     /// The three outcomes are the three things a taker fill can leave behind: nothing, a remainder
-    /// with nowhere to wait, or a remainder on the book. Returns the balance `book_rested`
-    /// restated, if it could not book the remainder.
+    /// with nowhere to wait, or a remainder on the book.
     fn retire_filled(
         &mut self,
         request: &OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
@@ -1711,7 +1704,7 @@ impl SimulatedVenue {
         fill: Fill,
         held: Option<Settlement>,
         time_exchange: DateTime<Utc>,
-    ) -> (UnindexedOrderState, Option<AssetBalance<AssetNameExchange>>) {
+    ) -> UnindexedOrderState {
         // Spelled out per arm rather than shared: a closure would be monomorphic in the state
         // type, and the two arms that record an order record two different ones.
         match held {
@@ -1724,7 +1717,7 @@ impl SimulatedVenue {
                     time_exchange,
                     fill.quantity,
                 );
-                let released = self.book_rested(
+                self.book_rested(
                     Order {
                         key: request.key.clone(),
                         side: request.state.side,
@@ -1738,10 +1731,9 @@ impl SimulatedVenue {
                         amount: held.requirement(),
                         asset: held.asset,
                     },
-                    time_exchange,
                 );
 
-                (OrderState::active(open), released)
+                OrderState::active(open)
             }
 
             // Either it filled outright, or what is left has nowhere to wait.
@@ -1764,7 +1756,7 @@ impl SimulatedVenue {
                     state: filled.clone(),
                 });
 
-                (OrderState::fully_filled(filled), None)
+                OrderState::fully_filled(filled)
             }
 
             // A market order carries no price, so its remainder has nothing to rest at and retires
@@ -1786,7 +1778,7 @@ impl SimulatedVenue {
                     state: cancelled.clone(),
                 });
 
-                (OrderState::inactive(cancelled), None)
+                OrderState::inactive(cancelled)
             }
         }
     }
@@ -1812,33 +1804,18 @@ impl SimulatedVenue {
 
     /// Puts `order` on the book holding `reservation`.
     ///
-    /// `open_order_inner` has already refused an open whose id names a resting order, and nothing
-    /// between that check and this booking rests another, so the book is vacant under this id. A
-    /// refusal here is therefore a bug in this venue. It is not hidden: it is asserted in a debug
-    /// build and logged in a release one, and the reservation just taken is given back, so the
-    /// ledger stays true even though the reply to the request will not be. The balance that
-    /// restates is returned.
-    fn book_rested(
-        &mut self,
-        order: OpenOrder,
-        reservation: Reservation,
-        time_exchange: DateTime<Utc>,
-    ) -> Option<AssetBalance<AssetNameExchange>> {
-        let Err(AlreadyResting(refused)) = self.account.book(order, Some(reservation)) else {
-            return None;
-        };
-        debug_assert!(
-            false,
-            "SimulatedVenue booked {} over a resting order: open_order_inner checks first",
-            refused.order.key.cid
-        );
-        error!(
-            cid = %refused.order.key.cid,
-            "SimulatedVenue refused to book an order over the one resting under its id, after \
-             accepting it; its reservation is released and the reply to it is wrong"
-        );
-        let Reservation { asset, amount } = refused.reservation?;
-        Some(self.account.release(&asset, amount, time_exchange))
+    /// # Panics
+    /// If an order is already resting under its id. `open_order_inner` refuses such an open before
+    /// anything else, under the same `&mut self`, so the book is vacant under this id by
+    /// construction, and a refusal here would be a bug in this venue with no correct reply left
+    /// to give.
+    fn book_rested(&mut self, order: OpenOrder, reservation: Reservation) {
+        if let Err(AlreadyResting(refused)) = self.account.book(order, Some(reservation)) {
+            unreachable!(
+                "SimulatedVenue booked {} over a resting order: open_order_inner checks first",
+                refused.order.key.cid
+            );
+        }
     }
 
     /// Puts what is left of an order onto the book, holding what that remainder's fill will cost.
@@ -1913,7 +1890,7 @@ impl SimulatedVenue {
             filled_quantity,
         );
 
-        let released = self.book_rested(
+        self.book_rested(
             Order {
                 key: request.key.clone(),
                 side: request.state.side,
@@ -1927,7 +1904,6 @@ impl SimulatedVenue {
                 amount: settlement.requirement(),
                 asset: settlement.asset,
             },
-            time_exchange,
         );
 
         let order_response = Order {
@@ -1943,9 +1919,7 @@ impl SimulatedVenue {
         (
             order_response,
             Some(OpenOrderNotifications::Rested {
-                // A refused booking's hold is given back after it is taken (see `book_rested`), so
-                // the later restatement is the one that is true.
-                balance: Snapshot(released.unwrap_or(balance_snapshot)),
+                balance: Snapshot(balance_snapshot),
             }),
         )
     }
@@ -4303,7 +4277,7 @@ mod tests {
         let mut seeded = seeded_part_filled("48000", "1", "0");
         seeded.state.id = VenueOrderId::Assigned(OrderId::new(u64::MAX.to_string()));
         assert!(
-            account.orders_mut().insert(seeded, None).is_ok(),
+            account.book(seeded, None).is_ok(),
             "the book is vacant under this id"
         );
 
@@ -4590,8 +4564,7 @@ mod tests {
         assert!(
             venue
                 .account
-                .orders_mut()
-                .insert(
+                .book(
                     seeded_part_filled("48000", "1", "0.4"),
                     // As `initial_state` seeds one: the venue never took anything for it.
                     None,
@@ -4650,8 +4623,7 @@ mod tests {
         assert!(
             venue
                 .account
-                .orders_mut()
-                .insert(seeded_part_filled("48000", "1", "0.4"), None)
+                .book(seeded_part_filled("48000", "1", "0.4"), None)
                 .is_ok(),
             "the book is vacant under this id"
         );
@@ -5911,8 +5883,7 @@ mod tests {
         assert!(
             venue
                 .account
-                .orders_mut()
-                .insert(
+                .book(
                     as_open(seeded).expect("the seeded order is Open"),
                     // As `initial_state` seeds one: the venue never took anything for it.
                     None,
@@ -6654,8 +6625,7 @@ mod tests {
         assert!(
             venue
                 .account
-                .orders_mut()
-                .insert(seeded_part_filled("48000", "1", "0.4"), None)
+                .book(seeded_part_filled("48000", "1", "0.4"), None)
                 .is_ok(),
             "the book is vacant under this id"
         );

@@ -1,7 +1,9 @@
 use crate::{
     UnindexedAccountSnapshot,
     balance::AssetBalance,
-    exchange::mock::orders::{AlreadyResting, OpenOrder, OpenOrders, Reservation, as_open},
+    exchange::mock::orders::{
+        AlreadyResting, OpenOrder, OpenOrders, Reservation, RestingOrder, as_open,
+    },
     order::{
         Order, UnindexedInactiveOrder,
         id::ClientOrderId,
@@ -66,12 +68,13 @@ impl AccountState {
         &self.orders_open
     }
 
-    /// This account's open orders, for a venue matching or cancelling one.
+    /// Takes the order resting under `cid` off the book, with whatever is held against it.
     ///
-    /// Book a new order with [`book`](Self::book) instead, which also retires what the ledgers
-    /// remember of an earlier order under the same id.
-    pub fn orders_mut(&mut self) -> &mut OpenOrders {
-        &mut self.orders_open
+    /// The caller records how it ended, with [`ack_cancelled`](Self::ack_cancelled),
+    /// [`ack_filled`](Self::ack_filled) or [`ack_expired`](Self::ack_expired). Booking is only
+    /// through [`book`](Self::book), which keeps an id in at most one place.
+    pub fn remove_order(&mut self, cid: &ClientOrderId) -> Option<RestingOrder> {
+        self.orders_open.remove(cid)
     }
 
     /// Puts `order` on the book holding `reservation`, unless an order is already resting under
