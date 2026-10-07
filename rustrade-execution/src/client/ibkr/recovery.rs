@@ -374,6 +374,8 @@ impl RecoveryError {
 /// with its commission report as the stream worker does.
 pub(super) struct RecoveredFills<'a> {
     floor: DateTime<Utc>,
+    /// This API client's id, which an execution of one of its orders carries.
+    api_client_id: i32,
     contracts: &'a ContractRegistry,
     order_ids: &'a OrderIdMap,
     awaiting_commission: ExecutionBuffer,
@@ -385,11 +387,13 @@ pub(super) struct RecoveredFills<'a> {
 impl<'a> RecoveredFills<'a> {
     pub(super) fn new(
         floor: DateTime<Utc>,
+        api_client_id: i32,
         contracts: &'a ContractRegistry,
         order_ids: &'a OrderIdMap,
     ) -> Self {
         Self {
             floor,
+            api_client_id,
             contracts,
             order_ids,
             awaiting_commission: ExecutionBuffer::new(),
@@ -416,11 +420,14 @@ impl<'a> RecoveredFills<'a> {
                         self.unparseable += 1;
                     }
                 }
-                if let Some((instrument, client_id)) =
-                    resolve_execution(&execution, self.contracts, self.order_ids)
-                {
+                if let Some(instrument) = resolve_execution(
+                    &execution,
+                    self.api_client_id,
+                    self.contracts,
+                    self.order_ids,
+                ) {
                     self.awaiting_commission
-                        .add_execution(execution, instrument, client_id);
+                        .add_execution(execution, instrument);
                 }
             }
             Executions::CommissionReport(report) => {
@@ -474,12 +481,17 @@ fn recover_fills(
     sink: &EventSink,
 ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, RecoveryError> {
     // No server-side time filter: TWS reads `ExecutionFilter::time` in a zone of its own choosing.
-    // A day's executions are few, and `RecoveredFills` applies the window.
+    // A day's executions are few, and `RecoveredFills` applies the window. Only this API client's:
+    // IB numbers orders per client, so another's could name an order id this client also uses.
+    let api_client_id = client.client_id();
     let subscription = client
-        .executions(ExecutionFilter::default())
+        .executions(ExecutionFilter {
+            client_id: Some(api_client_id),
+            ..ExecutionFilter::default()
+        })
         .map_err(RecoveryError::Ibapi)?;
     let deadline = Instant::now() + RECOVERY_TIMEOUT;
-    let mut fills = RecoveredFills::new(floor, contracts, order_ids);
+    let mut fills = RecoveredFills::new(floor, api_client_id, contracts, order_ids);
 
     loop {
         if !sink.is_open() {
@@ -510,7 +522,7 @@ fn recover_fills(
 /// `ibapi`'s timed receives answer `None` both when the time runs out and when there is nothing
 /// left to wait for: a subscription past its end marker, or a notice stream the client closed on
 /// shutdown. Only the second returns before the timeout.
-fn returned_early(elapsed: Duration, timeout: Duration) -> bool {
+pub(super) fn returned_early(elapsed: Duration, timeout: Duration) -> bool {
     elapsed < timeout / 2
 }
 
@@ -1016,6 +1028,15 @@ mod tests {
         })
     }
 
+    /// `item`, an execution, as one of API client `api_client_id`'s orders.
+    fn from_api_client(api_client_id: i32, item: Executions) -> Executions {
+        let Executions::ExecutionData(mut data) = item else {
+            unreachable!("an execution")
+        };
+        data.execution.client_id = api_client_id;
+        Executions::ExecutionData(data)
+    }
+
     fn commission(exec_id: &str) -> Executions {
         Executions::CommissionReport(CommissionReport {
             execution_id: exec_id.to_string(),
@@ -1029,7 +1050,7 @@ mod tests {
     fn recovered_fills_keep_the_window_and_tracked_orders() {
         let (contracts, order_ids) = tracked();
         let pending = ExecutionBuffer::new();
-        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), &contracts, &order_ids);
+        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), 0, &contracts, &order_ids);
 
         for item in [
             // Before the window: the stream delivered it, or it predates the stream.
@@ -1041,6 +1062,13 @@ mod tests {
             // In the window, but for an order this client does not track.
             execution("foreign", 99, "20260929 14:00:01 UTC"),
             commission("foreign"),
+            // In the window, under the tracked order's id, but another API client's order: IB
+            // numbers orders per client.
+            from_api_client(
+                905,
+                execution("other-client", IB_ORDER_ID, "20260929 14:00:02 UTC"),
+            ),
+            commission("other-client"),
         ] {
             fills.push(item);
         }
@@ -1048,7 +1076,8 @@ mod tests {
         let trades = fills.finish(&pending);
         assert_eq!(trades.len(), 1, "{trades:?}");
         assert_eq!(trades[0].id.0.as_str(), "gap");
-        assert_eq!(trades[0].order_id.0.as_str(), "cid-7");
+        // The IB order id, which the order's `Open` state carries.
+        assert_eq!(trades[0].order_id.0, IB_ORDER_ID.to_string());
         assert_eq!(trades[0].fees.fees, Decimal::ONE);
         assert_eq!(pending.pending_count(), 0);
     }
@@ -1059,7 +1088,7 @@ mod tests {
     fn recovered_execution_with_unparseable_time_is_kept() {
         let (contracts, order_ids) = tracked();
         let pending = ExecutionBuffer::new();
-        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), &contracts, &order_ids);
+        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), 0, &contracts, &order_ids);
         fills.push(execution("garbled", IB_ORDER_ID, "not a time"));
         fills.push(commission("garbled"));
 
@@ -1075,7 +1104,7 @@ mod tests {
     fn recovered_fills_put_an_execution_ahead_of_its_corrections() {
         let (contracts, order_ids) = tracked();
         let pending = ExecutionBuffer::new();
-        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), &contracts, &order_ids);
+        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), 0, &contracts, &order_ids);
         for item in [
             execution("x.01.02", IB_ORDER_ID, "20260929 14:00:00 UTC"),
             commission("x.01.02"),
@@ -1101,7 +1130,7 @@ mod tests {
     fn recovered_execution_without_commission_moves_to_the_stream_buffer() {
         let (contracts, order_ids) = tracked();
         let pending = ExecutionBuffer::new();
-        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), &contracts, &order_ids);
+        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), 0, &contracts, &order_ids);
         fills.push(execution("late", IB_ORDER_ID, "20260929 14:00:30 UTC"));
 
         assert!(fills.finish(&pending).is_empty());

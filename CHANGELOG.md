@@ -375,6 +375,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **IBKR fills never advanced the engine's orders, and IBKR order reads misreported orders, fees
+  and other API clients' activity** (`rustrade-execution`, feature `ibkr`). **Breaking:** what
+  these methods return changes.
+  - A `Trade`, and a `TradeAmended`, now carry the IB order id in `order_id`, the id the order's
+    `Open` state carries. They carried the client order id, so the engine never matched an IBKR fill
+    to its order: neither its strategy routing nor its fill progress came from the fill.
+  - `fetch_trades` pairs each execution with the commission report IB sends with it, so trades
+    carry their real fees. They were always zero in an `"UNKNOWN"` asset. An execution IB sends no
+    report for keeps that placeholder, now `execution::UNKNOWN_FEE_ASSET`, with a warning.
+  - `fetch_open_orders` reports each order's kind, limit price and time in force. It reported every
+    order that was not a plain limit as `Market`, with time in force `GoodUntilCancelled`, and a
+    filled quantity of zero. An order this client tracks keeps what it was placed with; any other
+    is read back from IB's listing, and one whose type or time in force this client never sends is
+    left out with a warning. The filled quantity is the one IB lists with the order.
+  - IB numbers orders per API client, so `fetch_open_orders`, `fetch_trades`, the account stream
+    and fill recovery now keep only this API client's orders and executions. Another client's, or
+    an order entered in TWS, could carry an order id this client also uses, and be reported as
+    this client's order.
+  - A good-till-date order IB cancels at its expiry is reported `Expired`, not `Cancelled`.
+  - `fetch_balances`, `fetch_open_orders` and `fetch_trades` fail if IB sends nothing for 10
+    seconds before the end of a listing. They blocked until IB answered, or returned what they had
+    read as if complete.
+  - `ExecutionBuffer::add_execution` no longer takes a client order id.
+
 - **A market stream's failed re-initialisation reached only the logs, and a failed subscription
   batch did not say which subscription failed** (`rustrade-data`, `rustrade-integration`). Closes
   #506.

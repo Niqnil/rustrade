@@ -105,7 +105,7 @@ use crate::{
         },
         state::{Cancelled, Expired, Filled, Open, OrderState, UnindexedOrderState},
     },
-    trade::{AssetFees, Trade, TradeId, TradesRead},
+    trade::{Trade, TradesRead},
 };
 use account::{BalanceAggregator, PositionAggregator};
 use chrono::{DateTime, Utc};
@@ -136,6 +136,7 @@ use serde::{Deserialize, Serialize};
 use smol_str::format_smolstr;
 use std::{
     collections::HashSet,
+    ops::ControlFlow,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
 };
@@ -355,24 +356,36 @@ fn is_transport_loss(e: &ibapi::Error) -> bool {
     )
 }
 
-/// The instrument and client order id `execution` belongs to, or `None` when this
+/// The instrument `execution` is in, or `None` when another API client placed its order, or this
 /// client does not track its order or its contract.
+///
+/// IB numbers orders per API client, so an order id names this client's order only together with
+/// this client's id.
 fn resolve_execution(
     execution: &ibapi::orders::ExecutionData,
+    api_client_id: i32,
     contracts: &ContractRegistry,
     order_ids: &OrderIdMap,
-) -> Option<(InstrumentNameExchange, ClientOrderId)> {
+) -> Option<InstrumentNameExchange> {
     let order_id = execution.execution.order_id;
     let con_id = execution.contract.contract_id;
 
+    if execution.execution.client_id != api_client_id {
+        debug!(
+            ib_order_id = order_id,
+            api_client_id = execution.execution.client_id,
+            "ExecutionData for another API client's order, dropping"
+        );
+        return None;
+    }
     // Fail-fast: skip second lookup if first fails
-    let Some(client_id) = order_ids.get_client_id(order_id) else {
+    if order_ids.get_client_id(order_id).is_none() {
         debug!(
             ib_order_id = order_id,
             con_id, "ExecutionData for unknown order ID, dropping"
         );
         return None;
-    };
+    }
     let Some(instrument) = contracts.get_name_by_con_id(con_id) else {
         debug!(
             ib_order_id = order_id,
@@ -380,7 +393,58 @@ fn resolve_execution(
         );
         return None;
     };
-    Some((instrument, client_id))
+    Some(instrument)
+}
+
+/// How long a listing read waits for IB's next message before giving up on the read.
+///
+/// IB sends a listing in one burst and then marks its end, so a pause this long means TWS has
+/// stalled, not that the listing is long.
+const LISTING_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Read one IB listing, passing each item to `on_item`, until IB marks the end of the listing or
+/// `on_item` breaks.
+///
+/// `next` is the subscription's `next_timeout`. That answers `None` both at the end marker and
+/// when its wait runs out, and only the first returns early (see [`recovery::returned_early`]).
+///
+/// # Errors
+/// [`UnindexedClientError::Internal`], naming `what`, when IB answers with an error, or sends
+/// nothing for `stall_timeout` ([`LISTING_STALL_TIMEOUT`] outside tests) before the end of the
+/// listing. Either way what was read is not the whole listing, and must not be mistaken for it.
+fn read_listing<T>(
+    what: &str,
+    stall_timeout: std::time::Duration,
+    mut next: impl FnMut(
+        std::time::Duration,
+    ) -> Option<Result<ibapi::subscriptions::SubscriptionItem<T>, ibapi::Error>>,
+    mut on_item: impl FnMut(T) -> ControlFlow<()>,
+) -> Result<(), UnindexedClientError> {
+    use ibapi::subscriptions::SubscriptionItem;
+
+    loop {
+        let waited = std::time::Instant::now();
+        match next(stall_timeout) {
+            Some(Ok(SubscriptionItem::Data(item))) => {
+                if on_item(item).is_break() {
+                    return Ok(());
+                }
+            }
+            Some(Ok(SubscriptionItem::Notice(notice))) => {
+                debug!(%notice, what, "Notice during an IBKR listing read");
+            }
+            Some(Err(e)) => return Err(UnindexedClientError::Internal(format!("{what}: {e}"))),
+            None if recovery::returned_early(waited.elapsed(), stall_timeout) => {
+                return Ok(());
+            }
+            None => {
+                return Err(UnindexedClientError::Internal(format!(
+                    "{what}: IB sent nothing for {:?} before the end of the listing",
+                    stall_timeout
+                )));
+            }
+        }
+    }
 }
 
 /// Read one account's positions into `positions`, returning whether IB marked the end of the
@@ -445,6 +509,7 @@ fn read_account_positions(
 fn forward_order_updates(
     updates: impl IntoIterator<Item = Result<ibapi::orders::OrderUpdate, ibapi::Error>>,
     sink: &recovery::EventSink,
+    api_client_id: i32,
     contracts: &ContractRegistry,
     order_ids: &OrderIdMap,
     pending_cancels: &PendingCancels,
@@ -530,7 +595,8 @@ fn forward_order_updates(
                     );
                     continue;
                 }
-                let Some((instrument, client_id)) = resolve_execution(&exec, contracts, order_ids)
+                let Some(instrument) =
+                    resolve_execution(&exec, api_client_id, contracts, order_ids)
                 else {
                     continue;
                 };
@@ -549,7 +615,7 @@ fn forward_order_updates(
                     );
                 }
 
-                exec_buffer.add_execution(exec, instrument, client_id);
+                exec_buffer.add_execution(exec, instrument);
                 None
             }
             OrderUpdate::CommissionReport(report) => {
@@ -1915,6 +1981,7 @@ impl ExecutionClient for IbkrClient {
         .map_err(|e| UnindexedClientError::TaskFailed(format!("task join: {e}")))?
         .map_err(|e| UnindexedClientError::Internal(format!("order updates: {e}")))?;
 
+        let api_client_id = self.client.client_id();
         let contracts_clone = self.contracts.clone();
         let order_ids_clone = self.order_ids.clone();
         let pending_cancels_clone = self.pending_cancels.clone();
@@ -1961,6 +2028,7 @@ impl ExecutionClient for IbkrClient {
                     forward_order_updates(
                         order_sub.iter_data(),
                         &sink,
+                        api_client_id,
                         &contracts_clone,
                         &order_ids_clone,
                         &pending_cancels_clone,
@@ -2317,6 +2385,11 @@ impl ExecutionClient for IbkrClient {
     /// The `time_exchange` field in returned balances uses `Utc::now()`, not
     /// the actual IB server timestamp. IB's account summary endpoint does not
     /// provide timestamps per balance update.
+    ///
+    /// # Errors
+    ///
+    /// [`UnindexedClientError::Internal`] if the request fails, IB answers with an
+    /// error, or IB sends nothing for 10 seconds before the end of the listing.
     async fn fetch_balances(
         &self,
         assets: &[AssetNameExchange],
@@ -2336,15 +2409,30 @@ impl ExecutionClient for IbkrClient {
                 .account_summary(&ACCOUNT_GROUP_ALL, &["TotalCashValue", "AvailableFunds"])
                 .map_err(|e| UnindexedClientError::Internal(format!("account_summary: {e}")))?;
 
+            // Errors and stalls are surfaced rather than a partial balance set returned. The
+            // subscription stays live after the listing, so its end is the `End` item.
             let mut aggregator = BalanceAggregator::new();
-            for summary in sub.iter_data() {
-                // Surface errors rather than returning a partial balance set.
-                let summary = summary
-                    .map_err(|e| UnindexedClientError::Internal(format!("account_summary: {e}")))?;
-                match summary {
-                    AccountSummaryResult::Summary(s) => aggregator.process(&s),
-                    AccountSummaryResult::End => break,
-                }
+            let mut ended = false;
+            read_listing(
+                "account_summary",
+                LISTING_STALL_TIMEOUT,
+                |timeout| sub.next_timeout(timeout),
+                |summary| match summary {
+                    AccountSummaryResult::Summary(s) => {
+                        aggregator.process(&s);
+                        ControlFlow::Continue(())
+                    }
+                    AccountSummaryResult::End => {
+                        ended = true;
+                        ControlFlow::Break(())
+                    }
+                },
+            )?;
+            if !ended {
+                return Err(UnindexedClientError::Internal(
+                    "account_summary: the subscription ended before the end of the listing"
+                        .to_string(),
+                ));
             }
 
             let mut balances = aggregator.to_balances();
@@ -2359,17 +2447,26 @@ impl ExecutionClient for IbkrClient {
         .map_err(|e| UnindexedClientError::TaskFailed(format!("task join: {e}")))?
     }
 
-    /// Fetch open orders.
+    /// Fetch the open orders this API client placed.
+    ///
+    /// IB numbers orders per API client, so orders other clients placed, and orders entered in
+    /// TWS, are left out: their ids could name an order of this client's.
+    ///
+    /// An order this client tracks is returned under its client order id, with the kind, price
+    /// and time in force it was placed with. Any other is returned under its IB order id, with
+    /// those read back from IB's listing; one whose order type or time in force this client
+    /// never sends is left out, with a warning. Every order's filled quantity is the one IB
+    /// reports with it.
+    ///
+    /// # Errors
+    ///
+    /// [`UnindexedClientError::Internal`] if the request fails, IB answers with an
+    /// error, or IB sends nothing for 10 seconds before the end of the listing.
     ///
     /// # Limitations
     ///
-    /// - The `filled_qty` in returned orders is set to zero. IB's open orders endpoint
-    ///   returns order definitions, not fill status. For accurate filled quantities,
-    ///   use `account_stream` which provides `OrderStatus` events with fill progress.
-    /// - The `time_in_force` defaults to `GoodUntilCancelled`. IB's open orders endpoint
-    ///   does not return the original TIF setting.
-    /// - This method blocks on IB's subscription until IB sends an end-of-data marker.
-    ///   If IB is stalled, this will block indefinitely.
+    /// IB lists every client's open orders to every request for them, so two such reads at once,
+    /// from clones of this client, can each see the other's end of the listing and stop early.
     async fn fetch_open_orders(
         &self,
         instruments: &[InstrumentNameExchange],
@@ -2384,87 +2481,28 @@ impl ExecutionClient for IbkrClient {
         };
 
         tokio::task::spawn_blocking(move || {
-            use ibapi::orders::Orders;
-
+            let api_client_id = client.client_id();
             // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
             let sub = client
                 .all_open_orders()
                 .map_err(|e| UnindexedClientError::Internal(format!("open_orders: {e}")))?;
 
-            let mut orders = Vec::new();
-            for order_item in sub.iter_data() {
-                // Surface errors rather than returning a partial open-order set,
-                // which the caller could misread during order reconciliation.
-                let order_item = order_item
-                    .map_err(|e| UnindexedClientError::Internal(format!("open_orders: {e}")))?;
-                let order_data = match order_item {
-                    Orders::OrderData(data) => data,
-                    _ => continue,
-                };
+            let mut listing = Vec::new();
+            read_listing(
+                "open_orders",
+                LISTING_STALL_TIMEOUT,
+                |timeout| sub.next_timeout(timeout),
+                |item| {
+                    listing.push(item);
+                    ControlFlow::Continue(())
+                },
+            )?;
 
-                let instrument = match contracts.get_name_by_con_id(order_data.contract.contract_id)
-                {
-                    Some(i) => i,
-                    None => continue,
-                };
-
-                if instruments_filter
-                    .as_ref()
-                    .is_some_and(|f| !f.contains(&instrument))
-                {
-                    continue;
-                }
-
-                let client_id = order_ids
-                    .get_client_id(order_data.order_id)
-                    .unwrap_or_else(|| {
-                        ClientOrderId::new(format_smolstr!("{}", order_data.order_id))
-                    });
-
-                let side = match order_data.order.action {
-                    ibapi::orders::Action::Buy => Side::Buy,
-                    ibapi::orders::Action::Sell
-                    | ibapi::orders::Action::SellShort
-                    | ibapi::orders::Action::SellLong => Side::Sell,
-                };
-
-                let price = order_data
-                    .order
-                    .limit_price
-                    .map(|p| parse_decimal_or_warn(p, "limit_price"));
-                let kind = if order_data.order.order_type == "LMT" {
-                    OrderKind::Limit
-                } else {
-                    OrderKind::Market
-                };
-
-                orders.push(Order {
-                    key: OrderKey {
-                        exchange: ExchangeId::Ibkr,
-                        instrument,
-                        strategy: StrategyId::unknown(),
-                        cid: client_id,
-                    },
-                    side,
-                    price,
-                    quantity: parse_decimal_or_warn(
-                        order_data.order.total_quantity,
-                        "total_quantity",
-                    ),
-                    kind,
-                    // IB's open orders endpoint doesn't return TIF; default to GTC
-                    time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                    state: Open::new(
-                        VenueOrderId::Assigned(OrderId::new(format_smolstr!(
-                            "{}",
-                            order_data.order_id
-                        ))),
-                        Utc::now(),
-                        Decimal::ZERO, // M-5: filled_qty unavailable from open orders endpoint
-                    ),
-                });
+            let mut orders =
+                open_orders_from_listing(listing, api_client_id, &contracts, &order_ids);
+            if let Some(filter) = &instruments_filter {
+                orders.retain(|order| filter.contains(&order.key.instrument));
             }
-
             Ok(orders)
         })
         .await
@@ -2480,11 +2518,17 @@ impl ExecutionClient for IbkrClient {
     ///   (`resume: None`) for what IB returned: a span reaching before today is not read
     ///   before today. For historical executions beyond today, use IB's Flex Query or
     ///   Activity Statements.
-    /// - **Fees are always zero.** IB's executions endpoint doesn't include commission
-    ///   data. For trades with accurate fees, use `account_stream()` which pairs
-    ///   `ExecutionData` with `CommissionReport` events.
-    /// - This method blocks on IB's executions subscription until IB sends an
-    ///   end-of-data marker. If IB is stalled, this will block indefinitely.
+    /// - Only the executions of orders this API client placed are read. IB numbers
+    ///   orders per API client, so another client's execution could name an order id
+    ///   of this client's.
+    /// - Each trade's fees come from the commission report IB sends with its
+    ///   execution. An execution whose report IB did not send is returned with a zero
+    ///   fee in [`UNKNOWN_FEE_ASSET`](execution::UNKNOWN_FEE_ASSET), with a warning.
+    ///
+    /// # Errors
+    ///
+    /// [`UnindexedClientError::Internal`] if the request fails, IB answers with an
+    /// error, or IB sends nothing for 10 seconds before the end of the listing.
     ///
     /// # Corrections
     ///
@@ -2503,7 +2547,6 @@ impl ExecutionClient for IbkrClient {
         }
         let client = self.client.clone();
         let contracts = self.contracts.clone();
-        let order_ids = self.order_ids.clone();
         let instruments_filter: Option<HashSet<_>> = if instruments.is_empty() {
             None
         } else {
@@ -2511,85 +2554,34 @@ impl ExecutionClient for IbkrClient {
         };
 
         tokio::task::spawn_blocking(move || {
-            use ibapi::orders::{ExecutionSide, Executions};
-
-            let exec_filter = ibapi::orders::ExecutionFilter::default();
+            let api_client_id = client.client_id();
+            let exec_filter = ibapi::orders::ExecutionFilter {
+                client_id: Some(api_client_id),
+                ..ibapi::orders::ExecutionFilter::default()
+            };
             // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
             let sub = client
                 .executions(exec_filter)
                 .map_err(|e| UnindexedClientError::Internal(format!("executions: {e}")))?;
 
-            let mut trades = Vec::new();
-            for exec_item in sub.iter_data() {
-                // Surface errors rather than returning a partial fill set, which the
-                // caller could misread during fill recovery.
-                let exec_item = exec_item
-                    .map_err(|e| UnindexedClientError::Internal(format!("executions: {e}")))?;
-                let exec_data = match exec_item {
-                    Executions::ExecutionData(data) => data,
-                    _ => continue,
-                };
+            let mut listing = Vec::new();
+            read_listing(
+                "executions",
+                LISTING_STALL_TIMEOUT,
+                |timeout| sub.next_timeout(timeout),
+                |item| {
+                    listing.push(item);
+                    ControlFlow::Continue(())
+                },
+            )?;
 
-                let instrument = match contracts.get_name_by_con_id(exec_data.contract.contract_id)
-                {
-                    Some(i) => i,
-                    None => continue,
-                };
-
-                if instruments_filter
-                    .as_ref()
-                    .is_some_and(|f| !f.contains(&instrument))
-                {
-                    continue;
-                }
-
-                let exec = &exec_data.execution;
-                let exec_time = match execution::parse_ib_timestamp(&exec.time) {
-                    Some(t) => t,
-                    None => {
-                        warn!(
-                            exec_id = %exec.execution_id,
-                            time = %exec.time,
-                            "Unparseable timestamp in execution, skipping"
-                        );
-                        continue;
-                    }
-                };
-
-                if exec_time < start || exec_time > end {
-                    continue;
-                }
-
-                // `ExecutionSide` is a closed two-variant enum in ibapi 3.x
-                // (the decoder rejects unknown wire values), so this is total.
-                let side = match exec.side {
-                    ExecutionSide::Bought => Side::Buy,
-                    ExecutionSide::Sold => Side::Sell,
-                };
-
-                let client_id = order_ids
-                    .get_client_id(exec.order_id)
-                    .unwrap_or_else(|| ClientOrderId::new(format_smolstr!("{}", exec.order_id)));
-
-                trades.push(Trade {
-                    id: TradeId::new(&exec.execution_id),
-                    order_id: OrderId::new(&client_id.0),
-                    instrument,
-                    strategy: StrategyId::unknown(),
-                    time_exchange: exec_time,
-                    side,
-                    price: parse_decimal_or_warn(exec.price, "exec.price"),
-                    quantity: parse_decimal_or_warn(exec.shares, "exec.shares"),
-                    order_filled_quantity: Some(parse_decimal_or_warn(
-                        exec.cumulative_quantity,
-                        "exec.cumulative_quantity",
-                    )),
-                    // IBKR executions API lacks commission data (available via CommissionReport callback).
-                    // "UNKNOWN" placeholder will fail indexing - use unindexed or correlate with WS.
-                    fees: AssetFees::new(AssetNameExchange::from("UNKNOWN"), Decimal::ZERO, None),
-                });
-            }
-
+            let trades = trades_from_executions(
+                listing,
+                api_client_id,
+                &contracts,
+                start..=end,
+                instruments_filter.as_ref(),
+            );
             Ok(TradesRead::complete(execution::keep_latest_revisions(
                 trades,
             )))
@@ -2598,6 +2590,196 @@ impl ExecutionClient for IbkrClient {
         .map_err(|e| UnindexedClientError::TaskFailed(format!("task join: {e}")))?
     }
 }
+
+/// The trades [`ExecutionClient::fetch_trades`] returns from what one executions request
+/// listed: the executions of this API client's orders, in registered contracts, at a time in
+/// `span`, in `instruments` when that is given. Each is paired with the commission report IB lists
+/// after it.
+///
+/// An execution IB listed no commission report for is a trade with an unknown fee, warned about.
+fn trades_from_executions(
+    listing: impl IntoIterator<Item = ibapi::orders::Executions>,
+    api_client_id: i32,
+    contracts: &ContractRegistry,
+    span: std::ops::RangeInclusive<DateTime<Utc>>,
+    instruments: Option<&HashSet<InstrumentNameExchange>>,
+) -> Vec<Trade<AssetNameExchange, InstrumentNameExchange>> {
+    use ibapi::orders::Executions;
+
+    let awaiting_commission = ExecutionBuffer::new();
+    let mut trades = Vec::new();
+    for item in listing {
+        match item {
+            Executions::ExecutionData(data) => {
+                let exec = &data.execution;
+                if exec.client_id != api_client_id {
+                    // The request asked IB for this client's alone.
+                    debug!(
+                        exec_id = %exec.execution_id,
+                        api_client_id = exec.client_id,
+                        "Execution of another API client's order, skipping"
+                    );
+                    continue;
+                }
+                let Some(instrument) = contracts.get_name_by_con_id(data.contract.contract_id)
+                else {
+                    continue;
+                };
+                if instruments.is_some_and(|filter| !filter.contains(&instrument)) {
+                    continue;
+                }
+                match execution::parse_ib_timestamp(&exec.time) {
+                    Some(time) if span.contains(&time) => {
+                        awaiting_commission.add_execution(data, instrument);
+                    }
+                    Some(_) => {}
+                    None => warn!(
+                        exec_id = %exec.execution_id,
+                        time = %exec.time,
+                        "Unparseable timestamp in execution, skipping"
+                    ),
+                }
+            }
+            Executions::CommissionReport(report) => {
+                if let Some(trade) = awaiting_commission.complete_with_commission(&report) {
+                    trades.push(trade);
+                }
+            }
+        }
+    }
+
+    let without_commission = awaiting_commission.take_without_commission();
+    if !without_commission.is_empty() {
+        warn!(
+            count = without_commission.len(),
+            "IBKR executions arrived without a commission report; returned with an unknown fee"
+        );
+        trades.extend(without_commission);
+    }
+    trades
+}
+
+/// The open orders [`ExecutionClient::fetch_open_orders`] returns from what one open-orders
+/// request listed: this API client's, by IB order id. See [`open_order_from_listing`].
+fn open_orders_from_listing(
+    listing: impl IntoIterator<Item = ibapi::orders::Orders>,
+    api_client_id: i32,
+    contracts: &ContractRegistry,
+    order_ids: &OrderIdMap,
+) -> Vec<Order<ExchangeId, InstrumentNameExchange, Open>> {
+    use ibapi::orders::Orders;
+
+    // IB lists each order, then its status, which carries the fill.
+    let mut listed = std::collections::BTreeMap::new();
+    let mut statuses = fnv::FnvHashMap::default();
+    for item in listing {
+        match item {
+            Orders::OrderData(data) if data.order.client_id == api_client_id => {
+                listed.insert(data.order_id, data);
+            }
+            Orders::OrderStatus(status) if status.client_id == api_client_id => {
+                statuses.insert(status.order_id, status);
+            }
+            _ => {}
+        }
+    }
+    listed
+        .into_values()
+        .filter_map(|data| {
+            open_order_from_listing(&data, statuses.get(&data.order_id), contracts, order_ids)
+        })
+        .collect()
+}
+
+/// The open order IB lists as `data`, with `status`, the status IB lists after it, or `None` when
+/// it is not in a registered contract, has ended, or cannot be read back.
+///
+/// An order this client tracks keeps its client order id and the shape it was placed with. Any
+/// other is named by its IB order id, its shape read back by [`order::order_shape_from_ib`].
+fn open_order_from_listing(
+    data: &ibapi::orders::OrderData,
+    status: Option<&ibapi::orders::OrderStatus>,
+    contracts: &ContractRegistry,
+    order_ids: &OrderIdMap,
+) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
+    let ib_id = data.order_id;
+    let instrument = contracts.get_name_by_con_id(data.contract.contract_id)?;
+
+    // IB can still list an order that has just ended.
+    let state = status.map_or(&data.order_state.status, |status| &status.status);
+    if state.is_terminal() {
+        debug!(
+            ib_order_id = ib_id,
+            ?state,
+            "Listed open order has ended, skipping"
+        );
+        return None;
+    }
+    // The status carries the fill. Without one, the order's own figure, which IB may leave zero.
+    let filled = status.map_or(data.order.filled_quantity, |status| status.filled);
+    let filled = try_decimal_or_warn(filled, format_args!("filled quantity of order {ib_id}"))
+        .unwrap_or(Decimal::ZERO);
+
+    let (cid, side, price, quantity, kind, time_in_force) = match order_ids
+        .get_client_id_and_context(ib_id)
+        .filter(|(_, ctx)| ctx.instrument == instrument)
+    {
+        Some((cid, ctx)) => (
+            cid,
+            ctx.side,
+            ctx.price,
+            ctx.quantity,
+            ctx.kind,
+            ctx.time_in_force,
+        ),
+        None => {
+            let shape = match order::order_shape_from_ib(&data.order) {
+                Ok(shape) => shape,
+                Err(reason) => {
+                    warn!(
+                        ib_order_id = ib_id,
+                        %instrument,
+                        %reason,
+                        "Open IBKR order cannot be read back, leaving it out"
+                    );
+                    return None;
+                }
+            };
+            (
+                ClientOrderId::new(format_smolstr!("{ib_id}")),
+                order::action_to_side(&data.order.action),
+                shape.price,
+                parse_decimal_or_warn(data.order.total_quantity, "total_quantity"),
+                shape.kind,
+                shape.time_in_force,
+            )
+        }
+    };
+
+    Some(Order {
+        key: OrderKey {
+            exchange: ExchangeId::Ibkr,
+            instrument,
+            strategy: StrategyId::unknown(),
+            cid,
+        },
+        side,
+        price,
+        quantity,
+        kind,
+        time_in_force,
+        state: Open::new(
+            VenueOrderId::Assigned(execution::ib_order_id(ib_id)),
+            Utc::now(),
+            filled,
+        ),
+    })
+}
+
+/// How long after a good-till-date order's expiry a cancellation is still read as the expiry,
+/// rather than as a cancellation before it: IB's clock and this host's differ, and the status
+/// takes time to arrive.
+const GTD_EXPIRY_TOLERANCE: chrono::Duration = chrono::Duration::seconds(5);
 
 /// Build an Order from IB OrderStatus using stored OrderContext.
 ///
@@ -2628,7 +2810,9 @@ impl ExecutionClient for IbkrClient {
 ///
 /// 1. If order ID is in `pending_cancels` (set by `cancel_order`) → `Cancelled`
 /// 2. Else if `time_in_force == GoodUntilEndOfDay` → `Expired` (DAY order expired)
-/// 3. Else → `Cancelled` (broker-initiated or external cancellation)
+/// 3. Else if `time_in_force` is `GoodTillDate` and its expiry has passed, give or take
+///    [`GTD_EXPIRY_TOLERANCE`] → `Expired`
+/// 4. Else → `Cancelled` (broker-initiated or external cancellation)
 ///
 /// # Known Limitation
 ///
@@ -2645,7 +2829,7 @@ fn make_order_from_status(
     use ibapi::orders::OrderStatusKind;
 
     let ib_id = status.order_id;
-    let order_id = OrderId::new(format_smolstr!("{}", ib_id));
+    let order_id = execution::ib_order_id(ib_id);
 
     // `None` when IB reports a fill that is not a number, so that an ended order does not report
     // an unknown fill as zero.
@@ -2674,6 +2858,11 @@ fn make_order_from_status(
                 OrderState::inactive(Cancelled::new(order_id, Utc::now(), reported_fill))
             } else if matches!(ctx.time_in_force, TimeInForce::GoodUntilEndOfDay) {
                 // DAY order without pending cancel — expired at market close
+                OrderState::inactive(Expired::new(order_id, Utc::now(), reported_fill))
+            } else if let TimeInForce::GoodTillDate { expiry } = ctx.time_in_force
+                && Utc::now() + GTD_EXPIRY_TOLERANCE >= expiry
+            {
+                // GTD order without pending cancel, at or past its expiry — expired
                 OrderState::inactive(Expired::new(order_id, Utc::now(), reported_fill))
             } else {
                 // GTC/IOC/FOK without pending cancel — broker or exchange cancelled
@@ -3251,6 +3440,45 @@ mod order_status_tests {
         ));
     }
 
+    /// A good-till-date order cancelled at or past its expiry, with no cancel requested, expired.
+    /// One cancelled before its expiry was cancelled.
+    #[test]
+    fn a_good_till_date_order_cancelled_at_its_expiry_expired() {
+        let cancelled_at = |expiry: DateTime<Utc>| {
+            let ctx = OrderContext {
+                time_in_force: TimeInForce::GoodTillDate { expiry },
+                ..ctx()
+            };
+            let raw = OrderStatus {
+                order_id: 42,
+                status: OrderStatusKind::Cancelled,
+                ..OrderStatus::default()
+            };
+            make_order_from_status(
+                &raw,
+                ClientOrderId::new("cid-1"),
+                &ctx,
+                &PendingCancels::new(),
+            )
+            .state
+        };
+        use crate::order::state::InactiveOrderState;
+
+        assert!(matches!(
+            cancelled_at(Utc::now() - chrono::Duration::minutes(1)),
+            OrderState::Inactive(InactiveOrderState::Expired(_))
+        ));
+        // IB's clock may run ahead of this host's.
+        assert!(matches!(
+            cancelled_at(Utc::now() + chrono::Duration::seconds(2)),
+            OrderState::Inactive(InactiveOrderState::Expired(_))
+        ));
+        assert!(matches!(
+            cancelled_at(Utc::now() + chrono::Duration::hours(1)),
+            OrderState::Inactive(InactiveOrderState::Cancelled(_))
+        ));
+    }
+
     /// An unmodelled status must not consume a pending cancel: the entry has to
     /// survive for the confirmed `Cancelled` that may still follow.
     #[test]
@@ -3419,6 +3647,7 @@ mod order_status_tests {
 mod order_reader_tests {
     use super::*;
     use crate::client::dedup::new_dedup_cache;
+    use crate::trade::TradeId;
     use ibapi::orders::{OrderStatus, OrderUpdate};
     use std::cell::Cell;
 
@@ -3442,6 +3671,7 @@ mod order_reader_tests {
                 .into_iter()
                 .inspect(|_| pulled.set(pulled.get() + 1)),
             sink,
+            0,
             &ContractRegistry::new(),
             &OrderIdMap::new(),
             &PendingCancels::new(),
@@ -3507,6 +3737,7 @@ mod order_reader_tests {
                     ..OrderStatus::default()
                 }))],
                 &sink,
+                0,
                 &ContractRegistry::new(),
                 &order_ids,
                 &PendingCancels::new(),
@@ -3562,6 +3793,7 @@ mod order_reader_tests {
         forward_order_updates(
             updates,
             &sink,
+            0,
             &ContractRegistry::new(),
             &order_ids,
             &PendingCancels::new(),
@@ -3666,6 +3898,7 @@ mod order_reader_tests {
                 commission("0000e0d5.5f8b1c2a.01.02"),
             ],
             &sink,
+            0,
             &contracts,
             &order_ids,
             &PendingCancels::new(),
@@ -3680,7 +3913,8 @@ mod order_reader_tests {
             panic!("expected the correction as an amendment");
         };
         assert_eq!(amendment.original, Some(original.id));
-        assert_eq!(amendment.order_id, OrderId::new("cid-7"));
+        // The IB order id, which the order's `Open` state carries, not the client order id.
+        assert_eq!(amendment.order_id, OrderId::new("7"));
         let TradeAmendmentKind::Corrected { replacement } = amendment.kind else {
             panic!("expected a resolved correction, got {:?}", amendment.kind);
         };
@@ -3726,5 +3960,336 @@ mod order_reader_tests {
             AccountEventKind::StreamTerminated(StreamTerminationReason::Error(ref reason))
                 if reason == "IBKR order-update stream ended"
         ));
+    }
+
+    mod listings {
+        use super::*;
+        use ibapi::{
+            contracts::Contract,
+            orders::{
+                CommissionReport, Execution, ExecutionData, Executions, OrderData,
+                OrderState as IbOrderState, OrderStatusKind, Orders,
+            },
+            subscriptions::SubscriptionItem,
+        };
+        use rust_decimal_macros::dec;
+        use std::time::Duration;
+
+        const API_CLIENT: i32 = 903;
+        const CON_ID: i32 = 265598;
+
+        fn contracts() -> ContractRegistry {
+            let contracts = ContractRegistry::new();
+            contracts.register(
+                InstrumentNameExchange::new("AAPL"),
+                Contract {
+                    contract_id: CON_ID,
+                    ..Contract::default()
+                },
+            );
+            contracts
+        }
+
+        /// A `next_timeout` that hands out `items`, then answers as IB does at the end of a
+        /// listing, at once; or, with `stalls`, only once the wait has run out.
+        fn subscription<T>(
+            items: Vec<Result<SubscriptionItem<T>, ibapi::Error>>,
+            stalls: bool,
+        ) -> impl FnMut(Duration) -> Option<Result<SubscriptionItem<T>, ibapi::Error>> {
+            let mut items = items.into_iter();
+            move |timeout| {
+                items.next().or_else(|| {
+                    if stalls {
+                        std::thread::sleep(timeout);
+                    }
+                    None
+                })
+            }
+        }
+
+        fn read(
+            items: Vec<Result<SubscriptionItem<u32>, ibapi::Error>>,
+            stalls: bool,
+            stop_at: Option<u32>,
+        ) -> Result<Vec<u32>, UnindexedClientError> {
+            let mut read = Vec::new();
+            read_listing(
+                "test",
+                Duration::from_millis(40),
+                subscription(items, stalls),
+                |item| {
+                    read.push(item);
+                    if Some(item) == stop_at {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                },
+            )?;
+            Ok(read)
+        }
+
+        #[test]
+        fn a_listing_read_ends_at_the_end_of_the_listing() {
+            let items = || vec![Ok(SubscriptionItem::Data(1)), Ok(SubscriptionItem::Data(2))];
+            assert_eq!(read(items(), false, None).unwrap(), [1, 2]);
+            assert_eq!(
+                read(items(), false, Some(1)).unwrap(),
+                [1],
+                "or where it breaks"
+            );
+        }
+
+        /// What a stalled or failed read holds is not the whole listing, so it is not returned.
+        #[test]
+        fn a_stalled_or_failed_listing_read_is_an_error() {
+            let stalled = read(vec![Ok(SubscriptionItem::Data(1))], true, None);
+            assert!(
+                matches!(&stalled, Err(UnindexedClientError::Internal(m)) if m.contains("sent nothing")),
+                "{stalled:?}"
+            );
+            let failed = read(
+                vec![
+                    Ok(SubscriptionItem::Data(1)),
+                    Err(ibapi::Error::ConnectionReset),
+                ],
+                false,
+                None,
+            );
+            assert!(
+                matches!(failed, Err(UnindexedClientError::Internal(_))),
+                "{failed:?}"
+            );
+        }
+
+        fn listed(api_client_id: i32, order_id: i32, order: ibapi::orders::Order) -> Orders {
+            Orders::OrderData(OrderData {
+                order_id,
+                contract: Contract {
+                    contract_id: CON_ID,
+                    ..Contract::default()
+                },
+                order: ibapi::orders::Order {
+                    client_id: api_client_id,
+                    order_id,
+                    ..order
+                },
+                order_state: IbOrderState {
+                    status: OrderStatusKind::Submitted,
+                    ..IbOrderState::default()
+                },
+            })
+        }
+
+        fn status(
+            api_client_id: i32,
+            order_id: i32,
+            status: OrderStatusKind,
+            filled: f64,
+        ) -> Orders {
+            Orders::OrderStatus(OrderStatus {
+                order_id,
+                client_id: api_client_id,
+                status,
+                filled,
+                ..OrderStatus::default()
+            })
+        }
+
+        fn stop_order() -> ibapi::orders::Order {
+            ibapi::orders::Order {
+                action: ibapi::orders::Action::Sell,
+                order_type: "STP".to_owned(),
+                total_quantity: 3.0,
+                aux_price: Some(140.5),
+                tif: ibapi::orders::TimeInForce::Day,
+                ..ibapi::orders::Order::default()
+            }
+        }
+
+        /// This client's open orders, by IB order id: a tracked one as it was placed, under its
+        /// client order id; another read back from IB's listing, under its IB order id. Each with
+        /// the fill its status reports.
+        #[test]
+        fn open_orders_are_this_api_clients_with_their_fills() {
+            let order_ids = OrderIdMap::new();
+            order_ids
+                .register(
+                    ClientOrderId::new("tracked"),
+                    2,
+                    OrderContext {
+                        instrument: InstrumentNameExchange::new("AAPL"),
+                        side: Side::Buy,
+                        price: Some(dec!(150)),
+                        quantity: dec!(10),
+                        kind: OrderKind::Limit,
+                        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                    },
+                )
+                .unwrap();
+
+            let orders = open_orders_from_listing(
+                [
+                    listed(API_CLIENT, 5, stop_order()),
+                    status(API_CLIENT, 5, OrderStatusKind::PreSubmitted, 0.0),
+                    // IB lists the tracked order with whatever it holds; what it was placed with
+                    // stands.
+                    listed(API_CLIENT, 2, ibapi::orders::Order::default()),
+                    status(API_CLIENT, 2, OrderStatusKind::Submitted, 4.0),
+                    // Another API client's order under the tracked order's id.
+                    listed(904, 2, stop_order()),
+                    status(904, 2, OrderStatusKind::Submitted, 9.0),
+                ],
+                API_CLIENT,
+                &contracts(),
+                &order_ids,
+            );
+
+            assert_eq!(orders.len(), 2, "{orders:?}");
+            let (tracked, untracked) = (&orders[0], &orders[1]);
+            assert_eq!(tracked.key.cid, ClientOrderId::new("tracked"));
+            assert_eq!(tracked.kind, OrderKind::Limit);
+            assert_eq!(tracked.price, Some(dec!(150)));
+            assert_eq!(tracked.quantity, dec!(10));
+            assert_eq!(tracked.state.id, VenueOrderId::Assigned(OrderId::new("2")));
+            assert_eq!(tracked.state.filled_quantity, dec!(4));
+
+            assert_eq!(untracked.key.cid, ClientOrderId::new("5"));
+            assert_eq!(
+                untracked.key.instrument,
+                InstrumentNameExchange::new("AAPL")
+            );
+            assert_eq!(untracked.side, Side::Sell);
+            assert_eq!(untracked.quantity, dec!(3));
+            assert_eq!(
+                untracked.kind,
+                OrderKind::Stop {
+                    trigger_price: dec!(140.5)
+                }
+            );
+            assert_eq!(untracked.time_in_force, TimeInForce::GoodUntilEndOfDay);
+            assert_eq!(
+                untracked.state.id,
+                VenueOrderId::Assigned(OrderId::new("5"))
+            );
+            assert_eq!(untracked.state.filled_quantity, Decimal::ZERO);
+        }
+
+        /// An order that has just ended, one in a contract not registered, and one whose shape
+        /// this client never sends are not returned as open.
+        #[test]
+        fn open_orders_leave_out_what_cannot_be_reported_open() {
+            let unregistered = Orders::OrderData(OrderData {
+                order_id: 3,
+                contract: Contract {
+                    contract_id: 1,
+                    ..Contract::default()
+                },
+                order: ibapi::orders::Order {
+                    client_id: API_CLIENT,
+                    ..stop_order()
+                },
+                order_state: IbOrderState::default(),
+            });
+            let unreadable = ibapi::orders::Order {
+                order_type: "REL".to_owned(),
+                ..stop_order()
+            };
+
+            let orders = open_orders_from_listing(
+                [
+                    listed(API_CLIENT, 1, stop_order()),
+                    status(API_CLIENT, 1, OrderStatusKind::Cancelled, 0.0),
+                    unregistered,
+                    listed(API_CLIENT, 4, unreadable),
+                ],
+                API_CLIENT,
+                &contracts(),
+                &OrderIdMap::new(),
+            );
+            assert!(orders.is_empty(), "{orders:?}");
+        }
+
+        fn executed(api_client_id: i32, order_id: i32, exec_id: &str, time: &str) -> Executions {
+            Executions::ExecutionData(ExecutionData {
+                request_id: 9001,
+                contract: Contract {
+                    contract_id: CON_ID,
+                    ..Contract::default()
+                },
+                execution: Execution {
+                    order_id,
+                    client_id: api_client_id,
+                    execution_id: exec_id.to_string(),
+                    time: time.to_string(),
+                    shares: 1.0,
+                    price: 100.0,
+                    cumulative_quantity: 1.0,
+                    ..Execution::default()
+                },
+            })
+        }
+
+        fn commission(exec_id: &str) -> Executions {
+            Executions::CommissionReport(CommissionReport {
+                execution_id: exec_id.to_string(),
+                commission: 1.25,
+                currency: "USD".to_string(),
+                ..CommissionReport::default()
+            })
+        }
+
+        /// The trades of a read: this API client's executions in the span, each under its IB
+        /// order id, with the fee of its commission report, or an unknown fee without one.
+        #[test]
+        fn trades_carry_their_ib_order_id_and_commission() {
+            let at = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+            let trades = trades_from_executions(
+                [
+                    executed(API_CLIENT, 7, "paired", "20261007 10:00:00 UTC"),
+                    commission("paired"),
+                    executed(API_CLIENT, 7, "unpaired", "20261007 10:00:01 UTC"),
+                    executed(API_CLIENT, 7, "too-early", "20261007 09:59:59 UTC"),
+                    commission("too-early"),
+                    executed(905, 7, "other-client", "20261007 10:00:02 UTC"),
+                    commission("other-client"),
+                ],
+                API_CLIENT,
+                &contracts(),
+                at("2026-10-07T10:00:00Z")..=at("2026-10-07T11:00:00Z"),
+                None,
+            );
+
+            let read: Vec<_> = trades
+                .iter()
+                .map(|trade| {
+                    (
+                        trade.id.0.as_str(),
+                        trade.order_id.0.as_str(),
+                        trade.fees.asset.as_ref(),
+                        trade.fees.fees,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                read,
+                [
+                    ("paired", "7", "USD", dec!(1.25)),
+                    ("unpaired", "7", execution::UNKNOWN_FEE_ASSET, Decimal::ZERO),
+                ]
+            );
+
+            let filtered = trades_from_executions(
+                [
+                    executed(API_CLIENT, 7, "paired", "20261007 10:00:00 UTC"),
+                    commission("paired"),
+                ],
+                API_CLIENT,
+                &contracts(),
+                at("2026-10-07T10:00:00Z")..=at("2026-10-07T11:00:00Z"),
+                Some(&HashSet::from([InstrumentNameExchange::new("MSFT")])),
+            );
+            assert!(filtered.is_empty(), "{filtered:?}");
+        }
     }
 }
