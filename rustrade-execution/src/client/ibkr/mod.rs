@@ -2777,7 +2777,8 @@ impl ExecutionClient for IbkrClient {
     /// - Each trade's fees come from the commission report IB sends with its
     ///   execution. An execution whose report IB did not send is returned with a zero
     ///   fee in [`UNKNOWN_FEE_ASSET`](execution::UNKNOWN_FEE_ASSET), with a warning.
-    /// - Trades are returned in `time_exchange` order, then by id.
+    /// - Trades are returned in `time_exchange` order, then by id. A corrected execution keeps the
+    ///   position of its first revision.
     ///
     /// # Errors
     ///
