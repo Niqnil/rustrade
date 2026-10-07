@@ -354,6 +354,15 @@ enum PlacementOutcome {
     NoStatus,
 }
 
+/// Whether `e` is a transport loss `ibapi` recovers from by reconnecting by itself, so that the
+/// same request may succeed once it has: a [`ConnectivityError`].
+///
+/// Narrower than [`is_transport_loss`]: `ibapi` returns `ConnectionFailed` only once it has given
+/// up reconnecting, and `Shutdown` once the client is shut down, so retrying cannot help.
+fn is_transient_transport_loss(e: &ibapi::Error) -> bool {
+    matches!(e, ibapi::Error::ConnectionReset | ibapi::Error::Io(_))
+}
+
 /// Whether `e` means the TWS transport was lost, as opposed to TWS or ibapi
 /// answering the request.
 ///
@@ -509,7 +518,7 @@ fn resolve_contract_blocking(
     let subscription = client
         .contract_details_stream(contract)
         .subscribe()
-        .map_err(|e| ResolveContractError::Request(e.to_string()))?;
+        .map_err(contract_details_error)?;
     let mut matches = Vec::new();
     let read = read_listing_items(
         "contract_details",
@@ -531,18 +540,32 @@ fn classify_contract_details(
 ) -> Result<ibapi::contracts::Contract, ResolveContractError> {
     match read {
         Ok(()) => {}
-        // IB answers a description that matches nothing with this error, not an empty listing.
-        Err(ListingError::Ibapi(ibapi::Error::Notice(notice)))
-            if notice.code == NO_SECURITY_DEFINITION_CODE =>
-        {
-            return Err(ResolveContractError::NoMatch);
+        Err(ListingError::Ibapi(e)) => return Err(contract_details_error(e)),
+        Err(e @ ListingError::Dropped) => {
+            return Err(ConnectivityError::Socket(e.to_string()).into());
         }
-        Err(e) => return Err(ResolveContractError::Request(e.to_string())),
+        Err(ListingError::Stalled(_)) => return Err(ConnectivityError::Timeout.into()),
     }
     if matches.len() > 1 {
         return Err(ResolveContractError::Ambiguous { matches });
     }
     matches.pop().ok_or(ResolveContractError::NoMatch)
+}
+
+/// What an `ibapi` error answering a contract-details request means for the resolution.
+fn contract_details_error(e: ibapi::Error) -> ResolveContractError {
+    match e {
+        // IB answers a description that matches nothing with this error, not an empty listing.
+        ibapi::Error::Notice(notice) if notice.code == NO_SECURITY_DEFINITION_CODE => {
+            ResolveContractError::NoMatch
+        }
+        ibapi::Error::Notice(notice) => ResolveContractError::Refused {
+            code: notice.code,
+            message: notice.message,
+        },
+        e if is_transient_transport_loss(&e) => ConnectivityError::Socket(e.to_string()).into(),
+        e => ResolveContractError::Failed(e.to_string()),
+    }
 }
 
 /// Serializes the reads of IB's order listings.
@@ -888,11 +911,10 @@ fn send_error<AssetKey, InstrumentKey>(
     e: &ibapi::Error,
     message: String,
 ) -> OrderError<AssetKey, InstrumentKey> {
-    match e {
-        ibapi::Error::ConnectionReset | ibapi::Error::Io(_) => {
-            OrderError::Connectivity(ConnectivityError::Socket(message))
-        }
-        _ => OrderError::Rejected(ApiError::OrderRejected(message)),
+    if is_transient_transport_loss(e) {
+        OrderError::Connectivity(ConnectivityError::Socket(message))
+    } else {
+        OrderError::Rejected(ApiError::OrderRejected(message))
     }
 }
 
@@ -1176,11 +1198,18 @@ impl IbkrClient {
     ///
     /// # Errors
     ///
+    /// [`ResolveContractError::is_transient`] tells the failures worth retrying from the rest.
+    ///
     /// - [`ResolveContractError::NoMatch`] when no IB contract matches the description.
     /// - [`ResolveContractError::Ambiguous`] when several do. Narrow the description, or pick
     ///   one of the matches it carries.
-    /// - [`ResolveContractError::Request`] when the request fails: IB refuses it, the
-    ///   connection drops, or IB sends nothing for 10 s before finishing its answer.
+    /// - [`ResolveContractError::Refused`] when IB answers the request with another error, such
+    ///   as a description it cannot validate. The same request is refused again.
+    /// - [`ResolveContractError::Connectivity`] when the connection drops
+    ///   ([`ConnectivityError::Socket`]) or IB sends nothing for 10 s before finishing its answer
+    ///   ([`ConnectivityError::Timeout`]). Transient: retry once `ibapi` has reconnected.
+    /// - [`ResolveContractError::Failed`] when the request cannot be made or read for any other
+    ///   reason, such as a client that has shut down or given up reconnecting.
     pub async fn resolve_contract(
         &self,
         contract: &ibapi::contracts::Contract,
@@ -1189,7 +1218,7 @@ impl IbkrClient {
         let contract = contract.clone();
         tokio::task::spawn_blocking(move || resolve_contract_blocking(&client, &contract))
             .await
-            .map_err(|e| ResolveContractError::Request(format!("task join: {e}")))?
+            .map_err(|e| ResolveContractError::Failed(format!("task join: {e}")))?
     }
 
     /// Register a contract IB has resolved for an instrument, so that orders can be placed on
@@ -4873,26 +4902,65 @@ mod order_reader_tests {
             );
         }
 
-        /// IB answers a description that matches nothing with error 200. Any other failure,
-        /// including a stall or a drop after some matches arrived, fails the request: the
+        /// IB answers a description that matches nothing with error 200, and any other error
+        /// is a refusal. A failure, even after some matches arrived, fails the resolution: the
         /// matches read are not all there are.
         #[test]
-        fn only_ibs_no_definition_error_means_no_match() {
+        fn a_failed_contract_details_read_says_whether_a_retry_can_help() {
+            let classify = |failure| classify_contract_details(Err(failure), vec![contract(1)]);
+
             assert_eq!(
-                classify_contract_details(Err(ib_notice(NO_SECURITY_DEFINITION_CODE)), Vec::new()),
+                classify(ib_notice(NO_SECURITY_DEFINITION_CODE)),
                 Err(ResolveContractError::NoMatch)
             );
-            for failure in [
-                ib_notice(321),
-                ListingError::Dropped,
-                ListingError::Stalled(Duration::from_secs(10)),
-            ] {
-                let classified = classify_contract_details(Err(failure), vec![contract(1)]);
+            assert_eq!(
+                classify(ib_notice(321)),
+                Err(ResolveContractError::Refused {
+                    code: 321,
+                    message: "notice".to_string()
+                })
+            );
+
+            let transient = [
+                (
+                    ListingError::Dropped,
+                    ConnectivityError::Socket(ListingError::Dropped.to_string()),
+                ),
+                (
+                    ListingError::Stalled(Duration::from_secs(10)),
+                    ConnectivityError::Timeout,
+                ),
+                (
+                    ListingError::Ibapi(ibapi::Error::ConnectionReset),
+                    ConnectivityError::Socket("ConnectionReset".to_string()),
+                ),
+            ];
+            for (failure, connectivity) in transient {
+                let classified = classify(failure);
+                assert_eq!(
+                    classified,
+                    Err(ResolveContractError::Connectivity(connectivity))
+                );
+                assert!(classified.unwrap_err().is_transient());
+            }
+
+            // ibapi has given up reconnecting, or the client is shut down: retrying cannot help.
+            for permanent in [ibapi::Error::ConnectionFailed, ibapi::Error::Shutdown] {
+                let classified = classify(ListingError::Ibapi(permanent));
                 assert!(
-                    matches!(classified, Err(ResolveContractError::Request(_))),
+                    matches!(&classified, Err(ResolveContractError::Failed(_))),
                     "{classified:?}"
                 );
+                assert!(!classified.unwrap_err().is_transient());
             }
+            assert!(
+                !ResolveContractError::Refused {
+                    code: 321,
+                    message: String::new()
+                }
+                .is_transient()
+            );
+            assert!(!ResolveContractError::NoMatch.is_transient());
         }
 
         /// The account summary stays live after its listing, so only its `End` item ends the

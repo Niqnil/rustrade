@@ -1,5 +1,6 @@
 //! Contract builders for IB integration.
 
+use crate::error::ConnectivityError;
 use ibapi::contracts::{Contract, Currency, Exchange, OptionRight, SecurityType, Symbol};
 use thiserror::Error;
 
@@ -62,10 +63,34 @@ pub enum ResolveContractError {
         matches: Vec<Contract>,
     },
 
-    /// The contract-details request failed: IB refused it, the connection dropped, or IB
-    /// stalled before finishing its answer.
+    /// IB answered the request with an error other than finding no match, such as a description
+    /// it cannot validate. Retrying the same description fails the same way.
+    #[error("IB refused the contract details request (error {code}): {message}")]
+    Refused {
+        /// IB's error code.
+        code: i32,
+        /// IB's error message.
+        message: String,
+    },
+
+    /// The connection dropped, or IB sent nothing for 10 s before finishing its answer.
+    /// Transient: retry once `ibapi` has reconnected.
     #[error("contract details request failed: {0}")]
-    Request(String),
+    Connectivity(#[from] ConnectivityError),
+
+    /// The request could not be made or read for another reason: the client shut down or gave
+    /// up reconnecting, `ibapi` could not decode IB's answer, or the blocking task failed.
+    /// Retrying on this client does not help.
+    #[error("contract details request failed: {0}")]
+    Failed(String),
+}
+
+impl ResolveContractError {
+    /// Whether the same request may succeed if retried: a
+    /// [`Connectivity`](Self::Connectivity) failure.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Connectivity(e) if e.is_transient())
+    }
 }
 
 fn contract_ids(contracts: &[Contract]) -> Vec<i32> {

@@ -255,6 +255,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`ConnectivityError::Timeout` displays as "request timed out"** (`rustrade-execution`). It said
+  "ExecutionRequest timed out", which read wrongly for the requests besides order placement that
+  report it, such as IBKR contract resolution.
+
 - **IBKR client order ids are at most 128 ASCII characters, and a failing fill recovery no longer
   ends the account stream** (`rustrade-execution`, feature `ibkr`). **Breaking.**
   - An order's client order id is sent as its IB order reference, which IB rejects when it is
@@ -441,9 +445,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`ContractIdTaken`), which used to move the id's reports to the new name. Either refusal
     leaves the registry unchanged.
   - New `IbkrClient::resolve_contract` resolves a contract description on the client's own
-    connection. It refuses a description that matches no IB contract (`NoMatch`) or several
-    (`Ambiguous`, carrying the matches), and fails if IB stalls for 10 seconds or the connection
-    drops (`Request`). The error is the new `contract::ResolveContractError`.
+    connection. Its error, the new `contract::ResolveContractError`, says whether a retry can
+    help (`is_transient`):
+    - `NoMatch` when no IB contract matches the description;
+    - `Ambiguous` when several do, carrying the matches;
+    - `Refused { code, message }` when IB answers with another error;
+    - `Connectivity(ConnectivityError)`, the transient case, when the connection drops or IB
+      sends nothing for 10 seconds;
+    - `Failed` otherwise, as for a client that has shut down or given up reconnecting.
   - `IbkrClient::connect_sync` resolves `IbkrConfig::contracts` the same way. It used to register
     the first of several matching contracts, which could be the wrong one, and skipped one with
     no match without a warning. Both are now skipped with a `warn!`, as a contract IB fails to
