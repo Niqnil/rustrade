@@ -28,10 +28,12 @@ use ibapi::{
     client::blocking::Client,
     orders::{ExecutionFilter, Executions, OrderData, OrderStatusKind, Orders},
 };
+use lru::LruCache;
+use parking_lot::Mutex;
 use rust_decimal::Decimal;
 use rustrade_instrument::ibkr::ContractRegistry;
 use smol_str::{SmolStr, format_smolstr};
-use std::{cell::OnceCell, ops::ControlFlow, time::Duration};
+use std::{cell::OnceCell, num::NonZeroUsize, ops::ControlFlow, sync::Arc, time::Duration};
 use tracing::{debug, warn};
 
 /// How many days of executions are read for the fill of an order that ended cancelled or
@@ -46,6 +48,37 @@ const EXECUTIONS_COVER: Duration = Duration::from_secs(6 * 24 * 60 * 60);
 /// How far IB's clock, which stamps an order's completion to the second, and this host's may be
 /// apart, when a completion is compared with when this client began tracking the order.
 const COMPLETION_CLOCK_SLACK: chrono::Duration = chrono::Duration::seconds(5);
+
+/// How many earlier orders' completions [`EarlierCompletions`] remembers warning about.
+const EARLIER_COMPLETIONS_REMEMBERED: usize = 1_024;
+
+/// The completions [`ended_order`] took as an earlier order's, under a client order id since
+/// reused, so that it warns about each only once.
+///
+/// IB keeps a completed order in its listing, so each lookup of a reused client order id meets
+/// the earlier order's completion again, and reusing an id after its order ended is legitimate.
+/// Each later meeting is logged at `debug!`. Bounded and LRU: a completion forgotten is warned
+/// about again.
+///
+/// Shared by every clone of the client, like the order id map.
+#[derive(Debug, Clone)]
+pub(super) struct EarlierCompletions(Arc<Mutex<LruCache<(ClientOrderId, DateTime<Utc>), ()>>>);
+
+impl EarlierCompletions {
+    pub(super) fn new() -> Self {
+        Self::with_capacity(EARLIER_COMPLETIONS_REMEMBERED)
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        let capacity = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN);
+        Self(Arc::new(Mutex::new(LruCache::new(capacity))))
+    }
+
+    /// Note the completion at `completed_at` under `cid`, answering whether it is new.
+    fn first_meeting(&self, cid: &ClientOrderId, completed_at: DateTime<Utc>) -> bool {
+        self.0.lock().put((cid.clone(), completed_at), ()).is_none()
+    }
+}
 
 /// How IB's completion text starts for an order it rejected after accepting it, such as a
 /// good-till-date order whose expiry has passed, which it lists as `Cancelled`.
@@ -224,7 +257,7 @@ impl Tracked {
 /// The order is not ended ([`OrderLookup::NotEnded`]) when IB lists another status, a shape this
 /// client never sends for an order it does not track, or a completion from before this client
 /// tracked the order under its id, give or take [`COMPLETION_CLOCK_SLACK`]: that one is an earlier
-/// order's, under an id since reused.
+/// order's, under an id since reused. That is warned about the first time `earlier` meets it.
 ///
 /// The ended order carries the IB order id when this client tracks the order, and otherwise IB's
 /// permanent id for it, since IB lists a completed order without its API order id.
@@ -232,6 +265,7 @@ pub(super) fn ended_order<E>(
     key: &UnindexedOrderKey,
     completed: &CompletedOrder,
     tracked: Option<&Tracked>,
+    earlier: &EarlierCompletions,
     executed: impl FnOnce() -> Result<Option<Decimal>, E>,
 ) -> Result<OrderLookup, E> {
     let data = &completed.data;
@@ -243,14 +277,26 @@ pub(super) fn ended_order<E>(
         && completed_at + COMPLETION_CLOCK_SLACK < Utc::now() - age
     {
         // A warning, since IB's clock lagging this host's by more than the slack would hold a
-        // genuinely ended order here at every check.
-        warn!(
-            cid = %key.cid,
-            %completed_at,
-            tracked_for_secs = age.num_seconds(),
-            "Completed IBKR order predates the order now under its client order id; taking it as \
-             an earlier order's. If it is this order's, IB's clock lags this host's"
-        );
+        // genuinely ended order here at every check. Once per completion, since a client order
+        // id reused after its order ended, the usual cause, meets it at every lookup.
+        if earlier.first_meeting(&key.cid, completed_at) {
+            warn!(
+                cid = %key.cid,
+                %completed_at,
+                tracked_for_secs = age.num_seconds(),
+                "Completed IBKR order predates the order now under its client order id; taking \
+                 it as an earlier order's, as when a client order id is reused after its order \
+                 ended. If it is this order's, IB's clock lags this host's. Not repeated for this \
+                 completion"
+            );
+        } else {
+            debug!(
+                cid = %key.cid,
+                %completed_at,
+                "Completed IBKR order predates the order now under its client order id; taking \
+                 it as an earlier order's"
+            );
+        }
         return Ok(OrderLookup::NotEnded);
     }
     let context = match tracked {
@@ -355,6 +401,7 @@ pub(super) struct EndedOrderReader<'a> {
     contracts: &'a ContractRegistry,
     order_ids: &'a OrderIdMap,
     pending_cancels: &'a PendingCancels,
+    earlier: &'a EarlierCompletions,
     completed: OnceCell<CompletedOrders>,
     executed: OnceCell<ExecutedQuantities>,
 }
@@ -366,6 +413,7 @@ impl<'a> EndedOrderReader<'a> {
         contracts: &'a ContractRegistry,
         order_ids: &'a OrderIdMap,
         pending_cancels: &'a PendingCancels,
+        earlier: &'a EarlierCompletions,
     ) -> Self {
         Self {
             client,
@@ -373,6 +421,7 @@ impl<'a> EndedOrderReader<'a> {
             contracts,
             order_ids,
             pending_cancels,
+            earlier,
             completed: OnceCell::new(),
             executed: OnceCell::new(),
         }
@@ -413,7 +462,7 @@ impl<'a> EndedOrderReader<'a> {
             return Ok(OrderLookup::Unknown);
         }
         let tracked = Tracked::find(&key.cid, self.order_ids, self.pending_cancels);
-        ended_order(key, order, tracked.as_ref(), || {
+        ended_order(key, order, tracked.as_ref(), self.earlier, || {
             Ok(self.executed()?.of(&key.cid))
         })
     }
@@ -643,9 +692,13 @@ mod tests {
         let order = one(Orders::OrderData(data));
 
         let found = ended(
-            ended_order(&key("a"), &order, None, || -> Result<_, ()> {
-                panic!("a filled order's fill is listed")
-            })
+            ended_order(
+                &key("a"),
+                &order,
+                None,
+                &EarlierCompletions::new(),
+                || -> Result<_, ()> { panic!("a filled order's fill is listed") },
+            )
             .unwrap(),
         );
 
@@ -676,9 +729,13 @@ mod tests {
             "Rejected by System:\nGood-till-date order expired",
         ));
         let found = ended(
-            ended_order(&key("a"), &order, None, || -> Result<_, ()> {
-                panic!("a rejected order filled nothing")
-            })
+            ended_order(
+                &key("a"),
+                &order,
+                None,
+                &EarlierCompletions::new(),
+                || -> Result<_, ()> { panic!("a rejected order filled nothing") },
+            )
             .unwrap(),
         );
         assert!(matches!(
@@ -700,8 +757,16 @@ mod tests {
             "",
         ));
         let filled = |tracked: Option<&Tracked>, executed: Option<Decimal>| {
-            let found =
-                ended(ended_order(&key("a"), &order, tracked, || Ok::<_, ()>(executed)).unwrap());
+            let found = ended(
+                ended_order(
+                    &key("a"),
+                    &order,
+                    tracked,
+                    &EarlierCompletions::new(),
+                    || Ok::<_, ()>(executed),
+                )
+                .unwrap(),
+            );
             let InactiveOrderState::Cancelled(cancelled) = found.state else {
                 panic!("{:?}", found.state)
             };
@@ -730,8 +795,16 @@ mod tests {
         ));
         let mut adopted = tracked(1, GTC, false);
         adopted.registration.adopted = true;
-        let found =
-            ended(ended_order(&key("a"), &order, Some(&adopted), || Ok::<_, ()>(None)).unwrap());
+        let found = ended(
+            ended_order(
+                &key("a"),
+                &order,
+                Some(&adopted),
+                &EarlierCompletions::new(),
+                || Ok::<_, ()>(None),
+            )
+            .unwrap(),
+        );
         let InactiveOrderState::Cancelled(cancelled) = found.state else {
             panic!("{:?}", found.state)
         };
@@ -760,28 +833,62 @@ mod tests {
             ..tracked(0, GTC, false)
         };
 
+        let noted = EarlierCompletions::new();
         let earlier = at(chrono::Duration::hours(2));
         assert!(matches!(
             ended_order(
                 &key("a"),
                 &earlier,
                 Some(&placed_an_hour_ago),
+                &noted,
                 || Ok::<_, ()>(None)
             )
             .unwrap(),
             OrderLookup::NotEnded
         ));
+        assert!(
+            !noted.first_meeting(&ClientOrderId::new("a"), earlier.time.unwrap()),
+            "the earlier order's completion is noted, so it is not warned about again"
+        );
         let later = at(chrono::Duration::minutes(30));
         assert!(matches!(
             ended_order(
                 &key("a"),
                 &later,
                 Some(&placed_an_hour_ago),
+                &noted,
                 || Ok::<_, ()>(None)
             )
             .unwrap(),
             OrderLookup::Ended(_)
         ));
+    }
+
+    /// IB keeps an earlier order's completion in its listing, so each lookup of its reused client
+    /// order id meets it again: only the first meeting is new. Another completion under the id,
+    /// or the same time under another id, is new too.
+    #[test]
+    fn an_earlier_orders_completion_is_new_only_at_its_first_meeting() {
+        let noted = EarlierCompletions::new();
+        let at = Utc::now() - chrono::Duration::hours(2);
+        let a = ClientOrderId::new("a");
+
+        assert!(noted.first_meeting(&a, at));
+        assert!(!noted.first_meeting(&a, at));
+        assert!(noted.first_meeting(&a, at - chrono::Duration::seconds(1)));
+        assert!(noted.first_meeting(&ClientOrderId::new("b"), at));
+    }
+
+    /// The set is bounded: a completion it has forgotten is new again, and warned about again.
+    #[test]
+    fn a_forgotten_earlier_completion_is_new_again() {
+        let noted = EarlierCompletions::with_capacity(1);
+        let at = Utc::now();
+        let (a, b) = (ClientOrderId::new("a"), ClientOrderId::new("b"));
+
+        assert!(noted.first_meeting(&a, at));
+        assert!(noted.first_meeting(&b, at));
+        assert!(noted.first_meeting(&a, at), "a was evicted by b");
     }
 
     /// A cancelled day order that this client did not ask to cancel expired, as the account
@@ -796,8 +903,17 @@ mod tests {
             "",
         ));
         let state = |tracked: &Tracked| {
-            ended(ended_order(&key("a"), &order, Some(tracked), || Ok::<_, ()>(None)).unwrap())
-                .state
+            ended(
+                ended_order(
+                    &key("a"),
+                    &order,
+                    Some(tracked),
+                    &EarlierCompletions::new(),
+                    || Ok::<_, ()>(None),
+                )
+                .unwrap(),
+            )
+            .state
         };
 
         assert!(matches!(
@@ -824,7 +940,17 @@ mod tests {
             "",
         ));
         assert!(matches!(
-            ended(ended_order(&key("a"), &inactive, None, || Ok::<_, ()>(None)).unwrap()).state,
+            ended(
+                ended_order(
+                    &key("a"),
+                    &inactive,
+                    None,
+                    &EarlierCompletions::new(),
+                    || Ok::<_, ()>(None)
+                )
+                .unwrap()
+            )
+            .state,
             InactiveOrderState::OpenFailed(_)
         ));
 
@@ -836,7 +962,13 @@ mod tests {
             "",
         ));
         assert!(matches!(
-            ended_order(&key("a"), &live, None, || Ok::<_, ()>(None)).unwrap(),
+            ended_order(&key("a"), &live, None, &EarlierCompletions::new(), || Ok::<
+                _,
+                (),
+            >(
+                None
+            ))
+            .unwrap(),
             OrderLookup::NotEnded
         ));
 
@@ -848,7 +980,14 @@ mod tests {
         data.order.order_type = "REL".to_owned();
         let unreadable = one(Orders::OrderData(data));
         assert!(matches!(
-            ended_order(&key("a"), &unreadable, None, || Ok::<_, ()>(None)).unwrap(),
+            ended_order(
+                &key("a"),
+                &unreadable,
+                None,
+                &EarlierCompletions::new(),
+                || Ok::<_, ()>(None)
+            )
+            .unwrap(),
             OrderLookup::NotEnded
         ));
     }
@@ -862,14 +1001,30 @@ mod tests {
         placed.context.kind = OrderKind::Market;
         placed.context.price = None;
 
-        let found =
-            ended(ended_order(&key("a"), &order, Some(&placed), || Ok::<_, ()>(None)).unwrap());
+        let found = ended(
+            ended_order(
+                &key("a"),
+                &order,
+                Some(&placed),
+                &EarlierCompletions::new(),
+                || Ok::<_, ()>(None),
+            )
+            .unwrap(),
+        );
         assert_eq!(found.kind, OrderKind::Market);
         assert_eq!(found.time_in_force, TimeInForce::GoodUntilEndOfDay);
 
         placed.context.instrument = InstrumentNameExchange::new("MSFT");
-        let found =
-            ended(ended_order(&key("a"), &order, Some(&placed), || Ok::<_, ()>(None)).unwrap());
+        let found = ended(
+            ended_order(
+                &key("a"),
+                &order,
+                Some(&placed),
+                &EarlierCompletions::new(),
+                || Ok::<_, ()>(None),
+            )
+            .unwrap(),
+        );
         assert_eq!(found.kind, OrderKind::Limit);
         assert_eq!(found.time_in_force, GTC);
     }
@@ -890,7 +1045,12 @@ mod tests {
         pending_cancels.insert(13);
 
         let order = one(completed(API_CLIENT, "a", OrderStatusKind::Filled, "", ""));
-        let filled = ended(ended_order(&key("a"), &order, None, || Ok::<_, ()>(None)).unwrap());
+        let filled = ended(
+            ended_order(&key("a"), &order, None, &EarlierCompletions::new(), || {
+                Ok::<_, ()>(None)
+            })
+            .unwrap(),
+        );
         release_ended(&filled, &order_ids, &pending_cancels);
         assert_eq!(order_ids.get_ib_id(&ClientOrderId::new("a")), None);
         assert!(order_ids.contains(12));
@@ -902,7 +1062,12 @@ mod tests {
             "",
             "",
         ));
-        let cancelled = ended(ended_order(&key("b"), &order, None, || Ok::<_, ()>(None)).unwrap());
+        let cancelled = ended(
+            ended_order(&key("b"), &order, None, &EarlierCompletions::new(), || {
+                Ok::<_, ()>(None)
+            })
+            .unwrap(),
+        );
         release_ended(&cancelled, &order_ids, &pending_cancels);
         assert!(!order_ids.contains(13));
         assert!(!pending_cancels.contains(13));

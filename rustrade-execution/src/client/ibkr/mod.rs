@@ -1043,6 +1043,9 @@ pub struct IbkrClient {
     /// Held across each read of IB's open-order and completed-order listings (see
     /// [`ListingLock`]).
     listings: ListingLock,
+    /// The completions taken as an earlier order's under a reused client order id, each warned
+    /// about once.
+    earlier_completions: ended_orders::EarlierCompletions,
 }
 
 impl std::fmt::Debug for IbkrClient {
@@ -1120,6 +1123,7 @@ impl IbkrClient {
             next_order_id: Arc::new(Mutex::new(next_id)),
             known_live: KnownLiveOrders::shared(ExchangeId::Ibkr),
             listings: ListingLock::default(),
+            earlier_completions: ended_orders::EarlierCompletions::new(),
         })
     }
 
@@ -2411,6 +2415,7 @@ impl ExecutionClient for IbkrClient {
             pending: self.execution_buffer.clone(),
             known: self.known_live.clone(),
             listings: self.listings.clone(),
+            earlier_completions: self.earlier_completions.clone(),
             sink: sink.clone(),
             runtime: tokio::runtime::Handle::current(),
         };
@@ -3600,6 +3605,7 @@ impl OrderStatusClient for IbkrClient {
         let contracts = self.contracts.clone();
         let order_ids = self.order_ids.clone();
         let pending_cancels = self.pending_cancels.clone();
+        let earlier_completions = self.earlier_completions.clone();
         tokio::task::spawn_blocking(move || {
             let reader = ended_orders::EndedOrderReader::new(
                 &client,
@@ -3607,6 +3613,7 @@ impl OrderStatusClient for IbkrClient {
                 &contracts,
                 &order_ids,
                 &pending_cancels,
+                &earlier_completions,
             );
             // Each lookup is answered from listings read on this thread, so the futures are
             // ready at once and nothing awaits the runtime.

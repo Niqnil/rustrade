@@ -458,6 +458,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client is dropped, and until then TWS/Gateway refuses a reconnect under the same ID with error
   326. The rustdoc now says so: drop every clone before reconnecting under the same ID.
 
+- **IBKR warned at every lookup of a client order id reused after its order ended**
+  (`rustrade-execution`, feature `ibkr`). IB keeps the earlier order's completion in its listing,
+  so each `fetch_ended_orders` call and each reconnect check repeated the warning that the
+  completion predates the order now under the id. It is now warned about once per completion,
+  and logged at `debug!` after that. The warning names the usual cause, a reused client order id,
+  ahead of the rare one, IB's clock lagging this host's.
+
 - **Hyperliquid reported a cancel it had not applied as cancelled** (`rustrade-execution`, feature
   `hyperliquid`). Hyperliquid answers such a cancel with a top-level `ok` and puts the error in the
   order's own status, for example "Order was never placed, already canceled, or filled.".
