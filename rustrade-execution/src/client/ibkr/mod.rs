@@ -371,7 +371,7 @@ fn resolve_execution(
     let con_id = execution.contract.contract_id;
 
     if execution.execution.client_id != api_client_id {
-        debug!(
+        trace!(
             ib_order_id = order_id,
             api_client_id = execution.execution.client_id,
             "ExecutionData for another API client's order, dropping"
@@ -379,7 +379,7 @@ fn resolve_execution(
         return None;
     }
     // Fail-fast: skip second lookup if first fails
-    if order_ids.get_client_id(order_id).is_none() {
+    if !order_ids.contains(order_id) {
         debug!(
             ib_order_id = order_id,
             con_id, "ExecutionData for unknown order ID, dropping"
@@ -405,16 +405,25 @@ const LISTING_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// Read one IB listing, passing each item to `on_item`, until IB marks the end of the listing or
 /// `on_item` breaks.
 ///
-/// `next` is the subscription's `next_timeout`. That answers `None` both at the end marker and
-/// when its wait runs out, and only the first returns early (see [`recovery::returned_early`]).
+/// `next` is the subscription's `next_timeout`. That answers `None` at the end marker, when its
+/// wait runs out, and when `ibapi` drops the subscription's channel. Only the first and last
+/// return early (see [`recovery::returned_early`]), so an early `None` is the end of the listing
+/// only while `connected` still says the client is connected.
 ///
 /// # Errors
-/// [`UnindexedClientError::Internal`], naming `what`, when IB answers with an error, or sends
+/// [`UnindexedClientError::Internal`], naming `what`, when IB answers with an error, sends
 /// nothing for `stall_timeout` ([`LISTING_STALL_TIMEOUT`] outside tests) before the end of the
-/// listing. Either way what was read is not the whole listing, and must not be mistaken for it.
+/// listing, or the connection is gone when the listing stops. Either way what was read is not the
+/// whole listing, and must not be mistaken for it.
+///
+/// # Known limitation
+/// A connection that drops and is restored between the last item and that check reads as the end
+/// of the listing. `ibapi` fails a request in flight when its socket drops, which surfaces here as
+/// an error first, so this needs the drop to lose that error too.
 fn read_listing<T>(
     what: &str,
     stall_timeout: std::time::Duration,
+    connected: impl Fn() -> bool,
     mut next: impl FnMut(
         std::time::Duration,
     ) -> Option<Result<ibapi::subscriptions::SubscriptionItem<T>, ibapi::Error>>,
@@ -435,6 +444,11 @@ fn read_listing<T>(
             }
             Some(Err(e)) => return Err(UnindexedClientError::Internal(format!("{what}: {e}"))),
             None if recovery::returned_early(waited.elapsed(), stall_timeout) => {
+                if !connected() {
+                    return Err(UnindexedClientError::Internal(format!(
+                        "{what}: the connection dropped before the end of the listing"
+                    )));
+                }
                 return Ok(());
             }
             None => {
@@ -445,6 +459,46 @@ fn read_listing<T>(
             }
         }
     }
+}
+
+/// Read one account-summary listing into balances.
+///
+/// Errors and stalls are surfaced rather than a partial balance set returned (see
+/// [`read_listing`]). The subscription stays live after the listing, so its end is the `End` item,
+/// and a subscription that stops before it fails the read.
+fn read_account_summary(
+    stall_timeout: std::time::Duration,
+    connected: impl Fn() -> bool,
+    next: impl FnMut(
+        std::time::Duration,
+    ) -> Option<
+        Result<ibapi::subscriptions::SubscriptionItem<AccountSummaryResult>, ibapi::Error>,
+    >,
+) -> Result<BalanceAggregator, UnindexedClientError> {
+    let mut aggregator = BalanceAggregator::new();
+    let mut ended = false;
+    read_listing(
+        "account_summary",
+        stall_timeout,
+        connected,
+        next,
+        |summary| match summary {
+            AccountSummaryResult::Summary(s) => {
+                aggregator.process(&s);
+                ControlFlow::Continue(())
+            }
+            AccountSummaryResult::End => {
+                ended = true;
+                ControlFlow::Break(())
+            }
+        },
+    )?;
+    if !ended {
+        return Err(UnindexedClientError::Internal(
+            "account_summary: the subscription ended before the end of the listing".to_string(),
+        ));
+    }
+    Ok(aggregator)
 }
 
 /// Read one account's positions into `positions`, returning whether IB marked the end of the
@@ -544,6 +598,16 @@ fn forward_order_updates(
             }
         };
         let event = match update {
+            // IB numbers orders per API client, and `ibapi` copies here every order status an
+            // open-orders listing carries, other clients' included.
+            OrderUpdate::OrderStatus(status) if status.client_id != api_client_id => {
+                trace!(
+                    ib_order_id = status.order_id,
+                    api_client_id = status.client_id,
+                    "OrderStatus for another API client's order, dropping"
+                );
+                None
+            }
             OrderUpdate::OrderStatus(status) => {
                 let ib_id = status.order_id;
                 // Single-lock methods for the terminal statuses, to avoid read+write. Each ends
@@ -2409,33 +2473,12 @@ impl ExecutionClient for IbkrClient {
                 .account_summary(&ACCOUNT_GROUP_ALL, &["TotalCashValue", "AvailableFunds"])
                 .map_err(|e| UnindexedClientError::Internal(format!("account_summary: {e}")))?;
 
-            // Errors and stalls are surfaced rather than a partial balance set returned. The
-            // subscription stays live after the listing, so its end is the `End` item.
-            let mut aggregator = BalanceAggregator::new();
-            let mut ended = false;
-            read_listing(
-                "account_summary",
+            let mut balances = read_account_summary(
                 LISTING_STALL_TIMEOUT,
+                || client.is_connected(),
                 |timeout| sub.next_timeout(timeout),
-                |summary| match summary {
-                    AccountSummaryResult::Summary(s) => {
-                        aggregator.process(&s);
-                        ControlFlow::Continue(())
-                    }
-                    AccountSummaryResult::End => {
-                        ended = true;
-                        ControlFlow::Break(())
-                    }
-                },
-            )?;
-            if !ended {
-                return Err(UnindexedClientError::Internal(
-                    "account_summary: the subscription ended before the end of the listing"
-                        .to_string(),
-                ));
-            }
-
-            let mut balances = aggregator.to_balances();
+            )?
+            .to_balances();
 
             if let Some(ref filter) = assets_filter {
                 balances.retain(|b| filter.contains(&b.asset));
@@ -2450,7 +2493,8 @@ impl ExecutionClient for IbkrClient {
     /// Fetch the open orders this API client placed.
     ///
     /// IB numbers orders per API client, so orders other clients placed, and orders entered in
-    /// TWS, are left out: their ids could name an order of this client's.
+    /// TWS, are left out: their ids could name an order of this client's. IB reports orders
+    /// entered in TWS under API client id 0, so a client connected as 0 keeps them.
     ///
     /// An order this client tracks is returned under its client order id, with the kind, price
     /// and time in force it was placed with. Any other is returned under its IB order id, with
@@ -2491,6 +2535,7 @@ impl ExecutionClient for IbkrClient {
             read_listing(
                 "open_orders",
                 LISTING_STALL_TIMEOUT,
+                || client.is_connected(),
                 |timeout| sub.next_timeout(timeout),
                 |item| {
                     listing.push(item);
@@ -2568,6 +2613,7 @@ impl ExecutionClient for IbkrClient {
             read_listing(
                 "executions",
                 LISTING_STALL_TIMEOUT,
+                || client.is_connected(),
                 |timeout| sub.next_timeout(timeout),
                 |item| {
                     listing.push(item);
@@ -2597,6 +2643,7 @@ impl ExecutionClient for IbkrClient {
 /// after it.
 ///
 /// An execution IB listed no commission report for is a trade with an unknown fee, warned about.
+/// The trades are in time order, then by id.
 fn trades_from_executions(
     listing: impl IntoIterator<Item = ibapi::orders::Executions>,
     api_client_id: i32,
@@ -2656,6 +2703,13 @@ fn trades_from_executions(
         );
         trades.extend(without_commission);
     }
+    // In time order. IB lists commission reports after their executions, and a map holds those
+    // without one, so neither gives that order.
+    trades.sort_by(|a, b| {
+        a.time_exchange
+            .cmp(&b.time_exchange)
+            .then_with(|| a.id.cmp(&b.id))
+    });
     trades
 }
 
@@ -2817,8 +2871,10 @@ const GTD_EXPIRY_TOLERANCE: chrono::Duration = chrono::Duration::seconds(5);
 /// # Known Limitation
 ///
 /// If the broker cancels a DAY order before market close (e.g., insufficient margin),
-/// it will be misclassified as `Expired`. This is rare and acceptable given the
-/// alternative (forking ibapi to preserve order_id in error callbacks).
+/// or a GTD order is cancelled outside this client, as in TWS, within
+/// [`GTD_EXPIRY_TOLERANCE`] of its expiry, it will be misclassified as `Expired`. This
+/// is rare and acceptable given the alternative (forking ibapi to preserve order_id in
+/// error callbacks).
 fn make_order_from_status(
     status: &ibapi::orders::OrderStatus,
     client_id: ClientOrderId,
@@ -2860,10 +2916,11 @@ fn make_order_from_status(
                 // DAY order without pending cancel — expired at market close
                 OrderState::inactive(Expired::new(order_id, Utc::now(), reported_fill))
             } else if let TimeInForce::GoodTillDate { expiry } = ctx.time_in_force
-                && Utc::now() + GTD_EXPIRY_TOLERANCE >= expiry
+                && let now = Utc::now()
+                && now + GTD_EXPIRY_TOLERANCE >= expiry
             {
                 // GTD order without pending cancel, at or past its expiry — expired
-                OrderState::inactive(Expired::new(order_id, Utc::now(), reported_fill))
+                OrderState::inactive(Expired::new(order_id, now, reported_fill))
             } else {
                 // GTC/IOC/FOK without pending cancel — broker or exchange cancelled
                 OrderState::inactive(Cancelled::new(order_id, Utc::now(), reported_fill))
@@ -3754,6 +3811,57 @@ mod order_reader_tests {
         }
     }
 
+    /// Another API client's status under a tracked order's IB id is not this client's order's:
+    /// IB numbers orders per client. It is dropped, and the tracked order keeps its entry.
+    #[test]
+    fn another_api_clients_status_does_not_reach_a_tracked_order() {
+        use ibapi::orders::OrderStatusKind;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = recovery::EventSink::new(tx, new_dedup_cache());
+        let order_ids = OrderIdMap::new();
+        let cid = ClientOrderId::new("cid-7");
+        order_ids
+            .register(
+                cid.clone(),
+                7,
+                OrderContext {
+                    instrument: InstrumentNameExchange::new("AAPL"),
+                    side: Side::Buy,
+                    price: Some(Decimal::from(100)),
+                    quantity: Decimal::ONE,
+                    kind: OrderKind::Limit,
+                    time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                },
+            )
+            .unwrap();
+
+        forward_order_updates(
+            [Ok(OrderUpdate::OrderStatus(OrderStatus {
+                order_id: 7,
+                client_id: 905,
+                status: OrderStatusKind::Cancelled,
+                ..OrderStatus::default()
+            }))],
+            &sink,
+            903,
+            &ContractRegistry::new(),
+            &order_ids,
+            &PendingCancels::new(),
+            &ExecutionBuffer::new(),
+        );
+
+        assert!(
+            matches!(
+                rx.try_recv().map(|event| event.kind),
+                Ok(AccountEventKind::StreamTerminated(_))
+            ),
+            "nothing forwarded before the stream ended"
+        );
+        assert_eq!(order_ids.get_ib_id(&cid), Some(7));
+        assert!(order_ids.contains(7));
+    }
+
     /// A status IB re-sends for a filled order, after its id names a later order, is dropped
     /// rather than read as the later order's, which it would end. The later order's own status is
     /// forwarded.
@@ -4012,10 +4120,20 @@ mod order_reader_tests {
             stalls: bool,
             stop_at: Option<u32>,
         ) -> Result<Vec<u32>, UnindexedClientError> {
+            read_while(items, stalls, stop_at, true)
+        }
+
+        fn read_while(
+            items: Vec<Result<SubscriptionItem<u32>, ibapi::Error>>,
+            stalls: bool,
+            stop_at: Option<u32>,
+            connected: bool,
+        ) -> Result<Vec<u32>, UnindexedClientError> {
             let mut read = Vec::new();
             read_listing(
                 "test",
                 Duration::from_millis(40),
+                || connected,
                 subscription(items, stalls),
                 |item| {
                     read.push(item);
@@ -4059,6 +4177,55 @@ mod order_reader_tests {
             assert!(
                 matches!(failed, Err(UnindexedClientError::Internal(_))),
                 "{failed:?}"
+            );
+        }
+
+        /// `ibapi` answers early when it drops a subscription's channel as well as at the end
+        /// marker, so a listing that stops while the client is disconnected is not its end.
+        #[test]
+        fn a_listing_that_stops_while_disconnected_is_an_error() {
+            let read = read_while(vec![Ok(SubscriptionItem::Data(1))], false, None, false);
+            assert!(
+                matches!(&read, Err(UnindexedClientError::Internal(m)) if m.contains("connection dropped")),
+                "{read:?}"
+            );
+        }
+
+        /// The account summary stays live after its listing, so only its `End` item ends the
+        /// read; one that stops before it is not a whole balance set.
+        #[test]
+        fn an_account_summary_read_needs_its_end_item() {
+            use ibapi::accounts::{AccountSummary, AccountSummaryResult};
+
+            let summary = || {
+                Ok(SubscriptionItem::Data(AccountSummaryResult::Summary(
+                    AccountSummary {
+                        account: "DU1".to_string(),
+                        tag: "TotalCashValue".to_string(),
+                        value: "100".to_string(),
+                        currency: "USD".to_string(),
+                    },
+                )))
+            };
+            let read = |items| {
+                read_account_summary(
+                    Duration::from_millis(40),
+                    || true,
+                    subscription(items, false),
+                )
+            };
+
+            let balances = read(vec![
+                summary(),
+                Ok(SubscriptionItem::Data(AccountSummaryResult::End)),
+            ])
+            .unwrap()
+            .to_balances();
+            assert_eq!(balances.len(), 1, "{balances:?}");
+            let cut_short = read(vec![summary()]);
+            assert!(
+                matches!(cut_short, Err(UnindexedClientError::Internal(_))),
+                "{cut_short:?}"
             );
         }
 
@@ -4246,12 +4413,13 @@ mod order_reader_tests {
             let at = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
             let trades = trades_from_executions(
                 [
-                    executed(API_CLIENT, 7, "paired", "20261007 10:00:00 UTC"),
+                    executed(API_CLIENT, 7, "paired", "20261007 10:00:02 UTC"),
                     commission("paired"),
+                    // Earlier than the paired one, and returned first: in time order.
                     executed(API_CLIENT, 7, "unpaired", "20261007 10:00:01 UTC"),
                     executed(API_CLIENT, 7, "too-early", "20261007 09:59:59 UTC"),
                     commission("too-early"),
-                    executed(905, 7, "other-client", "20261007 10:00:02 UTC"),
+                    executed(905, 7, "other-client", "20261007 10:00:03 UTC"),
                     commission("other-client"),
                 ],
                 API_CLIENT,
@@ -4274,8 +4442,8 @@ mod order_reader_tests {
             assert_eq!(
                 read,
                 [
-                    ("paired", "7", "USD", dec!(1.25)),
                     ("unpaired", "7", execution::UNKNOWN_FEE_ASSET, Decimal::ZERO),
+                    ("paired", "7", "USD", dec!(1.25)),
                 ]
             );
 

@@ -208,6 +208,11 @@ impl OrderIdMap {
         self.inner.read().cid_to_ib.get(client_id).copied()
     }
 
+    /// Whether IB order `ib_id` has an entry: a live order, or a filled one not yet reaped.
+    pub fn contains(&self, ib_id: i32) -> bool {
+        self.inner.read().ib_to_entry.contains_key(&ib_id)
+    }
+
     /// Look up ClientOrderId by IB order ID.
     pub fn get_client_id(&self, ib_id: i32) -> Option<ClientOrderId> {
         self.inner

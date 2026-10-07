@@ -393,10 +393,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     and fill recovery now keep only this API client's orders and executions. Another client's, or
     an order entered in TWS, could carry an order id this client also uses, and be reported as
     this client's order.
-  - A good-till-date order IB cancels at its expiry is reported `Expired`, not `Cancelled`.
+  - IB reports orders entered in TWS under API client id 0, so a client connected as 0 still
+    sees them.
+  - A good-till-date order IB cancels at its expiry is reported `Expired`, not `Cancelled`. One
+    cancelled outside this client, as in TWS, within 5 seconds of its expiry reads as expired too.
   - `fetch_balances`, `fetch_open_orders` and `fetch_trades` fail if IB sends nothing for 10
-    seconds before the end of a listing. They blocked until IB answered, or returned what they had
-    read as if complete.
+    seconds before the end of a listing, or the connection drops during it. They blocked until IB
+    answered, or returned what they had read as if complete. `fetch_trades` returns trades in time
+    order.
   - `ExecutionBuffer::add_execution` no longer takes a client order id.
 
 - **A market stream's failed re-initialisation reached only the logs, and a failed subscription
