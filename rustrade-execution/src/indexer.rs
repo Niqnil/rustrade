@@ -539,8 +539,9 @@ impl AccountEventIndexer {
     ///
     /// # Errors
     /// Returns `IndexError` if fee asset is not in the map. Some integrations use
-    /// "UNKNOWN" as a placeholder when fee data is unavailable (e.g., IBKR `fetch_trades`,
-    /// Binance when API omits `commission_asset`). These trades will fail indexing.
+    /// "UNKNOWN" as a placeholder when fee data is unavailable (e.g., IBKR `fetch_trades` for an
+    /// execution IB sent no commission report for, Binance when API omits `commission_asset`).
+    /// These trades will fail indexing.
     pub fn trade(
         &self,
         trade: Trade<AssetNameExchange, InstrumentNameExchange>,

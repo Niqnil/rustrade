@@ -1,5 +1,5 @@
 use crate::{
-    order::id::{ClientOrderId, StrategyId},
+    order::id::{OrderId, StrategyId},
     trade::{AssetFees, Trade, TradeId},
 };
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
@@ -46,7 +46,6 @@ struct ExecutionBufferInner {
 struct PendingExecution {
     execution: ExecutionData,
     instrument: InstrumentNameExchange,
-    client_order_id: ClientOrderId,
 }
 
 impl ExecutionBuffer {
@@ -57,12 +56,7 @@ impl ExecutionBuffer {
     }
 
     /// Buffer an execution, waiting for its commission report.
-    pub fn add_execution(
-        &self,
-        execution: ExecutionData,
-        instrument: InstrumentNameExchange,
-        client_order_id: ClientOrderId,
-    ) {
+    pub fn add_execution(&self, execution: ExecutionData, instrument: InstrumentNameExchange) {
         let exec_id = execution.execution.execution_id.clone();
         let mut inner = self.inner.lock();
         inner.pending.insert(
@@ -70,7 +64,6 @@ impl ExecutionBuffer {
             PendingExecution {
                 execution,
                 instrument,
-                client_order_id,
             },
         );
 
@@ -96,6 +89,27 @@ impl ExecutionBuffer {
         };
 
         Some(build_trade(pending, report))
+    }
+
+    /// Take every pending execution out of the buffer as a trade whose fee is unknown: zero, in
+    /// [`UNKNOWN_FEE_ASSET`].
+    ///
+    /// For a read that has ended, such as one executions request, whose commission reports will
+    /// not arrive in it any more.
+    pub(super) fn take_without_commission(
+        &self,
+    ) -> Vec<Trade<AssetNameExchange, InstrumentNameExchange>> {
+        std::mem::take(&mut self.inner.lock().pending)
+            .into_values()
+            .map(|pending| {
+                let fees = AssetFees::new(
+                    AssetNameExchange::from(UNKNOWN_FEE_ASSET),
+                    Decimal::ZERO,
+                    None,
+                );
+                trade_with_fees(pending, fees)
+            })
+            .collect()
     }
 
     /// Move every pending execution into `target`, returning how many moved.
@@ -259,10 +273,33 @@ pub(super) fn keep_latest_revisions(
     kept
 }
 
+/// The fee asset of a trade whose commission report IB did not send.
+pub const UNKNOWN_FEE_ASSET: &str = "UNKNOWN";
+
+/// The venue order id of IB order `ib_order_id`, as [`Open`](crate::order::state::Open) and every
+/// [`Trade`] of this client carry it.
+pub(super) fn ib_order_id(ib_order_id: i32) -> OrderId {
+    OrderId::new(format_smolstr!("{ib_order_id}"))
+}
+
 /// Build a rustrade Trade from IB execution + commission data.
 fn build_trade(
     pending: PendingExecution,
     commission: &CommissionReport,
+) -> Trade<AssetNameExchange, InstrumentNameExchange> {
+    let commission_amount = parse_decimal_or_warn(commission.commission, "commission");
+    let fees = AssetFees {
+        asset: AssetNameExchange::from(commission.currency.as_str()),
+        fees: commission_amount,
+        fees_quote: None, // Indexer computes based on fee asset vs instrument quote
+    };
+    trade_with_fees(pending, fees)
+}
+
+/// Build a rustrade Trade from an IB execution and its fees.
+fn trade_with_fees(
+    pending: PendingExecution,
+    fees: AssetFees<AssetNameExchange>,
 ) -> Trade<AssetNameExchange, InstrumentNameExchange> {
     let exec = &pending.execution.execution;
 
@@ -275,13 +312,13 @@ fn build_trade(
 
     let price = parse_decimal_or_warn(exec.price, "exec.price");
     let quantity = parse_decimal_or_warn(exec.shares, "exec.shares");
-    let commission_amount = parse_decimal_or_warn(commission.commission, "commission");
 
     let time_exchange = parse_ib_timestamp(&exec.time).unwrap_or_else(Utc::now);
 
     Trade {
         id: TradeId::new(&exec.execution_id),
-        order_id: crate::order::id::OrderId::new(&pending.client_order_id.0),
+        // The id the order's `Open` state carries, which is what a fill is matched against.
+        order_id: ib_order_id(exec.order_id),
         instrument: pending.instrument,
         strategy: StrategyId::unknown(),
         time_exchange,
@@ -294,11 +331,7 @@ fn build_trade(
             exec.cumulative_quantity,
             "exec.cumulative_quantity",
         )),
-        fees: AssetFees {
-            asset: AssetNameExchange::from(commission.currency.as_str()),
-            fees: commission_amount,
-            fees_quote: None, // Indexer computes based on fee asset vs instrument quote
-        },
+        fees,
     }
 }
 
@@ -418,11 +451,7 @@ mod tests {
             ..Default::default()
         };
         let add = |buffer: &ExecutionBuffer, exec_id: &str| {
-            buffer.add_execution(
-                execution(exec_id),
-                InstrumentNameExchange::new("AAPL"),
-                ClientOrderId::new("cid"),
-            );
+            buffer.add_execution(execution(exec_id), InstrumentNameExchange::new("AAPL"));
         };
         let source = ExecutionBuffer::new();
         let target = ExecutionBuffer::new();

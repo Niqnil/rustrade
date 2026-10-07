@@ -208,6 +208,11 @@ impl OrderIdMap {
         self.inner.read().cid_to_ib.get(client_id).copied()
     }
 
+    /// Whether IB order `ib_id` has an entry: a live order, or a filled one not yet reaped.
+    pub fn contains(&self, ib_id: i32) -> bool {
+        self.inner.read().ib_to_entry.contains_key(&ib_id)
+    }
+
     /// Look up ClientOrderId by IB order ID.
     pub fn get_client_id(&self, ib_id: i32) -> Option<ClientOrderId> {
         self.inner
@@ -390,6 +395,141 @@ pub(crate) fn side_to_action(side: rustrade_instrument::Side) -> Action {
         rustrade_instrument::Side::Buy => Action::Buy,
         rustrade_instrument::Side::Sell => Action::Sell,
     }
+}
+
+/// Convert an IB Action to a rustrade Side. A short sale is a sell.
+pub(crate) fn action_to_side(action: &Action) -> rustrade_instrument::Side {
+    match action {
+        Action::Buy => rustrade_instrument::Side::Buy,
+        Action::Sell | Action::SellShort | Action::SellLong => rustrade_instrument::Side::Sell,
+    }
+}
+
+/// What kind of order an IB order is, as [`build_ib_order`] would have built it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OrderShape {
+    pub(crate) kind: OrderKind,
+    /// The limit price, for the kinds that have one.
+    pub(crate) price: Option<Decimal>,
+    pub(crate) time_in_force: TimeInForce,
+}
+
+/// Read back the shape of an order IB lists, the inverse of [`build_ib_order`].
+///
+/// For an order this client did not place, or no longer tracks, such as one placed before a
+/// restart. A tracked order's shape is the one it was placed with.
+///
+/// # Errors
+/// A description of what does not map: an order type or time in force [`build_ib_order`] never
+/// sends, a price the type needs that IB did not list, or a good-till-date time that does not
+/// parse.
+pub(crate) fn order_shape_from_ib(order: &Order) -> Result<OrderShape, String> {
+    let order_type = order.order_type.as_str();
+    let decimal = |value: Option<f64>, field: &str| -> Result<Decimal, String> {
+        let value = value.ok_or_else(|| format!("{order_type} order without {field}"))?;
+        Decimal::try_from(value).map_err(|e| format!("{order_type} order's {field} {value}: {e}"))
+    };
+
+    let time_in_force = match &order.tif {
+        IbTimeInForce::Day => TimeInForce::GoodUntilEndOfDay,
+        IbTimeInForce::GoodTillCanceled => TimeInForce::GoodUntilCancelled { post_only: false },
+        IbTimeInForce::ImmediateOrCancel => TimeInForce::ImmediateOrCancel,
+        IbTimeInForce::FillOrKill => TimeInForce::FillOrKill,
+        IbTimeInForce::OnOpen => TimeInForce::AtOpen,
+        IbTimeInForce::GoodTillDate => TimeInForce::GoodTillDate {
+            expiry: parse_gtd_datetime(&order.good_till_date).ok_or_else(|| {
+                format!(
+                    "good-till-date time {:?} does not parse",
+                    order.good_till_date
+                )
+            })?,
+        },
+        other => return Err(format!("time in force {other:?}")),
+    };
+
+    // A trailing order is by percentage when IB lists a percentage, else by an amount in
+    // `aux_price`, as `build_ib_order` sends them.
+    let trailing = || -> Result<(Decimal, TrailingOffsetType), String> {
+        match order.trailing_percent {
+            Some(_) => Ok((
+                decimal(order.trailing_percent, "trailing_percent")?,
+                TrailingOffsetType::Percentage,
+            )),
+            None => Ok((
+                decimal(order.aux_price, "aux_price")?,
+                TrailingOffsetType::Absolute,
+            )),
+        }
+    };
+
+    let (kind, price, time_in_force) = match order_type {
+        "MKT" => (OrderKind::Market, None, time_in_force),
+        "LMT" => (
+            OrderKind::Limit,
+            Some(decimal(order.limit_price, "limit_price")?),
+            time_in_force,
+        ),
+        // At-close orders are typed, not timed, at IB (see `build_at_close_order`).
+        "MOC" => (OrderKind::Market, None, TimeInForce::AtClose),
+        "LOC" => (
+            OrderKind::Limit,
+            Some(decimal(order.limit_price, "limit_price")?),
+            TimeInForce::AtClose,
+        ),
+        "STP" => (
+            OrderKind::Stop {
+                trigger_price: decimal(order.aux_price, "aux_price")?,
+            },
+            None,
+            time_in_force,
+        ),
+        "STP LMT" => (
+            OrderKind::StopLimit {
+                trigger_price: decimal(order.aux_price, "aux_price")?,
+            },
+            Some(decimal(order.limit_price, "limit_price")?),
+            time_in_force,
+        ),
+        "TRAIL" => {
+            let (offset, offset_type) = trailing()?;
+            (
+                OrderKind::TrailingStop {
+                    offset,
+                    offset_type,
+                },
+                None,
+                time_in_force,
+            )
+        }
+        "TRAIL LIMIT" => {
+            let (offset, offset_type) = trailing()?;
+            (
+                OrderKind::TrailingStopLimit {
+                    offset,
+                    offset_type,
+                    limit_offset: decimal(order.limit_price_offset, "limit_price_offset")?,
+                },
+                None,
+                time_in_force,
+            )
+        }
+        other => return Err(format!("order type {other:?}")),
+    };
+
+    Ok(OrderShape {
+        kind,
+        price,
+        time_in_force,
+    })
+}
+
+/// Parse IB's good-till-date field: the form [`format_gtd_datetime`] sends, in UTC, or IB's
+/// `yyyyMMdd HH:mm:ss` with an optional zone.
+fn parse_gtd_datetime(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::NaiveDateTime::parse_from_str(value, GTD_FORMAT)
+        .map(|naive| naive.and_utc())
+        .ok()
+        .or_else(|| super::execution::parse_ib_timestamp(value))
 }
 
 /// Error when mapping rustrade order types to IB.
@@ -672,8 +812,11 @@ pub fn build_ib_order(
 /// IB accepts format: "yyyyMMdd HH:mm:ss" with optional timezone suffix.
 /// We use UTC format "yyyyMMdd-HH:mm:ss" which IB interprets as UTC.
 fn format_gtd_datetime(dt: &chrono::DateTime<chrono::Utc>) -> String {
-    dt.format("%Y%m%d-%H:%M:%S").to_string()
+    dt.format(GTD_FORMAT).to_string()
 }
+
+/// The good-till-date form this client sends, in UTC.
+const GTD_FORMAT: &str = "%Y%m%d-%H:%M:%S";
 
 /// Build an at-close order (MOC or LOC).
 ///
@@ -1774,5 +1917,157 @@ mod tests {
         assert_eq!(orders[0].tif, IbTimeInForce::GoodTillCanceled);
         assert_eq!(orders[1].tif, IbTimeInForce::GoodTillCanceled);
         assert_eq!(orders[2].tif, IbTimeInForce::GoodTillCanceled);
+    }
+
+    /// Every order this client builds reads back as what it was built from, so an open order it no
+    /// longer tracks is reported as placed.
+    #[test]
+    fn order_shape_from_ib_reads_back_what_build_ib_order_sends() {
+        use chrono::TimeZone;
+        use rust_decimal_macros::dec;
+
+        let expiry = chrono::Utc.with_ymd_and_hms(2026, 10, 9, 20, 0, 0).unwrap();
+        let kinds = [
+            (OrderKind::Market, None),
+            (OrderKind::Limit, Some(dec!(150.25))),
+            (
+                OrderKind::Stop {
+                    trigger_price: dec!(140.5),
+                },
+                None,
+            ),
+            (
+                OrderKind::StopLimit {
+                    trigger_price: dec!(140.5),
+                },
+                Some(dec!(140)),
+            ),
+            (
+                OrderKind::TrailingStop {
+                    offset: dec!(2.5),
+                    offset_type: TrailingOffsetType::Percentage,
+                },
+                None,
+            ),
+            (
+                OrderKind::TrailingStop {
+                    offset: dec!(1.75),
+                    offset_type: TrailingOffsetType::Absolute,
+                },
+                None,
+            ),
+            (
+                OrderKind::TrailingStopLimit {
+                    offset: dec!(2),
+                    offset_type: TrailingOffsetType::Percentage,
+                    limit_offset: dec!(0.5),
+                },
+                None,
+            ),
+            (
+                OrderKind::TrailingStopLimit {
+                    offset: dec!(1.5),
+                    offset_type: TrailingOffsetType::Absolute,
+                    limit_offset: dec!(0.25),
+                },
+                None,
+            ),
+        ];
+        let tifs = [
+            TimeInForce::GoodUntilCancelled { post_only: false },
+            TimeInForce::GoodUntilEndOfDay,
+            TimeInForce::ImmediateOrCancel,
+            TimeInForce::FillOrKill,
+            TimeInForce::AtOpen,
+            TimeInForce::GoodTillDate { expiry },
+        ];
+
+        for (kind, price) in kinds {
+            for time_in_force in tifs {
+                let order = build_ib_order(Side::Buy, 1.0, &kind, price, &time_in_force).unwrap();
+                assert_eq!(
+                    order_shape_from_ib(&order),
+                    Ok(OrderShape {
+                        kind,
+                        price,
+                        time_in_force
+                    }),
+                    "{kind} {time_in_force}"
+                );
+            }
+        }
+
+        // At-close orders are typed MOC/LOC at IB.
+        for (kind, price) in [
+            (OrderKind::Market, None),
+            (OrderKind::Limit, Some(dec!(99))),
+        ] {
+            let order =
+                build_ib_order(Side::Sell, 1.0, &kind, price, &TimeInForce::AtClose).unwrap();
+            assert_eq!(
+                order_shape_from_ib(&order),
+                Ok(OrderShape {
+                    kind,
+                    price,
+                    time_in_force: TimeInForce::AtClose
+                }),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn order_shape_from_ib_reads_ibs_own_good_till_date_form() {
+        use chrono::TimeZone;
+
+        let order = Order {
+            order_type: "MKT".to_owned(),
+            tif: IbTimeInForce::GoodTillDate,
+            good_till_date: "20261009 16:00:00 US/Eastern".to_owned(),
+            ..Order::default()
+        };
+        assert_eq!(
+            order_shape_from_ib(&order).unwrap().time_in_force,
+            TimeInForce::GoodTillDate {
+                expiry: chrono::Utc.with_ymd_and_hms(2026, 10, 9, 20, 0, 0).unwrap()
+            }
+        );
+    }
+
+    #[test]
+    fn order_shape_from_ib_refuses_what_this_client_never_sends() {
+        let order = |order_type: &str, tif: IbTimeInForce| Order {
+            order_type: order_type.to_owned(),
+            tif,
+            limit_price: Some(1.0),
+            ..Order::default()
+        };
+        for (order, reason) in [
+            (order("REL", IbTimeInForce::Day), "order type"),
+            (
+                order("LMT", IbTimeInForce::DayTillCanceled),
+                "time in force",
+            ),
+            (
+                Order {
+                    limit_price: None,
+                    ..order("LMT", IbTimeInForce::Day)
+                },
+                "without limit_price",
+            ),
+            (order("STP", IbTimeInForce::Day), "without aux_price"),
+            (order("MKT", IbTimeInForce::GoodTillDate), "good-till-date"),
+        ] {
+            let error = order_shape_from_ib(&order).unwrap_err();
+            assert!(error.contains(reason), "{error:?} should name {reason:?}");
+        }
+    }
+
+    #[test]
+    fn action_to_side_reads_a_short_sale_as_a_sell() {
+        assert_eq!(action_to_side(&Action::Buy), Side::Buy);
+        for action in [Action::Sell, Action::SellShort, Action::SellLong] {
+            assert_eq!(action_to_side(&action), Side::Sell, "{action:?}");
+        }
     }
 }
