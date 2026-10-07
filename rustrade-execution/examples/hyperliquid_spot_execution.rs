@@ -45,7 +45,7 @@ use rust_decimal_macros::dec;
 use rustrade_execution::{
     client::{
         ExecutionClient,
-        hyperliquid::{config::HyperliquidConfig, spot::HyperliquidSpotClient},
+        hyperliquid::{Network, config::HyperliquidConfig, spot::HyperliquidSpotClient},
     },
     order::{
         OrderEvent, OrderKey, OrderKind, TimeInForce,
@@ -76,11 +76,10 @@ async fn main() {
         }
     };
 
-    let network = if config.testnet { "TESTNET" } else { "MAINNET" };
-    info!("Connecting to Hyperliquid {network} (SPOT)...");
+    info!("Connecting to Hyperliquid {:?} (SPOT)...", config.network);
     info!("Wallet: {}", config.wallet_address_hex());
 
-    if !config.testnet {
+    if config.network == Network::Mainnet {
         warn!("WARNING: Running on MAINNET - real funds at risk!");
         warn!("Set HYPERLIQUID_TESTNET=true for safe testing");
     }
