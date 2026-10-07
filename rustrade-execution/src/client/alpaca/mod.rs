@@ -5025,6 +5025,7 @@ mod tests {
             map_order_kind(OrderKind::TrailingStopLimit {
                 offset: Decimal::from_str("5.0").unwrap(),
                 offset_type: TrailingOffsetType::Percentage,
+                stop_price: Decimal::from_str("95.0").unwrap(),
                 limit_offset: Decimal::from_str("1.0").unwrap(),
             }),
             None

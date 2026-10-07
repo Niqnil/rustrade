@@ -2764,6 +2764,7 @@ mod tests {
                 OrderKind::TrailingStopLimit {
                     offset: Decimal::from(100),
                     offset_type: TrailingOffsetType::BasisPoints,
+                    stop_price: Decimal::from(95),
                     limit_offset: Decimal::from(10),
                 },
                 TimeInForce::GoodUntilCancelled { post_only: false }
