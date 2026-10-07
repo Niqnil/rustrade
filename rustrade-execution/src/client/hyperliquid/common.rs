@@ -683,6 +683,11 @@ pub fn cloid_to_cid(cloid: &str) -> Option<ClientOrderId> {
 /// the order's own status ("Order was never placed, already canceled, or filled.", for one), so
 /// the top level alone does not say. Only a `success` status is a cancel. An answer carrying no
 /// status, or another kind of status, is not taken as one either: the order may still be working.
+/// A cancel names one order, so only the first status is read.
+///
+/// The reason is not classified. Hyperliquid's message says the order was never placed, already
+/// cancelled, or filled, without saying which, so naming it already cancelled or already filled
+/// would be a guess. A caller learns how the order ended from the account stream or a lookup.
 pub(super) fn cancel_outcome(response: ExchangeResponseStatus) -> Result<(), String> {
     let response = match response {
         ExchangeResponseStatus::Ok(response) => response,

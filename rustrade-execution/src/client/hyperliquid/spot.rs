@@ -1552,6 +1552,24 @@ mod tests {
             assert_eq!(reason, CANCEL_NOT_APPLIED);
             assert!(live, "the order is still held live");
         }
+
+        #[tokio::test]
+        async fn an_answer_without_a_status_is_a_rejected_spot_cancel() {
+            let (response, live) = cancel_answered(serde_json::json!({
+                "status": "ok",
+                "response": {"type": "cancel"},
+            }))
+            .await;
+            assert!(
+                matches!(
+                    response.state,
+                    Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(_)))
+                ),
+                "{:?}",
+                response.state
+            );
+            assert!(live, "the order is still held live");
+        }
     }
 
     use super::*;

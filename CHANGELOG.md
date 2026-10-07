@@ -435,6 +435,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   asking about that order. `cancel_order` now reports `Cancelled` only for a `success` status. An
   error status, or an answer with no status for the order, is an `ApiError::OrderRejected` carrying
   the reason, and the order stays tracked until the account stream or a lookup says how it ended.
+  The rejection is not reported as `OrderAlreadyCancelled` or `OrderAlreadyFullyFilled`: Hyperliquid's
+  message does not say which of "never placed, already canceled, or filled" happened, so the order
+  may already have ended either way.
 
 - **IBKR fills never advanced the engine's orders, and IBKR order reads misreported orders, fees
   and other API clients' activity** (`rustrade-execution`, feature `ibkr`). **Breaking:** what
