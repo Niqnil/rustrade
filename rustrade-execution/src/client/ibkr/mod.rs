@@ -67,7 +67,9 @@
 //!    [`IbkrClient::disconnect`] is called, or TWS/Gateway ends the API session,
 //!    `account_stream` ends with `StreamTerminated`, and `account_stream` on the
 //!    shut-down client fails, so replace the client, by reconnecting with
-//!    [`IbkrClient::connect_sync`] and choosing the client ID: the caller's decision. A new
+//!    [`IbkrClient::connect_sync`] and choosing the client ID: the caller's decision. The old
+//!    client's ID stays in use until every clone of it is dropped (see
+//!    [`IbkrClient::disconnect`]). A new
 //!    `IbkrClient` tracks the orders the old one placed once an account snapshot or
 //!    `fetch_open_orders` lists them; until then their events are dropped.
 //! 3. **Stale state cleanup**: Periodically call [`IbkrClient::clear_stale_executions`],
@@ -1268,14 +1270,17 @@ impl IbkrClient {
 
     /// Disconnect from IB Gateway.
     ///
-    /// Signals the ibapi client to shut down and releases the client ID for reuse.
+    /// Shuts the `ibapi` client down for every clone sharing it: requests in flight fail, any
+    /// active `account_stream()` ends with `StreamTerminated`, and later requests are refused.
     ///
-    /// [`IbkrClient`] implements [`Clone`] and has no `Drop` impl: the underlying
-    /// connection is released automatically when the last `Arc<Client>` reference
-    /// is dropped. Calling `disconnect()` explicitly terminates the connection
-    /// **immediately for all clones** sharing this client.
+    /// # Client ID release
     ///
-    /// Any active `account_stream()` ends with `StreamTerminated`.
+    /// This does not release the API client ID. `ibapi` keeps the TCP connection open until the
+    /// last clone of this client is dropped ([`IbkrClient`] implements [`Clone`] and shares one
+    /// connection), and TWS/Gateway treats the ID as in use while the connection is open. To
+    /// reconnect under the same ID, drop every clone first; otherwise
+    /// [`connect_sync`](Self::connect_sync) is refused with IB error 326 ("client id is already in
+    /// use").
     ///
     /// This is idempotent — calling it multiple times is safe.
     pub fn disconnect(&self) {

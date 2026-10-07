@@ -453,6 +453,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     contracts up by name. `rustrade-data`'s `IbkrMarketStream` is one: IB resolves each market
     data request's contract itself. A contract registered this way is never found by contract id.
 
+- **`IbkrClient::disconnect`'s rustdoc said it released the API client ID** (`rustrade-execution`,
+  feature `ibkr`). It does not: `ibapi` keeps the connection open until the last clone of the
+  client is dropped, and until then TWS/Gateway refuses a reconnect under the same ID with error
+  326. The rustdoc now says so: drop every clone before reconnecting under the same ID.
+
 - **Hyperliquid reported a cancel it had not applied as cancelled** (`rustrade-execution`, feature
   `hyperliquid`). Hyperliquid answers such a cancel with a top-level `ok` and puts the error in the
   order's own status, for example "Order was never placed, already canceled, or filled.".
