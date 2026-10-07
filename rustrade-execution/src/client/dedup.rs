@@ -140,7 +140,7 @@ pub(crate) fn dedup_key_from_event(event: &UnindexedAccountEvent) -> Option<Dedu
         // one twice is unknown, and TradeAmendment tells the consumer to apply it idempotently.
         // IBKR's EventSink tracks each execution's revisions itself, which also keeps an
         // execution from going out after its correction.
-        _ => None, // BalanceSnapshot, BalanceStreamUpdate, InstrumentBalanceUpdate, Snapshot, StreamTerminated, FillRecoveryGaveUp, TradeAmended — no dedup needed
+        _ => None, // BalanceSnapshot, BalanceStreamUpdate, InstrumentBalanceUpdate, Snapshot, StreamTerminated, FillRecoveryGaveUp, TradeAmended, ReinitFailed — no dedup needed
     }
 }
 

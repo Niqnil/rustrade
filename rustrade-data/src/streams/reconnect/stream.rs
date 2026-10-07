@@ -105,6 +105,11 @@ where
 
     /// Maps every [`ReconnectingStream`] `Stream::Item` into an [`reconnect::Event::Item`](Event),
     /// and chain a [`reconnect::Event::Reconnecting`](Event)
+    ///
+    /// Pairs with [`with_reconnect_backoff`](Self::with_reconnect_backoff), which discards failed
+    /// re-initialisations. To report them as events, use
+    /// [`with_reconnect_backoff_reporting`](Self::with_reconnect_backoff_reporting) with
+    /// [`with_reconnection_events_reporting`](Self::with_reconnection_events_reporting).
     fn with_reconnection_events<St, Origin>(
         self,
         origin: Origin,
@@ -116,6 +121,34 @@ where
     {
         self.map(move |stream| with_trailing_reconnecting(stream, origin.clone()))
             .flatten()
+    }
+
+    /// Maps the initialisation attempts yielded by
+    /// [`with_reconnect_backoff_reporting`](Self::with_reconnect_backoff_reporting) into
+    /// [`reconnect::Event`](Event)s.
+    ///
+    /// Each initialised stream's items become [`Event::Item`]s, followed by one
+    /// [`Event::Reconnecting`] when it ends. Each failed attempt becomes the single
+    /// [`Event::Item`] that `on_failure` makes of it. A failed attempt ends no stream, so it adds
+    /// no further [`Event::Reconnecting`].
+    fn with_reconnection_events_reporting<St, InitError, Origin, FnOnFailure>(
+        self,
+        origin: Origin,
+        on_failure: FnOnFailure,
+    ) -> impl Stream<Item = Event<Origin, St::Item>>
+    where
+        Self: Stream<Item = Result<St, ReinitFailure<InitError>>>,
+        St: Stream,
+        Origin: Clone,
+        FnOnFailure: Fn(ReinitFailure<InitError>) -> St::Item,
+    {
+        self.map(move |initialised| match initialised {
+            Ok(stream) => Either::Left(with_trailing_reconnecting(stream, origin.clone())),
+            Err(failure) => Either::Right(stream::once(future::ready(Event::Item(on_failure(
+                failure,
+            ))))),
+        })
+        .flatten()
     }
 
     /// Handles all encountered errors with the provided closure before filtering them out,
@@ -351,5 +384,35 @@ mod tests {
             .await;
 
         assert_eq!(streams, [1, 2]);
+    }
+
+    #[tokio::test]
+    async fn a_failure_becomes_one_item_and_only_an_ended_stream_adds_reconnecting() {
+        let origin = ExchangeId::Simulated;
+        let failure = |attempt| ReinitFailure {
+            attempt,
+            error: "refused",
+        };
+        let events = stream::iter([
+            Ok(stream::iter(vec![1_u32])),
+            Err(failure(1)),
+            Err(failure(2)),
+            Ok(stream::iter(vec![2])),
+        ])
+        .with_reconnection_events_reporting(origin, |failure| 100 + failure.attempt)
+        .collect::<Vec<_>>()
+        .await;
+
+        assert_eq!(
+            events,
+            [
+                Event::Item(1),
+                Event::Reconnecting(origin),
+                Event::Item(101),
+                Event::Item(102),
+                Event::Item(2),
+                Event::Reconnecting(origin),
+            ]
+        );
     }
 }

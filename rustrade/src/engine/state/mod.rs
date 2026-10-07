@@ -323,7 +323,10 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     ///
     /// This method:
     /// - Sets the account [`ConnectivityState`](connectivity::ConnectivityState) to
-    ///   [`Health::Healthy`](connectivity::Health::Healthy) if it was not previously.
+    ///   [`Health::Healthy`](connectivity::Health::Healthy) if it was not previously, unless the
+    ///   event is [`ReinitFailed`](AccountEventKind::ReinitFailed) or
+    ///   [`StreamTerminated`](AccountEventKind::StreamTerminated), which report on the account link
+    ///   without showing it is up.
     /// - Updates the `GlobalData` with the `AccountEvent`.
     /// - Updates the associated `AssetStates` and `InstrumentStates` with the `AccountEvent`.
     pub fn update_from_account(
@@ -334,8 +337,14 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
         GlobalData: for<'a> Processor<&'a AccountEvent>,
         InstrumentData: for<'a> Processor<&'a AccountEvent>,
     {
-        // Set exchange account connectivity to Healthy if it was Reconnecting
-        self.connectivity.update_from_account_event(&event.exchange);
+        // Set exchange account connectivity to Healthy if it was Reconnecting. A failed re-init
+        // or an ended stream reports on the link without showing it is up, so neither counts.
+        if !matches!(
+            event.kind,
+            AccountEventKind::ReinitFailed(_) | AccountEventKind::StreamTerminated(_)
+        ) {
+            self.connectivity.update_from_account_event(&event.exchange);
+        }
 
         let output = match &event.kind {
             AccountEventKind::Snapshot(snapshot) => {
@@ -417,6 +426,17 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                     attempts = gap.attempts,
                     reason = %gap.reason,
                     "account stream fill recovery gave up — fills in this span may be missing",
+                );
+                None
+            }
+            AccountEventKind::ReinitFailed(failure) => {
+                // The account link is still down, so state may be going stale. Whether to keep
+                // waiting, alert or halt is the consumer's policy; the engine only makes it loud.
+                error!(
+                    exchange = ?event.exchange,
+                    attempt = failure.attempt,
+                    error = %failure.error,
+                    "account stream re-initialisation failed — retrying with backoff",
                 );
                 None
             }
@@ -625,6 +645,73 @@ mod tests {
         assert_eq!(state.assets, before.assets);
         assert_eq!(state.instruments, before.instruments);
         assert_eq!(state.trading, before.trading);
+    }
+
+    /// A failed re-init and an ended stream report on the account link without showing it is
+    /// up, so neither marks it Healthy or changes account state. The next event from a live
+    /// stream marks it Healthy.
+    #[test]
+    fn only_events_from_a_live_account_stream_mark_the_account_healthy() {
+        use crate::engine::state::{
+            connectivity::Health, global::DefaultGlobalData,
+            instrument::data::DefaultInstrumentMarketData,
+        };
+        use chrono::{DateTime, Utc};
+        use rustrade_execution::{
+            FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope,
+            error::{
+                AccountReinitFailure, AccountStreamInitError, ClientError, ConnectivityError,
+                StreamTerminationReason,
+            },
+        };
+
+        let instruments = IndexedInstruments::new([test_instrument(EXECUTION, "btc", "usdt")]);
+        let mut state: EngineState<DefaultGlobalData, DefaultInstrumentMarketData> =
+            EngineState::builder(&instruments, DefaultGlobalData, |_| {
+                DefaultInstrumentMarketData::default()
+            })
+            .build();
+        let exchange = ExchangeIndex::new(0);
+        let account_health =
+            |state: &EngineState<_, _>| state.connectivity.connectivity_index(&exchange).account();
+        assert_eq!(account_health(&state), Health::Reconnecting);
+        let before = state.clone();
+
+        let reinit_failed = AccountEvent::new(
+            exchange,
+            AccountEventKind::ReinitFailed(AccountReinitFailure::new(
+                1,
+                AccountStreamInitError::Client(ClientError::Connectivity(
+                    ConnectivityError::Timeout,
+                )),
+            )),
+        );
+        let terminated = AccountEvent::new(
+            exchange,
+            AccountEventKind::StreamTerminated(StreamTerminationReason::Error(
+                "socket closed".to_owned(),
+            )),
+        );
+        for event in [&reinit_failed, &terminated] {
+            assert_eq!(state.update_from_account(event), None);
+            assert_eq!(account_health(&state), Health::Reconnecting, "{event:?}");
+        }
+        assert_eq!(state.assets, before.assets);
+        assert_eq!(state.instruments, before.instruments);
+        assert_eq!(state.trading, before.trading);
+
+        let from_live_stream = AccountEvent::new(
+            exchange,
+            AccountEventKind::FillRecoveryGaveUp(FillRecoveryGap::new(
+                FillRecoveryScope::AllInstruments,
+                DateTime::<Utc>::MIN_UTC,
+                DateTime::<Utc>::MAX_UTC,
+                1,
+                FillRecoveryFailure::TimedOut { timeout_secs: 30 },
+            )),
+        );
+        assert_eq!(state.update_from_account(&from_live_stream), None);
+        assert_eq!(account_health(&state), Health::Healthy);
     }
 
     /// A trade amendment is reported, not acted on: no position exits and the account state is

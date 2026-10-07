@@ -8,16 +8,16 @@ use crate::{
         reconnect,
         reconnect::stream::{
             ReconnectingStream, ReconnectionBackoffPolicy, ReinitFailure, init_reconnecting_stream,
-            terminate_on_error, with_trailing_reconnecting,
+            terminate_on_error,
         },
     },
     subscription::{Subscription, SubscriptionKind, display_subscriptions_without_exchange},
 };
 use derive_more::Constructor;
-use futures::{Stream, StreamExt, future::Either, stream};
+use futures::{Stream, StreamExt};
 use rustrade_instrument::exchange::ExchangeId;
 use serde::{Deserialize, Serialize};
-use std::{fmt::Display, future};
+use std::fmt::Display;
 use tracing::info;
 
 /// Default [`ReconnectionBackoffPolicy`] for a [`reconnecting`](`ReconnectingStream`) [`MarketStream`].
@@ -114,19 +114,15 @@ where
 {
     attempts
         .with_reconnect_backoff_reporting(policy, stream_key)
-        .map(move |initialised| match initialised {
-            Ok(stream) => Either::Left(with_trailing_reconnecting(
-                terminate_on_error(stream, DataError::is_terminal, stream_key),
-                exchange,
-            )),
-            Err(ReinitFailure { attempt, error }) => Either::Right(stream::once(future::ready(
-                reconnect::Event::Item(Err(DataError::ReinitFailed {
-                    attempt,
-                    error: Box::new(error),
-                })),
-            ))),
+        .map(move |initialised| {
+            initialised.map(|stream| terminate_on_error(stream, DataError::is_terminal, stream_key))
         })
-        .flatten()
+        .with_reconnection_events_reporting(exchange, |ReinitFailure { attempt, error }| {
+            Err(DataError::ReinitFailed {
+                attempt,
+                error: Box::new(error),
+            })
+        })
 }
 
 #[derive(
@@ -158,6 +154,7 @@ impl std::fmt::Debug for StreamKey {
 mod tests {
     use super::*;
     use crate::streams::reconnect::Event;
+    use futures::stream;
 
     const POLICY: ReconnectionBackoffPolicy = ReconnectionBackoffPolicy {
         backoff_ms_initial: 1,
