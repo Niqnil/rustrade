@@ -236,6 +236,17 @@ impl KnownLiveOrders {
         }
     }
 
+    /// Record that a new order is about to be placed under `cid`, which names no live order: forget
+    /// that an earlier order under it ended, so that this one is held as live once placed.
+    ///
+    /// Call it before sending the order, so that the new order's own end, which may be reported
+    /// before the response to placing it, is remembered over it.
+    // Only IBKR lets a client order id name a new order once its last one has ended.
+    #[cfg_attr(not(feature = "ibkr"), allow(dead_code))]
+    pub(crate) fn placing(&mut self, cid: &ClientOrderId) {
+        self.recently_ended.pop(cid);
+    }
+
     /// Record that the order `cid` has ended. Returns whether it was held as live.
     pub(crate) fn ended(&mut self, cid: &ClientOrderId) -> bool {
         self.recently_ended.put(cid.clone(), ());
@@ -964,6 +975,22 @@ mod tests {
             order_filled,
             AssetFees::new(AssetNameExchange::new("usdt"), Decimal::ZERO, None),
         )))
+    }
+
+    /// An id whose order ended is not held again by a late report of it as live, but a new order
+    /// placed under it is.
+    #[test]
+    fn a_new_order_under_an_ended_id_is_held_once_placing_it() {
+        let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
+        let reused = key("BTCUSDT", "reused");
+        known.ended(&reused.cid);
+        known.live(&reused, dec!(2), &open("1", Decimal::ZERO));
+        assert!(!known.contains(&reused.cid));
+
+        known.placing(&reused.cid);
+        known.live(&reused, dec!(2), &open("2", Decimal::ZERO));
+        assert!(known.contains(&reused.cid));
+        known.assert_consistent();
     }
 
     #[test]

@@ -151,7 +151,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `fetch_open_orders` and `account_snapshot` list an order this client does not track, such
     as one placed before a restart, under the id it was placed with, and track it from then on:
     its fills and status reach the account stream, and it can be cancelled. An order without a
-    reference, such as one entered in TWS, is still listed under its IB order id.
+    reference, such as one placed by an earlier version, is still listed under its IB order id,
+    and so is one whose reference names another order this client tracks.
   - `account_snapshot` returns each instrument's open orders of this API client, from one
     listing of the account's open orders. An instrument's `orders_complete` is `true` when IB
     listed every open order and each of the instrument's was read back under the id it was
@@ -172,8 +173,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the order under six days ago, otherwise unknown (`None`). IB lists a placement it accepted
     and then rejected as `Cancelled`, saying so in its completion text; it is `OpenFailed`, and
     so is an `Inactive` order. An order on another instrument than the key's, or none under the
-    id, is omitted. When several completed orders carry one id, the one that completed last is
-    reported.
+    id, is omitted. IB lists orders completed before a Gateway restart under API client id 0, so
+    those count as this client's: client order ids must be unique across the API clients on an
+    account. When several completed orders carry one id, the one that completed last is
+    reported, and one that completed before this client began tracking the order now under the
+    id is taken as an earlier order's.
   - IB answers every open-orders and completed-orders request with every listing in flight, so
     the client and its clones now read these listings one at a time. Two `fetch_open_orders`
     calls at once could each stop at the other's end of the listing.

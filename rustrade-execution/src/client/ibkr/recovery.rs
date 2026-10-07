@@ -33,7 +33,7 @@ use super::{
     ListingLock,
     ended_orders::{EndedOrderReader, release_ended},
     execution::{ExecutionBuffer, ExecutionRevision, revision_of},
-    open_orders_from_listing,
+    listed_cids,
     order::{OrderIdMap, PendingCancels},
     resolve_execution,
 };
@@ -713,7 +713,11 @@ impl RecoveryWatcher {
     /// completed orders of each held order it no longer shows.
     ///
     /// Runs on this thread: each listing and lookup is a blocking read, so the futures the check
-    /// awaits are ready at once.
+    /// awaits are ready at once, and the check's time budget
+    /// ([`ORDER_CHECK_TIMEOUT_SECS`](crate::client::order_recovery::ORDER_CHECK_TIMEOUT_SECS)),
+    /// checked between them, cannot cut one short. Each read is bounded instead by the listing's
+    /// stall timeout, and a check makes at most three: the open orders, the completed orders and
+    /// the executions, each once. Notices that arrive meanwhile are read once it returns.
     fn check_orders(&self, unchecked: &mut UncheckedOrders) {
         let reader = EndedOrderReader::new(
             &self.client,
@@ -745,15 +749,11 @@ impl RecoveryWatcher {
     /// The client order ids of this API client's open orders, as IB lists them.
     fn listed_cids(&self) -> Result<FnvHashSet<ClientOrderId>, UnindexedClientError> {
         let listing = self.listings.open_orders(&self.client)?;
-        Ok(open_orders_from_listing(
+        Ok(listed_cids(
             listing,
             self.client.client_id(),
-            &self.contracts,
             &self.order_ids,
-        )
-        .into_iter()
-        .filter_map(|listed| listed.order.map(|order| order.key.cid))
-        .collect())
+        ))
     }
 }
 

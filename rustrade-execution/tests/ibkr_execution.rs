@@ -1625,6 +1625,26 @@ fn resolved_aapl_config(client_id_offset: i32) -> IbkrConfig {
     }
 }
 
+/// How the order under `key` ended, once IB lists it completed.
+async fn ended_eventually(
+    client: &IbkrClient,
+    key: rustrade_execution::order::UnindexedOrderKey,
+) -> rustrade_execution::order::UnindexedInactiveOrder {
+    for _ in 0..20 {
+        let mut ended = client
+            .fetch_ended_orders(std::slice::from_ref(&key))
+            .await
+            .expect("fetch_ended_orders failed");
+        if let Some(order) = ended.pop() {
+            println!("Ended: {order:?}");
+            assert!(ended.is_empty());
+            return order;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    panic!("{} never listed completed", key.cid);
+}
+
 /// An order carries its client order id to IB, so the account snapshot lists it under that id, a
 /// new client under the same API client id finds it after a restart and can cancel it, and
 /// `fetch_ended_orders` reports how it ended. A client order id IB would reject is refused before
@@ -1715,6 +1735,63 @@ async fn test_orders_found_by_client_order_id_across_a_restart() {
     );
     assert!(entry.orders_complete, "{entry:?}");
 
+    // An order this client placed and cancelled ended with nothing filled: no execution of it in
+    // a read that covers its whole life.
+    let placed_here = ClientOrderId::new(format!(
+        "restart-here-{}",
+        chrono::Utc::now().timestamp_millis()
+    ));
+    let order = client
+        .open_order(rustrade_execution::order::OrderEvent {
+            key: OrderKey {
+                exchange: ExchangeId::Ibkr,
+                instrument: &aapl,
+                strategy: strategy.clone(),
+                cid: placed_here.clone(),
+            },
+            state: RequestOpen {
+                side: Side::Buy,
+                price: Some(dec!(1.00)),
+                quantity: dec!(1),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                position_id: None,
+                reduce_only: false,
+                market: None,
+            },
+        })
+        .await;
+    assert!(
+        matches!(order.state, OrderState::Active(ActiveOrderState::Open(_))),
+        "{order:?}"
+    );
+    let cancelled = client
+        .cancel_order(rustrade_execution::order::OrderEvent {
+            key: OrderKey {
+                exchange: ExchangeId::Ibkr,
+                instrument: &aapl,
+                strategy: strategy.clone(),
+                cid: placed_here.clone(),
+            },
+            state: rustrade_execution::order::request::RequestCancel { id: None },
+        })
+        .await;
+    assert!(cancelled.state.is_ok(), "{cancelled:?}");
+    let ended = ended_eventually(
+        &client,
+        OrderKey {
+            exchange: ExchangeId::Ibkr,
+            instrument: aapl.clone(),
+            strategy: strategy.clone(),
+            cid: placed_here,
+        },
+    )
+    .await;
+    let InactiveOrderState::Cancelled(cancelled) = &ended.state else {
+        panic!("not cancelled: {:?}", ended.state);
+    };
+    assert_eq!(cancelled.filled_quantity, Some(rust_decimal::Decimal::ZERO));
+
     // A restart: a new client under the same API client id, which has never seen the order. The
     // socket closes only when the last handle to the client goes, and IB then takes a moment to
     // release the id.
@@ -1778,24 +1855,14 @@ async fn test_orders_found_by_client_order_id_across_a_restart() {
         strategy,
         cid: cid.clone(),
     };
-    let mut ended = Vec::new();
-    for _ in 0..20 {
-        ended = restarted
-            .fetch_ended_orders(std::slice::from_ref(&key))
-            .await
-            .expect("fetch_ended_orders failed");
-        if !ended.is_empty() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    println!("Ended: {ended:?}");
-    assert_eq!(ended.len(), 1, "{ended:?}");
-    assert_eq!(ended[0].key, key);
-    let InactiveOrderState::Cancelled(cancelled) = &ended[0].state else {
-        panic!("not cancelled: {:?}", ended[0].state);
+    let ended = ended_eventually(&restarted, key.clone()).await;
+    assert_eq!(ended.key, key);
+    let InactiveOrderState::Cancelled(cancelled) = &ended.state else {
+        panic!("not cancelled: {:?}", ended.state);
     };
-    assert_eq!(cancelled.filled_quantity, Some(rust_decimal::Decimal::ZERO));
+    // Adopted, so when it was placed, and so whether the executions read covers its life, is
+    // unknown.
+    assert_eq!(cancelled.filled_quantity, None);
 
     let unknown = OrderKey {
         cid: ClientOrderId::new("never-placed"),

@@ -3,7 +3,7 @@ use crate::order::{
     id::{ClientOrderId, StrategyId},
     state::UnindexedOrderState,
 };
-use fnv::FnvHashMap;
+use fnv::{FnvHashMap, FnvHashSet};
 use ibapi::orders::{
     Action, OcaType, Order, TimeInForce as IbTimeInForce, builder::BracketPrices, order_builder,
 };
@@ -126,6 +126,15 @@ pub struct OrderIdMap {
     inner: Arc<RwLock<OrderIdMapInner>>,
 }
 
+/// When and how an order came to be tracked by an [`OrderIdMap`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Registration {
+    /// How long ago it was registered or adopted.
+    pub(crate) age: std::time::Duration,
+    /// Whether it was adopted from a listing rather than placed through this client.
+    pub(crate) adopted: bool,
+}
+
 /// [`OrderIdMap::register`] refused an id because a live order already holds it.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("client order id {0} already names a live IBKR order")]
@@ -140,14 +149,40 @@ struct OrderIdMapInner {
     ///
     /// Holds the live orders and the filled ones not yet reaped, which no longer hold their id.
     ib_to_entry: FnvHashMap<i32, (ClientOrderId, OrderContext, Instant)>,
+    /// The IB order ids of the entries adopted from a listing ([`OrderIdMap::adopt`]) rather than
+    /// placed through this client, whose registration time says nothing of when they were placed.
+    adopted: FnvHashSet<i32>,
 }
 
 impl OrderIdMapInner {
     /// Removes `ib_id`'s entry, and its id's mapping if that still names `ib_id`.
     fn remove(&mut self, ib_id: i32) -> Option<(ClientOrderId, OrderContext)> {
         let (client_id, ctx, _) = self.ib_to_entry.remove(&ib_id)?;
+        self.adopted.remove(&ib_id);
         self.release(&client_id, ib_id);
         Some((client_id, ctx))
+    }
+
+    /// Whether `client_id` is held by a live order, or named twice among `orders`: the refusal
+    /// [`OrderIdMap::register_all`] and [`OrderIdMap::adopt`] make.
+    fn in_use<'a>(
+        &self,
+        mut orders: impl Iterator<Item = &'a ClientOrderId>,
+        client_id: &ClientOrderId,
+    ) -> bool {
+        orders.any(|earlier| earlier == client_id) || self.cid_to_ib.contains_key(client_id)
+    }
+
+    fn insert(
+        &mut self,
+        client_id: ClientOrderId,
+        ib_id: i32,
+        context: OrderContext,
+        now: Instant,
+    ) {
+        self.adopted.remove(&ib_id);
+        self.cid_to_ib.insert(client_id.clone(), ib_id);
+        self.ib_to_entry.insert(ib_id, (client_id, context, now));
     }
 
     /// Frees `client_id` if it still names `ib_id`, rather than a later order under the same id.
@@ -189,18 +224,38 @@ impl OrderIdMap {
     ) -> Result<(), ClientOrderIdInUse> {
         let mut inner = self.inner.write();
         for (index, (client_id, _, _)) in orders.iter().enumerate() {
-            let repeated = orders[..index]
-                .iter()
-                .any(|(earlier, _, _)| earlier == client_id);
-            if repeated || inner.cid_to_ib.contains_key(client_id) {
+            if inner.in_use(
+                orders[..index].iter().map(|(earlier, _, _)| earlier),
+                client_id,
+            ) {
                 return Err(ClientOrderIdInUse(client_id.clone()));
             }
         }
         let now = Instant::now();
         for (client_id, ib_id, context) in orders {
-            inner.cid_to_ib.insert(client_id.clone(), ib_id);
-            inner.ib_to_entry.insert(ib_id, (client_id, context, now));
+            inner.insert(client_id, ib_id, context, now);
         }
+        Ok(())
+    }
+
+    /// Track an order this client did not place, found in IB's listing under `client_id`, the id
+    /// its order reference carries: one placed before a restart, say. Its
+    /// [`registration`](Self::registration) says it was adopted.
+    ///
+    /// # Errors
+    /// [`ClientOrderIdInUse`] if a live order already holds `client_id`. Nothing is tracked.
+    pub(crate) fn adopt(
+        &self,
+        client_id: ClientOrderId,
+        ib_id: i32,
+        context: OrderContext,
+    ) -> Result<(), ClientOrderIdInUse> {
+        let mut inner = self.inner.write();
+        if inner.in_use(std::iter::empty(), &client_id) {
+            return Err(ClientOrderIdInUse(client_id));
+        }
+        inner.insert(client_id, ib_id, context, Instant::now());
+        inner.adopted.insert(ib_id);
         Ok(())
     }
 
@@ -209,14 +264,20 @@ impl OrderIdMap {
         self.inner.read().cid_to_ib.get(client_id).copied()
     }
 
-    /// How long ago the live order under `client_id` was registered.
-    pub fn age_of(&self, client_id: &ClientOrderId) -> Option<std::time::Duration> {
+    /// How long ago the live order under `client_id` came to be tracked here, and whether it was
+    /// [adopted](Self::adopt) from a listing rather than placed through this client. A placed
+    /// order is registered just before it is sent, so its age is how long ago it was placed; an
+    /// adopted one's says only that it was open by then.
+    ///
+    /// `None` when no live order holds `client_id`.
+    pub(crate) fn registration(&self, client_id: &ClientOrderId) -> Option<Registration> {
         let inner = self.inner.read();
         let ib_id = inner.cid_to_ib.get(client_id)?;
-        inner
-            .ib_to_entry
-            .get(ib_id)
-            .map(|(_, _, registered_at)| registered_at.elapsed())
+        let (_, _, registered_at) = inner.ib_to_entry.get(ib_id)?;
+        Some(Registration {
+            age: registered_at.elapsed(),
+            adopted: inner.adopted.contains(ib_id),
+        })
     }
 
     /// Whether IB order `ib_id` has an entry: a live order, or a filled one not yet reaped.
@@ -369,9 +430,9 @@ impl PendingCancels {
         self.inner.lock().remove(&ib_id).is_some()
     }
 
-    /// Whether a cancel of IB order `ib_id` was requested through this client and not yet seen
-    /// to end the order.
-    pub fn contains(&self, ib_id: i32) -> bool {
+    /// Whether a cancel of IB order `ib_id` was requested through this client and is still
+    /// tracked: not yet seen to end the order, nor cleared as stale.
+    pub(crate) fn contains(&self, ib_id: i32) -> bool {
         self.inner.lock().contains_key(&ib_id)
     }
 
@@ -550,6 +611,7 @@ fn parse_gtd_datetime(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 }
 
 /// Error when mapping rustrade order types to IB.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrderMappingError {
     PostOnlyNotSupported,

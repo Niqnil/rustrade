@@ -10,7 +10,7 @@
 use super::{
     LISTING_STALL_TIMEOUT, ListingLock, cancelled_at_expiry,
     execution::{self, ExecutionRevision, try_decimal_or_warn},
-    order::{self, OrderContext, OrderIdMap, PendingCancels},
+    order::{self, OrderContext, OrderIdMap, PendingCancels, Registration},
     read_listing,
 };
 use crate::{
@@ -43,6 +43,10 @@ const EXECUTION_DAYS: i32 = 7;
 /// the read, since IB counts its days in a time zone of its own.
 const EXECUTIONS_COVER: Duration = Duration::from_secs(6 * 24 * 60 * 60);
 
+/// How far IB's clock, which stamps an order's completion to the second, and this host's may be
+/// apart, when a completion is compared with when this client began tracking the order.
+const COMPLETION_CLOCK_SLACK: chrono::Duration = chrono::Duration::seconds(5);
+
 /// How IB's completion text starts for an order it rejected after accepting it, such as a
 /// good-till-date order whose expiry has passed, which it lists as `Cancelled`.
 const REJECTED_PREFIX: &str = "Rejected";
@@ -66,33 +70,36 @@ pub(super) struct CompletedOrder {
 pub(super) struct CompletedOrders(FnvHashMap<SmolStr, CompletedOrder>);
 
 impl CompletedOrders {
-    pub(super) fn from_listing(
-        listing: impl IntoIterator<Item = Orders>,
-        api_client_id: i32,
-    ) -> Self {
-        let mut orders: FnvHashMap<SmolStr, CompletedOrder> = FnvHashMap::default();
+    #[cfg(test)]
+    fn from_listing(listing: impl IntoIterator<Item = Orders>, api_client_id: i32) -> Self {
+        let mut orders = Self::default();
         for item in listing {
-            let Orders::OrderData(data) = item else {
-                continue;
-            };
-            let client_id = data.order.client_id;
-            if (client_id != api_client_id && client_id != 0) || data.order.order_ref.is_empty() {
-                continue;
-            }
-            let order = CompletedOrder {
-                time: execution::parse_ib_timestamp(&data.order_state.completed_time),
-                data,
-            };
-            let order_ref = SmolStr::new(&order.data.order.order_ref);
-            match orders.get(&order_ref) {
-                // Listed in completion order, so a later one with no time is taken as later.
-                Some(kept) if kept.time > order.time && order.time.is_some() => {}
-                _ => {
-                    orders.insert(order_ref, order);
-                }
+            orders.push(item, api_client_id);
+        }
+        orders
+    }
+
+    /// Take in one item of the listing, as IB sends it.
+    pub(super) fn push(&mut self, item: Orders, api_client_id: i32) {
+        let Orders::OrderData(data) = item else {
+            return;
+        };
+        let client_id = data.order.client_id;
+        if (client_id != api_client_id && client_id != 0) || data.order.order_ref.is_empty() {
+            return;
+        }
+        let order = CompletedOrder {
+            time: execution::parse_ib_timestamp(&data.order_state.completed_time),
+            data,
+        };
+        match self.0.get(order.data.order.order_ref.as_str()) {
+            // Listed in completion order, so a later one with no time is taken as later.
+            Some(kept) if kept.time > order.time && order.time.is_some() => {}
+            _ => {
+                self.0
+                    .insert(SmolStr::new(&order.data.order.order_ref), order);
             }
         }
-        Self(orders)
     }
 
     fn get(&self, cid: &ClientOrderId) -> Option<&CompletedOrder> {
@@ -110,43 +117,52 @@ impl CompletedOrders {
 pub(super) struct ExecutedQuantities(FnvHashMap<SmolStr, FnvHashMap<SmolStr, (u32, Decimal)>>);
 
 impl ExecutedQuantities {
-    pub(super) fn from_executions(
+    #[cfg(test)]
+    fn from_executions(
         executions: impl IntoIterator<Item = Executions>,
         api_client_id: i32,
     ) -> Self {
-        let mut by_order: FnvHashMap<SmolStr, FnvHashMap<SmolStr, (u32, Decimal)>> =
-            FnvHashMap::default();
+        let mut executed = Self::default();
         for item in executions {
-            let Executions::ExecutionData(data) = item else {
-                continue;
-            };
-            let execution = &data.execution;
-            if (execution.client_id != api_client_id && execution.client_id != 0)
-                || execution.order_reference.is_empty()
-            {
-                continue;
-            }
-            let Some(shares) = try_decimal_or_warn(
-                execution.shares,
-                format_args!("shares of execution {}", execution.execution_id),
-            ) else {
-                continue;
-            };
-            let (id, revision) = ExecutionRevision::parse(&execution.execution_id)
-                .map_or((execution.execution_id.as_str(), 0), |revision| {
-                    (revision.execution, revision.revision)
-                });
-            let revisions = by_order
+            executed.push(item, api_client_id);
+        }
+        executed
+    }
+
+    /// Take in one item of the executions read, as IB sends it.
+    pub(super) fn push(&mut self, item: Executions, api_client_id: i32) {
+        let Executions::ExecutionData(data) = item else {
+            return;
+        };
+        let execution = &data.execution;
+        if (execution.client_id != api_client_id && execution.client_id != 0)
+            || execution.order_reference.is_empty()
+        {
+            return;
+        }
+        let Some(shares) = try_decimal_or_warn(
+            execution.shares,
+            format_args!("shares of execution {}", execution.execution_id),
+        ) else {
+            return;
+        };
+        let (id, revision) = ExecutionRevision::parse(&execution.execution_id)
+            .map_or((execution.execution_id.as_str(), 0), |revision| {
+                (revision.execution, revision.revision)
+            });
+        let revisions = match self.0.get_mut(execution.order_reference.as_str()) {
+            Some(revisions) => revisions,
+            None => self
+                .0
                 .entry(SmolStr::new(&execution.order_reference))
-                .or_default();
-            match revisions.get(id) {
-                Some((kept, _)) if *kept >= revision => {}
-                _ => {
-                    revisions.insert(SmolStr::new(id), (revision, shares));
-                }
+                .or_default(),
+        };
+        match revisions.get(id) {
+            Some((kept, _)) if *kept >= revision => {}
+            _ => {
+                revisions.insert(SmolStr::new(id), (revision, shares));
             }
         }
-        Self(by_order)
     }
 
     /// How much of the order under `cid` the executions show filled, or `None` when they show
@@ -163,8 +179,8 @@ impl ExecutedQuantities {
 pub(super) struct Tracked {
     ib_id: i32,
     context: OrderContext,
-    /// How long ago it was placed.
-    age: Duration,
+    /// When and how it came to be tracked.
+    registration: Registration,
     /// Whether a cancel of it was requested through this client.
     cancel_requested: bool,
 }
@@ -181,7 +197,7 @@ impl Tracked {
         Some(Self {
             ib_id,
             context,
-            age: order_ids.age_of(cid)?,
+            registration: order_ids.registration(cid)?,
             cancel_requested: pending_cancels.contains(ib_id),
         })
     }
@@ -201,11 +217,14 @@ impl Tracked {
 /// [`Expired`](InactiveOrderState::Expired) or [`Cancelled`](InactiveOrderState::Cancelled) by the
 /// rule the account stream applies (see [`cancelled_at_expiry`]), with its fill: what the
 /// executions show, or nothing when they show none of it and cover the order's whole life, which
-/// they do for an order this client placed under [`EXECUTIONS_COVER`] ago; otherwise `None`. An
-/// `Inactive` order is `OpenFailed`.
+/// they do for an order this client placed under [`EXECUTIONS_COVER`] ago, not one it adopted
+/// from a listing, whose placement it does not know; otherwise `None`. An `Inactive` order is
+/// `OpenFailed`.
 ///
-/// The order is not ended ([`OrderLookup::NotEnded`]) when IB lists another status, or a shape
-/// this client never sends for an order it does not track.
+/// The order is not ended ([`OrderLookup::NotEnded`]) when IB lists another status, a shape this
+/// client never sends for an order it does not track, or a completion from before this client
+/// tracked the order under its id, give or take [`COMPLETION_CLOCK_SLACK`]: that one is an earlier
+/// order's, under an id since reused.
 ///
 /// The ended order carries the IB order id when this client tracks the order, and otherwise IB's
 /// permanent id for it, since IB lists a completed order without its API order id.
@@ -217,6 +236,19 @@ pub(super) fn ended_order<E>(
 ) -> Result<OrderLookup, E> {
     let data = &completed.data;
     let tracked = tracked.filter(|tracked| tracked.context.instrument == key.instrument);
+    // A completion from before this client tracked the order under its id is an earlier
+    // order's, whose id has since been reused: the order asked about has not ended as it says.
+    if let (Some(tracked), Some(completed_at)) = (tracked, completed.time)
+        && let Ok(age) = chrono::Duration::from_std(tracked.registration.age)
+        && completed_at + COMPLETION_CLOCK_SLACK < Utc::now() - age
+    {
+        debug!(
+            cid = %key.cid,
+            %completed_at,
+            "Completed IBKR order predates the order now under its client order id"
+        );
+        return Ok(OrderLookup::NotEnded);
+    }
     let context = match tracked {
         Some(tracked) => tracked.context.clone(),
         None => match order::order_shape_from_ib(&data.order) {
@@ -276,7 +308,9 @@ pub(super) fn ended_order<E>(
             let filled = match executed()? {
                 Some(filled) => Some(filled),
                 None => tracked
-                    .is_some_and(|tracked| tracked.age < EXECUTIONS_COVER)
+                    .is_some_and(|tracked| {
+                        !tracked.registration.adopted && tracked.registration.age < EXECUTIONS_COVER
+                    })
                     .then_some(Decimal::ZERO),
             };
             let cancel_requested = tracked.is_some_and(|tracked| tracked.cancel_requested);
@@ -356,8 +390,10 @@ impl<'a> EndedOrderReader<'a> {
         let completed = match self.completed.get() {
             Some(completed) => completed,
             None => {
-                let listing = self.listings.completed_orders(self.client)?;
-                let completed = CompletedOrders::from_listing(listing, self.client.client_id());
+                let api_client_id = self.client.client_id();
+                let mut completed = CompletedOrders::default();
+                self.listings
+                    .completed_orders(self.client, |item| completed.push(item, api_client_id))?;
                 self.completed.get_or_init(|| completed)
             }
         };
@@ -389,18 +425,18 @@ impl<'a> EndedOrderReader<'a> {
                 ..ExecutionFilter::default()
             })
             .map_err(|e| UnindexedClientError::Internal(format!("executions: {e}")))?;
-        let mut executions = Vec::new();
+        let api_client_id = self.client.client_id();
+        let mut executed = ExecutedQuantities::default();
         read_listing(
             "executions",
             LISTING_STALL_TIMEOUT,
             || self.client.is_connected(),
             |timeout| subscription.next_timeout(timeout),
             |item| {
-                executions.push(item);
+                executed.push(item, api_client_id);
                 ControlFlow::Continue(())
             },
         )?;
-        let executed = ExecutedQuantities::from_executions(executions, self.client.client_id());
         Ok(self.executed.get_or_init(|| executed))
     }
 }
@@ -497,7 +533,10 @@ mod tests {
                 kind: OrderKind::Limit,
                 time_in_force,
             },
-            age: Duration::from_secs(age_days * 24 * 60 * 60),
+            registration: Registration {
+                age: Duration::from_secs(age_days * 24 * 60 * 60),
+                adopted: false,
+            },
             cancel_requested,
         }
     }
@@ -672,6 +711,73 @@ mod tests {
         assert_eq!(filled(Some(&old), None), None);
         assert_eq!(filled(None, None), None);
         assert_eq!(filled(None, Some(dec!(2))), Some(dec!(2)));
+    }
+
+    /// An adopted order's placement is unknown, so finding none of its executions says nothing
+    /// of its fill.
+    #[test]
+    fn an_adopted_orders_fill_without_executions_is_unknown() {
+        let order = one(completed(
+            API_CLIENT,
+            "a",
+            OrderStatusKind::Cancelled,
+            "",
+            "",
+        ));
+        let mut adopted = tracked(1, GTC, false);
+        adopted.registration.adopted = true;
+        let found =
+            ended(ended_order(&key("a"), &order, Some(&adopted), || Ok::<_, ()>(None)).unwrap());
+        let InactiveOrderState::Cancelled(cancelled) = found.state else {
+            panic!("{:?}", found.state)
+        };
+        assert_eq!(cancelled.filled_quantity, None);
+    }
+
+    /// A completion from before the tracked order under its id was placed is an earlier order's,
+    /// so the tracked one has not ended; one from after it has.
+    #[test]
+    fn a_completion_older_than_the_tracked_order_is_an_earlier_orders() {
+        let at = |ago: chrono::Duration| {
+            let time = Utc::now() - ago;
+            one(completed(
+                API_CLIENT,
+                "a",
+                OrderStatusKind::Cancelled,
+                &time.format("%Y%m%d %H:%M:%S UTC").to_string(),
+                "",
+            ))
+        };
+        let placed_an_hour_ago = Tracked {
+            registration: Registration {
+                age: Duration::from_secs(60 * 60),
+                adopted: false,
+            },
+            ..tracked(0, GTC, false)
+        };
+
+        let earlier = at(chrono::Duration::hours(2));
+        assert!(matches!(
+            ended_order(
+                &key("a"),
+                &earlier,
+                Some(&placed_an_hour_ago),
+                || Ok::<_, ()>(None)
+            )
+            .unwrap(),
+            OrderLookup::NotEnded
+        ));
+        let later = at(chrono::Duration::minutes(30));
+        assert!(matches!(
+            ended_order(
+                &key("a"),
+                &later,
+                Some(&placed_an_hour_ago),
+                || Ok::<_, ()>(None)
+            )
+            .unwrap(),
+            OrderLookup::Ended(_)
+        ));
     }
 
     /// A cancelled day order that this client did not ask to cancel expired, as the account

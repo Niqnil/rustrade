@@ -513,26 +513,27 @@ impl ListingLock {
     ///
     /// # Errors
     /// As [`read_listing`].
+    /// Each item is handed to `on_item` as it arrives, since the listing can be long and only a
+    /// few of its orders are wanted.
     fn completed_orders(
         &self,
         client: &Client,
-    ) -> Result<Vec<ibapi::orders::Orders>, UnindexedClientError> {
+        mut on_item: impl FnMut(ibapi::orders::Orders),
+    ) -> Result<(), UnindexedClientError> {
         let _serial = self.0.lock();
         let subscription = client
             .completed_orders(false)
             .map_err(|e| UnindexedClientError::Internal(format!("completed_orders: {e}")))?;
-        let mut listing = Vec::new();
         read_listing(
             "completed_orders",
             LISTING_STALL_TIMEOUT,
             || client.is_connected(),
             |timeout| subscription.next_timeout(timeout),
             |item| {
-                listing.push(item);
+                on_item(item);
                 ControlFlow::Continue(())
             },
-        )?;
-        Ok(listing)
+        )
     }
 }
 
@@ -1391,6 +1392,12 @@ impl IbkrClient {
                 OrderError::Rejected(ApiError::DuplicateClientOrderId(in_use.to_string())),
             );
         }
+        {
+            let mut known = self.known_live.lock();
+            for cid in [&parent_cid, &tp_cid, &sl_cid] {
+                known.placing(cid);
+            }
+        }
 
         // Place all three orders in spawn_blocking
         let client = self.client.clone();
@@ -1936,10 +1943,13 @@ impl ExecutionClient for IbkrClient {
     ///
     /// `orders_complete` is `true` when IB listed every open order to the end of the listing and
     /// each of the instrument's was read back under the client order id it was placed with and
-    /// with its status. So it is `false` on an instrument with an order entered in TWS, which
-    /// carries no client order id and is listed under its IB order id, an order whose shape this
-    /// client never sends, or one IB listed without its status. When the listing cannot be read,
-    /// no instrument's orders are complete, with a warning, and the snapshot is still returned.
+    /// with its status. So it is `false` on an instrument with an order of this API client's
+    /// that carries no client order id, which is listed under its IB order id: one placed by an
+    /// earlier version of this client, or, for a client connected as 0, one entered in TWS. So it
+    /// is too with an order whose shape this client never sends, one IB listed without its
+    /// status, or one whose client order id names another order this client tracks. When the
+    /// listing cannot be read, no instrument's orders are complete, with a warning, and the
+    /// snapshot is still returned.
     ///
     /// # Errors
     ///
@@ -2119,7 +2129,7 @@ impl ExecutionClient for IbkrClient {
     /// # Thread Lifecycle
     ///
     /// Spawns two background threads: `ibkr-order-stream` reads the blocking IB
-    /// subscription, and `ibkr-fill-recovery` watches for gaps in event delivery
+    /// subscription, and `ibkr-recovery` watches for gaps in event delivery
     /// (see below). The watcher exits within about a second of the returned
     /// `BoxStream` being dropped or the stream ending, or once the recovery or
     /// order check in progress then ends. The reader exits when:
@@ -2165,7 +2175,13 @@ impl ExecutionClient for IbkrClient {
     /// while connected, then given up with an error log: an order that ended
     /// then stays live in engine state until the next gap's check, so reconcile
     /// with `fetch_open_orders`. The client holds at most 4,096 orders as live,
-    /// forgetting the oldest beyond that.
+    /// forgetting the oldest beyond that. The check reads IB's listings on the
+    /// recovery thread, each bounded by a 10-second stall timeout, and the thread
+    /// reads notices again once it ends.
+    ///
+    /// Call this within a Tokio runtime with its time driver enabled, as
+    /// `#[tokio::main]` and `Runtime::new` build: the recovery thread runs the
+    /// order check on the runtime this was called on.
     ///
     /// While TWS reports its link to IB's servers lost (1100), nothing marks the
     /// gap on this stream until the link is restored and the recovered fills
@@ -2264,15 +2280,15 @@ impl ExecutionClient for IbkrClient {
         };
         let watcher_sink = sink.clone();
         std::thread::Builder::new()
-            .name("ibkr-fill-recovery".to_string())
+            .name("ibkr-recovery".to_string())
             .spawn(move || {
                 // Same panic policy as the reader below: a panic ends recovery, and a stream that
                 // can no longer recover must say so rather than stay open.
                 if let Err(panic_info) = catch_unwind(AssertUnwindSafe(|| watcher.run())) {
                     let msg = panic_message(panic_info.as_ref());
-                    error!("Fill recovery worker panicked: {msg}");
+                    error!("IBKR recovery worker panicked: {msg}");
                     watcher_sink.terminate(StreamTerminationReason::Error(format!(
-                        "IBKR fill-recovery worker panicked: {msg}"
+                        "IBKR recovery worker panicked: {msg}"
                     )));
                 }
             })
@@ -2533,6 +2549,9 @@ impl ExecutionClient for IbkrClient {
                 )),
             };
         }
+        // The id names no live order, so this is a new order under it, though an earlier one
+        // under it ended.
+        self.known_live.lock().placing(&request.key.cid);
 
         let client = self.client.clone();
         let side = request.state.side;
@@ -2713,10 +2732,12 @@ impl ExecutionClient for IbkrClient {
     /// one its IB order reference carries, with those read back from IB's listing. An order
     /// this client does not track but placed under a client order id, such as one placed before
     /// a restart, is tracked from then on, so its fills and status reach the account stream and
-    /// it can be cancelled. An order without a reference, such as one entered in TWS, is
-    /// returned under its IB order id. One whose order type or time in force this client never
-    /// sends is left out, with a warning. Every order's filled quantity is the one IB reports
-    /// with it.
+    /// it can be cancelled. Every listed order of this client's is adopted so, whatever
+    /// `instruments` asks for. An order without a reference, such as one placed by an earlier
+    /// version of this client, or, for a client connected as 0, one entered in TWS, is returned
+    /// under its IB order id; so is one whose reference names another order this client tracks.
+    /// One whose order type or time in force this client never sends is left out, with a
+    /// warning. Every order's filled quantity is the one IB reports with it.
     ///
     /// Each returned order named by the id it was placed with is held as live, for the account
     /// stream's check of how it ended after a gap.
@@ -2989,9 +3010,11 @@ fn open_orders_from_listing(
 /// such as one placed before a restart, is adopted: tracked from then on under that id, so its
 /// fills and status reach the account stream and it can be cancelled.
 ///
-/// An order without a reference, such as one entered in TWS, is named by its IB order id, which
-/// is not an id it was placed with, so it is not [exact](ListedOpenOrder::is_exact). Nor is one
-/// IB listed without its status, whose fill is the order's own figure, which IB leaves zero.
+/// An order without a reference, such as one placed by an earlier version of this client, is named
+/// by its IB order id, which is not an id it was placed with, so it is not
+/// [exact](ListedOpenOrder::is_exact). So is one whose reference names another order this client
+/// tracks, under that id or its IB order id, which cannot be adopted. Nor is one IB listed without
+/// its status, whose fill is the order's own figure, which IB leaves zero.
 fn open_order_from_listing(
     data: &ibapi::orders::OrderData,
     status: Option<&ibapi::orders::OrderStatus>,
@@ -3054,11 +3077,10 @@ fn open_order_from_listing(
                 time_in_force: shape.time_in_force,
             };
             match order_ref {
-                Some(cid) => {
-                    adopt_listed_order(order_ids, &cid, ib_id, &ctx);
-                    (cid, ctx, true)
-                }
-                None => (ClientOrderId::new(format_smolstr!("{ib_id}")), ctx, false),
+                Some(cid) if adopt_listed_order(order_ids, &cid, ib_id, &ctx) => (cid, ctx, true),
+                // Not trackable under its id, which names another order here, so not reported
+                // under it either: two orders would share it.
+                Some(_) | None => (ClientOrderId::new(format_smolstr!("{ib_id}")), ctx, false),
             }
         }
     };
@@ -3142,6 +3164,33 @@ impl SnapshotOrders {
     }
 }
 
+/// The client order ids of this API client's orders in an open-orders listing, for the account
+/// stream's check of how the orders it holds as live ended: each order's reference, or else the
+/// id this client tracks it under.
+///
+/// Unlike [`open_orders_from_listing`], nothing is read back or adopted, and an order IB lists
+/// with a status that has ended is kept. IB's completed orders may not list it yet, and its end
+/// reaches the account stream as that status, so the check need not look it up.
+fn listed_cids(
+    listing: impl IntoIterator<Item = ibapi::orders::Orders>,
+    api_client_id: i32,
+    order_ids: &OrderIdMap,
+) -> fnv::FnvHashSet<ClientOrderId> {
+    listing
+        .into_iter()
+        .filter_map(|item| match item {
+            ibapi::orders::Orders::OrderData(data) if data.order.client_id == api_client_id => {
+                if data.order.order_ref.is_empty() {
+                    order_ids.get_client_id(data.order_id)
+                } else {
+                    Some(ClientOrderId::new(data.order.order_ref.as_str()))
+                }
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Hold each order of `listed` named by the client order id it was placed with as live, for the
 /// account stream's check of how it ended if the stream misses its end. One named by its IB order
 /// id could not be looked up by it once ended.
@@ -3155,28 +3204,41 @@ fn remember_listed(known: &SharedKnownLiveOrders, listed: &[ListedOpenOrder]) {
 }
 
 /// Track the listed open order `ib_id` under `cid`, the id its order reference carries, unless
-/// either already names an order here.
-fn adopt_listed_order(order_ids: &OrderIdMap, cid: &ClientOrderId, ib_id: i32, ctx: &OrderContext) {
+/// either already names an order here. Returns whether it is tracked.
+fn adopt_listed_order(
+    order_ids: &OrderIdMap,
+    cid: &ClientOrderId,
+    ib_id: i32,
+    ctx: &OrderContext,
+) -> bool {
     if order_ids.contains(ib_id) {
-        debug!(
+        warn!(
             ib_order_id = ib_id,
             %cid,
-            "Listed IBKR order's id names another tracked order; not adopting it"
+            "Listed IBKR order's IB order id names another tracked order; listing it under its IB \
+             order id"
         );
-        return;
+        return false;
     }
-    match order_ids.register(cid.clone(), ib_id, ctx.clone()) {
-        Ok(()) => info!(
-            ib_order_id = ib_id,
-            %cid,
-            instrument = %ctx.instrument,
-            "Adopted an open IBKR order this client did not track"
-        ),
-        Err(in_use) => warn!(
-            ib_order_id = ib_id,
-            error = %in_use,
-            "Listed IBKR order's client order id names another live order; not adopting it"
-        ),
+    match order_ids.adopt(cid.clone(), ib_id, ctx.clone()) {
+        Ok(()) => {
+            info!(
+                ib_order_id = ib_id,
+                %cid,
+                instrument = %ctx.instrument,
+                "Adopted an open IBKR order this client did not track"
+            );
+            true
+        }
+        Err(in_use) => {
+            warn!(
+                ib_order_id = ib_id,
+                error = %in_use,
+                "Listed IBKR order's client order id names another live order; listing it under \
+                 its IB order id"
+            );
+            false
+        }
     }
 }
 
@@ -3380,8 +3442,13 @@ impl BracketOrderClient for IbkrClient {
 /// reported expired by the rule [`ExecutionClient::account_stream`] applies. An order IB lists
 /// under no client order id, such as one entered in TWS, cannot be found.
 ///
-/// A client order id is taken to name one order for good, as the engine takes it: when IB lists
-/// several completed orders under one id, the one that completed last is reported.
+/// IB lists the orders completed before a Gateway restart under API client id 0, so a completed
+/// order is matched by its client order id whichever of this client's id and 0 it is listed
+/// under. Client order ids must therefore be unique across the API clients on the account.
+///
+/// When IB lists several completed orders under one id, the one that completed last is reported.
+/// One that completed before this client began tracking the order now under that id is an
+/// earlier order's, under a reused id, and the order is not reported ended.
 ///
 /// The account stream runs the same lookup itself after a gap in event delivery; see
 /// [`ExecutionClient::account_stream`].
@@ -4864,8 +4931,9 @@ mod order_reader_tests {
         }
 
         /// A tracked order under the listed order's IB order id but another client order id is an
-        /// earlier order whose id IB reused: the listed order is named by its reference, and the
-        /// tracked one keeps its mapping.
+        /// earlier order whose id IB reused: the tracked one keeps its mapping, and the listed
+        /// order, which cannot be tracked under its reference, is listed under its IB order id and
+        /// not exactly.
         #[test]
         fn a_reused_ib_order_id_does_not_name_the_listed_order() {
             let order_ids = OrderIdMap::new();
@@ -4895,7 +4963,8 @@ mod order_reader_tests {
             );
 
             let order = listed[0].order.as_ref().unwrap();
-            assert_eq!(order.key.cid, ClientOrderId::new("later"));
+            assert_eq!(order.key.cid, ClientOrderId::new("7"));
+            assert!(!listed[0].is_exact());
             assert_eq!(
                 order.kind,
                 OrderKind::Stop {
@@ -4904,6 +4973,48 @@ mod order_reader_tests {
             );
             assert_eq!(order_ids.get_ib_id(&ClientOrderId::new("earlier")), Some(7));
             assert_eq!(order_ids.get_ib_id(&ClientOrderId::new("later")), None);
+        }
+
+        /// The order check's listing names each of this client's orders by its reference, or else
+        /// its tracked id, keeps one that has just ended, and adopts nothing.
+        #[test]
+        fn listed_cids_name_this_clients_orders_without_adopting_them() {
+            let order_ids = OrderIdMap::new();
+            order_ids
+                .register(
+                    ClientOrderId::new("tracked"),
+                    2,
+                    OrderContext {
+                        instrument: InstrumentNameExchange::new("AAPL"),
+                        side: Side::Buy,
+                        price: Some(dec!(150)),
+                        quantity: dec!(10),
+                        kind: OrderKind::Limit,
+                        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                    },
+                )
+                .unwrap();
+
+            let cids = listed_cids(
+                [
+                    listed(API_CLIENT, 1, referenced("ended")),
+                    status(API_CLIENT, 1, OrderStatusKind::Cancelled, 0.0),
+                    listed(API_CLIENT, 2, stop_order()),
+                    listed(API_CLIENT, 3, stop_order()),
+                    listed(904, 4, referenced("other-client")),
+                ],
+                API_CLIENT,
+                &order_ids,
+            );
+
+            assert_eq!(
+                cids,
+                fnv::FnvHashSet::from_iter([
+                    ClientOrderId::new("ended"),
+                    ClientOrderId::new("tracked")
+                ])
+            );
+            assert_eq!(order_ids.get_ib_id(&ClientOrderId::new("ended")), None);
         }
 
         /// A snapshot's instrument has complete orders only when each was read back exactly, and
