@@ -19,6 +19,7 @@ use crate::{
 };
 use chrono::{DateTime, TimeZone, Utc};
 use futures::Stream;
+use hyperliquid_rust_sdk::{ExchangeDataStatus, ExchangeResponseStatus};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
     Side,
@@ -675,6 +676,29 @@ pub fn cloid_to_cid(cloid: &str) -> Option<ClientOrderId> {
     Some(ClientOrderId::new(format_smolstr!("{}", uuid.hyphenated())))
 }
 
+/// Whether Hyperliquid applied a cancel of one order, read from its answer: `Err` with the reason
+/// when it did not.
+///
+/// Hyperliquid answers a cancel it could not apply with a top-level `ok`, and puts the error in
+/// the order's own status ("Order was never placed, already canceled, or filled.", for one), so
+/// the top level alone does not say. Only a `success` status is a cancel. An answer carrying no
+/// status, or another kind of status, is not taken as one either: the order may still be working.
+pub(super) fn cancel_outcome(response: ExchangeResponseStatus) -> Result<(), String> {
+    let response = match response {
+        ExchangeResponseStatus::Ok(response) => response,
+        ExchangeResponseStatus::Err(reason) => return Err(reason),
+    };
+    match response
+        .data
+        .and_then(|data| data.statuses.into_iter().next())
+    {
+        Some(ExchangeDataStatus::Success) => Ok(()),
+        Some(ExchangeDataStatus::Error(reason)) => Err(reason),
+        Some(status) => Err(format!("cancel answered with status {status:?}")),
+        None => Err("cancel answered without a status for the order".to_owned()),
+    }
+}
+
 /// The client id to report a venue order record under, given the record's `cloid` and `oid`.
 ///
 /// Every order this client places carries a cloid ([`cid_to_cloid`]), so a record with one is
@@ -814,6 +838,62 @@ mod tests {
         );
     }
 
+    /// [`info_tests::cancel_answer`] as the SDK reads it.
+    fn cancel_answer(statuses: serde_json::Value) -> ExchangeResponseStatus {
+        serde_json::from_value(info_tests::cancel_answer(statuses)).unwrap()
+    }
+
+    #[test]
+    fn only_a_success_status_is_a_cancel() {
+        assert_eq!(
+            cancel_outcome(cancel_answer(serde_json::json!(["success"]))),
+            Ok(())
+        );
+    }
+
+    /// The exchange endpoint documentation's own example of a cancel that was not applied.
+    #[test]
+    fn an_error_status_under_a_top_level_ok_is_not_a_cancel() {
+        let answer = cancel_answer(serde_json::json!([
+            {"error": info_tests::CANCEL_NOT_APPLIED}
+        ]));
+        assert_eq!(
+            cancel_outcome(answer),
+            Err(info_tests::CANCEL_NOT_APPLIED.to_owned())
+        );
+    }
+
+    #[test]
+    fn an_answer_without_a_success_status_is_not_a_cancel() {
+        let no_data: ExchangeResponseStatus = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "response": {"type": "cancel"},
+        }))
+        .unwrap();
+        let answers = [
+            no_data,
+            cancel_answer(serde_json::json!([])),
+            cancel_answer(serde_json::json!([{"resting": {"oid": 1}}])),
+        ];
+        for answer in answers {
+            let outcome = cancel_outcome(answer.clone());
+            assert!(outcome.is_err(), "{answer:?} read as {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn a_top_level_error_is_not_a_cancel() {
+        let answer: ExchangeResponseStatus = serde_json::from_value(serde_json::json!({
+            "status": "err",
+            "response": "User or API Wallet does not exist.",
+        }))
+        .unwrap();
+        assert_eq!(
+            cancel_outcome(answer),
+            Err("User or API Wallet does not exist.".to_owned())
+        );
+    }
+
     #[test]
     fn test_instrument_to_spot_coin() {
         let coin = instrument_to_spot_coin(&InstrumentNameExchange::from("PURR-USDC-SPOT"));
@@ -911,6 +991,44 @@ pub(super) mod info_tests {
         client.http_client.base_url = uri;
         client
     }
+
+    /// The wallet clients built in tests sign with. No real server sees what it signs.
+    pub(in crate::client::hyperliquid) fn test_wallet() -> ethers::signers::LocalWallet {
+        "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+            .parse()
+            .unwrap()
+    }
+
+    /// Build an `ExchangeClient` pointed at `uri` that knows the assets in `coin_to_asset`.
+    /// `ExchangeClient::new` would read them over the network instead.
+    pub(in crate::client::hyperliquid) async fn exchange_client_against(
+        uri: String,
+        coin_to_asset: HashMap<String, u32>,
+    ) -> hyperliquid_rust_sdk::ExchangeClient {
+        hyperliquid_rust_sdk::ExchangeClient {
+            http_client: info_client_against(uri).await.http_client,
+            wallet: test_wallet(),
+            meta: hyperliquid_rust_sdk::Meta {
+                universe: Vec::new(),
+            },
+            vault_address: None,
+            coin_to_asset,
+        }
+    }
+
+    /// Hyperliquid's answer to a cancel, as its exchange endpoint sends it, carrying `statuses`.
+    pub(in crate::client::hyperliquid) fn cancel_answer(
+        statuses: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "status": "ok",
+            "response": {"type": "cancel", "data": {"statuses": statuses}},
+        })
+    }
+
+    /// The documentation's example of a cancel Hyperliquid did not apply, under a top-level `ok`.
+    pub(in crate::client::hyperliquid) const CANCEL_NOT_APPLIED: &str =
+        "Order was never placed, already canceled, or filled.";
 
     async fn serve(body: String) -> (MockServer, hyperliquid_rust_sdk::InfoClient) {
         let server = MockServer::start().await;

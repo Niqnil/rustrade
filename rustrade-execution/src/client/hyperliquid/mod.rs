@@ -172,9 +172,9 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use common::{
-    CLOID_REQUIRED, CancelOnDropStream, OpenOrderListing, UnknownCoins, cid_to_cloid, map_tif,
-    millis_to_datetime, open_order_to_order, parse_decimal, parse_side, round_to_5_sig_figs,
-    span_millis, user_fills_by_time, warn_unknown_coins,
+    CLOID_REQUIRED, CancelOnDropStream, OpenOrderListing, UnknownCoins, cancel_outcome,
+    cid_to_cloid, map_tif, millis_to_datetime, open_order_to_order, parse_decimal, parse_side,
+    round_to_5_sig_figs, span_millis, user_fills_by_time, warn_unknown_coins,
 };
 pub use config::{HyperliquidConfig, HyperliquidConfigError, Network};
 pub use error::HyperliquidConnectError;
@@ -741,9 +741,7 @@ impl ExecutionClient for HyperliquidClient {
         request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
     ) -> UnindexedOrderResponseCancel {
         use crate::order::{request::OrderResponseCancel, state::Cancelled};
-        use hyperliquid_rust_sdk::{
-            ClientCancelRequest, ClientCancelRequestCloid, ExchangeResponseStatus,
-        };
+        use hyperliquid_rust_sdk::{ClientCancelRequest, ClientCancelRequestCloid};
         use uuid::Uuid;
 
         let coin = match self.dexes.coin(request.key.instrument) {
@@ -847,8 +845,8 @@ impl ExecutionClient for HyperliquidClient {
             }
         };
 
-        match response {
-            ExchangeResponseStatus::Ok(_) => {
+        match cancel_outcome(response) {
+            Ok(()) => {
                 debug!("Cancel order accepted");
                 // Hyperliquid answers a cancel once the order has left the book.
                 self.known_live.lock().ended(&request.key.cid);
@@ -867,8 +865,9 @@ impl ExecutionClient for HyperliquidClient {
                     )),
                 }
             }
-            ExchangeResponseStatus::Err(msg) => {
-                warn!(%msg, "Cancel rejected by exchange");
+            // Not reported ended: if the order did end, the account stream or a lookup says how.
+            Err(reason) => {
+                warn!(%reason, cid = %request.key.cid, "Cancel rejected by exchange");
                 OrderResponseCancel {
                     key: OrderKey {
                         exchange: ExchangeId::HyperliquidPerp,
@@ -877,7 +876,7 @@ impl ExecutionClient for HyperliquidClient {
                         cid: request.key.cid.clone(),
                     },
                     state: Err(UnindexedOrderError::Rejected(
-                        crate::error::ApiError::OrderRejected(msg),
+                        crate::error::ApiError::OrderRejected(reason),
                     )),
                 }
             }
@@ -1454,6 +1453,7 @@ mod tests {
     use crate::client::dedup::{dedup_key_from_event, is_duplicate};
     use rust_decimal_macros::dec;
     use rustrade_integration::collection::snapshot::Snapshot;
+    use std::collections::HashMap;
 
     /// Only Hyperliquid's default DEX.
     fn default_dex() -> PerpDexes {
@@ -1614,9 +1614,119 @@ mod tests {
         }
     }
 
+    /// A client trading `xyz` and `flx` against `server`, built without the network, that places
+    /// and cancels on the assets in `coin_to_asset`.
+    async fn client_against(
+        server: &wiremock::MockServer,
+        coin_to_asset: HashMap<String, u32>,
+    ) -> HyperliquidClient {
+        use super::common::info_tests::{
+            exchange_client_against, info_client_against, test_wallet,
+        };
+        HyperliquidClient {
+            config: HyperliquidConfig::new(test_wallet(), Network::Testnet),
+            info_client: Arc::new(info_client_against(server.uri()).await),
+            exchange_client: Arc::new(exchange_client_against(server.uri(), coin_to_asset).await),
+            dexes: Arc::new(super::perp_dexes::tests::xyz_and_flx().await),
+            known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidPerp),
+        }
+    }
+
+    mod cancel {
+        use super::super::common::info_tests::{CANCEL_NOT_APPLIED, cancel_answer};
+        use super::*;
+        use crate::error::ApiError;
+        use crate::order::{OrderEvent, request::RequestCancel};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// Cancel a live `BTC-USDC-PERP` order through a client whose exchange endpoint answers
+        /// `answer`. Returns the response, and whether the order is still held live afterwards.
+        async fn cancel_answered(
+            answer: serde_json::Value,
+        ) -> (UnindexedOrderResponseCancel, bool) {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/exchange"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(answer))
+                .mount(&server)
+                .await;
+            let client = client_against(&server, HashMap::from([("BTC".to_owned(), 0)])).await;
+            let instrument = InstrumentNameExchange::new("BTC-USDC-PERP");
+            let key = OrderKey {
+                exchange: ExchangeId::HyperliquidPerp,
+                instrument: instrument.clone(),
+                strategy: StrategyId::new("strategy"),
+                cid: ClientOrderId::uuid(),
+            };
+            let id = VenueOrderId::Assigned(OrderId::new("7"));
+            let open = Open {
+                id: id.clone(),
+                time_exchange: Utc::now(),
+                filled_quantity: Decimal::ZERO,
+            };
+            client.known_live.lock().live(&key, dec!(1), &open);
+
+            let response = client
+                .cancel_order(OrderEvent {
+                    key: OrderKey {
+                        exchange: key.exchange,
+                        instrument: &instrument,
+                        strategy: key.strategy.clone(),
+                        cid: key.cid.clone(),
+                    },
+                    state: RequestCancel { id: Some(id) },
+                })
+                .await;
+            let live = client.known_live.lock().contains(&key.cid);
+            (response, live)
+        }
+
+        #[tokio::test]
+        async fn a_success_status_cancels_the_order() {
+            let (response, live) =
+                cancel_answered(cancel_answer(serde_json::json!(["success"]))).await;
+            assert!(response.state.is_ok(), "{:?}", response.state);
+            assert!(!live, "a cancelled order is no longer held live");
+        }
+
+        /// An order that filled before the cancel arrived is answered this way, so it must not be
+        /// reported cancelled, and stays held live until the account stream or a lookup ends it.
+        #[tokio::test]
+        async fn an_error_status_is_a_rejected_cancel_and_the_order_stays_live() {
+            let (response, live) = cancel_answered(cancel_answer(serde_json::json!([
+                {"error": CANCEL_NOT_APPLIED}
+            ])))
+            .await;
+            let Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(reason))) =
+                &response.state
+            else {
+                panic!("expected a rejected cancel, got {:?}", response.state);
+            };
+            assert_eq!(reason, CANCEL_NOT_APPLIED);
+            assert!(live, "the order is still held live");
+        }
+
+        #[tokio::test]
+        async fn an_answer_without_a_status_is_a_rejected_cancel() {
+            let (response, live) = cancel_answered(serde_json::json!({
+                "status": "ok",
+                "response": {"type": "cancel"},
+            }))
+            .await;
+            assert!(
+                matches!(
+                    response.state,
+                    Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(_)))
+                ),
+                "{:?}",
+                response.state
+            );
+            assert!(live, "the order is still held live");
+        }
+    }
+
     mod instrument_names {
-        use super::super::common::info_tests::info_client_against;
-        use super::super::perp_dexes::tests::xyz_and_flx;
         use super::*;
         use crate::error::ApiError;
         use crate::order::{
@@ -1630,26 +1740,7 @@ mod tests {
         /// `InstrumentInvalid`.
         async fn offline_client() -> (MockServer, HyperliquidClient) {
             let server = MockServer::start().await;
-            let wallet: ethers::signers::LocalWallet =
-                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-                    .parse()
-                    .unwrap();
-            let exchange_client = ExchangeClient {
-                http_client: info_client_against(server.uri()).await.http_client,
-                wallet: wallet.clone(),
-                meta: hyperliquid_rust_sdk::Meta {
-                    universe: Vec::new(),
-                },
-                vault_address: None,
-                coin_to_asset: Default::default(),
-            };
-            let client = HyperliquidClient {
-                config: HyperliquidConfig::new(wallet, Network::Testnet),
-                info_client: Arc::new(info_client_against(server.uri()).await),
-                exchange_client: Arc::new(exchange_client),
-                dexes: Arc::new(xyz_and_flx().await),
-                known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidPerp),
-            };
+            let client = client_against(&server, HashMap::new()).await;
             (server, client)
         }
 
