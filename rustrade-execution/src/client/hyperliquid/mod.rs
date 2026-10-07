@@ -395,9 +395,10 @@ impl ExecutionClient for HyperliquidClient {
             dex_states(info_client, address, dexes),
             perp_account::open_orders(info_client, address, dexes),
         )?;
-        let balances = perp_account::balances(info_client, address, dexes, mode, &states).await?;
-
         let now = Utc::now();
+        let balances =
+            perp_account::snapshot_balances(info_client, address, dexes, mode, &states, now)
+                .await?;
 
         // Build instrument filter if provided
         let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {

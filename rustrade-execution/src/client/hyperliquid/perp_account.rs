@@ -101,38 +101,42 @@ pub(super) async fn spot_state(
         .balances)
 }
 
-/// The collateral balances of the DEXs traded, read where `mode` holds them: from `states`, each
-/// DEX's `clearinghouseState`, under [`AccountMode::PerDex`], or from `spotClearinghouseState`,
-/// read here, under [`AccountMode::Unified`]. See [`per_dex_balances`] and [`unified_balances`].
-pub(super) async fn balances(
+/// The collateral balances of the DEXs traded, for an account snapshot that has read every DEX's
+/// state: from `states` under [`AccountMode::PerDex`], or from `spotClearinghouseState`, read
+/// here, under [`AccountMode::Unified`]. See [`per_dex_balances`] and [`unified_balances`].
+pub(super) async fn snapshot_balances(
     info_client: &InfoClient,
     address: H160,
     dexes: &PerpDexes,
     mode: AccountMode,
     states: &[(Option<&str>, UserStateResponse)],
+    now: DateTime<Utc>,
 ) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError> {
     Ok(match mode {
-        AccountMode::PerDex => per_dex_balances(states, dexes, Utc::now()),
+        AccountMode::PerDex => per_dex_balances(states, dexes, now),
         AccountMode::Unified => {
-            let spot = spot_state(info_client, address).await?;
-            unified_balances(&spot, dexes, Utc::now())
+            unified_balances(&spot_state(info_client, address).await?, dexes, now)
         }
     })
 }
 
 /// The collateral balances of the DEXs traded: `userAbstraction`, then only what that mode holds
-/// them in; see [`balances`].
+/// them in, each DEX's `clearinghouseState` or `spotClearinghouseState`.
 pub(super) async fn fetch_balances(
     info_client: &InfoClient,
     address: H160,
     dexes: &PerpDexes,
 ) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError> {
-    let mode = account_mode(info_client, address).await?;
-    let states = match mode {
-        AccountMode::PerDex => dex_states(info_client, address, dexes).await?,
-        AccountMode::Unified => Vec::new(),
-    };
-    balances(info_client, address, dexes, mode, &states).await
+    Ok(match account_mode(info_client, address).await? {
+        AccountMode::PerDex => per_dex_balances(
+            &dex_states(info_client, address, dexes).await?,
+            dexes,
+            Utc::now(),
+        ),
+        AccountMode::Unified => {
+            unified_balances(&spot_state(info_client, address).await?, dexes, Utc::now())
+        }
+    })
 }
 
 /// One balance per DEX, from its margin summary: the default DEX's under its collateral's name

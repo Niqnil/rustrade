@@ -154,7 +154,11 @@ impl HyperliquidConfig {
 ///
 /// Does NOT include the private key for security reasons.
 /// Use [`HyperliquidConfig::from_env`] to load credentials.
+///
+/// An unknown field is an error, so a file written for an earlier version, whose `testnet` field
+/// `network` replaced, fails to load rather than fall back to testnet without a word.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HyperliquidConfigFile {
     /// The network to trade on, `"mainnet"` or `"testnet"`.
     ///
@@ -381,6 +385,12 @@ mod tests {
             "absent `network` field must default to safe testnet"
         );
         assert!(file.dexes.is_empty());
+    }
+
+    #[test]
+    fn a_config_file_from_before_network_fails_to_load() {
+        let file = serde_json::from_str::<HyperliquidConfigFile>(r#"{"testnet": false}"#);
+        assert!(file.unwrap_err().to_string().contains("testnet"));
     }
 
     #[test]

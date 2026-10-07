@@ -164,7 +164,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `network: rustrade_instrument::hyperliquid::Network` (re-exported as
     `client::hyperliquid::Network`), and `from_private_key` and `new` take a `Network`.
     `HYPERLIQUID_TESTNET` is read as before. `HyperliquidConfigFile.testnet` is likewise replaced
-    by `network` (`"mainnet"` or `"testnet"`, absent ⇒ testnet), and the file gains `dexes`.
+    by `network` (`"mainnet"` or `"testnet"`, absent ⇒ testnet), and the file gains `dexes`. An
+    unknown field, such as the old `testnet`, now fails to load rather than being ignored.
   - **Breaking:** `HyperliquidClient::connect` returns the new `HyperliquidConnectError`:
     `Connectivity`, `UnknownDex` for a DEX Hyperliquid does not list, or `Metadata` for one whose
     markets cannot be read. `HyperliquidSpotClient::connect` is unchanged and ignores `dexes`.
