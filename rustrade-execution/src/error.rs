@@ -146,7 +146,7 @@ pub enum ConnectivityError {
     /// Transient — retry with backoff. May indicate network congestion, server
     /// overload, or an overly aggressive timeout. Consider increasing timeout
     /// on subsequent attempts.
-    #[error("ExecutionRequest timed out")]
+    #[error("request timed out")]
     Timeout,
 
     /// Network-level socket error (connection refused, reset, DNS failure, etc.).

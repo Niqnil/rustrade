@@ -1,5 +1,6 @@
 //! Contract builders for IB integration.
 
+use crate::error::ConnectivityError;
 use ibapi::contracts::{Contract, Currency, Exchange, OptionRight, SecurityType, Symbol};
 use thiserror::Error;
 
@@ -36,6 +37,69 @@ pub enum ContractConfigError {
     /// The `security_type` is not one of the supported `STK`/`FUT`/`OPT`/`CASH`.
     #[error("unrecognized security_type {security_type:?} (expected one of STK/FUT/OPT/CASH)")]
     UnrecognizedSecurityType { security_type: String },
+}
+
+/// Reasons [`IbkrClient::resolve_contract`](super::IbkrClient::resolve_contract) cannot
+/// resolve a contract description into one IB contract.
+///
+/// `#[non_exhaustive]`: new reasons may be added without a breaking change.
+#[derive(Debug, Clone, PartialEq, Error)]
+#[non_exhaustive]
+pub enum ResolveContractError {
+    /// No IB contract matches the description.
+    #[error("no IB contract matches the description")]
+    NoMatch,
+
+    /// Several IB contracts match the description, for example the same symbol on several
+    /// exchanges, or options of several trading classes. Narrow the description, or pick one of
+    /// `matches` and register it.
+    #[error(
+        "{} IB contracts match the description (contract ids {:?}); narrow it",
+        .matches.len(),
+        contract_ids(.matches)
+    )]
+    Ambiguous {
+        /// Every contract that matches, as IB resolved it.
+        matches: Vec<Contract>,
+    },
+
+    /// IB answered the request with an error other than finding no match, such as a description
+    /// it cannot validate. Retrying the same description usually fails the same way, so
+    /// [`is_transient`](Self::is_transient) is false. Some IB errors, such as a pacing
+    /// violation, can clear on a later retry: tell those apart by `code`.
+    #[error("IB refused the contract details request (error {code}): {message}")]
+    Refused {
+        /// IB's error code.
+        code: i32,
+        /// IB's error message.
+        message: String,
+    },
+
+    /// The connection dropped, or IB sent nothing for 10 s before finishing its answer.
+    /// Transient: retry once `ibapi` has reconnected.
+    #[error("contract details request failed: {0}")]
+    Connectivity(#[from] ConnectivityError),
+
+    /// The request could not be made or read for another reason: the client shut down or gave
+    /// up reconnecting, `ibapi` could not decode IB's answer, or the blocking task failed.
+    /// Retrying on this client does not help.
+    #[error("contract details request failed: {0}")]
+    Failed(String),
+}
+
+impl ResolveContractError {
+    /// Whether the same request may succeed if retried: a
+    /// [`Connectivity`](Self::Connectivity) failure.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Connectivity(e) if e.is_transient())
+    }
+}
+
+fn contract_ids(contracts: &[Contract]) -> Vec<i32> {
+    contracts
+        .iter()
+        .map(|contract| contract.contract_id)
+        .collect()
 }
 
 /// Map a human/wire option-right string to `OptionRight`.

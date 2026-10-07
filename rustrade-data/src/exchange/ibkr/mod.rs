@@ -175,7 +175,11 @@ where
     /// # Arguments
     ///
     /// * `config` - Connection configuration
-    /// * `contracts` - Contract registry for instrument resolution
+    /// * `contracts` - Contract registry for instrument resolution. Subscriptions look their
+    ///   contracts up by name only, and IB resolves each contract description on request, so
+    ///   contracts registered with
+    ///   [`register_by_name_only`](rustrade_instrument::ibkr::ContractRegistry::register_by_name_only)
+    ///   need not be resolved first.
     /// * `subscriptions` - List of subscriptions to activate
     ///
     /// # Errors

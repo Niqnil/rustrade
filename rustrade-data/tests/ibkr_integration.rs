@@ -600,7 +600,7 @@ async fn test_market_stream_connection() {
     };
 
     let registry = ContractRegistry::new();
-    registry.register("AAPL".into(), aapl_contract());
+    registry.register_by_name_only("AAPL".into(), aapl_contract());
     let registry = Arc::new(registry);
 
     let subscriptions = vec![IbkrSubscription {
@@ -634,7 +634,7 @@ async fn test_market_stream_quotes() {
     };
 
     let registry = ContractRegistry::new();
-    registry.register("AAPL".into(), aapl_contract());
+    registry.register_by_name_only("AAPL".into(), aapl_contract());
     let registry = Arc::new(registry);
 
     let subscriptions = vec![IbkrSubscription {
@@ -700,7 +700,7 @@ async fn test_market_stream_depth() {
     };
 
     let registry = ContractRegistry::new();
-    registry.register("AAPL".into(), aapl_contract());
+    registry.register_by_name_only("AAPL".into(), aapl_contract());
     let registry = Arc::new(registry);
 
     let subscriptions = vec![IbkrSubscription {
@@ -792,8 +792,8 @@ async fn test_market_stream_multiple_subscriptions() {
     };
 
     let registry = ContractRegistry::new();
-    registry.register("AAPL".into(), aapl_contract());
-    registry.register("MSFT".into(), Contract::stock("MSFT").build());
+    registry.register_by_name_only("AAPL".into(), aapl_contract());
+    registry.register_by_name_only("MSFT".into(), Contract::stock("MSFT").build());
     let registry = Arc::new(registry);
 
     let subscriptions = vec![
@@ -889,7 +889,9 @@ async fn test_contract_resolution() {
     println!("Currency: {}", first.contract.currency);
 
     let registry = ContractRegistry::new();
-    registry.register("AAPL".into(), first.contract.clone());
+    registry
+        .register("AAPL".into(), first.contract.clone())
+        .unwrap();
 
     assert_eq!(registry.len(), 1);
     assert!(registry.get_contract(&"AAPL".into()).is_some());
@@ -1190,7 +1192,7 @@ async fn test_option_greeks_stream() {
     let option = aapl_call_option().await;
 
     let registry = ContractRegistry::new();
-    registry.register("AAPL_CALL".into(), option);
+    registry.register("AAPL_CALL".into(), option).unwrap();
     let registry = Arc::new(registry);
 
     let subscriptions = vec![IbkrSubscription {

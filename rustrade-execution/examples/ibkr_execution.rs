@@ -76,10 +76,17 @@ async fn main() {
 
     info!("Connected!");
 
-    // Register AAPL contract
+    // Resolve the AAPL contract through IB, then register it. IB reports fills and positions
+    // by contract id, which a locally built contract lacks until it is resolved. A contract
+    // listed in `IbkrConfig::contracts` is resolved and registered when the client connects.
     let aapl_name: InstrumentNameExchange = "AAPL".into();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
+    let aapl_contract = client
+        .resolve_contract(&stock_contract("AAPL", "SMART", "USD"))
+        .await
+        .expect("AAPL must resolve to one IB contract");
+    client
+        .register_contract(aapl_name.clone(), aapl_contract)
+        .expect("a resolved contract registers");
 
     info!("Registered AAPL contract");
 

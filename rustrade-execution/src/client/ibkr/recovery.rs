@@ -31,7 +31,7 @@
 
 use super::{
     ListingLock,
-    ended_orders::{EndedOrderReader, release_ended},
+    ended_orders::{EarlierCompletions, EndedOrderReader, release_ended},
     execution::{ExecutionBuffer, ExecutionRevision, revision_of},
     listed_cids,
     order::{OrderIdMap, PendingCancels},
@@ -588,6 +588,7 @@ pub(super) struct RecoveryWatcher {
     pub(super) pending: ExecutionBuffer,
     pub(super) known: SharedKnownLiveOrders,
     pub(super) listings: ListingLock,
+    pub(super) earlier_completions: EarlierCompletions,
     pub(super) sink: EventSink,
     /// The runtime the order check, which is shared with the other venues, runs its timers on.
     pub(super) runtime: tokio::runtime::Handle,
@@ -725,6 +726,7 @@ impl RecoveryWatcher {
             &self.contracts,
             &self.order_ids,
             &self.pending_cancels,
+            &self.earlier_completions,
         );
         let list_open = |_instruments: Vec<_>| std::future::ready(self.listed_cids());
         let lookup = |key| {
@@ -1210,13 +1212,15 @@ mod tests {
 
     fn tracked() -> (ContractRegistry, OrderIdMap) {
         let contracts = ContractRegistry::new();
-        contracts.register(
-            InstrumentNameExchange::new("AAPL"),
-            Contract {
-                contract_id: CON_ID,
-                ..Contract::default()
-            },
-        );
+        contracts
+            .register(
+                InstrumentNameExchange::new("AAPL"),
+                Contract {
+                    contract_id: CON_ID,
+                    ..Contract::default()
+                },
+            )
+            .unwrap();
         let order_ids = OrderIdMap::new();
         order_ids
             .register(
