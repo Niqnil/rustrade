@@ -4,11 +4,10 @@
 use super::common::info;
 use super::error::HyperliquidConnectError;
 use hyperliquid_rust_sdk::InfoClient;
-use parking_lot::Mutex;
 use rustrade_instrument::{hyperliquid::CoinKind, instrument::name::InstrumentNameExchange};
 use serde::Deserialize;
 use smol_str::{SmolStr, format_smolstr};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use tracing::warn;
 
 /// The collateral token of Hyperliquid's default perpetual DEX.
@@ -24,15 +23,16 @@ const HIP3_ASSETS_PER_DEX: u32 = 10_000;
 /// A perpetual is named `{coin}-{collateral}-PERP`, after the token its DEX settles in:
 /// `BTC-USDC-PERP` on the default DEX, `xyz:TSLA-USDC-PERP` and `flx:TSLA-USDH-PERP` on HIP-3
 /// ones. A coin on a HIP-3 DEX the client was not configured with has no name here: its
-/// collateral is not known.
+/// collateral is not known. [`UnconfiguredDexes`] logs such coins.
+///
+/// Read-only once fetched, so shared between tasks without a lock.
 #[derive(Debug, Default)]
 pub(super) struct PerpDexes {
-    /// Each configured HIP-3 DEX's collateral token, by DEX name.
-    collateral: HashMap<SmolStr, SmolStr>,
+    /// Each configured HIP-3 DEX's collateral token, by DEX name. Ordered, so every read that
+    /// walks the DEXs reports them in the same order.
+    collateral: BTreeMap<SmolStr, SmolStr>,
     /// The asset id of every perpetual the configured HIP-3 DEXs list, by coin.
     asset_ids: HashMap<String, u32>,
-    /// The unconfigured DEXs whose coins have been left out, so each is logged once.
-    warned: Mutex<HashSet<SmolStr>>,
 }
 
 /// One entry of the `perpDexs` response. The default DEX is listed first, as `null`.
@@ -178,7 +178,7 @@ impl PerpDexes {
             .map(|(coin, asset)| (coin.clone(), *asset))
     }
 
-    /// The configured HIP-3 DEXs, in no particular order.
+    /// The configured HIP-3 DEXs, by name.
     pub(super) fn hip3(&self) -> impl Iterator<Item = &str> {
         self.collateral.keys().map(SmolStr::as_str)
     }
@@ -199,39 +199,31 @@ impl PerpDexes {
             .collect()
     }
 
-    /// The collateral token of the DEX `coin` trades on, `None` if `coin` is on a HIP-3 DEX not
-    /// configured, which is logged once per DEX.
-    pub(super) fn collateral_of(&self, coin: &str) -> Option<&str> {
-        let dex = dex_of(coin);
-        let collateral = self.collateral(dex);
-        if collateral.is_none()
-            && let Some(dex) = dex
-            && self.warned.lock().insert(SmolStr::from(dex))
-        {
-            warn!(
-                %dex,
-                %coin,
-                "Hyperliquid perpetual is on a DEX this client is not configured with, so its \
-                 collateral is unknown; leaving that DEX's coins out (logged once per DEX)"
-            );
-        }
-        collateral
-    }
-
-    /// The perpetual instrument `coin` names, `{coin}-{collateral}-PERP`, or `None` when it
-    /// names a spot pair, a market of a kind [`CoinKind::of`] does not recognise, or a perpetual
-    /// on a HIP-3 DEX not configured.
+    /// The perpetual instrument `coin` names, `{coin}-{collateral}-PERP`, with the collateral
+    /// token, or `None` when it names a spot pair, a market of a kind [`CoinKind::of`] does not
+    /// recognise, or a perpetual on a HIP-3 DEX not configured.
     ///
     /// The account streams and open orders deliver every market's coins together, so other
     /// markets are expected here.
-    pub(super) fn instrument(&self, coin: &str) -> Option<InstrumentNameExchange> {
+    pub(super) fn perp(&self, coin: &str) -> Option<(InstrumentNameExchange, &str)> {
         if CoinKind::of(coin) != CoinKind::Perp {
             return None;
         }
-        let collateral = self.collateral_of(coin)?;
-        Some(InstrumentNameExchange::from(format_smolstr!(
-            "{coin}-{collateral}-PERP"
-        )))
+        let collateral = self.collateral(dex_of(coin))?;
+        let instrument = InstrumentNameExchange::from(format_smolstr!("{coin}-{collateral}-PERP"));
+        Some((instrument, collateral))
+    }
+
+    /// The perpetual instrument `coin` names; see [`perp`](Self::perp).
+    pub(super) fn instrument(&self, coin: &str) -> Option<InstrumentNameExchange> {
+        self.perp(coin).map(|(instrument, _)| instrument)
+    }
+
+    /// The HIP-3 DEX of `coin` when `coin` is a perpetual on one this client is not configured
+    /// with, and so is left out.
+    fn unconfigured_dex<'a>(&self, coin: &'a str) -> Option<&'a str> {
+        let dex = dex_of(coin)?;
+        (CoinKind::of(coin) == CoinKind::Perp && !self.collateral.contains_key(dex)).then_some(dex)
     }
 
     /// The coin `instrument` names: the inverse of [`instrument`](Self::instrument).
@@ -268,6 +260,48 @@ impl PerpDexes {
                 dex.unwrap_or_default()
             )),
         }
+    }
+}
+
+/// The HIP-3 DEXs not configured whose perpetuals an account stream has left out, so it logs
+/// each DEX once rather than on every event. Held by each stream task, so it needs no lock.
+#[derive(Debug, Default)]
+pub(super) struct UnconfiguredDexes(HashSet<SmolStr>);
+
+impl UnconfiguredDexes {
+    /// Log with `warn!` the DEX of `coin` if `coin` is a perpetual on a DEX not configured, and
+    /// the DEX was not logged before.
+    pub(super) fn warn_once(&mut self, dexes: &PerpDexes, coin: &str) {
+        if let Some(dex) = dexes.unconfigured_dex(coin)
+            && !self.0.contains(dex)
+        {
+            warn!(
+                %dex,
+                %coin,
+                "Hyperliquid perpetual is on a DEX this client is not configured with, so its \
+                 collateral is unknown; leaving that DEX's coins out (logged once per stream)"
+            );
+            self.0.insert(SmolStr::from(dex));
+        }
+    }
+}
+
+/// Log with one `warn!` the distinct HIP-3 DEXs not configured that `coins` are perpetuals on,
+/// which are left out. For a read that lists many rows at once.
+pub(super) fn warn_unconfigured_dexes<'a>(
+    dexes: &PerpDexes,
+    coins: impl IntoIterator<Item = &'a str>,
+) {
+    let unconfigured = coins
+        .into_iter()
+        .filter_map(|coin| dexes.unconfigured_dex(coin))
+        .collect::<BTreeSet<_>>();
+    if !unconfigured.is_empty() {
+        warn!(
+            ?unconfigured,
+            "Hyperliquid perpetuals are on DEXs this client is not configured with, so their \
+             collateral is unknown; leaving them out"
+        );
     }
 }
 
@@ -417,6 +451,26 @@ pub(super) mod tests {
         assert!(coin("BTC").is_err());
         assert!(coin("HYPE-USDC-SPOT").is_err());
         assert!(coin("@107-USDC-PERP").is_err());
+    }
+
+    #[tokio::test]
+    async fn only_perpetuals_on_unconfigured_dexes_are_logged_once_each() {
+        let dexes = xyz_and_flx().await;
+        let mut logged = UnconfiguredDexes::default();
+        for coin in ["km:TSLA", "km:NVDA", "xyz:TSLA", "BTC", "@107", "hyna:BTC"] {
+            logged.warn_once(&dexes, coin);
+        }
+        assert_eq!(logged.0, HashSet::from(["km".into(), "hyna".into()]));
+    }
+
+    #[tokio::test]
+    async fn a_perpetual_comes_with_its_collateral() {
+        let dexes = xyz_and_flx().await;
+        let (instrument, collateral) = dexes.perp("flx:TSLA").unwrap();
+        assert_eq!(
+            (instrument.as_ref(), collateral),
+            ("flx:TSLA-USDH-PERP", "USDH")
+        );
     }
 
     #[tokio::test]

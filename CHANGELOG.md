@@ -163,7 +163,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Breaking:** `HyperliquidConfig.testnet: bool` is replaced by
     `network: rustrade_instrument::hyperliquid::Network` (re-exported as
     `client::hyperliquid::Network`), and `from_private_key` and `new` take a `Network`.
-    `HYPERLIQUID_TESTNET` is read as before.
+    `HYPERLIQUID_TESTNET` is read as before. `HyperliquidConfigFile.testnet` is likewise replaced
+    by `network` (`"mainnet"` or `"testnet"`, absent ⇒ testnet), and the file gains `dexes`.
   - **Breaking:** `HyperliquidClient::connect` returns the new `HyperliquidConnectError`:
     `Connectivity`, `UnknownDex` for a DEX Hyperliquid does not list, or `Metadata` for one whose
     markets cannot be read. `HyperliquidSpotClient::connect` is unchanged and ignores `dexes`.
@@ -518,7 +519,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   perpetuals client hard-coded the fee asset of fills on the account stream and from
   `fetch_trades`. A builder-deployed (HIP-3) perpetual settles in its deployer's collateral, so a
   fee charged in USDH, USDE or USDT0 was reported as USDC. The fee asset now comes from the fill's
-  `feeToken`, falling back to USDC only if it is absent. `fees_quote` is set only for a USDC fee.
+  `feeToken`, falling back to USDC only if it is absent.
 - **Hyperliquid data subscriptions upper-cased mixed-case perpetuals (`kPEPE` became `KPEPE`),
   and had no way to find a builder-deployed (HIP-3) perpetual** (`rustrade-data` and
   `rustrade-instrument`, `hyperliquid` features). **Breaking.** A subscription built from a

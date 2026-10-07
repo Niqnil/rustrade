@@ -187,10 +187,8 @@ use order_recovery::{
     ReconnectWatch, fetch_order_record, listed_cids, lookup_from_record, remember_open,
     remember_snapshot, send_fills, send_observed, spawn_order_checks,
 };
-use perp_account::{
-    AccountMode, account_mode, dex_states, per_dex_balances, spot_state, unified_balances,
-};
-use perp_dexes::{PerpDexes, dex_of};
+use perp_account::{account_mode, dex_states};
+use perp_dexes::{PerpDexes, UnconfiguredDexes, warn_unconfigured_dexes};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
     Side,
@@ -242,6 +240,11 @@ impl HyperliquidClient {
     /// - [`HyperliquidConnectError::UnknownDex`] when Hyperliquid lists no DEX by a configured
     ///   name on the configured network.
     /// - [`HyperliquidConnectError::Metadata`] when a DEX's markets cannot be read.
+    ///
+    /// # Cost
+    ///
+    /// With any DEX configured: `perpDexs`, `spotMeta` and each DEX's `meta`, weight 20 each, so
+    /// `40 + 20 × dexes`, besides what the SDK reads to build its own clients.
     pub async fn connect(config: HyperliquidConfig) -> Result<Self, HyperliquidConnectError> {
         let base_url = config.base_url();
 
@@ -354,6 +357,9 @@ impl ExecutionClient for HyperliquidClient {
     /// A mode this version does not know fails the snapshot rather than report balances read from
     /// the wrong place.
     ///
+    /// Positions on a HIP-3 DEX the client is not configured with are not read, and so not
+    /// reported: name the DEX in [`HyperliquidConfig::dexes`] to see them.
+    ///
     /// # Positions
     ///
     /// Every requested perpetual is listed. Its position is [`PositionReport::Open`] when
@@ -369,8 +375,11 @@ impl ExecutionClient for HyperliquidClient {
     ///
     /// # Cost
     ///
-    /// `userAbstraction` and `spotClearinghouseState`, then for each DEX traded (the default one
-    /// included) a `clearinghouseState` (weight 2) and an `openOrders` (weight 20), all at once.
+    /// At once, `userAbstraction` (weight 20) and, for each DEX traded, the default one included,
+    /// a `clearinghouseState` (weight 2) and an `openOrders` (weight 20); then, under a unified
+    /// account or portfolio margin, `spotClearinghouseState` (weight 2). With `n` HIP-3 DEXs
+    /// that is `42 + 22n`, or `44 + 22n`, against Hyperliquid's limit of 1,200 a minute per IP
+    /// address.
     async fn account_snapshot(
         &self,
         _assets: &[AssetNameExchange],
@@ -381,18 +390,14 @@ impl ExecutionClient for HyperliquidClient {
         let info_client = &*self.info_client;
         let dexes = &*self.dexes;
 
-        let (mode, states, open_orders, spot) = tokio::try_join!(
+        let (mode, states, open_orders) = tokio::try_join!(
             account_mode(info_client, address),
             dex_states(info_client, address, dexes),
             perp_account::open_orders(info_client, address, dexes),
-            spot_state(info_client, address),
         )?;
+        let balances = perp_account::balances(info_client, address, dexes, mode, &states).await?;
 
         let now = Utc::now();
-        let balances = match mode {
-            AccountMode::PerDex => per_dex_balances(&states, dexes, now),
-            AccountMode::Unified => unified_balances(&spot, dexes, now),
-        };
 
         // Build instrument filter if provided
         let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
@@ -591,6 +596,7 @@ impl ExecutionClient for HyperliquidClient {
         let fills_dexes = self.dexes.clone();
         tokio::spawn(async move {
             let mut unknown_coins = UnknownCoins::default();
+            let mut unconfigured = UnconfiguredDexes::default();
             let mut reconnects = ReconnectWatch::new(reconnected);
             loop {
                 tokio::select! {
@@ -623,6 +629,7 @@ impl ExecutionClient for HyperliquidClient {
                             Message::UserFills(fills) => {
                                 let convert = |fill: &hyperliquid_rust_sdk::TradeInfo| {
                                     unknown_coins.warn_once(&fill.coin);
+                                    unconfigured.warn_once(&fills_dexes, &fill.coin);
                                     fill_to_account_event(fill, &fills_dexes)
                                 };
                                 if !send_fills(
@@ -664,6 +671,7 @@ impl ExecutionClient for HyperliquidClient {
         tokio::spawn(async move {
             let _ws_client = ws_client;
             let mut unknown_coins = UnknownCoins::default();
+            let mut unconfigured = UnconfiguredDexes::default();
 
             loop {
                 tokio::select! {
@@ -696,6 +704,7 @@ impl ExecutionClient for HyperliquidClient {
                             Message::OrderUpdates(updates) => {
                                 for update in updates.data {
                                     unknown_coins.warn_once(&update.order.coin);
+                                    unconfigured.warn_once(&orders_dexes, &update.order.coin);
                                     if let Some(event) =
                                         order_update_to_account_event(&update, &orders_dexes)
                                         && !send_observed(&orders_known, &orders_event_tx, event)
@@ -1149,8 +1158,8 @@ impl ExecutionClient for HyperliquidClient {
     }
 
     /// The collateral balances, read as [`account_snapshot`](ExecutionClient::account_snapshot)
-    /// reads them: `userAbstraction`, then either `spotClearinghouseState` or each DEX's
-    /// `clearinghouseState`.
+    /// reads them: `userAbstraction` (weight 20), then either `spotClearinghouseState` or each
+    /// DEX's `clearinghouseState` (weight 2 each).
     async fn fetch_balances(
         &self,
         _assets: &[AssetNameExchange],
@@ -1223,6 +1232,7 @@ impl ExecutionClient for HyperliquidClient {
 
         let fills = user_fills_by_time(&self.info_client, address, start_ms, end_ms).await?;
         warn_unknown_coins(fills.iter().map(|fill| fill.coin.as_str()));
+        warn_unconfigured_dexes(&self.dexes, fills.iter().map(|fill| fill.coin.as_str()));
 
         let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
             None
@@ -1234,10 +1244,7 @@ impl ExecutionClient for HyperliquidClient {
 
         let mut result = Vec::new();
         for fill in fills {
-            let (Some(instrument), Some(collateral)) = (
-                self.dexes.instrument(&fill.coin),
-                self.dexes.collateral(dex_of(&fill.coin)),
-            ) else {
+            let Some((instrument, collateral)) = self.dexes.perp(&fill.coin) else {
                 continue;
             };
 
@@ -1396,8 +1403,7 @@ fn fill_to_account_event(
     fill: &hyperliquid_rust_sdk::TradeInfo,
     dexes: &PerpDexes,
 ) -> Option<UnindexedAccountEvent> {
-    let instrument = dexes.instrument(&fill.coin)?;
-    let collateral = dexes.collateral(dex_of(&fill.coin))?;
+    let (instrument, collateral) = dexes.perp(&fill.coin)?;
     let side = parse_side(&fill.side)?;
     let price = parse_decimal(&fill.px, "fill.px")?;
     let quantity = parse_decimal(&fill.sz, "fill.sz")?;
@@ -1604,6 +1610,145 @@ mod tests {
                 listed.into_iter().collect::<Vec<_>>(),
                 [ClientOrderId::new(CID)]
             );
+        }
+    }
+
+    mod instrument_names {
+        use super::super::common::info_tests::info_client_against;
+        use super::super::perp_dexes::tests::xyz_and_flx;
+        use super::*;
+        use crate::error::ApiError;
+        use crate::order::{
+            OrderEvent,
+            request::{RequestCancel, RequestOpen},
+        };
+        use wiremock::MockServer;
+
+        /// A client trading `xyz` and `flx`, built without the network, against a server with
+        /// nothing mounted: any request it sent would fail with something other than
+        /// `InstrumentInvalid`.
+        async fn offline_client() -> (MockServer, HyperliquidClient) {
+            let server = MockServer::start().await;
+            let wallet: ethers::signers::LocalWallet =
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+                    .parse()
+                    .unwrap();
+            let exchange_client = ExchangeClient {
+                http_client: info_client_against(server.uri()).await.http_client,
+                wallet: wallet.clone(),
+                meta: hyperliquid_rust_sdk::Meta {
+                    universe: Vec::new(),
+                },
+                vault_address: None,
+                coin_to_asset: Default::default(),
+            };
+            let client = HyperliquidClient {
+                config: HyperliquidConfig::new(wallet, Network::Testnet),
+                info_client: Arc::new(info_client_against(server.uri()).await),
+                exchange_client: Arc::new(exchange_client),
+                dexes: Arc::new(xyz_and_flx().await),
+                known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidPerp),
+            };
+            (server, client)
+        }
+
+        /// Names no perpetual the client trades: the old `-USD-` name, a quote other than the
+        /// DEX's collateral, a DEX not configured, and a spot pair.
+        const REFUSED: [&str; 4] = [
+            "BTC-USD-PERP",
+            "flx:TSLA-USDC-PERP",
+            "km:TSLA-USDH-PERP",
+            "HYPE-USDC-SPOT",
+        ];
+
+        fn is_invalid(
+            error: &ApiError<AssetNameExchange, InstrumentNameExchange>,
+            name: &str,
+        ) -> bool {
+            matches!(error, ApiError::InstrumentInvalid(instrument, _) if instrument.as_ref() == name)
+        }
+
+        #[tokio::test]
+        async fn an_order_on_a_name_the_client_does_not_trade_is_refused_unsent() {
+            let (_server, client) = offline_client().await;
+            for name in REFUSED {
+                let instrument = InstrumentNameExchange::from(name);
+                let order = client
+                    .open_order(OrderEvent {
+                        key: OrderKey {
+                            exchange: ExchangeId::HyperliquidPerp,
+                            instrument: &instrument,
+                            strategy: StrategyId::new("strategy"),
+                            cid: ClientOrderId::uuid(),
+                        },
+                        state: RequestOpen {
+                            side: Side::Buy,
+                            price: Some(dec!(1)),
+                            quantity: dec!(1),
+                            kind: OrderKind::Limit,
+                            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                            position_id: None,
+                            reduce_only: false,
+                            market: None,
+                        },
+                    })
+                    .await;
+                let OrderState::Inactive(crate::order::state::InactiveOrderState::OpenFailed(
+                    OrderError::Rejected(error),
+                )) = &order.state
+                else {
+                    panic!("{name}: expected a rejection, got {:?}", order.state);
+                };
+                assert!(is_invalid(error, name), "{name}: {error:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_cancel_on_a_name_the_client_does_not_trade_is_refused_unsent() {
+            let (_server, client) = offline_client().await;
+            for name in REFUSED {
+                let instrument = InstrumentNameExchange::from(name);
+                let response = client
+                    .cancel_order(OrderEvent {
+                        key: OrderKey {
+                            exchange: ExchangeId::HyperliquidPerp,
+                            instrument: &instrument,
+                            strategy: StrategyId::new("strategy"),
+                            cid: ClientOrderId::uuid(),
+                        },
+                        state: RequestCancel {
+                            id: Some(VenueOrderId::Assigned(OrderId::new("1"))),
+                        },
+                    })
+                    .await;
+                let Err(UnindexedOrderError::Rejected(error)) = &response.state else {
+                    panic!("{name}: expected a rejection, got {:?}", response.state);
+                };
+                assert!(is_invalid(error, name), "{name}: {error:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_read_filtered_to_a_name_the_client_does_not_trade_fails_unsent() {
+            let (_server, client) = offline_client().await;
+            for name in REFUSED {
+                let instruments = [InstrumentNameExchange::from(name)];
+                let snapshot = client.account_snapshot(&[], &instruments).await;
+                let open = client.fetch_open_orders(&instruments).await;
+                let trades = client
+                    .fetch_trades(
+                        Utc::now() - chrono::Duration::hours(1),
+                        Utc::now(),
+                        &instruments,
+                    )
+                    .await;
+                for error in [snapshot.err(), open.err(), trades.err()] {
+                    let Some(UnindexedClientError::Api(error)) = &error else {
+                        panic!("{name}: expected an API error, got {error:?}");
+                    };
+                    assert!(is_invalid(error, name), "{name}: {error:?}");
+                }
+            }
         }
     }
 

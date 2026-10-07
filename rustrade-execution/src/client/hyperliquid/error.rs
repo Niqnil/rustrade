@@ -237,4 +237,21 @@ mod tests {
             UnindexedOrderError::Rejected(ApiError::OrderRejected(_))
         ));
     }
+
+    #[test]
+    fn a_connect_error_is_transient_only_when_the_request_was() {
+        let socket = ConnectivityError::Socket("reset".to_owned());
+        assert_eq!(
+            HyperliquidConnectError::from(UnindexedClientError::Connectivity(socket.clone())),
+            HyperliquidConnectError::Connectivity(socket)
+        );
+        assert!(matches!(
+            HyperliquidConnectError::from(UnindexedClientError::Api(UnindexedApiError::RateLimit)),
+            HyperliquidConnectError::Connectivity(ConnectivityError::Socket(_))
+        ));
+        assert!(matches!(
+            HyperliquidConnectError::from(UnindexedClientError::Internal("bad json".to_owned())),
+            HyperliquidConnectError::Metadata(reason) if reason.contains("bad json")
+        ));
+    }
 }

@@ -594,8 +594,8 @@ async fn test_hip3_order_round_trip() {
         snapshot
             .balances
             .iter()
-            .any(|balance| balance.asset.as_ref() == "USDC"),
-        "the default DEX's collateral is reported"
+            .any(|balance| balance.asset.as_ref() == "USDC" && balance.balance.total > dec!(0)),
+        "the default DEX's collateral is reported, wherever the account's mode holds it"
     );
 
     let cancelled = client

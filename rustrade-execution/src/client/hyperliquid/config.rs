@@ -27,8 +27,13 @@ pub struct HyperliquidConfig {
     /// as spelled there. Empty by default: only the default DEX.
     ///
     /// The perpetuals client reads each one's markets when it connects, and refuses to connect
-    /// if Hyperliquid does not list one. See [`HyperliquidClient`](super::HyperliquidClient)'s
-    /// HIP-3 docs. The spot client ignores this.
+    /// if Hyperliquid does not list one. A name given twice counts once. See
+    /// [`HyperliquidClient`](super::HyperliquidClient)'s HIP-3 docs. The spot client ignores
+    /// this.
+    ///
+    /// Each DEX adds a `clearinghouseState` (weight 2) and an `openOrders` (weight 20) request to
+    /// every account snapshot, and an `openOrders` to every listing of open orders, against
+    /// Hyperliquid's REST limit of 1,200 a minute per IP address.
     pub dexes: Vec<SmolStr>,
 }
 
@@ -151,21 +156,25 @@ impl HyperliquidConfig {
 /// Use [`HyperliquidConfig::from_env`] to load credentials.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HyperliquidConfigFile {
-    /// Whether to use testnet (true) or mainnet (false).
+    /// The network to trade on, `"mainnet"` or `"testnet"`.
     ///
-    /// An absent `testnet` field defaults to the **safe** testnet environment (`true`), matching
+    /// An absent `network` field defaults to the **safe** testnet, matching
     /// [`HyperliquidConfig::from_env`] and the Alpaca/Binance config files.
-    #[serde(default = "default_testnet")]
-    pub testnet: bool,
+    #[serde(default = "default_network")]
+    pub network: Network,
+
+    /// The HIP-3 DEXs to trade; see [`HyperliquidConfig::dexes`]. Absent ⇒ none.
+    #[serde(default)]
+    pub dexes: Vec<SmolStr>,
 }
 
-/// Serde default for [`HyperliquidConfigFile::testnet`]: an absent `testnet` field deserializes to
-/// the **safe** testnet environment (`true`).
+/// Serde default for [`HyperliquidConfigFile::network`]: an absent `network` field deserializes to
+/// the **safe** testnet.
 ///
 /// `#[serde(default = "…")]` requires a named function (it cannot take a literal), so this exists
 /// purely to supply that default to the derive.
-fn default_testnet() -> bool {
-    true
+fn default_network() -> Network {
+    Network::Testnet
 }
 
 /// Errors that can occur when creating a HyperliquidConfig.
@@ -321,6 +330,27 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn from_env_rejects_non_utf8_dexes() {
+        use std::os::unix::ffi::OsStringExt;
+        let dexes = std::ffi::OsString::from_vec(vec![b'x', 0xff]);
+        temp_env::with_vars(
+            [
+                (
+                    "HYPERLIQUID_PRIVATE_KEY",
+                    Some(std::ffi::OsString::from(TEST_KEY)),
+                ),
+                ("HYPERLIQUID_DEXES", Some(dexes)),
+            ],
+            || {
+                let err = HyperliquidConfig::from_env().unwrap_err();
+                assert!(matches!(err, HyperliquidConfigError::InvalidDexes(_)));
+            },
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn from_env_trades_no_dex_when_none_is_named() {
@@ -343,11 +373,21 @@ mod tests {
     }
 
     #[test]
-    fn test_config_file_absent_testnet_defaults_to_testnet() {
+    fn test_config_file_absent_network_defaults_to_testnet() {
         let file: HyperliquidConfigFile = serde_json::from_str("{}").unwrap();
-        assert!(
-            file.testnet,
-            "absent `testnet` field must default to safe testnet"
+        assert_eq!(
+            file.network,
+            Network::Testnet,
+            "absent `network` field must default to safe testnet"
         );
+        assert!(file.dexes.is_empty());
+    }
+
+    #[test]
+    fn a_config_file_names_its_network_and_dexes() {
+        let file: HyperliquidConfigFile =
+            serde_json::from_str(r#"{"network": "mainnet", "dexes": ["xyz", "flx"]}"#).unwrap();
+        assert_eq!(file.network, Network::Mainnet);
+        assert_eq!(file.dexes, ["xyz", "flx"]);
     }
 }

@@ -101,24 +101,38 @@ pub(super) async fn spot_state(
         .balances)
 }
 
-/// The collateral balances of the DEXs traded, read where `mode` holds them.
-///
-/// Reads `userAbstraction`, then either each DEX's `clearinghouseState` or
-/// `spotClearinghouseState`; see [`per_dex_balances`] and [`unified_balances`].
+/// The collateral balances of the DEXs traded, read where `mode` holds them: from `states`, each
+/// DEX's `clearinghouseState`, under [`AccountMode::PerDex`], or from `spotClearinghouseState`,
+/// read here, under [`AccountMode::Unified`]. See [`per_dex_balances`] and [`unified_balances`].
+pub(super) async fn balances(
+    info_client: &InfoClient,
+    address: H160,
+    dexes: &PerpDexes,
+    mode: AccountMode,
+    states: &[(Option<&str>, UserStateResponse)],
+) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError> {
+    Ok(match mode {
+        AccountMode::PerDex => per_dex_balances(states, dexes, Utc::now()),
+        AccountMode::Unified => {
+            let spot = spot_state(info_client, address).await?;
+            unified_balances(&spot, dexes, Utc::now())
+        }
+    })
+}
+
+/// The collateral balances of the DEXs traded: `userAbstraction`, then only what that mode holds
+/// them in; see [`balances`].
 pub(super) async fn fetch_balances(
     info_client: &InfoClient,
     address: H160,
     dexes: &PerpDexes,
 ) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError> {
-    let now = Utc::now();
-    Ok(match account_mode(info_client, address).await? {
-        AccountMode::PerDex => {
-            per_dex_balances(&dex_states(info_client, address, dexes).await?, dexes, now)
-        }
-        AccountMode::Unified => {
-            unified_balances(&spot_state(info_client, address).await?, dexes, now)
-        }
-    })
+    let mode = account_mode(info_client, address).await?;
+    let states = match mode {
+        AccountMode::PerDex => dex_states(info_client, address, dexes).await?,
+        AccountMode::Unified => Vec::new(),
+    };
+    balances(info_client, address, dexes, mode, &states).await
 }
 
 /// One balance per DEX, from its margin summary: the default DEX's under its collateral's name
@@ -309,6 +323,111 @@ mod tests {
                 ("xyz:USDC".to_owned(), dec!(2), dec!(2)),
             ]
         );
+    }
+
+    /// A server answering `userAbstraction` with `mode`, `spotClearinghouseState` with 998.99
+    /// USDC (5.31 on hold), and each DEX's `clearinghouseState` with a distinct account value.
+    async fn balance_server(mode: &str) -> wiremock::MockServer {
+        use wiremock::matchers::{body_partial_json, method, path};
+        let server = wiremock::MockServer::start().await;
+        let mount = |request: serde_json::Value, answer: serde_json::Value| {
+            wiremock::Mock::given(method("POST"))
+                .and(path("/info"))
+                .and(body_partial_json(request))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(answer))
+        };
+        mount(serde_json::json!({"type": "userAbstraction"}), mode.into())
+            .mount(&server)
+            .await;
+        mount(
+            serde_json::json!({"type": "spotClearinghouseState"}),
+            serde_json::json!({"balances": [
+                {"coin": "USDC", "token": 0, "total": "998.99", "hold": "5.31", "entryNtl": "0.0"}
+            ]}),
+        )
+        .mount(&server)
+        .await;
+        let state = |value: &str| {
+            serde_json::json!({
+                "assetPositions": [],
+                "crossMarginSummary": {"accountValue": value, "totalMarginUsed": "0.0",
+                                       "totalNtlPos": "0.0", "totalRawUsd": "0.0"},
+                "marginSummary": {"accountValue": value, "totalMarginUsed": "0.0",
+                                  "totalNtlPos": "0.0", "totalRawUsd": "0.0"},
+                "withdrawable": "0.0"
+            })
+        };
+        // The DEX-specific mocks first: a request with `dex` also matches the bare one.
+        for (dex, value) in [("xyz", "2.0"), ("flx", "3.0")] {
+            mount(
+                serde_json::json!({"type": "clearinghouseState", "dex": dex}),
+                state(value),
+            )
+            .mount(&server)
+            .await;
+        }
+        mount(
+            serde_json::json!({"type": "clearinghouseState"}),
+            state("1.0"),
+        )
+        .mount(&server)
+        .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn a_unified_account_reads_its_balances_from_the_spot_clearinghouse() {
+        use super::super::common::info_tests::info_client_against;
+        let dexes = xyz_and_flx().await;
+        for mode in ["unifiedAccount", "portfolioMargin"] {
+            let server = balance_server(mode).await;
+            let info_client = info_client_against(server.uri()).await;
+            let balances = fetch_balances(&info_client, H160::zero(), &dexes)
+                .await
+                .unwrap();
+            assert_eq!(
+                summary(&balances),
+                [
+                    ("USDC".to_owned(), dec!(998.99), dec!(993.68)),
+                    ("USDH".to_owned(), dec!(0), dec!(0)),
+                ],
+                "{mode}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_standard_account_reads_its_balances_from_each_dex() {
+        use super::super::common::info_tests::info_client_against;
+        let dexes = xyz_and_flx().await;
+        for mode in ["default", "disabled", "dexAbstraction"] {
+            let server = balance_server(mode).await;
+            let info_client = info_client_against(server.uri()).await;
+            let balances = fetch_balances(&info_client, H160::zero(), &dexes)
+                .await
+                .unwrap();
+            assert_eq!(
+                summary(&balances),
+                [
+                    ("USDC".to_owned(), dec!(1), dec!(1)),
+                    ("flx:USDH".to_owned(), dec!(3), dec!(3)),
+                    ("xyz:USDC".to_owned(), dec!(2), dec!(2)),
+                ],
+                "{mode}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_account_mode_fails_the_balance_read() {
+        use super::super::common::info_tests::info_client_against;
+        let dexes = xyz_and_flx().await;
+        let server = balance_server("somethingNew").await;
+        let info_client = info_client_against(server.uri()).await;
+        let error = fetch_balances(&info_client, H160::zero(), &dexes)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("somethingNew"), "{error}");
     }
 
     #[test]
