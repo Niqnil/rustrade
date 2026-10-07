@@ -855,11 +855,12 @@ mod tests {
         assert_both_answered(&key, &events, &rejection);
     }
 
-    /// Opens an account stream that fails on the attempts in `fail_on`, counted from 0. The first
-    /// stream it opens ends at once, and any later one stays open.
+    /// Opens an account stream that fails on the attempts in `fail_on`, counted from 0. A stream
+    /// opened before attempt `open_from` ends at once; one opened from it on stays open.
     #[derive(Debug, Clone, Default)]
     struct FlakyAccountClient {
         fail_on: &'static [usize],
+        open_from: usize,
         attempts: Arc<std::sync::atomic::AtomicUsize>,
     }
 
@@ -893,7 +894,7 @@ mod tests {
                 Err(UnindexedClientError::Connectivity(
                     ConnectivityError::Timeout,
                 ))
-            } else if attempt == 0 {
+            } else if attempt < self.open_from {
                 Ok(futures::stream::empty().boxed())
             } else {
                 Ok(futures::stream::pending().boxed())
@@ -967,10 +968,12 @@ mod tests {
 
     /// Each failed re-init reaches the consumer in order, as a `ReinitFailed` counting
     /// consecutive failures, with no `Reconnecting` beyond the one that marked the disconnect.
+    /// The count restarts after a stream initialises.
     #[tokio::test]
     async fn each_failed_account_stream_reinit_is_sent_in_order() {
         let Ok(manager) = init_flaky(FlakyAccountClient {
-            fail_on: &[1, 2],
+            fail_on: &[1, 2, 4],
+            open_from: 5,
             ..FlakyAccountClient::default()
         })
         .await
@@ -979,7 +982,7 @@ mod tests {
         };
         let exchange = manager.indexer.map.exchange.key;
 
-        let events = manager.account_stream.take(5).collect::<Vec<_>>().await;
+        let events = manager.account_stream.take(8).collect::<Vec<_>>().await;
 
         let snapshot = || {
             AccountStreamEvent::Item(AccountEvent {
@@ -1005,6 +1008,9 @@ mod tests {
                 AccountStreamEvent::Reconnecting(EXCHANGE),
                 reinit_failed(1),
                 reinit_failed(2),
+                snapshot(),
+                AccountStreamEvent::Reconnecting(EXCHANGE),
+                reinit_failed(1),
                 snapshot(),
             ]
         );

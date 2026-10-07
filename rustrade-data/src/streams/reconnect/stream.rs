@@ -105,6 +105,11 @@ where
 
     /// Maps every [`ReconnectingStream`] `Stream::Item` into an [`reconnect::Event::Item`](Event),
     /// and chain a [`reconnect::Event::Reconnecting`](Event)
+    ///
+    /// Pairs with [`with_reconnect_backoff`](Self::with_reconnect_backoff), which discards failed
+    /// re-initialisations. To report them as events, use
+    /// [`with_reconnect_backoff_reporting`](Self::with_reconnect_backoff_reporting) with
+    /// [`with_reconnection_events_reporting`](Self::with_reconnection_events_reporting).
     fn with_reconnection_events<St, Origin>(
         self,
         origin: Origin,
@@ -134,7 +139,7 @@ where
     where
         Self: Stream<Item = Result<St, ReinitFailure<InitError>>>,
         St: Stream,
-        Origin: Clone + 'static,
+        Origin: Clone,
         FnOnFailure: Fn(ReinitFailure<InitError>) -> St::Item,
     {
         self.map(move |initialised| match initialised {
@@ -379,5 +384,35 @@ mod tests {
             .await;
 
         assert_eq!(streams, [1, 2]);
+    }
+
+    #[tokio::test]
+    async fn a_failure_becomes_one_item_and_only_an_ended_stream_adds_reconnecting() {
+        let origin = ExchangeId::Simulated;
+        let failure = |attempt| ReinitFailure {
+            attempt,
+            error: "refused",
+        };
+        let events = stream::iter([
+            Ok(stream::iter(vec![1_u32])),
+            Err(failure(1)),
+            Err(failure(2)),
+            Ok(stream::iter(vec![2])),
+        ])
+        .with_reconnection_events_reporting(origin, |failure| 100 + failure.attempt)
+        .collect::<Vec<_>>()
+        .await;
+
+        assert_eq!(
+            events,
+            [
+                Event::Item(1),
+                Event::Reconnecting(origin),
+                Event::Item(101),
+                Event::Item(102),
+                Event::Item(2),
+                Event::Reconnecting(origin),
+            ]
+        );
     }
 }
