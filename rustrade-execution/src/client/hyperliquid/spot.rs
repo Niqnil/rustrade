@@ -65,8 +65,8 @@
 use super::common::{
     CLOID_REQUIRED, CancelOnDropStream, OpenOrder, OpenOrderListing, UserFill, cid_to_cloid,
     instrument_to_spot_coin, map_tif, millis_to_datetime, open_order_to_order, open_orders,
-    parse_decimal, parse_side, round_to_5_sig_figs, span_millis, spot_pair_to_instrument,
-    user_fills_by_time,
+    parse_decimal, parse_side, round_to_5_sig_figs, span_millis, spot_balances,
+    spot_pair_to_instrument, user_fills_by_time,
 };
 use super::config::HyperliquidConfig;
 use super::error::{map_order_error, map_sdk_error};
@@ -82,7 +82,7 @@ use crate::client::order_recovery::{
 use crate::{
     AccountEvent, AccountEventKind, AccountSnapshot, UnindexedAccountEvent,
     UnindexedAccountSnapshot,
-    balance::{AssetBalance, Balance},
+    balance::AssetBalance,
     client::{ExecutionClient, OrderStatusClient},
     emit_stream_terminated,
     error::{
@@ -101,7 +101,7 @@ use chrono::{DateTime, Utc};
 use ethers::signers::Signer;
 use fnv::FnvHashSet;
 use futures::{StreamExt, stream::BoxStream};
-use hyperliquid_rust_sdk::{BaseUrl, ExchangeClient, InfoClient, Message, Subscription};
+use hyperliquid_rust_sdk::{ExchangeClient, InfoClient, Message, Subscription};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
     Side,
@@ -148,11 +148,7 @@ impl HyperliquidSpotClient {
     /// [`ConnectivityError::Socket`] when the SDK clients cannot be created, or Hyperliquid's
     /// `spotMeta` cannot be read (see [Spot coins](self#spot-coins)).
     pub async fn connect(config: HyperliquidConfig) -> Result<Self, ConnectivityError> {
-        let base_url = if config.testnet {
-            BaseUrl::Testnet
-        } else {
-            BaseUrl::Mainnet
-        };
+        let base_url = config.base_url();
 
         let info_client = InfoClient::new(None, Some(base_url))
             .await
@@ -169,7 +165,7 @@ impl HyperliquidSpotClient {
             .map_err(|e| ConnectivityError::Socket(format!("spotMeta: {e}")))?;
 
         info!(
-            testnet = config.testnet,
+            network = ?config.network,
             wallet = %config.wallet_address_hex(),
             "Created HyperliquidSpotClient"
         );
@@ -181,15 +177,6 @@ impl HyperliquidSpotClient {
             spot_coins,
             known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidSpot),
         })
-    }
-
-    /// Returns the base URL for the configured network (mainnet or testnet).
-    fn base_url(&self) -> BaseUrl {
-        if self.config.testnet {
-            BaseUrl::Testnet
-        } else {
-            BaseUrl::Mainnet
-        }
     }
 
     /// Returns the wallet address as a hex string (for logging/debugging).
@@ -227,11 +214,7 @@ impl ExecutionClient for HyperliquidSpotClient {
     /// Use [`HyperliquidSpotClient::connect`] instead — it's async-safe and returns `Result`.
     /// This method exists only for trait compliance; prefer `connect()` in all new code.
     fn new(config: Self::Config) -> Self {
-        let base_url = if config.testnet {
-            BaseUrl::Testnet
-        } else {
-            BaseUrl::Mainnet
-        };
+        let base_url = config.base_url();
 
         let handle = tokio::runtime::Handle::current();
 
@@ -256,7 +239,7 @@ impl ExecutionClient for HyperliquidSpotClient {
         });
 
         info!(
-            testnet = config.testnet,
+            network = ?config.network,
             wallet = %config.wallet_address_hex(),
             "Created HyperliquidSpotClient"
         );
@@ -289,7 +272,7 @@ impl ExecutionClient for HyperliquidSpotClient {
         )?;
 
         let now = Utc::now();
-        let balances = parse_token_balances(&token_balances.balances, now);
+        let balances = spot_balances(&token_balances.balances, now).collect();
 
         let coins = open_orders.iter().map(|order| order.coin.as_str());
         let pairs = self.spot_coins.covering(coins.clone()).await;
@@ -344,7 +327,7 @@ impl ExecutionClient for HyperliquidSpotClient {
         _instruments: &[InstrumentNameExchange],
     ) -> Result<Self::AccountStream, UnindexedClientError> {
         let user = self.wallet_h160();
-        let base_url = self.base_url();
+        let base_url = self.config.base_url();
 
         let mut ws_client = InfoClient::with_reconnect(None, Some(base_url))
             .await
@@ -1019,7 +1002,7 @@ impl ExecutionClient for HyperliquidSpotClient {
             .map_err(map_sdk_error)?;
 
         let now = Utc::now();
-        Ok(parse_token_balances(&token_balances.balances, now))
+        Ok(spot_balances(&token_balances.balances, now).collect())
     }
 
     async fn fetch_open_orders(
@@ -1270,27 +1253,6 @@ fn spot_trades(
     }
 
     Ok(result)
-}
-
-/// Parse spot token balances from SDK response.
-fn parse_token_balances(
-    balances: &[hyperliquid_rust_sdk::UserTokenBalance],
-    now: DateTime<Utc>,
-) -> Vec<AssetBalance<AssetNameExchange>> {
-    balances
-        .iter()
-        .map(|bal| {
-            let total = parse_decimal(&bal.total, "total").unwrap_or(Decimal::ZERO);
-            let hold = parse_decimal(&bal.hold, "hold").unwrap_or(Decimal::ZERO);
-            let free = (total - hold).max(Decimal::ZERO);
-
-            AssetBalance::new(
-                AssetNameExchange::from(bal.coin.as_str()),
-                Balance::new(total, free),
-                now,
-            )
-        })
-        .collect()
 }
 
 /// Convert SDK TradeInfo (fill) on `pair` to AccountEvent::Trade for spot.

@@ -405,7 +405,7 @@ pub(super) mod tests {
     pub(in crate::client::hyperliquid) const CLOID: &str = "0x873ce360db324c79953457fc5b02fbe1";
 
     fn btc() -> InstrumentNameExchange {
-        InstrumentNameExchange::new("BTC-USD-PERP")
+        InstrumentNameExchange::new("BTC-USDC-PERP")
     }
 
     fn key(cid: &str) -> UnindexedOrderKey {
@@ -629,7 +629,7 @@ pub(super) mod tests {
 
     #[test]
     fn an_order_on_another_instrument_is_unknown() {
-        let eth = InstrumentNameExchange::new("ETH-USD-PERP");
+        let eth = InstrumentNameExchange::new("ETH-USDC-PERP");
         let elsewhere = lookup_from_record(key(CID), &record("ETH", "canceled", "0"), Some(eth));
         let untraded = lookup_from_record(key(CID), &record("@107", "canceled", "0"), None);
 
@@ -664,7 +664,7 @@ pub(super) mod tests {
         ];
         let to_instrument = |coin: &str| {
             (!coin.starts_with('@'))
-                .then(|| InstrumentNameExchange::new(format!("{coin}-USD-PERP")))
+                .then(|| InstrumentNameExchange::new(format!("{coin}-USDC-PERP")))
         };
 
         let listed = listed_cids(&rows, &[btc()], to_instrument);

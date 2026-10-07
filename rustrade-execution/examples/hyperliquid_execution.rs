@@ -14,6 +14,8 @@
 //! 3. Environment variables:
 //!    - `HYPERLIQUID_PRIVATE_KEY`: Hex-encoded private key (with or without 0x prefix)
 //!    - `HYPERLIQUID_TESTNET`: Set to "true" for testnet (recommended)
+//!    - `HYPERLIQUID_DEXES` (optional): builder-deployed (HIP-3) DEXs to trade too, such as
+//!      `xyz,flx`. Their perpetuals are named after the DEX's collateral, e.g. `xyz:TSLA-USDC-PERP`
 //!
 //! # Usage
 //!
@@ -38,7 +40,7 @@ use rust_decimal_macros::dec;
 use rustrade_execution::{
     client::{
         ExecutionClient,
-        hyperliquid::{HyperliquidClient, config::HyperliquidConfig},
+        hyperliquid::{HyperliquidClient, Network, config::HyperliquidConfig},
     },
     order::{
         OrderEvent, OrderKey, OrderKind, TimeInForce,
@@ -69,11 +71,10 @@ async fn main() {
         }
     };
 
-    let network = if config.testnet { "TESTNET" } else { "MAINNET" };
-    info!("Connecting to Hyperliquid {network}...");
+    info!("Connecting to Hyperliquid {:?}...", config.network);
     info!("Wallet: {}", config.wallet_address_hex());
 
-    if !config.testnet {
+    if config.network == Network::Mainnet {
         warn!("WARNING: Running on MAINNET - real funds at risk!");
         warn!("Set HYPERLIQUID_TESTNET=true for safe testing");
     }
@@ -146,7 +147,7 @@ async fn main() {
     info!("");
     info!("=== Placing Limit Order ===");
 
-    let btc_perp: InstrumentNameExchange = "BTC-USD-PERP".into();
+    let btc_perp: InstrumentNameExchange = "BTC-USDC-PERP".into();
     // Hyperliquid accepts only client ids in `ClientOrderId::uuid()` form.
     let order_cid = ClientOrderId::uuid();
     let strategy = StrategyId::new("demo-strategy");
@@ -176,7 +177,7 @@ async fn main() {
         state: request_open,
     };
 
-    info!("Placing BUY 0.001 BTC-USD-PERP @ $50,000 (won't fill - below market)");
+    info!("Placing BUY 0.001 BTC-USDC-PERP @ $50,000 (won't fill - below market)");
 
     let response = client.open_order(open_request).await;
     match &response.state {

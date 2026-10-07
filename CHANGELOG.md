@@ -143,6 +143,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   order the venue does not know (`unknownOid`), one on another instrument than the key's, and an
   id that is neither a canonical UUID nor an oid. An order placed without a cloid, which the
   clients report under its oid, is looked up by that oid. Refs #370.
+- **The Hyperliquid perpetuals client trades builder-deployed (HIP-3) perpetuals**
+  (`rustrade-execution`, `hyperliquid` feature). **Breaking.** It placed and cancelled only on the
+  default DEX: the SDK knows no HIP-3 asset ids, and a HIP-3 DEX's positions and open orders are
+  listed only when asked for that DEX.
+  - New `HyperliquidConfig::dexes` names the HIP-3 DEXs to trade besides the default one (`xyz`,
+    `flx`), set with `with_dexes` or the `HYPERLIQUID_DEXES` environment variable
+    (comma-separated). `HyperliquidClient::connect` reads each one's markets and collateral token
+    from `perpDexs`, `spotMeta` and its `meta`, and adds their asset ids to the SDK's.
+  - `account_snapshot`, `fetch_open_orders` and the reconnect check read each DEX traded, with one
+    `clearinghouseState` and one `openOrders` request per DEX, the default one included. Fills
+    need no extra request.
+  - **Breaking:** every perpetual is named after its DEX's collateral token,
+    `{coin}-{collateral}-PERP`: `BTC-USDC-PERP` (was `BTC-USD-PERP`), `xyz:TSLA-USDC-PERP`,
+    `flx:TSLA-USDH-PERP`. An order, cancel or filtered read on any other name, a perpetual on an
+    unconfigured DEX included, is refused with `ApiError::InstrumentInvalid`. Fills and orders on
+    an unconfigured DEX are left out, logged once per DEX. A fill's `fees_quote` is now set
+    whenever the fee is in the DEX's collateral, not only for USDC.
+  - **Breaking:** `HyperliquidConfig.testnet: bool` is replaced by
+    `network: rustrade_instrument::hyperliquid::Network` (re-exported as
+    `client::hyperliquid::Network`), and `from_private_key` and `new` take a `Network`.
+    `HYPERLIQUID_TESTNET` is read as before.
+  - **Breaking:** `HyperliquidClient::connect` returns the new `HyperliquidConnectError`:
+    `Connectivity`, `UnknownDex` for a DEX Hyperliquid does not list, or `Metadata` for one whose
+    markets cannot be read. `HyperliquidSpotClient::connect` is unchanged and ignores `dexes`.
+  - **Breaking:** `client::hyperliquid::common::perp_coin_to_instrument` and
+    `instrument_to_perp_coin` are removed: a perpetual's name now depends on its DEX's metadata.
+
+  A perpetual listed after the client connects cannot be ordered until it connects again, as the
+  SDK's asset ids are read once. Closes #503.
 - **A given-up fill recovery is reported on the account stream, not only in the log**
   (`rustrade-execution`). Before, when fill recovery gave up on a span of fills, those fills never
   reached the consumer and the only trace was an `error!` line. The new
@@ -476,12 +505,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `spot_pair_to_instrument(&SpotPair)`.
 
   Closes #496.
+- **Hyperliquid perpetuals reported a zero balance for a unified or portfolio-margin account**
+  (`rustrade-execution`). `account_snapshot` and `fetch_balances` read USDC from the default DEX's
+  margin summary, which Hyperliquid documents as not meaningful in those modes, where every
+  balance is held in the spot clearinghouse. They now read the account's mode with
+  `userAbstraction` each time. Under unified account or portfolio margin they report one balance
+  per collateral token of the DEXs traded, from `spotClearinghouseState`, free of what is on hold.
+  Under standard mode they report one balance per DEX, from its margin summary: `USDC` for the
+  default DEX and `{dex}:{collateral}` (`xyz:USDC`, `flx:USDH`) for each HIP-3 DEX, since each
+  margins separately. A mode the client does not know fails the read.
 - **Hyperliquid perpetual fills reported every fee as USDC** (`rustrade-execution`). The
   perpetuals client hard-coded the fee asset of fills on the account stream and from
   `fetch_trades`. A builder-deployed (HIP-3) perpetual settles in its deployer's collateral, so a
   fee charged in USDH, USDE or USDT0 was reported as USDC. The fee asset now comes from the fill's
   `feeToken`, falling back to USDC only if it is absent. `fees_quote` is set only for a USDC fee.
-  The client still cannot place orders on HIP-3 perpetuals.
 - **Hyperliquid data subscriptions upper-cased mixed-case perpetuals (`kPEPE` became `KPEPE`),
   and had no way to find a builder-deployed (HIP-3) perpetual** (`rustrade-data` and
   `rustrade-instrument`, `hyperliquid` features). **Breaking.** A subscription built from a

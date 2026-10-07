@@ -68,12 +68,37 @@
 //! open-order and fill endpoints, each order and fill under its *coin*. Each client keeps only its
 //! own, judged by [`CoinKind::of`](rustrade_instrument::hyperliquid::CoinKind::of):
 //! - [`HyperliquidClient`] keeps perpetuals (`BTC`, `kPEPE`, and HIP-3 perpetuals such as
-//!   `xyz:TSLA`), named `{coin}-USD-PERP`;
+//!   `xyz:TSLA` on the DEXs it is configured with), named `{coin}-{collateral}-PERP`; see [HIP-3
+//!   perpetuals](#hip-3-perpetuals);
 //! - [`spot::HyperliquidSpotClient`] keeps spot pairs (`@107`, `PURR/USDC`), named from their
 //!   tokens; see its [Spot coins](spot#spot-coins).
 //!
 //! A coin of a kind neither recognises, such as an outcome coin (`#12`), is left out by both, and
 //! logged with `warn!` by the perpetuals client.
+//!
+//! # HIP-3 perpetuals
+//!
+//! Besides its default perpetuals DEX, Hyperliquid hosts builder-deployed (HIP-3) DEXs, each
+//! with its own perpetuals, named `{dex}:{asset}` (`xyz:TSLA`), its own margin, and its own
+//! collateral token, which need not be USDC. [`HyperliquidClient`] trades the default DEX and the
+//! HIP-3 DEXs named in [`HyperliquidConfig::dexes`], which it reads when it connects.
+//!
+//! - **Names.** Every perpetual is named after the token its DEX settles in:
+//!   `{coin}-{collateral}-PERP`, such as `BTC-USDC-PERP`, `xyz:TSLA-USDC-PERP` and
+//!   `flx:TSLA-USDH-PERP`. An order, cancel or filtered read on any other name, a perpetual on an
+//!   unconfigured DEX included, is refused with
+//!   [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid).
+//! - **Unconfigured DEXs.** Their fills and orders still arrive on the account stream and in the
+//!   venue's listings, but without the DEX's metadata they cannot be named, so they are left out,
+//!   logged at `warn` once per DEX.
+//! - **New listings.** The SDK addresses an order by the asset ids read at connect, so a
+//!   perpetual listed after that, on any DEX, cannot be ordered until the client connects again.
+//! - **Balances.** Where collateral is held depends on the account's abstraction mode; see
+//!   [`account_snapshot`](HyperliquidClient#method.account_snapshot).
+//! - **Cost.** Connecting reads `perpDexs`, `spotMeta` and each configured DEX's `meta` (weight
+//!   20 each) when any DEX is configured. Each read of open orders or positions makes one
+//!   request per DEX, the default one included: Hyperliquid lists a HIP-3 DEX's only when asked
+//!   for it. Fills need no such request.
 //!
 //! # Client order ids
 //!
@@ -117,6 +142,8 @@ pub mod common;
 pub mod config;
 pub mod error;
 mod order_recovery;
+mod perp_account;
+mod perp_dexes;
 pub mod spot;
 mod spot_coins;
 
@@ -127,7 +154,7 @@ use crate::client::order_recovery::{
 use crate::{
     AccountEvent, AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot,
     UnindexedAccountEvent, UnindexedAccountSnapshot,
-    balance::{AssetBalance, Balance},
+    balance::AssetBalance,
     client::{ExecutionClient, OrderStatusClient},
     emit_stream_terminated,
     error::{
@@ -145,21 +172,25 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use common::{
-    CLOID_REQUIRED, CancelOnDropStream, OpenOrderListing, UnknownCoins, cid_to_cloid,
-    instrument_to_perp_coin, map_tif, millis_to_datetime, open_order_to_order, open_orders,
-    parse_decimal, parse_side, perp_coin_to_instrument, perp_instrument, round_to_5_sig_figs,
+    CLOID_REQUIRED, CancelOnDropStream, OpenOrderListing, UnknownCoins, cid_to_cloid, map_tif,
+    millis_to_datetime, open_order_to_order, parse_decimal, parse_side, round_to_5_sig_figs,
     span_millis, user_fills_by_time, warn_unknown_coins,
 };
-pub use config::{HyperliquidConfig, HyperliquidConfigError};
-use error::{map_order_error, map_sdk_error};
+pub use config::{HyperliquidConfig, HyperliquidConfigError, Network};
+pub use error::HyperliquidConnectError;
+use error::map_order_error;
 use ethers::signers::Signer;
 use fnv::FnvHashSet;
 use futures::{StreamExt, stream::BoxStream};
-use hyperliquid_rust_sdk::{BaseUrl, ExchangeClient, InfoClient, Message, Subscription};
+use hyperliquid_rust_sdk::{ExchangeClient, InfoClient, Message, Subscription};
 use order_recovery::{
     ReconnectWatch, fetch_order_record, listed_cids, lookup_from_record, remember_open,
     remember_snapshot, send_fills, send_observed, spawn_order_checks,
 };
+use perp_account::{
+    AccountMode, account_mode, dex_states, per_dex_balances, spot_state, unified_balances,
+};
+use perp_dexes::{PerpDexes, dex_of};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
     Side,
@@ -179,9 +210,6 @@ use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-/// USDC asset name on Hyperliquid, the collateral of its default perpetuals.
-const USDC_ASSET: &str = "USDC";
-
 /// Hyperliquid perpetual futures execution client.
 ///
 /// Wraps the official `hyperliquid_rust_sdk` to implement the `ExecutionClient` trait.
@@ -191,6 +219,8 @@ pub struct HyperliquidClient {
     config: HyperliquidConfig,
     info_client: Arc<InfoClient>,
     exchange_client: Arc<ExchangeClient>,
+    /// The DEXs traded, and the names of their perpetuals.
+    dexes: Arc<PerpDexes>,
     /// The orders seen live and not yet seen end, which a reconnect asks about. Shared by every
     /// clone and every account stream, since an order placed through one ends on any of them.
     known_live: SharedKnownLiveOrders,
@@ -201,24 +231,36 @@ impl HyperliquidClient {
     ///
     /// Use this when calling from an async context (e.g., tokio tests).
     /// For sync contexts, use `ExecutionClient::new()`.
-    pub async fn connect(config: HyperliquidConfig) -> Result<Self, ConnectivityError> {
-        let base_url = if config.testnet {
-            BaseUrl::Testnet
-        } else {
-            BaseUrl::Mainnet
-        };
+    ///
+    /// Reads the markets of each DEX in [`HyperliquidConfig::dexes`]; see [HIP-3
+    /// perpetuals](self#hip-3-perpetuals).
+    ///
+    /// # Errors
+    ///
+    /// - [`HyperliquidConnectError::Connectivity`] when the SDK clients cannot be created, or a
+    ///   request for the DEXs' markets fails in transit.
+    /// - [`HyperliquidConnectError::UnknownDex`] when Hyperliquid lists no DEX by a configured
+    ///   name on the configured network.
+    /// - [`HyperliquidConnectError::Metadata`] when a DEX's markets cannot be read.
+    pub async fn connect(config: HyperliquidConfig) -> Result<Self, HyperliquidConnectError> {
+        let base_url = config.base_url();
 
         let info_client = InfoClient::new(None, Some(base_url))
             .await
             .map_err(|e| ConnectivityError::Socket(format!("InfoClient: {e}")))?;
 
+        let dexes = PerpDexes::fetch(&info_client, &config.dexes).await?;
+
         let wallet = config.wallet.clone();
-        let exchange_client = ExchangeClient::new(None, wallet, Some(base_url), None, None)
+        let mut exchange_client = ExchangeClient::new(None, wallet, Some(base_url), None, None)
             .await
             .map_err(|e| ConnectivityError::Socket(format!("ExchangeClient: {e}")))?;
+        // The SDK addresses an order by the coin's asset id, and reads only the default DEX's.
+        exchange_client.coin_to_asset.extend(dexes.asset_ids());
 
         info!(
-            testnet = config.testnet,
+            network = ?config.network,
+            dexes = ?config.dexes,
             wallet = %config.wallet_address_hex(),
             "Created HyperliquidClient"
         );
@@ -227,17 +269,9 @@ impl HyperliquidClient {
             config,
             info_client: Arc::new(info_client),
             exchange_client: Arc::new(exchange_client),
+            dexes: Arc::new(dexes),
             known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidPerp),
         })
-    }
-
-    /// Returns the base URL for the configured network (mainnet or testnet).
-    fn base_url(&self) -> BaseUrl {
-        if self.config.testnet {
-            BaseUrl::Testnet
-        } else {
-            BaseUrl::Mainnet
-        }
     }
 
     /// Returns the wallet address as a hex string (for logging/debugging).
@@ -248,6 +282,24 @@ impl HyperliquidClient {
     /// Returns the wallet address as ethers H160.
     fn wallet_h160(&self) -> ethers::types::H160 {
         self.config.wallet.address()
+    }
+
+    /// Fail with [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid) on
+    /// the first of `instruments` that names no perpetual this client trades. A read filtered to
+    /// it would otherwise report it empty without having looked.
+    fn check_instruments(
+        &self,
+        instruments: &[InstrumentNameExchange],
+    ) -> Result<(), UnindexedClientError> {
+        for instrument in instruments {
+            self.dexes.coin(instrument).map_err(|reason| {
+                UnindexedClientError::Api(crate::error::ApiError::InstrumentInvalid(
+                    instrument.clone(),
+                    reason,
+                ))
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -268,96 +320,79 @@ impl ExecutionClient for HyperliquidClient {
     ///
     /// - If no Tokio runtime is available on the current thread
     /// - If called from within an async context (e.g., inside `async fn`, `spawn`, or `block_on`)
-    /// - If SDK initialization fails (network error, invalid credentials)
+    /// - Whenever [`HyperliquidClient::connect`] would fail: SDK initialization fails (network
+    ///   error, invalid credentials), or a configured DEX is unknown or unreadable
     ///
     /// # Recommended Usage
     ///
     /// Use [`HyperliquidClient::connect`] instead — it's async-safe and returns `Result`.
     /// This method exists only for trait compliance; prefer `connect()` in all new code.
     fn new(config: Self::Config) -> Self {
-        let base_url = if config.testnet {
-            BaseUrl::Testnet
-        } else {
-            BaseUrl::Mainnet
-        };
-
         // SDK initialization is async; block on it since ExecutionClient::new is sync.
         // WARNING: This will panic if called from within an async context.
-        let handle = tokio::runtime::Handle::current();
-
-        let info_client = handle.block_on(async {
-            InfoClient::new(None, Some(base_url))
-                .await
-                .unwrap_or_else(|e| panic!("Failed to create Hyperliquid InfoClient: {e}"))
-        });
-
-        let wallet = config.wallet.clone();
-        let exchange_client = handle.block_on(async {
-            ExchangeClient::new(None, wallet, Some(base_url), None, None)
-                .await
-                .unwrap_or_else(|e| panic!("Failed to create Hyperliquid ExchangeClient: {e}"))
-        });
-
-        info!(
-            testnet = config.testnet,
-            wallet = %config.wallet_address_hex(),
-            "Created HyperliquidClient"
-        );
-
-        Self {
-            config,
-            info_client: Arc::new(info_client),
-            exchange_client: Arc::new(exchange_client),
-            known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidPerp),
-        }
+        tokio::runtime::Handle::current()
+            .block_on(Self::connect(config))
+            .unwrap_or_else(|e| panic!("Failed to create HyperliquidClient: {e}"))
     }
 
-    /// The USDC collateral balance, and each perpetual's open orders and position.
+    /// The collateral balances, and each perpetual's open orders and position, across the default
+    /// DEX and every configured HIP-3 DEX.
+    ///
+    /// # Balances
+    ///
+    /// Read where the account's abstraction mode holds them (see [HIP-3
+    /// perpetuals](self#hip-3-perpetuals)):
+    /// - **Unified account or portfolio margin**: one balance per collateral token of the DEXs
+    ///   traded (`USDC`, `USDH`), from the spot clearinghouse, free of what is on hold. A token not
+    ///   held is reported at zero. Other tokens, which portfolio margin may also count as
+    ///   collateral, are left to [`spot::HyperliquidSpotClient`].
+    /// - **Standard** (the default for an account that never chose a mode): one balance per DEX,
+    ///   from its margin summary, as each margins separately: the default DEX's as `USDC`, each
+    ///   HIP-3 DEX's as `{dex}:{collateral}` (`xyz:USDC`, `flx:USDH`). The free balance is what
+    ///   margin does not use, never below zero.
+    ///
+    /// A mode this version does not know fails the snapshot rather than report balances read from
+    /// the wrong place.
     ///
     /// # Positions
     ///
     /// Every requested perpetual is listed. Its position is [`PositionReport::Open`] when
     /// Hyperliquid reports a non-zero size for it, and [`PositionReport::Flat`] otherwise, since
-    /// the user state holds every open perpetual position. A size that does not parse is
+    /// each DEX's state holds every open position on it. A size that does not parse is
     /// [`PositionReport::Unreported`], with a warning.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid) for a requested
+    /// instrument that names no perpetual this client trades, such as one on a HIP-3 DEX it is not
+    /// configured with: it was not read, so nothing can be said about it.
+    ///
+    /// # Cost
+    ///
+    /// `userAbstraction` and `spotClearinghouseState`, then for each DEX traded (the default one
+    /// included) a `clearinghouseState` (weight 2) and an `openOrders` (weight 20), all at once.
     async fn account_snapshot(
         &self,
         _assets: &[AssetNameExchange],
         instruments: &[InstrumentNameExchange],
     ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
+        self.check_instruments(instruments)?;
         let address = self.wallet_h160();
+        let info_client = &*self.info_client;
+        let dexes = &*self.dexes;
 
-        // Fetch user state (balances + positions) and open orders concurrently
-        let (user_state, open_orders) = tokio::try_join!(
-            async {
-                self.info_client
-                    .user_state(address)
-                    .await
-                    .map_err(map_sdk_error)
-            },
-            open_orders(&self.info_client, address)
+        let (mode, states, open_orders, spot) = tokio::try_join!(
+            account_mode(info_client, address),
+            dex_states(info_client, address, dexes),
+            perp_account::open_orders(info_client, address, dexes),
+            spot_state(info_client, address),
         )?;
 
         let now = Utc::now();
-
-        // Build balance from margin summary (USDC is the default perp DEX's only collateral)
-        let account_value =
-            parse_decimal(&user_state.margin_summary.account_value, "account_value")
-                .unwrap_or(Decimal::ZERO);
-        let margin_used = parse_decimal(
-            &user_state.margin_summary.total_margin_used,
-            "total_margin_used",
-        )
-        .unwrap_or(Decimal::ZERO);
-
-        // Free balance can go negative during liquidation (margin_used > account_value).
-        // Clamp to zero since negative free balance has no meaningful interpretation.
-        let free_balance = (account_value - margin_used).max(Decimal::ZERO);
-        let balances = vec![AssetBalance::new(
-            AssetNameExchange::from(USDC_ASSET),
-            Balance::new(account_value, free_balance),
-            now,
-        )];
+        let balances = match mode {
+            AccountMode::PerDex => per_dex_balances(&states, dexes, now),
+            AccountMode::Unified => unified_balances(&spot, dexes, now),
+        };
 
         // Build instrument filter if provided
         let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
@@ -373,14 +408,16 @@ impl ExecutionClient for HyperliquidClient {
             &open_orders,
             ExchangeId::HyperliquidPerp,
             instruments,
-            perp_instrument,
+            |coin| dexes.instrument(coin),
         );
 
-        // Build positions from asset_positions
+        // Build positions from each DEX's asset_positions
         let mut instrument_snapshots = Vec::new();
-        for asset_pos in user_state.asset_positions {
+        for asset_pos in states.iter().flat_map(|(_, state)| &state.asset_positions) {
             let pos = &asset_pos.position;
-            let instrument = perp_coin_to_instrument(&pos.coin);
+            let Some(instrument) = dexes.instrument(&pos.coin) else {
+                continue;
+            };
 
             if instrument_filter
                 .as_ref()
@@ -408,7 +445,7 @@ impl ExecutionClient for HyperliquidClient {
         }
 
         // Every other instrument listed: open orders but no position, or requested with neither.
-        // `asset_positions` holds every open perp position, so these are flat.
+        // Each DEX's `asset_positions` holds every open position on it, so these are flat.
         instrument_snapshots.extend(listing.into_snapshots().map(|mut snapshot| {
             snapshot.position = PositionReport::Flat;
             snapshot
@@ -466,10 +503,11 @@ impl ExecutionClient for HyperliquidClient {
     ///   It holds up to 4,096 orders and forgets the oldest past that, logged at `warn`. An order
     ///   placed outside this client and never listed or reported to it is not covered. Every
     ///   instrument is checked, as the stream ignores `instruments`.
-    /// - **Cost.** One `openOrders` request (weight 20) listing every open order, then one
-    ///   `orderStatus` request (weight 2) for each held order the listing no longer shows, 8 at a
-    ///   time. Both count against Hyperliquid's REST limit of 1,200 a minute per IP address. The
-    ///   cost is per stream: a perpetuals and a spot stream on one wallet each make their own.
+    /// - **Cost.** One `openOrders` request (weight 20) per DEX traded, together listing every
+    ///   open order, then one `orderStatus` request (weight 2) for each held order the listing no
+    ///   longer shows, 8 at a time. Both count against Hyperliquid's REST limit of 1,200 a minute
+    ///   per IP address. The cost is per stream: a perpetuals and a spot stream on one wallet each
+    ///   make their own.
     /// - **Failures.** Each order's lookup is settled as it ends. An instrument whose listing or
     ///   lookup fails, or whose check is still running after 30 s, is retried while the stream is
     ///   open 1, 2, 4, 8 and 16 minutes later, asking only about the orders still held, then given
@@ -483,7 +521,7 @@ impl ExecutionClient for HyperliquidClient {
         _instruments: &[InstrumentNameExchange],
     ) -> Result<Self::AccountStream, UnindexedClientError> {
         let user = self.wallet_h160();
-        let base_url = self.base_url();
+        let base_url = self.config.base_url();
 
         // Create a dedicated InfoClient for WebSocket streaming.
         // Using with_reconnect() enables SDK-managed reconnection.
@@ -532,14 +570,17 @@ impl ExecutionClient for HyperliquidClient {
         let reconnected = Arc::new(Notify::new());
         let checks_cancel = cancel_token.child_token();
         let (list_client, lookup_client) = (self.info_client.clone(), self.info_client.clone());
+        let (list_dexes, lookup_dexes) = (self.dexes.clone(), self.dexes.clone());
         spawn_order_checks(
             ExchangeId::HyperliquidPerp,
             self.known_live.clone(),
             reconnected.clone(),
             checks_cancel.clone(),
             event_tx.clone(),
-            move |instruments| perp_listed_cids(list_client.clone(), user, instruments),
-            move |key| perp_order_lookup(lookup_client.clone(), user, key),
+            move |instruments| {
+                perp_listed_cids(list_client.clone(), list_dexes.clone(), user, instruments)
+            },
+            move |key| perp_order_lookup(lookup_client.clone(), lookup_dexes.clone(), user, key),
         );
 
         // Spawn task to process fills
@@ -547,6 +588,7 @@ impl ExecutionClient for HyperliquidClient {
         let fills_cancel = cancel_token.clone();
         let fills_terminated = terminated.clone();
         let fills_checks_cancel = checks_cancel.clone();
+        let fills_dexes = self.dexes.clone();
         tokio::spawn(async move {
             let mut unknown_coins = UnknownCoins::default();
             let mut reconnects = ReconnectWatch::new(reconnected);
@@ -581,7 +623,7 @@ impl ExecutionClient for HyperliquidClient {
                             Message::UserFills(fills) => {
                                 let convert = |fill: &hyperliquid_rust_sdk::TradeInfo| {
                                     unknown_coins.warn_once(&fill.coin);
-                                    fill_to_account_event(fill)
+                                    fill_to_account_event(fill, &fills_dexes)
                                 };
                                 if !send_fills(
                                     &fills.data,
@@ -618,6 +660,7 @@ impl ExecutionClient for HyperliquidClient {
         let orders_cancel = cancel_token.clone();
         let orders_terminated = terminated;
         let orders_known = self.known_live.clone();
+        let orders_dexes = self.dexes.clone();
         tokio::spawn(async move {
             let _ws_client = ws_client;
             let mut unknown_coins = UnknownCoins::default();
@@ -653,7 +696,8 @@ impl ExecutionClient for HyperliquidClient {
                             Message::OrderUpdates(updates) => {
                                 for update in updates.data {
                                     unknown_coins.warn_once(&update.order.coin);
-                                    if let Some(event) = order_update_to_account_event(&update)
+                                    if let Some(event) =
+                                        order_update_to_account_event(&update, &orders_dexes)
                                         && !send_observed(&orders_known, &orders_event_tx, event)
                                     {
                                         debug!("Orders event channel closed");
@@ -692,7 +736,26 @@ impl ExecutionClient for HyperliquidClient {
         };
         use uuid::Uuid;
 
-        let coin = instrument_to_perp_coin(request.key.instrument);
+        let coin = match self.dexes.coin(request.key.instrument) {
+            Ok(coin) => coin.to_owned(),
+            Err(reason) => {
+                warn!(%reason, cid = %request.key.cid, "Cannot cancel order on this instrument");
+                return OrderResponseCancel {
+                    key: OrderKey {
+                        exchange: ExchangeId::HyperliquidPerp,
+                        instrument: request.key.instrument.clone(),
+                        strategy: request.key.strategy.clone(),
+                        cid: request.key.cid.clone(),
+                    },
+                    state: Err(UnindexedOrderError::Rejected(
+                        crate::error::ApiError::InstrumentInvalid(
+                            request.key.instrument.clone(),
+                            reason,
+                        ),
+                    )),
+                };
+            }
+        };
 
         enum CancelMethod {
             ByOid(u64),
@@ -858,7 +921,30 @@ impl ExecutionClient for HyperliquidClient {
                 }
             };
 
-        let coin = instrument_to_perp_coin(request.key.instrument);
+        let coin = match self.dexes.coin(request.key.instrument) {
+            Ok(coin) => coin.to_owned(),
+            Err(reason) => {
+                return Order {
+                    key: OrderKey {
+                        exchange: ExchangeId::HyperliquidPerp,
+                        instrument: request.key.instrument.clone(),
+                        strategy: request.key.strategy.clone(),
+                        cid: request.key.cid.clone(),
+                    },
+                    side: request.state.side,
+                    price: request.state.price,
+                    quantity: request.state.quantity,
+                    kind: request.state.kind,
+                    time_in_force: request.state.time_in_force,
+                    state: OrderState::inactive(OrderError::Rejected(
+                        crate::error::ApiError::InstrumentInvalid(
+                            request.key.instrument.clone(),
+                            reason,
+                        ),
+                    )),
+                };
+            }
+        };
         let is_buy = request.state.side == Side::Buy;
 
         match request.state.kind {
@@ -1062,46 +1148,31 @@ impl ExecutionClient for HyperliquidClient {
         order
     }
 
+    /// The collateral balances, read as [`account_snapshot`](ExecutionClient::account_snapshot)
+    /// reads them: `userAbstraction`, then either `spotClearinghouseState` or each DEX's
+    /// `clearinghouseState`.
     async fn fetch_balances(
         &self,
         _assets: &[AssetNameExchange],
     ) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError> {
-        let address = self.wallet_h160();
-
-        let user_state = self
-            .info_client
-            .user_state(address)
-            .await
-            .map_err(map_sdk_error)?;
-
-        let now = Utc::now();
-
-        // The default perp DEX uses USDC as its only collateral
-        let account_value =
-            parse_decimal(&user_state.margin_summary.account_value, "account_value")
-                .unwrap_or(Decimal::ZERO);
-        let margin_used = parse_decimal(
-            &user_state.margin_summary.total_margin_used,
-            "total_margin_used",
-        )
-        .unwrap_or(Decimal::ZERO);
-
-        // Free balance can go negative during liquidation; clamp to zero
-        let free_balance = (account_value - margin_used).max(Decimal::ZERO);
-        Ok(vec![AssetBalance::new(
-            AssetNameExchange::from(USDC_ASSET),
-            Balance::new(account_value, free_balance),
-            now,
-        )])
+        perp_account::fetch_balances(&self.info_client, self.wallet_h160(), &self.dexes).await
     }
 
+    /// Every open order on each DEX traded, with one `openOrders` (weight 20) per DEX.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid) for an instrument
+    /// in `instruments` that names no perpetual this client trades.
     async fn fetch_open_orders(
         &self,
         instruments: &[InstrumentNameExchange],
     ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError> {
+        self.check_instruments(instruments)?;
         let address = self.wallet_h160();
 
-        let open_orders = open_orders(&self.info_client, address).await?;
+        let open_orders =
+            perp_account::open_orders(&self.info_client, address, &self.dexes).await?;
         warn_unknown_coins(open_orders.iter().map(|order| order.coin.as_str()));
 
         let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
@@ -1115,7 +1186,7 @@ impl ExecutionClient for HyperliquidClient {
         let orders: Vec<_> = open_orders
             .iter()
             .filter_map(|order| {
-                let instrument = perp_instrument(&order.coin)?;
+                let instrument = self.dexes.instrument(&order.coin)?;
                 if instrument_filter
                     .as_ref()
                     .is_some_and(|f| !f.contains(&instrument))
@@ -1131,13 +1202,20 @@ impl ExecutionClient for HyperliquidClient {
 
     /// Reads the span with `userFillsByTime`, to its end within the call, so the read is always
     /// complete (`resume: None`). Hyperliquid keeps only each wallet's 10,000 most recent fills,
-    /// so a span reaching further back is read only as far as those go.
+    /// so a span reaching further back is read only as far as those go. One read covers every
+    /// DEX; fills on a HIP-3 DEX this client is not configured with are left out.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid) for an instrument
+    /// in `instruments` that names no perpetual this client trades.
     async fn fetch_trades(
         &self,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
         instruments: &[InstrumentNameExchange],
     ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError> {
+        self.check_instruments(instruments)?;
         let Some((start_ms, end_ms)) = span_millis(start, end) else {
             return Ok(TradesRead::complete(Vec::new()));
         };
@@ -1156,7 +1234,10 @@ impl ExecutionClient for HyperliquidClient {
 
         let mut result = Vec::new();
         for fill in fills {
-            let Some(instrument) = perp_instrument(&fill.coin) else {
+            let (Some(instrument), Some(collateral)) = (
+                self.dexes.instrument(&fill.coin),
+                self.dexes.collateral(dex_of(&fill.coin)),
+            ) else {
                 continue;
             };
 
@@ -1198,7 +1279,7 @@ impl ExecutionClient for HyperliquidClient {
                 // `TradeInfo` carries no cumulative filled quantity; Hyperliquid reports order
                 // state as its own `OrderUpdate` message.
                 order_filled_quantity: None,
-                fees: perp_fill_fees(fill.fee_token.as_deref(), fee),
+                fees: perp_fill_fees(fill.fee_token.as_deref(), fee, collateral),
             });
         }
 
@@ -1227,7 +1308,7 @@ impl OrderStatusClient for HyperliquidClient {
     ) -> Result<Vec<UnindexedInactiveOrder>, UnindexedClientError> {
         let address = self.wallet_h160();
         fetch_ended_by_key(orders, |key| {
-            perp_order_lookup(self.info_client.clone(), address, key)
+            perp_order_lookup(self.info_client.clone(), self.dexes.clone(), address, key)
         })
         .await
     }
@@ -1236,25 +1317,29 @@ impl OrderStatusClient for HyperliquidClient {
 /// Look the order under `key` up with `orderStatus`, on the perpetual its coin names.
 async fn perp_order_lookup(
     info_client: Arc<InfoClient>,
+    dexes: Arc<PerpDexes>,
     address: ethers::types::H160,
     key: UnindexedOrderKey,
 ) -> Result<OrderLookup, UnindexedClientError> {
     let Some(record) = fetch_order_record(&info_client, address, &key.cid).await? else {
         return Ok(OrderLookup::Unknown);
     };
-    let instrument = perp_instrument(&record.order.coin);
+    let instrument = dexes.instrument(&record.order.coin);
     Ok(lookup_from_record(key, &record, instrument))
 }
 
-/// The client order ids `openOrders` (weight 20) lists on the perpetuals `instruments`, for a
-/// reconnect's check of the orders held as live.
+/// The client order ids `openOrders` (weight 20 per DEX traded) lists on the perpetuals
+/// `instruments`, for a reconnect's check of the orders held as live.
 async fn perp_listed_cids(
     info_client: Arc<InfoClient>,
+    dexes: Arc<PerpDexes>,
     address: ethers::types::H160,
     instruments: Vec<InstrumentNameExchange>,
 ) -> Result<FnvHashSet<ClientOrderId>, UnindexedClientError> {
-    let rows = open_orders(&info_client, address).await?;
-    Ok(listed_cids(&rows, &instruments, perp_instrument))
+    let rows = perp_account::open_orders(&info_client, address, &dexes).await?;
+    Ok(listed_cids(&rows, &instruments, |coin| {
+        dexes.instrument(coin)
+    }))
 }
 
 /// Report one perpetual position from Hyperliquid's user state.
@@ -1286,24 +1371,33 @@ fn perp_position_report(
     ))
 }
 
-/// The fee of a perpetual fill, in the asset `fee_token` names.
+/// The fee of a fill on a perpetual whose DEX settles in `collateral`, in the asset `fee_token`
+/// names.
 ///
-/// A default perpetual settles in USDC, but a builder-deployed (HIP-3) one settles in its
-/// deployer's collateral, such as USDH or USDT0, so the venue's `feeToken` is read rather than
-/// assumed. Only its absence, which has not been observed, falls back to USDC.
+/// The venue's `feeToken` is read rather than assumed; only its absence, which has not been
+/// observed, falls back to `collateral`.
 ///
-/// The quote-equivalent is set only for a USDC fee, the one collateral this client can name
-/// without the deployer's metadata, and is `None` otherwise. It serves unindexed consumers: the
-/// indexer recomputes it either way, from the instrument's own quote and base.
-fn perp_fill_fees(fee_token: Option<&str>, fee: Decimal) -> AssetFees<AssetNameExchange> {
-    let asset = fee_token.unwrap_or(USDC_ASSET);
-    let fees_quote = asset.eq_ignore_ascii_case(USDC_ASSET).then_some(fee);
+/// The quote-equivalent is set when the fee is in `collateral`, which is the instrument's quote,
+/// and is `None` otherwise. It serves unindexed consumers: the indexer recomputes it either way,
+/// from the instrument's own quote and base.
+fn perp_fill_fees(
+    fee_token: Option<&str>,
+    fee: Decimal,
+    collateral: &str,
+) -> AssetFees<AssetNameExchange> {
+    let asset = fee_token.unwrap_or(collateral);
+    let fees_quote = (asset == collateral).then_some(fee);
     AssetFees::new(AssetNameExchange::from(asset), fee, fees_quote)
 }
 
-/// Convert SDK TradeInfo (fill) to AccountEvent::Trade, `None` if its coin names no perpetual.
-fn fill_to_account_event(fill: &hyperliquid_rust_sdk::TradeInfo) -> Option<UnindexedAccountEvent> {
-    let instrument = perp_instrument(&fill.coin)?;
+/// Convert SDK TradeInfo (fill) to AccountEvent::Trade, `None` if its coin names no perpetual
+/// this client trades.
+fn fill_to_account_event(
+    fill: &hyperliquid_rust_sdk::TradeInfo,
+    dexes: &PerpDexes,
+) -> Option<UnindexedAccountEvent> {
+    let instrument = dexes.instrument(&fill.coin)?;
+    let collateral = dexes.collateral(dex_of(&fill.coin))?;
     let side = parse_side(&fill.side)?;
     let price = parse_decimal(&fill.px, "fill.px")?;
     let quantity = parse_decimal(&fill.sz, "fill.sz")?;
@@ -1323,7 +1417,7 @@ fn fill_to_account_event(fill: &hyperliquid_rust_sdk::TradeInfo) -> Option<Unind
         // `TradeInfo` carries no cumulative filled quantity, so the order's state must be learned
         // from an `OrderUpdate` -- which Hyperliquid sends as its own message.
         order_filled_quantity: None,
-        fees: perp_fill_fees(Some(&fill.fee_token), fee),
+        fees: perp_fill_fees(Some(&fill.fee_token), fee, collateral),
     };
 
     Some(AccountEvent::new(
@@ -1333,14 +1427,15 @@ fn fill_to_account_event(fill: &hyperliquid_rust_sdk::TradeInfo) -> Option<Unind
 }
 
 /// Convert SDK OrderUpdate to AccountEvent::OrderSnapshot, `None` if its coin names no
-/// perpetual.
+/// perpetual this client trades.
 fn order_update_to_account_event(
     update: &hyperliquid_rust_sdk::OrderUpdate,
+    dexes: &PerpDexes,
 ) -> Option<UnindexedAccountEvent> {
     common::order_update_to_account_event(
         update,
         ExchangeId::HyperliquidPerp,
-        perp_instrument(&update.order.coin)?,
+        dexes.instrument(&update.order.coin)?,
     )
 }
 
@@ -1352,6 +1447,11 @@ mod tests {
     use crate::client::dedup::{dedup_key_from_event, is_duplicate};
     use rust_decimal_macros::dec;
     use rustrade_integration::collection::snapshot::Snapshot;
+
+    /// Only Hyperliquid's default DEX.
+    fn default_dex() -> PerpDexes {
+        PerpDexes::default()
+    }
 
     mod order_recovery {
         use super::super::common::info_tests::info_client_against;
@@ -1375,7 +1475,7 @@ mod tests {
         fn key() -> UnindexedOrderKey {
             OrderKey {
                 exchange: ExchangeId::HyperliquidPerp,
-                instrument: InstrumentNameExchange::new("BTC-USD-PERP"),
+                instrument: InstrumentNameExchange::new("BTC-USDC-PERP"),
                 strategy: StrategyId::new("strategy"),
                 cid: ClientOrderId::new(CID),
             }
@@ -1414,7 +1514,7 @@ mod tests {
             let first = snapshot(vec![sweep_fill(1, "60000")]);
             assert!(send_fills(
                 &first,
-                fill_to_account_event,
+                |fill| fill_to_account_event(fill, &default_dex()),
                 &dedup,
                 &tx,
                 &mut reconnects
@@ -1428,7 +1528,7 @@ mod tests {
             let resubscribed = snapshot(vec![sweep_fill(1, "60000"), sweep_fill(2, "60001")]);
             assert!(send_fills(
                 &resubscribed,
-                fill_to_account_event,
+                |fill| fill_to_account_event(fill, &default_dex()),
                 &dedup,
                 &tx,
                 &mut reconnects
@@ -1446,7 +1546,7 @@ mod tests {
             let unsent = snapshot(vec![sweep_fill(3, "60002")]);
             assert!(!send_fills(
                 &unsent,
-                fill_to_account_event,
+                |fill| fill_to_account_event(fill, &default_dex()),
                 &dedup,
                 &tx,
                 &mut reconnects
@@ -1458,9 +1558,10 @@ mod tests {
         async fn a_perp_lookup_reads_how_the_order_ended() {
             let (_server, client) = serve(order_status("BTC")).await;
 
-            let lookup = perp_order_lookup(client, ethers::types::H160::zero(), key())
-                .await
-                .unwrap();
+            let lookup =
+                perp_order_lookup(client, Arc::default(), ethers::types::H160::zero(), key())
+                    .await
+                    .unwrap();
 
             let OrderLookup::Ended(order) = lookup else {
                 panic!("expected an ended order, got {lookup:?}");
@@ -1473,9 +1574,10 @@ mod tests {
         async fn a_perp_lookup_of_a_spot_order_is_unknown() {
             let (_server, client) = serve(order_status("@107")).await;
 
-            let lookup = perp_order_lookup(client, ethers::types::H160::zero(), key())
-                .await
-                .unwrap();
+            let lookup =
+                perp_order_lookup(client, Arc::default(), ethers::types::H160::zero(), key())
+                    .await
+                    .unwrap();
 
             assert!(matches!(lookup, OrderLookup::Unknown));
         }
@@ -1491,8 +1593,9 @@ mod tests {
 
             let listed = perp_listed_cids(
                 client,
+                Arc::default(),
                 ethers::types::H160::zero(),
-                vec![InstrumentNameExchange::new("BTC-USD-PERP")],
+                vec![InstrumentNameExchange::new("BTC-USDC-PERP")],
             )
             .await
             .unwrap();
@@ -1561,12 +1664,12 @@ mod tests {
         }"#;
 
         let fill: hyperliquid_rust_sdk::TradeInfo = serde_json::from_str(fill_json).unwrap();
-        let event = fill_to_account_event(&fill).unwrap();
+        let event = fill_to_account_event(&fill, &default_dex()).unwrap();
 
         assert_eq!(event.exchange, ExchangeId::HyperliquidPerp);
         match event.kind {
             AccountEventKind::Trade(trade) => {
-                assert_eq!(trade.instrument.as_ref(), "BTC-USD-PERP");
+                assert_eq!(trade.instrument.as_ref(), "BTC-USDC-PERP");
                 assert_eq!(
                     trade.id.0, "99999",
                     "the id is the fill's tid, not its hash"
@@ -1582,8 +1685,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_builder_deployed_fill_reports_the_fee_token_it_was_charged_in() {
+    #[tokio::test]
+    async fn a_builder_deployed_fill_is_named_and_charged_in_its_dex_collateral() {
         // A HIP-3 perpetual settles in its deployer's collateral, which is not always USDC.
         let fill_json = r#"{
             "coin": "flx:TSLA", "side": "B", "px": "250", "sz": "2",
@@ -1593,32 +1696,38 @@ mod tests {
         }"#;
         let fill: hyperliquid_rust_sdk::TradeInfo = serde_json::from_str(fill_json).unwrap();
 
-        let AccountEventKind::Trade(trade) = fill_to_account_event(&fill).unwrap().kind else {
+        let dexes = perp_dexes::tests::xyz_and_flx().await;
+        let AccountEventKind::Trade(trade) = fill_to_account_event(&fill, &dexes).unwrap().kind
+        else {
             panic!("Expected Trade event");
         };
-        assert_eq!(trade.instrument.as_ref(), "flx:TSLA-USD-PERP");
+        assert_eq!(trade.instrument.as_ref(), "flx:TSLA-USDH-PERP");
         assert_eq!(trade.fees.asset.as_ref(), "USDH");
         assert_eq!(trade.fees.fees, dec!(0.2));
         assert_eq!(
-            trade.fees.fees_quote, None,
-            "the client cannot tell a non-USDC fee is in the instrument's quote"
+            trade.fees.fees_quote,
+            Some(dec!(0.2)),
+            "the fee is in the instrument's quote"
         );
+
+        // Without `flx` configured, its collateral is unknown, so the fill is left out.
+        assert!(fill_to_account_event(&fill, &default_dex()).is_none());
     }
 
     #[test]
-    fn perp_fill_fees_reads_the_fee_token_and_falls_back_to_usdc() {
+    fn perp_fill_fees_reads_the_fee_token_and_falls_back_to_the_collateral() {
         assert_eq!(
-            perp_fill_fees(Some("USDT0"), dec!(1.5)),
+            perp_fill_fees(Some("USDT0"), dec!(1.5), "USDC"),
             AssetFees::new(AssetNameExchange::from("USDT0"), dec!(1.5), None)
         );
         assert_eq!(
-            perp_fill_fees(Some("USDC"), dec!(1.5)),
+            perp_fill_fees(Some("USDC"), dec!(1.5), "USDC"),
             AssetFees::new(AssetNameExchange::from("USDC"), dec!(1.5), Some(dec!(1.5)))
         );
         assert_eq!(
-            perp_fill_fees(None, dec!(1.5)),
-            AssetFees::new(AssetNameExchange::from("USDC"), dec!(1.5), Some(dec!(1.5))),
-            "an absent feeToken is the default perpetuals' USDC"
+            perp_fill_fees(None, dec!(1.5), "USDH"),
+            AssetFees::new(AssetNameExchange::from("USDH"), dec!(1.5), Some(dec!(1.5))),
+            "an absent feeToken is the DEX's collateral"
         );
     }
 
@@ -1643,11 +1752,11 @@ mod tests {
         }"#;
 
         let fill: hyperliquid_rust_sdk::TradeInfo = serde_json::from_str(fill_json).unwrap();
-        let event = fill_to_account_event(&fill).unwrap();
+        let event = fill_to_account_event(&fill, &default_dex()).unwrap();
 
         match event.kind {
             AccountEventKind::Trade(trade) => {
-                assert_eq!(trade.instrument.as_ref(), "ETH-USD-PERP");
+                assert_eq!(trade.instrument.as_ref(), "ETH-USDC-PERP");
                 assert_eq!(trade.side, Side::Sell);
                 assert_eq!(trade.price, dec!(3200));
                 assert_eq!(trade.quantity, dec!(1.5));
@@ -1674,8 +1783,8 @@ mod tests {
         // One aggressive order sweeping two resting levels: same `hash`, same `oid`, two fills.
         // Deriving the id from `hash` gave both the same `TradeId`, so anything reconciling on it
         // treated them as one fill and dropped the second -- understating filled quantity and fees.
-        let first = fill_to_account_event(&sweep_fill(111, "65000.5")).unwrap();
-        let second = fill_to_account_event(&sweep_fill(222, "65001.0")).unwrap();
+        let first = fill_to_account_event(&sweep_fill(111, "65000.5"), &default_dex()).unwrap();
+        let second = fill_to_account_event(&sweep_fill(222, "65001.0"), &default_dex()).unwrap();
 
         let (AccountEventKind::Trade(first), AccountEventKind::Trade(second)) =
             (first.kind, second.kind)
@@ -1694,8 +1803,8 @@ mod tests {
         // The `userFills` subscription opens with a snapshot of recent fills, and the SDK
         // resubscribes on reconnect -- so the same fill arrives again on every reconnect.
         let cache = new_dedup_cache();
-        let event = fill_to_account_event(&sweep_fill(111, "65000.5")).unwrap();
-        let replay = fill_to_account_event(&sweep_fill(111, "65000.5")).unwrap();
+        let event = fill_to_account_event(&sweep_fill(111, "65000.5"), &default_dex()).unwrap();
+        let replay = fill_to_account_event(&sweep_fill(111, "65000.5"), &default_dex()).unwrap();
 
         assert!(!is_duplicate(&cache, dedup_key_from_event(&event).unwrap()));
         assert!(is_duplicate(&cache, dedup_key_from_event(&replay).unwrap()));
@@ -1706,8 +1815,8 @@ mod tests {
         // The guard against the fix and the dedup fighting each other: two fills of one sweep are
         // not duplicates of one another, and dedup must not collapse what the id now separates.
         let cache = new_dedup_cache();
-        let first = fill_to_account_event(&sweep_fill(111, "65000.5")).unwrap();
-        let second = fill_to_account_event(&sweep_fill(222, "65001.0")).unwrap();
+        let first = fill_to_account_event(&sweep_fill(111, "65000.5"), &default_dex()).unwrap();
+        let second = fill_to_account_event(&sweep_fill(222, "65001.0"), &default_dex()).unwrap();
 
         assert!(!is_duplicate(&cache, dedup_key_from_event(&first).unwrap()));
         assert!(!is_duplicate(
@@ -1721,7 +1830,7 @@ mod tests {
         // Hyperliquid documents `tid` as qualified by coin rather than globally unique, which is
         // why the dedup key carries the instrument.
         let cache = new_dedup_cache();
-        let btc = fill_to_account_event(&sweep_fill(111, "65000.5")).unwrap();
+        let btc = fill_to_account_event(&sweep_fill(111, "65000.5"), &default_dex()).unwrap();
 
         let eth_json = r#"{
             "coin": "ETH", "side": "B", "px": "3200", "sz": "1.5",
@@ -1730,7 +1839,7 @@ mod tests {
             "crossed": true, "fee": "4.8", "feeToken": "USDC", "tid": 111
         }"#;
         let eth: hyperliquid_rust_sdk::TradeInfo = serde_json::from_str(eth_json).unwrap();
-        let eth = fill_to_account_event(&eth).unwrap();
+        let eth = fill_to_account_event(&eth, &default_dex()).unwrap();
 
         assert!(!is_duplicate(&cache, dedup_key_from_event(&btc).unwrap()));
         assert!(!is_duplicate(&cache, dedup_key_from_event(&eth).unwrap()));
@@ -1754,12 +1863,12 @@ mod tests {
         }"#;
 
         let update: hyperliquid_rust_sdk::OrderUpdate = serde_json::from_str(update_json).unwrap();
-        let event = order_update_to_account_event(&update).unwrap();
+        let event = order_update_to_account_event(&update, &default_dex()).unwrap();
 
         assert_eq!(event.exchange, ExchangeId::HyperliquidPerp);
         match event.kind {
             AccountEventKind::OrderSnapshot(Snapshot(order)) => {
-                assert_eq!(order.key.instrument.as_ref(), "BTC-USD-PERP");
+                assert_eq!(order.key.instrument.as_ref(), "BTC-USDC-PERP");
                 assert_eq!(order.side, Side::Buy);
                 assert_eq!(order.price, Some(dec!(64000)));
                 assert_eq!(order.quantity, dec!(0.5));
@@ -1790,7 +1899,7 @@ mod tests {
         }"#;
 
         let update: hyperliquid_rust_sdk::OrderUpdate = serde_json::from_str(update_json).unwrap();
-        let event = order_update_to_account_event(&update).unwrap();
+        let event = order_update_to_account_event(&update, &default_dex()).unwrap();
 
         match event.kind {
             AccountEventKind::OrderSnapshot(Snapshot(order)) => {
@@ -1824,11 +1933,11 @@ mod tests {
         }"#;
 
         let update: hyperliquid_rust_sdk::OrderUpdate = serde_json::from_str(update_json).unwrap();
-        let event = order_update_to_account_event(&update).unwrap();
+        let event = order_update_to_account_event(&update, &default_dex()).unwrap();
 
         match event.kind {
             AccountEventKind::OrderSnapshot(Snapshot(order)) => {
-                assert_eq!(order.key.instrument.as_ref(), "SOL-USD-PERP");
+                assert_eq!(order.key.instrument.as_ref(), "SOL-USDC-PERP");
                 assert!(matches!(
                     order.state,
                     crate::order::state::OrderState::Inactive(
@@ -1858,7 +1967,7 @@ mod tests {
         }"#;
 
         let update: hyperliquid_rust_sdk::OrderUpdate = serde_json::from_str(update_json).unwrap();
-        let event = order_update_to_account_event(&update);
+        let event = order_update_to_account_event(&update, &default_dex());
         assert!(event.is_none());
     }
 }

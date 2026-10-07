@@ -39,7 +39,7 @@ use rust_decimal_macros::dec;
 use rustrade_execution::{
     client::{
         ExecutionClient,
-        hyperliquid::{config::HyperliquidConfig, spot::HyperliquidSpotClient},
+        hyperliquid::{Network, config::HyperliquidConfig, spot::HyperliquidSpotClient},
     },
     order::{
         OrderKey, OrderKind, TimeInForce,
@@ -88,7 +88,11 @@ async fn test_spot_connection() {
     init_logging();
 
     let config = test_config();
-    assert!(config.testnet, "Integration tests must run on testnet");
+    assert_eq!(
+        config.network,
+        Network::Testnet,
+        "Integration tests must run on testnet"
+    );
 
     println!("Wallet address: {}", config.wallet_address_hex());
 
@@ -254,7 +258,11 @@ async fn test_spot_place_and_cancel_limit_order() {
     init_logging();
 
     let config = test_config();
-    assert!(config.testnet, "This test MUST run on testnet only!");
+    assert_eq!(
+        config.network,
+        Network::Testnet,
+        "This test MUST run on testnet only!"
+    );
 
     let client = HyperliquidSpotClient::connect(config)
         .await
@@ -453,7 +461,11 @@ async fn test_spot_account_stream_with_order() {
     init_logging();
 
     let config = test_config();
-    assert!(config.testnet, "This test MUST run on testnet only!");
+    assert_eq!(
+        config.network,
+        Network::Testnet,
+        "This test MUST run on testnet only!"
+    );
 
     let client = HyperliquidSpotClient::connect(config)
         .await

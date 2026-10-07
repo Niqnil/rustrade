@@ -12,7 +12,11 @@ use crate::order::{
     id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
     state::{Cancelled, Filled, Open, OrderState},
 };
-use crate::{InstrumentAccountSnapshot, UnindexedAccountEvent, position::PositionReport};
+use crate::{
+    InstrumentAccountSnapshot, UnindexedAccountEvent,
+    balance::{AssetBalance, Balance},
+    position::PositionReport,
+};
 use chrono::{DateTime, TimeZone, Utc};
 use futures::Stream;
 use rust_decimal::Decimal;
@@ -238,27 +242,28 @@ pub async fn open_orders(
     info_client: &hyperliquid_rust_sdk::InfoClient,
     address: ethers::types::H160,
 ) -> Result<Vec<OpenOrder>, UnindexedClientError> {
-    user_info(info_client, "openOrders", address).await
+    user_info(info_client, "openOrders", address, None).await
 }
 
-/// POST the info request `{"type": kind, "user": address}` and parse the response as `T`.
+/// POST the info request `{"type": kind, "user": address}`, with `"dex": dex` when `dex` names a
+/// builder-deployed (HIP-3) perpetual DEX, and parse the response as `T`.
 ///
 /// Issued through the SDK's own [`HttpClient`](hyperliquid_rust_sdk::InfoClient::http_client), so
 /// base URL, TLS configuration and error type are exactly those of every other info request this
 /// client makes — only the response type differs.
-async fn user_info<T: DeserializeOwned>(
+pub(super) async fn user_info<T: DeserializeOwned>(
     info_client: &hyperliquid_rust_sdk::InfoClient,
     kind: &str,
     address: ethers::types::H160,
+    dex: Option<&str>,
 ) -> Result<T, UnindexedClientError> {
     // `{:?}` on H160 renders the checksummed 0x-prefixed form the endpoint expects. `Display`
     // abbreviates the middle of the address ("0x1234…5678"), so it must not be used here.
-    info(
-        info_client,
-        kind,
-        format!(r#"{{"type":"{kind}","user":"{address:?}"}}"#),
-    )
-    .await
+    let mut body = serde_json::json!({"type": kind, "user": format!("{address:?}")});
+    if let Some(dex) = dex {
+        body["dex"] = dex.into();
+    }
+    info(info_client, kind, body.to_string()).await
 }
 
 /// POST the info request `body`, of type `kind`, and parse the response as `T`.
@@ -277,6 +282,23 @@ pub(super) async fn info<T: DeserializeOwned>(
     // change or a venue-side regression, not a transient fault, and retrying will not fix it.
     serde_json::from_str(&raw).map_err(|e| {
         UnindexedClientError::Internal(format!("Hyperliquid {kind} response did not parse: {e}"))
+    })
+}
+
+/// Each spot token balance in `balances` (`spotClearinghouseState`), free of what is on hold.
+pub(super) fn spot_balances<'a>(
+    balances: impl IntoIterator<Item = &'a hyperliquid_rust_sdk::UserTokenBalance>,
+    now: DateTime<Utc>,
+) -> impl Iterator<Item = AssetBalance<AssetNameExchange>> {
+    balances.into_iter().map(move |balance| {
+        let total = parse_decimal(&balance.total, "total").unwrap_or(Decimal::ZERO);
+        let hold = parse_decimal(&balance.hold, "hold").unwrap_or(Decimal::ZERO);
+        let free = (total - hold).max(Decimal::ZERO);
+        AssetBalance::new(
+            AssetNameExchange::from(balance.coin.as_str()),
+            Balance::new(total, free),
+            now,
+        )
     })
 }
 
@@ -675,21 +697,6 @@ pub(super) fn record_cid(cloid: Option<&str>, oid: u64) -> Option<ClientOrderId>
     }
 }
 
-/// Build perp instrument name from Hyperliquid coin name (e.g., "BTC" -> "BTC-USD-PERP").
-pub fn perp_coin_to_instrument(coin: &str) -> InstrumentNameExchange {
-    InstrumentNameExchange::from(format_smolstr!("{}-USD-PERP", coin))
-}
-
-/// The perpetual instrument `coin` names, or `None` when it names a spot pair or a market of a
-/// kind [`CoinKind::of`] does not recognise.
-///
-/// The account streams and open orders deliver every market's coins together, so other markets
-/// are expected here. The perpetuals client logs the unrecognised ones, which neither client
-/// reports, with [`warn_unknown_coins`] or [`UnknownCoins`].
-pub(super) fn perp_instrument(coin: &str) -> Option<InstrumentNameExchange> {
-    (CoinKind::of(coin) == CoinKind::Perp).then(|| perp_coin_to_instrument(coin))
-}
-
 /// Whether `coin` names a market of a kind [`CoinKind::of`] does not recognise.
 fn is_unknown_coin(coin: &str) -> bool {
     !matches!(CoinKind::of(coin), CoinKind::Perp | CoinKind::Spot)
@@ -726,18 +733,6 @@ impl UnknownCoins {
             );
             self.0.insert(coin.to_owned());
         }
-    }
-}
-
-/// Extract coin name from perp instrument (e.g., "BTC-USD-PERP" -> "BTC").
-///
-/// Returns `String` because Hyperliquid SDK requires `String` for asset fields.
-pub fn instrument_to_perp_coin(instrument: &InstrumentNameExchange) -> String {
-    let s = instrument.as_ref();
-    // Expected format: "COIN-USD-PERP" or just "COIN"
-    match s.split_once('-') {
-        Some((coin, _)) => coin.to_string(),
-        None => s.to_string(),
     }
 }
 
@@ -798,28 +793,6 @@ mod tests {
     }
 
     #[test]
-    fn test_perp_coin_to_instrument() {
-        let inst = perp_coin_to_instrument("BTC");
-        assert_eq!(inst.as_ref(), "BTC-USD-PERP");
-
-        let inst = perp_coin_to_instrument("ETH");
-        assert_eq!(inst.as_ref(), "ETH-USD-PERP");
-    }
-
-    #[test]
-    fn test_instrument_to_perp_coin() {
-        let coin = instrument_to_perp_coin(&InstrumentNameExchange::from("BTC-USD-PERP"));
-        assert_eq!(coin, "BTC");
-
-        let coin = instrument_to_perp_coin(&InstrumentNameExchange::from("ETH-USD-PERP"));
-        assert_eq!(coin, "ETH");
-
-        // Just coin name without suffix
-        let coin = instrument_to_perp_coin(&InstrumentNameExchange::from("SOL"));
-        assert_eq!(coin, "SOL");
-    }
-
-    #[test]
     fn test_spot_pair_to_instrument() {
         let pairs = super::super::spot_coins::test_spot_pairs();
         let instrument = |coin| spot_pair_to_instrument(pairs.get(coin).unwrap());
@@ -842,19 +815,6 @@ mod tests {
     }
 
     #[test]
-    fn test_perp_instrument() {
-        assert_eq!(perp_instrument("BTC"), Some(perp_coin_to_instrument("BTC")));
-        assert_eq!(perp_instrument("kPEPE").unwrap().as_ref(), "kPEPE-USD-PERP");
-        assert_eq!(
-            perp_instrument("xyz:TSLA").unwrap().as_ref(),
-            "xyz:TSLA-USD-PERP"
-        );
-        assert_eq!(perp_instrument("@107"), None, "spot");
-        assert_eq!(perp_instrument("PURR/USDC"), None, "spot");
-        assert_eq!(perp_instrument("#12"), None, "unrecognised");
-    }
-
-    #[test]
     fn test_instrument_to_spot_coin() {
         let coin = instrument_to_spot_coin(&InstrumentNameExchange::from("PURR-USDC-SPOT"));
         assert_eq!(coin, Some("PURR/USDC".to_string()));
@@ -864,7 +824,7 @@ mod tests {
 
         // Malformed instruments return None
         assert_eq!(
-            instrument_to_spot_coin(&InstrumentNameExchange::from("BTC-USD-PERP")),
+            instrument_to_spot_coin(&InstrumentNameExchange::from("BTC-USDC-PERP")),
             None
         );
         assert_eq!(
@@ -1294,7 +1254,7 @@ pub(super) mod info_tests {
     }
 
     fn eth() -> InstrumentNameExchange {
-        InstrumentNameExchange::from("ETH-USD-PERP")
+        InstrumentNameExchange::from("ETH-USDC-PERP")
     }
 
     #[test]
@@ -1409,7 +1369,7 @@ pub(super) mod info_tests {
     }
 
     fn perp(coin: &str) -> Option<InstrumentNameExchange> {
-        Some(perp_coin_to_instrument(coin))
+        Some(InstrumentNameExchange::from(format!("{coin}-USDC-PERP")))
     }
 
     #[test]
@@ -1425,7 +1385,7 @@ pub(super) mod info_tests {
     #[test]
     fn an_open_order_without_its_original_size_is_its_remainder_with_nothing_filled() {
         let row = &rows()[2];
-        let btc = InstrumentNameExchange::from("BTC-USD-PERP");
+        let btc = InstrumentNameExchange::from("BTC-USDC-PERP");
         let order = open_order_to_order(row, ExchangeId::HyperliquidPerp, btc).unwrap();
 
         assert_eq!(order.key.cid, ClientOrderId::new("7003"));
@@ -1435,7 +1395,7 @@ pub(super) mod info_tests {
 
     #[test]
     fn every_requested_instrument_is_listed_complete_even_with_nothing_open() {
-        let sol = InstrumentNameExchange::from("SOL-USD-PERP");
+        let sol = InstrumentNameExchange::from("SOL-USDC-PERP");
         let mut listing = OpenOrderListing::new(
             &rows(),
             ExchangeId::HyperliquidPerp,
@@ -1464,14 +1424,14 @@ pub(super) mod info_tests {
             .map(|entry| entry.instrument.to_string())
             .collect::<Vec<_>>();
         instruments.sort();
-        assert_eq!(instruments, ["BTC-USD-PERP", "ETH-USD-PERP"]);
+        assert_eq!(instruments, ["BTC-USDC-PERP", "ETH-USDC-PERP"]);
     }
 
     #[test]
     fn an_order_that_does_not_convert_leaves_only_its_instrument_incomplete() {
         let mut rows = rows();
         rows[1].side = "?".to_string();
-        let btc = InstrumentNameExchange::from("BTC-USD-PERP");
+        let btc = InstrumentNameExchange::from("BTC-USDC-PERP");
         let mut listing = OpenOrderListing::new(
             &rows,
             ExchangeId::HyperliquidPerp,
