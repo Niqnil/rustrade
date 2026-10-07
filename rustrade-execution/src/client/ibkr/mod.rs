@@ -1204,7 +1204,8 @@ impl IbkrClient {
     /// - [`ResolveContractError::Ambiguous`] when several do. Narrow the description, or pick
     ///   one of the matches it carries.
     /// - [`ResolveContractError::Refused`] when IB answers the request with another error, such
-    ///   as a description it cannot validate. The same request is refused again.
+    ///   as a description it cannot validate. The same request is usually refused again; tell the
+    ///   errors worth retrying apart by IB's `code`.
     /// - [`ResolveContractError::Connectivity`] when the connection drops
     ///   ([`ConnectivityError::Socket`]) or IB sends nothing for 10 s before finishing its answer
     ///   ([`ConnectivityError::Timeout`]). Transient: retry once `ibapi` has reconnected.
@@ -4932,7 +4933,7 @@ mod order_reader_tests {
                 ),
                 (
                     ListingError::Ibapi(ibapi::Error::ConnectionReset),
-                    ConnectivityError::Socket("ConnectionReset".to_string()),
+                    ConnectivityError::Socket(ibapi::Error::ConnectionReset.to_string()),
                 ),
             ];
             for (failure, connectivity) in transient {

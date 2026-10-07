@@ -64,7 +64,9 @@ pub enum ResolveContractError {
     },
 
     /// IB answered the request with an error other than finding no match, such as a description
-    /// it cannot validate. Retrying the same description fails the same way.
+    /// it cannot validate. Retrying the same description usually fails the same way, so
+    /// [`is_transient`](Self::is_transient) is false. Some IB errors, such as a pacing
+    /// violation, can clear on a later retry: tell those apart by `code`.
     #[error("IB refused the contract details request (error {code}): {message}")]
     Refused {
         /// IB's error code.
