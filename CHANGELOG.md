@@ -427,6 +427,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An IBKR contract registered without its IB contract id lost every fill, order listing and
+  position for it** (`rustrade-execution`, feature `ibkr`; `rustrade-instrument`, feature `ibkr`).
+  **Breaking:** registration is fallible. `IbkrClient::register_contract` accepted a contract IB
+  had not resolved, such as `stock_contract("AAPL", "SMART", "USD")`, which has contract id 0.
+  Orders on it were placed, because placement looks contracts up by name. But IB reports
+  everything by contract id, so the client dropped the contract's stream and recovered fills, its
+  `fetch_trades` and `fetch_open_orders` entries and its `account_snapshot` positions, logging
+  only at `debug!`.
+  - `IbkrClient::register_contract` and `ContractRegistry::register` return
+    `Result<(), ContractRegistryError>`. They refuse a contract with no IB contract id
+    (`Unresolved`), and one whose id is already registered under another name
+    (`ContractIdTaken`), which used to move the id's reports to the new name. Either refusal
+    leaves the registry unchanged.
+  - New `IbkrClient::resolve_contract` resolves a contract description on the client's own
+    connection. It refuses a description that matches no IB contract (`NoMatch`) or several
+    (`Ambiguous`, carrying the matches), and fails if IB stalls for 10 seconds or the connection
+    drops (`Request`). The error is the new `contract::ResolveContractError`.
+  - `IbkrClient::connect_sync` resolves `IbkrConfig::contracts` the same way. It used to register
+    the first of several matching contracts, which could be the wrong one, and skipped one with
+    no match without a warning. Both are now skipped with a `warn!`, as a contract IB fails to
+    resolve was already. Its rustdoc said a failed resolution failed the connection. It never
+    did, and the rustdoc now says so.
+  - New `ContractRegistry::register_by_name_only` keeps the old behaviour for uses that only look
+    contracts up by name. `rustrade-data`'s `IbkrMarketStream` is one: IB resolves each market
+    data request's contract itself. A contract registered this way is never found by contract id.
+
 - **Hyperliquid reported a cancel it had not applied as cancelled** (`rustrade-execution`, feature
   `hyperliquid`). Hyperliquid answers such a cancel with a top-level `ok` and puts the error in the
   order's own status, for example "Order was never placed, already canceled, or filled.".

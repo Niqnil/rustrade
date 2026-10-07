@@ -119,6 +119,7 @@ use crate::{
 };
 use account::{BalanceAggregator, PositionAggregator};
 use chrono::{DateTime, Utc};
+use contract::ResolveContractError;
 use execution::{ExecutionBuffer, ExecutionRevision, parse_decimal_or_warn, try_decimal_or_warn};
 use futures::stream::BoxStream;
 use ibapi::{
@@ -139,7 +140,7 @@ use rustrade_instrument::{
     Side,
     asset::name::AssetNameExchange,
     exchange::ExchangeId,
-    ibkr::ContractRegistry,
+    ibkr::{ContractRegistry, ContractRegistryError},
     instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use serde::{Deserialize, Serialize};
@@ -150,6 +151,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
 };
+use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
@@ -434,11 +436,40 @@ fn read_listing<T>(
     what: &str,
     stall_timeout: std::time::Duration,
     connected: impl Fn() -> bool,
+    next: impl FnMut(
+        std::time::Duration,
+    ) -> Option<Result<ibapi::subscriptions::SubscriptionItem<T>, ibapi::Error>>,
+    on_item: impl FnMut(T) -> ControlFlow<()>,
+) -> Result<(), UnindexedClientError> {
+    read_listing_items(what, stall_timeout, connected, next, on_item)
+        .map_err(|e| UnindexedClientError::Internal(format!("{what}: {e}")))
+}
+
+/// Why a listing read ended short of IB's end-of-listing marker: see [`read_listing`].
+#[derive(Debug, Error)]
+enum ListingError {
+    /// IB answered the request with an error.
+    #[error("{0}")]
+    Ibapi(ibapi::Error),
+    /// The connection was gone when the listing stopped.
+    #[error("the connection dropped before the end of the listing")]
+    Dropped,
+    /// IB sent nothing for this long before the end of the listing.
+    #[error("IB sent nothing for {0:?} before the end of the listing")]
+    Stalled(std::time::Duration),
+}
+
+/// [`read_listing`], keeping why the read failed for a caller that tells IB's errors apart.
+/// `what` only names the listing in the notices logged during the read.
+fn read_listing_items<T>(
+    what: &str,
+    stall_timeout: std::time::Duration,
+    connected: impl Fn() -> bool,
     mut next: impl FnMut(
         std::time::Duration,
     ) -> Option<Result<ibapi::subscriptions::SubscriptionItem<T>, ibapi::Error>>,
     mut on_item: impl FnMut(T) -> ControlFlow<()>,
-) -> Result<(), UnindexedClientError> {
+) -> Result<(), ListingError> {
     use ibapi::subscriptions::SubscriptionItem;
 
     loop {
@@ -452,23 +483,64 @@ fn read_listing<T>(
             Some(Ok(SubscriptionItem::Notice(notice))) => {
                 debug!(%notice, what, "Notice during an IBKR listing read");
             }
-            Some(Err(e)) => return Err(UnindexedClientError::Internal(format!("{what}: {e}"))),
+            Some(Err(e)) => return Err(ListingError::Ibapi(e)),
             None if recovery::returned_early(waited.elapsed(), stall_timeout) => {
                 if !connected() {
-                    return Err(UnindexedClientError::Internal(format!(
-                        "{what}: the connection dropped before the end of the listing"
-                    )));
+                    return Err(ListingError::Dropped);
                 }
                 return Ok(());
             }
-            None => {
-                return Err(UnindexedClientError::Internal(format!(
-                    "{what}: IB sent nothing for {:?} before the end of the listing",
-                    stall_timeout
-                )));
-            }
+            None => return Err(ListingError::Stalled(stall_timeout)),
         }
     }
+}
+
+/// IB's error code for a contract description that matches no contract ("No security definition
+/// has been found for the request").
+const NO_SECURITY_DEFINITION_CODE: i32 = 200;
+
+/// Resolve `contract` through IB's contract details: see [`IbkrClient::resolve_contract`].
+fn resolve_contract_blocking(
+    client: &Client,
+    contract: &ibapi::contracts::Contract,
+) -> Result<ibapi::contracts::Contract, ResolveContractError> {
+    let subscription = client
+        .contract_details_stream(contract)
+        .subscribe()
+        .map_err(|e| ResolveContractError::Request(e.to_string()))?;
+    let mut matches = Vec::new();
+    let read = read_listing_items(
+        "contract_details",
+        LISTING_STALL_TIMEOUT,
+        || client.is_connected(),
+        |timeout| subscription.next_timeout(timeout),
+        |details: ibapi::contracts::ContractDetails| {
+            matches.push(details.contract);
+            ControlFlow::Continue(())
+        },
+    );
+    classify_contract_details(read, matches)
+}
+
+/// The resolved contract from a contract-details read: its one match, or why there is not one.
+fn classify_contract_details(
+    read: Result<(), ListingError>,
+    mut matches: Vec<ibapi::contracts::Contract>,
+) -> Result<ibapi::contracts::Contract, ResolveContractError> {
+    match read {
+        Ok(()) => {}
+        // IB answers a description that matches nothing with this error, not an empty listing.
+        Err(ListingError::Ibapi(ibapi::Error::Notice(notice)))
+            if notice.code == NO_SECURITY_DEFINITION_CODE =>
+        {
+            return Err(ResolveContractError::NoMatch);
+        }
+        Err(e) => return Err(ResolveContractError::Request(e.to_string())),
+    }
+    if matches.len() > 1 {
+        return Err(ResolveContractError::Ambiguous { matches });
+    }
+    matches.pop().ok_or(ResolveContractError::NoMatch)
 }
 
 /// Serializes the reads of IB's order listings.
@@ -984,9 +1056,16 @@ impl std::fmt::Debug for IbkrClient {
 impl IbkrClient {
     /// Connect to TWS/Gateway and initialize the client (sync, blocking).
     ///
+    /// Each contract in [`IbkrConfig::contracts`] is resolved as
+    /// [`resolve_contract`](Self::resolve_contract) does and registered as
+    /// [`register_contract`](Self::register_contract) does. A contract that cannot be built,
+    /// resolved or registered is skipped with a `warn!` naming why, and the client connects
+    /// without it: orders for it are refused as for any unregistered instrument. Check
+    /// [`contract_registry`](Self::contract_registry) to confirm what was registered.
+    ///
     /// # Errors
     ///
-    /// Returns error if connection fails or contract resolution fails.
+    /// Returns error if the connection fails.
     pub fn connect_sync(config: IbkrConfig) -> Result<Self, UnindexedClientError> {
         let url = format!("{}:{}", config.host, config.port);
         info!(url = %url, client_id = config.client_id, "Connecting to IB");
@@ -1009,16 +1088,17 @@ impl IbkrClient {
             };
             let name = InstrumentNameExchange::from(contract_config.name.as_str());
 
-            match client.contract_details(&contract) {
-                Ok(details) => {
-                    if let Some(detail) = details.into_iter().next() {
-                        contracts.register(name.clone(), detail.contract.clone());
-                        debug!(name = %name, con_id = detail.contract.contract_id, "Registered contract");
-                    }
-                }
+            let resolved = match resolve_contract_blocking(&client, &contract) {
+                Ok(resolved) => resolved,
                 Err(e) => {
-                    warn!(name = %name, error = %e, "Failed to resolve contract");
+                    warn!(name = %name, error = %e, "Failed to resolve contract, skipping");
+                    continue;
                 }
+            };
+            let con_id = resolved.contract_id;
+            match contracts.register(name.clone(), resolved) {
+                Ok(()) => debug!(name = %name, con_id, "Registered contract"),
+                Err(e) => warn!(name = %name, error = %e, "Failed to register contract, skipping"),
             }
         }
 
@@ -1068,13 +1148,65 @@ impl IbkrClient {
         base
     }
 
-    /// Register a contract for an instrument.
+    /// Resolve a contract description through IB's contract details, on this client's
+    /// connection, into the one IB contract it matches.
+    ///
+    /// A contract built locally, such as `stock_contract("AAPL", "SMART", "USD")`, has no IB
+    /// contract id until it is resolved, and [`register_contract`](Self::register_contract)
+    /// refuses it. Resolve it here first:
+    ///
+    /// ```no_run
+    /// # async fn example(client: rustrade_execution::client::ibkr::IbkrClient)
+    /// # -> Result<(), Box<dyn std::error::Error>> {
+    /// use rustrade_execution::client::ibkr::contract::stock_contract;
+    ///
+    /// let aapl = client
+    ///     .resolve_contract(&stock_contract("AAPL", "SMART", "USD"))
+    ///     .await?;
+    /// client.register_contract("AAPL".into(), aapl)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// - [`ResolveContractError::NoMatch`] when no IB contract matches the description.
+    /// - [`ResolveContractError::Ambiguous`] when several do. Narrow the description, or pick
+    ///   one of the matches it carries.
+    /// - [`ResolveContractError::Request`] when the request fails: IB refuses it, the
+    ///   connection drops, or IB sends nothing for 10 s before finishing its answer.
+    pub async fn resolve_contract(
+        &self,
+        contract: &ibapi::contracts::Contract,
+    ) -> Result<ibapi::contracts::Contract, ResolveContractError> {
+        let client = Arc::clone(&self.client);
+        let contract = contract.clone();
+        tokio::task::spawn_blocking(move || resolve_contract_blocking(&client, &contract))
+            .await
+            .map_err(|e| ResolveContractError::Request(format!("task join: {e}")))?
+    }
+
+    /// Register a contract IB has resolved for an instrument, so that orders can be placed on
+    /// it and everything IB reports for it (fills, order listings, positions) is attributed to
+    /// `name`.
+    ///
+    /// Resolve the contract first with [`resolve_contract`](Self::resolve_contract), or list it
+    /// in [`IbkrConfig::contracts`] for [`connect_sync`](Self::connect_sync) to resolve.
+    ///
+    /// # Errors
+    ///
+    /// Leaves the registry unchanged and returns:
+    /// - [`ContractRegistryError::Unresolved`] when the contract has no IB contract id. IB
+    ///   reports everything about a contract by that id, so without it the orders would fill
+    ///   with no fill ever reported.
+    /// - [`ContractRegistryError::ContractIdTaken`] when the contract is already registered
+    ///   under another name.
     pub fn register_contract(
         &self,
         name: InstrumentNameExchange,
         contract: ibapi::contracts::Contract,
-    ) {
-        self.contracts.register(name, contract);
+    ) -> Result<(), ContractRegistryError> {
+        self.contracts.register(name, contract)
     }
 
     /// Get the contract registry.
@@ -4432,13 +4564,15 @@ mod order_reader_tests {
         };
 
         let contracts = ContractRegistry::new();
-        contracts.register(
-            InstrumentNameExchange::new("AAPL"),
-            Contract {
-                contract_id: 265598,
-                ..Contract::default()
-            },
-        );
+        contracts
+            .register(
+                InstrumentNameExchange::new("AAPL"),
+                Contract {
+                    contract_id: 265598,
+                    ..Contract::default()
+                },
+            )
+            .unwrap();
         let order_ids = OrderIdMap::new();
         order_ids
             .register(
@@ -4586,13 +4720,15 @@ mod order_reader_tests {
 
         fn contracts() -> ContractRegistry {
             let contracts = ContractRegistry::new();
-            contracts.register(
-                InstrumentNameExchange::new("AAPL"),
-                Contract {
-                    contract_id: CON_ID,
-                    ..Contract::default()
-                },
-            );
+            contracts
+                .register(
+                    InstrumentNameExchange::new("AAPL"),
+                    Contract {
+                        contract_id: CON_ID,
+                        ..Contract::default()
+                    },
+                )
+                .unwrap();
             contracts
         }
 
@@ -4687,6 +4823,64 @@ mod order_reader_tests {
                 matches!(&read, Err(UnindexedClientError::Internal(m)) if m.contains("connection dropped")),
                 "{read:?}"
             );
+        }
+
+        fn contract(contract_id: i32) -> Contract {
+            Contract {
+                contract_id,
+                ..Contract::default()
+            }
+        }
+
+        fn ib_notice(code: i32) -> ListingError {
+            ListingError::Ibapi(ibapi::Error::Notice(ibapi::Notice {
+                request_id: Some(9),
+                code,
+                message: "notice".to_string(),
+                error_time: None,
+                advanced_order_reject_json: String::new(),
+            }))
+        }
+
+        /// A description resolves only when IB lists exactly one contract for it.
+        #[test]
+        fn a_contract_description_resolves_only_to_a_single_match() {
+            assert_eq!(
+                classify_contract_details(Ok(()), vec![contract(1)]),
+                Ok(contract(1))
+            );
+            assert_eq!(
+                classify_contract_details(Ok(()), Vec::new()),
+                Err(ResolveContractError::NoMatch)
+            );
+            assert_eq!(
+                classify_contract_details(Ok(()), vec![contract(1), contract(2)]),
+                Err(ResolveContractError::Ambiguous {
+                    matches: vec![contract(1), contract(2)]
+                })
+            );
+        }
+
+        /// IB answers a description that matches nothing with error 200. Any other failure,
+        /// including a stall or a drop after some matches arrived, fails the request: the
+        /// matches read are not all there are.
+        #[test]
+        fn only_ibs_no_definition_error_means_no_match() {
+            assert_eq!(
+                classify_contract_details(Err(ib_notice(NO_SECURITY_DEFINITION_CODE)), Vec::new()),
+                Err(ResolveContractError::NoMatch)
+            );
+            for failure in [
+                ib_notice(321),
+                ListingError::Dropped,
+                ListingError::Stalled(Duration::from_secs(10)),
+            ] {
+                let classified = classify_contract_details(Err(failure), vec![contract(1)]);
+                assert!(
+                    matches!(classified, Err(ResolveContractError::Request(_))),
+                    "{classified:?}"
+                );
+            }
         }
 
         /// The account summary stays live after its listing, so only its `End` item ends the
@@ -5015,13 +5209,15 @@ mod order_reader_tests {
         fn snapshot_orders_are_complete_only_when_each_is_exact() {
             let msft = InstrumentNameExchange::new("MSFT");
             let contracts = contracts();
-            contracts.register(
-                msft.clone(),
-                Contract {
-                    contract_id: 272093,
-                    ..Contract::default()
-                },
-            );
+            contracts
+                .register(
+                    msft.clone(),
+                    Contract {
+                        contract_id: 272093,
+                        ..Contract::default()
+                    },
+                )
+                .unwrap();
             let in_msft = |order_id, order| {
                 let Orders::OrderData(mut data) = listed(API_CLIENT, order_id, order) else {
                     unreachable!()

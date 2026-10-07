@@ -1210,13 +1210,15 @@ mod tests {
 
     fn tracked() -> (ContractRegistry, OrderIdMap) {
         let contracts = ContractRegistry::new();
-        contracts.register(
-            InstrumentNameExchange::new("AAPL"),
-            Contract {
-                contract_id: CON_ID,
-                ..Contract::default()
-            },
-        );
+        contracts
+            .register(
+                InstrumentNameExchange::new("AAPL"),
+                Contract {
+                    contract_id: CON_ID,
+                    ..Contract::default()
+                },
+            )
+            .unwrap();
         let order_ids = OrderIdMap::new();
         order_ids
             .register(

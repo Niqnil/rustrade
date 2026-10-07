@@ -38,6 +38,43 @@ pub enum ContractConfigError {
     UnrecognizedSecurityType { security_type: String },
 }
 
+/// Reasons [`IbkrClient::resolve_contract`](super::IbkrClient::resolve_contract) cannot
+/// resolve a contract description into one IB contract.
+///
+/// `#[non_exhaustive]`: new reasons may be added without a breaking change.
+#[derive(Debug, Clone, PartialEq, Error)]
+#[non_exhaustive]
+pub enum ResolveContractError {
+    /// No IB contract matches the description.
+    #[error("no IB contract matches the description")]
+    NoMatch,
+
+    /// Several IB contracts match the description, for example the same symbol on several
+    /// exchanges, or options of several trading classes. Narrow the description, or pick one of
+    /// `matches` and register it.
+    #[error(
+        "{} IB contracts match the description (contract ids {:?}); narrow it",
+        .matches.len(),
+        contract_ids(.matches)
+    )]
+    Ambiguous {
+        /// Every contract that matches, as IB resolved it.
+        matches: Vec<Contract>,
+    },
+
+    /// The contract-details request failed: IB refused it, the connection dropped, or IB
+    /// stalled before finishing its answer.
+    #[error("contract details request failed: {0}")]
+    Request(String),
+}
+
+fn contract_ids(contracts: &[Contract]) -> Vec<i32> {
+    contracts
+        .iter()
+        .map(|contract| contract.contract_id)
+        .collect()
+}
+
 /// Map a human/wire option-right string to `OptionRight`.
 ///
 /// Accepts IBKR wire values (`"C"`/`"P"`) and common long forms

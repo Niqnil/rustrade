@@ -43,7 +43,7 @@
 //! | Test | Description |
 //! |------|-------------|
 //! | `test_connection` | Connect to IB Gateway |
-//! | `test_contract_registration` | Register contracts in local registry |
+//! | `test_contract_registration` | Resolve contracts, and refuse unresolved or duplicate ones |
 //! | `test_fetch_balances` | Fetch account balances |
 //! | `test_account_snapshot` | Fetch full account snapshot |
 //! | `test_fetch_open_orders` | Fetch currently open orders |
@@ -68,12 +68,16 @@
 #![cfg(feature = "ibkr")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Integration tests: panics are the correct failure mode
 
+use ibapi::contracts::{Contract, Currency, Exchange, SecurityType, Symbol};
 use rust_decimal_macros::dec;
 use rustrade_execution::{
     AccountEventKind,
     client::{
         ExecutionClient, OrderStatusClient,
-        ibkr::{ContractConfig, IbkrClient, IbkrConfig, contract::stock_contract},
+        ibkr::{
+            ContractConfig, IbkrClient, IbkrConfig,
+            contract::{ResolveContractError, stock_contract},
+        },
     },
     order::{
         OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
@@ -83,7 +87,7 @@ use rustrade_execution::{
     },
 };
 use rustrade_instrument::{
-    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
+    Side, asset::name::AssetNameExchange, exchange::ExchangeId, ibkr::ContractRegistryError,
     instrument::name::InstrumentNameExchange,
 };
 use serial_test::serial;
@@ -118,6 +122,24 @@ fn test_config(client_id_offset: i32) -> IbkrConfig {
         client_id: test_client_id_base() + client_id_offset,
         account: std::env::var("IBKR_PAPER_ACCOUNT").expect("IBKR_PAPER_ACCOUNT env var required"),
         contracts: vec![],
+    }
+}
+
+/// AAPL resolved through `IbkrConfig::contracts`, so IB's listings, which name contracts by id,
+/// can be attributed to it.
+fn resolved_aapl_config(client_id_offset: i32) -> IbkrConfig {
+    IbkrConfig {
+        contracts: vec![ContractConfig {
+            name: "AAPL".to_string(),
+            symbol: "AAPL".to_string(),
+            security_type: "STK".to_string(),
+            exchange: "SMART".to_string(),
+            currency: "USD".to_string(),
+            last_trade_date: None,
+            strike: None,
+            right: None,
+        }],
+        ..test_config(client_id_offset)
     }
 }
 
@@ -160,19 +182,64 @@ async fn test_contract_registration() {
 
     let config = test_config(1);
     let client = connect_client(config).await.expect("connection failed");
-
     let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
+    let description = stock_contract("AAPL", "SMART", "USD");
 
-    client.register_contract(aapl_name.clone(), aapl_contract);
+    // A contract IB has not resolved is refused: IB would report its fills by an id it lacks.
+    assert_eq!(
+        client.register_contract(aapl_name.clone(), description.clone()),
+        Err(ContractRegistryError::Unresolved {
+            name: aapl_name.clone()
+        })
+    );
+    assert!(client.contract_registry().is_empty());
 
-    assert_eq!(client.contract_registry().len(), 1);
+    let aapl = client
+        .resolve_contract(&description)
+        .await
+        .expect("AAPL must resolve");
     assert!(
+        aapl.contract_id > 0,
+        "resolved contract has no id: {aapl:?}"
+    );
+    client
+        .register_contract(aapl_name.clone(), aapl.clone())
+        .expect("a resolved contract registers");
+    assert_eq!(client.contract_registry().len(), 1);
+    assert_eq!(
         client
             .contract_registry()
-            .get_contract(&aapl_name)
-            .is_some()
+            .get_name_by_con_id(aapl.contract_id),
+        Some(aapl_name.clone())
     );
+
+    // The same IB contract cannot be registered under a second name.
+    assert!(matches!(
+        client.register_contract("AAPL-2".into(), aapl.clone()),
+        Err(ContractRegistryError::ContractIdTaken { .. })
+    ));
+
+    let unknown = stock_contract("NOSUCHSYMBOLXQZ", "SMART", "USD");
+    assert_eq!(
+        client.resolve_contract(&unknown).await,
+        Err(ResolveContractError::NoMatch)
+    );
+
+    // A future with no expiry matches every listed contract month.
+    let every_es_month = Contract {
+        symbol: Symbol::from("ES"),
+        security_type: SecurityType::Future,
+        exchange: Exchange::from("CME"),
+        currency: Currency::from("USD"),
+        ..Contract::default()
+    };
+    match client.resolve_contract(&every_es_month).await {
+        Err(ResolveContractError::Ambiguous { matches }) => {
+            println!("ES months: {}", matches.len());
+            assert!(matches.len() > 1);
+        }
+        other => panic!("expected an ambiguous description, got {other:?}"),
+    }
 }
 
 // ============================================================================
@@ -242,12 +309,8 @@ async fn test_account_snapshot() {
 async fn test_fetch_open_orders() {
     init_logging();
 
-    let config = test_config(4);
+    let config = resolved_aapl_config(4);
     let client = connect_client(config).await.expect("connection failed");
-
-    let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let instruments: Vec<InstrumentNameExchange> = vec![];
     let result = client.fetch_open_orders(&instruments).await;
@@ -278,12 +341,10 @@ async fn test_fetch_open_orders() {
 async fn test_place_and_cancel_limit_order() {
     init_logging();
 
-    let config = test_config(5);
+    let config = resolved_aapl_config(5);
     let client = connect_client(config).await.expect("connection failed");
 
     let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let strategy = StrategyId::new("test-strategy");
     let order_cid = ClientOrderId::new(format!(
@@ -420,12 +481,8 @@ async fn test_account_stream() {
 async fn test_fetch_trades() {
     init_logging();
 
-    let config = test_config(7);
+    let config = resolved_aapl_config(7);
     let client = connect_client(config).await.expect("connection failed");
-
-    let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let since = chrono::Utc::now() - chrono::Duration::hours(24);
     let instruments: Vec<InstrumentNameExchange> = vec![];
@@ -572,12 +629,10 @@ async fn test_cancel_nonexistent_order() {
 async fn test_cancel_produces_cancelled_not_expired() {
     init_logging();
 
-    let config = test_config(11);
+    let config = resolved_aapl_config(11);
     let client = connect_client(config).await.expect("connection failed");
 
     let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let assets: Vec<AssetNameExchange> = vec![];
     let instruments: Vec<InstrumentNameExchange> = vec![];
@@ -708,12 +763,10 @@ async fn test_cancel_produces_cancelled_not_expired() {
 async fn test_place_and_cancel_stop_order() {
     init_logging();
 
-    let config = test_config(12);
+    let config = resolved_aapl_config(12);
     let client = connect_client(config).await.expect("connection failed");
 
     let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let strategy = StrategyId::new("test-stop-order");
     let order_cid = ClientOrderId::new(format!(
@@ -804,12 +857,10 @@ async fn test_place_and_cancel_stop_order() {
 async fn test_place_and_cancel_stop_limit_order() {
     init_logging();
 
-    let config = test_config(13);
+    let config = resolved_aapl_config(13);
     let client = connect_client(config).await.expect("connection failed");
 
     let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let strategy = StrategyId::new("test-stop-limit-order");
     let order_cid = ClientOrderId::new(format!(
@@ -901,12 +952,10 @@ async fn test_place_and_cancel_stop_limit_order() {
 async fn test_place_and_cancel_trailing_stop_percentage() {
     init_logging();
 
-    let config = test_config(14);
+    let config = resolved_aapl_config(14);
     let client = connect_client(config).await.expect("connection failed");
 
     let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let strategy = StrategyId::new("test-trailing-stop-pct");
     let order_cid = ClientOrderId::new(format!(
@@ -1000,12 +1049,10 @@ async fn test_place_and_cancel_trailing_stop_percentage() {
 async fn test_place_and_cancel_trailing_stop_limit_absolute() {
     init_logging();
 
-    let config = test_config(15);
+    let config = resolved_aapl_config(15);
     let client = connect_client(config).await.expect("connection failed");
 
     let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let strategy = StrategyId::new("test-trailing-stop-limit-abs");
     let order_cid = ClientOrderId::new(format!(
@@ -1111,12 +1158,10 @@ async fn test_place_and_cancel_bracket_order() {
 
     init_logging();
 
-    let config = test_config(16);
+    let config = resolved_aapl_config(16);
     let client = connect_client(config).await.expect("connection failed");
 
     let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let strategy = StrategyId::new("test-bracket-order");
     let parent_cid =
@@ -1229,12 +1274,10 @@ async fn test_bracket_order_oca_group_linkage() {
 
     init_logging();
 
-    let config = test_config(17);
+    let config = resolved_aapl_config(17);
     let client = connect_client(config).await.expect("connection failed");
 
     let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let strategy = StrategyId::new("test-bracket-oca");
     let parent_cid = ClientOrderId::new(format!(
@@ -1330,12 +1373,10 @@ async fn test_bracket_order_oca_group_linkage() {
 async fn test_place_and_cancel_gtd_order() {
     init_logging();
 
-    let config = test_config(18);
+    let config = resolved_aapl_config(18);
     let client = connect_client(config).await.expect("connection failed");
 
     let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let strategy = StrategyId::new("test-gtd-order");
     let order_cid = ClientOrderId::new(format!(
@@ -1429,12 +1470,10 @@ async fn test_place_and_cancel_gtd_order() {
 async fn test_place_moo_order_premarket() {
     init_logging();
 
-    let config = test_config(19);
+    let config = resolved_aapl_config(19);
     let client = connect_client(config).await.expect("connection failed");
 
     let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let strategy = StrategyId::new("test-moo-order");
     let order_cid = ClientOrderId::new(format!(
@@ -1523,12 +1562,10 @@ async fn test_place_moo_order_premarket() {
 async fn test_place_loo_order_premarket() {
     init_logging();
 
-    let config = test_config(20);
+    let config = resolved_aapl_config(20);
     let client = connect_client(config).await.expect("connection failed");
 
     let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let strategy = StrategyId::new("test-loo-order");
     let order_cid = ClientOrderId::new(format!(
@@ -1606,24 +1643,6 @@ async fn test_place_loo_order_premarket() {
 // ============================================================================
 // Orders by client order id — Tier 0: Paper Account Only (FREE)
 // ============================================================================
-
-/// AAPL resolved through `IbkrConfig::contracts`, so IB's listings, which name contracts by id,
-/// can be attributed to it.
-fn resolved_aapl_config(client_id_offset: i32) -> IbkrConfig {
-    IbkrConfig {
-        contracts: vec![ContractConfig {
-            name: "AAPL".to_string(),
-            symbol: "AAPL".to_string(),
-            security_type: "STK".to_string(),
-            exchange: "SMART".to_string(),
-            currency: "USD".to_string(),
-            last_trade_date: None,
-            strike: None,
-            right: None,
-        }],
-        ..test_config(client_id_offset)
-    }
-}
 
 /// How the order under `key` ended, once IB lists it completed.
 async fn ended_eventually(
