@@ -63,9 +63,9 @@
 //! [`super`] module documentation for why.
 
 use super::common::{
-    CLOID_REQUIRED, CancelOnDropStream, OpenOrder, OpenOrderListing, UserFill, cid_to_cloid,
-    instrument_to_spot_coin, map_tif, millis_to_datetime, open_order_to_order, open_orders,
-    parse_decimal, parse_side, round_to_5_sig_figs, span_millis, spot_balances,
+    CLOID_REQUIRED, CancelOnDropStream, OpenOrder, OpenOrderListing, UserFill, cancel_outcome,
+    cid_to_cloid, instrument_to_spot_coin, map_tif, millis_to_datetime, open_order_to_order,
+    open_orders, parse_decimal, parse_side, round_to_5_sig_figs, span_millis, spot_balances,
     spot_pair_to_instrument, user_fills_by_time,
 };
 use super::config::HyperliquidConfig;
@@ -564,9 +564,7 @@ impl ExecutionClient for HyperliquidSpotClient {
         request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
     ) -> UnindexedOrderResponseCancel {
         use crate::order::{request::OrderResponseCancel, state::Cancelled};
-        use hyperliquid_rust_sdk::{
-            ClientCancelRequest, ClientCancelRequestCloid, ExchangeResponseStatus,
-        };
+        use hyperliquid_rust_sdk::{ClientCancelRequest, ClientCancelRequestCloid};
         use uuid::Uuid;
 
         let coin = match instrument_to_spot_coin(request.key.instrument) {
@@ -673,8 +671,8 @@ impl ExecutionClient for HyperliquidSpotClient {
             }
         };
 
-        match response {
-            ExchangeResponseStatus::Ok(_) => {
+        match cancel_outcome(response) {
+            Ok(()) => {
                 debug!("Spot cancel order accepted");
                 // Hyperliquid answers a cancel once the order has left the book.
                 self.known_live.lock().ended(&request.key.cid);
@@ -694,8 +692,9 @@ impl ExecutionClient for HyperliquidSpotClient {
                     )),
                 }
             }
-            ExchangeResponseStatus::Err(msg) => {
-                warn!(%msg, "Spot cancel rejected by exchange");
+            // Not reported ended: if the order did end, the account stream or a lookup says how.
+            Err(reason) => {
+                warn!(%reason, cid = %request.key.cid, "Spot cancel rejected by exchange");
                 OrderResponseCancel {
                     key: OrderKey {
                         exchange: ExchangeId::HyperliquidSpot,
@@ -704,7 +703,7 @@ impl ExecutionClient for HyperliquidSpotClient {
                         cid: request.key.cid.clone(),
                     },
                     state: Err(UnindexedOrderError::Rejected(
-                        crate::error::ApiError::OrderRejected(msg),
+                        crate::error::ApiError::OrderRejected(reason),
                     )),
                 }
             }
@@ -1452,6 +1451,127 @@ mod tests {
             );
         }
     }
+
+    mod cancel {
+        use super::super::super::common::info_tests::{
+            CANCEL_NOT_APPLIED, cancel_answer, exchange_client_against, info_client_against,
+            test_wallet,
+        };
+        use super::super::super::config::Network;
+        use super::super::super::spot_coins::TEST_SPOT_META;
+        use super::*;
+        use crate::error::ApiError;
+        use crate::order::{OrderEvent, request::RequestCancel};
+        use std::collections::HashMap;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// Cancel a live `HYPE-USDC-SPOT` order through a client whose exchange endpoint answers
+        /// `answer`. Returns the response, and whether the order is still held live afterwards.
+        async fn cancel_answered(
+            answer: serde_json::Value,
+        ) -> (UnindexedOrderResponseCancel, bool) {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/info"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(TEST_SPOT_META, "application/json"),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/exchange"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(answer))
+                .mount(&server)
+                .await;
+            let info_client = Arc::new(info_client_against(server.uri()).await);
+            let client = HyperliquidSpotClient {
+                config: HyperliquidConfig::new(test_wallet(), Network::Testnet),
+                spot_coins: SpotCoins::fetch(info_client.clone()).await.unwrap(),
+                info_client,
+                exchange_client: Arc::new(
+                    exchange_client_against(
+                        server.uri(),
+                        HashMap::from([("HYPE/USDC".to_owned(), 10_107)]),
+                    )
+                    .await,
+                ),
+                known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidSpot),
+            };
+            let instrument = InstrumentNameExchange::new("HYPE-USDC-SPOT");
+            let key = OrderKey {
+                exchange: ExchangeId::HyperliquidSpot,
+                instrument: instrument.clone(),
+                strategy: StrategyId::new("strategy"),
+                cid: ClientOrderId::uuid(),
+            };
+            let id = VenueOrderId::Assigned(OrderId::new("7"));
+            let open = Open {
+                id: id.clone(),
+                time_exchange: Utc::now(),
+                filled_quantity: Decimal::ZERO,
+            };
+            client.known_live.lock().live(&key, dec!(1), &open);
+
+            let response = client
+                .cancel_order(OrderEvent {
+                    key: OrderKey {
+                        exchange: key.exchange,
+                        instrument: &instrument,
+                        strategy: key.strategy.clone(),
+                        cid: key.cid.clone(),
+                    },
+                    state: RequestCancel { id: Some(id) },
+                })
+                .await;
+            let live = client.known_live.lock().contains(&key.cid);
+            (response, live)
+        }
+
+        #[tokio::test]
+        async fn a_success_status_cancels_the_spot_order() {
+            let (response, live) =
+                cancel_answered(cancel_answer(serde_json::json!(["success"]))).await;
+            assert!(response.state.is_ok(), "{:?}", response.state);
+            assert!(!live, "a cancelled order is no longer held live");
+        }
+
+        /// An order that filled before the cancel arrived is answered this way, so it must not be
+        /// reported cancelled, and stays held live until the account stream or a lookup ends it.
+        #[tokio::test]
+        async fn an_error_status_is_a_rejected_spot_cancel_and_the_order_stays_live() {
+            let (response, live) = cancel_answered(cancel_answer(serde_json::json!([
+                {"error": CANCEL_NOT_APPLIED}
+            ])))
+            .await;
+            let Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(reason))) =
+                &response.state
+            else {
+                panic!("expected a rejected cancel, got {:?}", response.state);
+            };
+            assert_eq!(reason, CANCEL_NOT_APPLIED);
+            assert!(live, "the order is still held live");
+        }
+
+        #[tokio::test]
+        async fn an_answer_without_a_status_is_a_rejected_spot_cancel() {
+            let (response, live) = cancel_answered(serde_json::json!({
+                "status": "ok",
+                "response": {"type": "cancel"},
+            }))
+            .await;
+            assert!(
+                matches!(
+                    response.state,
+                    Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(_)))
+                ),
+                "{:?}",
+                response.state
+            );
+            assert!(live, "the order is still held live");
+        }
+    }
+
     use super::*;
     use rust_decimal_macros::dec;
     use rustrade_integration::collection::snapshot::Snapshot;

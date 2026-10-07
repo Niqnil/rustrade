@@ -427,6 +427,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Hyperliquid reported a cancel it had not applied as cancelled** (`rustrade-execution`, feature
+  `hyperliquid`). Hyperliquid answers such a cancel with a top-level `ok` and puts the error in the
+  order's own status, for example "Order was never placed, already canceled, or filled.".
+  `HyperliquidClient` and `HyperliquidSpotClient` read only the top level. So a cancel of an order
+  that had already filled was reported as `Ok(Cancelled)`, and the reconnect check then stopped
+  asking about that order. `cancel_order` now reports `Cancelled` only for a `success` status. An
+  error status, or an answer with no status for the order, is an `ApiError::OrderRejected` carrying
+  the reason, and the order stays tracked until the account stream or a lookup says how it ended.
+  The rejection is not reported as `OrderAlreadyCancelled` or `OrderAlreadyFullyFilled`: Hyperliquid's
+  message does not say which of "never placed, already canceled, or filled" happened, so the order
+  may already have ended either way.
+
 - **IBKR fills never advanced the engine's orders, and IBKR order reads misreported orders, fees
   and other API clients' activity** (`rustrade-execution`, feature `ibkr`). **Breaking:** what
   these methods return changes.

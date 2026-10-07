@@ -1277,6 +1277,11 @@ async fn test_cancel_nonexistent_order() {
     init_logging();
 
     let config = test_config();
+    assert_eq!(
+        config.network,
+        Network::Testnet,
+        "This test MUST run on testnet only!"
+    );
     let client = HyperliquidClient::connect(config)
         .await
         .expect("Failed to connect");
@@ -1303,8 +1308,19 @@ async fn test_cancel_nonexistent_order() {
 
     let response = client.cancel_order(cancel_request).await;
 
-    // Hyperliquid may return success or error for nonexistent orders
+    // Hyperliquid answers with a top-level `ok` and the error in the order's own status, which
+    // must not read as a cancel.
     println!("Cancel nonexistent order result: {:?}", response.state);
+    assert!(
+        matches!(
+            response.state,
+            Err(rustrade_execution::error::OrderError::Rejected(
+                rustrade_execution::error::ApiError::OrderRejected(_)
+            ))
+        ),
+        "a cancel of an order Hyperliquid does not hold must be rejected, got {:?}",
+        response.state
+    );
 }
 
 #[tokio::test]
