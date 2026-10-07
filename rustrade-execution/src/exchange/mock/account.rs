@@ -1,7 +1,7 @@
 use crate::{
     UnindexedAccountSnapshot,
     balance::AssetBalance,
-    exchange::mock::orders::{OpenOrders, as_open},
+    exchange::mock::orders::{AlreadyResting, OpenOrder, OpenOrders, Reservation, as_open},
     order::{
         Order, UnindexedInactiveOrder,
         id::ClientOrderId,
@@ -15,6 +15,7 @@ use rust_decimal::Decimal;
 use rustrade_instrument::{
     asset::name::AssetNameExchange, exchange::ExchangeId, instrument::name::InstrumentNameExchange,
 };
+use thiserror::Error;
 
 #[derive(Debug)]
 pub struct AccountState {
@@ -65,14 +66,50 @@ impl AccountState {
         &self.orders_open
     }
 
-    /// This account's open orders, for a venue booking, matching or cancelling one.
+    /// This account's open orders, for a venue matching or cancelling one.
+    ///
+    /// Book a new order with [`book`](Self::book) instead, which also retires what the ledgers
+    /// remember of an earlier order under the same id.
     pub fn orders_mut(&mut self) -> &mut OpenOrders {
         &mut self.orders_open
     }
 
+    /// Puts `order` on the book holding `reservation`, unless an order is already resting under
+    /// its [`ClientOrderId`].
+    ///
+    /// A client order id names one order at a time, not one for good: once an order has ended its
+    /// id may name a new one. So booking forgets how an earlier order under the same id ended,
+    /// which keeps an id in at most one place, the book or one ledger, and a snapshot from listing
+    /// it twice.
+    ///
+    /// # Errors
+    /// [`AlreadyResting`], with `order` and `reservation` handed back and nothing changed, if an
+    /// order is already resting under its id. See [`OpenOrders::insert`].
+    pub fn book(
+        &mut self,
+        order: OpenOrder,
+        reservation: Option<Reservation>,
+    ) -> Result<(), AlreadyResting> {
+        let cid = order.key.cid.clone();
+        self.orders_open.insert(order, reservation)?;
+        self.forget_ended(&cid);
+        Ok(())
+    }
+
+    /// Drops what the ledgers remember of how an order under `cid` ended, so that the order about
+    /// to be recorded under it is the only one they hold.
+    fn forget_ended(&mut self, cid: &ClientOrderId) {
+        self.orders_cancelled.remove(cid);
+        self.orders_filled.remove(cid);
+        self.orders_expired.remove(cid);
+    }
+
     /// Records that `order` was cancelled, so it is reported by a later account snapshot and a
     /// second cancel for it can be told apart from a cancel for an order that never existed.
+    ///
+    /// Replaces whatever the ledgers held for an earlier order under the same id.
     pub fn ack_cancelled(&mut self, order: Order<ExchangeId, InstrumentNameExchange, Cancelled>) {
+        self.forget_ended(&order.key.cid);
         self.orders_cancelled.insert(order.key.cid.clone(), order);
     }
 
@@ -84,9 +121,9 @@ impl AccountState {
     /// Records that `order` filled, so a cancel that loses the race to it can say so and an
     /// order-state lookup can report it.
     ///
-    /// Keyed on the client order id, which this venue assumes is never reused: a second fill under
-    /// the same id would replace the first.
+    /// Replaces whatever the ledgers held for an earlier order under the same id.
     pub fn ack_filled(&mut self, order: Order<ExchangeId, InstrumentNameExchange, Filled>) {
+        self.forget_ended(&order.key.cid);
         self.orders_filled.insert(order.key.cid.clone(), order);
     }
 
@@ -100,11 +137,13 @@ impl AccountState {
     /// An order a configured `initial_state` reported as cancelled is found too; one it reported
     /// in any other inactive state is not, because a snapshot seeds only open and cancelled orders.
     ///
-    /// Each ledger an order can end in is checked in turn and the open book is not, which is sound
-    /// because this venue assumes a client order id is never reused: an order leaves the book
-    /// before it is recorded as ended, so it is in at most one of these places.
+    /// An id names at most one order at a time, and an id is in at most one place: the book, or
+    /// one of the ledgers an order can end in, holding the latest order under it (see
+    /// [`book`](Self::book)). So the answer is how the latest order under `cid` ended.
     pub fn order_ended(&self, cid: &ClientOrderId) -> Option<UnindexedInactiveOrder> {
-        if let Some(filled) = self.orders_filled.get(cid) {
+        if self.orders_open.contains(cid) {
+            None
+        } else if let Some(filled) = self.orders_filled.get(cid) {
             Some(filled.clone().map_state(InactiveOrderState::FullyFilled))
         } else if let Some(cancelled) = self.orders_cancelled.get(cid) {
             Some(cancelled.clone().map_state(InactiveOrderState::Cancelled))
@@ -117,7 +156,10 @@ impl AccountState {
 
     /// Records that `order` reached its own deadline, so it is reported by a later account snapshot
     /// and a cancel arriving after it can be told apart from a cancel for an unknown order.
+    ///
+    /// Replaces whatever the ledgers held for an earlier order under the same id.
     pub fn ack_expired(&mut self, order: Order<ExchangeId, InstrumentNameExchange, Expired>) {
+        self.forget_ended(&order.key.cid);
         self.orders_expired.insert(order.key.cid.clone(), order);
     }
 
@@ -420,8 +462,26 @@ pub struct BalanceInsufficient {
     pub required: Decimal,
 }
 
-impl From<UnindexedAccountSnapshot> for AccountState {
-    fn from(value: UnindexedAccountSnapshot) -> Self {
+/// An account snapshot lists one [`ClientOrderId`] more than once among the orders it seeds.
+///
+/// A snapshot seeds open and cancelled orders, and a client order id names one order at a time,
+/// so it can be listed once among them. Two entries under one id would leave the venue to choose
+/// which order it holds, silently.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("account snapshot lists {0} more than once among its open and cancelled orders")]
+pub struct DuplicateSeededOrder(pub ClientOrderId);
+
+/// Seeds an account from a snapshot, as a [`SimulatedVenue`] does from its `initial_state`.
+///
+/// # Errors
+/// [`DuplicateSeededOrder`] if the snapshot lists one [`ClientOrderId`] more than once among its
+/// open and cancelled orders.
+///
+/// [`SimulatedVenue`]: crate::exchange::mock::SimulatedVenue
+impl TryFrom<UnindexedAccountSnapshot> for AccountState {
+    type Error = DuplicateSeededOrder;
+
+    fn try_from(value: UnindexedAccountSnapshot) -> Result<Self, Self::Error> {
         let UnindexedAccountSnapshot {
             exchange: _,
             balances,
@@ -433,67 +493,73 @@ impl From<UnindexedAccountSnapshot> for AccountState {
             .map(|asset_balance| (asset_balance.asset.clone(), asset_balance))
             .collect();
 
-        let (orders_open, orders_cancelled) = instruments.into_iter().fold(
-            (OpenOrders::default(), FnvHashMap::default()),
-            |(mut orders_open, mut orders_cancelled), snapshot| {
-                for order in snapshot.orders {
-                    match &order.state {
-                        OrderState::Active(_) => {
-                            // `as_open` yields `None` for an active order that is not yet open —
-                            // an `OpenInFlight`, which has no venue-side existence to record.
-                            if let Some(open) = as_open(order) {
-                                // Seeded, not booked here: the venue holds nothing against it, so
-                                // a displaced entry can leak nothing. A snapshot listing one
-                                // `ClientOrderId` twice is a mis-specified fixture rather than a
-                                // runtime condition, and the later order silently replacing the
-                                // earlier is what it would otherwise get.
-                                let cid = open.key.cid.clone();
-                                let displaced = orders_open.insert(open, None);
-                                debug_assert!(
-                                    displaced.is_none(),
-                                    "account snapshot lists {cid} as open more than once, so only \
-                                     the last of them reaches the book"
-                                );
-                            }
-                        }
-                        OrderState::Inactive(InactiveOrderState::Cancelled(cancelled)) => {
-                            let cancelled = cancelled.clone();
-                            orders_cancelled.insert(
-                                order.key.cid.clone(),
-                                Order {
-                                    key: order.key,
-                                    side: order.side,
-                                    price: order.price,
-                                    quantity: order.quantity,
-                                    kind: order.kind,
-                                    time_in_force: order.time_in_force,
-                                    state: cancelled,
-                                },
-                            );
-                        }
-                        _ => {}
+        let mut orders_open = OpenOrders::default();
+        let mut orders_cancelled = FnvHashMap::default();
+        for order in instruments.into_iter().flat_map(|snapshot| snapshot.orders) {
+            match &order.state {
+                OrderState::Active(_) => {
+                    // `as_open` yields `None` for an active order that is not yet open — an
+                    // `OpenInFlight`, which has no venue-side existence to record.
+                    let Some(open) = as_open(order) else {
+                        continue;
+                    };
+                    let cid = open.key.cid.clone();
+                    if orders_cancelled.contains_key(&cid) {
+                        return Err(DuplicateSeededOrder(cid));
                     }
+                    // Seeded, not booked here: the venue holds nothing against it.
+                    orders_open
+                        .insert(open, None)
+                        .map_err(|_| DuplicateSeededOrder(cid))?;
                 }
+                OrderState::Inactive(InactiveOrderState::Cancelled(cancelled)) => {
+                    let cid = order.key.cid.clone();
+                    if orders_open.contains(&cid) || orders_cancelled.contains_key(&cid) {
+                        return Err(DuplicateSeededOrder(cid));
+                    }
+                    let cancelled = cancelled.clone();
+                    orders_cancelled.insert(
+                        cid,
+                        Order {
+                            key: order.key,
+                            side: order.side,
+                            price: order.price,
+                            quantity: order.quantity,
+                            kind: order.kind,
+                            time_in_force: order.time_in_force,
+                            state: cancelled,
+                        },
+                    );
+                }
+                // Not seeded: see `order_ended`.
+                OrderState::Inactive(_) => {}
+            }
+        }
 
-                (orders_open, orders_cancelled)
-            },
-        );
-
-        Self {
+        Ok(Self {
             balances,
             orders_open,
             orders_cancelled,
             orders_filled: FnvHashMap::default(),
             orders_expired: FnvHashMap::default(),
             trades: vec![],
-        }
+        })
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics are the correct failure mode
 mod tests {
     use super::*;
-    use crate::{balance::Balance, exchange::mock::fixtures::funded};
+    use crate::{
+        balance::Balance,
+        exchange::mock::fixtures::{funded, seeded_gtd, spot_config_holding},
+        order::{
+            UnindexedOrder,
+            id::OrderId,
+            state::{Cancelled, Filled},
+        },
+    };
     use rust_decimal_macros::dec;
 
     fn usd() -> AssetNameExchange {
@@ -557,5 +623,67 @@ mod tests {
             }
         );
         assert_eq!(usd_balance(&account), Balance::new(dec!(100), dec!(100)));
+    }
+
+    /// A snapshot holding `orders`, as a configured `initial_state` would.
+    fn snapshot_of(orders: impl IntoIterator<Item = UnindexedOrder>) -> UnindexedAccountSnapshot {
+        let mut orders = orders.into_iter();
+        let first = orders.next().unwrap();
+        let mut snapshot = spot_config_holding("1", "1000", first).initial_state;
+        snapshot.instruments[0].orders.extend(orders);
+        snapshot
+    }
+
+    fn open(cid: &str) -> UnindexedOrder {
+        let at = DateTime::<Utc>::MIN_UTC;
+        seeded_gtd(cid, "100", at, at + chrono::TimeDelta::days(1))
+    }
+
+    fn ended(
+        cid: &str,
+        state: OrderState<AssetNameExchange, InstrumentNameExchange>,
+    ) -> UnindexedOrder {
+        UnindexedOrder { state, ..open(cid) }
+    }
+
+    fn cancelled(cid: &str) -> UnindexedOrder {
+        let at = DateTime::<Utc>::MIN_UTC;
+        ended(
+            cid,
+            OrderState::inactive(Cancelled::new(OrderId::new(cid), at, None)),
+        )
+    }
+
+    /// One id listed twice among the orders a snapshot seeds is refused, rather than one of them
+    /// silently winning, whichever two of open and cancelled they are.
+    #[test]
+    fn a_snapshot_seeding_one_id_twice_is_refused() {
+        for (orders, case) in [
+            ([open("x"), open("x")], "open twice"),
+            ([open("x"), cancelled("x")], "open, then cancelled"),
+            ([cancelled("x"), open("x")], "cancelled, then open"),
+            ([cancelled("x"), cancelled("x")], "cancelled twice"),
+        ] {
+            assert_eq!(
+                AccountState::try_from(snapshot_of(orders)).err(),
+                Some(DuplicateSeededOrder(ClientOrderId::new("x"))),
+                "{case}"
+            );
+        }
+    }
+
+    /// An order the snapshot does not seed holds no id, so it cannot clash with one it does.
+    #[test]
+    fn an_order_a_snapshot_does_not_seed_does_not_clash() {
+        let at = DateTime::<Utc>::MIN_UTC;
+        let filled = ended(
+            "x",
+            OrderState::fully_filled(Filled::new(OrderId::new("x"), at, dec!(1), None)),
+        );
+
+        let Ok(account) = AccountState::try_from(snapshot_of([filled, open("x")])) else {
+            panic!("a filled order is not seeded");
+        };
+        assert!(account.orders().contains(&ClientOrderId::new("x")));
     }
 }

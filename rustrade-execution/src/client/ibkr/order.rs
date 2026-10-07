@@ -11,6 +11,7 @@ use parking_lot::{Mutex, RwLock};
 use rust_decimal::Decimal;
 use rustrade_instrument::{Side, exchange::ExchangeId, instrument::name::InstrumentNameExchange};
 use std::{sync::Arc, time::Instant};
+use thiserror::Error;
 
 // ============================================================================
 // Bracket Order Types
@@ -101,17 +102,57 @@ pub struct OrderContext {
 /// IB uses `i32` order IDs from a sequence. Barter uses `ClientOrderId` (SmolStr).
 /// This map maintains the bidirectional relationship and stores order context
 /// for reconstructing full `Order` structs from `OrderStatus` callbacks.
+///
+/// # A client order id names one live order at a time
+///
+/// TWS never sees a [`ClientOrderId`], so this map is the only place its uniqueness can be kept.
+/// An id is held from [`register`](Self::register) until its order ends, and registering an id
+/// already held is refused with [`ClientOrderIdInUse`]. Once its order has ended the id may name a
+/// new order.
+///
+/// An order ends here when the account stream reports it `Filled`, `Cancelled` or `Inactive`, or
+/// when [`clear_stale`](Self::clear_stale) reaps it. A `Filled` order releases its id
+/// ([`release_client_id`](Self::release_client_id)) but keeps its IB-id entry, so the executions
+/// and commissions IB may still send for it resolve to the id it was placed under. That entry is
+/// reaped by `clear_stale`.
+///
+/// Every removal is conditional on the id still naming the order removed, so an earlier order
+/// under a reused id cannot take the mapping of the order now under it.
 #[derive(Debug, Clone)]
 pub struct OrderIdMap {
     inner: Arc<RwLock<OrderIdMapInner>>,
 }
 
+/// [`OrderIdMap::register`] refused an id because a live order already holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("client order id {0} already names a live IBKR order")]
+pub struct ClientOrderIdInUse(pub ClientOrderId);
+
 #[derive(Debug, Default)]
 struct OrderIdMapInner {
+    /// The live orders: each id held by an order that has not ended.
     cid_to_ib: FnvHashMap<ClientOrderId, i32>,
     /// Merged map: IB order ID → (ClientOrderId, OrderContext, registration time) for single-lookup on hot path.
     /// The Instant tracks when the order was registered, enabling age-based cleanup.
+    ///
+    /// Holds the live orders and the filled ones not yet reaped, which no longer hold their id.
     ib_to_entry: FnvHashMap<i32, (ClientOrderId, OrderContext, Instant)>,
+}
+
+impl OrderIdMapInner {
+    /// Removes `ib_id`'s entry, and its id's mapping if that still names `ib_id`.
+    fn remove(&mut self, ib_id: i32) -> Option<(ClientOrderId, OrderContext)> {
+        let (client_id, ctx, _) = self.ib_to_entry.remove(&ib_id)?;
+        self.release(&client_id, ib_id);
+        Some((client_id, ctx))
+    }
+
+    /// Frees `client_id` if it still names `ib_id`, rather than a later order under the same id.
+    fn release(&mut self, client_id: &ClientOrderId, ib_id: i32) {
+        if self.cid_to_ib.get(client_id) == Some(&ib_id) {
+            self.cid_to_ib.remove(client_id);
+        }
+    }
 }
 
 impl OrderIdMap {
@@ -122,15 +163,45 @@ impl OrderIdMap {
     }
 
     /// Register a mapping between ClientOrderId and IB order ID with order context.
-    pub fn register(&self, client_id: ClientOrderId, ib_id: i32, context: OrderContext) {
-        let mut inner = self.inner.write();
-        inner.cid_to_ib.insert(client_id.clone(), ib_id);
-        inner
-            .ib_to_entry
-            .insert(ib_id, (client_id, context, Instant::now()));
+    ///
+    /// # Errors
+    /// [`ClientOrderIdInUse`] if a live order already holds `client_id`. Nothing is registered.
+    pub fn register(
+        &self,
+        client_id: ClientOrderId,
+        ib_id: i32,
+        context: OrderContext,
+    ) -> Result<(), ClientOrderIdInUse> {
+        self.register_all([(client_id, ib_id, context)])
     }
 
-    /// Look up IB order ID by ClientOrderId.
+    /// Register several orders at once, such as the legs of a bracket: all of them or none.
+    ///
+    /// # Errors
+    /// [`ClientOrderIdInUse`], naming the first id at fault, if a live order already holds one of
+    /// the ids or two of `orders` share one. Nothing is registered.
+    pub fn register_all<const N: usize>(
+        &self,
+        orders: [(ClientOrderId, i32, OrderContext); N],
+    ) -> Result<(), ClientOrderIdInUse> {
+        let mut inner = self.inner.write();
+        for (index, (client_id, _, _)) in orders.iter().enumerate() {
+            let repeated = orders[..index]
+                .iter()
+                .any(|(earlier, _, _)| earlier == client_id);
+            if repeated || inner.cid_to_ib.contains_key(client_id) {
+                return Err(ClientOrderIdInUse(client_id.clone()));
+            }
+        }
+        let now = Instant::now();
+        for (client_id, ib_id, context) in orders {
+            inner.cid_to_ib.insert(client_id.clone(), ib_id);
+            inner.ib_to_entry.insert(ib_id, (client_id, context, now));
+        }
+        Ok(())
+    }
+
+    /// Look up the IB order ID of the live order under `client_id`.
     pub fn get_ib_id(&self, client_id: &ClientOrderId) -> Option<i32> {
         self.inner.read().cid_to_ib.get(client_id).copied()
     }
@@ -153,29 +224,36 @@ impl OrderIdMap {
             .map(|(cid, ctx, _)| (cid.clone(), ctx.clone()))
     }
 
+    /// Free the id of the filled order `ib_id`, keeping its entry, and return both, in a single
+    /// write lock acquisition.
+    ///
+    /// Use this for a `Filled` status: the id may then name a new order, while the executions and
+    /// commissions IB may still send for this one resolve to it by IB id.
+    pub fn release_client_id(&self, ib_id: i32) -> Option<(ClientOrderId, OrderContext)> {
+        let mut inner = self.inner.write();
+        let (client_id, ctx, _) = inner.ib_to_entry.get(&ib_id)?;
+        let (client_id, ctx) = (client_id.clone(), ctx.clone());
+        inner.release(&client_id, ib_id);
+        Some((client_id, ctx))
+    }
+
     /// Remove mapping and return context in a single write lock acquisition.
     ///
     /// Use this for terminal status events (Cancelled/Inactive) to avoid the
     /// read-then-write pattern of `get_client_id_and_context` + `remove_by_ib_id`.
+    /// The id's mapping is removed only if it still names `ib_id`.
     pub fn remove_and_get_context(&self, ib_id: i32) -> Option<(ClientOrderId, OrderContext)> {
-        let mut inner = self.inner.write();
-        if let Some((client_id, ctx, _)) = inner.ib_to_entry.remove(&ib_id) {
-            inner.cid_to_ib.remove(&client_id);
-            Some((client_id, ctx))
-        } else {
-            None
-        }
+        self.inner.write().remove(ib_id)
     }
 
-    /// Remove a mapping by IB order ID (used when order is fully filled/cancelled).
+    /// Remove a mapping by IB order ID (used when an order failed or was rolled back).
+    ///
+    /// The id's mapping is removed only if it still names `ib_id`.
     pub fn remove_by_ib_id(&self, ib_id: i32) -> Option<ClientOrderId> {
-        let mut inner = self.inner.write();
-        if let Some((client_id, _, _)) = inner.ib_to_entry.remove(&ib_id) {
-            inner.cid_to_ib.remove(&client_id);
-            Some(client_id)
-        } else {
-            None
-        }
+        self.inner
+            .write()
+            .remove(ib_id)
+            .map(|(client_id, _)| client_id)
     }
 
     /// Clear order ID mappings older than the given duration.
@@ -187,11 +265,13 @@ impl OrderIdMap {
     /// IB does not guarantee event ordering between `OrderStatus("Filled")` and
     /// `ExecutionData`/`CommissionReport`. For fast-filling orders (especially
     /// market orders), execution data may arrive AFTER the filled status — or
-    /// the filled status may not arrive at all. Removing mappings on terminal
-    /// status would cause data loss.
+    /// the filled status may not arrive at all. So a `Filled` status frees the
+    /// order's client id but keeps its IB-id entry, and an order whose terminal
+    /// status never arrives keeps both.
     ///
-    /// Instead, call this method periodically to clean up old mappings. A
-    /// reasonable interval is 5-10 minutes with a max_age of 1 hour.
+    /// Call this method periodically to clean up old mappings. A
+    /// reasonable interval is 5-10 minutes with a max_age of 1 hour. An order
+    /// still working past `max_age` is cleared too, freeing its id.
     pub fn clear_stale(&self, max_age: std::time::Duration) -> usize {
         let mut inner = self.inner.write();
         let before = inner.ib_to_entry.len();
@@ -205,20 +285,18 @@ impl OrderIdMap {
             .collect();
 
         for ib_id in stale_ids {
-            if let Some((client_id, _, _)) = inner.ib_to_entry.remove(&ib_id) {
-                inner.cid_to_ib.remove(&client_id);
-            }
+            inner.remove(ib_id);
         }
 
         before - inner.ib_to_entry.len()
     }
 
-    /// Number of active mappings.
+    /// Number of live orders: those holding a client id.
     pub fn len(&self) -> usize {
         self.inner.read().cid_to_ib.len()
     }
 
-    /// Check if map is empty.
+    /// Check if no order is live.
     pub fn is_empty(&self) -> bool {
         self.inner.read().cid_to_ib.is_empty()
     }
@@ -700,7 +778,7 @@ mod tests {
         let cid = ClientOrderId::new("order-123");
         let ctx = test_context();
 
-        map.register(cid.clone(), 42, ctx.clone());
+        map.register(cid.clone(), 42, ctx.clone()).unwrap();
 
         assert_eq!(map.get_ib_id(&cid), Some(42));
         assert_eq!(map.get_client_id(42), Some(cid.clone()));
@@ -717,7 +795,7 @@ mod tests {
         let map = OrderIdMap::new();
         let cid = ClientOrderId::new("order-456");
 
-        map.register(cid.clone(), 100, test_context());
+        map.register(cid.clone(), 100, test_context()).unwrap();
         assert_eq!(map.len(), 1);
 
         let removed = map.remove_by_ib_id(100);
@@ -834,7 +912,7 @@ mod tests {
         let cid = ClientOrderId::new("order-789");
         let ctx = test_context();
 
-        map.register(cid.clone(), 50, ctx);
+        map.register(cid.clone(), 50, ctx).unwrap();
         assert_eq!(map.len(), 1);
 
         // Remove and get context in single operation
@@ -860,8 +938,10 @@ mod tests {
         let map = OrderIdMap::new();
 
         // Register orders
-        map.register(ClientOrderId::new("old-1"), 1, test_context());
-        map.register(ClientOrderId::new("old-2"), 2, test_context());
+        map.register(ClientOrderId::new("old-1"), 1, test_context())
+            .unwrap();
+        map.register(ClientOrderId::new("old-2"), 2, test_context())
+            .unwrap();
 
         // With zero max_age, all entries are stale
         let cleared = map.clear_stale(Duration::ZERO);
@@ -869,13 +949,135 @@ mod tests {
         assert!(map.is_empty());
 
         // Register new orders
-        map.register(ClientOrderId::new("new-1"), 10, test_context());
-        map.register(ClientOrderId::new("new-2"), 20, test_context());
+        map.register(ClientOrderId::new("new-1"), 10, test_context())
+            .unwrap();
+        map.register(ClientOrderId::new("new-2"), 20, test_context())
+            .unwrap();
 
         // With large max_age, nothing is stale
         let cleared = map.clear_stale(Duration::from_secs(3600));
         assert_eq!(cleared, 0);
         assert_eq!(map.len(), 2);
+    }
+
+    /// A live order's id is refused to a second order, and the first keeps its mapping.
+    #[test]
+    fn a_live_orders_id_is_refused_to_a_second_order() {
+        let map = OrderIdMap::new();
+        let cid = ClientOrderId::new("taken");
+        map.register(cid.clone(), 1, test_context()).unwrap();
+
+        assert_eq!(
+            map.register(cid.clone(), 2, test_context()),
+            Err(ClientOrderIdInUse(cid.clone()))
+        );
+        assert_eq!(
+            map.get_ib_id(&cid),
+            Some(1),
+            "a cancel by id still reaches the first"
+        );
+        assert!(
+            map.get_client_id(2).is_none(),
+            "nothing of the second was registered"
+        );
+    }
+
+    /// A filled order frees its id at once, while its late executions still resolve to it.
+    #[test]
+    fn a_filled_order_frees_its_id_and_keeps_resolving_by_ib_id() {
+        let map = OrderIdMap::new();
+        let cid = ClientOrderId::new("reused");
+        map.register(cid.clone(), 1, test_context()).unwrap();
+
+        assert_eq!(
+            map.release_client_id(1).map(|(id, _)| id),
+            Some(cid.clone())
+        );
+        assert!(map.is_empty(), "no order is live");
+        assert_eq!(
+            map.get_client_id(1),
+            Some(cid.clone()),
+            "a late execution resolves"
+        );
+
+        // The id is free again.
+        map.register(cid.clone(), 2, test_context()).unwrap();
+        assert_eq!(map.get_ib_id(&cid), Some(2));
+        assert_eq!(map.get_client_id(1), Some(cid.clone()), "and still does");
+    }
+
+    /// An earlier order under a reused id ending, or being reaped, leaves the order now under the
+    /// id mapped.
+    #[test]
+    fn an_earlier_order_ending_leaves_a_reused_ids_mapping() {
+        let map = OrderIdMap::new();
+        let cid = ClientOrderId::new("reused");
+        map.register(cid.clone(), 1, test_context()).unwrap();
+        let _ = map.release_client_id(1);
+        map.register(cid.clone(), 2, test_context()).unwrap();
+
+        assert!(
+            map.remove_and_get_context(1).is_some(),
+            "the first order's entry goes"
+        );
+        assert_eq!(map.get_ib_id(&cid), Some(2), "the second keeps the id");
+        assert!(map.remove_by_ib_id(1).is_none());
+        assert_eq!(map.get_ib_id(&cid), Some(2));
+    }
+
+    /// Reaping a filled order's entry leaves a reused id's mapping too.
+    #[test]
+    fn reaping_a_filled_order_leaves_a_reused_ids_mapping() {
+        use std::time::Duration;
+
+        let map = OrderIdMap::new();
+        let cid = ClientOrderId::new("reused");
+        map.register(cid.clone(), 1, test_context()).unwrap();
+        let _ = map.release_client_id(1);
+        std::thread::sleep(Duration::from_millis(5));
+        map.register(cid.clone(), 2, test_context()).unwrap();
+
+        assert_eq!(
+            map.clear_stale(Duration::from_millis(5)),
+            1,
+            "only the filled one"
+        );
+        assert_eq!(map.get_ib_id(&cid), Some(2));
+    }
+
+    /// Several orders register all or none: an id already live, or one repeated among them,
+    /// registers none of them.
+    #[test]
+    fn register_all_registers_every_order_or_none() {
+        let map = OrderIdMap::new();
+        map.register(ClientOrderId::new("live"), 1, test_context())
+            .unwrap();
+
+        let clash = map.register_all([
+            (ClientOrderId::new("a"), 10, test_context()),
+            (ClientOrderId::new("live"), 11, test_context()),
+        ]);
+        assert_eq!(clash, Err(ClientOrderIdInUse(ClientOrderId::new("live"))));
+
+        let repeated = map.register_all([
+            (ClientOrderId::new("b"), 20, test_context()),
+            (ClientOrderId::new("b"), 21, test_context()),
+        ]);
+        assert_eq!(repeated, Err(ClientOrderIdInUse(ClientOrderId::new("b"))));
+
+        assert_eq!(map.len(), 1, "neither registered anything");
+        assert!(
+            [10, 11, 20, 21]
+                .iter()
+                .all(|ib_id| map.get_client_id(*ib_id).is_none())
+        );
+
+        map.register_all([
+            (ClientOrderId::new("a"), 10, test_context()),
+            (ClientOrderId::new("b"), 20, test_context()),
+        ])
+        .unwrap();
+        assert_eq!(map.len(), 3);
     }
 
     #[test]

@@ -2329,6 +2329,100 @@ fn test_command_send_requests_unknown_instrument_rejected_before_send() {
     }
 }
 
+fn duplicate_cid_error(cid: &str) -> EngineError {
+    EngineError::Recoverable(RecoverableEngineError::DuplicateClientOrderId(
+        cid.to_string(),
+    ))
+}
+
+/// An open under a client order id the engine already tracks an order under, for that instrument,
+/// is rejected before it is sent, and the tracked order is kept: whether the order holding the id
+/// was recorded by an earlier action or by an earlier open in the same batch. The same id on
+/// another instrument is a different order.
+#[test]
+fn test_command_send_open_requests_duplicate_cid_rejected_before_send() {
+    let (execution_tx, mut execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    send_spot_price(&mut engine, 1, dec!(45_000));
+    let (known, other) = (InstrumentIndex(1), InstrumentIndex(0));
+    let open_sized = |instrument, quantity| {
+        let mut open = open_request(instrument, "dup");
+        open.state.quantity = quantity;
+        open
+    };
+    let opens_output = |engine: &mut TestEngine, opens: Vec<OrderRequestOpen>| {
+        let audit = process_with_audit(
+            engine,
+            EngineEvent::Command(Command::SendOpenRequests(OneOrMany::Many(opens))),
+        );
+        let EngineAudit::Process(audit) = audit.event else {
+            panic!("expected EngineAudit::Process");
+        };
+        assert!(
+            audit.errors.is_empty(),
+            "a duplicate must not stop the engine"
+        );
+        let NoneOneOrMany::One(EngineOutput::Commanded(ActionOutput::OpenOrders(output))) =
+            audit.outputs
+        else {
+            panic!("expected one OpenOrders output, got {:?}", audit.outputs);
+        };
+        output
+    };
+    let tracked_quantity = |engine: &TestEngine| {
+        engine.state.instruments.instrument_index(&known).orders.0[&ClientOrderId::new("dup")]
+            .quantity
+    };
+
+    // In one batch: the second open under the id is rejected, the same id elsewhere is sent.
+    let first = open_sized(known, dec!(1));
+    let in_batch = open_sized(known, dec!(2));
+    let elsewhere = open_sized(other, dec!(3));
+    let output = opens_output(
+        &mut engine,
+        vec![first.clone(), in_batch.clone(), elsewhere.clone()],
+    );
+    assert_eq!(
+        output.errors,
+        NoneOneOrMany::One(Box::new((in_batch, duplicate_cid_error("dup"))))
+    );
+    let sent: Vec<_> = output.sent_iter().map(|open| open.key.clone()).collect();
+    assert_eq!(sent, [first.key.clone(), elsewhere.key.clone()]);
+    for expected in [&first, &elsewhere] {
+        match execution_rx.rx.try_recv() {
+            Ok(ExecutionRequest::Open(request)) => assert_eq!(request.key, expected.key),
+            other => panic!("expected {:?} to be sent, got {other:?}", expected.key),
+        }
+    }
+    assert!(
+        execution_rx.rx.try_recv().is_err(),
+        "the duplicate must not be sent"
+    );
+    assert_eq!(
+        tracked_quantity(&engine),
+        dec!(1),
+        "the first open is the one tracked"
+    );
+
+    // In a later action: the id is tracked, so an open under it is rejected.
+    let later = open_sized(known, dec!(4));
+    let output = opens_output(&mut engine, vec![later.clone()]);
+    assert_eq!(
+        output.errors,
+        NoneOneOrMany::One(Box::new((later, duplicate_cid_error("dup"))))
+    );
+    assert!(output.sent.is_none());
+    assert!(
+        execution_rx.rx.try_recv().is_err(),
+        "the duplicate must not be sent"
+    );
+    assert_eq!(
+        tracked_quantity(&engine),
+        dec!(1),
+        "and the tracked order is kept"
+    );
+}
+
 /// Emits one cancel and one open for a fixed instrument, from both the algo and the
 /// close-positions hooks, regardless of state — standing in for user strategy code that holds an
 /// index the engine was not built with.

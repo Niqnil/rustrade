@@ -299,6 +299,28 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     #[error("order already expired")]
     OrderAlreadyExpired,
 
+    /// Open request refused because its [`ClientOrderId`] is already in use at the venue.
+    ///
+    /// The refusal concerns this request alone: the order already under the id is **unaffected**,
+    /// and is not reported ended by it. What "in use" means is the venue's rule. On the
+    /// [`SimulatedVenue`] and the IBKR client it is an order still working under the id, and an id
+    /// is free again once its order has ended. Binance documents an id as unique among open
+    /// orders. The `String` carries the venue's message, or the client's own where it refused the
+    /// request before sending it.
+    ///
+    /// Reported by the [`SimulatedVenue`], by the IBKR client, which refuses the request before it
+    /// reaches TWS, since TWS never sees a client order id, and by the Binance spot and margin
+    /// clients, from Binance's `"Duplicate order sent."`. Other clients report a venue's duplicate
+    /// rejection as [`OrderRejected`](Self::OrderRejected) until its message has been confirmed.
+    ///
+    /// Not transient — the same request fails identically while the order under the id works.
+    /// Use another id, or wait for that order to end.
+    ///
+    /// [`ClientOrderId`]: crate::order::id::ClientOrderId
+    /// [`SimulatedVenue`]: crate::exchange::mock::SimulatedVenue
+    #[error("client order id in use: {0}")]
+    DuplicateClientOrderId(String),
+
     /// The exchange refused the request itself, rather than an order it carried.
     ///
     /// The request was malformed or asked for something the venue does not serve — a missing,

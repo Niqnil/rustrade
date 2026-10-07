@@ -481,21 +481,16 @@ fn forward_order_updates(
         let event = match update {
             OrderUpdate::OrderStatus(status) => {
                 let ib_id = status.order_id;
-                // Use single-lock method for terminal status to avoid read+write.
-                // Only `Cancelled`/`Inactive` remove the mapping here: a `Filled`
-                // order's mapping is intentionally retained so late-arriving
-                // ExecutionData/CommissionReport events still resolve it (reaped
-                // later by `OrderIdMap::clear_stale`), so this is deliberately
-                // narrower than `OrderStatusKind::is_terminal()`.
-                let is_terminal = matches!(
-                    status.status,
-                    OrderStatusKind::Cancelled | OrderStatusKind::Inactive
-                );
-
-                let lookup_result = if is_terminal {
-                    order_ids.remove_and_get_context(ib_id)
-                } else {
-                    order_ids.get_client_id_and_context(ib_id)
+                // Single-lock methods for the terminal statuses, to avoid read+write. Each ends
+                // the order, freeing its client id. Only `Cancelled`/`Inactive` remove its entry:
+                // a `Filled` order's is retained so late-arriving ExecutionData/CommissionReport
+                // events still resolve it (reaped later by `OrderIdMap::clear_stale`).
+                let lookup_result = match status.status {
+                    OrderStatusKind::Cancelled | OrderStatusKind::Inactive => {
+                        order_ids.remove_and_get_context(ib_id)
+                    }
+                    OrderStatusKind::Filled => order_ids.release_client_id(ib_id),
+                    _ => order_ids.get_client_id_and_context(ib_id),
                 };
 
                 if let Some((client_id, ctx)) = lookup_result {
@@ -887,11 +882,14 @@ impl IbkrClient {
     /// IB does not guarantee event ordering between `OrderStatus("Filled")` and
     /// `ExecutionData`/`CommissionReport`. For fast-filling orders (especially
     /// market orders), execution data may arrive AFTER the filled status — or
-    /// the filled status may not arrive at all. Removing mappings on terminal
-    /// status would cause data loss.
+    /// the filled status may not arrive at all. So a `Filled` status frees the
+    /// order's client order id but keeps its IB order ID's entry, and an order
+    /// whose terminal status never arrives keeps both: its id cannot name a new
+    /// order (see `open_order`'s "Client order ids") until this clears it.
     ///
     /// Call this periodically alongside `clear_stale_executions()`. A reasonable
-    /// interval is 5-10 minutes with a max_age of 1 hour.
+    /// interval is 5-10 minutes with a max_age of 1 hour. An order still working
+    /// past `max_age` is cleared too, and its id freed.
     pub fn clear_stale_order_ids(&self, max_age: std::time::Duration) -> usize {
         self.order_ids.clear_stale(max_age)
     }
@@ -949,6 +947,12 @@ impl IbkrClient {
     /// waiting (an unknown/no-status outcome): leaving part of a bracket
     /// working while the rest is in an unknown state is unsafe, so every leg is
     /// cancelled and an error is returned.
+    ///
+    /// If any leg's client order id (the parent's, or the `_tp`/`_sl` id
+    /// derived from it) is held by a live order, nothing is sent and every leg
+    /// comes back `Inactive` with [`ApiError::DuplicateClientOrderId`]; the live
+    /// order is unaffected. See `ExecutionClient::open_order`'s "Client order
+    /// ids" for when an id is held.
     ///
     /// # Legs of Unknown Fate
     ///
@@ -1135,10 +1139,18 @@ impl IbkrClient {
             time_in_force: request.time_in_force,
         };
 
-        self.order_ids
-            .register(parent_cid.clone(), parent_ib_id, parent_ctx);
-        self.order_ids.register(tp_cid.clone(), tp_ib_id, tp_ctx);
-        self.order_ids.register(sl_cid.clone(), sl_ib_id, sl_ctx);
+        // All three or none, before anything is sent: a leg under an id a live order holds would
+        // take that order's mapping. On a refusal the three allocated IDs are simply skipped.
+        if let Err(in_use) = self.order_ids.register_all([
+            (parent_cid.clone(), parent_ib_id, parent_ctx),
+            (tp_cid.clone(), tp_ib_id, tp_ctx),
+            (sl_cid.clone(), sl_ib_id, sl_ctx),
+        ]) {
+            return make_all_inactive_bracket(
+                &request,
+                OrderError::Rejected(ApiError::DuplicateClientOrderId(in_use.to_string())),
+            );
+        }
 
         // Place all three orders in spawn_blocking
         let client = self.client.clone();
@@ -2041,6 +2053,19 @@ impl ExecutionClient for IbkrClient {
 
     /// Submit an order to IB.
     ///
+    /// # Client order ids
+    ///
+    /// TWS never sees a [`ClientOrderId`], so this client keeps each one unique itself: an open
+    /// under an id that a live order holds is refused before anything is sent, as
+    /// [`ApiError::DuplicateClientOrderId`], and the live order is unaffected. An order stops
+    /// holding its id when the account stream reports it `Filled`, `Cancelled` or `Inactive`, or
+    /// when [`clear_stale_order_ids`](IbkrClient::clear_stale_order_ids) reaps it. Without a
+    /// running [`account_stream`](Self::account_stream), no order is reported ended, and an id is
+    /// held until reaped.
+    ///
+    /// A cancel names the live order under its id, so cancelling a filled order's id once it is
+    /// freed is refused locally as not found, rather than at TWS.
+    ///
     /// # Cancellation Safety
     ///
     /// This future registers the order ID mapping before submitting to IB.
@@ -2133,8 +2158,24 @@ impl ExecutionClient for IbkrClient {
             kind: request.state.kind,
             time_in_force: request.state.time_in_force,
         };
-        self.order_ids
-            .register(request.key.cid.clone(), ib_order_id, context);
+        // Before anything is sent: TWS never sees the client order id, so this is the only place
+        // a second live order under it can be refused. A refused id simply skips the allocated ID.
+        if let Err(in_use) = self
+            .order_ids
+            .register(request.key.cid.clone(), ib_order_id, context)
+        {
+            return Order {
+                key,
+                side: request.state.side,
+                price: request.state.price,
+                quantity: request.state.quantity,
+                kind: request.state.kind,
+                time_in_force: request.state.time_in_force,
+                state: OrderState::inactive(OrderError::Rejected(
+                    ApiError::DuplicateClientOrderId(in_use.to_string()),
+                )),
+            };
+        }
 
         let client = self.client.clone();
         let side = request.state.side;
@@ -3290,9 +3331,11 @@ mod order_status_tests {
         let request = bracket_request();
         let (tp_cid, sl_cid) = derive_child_cids(&request.parent_cid);
         let order_ids = OrderIdMap::new();
-        order_ids.register(request.parent_cid.clone(), 10, ctx());
-        order_ids.register(tp_cid, 11, ctx());
-        order_ids.register(sl_cid, 12, ctx());
+        order_ids
+            .register(request.parent_cid.clone(), 10, ctx())
+            .unwrap();
+        order_ids.register(tp_cid, 11, ctx()).unwrap();
+        order_ids.register(sl_cid, 12, ctx()).unwrap();
 
         let result = failed_bracket(
             &request,
@@ -3326,9 +3369,11 @@ mod order_status_tests {
         let request = bracket_request();
         let (tp_cid, sl_cid) = derive_child_cids(&request.parent_cid);
         let order_ids = OrderIdMap::new();
-        order_ids.register(request.parent_cid.clone(), 10, ctx());
-        order_ids.register(tp_cid, 11, ctx());
-        order_ids.register(sl_cid, 12, ctx());
+        order_ids
+            .register(request.parent_cid.clone(), 10, ctx())
+            .unwrap();
+        order_ids.register(tp_cid, 11, ctx()).unwrap();
+        order_ids.register(sl_cid, 12, ctx()).unwrap();
 
         let result = failed_bracket(
             &request,
@@ -3403,6 +3448,61 @@ mod order_reader_tests {
         assert_eq!(run(&sink, unforwarded(3)), 1);
     }
 
+    /// How each terminal status leaves an order's client id and IB-id entry: `Filled` frees the
+    /// id and keeps the entry for late executions, `Cancelled`/`Inactive` remove both, and a
+    /// working status keeps both.
+    #[test]
+    fn a_terminal_status_frees_the_orders_client_id() {
+        use ibapi::orders::OrderStatusKind;
+
+        for (kind, entry_kept, id_held) in [
+            (OrderStatusKind::Filled, true, false),
+            (OrderStatusKind::Cancelled, false, false),
+            (OrderStatusKind::Inactive, false, false),
+            (OrderStatusKind::Submitted, true, true),
+        ] {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let sink = recovery::EventSink::new(tx, new_dedup_cache());
+            let order_ids = OrderIdMap::new();
+            let cid = ClientOrderId::new("cid-7");
+            order_ids
+                .register(
+                    cid.clone(),
+                    7,
+                    OrderContext {
+                        instrument: InstrumentNameExchange::new("AAPL"),
+                        side: Side::Buy,
+                        price: Some(Decimal::from(100)),
+                        quantity: Decimal::ONE,
+                        kind: OrderKind::Limit,
+                        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                    },
+                )
+                .unwrap();
+
+            forward_order_updates(
+                [Ok(OrderUpdate::OrderStatus(OrderStatus {
+                    order_id: 7,
+                    status: kind.clone(),
+                    ..OrderStatus::default()
+                }))],
+                &sink,
+                &ContractRegistry::new(),
+                &order_ids,
+                &PendingCancels::new(),
+                &ExecutionBuffer::new(),
+            );
+
+            assert!(rx.try_recv().is_ok(), "{kind:?}: the status is forwarded");
+            assert_eq!(
+                order_ids.get_client_id(7).is_some(),
+                entry_kept,
+                "{kind:?}: entry"
+            );
+            assert_eq!(order_ids.get_ib_id(&cid).is_some(), id_held, "{kind:?}: id");
+        }
+    }
+
     /// An execution and its correction, each completed by its commission report, reach the
     /// stream as a trade and an amendment of it, never as two trades.
     #[test]
@@ -3422,18 +3522,20 @@ mod order_reader_tests {
             },
         );
         let order_ids = OrderIdMap::new();
-        order_ids.register(
-            ClientOrderId::new("cid-7"),
-            7,
-            OrderContext {
-                instrument: InstrumentNameExchange::new("AAPL"),
-                side: Side::Buy,
-                price: Some(Decimal::from(100)),
-                quantity: Decimal::ONE,
-                kind: OrderKind::Limit,
-                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-            },
-        );
+        order_ids
+            .register(
+                ClientOrderId::new("cid-7"),
+                7,
+                OrderContext {
+                    instrument: InstrumentNameExchange::new("AAPL"),
+                    side: Side::Buy,
+                    price: Some(Decimal::from(100)),
+                    quantity: Decimal::ONE,
+                    kind: OrderKind::Limit,
+                    time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                },
+            )
+            .unwrap();
         let execution = |exec_id: &str, price: f64| {
             Ok(OrderUpdate::ExecutionData(ExecutionData {
                 // TWS tags an execution happening now with -1.
