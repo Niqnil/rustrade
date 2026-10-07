@@ -35,7 +35,7 @@
 use rust_decimal_macros::dec;
 use rustrade_execution::{
     client::{
-        ExecutionClient,
+        ExecutionClient, OrderStatusClient,
         hyperliquid::{HyperliquidClient, config::HyperliquidConfig},
     },
     order::{
@@ -410,6 +410,98 @@ async fn test_place_and_cancel_limit_order() {
             panic!("Unexpected order state: {:?}", other);
         }
     }
+}
+
+/// `fetch_ended_orders` omits a live order and an id the venue does not know, and reports a
+/// cancelled order as cancelled, with nothing filled, under the key it was asked about.
+#[tokio::test]
+#[ignore]
+async fn test_fetch_ended_orders_reports_a_cancelled_order() {
+    init_logging();
+
+    let config = test_config();
+    assert!(config.testnet, "This test MUST run on testnet only!");
+
+    let client = HyperliquidClient::connect(config)
+        .await
+        .expect("Failed to connect");
+
+    let instrument = btc_instrument();
+    let strategy = StrategyId::new("test-strategy");
+    let key = OrderKey {
+        exchange: ExchangeId::HyperliquidPerp,
+        instrument: &instrument,
+        strategy: strategy.clone(),
+        cid: ClientOrderId::uuid(),
+    };
+    let owned_key = OrderKey {
+        exchange: key.exchange,
+        instrument: instrument.clone(),
+        strategy: strategy.clone(),
+        cid: key.cid.clone(),
+    };
+    let unknown_key = OrderKey {
+        cid: ClientOrderId::uuid(),
+        ..owned_key.clone()
+    };
+
+    // Far below the market, so it rests.
+    let response = client
+        .open_order(rustrade_execution::order::OrderEvent {
+            key: key.clone(),
+            state: RequestOpen {
+                side: Side::Buy,
+                price: Some(dec!(50000.0)),
+                quantity: dec!(0.001),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                position_id: None,
+                reduce_only: false,
+                market: None,
+            },
+        })
+        .await;
+    let OrderState::Active(ActiveOrderState::Open(open)) = &response.state else {
+        panic!("Order not resting: {:?}", response.state);
+    };
+
+    let live = client
+        .fetch_ended_orders(&[owned_key.clone(), unknown_key.clone()])
+        .await
+        .expect("lookup failed");
+    assert!(
+        live.is_empty(),
+        "a live order and an unknown id are omitted: {live:?}"
+    );
+
+    let cancelled = client
+        .cancel_order(rustrade_execution::order::OrderEvent {
+            key,
+            state: rustrade_execution::order::request::RequestCancel {
+                id: Some(open.id.clone()),
+            },
+        })
+        .await;
+    assert!(
+        cancelled.state.is_ok(),
+        "Cancel rejected: {:?}",
+        cancelled.state
+    );
+
+    let ended = client
+        .fetch_ended_orders(&[unknown_key, owned_key.clone()])
+        .await
+        .expect("lookup failed");
+    println!("Ended: {ended:?}");
+    assert_eq!(ended.len(), 1);
+    assert_eq!(
+        ended[0].key, owned_key,
+        "reported under the key asked about"
+    );
+    let InactiveOrderState::Cancelled(cancelled) = &ended[0].state else {
+        panic!("expected cancelled, got {:?}", ended[0].state);
+    };
+    assert_eq!(cancelled.filled_quantity, Some(dec!(0)));
 }
 
 // ============================================================================

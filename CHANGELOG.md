@@ -123,6 +123,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `filled_avg_price`, `canceled` and `replaced` as cancelled with what filled before, `expired`,
   `rejected` as `OpenFailed`, and a 404 or an order on another symbol than the key's omitted.
   `done_for_day` and the other working statuses are not ended. Refs #370.
+- **Hyperliquid reports how orders ended while its account stream was disconnected**
+  (`rustrade-execution`), as Binance and Alpaca do (above), for perpetuals and spot. The SDK
+  reconnects the socket itself and resubscribes, and `orderUpdates` opens with no snapshot, so an
+  order cancelled or rejected meanwhile was never reported. `HyperliquidClient` and
+  `HyperliquidSpotClient` now hold the orders they have seen live: from placing them, from
+  `account_snapshot` and `fetch_open_orders`, from a successful cancel, which ends one, and from
+  the stream. The stream reads the SDK's drop notice followed by the resubscribed `userFills`
+  snapshot as a reconnect. Once that snapshot's fills are sent on, it lists every open order with
+  one `openOrders` request and looks up each held order the listing no longer shows with
+  `orderStatus`, by its cloid. Each order that ended is sent as an `OrderSnapshot` of its inactive
+  state, under `StrategyId::unknown()`. A failed check is retried while the stream is open 1, 2,
+  4, 8 and 16 minutes later, then given up with an `error!`. The snapshot is the only fill
+  recovery, and Hyperliquid does not say how far back it reaches, so after a long outage an order
+  can be reported filled before, or without, its older fills; `fetch_trades` reads those. Both
+  clients also implement `OrderStatusClient` with the same lookup. `filled` is fully filled, with
+  no average price, since the record carries none. Every `…Canceled` status and `scheduledCancel`
+  is cancelled, with what filled before. Every `…Rejected` status is `OpenFailed`. Omitted: an
+  order the venue does not know (`unknownOid`), one on another instrument than the key's, and an
+  id that is neither a canonical UUID nor an oid. An order placed without a cloid, which the
+  clients report under its oid, is looked up by that oid. Refs #370.
 - **A given-up fill recovery is reported on the account stream, not only in the log**
   (`rustrade-execution`). Before, when fill recovery gave up on a span of fills, those fills never
   reached the consumer and the only trace was an `error!` line. The new

@@ -66,7 +66,11 @@ pub(crate) trait PendingFills {
 /// No fills left to recover, as for a client whose fill recovery is done, or given up, before its
 /// order check starts.
 #[derive(Debug, Clone, Copy, Default)]
-#[cfg_attr(not(feature = "alpaca"), allow(dead_code))] // Only Alpaca recovers fills before its check.
+// Alpaca recovers its fills before its check, and Hyperliquid has them redelivered before its own.
+#[cfg_attr(
+    not(any(feature = "alpaca", feature = "hyperliquid")),
+    allow(dead_code)
+)]
 pub(crate) struct NoPendingFills;
 
 impl PendingFills for NoPendingFills {
@@ -328,12 +332,18 @@ impl KnownLiveOrders {
     }
 
     /// Every instrument with an order held as live.
-    #[cfg_attr(not(feature = "alpaca"), allow(dead_code))] // Only Alpaca streams every instrument.
+    // Only Alpaca and Hyperliquid stream every instrument.
+    #[cfg_attr(
+        not(any(feature = "alpaca", feature = "hyperliquid")),
+        allow(dead_code)
+    )]
     pub(crate) fn instruments(&self) -> Vec<InstrumentNameExchange> {
         self.by_instrument.0.keys().cloned().collect()
     }
 
     /// Those of `instruments` with an order held as live.
+    // Hyperliquid's stream ignores its instruments, so it checks every one held.
+    #[cfg_attr(not(any(feature = "alpaca", feature = "binance")), allow(dead_code))]
     pub(crate) fn instruments_among(
         &self,
         instruments: &[InstrumentNameExchange],
@@ -589,8 +599,11 @@ pub(crate) enum OpenListing {
     /// One listing of every instrument due, as on a venue that lists several symbols in one
     /// request. A listing that fails charges every instrument in it. Either way, a lookup that
     /// fails charges only the instrument of the order it asked about.
-    // Only Alpaca lists several symbols.
-    #[cfg_attr(not(feature = "alpaca"), allow(dead_code))]
+    // Only Alpaca and Hyperliquid list several symbols.
+    #[cfg_attr(
+        not(any(feature = "alpaca", feature = "hyperliquid")),
+        allow(dead_code)
+    )]
     Batched,
 }
 
