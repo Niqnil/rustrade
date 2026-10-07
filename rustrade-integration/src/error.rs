@@ -1,4 +1,4 @@
-use crate::subscription::SubscriptionId;
+use crate::subscription::{SubscriptionId, display_subscription_ids};
 use prost::DecodeError;
 use reqwest::Error;
 use thiserror::Error;
@@ -41,6 +41,21 @@ pub enum SocketError {
 
     #[error("error subscribing to resources over the socket: {0}")]
     Subscribe(String),
+
+    /// Subscription validation ended before every subscription in a batch was acknowledged.
+    ///
+    /// `unacknowledged` holds the subscriptions that received no acknowledgement, sorted. They are
+    /// candidates, not proof of rejection: a venue that closes the connection on one bad
+    /// subscription also leaves those sent after it unanswered. When the venue's acknowledgements
+    /// cannot be matched to subscriptions, it holds the whole batch.
+    #[error(
+        "subscriptions not acknowledged ({reason}): {}",
+        display_subscription_ids(unacknowledged)
+    )]
+    Unacknowledged {
+        reason: String,
+        unacknowledged: Vec<SubscriptionId>,
+    },
 
     #[error("ExchangeStream terminated with closing frame: {0}")]
     Terminated(String),

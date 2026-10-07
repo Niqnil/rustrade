@@ -75,7 +75,10 @@ use crate::{
 };
 use derive_more::Display;
 use rustrade_instrument::exchange::ExchangeId;
-use rustrade_integration::protocol::websocket::{WebSocketSerdeParser, WsMessage};
+use rustrade_integration::{
+    protocol::websocket::{WebSocketSerdeParser, WsMessage},
+    subscription::SubscriptionId,
+};
 use rustrade_macro::{DeExchange, SerExchange};
 use serde_json::json;
 use std::time::Duration;
@@ -158,6 +161,10 @@ impl Connector for Hyperliquid {
     fn requests(exchange_subs: Vec<ExchangeSub<Self::Channel, Self::Market>>) -> Vec<WsMessage> {
         build_subscribe_messages(exchange_subs)
     }
+
+    fn acknowledged_subscription(response: &Self::SubResponse) -> Option<SubscriptionId> {
+        response.subscription_id()
+    }
 }
 
 impl<Instrument> StreamSelector<Instrument, PublicTrades> for Hyperliquid
@@ -228,6 +235,10 @@ impl Connector for HyperliquidSpot {
 
     fn requests(exchange_subs: Vec<ExchangeSub<Self::Channel, Self::Market>>) -> Vec<WsMessage> {
         build_subscribe_messages(exchange_subs)
+    }
+
+    fn acknowledged_subscription(response: &Self::SubResponse) -> Option<SubscriptionId> {
+        response.subscription_id()
     }
 }
 

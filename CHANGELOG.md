@@ -375,6 +375,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A market stream's failed re-initialisation reached only the logs, and a failed subscription
+  batch did not say which subscription failed** (`rustrade-data`, `rustrade-integration`). Closes
+  #506.
+  - When a venue does not acknowledge every subscription in a batch, for example Hyperliquid
+    dropping the connection on a coin it does not know, the error now names the subscriptions left
+    unacknowledged: the new `SocketError::Unacknowledged { reason, unacknowledged }`, carried into
+    `DataError::SubscriptionsUnacknowledged` instead of being flattened to `DataError::Socket`.
+    These are candidates, not proof of rejection: a venue that drops the connection also leaves
+    the subscriptions sent after the bad one unanswered. A venue names its acknowledgements through
+    the new `Connector::acknowledged_subscription`, which defaults to `None`, and Hyperliquid
+    (perpetuals and spot) implements it. Every other venue, and a response that names no
+    subscription in the batch, reports the whole batch.
+  - After a stream has started, each failed re-initialisation now yields
+    `Event::Item(Err(DataError::ReinitFailed { attempt, error }))`, where `attempt` counts
+    consecutive failures from 1. Before, the consumer received one `Event::Reconnecting` and then
+    nothing while the stream retried forever. A failed attempt is yielded at once, then the backoff
+    runs; no further `Reconnecting` follows it. The stream keeps retrying: when to give up, or to
+    rebuild without a subscription the venue no longer accepts, is the caller's decision.
+  - The new `ReconnectingStream::with_reconnect_backoff_reporting` yields each failure as a
+    `ReinitFailure { attempt, error }`; `with_reconnect_backoff` still logs and discards them.
+  - Subscription validation's timeout was re-armed by every message it read, so it never fired
+    while an acknowledged subscription kept streaming events. It now runs from the start of
+    validation.
+  - **Breaking:** `SocketError` is not `#[non_exhaustive]`, so an exhaustive match on it needs an
+    arm for `Unacknowledged`. A consumer's `with_error_handler` now also receives `ReinitFailed`.
+
 - **An IBKR order whose id was reused lost its mapping** (`rustrade-execution`, feature `ibkr`).
   When an earlier order under the id ended, or was reaped by `clear_stale_order_ids`, it removed
   the id's mapping even though it named the later order, so that order's cancel and status
