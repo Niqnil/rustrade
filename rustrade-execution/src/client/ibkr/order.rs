@@ -2407,6 +2407,15 @@ mod tests {
                 },
                 "not positive",
             ),
+            (
+                Order {
+                    trailing_percent: Some(5.0),
+                    trail_stop_price: Some(-1.0),
+                    limit_price_offset: Some(0.5),
+                    ..order("TRAIL LIMIT", IbTimeInForce::Day)
+                },
+                "not positive",
+            ),
         ] {
             let error = order_shape_from_ib(&order).unwrap_err();
             assert!(error.contains(reason), "{error:?} should name {reason:?}");

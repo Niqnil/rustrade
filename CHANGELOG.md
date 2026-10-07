@@ -439,8 +439,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     with `Inactive` ("Invalid Price"), and none for a percentage trail, which IB refuses outright
     (error 321). No IBKR trailing stop-limit order could work.
   - `stop_price` is the stop at submission, which then trails the market by `offset`. It must be
-    positive. An order read back from a venue listing may report the stop after it has trailed,
-    not the one it was placed with. The limit price follows from the stop and `limit_offset`.
+    positive. IBKR moves a stop further from the market than `offset` to `offset` from it within
+    seconds of accepting the order, so an order read back from a venue listing may report the
+    stop after it has trailed, not the one it was placed with. The limit price follows from the
+    stop and `limit_offset`. The kind's `Display` now includes the stop:
+    `TrailingStopLimit(offset, offset_type, stop_price, limit_offset)`.
   - The IBKR client sends `stop_price` as IB's `trail_stop_price` for both absolute and
     percentage trails. It refuses a zero or negative stop with the new
     `OrderMappingError::NonPositiveStopPrice`, and a `RequestOpen::price` given for this kind

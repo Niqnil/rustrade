@@ -297,8 +297,10 @@ pub enum OrderKind {
         offset_type: TrailingOffsetType,
         /// The stop price at submission; it then trails the market by `offset`. Must be positive.
         ///
-        /// An order read back from a venue listing may report the stop after it has trailed,
-        /// not the one it was placed with.
+        /// The venue may trail it straight away: IBKR moves a stop further from the market than
+        /// `offset` to `offset` from it within seconds of accepting the order. So an order read
+        /// back from a venue listing may report the stop after it has trailed, not the one it was
+        /// placed with.
         stop_price: Decimal,
         /// Offset from the triggered stop price to set the limit price.
         limit_offset: Decimal,
