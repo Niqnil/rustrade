@@ -431,6 +431,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A failing account-stream re-initialisation was retried forever in silence, and the engine
+  marked an account link up on events that showed it down** (`rustrade`, `rustrade-execution`,
+  `rustrade-data`). Closes #515.
+  - After the account stream ends, `ExecutionManager` re-initialises it with backoff. Each failed
+    attempt was logged with `warn!` and discarded, so the consumer received one
+    `Event::Reconnecting` and then nothing, and a reconnect that would never succeed, for example
+    after credentials were revoked, looked like one still in its backoff. Each failed attempt is
+    now sent in-band, in order with the account events, as the new
+    `AccountEventKind::ReinitFailed(AccountReinitFailure { attempt, error })`, where `attempt`
+    counts consecutive failures from 1. No further `Reconnecting` follows it. The manager keeps
+    retrying: when to give up is the caller's decision.
+  - `error` is the new `AccountStreamInitError`: `Client(ClientError)` when the client failed to
+    fetch the snapshot or open the stream (see `ClientError::is_transient`), or `Index(IndexError)`
+    when the snapshot named something not indexed. `AccountEventIndexer` indexes it with the new
+    `account_stream_init_error` and `reinit_failure`.
+  - The engine logs `ReinitFailed` at `error!` and changes no state. It no longer marks the
+    account link `Healthy` on a `ReinitFailed` or a `StreamTerminated`, both of which arrive while
+    the link is down.
+  - The new `ReconnectingStream::with_reconnection_events_reporting` turns the attempts from
+    `with_reconnect_backoff_reporting` into reconnect events, making one item of each failure.
+    Market streams and the account stream both use it.
+  - **Breaking:** `ExecutionError::Client` and `ExecutionError::Index`, which only account-stream
+    initialisation produced, are replaced by `ExecutionError::AccountStreamInit(AccountStreamInitError)`.
+    `ExecutionManager::init` returns it when the first attempt fails.
+
 - **An IBKR contract registered without its IB contract id lost every fill, order listing and
   position for it** (`rustrade-execution`, feature `ibkr`; `rustrade-instrument`, feature `ibkr`).
   **Breaking:** registration is fallible. `IbkrClient::register_contract` accepted a contract IB

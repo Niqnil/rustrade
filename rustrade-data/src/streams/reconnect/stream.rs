@@ -118,6 +118,34 @@ where
             .flatten()
     }
 
+    /// Maps the initialisation attempts yielded by
+    /// [`with_reconnect_backoff_reporting`](Self::with_reconnect_backoff_reporting) into
+    /// [`reconnect::Event`](Event)s.
+    ///
+    /// Each initialised stream's items become [`Event::Item`]s, followed by one
+    /// [`Event::Reconnecting`] when it ends. Each failed attempt becomes the single
+    /// [`Event::Item`] that `on_failure` makes of it. A failed attempt ends no stream, so it adds
+    /// no further [`Event::Reconnecting`].
+    fn with_reconnection_events_reporting<St, InitError, Origin, FnOnFailure>(
+        self,
+        origin: Origin,
+        on_failure: FnOnFailure,
+    ) -> impl Stream<Item = Event<Origin, St::Item>>
+    where
+        Self: Stream<Item = Result<St, ReinitFailure<InitError>>>,
+        St: Stream,
+        Origin: Clone + 'static,
+        FnOnFailure: Fn(ReinitFailure<InitError>) -> St::Item,
+    {
+        self.map(move |initialised| match initialised {
+            Ok(stream) => Either::Left(with_trailing_reconnecting(stream, origin.clone())),
+            Err(failure) => Either::Right(stream::once(future::ready(Event::Item(on_failure(
+                failure,
+            ))))),
+        })
+        .flatten()
+    }
+
     /// Handles all encountered errors with the provided closure before filtering them out,
     /// returning a [`Stream`] of the Ok values. Useful for logging recoverable errors before
     /// continuing.

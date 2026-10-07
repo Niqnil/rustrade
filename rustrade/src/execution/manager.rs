@@ -11,12 +11,14 @@ use futures::{
 };
 use rustrade_data::streams::{
     consumer::StreamKey,
-    reconnect::stream::{ReconnectingStream, ReconnectionBackoffPolicy, init_reconnecting_stream},
+    reconnect::stream::{
+        ReconnectingStream, ReconnectionBackoffPolicy, ReinitFailure, init_reconnecting_stream,
+    },
 };
 use rustrade_execution::{
     AccountEvent, AccountEventKind,
     client::ExecutionClient,
-    error::{ConnectivityError, OrderError},
+    error::{AccountReinitFailure, AccountStreamInitError, ConnectivityError, OrderError},
     indexer::{AccountEventIndexer, IndexedAccountStream},
     map::ExecutionInstrumentMap,
     order::{
@@ -118,6 +120,18 @@ where
     /// A response resolving the last in-flight request could then tear the run down while the trade
     /// that opens the position was still unread on the account side, truncating both the trade and
     /// the balance ledger non-deterministically.
+    ///
+    /// # Re-initialisation
+    /// When the AccountStream ends, the returned `Stream` yields one
+    /// [`Reconnecting`](rustrade_data::streams::reconnect::Event::Reconnecting), and the manager
+    /// re-initialises it with `reconnect_policy`'s backoff, for as long as it runs. Each failed
+    /// attempt is yielded as an [`AccountEventKind::ReinitFailed`], with no further
+    /// `Reconnecting`. Whether to stop waiting is the caller's decision.
+    ///
+    /// # Errors
+    /// [`ExecutionError::Config`] if `client` and `indexer` are for different exchanges, and
+    /// [`ExecutionError::AccountStreamInit`] if the first attempt to initialise the AccountStream
+    /// fails.
     pub async fn init(
         request_stream: RequestStream,
         request_timeout: std::time::Duration,
@@ -175,10 +189,21 @@ where
         let (response_tx, response_rx) = mpsc_unbounded();
 
         // Boxed so the manager can poll it inline in `run`'s `select!` -- see `account_stream`.
+        // A failed re-init is sent in-band, in order with the account events, so the consumer can
+        // tell a reconnect that keeps failing from one still in its backoff.
+        let exchange = indexer.map.exchange.key;
         let account_stream = Box::pin(
             account_stream
-                .with_reconnect_backoff::<_, ExecutionError>(reconnect_policy, stream_key)
-                .with_reconnection_events(indexer.map.exchange.value),
+                .with_reconnect_backoff_reporting(reconnect_policy, stream_key)
+                .with_reconnection_events_reporting(
+                    indexer.map.exchange.value,
+                    move |ReinitFailure { attempt, error }| AccountEvent {
+                        exchange,
+                        kind: AccountEventKind::ReinitFailed(AccountReinitFailure::new(
+                            attempt, error,
+                        )),
+                    },
+                ),
         );
 
         Ok((
@@ -221,7 +246,7 @@ where
         indexer: &AccountEventIndexer,
         assets: &[AssetNameExchange],
         instruments: &[InstrumentNameExchange],
-    ) -> Result<AccountEvent, ExecutionError> {
+    ) -> Result<AccountEvent, AccountStreamInitError> {
         match client.account_snapshot(assets, instruments).await {
             Ok(snapshot) => {
                 let indexed_snapshot = indexer.snapshot(snapshot)?;
@@ -230,7 +255,7 @@ where
                     kind: AccountEventKind::Snapshot(indexed_snapshot),
                 })
             }
-            Err(error) => Err(ExecutionError::Client(indexer.client_error(error))),
+            Err(error) => Err(AccountStreamInitError::Client(indexer.client_error(error))),
         }
     }
 
@@ -239,10 +264,13 @@ where
         indexer: AccountEventIndexer,
         assets: &[AssetNameExchange],
         instruments: &[InstrumentNameExchange],
-    ) -> Result<impl Stream<Item = AccountEvent> + use<RequestStream, Client>, ExecutionError> {
+    ) -> Result<impl Stream<Item = AccountEvent> + use<RequestStream, Client>, AccountStreamInitError>
+    {
         let stream = match client.account_stream(assets, instruments).await {
             Ok(stream) => stream,
-            Err(error) => return Err(ExecutionError::Client(indexer.client_error(error))),
+            Err(error) => {
+                return Err(AccountStreamInitError::Client(indexer.client_error(error)));
+            }
         };
 
         Ok(
@@ -577,9 +605,9 @@ mod tests {
     use chrono::{DateTime, Utc};
     use rust_decimal_macros::dec;
     use rustrade_execution::{
-        UnindexedAccountEvent, UnindexedAccountSnapshot,
+        AccountSnapshot, UnindexedAccountEvent, UnindexedAccountSnapshot,
         balance::AssetBalance,
-        error::{ApiError, UnindexedClientError, UnindexedOrderError},
+        error::{ApiError, ClientError, UnindexedClientError, UnindexedOrderError},
         map::generate_execution_instrument_map,
         order::{
             OrderKey, OrderKind, TimeInForce,
@@ -825,6 +853,180 @@ mod tests {
             "insufficient balance".to_string(),
         ));
         assert_both_answered(&key, &events, &rejection);
+    }
+
+    /// Opens an account stream that fails on the attempts in `fail_on`, counted from 0. The first
+    /// stream it opens ends at once, and any later one stays open.
+    #[derive(Debug, Clone, Default)]
+    struct FlakyAccountClient {
+        fail_on: &'static [usize],
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ExecutionClient for FlakyAccountClient {
+        const EXCHANGE: ExchangeId = EXCHANGE;
+        const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant] = &[];
+        type Config = ();
+        type AccountStream = BoxStream<'static, UnindexedAccountEvent>;
+
+        fn new(_: Self::Config) -> Self {
+            Self::default()
+        }
+
+        async fn account_snapshot(
+            &self,
+            _: &[AssetNameExchange],
+            _: &[InstrumentNameExchange],
+        ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
+            Ok(UnindexedAccountSnapshot::new(EXCHANGE, vec![], vec![]))
+        }
+
+        async fn account_stream(
+            &self,
+            _: &[AssetNameExchange],
+            _: &[InstrumentNameExchange],
+        ) -> Result<Self::AccountStream, UnindexedClientError> {
+            let attempt = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.fail_on.contains(&attempt) {
+                Err(UnindexedClientError::Connectivity(
+                    ConnectivityError::Timeout,
+                ))
+            } else if attempt == 0 {
+                Ok(futures::stream::empty().boxed())
+            } else {
+                Ok(futures::stream::pending().boxed())
+            }
+        }
+
+        async fn cancel_order(
+            &self,
+            _: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
+        ) -> UnindexedOrderResponseCancel {
+            unreachable!("the account stream does not cancel orders")
+        }
+
+        async fn open_order(
+            &self,
+            _: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
+        ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
+            unreachable!("the account stream does not open orders")
+        }
+
+        async fn fetch_balances(
+            &self,
+            _: &[AssetNameExchange],
+        ) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError> {
+            unreachable!("the account stream does not fetch balances")
+        }
+
+        async fn fetch_open_orders(
+            &self,
+            _: &[InstrumentNameExchange],
+        ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError>
+        {
+            unreachable!("the account stream does not fetch open orders")
+        }
+
+        async fn fetch_trades(
+            &self,
+            _: DateTime<Utc>,
+            _: DateTime<Utc>,
+            _: &[InstrumentNameExchange],
+        ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError>
+        {
+            unreachable!("the account stream does not fetch trades")
+        }
+    }
+
+    /// Initialise a manager over `client`, with a 1 ms backoff.
+    async fn init_flaky(
+        client: FlakyAccountClient,
+    ) -> Result<
+        ExecutionManager<
+            futures::stream::Pending<ExecutionRequest<ExchangeIndex, InstrumentIndex>>,
+            FlakyAccountClient,
+        >,
+        ExecutionError,
+    > {
+        let instruments = IndexedInstruments::new([instrument(EXCHANGE, "btc", "usdt")]);
+        let Ok(map) = generate_execution_instrument_map(&instruments, EXCHANGE) else {
+            panic!("the instrument map should build");
+        };
+        ExecutionManager::init(
+            futures::stream::pending(),
+            std::time::Duration::from_secs(5),
+            Arc::new(client),
+            AccountEventIndexer::new(Arc::new(map)),
+            ReconnectionBackoffPolicy::new(1, 1, 1),
+        )
+        .await
+        .map(|(manager, _events)| manager)
+    }
+
+    /// Each failed re-init reaches the consumer in order, as a `ReinitFailed` counting
+    /// consecutive failures, with no `Reconnecting` beyond the one that marked the disconnect.
+    #[tokio::test]
+    async fn each_failed_account_stream_reinit_is_sent_in_order() {
+        let Ok(manager) = init_flaky(FlakyAccountClient {
+            fail_on: &[1, 2],
+            ..FlakyAccountClient::default()
+        })
+        .await
+        else {
+            panic!("the first attempt succeeds, so init should too");
+        };
+        let exchange = manager.indexer.map.exchange.key;
+
+        let events = manager.account_stream.take(5).collect::<Vec<_>>().await;
+
+        let snapshot = || {
+            AccountStreamEvent::Item(AccountEvent {
+                exchange,
+                kind: AccountEventKind::Snapshot(AccountSnapshot::new(exchange, vec![], vec![])),
+            })
+        };
+        let reinit_failed = |attempt| {
+            AccountStreamEvent::Item(AccountEvent {
+                exchange,
+                kind: AccountEventKind::ReinitFailed(AccountReinitFailure::new(
+                    attempt,
+                    AccountStreamInitError::Client(ClientError::Connectivity(
+                        ConnectivityError::Timeout,
+                    )),
+                )),
+            })
+        };
+        assert_eq!(
+            events,
+            [
+                snapshot(),
+                AccountStreamEvent::Reconnecting(EXCHANGE),
+                reinit_failed(1),
+                reinit_failed(2),
+                snapshot(),
+            ]
+        );
+    }
+
+    /// A failure of the first attempt is returned from `init`, not sent on the stream.
+    #[tokio::test]
+    async fn a_failed_first_account_stream_init_fails_init() {
+        let result = init_flaky(FlakyAccountClient {
+            fail_on: &[0],
+            ..FlakyAccountClient::default()
+        })
+        .await;
+
+        assert_eq!(
+            result.err(),
+            Some(ExecutionError::AccountStreamInit(
+                AccountStreamInitError::Client(ClientError::Connectivity(
+                    ConnectivityError::Timeout
+                ))
+            ))
+        );
     }
 
     /// A response whose own key resolves, but to a different order, is a client bug too: it must

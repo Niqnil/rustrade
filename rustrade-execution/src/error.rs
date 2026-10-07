@@ -11,9 +11,11 @@
 //! it over pattern matching on specific variants, as the internal taxonomy may
 //! evolve while `is_transient()` semantics remain stable.
 
+use derive_more::Constructor;
 use rustrade_instrument::{
     asset::{AssetIndex, name::AssetNameExchange},
     exchange::ExchangeId,
+    index::error::IndexError,
     instrument::{InstrumentIndex, name::InstrumentNameExchange},
 };
 use rustrade_integration::error::SocketError;
@@ -428,6 +430,40 @@ pub enum StreamTerminationReason {
     /// lagged past the buffer). The consumer is responsible for any re-establishment.
     #[error("unrecoverable stream error: {0}")]
     Error(String),
+}
+
+/// Type alias for an [`AccountStreamInitError`] that is keyed on [`AssetNameExchange`] and
+/// [`InstrumentNameExchange`] (yet to be indexed).
+pub type UnindexedAccountStreamInitError =
+    AccountStreamInitError<AssetNameExchange, InstrumentNameExchange>;
+
+/// Why an attempt to initialise an account stream, its snapshot and its updates, failed.
+#[non_exhaustive]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]
+pub enum AccountStreamInitError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
+    /// The [`ExecutionClient`](crate::client::ExecutionClient) failed to fetch the account
+    /// snapshot or to open the account stream. See [`ClientError::is_transient`].
+    #[error("{0}")]
+    Client(#[from] ClientError<AssetKey, InstrumentKey>),
+
+    /// The account snapshot named an exchange, asset or instrument that is not indexed. This does
+    /// not resolve on retry while the venue keeps reporting it.
+    #[error("IndexError: {0}")]
+    Index(#[from] IndexError),
+}
+
+/// A failed attempt to re-initialise an account stream after it ended.
+///
+/// Delivered in-band as the payload of
+/// [`AccountEventKind::ReinitFailed`](crate::AccountEventKind::ReinitFailed), once per failed
+/// attempt. Attempts continue with backoff; giving up is the consumer's decision.
+#[non_exhaustive]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Constructor)]
+pub struct AccountReinitFailure<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
+    /// Consecutive failed attempts since the stream last initialised, starting at 1.
+    pub attempt: u32,
+    /// Why this attempt failed.
+    pub error: AccountStreamInitError<AssetKey, InstrumentKey>,
 }
 
 /// Represents errors related to exchange, asset and instrument identifier key lookups.

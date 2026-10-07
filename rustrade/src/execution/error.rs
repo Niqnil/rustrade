@@ -1,5 +1,4 @@
-use rustrade_execution::error::ClientError;
-use rustrade_instrument::index::error::IndexError;
+use rustrade_execution::error::AccountStreamInitError;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -10,13 +9,9 @@ pub enum ExecutionError {
     #[error("ExecutionManager config invalid: {0}")]
     Config(String),
 
-    /// Represents an error that occurred whilst mapping exchange-centric data structures into
-    /// their indexed counterparts.
-    #[error("IndexError: {0}")]
-    Index(#[from] IndexError),
-
-    /// Represents all errors produced by an
-    /// [`ExecutionClient`](rustrade_execution::client::ExecutionClient).
-    #[error("{0}")]
-    Client(#[from] ClientError),
+    /// The first attempt to initialise the exchange account stream, its snapshot and its updates,
+    /// failed. Later failed attempts arrive in-band as
+    /// [`AccountEventKind::ReinitFailed`](rustrade_execution::AccountEventKind::ReinitFailed).
+    #[error("account stream initialisation failed: {0}")]
+    AccountStreamInit(#[from] AccountStreamInitError),
 }

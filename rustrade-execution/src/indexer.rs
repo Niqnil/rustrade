@@ -4,7 +4,8 @@ use crate::{
     UnindexedAccountSnapshot,
     balance::{AssetBalance, AssetBalanceUpdate},
     error::{
-        ApiError, ClientError, KeyError, OrderError, UnindexedApiError, UnindexedClientError,
+        AccountReinitFailure, AccountStreamInitError, ApiError, ClientError, KeyError, OrderError,
+        UnindexedAccountStreamInitError, UnindexedApiError, UnindexedClientError,
         UnindexedOrderError,
     },
     fill_recovery::{FillRecoveryGap, FillRecoveryScope},
@@ -83,6 +84,9 @@ impl AccountEventIndexer {
             }
             AccountEventKind::TradeAmended(amendment) => {
                 AccountEventKind::TradeAmended(self.trade_amendment(amendment)?)
+            }
+            AccountEventKind::ReinitFailed(failure) => {
+                AccountEventKind::ReinitFailed(self.reinit_failure(failure))
             }
         };
 
@@ -490,6 +494,31 @@ impl AccountEventIndexer {
         }
     }
 
+    /// Index an [`UnindexedAccountStreamInitError`]. Never fails, as [`Self::client_error`].
+    pub fn account_stream_init_error(
+        &self,
+        error: UnindexedAccountStreamInitError,
+    ) -> AccountStreamInitError {
+        match error {
+            AccountStreamInitError::Client(error) => {
+                AccountStreamInitError::Client(self.client_error(error))
+            }
+            AccountStreamInitError::Index(error) => AccountStreamInitError::Index(error),
+        }
+    }
+
+    /// Index an [`AccountReinitFailure`]. Never fails, as [`Self::client_error`].
+    pub fn reinit_failure(
+        &self,
+        failure: AccountReinitFailure<AssetNameExchange, InstrumentNameExchange>,
+    ) -> AccountReinitFailure {
+        let AccountReinitFailure { attempt, error } = failure;
+        AccountReinitFailure {
+            attempt,
+            error: self.account_stream_init_error(error),
+        }
+    }
+
     /// Index a [`TradeAmendment`]. A replacement trade is indexed as [`trade`](Self::trade) indexes
     /// one, so an amendment fails where its trade would.
     pub fn trade_amendment(
@@ -642,6 +671,45 @@ mod tests {
             matches!(indexed.kind, AccountEventKind::StreamTerminated(r) if r == reason),
             "expected StreamTerminated to pass through unchanged",
         );
+    }
+
+    /// A failed re-init never fails to index: its client error is indexed as
+    /// [`AccountEventIndexer::client_error`] indexes one, and an index error passes through.
+    #[test]
+    fn account_event_indexes_a_reinit_failure() {
+        let indexer = binance_indexer();
+        let btc = indexer
+            .map
+            .find_asset_index(&AssetNameExchange::new("BTC"))
+            .unwrap();
+        let unindexed_client = AccountStreamInitError::Client(ClientError::Api(
+            ApiError::BalanceInsufficient(Some(AssetNameExchange::new("BTC")), "low".to_owned()),
+        ));
+        let indexed_client = AccountStreamInitError::Client(ClientError::Api(
+            ApiError::BalanceInsufficient(Some(btc), "low".to_owned()),
+        ));
+        let index_error = IndexError::AssetIndex("ETH".to_owned());
+
+        for (error, expected) in [
+            (unindexed_client, indexed_client),
+            (
+                AccountStreamInitError::Index(index_error.clone()),
+                AccountStreamInitError::Index(index_error),
+            ),
+        ] {
+            let indexed = indexer
+                .account_event(UnindexedAccountEvent::new(
+                    ExchangeId::BinanceSpot,
+                    AccountEventKind::ReinitFailed(AccountReinitFailure::new(2, error)),
+                ))
+                .unwrap();
+
+            assert_eq!(indexed.exchange, indexer.map.exchange.key);
+            assert_eq!(
+                indexed.kind,
+                AccountEventKind::ReinitFailed(AccountReinitFailure::new(2, expected))
+            );
+        }
     }
 
     /// A fill recovery give-up indexes each instrument it names, and fails as a whole when one
