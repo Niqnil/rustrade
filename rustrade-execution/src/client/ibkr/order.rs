@@ -105,7 +105,8 @@ pub struct OrderContext {
 ///
 /// # A client order id names one live order at a time
 ///
-/// TWS never sees a [`ClientOrderId`], so this map is the only place its uniqueness can be kept.
+/// TWS receives a [`ClientOrderId`] only as the order's reference ([`order_ref`]), whose uniqueness
+/// it does not check, so this map is the only place it can be kept.
 /// An id is held from [`register`](Self::register) until its order ends, and registering an id
 /// already held is refused with [`ClientOrderIdInUse`]. Once its order has ended the id may name a
 /// new order.
@@ -206,6 +207,16 @@ impl OrderIdMap {
     /// Look up the IB order ID of the live order under `client_id`.
     pub fn get_ib_id(&self, client_id: &ClientOrderId) -> Option<i32> {
         self.inner.read().cid_to_ib.get(client_id).copied()
+    }
+
+    /// How long ago the live order under `client_id` was registered.
+    pub fn age_of(&self, client_id: &ClientOrderId) -> Option<std::time::Duration> {
+        let inner = self.inner.read();
+        let ib_id = inner.cid_to_ib.get(client_id)?;
+        inner
+            .ib_to_entry
+            .get(ib_id)
+            .map(|(_, _, registered_at)| registered_at.elapsed())
     }
 
     /// Whether IB order `ib_id` has an entry: a live order, or a filled one not yet reaped.
@@ -356,6 +367,12 @@ impl PendingCancels {
     #[must_use]
     pub fn remove(&self, ib_id: i32) -> bool {
         self.inner.lock().remove(&ib_id).is_some()
+    }
+
+    /// Whether a cancel of IB order `ib_id` was requested through this client and not yet seen
+    /// to end the order.
+    pub fn contains(&self, ib_id: i32) -> bool {
+        self.inner.lock().contains_key(&ib_id)
     }
 
     /// Clear entries older than the given duration.
@@ -555,6 +572,9 @@ pub enum OrderMappingError {
     /// on the wrong side of the entry (for a buy, the take profit must be above the entry and the
     /// stop loss below; a sell the reverse).
     InvalidBracketPrices(String),
+    /// The client order id cannot be sent as the order's IB order reference, which carries it:
+    /// IB takes at most [`MAX_ORDER_REF_LEN`] ASCII characters there.
+    InvalidClientOrderId(ClientOrderId),
 }
 
 impl std::fmt::Display for OrderMappingError {
@@ -583,8 +603,33 @@ impl std::fmt::Display for OrderMappingError {
                  the order to MOC/LOC; time_in_force_to_ib cannot map it directly"
             ),
             Self::InvalidBracketPrices(e) => write!(f, "invalid bracket prices: {e}"),
+            Self::InvalidClientOrderId(cid) => write!(
+                f,
+                "client order id {cid} is not an IB order reference: at most \
+                 {MAX_ORDER_REF_LEN} ASCII characters"
+            ),
         }
     }
+}
+
+/// The longest order reference IB echoes back whole, verified on paper. The client order id
+/// travels there, so it is limited to this.
+pub const MAX_ORDER_REF_LEN: usize = 128;
+
+/// The IB order reference that carries `cid`: the id itself.
+///
+/// IB echoes the reference on every open-order, completed-order and execution report, so an order
+/// can be named by the id it was placed with even by a client that did not place it.
+///
+/// # Errors
+/// [`OrderMappingError::InvalidClientOrderId`] for an id IB would reject (error 10363 for
+/// non-ASCII text) or not echo whole: empty, longer than [`MAX_ORDER_REF_LEN`], or not ASCII.
+pub fn order_ref(cid: &ClientOrderId) -> Result<String, OrderMappingError> {
+    let id = cid.0.as_str();
+    if id.is_empty() || id.len() > MAX_ORDER_REF_LEN || !id.is_ascii() {
+        return Err(OrderMappingError::InvalidClientOrderId(cid.clone()));
+    }
+    Ok(id.to_owned())
 }
 
 impl std::error::Error for OrderMappingError {}
@@ -1917,6 +1962,30 @@ mod tests {
         assert_eq!(orders[0].tif, IbTimeInForce::GoodTillCanceled);
         assert_eq!(orders[1].tif, IbTimeInForce::GoodTillCanceled);
         assert_eq!(orders[2].tif, IbTimeInForce::GoodTillCanceled);
+    }
+
+    /// A client order id travels as the order reference whole, so one IB would reject or cut is
+    /// refused: empty, longer than IB echoes back, or not ASCII (IB error 10363).
+    #[test]
+    fn order_ref_is_the_client_order_id_when_ib_echoes_it_whole() {
+        let longest = "a".repeat(MAX_ORDER_REF_LEN);
+        assert_eq!(
+            order_ref(&ClientOrderId::new(longest.as_str())).unwrap(),
+            longest
+        );
+        assert_eq!(
+            order_ref(&ClientOrderId::new("cid-1_tp")).unwrap(),
+            "cid-1_tp"
+        );
+
+        let too_long = "a".repeat(MAX_ORDER_REF_LEN + 1);
+        for refused in ["", too_long.as_str(), "ordre-é"] {
+            let cid = ClientOrderId::new(refused);
+            assert_eq!(
+                order_ref(&cid),
+                Err(OrderMappingError::InvalidClientOrderId(cid.clone()))
+            );
+        }
     }
 
     /// Every order this client builds reads back as what it was built from, so an open order it no

@@ -66,9 +66,10 @@ pub(crate) trait PendingFills {
 /// No fills left to recover, as for a client whose fill recovery is done, or given up, before its
 /// order check starts.
 #[derive(Debug, Clone, Copy, Default)]
-// Alpaca recovers its fills before its check, and Hyperliquid has them redelivered before its own.
+// Alpaca and IBKR recover their fills before their checks, and Hyperliquid has them redelivered
+// before its own.
 #[cfg_attr(
-    not(any(feature = "alpaca", feature = "hyperliquid")),
+    not(any(feature = "alpaca", feature = "hyperliquid", feature = "ibkr")),
     allow(dead_code)
 )]
 pub(crate) struct NoPendingFills;
@@ -332,9 +333,9 @@ impl KnownLiveOrders {
     }
 
     /// Every instrument with an order held as live.
-    // Only Alpaca and Hyperliquid stream every instrument.
+    // Only Alpaca, Hyperliquid and IBKR stream every instrument.
     #[cfg_attr(
-        not(any(feature = "alpaca", feature = "hyperliquid")),
+        not(any(feature = "alpaca", feature = "hyperliquid", feature = "ibkr")),
         allow(dead_code)
     )]
     pub(crate) fn instruments(&self) -> Vec<InstrumentNameExchange> {
@@ -529,6 +530,19 @@ impl UncheckedOrders {
     }
 }
 
+/// Where [`recover_ended_orders`] sends each order it finds ended: the account stream.
+pub(crate) trait EventSender {
+    /// Send `event` on the stream. Returns `false` once nothing more can be sent, because the
+    /// consumer has gone or the stream has ended.
+    fn send_event(&self, event: UnindexedAccountEvent) -> bool;
+}
+
+impl EventSender for mpsc::UnboundedSender<UnindexedAccountEvent> {
+    fn send_event(&self, event: UnindexedAccountEvent) -> bool {
+        self.send(event).is_ok()
+    }
+}
+
 /// What looking up one order by its key found.
 #[derive(Debug)]
 pub(crate) enum OrderLookup {
@@ -599,9 +613,9 @@ pub(crate) enum OpenListing {
     /// One listing of every instrument due, as on a venue that lists several symbols in one
     /// request. A listing that fails charges every instrument in it. Either way, a lookup that
     /// fails charges only the instrument of the order it asked about.
-    // Only Alpaca and Hyperliquid list several symbols.
+    // Only Alpaca, Hyperliquid and IBKR list several symbols.
     #[cfg_attr(
-        not(any(feature = "alpaca", feature = "hyperliquid")),
+        not(any(feature = "alpaca", feature = "hyperliquid", feature = "ibkr")),
         allow(dead_code)
     )]
     Batched,
@@ -634,7 +648,7 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
     known: &SharedKnownLiveOrders,
     unchecked: &mut UncheckedOrders,
     pending: &impl PendingFills,
-    tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
+    tx: &impl EventSender,
     listing: OpenListing,
     list_open: L,
     lookup: Q,
@@ -809,7 +823,7 @@ fn settle(
     known: &SharedKnownLiveOrders,
     key: UnindexedOrderKey,
     found: OrderLookup,
-    tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
+    tx: &impl EventSender,
 ) -> Option<u32> {
     let mut known = known.lock();
     match found {
@@ -823,8 +837,7 @@ fn settle(
                     (*order).map_state(OrderState::Inactive),
                 )),
             );
-            tx.send(event).ok()?;
-            Some(1)
+            tx.send_event(event).then_some(1)
         }
         OrderLookup::Unknown => {
             if known.ended(&key.cid) {

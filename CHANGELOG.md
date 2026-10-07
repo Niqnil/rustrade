@@ -143,6 +143,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   order the venue does not know (`unknownOid`), one on another instrument than the key's, and an
   id that is neither a canonical UUID nor an oid. An order placed without a cloid, which the
   clients report under its oid, is looked up by that oid. Refs #370.
+- **IBKR reports how orders ended while its account stream was disconnected, implements
+  `OrderStatusClient`, and lists open orders in its account snapshot** (`rustrade-execution`,
+  feature `ibkr`), as the other venues do (above). Closes #370 and #371.
+  - Every order, bracket legs included, now carries its client order id as its IB order
+    reference, which IB lists with the order, its executions and its completion. So
+    `fetch_open_orders` and `account_snapshot` list an order this client does not track, such
+    as one placed before a restart, under the id it was placed with, and track it from then on:
+    its fills and status reach the account stream, and it can be cancelled. An order without a
+    reference, such as one entered in TWS, is still listed under its IB order id.
+  - `account_snapshot` returns each instrument's open orders of this API client, from one
+    listing of the account's open orders. An instrument's `orders_complete` is `true` when IB
+    listed every open order and each of the instrument's was read back under the id it was
+    placed with and with its status. An instrument with an open order is reported even with no
+    position. If the listing cannot be read, the snapshot is still returned, with no
+    instrument's orders complete and a warning.
+  - `IbkrClient` holds the orders it has seen live: from placing them, from `account_snapshot`
+    and `fetch_open_orders`, and from the stream. After a gap in event delivery, once fill
+    recovery has finished or given up, the stream lists the open orders once and looks up each
+    held order the listing no longer shows in IB's completed orders. Each that ended is sent as
+    an `OrderSnapshot` of its inactive state, under `StrategyId::unknown()`, and its client
+    order id is freed. A failed check is retried while connected 1, 2, 4, 8 and 16 minutes
+    later, then given up with an `error!`.
+  - `IbkrClient` implements `OrderStatusClient` with the same lookup, by order reference, so it
+    finds orders placed before a restart too. `Filled` is fully filled, with no average price. A
+    `Cancelled` order is cancelled or expired by the rule the stream applies, with the fill its
+    executions over the last seven days show: nothing when they show none and this client placed
+    the order under six days ago, otherwise unknown (`None`). IB lists a placement it accepted
+    and then rejected as `Cancelled`, saying so in its completion text; it is `OpenFailed`, and
+    so is an `Inactive` order. An order on another instrument than the key's, or none under the
+    id, is omitted. When several completed orders carry one id, the one that completed last is
+    reported.
+  - IB answers every open-orders and completed-orders request with every listing in flight, so
+    the client and its clones now read these listings one at a time. Two `fetch_open_orders`
+    calls at once could each stop at the other's end of the listing.
 - **The Hyperliquid perpetuals client trades builder-deployed (HIP-3) perpetuals**
   (`rustrade-execution`, `hyperliquid` feature). **Breaking.** It placed and cancelled only on the
   default DEX: the SDK knows no HIP-3 asset ids, and a HIP-3 DEX's positions and open orders are
@@ -216,6 +250,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fill reached: the stream and recovery now recognise a fill by its execution id. Closes #483.
 
 ### Changed
+
+- **IBKR client order ids are at most 128 ASCII characters, and a failing fill recovery no longer
+  ends the account stream** (`rustrade-execution`, feature `ibkr`). **Breaking.**
+  - An order's client order id is sent as its IB order reference, which IB rejects when it is
+    not ASCII (error 10363) and echoes back whole only up to 128 characters. An open, or a
+    bracket any of whose leg ids (the parent's plus `_tp` and `_sl`) is empty, longer, or not
+    ASCII, is refused before anything is sent, with the new
+    `OrderMappingError::InvalidClientOrderId`.
+  - When reading a gap's fills fails three times, the account stream sends
+    `AccountEventKind::FillRecoveryGaveUp` covering every instrument, from the start of the gap
+    to when it gave up, and stays open. It ended with `StreamTerminated`, leaving its reader
+    thread blocked and `account_stream` failing until TWS sent another event. Read the span with
+    `fetch_trades`.
 
 - **A client order id names one live order at a time: an open under one in use is rejected**
   (`rustrade-execution`, `rustrade`). **Breaking:** the simulated venue's behaviour changes. A

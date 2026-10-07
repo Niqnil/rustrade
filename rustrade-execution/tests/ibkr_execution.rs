@@ -63,6 +63,7 @@
 //! | `test_place_and_cancel_gtd_order` | Good-Till-Date order |
 //! | `test_place_moo_order_premarket` | Market-on-Open (timing-sensitive) |
 //! | `test_place_loo_order_premarket` | Limit-on-Open (timing-sensitive) |
+//! | `test_orders_found_by_client_order_id_across_a_restart` | Snapshot orders, adoption after a restart, ended-order lookup |
 
 #![cfg(feature = "ibkr")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Integration tests: panics are the correct failure mode
@@ -71,8 +72,8 @@ use rust_decimal_macros::dec;
 use rustrade_execution::{
     AccountEventKind,
     client::{
-        ExecutionClient,
-        ibkr::{IbkrClient, IbkrConfig, contract::stock_contract},
+        ExecutionClient, OrderStatusClient,
+        ibkr::{ContractConfig, IbkrClient, IbkrConfig, contract::stock_contract},
     },
     order::{
         OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
@@ -1600,4 +1601,211 @@ async fn test_place_loo_order_premarket() {
             panic!("Unexpected order state: {:?}", other);
         }
     }
+}
+
+// ============================================================================
+// Orders by client order id — Tier 0: Paper Account Only (FREE)
+// ============================================================================
+
+/// AAPL resolved through `IbkrConfig::contracts`, so IB's listings, which name contracts by id,
+/// can be attributed to it.
+fn resolved_aapl_config(client_id_offset: i32) -> IbkrConfig {
+    IbkrConfig {
+        contracts: vec![ContractConfig {
+            name: "AAPL".to_string(),
+            symbol: "AAPL".to_string(),
+            security_type: "STK".to_string(),
+            exchange: "SMART".to_string(),
+            currency: "USD".to_string(),
+            last_trade_date: None,
+            strike: None,
+            right: None,
+        }],
+        ..test_config(client_id_offset)
+    }
+}
+
+/// An order carries its client order id to IB, so the account snapshot lists it under that id, a
+/// new client under the same API client id finds it after a restart and can cancel it, and
+/// `fetch_ended_orders` reports how it ended. A client order id IB would reject is refused before
+/// anything is sent.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_orders_found_by_client_order_id_across_a_restart() {
+    init_logging();
+
+    let aapl = aapl_instrument();
+    let strategy = StrategyId::new("test-strategy");
+    let client = connect_client(resolved_aapl_config(21))
+        .await
+        .expect("connection failed");
+
+    let refused = client
+        .open_order(rustrade_execution::order::OrderEvent {
+            key: OrderKey {
+                exchange: ExchangeId::Ibkr,
+                instrument: &aapl,
+                strategy: strategy.clone(),
+                cid: ClientOrderId::new("ordre-\u{e9}"),
+            },
+            state: RequestOpen {
+                side: Side::Buy,
+                price: Some(dec!(1.00)),
+                quantity: dec!(1),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                position_id: None,
+                reduce_only: false,
+                market: None,
+            },
+        })
+        .await;
+    assert!(
+        matches!(
+            refused.state,
+            OrderState::Inactive(InactiveOrderState::OpenFailed(_))
+        ),
+        "{refused:?}"
+    );
+
+    let cid = ClientOrderId::new(format!("restart-{}", chrono::Utc::now().timestamp_millis()));
+    let placed = client
+        .open_order(rustrade_execution::order::OrderEvent {
+            key: OrderKey {
+                exchange: ExchangeId::Ibkr,
+                instrument: &aapl,
+                strategy: strategy.clone(),
+                cid: cid.clone(),
+            },
+            state: RequestOpen {
+                side: Side::Buy,
+                price: Some(dec!(1.00)),
+                quantity: dec!(1),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                position_id: None,
+                reduce_only: false,
+                market: None,
+            },
+        })
+        .await;
+    assert!(
+        matches!(placed.state, OrderState::Active(ActiveOrderState::Open(_))),
+        "{placed:?}"
+    );
+
+    let snapshot = client
+        .account_snapshot(&[], std::slice::from_ref(&aapl))
+        .await
+        .expect("account_snapshot failed");
+    let entry = snapshot
+        .instruments
+        .iter()
+        .find(|entry| entry.instrument == aapl)
+        .expect("AAPL has an open order");
+    println!(
+        "AAPL: {} order(s), complete: {}",
+        entry.orders.len(),
+        entry.orders_complete
+    );
+    assert!(
+        entry.orders.iter().any(|order| order.key.cid == cid),
+        "{entry:?}"
+    );
+    assert!(entry.orders_complete, "{entry:?}");
+
+    // A restart: a new client under the same API client id, which has never seen the order. The
+    // socket closes only when the last handle to the client goes, and IB then takes a moment to
+    // release the id.
+    client.disconnect();
+    drop(client);
+    let mut restarted = Err(String::new());
+    for _ in 0..15 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        restarted = connect_client(resolved_aapl_config(21)).await;
+        if restarted.is_ok() {
+            break;
+        }
+    }
+    let restarted = restarted.expect("reconnection failed");
+
+    let open = restarted
+        .fetch_open_orders(std::slice::from_ref(&aapl))
+        .await
+        .expect("fetch_open_orders failed");
+    let listed = open
+        .iter()
+        .find(|order| order.key.cid == cid)
+        .expect("the order is listed under its client order id");
+    assert_eq!(listed.kind, OrderKind::Limit);
+    assert_eq!(listed.price, Some(dec!(1.00)));
+
+    // Orders an earlier, failed run left open.
+    for leftover in open
+        .iter()
+        .filter(|order| order.key.cid != cid && order.key.cid.0.starts_with("restart-"))
+    {
+        let _ = restarted
+            .cancel_order(rustrade_execution::order::OrderEvent {
+                key: OrderKey {
+                    exchange: ExchangeId::Ibkr,
+                    instrument: &aapl,
+                    strategy: strategy.clone(),
+                    cid: leftover.key.cid.clone(),
+                },
+                state: rustrade_execution::order::request::RequestCancel { id: None },
+            })
+            .await;
+    }
+
+    let cancelled = restarted
+        .cancel_order(rustrade_execution::order::OrderEvent {
+            key: OrderKey {
+                exchange: ExchangeId::Ibkr,
+                instrument: &aapl,
+                strategy: strategy.clone(),
+                cid: cid.clone(),
+            },
+            state: rustrade_execution::order::request::RequestCancel { id: None },
+        })
+        .await;
+    assert!(cancelled.state.is_ok(), "{cancelled:?}");
+
+    let key = OrderKey {
+        exchange: ExchangeId::Ibkr,
+        instrument: aapl.clone(),
+        strategy,
+        cid: cid.clone(),
+    };
+    let mut ended = Vec::new();
+    for _ in 0..20 {
+        ended = restarted
+            .fetch_ended_orders(std::slice::from_ref(&key))
+            .await
+            .expect("fetch_ended_orders failed");
+        if !ended.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    println!("Ended: {ended:?}");
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert_eq!(ended[0].key, key);
+    let InactiveOrderState::Cancelled(cancelled) = &ended[0].state else {
+        panic!("not cancelled: {:?}", ended[0].state);
+    };
+    assert_eq!(cancelled.filled_quantity, Some(rust_decimal::Decimal::ZERO));
+
+    let unknown = OrderKey {
+        cid: ClientOrderId::new("never-placed"),
+        ..key
+    };
+    assert!(
+        restarted
+            .fetch_ended_orders(&[unknown])
+            .await
+            .expect("fetch_ended_orders failed")
+            .is_empty()
+    );
 }

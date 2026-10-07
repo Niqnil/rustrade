@@ -16,26 +16,44 @@
 //! 3. It emits them through the stream's [`EventSink`], which drops every trade already delivered
 //!    and reports a correction as one.
 //!
+//! 4. It then checks how the orders it holds as live ([`KnownLiveOrders`]) ended during the gap:
+//!    it lists the open orders once and looks up each held order the listing no longer shows in
+//!    IB's completed orders ([`recover_ended_orders`]), reporting each that ended as an
+//!    [`AccountEventKind::OrderSnapshot`]. A check that fails is retried on a backoff.
+//!
+//! When fill recovery keeps failing, the watcher reports the gap as
+//! [`AccountEventKind::FillRecoveryGaveUp`] and goes on, with the order check, and with the next
+//! gap.
+//!
 //! The watcher also ends the stream when the client shuts down for good. `ibapi` never closes the
 //! order update stream, so the reader cannot see that happen, but it does close every notice
 //! stream.
-//!
-//! Only fills are recovered. An order that was cancelled, expired or rejected during the gap is
-//! not reported.
 
 use super::{
+    ListingLock,
+    ended_orders::{EndedOrderReader, release_ended},
     execution::{ExecutionBuffer, ExecutionRevision, revision_of},
-    order::OrderIdMap,
+    open_orders_from_listing,
+    order::{OrderIdMap, PendingCancels},
     resolve_execution,
 };
 use crate::{
     AccountEventKind, UnindexedAccountEvent,
-    client::dedup::{DEDUP_CACHE_SIZE, SharedDedupCache, dedup_key_from_event, is_duplicate},
+    client::{
+        dedup::{DEDUP_CACHE_SIZE, SharedDedupCache, dedup_key_from_event, is_duplicate},
+        order_recovery::{
+            EventSender, KnownLiveOrders, NoPendingFills, OpenListing, OrderLookup,
+            SharedKnownLiveOrders, UncheckedOrders, recover_ended_orders,
+        },
+    },
     emit_stream_terminated,
-    error::StreamTerminationReason,
+    error::{StreamTerminationReason, UnindexedClientError},
+    fill_recovery::{FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope},
+    order::id::ClientOrderId,
     trade::{Trade, TradeAmendment, TradeAmendmentKind, TradeId},
 };
 use chrono::{DateTime, Utc};
+use fnv::FnvHashSet;
 use ibapi::{
     TRANSPORT_RECONNECT_CODE,
     client::blocking::{Client, NoticeStream},
@@ -85,7 +103,7 @@ const RECOVERY_LOOKBACK: chrono::Duration = chrono::Duration::seconds(30);
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Recovery attempts that may fail, for a reason other than the transport dropping again, before
-/// the stream is terminated.
+/// the gap is given up and reported as [`AccountEventKind::FillRecoveryGaveUp`].
 const MAX_RECOVERY_FAILURES: u32 = 3;
 
 /// TWS has lost its connection to IB's servers. The API socket stays up.
@@ -216,7 +234,8 @@ impl GapTracker {
 /// Sending and ending the stream go through one lock. So once [`terminate`](Self::terminate) has
 /// emitted `StreamTerminated`, nothing can follow it, whichever thread sends next. Trades pass
 /// through a dedup cache, so a fill that recovery reads again is delivered once, and a correction
-/// is reported as one (see [`send_execution`](Self::send_execution)).
+/// is reported as one (see [`send_execution`](Self::send_execution)). Each event sent teaches the
+/// client's [`KnownLiveOrders`] what it says about an order.
 #[derive(Debug, Clone)]
 pub(super) struct EventSink {
     tx: Arc<Mutex<Option<mpsc::UnboundedSender<UnindexedAccountEvent>>>>,
@@ -224,9 +243,14 @@ pub(super) struct EventSink {
     /// The latest revision delivered of each execution, by [`ExecutionRevision::execution`].
     /// Bounded like the dedup cache, so it forgets the oldest execution rather than grow.
     ///
-    /// Lock order: `revisions`, then `dedup`, then `tx`. Nothing takes `revisions` while holding
-    /// either of the others.
+    /// Lock order: `revisions`, then `known`, then `tx`; `dedup` is taken and released on its
+    /// own. Nothing takes `revisions` while holding another, nor `known` while holding `tx`.
     revisions: Arc<Mutex<LruCache<SmolStr, DeliveredRevision>>>,
+    /// The orders the client holds as live. Held across each send of an event it learns from,
+    /// as the order check holds it across its own, so an order this stream reports ending and
+    /// the check reach the consumer in the order they were decided, and the order is reported
+    /// once.
+    known: SharedKnownLiveOrders,
 }
 
 /// The latest revision of an execution an [`EventSink`] delivered.
@@ -240,20 +264,27 @@ impl EventSink {
     pub(super) fn new(
         tx: mpsc::UnboundedSender<UnindexedAccountEvent>,
         dedup: SharedDedupCache,
+        known: SharedKnownLiveOrders,
     ) -> Self {
         Self {
             tx: Arc::new(Mutex::new(Some(tx))),
             dedup,
             revisions: Arc::new(Mutex::new(LruCache::new(REVISIONS_REMEMBERED))),
+            known,
         }
     }
 
-    /// Send `event`. Returns `false` once the stream has ended or the consumer has gone.
+    /// Send `event`, having learnt from it what [`KnownLiveOrders`] learns. Returns `false` once
+    /// the stream has ended or the consumer has gone.
     pub(super) fn send(&self, event: UnindexedAccountEvent) -> bool {
-        self.tx
-            .lock()
-            .as_ref()
-            .is_some_and(|tx| tx.send(event).is_ok())
+        let known = KnownLiveOrders::observes(&event.kind).then(|| {
+            let mut known = self.known.lock();
+            known.observe(&event);
+            known
+        });
+        let sent = self.send_event(event);
+        drop(known);
+        sent
     }
 
     /// Send `trade`, an execution completed by its commission report, unless it or a later
@@ -350,6 +381,17 @@ impl EventSink {
     }
 }
 
+/// The order check sends what it learns through the sink as it is, under the [`KnownLiveOrders`]
+/// lock it already holds.
+impl EventSender for EventSink {
+    fn send_event(&self, event: UnindexedAccountEvent) -> bool {
+        self.tx
+            .lock()
+            .as_ref()
+            .is_some_and(|tx| tx.send(event).is_ok())
+    }
+}
+
 /// Why a recovery attempt failed.
 #[derive(Debug, thiserror::Error)]
 pub(super) enum RecoveryError {
@@ -365,6 +407,16 @@ pub(super) enum RecoveryError {
 impl RecoveryError {
     fn is_transport_loss(&self) -> bool {
         matches!(self, Self::Ibapi(e) if super::is_transport_loss(e))
+    }
+
+    /// How [`AccountEventKind::FillRecoveryGaveUp`] states this failure.
+    fn failure(&self) -> FillRecoveryFailure {
+        match self {
+            Self::TimedOut => FillRecoveryFailure::TimedOut {
+                timeout_secs: RECOVERY_TIMEOUT.as_secs(),
+            },
+            Self::Ibapi(_) | Self::StreamClosed => FillRecoveryFailure::Request(self.to_string()),
+        }
     }
 }
 
@@ -532,18 +584,37 @@ pub(super) struct RecoveryWatcher {
     pub(super) notices: NoticeStream,
     pub(super) contracts: ContractRegistry,
     pub(super) order_ids: OrderIdMap,
+    pub(super) pending_cancels: PendingCancels,
     pub(super) pending: ExecutionBuffer,
+    pub(super) known: SharedKnownLiveOrders,
+    pub(super) listings: ListingLock,
     pub(super) sink: EventSink,
+    /// The runtime the order check, which is shared with the other venues, runs its timers on.
+    pub(super) runtime: tokio::runtime::Handle,
+}
+
+/// What became of one attempt at recovering a gap's fills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Recovery {
+    /// The gap is done with: its fills were recovered, or reported given up.
+    Done,
+    /// It failed and will be tried again.
+    Retry,
+    /// The stream has ended, or its consumer has gone.
+    StreamClosed,
 }
 
 impl RecoveryWatcher {
-    /// Watch for gaps and recover their fills until the stream ends or its consumer goes.
+    /// Watch for gaps, recover their fills, and check how the orders held as live ended, until
+    /// the stream ends or its consumer goes.
     ///
-    /// If recovery keeps failing, the stream is terminated rather than left open with a gap nobody
-    /// knows about. If the client shuts down for good, the watcher stops: the order-update reader
-    /// ends the stream then, on the `Error::Shutdown` `ibapi` sends it.
+    /// If fill recovery keeps failing, the gap is reported as
+    /// [`AccountEventKind::FillRecoveryGaveUp`] and the stream stays open. If the client shuts
+    /// down for good, the watcher stops: the order-update reader ends the stream then, on the
+    /// `Error::Shutdown` `ibapi` sends it.
     pub(super) fn run(self) {
         let mut tracker = GapTracker::new(Utc::now());
+        let mut unchecked = UncheckedOrders::default();
 
         while self.sink.is_open() {
             let connected = self.client.is_connected();
@@ -553,10 +624,18 @@ impl RecoveryWatcher {
                 observe_notice(&mut tracker, &notice);
             }
 
-            if let Some(floor) = tracker.recovery_floor(connected)
-                && !self.recover(&mut tracker, floor)
-            {
-                return;
+            if let Some(floor) = tracker.recovery_floor(connected) {
+                match self.recover(&mut tracker, floor) {
+                    // Every order held as live may have ended during the gap. Checked after the
+                    // fills, so an order's fills reach the stream before how it ended.
+                    Recovery::Done => unchecked.open(self.known.lock().instruments()),
+                    Recovery::Retry => {}
+                    Recovery::StreamClosed => return,
+                }
+            }
+
+            if connected && order_check_due(&unchecked) {
+                self.check_orders(&mut unchecked);
             }
 
             // The poll interval's sleep. It ends early on a notice, or at once if `ibapi` closed
@@ -567,7 +646,7 @@ impl RecoveryWatcher {
             match self.notices.next_timeout(POLL_INTERVAL) {
                 Some(notice) => observe_notice(&mut tracker, &notice),
                 None if returned_early(waited.elapsed(), POLL_INTERVAL) => {
-                    debug!("IBKR notice stream closed; fill recovery stops");
+                    debug!("IBKR notice stream closed; recovery stops");
                     return;
                 }
                 None => {}
@@ -575,8 +654,8 @@ impl RecoveryWatcher {
         }
     }
 
-    /// Recover the gap from `floor` on. Returns `false` once the watcher should stop.
-    fn recover(&self, tracker: &mut GapTracker, floor: DateTime<Utc>) -> bool {
+    /// Recover the gap from `floor` on.
+    fn recover(&self, tracker: &mut GapTracker, floor: DateTime<Utc>) -> Recovery {
         match recover_fills(
             &self.client,
             floor,
@@ -593,26 +672,96 @@ impl RecoveryWatcher {
                 );
                 for trade in trades {
                     if !self.sink.send_execution(trade) {
-                        return false;
+                        return Recovery::StreamClosed;
                     }
                 }
                 tracker.recovered();
-                true
+                Recovery::Done
             }
-            Err(RecoveryError::StreamClosed) => false,
+            Err(RecoveryError::StreamClosed) => Recovery::StreamClosed,
             Err(e) => {
                 warn!(error = %e, since = %floor, "IBKR fill recovery failed");
-                if tracker.recovery_failed(e.is_transport_loss()) {
-                    error!(error = %e, "Giving up IBKR fill recovery; terminating the account stream");
-                    self.sink.terminate(StreamTerminationReason::Error(format!(
-                        "IBKR fill recovery after a gap in event delivery failed: {e}"
-                    )));
-                    return false;
+                if !tracker.recovery_failed(e.is_transport_loss()) {
+                    return Recovery::Retry;
                 }
-                true
+                error!(
+                    error = %e,
+                    since = %floor,
+                    "Giving up IBKR fill recovery: reconcile the gap with fetch_trades"
+                );
+                let gave_up = UnindexedAccountEvent::new(
+                    ExchangeId::Ibkr,
+                    AccountEventKind::FillRecoveryGaveUp(FillRecoveryGap::new(
+                        FillRecoveryScope::AllInstruments,
+                        floor,
+                        Utc::now().max(floor),
+                        MAX_RECOVERY_FAILURES,
+                        e.failure(),
+                    )),
+                );
+                if !self.sink.send(gave_up) {
+                    return Recovery::StreamClosed;
+                }
+                tracker.recovered();
+                Recovery::Done
             }
         }
     }
+
+    /// Check how the orders held as live on each instrument due ended, as
+    /// [`recover_ended_orders`] does, with one listing of the open orders, and a lookup in IB's
+    /// completed orders of each held order it no longer shows.
+    ///
+    /// Runs on this thread: each listing and lookup is a blocking read, so the futures the check
+    /// awaits are ready at once.
+    fn check_orders(&self, unchecked: &mut UncheckedOrders) {
+        let reader = EndedOrderReader::new(
+            &self.client,
+            &self.listings,
+            &self.contracts,
+            &self.order_ids,
+            &self.pending_cancels,
+        );
+        let list_open = |_instruments: Vec<_>| std::future::ready(self.listed_cids());
+        let lookup = |key| {
+            let found = reader.lookup(&key);
+            if let Ok(OrderLookup::Ended(order)) = &found {
+                release_ended(order, &self.order_ids, &self.pending_cancels);
+            }
+            std::future::ready(found)
+        };
+        self.runtime.block_on(recover_ended_orders(
+            ExchangeId::Ibkr,
+            &self.known,
+            unchecked,
+            &NoPendingFills,
+            &self.sink,
+            OpenListing::Batched,
+            list_open,
+            lookup,
+        ));
+    }
+
+    /// The client order ids of this API client's open orders, as IB lists them.
+    fn listed_cids(&self) -> Result<FnvHashSet<ClientOrderId>, UnindexedClientError> {
+        let listing = self.listings.open_orders(&self.client)?;
+        Ok(open_orders_from_listing(
+            listing,
+            self.client.client_id(),
+            &self.contracts,
+            &self.order_ids,
+        )
+        .into_iter()
+        .filter_map(|listed| listed.order.map(|order| order.key.cid))
+        .collect())
+    }
+}
+
+/// Whether an instrument's check of how its orders held as live ended is due.
+fn order_check_due(unchecked: &UncheckedOrders) -> bool {
+    unchecked
+        .next_due(&NoPendingFills)
+        .is_some_and(|due| due <= tokio::time::Instant::now())
 }
 
 fn observe_notice(tracker: &mut GapTracker, notice: &ibapi::Notice) {
@@ -828,7 +977,84 @@ mod tests {
 
     fn sink() -> (EventSink, mpsc::UnboundedReceiver<UnindexedAccountEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (EventSink::new(tx, new_dedup_cache()), rx)
+        (
+            EventSink::new(
+                tx,
+                new_dedup_cache(),
+                KnownLiveOrders::shared(ExchangeId::Ibkr),
+            ),
+            rx,
+        )
+    }
+
+    /// The sink teaches the client's live orders what each event it sends says about an order,
+    /// so a later gap's order check asks only about those still live; what the order check sends
+    /// through it, it has already learnt.
+    #[test]
+    fn the_sink_teaches_the_live_orders_what_it_sends() {
+        use crate::order::{
+            Order, OrderKey, OrderKind, TimeInForce,
+            id::{OrderId, StrategyId},
+            state::{Cancelled, Open, OrderState},
+        };
+        use rust_decimal_macros::dec;
+
+        let known = KnownLiveOrders::shared(ExchangeId::Ibkr);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = EventSink::new(tx, new_dedup_cache(), known.clone());
+        let snapshot = |cid: &str, state| {
+            UnindexedAccountEvent::new(
+                ExchangeId::Ibkr,
+                AccountEventKind::OrderSnapshot(crate::Snapshot::new(Order {
+                    key: OrderKey {
+                        exchange: ExchangeId::Ibkr,
+                        instrument: InstrumentNameExchange::new("AAPL"),
+                        strategy: StrategyId::unknown(),
+                        cid: ClientOrderId::new(cid),
+                    },
+                    side: Side::Buy,
+                    price: Some(dec!(150)),
+                    quantity: dec!(10),
+                    kind: OrderKind::Limit,
+                    time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                    state,
+                })),
+            )
+        };
+        let open = || {
+            OrderState::active(Open::new(
+                crate::order::id::VenueOrderId::Assigned(OrderId::new("7")),
+                Utc::now(),
+                Decimal::ZERO,
+            ))
+        };
+
+        assert!(sink.send(snapshot("a", open())));
+        assert!(known.lock().contains(&ClientOrderId::new("a")));
+        assert!(sink.send(snapshot(
+            "a",
+            OrderState::inactive(Cancelled::new(OrderId::new("7"), Utc::now(), None))
+        )));
+        assert!(!known.lock().contains(&ClientOrderId::new("a")));
+
+        assert!(sink.send_event(snapshot("b", open())));
+        assert!(!known.lock().contains(&ClientOrderId::new("b")));
+        assert_eq!(drain(&mut rx).len(), 3);
+    }
+
+    /// A gap given up is reported with why its last read failed.
+    #[test]
+    fn a_failed_recovery_states_why() {
+        assert_eq!(
+            RecoveryError::TimedOut.failure(),
+            FillRecoveryFailure::TimedOut {
+                timeout_secs: RECOVERY_TIMEOUT.as_secs()
+            }
+        );
+        assert!(matches!(
+            RecoveryError::Ibapi(ibapi::Error::Simple("refused".into())).failure(),
+            FillRecoveryFailure::Request(reason) if reason.contains("refused")
+        ));
     }
 
     fn drain(
