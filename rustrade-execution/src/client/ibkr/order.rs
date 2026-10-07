@@ -1355,6 +1355,113 @@ mod tests {
         assert_eq!(map.len(), 3);
     }
 
+    /// A listed order is adopted under its client order id: tracked, and marked adopted.
+    #[test]
+    fn an_adopted_order_is_tracked_and_marked_adopted() {
+        let map = OrderIdMap::new();
+        let cid = ClientOrderId::new("listed");
+
+        map.adopt(cid.clone(), 7, test_context()).unwrap();
+
+        assert_eq!(map.get_ib_id(&cid), Some(7));
+        assert_eq!(map.get_client_id(7), Some(cid.clone()));
+        assert!(map.registration(&cid).is_some_and(|r| r.adopted));
+    }
+
+    /// An IB order id that already names a tracked order, live or filled and not yet reaped, is
+    /// not adopted under another id, and the tracked order is left as it was.
+    #[test]
+    fn adopting_an_ib_order_id_already_tracked_is_refused_and_changes_nothing() {
+        let map = OrderIdMap::new();
+        let placed = ClientOrderId::new("placed");
+        let adopted = ClientOrderId::new("adopted");
+        let filled = ClientOrderId::new("filled");
+        map.register(placed.clone(), 1, test_context()).unwrap();
+        map.adopt(adopted.clone(), 2, test_context()).unwrap();
+        map.register(filled.clone(), 3, test_context()).unwrap();
+        let _ = map.release_client_id(3);
+
+        for ib_id in [1, 2, 3] {
+            let other = ClientOrderId::new(smol_str::format_smolstr!("other-{ib_id}"));
+            assert_eq!(
+                map.adopt(other.clone(), ib_id, test_context()),
+                Err(AdoptionRefused::IbOrderIdTracked)
+            );
+            assert!(map.get_ib_id(&other).is_none(), "{other} was not tracked");
+        }
+
+        assert_eq!(map.get_client_id(1), Some(placed.clone()));
+        assert_eq!(map.get_client_id(2), Some(adopted.clone()));
+        assert_eq!(map.get_client_id(3), Some(filled.clone()));
+        assert!(map.registration(&placed).is_some_and(|r| !r.adopted));
+        assert!(map.registration(&adopted).is_some_and(|r| r.adopted));
+        assert!(
+            map.registration(&filled).is_none(),
+            "the filled order's id stays free"
+        );
+        assert_eq!(map.len(), 2);
+    }
+
+    /// A client order id a live order holds is not adopted for another IB order, and the live
+    /// order is left as it was.
+    #[test]
+    fn adopting_a_client_order_id_a_live_order_holds_is_refused_and_changes_nothing() {
+        let map = OrderIdMap::new();
+        let placed = ClientOrderId::new("placed");
+        let adopted = ClientOrderId::new("adopted");
+        map.register(placed.clone(), 1, test_context()).unwrap();
+        map.adopt(adopted.clone(), 2, test_context()).unwrap();
+        let before = [
+            map.registration(&placed).map(|r| r.adopted),
+            map.registration(&adopted).map(|r| r.adopted),
+        ];
+
+        for (cid, ib_id) in [(&placed, 10), (&adopted, 20)] {
+            assert_eq!(
+                map.adopt(cid.clone(), ib_id, test_context()),
+                Err(AdoptionRefused::ClientOrderIdInUse)
+            );
+            assert!(!map.contains(ib_id), "IB order {ib_id} was not tracked");
+        }
+
+        assert_eq!(map.get_ib_id(&placed), Some(1));
+        assert_eq!(map.get_ib_id(&adopted), Some(2));
+        assert_eq!(
+            [
+                map.registration(&placed).map(|r| r.adopted),
+                map.registration(&adopted).map(|r| r.adopted),
+            ],
+            before
+        );
+        assert_eq!(map.len(), 2);
+    }
+
+    /// A client order id whose earlier order ended, cancelled or filled, may name an adopted
+    /// order. A filled order keeps its entry, so its late executions still resolve.
+    #[test]
+    fn an_order_is_adopted_under_an_id_whose_earlier_order_ended() {
+        let map = OrderIdMap::new();
+        let cancelled = ClientOrderId::new("cancelled");
+        let filled = ClientOrderId::new("filled");
+        map.register(cancelled.clone(), 1, test_context()).unwrap();
+        map.register(filled.clone(), 2, test_context()).unwrap();
+        let _ = map.remove_and_get_context(1);
+        let _ = map.release_client_id(2);
+
+        map.adopt(cancelled.clone(), 11, test_context()).unwrap();
+        map.adopt(filled.clone(), 12, test_context()).unwrap();
+
+        assert_eq!(map.get_ib_id(&cancelled), Some(11));
+        assert_eq!(map.get_ib_id(&filled), Some(12));
+        assert!(map.registration(&cancelled).is_some_and(|r| r.adopted));
+        assert!(map.registration(&filled).is_some_and(|r| r.adopted));
+        assert_eq!(
+            map.get_client_id(2),
+            Some(filled),
+            "the filled order's executions resolve"
+        );
+    }
+
     #[test]
     fn test_pending_cancels_insert_remove() {
         let cancels = PendingCancels::new();
