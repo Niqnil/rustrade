@@ -974,13 +974,6 @@ impl ExecutionClient for HyperliquidClient {
             return make_rejected(CLOID_REQUIRED.to_string());
         };
 
-        // Map time-in-force (warn if FOK is substituted with IOC)
-        if matches!(request.state.time_in_force, TimeInForce::FillOrKill) {
-            warn!(
-                instrument = %request.key.instrument,
-                "FillOrKill not supported by Hyperliquid, using ImmediateOrCancel (may result in partial fills)"
-            );
-        }
         let tif = map_tif(&request.state.time_in_force).to_string();
 
         let Some(precision) = self.order_precision(request.key.instrument) else {
@@ -1013,6 +1006,14 @@ impl ExecutionClient for HyperliquidClient {
                 ));
             }
         };
+
+        // Logged only for an order about to be sent.
+        if matches!(request.state.time_in_force, TimeInForce::FillOrKill) {
+            warn!(
+                instrument = %request.key.instrument,
+                "FillOrKill not supported by Hyperliquid, using ImmediateOrCancel (may result in partial fills)"
+            );
+        }
 
         let order_request = ClientOrderRequest {
             asset: coin,
@@ -1716,6 +1717,13 @@ mod tests {
                     dec!(0.000001),
                     OrderField::Quantity,
                     PrecisionLimit::DecimalPlaces { max: 5 },
+                ),
+                (
+                    OrderKind::Limit,
+                    dec!(60000),
+                    dec!(0),
+                    OrderField::Quantity,
+                    PrecisionLimit::NotPositive,
                 ),
                 (
                     OrderKind::Limit,

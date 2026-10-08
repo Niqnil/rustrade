@@ -443,16 +443,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The clients now never round. An order whose quantity, price or trigger price breaks
     Hyperliquid's rules is refused before anything is sent, with the new
     `OrderError::InvalidPrecision(PrecisionViolation { field, value, limit })`. `OrderField` names
-    the value, and `PrecisionLimit` the rule it broke: `DecimalPlaces`, `SignificantFigures`, or
-    `NotRepresentable` for a value the SDK's `f64` wire format would change. The error is not
-    transient. Valid values are sent exactly as requested.
+    the value, and `PrecisionLimit` the rule it broke: `DecimalPlaces`, `SignificantFigures`,
+    `NotRepresentable` for a value the SDK's `f64` wire format would change, or `NotPositive` for
+    a zero or negative value. The error is not transient. Valid values are sent exactly as
+    requested.
   - Read the rules with the new `HyperliquidClient::order_precision` and
     `HyperliquidSpotClient::order_precision` (async: it reads `spotMeta` again for a pair listed
-    since), which return the new `OrderPrecision`. It checks values with `check_quantity` and
-    `check_price`, and rounds them with `round_quantity` and `round_price` in the direction you
+    since), which return the new `OrderPrecision`. It checks values with `check_quantity`,
+    `check_price` and `check_trigger_price`, and rounds them with `round_quantity` and `round_price` in the direction you
     pass, so the rounding policy stays with the caller.
   - `SpotPair` gains `base_sz_decimals()`, read from `spotMeta`, and the HIP-3 DEXs' `meta` now
-    supplies each perpetual's `szDecimals`. An order on a perpetual listed after the client
+    supplies each perpetual's `szDecimals`. Both responses must now carry `szDecimals`, which
+    Hyperliquid always sends: a `spotMeta` deserialized into `SpotPairs` without it fails, as it
+    already did in the SDK. An order on a perpetual listed after the client
     connected is refused with `ApiError::InstrumentInvalid`, as the client has no `szDecimals`
     for it. Reconnect to trade it.
   - The public `hyperliquid::common::round_to_5_sig_figs` is removed.

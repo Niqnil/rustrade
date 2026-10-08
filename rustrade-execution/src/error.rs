@@ -378,9 +378,11 @@ pub enum OrderError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     InvalidPrecision(PrecisionViolation),
 }
 
-/// A value in an order request with more precision than the venue accepts.
+/// A value in an order request with more precision than the venue accepts, or that is not
+/// positive.
 ///
 /// Carried by [`OrderError::InvalidPrecision`].
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct PrecisionViolation {
     /// Which value of the request broke the rule.
@@ -389,6 +391,17 @@ pub struct PrecisionViolation {
     pub value: Decimal,
     /// The rule it broke.
     pub limit: PrecisionLimit,
+}
+
+impl PrecisionViolation {
+    /// The request's `field`, of `value`, breaks `limit`.
+    pub fn new(field: OrderField, value: Decimal, limit: PrecisionLimit) -> Self {
+        Self {
+            field,
+            value,
+            limit,
+        }
+    }
 }
 
 impl fmt::Display for PrecisionViolation {
@@ -412,6 +425,7 @@ impl fmt::Display for PrecisionViolation {
             PrecisionLimit::NotRepresentable => {
                 write!(f, "cannot be sent exactly in the venue's number format")
             }
+            PrecisionLimit::NotPositive => write!(f, "is not positive"),
         }
     }
 }
@@ -455,6 +469,8 @@ pub enum PrecisionLimit {
     /// The value cannot be sent exactly: the venue's client library converts it to a number
     /// format that would change it.
     NotRepresentable,
+    /// The value is zero or negative. A quantity or price must be positive.
+    NotPositive,
 }
 
 impl<AssetKey, InstrumentKey> OrderError<AssetKey, InstrumentKey> {

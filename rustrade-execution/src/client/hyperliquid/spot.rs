@@ -200,8 +200,8 @@ impl HyperliquidSpotClient {
         instrument: &InstrumentNameExchange,
     ) -> Option<OrderPrecision> {
         let (base, quote) = spot_base_quote(instrument)?;
-        let pair = self.spot_coins.find(base, quote).await?;
-        Some(OrderPrecision::spot(pair.base_sz_decimals()))
+        let base_sz_decimals = self.spot_coins.base_sz_decimals(base, quote).await?;
+        Some(OrderPrecision::spot(base_sz_decimals))
     }
 
     /// Returns the wallet address as ethers H160.
@@ -802,12 +802,6 @@ impl ExecutionClient for HyperliquidSpotClient {
             return make_rejected(CLOID_REQUIRED.to_string());
         };
 
-        if matches!(request.state.time_in_force, TimeInForce::FillOrKill) {
-            warn!(
-                instrument = %request.key.instrument,
-                "FillOrKill not supported by Hyperliquid, using ImmediateOrCancel (may result in partial fills)"
-            );
-        }
         let tif = map_tif(&request.state.time_in_force).to_string();
 
         let Some(precision) = self.order_precision(request.key.instrument).await else {
@@ -859,6 +853,14 @@ impl ExecutionClient for HyperliquidSpotClient {
                 "Spot order below $10 minimum notional value"
             );
             return make_rejected(format!("Spot order notional ${notional} below $10 minimum"));
+        }
+
+        // Logged only for an order about to be sent.
+        if matches!(request.state.time_in_force, TimeInForce::FillOrKill) {
+            warn!(
+                instrument = %request.key.instrument,
+                "FillOrKill not supported by Hyperliquid, using ImmediateOrCancel (may result in partial fills)"
+            );
         }
 
         let order_request = ClientOrderRequest {

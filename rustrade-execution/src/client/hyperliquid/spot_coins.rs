@@ -69,13 +69,14 @@ impl SpotCoins {
         .await
     }
 
-    /// The pair of `base` quoted in `quote`, as [`SpotPairs::find`] matches it, read again first
-    /// if the pairs lack it, as [`covering`](Self::covering) does.
-    pub(super) async fn find(&self, base: &str, quote: &str) -> Option<SpotPair> {
+    /// The base token's `szDecimals` of the pair of `base` quoted in `quote`, as
+    /// [`SpotPairs::find`] matches it, read again first if the pairs lack it, as
+    /// [`covering`](Self::covering) does.
+    pub(super) async fn base_sz_decimals(&self, base: &str, quote: &str) -> Option<u32> {
         self.read_again_unless(|pairs| pairs.find(base, quote).is_some())
             .await
             .find(base, quote)
-            .cloned()
+            .map(SpotPair::base_sz_decimals)
     }
 
     /// The pairs, read again first unless they are `complete`, at most once per

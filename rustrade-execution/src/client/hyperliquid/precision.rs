@@ -77,7 +77,7 @@ impl OrderPrecision {
         self.max_decimals.saturating_sub(self.sz_decimals)
     }
 
-    /// Check `quantity` against the rules, and that it can be sent exactly.
+    /// Check that `quantity` is positive, meets the rules, and can be sent exactly.
     ///
     /// # Errors
     ///
@@ -87,8 +87,7 @@ impl OrderPrecision {
         self.wire_quantity(quantity).map(drop)
     }
 
-    /// Check `price` against the rules, and that it can be sent exactly. A trigger price follows
-    /// the same rules.
+    /// Check that the limit price `price` is positive, meets the rules, and can be sent exactly.
     ///
     /// # Errors
     ///
@@ -97,9 +96,22 @@ impl OrderPrecision {
         self.wire_price(OrderField::Price, price).map(drop)
     }
 
+    /// Check a stop or take-profit order's `trigger_price` as [`check_price`](Self::check_price)
+    /// checks a limit price: it follows the same rules.
+    ///
+    /// # Errors
+    ///
+    /// The rule `trigger_price` breaks, as a [`PrecisionViolation`] naming
+    /// [`OrderField::TriggerPrice`].
+    pub fn check_trigger_price(&self, trigger_price: Decimal) -> Result<(), PrecisionViolation> {
+        self.wire_price(OrderField::TriggerPrice, trigger_price)
+            .map(drop)
+    }
+
     /// `quantity` rounded to the decimal places the rules allow, by `strategy`.
     ///
-    /// A quantity smaller than the smallest step can round to zero, which Hyperliquid refuses.
+    /// A quantity smaller than the smallest step can round to zero, which
+    /// [`check_quantity`](Self::check_quantity) refuses.
     pub fn round_quantity(&self, quantity: Decimal, strategy: RoundingStrategy) -> Decimal {
         quantity
             .round_dp_with_strategy(self.quantity_decimals(), strategy)
@@ -108,6 +120,9 @@ impl OrderPrecision {
 
     /// `price` rounded by `strategy` to the decimal places and significant figures the rules
     /// allow. An integer price is returned unchanged.
+    ///
+    /// A price smaller than the smallest step the decimal places allow can round to zero, which
+    /// [`check_price`](Self::check_price) refuses.
     pub fn round_price(&self, price: Decimal, strategy: RoundingStrategy) -> Decimal {
         let price = price.normalize();
         if price.scale() == 0 {
@@ -124,11 +139,10 @@ impl OrderPrecision {
 
     /// `quantity` as the `f64` the SDK takes, once checked.
     fn wire_quantity(&self, quantity: Decimal) -> Result<f64, PrecisionViolation> {
-        let violation = |limit| PrecisionViolation {
-            field: OrderField::Quantity,
-            value: quantity,
-            limit,
-        };
+        let violation = |limit| PrecisionViolation::new(OrderField::Quantity, quantity, limit);
+        if quantity <= Decimal::ZERO {
+            return Err(violation(PrecisionLimit::NotPositive));
+        }
         if quantity.normalize().scale() > self.quantity_decimals() {
             return Err(violation(PrecisionLimit::DecimalPlaces {
                 max: self.quantity_decimals(),
@@ -139,11 +153,10 @@ impl OrderPrecision {
 
     /// `price`, the request's `field`, as the `f64` the SDK takes, once checked.
     fn wire_price(&self, field: OrderField, price: Decimal) -> Result<f64, PrecisionViolation> {
-        let violation = |limit| PrecisionViolation {
-            field,
-            value: price,
-            limit,
-        };
+        let violation = |limit| PrecisionViolation::new(field, price, limit);
+        if price <= Decimal::ZERO {
+            return Err(violation(PrecisionLimit::NotPositive));
+        }
         let normalized = price.normalize();
         if normalized.scale() > 0 {
             if normalized.scale() > self.price_decimals() {
@@ -357,6 +370,72 @@ mod tests {
     }
 
     #[test]
+    fn a_value_that_is_not_positive_is_refused() {
+        let perp = OrderPrecision::perp(2);
+        for value in [dec!(0), dec!(0.00), dec!(-1), dec!(-0.5)] {
+            assert_eq!(
+                perp.check_quantity(value),
+                Err(violation(
+                    OrderField::Quantity,
+                    value,
+                    PrecisionLimit::NotPositive
+                ))
+            );
+            assert_eq!(
+                perp.check_price(value),
+                Err(violation(
+                    OrderField::Price,
+                    value,
+                    PrecisionLimit::NotPositive
+                ))
+            );
+            assert_eq!(
+                perp.check_trigger_price(value),
+                Err(violation(
+                    OrderField::TriggerPrice,
+                    value,
+                    PrecisionLimit::NotPositive
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_rounded_to_zero_is_refused() {
+        let quantity =
+            OrderPrecision::perp(2).round_quantity(dec!(0.004), RoundingStrategy::ToZero);
+        assert_eq!(quantity, Decimal::ZERO);
+        assert!(OrderPrecision::perp(2).check_quantity(quantity).is_err());
+
+        // A perpetual with szDecimals 6 allows no decimal places in a price.
+        let precision = OrderPrecision::perp(6);
+        let price = precision.round_price(dec!(0.4), RoundingStrategy::ToZero);
+        assert_eq!(price, Decimal::ZERO);
+        assert_eq!(
+            precision.check_price(price),
+            Err(violation(
+                OrderField::Price,
+                price,
+                PrecisionLimit::NotPositive
+            ))
+        );
+    }
+
+    #[test]
+    fn a_trigger_price_follows_the_price_rules_under_its_own_name() {
+        let perp = OrderPrecision::perp(0);
+        assert_eq!(perp.check_trigger_price(dec!(1234.5)), Ok(()));
+        assert_eq!(
+            perp.check_trigger_price(dec!(1234.56)),
+            Err(violation(
+                OrderField::TriggerPrice,
+                dec!(1234.56),
+                PrecisionLimit::SignificantFigures { max: 5 }
+            ))
+        );
+    }
+
+    #[test]
     fn the_price_cap_never_goes_below_zero_decimal_places() {
         let precision = OrderPrecision::perp(8);
         assert_eq!(precision.price_decimals(), 0);
@@ -422,6 +501,16 @@ mod tests {
             Err(violation(
                 OrderField::Price,
                 huge,
+                PrecisionLimit::NotRepresentable
+            ))
+        );
+        // Within the decimal places allowed, but with more digits than an f64 holds.
+        let long = dec!(12345678901234.12345678);
+        assert_eq!(
+            OrderPrecision::spot(8).check_quantity(long),
+            Err(violation(
+                OrderField::Quantity,
+                long,
                 PrecisionLimit::NotRepresentable
             ))
         );
