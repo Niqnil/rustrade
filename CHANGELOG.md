@@ -268,7 +268,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - New `connect_sync_lenient` returns `ConnectOutcome { client, skipped }`: it connects without
     each contract that fails, and returns those in `skipped`.
   - `SkippedContract { name, reason }` carries a `ContractSkipReason` of `Config`, `Resolve` or
-    `Register`, wrapping the error of the step that failed. `is_transient()` is true only for a
+    `Register`, wrapping the error of the step that failed. `SkippedContract::new` builds one, for
+    testing code that handles skips without IB. `is_transient()` is true only for a
     transient `Resolve` failure, such as a dropped connection. The library does not retry. To
     retry one contract, call `resolve_contract` and `register_contract` on the connected client.
   - `ExecutionClient::new`, which `ExecutionBuilder` calls, uses `connect_sync`, so it now panics

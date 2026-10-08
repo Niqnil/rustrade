@@ -61,6 +61,14 @@ pub struct SkippedContract {
     pub reason: ContractSkipReason,
 }
 
+impl SkippedContract {
+    /// A skipped contract, for code that handles [`ConnectOutcome::skipped`] or
+    /// [`IbkrConnectError::Contracts`] to be tested without IB.
+    pub fn new(name: InstrumentNameExchange, reason: ContractSkipReason) -> Self {
+        Self { name, reason }
+    }
+}
+
 impl std::fmt::Display for SkippedContract {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.name, self.reason)

@@ -1096,8 +1096,10 @@ impl IbkrClient {
     /// configured. To connect anyway and get the failures back, use
     /// [`connect_sync_lenient`](Self::connect_sync_lenient).
     ///
-    /// The library does not retry. [`ContractSkipReason::is_transient`] tells whether
-    /// connecting again may succeed.
+    /// The library does not retry. If every contract in [`IbkrConnectError::Contracts`] has a
+    /// [`reason`](SkippedContract::reason) that [`is_transient`](ContractSkipReason::is_transient),
+    /// connecting again may succeed. Otherwise fix the config, or connect with
+    /// [`connect_sync_lenient`](Self::connect_sync_lenient).
     ///
     /// # Errors
     ///
@@ -1123,6 +1125,11 @@ impl IbkrClient {
     /// instrument, so check `skipped`. To retry one, call
     /// [`resolve_contract`](Self::resolve_contract) and then
     /// [`register_contract`](Self::register_contract) on the connected client.
+    ///
+    /// Blocking, like [`connect_sync`](Self::connect_sync): it waits for the connection and for
+    /// one contract details request per configured contract, each of which can take up to 10
+    /// seconds if IB stops answering. From async code, call it inside
+    /// `tokio::task::spawn_blocking`.
     ///
     /// # Errors
     ///
@@ -2083,7 +2090,8 @@ impl ExecutionClient for IbkrClient {
     #[track_caller]
     fn new(config: Self::Config) -> Self {
         #[allow(clippy::expect_used)] // Trait signature doesn't allow Result
-        Self::connect_sync(config).expect("failed to connect to IB")
+        Self::connect_sync(config)
+            .expect("failed to connect to IB or to register its configured contracts")
     }
 
     /// Fetch account snapshot: balances, and the position and open orders of each registered
