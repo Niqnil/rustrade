@@ -440,6 +440,8 @@ pub enum OrderField {
     Price,
     /// The price that triggers a stop or take-profit order.
     TriggerPrice,
+    /// A trailing order's offset.
+    TrailingOffset,
 }
 
 impl fmt::Display for OrderField {
@@ -448,6 +450,7 @@ impl fmt::Display for OrderField {
             Self::Quantity => "quantity",
             Self::Price => "price",
             Self::TriggerPrice => "trigger price",
+            Self::TrailingOffset => "trailing offset",
         })
     }
 }
@@ -469,7 +472,7 @@ pub enum PrecisionLimit {
     /// The value cannot be sent exactly: the venue's client library converts it to a number
     /// format that would change it.
     NotRepresentable,
-    /// The value is zero or negative. A quantity or price must be positive.
+    /// The value is zero or negative. A quantity, price or trailing offset must be positive.
     NotPositive,
 }
 

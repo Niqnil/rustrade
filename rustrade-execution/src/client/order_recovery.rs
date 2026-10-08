@@ -16,7 +16,7 @@ use crate::{
     AccountEventKind, UnindexedAccountEvent,
     error::UnindexedClientError,
     order::{
-        UnindexedInactiveOrder, UnindexedOrderKey,
+        OrderKind, UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId},
         state::{ActiveOrderState, Open, OrderState, UnindexedOrderState},
     },
@@ -116,6 +116,9 @@ struct KnownLive {
     /// The venue's id, when known, which is how a fill names its order.
     order_id: Option<OrderId>,
     quantity: Decimal,
+    /// The order's kind, as first learned. An order's kind never changes, and a lookup whose
+    /// answer cannot describe it reports this instead (see [`KnownLiveOrders::kind_of`]).
+    kind: OrderKind,
     /// When the entry was added, as its key in [`KnownLiveOrders::by_age`].
     seq: u64,
 }
@@ -165,9 +168,15 @@ impl KnownLiveOrders {
         Arc::new(parking_lot::Mutex::new(Self::new(exchange)))
     }
 
-    /// Record that the order under `key`, of `quantity`, is live as `open` says. An `open` with
-    /// nothing left to fill has ended instead.
-    pub(crate) fn live(&mut self, key: &UnindexedOrderKey, quantity: Decimal, open: &Open) {
+    /// Record that the order under `key`, of `quantity` and `kind`, is live as `open` says. An
+    /// `open` with nothing left to fill has ended instead.
+    pub(crate) fn live(
+        &mut self,
+        key: &UnindexedOrderKey,
+        quantity: Decimal,
+        kind: OrderKind,
+        open: &Open,
+    ) {
         let cid = &key.cid;
         if open.filled_quantity >= quantity {
             self.ended(cid);
@@ -208,6 +217,7 @@ impl KnownLiveOrders {
                     instrument: key.instrument.clone(),
                     order_id: order_id.clone(),
                     quantity,
+                    kind,
                     seq,
                 },
             );
@@ -219,16 +229,19 @@ impl KnownLiveOrders {
         }
     }
 
-    /// Record what the response to placing the order under `key`, of `quantity`, said: live, or
-    /// already ended, which a later report of it as live then cannot undo.
+    /// Record what the response to placing the order under `key`, of `quantity` and `kind`, said:
+    /// live, or already ended, which a later report of it as live then cannot undo.
     pub(crate) fn placed(
         &mut self,
         key: &UnindexedOrderKey,
         quantity: Decimal,
+        kind: OrderKind,
         state: &UnindexedOrderState,
     ) {
         match state {
-            OrderState::Active(ActiveOrderState::Open(open)) => self.live(key, quantity, open),
+            OrderState::Active(ActiveOrderState::Open(open)) => {
+                self.live(key, quantity, kind, open);
+            }
             OrderState::Active(_) => {}
             OrderState::Inactive(_) => {
                 self.ended(&key.cid);
@@ -275,7 +288,7 @@ impl KnownLiveOrders {
         match &event.kind {
             AccountEventKind::OrderSnapshot(Snapshot(order)) => match &order.state {
                 OrderState::Active(ActiveOrderState::Open(open)) => {
-                    self.live(&order.key, order.quantity, open);
+                    self.live(&order.key, order.quantity, order.kind, open);
                 }
                 OrderState::Active(_) => {}
                 OrderState::Inactive(_) => {
@@ -306,6 +319,23 @@ impl KnownLiveOrders {
             }
             _ => {}
         }
+    }
+
+    /// The kind of the order `cid`, if it is held as live.
+    ///
+    /// For a lookup whose venue answer cannot describe the order's kind, such as a Binance margin
+    /// conditional order, whose REST row does not say whether it trails: the order still ends
+    /// with the kind it was placed or reported with, rather than staying held.
+    ///
+    /// It is the kind first recorded for `cid`: a later report of the order as live does not
+    /// change it. That assumes a client order id names one order for as long as it is held: an id
+    /// reused for an order of another kind while held would keep the first kind. An id named
+    /// again once its order has ended (see [`placing`](Self::placing)) is recorded afresh, since
+    /// an order that ends is no longer held.
+    // Only Binance margin's lookups cannot always describe an order's kind.
+    #[cfg_attr(not(feature = "binance"), allow(dead_code))]
+    pub(crate) fn kind_of(&self, cid: &ClientOrderId) -> Option<OrderKind> {
+        self.orders.get(cid).map(|known| known.kind)
     }
 
     /// Whether the order `cid` is held as live.
@@ -977,6 +1007,40 @@ mod tests {
         )))
     }
 
+    /// The set keeps the kind an order was first learned with, from a placement or a report, and
+    /// forgets it with the order.
+    #[test]
+    fn the_set_keeps_the_kind_an_order_was_first_learned_with() {
+        let trailing_stop = OrderKind::TrailingStop {
+            offset: dec!(1.5),
+            offset_type: crate::order::TrailingOffsetType::Percentage,
+        };
+        let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
+        let order = key("BTCUSDT", "trailing");
+        known.placed(
+            &order,
+            dec!(2),
+            trailing_stop,
+            &OrderState::active(open("7", Decimal::ZERO)),
+        );
+        assert_eq!(known.kind_of(&order.cid), Some(trailing_stop));
+
+        // A later report, here describing the trail in basis points, does not replace it.
+        known.live(
+            &order,
+            dec!(2),
+            OrderKind::TrailingStop {
+                offset: dec!(150),
+                offset_type: crate::order::TrailingOffsetType::BasisPoints,
+            },
+            &open("7", dec!(1)),
+        );
+        assert_eq!(known.kind_of(&order.cid), Some(trailing_stop));
+
+        known.ended(&order.cid);
+        assert_eq!(known.kind_of(&order.cid), None);
+    }
+
     /// An id whose order ended is not held again by a late report of it as live, but a new order
     /// placed under it is.
     #[test]
@@ -984,11 +1048,21 @@ mod tests {
         let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
         let reused = key("BTCUSDT", "reused");
         known.ended(&reused.cid);
-        known.live(&reused, dec!(2), &open("1", Decimal::ZERO));
+        known.live(
+            &reused,
+            dec!(2),
+            OrderKind::Limit,
+            &open("1", Decimal::ZERO),
+        );
         assert!(!known.contains(&reused.cid));
 
         known.placing(&reused.cid);
-        known.live(&reused, dec!(2), &open("2", Decimal::ZERO));
+        known.live(
+            &reused,
+            dec!(2),
+            OrderKind::Limit,
+            &open("2", Decimal::ZERO),
+        );
         assert!(known.contains(&reused.cid));
         known.assert_consistent();
     }
@@ -1044,7 +1118,7 @@ mod tests {
     fn a_fill_drops_its_order_only_once_it_reports_the_whole_quantity() {
         let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
         let order = key("BTCUSDT", "a");
-        known.live(&order, dec!(2), &open("7", Decimal::ZERO));
+        known.live(&order, dec!(2), OrderKind::Limit, &open("7", Decimal::ZERO));
 
         known.observe(&fill("7", None));
         assert!(known.contains(&order.cid), "no cumulative says nothing");
@@ -1062,10 +1136,11 @@ mod tests {
     fn a_report_without_the_venue_id_keeps_the_one_known() {
         let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
         let order = key("BTCUSDT", "a");
-        known.live(&order, dec!(2), &open("7", Decimal::ZERO));
+        known.live(&order, dec!(2), OrderKind::Limit, &open("7", Decimal::ZERO));
         known.live(
             &order,
             dec!(2),
+            OrderKind::Limit,
             &Open::new(VenueOrderId::ClientAssigned, Utc::now(), dec!(1)),
         );
 
@@ -1079,13 +1154,13 @@ mod tests {
     fn an_order_with_nothing_left_or_already_ended_is_not_added() {
         let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
         let filled = key("BTCUSDT", "filled");
-        known.live(&filled, dec!(2), &open("1", dec!(2)));
+        known.live(&filled, dec!(2), OrderKind::Limit, &open("1", dec!(2)));
         assert!(!known.contains(&filled.cid));
 
         let late = key("BTCUSDT", "late");
-        known.live(&late, dec!(2), &open("2", Decimal::ZERO));
+        known.live(&late, dec!(2), OrderKind::Limit, &open("2", Decimal::ZERO));
         assert!(known.ended(&late.cid));
-        known.live(&late, dec!(2), &open("2", Decimal::ZERO));
+        known.live(&late, dec!(2), OrderKind::Limit, &open("2", Decimal::ZERO));
         assert!(
             !known.contains(&late.cid),
             "a late live report does not bring it back"
@@ -1100,6 +1175,7 @@ mod tests {
         known.placed(
             &open_order,
             dec!(2),
+            OrderKind::Limit,
             &OrderState::active(open("1", Decimal::ZERO)),
         );
         assert!(known.contains(&open_order.cid));
@@ -1108,6 +1184,7 @@ mod tests {
         known.placed(
             &in_flight,
             dec!(2),
+            OrderKind::Limit,
             &OrderState::active(OpenInFlight::new(Utc::now())),
         );
         assert!(
@@ -1131,8 +1208,8 @@ mod tests {
         ];
         for (cid, state) in ended {
             let order = key("BTCUSDT", cid);
-            known.placed(&order, dec!(2), &state);
-            known.live(&order, dec!(2), &open("9", Decimal::ZERO));
+            known.placed(&order, dec!(2), OrderKind::Limit, &state);
+            known.live(&order, dec!(2), OrderKind::Limit, &open("9", Decimal::ZERO));
             assert!(
                 !known.contains(&order.cid),
                 "{cid}: a late live report does not bring it back"
@@ -1150,6 +1227,7 @@ mod tests {
             known.live(
                 &key(instrument, &n.to_string()),
                 dec!(1),
+                OrderKind::Limit,
                 &open(&n.to_string(), Decimal::ZERO),
             );
         }
@@ -1161,11 +1239,17 @@ mod tests {
         );
         // An order that ends frees its place, so the next one forgets nothing.
         assert!(known.ended(&ClientOrderId::new("2")));
-        known.live(&key("BTCUSDT", "new"), dec!(1), &open("new", Decimal::ZERO));
+        known.live(
+            &key("BTCUSDT", "new"),
+            dec!(1),
+            OrderKind::Limit,
+            &open("new", Decimal::ZERO),
+        );
         assert!(known.contains(&ClientOrderId::new("1")));
         known.live(
             &key("BTCUSDT", "newer"),
             dec!(1),
+            OrderKind::Limit,
             &open("newer", Decimal::ZERO),
         );
         assert!(
@@ -1188,8 +1272,18 @@ mod tests {
     #[test]
     fn keys_on_names_only_that_instrument() {
         let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
-        known.live(&key("BTCUSDT", "a"), dec!(1), &open("1", Decimal::ZERO));
-        known.live(&key("ETHUSDT", "b"), dec!(1), &open("2", Decimal::ZERO));
+        known.live(
+            &key("BTCUSDT", "a"),
+            dec!(1),
+            OrderKind::Limit,
+            &open("1", Decimal::ZERO),
+        );
+        known.live(
+            &key("ETHUSDT", "b"),
+            dec!(1),
+            OrderKind::Limit,
+            &open("2", Decimal::ZERO),
+        );
 
         assert_eq!(
             known.keys_on(
@@ -1219,8 +1313,18 @@ mod tests {
             InstrumentNameExchange::new("BTCUSDT"),
             InstrumentNameExchange::new("ETHUSDT"),
         );
-        known.live(&key("BTCUSDT", "a"), dec!(1), &open("1", Decimal::ZERO));
-        known.live(&key("BTCUSDT", "b"), dec!(1), &open("2", Decimal::ZERO));
+        known.live(
+            &key("BTCUSDT", "a"),
+            dec!(1),
+            OrderKind::Limit,
+            &open("1", Decimal::ZERO),
+        );
+        known.live(
+            &key("BTCUSDT", "b"),
+            dec!(1),
+            OrderKind::Limit,
+            &open("2", Decimal::ZERO),
+        );
 
         known.ended(&ClientOrderId::new("a"));
         assert_eq!(
@@ -1230,7 +1334,12 @@ mod tests {
         );
         known.assert_consistent();
 
-        known.live(&key("ETHUSDT", "b"), dec!(1), &open("2", Decimal::ZERO));
+        known.live(
+            &key("ETHUSDT", "b"),
+            dec!(1),
+            OrderKind::Limit,
+            &open("2", Decimal::ZERO),
+        );
         assert_eq!(
             known.instruments(),
             std::slice::from_ref(&eth),
@@ -1439,6 +1548,7 @@ mod tests {
             known.lock().live(
                 &key(instrument, instrument),
                 dec!(1),
+                OrderKind::Limit,
                 &open(&n.to_string(), Decimal::ZERO),
             );
             unchecked.open([InstrumentNameExchange::new(*instrument)]);
@@ -1543,9 +1653,12 @@ mod tests {
             ("BTCUSDT", "btc-failing", "2"),
             ("ETHUSDT", "eth-ended", "3"),
         ] {
-            known
-                .lock()
-                .live(&key(instrument, cid), dec!(1), &open(id, Decimal::ZERO));
+            known.lock().live(
+                &key(instrument, cid),
+                dec!(1),
+                OrderKind::Limit,
+                &open(id, Decimal::ZERO),
+            );
         }
         let mut unchecked = UncheckedOrders::default();
         unchecked.open(known.lock().instruments());

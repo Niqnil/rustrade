@@ -45,6 +45,19 @@
 //!   and `warn!` for order updates. [`ExecutionClient::fetch_trades`] recovers a fill left out
 //!   once the pair resolves.
 //!
+//! Since every report names a pair from its tokens as Hyperliquid spells them, an order's
+//! instrument must spell them the same way: `kPEPE-USDC-SPOT`, not `KPEPE-USDC-SPOT`.
+//! [`ExecutionClient::open_order`] refuses an order under another spelling unsent, with
+//! [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid) naming the one to
+//! use. An order is then reported under the name it was placed under, and the reads that take
+//! `instruments`, which match names exactly, find it. The perpetuals client matches names
+//! exactly too.
+//!
+//! Neither the reads nor `cancel_order` check the spelling. An `instruments` filter naming a pair
+//! in another spelling, or no listed pair, matches nothing, so the read returns nothing for it
+//! without an error. [`ExecutionClient::cancel_order`] sends the coin as the instrument spells it, so a
+//! cancel under another spelling fails in the SDK.
+//!
 //! Orders are placed through the SDK's `ExchangeClient`, which reads `spotMeta` once, when it is
 //! created, and is never refreshed. So a pair listed after the client was created can be reported
 //! but not traded until the client is created again.
@@ -195,19 +208,50 @@ impl HyperliquidSpotClient {
     /// `None` when `instrument` is not of that form, or Hyperliquid lists no such pair. A pair
     /// missing from the pairs this client holds is looked for in `spotMeta` again first, at most
     /// once every 10 seconds, so a pair listed since the client connected is found.
+    ///
+    /// `None` too when `instrument` spells the pair's tokens differently from Hyperliquid, even
+    /// only in ASCII case (`KPEPE-USDC-SPOT` for `kPEPE/USDC`). Every order report names the
+    /// pair as Hyperliquid spells it, so [`open_order`](ExecutionClient::open_order) refuses an
+    /// order under any other spelling, naming the one to use.
     pub async fn order_precision(
         &self,
         instrument: &InstrumentNameExchange,
     ) -> Option<OrderPrecision> {
         let (base, quote) = spot_base_quote(instrument)?;
-        let base_sz_decimals = self.spot_coins.base_sz_decimals(base, quote).await?;
-        Some(OrderPrecision::spot(base_sz_decimals))
+        let pair = self.traded_pair(base, quote).await.ok()?;
+        Some(OrderPrecision::spot(pair.base_sz_decimals()))
+    }
+
+    /// The pair of `base` quoted in `quote`, spelled exactly as Hyperliquid spells its tokens,
+    /// looked for as [`order_precision`](Self::order_precision) describes.
+    async fn traded_pair(&self, base: &str, quote: &str) -> Result<SpotPair, UntradedPair> {
+        let pair = self
+            .spot_coins
+            .find(base, quote)
+            .await
+            .ok_or(UntradedPair::Unlisted)?;
+        if pair.base() == base && pair.quote() == quote {
+            Ok(pair)
+        } else {
+            Err(UntradedPair::Misspelled(pair))
+        }
     }
 
     /// Returns the wallet address as ethers H160.
     fn wallet_h160(&self) -> ethers::types::H160 {
         self.config.wallet.address()
     }
+}
+
+/// Why a spot instrument names no pair the client places orders on.
+#[derive(Debug)]
+enum UntradedPair {
+    /// Hyperliquid lists no such pair, even after `spotMeta` is read again.
+    Unlisted,
+    /// Hyperliquid lists the pair, but spells its tokens differently, if only in ASCII case.
+    /// Every report names the pair as Hyperliquid spells it, so an order placed under this
+    /// spelling would be reported under another name, and left out of reads filtered by this one.
+    Misspelled(SpotPair),
 }
 
 impl ExecutionClient for HyperliquidSpotClient {
@@ -587,6 +631,9 @@ impl ExecutionClient for HyperliquidSpotClient {
         use hyperliquid_rust_sdk::{ClientCancelRequest, ClientCancelRequestCloid};
         use uuid::Uuid;
 
+        // An order is placed, and reported, only under its pair's exact spelling (see
+        // `open_order`), so the instrument of any order this client placed or reported spells
+        // the coin as the SDK keys it. A name in another spelling fails in the SDK.
         let coin = match instrument_to_spot_coin(request.key.instrument) {
             Some(c) => c,
             None => {
@@ -762,18 +809,15 @@ impl ExecutionClient for HyperliquidSpotClient {
         };
         let make_unsupported = |msg: String| make_inactive(OrderError::UnsupportedOrderType(msg));
 
-        let coin = match instrument_to_spot_coin(request.key.instrument) {
-            Some(c) => c,
-            None => {
-                warn!(
-                    instrument = %request.key.instrument,
-                    "Invalid spot instrument format (expected BASE-QUOTE-SPOT)"
-                );
-                return make_rejected(format!(
-                    "Invalid instrument format: {}",
-                    request.key.instrument
-                ));
-            }
+        let Some((base, quote)) = spot_base_quote(request.key.instrument) else {
+            warn!(
+                instrument = %request.key.instrument,
+                "Invalid spot instrument format (expected BASE-QUOTE-SPOT)"
+            );
+            return make_rejected(format!(
+                "Invalid instrument format: {}",
+                request.key.instrument
+            ));
         };
         let is_buy = request.state.side == Side::Buy;
 
@@ -804,14 +848,34 @@ impl ExecutionClient for HyperliquidSpotClient {
 
         let tif = map_tif(&request.state.time_in_force).to_string();
 
-        let Some(precision) = self.order_precision(request.key.instrument).await else {
-            return make_inactive(OrderError::Rejected(
-                crate::error::ApiError::InstrumentInvalid(
-                    request.key.instrument.clone(),
-                    format!("Hyperliquid's spotMeta lists no spot pair {coin}"),
-                ),
-            ));
+        let pair = match self.traded_pair(base, quote).await {
+            Ok(pair) => pair,
+            Err(untraded) => {
+                let reason = match untraded {
+                    UntradedPair::Unlisted => {
+                        format!("Hyperliquid's spotMeta lists no spot pair {base}/{quote}")
+                    }
+                    UntradedPair::Misspelled(pair) => format!(
+                        "Hyperliquid spells this spot pair {}/{}, and reports its orders under \
+                         {}; name the instrument that way",
+                        pair.base(),
+                        pair.quote(),
+                        spot_pair_to_instrument(&pair)
+                    ),
+                };
+                warn!(instrument = %request.key.instrument, %reason, "Spot order refused unsent");
+                return make_inactive(OrderError::Rejected(
+                    crate::error::ApiError::InstrumentInvalid(
+                        request.key.instrument.clone(),
+                        reason,
+                    ),
+                ));
+            }
         };
+        let precision = OrderPrecision::spot(pair.base_sz_decimals());
+        // The SDK addresses a spot pair by `BASE/QUOTE` spelled exactly as `spotMeta` spells its
+        // tokens, which the pair's own names are.
+        let coin = format!("{}/{}", pair.base(), pair.quote());
         let wire = match wire_order(
             &precision,
             request.state.kind,
@@ -975,7 +1039,7 @@ impl ExecutionClient for HyperliquidSpotClient {
         };
         self.known_live
             .lock()
-            .placed(&order.key, order.quantity, &order.state);
+            .placed(&order.key, order.quantity, order.kind, &order.state);
         order
     }
 
@@ -1450,7 +1514,7 @@ mod tests {
         use super::super::super::config::Network;
         use super::super::super::spot_coins::TEST_SPOT_META;
         use super::*;
-        use crate::error::{OrderField, PrecisionLimit, PrecisionViolation};
+        use crate::error::{ApiError, OrderField, PrecisionLimit, PrecisionViolation};
         use crate::order::{OrderEvent, request::RequestOpen, state::InactiveOrderState};
         use std::collections::HashMap;
         use wiremock::matchers::{method, path};
@@ -1496,7 +1560,16 @@ mod tests {
             price: Decimal,
             quantity: Decimal,
         ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
-            let instrument = InstrumentNameExchange::new("HYPE-USDC-SPOT");
+            place(client, "HYPE-USDC-SPOT", price, quantity).await
+        }
+
+        async fn place(
+            client: &HyperliquidSpotClient,
+            instrument: &str,
+            price: Decimal,
+            quantity: Decimal,
+        ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
+            let instrument = InstrumentNameExchange::new(instrument);
             client
                 .open_order(OrderEvent {
                     key: OrderKey {
@@ -1556,6 +1629,51 @@ mod tests {
                     .await,
                 None
             );
+        }
+
+        #[tokio::test]
+        async fn a_spot_order_spelling_the_pair_differently_is_refused_unsent() {
+            let (server, client) = resting_client().await;
+
+            // Hyperliquid spells the pair HYPE/USDC, and reports its orders under HYPE-USDC-SPOT.
+            for instrument in ["hype-usdc-SPOT", "Hype-USDC-SPOT"] {
+                let order = place(&client, instrument, dec!(25), dec!(1)).await;
+                assert_eq!(
+                    order.state,
+                    OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                        ApiError::InstrumentInvalid(
+                            InstrumentNameExchange::new(instrument),
+                            "Hyperliquid spells this spot pair HYPE/USDC, and reports its orders \
+                             under HYPE-USDC-SPOT; name the instrument that way"
+                                .to_owned(),
+                        )
+                    )))
+                );
+                assert_eq!(
+                    client
+                        .order_precision(&InstrumentNameExchange::new(instrument))
+                        .await,
+                    None
+                );
+            }
+            assert_eq!(sent_orders(&server).await, Vec::<serde_json::Value>::new());
+        }
+
+        #[tokio::test]
+        async fn a_spot_order_on_an_unlisted_pair_is_refused_unsent() {
+            let (server, client) = resting_client().await;
+
+            let order = place(&client, "HYPE-PURR-SPOT", dec!(25), dec!(1)).await;
+            assert_eq!(
+                order.state,
+                OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                    ApiError::InstrumentInvalid(
+                        InstrumentNameExchange::new("HYPE-PURR-SPOT"),
+                        "Hyperliquid's spotMeta lists no spot pair HYPE/PURR".to_owned(),
+                    )
+                )))
+            );
+            assert_eq!(sent_orders(&server).await, Vec::<serde_json::Value>::new());
         }
 
         #[tokio::test]
@@ -1673,7 +1791,10 @@ mod tests {
                 time_exchange: Utc::now(),
                 filled_quantity: Decimal::ZERO,
             };
-            client.known_live.lock().live(&key, dec!(1), &open);
+            client
+                .known_live
+                .lock()
+                .live(&key, dec!(1), OrderKind::Limit, &open);
 
             let response = client
                 .cancel_order(OrderEvent {

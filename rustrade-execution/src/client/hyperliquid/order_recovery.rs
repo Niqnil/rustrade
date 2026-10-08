@@ -206,7 +206,7 @@ pub(super) fn remember_snapshot(
         .flat_map(|instrument| &instrument.orders)
     {
         if let OrderState::Active(ActiveOrderState::Open(open)) = &order.state {
-            known.live(&order.key, order.quantity, open);
+            known.live(&order.key, order.quantity, order.kind, open);
         }
     }
 }
@@ -218,7 +218,7 @@ pub(super) fn remember_open<'a>(
 ) {
     let mut known = known.lock();
     for order in orders {
-        known.live(&order.key, order.quantity, &order.state);
+        known.live(&order.key, order.quantity, order.kind, &order.state);
     }
 }
 
@@ -720,7 +720,12 @@ pub(super) mod tests {
     #[test]
     fn an_order_the_stream_reports_ending_is_no_longer_held() {
         let known = KnownLiveOrders::shared(ExchangeId::HyperliquidPerp);
-        known.lock().live(&key(CID), dec!(0.01), &open());
+        known.lock().live(
+            &key(CID),
+            dec!(0.01),
+            crate::order::OrderKind::Limit,
+            &open(),
+        );
         let (tx, mut rx) = mpsc::unbounded_channel();
         let ended = record("BTC", "canceled", "0.01");
         let event = super::super::common::order_update_to_account_event(
@@ -745,7 +750,12 @@ pub(super) mod tests {
         mpsc::UnboundedReceiver<UnindexedAccountEvent>,
     ) {
         let known = KnownLiveOrders::shared(ExchangeId::HyperliquidPerp);
-        known.lock().live(&key(CID), dec!(0.01), &open());
+        known.lock().live(
+            &key(CID),
+            dec!(0.01),
+            crate::order::OrderKind::Limit,
+            &open(),
+        );
         let reconnected = Arc::new(Notify::new());
         let cancel = CancellationToken::new();
         let (tx, rx) = mpsc::unbounded_channel();

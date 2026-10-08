@@ -1129,7 +1129,7 @@ impl ExecutionClient for HyperliquidClient {
         };
         self.known_live
             .lock()
-            .placed(&order.key, order.quantity, &order.state);
+            .placed(&order.key, order.quantity, order.kind, &order.state);
         order
     }
 
@@ -1857,7 +1857,10 @@ mod tests {
                 time_exchange: Utc::now(),
                 filled_quantity: Decimal::ZERO,
             };
-            client.known_live.lock().live(&key, dec!(1), &open);
+            client
+                .known_live
+                .lock()
+                .live(&key, dec!(1), OrderKind::Limit, &open);
 
             let response = client
                 .cancel_order(OrderEvent {

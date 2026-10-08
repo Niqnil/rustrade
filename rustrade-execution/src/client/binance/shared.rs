@@ -6,12 +6,12 @@
 //!
 //! Nothing here is spot- or margin-specific: the parsers operate on rustrade's own types
 //! (`OrderKind`, `TimeInForce`, `Side`) or on Binance's stable wire strings, so both clients
-//! reuse them unchanged. The two event converters join them the same way, each naming the field
-//! subset it reads as a trait -- [`BinanceOrderFields`] for the REST order-response endpoints,
-//! [`BinanceExecutionReportFields`] for the WebSocket user-data `executionReport`. Those subsets
-//! are provably identical across every SDK type implementing them, even though the structs around
-//! them are not, which is what makes one converter safe to share and keeps a venue name out of
-//! both. The remaining SDK-typed converters, which differ between spot's WS-API enums and
+//! reuse them unchanged. The REST order-response converter names the field subset it reads as a
+//! trait, [`BinanceOrderFields`], which is identical across every SDK type implementing it even
+//! though the structs around it are not. The WebSocket user-data `executionReport` is decoded into
+//! this crate's own [`ExecutionReport`] instead, because the SDK's spot and margin report types
+//! disagree on wire types. Either way one converter serves both clients and keeps a venue name out
+//! of it. The remaining SDK-typed converters, which differ between spot's WS-API enums and
 //! margin's REST params, deliberately stay in their respective modules.
 //!
 //! Event deduplication lives in [`crate::client::dedup`], shared with the other clients that
@@ -19,7 +19,10 @@
 
 use crate::{
     AccountEventKind, UnindexedAccountEvent,
-    error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
+    error::{
+        ApiError, ConnectivityError, OrderError, OrderField, PrecisionLimit, PrecisionViolation,
+        UnindexedClientError, UnindexedOrderError,
+    },
     fill_recovery::{FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope},
     order::{
         Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType, UnindexedInactiveOrder,
@@ -51,8 +54,13 @@ use rustrade_instrument::{
     Side, asset::name::AssetNameExchange, exchange::ExchangeId,
     instrument::name::InstrumentNameExchange,
 };
+use serde::{
+    Deserialize, Deserializer,
+    de::{self, Visitor},
+};
 use smol_str::format_smolstr;
 use std::{
+    fmt,
     pin::Pin,
     str::FromStr,
     sync::{
@@ -499,7 +507,7 @@ pub(crate) fn log_unrecognised_frame(venue: &'static str, seen: &AtomicU64, fram
 }
 
 /// The first 200 characters of a frame, for a log line about it.
-fn frame_excerpt(frame: &str) -> &str {
+pub(crate) fn frame_excerpt(frame: &str) -> &str {
     frame
         .char_indices()
         .nth(200)
@@ -923,30 +931,160 @@ pub(crate) fn parse_side(s: &str) -> Option<Side> {
     }
 }
 
-pub(crate) fn parse_order_kind(t: &str) -> Option<OrderKind> {
-    match t {
-        "MARKET" => Some(OrderKind::Market),
-        // STOP_LOSS and TAKE_PROFIT are conditional orders that Binance
-        // triggers at a stop price. Barter's OrderKind has no conditional variant.
-        // Drop them: mapping to Market would misrepresent conditional orders as
-        // immediately executable in snapshots, which is more dangerous than omitting.
-        "STOP_LOSS" | "TAKE_PROFIT" => {
-            warn!(
-                order_type = t,
-                "dropping conditional Binance order type (no OrderKind equivalent)"
-            );
+/// What an order row or `executionReport` says about the order's `trailingDelta`.
+///
+/// Binance sets a trailing order as a conditional type plus a `trailingDelta`, so whether a
+/// `STOP_LOSS` is a fixed stop or a trailing one depends on this, not on its type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrailingDelta {
+    /// The source reports trailing deltas and this order has none: it does not trail.
+    Absent,
+    /// The order trails by this many basis points.
+    BasisPoints(u32),
+    /// Whether the order trails cannot be told: the source does not report the field (margin's
+    /// REST order queries, see #541) or reported it unreadably.
+    Unknown,
+}
+
+impl TrailingDelta {
+    /// Read a `trailingDelta` from a source that reports it: absent or zero means the order does
+    /// not trail, and a negative one is unreadable.
+    pub(crate) fn from_reported(delta: Option<i64>) -> Self {
+        match delta {
+            None | Some(0) => Self::Absent,
+            Some(bips) => u32::try_from(bips).map_or(Self::Unknown, Self::BasisPoints),
+        }
+    }
+}
+
+/// The [`OrderKind`] a Binance order row or `executionReport` describes, from its `type`,
+/// `stopPrice` and `trailingDelta`.
+///
+/// - `MARKET` is [`OrderKind::Market`]; `LIMIT` and `LIMIT_MAKER` are [`OrderKind::Limit`].
+/// - `STOP_LOSS`, `STOP_LOSS_LIMIT`, `TAKE_PROFIT` and `TAKE_PROFIT_LIMIT` without a trailing delta
+///   are [`OrderKind::Stop`], [`OrderKind::StopLimit`], [`OrderKind::TakeProfit`] and
+///   [`OrderKind::TakeProfitLimit`], triggered at `stopPrice`.
+/// - `STOP_LOSS` with a trailing delta is an [`OrderKind::TrailingStop`] of that many basis points,
+///   whichever offset type it was placed with. A `stopPrice` alongside it is an activation price,
+///   which `TrailingStop` cannot hold yet (#539), so it decodes without it, with a warning.
+///
+/// Returns `None`, with a warning, for an order this cannot describe faithfully, so that it is
+/// dropped and its listing reads as incomplete rather than describing a different order:
+/// - a type this version does not know;
+/// - a fixed-trigger order without a positive `stopPrice`;
+/// - a trailing `STOP_LOSS_LIMIT`, whose limit price stays fixed while the stop trails, unlike
+///   [`OrderKind::TrailingStopLimit`]'s (#540), and a trailing take-profit;
+/// - a conditional order whose trailing delta is [`TrailingDelta::Unknown`], which could be either
+///   a fixed or a trailing order.
+///
+/// The warnings for those last two cases and for an activation price come from the venue's
+/// shape, not from one bad order, and recur on every listing and report of the same live order;
+/// each warns on its first occurrence and every 1000th after (see [`sampled`]), and logs the rest
+/// at `debug`.
+pub(crate) fn decode_order_kind(
+    exchange: ExchangeId,
+    order_id: Option<i64>,
+    order_type: &str,
+    stop_price: Option<&str>,
+    trailing_delta: TrailingDelta,
+) -> Option<OrderKind> {
+    let stop_price = stop_price
+        .and_then(|raw| Decimal::from_str(raw).ok())
+        .filter(|price| price.is_sign_positive() && !price.is_zero());
+    let triggered = |kind: fn(Decimal) -> OrderKind| {
+        if stop_price.is_none() {
+            warn!(%exchange, ?order_id, order_type, "Binance conditional order has no positive stopPrice, dropping it");
+        }
+        stop_price.map(kind)
+    };
+    match (order_type, trailing_delta) {
+        ("MARKET", _) => Some(OrderKind::Market),
+        ("LIMIT" | "LIMIT_MAKER", _) => Some(OrderKind::Limit),
+        (_, TrailingDelta::Unknown) if is_conditional_order_type(order_type) => {
+            static SEEN: AtomicU64 = AtomicU64::new(0);
+            let (count, warns) = sampled(&SEEN);
+            if warns {
+                warn!(%exchange, ?order_id, order_type, count, "Binance conditional order may be a trailing one and its trailingDelta is unknown, dropping it; further ones are logged at debug, with a warning every 1000th");
+            } else {
+                debug!(%exchange, ?order_id, order_type, count, "Binance conditional order may be a trailing one and its trailingDelta is unknown, dropping it");
+            }
             None
         }
-        // STOP_LOSS_LIMIT and TAKE_PROFIT_LIMIT are conditional orders
-        // with a limit price that enter the book only after a stop trigger.
-        // Mapping to Limit is imprecise (treats them as resting limit orders)
-        // but preserves visibility into open orders. Dropping them (like the
-        // pure stop variants above) would lose order tracking entirely.
-        "LIMIT" | "LIMIT_MAKER" | "STOP_LOSS_LIMIT" | "TAKE_PROFIT_LIMIT" => Some(OrderKind::Limit),
+        ("STOP_LOSS", TrailingDelta::Absent) => {
+            triggered(|trigger_price| OrderKind::Stop { trigger_price })
+        }
+        ("STOP_LOSS_LIMIT", TrailingDelta::Absent) => {
+            triggered(|trigger_price| OrderKind::StopLimit { trigger_price })
+        }
+        ("TAKE_PROFIT", TrailingDelta::Absent) => {
+            triggered(|trigger_price| OrderKind::TakeProfit { trigger_price })
+        }
+        ("TAKE_PROFIT_LIMIT", TrailingDelta::Absent) => {
+            triggered(|trigger_price| OrderKind::TakeProfitLimit { trigger_price })
+        }
+        ("STOP_LOSS", TrailingDelta::BasisPoints(bips)) => {
+            if let Some(activation_price) = stop_price {
+                static SEEN: AtomicU64 = AtomicU64::new(0);
+                let (count, warns) = sampled(&SEEN);
+                if warns {
+                    warn!(%exchange, ?order_id, %activation_price, count, "Binance trailing stop has an activation price, which TrailingStop cannot carry; reporting it without; further ones are logged at debug, with a warning every 1000th");
+                } else {
+                    debug!(%exchange, ?order_id, %activation_price, count, "Binance trailing stop has an activation price, which TrailingStop cannot carry; reporting it without");
+                }
+            }
+            Some(OrderKind::TrailingStop {
+                offset: Decimal::from(bips),
+                offset_type: TrailingOffsetType::BasisPoints,
+            })
+        }
+        (
+            "STOP_LOSS_LIMIT" | "TAKE_PROFIT" | "TAKE_PROFIT_LIMIT",
+            TrailingDelta::BasisPoints(_),
+        ) => {
+            static SEEN: AtomicU64 = AtomicU64::new(0);
+            let (count, warns) = sampled(&SEEN);
+            if warns {
+                warn!(%exchange, ?order_id, order_type, count, "Binance trailing order of a type OrderKind cannot describe, dropping it; further ones are logged at debug, with a warning every 1000th");
+            } else {
+                debug!(%exchange, ?order_id, order_type, count, "Binance trailing order of a type OrderKind cannot describe, dropping it");
+            }
+            None
+        }
         _ => {
-            warn!(order_type = t, "unsupported Binance order type");
+            warn!(%exchange, ?order_id, order_type, "unsupported Binance order type");
             None
         }
+    }
+}
+
+/// Count one more occurrence of a recurring condition on `seen`, a process-wide counter per
+/// condition, and say whether it warns: the first does, and every 1000th after it, as in
+/// [`log_unrecognised_frame`]. Returns the running count with it.
+fn sampled(seen: &AtomicU64) -> (u64, bool) {
+    let count = seen.fetch_add(1, Ordering::Relaxed) + 1;
+    (count, count == 1 || count.is_multiple_of(1000))
+}
+
+/// Whether a Binance order `type` is conditional, and so may carry a `trailingDelta`.
+fn is_conditional_order_type(order_type: &str) -> bool {
+    matches!(
+        order_type,
+        "STOP_LOSS" | "STOP_LOSS_LIMIT" | "TAKE_PROFIT" | "TAKE_PROFIT_LIMIT"
+    )
+}
+
+/// Whether orders of `kind` carry a limit price in Binance's `price` field, which reads zero on
+/// every other kind.
+fn kind_has_limit_price(kind: &OrderKind) -> bool {
+    match kind {
+        OrderKind::Limit
+        | OrderKind::StopLimit { .. }
+        | OrderKind::TakeProfitLimit { .. }
+        | OrderKind::TrailingStopLimit { .. } => true,
+        OrderKind::Market
+        | OrderKind::Stop { .. }
+        | OrderKind::TakeProfit { .. }
+        | OrderKind::TrailingStop { .. } => false,
     }
 }
 
@@ -979,8 +1117,9 @@ pub(crate) fn parse_time_in_force(tif: &str) -> TimeInForce {
 /// `QueryMarginAccountsOpenOrdersResponseInner` and `QueryMarginAccountsOrderResponse` on margin.
 /// Those structs are emphatically not
 /// interchangeable -- the spot family carries substantially more fields than the margin one, and
-/// several fields share a name while differing in type -- but the thirteen named here are
-/// identical in name and type across all of them.
+/// several fields share a name while differing in type -- but the fourteen named here are
+/// identical in name and type across all of them. The one that is not, `trailingDelta`, the margin
+/// structs lack entirely, so each impl says how it reads it.
 ///
 /// Naming that read subset is what makes a single converter safe to share. The dependency surface
 /// is explicit, so an SDK change to any *other* field cannot silently alter order parsing, and a
@@ -1005,14 +1144,26 @@ pub(crate) trait BinanceOrderFields {
     fn status(&self) -> Option<&str>;
     /// The quote quantity the order has traded so far, spelled `cummulativeQuoteQty` by Binance.
     fn cumulative_quote_qty(&self) -> Option<&str>;
+    /// `stopPrice`: a conditional order's trigger, or a trailing order's activation price.
+    fn stop_price(&self) -> Option<&str>;
+    /// `trailingDelta`. The margin order queries do not carry it (#541), so on those every order
+    /// reads [`TrailingDelta::Unknown`].
+    fn trailing_delta(&self) -> TrailingDelta;
 }
 
 /// Implement [`BinanceOrderFields`] for SDK response types that share these field names.
 ///
-/// Every struct listed below declares these thirteen fields with the same types, so the accessors
-/// are identical; a macro keeps them from drifting apart under hand-editing.
+/// Every struct listed below declares the fourteen shared fields with the same types, so those
+/// accessors are identical; a macro keeps them from drifting apart under hand-editing. Each list
+/// names how its structs read `trailingDelta`.
 macro_rules! impl_binance_order_fields {
-    ($($t:ty),* $(,)?) => {
+    (reports_trailing_delta: $($t:ty),* $(,)?) => {
+        impl_binance_order_fields!(@impl |order| TrailingDelta::from_reported(order.trailing_delta); $($t),*);
+    };
+    (omits_trailing_delta: $($t:ty),* $(,)?) => {
+        impl_binance_order_fields!(@impl |_order| TrailingDelta::Unknown; $($t),*);
+    };
+    (@impl |$order:ident| $trailing_delta:expr; $($t:ty),*) => {
         $(
             impl BinanceOrderFields for $t {
                 fn order_id(&self) -> Option<i64> { self.order_id }
@@ -1030,16 +1181,23 @@ macro_rules! impl_binance_order_fields {
                 fn cumulative_quote_qty(&self) -> Option<&str> {
                     self.cummulative_quote_qty.as_deref()
                 }
+                fn stop_price(&self) -> Option<&str> { self.stop_price.as_deref() }
+                fn trailing_delta(&self) -> TrailingDelta {
+                    let $order = self;
+                    $trailing_delta
+                }
             }
         )*
     };
 }
 
 impl_binance_order_fields!(
-    binance_sdk::spot::rest_api::AllOrdersResponseInner,
+    reports_trailing_delta: binance_sdk::spot::rest_api::AllOrdersResponseInner,
     binance_sdk::spot::rest_api::GetOpenOrdersResponseInner,
     binance_sdk::spot::rest_api::GetOrderResponse,
-    binance_sdk::margin_trading::rest_api::QueryMarginAccountsOpenOrdersResponseInner,
+);
+impl_binance_order_fields!(
+    omits_trailing_delta: binance_sdk::margin_trading::rest_api::QueryMarginAccountsOpenOrdersResponseInner,
     binance_sdk::margin_trading::rest_api::QueryMarginAccountsOrderResponse,
 );
 
@@ -1084,7 +1242,7 @@ pub(crate) fn convert_open_order<T: BinanceOrderFields>(
             return None;
         }
     }
-    let row = convert_order_row(o, exchange, instrument)?;
+    let row = convert_order_row(o, exchange, instrument, UnknownTrailingDelta::Drop)?;
     Some(row.map_state(|row| {
         // A live order's fill only grows, so an unknown one reads as nothing filled until the
         // account stream reports more.
@@ -1108,10 +1266,19 @@ pub(crate) fn convert_open_order<T: BinanceOrderFields>(
 /// Returns `None` for an order still live, and, with a warning, for a row whose status is missing
 /// or unknown or that cannot be converted. A caller reads `None` as "not ended", so such an order
 /// is asked about again later rather than retired on a guess.
+///
+/// A conditional order whose trailing delta the row cannot tell (margin, #541) is still reported,
+/// rather than left unretired: what matters of an order that has ended is that it ended, and an
+/// order held as live after it fired is a protective stop that is not there. It is reported with
+/// `recorded_kind`, the kind the client holds the order with, when the caller has one; otherwise
+/// with its fixed-trigger kind at `stopPrice`, with a warning, since it may have trailed. Without
+/// a recorded kind, one without a positive `stopPrice`, which can only be a trailing order, has no
+/// kind to report and still reads as not ended.
 pub(crate) fn convert_ended_order<T: BinanceOrderFields>(
     o: &T,
     exchange: ExchangeId,
     key: &UnindexedOrderKey,
+    recorded_kind: Option<OrderKind>,
 ) -> Option<UnindexedInactiveOrder> {
     let instrument = &key.instrument;
     let Some(status) = o.status() else {
@@ -1121,7 +1288,14 @@ pub(crate) fn convert_ended_order<T: BinanceOrderFields>(
     if rest_order_is_open(status) {
         return None;
     }
-    let row = convert_order_row(o, exchange, instrument)?;
+    let row = convert_order_row(
+        o,
+        exchange,
+        instrument,
+        UnknownTrailingDelta::Ended {
+            recorded: recorded_kind,
+        },
+    )?;
     let Some(state) = ended_order_state(
         status,
         row.state.order_id.clone(),
@@ -1313,6 +1487,18 @@ struct OrderRow {
     filled_qty: Option<Decimal>,
 }
 
+/// How [`convert_order_row`] reads a conditional order whose trailing delta is
+/// [`TrailingDelta::Unknown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnknownTrailingDelta {
+    /// Drop the row: a live order described wrongly misleads whatever acts on it.
+    Drop,
+    /// The order has ended (see [`convert_ended_order`]): report it with `recorded`, the kind the
+    /// client holds it with, or failing that read it as a fixed-trigger order, since the kind of an
+    /// order that has ended no longer steers anything.
+    Ended { recorded: Option<OrderKind> },
+}
+
 /// Convert the fields of a REST order row that do not depend on its status, shared by
 /// [`convert_open_order`] and [`convert_ended_order`]. Returns `None`, with a warning, when a field
 /// the order cannot be described without is missing or unparseable.
@@ -1320,6 +1506,7 @@ fn convert_order_row<T: BinanceOrderFields>(
     o: &T,
     exchange: ExchangeId,
     instrument: &InstrumentNameExchange,
+    unknown_trailing_delta: UnknownTrailingDelta,
 ) -> Option<Order<ExchangeId, InstrumentNameExchange, OrderRow>> {
     let Some(order_id_raw) = o.order_id() else {
         warn!(%exchange, %instrument, "Binance order missing orderId");
@@ -1341,7 +1528,6 @@ fn convert_order_row<T: BinanceOrderFields>(
             return None;
         }
     };
-    let price = o.price().and_then(|s| Decimal::from_str(s).ok());
     let quantity = match o.orig_qty().and_then(|s| Decimal::from_str(s).ok()) {
         Some(v) => v,
         None => {
@@ -1351,12 +1537,44 @@ fn convert_order_row<T: BinanceOrderFields>(
     };
     let filled_qty = binance_filled_qty(exchange, &order_id, o.executed_qty());
     let kind = match o.order_type() {
-        // parse_order_kind already logs a warning on unknown values
-        Some(t) => parse_order_kind(t)?,
+        Some(t) => {
+            let trailing_delta = o.trailing_delta();
+            // decode_order_kind already logs a warning on what it cannot describe
+            let decode = |trailing_delta| {
+                decode_order_kind(
+                    exchange,
+                    Some(order_id_raw),
+                    t,
+                    o.stop_price(),
+                    trailing_delta,
+                )
+            };
+            let undescribed =
+                trailing_delta == TrailingDelta::Unknown && is_conditional_order_type(t);
+            match unknown_trailing_delta {
+                UnknownTrailingDelta::Ended {
+                    recorded: Some(recorded),
+                } if undescribed => {
+                    debug!(%exchange, %instrument, order_id = %order_id_raw, order_type = t, kind = %recorded, "Binance order has ended and its row cannot tell whether it trailed; reporting it with the kind it was held with");
+                    recorded
+                }
+                UnknownTrailingDelta::Ended { recorded: None } if undescribed => {
+                    warn!(%exchange, %instrument, order_id = %order_id_raw, order_type = t, "Binance order has ended and may have been a trailing one, which its row cannot tell; reporting it with its fixed trigger");
+                    decode(TrailingDelta::Absent)?
+                }
+                _ => decode(trailing_delta)?,
+            }
+        }
         None => {
             warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance order missing type");
             return None;
         }
+    };
+    // Binance reports a price of zero on kinds that carry no limit price.
+    let price = if kind_has_limit_price(&kind) {
+        o.price().and_then(|s| Decimal::from_str(s).ok())
+    } else {
+        None
     };
     let time_in_force = parse_time_in_force(o.time_in_force().unwrap_or("GTC"));
     // `update_time` over `time`: `Open::time_exchange` orders an order's states, and the engine
@@ -1636,122 +1854,172 @@ pub(crate) fn order_running_totals<T: BinanceExecutionFields>(
 // executionReport conversion (WebSocket user-data stream)
 // ---------------------------------------------------------------------------
 
-/// The subset of a Binance `executionReport` that [`convert_execution_report`] reads.
+/// A Binance user-data `executionReport`, as both the spot and margin clients read it.
 ///
-/// As with [`BinanceOrderFields`], binance-sdk generates a distinct nominal type per stream
-/// family and gives them no shared trait: `spot::websocket_api::ExecutionReport` and
-/// `margin_trading::websocket_streams::ExecutionReport`. The two are not interchangeable -- spot
-/// declares 55 fields to margin's 50, and eight fields sharing a name differ in type
-/// (`Option<i64>` on spot against `Option<String>` on margin). None of those eight is named here;
-/// the eighteen below are identical in name and type across both.
+/// binance-sdk generates one report type per stream family, and they disagree on wire types that
+/// Binance documents as identical: the margin stream's declares `d`, `D`, `j`, `J` and `v` strings
+/// where spot's declares them integers, and Binance's docs show numbers
+/// (binance/binance-connector-rust#108). Decoding into an SDK type can therefore fail a whole
+/// report, fills included, over a key this crate never reads. This type models only the keys the
+/// converter reads and ignores every other, so an unread key cannot fail a decode, and the two
+/// clients decode through one definition, which the spot testnet exercises for margin too.
 ///
-/// Naming that read subset is what makes a single converter safe to share, and keeps the
-/// dependency on the SDK explicit: a change to any *other* field cannot silently alter execution
-/// handling, and a correction to the conversion reaches every Binance client at once.
+/// Every field is optional: which keys a report carries depends on its execution type, and each
+/// use below says what it does without one.
 ///
-/// Accessors borrow rather than consume, so one report can serve both events a `TRADE` produces.
-pub(crate) trait BinanceExecutionReportFields {
-    /// Binance field `x`: what happened (`NEW`, `TRADE`, `CANCELED`, ...).
-    fn execution_type(&self) -> Option<&str>;
-    /// Binance field `X`: the order's status *after* this execution, which is not the same
-    /// question as `execution_type` -- a `TRADE` may leave the order `PARTIALLY_FILLED`,
-    /// `FILLED`, or already retired by a report that overtook it.
-    fn order_status(&self) -> Option<&str>;
-    /// Binance field `s`.
-    fn symbol(&self) -> Option<&str>;
-    /// Binance field `S`.
-    fn side(&self) -> Option<&str>;
-    /// Binance field `i`: the venue's order id.
-    fn order_id(&self) -> Option<i64>;
-    /// Binance field `c`.
-    fn client_order_id(&self) -> Option<&str>;
-    /// Binance field `T`: transaction time, in milliseconds.
-    fn transaction_time(&self) -> Option<i64>;
-    /// Binance field `t`: the execution's own id, present only on a `TRADE`.
-    fn trade_id(&self) -> Option<i64>;
-    /// Binance field `L`: the price of this execution alone.
-    fn last_executed_price(&self) -> Option<&str>;
-    /// Binance field `l`: the quantity of this execution alone.
-    fn last_executed_quantity(&self) -> Option<&str>;
-    /// Binance field `n`.
-    fn commission_amount(&self) -> Option<&str>;
-    /// Binance field `N`: the asset the commission was charged in, which need not be either leg
-    /// of the traded pair.
-    fn commission_asset(&self) -> Option<&str>;
-    /// Binance field `z`: the *order's* cumulative filled quantity as of this execution, as
-    /// opposed to `last_executed_quantity`, which is this execution alone.
-    fn cumulative_filled_quantity(&self) -> Option<&str>;
-    /// Binance field `r`.
-    fn reject_reason(&self) -> Option<&str>;
-    /// Binance field `o`.
-    fn order_type(&self) -> Option<&str>;
-    /// Binance field `p`: the order's limit price, `"0"` on order kinds that carry none.
-    fn price(&self) -> Option<&str>;
-    /// Binance field `q`: the order's total quantity, as opposed to any executed portion of it.
-    fn order_quantity(&self) -> Option<&str>;
-    /// Binance field `f`.
-    fn time_in_force(&self) -> Option<&str>;
+/// Unlike `d`, the keys read as integers, `i`, `T` and `t`, are integers in Binance's docs and in
+/// both SDK models, so they are read strictly. A report carrying one of them in another shape
+/// still fails to decode whole; the stream handlers log it with an excerpt of the frame.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+// Tests build stream frames from reports.
+#[cfg_attr(test, derive(serde::Serialize))]
+pub(crate) struct ExecutionReport {
+    /// `x`: what happened (`NEW`, `TRADE`, `CANCELED`, ...).
+    #[serde(rename = "x")]
+    pub(crate) execution_type: Option<String>,
+    /// `X`: the order's status *after* this execution, which is not the same question as
+    /// `execution_type` -- a `TRADE` may leave the order `PARTIALLY_FILLED`, `FILLED`, or already
+    /// retired by a report that overtook it.
+    #[serde(rename = "X")]
+    pub(crate) order_status: Option<String>,
+    /// `s`.
+    #[serde(rename = "s")]
+    pub(crate) symbol: Option<String>,
+    /// `S`.
+    #[serde(rename = "S")]
+    pub(crate) side: Option<String>,
+    /// `i`: the venue's order id.
+    #[serde(rename = "i")]
+    pub(crate) order_id: Option<i64>,
+    /// `c`.
+    #[serde(rename = "c")]
+    pub(crate) client_order_id: Option<String>,
+    /// `T`: transaction time, in milliseconds.
+    #[serde(rename = "T")]
+    pub(crate) transaction_time: Option<i64>,
+    /// `t`: the execution's own id, present only on a `TRADE`.
+    #[serde(rename = "t")]
+    pub(crate) trade_id: Option<i64>,
+    /// `L`: the price of this execution alone.
+    #[serde(rename = "L")]
+    pub(crate) last_executed_price: Option<String>,
+    /// `l`: the quantity of this execution alone.
+    #[serde(rename = "l")]
+    pub(crate) last_executed_quantity: Option<String>,
+    /// `n`.
+    #[serde(rename = "n")]
+    pub(crate) commission_amount: Option<String>,
+    /// `N`: the asset the commission was charged in, which need not be either leg of the traded
+    /// pair. Absent and `null` both read as `None`.
+    #[serde(rename = "N")]
+    pub(crate) commission_asset: Option<String>,
+    /// `z`: the *order's* cumulative filled quantity as of this execution, as opposed to
+    /// `last_executed_quantity`, which is this execution alone.
+    #[serde(rename = "z")]
+    pub(crate) cumulative_filled_quantity: Option<String>,
+    /// `r`.
+    #[serde(rename = "r")]
+    pub(crate) reject_reason: Option<String>,
+    /// `o`.
+    #[serde(rename = "o")]
+    pub(crate) order_type: Option<String>,
+    /// `p`: the order's limit price, `"0"` on order kinds that carry none.
+    #[serde(rename = "p")]
+    pub(crate) price: Option<String>,
+    /// `q`: the order's total quantity, as opposed to any executed portion of it.
+    #[serde(rename = "q")]
+    pub(crate) order_quantity: Option<String>,
+    /// `f`.
+    #[serde(rename = "f")]
+    pub(crate) time_in_force: Option<String>,
+    /// `P`: a conditional order's trigger, or a trailing order's activation price; `"0"` on order
+    /// kinds that carry neither.
+    #[serde(rename = "P")]
+    pub(crate) stop_price: Option<String>,
+    /// `d`: the trailing delta in basis points, sent only for a trailing order. Binance's docs show
+    /// a number and the margin SDK model a string, so either is accepted.
+    #[serde(rename = "d")]
+    pub(crate) trailing_delta: Option<WireInt>,
 }
 
-/// Read an optional SDK string field as `Option<&str>`, whether the SDK declares it
-/// `Option<String>` or `Option<Option<String>>`.
+/// An integer that Binance may send as a JSON number or as a numeric string.
 ///
-/// binance-sdk declares a field it treats as nullable as a double option, so that an absent key
-/// (`None`) and an explicit `null` (`Some(None)`) differ. No accessor here distinguishes them: both
-/// read as `None`. The spot WebSocket API's `ExecutionReport` declares `N` this way and the margin
-/// stream's does not, so the shared macro below reads every string field through this trait.
-trait SdkOptionalStr {
-    fn as_opt_str(&self) -> Option<&str>;
+/// Decoding never fails on the value itself: anything else is kept as [`WireInt::Unreadable`], so
+/// that one odd key costs that key alone rather than the report around it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WireInt {
+    Int(i64),
+    /// Neither an integer nor a string holding one; carries the value as received, or what kind
+    /// of value it was.
+    Unreadable(String),
 }
 
-impl SdkOptionalStr for Option<String> {
-    fn as_opt_str(&self) -> Option<&str> {
-        self.as_deref()
+impl<'de> Deserialize<'de> for WireInt {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(WireIntVisitor)
     }
 }
 
-impl SdkOptionalStr for Option<Option<String>> {
-    fn as_opt_str(&self) -> Option<&str> {
-        self.as_ref().and_then(Option::as_deref)
+/// Reads a [`WireInt`] from whatever JSON value arrives, without building a `serde_json::Value`.
+struct WireIntVisitor;
+
+impl<'de> Visitor<'de> for WireIntVisitor {
+    type Value = WireInt;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("an integer, or a string holding one")
+    }
+
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<WireInt, E> {
+        Ok(WireInt::Int(v))
+    }
+
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<WireInt, E> {
+        Ok(i64::try_from(v).map_or_else(|_| WireInt::Unreadable(v.to_string()), WireInt::Int))
+    }
+
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<WireInt, E> {
+        Ok(WireInt::Unreadable(v.to_string()))
+    }
+
+    fn visit_bool<E: de::Error>(self, v: bool) -> Result<WireInt, E> {
+        Ok(WireInt::Unreadable(v.to_string()))
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<WireInt, E> {
+        Ok(v.parse()
+            .map_or_else(|_| WireInt::Unreadable(v.to_owned()), WireInt::Int))
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<WireInt, E> {
+        Ok(WireInt::Unreadable("null".to_owned()))
+    }
+
+    fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<WireInt, A::Error> {
+        while seq.next_element::<de::IgnoredAny>()?.is_some() {}
+        Ok(WireInt::Unreadable("an array".to_owned()))
+    }
+
+    fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<WireInt, A::Error> {
+        while map
+            .next_entry::<de::IgnoredAny, de::IgnoredAny>()?
+            .is_some()
+        {}
+        Ok(WireInt::Unreadable("an object".to_owned()))
     }
 }
 
-/// Implement [`BinanceExecutionReportFields`] for SDK types that share these field names.
-///
-/// Every struct listed below declares these eighteen fields, so the accessors are identical; a
-/// macro keeps them from drifting apart under hand-editing. String fields are read through
-/// [`SdkOptionalStr`], since the SDK declares some of them nullable on one type and not another.
-macro_rules! impl_binance_execution_report_fields {
-    ($($t:ty),* $(,)?) => {
-        $(
-            impl BinanceExecutionReportFields for $t {
-                fn execution_type(&self) -> Option<&str> { self.x.as_opt_str() }
-                fn order_status(&self) -> Option<&str> { self.x_uppercase.as_opt_str() }
-                fn symbol(&self) -> Option<&str> { self.s.as_opt_str() }
-                fn side(&self) -> Option<&str> { self.s_uppercase.as_opt_str() }
-                fn order_id(&self) -> Option<i64> { self.i }
-                fn client_order_id(&self) -> Option<&str> { self.c.as_opt_str() }
-                fn transaction_time(&self) -> Option<i64> { self.t_uppercase }
-                fn trade_id(&self) -> Option<i64> { self.t }
-                fn last_executed_price(&self) -> Option<&str> { self.l_uppercase.as_opt_str() }
-                fn last_executed_quantity(&self) -> Option<&str> { self.l.as_opt_str() }
-                fn commission_amount(&self) -> Option<&str> { self.n.as_opt_str() }
-                fn commission_asset(&self) -> Option<&str> { self.n_uppercase.as_opt_str() }
-                fn cumulative_filled_quantity(&self) -> Option<&str> { self.z.as_opt_str() }
-                fn reject_reason(&self) -> Option<&str> { self.r.as_opt_str() }
-                fn order_type(&self) -> Option<&str> { self.o.as_opt_str() }
-                fn price(&self) -> Option<&str> { self.p.as_opt_str() }
-                fn order_quantity(&self) -> Option<&str> { self.q.as_opt_str() }
-                fn time_in_force(&self) -> Option<&str> { self.f.as_opt_str() }
-            }
-        )*
-    };
+// Tests build stream frames from reports. An `Int` serializes as the number it was read from, and
+// an `Unreadable` as a string of its text, which reads back as `Unreadable` unless it is an integer.
+#[cfg(test)]
+impl serde::Serialize for WireInt {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Int(int) => serializer.serialize_i64(*int),
+            Self::Unreadable(raw) => serializer.serialize_str(raw),
+        }
+    }
 }
-
-impl_binance_execution_report_fields!(
-    binance_sdk::spot::websocket_api::ExecutionReport,
-    binance_sdk::margin_trading::websocket_streams::ExecutionReport,
-);
 
 /// Whether a `TRADE` report's order status says the order is still live at the exchange, and may
 /// therefore be written into engine state as an `Open` snapshot.
@@ -1781,32 +2049,32 @@ fn trade_order_is_live(status: &str) -> bool {
 // Inherent complexity: one arm per Binance execution type (TRADE, NEW, CANCELED, EXPIRED,
 // REJECTED, REPLACE), each validating the fields its own variant needs.
 #[allow(clippy::cognitive_complexity)]
-pub(crate) fn convert_execution_report<T: BinanceExecutionReportFields>(
-    report: &T,
+pub(crate) fn convert_execution_report(
+    report: &ExecutionReport,
     exchange: ExchangeId,
     buf: &mut Vec<UnindexedAccountEvent>,
 ) {
-    let Some(exec_type) = report.execution_type() else {
+    let Some(exec_type) = report.execution_type.as_deref() else {
         warn!(%exchange, "Binance executionReport missing execution type (x), dropping");
         return;
     };
-    let Some(symbol) = report.symbol().map(InstrumentNameExchange::new) else {
+    let Some(symbol) = report.symbol.as_deref().map(InstrumentNameExchange::new) else {
         warn!(%exchange, "Binance executionReport missing symbol (s), dropping");
         return;
     };
     // Check order_id first -- if it is missing the event is dropped, so avoid constructing cid.
-    let Some(order_id_raw) = report.order_id() else {
+    let Some(order_id_raw) = report.order_id else {
         warn!(%exchange, %symbol, "Binance executionReport missing orderId (i), dropping");
         return;
     };
     let order_id = OrderId(format_smolstr!("{order_id_raw}"));
-    let cid = match report.client_order_id() {
+    let cid = match report.client_order_id.as_deref() {
         Some(c) => ClientOrderId::new(c),
         None => ClientOrderId::new(order_id.0.as_str()),
     };
 
     let time_exchange = match report
-        .transaction_time()
+        .transaction_time
         .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
     {
         Some(t) => t,
@@ -1829,17 +2097,17 @@ pub(crate) fn convert_execution_report<T: BinanceExecutionReportFields>(
         }
         "TRADE" => {
             // Partial or full fill.
-            let Some(trade_id) = report.trade_id() else {
+            let Some(trade_id) = report.trade_id else {
                 warn!(%exchange, %symbol, "Binance TRADE event missing trade ID (t), dropping");
                 return;
             };
             let trade_id = TradeId(format_smolstr!("{trade_id}"));
             // parse_side already logs a warning on unknown values.
-            let Some(side) = report.side().and_then(parse_side) else {
+            let Some(side) = report.side.as_deref().and_then(parse_side) else {
                 warn!(%exchange, %symbol, "Binance TRADE event missing/unknown side (S), dropping");
                 return;
             };
-            let last_price = match report.last_executed_price() {
+            let last_price = match report.last_executed_price.as_deref() {
                 Some(s) => match Decimal::from_str(s) {
                     Ok(v) => v,
                     Err(e) => {
@@ -1852,7 +2120,7 @@ pub(crate) fn convert_execution_report<T: BinanceExecutionReportFields>(
                     return;
                 }
             };
-            let last_qty = match report.last_executed_quantity() {
+            let last_qty = match report.last_executed_quantity.as_deref() {
                 Some(s) => match Decimal::from_str(s) {
                     Ok(v) => v,
                     Err(e) => {
@@ -1866,7 +2134,9 @@ pub(crate) fn convert_execution_report<T: BinanceExecutionReportFields>(
                 }
             };
             // Commission parse failure: log and default to 0 rather than dropping the fill.
-            let commission = match Decimal::from_str(report.commission_amount().unwrap_or("0")) {
+            let commission = match Decimal::from_str(
+                report.commission_amount.as_deref().unwrap_or("0"),
+            ) {
                 Ok(v) => v,
                 Err(e) => {
                     warn!(%exchange, %symbol, error = %e, "Binance TRADE event unparseable commission (n), defaulting to 0");
@@ -1877,13 +2147,15 @@ pub(crate) fn convert_execution_report<T: BinanceExecutionReportFields>(
             // here; the indexer computes it if the fee is in the quote or base asset. The
             // "UNKNOWN" fallback (rare: the API omits N) will fail indexing.
             let fee_asset = report
-                .commission_asset()
+                .commission_asset
+                .as_deref()
                 .map(AssetNameExchange::from)
                 .unwrap_or_else(|| AssetNameExchange::from("UNKNOWN"));
             // `z` is the order's cumulative filled quantity as of this execution, which is what
             // advances the order; `last_qty` above is this execution alone.
             let order_filled_quantity = report
-                .cumulative_filled_quantity()
+                .cumulative_filled_quantity
+                .as_deref()
                 .and_then(|s| Decimal::from_str(s).ok());
 
             let trade = Trade::new(
@@ -1908,7 +2180,7 @@ pub(crate) fn convert_execution_report<T: BinanceExecutionReportFields>(
             // filled order reads as having nothing filled until REST reconciliation refreshes it.
             // `convert_order_snapshot` reads field `z` (cumulative filled quantity), which is
             // exactly what a TRADE report carries, so the same builder serves both arms.
-            let order_status = report.order_status().unwrap_or_default();
+            let order_status = report.order_status.as_deref().unwrap_or_default();
             if trade_order_is_live(order_status) {
                 buf.extend(convert_order_snapshot(
                     report,
@@ -1942,7 +2214,7 @@ pub(crate) fn convert_execution_report<T: BinanceExecutionReportFields>(
             // Rejected by the matching engine after initial acceptance (e.g. insufficient funds
             // discovered post-validation). Mapped to OrderCancelled with an error state so the
             // engine removes this order.
-            let reject_reason = report.reject_reason().unwrap_or("unknown");
+            let reject_reason = report.reject_reason.as_deref().unwrap_or("unknown");
             warn!(
                 %exchange, %symbol, %order_id, reason = reject_reason,
                 "Binance order REJECTED by matching engine"
@@ -1985,15 +2257,19 @@ pub(crate) fn convert_execution_report<T: BinanceExecutionReportFields>(
 ///
 /// All of them report an order leaving the book with whatever it had filled (`z`) at that point,
 /// and differ only in why -- which the caller has already established by matching on `x`.
-fn cancelled_event<T: BinanceExecutionReportFields>(
-    report: &T,
+fn cancelled_event(
+    report: &ExecutionReport,
     exchange: ExchangeId,
     symbol: InstrumentNameExchange,
     cid: ClientOrderId,
     order_id: OrderId,
     time_exchange: DateTime<Utc>,
 ) -> UnindexedAccountEvent {
-    let filled_qty = binance_filled_qty(exchange, &order_id, report.cumulative_filled_quantity());
+    let filled_qty = binance_filled_qty(
+        exchange,
+        &order_id,
+        report.cumulative_filled_quantity.as_deref(),
+    );
     let response = UnindexedOrderResponseCancel {
         key: OrderKey::new(exchange, symbol, StrategyId::unknown(), cid),
         state: Ok(Cancelled::new(order_id, time_exchange, filled_qty)),
@@ -2009,8 +2285,8 @@ fn cancelled_event<T: BinanceExecutionReportFields>(
 ///
 /// Returns `None` when a field the snapshot cannot be built without is missing or unparseable;
 /// each such case is warned about individually.
-fn convert_order_snapshot<T: BinanceExecutionReportFields>(
-    report: &T,
+fn convert_order_snapshot(
+    report: &ExecutionReport,
     exchange: ExchangeId,
     symbol: InstrumentNameExchange,
     cid: ClientOrderId,
@@ -2018,57 +2294,63 @@ fn convert_order_snapshot<T: BinanceExecutionReportFields>(
     time_exchange: DateTime<Utc>,
 ) -> Option<UnindexedAccountEvent> {
     // parse_side already logs a warning on unknown values.
-    let Some(side) = report.side().and_then(parse_side) else {
+    let Some(side) = report.side.as_deref().and_then(parse_side) else {
         warn!(%exchange, %symbol, "Binance order report missing/unknown side (S), dropping snapshot");
         return None;
     };
-    // parse_order_kind already logs a warning on unknown values.
-    let kind = parse_order_kind(report.order_type().unwrap_or("LIMIT"))?;
-    let price: Option<Decimal> = match (report.price(), &kind) {
-        (Some(p), _) => match Decimal::from_str(p) {
-            Ok(v) if !v.is_zero() => Some(v),
-            Ok(_) => {
-                // Binance sends "0" / "0.00" as the price field for Market/Stop/TrailingStop
-                // orders. Trace only when a zero arrives on an order kind that should carry a
-                // limit price, so the surprising case is observable.
-                if matches!(
-                    kind,
-                    OrderKind::Limit
-                        | OrderKind::StopLimit { .. }
-                        | OrderKind::TakeProfitLimit { .. }
-                        | OrderKind::TrailingStopLimit { .. }
-                ) {
-                    trace!(%exchange, %symbol, %kind, "Binance order report has zero price (p) on limit-type order, treating as no limit price");
-                }
-                None
+    let trailing_delta = match &report.trailing_delta {
+        None => TrailingDelta::Absent,
+        Some(WireInt::Int(delta)) => TrailingDelta::from_reported(Some(*delta)),
+        Some(WireInt::Unreadable(raw)) => {
+            // A shape Binance sends one way recurs on every report of the order, so sample it.
+            static SEEN: AtomicU64 = AtomicU64::new(0);
+            let (count, warns) = sampled(&SEEN);
+            if warns {
+                warn!(%exchange, %symbol, %order_id, raw, count, "Binance order report has an unreadable trailing delta (d); further ones are logged at debug, with a warning every 1000th");
+            } else {
+                debug!(%exchange, %symbol, %order_id, raw, count, "Binance order report has an unreadable trailing delta (d)");
             }
-            Err(e) => {
-                warn!(%exchange, %symbol, price = p, error = %e, "Binance order report unparseable price (p), dropping snapshot");
-                return None;
-            }
-        },
-        (
-            None,
-            OrderKind::Market
-            | OrderKind::Stop { .. }
-            | OrderKind::TakeProfit { .. }
-            | OrderKind::TrailingStop { .. },
-        ) => {
-            // Market, Stop and TakeProfit orders carry no limit price.
-            None
-        }
-        (
-            None,
-            OrderKind::Limit
-            | OrderKind::StopLimit { .. }
-            | OrderKind::TakeProfitLimit { .. }
-            | OrderKind::TrailingStopLimit { .. },
-        ) => {
-            warn!(%exchange, %symbol, "Binance limit-type order report missing price (p), dropping snapshot");
-            return None;
+            TrailingDelta::Unknown
         }
     };
-    let quantity = match report.order_quantity() {
+    // Without its type the order's kind is unknown, so the snapshot is dropped, as a REST row
+    // without one is, rather than read as a `LIMIT`.
+    let Some(order_type) = report.order_type.as_deref() else {
+        warn!(%exchange, %symbol, %order_id, "Binance order report missing order type (o), dropping snapshot");
+        return None;
+    };
+    // decode_order_kind already logs a warning on what it cannot describe.
+    let kind = decode_order_kind(
+        exchange,
+        report.order_id,
+        order_type,
+        report.stop_price.as_deref(),
+        trailing_delta,
+    )?;
+    // Binance sends "0" as the price of kinds that carry no limit price, so read it only on the
+    // kinds that do.
+    let price = if kind_has_limit_price(&kind) {
+        match report.price.as_deref() {
+            Some(p) => match Decimal::from_str(p) {
+                Ok(v) if !v.is_zero() => Some(v),
+                Ok(_) => {
+                    trace!(%exchange, %symbol, %kind, "Binance order report has zero price (p) on limit-type order, treating as no limit price");
+                    None
+                }
+                Err(e) => {
+                    warn!(%exchange, %symbol, price = p, error = %e, "Binance order report unparseable price (p), dropping snapshot");
+                    return None;
+                }
+            },
+            None => {
+                warn!(%exchange, %symbol, "Binance limit-type order report missing price (p), dropping snapshot");
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+    let quantity = match report.order_quantity.as_deref() {
         Some(q) => match Decimal::from_str(q) {
             Ok(v) => v,
             Err(e) => {
@@ -2081,12 +2363,13 @@ fn convert_order_snapshot<T: BinanceExecutionReportFields>(
             return None;
         }
     };
-    let time_in_force = parse_time_in_force(report.time_in_force().unwrap_or("GTC"));
+    let time_in_force = parse_time_in_force(report.time_in_force.as_deref().unwrap_or("GTC"));
     // Field `z`: the order's cumulative filled quantity. Usually 0 on a NEW, but read it there
     // too in case of an immediate partial fill on an aggressive order; on a TRADE it is the whole
     // point of the snapshot.
     let filled_qty = report
-        .cumulative_filled_quantity()
+        .cumulative_filled_quantity
+        .as_deref()
         .and_then(|s| Decimal::from_str(s).ok())
         .unwrap_or(Decimal::ZERO);
 
@@ -2482,10 +2765,10 @@ pub(crate) enum BinanceTimeInForce {
 /// Map a rustrade [`OrderKind`] + [`TimeInForce`] to Binance order semantics.
 ///
 /// Returns `None` for combinations Binance does not support (so callers surface
-/// `UnsupportedOrderType`). `TrailingStop`/`TrailingStopLimit` classify to
-/// [`BinanceOrderType::StopLoss`]/`None` here (valid for spot, which sets `trailingDelta`);
-/// the **margin** adapter rejects trailing kinds *before* calling this, since it does not map
-/// them to `trailingDelta` yet.
+/// `UnsupportedOrderType`). `TrailingStop` classifies to [`BinanceOrderType::StopLoss`], to which
+/// the caller adds a `trailingDelta` from [`trailing_delta_basis_points`]. `TrailingStopLimit`
+/// classifies to `None`: Binance's trailing `STOP_LOSS_LIMIT` keeps its limit price fixed while
+/// the stop trails, where `TrailingStopLimit`'s limit follows the stop (#540).
 pub(crate) fn classify_order_kind_tif(
     kind: OrderKind,
     tif: TimeInForce,
@@ -2568,19 +2851,82 @@ pub(crate) fn classify_order_kind_tif(
                 Some((BinanceOrderType::StopLoss, None))
             }
             TrailingOffsetType::Absolute => {
-                warn!(
-                    "Binance TrailingStop does not support Absolute offset; \
-                     convert to basis points: (absolute / price) * 10000"
-                );
+                warn!("{ABSOLUTE_TRAILING_OFFSET_UNSUPPORTED}");
                 None
             }
         },
-        // Binance does not support TrailingStopLimit.
+        // Binance's trailing STOP_LOSS_LIMIT has a fixed limit price, not one that follows the
+        // stop as TrailingStopLimit's does (#540).
         OrderKind::TrailingStopLimit { .. } => {
             warn!("Binance does not support TrailingStopLimit orders");
             None
         }
     }
+}
+
+/// Why an Absolute trailing offset is refused, and what to send instead.
+const ABSOLUTE_TRAILING_OFFSET_UNSUPPORTED: &str = "Binance TrailingStop does not support an \
+     Absolute offset; convert it to basis points: (absolute / price) * 10000";
+
+/// Why a [`OrderKind::TrailingStop`] offset cannot be sent as Binance's `trailingDelta`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrailingDeltaError {
+    /// Binance trails by a share of the price only, so an [`TrailingOffsetType::Absolute`] offset
+    /// has no `trailingDelta`.
+    AbsoluteOffset,
+    /// The offset is not a positive whole number of basis points, or too large to send.
+    Invalid(PrecisionViolation),
+}
+
+impl TrailingDeltaError {
+    /// The order error this refusal is reported as.
+    pub(crate) fn into_order_error<AssetKey, InstrumentKey>(
+        self,
+    ) -> OrderError<AssetKey, InstrumentKey> {
+        match self {
+            Self::AbsoluteOffset => {
+                OrderError::UnsupportedOrderType(ABSOLUTE_TRAILING_OFFSET_UNSUPPORTED.to_owned())
+            }
+            Self::Invalid(violation) => OrderError::InvalidPrecision(violation),
+        }
+    }
+}
+
+/// Binance's `trailingDelta` for a [`OrderKind::TrailingStop`] `offset`, in basis points.
+///
+/// A `BasisPoints` offset is sent as it is and a `Percentage` one times 100. Binance takes a whole
+/// number of basis points, and rounding would trail by a different distance than asked, so an
+/// offset that does not come to one is refused (a `Percentage` offset with more than two decimal
+/// places, a fractional `BasisPoints` one), as is one that is not positive or too large to send.
+/// Binance enforces its own range on top (the symbol's `TRAILING_DELTA` filter).
+pub(crate) fn trailing_delta_basis_points(
+    offset: Decimal,
+    offset_type: TrailingOffsetType,
+) -> Result<i32, TrailingDeltaError> {
+    let invalid = |limit| {
+        TrailingDeltaError::Invalid(PrecisionViolation::new(
+            OrderField::TrailingOffset,
+            offset,
+            limit,
+        ))
+    };
+    let (basis_points, max_decimal_places) = match offset_type {
+        TrailingOffsetType::BasisPoints => (Some(offset), 0),
+        TrailingOffsetType::Percentage => (offset.checked_mul(Decimal::ONE_HUNDRED), 2),
+        TrailingOffsetType::Absolute => return Err(TrailingDeltaError::AbsoluteOffset),
+    };
+    if offset.is_sign_negative() || offset.is_zero() {
+        return Err(invalid(PrecisionLimit::NotPositive));
+    }
+    let Some(basis_points) = basis_points else {
+        return Err(invalid(PrecisionLimit::NotRepresentable));
+    };
+    if !basis_points.fract().is_zero() {
+        return Err(invalid(PrecisionLimit::DecimalPlaces {
+            max: max_decimal_places,
+        }));
+    }
+    i32::try_from(basis_points).map_err(|_| invalid(PrecisionLimit::NotRepresentable))
 }
 
 // ---------------------------------------------------------------------------
@@ -2774,35 +3120,465 @@ fn order_error_from(
 mod tests {
     use super::*;
 
-    /// The spot WebSocket API declares `N` nullable: absent and `null` both read as no commission
-    /// asset, and a value reads as itself. The margin stream's plain `Option` reads the same.
-    #[test]
-    fn commission_asset_reads_absent_null_and_present_alike_on_both_report_types() {
-        type Spot = binance_sdk::spot::websocket_api::ExecutionReport;
-        type Margin = binance_sdk::margin_trading::websocket_streams::ExecutionReport;
-        let parse_spot = |json: &str| match serde_json::from_str::<Spot>(json) {
+    fn report(json: &str) -> ExecutionReport {
+        match serde_json::from_str(json) {
             Ok(report) => report,
             Err(error) => panic!("{json} should parse: {error}"),
-        };
-        let parse_margin = |json: &str| match serde_json::from_str::<Margin>(json) {
-            Ok(report) => report,
-            Err(error) => panic!("{json} should parse: {error}"),
-        };
+        }
+    }
 
+    /// `N` reads as no commission asset whether absent or `null`, and a value reads as itself.
+    #[test]
+    fn a_report_reads_an_absent_null_or_present_commission_asset() {
+        assert_eq!(report(r#"{"e":"executionReport"}"#).commission_asset, None);
+        assert_eq!(report(r#"{"N":null}"#).commission_asset, None);
         assert_eq!(
-            parse_spot(r#"{"e":"executionReport"}"#).commission_asset(),
-            None
-        );
-        assert_eq!(parse_spot(r#"{"N":null}"#).commission_asset(), None);
-        assert_eq!(parse_spot(r#"{"N":"BNB"}"#).commission_asset(), Some("BNB"));
-        assert_eq!(
-            parse_margin(r#"{"e":"executionReport"}"#).commission_asset(),
-            None
-        );
-        assert_eq!(parse_margin(r#"{"N":null}"#).commission_asset(), None);
-        assert_eq!(
-            parse_margin(r#"{"N":"BNB"}"#).commission_asset(),
+            report(r#"{"N":"BNB"}"#).commission_asset.as_deref(),
             Some("BNB")
+        );
+    }
+
+    /// `d` decodes whether Binance sends it as a number, as its docs show, or as a string, as the
+    /// margin SDK model declares; anything else is kept as unreadable rather than failing the
+    /// report.
+    #[test]
+    fn a_report_reads_the_trailing_delta_as_a_number_or_a_string() {
+        assert_eq!(report(r#"{}"#).trailing_delta, None);
+        assert_eq!(report(r#"{"d":null}"#).trailing_delta, None);
+        assert_eq!(report(r#"{"d":25}"#).trailing_delta, Some(WireInt::Int(25)));
+        assert_eq!(
+            report(r#"{"d":"25"}"#).trailing_delta,
+            Some(WireInt::Int(25))
+        );
+        assert_eq!(
+            report(r#"{"d":"x"}"#).trailing_delta,
+            Some(WireInt::Unreadable("x".to_owned()))
+        );
+        assert_eq!(
+            report(r#"{"d":true}"#).trailing_delta,
+            Some(WireInt::Unreadable("true".to_owned()))
+        );
+        assert_eq!(
+            report(r#"{"d":[1],"x":"NEW"}"#).trailing_delta,
+            Some(WireInt::Unreadable("an array".to_owned()))
+        );
+        assert_eq!(
+            report(r#"{"d":{"a":1},"x":"NEW"}"#)
+                .execution_type
+                .as_deref(),
+            Some("NEW")
+        );
+        assert_eq!(
+            report(r#"{"d":2.5}"#).trailing_delta,
+            Some(WireInt::Unreadable("2.5".to_owned()))
+        );
+    }
+
+    /// Keys the converter does not read cannot fail a report, whatever their type. binance-sdk's
+    /// margin stream model fails on the numbers Binance documents for `d`, `D`, `j`, `J` and `v`
+    /// (binance/binance-connector-rust#108); this asserts that too, so an SDK fix is noticed.
+    #[test]
+    fn keys_the_converter_does_not_read_cannot_fail_a_report() {
+        let json = r#"{"e":"executionReport","x":"NEW","i":7,"o":"STOP_LOSS","P":"0",
+            "d":4,"D":1668680518494,"j":1,"J":1000000,"v":3,"W":1499405658658,"V":"NONE"}"#;
+        let parsed = report(json);
+        assert_eq!(parsed.execution_type.as_deref(), Some("NEW"));
+        assert_eq!(parsed.trailing_delta, Some(WireInt::Int(4)));
+        assert!(
+            serde_json::from_str::<binance_sdk::margin_trading::websocket_streams::ExecutionReport>(
+                json
+            )
+            .is_err(),
+            "binance-sdk's margin report now decodes numeric d/D/j/J/v; revisit ExecutionReport"
+        );
+    }
+
+    #[test]
+    fn a_reported_trailing_delta_reads_absent_when_missing_or_zero() {
+        assert_eq!(TrailingDelta::from_reported(None), TrailingDelta::Absent);
+        assert_eq!(TrailingDelta::from_reported(Some(0)), TrailingDelta::Absent);
+        assert_eq!(
+            TrailingDelta::from_reported(Some(25)),
+            TrailingDelta::BasisPoints(25)
+        );
+        assert_eq!(
+            TrailingDelta::from_reported(Some(-1)),
+            TrailingDelta::Unknown
+        );
+    }
+
+    fn decode(
+        order_type: &str,
+        stop_price: Option<&str>,
+        trailing_delta: TrailingDelta,
+    ) -> Option<OrderKind> {
+        decode_order_kind(
+            ExchangeId::BinanceSpot,
+            Some(1),
+            order_type,
+            stop_price,
+            trailing_delta,
+        )
+    }
+
+    #[test]
+    fn plain_types_decode_whatever_the_trailing_delta() {
+        for delta in [
+            TrailingDelta::Absent,
+            TrailingDelta::BasisPoints(25),
+            TrailingDelta::Unknown,
+        ] {
+            assert_eq!(decode("MARKET", None, delta), Some(OrderKind::Market));
+            assert_eq!(decode("LIMIT", None, delta), Some(OrderKind::Limit));
+            assert_eq!(decode("LIMIT_MAKER", None, delta), Some(OrderKind::Limit));
+        }
+        assert_eq!(decode("UNKNOWN_TYPE", None, TrailingDelta::Absent), None);
+    }
+
+    #[test]
+    fn a_conditional_order_without_a_trailing_delta_decodes_with_its_trigger() {
+        let trigger_price = Decimal::from(100);
+        let cases = [
+            ("STOP_LOSS", OrderKind::Stop { trigger_price }),
+            ("STOP_LOSS_LIMIT", OrderKind::StopLimit { trigger_price }),
+            ("TAKE_PROFIT", OrderKind::TakeProfit { trigger_price }),
+            (
+                "TAKE_PROFIT_LIMIT",
+                OrderKind::TakeProfitLimit { trigger_price },
+            ),
+        ];
+        for (order_type, kind) in cases {
+            assert_eq!(
+                decode(order_type, Some("100.00"), TrailingDelta::Absent),
+                Some(kind),
+                "{order_type}"
+            );
+            // Without a positive trigger the order cannot be described.
+            for stop_price in [None, Some("0.00000000"), Some("-1"), Some("x")] {
+                assert_eq!(
+                    decode(order_type, stop_price, TrailingDelta::Absent),
+                    None,
+                    "{order_type} {stop_price:?}"
+                );
+            }
+        }
+    }
+
+    /// A trailing `STOP_LOSS` decodes in basis points, with or without an activation price.
+    #[test]
+    fn a_trailing_stop_loss_decodes_as_a_trailing_stop() {
+        let trailing_stop = Some(OrderKind::TrailingStop {
+            offset: Decimal::from(25),
+            offset_type: TrailingOffsetType::BasisPoints,
+        });
+        for stop_price in [None, Some("0.00000000"), Some("105.5")] {
+            assert_eq!(
+                decode("STOP_LOSS", stop_price, TrailingDelta::BasisPoints(25)),
+                trailing_stop,
+                "{stop_price:?}"
+            );
+        }
+    }
+
+    /// A trailing order of any other type has no `OrderKind`, and a conditional order whose
+    /// trailing delta is unknown could be either: both are dropped rather than misdescribed.
+    #[test]
+    fn conditional_orders_that_cannot_be_described_are_dropped() {
+        for order_type in ["STOP_LOSS_LIMIT", "TAKE_PROFIT", "TAKE_PROFIT_LIMIT"] {
+            assert_eq!(
+                decode(order_type, Some("100"), TrailingDelta::BasisPoints(25)),
+                None,
+                "{order_type}"
+            );
+        }
+        for order_type in [
+            "STOP_LOSS",
+            "STOP_LOSS_LIMIT",
+            "TAKE_PROFIT",
+            "TAKE_PROFIT_LIMIT",
+        ] {
+            assert_eq!(
+                decode(order_type, Some("100"), TrailingDelta::Unknown),
+                None,
+                "{order_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trailing_offset_converts_to_whole_basis_points() {
+        use rust_decimal_macros::dec;
+        let ok = |offset, offset_type| trailing_delta_basis_points(offset, offset_type);
+        assert_eq!(ok(dec!(25), TrailingOffsetType::BasisPoints), Ok(25));
+        assert_eq!(ok(dec!(25.0), TrailingOffsetType::BasisPoints), Ok(25));
+        assert_eq!(ok(dec!(1.5), TrailingOffsetType::Percentage), Ok(150));
+        assert_eq!(ok(dec!(0.15), TrailingOffsetType::Percentage), Ok(15));
+        assert_eq!(
+            ok(dec!(1), TrailingOffsetType::Absolute),
+            Err(TrailingDeltaError::AbsoluteOffset)
+        );
+    }
+
+    /// An offset that is not a positive whole number of basis points is refused, never rounded.
+    #[test]
+    fn a_trailing_offset_that_is_not_whole_positive_basis_points_is_refused() {
+        use rust_decimal_macros::dec;
+        let refused = |offset, offset_type, limit| {
+            assert_eq!(
+                trailing_delta_basis_points(offset, offset_type),
+                Err(TrailingDeltaError::Invalid(PrecisionViolation::new(
+                    OrderField::TrailingOffset,
+                    offset,
+                    limit
+                ))),
+                "{offset} {offset_type:?}"
+            );
+        };
+        refused(
+            dec!(0.155),
+            TrailingOffsetType::Percentage,
+            PrecisionLimit::DecimalPlaces { max: 2 },
+        );
+        refused(
+            dec!(2.5),
+            TrailingOffsetType::BasisPoints,
+            PrecisionLimit::DecimalPlaces { max: 0 },
+        );
+        for offset_type in [
+            TrailingOffsetType::BasisPoints,
+            TrailingOffsetType::Percentage,
+        ] {
+            refused(dec!(0), offset_type, PrecisionLimit::NotPositive);
+            refused(dec!(-10), offset_type, PrecisionLimit::NotPositive);
+        }
+        refused(
+            Decimal::from(i64::from(i32::MAX) + 1),
+            TrailingOffsetType::BasisPoints,
+            PrecisionLimit::NotRepresentable,
+        );
+        refused(
+            Decimal::MAX,
+            TrailingOffsetType::Percentage,
+            PrecisionLimit::NotRepresentable,
+        );
+    }
+
+    #[test]
+    fn a_trailing_offset_refusal_is_an_order_error() {
+        use rust_decimal_macros::dec;
+        let violation = PrecisionViolation::new(
+            OrderField::TrailingOffset,
+            dec!(2.5),
+            PrecisionLimit::NotPositive,
+        );
+        assert_eq!(
+            TrailingDeltaError::Invalid(violation).into_order_error::<(), ()>(),
+            OrderError::InvalidPrecision(violation)
+        );
+        assert!(matches!(
+            TrailingDeltaError::AbsoluteOffset.into_order_error::<(), ()>(),
+            OrderError::UnsupportedOrderType(_)
+        ));
+    }
+
+    /// A REST order row of `order_type`, with `extra` keys merged in.
+    fn order_row(order_type: &str, status: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut row = serde_json::json!({
+            "symbol": "BTCUSDT", "orderId": 7, "clientOrderId": "cid-7", "price": "0.00000000",
+            "origQty": "2", "executedQty": "0", "cummulativeQuoteQty": "0", "status": status,
+            "timeInForce": "GTC", "type": order_type, "side": "SELL",
+            "stopPrice": "0.00000000", "time": 1_700_000_000_000_i64,
+            "updateTime": 1_700_000_060_000_i64,
+        });
+        if let (Some(row), serde_json::Value::Object(extra)) = (row.as_object_mut(), extra) {
+            row.extend(extra);
+        }
+        row
+    }
+
+    fn spot_row(row: serde_json::Value) -> binance_sdk::spot::rest_api::GetOpenOrdersResponseInner {
+        match serde_json::from_value(row) {
+            Ok(row) => row,
+            Err(error) => panic!("spot row should parse: {error}"),
+        }
+    }
+
+    fn margin_row(
+        row: serde_json::Value,
+    ) -> binance_sdk::margin_trading::rest_api::QueryMarginAccountsOpenOrdersResponseInner {
+        match serde_json::from_value(row) {
+            Ok(row) => row,
+            Err(error) => panic!("margin row should parse: {error}"),
+        }
+    }
+
+    /// Spot rows report `trailingDelta`, so a trailing stop lists as one, and conditional orders
+    /// list with their triggers, with no limit price where the kind takes none.
+    #[test]
+    fn spot_rows_list_conditional_and_trailing_orders() {
+        let btc = InstrumentNameExchange::new("BTCUSDT");
+        let rows = [
+            spot_row(order_row(
+                "STOP_LOSS",
+                "NEW",
+                serde_json::json!({"trailingDelta": 25, "trailingTime": -1}),
+            )),
+            spot_row(order_row(
+                "STOP_LOSS_LIMIT",
+                "NEW",
+                serde_json::json!({"clientOrderId": "cid-8", "price": "95", "stopPrice": "96"}),
+            )),
+            spot_row(order_row(
+                "STOP_LOSS",
+                "NEW",
+                serde_json::json!({"clientOrderId": "cid-9", "stopPrice": "96"}),
+            )),
+        ];
+        let listing = convert_open_order_listing(&rows, ExchangeId::BinanceSpot, &btc);
+        assert!(listing.complete);
+        let described: Vec<_> = listing
+            .orders
+            .iter()
+            .map(|order| (order.key.cid.0.as_str(), order.kind, order.price))
+            .collect();
+        assert_eq!(
+            described,
+            [
+                (
+                    "cid-7",
+                    OrderKind::TrailingStop {
+                        offset: Decimal::from(25),
+                        offset_type: TrailingOffsetType::BasisPoints,
+                    },
+                    None,
+                ),
+                (
+                    "cid-8",
+                    OrderKind::StopLimit {
+                        trigger_price: Decimal::from(96)
+                    },
+                    Some(Decimal::from(95)),
+                ),
+                (
+                    "cid-9",
+                    OrderKind::Stop {
+                        trigger_price: Decimal::from(96)
+                    },
+                    None,
+                ),
+            ]
+        );
+    }
+
+    /// Margin rows do not report `trailingDelta`, so a live conditional row could be a trailing
+    /// order: it is left out and the listing reads incomplete, while plain rows list as before.
+    #[test]
+    fn margin_listings_leave_out_conditional_rows_and_read_incomplete() {
+        let btc = InstrumentNameExchange::new("BTCUSDT");
+        for order_type in [
+            "STOP_LOSS",
+            "STOP_LOSS_LIMIT",
+            "TAKE_PROFIT",
+            "TAKE_PROFIT_LIMIT",
+        ] {
+            let rows = [
+                margin_row(order_row(
+                    "LIMIT",
+                    "NEW",
+                    serde_json::json!({"clientOrderId": "cid-1", "price": "95"}),
+                )),
+                margin_row(order_row(
+                    order_type,
+                    "NEW",
+                    serde_json::json!({"price": "95", "stopPrice": "96"}),
+                )),
+            ];
+            let listing = convert_open_order_listing(&rows, ExchangeId::BinanceMargin, &btc);
+            assert!(!listing.complete, "{order_type}");
+            assert_eq!(listing.orders.len(), 1, "{order_type}");
+            assert_eq!(listing.orders[0].kind, OrderKind::Limit);
+        }
+    }
+
+    /// A margin conditional order that has ended is still reported as ended, so it is not held as
+    /// live: with the kind the client holds it with, or failing that with its fixed trigger,
+    /// without which it cannot be described. The held kind stands in only for what the row cannot
+    /// tell.
+    #[test]
+    fn an_ended_margin_conditional_order_reports_its_ending() {
+        let key = UnindexedOrderKey::new(
+            ExchangeId::BinanceMargin,
+            InstrumentNameExchange::new("BTCUSDT"),
+            StrategyId::unknown(),
+            ClientOrderId::new("cid-7"),
+        );
+        let row = margin_row(order_row(
+            "STOP_LOSS",
+            "CANCELED",
+            serde_json::json!({"stopPrice": "96"}),
+        ));
+        let Some(order) = convert_ended_order(&row, ExchangeId::BinanceMargin, &key, None) else {
+            panic!("an ended stop should be reported");
+        };
+        assert_eq!(
+            order.kind,
+            OrderKind::Stop {
+                trigger_price: Decimal::from(96)
+            }
+        );
+        assert!(matches!(order.state, InactiveOrderState::Cancelled(_)));
+
+        let untriggered = margin_row(order_row("STOP_LOSS", "CANCELED", serde_json::json!({})));
+        assert!(convert_ended_order(&untriggered, ExchangeId::BinanceMargin, &key, None).is_none());
+
+        // With the kind the client holds the order with, that kind is reported, trigger or not.
+        let trailing_stop = OrderKind::TrailingStop {
+            offset: Decimal::from(25),
+            offset_type: TrailingOffsetType::BasisPoints,
+        };
+        for row in [&row, &untriggered] {
+            let Some(order) =
+                convert_ended_order(row, ExchangeId::BinanceMargin, &key, Some(trailing_stop))
+            else {
+                panic!("an ended order held with its kind should be reported");
+            };
+            assert_eq!(order.kind, trailing_stop);
+            assert_eq!(order.price, None);
+        }
+
+        // A row that can describe the order is read as it describes it, whatever kind the client
+        // holds: a margin `LIMIT` row, and a spot stop row, which reports `trailingDelta`.
+        let limit = margin_row(order_row(
+            "LIMIT",
+            "CANCELED",
+            serde_json::json!({"price": "95"}),
+        ));
+        let spot_stop = spot_row(order_row(
+            "STOP_LOSS",
+            "CANCELED",
+            serde_json::json!({"stopPrice": "96"}),
+        ));
+        let read = [
+            convert_ended_order(&limit, ExchangeId::BinanceMargin, &key, Some(trailing_stop)),
+            convert_ended_order(
+                &spot_stop,
+                ExchangeId::BinanceSpot,
+                &key,
+                Some(trailing_stop),
+            ),
+        ]
+        .map(|order| order.map(|order| (order.kind, order.price)));
+        assert_eq!(
+            read,
+            [
+                Some((OrderKind::Limit, Some(Decimal::from(95)))),
+                Some((
+                    OrderKind::Stop {
+                        trigger_price: Decimal::from(96)
+                    },
+                    None
+                )),
+            ]
         );
     }
 

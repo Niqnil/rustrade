@@ -35,15 +35,16 @@
 
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
-    CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
-    MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, PlacementResponse, RateLimitTracker,
-    RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnrecoveredFills, UserDataFrame,
-    WeightPool, binance_filled_qty, classify_order_kind_tif, classify_rest_query_error,
-    classify_ws_order_error, convert_ended_order, convert_execution_report,
-    convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event, drop_after,
-    gap_failed, gap_time, is_duplicate, is_handshake_rate_limit, is_unknown_order,
-    log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, placed_order_state,
-    recovered_order_totals, response_decode_error, rest_call_with_retry, unix_ms,
+    CONNECT_TIMEOUT_SECS, ExecutionReport, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS,
+    HEARTBEAT_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing,
+    PlacementResponse, RateLimitTracker, RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS,
+    SharedDedupCache, UnrecoveredFills, UserDataFrame, WeightPool, binance_filled_qty,
+    classify_order_kind_tif, classify_rest_query_error, classify_ws_order_error,
+    convert_ended_order, convert_execution_report, convert_open_order_listing,
+    convert_open_order_owned_symbol, dedup_key_from_event, drop_after, frame_excerpt, gap_failed,
+    gap_time, is_duplicate, is_handshake_rate_limit, is_unknown_order, log_unrecognised_frame,
+    new_dedup_cache, parse_user_data_frame, placed_order_state, recovered_order_totals,
+    response_decode_error, rest_call_with_retry, trailing_delta_basis_points, unix_ms,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
@@ -62,8 +63,7 @@ use crate::{
         UnindexedOrderError,
     },
     order::{
-        Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType, UnindexedInactiveOrder,
-        UnindexedOrderKey,
+        Order, OrderKey, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Cancelled, Open, OrderState, UnindexedOrderState},
@@ -340,7 +340,7 @@ impl BinanceSpot {
     ) {
         let mut known = self.known_live.lock();
         for order in orders {
-            known.live(&order.key, order.quantity, &order.state);
+            known.live(&order.key, order.quantity, order.kind, &order.state);
         }
     }
 
@@ -548,10 +548,13 @@ async fn fetch_order_lookup(
 
     let row = response.data().await.map_err(response_decode_error)?;
 
-    Ok(convert_ended_order(&row, ExchangeId::BinanceSpot, &key)
-        .map_or(OrderLookup::NotEnded, |order| {
-            OrderLookup::Ended(Box::new(order))
-        }))
+    // Spot rows report trailingDelta, so every kind decodes without the one the client holds.
+    Ok(
+        convert_ended_order(&row, ExchangeId::BinanceSpot, &key, None)
+            .map_or(OrderLookup::NotEnded, |order| {
+                OrderLookup::Ended(Box::new(order))
+            }),
+    )
 }
 
 /// The client order ids `GET /api/v3/openOrders` lists on `instruments` (weight 6 each, one at a
@@ -1188,71 +1191,23 @@ impl ExecutionClient for BinanceSpot {
             OrderKind::TrailingStop {
                 offset,
                 offset_type,
-            } => {
-                // Convert to basis points (i32). Binance trailingDelta is in basis points.
-                let basis_points: i32 = match offset_type {
-                    TrailingOffsetType::BasisPoints => {
-                        let Ok(bp) = i32::try_from(offset) else {
-                            return Order {
-                                key: order_key,
-                                side,
-                                price,
-                                quantity,
-                                kind,
-                                time_in_force,
-                                state: OrderState::inactive(OrderError::UnsupportedOrderType(
-                                    format!(
-                                        "TrailingStop basis-point offset {offset} overflows i32 \
-                                         (Binance trailingDelta filter typically caps at 2000)"
-                                    ),
-                                )),
-                            };
-                        };
-                        bp
-                    }
-                    TrailingOffsetType::Percentage => {
-                        let Ok(bp) = i32::try_from(offset * Decimal::from(100)) else {
-                            return Order {
-                                key: order_key,
-                                side,
-                                price,
-                                quantity,
-                                kind,
-                                time_in_force,
-                                state: OrderState::inactive(OrderError::UnsupportedOrderType(
-                                    format!(
-                                        "TrailingStop percentage offset {offset} overflows i32 \
-                                         after scaling to basis points"
-                                    ),
-                                )),
-                            };
-                        };
-                        bp
-                    }
-                    TrailingOffsetType::Absolute => {
-                        // convert_order_kind_tif already rejects Absolute; surface a clean
-                        // error here too rather than panic, so a future refactor that
-                        // changes that contract still fails observably.
-                        return Order {
-                            key: order_key,
-                            side,
-                            price,
-                            quantity,
-                            kind,
-                            time_in_force,
-                            state: OrderState::inactive(OrderError::UnsupportedOrderType(
-                                "TrailingStop with Absolute offset is not supported by Binance; \
-                                 convert to basis points: (absolute / price) * 10000"
-                                    .into(),
-                            )),
-                        };
-                    }
-                };
-                params_builder = params_builder.trailing_delta(basis_points);
-            }
-            // Market and TrailingStopLimit need no price/stop_price/trailing_delta here.
-            // (TrailingStopLimit is already rejected by convert_order_kind_tif above.)
-            // Wildcard catches them and any future variants added before this match is updated.
+            } => match trailing_delta_basis_points(offset, offset_type) {
+                Ok(basis_points) => params_builder = params_builder.trailing_delta(basis_points),
+                Err(refused) => {
+                    return Order {
+                        key: order_key,
+                        side,
+                        price,
+                        quantity,
+                        kind,
+                        time_in_force,
+                        state: OrderState::inactive(refused.into_order_error()),
+                    };
+                }
+            },
+            // Market needs no price/stop_price/trailing_delta; TrailingStopLimit is already
+            // rejected by convert_order_kind_tif above. The wildcard also catches any future
+            // variant added before this match is updated.
             _ => {}
         }
 
@@ -1329,7 +1284,9 @@ impl ExecutionClient for BinanceSpot {
                             cumulative_quote_qty: data.cummulative_quote_qty.as_deref(),
                         },
                     );
-                    self.known_live.lock().placed(&order_key, quantity, &state);
+                    self.known_live
+                        .lock()
+                        .placed(&order_key, quantity, kind, &state);
 
                     Order {
                         key: order_key,
@@ -2299,12 +2256,12 @@ fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -
         "executionReport" => {
             // Single typed pass straight from the inner event — no intermediate DOM, and only the
             // matched branch deserializes its payload. The SDK struct ignores the unknown `e` tag.
-            match serde_json::from_str::<binance_sdk::spot::websocket_api::ExecutionReport>(event) {
+            match serde_json::from_str::<ExecutionReport>(event) {
                 Ok(report) => {
                     convert_execution_report(&report, ExchangeId::BinanceSpot, buf);
                 }
                 Err(e) => {
-                    warn!(error = %e, "BinanceSpot: undeserializable executionReport, dropping")
+                    warn!(error = %e, frame = frame_excerpt(event), "BinanceSpot: undeserializable executionReport, dropping")
                 }
             }
             false
@@ -2315,7 +2272,7 @@ fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -
             ) {
                 Ok(position) => convert_account_position(position, buf),
                 Err(e) => {
-                    warn!(error = %e, "BinanceSpot: undeserializable outboundAccountPosition, dropping")
+                    warn!(error = %e, frame = frame_excerpt(event), "BinanceSpot: undeserializable outboundAccountPosition, dropping")
                 }
             }
             false
@@ -2413,7 +2370,9 @@ fn convert_account_position(
 ///
 /// Binance implements trailing stops via `STOP_LOSS` with `trailingDelta` parameter.
 ///
-/// **Supported offset types:**
+/// **Supported offset types** (`open_order` refuses an offset that does not come to a positive
+/// whole number of basis points with `InvalidPrecision`; see the shared
+/// `trailing_delta_basis_points`):
 /// - `BasisPoints`: used directly (1 basis point = 0.01%)
 /// - `Percentage`: converted to basis points (multiplied by 100)
 ///
@@ -2421,7 +2380,8 @@ fn convert_account_position(
 /// - `Absolute`: returns `None` → `UnsupportedOrderType`. The caller (`open_order`)
 ///   must surface this so end users can convert absolute offsets to basis points
 ///   themselves: `basis_points = (absolute / price) * 10000`
-/// - `TrailingStopLimit`: Binance does not support limit orders with trailing stops
+/// - `TrailingStopLimit`: Binance's trailing `STOP_LOSS_LIMIT` keeps its limit price fixed while
+///   the stop trails, where `TrailingStopLimit`'s limit follows the stop (#540)
 ///
 fn convert_order_kind_tif(
     kind: OrderKind,
@@ -2602,21 +2562,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_order_kind() {
-        assert_eq!(parse_order_kind("MARKET"), Some(OrderKind::Market));
-        assert_eq!(parse_order_kind("LIMIT"), Some(OrderKind::Limit));
-        assert_eq!(parse_order_kind("LIMIT_MAKER"), Some(OrderKind::Limit));
-        assert_eq!(parse_order_kind("STOP_LOSS"), None);
-        assert_eq!(parse_order_kind("TAKE_PROFIT"), None);
-        assert_eq!(parse_order_kind("STOP_LOSS_LIMIT"), Some(OrderKind::Limit));
-        assert_eq!(
-            parse_order_kind("TAKE_PROFIT_LIMIT"),
-            Some(OrderKind::Limit)
-        );
-        assert_eq!(parse_order_kind("UNKNOWN_TYPE"), None);
-    }
-
-    #[test]
     fn test_parse_time_in_force() {
         assert_eq!(
             parse_time_in_force("GTC"),
@@ -2758,7 +2703,7 @@ mod tests {
             .is_none()
         );
 
-        // TrailingStopLimit → unsupported (Binance doesn't support)
+        // TrailingStopLimit → unsupported (Binance's trailing limit is fixed, not offset)
         assert!(
             convert_order_kind_tif(
                 OrderKind::TrailingStopLimit {
@@ -3356,20 +3301,18 @@ mod tests {
     // 7b: convert_execution_report round-trip tests
     // ExecutionReport derives Default with all-Option fields, making it easy to
     // construct targeted test cases.
-    fn make_base_report() -> binance_sdk::spot::websocket_api::ExecutionReport {
-        binance_sdk::spot::websocket_api::ExecutionReport {
-            s: Some("BTCUSDT".to_string()),
-            i: Some(12345),
-            c: Some("client-1".to_string()),
-            t_uppercase: Some(1_700_000_000_000),
+    fn make_base_report() -> ExecutionReport {
+        ExecutionReport {
+            symbol: Some("BTCUSDT".to_string()),
+            order_id: Some(12345),
+            client_order_id: Some("client-1".to_string()),
+            transaction_time: Some(1_700_000_000_000),
             ..Default::default()
         }
     }
 
     /// Run the shared converter over one report and collect what it appends.
-    fn convert(
-        report: binance_sdk::spot::websocket_api::ExecutionReport,
-    ) -> Vec<UnindexedAccountEvent> {
+    fn convert(report: ExecutionReport) -> Vec<UnindexedAccountEvent> {
         let mut buf = Vec::new();
         convert_execution_report(&report, ExchangeId::BinanceSpot, &mut buf);
         buf
@@ -3389,14 +3332,14 @@ mod tests {
 
     #[test]
     fn test_convert_execution_report_new() {
-        let report = binance_sdk::spot::websocket_api::ExecutionReport {
-            x: Some("NEW".to_string()),
-            s_uppercase: Some("BUY".to_string()),
-            o: Some("LIMIT".to_string()),
-            p: Some("50000.00".to_string()),
-            q: Some("0.01".to_string()),
-            f: Some("GTC".to_string()),
-            z: Some("0".to_string()),
+        let report = ExecutionReport {
+            execution_type: Some("NEW".to_string()),
+            side: Some("BUY".to_string()),
+            order_type: Some("LIMIT".to_string()),
+            price: Some("50000.00".to_string()),
+            order_quantity: Some("0.01".to_string()),
+            time_in_force: Some("GTC".to_string()),
+            cumulative_filled_quantity: Some("0".to_string()),
             ..make_base_report()
         };
 
@@ -3416,17 +3359,63 @@ mod tests {
         }
     }
 
+    /// A report without its order type (`o`) cannot say what kind the order is, so its snapshot
+    /// is dropped, as a REST row without one is, rather than read as a `Limit`. A fill it reports
+    /// is still emitted.
+    #[test]
+    fn a_report_without_an_order_type_has_no_order_snapshot() {
+        let new = ExecutionReport {
+            execution_type: Some("NEW".to_string()),
+            side: Some("BUY".to_string()),
+            price: Some("50000.00".to_string()),
+            order_quantity: Some("0.01".to_string()),
+            ..make_base_report()
+        };
+        assert!(convert(new).is_empty());
+
+        let fill = ExecutionReport {
+            execution_type: Some("TRADE".to_string()),
+            order_status: Some("PARTIALLY_FILLED".to_string()),
+            side: Some("BUY".to_string()),
+            trade_id: Some(9999),
+            last_executed_price: Some("50000.00".to_string()),
+            last_executed_quantity: Some("0.005".to_string()),
+            commission_amount: Some("0".to_string()),
+            cumulative_filled_quantity: Some("0.005".to_string()),
+            order_type: Some("LIMIT".to_string()),
+            price: Some("50000.00".to_string()),
+            order_quantity: Some("0.01".to_string()),
+            ..make_base_report()
+        };
+        let kinds = |report| {
+            convert(report)
+                .into_iter()
+                .map(|event| match event.kind {
+                    AccountEventKind::Trade(_) => "trade",
+                    AccountEventKind::OrderSnapshot(_) => "snapshot",
+                    _ => "other",
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(kinds(fill.clone()), ["trade", "snapshot"]);
+        let untyped = ExecutionReport {
+            order_type: None,
+            ..fill
+        };
+        assert_eq!(kinds(untyped), ["trade"]);
+    }
+
     #[test]
     fn test_convert_execution_report_trade() {
         // No `X` (order status): the report says nothing about whether the order is still
         // working, so only the execution is emitted.
-        let report = binance_sdk::spot::websocket_api::ExecutionReport {
-            x: Some("TRADE".to_string()),
-            s_uppercase: Some("BUY".to_string()),
-            t: Some(9999),
-            l_uppercase: Some("50000.00".to_string()),
-            l: Some("0.01".to_string()),
-            n: Some("0.000001".to_string()),
+        let report = ExecutionReport {
+            execution_type: Some("TRADE".to_string()),
+            side: Some("BUY".to_string()),
+            trade_id: Some(9999),
+            last_executed_price: Some("50000.00".to_string()),
+            last_executed_quantity: Some("0.01".to_string()),
+            commission_amount: Some("0.000001".to_string()),
             ..make_base_report()
         };
 
@@ -3476,18 +3465,18 @@ mod tests {
     /// order reads as having nothing filled until REST reconciliation refreshes it.
     #[test]
     fn a_partially_filled_report_carries_the_cumulative_filled_quantity() {
-        let report = binance_sdk::spot::websocket_api::ExecutionReport {
-            x: Some("TRADE".to_string()),
-            x_uppercase: Some("PARTIALLY_FILLED".to_string()),
-            s_uppercase: Some("BUY".to_string()),
-            o: Some("LIMIT".to_string()),
-            p: Some("50000.00".to_string()),
-            q: Some("0.01".to_string()),
-            f: Some("GTC".to_string()),
-            t: Some(9999),
-            l_uppercase: Some("50000.00".to_string()),
-            l: Some("0.004".to_string()),
-            z: Some("0.004".to_string()),
+        let report = ExecutionReport {
+            execution_type: Some("TRADE".to_string()),
+            order_status: Some("PARTIALLY_FILLED".to_string()),
+            side: Some("BUY".to_string()),
+            order_type: Some("LIMIT".to_string()),
+            price: Some("50000.00".to_string()),
+            order_quantity: Some("0.01".to_string()),
+            time_in_force: Some("GTC".to_string()),
+            trade_id: Some(9999),
+            last_executed_price: Some("50000.00".to_string()),
+            last_executed_quantity: Some("0.004".to_string()),
+            cumulative_filled_quantity: Some("0.004".to_string()),
             ..make_base_report()
         };
 
@@ -3509,18 +3498,18 @@ mod tests {
     /// is done rather than leaving it as a resting order that no longer exists at the venue.
     #[test]
     fn a_filled_report_reports_nothing_left_to_fill() {
-        let report = binance_sdk::spot::websocket_api::ExecutionReport {
-            x: Some("TRADE".to_string()),
-            x_uppercase: Some("FILLED".to_string()),
-            s_uppercase: Some("BUY".to_string()),
-            o: Some("LIMIT".to_string()),
-            p: Some("50000.00".to_string()),
-            q: Some("0.01".to_string()),
-            f: Some("GTC".to_string()),
-            t: Some(10_000),
-            l_uppercase: Some("50000.00".to_string()),
-            l: Some("0.006".to_string()),
-            z: Some("0.01".to_string()),
+        let report = ExecutionReport {
+            execution_type: Some("TRADE".to_string()),
+            order_status: Some("FILLED".to_string()),
+            side: Some("BUY".to_string()),
+            order_type: Some("LIMIT".to_string()),
+            price: Some("50000.00".to_string()),
+            order_quantity: Some("0.01".to_string()),
+            time_in_force: Some("GTC".to_string()),
+            trade_id: Some(10_000),
+            last_executed_price: Some("50000.00".to_string()),
+            last_executed_quantity: Some("0.006".to_string()),
+            cumulative_filled_quantity: Some("0.01".to_string()),
             ..make_base_report()
         };
 
@@ -3541,18 +3530,18 @@ mod tests {
     #[test]
     fn a_trade_for_an_order_no_longer_working_emits_the_execution_without_a_snapshot() {
         for status in ["CANCELED", "EXPIRED", "REJECTED", "PENDING_CANCEL", "NEW"] {
-            let report = binance_sdk::spot::websocket_api::ExecutionReport {
-                x: Some("TRADE".to_string()),
-                x_uppercase: Some(status.to_string()),
-                s_uppercase: Some("BUY".to_string()),
-                o: Some("LIMIT".to_string()),
-                p: Some("50000.00".to_string()),
-                q: Some("0.01".to_string()),
-                f: Some("GTC".to_string()),
-                t: Some(9999),
-                l_uppercase: Some("50000.00".to_string()),
-                l: Some("0.004".to_string()),
-                z: Some("0.004".to_string()),
+            let report = ExecutionReport {
+                execution_type: Some("TRADE".to_string()),
+                order_status: Some(status.to_string()),
+                side: Some("BUY".to_string()),
+                order_type: Some("LIMIT".to_string()),
+                price: Some("50000.00".to_string()),
+                order_quantity: Some("0.01".to_string()),
+                time_in_force: Some("GTC".to_string()),
+                trade_id: Some(9999),
+                last_executed_price: Some("50000.00".to_string()),
+                last_executed_quantity: Some("0.004".to_string()),
+                cumulative_filled_quantity: Some("0.004".to_string()),
                 ..make_base_report()
             };
             let events = convert(report);
@@ -3571,12 +3560,12 @@ mod tests {
     #[test]
     fn test_convert_execution_report_trade_missing_last_price() {
         // l_uppercase (L = last filled price) missing: must drop the fill
-        let report = binance_sdk::spot::websocket_api::ExecutionReport {
-            x: Some("TRADE".to_string()),
-            s_uppercase: Some("BUY".to_string()),
-            t: Some(9999),
-            l_uppercase: None, // missing L field
-            l: Some("0.01".to_string()),
+        let report = ExecutionReport {
+            execution_type: Some("TRADE".to_string()),
+            side: Some("BUY".to_string()),
+            trade_id: Some(9999),
+            last_executed_price: None, // missing L field
+            last_executed_quantity: Some("0.01".to_string()),
             ..make_base_report()
         };
         assert!(
@@ -3588,12 +3577,12 @@ mod tests {
     #[test]
     fn test_convert_execution_report_trade_missing_last_qty() {
         // l (last filled qty) missing: must drop the fill
-        let report = binance_sdk::spot::websocket_api::ExecutionReport {
-            x: Some("TRADE".to_string()),
-            s_uppercase: Some("BUY".to_string()),
-            t: Some(9999),
-            l_uppercase: Some("50000.00".to_string()),
-            l: None, // missing l field
+        let report = ExecutionReport {
+            execution_type: Some("TRADE".to_string()),
+            side: Some("BUY".to_string()),
+            trade_id: Some(9999),
+            last_executed_price: Some("50000.00".to_string()),
+            last_executed_quantity: None, // missing l field
             ..make_base_report()
         };
         assert!(
@@ -3604,8 +3593,8 @@ mod tests {
 
     #[test]
     fn test_convert_execution_report_canceled() {
-        let report = binance_sdk::spot::websocket_api::ExecutionReport {
-            x: Some("CANCELED".to_string()),
+        let report = ExecutionReport {
+            execution_type: Some("CANCELED".to_string()),
             ..make_base_report()
         };
 
@@ -3620,9 +3609,9 @@ mod tests {
     #[test]
     fn a_cancel_report_carries_its_fill_or_none() {
         let cancelled = |z: Option<&str>| {
-            let report = binance_sdk::spot::websocket_api::ExecutionReport {
-                x: Some("CANCELED".to_string()),
-                z: z.map(str::to_string),
+            let report = ExecutionReport {
+                execution_type: Some("CANCELED".to_string()),
+                cumulative_filled_quantity: z.map(str::to_string),
                 ..make_base_report()
             };
             let event = sole_event(convert(report)).expect("CANCELED should produce Some");
@@ -3643,8 +3632,8 @@ mod tests {
 
     #[test]
     fn test_convert_execution_report_expired() {
-        let report = binance_sdk::spot::websocket_api::ExecutionReport {
-            x: Some("EXPIRED".to_string()),
+        let report = ExecutionReport {
+            execution_type: Some("EXPIRED".to_string()),
             ..make_base_report()
         };
         let event = sole_event(convert(report)).expect("EXPIRED should produce Some");
@@ -3656,8 +3645,8 @@ mod tests {
 
     #[test]
     fn test_convert_execution_report_expired_in_match() {
-        let report = binance_sdk::spot::websocket_api::ExecutionReport {
-            x: Some("EXPIRED_IN_MATCH".to_string()),
+        let report = ExecutionReport {
+            execution_type: Some("EXPIRED_IN_MATCH".to_string()),
             ..make_base_report()
         };
         let event = sole_event(convert(report)).expect("EXPIRED_IN_MATCH should produce Some");
@@ -3669,9 +3658,9 @@ mod tests {
 
     #[test]
     fn test_convert_execution_report_rejected() {
-        let report = binance_sdk::spot::websocket_api::ExecutionReport {
-            x: Some("REJECTED".to_string()),
-            r: Some("INSUFFICIENT_FUNDS".to_string()),
+        let report = ExecutionReport {
+            execution_type: Some("REJECTED".to_string()),
+            reject_reason: Some("INSUFFICIENT_FUNDS".to_string()),
             ..make_base_report()
         };
 
@@ -3685,8 +3674,8 @@ mod tests {
     #[test]
     fn test_convert_execution_report_missing_exec_type() {
         // Missing x field: must drop the event
-        let report = binance_sdk::spot::websocket_api::ExecutionReport {
-            s: Some("BTCUSDT".to_string()),
+        let report = ExecutionReport {
+            symbol: Some("BTCUSDT".to_string()),
             ..Default::default()
         };
         assert!(
@@ -3698,8 +3687,8 @@ mod tests {
     #[test]
     fn test_convert_execution_report_missing_symbol() {
         // Missing s field with valid x: must drop the event
-        let report = binance_sdk::spot::websocket_api::ExecutionReport {
-            x: Some("NEW".to_string()),
+        let report = ExecutionReport {
+            execution_type: Some("NEW".to_string()),
             ..Default::default()
         };
         assert!(
@@ -3711,10 +3700,10 @@ mod tests {
     #[test]
     fn test_convert_execution_report_missing_order_id() {
         // Missing i field (orderId): shared early-exit path for all exec types
-        let report = binance_sdk::spot::websocket_api::ExecutionReport {
-            x: Some("NEW".to_string()),
-            s: Some("BTCUSDT".to_string()),
-            i: None,
+        let report = ExecutionReport {
+            execution_type: Some("NEW".to_string()),
+            symbol: Some("BTCUSDT".to_string()),
+            order_id: None,
             ..Default::default()
         };
         assert!(
@@ -3726,9 +3715,9 @@ mod tests {
     #[test]
     fn test_convert_execution_report_trade_missing_trade_id() {
         // Missing t field (tradeId) on a TRADE event: must drop the fill
-        let report = binance_sdk::spot::websocket_api::ExecutionReport {
-            x: Some("TRADE".to_string()),
-            t: None,
+        let report = ExecutionReport {
+            execution_type: Some("TRADE".to_string()),
+            trade_id: None,
             ..make_base_report()
         };
         assert!(
@@ -3739,8 +3728,8 @@ mod tests {
 
     #[test]
     fn test_convert_execution_report_replace_yields_cancelled() {
-        let report = binance_sdk::spot::websocket_api::ExecutionReport {
-            x: Some("REPLACE".to_string()),
+        let report = ExecutionReport {
+            execution_type: Some("REPLACE".to_string()),
             ..make_base_report()
         };
         // REPLACE describes the cancelled original order (field `i` = original order ID).
@@ -4375,9 +4364,9 @@ mod tests {
     fn test_dedup_key_from_event_cancelled_error_returns_none() {
         // A REJECTED execution report produces OrderCancelled with Err state.
         // Verify that dedup_key_from_event returns None for such events (no dedup needed).
-        let report = binance_sdk::spot::websocket_api::ExecutionReport {
-            x: Some("REJECTED".to_string()),
-            r: Some("INSUFFICIENT_FUNDS".to_string()),
+        let report = ExecutionReport {
+            execution_type: Some("REJECTED".to_string()),
+            reject_reason: Some("INSUFFICIENT_FUNDS".to_string()),
             ..make_base_report()
         };
         let event = sole_event(convert(report)).expect("REJECTED report should produce Some");
@@ -4414,14 +4403,14 @@ mod tests {
 
     #[test]
     fn test_convert_user_data_events_execution_report_pushes_to_buf() {
-        let report = binance_sdk::spot::websocket_api::ExecutionReport {
-            x: Some("NEW".to_string()),
-            s_uppercase: Some("BUY".to_string()),
-            o: Some("LIMIT".to_string()),
-            p: Some("50000.00".to_string()),
-            q: Some("0.01".to_string()),
-            f: Some("GTC".to_string()),
-            z: Some("0".to_string()),
+        let report = ExecutionReport {
+            execution_type: Some("NEW".to_string()),
+            side: Some("BUY".to_string()),
+            order_type: Some("LIMIT".to_string()),
+            price: Some("50000.00".to_string()),
+            order_quantity: Some("0.01".to_string()),
+            time_in_force: Some("GTC".to_string()),
+            cumulative_filled_quantity: Some("0".to_string()),
             ..make_base_report()
         };
         let frame = user_data_frame("executionReport", &report);
@@ -5392,7 +5381,7 @@ mod tests {
         key: &UnindexedOrderKey,
         row: serde_json::Value,
     ) -> Option<crate::order::state::UnindexedInactiveOrderState> {
-        let order = convert_ended_order(&get_order_row(row), ExchangeId::BinanceSpot, key)?;
+        let order = convert_ended_order(&get_order_row(row), ExchangeId::BinanceSpot, key, None)?;
         assert_eq!(&order.key, key, "reported under the key asked");
         assert_eq!(order.quantity, Decimal::TWO);
         Some(order.state)
@@ -5678,6 +5667,7 @@ mod tests {
             known.lock().live(
                 &spot_key("BTCUSDT", cid),
                 Decimal::TWO,
+                OrderKind::Limit,
                 &Open::new(
                     VenueOrderId::Assigned(OrderId::new(n.to_string())),
                     Utc::now(),
@@ -5885,6 +5875,7 @@ mod tests {
         known.lock().live(
             &eth,
             Decimal::TWO,
+            OrderKind::Limit,
             &Open::new(
                 VenueOrderId::Assigned(OrderId::new("9")),
                 Utc::now(),
