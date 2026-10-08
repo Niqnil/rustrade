@@ -53,6 +53,11 @@
 //! `instruments`, which match names exactly, find it. The perpetuals client matches names
 //! exactly too.
 //!
+//! Only `open_order` checks the spelling. An `instruments` filter naming a pair in another
+//! spelling, or no listed pair, matches nothing, so the read returns nothing for it without an
+//! error. [`ExecutionClient::cancel_order`] sends the coin as the instrument spells it, so a
+//! cancel under another spelling fails in the SDK.
+//!
 //! Orders are placed through the SDK's `ExchangeClient`, which reads `spotMeta` once, when it is
 //! created, and is never refreshed. So a pair listed after the client was created can be reported
 //! but not traded until the client is created again.
@@ -627,8 +632,8 @@ impl ExecutionClient for HyperliquidSpotClient {
         use uuid::Uuid;
 
         // An order is placed, and reported, only under its pair's exact spelling (see
-        // `open_order`), so the instrument of an order to cancel already spells the coin as the
-        // SDK keys it.
+        // `open_order`), so the instrument of any order this client placed or reported spells
+        // the coin as the SDK keys it. A name in another spelling fails in the SDK.
         let coin = match instrument_to_spot_coin(request.key.instrument) {
             Some(c) => c,
             None => {
