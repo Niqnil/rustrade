@@ -486,8 +486,8 @@ pub(crate) fn parse_user_data_frame(frame: &str) -> UserDataFrame<'_> {
 /// that venue and never resets, so a later stream or outage warns again only at the next
 /// thousandth frame, not on its first.
 pub(crate) fn log_unrecognised_frame(venue: &'static str, seen: &AtomicU64, frame: &str) {
-    let count = seen.fetch_add(1, Ordering::Relaxed) + 1;
-    if count == 1 || count.is_multiple_of(1000) {
+    let (count, loud) = count_sampled(seen);
+    if loud {
         warn!(
             venue,
             count,
@@ -504,6 +504,43 @@ pub(crate) fn log_unrecognised_frame(venue: &'static str, seen: &AtomicU64, fram
             "Binance WS: unrecognised user-data frame, ignoring it"
         );
     }
+}
+
+/// Log a user-data event whose `e` tag the stream handler has no arm for: at `warn` for the
+/// first, and for every 1000th after it with the running count, and at `trace` otherwise.
+///
+/// Event types a handler knowingly ignores get their own arm; this is for the rest. So a venue that
+/// renames an event, or a handler that matches the wrong name, is seen at once rather than dropped
+/// silently. `seen` follows [`log_unrecognised_frame`]'s rules: one process-wide counter per venue.
+pub(crate) fn log_unhandled_event(
+    venue: &'static str,
+    seen: &AtomicU64,
+    event_type: &str,
+    event: &str,
+) {
+    let (count, loud) = count_sampled(seen);
+    if loud {
+        warn!(
+            venue,
+            count,
+            event_type,
+            event = frame_excerpt(event),
+            "Binance WS: user-data event of a type this client does not handle, ignoring it; \
+             further ones are logged at trace, with a warning every 1000th"
+        );
+    } else {
+        trace!(
+            venue,
+            count, event_type, "Binance WS: unhandled user-data event, ignoring it"
+        );
+    }
+}
+
+/// Count one occurrence on `seen`; returns the running count and whether to log it loudly (the
+/// first, and every 1000th).
+fn count_sampled(seen: &AtomicU64) -> (u64, bool) {
+    let count = seen.fetch_add(1, Ordering::Relaxed) + 1;
+    (count, count == 1 || count.is_multiple_of(1000))
 }
 
 /// The first 200 characters of a frame, for a log line about it.

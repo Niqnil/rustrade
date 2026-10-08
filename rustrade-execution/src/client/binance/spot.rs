@@ -42,9 +42,10 @@ use super::shared::{
     classify_order_kind_tif, classify_rest_query_error, classify_ws_order_error,
     convert_ended_order, convert_execution_report, convert_open_order_listing,
     convert_open_order_owned_symbol, dedup_key_from_event, drop_after, frame_excerpt, gap_failed,
-    gap_time, is_duplicate, is_handshake_rate_limit, is_unknown_order, log_unrecognised_frame,
-    new_dedup_cache, parse_user_data_frame, placed_order_state, recovered_order_totals,
-    response_decode_error, rest_call_with_retry, trailing_delta_basis_points, unix_ms,
+    gap_time, is_duplicate, is_handshake_rate_limit, is_unknown_order, log_unhandled_event,
+    log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, placed_order_state,
+    recovered_order_totals, response_decode_error, rest_call_with_retry,
+    trailing_delta_basis_points, unix_ms,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
@@ -2293,10 +2294,16 @@ fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -
             warn!("BinanceSpot user data stream terminated by exchange, signalling reconnect");
             true
         }
-        // listStatus, externalLockUpdate, and any future/unknown event types: harmless
-        // fall-through (observable at trace, never tears down the stream).
-        _ => {
+        "listStatus" | "externalLockUpdate" => {
+            // OCO/OTO list status (each leg's own executionReport carries the order state) and
+            // balance locked or unlocked by an external system (e.g. as collateral elsewhere):
+            // ignored knowingly, never tear down the stream.
             trace!(event_type, "BinanceSpot ignoring unhandled user data event");
+            false
+        }
+        _ => {
+            static SEEN: AtomicU64 = AtomicU64::new(0);
+            log_unhandled_event("BinanceSpot", &SEEN, event_type, event);
             false
         }
     }
@@ -4479,14 +4486,17 @@ mod tests {
 
     #[test]
     fn test_convert_user_data_events_unknown_event_ignored() {
-        // listStatus / externalLockUpdate / future event types: harmless fall-through —
-        // ignored, no events pushed, stream not terminated.
-        let frame =
-            r#"{"subscriptionId":0,"event":{"e":"listStatus","E":1700000000000,"s":"BTCUSDT"}}"#;
-        let mut buf = Vec::new();
-        let terminated = convert_user_data_events(frame, &mut buf);
-        assert!(!terminated, "unknown event must not signal termination");
-        assert!(buf.is_empty(), "unknown event should push no events");
+        // Knowingly ignored types (listStatus, externalLockUpdate) and types with no arm at all
+        // (logged by log_unhandled_event): no events pushed, stream not terminated.
+        for e in ["listStatus", "externalLockUpdate", "someFutureEvent"] {
+            let frame = format!(
+                r#"{{"subscriptionId":0,"event":{{"e":"{e}","E":1700000000000,"s":"BTCUSDT"}}}}"#
+            );
+            let mut buf = Vec::new();
+            let terminated = convert_user_data_events(&frame, &mut buf);
+            assert!(!terminated, "{e} must not signal termination");
+            assert!(buf.is_empty(), "{e} should push no events");
+        }
     }
 
     /// Regression: the WS-API subscription wraps every event, and binance-sdk passes the frame on

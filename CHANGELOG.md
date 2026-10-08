@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`BinanceMargin` logs its borrow/repay and margin-level stream events** (`rustrade-execution`). Fixes #547.
+  - The user-data stream matched `userLiabilityChange` and `marginLevelStatusChange`. Binance
+    documents these events as `USER_LIABILITY_CHANGE` and `MARGIN_LEVEL_STATUS_CHANGE`, so
+    documented frames were dropped at trace level, including the liquidation-risk warning.
+  - Both spellings are now accepted until a live frame confirms which one the `userListenToken`
+    stream sends. The events are still logged only, never applied to balance state (#108).
+- **`BinanceSpot` and `BinanceMargin` warn about user-data event types they do not handle**
+  (`rustrade-execution`). Before, any such event was dropped at trace level. Now the first one,
+  and every 1,000th after it, is logged at WARN. Event types the clients ignore on purpose
+  (`listStatus`, and `externalLockUpdate` on spot) are still logged at trace.
+
 ## [0.10.0] - 2026-10-08
 
 ### Added
