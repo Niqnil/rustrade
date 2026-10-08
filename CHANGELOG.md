@@ -21,14 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **`BinanceMargin` leaves conditional orders out of its REST listings and reports them
-  incomplete** (`rustrade-execution`).
+- **`BinanceMargin` leaves conditional orders out of its REST listings** (`rustrade-execution`).
   - Binance margin accepts a `trailingDelta` on every conditional type (`STOP_LOSS`,
     `STOP_LOSS_LIMIT`, `TAKE_PROFIT`, `TAKE_PROFIT_LIMIT`), but its REST order queries, as
     binance-sdk models them, do not report one (#541). A conditional row could therefore be a fixed
     or a trailing order, so `fetch_open_orders` and `account_snapshot` now leave it out, with a
-    warning, and report the listing incomplete. Before, `STOP_LOSS_LIMIT` and `TAKE_PROFIT_LIMIT`
-    rows were listed as `Limit` orders, and `STOP_LOSS` and `TAKE_PROFIT` rows were already left out.
+    warning. `account_snapshot` reports such a listing incomplete; `fetch_open_orders` returns no
+    completeness flag, so there only the warning shows it. Before, `STOP_LOSS_LIMIT` and
+    `TAKE_PROFIT_LIMIT` rows were listed as `Limit` orders, and `STOP_LOSS` and `TAKE_PROFIT` rows
+    were already left out.
   - The account stream reports these orders in full.
   - `fetch_ended_orders`, and the stream's check after a reconnect, still report such an order
     ended, with its fixed-trigger kind at `stopPrice`, so a stop that fired is not held as live.
@@ -56,10 +57,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Both clients now decode `executionReport` into their own type, which reads only the fields it
   uses and takes the trailing delta as a number or a string. The wire type is not confirmed on
   margin, which has no testnet; the new type handles either.
-- **Binance trailing offsets were truncated to whole basis points** (`rustrade-execution`). A
-  `Percentage` offset of `0.155` was sent as a 15 basis-point trail. An offset that does not come to
-  a positive whole number of basis points is now refused with `OrderError::InvalidPrecision`, before
-  anything is sent, rather than trailing by a different distance than asked.
+- **Binance trailing offsets were truncated to whole basis points** (`rustrade-execution`).
+  **Breaking.** A `Percentage` offset of `0.155` was sent as a 15 basis-point trail. An offset that
+  does not come to a positive whole number of basis points is now refused with
+  `OrderError::InvalidPrecision`, before anything is sent, rather than trailing by a different
+  distance than asked. An offset too large to send, which `BinanceSpot` reported as
+  `OrderError::UnsupportedOrderType`, is now `InvalidPrecision` too.
 
 ## [0.9.0] - 2026-10-08
 

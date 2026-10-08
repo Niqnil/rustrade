@@ -54,9 +54,13 @@ use rustrade_instrument::{
     Side, asset::name::AssetNameExchange, exchange::ExchangeId,
     instrument::name::InstrumentNameExchange,
 };
-use serde::{Deserialize, Deserializer};
+use serde::{
+    Deserialize, Deserializer,
+    de::{self, Visitor},
+};
 use smol_str::format_smolstr;
 use std::{
+    fmt,
     pin::Pin,
     str::FromStr,
     sync::{
@@ -972,6 +976,11 @@ impl TrailingDelta {
 ///   [`OrderKind::TrailingStopLimit`]'s (#540), and a trailing take-profit;
 /// - a conditional order whose trailing delta is [`TrailingDelta::Unknown`], which could be either
 ///   a fixed or a trailing order.
+///
+/// The warnings for those last two cases and for an activation price come from the venue's
+/// shape, not from one bad order, and recur on every listing and report of the same live order;
+/// each warns on its first occurrence and every 1000th after (see [`sampled`]), and logs the rest
+/// at `debug`.
 pub(crate) fn decode_order_kind(
     exchange: ExchangeId,
     order_id: Option<i64>,
@@ -992,7 +1001,13 @@ pub(crate) fn decode_order_kind(
         ("MARKET", _) => Some(OrderKind::Market),
         ("LIMIT" | "LIMIT_MAKER", _) => Some(OrderKind::Limit),
         (_, TrailingDelta::Unknown) if is_conditional_order_type(order_type) => {
-            warn!(%exchange, ?order_id, order_type, "Binance conditional order may be a trailing one and its trailingDelta is unknown, dropping it");
+            static SEEN: AtomicU64 = AtomicU64::new(0);
+            let (count, warns) = sampled(&SEEN);
+            if warns {
+                warn!(%exchange, ?order_id, order_type, count, "Binance conditional order may be a trailing one and its trailingDelta is unknown, dropping it; further ones are logged at debug, with a warning every 1000th");
+            } else {
+                debug!(%exchange, ?order_id, order_type, count, "Binance conditional order may be a trailing one and its trailingDelta is unknown, dropping it");
+            }
             None
         }
         ("STOP_LOSS", TrailingDelta::Absent) => {
@@ -1009,7 +1024,13 @@ pub(crate) fn decode_order_kind(
         }
         ("STOP_LOSS", TrailingDelta::BasisPoints(bips)) => {
             if let Some(activation_price) = stop_price {
-                warn!(%exchange, ?order_id, %activation_price, "Binance trailing stop has an activation price, which TrailingStop cannot carry; reporting it without");
+                static SEEN: AtomicU64 = AtomicU64::new(0);
+                let (count, warns) = sampled(&SEEN);
+                if warns {
+                    warn!(%exchange, ?order_id, %activation_price, count, "Binance trailing stop has an activation price, which TrailingStop cannot carry; reporting it without; further ones are logged at debug, with a warning every 1000th");
+                } else {
+                    debug!(%exchange, ?order_id, %activation_price, count, "Binance trailing stop has an activation price, which TrailingStop cannot carry; reporting it without");
+                }
             }
             Some(OrderKind::TrailingStop {
                 offset: Decimal::from(bips),
@@ -1020,7 +1041,13 @@ pub(crate) fn decode_order_kind(
             "STOP_LOSS_LIMIT" | "TAKE_PROFIT" | "TAKE_PROFIT_LIMIT",
             TrailingDelta::BasisPoints(_),
         ) => {
-            warn!(%exchange, ?order_id, order_type, "Binance trailing order of a type OrderKind cannot describe, dropping it");
+            static SEEN: AtomicU64 = AtomicU64::new(0);
+            let (count, warns) = sampled(&SEEN);
+            if warns {
+                warn!(%exchange, ?order_id, order_type, count, "Binance trailing order of a type OrderKind cannot describe, dropping it; further ones are logged at debug, with a warning every 1000th");
+            } else {
+                debug!(%exchange, ?order_id, order_type, count, "Binance trailing order of a type OrderKind cannot describe, dropping it");
+            }
             None
         }
         _ => {
@@ -1028,6 +1055,14 @@ pub(crate) fn decode_order_kind(
             None
         }
     }
+}
+
+/// Count one more occurrence of a recurring condition on `seen`, a process-wide counter per
+/// condition, and say whether it warns: the first does, and every 1000th after it, as in
+/// [`log_unrecognised_frame`]. Returns the running count with it.
+fn sampled(seen: &AtomicU64) -> (u64, bool) {
+    let count = seen.fetch_add(1, Ordering::Relaxed) + 1;
+    (count, count == 1 || count.is_multiple_of(1000))
 }
 
 /// Whether a Binance order `type` is conditional, and so may carry a `trailingDelta`.
@@ -1889,19 +1924,63 @@ pub(crate) struct ExecutionReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WireInt {
     Int(i64),
-    /// Neither an integer nor a string holding one; carries the JSON as received.
+    /// Neither an integer nor a string holding one; carries the value as received, or what kind
+    /// of value it was.
     Unreadable(String),
 }
 
 impl<'de> Deserialize<'de> for WireInt {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = serde_json::Value::deserialize(deserializer)?;
-        let int = match &value {
-            serde_json::Value::Number(n) => n.as_i64(),
-            serde_json::Value::String(s) => s.parse().ok(),
-            _ => None,
-        };
-        Ok(int.map_or_else(|| Self::Unreadable(value.to_string()), Self::Int))
+        deserializer.deserialize_any(WireIntVisitor)
+    }
+}
+
+/// Reads a [`WireInt`] from whatever JSON value arrives, without building a `serde_json::Value`.
+struct WireIntVisitor;
+
+impl<'de> Visitor<'de> for WireIntVisitor {
+    type Value = WireInt;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("an integer, or a string holding one")
+    }
+
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<WireInt, E> {
+        Ok(WireInt::Int(v))
+    }
+
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<WireInt, E> {
+        Ok(i64::try_from(v).map_or_else(|_| WireInt::Unreadable(v.to_string()), WireInt::Int))
+    }
+
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<WireInt, E> {
+        Ok(WireInt::Unreadable(v.to_string()))
+    }
+
+    fn visit_bool<E: de::Error>(self, v: bool) -> Result<WireInt, E> {
+        Ok(WireInt::Unreadable(v.to_string()))
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<WireInt, E> {
+        Ok(v.parse()
+            .map_or_else(|_| WireInt::Unreadable(v.to_owned()), WireInt::Int))
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<WireInt, E> {
+        Ok(WireInt::Unreadable("null".to_owned()))
+    }
+
+    fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<WireInt, A::Error> {
+        while seq.next_element::<de::IgnoredAny>()?.is_some() {}
+        Ok(WireInt::Unreadable("an array".to_owned()))
+    }
+
+    fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<WireInt, A::Error> {
+        while map
+            .next_entry::<de::IgnoredAny, de::IgnoredAny>()?
+            .is_some()
+        {}
+        Ok(WireInt::Unreadable("an object".to_owned()))
     }
 }
 
@@ -1911,9 +1990,7 @@ impl serde::Serialize for WireInt {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             Self::Int(int) => serializer.serialize_i64(*int),
-            Self::Unreadable(raw) => serde_json::from_str::<serde_json::Value>(raw)
-                .map_err(serde::ser::Error::custom)?
-                .serialize(serializer),
+            Self::Unreadable(raw) => serializer.serialize_str(raw),
         }
     }
 }
@@ -3036,7 +3113,21 @@ mod tests {
         );
         assert_eq!(
             report(r#"{"d":"x"}"#).trailing_delta,
-            Some(WireInt::Unreadable(r#""x""#.to_owned()))
+            Some(WireInt::Unreadable("x".to_owned()))
+        );
+        assert_eq!(
+            report(r#"{"d":true}"#).trailing_delta,
+            Some(WireInt::Unreadable("true".to_owned()))
+        );
+        assert_eq!(
+            report(r#"{"d":[1],"x":"NEW"}"#).trailing_delta,
+            Some(WireInt::Unreadable("an array".to_owned()))
+        );
+        assert_eq!(
+            report(r#"{"d":{"a":1},"x":"NEW"}"#)
+                .execution_type
+                .as_deref(),
+            Some("NEW")
         );
         assert_eq!(
             report(r#"{"d":2.5}"#).trailing_delta,

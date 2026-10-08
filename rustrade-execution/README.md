@@ -75,7 +75,8 @@ allows (`OrderError::InvalidPrecision`), and never rounds one: read the rules wi
 `order_precision` and round first. `BinanceMargin` matches Binance spot,
 `TrailingStop` included. Its REST order queries do not report a trailing delta, so
 `fetch_open_orders` and `account_snapshot` leave out its conditional orders (stop,
-stop-limit, take-profit and take-profit-limit) and report the listing incomplete; the
-account stream reports them in full.
+stop-limit, take-profit and take-profit-limit). `account_snapshot` reports such a listing
+incomplete; `fetch_open_orders` has no completeness flag, so there only a warning shows it.
+The account stream reports these orders in full.
 
 See the [workspace README](../README.md) for documentation, examples, and contributing guidelines.

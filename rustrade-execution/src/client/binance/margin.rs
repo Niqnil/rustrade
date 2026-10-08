@@ -377,10 +377,10 @@ impl BinanceMarginConfig {
 /// `STOP_LOSS_LIMIT`, `TAKE_PROFIT`, `TAKE_PROFIT_LIMIT`), but its REST order queries, as
 /// binance-sdk models them, do not report one (#541). A conditional order read over REST could
 /// therefore be a fixed or a trailing order, so [`fetch_open_orders`](Self::fetch_open_orders) and
-/// [`account_snapshot`](Self::account_snapshot) leave a live one out, with a warning, and report
-/// the listing incomplete rather than describe it wrongly. The
-/// [`account_stream`](Self::account_stream) reports these orders in full: its `executionReport`
-/// carries the trailing delta.
+/// [`account_snapshot`](Self::account_snapshot) leave a live one out rather than describe it
+/// wrongly. `account_snapshot` reports such a listing incomplete; `fetch_open_orders` has no way
+/// to, so there the omission shows only in the log. The [`account_stream`](Self::account_stream)
+/// reports these orders in full: its `executionReport` carries the trailing delta.
 ///
 /// An order that has ended is still reported as ended by
 /// [`fetch_ended_orders`](crate::client::OrderStatusClient::fetch_ended_orders) and by the stream's
@@ -1037,6 +1037,14 @@ impl ExecutionClient for BinanceMargin {
     /// **Isolated**: per-symbol on the venue — always iterates the effective isolated set (empty
     /// `instruments` → configured `isolated_symbols`; out-of-set instruments skipped with a warning);
     /// never issues a no-symbol isolated call.
+    ///
+    /// **Conditional orders are omitted** (`STOP_LOSS`, `STOP_LOSS_LIMIT`, `TAKE_PROFIT`,
+    /// `TAKE_PROFIT_LIMIT`, so every `Stop`, `StopLimit`, `TakeProfit`, `TakeProfitLimit` and
+    /// `TrailingStop`): the REST row cannot tell a fixed from a trailing one (#541). This returns
+    /// no completeness flag, so the omission shows only in the log. A caller that needs to know
+    /// whether the result is the whole book reads [`account_snapshot`](Self::account_snapshot),
+    /// which reports such a listing incomplete, and tracks these orders from the
+    /// [`account_stream`](Self::account_stream). See the type-level docs.
     async fn fetch_open_orders(
         &self,
         instruments: &[InstrumentNameExchange],
@@ -5046,13 +5054,6 @@ mod tests {
         }
     }
 
-    /// A partial fill carries two facts, and both must reach the consumer: the execution print
-    /// (`l`/`L`) and the order's new cumulative filled quantity (`z`).
-    ///
-    /// The execution alone never moves the order -- `Orders::update_from_fill` writes only
-    /// `filled_quantity` and needs the order already tracked -- so without the paired snapshot a
-    /// partially filled margin order reads as having nothing filled until REST reconciliation
-    /// refreshes it.
     /// A trailing order's report decodes with `d` as Binance documents it, a number, which
     /// binance-sdk's margin model declares a string, and as a string too.
     #[test]
@@ -5083,6 +5084,13 @@ mod tests {
         }
     }
 
+    /// A partial fill carries two facts, and both must reach the consumer: the execution print
+    /// (`l`/`L`) and the order's new cumulative filled quantity (`z`).
+    ///
+    /// The execution alone never moves the order -- `Orders::update_from_fill` writes only
+    /// `filled_quantity` and needs the order already tracked -- so without the paired snapshot a
+    /// partially filled margin order reads as having nothing filled until REST reconciliation
+    /// refreshes it.
     #[test]
     fn margin_ws_execution_report_trade_maps_to_trade_and_order_snapshot() {
         let frame = push(serde_json::json!({
