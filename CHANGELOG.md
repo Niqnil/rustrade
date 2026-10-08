@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`BinanceMargin` places trailing stops** (`rustrade-execution`). Closes #106.
+  - A `TrailingStop` with a `BasisPoints` or `Percentage` offset is sent as a `STOP_LOSS` with
+    `trailingDelta`, as `BinanceSpot` does. `Absolute` offsets and `TrailingStopLimit` are still
+    unsupported: Binance's trailing `STOP_LOSS_LIMIT` keeps a fixed limit price, where
+    `TrailingStopLimit`'s limit follows the stop (#540).
+  - Binance has no margin testnet, so the mapping is verified against the request binance-sdk sends
+    (wiremock), not against the venue.
+- **`OrderField::TrailingOffset`** (`rustrade-execution`), named by the `PrecisionViolation` of a
+  refused trailing offset.
+
+### Changed
+
+- **`BinanceMargin` leaves conditional orders out of its REST listings and reports them
+  incomplete** (`rustrade-execution`).
+  - Binance margin accepts a `trailingDelta` on every conditional type (`STOP_LOSS`,
+    `STOP_LOSS_LIMIT`, `TAKE_PROFIT`, `TAKE_PROFIT_LIMIT`), but its REST order queries, as
+    binance-sdk models them, do not report one (#541). A conditional row could therefore be a fixed
+    or a trailing order, so `fetch_open_orders` and `account_snapshot` now leave it out, with a
+    warning, and report the listing incomplete. Before, `STOP_LOSS_LIMIT` and `TAKE_PROFIT_LIMIT`
+    rows were listed as `Limit` orders, and `STOP_LOSS` and `TAKE_PROFIT` rows were already left out.
+  - The account stream reports these orders in full.
+  - `fetch_ended_orders`, and the stream's check after a reconnect, still report such an order
+    ended, with its fixed-trigger kind at `stopPrice`, so a stop that fired is not held as live.
+    One without a positive `stopPrice` cannot be described and reads as not ended, with a warning.
+
+### Fixed
+
+- **Binance conditional orders were read back as the wrong kind, or not at all**
+  (`rustrade-execution`).
+  - `STOP_LOSS` and `TAKE_PROFIT` orders were dropped from spot listings and from both clients'
+    account-stream snapshots, and `STOP_LOSS_LIMIT` and `TAKE_PROFIT_LIMIT` were reported as
+    `Limit`. They now read back as `Stop`, `TakeProfit`, `StopLimit` and `TakeProfitLimit` with
+    their trigger price, and a `STOP_LOSS` with a trailing delta as a `TrailingStop` in basis
+    points, whatever offset type it was placed with. A REST row of a kind that carries no limit
+    price reports no price instead of zero, as the stream already did.
+  - A trailing order `OrderKind` cannot describe (a trailing `STOP_LOSS_LIMIT`, a trailing
+    take-profit) is left out with a warning, and its listing reported incomplete. A trailing stop's
+    activation price is not represented yet (#539); one placed with an activation price is reported
+    without it, with a warning.
+- **`BinanceMargin` could drop every account-stream report for some orders** (`rustrade-execution`).
+  binance-sdk's margin `ExecutionReport` declares `d`, `D`, `j`, `J` and `v` strings, where its spot
+  model and Binance's documentation have numbers (binance/binance-connector-rust#108). A report
+  carrying one as a number failed to decode and was dropped whole, fills included: every report of
+  a trailing order, of an order placed with a strategy id, or of a self-trade-prevention expiry.
+  Both clients now decode `executionReport` into their own type, which reads only the fields it
+  uses and takes the trailing delta as a number or a string. The wire type is not confirmed on
+  margin, which has no testnet; the new type handles either.
+- **Binance trailing offsets were truncated to whole basis points** (`rustrade-execution`). A
+  `Percentage` offset of `0.155` was sent as a 15 basis-point trail. An offset that does not come to
+  a positive whole number of basis points is now refused with `OrderError::InvalidPrecision`, before
+  anything is sent, rather than trailing by a different distance than asked.
+
 ## [0.9.0] - 2026-10-08
 
 ### Added
