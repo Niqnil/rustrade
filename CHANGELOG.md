@@ -374,8 +374,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`N`) nullable, distinguishing an absent key from `null`. Both still read as no commission asset,
   as before. The margin stream's report is unchanged. 74.0.0 changes only the dual-investment
   module, which the `binance` feature does not compile.
+
 - **`databento` 0.62.0 → 0.63.0** (`rustrade-data`, `databento` feature). Its live client decodes
   records in batches, and it moves to DBN 0.71.0 and zstd 0.14. No change to this crate's API.
+
 - **A reconnect's check of the orders it holds reads each instrument's own orders**
   (`rustrade-execution`). The known-live orders are indexed by instrument, so the check no longer
   scans every held order for each instrument it covers. No API change. Closes #468.
