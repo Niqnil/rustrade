@@ -738,7 +738,9 @@ pub fn spot_pair_to_instrument(pair: &SpotPair) -> InstrumentNameExchange {
 /// send a malformed asset to the exchange.
 ///
 /// The SDK's `ExchangeClient` addresses every spot pair by this `BASE/QUOTE` form as well as by
-/// the coin Hyperliquid names it (`@107`), so orders can be placed with it.
+/// the coin Hyperliquid names it (`@107`), but only spelled exactly as `spotMeta` spells the
+/// pair's tokens. The name is not checked against `spotMeta`, so `KPEPE-USDC-SPOT` gives
+/// `KPEPE/USDC`, which the SDK does not know for the pair `kPEPE/USDC`.
 pub fn instrument_to_spot_coin(instrument: &InstrumentNameExchange) -> Option<String> {
     let (base, quote) = spot_base_quote(instrument)?;
     Some(format!("{base}/{quote}"))
