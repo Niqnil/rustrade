@@ -65,6 +65,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `OrderError::InvalidPrecision`, before anything is sent, rather than trailing by a different
   distance than asked. An offset too large to send, which `BinanceSpot` reported as
   `OrderError::UnsupportedOrderType`, is now `InvalidPrecision` too.
+- **`HyperliquidSpotClient` accepted a spot instrument spelled in another case, then failed to
+  place it** (`rustrade-execution`). Closes #535. `KPEPE-USDC-SPOT` passed the precision check
+  against the pair Hyperliquid spells `kPEPE/USDC`, but went out as `KPEPE/USDC`, which the
+  Hyperliquid SDK does not know, so the order failed with what read as a venue error. Every report
+  names the pair as Hyperliquid spells it, so `open_order` now matches the pair exactly and refuses
+  any other spelling unsent, with `ApiError::InstrumentInvalid` naming the one to use, as the
+  perpetuals client already does. `order_precision` returns `None` for such a name.
 - **Binance account streams read an order report without an order type as a `Limit` order**
   (`rustrade-execution`). An `executionReport` missing `o` produced an order snapshot of kind
   `Limit`, without a warning. Its snapshot is now dropped with a warning, as a REST order row
