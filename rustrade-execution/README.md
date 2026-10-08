@@ -43,7 +43,10 @@ spot), and `ibkr`. The mock client is always available.
 - **Hyperliquid** perpetuals are named `{coin}-{collateral}-PERP` (`BTC-USDC-PERP`,
   `xyz:TSLA-USDC-PERP`). `HyperliquidClient::connect` reads the default DEX, plus each
   builder-deployed (HIP-3) DEX in `HyperliquidConfig::dexes` (`with_dexes`, or `HYPERLIQUID_DEXES`
-  for `from_env`), on the configured `network`.
+  for `from_env`), on the configured `network`. Spot pairs are named `{base}-{quote}-SPOT` from
+  the pair's tokens, spelled as Hyperliquid spells them (`kPEPE-USDC-SPOT`, not
+  `KPEPE-USDC-SPOT`); `HyperliquidSpotClient` refuses an order on any other spelling, unsent, with
+  `ApiError::InstrumentInvalid`.
 - **IBKR** `connect_sync` fails if any contract in `IbkrConfig::contracts` cannot be built,
   resolved or registered, listing every one. `connect_sync_lenient` connects without them and
   returns them instead.
