@@ -600,12 +600,13 @@ binance-sdk=74.0.0  # 2026-10-08 | Exchange SDK, signing/IO. PINNED: margin user
 # 971a687c42268b035b75255d898b8c18 -- all unchanged), so all 3 internals hold BY CONSTRUCTION:
 #   1. `send_message` (websocket.rs:1667), WebsocketMessageSendOptions (:1439-1443) still exactly
 #      with_api_key / is_signed / is_session_logon / is_session_logout; both margin call sites
-#      (margin.rs:1593, :1633) still pass `WebsocketMessageSendOptions::new()`.
+#      (margin.rs:1594, :1634) still pass `WebsocketMessageSendOptions::new()` (:1597, :1637).
 #   2. `WebsocketEventEmitter::subscribe` (websocket.rs:128-146): one task, one unbounded channel, sequential
-#      `while let Some(event) = rx.recv().await { callback(event) }`; registered at margin.rs:1977.
+#      `while let Some(event) = rx.recv().await { callback(event) }`; registered at margin.rs:1978.
 #   3. `send_request` (utils.rs:951-959), 7 args; timestamp (:967-968), `get_signature` (:971-980),
 #      `signature` appended (:996-997), `X-MBX-APIKEY` (:1034); hand-rolled `userListenToken` POST at
-#      margin.rs:1510.
+#      margin.rs:1509.
+# (margin.rs line numbers are as of this PR's head; they drift.)
 # Still no `userListenToken` / `userDataStream.subscribe.listenToken` binding in margin_trading (#109 stays
 # blocked). `MarginAccountNewOrderParams` has carried `trailing_delta: Option<i64>` since 69.x (still there,
 # trade_api.rs:2723), so the margin trailing-stop gap (#106) is ours, not the SDK's.
