@@ -551,7 +551,9 @@ impl UnhandledEvents {
 ///
 /// Event types a handler knowingly ignores get their own arm; this is for the rest. Warning per
 /// type means a frequent unhandled event cannot hide a rarer one: a venue that renames an event,
-/// or a handler that matches the wrong name, is seen at once rather than dropped silently.
+/// or a handler that matches the wrong name, is seen at once rather than dropped silently (while
+/// fewer than [`UnhandledEvents::MAX_TYPES`] types have been seen; past that, a new type waits for
+/// the next 1000th).
 pub(crate) fn log_unhandled_event(
     venue: &'static str,
     seen: &UnhandledEvents,
