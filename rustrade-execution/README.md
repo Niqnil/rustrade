@@ -57,6 +57,6 @@ Additional order types:
 Hyperliquid requires every order it accepts to carry a client order ID in
 `ClientOrderId::uuid()` form; an order with any other ID is rejected. `BinanceMargin`
 matches Binance spot except that both `TrailingStop` and `TrailingStopLimit` are
-rejected as unsupported (the SDK margin binding omits `trailingDelta`).
+rejected as unsupported (not mapped yet; Binance margin has no testnet to verify them on).
 
 See the [workspace README](../README.md) for documentation, examples, and contributing guidelines.

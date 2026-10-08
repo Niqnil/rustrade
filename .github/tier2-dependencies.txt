@@ -323,7 +323,7 @@ ibapi=5.0.0  # 2026-10-06 | Financial protocol, community-maintained, no officia
 #
 # Exercised against the paper gateway (positions, account_snapshot, EUR.USD paper orders). The #[ignore]d
 # ibkr integration tests still do not run in CI.
-binance-sdk=73.0.0  # 2026-10-06 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
+binance-sdk=74.0.0  # 2026-10-08 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
 #   1. common::websocket::WebsocketApi::send_message      — signature + WebsocketMessageSendOptions signing fields (margin WS subscribe send)
 #   2. ws.common.events.subscribe (WebsocketEventEmitter) — receive/event-callback path (margin WS event delivery)
 #   3. common::utils::send_request                        — signature + HMAC signing + X-MBX-APIKEY header (hand-rolled `userListenToken` POST; SDK binds no endpoint for it)
@@ -587,6 +587,35 @@ binance-sdk=73.0.0  # 2026-10-06 | Exchange SDK, signing/IO. PINNED: margin user
 # checksum plus 12 one-line re-pointings of EXISTING packages' dependency edges (windows-sys ->0.61.2,
 # socket2 0.5.10 -> 0.6.3, getrandom 0.3.4 -> 0.4.2 for tempfile): zero `[[package]]` entries added or
 # removed, no net-new crates. CONSUMER-SIDE API CHURN: one line, the `commission_asset` accessor above.
+#
+# Re-verified against the =74.0.0 crates.io source on 2026-10-08 (73.0.0 -> 74.0.0). .crate sha256
+# 3bf2c8c50455875559da8c03427f7ce741b0e7528f4508d73e0e6c7fb319eba8 matches the index; publisher unchanged
+# (solutionsGH); published from git 2771d295e46e0fdc8f5aca6296765fe43c46c3ee.
+# THE ENTIRE `src/` DELTA IS ONE MODULE WE DO NOT COMPILE: `diff -rq` over src/ returns 12 entries, all under
+# dual_investment/rest_api/ (the `change_auto_compound_status` endpoint and its response model removed --
+# what made it MAJOR -- plus reshaped dual-investment response models), behind the `dual_investment`
+# feature (lib.rs:35-36), not in our `spot` + `margin_trading` selection. `src/common/`, `src/spot/`,
+# `src/margin_trading/` and `src/lib.rs` are ALL BYTE-IDENTICAL (websocket.rs md5
+# 367bbb4fe76c40d401ba23bcaba8c08a, utils.rs md5 1541c46b7c5ba4f5f7ef57286c99695d, lib.rs md5
+# 971a687c42268b035b75255d898b8c18 -- all unchanged), so all 3 internals hold BY CONSTRUCTION:
+#   1. `send_message` (websocket.rs:1667), WebsocketMessageSendOptions (:1439-1443) still exactly
+#      with_api_key / is_signed / is_session_logon / is_session_logout; both margin call sites
+#      (margin.rs:1593, :1633) still pass `WebsocketMessageSendOptions::new()`.
+#   2. `WebsocketEventEmitter::subscribe` (websocket.rs:128-146): one task, one unbounded channel, sequential
+#      `while let Some(event) = rx.recv().await { callback(event) }`; registered at margin.rs:1977.
+#   3. `send_request` (utils.rs:951-959), 7 args; timestamp (:967-968), `get_signature` (:971-980),
+#      `signature` appended (:996-997), `X-MBX-APIKEY` (:1034); hand-rolled `userListenToken` POST at
+#      margin.rs:1510.
+# Still no `userListenToken` / `userDataStream.subscribe.listenToken` binding in margin_trading (#109 stays
+# blocked). `MarginAccountNewOrderParams` has carried `trailing_delta: Option<i64>` since 69.x (still there,
+# trade_api.rs:2723), so the margin trailing-stop gap (#106) is ours, not the SDK's.
+#
+# Security: PASS, unchanged rather than equivalent -- real `unsafe` is the same 10 test-only sites in the
+# byte-identical utils.rs; build.rs identical; constants.rs identical (no new hosts); no new env reads,
+# filesystem, process or encoded-blob sites in the delta. Both standing caveats carry forward unchanged.
+# Dependency surface: Cargo.toml.orig differs by the version line and one removed dual_investment
+# `[[example]]` only; `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]` and `[features]`
+# identical. Our Cargo.lock delta is binance-sdk's version + checksum alone. CONSUMER-SIDE API CHURN: NONE.
 quick-xml  # 2026-07-08 | New direct dep (XML parsing of broker Flex statements). Reviewed @ 0.41.0: #![forbid(unsafe_code)] crate-wide, zero net-new transitive deps (serde+memchr only, both already in tree), no RUSTSEC advisories, de-facto-standard parser. Not pinned — any version bump still needs review.
 #   Re-reviewed @ 0.42.0 (2026-09-16), the review this entry's "any version bump still needs
 #   review" mandates. All four properties recorded at 0.41.0 re-verified and still hold:
