@@ -208,9 +208,9 @@ mod tests {
             {"name": "@107", "tokens": [150, 0], "index": 107}
         ],
         "tokens": [
-            {"name": "USDC", "index": 0},
-            {"name": "PURR", "index": 1},
-            {"name": "HYPE", "index": 150}
+            {"name": "USDC", "szDecimals": 8, "index": 0},
+            {"name": "PURR", "szDecimals": 0, "index": 1},
+            {"name": "HYPE", "szDecimals": 2, "index": 150}
         ]
     }"#;
 

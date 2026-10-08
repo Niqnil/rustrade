@@ -33,6 +33,8 @@ pub(super) struct PerpDexes {
     collateral: BTreeMap<SmolStr, SmolStr>,
     /// The asset id of every perpetual the configured HIP-3 DEXs list, by coin.
     asset_ids: HashMap<String, u32>,
+    /// The `szDecimals` of every perpetual traded, the default DEX's included, by coin.
+    sz_decimals: HashMap<String, u32>,
 }
 
 /// One entry of the `perpDexs` response. The default DEX is listed first, as `null`.
@@ -51,8 +53,10 @@ struct DexMeta {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct DexPerp {
     name: String,
+    sz_decimals: u32,
 }
 
 /// The parts of a `spotMeta` response that this client uses.
@@ -164,6 +168,7 @@ impl PerpDexes {
                         "DEX {dex:?} lists more than {HIP3_ASSETS_PER_DEX} perpetuals"
                     ))
                 })?;
+            self.sz_decimals.insert(perp.name.clone(), perp.sz_decimals);
             self.asset_ids.insert(perp.name, asset);
         }
         self.collateral.insert(dex.clone(), collateral.clone());
@@ -176,6 +181,21 @@ impl PerpDexes {
         self.asset_ids
             .iter()
             .map(|(coin, asset)| (coin.clone(), *asset))
+    }
+
+    /// Record the `szDecimals` of the default DEX's perpetuals, from the `meta` the SDK read.
+    pub(super) fn add_default_perps(&mut self, universe: &[hyperliquid_rust_sdk::AssetMeta]) {
+        self.sz_decimals.extend(
+            universe
+                .iter()
+                .map(|asset| (asset.name.clone(), asset.sz_decimals)),
+        );
+    }
+
+    /// The `szDecimals` of the perpetual `coin`, `None` if no DEX traded listed it when the
+    /// client connected.
+    pub(super) fn sz_decimals(&self, coin: &str) -> Option<u32> {
+        self.sz_decimals.get(coin).copied()
     }
 
     /// The configured HIP-3 DEXs, by name.

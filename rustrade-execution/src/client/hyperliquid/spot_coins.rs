@@ -60,22 +60,37 @@ impl SpotCoins {
     where
         Coins: IntoIterator<Item = &'a str> + Clone,
     {
-        let lacks_one = |pairs: &SpotPairs| {
+        self.read_again_unless(|pairs| {
             coins
                 .clone()
                 .into_iter()
-                .any(|coin| CoinKind::of(coin) == CoinKind::Spot && pairs.get(coin).is_none())
-        };
+                .all(|coin| CoinKind::of(coin) != CoinKind::Spot || pairs.get(coin).is_some())
+        })
+        .await
+    }
 
+    /// The base token's `szDecimals` of the pair of `base` quoted in `quote`, as
+    /// [`SpotPairs::find`] matches it, read again first if the pairs lack it, as
+    /// [`covering`](Self::covering) does.
+    pub(super) async fn base_sz_decimals(&self, base: &str, quote: &str) -> Option<u32> {
+        self.read_again_unless(|pairs| pairs.find(base, quote).is_some())
+            .await
+            .find(base, quote)
+            .map(SpotPair::base_sz_decimals)
+    }
+
+    /// The pairs, read again first unless they are `complete`, at most once per
+    /// [`REFETCH_INTERVAL`].
+    async fn read_again_unless(&self, complete: impl Fn(&SpotPairs) -> bool) -> Arc<SpotPairs> {
         let pairs = self.current();
-        if !lacks_one(&pairs) {
+        if complete(&pairs) {
             return pairs;
         }
 
         let mut refetched = self.0.refetched.lock().await;
         // Another caller may have read `spotMeta` while this one waited for the lock.
         let pairs = self.current();
-        if !lacks_one(&pairs) || refetched.is_some_and(|at| at.elapsed() < REFETCH_INTERVAL) {
+        if complete(&pairs) || refetched.is_some_and(|at| at.elapsed() < REFETCH_INTERVAL) {
             return pairs;
         }
 
@@ -85,7 +100,7 @@ impl SpotCoins {
             Ok(fetched) => {
                 info!(
                     pairs = fetched.len(),
-                    "Read Hyperliquid spotMeta again for a spot coin it lacked"
+                    "Read Hyperliquid spotMeta again for a spot pair it lacked"
                 );
                 let fetched = Arc::new(fetched);
                 *self.0.pairs.write() = Arc::clone(&fetched);

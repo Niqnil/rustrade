@@ -227,6 +227,7 @@ pub struct SpotPair {
     index: u32,
     base: SmolStr,
     quote: SmolStr,
+    base_sz_decimals: u32,
 }
 
 impl SpotPair {
@@ -249,6 +250,12 @@ impl SpotPair {
     /// The quote token's name, as Hyperliquid spells it (`USDC`).
     pub fn quote(&self) -> &str {
         &self.quote
+    }
+
+    /// The base token's `szDecimals`: the most decimal places an order's size on this pair may
+    /// have. It also caps a price's decimal places, at `8 - szDecimals`.
+    pub fn base_sz_decimals(&self) -> u32 {
+        self.base_sz_decimals
     }
 }
 
@@ -304,17 +311,19 @@ struct SpotMetaPair {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SpotMetaToken {
     name: SmolStr,
     index: u32,
+    sz_decimals: u32,
 }
 
 impl From<SpotMeta> for SpotPairs {
     fn from(meta: SpotMeta) -> Self {
-        let tokens: HashMap<u32, SmolStr> = meta
+        let tokens: HashMap<u32, (SmolStr, u32)> = meta
             .tokens
             .into_iter()
-            .map(|token| (token.index, token.name))
+            .map(|token| (token.index, (token.name, token.sz_decimals)))
             .collect();
 
         Self(
@@ -322,11 +331,13 @@ impl From<SpotMeta> for SpotPairs {
                 .into_iter()
                 .filter_map(|pair| {
                     let [base, quote] = pair.tokens;
+                    let (base, base_sz_decimals) = tokens.get(&base)?.clone();
                     let pair = SpotPair {
                         index: pair.index,
-                        base: tokens.get(&base)?.clone(),
-                        quote: tokens.get(&quote)?.clone(),
+                        base,
+                        quote: tokens.get(&quote)?.0.clone(),
                         coin: pair.name,
+                        base_sz_decimals,
                     };
                     Some((pair.coin.clone(), pair))
                 })
@@ -382,6 +393,23 @@ mod tests {
     }
 
     #[test]
+    fn a_spot_pair_carries_its_base_tokens_sz_decimals() {
+        let pairs = pairs();
+
+        assert_eq!(pairs.get("@107").unwrap().base_sz_decimals(), 2, "HYPE");
+        assert_eq!(
+            pairs.get("@207").unwrap().base_sz_decimals(),
+            2,
+            "HYPE, not USDT0"
+        );
+        assert_eq!(
+            pairs.get("PURR/USDC").unwrap().base_sz_decimals(),
+            0,
+            "PURR"
+        );
+    }
+
+    #[test]
     fn spot_pairs_leave_out_a_pair_with_an_unlisted_token() {
         let pairs = pairs();
 
@@ -424,9 +452,9 @@ mod tests {
                     {"name": "@2", "tokens": [2, 0], "index": 2}
                 ],
                 "tokens": [
-                    {"name": "USDC", "index": 0},
-                    {"name": "ABC", "index": 1},
-                    {"name": "abc", "index": 2}
+                    {"name": "USDC", "szDecimals": 8, "index": 0},
+                    {"name": "ABC", "szDecimals": 2, "index": 1},
+                    {"name": "abc", "szDecimals": 2, "index": 2}
                 ]
             }"#,
         )
