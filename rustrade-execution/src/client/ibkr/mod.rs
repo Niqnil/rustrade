@@ -86,6 +86,7 @@
 //! - `rustrade_data::exchange::ibkr` for market data
 
 pub mod account;
+mod connect;
 pub mod contract;
 mod ended_orders;
 pub mod execution;
@@ -121,6 +122,7 @@ use crate::{
 };
 use account::{BalanceAggregator, PositionAggregator};
 use chrono::{DateTime, Utc};
+pub use connect::{ConnectOutcome, ContractSkipReason, IbkrConnectError, SkippedContract};
 use contract::ResolveContractError;
 use execution::{ExecutionBuffer, ExecutionRevision, parse_decimal_or_warn, try_decimal_or_warn};
 use futures::stream::BoxStream;
@@ -171,7 +173,9 @@ pub struct IbkrConfig {
     /// Currently unused — balance/position queries use "All" group.
     /// Reserved for future multi-account routing (advisor accounts).
     pub account: String,
-    /// Pre-configured contracts to register on startup
+    /// Contracts to resolve and register on connect. [`IbkrClient::connect_sync`] fails if any
+    /// of them cannot be registered; [`IbkrClient::connect_sync_lenient`] connects without it
+    /// and reports it.
     #[serde(default)]
     pub contracts: Vec<ContractConfig>,
 }
@@ -1081,19 +1085,63 @@ impl std::fmt::Debug for IbkrClient {
 }
 
 impl IbkrClient {
-    /// Connect to TWS/Gateway and initialize the client (sync, blocking).
+    /// Connect to TWS/Gateway and register every contract in [`IbkrConfig::contracts`]
+    /// (sync, blocking).
     ///
-    /// Each contract in [`IbkrConfig::contracts`] is resolved as
+    /// Each contract is built from its config, resolved as
     /// [`resolve_contract`](Self::resolve_contract) does and registered as
-    /// [`register_contract`](Self::register_contract) does. A contract that cannot be built,
-    /// resolved or registered is skipped with a `warn!` naming why, and the client connects
-    /// without it: orders for it are refused as for any unregistered instrument. Check
-    /// [`contract_registry`](Self::contract_registry) to confirm what was registered.
+    /// [`register_contract`](Self::register_contract) does. If any of them fails, the
+    /// connection is dropped and [`IbkrConnectError::Contracts`] lists every contract that
+    /// failed, not just the first, so that a client never starts without a contract its caller
+    /// configured. To connect anyway and get the failures back, use
+    /// [`connect_sync_lenient`](Self::connect_sync_lenient).
+    ///
+    /// The library does not retry. If every contract in [`IbkrConnectError::Contracts`] has a
+    /// [`reason`](SkippedContract::reason) that [`is_transient`](ContractSkipReason::is_transient),
+    /// connecting again may succeed. Otherwise fix the config, or connect with
+    /// [`connect_sync_lenient`](Self::connect_sync_lenient).
     ///
     /// # Errors
     ///
-    /// Returns error if the connection fails.
-    pub fn connect_sync(config: IbkrConfig) -> Result<Self, UnindexedClientError> {
+    /// - [`IbkrConnectError::Connect`] if TWS/Gateway cannot be reached or refuses the
+    ///   connection.
+    /// - [`IbkrConnectError::Contracts`] if any configured contract cannot be registered.
+    pub fn connect_sync(config: IbkrConfig) -> Result<Self, IbkrConnectError> {
+        let ConnectOutcome { client, skipped } = Self::connect_inner(config)?;
+        if skipped.is_empty() {
+            Ok(client)
+        } else {
+            // Dropping the only `ibapi` client closes the connection, freeing the client ID.
+            drop(client);
+            Err(IbkrConnectError::Contracts(skipped))
+        }
+    }
+
+    /// Connect to TWS/Gateway as [`connect_sync`](Self::connect_sync) does, but without each
+    /// configured contract that cannot be registered, returning those in
+    /// [`ConnectOutcome::skipped`].
+    ///
+    /// Orders for a skipped contract's instrument are refused as for any unregistered
+    /// instrument, so check `skipped`. To retry one, call
+    /// [`resolve_contract`](Self::resolve_contract) and then
+    /// [`register_contract`](Self::register_contract) on the connected client.
+    ///
+    /// Blocking, like [`connect_sync`](Self::connect_sync): it waits for the connection and for
+    /// one contract details request per configured contract, each of which can take up to 10
+    /// seconds if IB stops answering. From async code, call it inside
+    /// `tokio::task::spawn_blocking`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if TWS/Gateway cannot be reached or refuses the connection.
+    pub fn connect_sync_lenient(
+        config: IbkrConfig,
+    ) -> Result<ConnectOutcome, UnindexedClientError> {
+        Self::connect_inner(config)
+    }
+
+    /// Connect, then register each configured contract, collecting the ones that fail.
+    fn connect_inner(config: IbkrConfig) -> Result<ConnectOutcome, UnindexedClientError> {
         let url = format!("{}:{}", config.host, config.port);
         info!(url = %url, client_id = config.client_id, "Connecting to IB");
 
@@ -1104,38 +1152,18 @@ impl IbkrClient {
         let next_id = client.next_order_id();
 
         let contracts = ContractRegistry::new();
-
-        for contract_config in &config.contracts {
-            let contract = match contract_config.to_contract() {
-                Ok(contract) => contract,
-                Err(e) => {
-                    warn!(name = %contract_config.name, error = %e, "Invalid contract config, skipping");
-                    continue;
-                }
-            };
-            let name = InstrumentNameExchange::from(contract_config.name.as_str());
-
-            let resolved = match resolve_contract_blocking(&client, &contract) {
-                Ok(resolved) => resolved,
-                Err(e) => {
-                    warn!(name = %name, error = %e, "Failed to resolve contract, skipping");
-                    continue;
-                }
-            };
-            let con_id = resolved.contract_id;
-            match contracts.register(name.clone(), resolved) {
-                Ok(()) => debug!(name = %name, con_id, "Registered contract"),
-                Err(e) => warn!(name = %name, error = %e, "Failed to register contract, skipping"),
-            }
-        }
+        let skipped = connect::register_configured(&config.contracts, &contracts, |contract| {
+            resolve_contract_blocking(&client, contract)
+        });
 
         info!(
             contracts = contracts.len(),
+            skipped = skipped.len(),
             next_order_id = next_id,
             "Connected to IB"
         );
 
-        Ok(Self {
+        let client = Self {
             config: Arc::new(config),
             client: Arc::new(client),
             contracts,
@@ -1146,7 +1174,8 @@ impl IbkrClient {
             known_live: KnownLiveOrders::shared(ExchangeId::Ibkr),
             listings: ListingLock::default(),
             earlier_completions: ended_orders::EarlierCompletions::new(),
-        })
+        };
+        Ok(ConnectOutcome { client, skipped })
     }
 
     /// Get the next order ID and increment the counter.
@@ -1988,7 +2017,7 @@ impl ExecutionClient for IbkrClient {
     type Config = IbkrConfig;
     type AccountStream = BoxStream<'static, UnindexedAccountEvent>;
 
-    /// Rejects a `ContractConfig` that [`connect_sync`](Self::connect_sync) would skip as invalid,
+    /// Rejects a `ContractConfig` that [`connect_sync`](Self::connect_sync) would refuse as invalid,
     /// or whose `security_type` contradicts the kind of the instrument it is keyed to by `name`:
     /// `STK` or `CASH` for a `Spot`, `FUT` for a `Future`, `OPT` for an `Option`. Every problem
     /// found is reported, not just the first.
@@ -2053,13 +2082,16 @@ impl ExecutionClient for IbkrClient {
     ///
     /// # Panics
     ///
-    /// Panics if connection fails. The `ExecutionClient` trait doesn't allow
-    /// `new()` to return `Result`. Use `IbkrClient::connect_sync()` directly
-    /// for fallible construction.
+    /// Panics if [`IbkrClient::connect_sync`] fails: when TWS/Gateway cannot be reached or
+    /// refuses the connection, or when any contract in [`IbkrConfig::contracts`] cannot be
+    /// registered. The `ExecutionClient` trait doesn't allow `new()` to return `Result`. Call
+    /// [`IbkrClient::connect_sync`] or [`IbkrClient::connect_sync_lenient`] directly for
+    /// fallible construction.
     #[track_caller]
     fn new(config: Self::Config) -> Self {
         #[allow(clippy::expect_used)] // Trait signature doesn't allow Result
-        Self::connect_sync(config).expect("failed to connect to IB")
+        Self::connect_sync(config)
+            .expect("failed to connect to IB or to register its configured contracts")
     }
 
     /// Fetch account snapshot: balances, and the position and open orders of each registered
@@ -3801,8 +3833,8 @@ mod contract_config_tests {
         assert!(error.contains("OPT"), "{error}");
     }
 
-    /// `connect_sync` only logs and skips an invalid entry; built through `ExecutionBuilder`, it
-    /// fails the build instead. Every problem is reported, not just the first.
+    /// `connect_sync` refuses an invalid entry only once connected; built through
+    /// `ExecutionBuilder`, it fails the build before connecting. Every problem is reported, not just the first.
     #[test]
     fn validate_config_reports_every_invalid_or_contradicting_entry() {
         let name = InstrumentNameExchange::new("ES");
