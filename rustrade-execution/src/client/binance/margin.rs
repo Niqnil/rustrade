@@ -51,15 +51,16 @@
 
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
-    CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
-    MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, PlacementResponse, RateLimitTracker,
-    RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnrecoveredFills, UserDataFrame,
-    WeightPool, binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
+    CONNECT_TIMEOUT_SECS, ExecutionReport, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS,
+    HEARTBEAT_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing,
+    PlacementResponse, RateLimitTracker, RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS,
+    SharedDedupCache, TrailingDeltaError, UnrecoveredFills, UserDataFrame, WeightPool,
+    binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
     classify_rest_query_error, convert_ended_order, convert_execution_report,
     convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event, drop_after,
     gap_failed, gap_time, is_duplicate, is_unknown_order, log_unrecognised_frame, new_dedup_cache,
     parse_user_data_frame, placed_order_state, recovered_order_totals, response_decode_error,
-    rest_call_with_retry,
+    rest_call_with_retry, trailing_delta_basis_points,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
@@ -113,7 +114,7 @@ use binance_sdk::{
             QueryMarginAccountsTradeListResponseInner, RestApi,
         },
         websocket_streams::{
-            ExecutionReport, MarginLevelStatusChange, OutboundAccountPosition, UserLiabilityChange,
+            MarginLevelStatusChange, OutboundAccountPosition, UserLiabilityChange,
         },
     },
 };
@@ -365,10 +366,29 @@ impl BinanceMarginConfig {
 ///   are scoped to the configured [`BinanceMarginConfig::isolated_symbols`]. See
 ///   [`account_snapshot`](Self::account_snapshot) for the full per-method semantics.
 ///
-/// # Trailing stops unsupported
-/// `TrailingStop` / `TrailingStopLimit` return [`OrderError::UnsupportedOrderType`]: this client does
-/// not map them yet. Binance margin accepts `trailingDelta`, and the SDK binds it, but margin has no
-/// testnet to verify the mapping on. See [`open_order`](Self::open_order).
+/// # Trailing stops
+/// As on spot, a `TrailingStop` is placed as a `STOP_LOSS` with a `trailingDelta`, for
+/// `BasisPoints` and `Percentage` offsets that come to a whole number of basis points. Absolute
+/// offsets and `TrailingStopLimit` return [`OrderError::UnsupportedOrderType`]. See
+/// [`open_order`](Self::open_order).
+///
+/// # Conditional orders read back over REST
+/// Binance margin accepts a `trailingDelta` on every conditional type (`STOP_LOSS`,
+/// `STOP_LOSS_LIMIT`, `TAKE_PROFIT`, `TAKE_PROFIT_LIMIT`), but its REST order queries, as
+/// binance-sdk models them, do not report one (#541). A conditional order read over REST could
+/// therefore be a fixed or a trailing order, so [`fetch_open_orders`](Self::fetch_open_orders) and
+/// [`account_snapshot`](Self::account_snapshot) leave a live one out rather than describe it
+/// wrongly. `account_snapshot` reports such a listing incomplete; `fetch_open_orders` has no way
+/// to, so there the omission shows only in the log. The [`account_stream`](Self::account_stream)
+/// reports these orders in full: its `executionReport` carries the trailing delta.
+///
+/// An order that has ended is still reported as ended by
+/// [`fetch_ended_orders`](crate::client::OrderStatusClient::fetch_ended_orders) and by the stream's
+/// check after a reconnect, so that a stop that fired is not held as live. Its kind is the one this
+/// client holds it with: every order it placed, listed or saw on its stream while live. An order
+/// it does not hold is reported with its fixed-trigger kind at `stopPrice`, which a trailing order
+/// it really was does not match, and one of those without a positive `stopPrice` cannot be
+/// described at all and reads as not ended, with a warning.
 ///
 /// # User-data stream (`userListenToken`)
 /// [`account_stream`](Self::account_stream) is hand-rolled over the `userListenToken` model — the
@@ -441,7 +461,7 @@ impl BinanceMargin {
     ) {
         let mut known = self.known_live.lock();
         for order in orders {
-            known.live(&order.key, order.quantity, &order.state);
+            known.live(&order.key, order.quantity, order.kind, &order.state);
         }
     }
 
@@ -664,8 +684,10 @@ impl ExecutionClient for BinanceMargin {
     /// - `isIsolated` is config-driven (`"TRUE"` for isolated, `"FALSE"` for cross).
     /// - `autoRepayAtCancel` is set only under [`MarginSideEffect::AutoBorrowRepay`]: a `NoBorrow`
     ///   client takes no loan, so requesting repay-on-cancel would be incoherent.
-    /// - Trailing-stop kinds return [`OrderError::UnsupportedOrderType`]: not mapped yet (see the
-    ///   type-level docs).
+    /// - A `TrailingStop` is sent as a `STOP_LOSS` with `trailingDelta` in basis points. An
+    ///   Absolute offset, and `TrailingStopLimit`, return [`OrderError::UnsupportedOrderType`]; an
+    ///   offset that is not a positive whole number of basis points returns
+    ///   [`OrderError::InvalidPrecision`] (see the type-level docs).
     async fn open_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
@@ -715,6 +737,9 @@ impl ExecutionClient for BinanceMargin {
                         "BinanceMargin does not support OrderKind::{kind:?} with {time_in_force:?}"
                     ),
                 )));
+            }
+            Err(BuildOrderError::TrailingDelta(refused)) => {
+                return inactive(OrderState::inactive(refused.into_order_error()));
             }
             Err(BuildOrderError::Build(msg)) => {
                 error!(%msg, "BinanceMargin failed to build new order params");
@@ -780,7 +805,9 @@ impl ExecutionClient for BinanceMargin {
                 cumulative_quote_qty: data.cummulative_quote_qty.as_deref(),
             },
         );
-        self.known_live.lock().placed(&order_key, quantity, &state);
+        self.known_live
+            .lock()
+            .placed(&order_key, quantity, kind, &state);
 
         Order {
             key: order_key,
@@ -1013,6 +1040,14 @@ impl ExecutionClient for BinanceMargin {
     /// **Isolated**: per-symbol on the venue — always iterates the effective isolated set (empty
     /// `instruments` → configured `isolated_symbols`; out-of-set instruments skipped with a warning);
     /// never issues a no-symbol isolated call.
+    ///
+    /// **Conditional orders are omitted** (`STOP_LOSS`, `STOP_LOSS_LIMIT`, `TAKE_PROFIT`,
+    /// `TAKE_PROFIT_LIMIT`, so every `Stop`, `StopLimit`, `TakeProfit`, `TakeProfitLimit` and
+    /// `TrailingStop`): the REST row cannot tell a fixed from a trailing one (#541). This returns
+    /// no completeness flag, so the omission shows only in the log. A caller that needs to know
+    /// whether the result is the whole book reads [`account_snapshot`](Self::account_snapshot),
+    /// which reports such a listing incomplete, and tracks these orders from the
+    /// [`account_stream`](Self::account_stream). See the type-level docs.
     async fn fetch_open_orders(
         &self,
         instruments: &[InstrumentNameExchange],
@@ -1424,12 +1459,14 @@ impl OrderStatusClient for BinanceMargin {
         orders: &[UnindexedOrderKey],
     ) -> Result<Vec<UnindexedInactiveOrder>, UnindexedClientError> {
         fetch_ended_by_key(orders, |key| {
+            let recorded_kind = self.known_live.lock().kind_of(&key.cid);
             fetch_margin_order_lookup(
                 self.rest.clone(),
                 self.rate_limiter.clone(),
                 key,
                 self.config.is_isolated,
                 RequestKind::Query,
+                recorded_kind,
             )
         })
         .await
@@ -3058,12 +3095,17 @@ async fn fetch_margin_all_open_orders(
 
 /// Look the order under `key` up with `GET /sapi/v1/margin/order` by its client order id
 /// (weight 10), in the cross or isolated account as `is_isolated` says.
+///
+/// `recorded_kind` is the kind the client holds the order with, if it does. The row cannot say
+/// whether a conditional order trailed (#541), so an ended one is reported with that kind, or
+/// failing it with its fixed trigger (see [`convert_ended_order`]).
 async fn fetch_margin_order_lookup(
     rest: Arc<RestApi>,
     rate_limiter: Arc<RateLimitTracker>,
     key: UnindexedOrderKey,
     is_isolated: bool,
     kind: RequestKind,
+    recorded_kind: Option<OrderKind>,
 ) -> Result<OrderLookup, UnindexedClientError> {
     // Convert once before the retry closure to avoid a String allocation on every retry.
     let symbol = key.instrument.name().to_string();
@@ -3091,10 +3133,12 @@ async fn fetch_margin_order_lookup(
 
     let row = response.data().await.map_err(response_decode_error)?;
 
-    Ok(convert_ended_order(&row, ExchangeId::BinanceMargin, &key)
-        .map_or(OrderLookup::NotEnded, |order| {
-            OrderLookup::Ended(Box::new(order))
-        }))
+    Ok(
+        convert_ended_order(&row, ExchangeId::BinanceMargin, &key, recorded_kind)
+            .map_or(OrderLookup::NotEnded, |order| {
+                OrderLookup::Ended(Box::new(order))
+            }),
+    )
 }
 
 /// The client order ids `GET /sapi/v1/margin/openOrders` lists on `instruments` (weight 10 each,
@@ -3142,12 +3186,15 @@ async fn recover_margin_ended_orders(
             listed_margin_open_cids(rest.clone(), rate_limiter.clone(), instruments, is_isolated)
         },
         |key| {
+            // Held as live, so the client knows its kind, which the row may not show.
+            let recorded_kind = known.lock().kind_of(&key.cid);
             fetch_margin_order_lookup(
                 rest.clone(),
                 rate_limiter.clone(),
                 key,
                 is_isolated,
                 RequestKind::Essential,
+                recorded_kind,
             )
         },
     )
@@ -3712,6 +3759,8 @@ enum BuildOrderError {
     Unsupported,
     /// The SDK params builder rejected the inputs (carries the builder's error message).
     Build(String),
+    /// A `TrailingStop`'s offset cannot be sent as `trailingDelta`.
+    TrailingDelta(TrailingDeltaError),
 }
 
 /// Construct a margin endpoint's `isIsolated` parameter enum from the configured margin mode.
@@ -3791,7 +3840,7 @@ fn build_cancel_order_params(
 /// Build the margin new-order params from a rustrade order request (pure; no I/O).
 ///
 /// Factored out of [`BinanceMargin::open_order`] so the rustrade→Binance mapping (sideEffectType,
-/// `isIsolated`, conditional `stopPrice`, `autoRepayAtCancel` gating, trailing rejection) is
+/// `isIsolated`, conditional `stopPrice`, `trailingDelta`, `autoRepayAtCancel` gating) is
 /// unit-testable without a live REST call. `isIsolated` is config-driven via `is_isolated`
 /// (`true` = isolated, `false` = cross).
 #[allow(clippy::too_many_arguments)] // mirrors the flat request fields; grouping them into a
@@ -3834,7 +3883,8 @@ fn build_new_order_params(
     }
 
     // Conditional price fields (mirror spot): LIMIT carries price; STOP/TAKE_PROFIT carry a stop
-    // (trigger) price; the *_LIMIT variants carry both.
+    // (trigger) price; the *_LIMIT variants carry both; a trailing STOP_LOSS carries a
+    // trailingDelta.
     match kind {
         OrderKind::Limit => {
             builder = builder.price(price);
@@ -3845,7 +3895,15 @@ fn build_new_order_params(
         OrderKind::StopLimit { trigger_price } | OrderKind::TakeProfitLimit { trigger_price } => {
             builder = builder.price(price).stop_price(trigger_price);
         }
-        // Market carries no price/stop_price; trailing-stop kinds are rejected earlier by
+        OrderKind::TrailingStop {
+            offset,
+            offset_type,
+        } => {
+            let basis_points = trailing_delta_basis_points(offset, offset_type)
+                .map_err(BuildOrderError::TrailingDelta)?;
+            builder = builder.trailing_delta(i64::from(basis_points));
+        }
+        // Market carries no price/stop_price; TrailingStopLimit is rejected earlier by
         // convert_order_kind_tif_margin. A future OrderKind needing price fields that lands here
         // would surface as a BuildOrderError::Build from the SDK builder, not a silent bad order.
         _ => {}
@@ -3862,9 +3920,9 @@ fn build_new_order_params(
 /// result onto margin's SDK output types — a [`MarginAccountNewOrderTypeEnum`] and a
 /// [`MarginAccountNewOrderTimeInForceEnum`]. Mirrors spot's own `convert_order_kind_tif` adapter.
 ///
-/// Returns `None` for unsupported combinations. Trailing-stop kinds are rejected here (not mapped
-/// yet: margin has no testnet to verify `trailingDelta` on), unlike spot which maps them to a
-/// `STOP_LOSS` with `trailingDelta`.
+/// Returns `None` for unsupported combinations, as spot does: a `TrailingStop` maps to a
+/// `STOP_LOSS` (with the `trailingDelta` [`build_new_order_params`] adds), and `TrailingStopLimit`
+/// and Absolute trailing offsets are unsupported.
 fn convert_order_kind_tif_margin(
     kind: OrderKind,
     tif: TimeInForce,
@@ -3872,17 +3930,6 @@ fn convert_order_kind_tif_margin(
     MarginAccountNewOrderTypeEnum,
     Option<MarginAccountNewOrderTimeInForceEnum>,
 )> {
-    if matches!(
-        kind,
-        OrderKind::TrailingStop { .. } | OrderKind::TrailingStopLimit { .. }
-    ) {
-        warn!(
-            ?kind,
-            "BinanceMargin does not support trailing-stop orders yet"
-        );
-        return None;
-    }
-
     let (binance_type, binance_tif) = classify_order_kind_tif(kind, tif)?;
     let margin_type = match binance_type {
         BinanceOrderType::Market => MarginAccountNewOrderTypeEnum::Market,
@@ -4354,19 +4401,47 @@ mod tests {
         assert_eq!(take_profit.stop_price, Some(trigger));
     }
 
+    /// A `TrailingStop` is a `STOP_LOSS` with `trailingDelta` in basis points and no `stopPrice`,
+    /// as on spot.
     #[test]
-    fn trailing_kinds_are_rejected() {
-        let trailing_stop = params(
+    fn a_trailing_stop_maps_to_stop_loss_with_trailing_delta() {
+        let cases = [
+            (Decimal::from(25), TrailingOffsetType::BasisPoints, 25),
+            (Decimal::new(15, 1), TrailingOffsetType::Percentage, 150),
+        ];
+        for (offset, offset_type, trailing_delta) in cases {
+            let p = params(
+                Side::Sell,
+                None,
+                OrderKind::TrailingStop {
+                    offset,
+                    offset_type,
+                },
+                gtc(),
+                MarginSideEffect::NoBorrow,
+            )
+            .expect("build");
+            assert_eq!(p.r#type.as_str(), "STOP_LOSS");
+            assert_eq!(p.trailing_delta, Some(trailing_delta), "{offset_type:?}");
+            assert_eq!(p.stop_price, None);
+            assert_eq!(p.price, None);
+            assert!(p.time_in_force.is_none());
+        }
+    }
+
+    #[test]
+    fn absolute_trailing_offsets_and_trailing_stop_limits_are_unsupported() {
+        let absolute = params(
             Side::Sell,
             None,
             OrderKind::TrailingStop {
                 offset: Decimal::from(100),
-                offset_type: TrailingOffsetType::BasisPoints,
+                offset_type: TrailingOffsetType::Absolute,
             },
             gtc(),
             MarginSideEffect::AutoBorrowRepay,
         );
-        assert!(matches!(trailing_stop, Err(BuildOrderError::Unsupported)));
+        assert!(matches!(absolute, Err(BuildOrderError::Unsupported)));
 
         let trailing_stop_limit = params(
             Side::Sell,
@@ -4383,6 +4458,27 @@ mod tests {
         assert!(matches!(
             trailing_stop_limit,
             Err(BuildOrderError::Unsupported)
+        ));
+    }
+
+    /// An offset that is not a whole number of basis points is refused, not rounded.
+    #[test]
+    fn a_fractional_trailing_offset_is_refused() {
+        let fractional = params(
+            Side::Sell,
+            None,
+            OrderKind::TrailingStop {
+                offset: Decimal::new(155, 3),
+                offset_type: TrailingOffsetType::Percentage,
+            },
+            gtc(),
+            MarginSideEffect::AutoBorrowRepay,
+        );
+        assert!(matches!(
+            fractional,
+            Err(BuildOrderError::TrailingDelta(TrailingDeltaError::Invalid(
+                _
+            )))
         ));
     }
 
@@ -4970,6 +5066,36 @@ mod tests {
             let mut buf = Vec::new();
             assert!(!convert_margin_user_data_events(frame, &mut buf), "{frame}");
             assert!(buf.is_empty(), "{frame}");
+        }
+    }
+
+    /// A trailing order's report decodes with `d` as Binance documents it, a number, which
+    /// binance-sdk's margin model declares a string, and as a string too.
+    #[test]
+    fn margin_ws_trailing_stop_report_decodes_as_a_trailing_stop() {
+        for trailing_delta in [serde_json::json!(25), serde_json::json!("25")] {
+            let frame = push(serde_json::json!({
+                "e": "executionReport", "s": "BTCUSDT", "S": "SELL", "o": "STOP_LOSS",
+                "x": "NEW", "X": "NEW", "i": 12_345_i64, "c": "cid-1", "t": -1_i64,
+                "p": "0.00000000", "P": "0.00000000", "d": trailing_delta, "D": 1_700_000_000_000_i64,
+                "q": "2", "f": "GTC", "z": "0", "T": 1_700_000_000_000_i64,
+            }));
+            let mut buf = Vec::new();
+            assert!(!convert_margin_user_data_events(&frame, &mut buf));
+            let [event] = buf.as_slice() else {
+                panic!("one snapshot expected for {frame}, got {buf:?}");
+            };
+            let AccountEventKind::OrderSnapshot(snapshot) = &event.kind else {
+                panic!("expected an order snapshot, got {event:?}");
+            };
+            assert_eq!(
+                snapshot.0.kind,
+                OrderKind::TrailingStop {
+                    offset: Decimal::from(25),
+                    offset_type: TrailingOffsetType::BasisPoints,
+                }
+            );
+            assert_eq!(snapshot.0.price, None);
         }
     }
 
@@ -6255,7 +6381,8 @@ mod tests {
         let key = margin_key("BTCUSDT", "a");
         let ended = |row: serde_json::Value| {
             let row: QueryMarginAccountsOrderResponse = serde_json::from_value(row).unwrap();
-            convert_ended_order(&row, ExchangeId::BinanceMargin, &key).map(|order| order.state)
+            convert_ended_order(&row, ExchangeId::BinanceMargin, &key, None)
+                .map(|order| order.state)
         };
 
         let mut filled = margin_order_row("a", "FILLED");
@@ -6421,6 +6548,7 @@ mod tests {
             known.lock().live(
                 &margin_key("BTCUSDT", cid),
                 Decimal::TWO,
+                OrderKind::Limit,
                 &Open::new(
                     VenueOrderId::Assigned(OrderId::new(n.to_string())),
                     Utc::now(),
@@ -6429,6 +6557,86 @@ mod tests {
             );
         }
         known
+    }
+
+    /// A margin trailing stop's row cannot say that it trailed (#541), and carries no positive
+    /// `stopPrice` when it was placed without an activation price, yet how it ended is still
+    /// reported, with the kind the client holds it with: by a reconnect's check and by
+    /// `fetch_ended_orders`.
+    #[tokio::test]
+    async fn an_ended_margin_trailing_stop_is_reported_with_the_kind_it_was_held_with() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/openOrders"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        let mut row = margin_order_row("trailing", "CANCELED");
+        row["type"] = "STOP_LOSS".into();
+        row["price"] = "0.00000000".into();
+        row["stopPrice"] = "0.00000000".into();
+        mount_margin_order(
+            &server,
+            "trailing",
+            wiremock::ResponseTemplate::new(200).set_body_json(row),
+        )
+        .await;
+        let trailing_stop = OrderKind::TrailingStop {
+            offset: Decimal::from(25),
+            offset_type: TrailingOffsetType::BasisPoints,
+        };
+        let hold = |known: &SharedKnownLiveOrders| {
+            known.lock().live(
+                &margin_key("BTCUSDT", "trailing"),
+                Decimal::TWO,
+                trailing_stop,
+                &Open::new(
+                    VenueOrderId::Assigned(OrderId::new("7")),
+                    Utc::now(),
+                    Decimal::ZERO,
+                ),
+            );
+        };
+
+        let known = KnownLiveOrders::shared(ExchangeId::BinanceMargin);
+        hold(&known);
+        let mut unchecked = UncheckedOrders::default();
+        unchecked.open([InstrumentNameExchange::new("BTCUSDT")]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        recover_margin_ended_orders(
+            &margin_rest_at(&server),
+            &Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
+            &known,
+            &mut unchecked,
+            &UnrecoveredFills::default(),
+            &tx,
+            false,
+        )
+        .await;
+        let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let [event] = sent.as_slice() else {
+            panic!("the trailing stop ended: {sent:?}");
+        };
+        let AccountEventKind::OrderSnapshot(snapshot) = &event.kind else {
+            panic!("an order snapshot: {event:?}");
+        };
+        assert_eq!(snapshot.0.kind, trailing_stop);
+        assert!(matches!(
+            snapshot.0.state,
+            OrderState::Inactive(crate::order::state::InactiveOrderState::Cancelled(_))
+        ));
+        assert!(!known.lock().contains(&ClientOrderId::new("trailing")));
+
+        let client = margin_client_at(&server, false);
+        hold(&client.known_live);
+        let ended = client
+            .fetch_ended_orders(&[margin_key("BTCUSDT", "trailing")])
+            .await
+            .expect("lookup");
+        let [order] = ended.as_slice() else {
+            panic!("the trailing stop ended: {ended:?}");
+        };
+        assert_eq!(order.kind, trailing_stop);
     }
 
     #[tokio::test]
@@ -6521,6 +6729,76 @@ mod tests {
                 market: None,
             },
         }
+    }
+
+    /// A margin `TrailingStop` reaches Binance as a `STOP_LOSS` with `trailingDelta`, and an
+    /// offset Binance cannot take is refused without a request.
+    #[tokio::test]
+    async fn a_margin_trailing_stop_is_sent_with_trailing_delta() {
+        let server = wiremock::MockServer::start().await;
+        let sent_as_trailing_stop = |request: &wiremock::Request| {
+            // The SDK may send the params in the query string or the form body; read both.
+            let mut body_as_query = request.url.clone();
+            body_as_query.set_query(Some(&String::from_utf8_lossy(&request.body)));
+            let params: Vec<(String, String)> = request
+                .url
+                .query_pairs()
+                .chain(body_as_query.query_pairs())
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
+            let has = |key: &str, value: &str| params.iter().any(|(k, v)| k == key && v == value);
+            has("type", "STOP_LOSS")
+                && has("trailingDelta", "25")
+                && has("sideEffectType", "AUTO_BORROW_REPAY")
+                && !params.iter().any(|(k, _)| k == "stopPrice" || k == "price")
+        };
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/order"))
+            .and(sent_as_trailing_stop)
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "symbol": "BTCUSDT", "orderId": 7, "clientOrderId": "trailing",
+                    "transactTime": 1_700_000_000_000_i64, "price": "0", "origQty": "2",
+                    "executedQty": "0", "cummulativeQuoteQty": "0", "status": "NEW",
+                    "timeInForce": "GTC", "type": "STOP_LOSS", "side": "SELL",
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = margin_client_at(&server, false);
+        let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+        let trailing_request = |cid, offset| {
+            let mut request = margin_open_request(&btcusdt, cid);
+            request.state.side = Side::Sell;
+            request.state.price = None;
+            request.state.kind = OrderKind::TrailingStop {
+                offset,
+                offset_type: TrailingOffsetType::BasisPoints,
+            };
+            request
+        };
+
+        let placed = client
+            .open_order(trailing_request("trailing", Decimal::from(25)))
+            .await;
+        assert!(
+            matches!(placed.state, OrderState::Active(ActiveOrderState::Open(_))),
+            "{placed:?}"
+        );
+
+        let refused = client
+            .open_order(trailing_request("fractional", Decimal::new(25, 1)))
+            .await;
+        assert!(
+            matches!(
+                refused.state,
+                OrderState::Inactive(crate::order::state::InactiveOrderState::OpenFailed(
+                    OrderError::InvalidPrecision(_)
+                ))
+            ),
+            "{refused:?}"
+        );
     }
 
     #[tokio::test]
@@ -6649,6 +6927,7 @@ mod tests {
             known.lock().live(
                 &margin_key(instrument.name(), cid),
                 Decimal::TWO,
+                OrderKind::Limit,
                 &Open::new(
                     VenueOrderId::Assigned(OrderId::new(cid)),
                     Utc::now(),
@@ -6701,6 +6980,7 @@ mod tests {
             known.lock().live(
                 &margin_key("BTCUSDT", cid),
                 Decimal::from_str(quantity).unwrap(),
+                OrderKind::Limit,
                 &Open::new(
                     VenueOrderId::Assigned(OrderId::new(order_id)),
                     Utc::now(),
@@ -6774,7 +7054,7 @@ mod tests {
                 Decimal::ZERO,
             );
             let mut known = client.known_live.lock();
-            known.live(&placed.key, dec!(2), &late);
+            known.live(&placed.key, dec!(2), OrderKind::Limit, &late);
             assert!(
                 !known.contains(&ClientOrderId::new(cid)),
                 "{cid}: not held, even after a late live report"

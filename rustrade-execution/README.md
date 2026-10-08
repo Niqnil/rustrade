@@ -64,14 +64,19 @@ Additional order types:
 | TrailingStopLimit | ✅ | ❌ | ❌ | ❌ |
 
 ⚠️ Binance `TrailingStop` supports `BasisPoints` and `Percentage` offsets only;
-`Absolute` offsets are rejected as unsupported. ⚠️ Alpaca `TrailingStop` supports
+`Absolute` offsets are rejected as unsupported, and an offset that does not come to a
+positive whole number of basis points is refused (`OrderError::InvalidPrecision`), not
+rounded. ⚠️ Alpaca `TrailingStop` supports
 `Percentage` and `Absolute` offsets only; `BasisPoints` is rejected as unsupported.
 Hyperliquid requires every order it accepts to carry a client order ID in
 `ClientOrderId::uuid()` form; an order with any other ID is rejected. It also refuses, unsent,
 an order whose quantity or price is not positive or has more precision than the market
 allows (`OrderError::InvalidPrecision`), and never rounds one: read the rules with
-`order_precision` and round first. `BinanceMargin`
-matches Binance spot except that both `TrailingStop` and `TrailingStopLimit` are
-rejected as unsupported (not mapped yet; Binance margin has no testnet to verify them on).
+`order_precision` and round first. `BinanceMargin` matches Binance spot,
+`TrailingStop` included. Its REST order queries do not report a trailing delta, so
+`fetch_open_orders` and `account_snapshot` leave out its conditional orders (stop,
+stop-limit, take-profit and take-profit-limit). `account_snapshot` reports such a listing
+incomplete; `fetch_open_orders` has no completeness flag, so there only a warning shows it.
+The account stream reports these orders in full.
 
 See the [workspace README](../README.md) for documentation, examples, and contributing guidelines.

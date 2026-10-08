@@ -1100,7 +1100,7 @@ impl AlpacaClient {
     ) {
         let mut known = self.known_live.lock();
         for order in orders {
-            known.live(&order.key, order.quantity, &order.state);
+            known.live(&order.key, order.quantity, order.kind, &order.state);
         }
     }
 }
@@ -1508,7 +1508,7 @@ impl ExecutionClient for AlpacaClient {
                 .flat_map(|snapshot| &snapshot.orders)
             {
                 if let OrderState::Active(ActiveOrderState::Open(open)) = &order.state {
-                    known.live(&order.key, order.quantity, open);
+                    known.live(&order.key, order.quantity, order.kind, open);
                 }
             }
         }
@@ -2118,9 +2118,12 @@ impl AlpacaClient {
         match result {
             Ok(resp) => {
                 let state = placed_order_state(&resp, &order_key.instrument, request.quantity);
-                self.known_live
-                    .lock()
-                    .placed(&order_key, request.quantity, &state);
+                self.known_live.lock().placed(
+                    &order_key,
+                    request.quantity,
+                    OrderKind::Limit,
+                    &state,
+                );
 
                 AlpacaBracketOrderResult {
                     parent: Order {
@@ -2304,7 +2307,9 @@ impl AlpacaClient {
         match result {
             Ok(resp) => {
                 let state = placed_order_state(&resp, &order_key.instrument, quantity);
-                self.known_live.lock().placed(&order_key, quantity, &state);
+                self.known_live
+                    .lock()
+                    .placed(&order_key, quantity, kind, &state);
 
                 Order {
                     key: order_key,
@@ -8862,7 +8867,9 @@ mod tests {
                 Utc::now(),
                 Decimal::ZERO,
             );
-            known.lock().live(key, Decimal::TWO, &open);
+            known
+                .lock()
+                .live(key, Decimal::TWO, OrderKind::Limit, &open);
         }
 
         #[tokio::test]
@@ -9459,6 +9466,7 @@ mod tests {
             known.lock().live(
                 &key,
                 Decimal::TWO,
+                OrderKind::Limit,
                 &Open::new(
                     VenueOrderId::Assigned(OrderId::new("ord-1")),
                     Utc::now(),
