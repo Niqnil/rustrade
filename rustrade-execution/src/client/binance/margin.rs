@@ -384,10 +384,11 @@ impl BinanceMarginConfig {
 ///
 /// An order that has ended is still reported as ended by
 /// [`fetch_ended_orders`](crate::client::OrderStatusClient::fetch_ended_orders) and by the stream's
-/// check after a reconnect, so that a stop that fired is not held as live. Its kind is then the
-/// fixed-trigger one at `stopPrice`, which a trailing order it really was does not match; one
-/// without a positive `stopPrice` cannot be described at all and reads as not ended, with a
-/// warning.
+/// check after a reconnect, so that a stop that fired is not held as live. Its kind is the one this
+/// client holds it with: every order it placed, listed or saw on its stream while live. An order
+/// it does not hold is reported with its fixed-trigger kind at `stopPrice`, which a trailing order
+/// it really was does not match, and one of those without a positive `stopPrice` cannot be
+/// described at all and reads as not ended, with a warning.
 ///
 /// # User-data stream (`userListenToken`)
 /// [`account_stream`](Self::account_stream) is hand-rolled over the `userListenToken` model — the
@@ -460,7 +461,7 @@ impl BinanceMargin {
     ) {
         let mut known = self.known_live.lock();
         for order in orders {
-            known.live(&order.key, order.quantity, &order.state);
+            known.live(&order.key, order.quantity, order.kind, &order.state);
         }
     }
 
@@ -804,7 +805,9 @@ impl ExecutionClient for BinanceMargin {
                 cumulative_quote_qty: data.cummulative_quote_qty.as_deref(),
             },
         );
-        self.known_live.lock().placed(&order_key, quantity, &state);
+        self.known_live
+            .lock()
+            .placed(&order_key, quantity, kind, &state);
 
         Order {
             key: order_key,
@@ -1456,12 +1459,14 @@ impl OrderStatusClient for BinanceMargin {
         orders: &[UnindexedOrderKey],
     ) -> Result<Vec<UnindexedInactiveOrder>, UnindexedClientError> {
         fetch_ended_by_key(orders, |key| {
+            let recorded_kind = self.known_live.lock().kind_of(&key.cid);
             fetch_margin_order_lookup(
                 self.rest.clone(),
                 self.rate_limiter.clone(),
                 key,
                 self.config.is_isolated,
                 RequestKind::Query,
+                recorded_kind,
             )
         })
         .await
@@ -3090,12 +3095,17 @@ async fn fetch_margin_all_open_orders(
 
 /// Look the order under `key` up with `GET /sapi/v1/margin/order` by its client order id
 /// (weight 10), in the cross or isolated account as `is_isolated` says.
+///
+/// `recorded_kind` is the kind the client holds the order with, if it does. The row cannot say
+/// whether a conditional order trailed (#541), so an ended one is reported with that kind, or
+/// failing it with its fixed trigger (see [`convert_ended_order`]).
 async fn fetch_margin_order_lookup(
     rest: Arc<RestApi>,
     rate_limiter: Arc<RateLimitTracker>,
     key: UnindexedOrderKey,
     is_isolated: bool,
     kind: RequestKind,
+    recorded_kind: Option<OrderKind>,
 ) -> Result<OrderLookup, UnindexedClientError> {
     // Convert once before the retry closure to avoid a String allocation on every retry.
     let symbol = key.instrument.name().to_string();
@@ -3123,10 +3133,12 @@ async fn fetch_margin_order_lookup(
 
     let row = response.data().await.map_err(response_decode_error)?;
 
-    Ok(convert_ended_order(&row, ExchangeId::BinanceMargin, &key)
-        .map_or(OrderLookup::NotEnded, |order| {
-            OrderLookup::Ended(Box::new(order))
-        }))
+    Ok(
+        convert_ended_order(&row, ExchangeId::BinanceMargin, &key, recorded_kind)
+            .map_or(OrderLookup::NotEnded, |order| {
+                OrderLookup::Ended(Box::new(order))
+            }),
+    )
 }
 
 /// The client order ids `GET /sapi/v1/margin/openOrders` lists on `instruments` (weight 10 each,
@@ -3174,12 +3186,15 @@ async fn recover_margin_ended_orders(
             listed_margin_open_cids(rest.clone(), rate_limiter.clone(), instruments, is_isolated)
         },
         |key| {
+            // Held as live, so the client knows its kind, which the row may not show.
+            let recorded_kind = known.lock().kind_of(&key.cid);
             fetch_margin_order_lookup(
                 rest.clone(),
                 rate_limiter.clone(),
                 key,
                 is_isolated,
                 RequestKind::Essential,
+                recorded_kind,
             )
         },
     )
@@ -6366,7 +6381,8 @@ mod tests {
         let key = margin_key("BTCUSDT", "a");
         let ended = |row: serde_json::Value| {
             let row: QueryMarginAccountsOrderResponse = serde_json::from_value(row).unwrap();
-            convert_ended_order(&row, ExchangeId::BinanceMargin, &key).map(|order| order.state)
+            convert_ended_order(&row, ExchangeId::BinanceMargin, &key, None)
+                .map(|order| order.state)
         };
 
         let mut filled = margin_order_row("a", "FILLED");
@@ -6532,6 +6548,7 @@ mod tests {
             known.lock().live(
                 &margin_key("BTCUSDT", cid),
                 Decimal::TWO,
+                OrderKind::Limit,
                 &Open::new(
                     VenueOrderId::Assigned(OrderId::new(n.to_string())),
                     Utc::now(),
@@ -6540,6 +6557,86 @@ mod tests {
             );
         }
         known
+    }
+
+    /// A margin trailing stop's row cannot say that it trailed (#541), and carries no positive
+    /// `stopPrice` when it was placed without an activation price, yet how it ended is still
+    /// reported, with the kind the client holds it with: by a reconnect's check and by
+    /// `fetch_ended_orders`.
+    #[tokio::test]
+    async fn an_ended_margin_trailing_stop_is_reported_with_the_kind_it_was_held_with() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/openOrders"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        let mut row = margin_order_row("trailing", "CANCELED");
+        row["type"] = "STOP_LOSS".into();
+        row["price"] = "0.00000000".into();
+        row["stopPrice"] = "0.00000000".into();
+        mount_margin_order(
+            &server,
+            "trailing",
+            wiremock::ResponseTemplate::new(200).set_body_json(row),
+        )
+        .await;
+        let trailing_stop = OrderKind::TrailingStop {
+            offset: Decimal::from(25),
+            offset_type: TrailingOffsetType::BasisPoints,
+        };
+        let hold = |known: &SharedKnownLiveOrders| {
+            known.lock().live(
+                &margin_key("BTCUSDT", "trailing"),
+                Decimal::TWO,
+                trailing_stop,
+                &Open::new(
+                    VenueOrderId::Assigned(OrderId::new("7")),
+                    Utc::now(),
+                    Decimal::ZERO,
+                ),
+            );
+        };
+
+        let known = KnownLiveOrders::shared(ExchangeId::BinanceMargin);
+        hold(&known);
+        let mut unchecked = UncheckedOrders::default();
+        unchecked.open([InstrumentNameExchange::new("BTCUSDT")]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        recover_margin_ended_orders(
+            &margin_rest_at(&server),
+            &Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
+            &known,
+            &mut unchecked,
+            &UnrecoveredFills::default(),
+            &tx,
+            false,
+        )
+        .await;
+        let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let [event] = sent.as_slice() else {
+            panic!("the trailing stop ended: {sent:?}");
+        };
+        let AccountEventKind::OrderSnapshot(snapshot) = &event.kind else {
+            panic!("an order snapshot: {event:?}");
+        };
+        assert_eq!(snapshot.0.kind, trailing_stop);
+        assert!(matches!(
+            snapshot.0.state,
+            OrderState::Inactive(crate::order::state::InactiveOrderState::Cancelled(_))
+        ));
+        assert!(!known.lock().contains(&ClientOrderId::new("trailing")));
+
+        let client = margin_client_at(&server, false);
+        hold(&client.known_live);
+        let ended = client
+            .fetch_ended_orders(&[margin_key("BTCUSDT", "trailing")])
+            .await
+            .expect("lookup");
+        let [order] = ended.as_slice() else {
+            panic!("the trailing stop ended: {ended:?}");
+        };
+        assert_eq!(order.kind, trailing_stop);
     }
 
     #[tokio::test]
@@ -6830,6 +6927,7 @@ mod tests {
             known.lock().live(
                 &margin_key(instrument.name(), cid),
                 Decimal::TWO,
+                OrderKind::Limit,
                 &Open::new(
                     VenueOrderId::Assigned(OrderId::new(cid)),
                     Utc::now(),
@@ -6882,6 +6980,7 @@ mod tests {
             known.lock().live(
                 &margin_key("BTCUSDT", cid),
                 Decimal::from_str(quantity).unwrap(),
+                OrderKind::Limit,
                 &Open::new(
                     VenueOrderId::Assigned(OrderId::new(order_id)),
                     Utc::now(),
@@ -6955,7 +7054,7 @@ mod tests {
                 Decimal::ZERO,
             );
             let mut known = client.known_live.lock();
-            known.live(&placed.key, dec!(2), &late);
+            known.live(&placed.key, dec!(2), OrderKind::Limit, &late);
             assert!(
                 !known.contains(&ClientOrderId::new(cid)),
                 "{cid}: not held, even after a late live report"

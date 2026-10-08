@@ -1824,7 +1824,7 @@ impl IbkrClient {
         };
         let mut known = self.known_live.lock();
         for leg in [&result.parent, &result.take_profit, &result.stop_loss] {
-            known.placed(&leg.key, leg.quantity, &leg.state);
+            known.placed(&leg.key, leg.quantity, leg.kind, &leg.state);
         }
         drop(known);
         result
@@ -2871,7 +2871,7 @@ impl ExecutionClient for IbkrClient {
         };
         self.known_live
             .lock()
-            .placed(&order.key, order.quantity, &order.state);
+            .placed(&order.key, order.quantity, order.kind, &order.state);
         order
     }
 
@@ -3401,7 +3401,7 @@ fn remember_listed(known: &SharedKnownLiveOrders, listed: &[ListedOpenOrder]) {
     let mut known = known.lock();
     for listed in listed.iter().filter(|listed| listed.named_as_placed) {
         if let Some(order) = &listed.order {
-            known.live(&order.key, order.quantity, &order.state);
+            known.live(&order.key, order.quantity, order.kind, &order.state);
         }
     }
 }

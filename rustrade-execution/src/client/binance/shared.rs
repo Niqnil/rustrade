@@ -1267,15 +1267,18 @@ pub(crate) fn convert_open_order<T: BinanceOrderFields>(
 /// or unknown or that cannot be converted. A caller reads `None` as "not ended", so such an order
 /// is asked about again later rather than retired on a guess.
 ///
-/// A conditional order whose trailing delta the row cannot tell (margin, #541) is reported with its
-/// fixed-trigger kind at `stopPrice`, with a warning, rather than left unretired: what matters of an
-/// order that has ended is that it ended, and an order held as live after it fired is a protective
-/// stop that is not there. One without a positive `stopPrice`, which can only be a trailing order,
-/// has no kind to report and still reads as not ended.
+/// A conditional order whose trailing delta the row cannot tell (margin, #541) is still reported,
+/// rather than left unretired: what matters of an order that has ended is that it ended, and an
+/// order held as live after it fired is a protective stop that is not there. It is reported with
+/// `recorded_kind`, the kind the client holds the order with, when the caller has one; otherwise
+/// with its fixed-trigger kind at `stopPrice`, with a warning, since it may have trailed. Without
+/// a recorded kind, one without a positive `stopPrice`, which can only be a trailing order, has no
+/// kind to report and still reads as not ended.
 pub(crate) fn convert_ended_order<T: BinanceOrderFields>(
     o: &T,
     exchange: ExchangeId,
     key: &UnindexedOrderKey,
+    recorded_kind: Option<OrderKind>,
 ) -> Option<UnindexedInactiveOrder> {
     let instrument = &key.instrument;
     let Some(status) = o.status() else {
@@ -1285,7 +1288,14 @@ pub(crate) fn convert_ended_order<T: BinanceOrderFields>(
     if rest_order_is_open(status) {
         return None;
     }
-    let row = convert_order_row(o, exchange, instrument, UnknownTrailingDelta::AssumeFixed)?;
+    let row = convert_order_row(
+        o,
+        exchange,
+        instrument,
+        UnknownTrailingDelta::Ended {
+            recorded: recorded_kind,
+        },
+    )?;
     let Some(state) = ended_order_state(
         status,
         row.state.order_id.clone(),
@@ -1483,9 +1493,10 @@ struct OrderRow {
 enum UnknownTrailingDelta {
     /// Drop the row: a live order described wrongly misleads whatever acts on it.
     Drop,
-    /// Read it as a fixed-trigger order: only for an order that has ended, whose kind no longer
-    /// steers anything (see [`convert_ended_order`]).
-    AssumeFixed,
+    /// The order has ended (see [`convert_ended_order`]): report it with `recorded`, the kind the
+    /// client holds it with, or failing that read it as a fixed-trigger order, since the kind of an
+    /// order that has ended no longer steers anything.
+    Ended { recorded: Option<OrderKind> },
 }
 
 /// Convert the fields of a REST order row that do not depend on its status, shared by
@@ -1527,22 +1538,32 @@ fn convert_order_row<T: BinanceOrderFields>(
     let filled_qty = binance_filled_qty(exchange, &order_id, o.executed_qty());
     let kind = match o.order_type() {
         Some(t) => {
-            let mut trailing_delta = o.trailing_delta();
-            if trailing_delta == TrailingDelta::Unknown
-                && unknown_trailing_delta == UnknownTrailingDelta::AssumeFixed
-                && is_conditional_order_type(t)
-            {
-                warn!(%exchange, %instrument, order_id = %order_id_raw, order_type = t, "Binance order has ended and may have been a trailing one, which its row cannot tell; reporting it with its fixed trigger");
-                trailing_delta = TrailingDelta::Absent;
-            }
+            let trailing_delta = o.trailing_delta();
             // decode_order_kind already logs a warning on what it cannot describe
-            decode_order_kind(
-                exchange,
-                Some(order_id_raw),
-                t,
-                o.stop_price(),
-                trailing_delta,
-            )?
+            let decode = |trailing_delta| {
+                decode_order_kind(
+                    exchange,
+                    Some(order_id_raw),
+                    t,
+                    o.stop_price(),
+                    trailing_delta,
+                )
+            };
+            let undescribed =
+                trailing_delta == TrailingDelta::Unknown && is_conditional_order_type(t);
+            match unknown_trailing_delta {
+                UnknownTrailingDelta::Ended {
+                    recorded: Some(recorded),
+                } if undescribed => {
+                    debug!(%exchange, %instrument, order_id = %order_id_raw, order_type = t, kind = %recorded, "Binance order has ended and its row cannot tell whether it trailed; reporting it with the kind it was held with");
+                    recorded
+                }
+                UnknownTrailingDelta::Ended { recorded: None } if undescribed => {
+                    warn!(%exchange, %instrument, order_id = %order_id_raw, order_type = t, "Binance order has ended and may have been a trailing one, which its row cannot tell; reporting it with its fixed trigger");
+                    decode(TrailingDelta::Absent)?
+                }
+                _ => decode(trailing_delta)?,
+            }
         }
         None => {
             warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance order missing type");
@@ -3469,8 +3490,9 @@ mod tests {
         }
     }
 
-    /// A margin conditional order that has ended is still reported as ended, with its fixed
-    /// trigger, so it is not held as live; without a positive trigger it cannot be described.
+    /// A margin conditional order that has ended is still reported as ended, so it is not held as
+    /// live: with the kind the client holds it with, or failing that with its fixed trigger,
+    /// without which it cannot be described.
     #[test]
     fn an_ended_margin_conditional_order_reports_its_ending() {
         let key = UnindexedOrderKey::new(
@@ -3484,7 +3506,7 @@ mod tests {
             "CANCELED",
             serde_json::json!({"stopPrice": "96"}),
         ));
-        let Some(order) = convert_ended_order(&row, ExchangeId::BinanceMargin, &key) else {
+        let Some(order) = convert_ended_order(&row, ExchangeId::BinanceMargin, &key, None) else {
             panic!("an ended stop should be reported");
         };
         assert_eq!(
@@ -3496,7 +3518,22 @@ mod tests {
         assert!(matches!(order.state, InactiveOrderState::Cancelled(_)));
 
         let untriggered = margin_row(order_row("STOP_LOSS", "CANCELED", serde_json::json!({})));
-        assert!(convert_ended_order(&untriggered, ExchangeId::BinanceMargin, &key).is_none());
+        assert!(convert_ended_order(&untriggered, ExchangeId::BinanceMargin, &key, None).is_none());
+
+        // With the kind the client holds the order with, that kind is reported, trigger or not.
+        let trailing_stop = OrderKind::TrailingStop {
+            offset: Decimal::from(25),
+            offset_type: TrailingOffsetType::BasisPoints,
+        };
+        for row in [&row, &untriggered] {
+            let Some(order) =
+                convert_ended_order(row, ExchangeId::BinanceMargin, &key, Some(trailing_stop))
+            else {
+                panic!("an ended order held with its kind should be reported");
+            };
+            assert_eq!(order.kind, trailing_stop);
+            assert_eq!(order.price, None);
+        }
     }
 
     /// A gap is due once opened, leaves when recovered, and when its read fails is retried with a

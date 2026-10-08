@@ -340,7 +340,7 @@ impl BinanceSpot {
     ) {
         let mut known = self.known_live.lock();
         for order in orders {
-            known.live(&order.key, order.quantity, &order.state);
+            known.live(&order.key, order.quantity, order.kind, &order.state);
         }
     }
 
@@ -548,10 +548,13 @@ async fn fetch_order_lookup(
 
     let row = response.data().await.map_err(response_decode_error)?;
 
-    Ok(convert_ended_order(&row, ExchangeId::BinanceSpot, &key)
-        .map_or(OrderLookup::NotEnded, |order| {
-            OrderLookup::Ended(Box::new(order))
-        }))
+    // Spot rows report trailingDelta, so every kind decodes without the one the client holds.
+    Ok(
+        convert_ended_order(&row, ExchangeId::BinanceSpot, &key, None)
+            .map_or(OrderLookup::NotEnded, |order| {
+                OrderLookup::Ended(Box::new(order))
+            }),
+    )
 }
 
 /// The client order ids `GET /api/v3/openOrders` lists on `instruments` (weight 6 each, one at a
@@ -1281,7 +1284,9 @@ impl ExecutionClient for BinanceSpot {
                             cumulative_quote_qty: data.cummulative_quote_qty.as_deref(),
                         },
                     );
-                    self.known_live.lock().placed(&order_key, quantity, &state);
+                    self.known_live
+                        .lock()
+                        .placed(&order_key, quantity, kind, &state);
 
                     Order {
                         key: order_key,
@@ -5330,7 +5335,7 @@ mod tests {
         key: &UnindexedOrderKey,
         row: serde_json::Value,
     ) -> Option<crate::order::state::UnindexedInactiveOrderState> {
-        let order = convert_ended_order(&get_order_row(row), ExchangeId::BinanceSpot, key)?;
+        let order = convert_ended_order(&get_order_row(row), ExchangeId::BinanceSpot, key, None)?;
         assert_eq!(&order.key, key, "reported under the key asked");
         assert_eq!(order.quantity, Decimal::TWO);
         Some(order.state)
@@ -5616,6 +5621,7 @@ mod tests {
             known.lock().live(
                 &spot_key("BTCUSDT", cid),
                 Decimal::TWO,
+                OrderKind::Limit,
                 &Open::new(
                     VenueOrderId::Assigned(OrderId::new(n.to_string())),
                     Utc::now(),
@@ -5823,6 +5829,7 @@ mod tests {
         known.lock().live(
             &eth,
             Decimal::TWO,
+            OrderKind::Limit,
             &Open::new(
                 VenueOrderId::Assigned(OrderId::new("9")),
                 Utc::now(),

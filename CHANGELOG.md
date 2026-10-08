@@ -32,8 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     were already left out.
   - The account stream reports these orders in full.
   - `fetch_ended_orders`, and the stream's check after a reconnect, still report such an order
-    ended, with its fixed-trigger kind at `stopPrice`, so a stop that fired is not held as live.
-    One without a positive `stopPrice` cannot be described and reads as not ended, with a warning.
+    ended, so a stop that fired is not held as live. It is reported with the kind the client
+    holds it with, which covers every order it placed, listed or saw live on its stream. An order
+    it does not hold is reported with its fixed-trigger kind at `stopPrice`; one of those without
+    a positive `stopPrice` cannot be described and reads as not ended, with a warning.
 
 ### Fixed
 
