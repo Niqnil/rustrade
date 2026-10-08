@@ -53,9 +53,9 @@
 //! `instruments`, which match names exactly, find it. The perpetuals client matches names
 //! exactly too.
 //!
-//! Only `open_order` checks the spelling. An `instruments` filter naming a pair in another
-//! spelling, or no listed pair, matches nothing, so the read returns nothing for it without an
-//! error. [`ExecutionClient::cancel_order`] sends the coin as the instrument spells it, so a
+//! Neither the reads nor `cancel_order` check the spelling. An `instruments` filter naming a pair
+//! in another spelling, or no listed pair, matches nothing, so the read returns nothing for it
+//! without an error. [`ExecutionClient::cancel_order`] sends the coin as the instrument spells it, so a
 //! cancel under another spelling fails in the SDK.
 //!
 //! Orders are placed through the SDK's `ExchangeClient`, which reads `spotMeta` once, when it is
