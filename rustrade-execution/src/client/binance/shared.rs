@@ -1867,9 +1867,9 @@ pub(crate) fn order_running_totals<T: BinanceExecutionFields>(
 /// Every field is optional: which keys a report carries depends on its execution type, and each
 /// use below says what it does without one.
 ///
-/// The other keys read as integers, `i`, `T` and `t`, are integers in Binance's docs and in both
-/// SDK models, so they are read strictly. A report carrying one of them in another shape still
-/// fails to decode whole; the stream handlers log it with an excerpt of the frame.
+/// Unlike `d`, the keys read as integers, `i`, `T` and `t`, are integers in Binance's docs and in
+/// both SDK models, so they are read strictly. A report carrying one of them in another shape
+/// still fails to decode whole; the stream handlers log it with an excerpt of the frame.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 // Tests build stream frames from reports.
 #[cfg_attr(test, derive(serde::Serialize))]
