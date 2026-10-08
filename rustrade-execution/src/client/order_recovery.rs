@@ -326,6 +326,12 @@ impl KnownLiveOrders {
     /// For a lookup whose venue answer cannot describe the order's kind, such as a Binance margin
     /// conditional order, whose REST row does not say whether it trails: the order still ends
     /// with the kind it was placed or reported with, rather than staying held.
+    ///
+    /// It is the kind first recorded for `cid`: a later report of the order as live does not
+    /// change it. That assumes a client order id names one order for as long as it is held: an id
+    /// reused for an order of another kind while held would keep the first kind. An id named
+    /// again once its order has ended (see [`placing`](Self::placing)) is recorded afresh, since
+    /// an order that ends is no longer held.
     // Only Binance margin's lookups cannot always describe an order's kind.
     #[cfg_attr(not(feature = "binance"), allow(dead_code))]
     pub(crate) fn kind_of(&self, cid: &ClientOrderId) -> Option<OrderKind> {

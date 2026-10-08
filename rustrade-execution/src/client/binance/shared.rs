@@ -507,7 +507,7 @@ pub(crate) fn log_unrecognised_frame(venue: &'static str, seen: &AtomicU64, fram
 }
 
 /// The first 200 characters of a frame, for a log line about it.
-fn frame_excerpt(frame: &str) -> &str {
+pub(crate) fn frame_excerpt(frame: &str) -> &str {
     frame
         .char_indices()
         .nth(200)
@@ -1866,6 +1866,10 @@ pub(crate) fn order_running_totals<T: BinanceExecutionFields>(
 ///
 /// Every field is optional: which keys a report carries depends on its execution type, and each
 /// use below says what it does without one.
+///
+/// Unlike `d`, the keys read as integers, `i`, `T` and `t`, are integers in Binance's docs and in
+/// both SDK models, so they are read strictly. A report carrying one of them in another shape
+/// still fails to decode whole; the stream handlers log it with an excerpt of the frame.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 // Tests build stream frames from reports.
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -2309,11 +2313,17 @@ fn convert_order_snapshot(
             TrailingDelta::Unknown
         }
     };
+    // Without its type the order's kind is unknown, so the snapshot is dropped, as a REST row
+    // without one is, rather than read as a `LIMIT`.
+    let Some(order_type) = report.order_type.as_deref() else {
+        warn!(%exchange, %symbol, %order_id, "Binance order report missing order type (o), dropping snapshot");
+        return None;
+    };
     // decode_order_kind already logs a warning on what it cannot describe.
     let kind = decode_order_kind(
         exchange,
         report.order_id,
-        report.order_type.as_deref().unwrap_or("LIMIT"),
+        order_type,
         report.stop_price.as_deref(),
         trailing_delta,
     )?;
@@ -3492,7 +3502,8 @@ mod tests {
 
     /// A margin conditional order that has ended is still reported as ended, so it is not held as
     /// live: with the kind the client holds it with, or failing that with its fixed trigger,
-    /// without which it cannot be described.
+    /// without which it cannot be described. The held kind stands in only for what the row cannot
+    /// tell.
     #[test]
     fn an_ended_margin_conditional_order_reports_its_ending() {
         let key = UnindexedOrderKey::new(
@@ -3534,6 +3545,41 @@ mod tests {
             assert_eq!(order.kind, trailing_stop);
             assert_eq!(order.price, None);
         }
+
+        // A row that can describe the order is read as it describes it, whatever kind the client
+        // holds: a margin `LIMIT` row, and a spot stop row, which reports `trailingDelta`.
+        let limit = margin_row(order_row(
+            "LIMIT",
+            "CANCELED",
+            serde_json::json!({"price": "95"}),
+        ));
+        let spot_stop = spot_row(order_row(
+            "STOP_LOSS",
+            "CANCELED",
+            serde_json::json!({"stopPrice": "96"}),
+        ));
+        let read = [
+            convert_ended_order(&limit, ExchangeId::BinanceMargin, &key, Some(trailing_stop)),
+            convert_ended_order(
+                &spot_stop,
+                ExchangeId::BinanceSpot,
+                &key,
+                Some(trailing_stop),
+            ),
+        ]
+        .map(|order| order.map(|order| (order.kind, order.price)));
+        assert_eq!(
+            read,
+            [
+                Some((OrderKind::Limit, Some(Decimal::from(95)))),
+                Some((
+                    OrderKind::Stop {
+                        trigger_price: Decimal::from(96)
+                    },
+                    None
+                )),
+            ]
+        );
     }
 
     /// A gap is due once opened, leaves when recovered, and when its read fails is retried with a
