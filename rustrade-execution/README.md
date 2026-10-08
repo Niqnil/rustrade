@@ -60,6 +60,6 @@ an order whose quantity or price is not positive or has more precision than the 
 allows (`OrderError::InvalidPrecision`), and never rounds one: read the rules with
 `order_precision` and round first. `BinanceMargin`
 matches Binance spot except that both `TrailingStop` and `TrailingStopLimit` are
-rejected as unsupported (the SDK margin binding omits `trailingDelta`).
+rejected as unsupported (not mapped yet; Binance margin has no testnet to verify them on).
 
 See the [workspace README](../README.md) for documentation, examples, and contributing guidelines.

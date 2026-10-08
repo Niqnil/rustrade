@@ -2484,8 +2484,8 @@ pub(crate) enum BinanceTimeInForce {
 /// Returns `None` for combinations Binance does not support (so callers surface
 /// `UnsupportedOrderType`). `TrailingStop`/`TrailingStopLimit` classify to
 /// [`BinanceOrderType::StopLoss`]/`None` here (valid for spot, which sets `trailingDelta`);
-/// the **margin** adapter rejects trailing kinds *before* calling this, since the margin SDK
-/// has no `trailingDelta` binding.
+/// the **margin** adapter rejects trailing kinds *before* calling this, since it does not map
+/// them to `trailingDelta` yet.
 pub(crate) fn classify_order_kind_tif(
     kind: OrderKind,
     tif: TimeInForce,

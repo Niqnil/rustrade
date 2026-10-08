@@ -363,12 +363,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an account's marker still ends that read, without reporting unlisted instruments flat.
   Closes #408.
 
-- **`binance-sdk` 70.2.0 → 73.0.0** (`rustrade-execution`, `binance` feature). The three
+- **`binance-sdk` 70.2.0 → 74.0.0** (`rustrade-execution`, `binance` feature). The three
   `binance_sdk::common` internals the margin user-data stream couples to were re-verified before
   merge, and hold by construction: `common/` is byte-identical to 70.2.0. The one change that
   reaches us is that the spot WebSocket API's execution report now declares the commission asset
   (`N`) nullable, distinguishing an absent key from `null`. Both still read as no commission asset,
-  as before. The margin stream's report is unchanged.
+  as before. The margin stream's report is unchanged. 74.0.0 changes only the dual-investment
+  module, which the `binance` feature does not compile.
 
 - **An Alpaca fill's `TradeId` is Alpaca's execution id on every path** (`rustrade-execution`).
   **Breaking.** The account stream and reconnect recovery gave a fill the id

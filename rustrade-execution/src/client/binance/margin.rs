@@ -366,8 +366,9 @@ impl BinanceMarginConfig {
 ///   [`account_snapshot`](Self::account_snapshot) for the full per-method semantics.
 ///
 /// # Trailing stops unsupported
-/// `TrailingStop` / `TrailingStopLimit` return [`OrderError::UnsupportedOrderType`]: the binance-sdk
-/// margin new-order binding omits `trailingDelta`. See [`open_order`](Self::open_order).
+/// `TrailingStop` / `TrailingStopLimit` return [`OrderError::UnsupportedOrderType`]: this client does
+/// not map them yet. Binance margin accepts `trailingDelta`, and the SDK binds it, but margin has no
+/// testnet to verify the mapping on. See [`open_order`](Self::open_order).
 ///
 /// # User-data stream (`userListenToken`)
 /// [`account_stream`](Self::account_stream) is hand-rolled over the `userListenToken` model — the
@@ -663,8 +664,8 @@ impl ExecutionClient for BinanceMargin {
     /// - `isIsolated` is config-driven (`"TRUE"` for isolated, `"FALSE"` for cross).
     /// - `autoRepayAtCancel` is set only under [`MarginSideEffect::AutoBorrowRepay`]: a `NoBorrow`
     ///   client takes no loan, so requesting repay-on-cancel would be incoherent.
-    /// - Trailing-stop kinds return [`OrderError::UnsupportedOrderType`] (the SDK omits
-    ///   `trailingDelta` on the margin binding).
+    /// - Trailing-stop kinds return [`OrderError::UnsupportedOrderType`]: not mapped yet (see the
+    ///   type-level docs).
     async fn open_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
@@ -3861,9 +3862,9 @@ fn build_new_order_params(
 /// result onto margin's SDK output types — a [`MarginAccountNewOrderTypeEnum`] and a
 /// [`MarginAccountNewOrderTimeInForceEnum`]. Mirrors spot's own `convert_order_kind_tif` adapter.
 ///
-/// Returns `None` for unsupported combinations. Trailing-stop kinds are rejected here (the margin
-/// SDK has no `trailingDelta` binding), unlike spot which maps them to a `STOP_LOSS` with
-/// `trailingDelta`.
+/// Returns `None` for unsupported combinations. Trailing-stop kinds are rejected here (not mapped
+/// yet: margin has no testnet to verify `trailingDelta` on), unlike spot which maps them to a
+/// `STOP_LOSS` with `trailingDelta`.
 fn convert_order_kind_tif_margin(
     kind: OrderKind,
     tif: TimeInForce,
@@ -3877,7 +3878,7 @@ fn convert_order_kind_tif_margin(
     ) {
         warn!(
             ?kind,
-            "BinanceMargin does not support trailing-stop orders (SDK trailingDelta binding gap)"
+            "BinanceMargin does not support trailing-stop orders yet"
         );
         return None;
     }
