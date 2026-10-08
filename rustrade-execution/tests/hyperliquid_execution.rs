@@ -1357,3 +1357,110 @@ async fn test_cancel_without_order_id() {
     );
     println!("Cancel correctly rejected: {:?}", response.state.err());
 }
+
+/// The precision check accepts what Hyperliquid accepts at its boundaries: a BTC sell at an
+/// integer price past 5 significant figures, and a size at the asset's full `szDecimals`, both of
+/// which the client once rounded. Each order rests away from the market, then is cancelled.
+#[tokio::test]
+#[ignore] // Requires a Hyperliquid testnet account
+async fn test_boundary_precision_orders_rest() {
+    use rust_decimal::{Decimal, RoundingStrategy};
+
+    init_logging();
+    let config = test_config();
+    assert_eq!(
+        config.network,
+        Network::Testnet,
+        "This test MUST run on testnet only!"
+    );
+    let client = HyperliquidClient::connect(config)
+        .await
+        .expect("Failed to connect");
+
+    let info =
+        hyperliquid_rust_sdk::InfoClient::new(None, Some(hyperliquid_rust_sdk::BaseUrl::Testnet))
+            .await
+            .expect("Failed to create InfoClient");
+    let mids = info.all_mids().await.expect("Failed to read allMids");
+    let mid = |coin: &str| -> Decimal {
+        mids.get(coin)
+            .unwrap_or_else(|| panic!("allMids has no {coin} mid"))
+            .parse()
+            .expect("mid is a decimal")
+    };
+
+    // A sell 20% above the market, at an integer of at least 6 digits ending in 1, so it keeps 6
+    // significant figures.
+    let btc_price = (mid("BTC") * dec!(1.2))
+        .max(dec!(100000))
+        .trunc()
+        .checked_div(dec!(10))
+        .expect("divides")
+        .trunc()
+        * dec!(10)
+        + dec!(1);
+    // A buy 30% below the market, rounded down to the rules.
+    let eth = eth_instrument();
+    let eth_precision = client.order_precision(&eth).expect("ETH is listed");
+    let eth_price = eth_precision.round_price(mid("ETH") * dec!(0.7), RoundingStrategy::ToZero);
+
+    let btc = btc_instrument();
+    let btc_precision = client.order_precision(&btc).expect("BTC is listed");
+    for (instrument, precision, side, price) in [
+        (&btc, btc_precision, Side::Sell, btc_price),
+        (&eth, eth_precision, Side::Buy, eth_price),
+    ] {
+        // About $12, above the $10 minimum, at the asset's full size decimals.
+        let quantity = precision.round_quantity(dec!(12) / price, RoundingStrategy::AwayFromZero);
+        precision
+            .check_price(price)
+            .expect("the price meets the rules");
+        precision
+            .check_quantity(quantity)
+            .expect("the quantity meets the rules");
+        println!("Placing {side:?} {quantity} {instrument} @ {price}");
+
+        let key = OrderKey {
+            exchange: ExchangeId::HyperliquidPerp,
+            instrument,
+            strategy: StrategyId::new("test-precision"),
+            cid: ClientOrderId::uuid(),
+        };
+        let response = client
+            .open_order(rustrade_execution::order::OrderEvent {
+                key: key.clone(),
+                state: RequestOpen {
+                    side,
+                    price: Some(price),
+                    quantity,
+                    kind: OrderKind::Limit,
+                    time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                    position_id: None,
+                    reduce_only: false,
+                    market: None,
+                },
+            })
+            .await;
+        let OrderState::Active(ActiveOrderState::Open(open)) = &response.state else {
+            panic!(
+                "{instrument} @ {price} x {quantity} was not resting: {:?}",
+                response.state
+            );
+        };
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let cancelled = client
+            .cancel_order(rustrade_execution::order::OrderEvent {
+                key,
+                state: rustrade_execution::order::request::RequestCancel {
+                    id: Some(open.id.clone()),
+                },
+            })
+            .await;
+        assert!(
+            cancelled.state.is_ok(),
+            "cancel of {instrument}: {:?}",
+            cancelled.state
+        );
+    }
+}

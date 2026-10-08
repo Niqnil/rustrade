@@ -587,46 +587,6 @@ pub fn millis_to_datetime(millis: u64) -> Option<DateTime<Utc>> {
         .single()
 }
 
-/// Round a price to 5 significant figures (Hyperliquid requirement).
-///
-/// Performs rounding using `Decimal` arithmetic to avoid floating-point precision
-/// errors. The final `f64` conversion happens only at the SDK interface boundary.
-pub fn round_to_5_sig_figs(value: Decimal) -> f64 {
-    use rust_decimal::prelude::ToPrimitive;
-
-    if value.is_zero() {
-        return 0.0;
-    }
-
-    // Use f64 only for computing magnitude (acceptable precision for this purpose;
-    // we only need to know which power of 10 the number is close to).
-    let abs_f = value.abs().to_f64().unwrap_or(0.0);
-    if abs_f == 0.0 {
-        return 0.0;
-    }
-
-    // Clamp magnitude to prevent overflow when computing scale factor
-    #[allow(clippy::cast_possible_truncation)]
-    let magnitude = abs_f.log10().floor().clamp(-30.0, 30.0) as i32;
-
-    // Round using Decimal arithmetic to preserve precision
-    let rounded = if magnitude >= 4 {
-        // Large numbers (e.g., 123456): scale down, round integer, scale back up
-        // Safety: magnitude >= 4 guarantees (magnitude - 4) is non-negative
-        #[allow(clippy::cast_sign_loss)]
-        let factor = Decimal::from(10i64.pow((magnitude - 4) as u32));
-        (value / factor).round() * factor
-    } else {
-        // Small/medium numbers: round to appropriate decimal places
-        #[allow(clippy::cast_sign_loss)]
-        let dp = (4 - magnitude) as u32;
-        value.round_dp(dp)
-    };
-
-    // SDK requires f64 — convert only at the interface boundary
-    rounded.to_f64().unwrap_or(0.0)
-}
-
 /// Map rustrade TimeInForce to Hyperliquid TIF string.
 pub fn map_tif(tif: &TimeInForce) -> &'static str {
     match tif {
@@ -780,11 +740,14 @@ pub fn spot_pair_to_instrument(pair: &SpotPair) -> InstrumentNameExchange {
 /// The SDK's `ExchangeClient` addresses every spot pair by this `BASE/QUOTE` form as well as by
 /// the coin Hyperliquid names it (`@107`), so orders can be placed with it.
 pub fn instrument_to_spot_coin(instrument: &InstrumentNameExchange) -> Option<String> {
-    let s = instrument.as_ref();
-    // Expected format: "BASE-QUOTE-SPOT" -> "BASE/QUOTE"
-    let without_suffix = s.strip_suffix("-SPOT")?;
-    let (base, quote) = without_suffix.split_once('-')?;
-    Some(format!("{}/{}", base, quote))
+    let (base, quote) = spot_base_quote(instrument)?;
+    Some(format!("{base}/{quote}"))
+}
+
+/// The base and quote tokens of a spot instrument named `BASE-QUOTE-SPOT`, `None` for a name of
+/// another form.
+pub(super) fn spot_base_quote(instrument: &InstrumentNameExchange) -> Option<(&str, &str)> {
+    instrument.as_ref().strip_suffix("-SPOT")?.split_once('-')
 }
 
 #[cfg(test)]
@@ -916,16 +879,6 @@ mod tests {
             instrument_to_spot_coin(&InstrumentNameExchange::from("INVALID")),
             None
         );
-    }
-
-    #[test]
-    fn test_round_to_5_sig_figs() {
-        assert_eq!(round_to_5_sig_figs(dec!(0)), 0.0);
-        assert_eq!(round_to_5_sig_figs(dec!(12345)), 12345.0);
-        assert_eq!(round_to_5_sig_figs(dec!(123456)), 123460.0);
-        assert_eq!(round_to_5_sig_figs(dec!(0.00012345)), 0.00012345);
-        assert_eq!(round_to_5_sig_figs(dec!(0.000123456)), 0.00012346);
-        assert_eq!(round_to_5_sig_figs(dec!(1.23456789)), 1.2346);
     }
 
     #[test]

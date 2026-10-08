@@ -431,6 +431,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Hyperliquid orders were rounded to 5 significant figures before sending, which could change
+  the order or get it rejected** (`rustrade-execution`, `rustrade-instrument`). Closes #528.
+  **Breaking.**
+  - Both Hyperliquid clients passed quantity, limit price and trigger price through 5-significant-
+    figure rounding. A size Hyperliquid caps at the asset's `szDecimals` decimal places, not at
+    significant figures, so a quantity such as `123456` went out as `123460`, and `1.234` on an
+    asset with `szDecimals` 2 was rejected by the venue. Prices also ignored the venue's decimal-
+    place cap (`6 - szDecimals` for perpetuals, `8 - szDecimals` for spot), and an integer price,
+    which Hyperliquid always accepts, was rounded too.
+  - The clients now never round. An order whose quantity, price or trigger price breaks
+    Hyperliquid's rules is refused before anything is sent, with the new
+    `OrderError::InvalidPrecision(PrecisionViolation { field, value, limit })`. `OrderField` names
+    the value, and `PrecisionLimit` the rule it broke: `DecimalPlaces`, `SignificantFigures`,
+    `NotRepresentable` for a value the SDK's `f64` wire format would change, or `NotPositive` for
+    a zero or negative value. The error is not transient. Valid values are sent exactly as
+    requested.
+  - Read the rules with the new `HyperliquidClient::order_precision` and
+    `HyperliquidSpotClient::order_precision` (async: it reads `spotMeta` again for a pair listed
+    since), which return the new `OrderPrecision`. It checks values with `check_quantity`,
+    `check_price` and `check_trigger_price`, and rounds them with `round_quantity` and `round_price` in the direction you
+    pass, so the rounding policy stays with the caller.
+  - `SpotPair` gains `base_sz_decimals()`, read from `spotMeta`, and the HIP-3 DEXs' `meta` now
+    supplies each perpetual's `szDecimals`. Both responses must now carry `szDecimals`, which
+    Hyperliquid always sends: a `spotMeta` deserialized into `SpotPairs` without it fails, as it
+    already did in the SDK. An order on a perpetual listed after the client
+    connected is refused with `ApiError::InstrumentInvalid`, as the client has no `szDecimals`
+    for it. Reconnect to trade it.
+  - The public `hyperliquid::common::round_to_5_sig_figs` is removed.
+
 - **IBKR rejected every trailing stop-limit order: `OrderKind::TrailingStopLimit` had no initial
   stop** (`rustrade-execution`). Closes #518. **Breaking:** the kind has a new required field,
   `stop_price: Decimal`.

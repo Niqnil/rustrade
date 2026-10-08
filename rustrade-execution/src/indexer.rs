@@ -473,6 +473,9 @@ impl AccountEventIndexer {
             UnindexedOrderError::Connectivity(error) => OrderError::Connectivity(error),
             UnindexedOrderError::Rejected(error) => OrderError::Rejected(self.api_error(error)),
             UnindexedOrderError::UnsupportedOrderType(msg) => OrderError::UnsupportedOrderType(msg),
+            UnindexedOrderError::InvalidPrecision(violation) => {
+                OrderError::InvalidPrecision(violation)
+            }
         }
     }
 
