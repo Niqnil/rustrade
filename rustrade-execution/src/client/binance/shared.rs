@@ -506,6 +506,78 @@ pub(crate) fn log_unrecognised_frame(venue: &'static str, seen: &AtomicU64, fram
     }
 }
 
+/// The user-data event types one venue's handlers had no arm for, for [`log_unhandled_event`].
+///
+/// One process-wide instance per venue (a `static`), shared by every stream of that venue and
+/// never reset, like [`log_unrecognised_frame`]'s counter.
+pub(crate) struct UnhandledEvents {
+    count: AtomicU64,
+    /// Types already warned about. Capped at [`UnhandledEvents::MAX_TYPES`], so a stream of junk
+    /// `e` tags cannot grow it without bound.
+    types: parking_lot::Mutex<Vec<String>>,
+}
+
+impl UnhandledEvents {
+    const MAX_TYPES: usize = 32;
+
+    pub(crate) const fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            types: parking_lot::const_mutex(Vec::new()),
+        }
+    }
+
+    /// Count one event of `event_type`. Returns the running count, and whether to log it loudly:
+    /// the first of its type (while fewer than [`Self::MAX_TYPES`] are tracked), or every 1000th
+    /// event overall.
+    fn record(&self, event_type: &str) -> (u64, bool) {
+        let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        let first_of_type = {
+            let mut types = self.types.lock();
+            if types.iter().any(|seen| seen == event_type) || types.len() >= Self::MAX_TYPES {
+                false
+            } else {
+                types.push(event_type.to_owned());
+                true
+            }
+        };
+        (count, first_of_type || count.is_multiple_of(1000))
+    }
+}
+
+/// Log a user-data event whose `e` tag the stream handler has no arm for: at `warn` for the first
+/// of each type, and for every 1000th unhandled event with the running count, and at `trace`
+/// otherwise.
+///
+/// Event types a handler knowingly ignores get their own arm; this is for the rest. Warning per
+/// type means a frequent unhandled event cannot hide a rarer one: a venue that renames an event,
+/// or a handler that matches the wrong name, is seen at once rather than dropped silently (while
+/// fewer than [`UnhandledEvents::MAX_TYPES`] types have been seen; past that, a new type waits for
+/// the next 1000th).
+pub(crate) fn log_unhandled_event(
+    venue: &'static str,
+    seen: &UnhandledEvents,
+    event_type: &str,
+    event: &str,
+) {
+    let (count, loud) = seen.record(event_type);
+    if loud {
+        warn!(
+            venue,
+            count,
+            event_type,
+            event = frame_excerpt(event),
+            "Binance WS: user-data event of a type this client does not handle, ignoring it; \
+             further ones of this type are logged at trace, with a warning every 1000th"
+        );
+    } else {
+        trace!(
+            venue,
+            count, event_type, "Binance WS: unhandled user-data event, ignoring it"
+        );
+    }
+}
+
 /// The first 200 characters of a frame, for a log line about it.
 pub(crate) fn frame_excerpt(frame: &str) -> &str {
     frame
@@ -3119,6 +3191,34 @@ fn order_error_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The loud path runs for the first event of each type and for every 1000th event overall, so
+    /// a frequent unhandled type cannot hide a later one; repeats of a type stay quiet.
+    #[test]
+    fn unhandled_events_warn_once_per_type_and_every_thousandth() {
+        let seen = UnhandledEvents::new();
+        assert_eq!(seen.record("frequent"), (1, true));
+        for count in 2..=10 {
+            assert_eq!(seen.record("frequent"), (count, false));
+        }
+        assert_eq!(
+            seen.record("renamed"),
+            (11, true),
+            "a new type warns despite the first"
+        );
+        assert_eq!(seen.record("renamed"), (12, false));
+        for count in 13..1000 {
+            assert_eq!(seen.record("frequent"), (count, false));
+        }
+        assert_eq!(seen.record("frequent"), (1000, true));
+
+        // Past the cap a new type is no longer tracked, so it stays quiet between thousandths.
+        let capped = UnhandledEvents::new();
+        for i in 0..UnhandledEvents::MAX_TYPES {
+            assert!(capped.record(&format!("type{i}")).1);
+        }
+        assert!(!capped.record("one_too_many").1);
+    }
 
     fn report(json: &str) -> ExecutionReport {
         match serde_json::from_str(json) {

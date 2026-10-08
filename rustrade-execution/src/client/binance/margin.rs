@@ -40,9 +40,9 @@
 //! - `balanceUpdate` events (deposits/withdrawals) are not forwarded. Callers reconcile balances
 //!   after external transfers via [`ExecutionClient::fetch_balances`] or
 //!   [`ExecutionClient::account_snapshot`].
-//! - `userLiabilityChange` is surfaced at INFO but never folded into balance state: borrow/repay
-//!   is a delta, and accumulating it would be the position tracking this library leaves to its
-//!   consumers.
+//! - `USER_LIABILITY_CHANGE` (borrow/repay) is surfaced at INFO but never folded into balance
+//!   state: it is a delta, and accumulating it would be the position tracking this library leaves
+//!   to its consumers.
 //! - A `TRADE` report whose order status (`X`) is neither `PARTIALLY_FILLED` nor `FILLED` emits
 //!   the execution but no order snapshot, so a fill arriving after its order's terminal report
 //!   cannot resurrect a retired order as a resting one. That order's filled quantity is settled
@@ -54,13 +54,14 @@ use super::shared::{
     CONNECT_TIMEOUT_SECS, ExecutionReport, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS,
     HEARTBEAT_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing,
     PlacementResponse, RateLimitTracker, RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS,
-    SharedDedupCache, TrailingDeltaError, UnrecoveredFills, UserDataFrame, WeightPool,
-    binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
+    SharedDedupCache, TrailingDeltaError, UnhandledEvents, UnrecoveredFills, UserDataFrame,
+    WeightPool, binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
     classify_rest_query_error, convert_ended_order, convert_execution_report,
     convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event, drop_after,
-    frame_excerpt, gap_failed, gap_time, is_duplicate, is_unknown_order, log_unrecognised_frame,
-    new_dedup_cache, parse_user_data_frame, placed_order_state, recovered_order_totals,
-    response_decode_error, rest_call_with_retry, trailing_delta_basis_points,
+    frame_excerpt, gap_failed, gap_time, is_duplicate, is_unknown_order, log_unhandled_event,
+    log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, placed_order_state,
+    recovered_order_totals, response_decode_error, rest_call_with_retry,
+    trailing_delta_basis_points,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
@@ -403,7 +404,7 @@ impl BinanceMarginConfig {
 /// [`MarginDetails`](crate::balance::MarginDetails). Authoritative debt totals come from the REST
 /// [`account_snapshot`](Self::account_snapshot) (`BalanceSnapshot`); the WS stream keeps
 /// `free`/`locked` live via `BalanceStreamUpdate` but **never** clobbers or re-establishes debt, and
-/// `userLiabilityChange` is surfaced as an observable log only, never accumulated into state.
+/// `USER_LIABILITY_CHANGE` is surfaced as an observable log only, never accumulated into state.
 /// Consequently `net_asset` reflects debt only as fresh as the last `account_snapshot` for that
 /// asset — call it at startup and refresh on demand (see [`account_stream`](Self::account_stream)'s
 /// cold-start note).
@@ -1229,7 +1230,7 @@ impl ExecutionClient for BinanceMargin {
     /// This method does **not** seed balances. Margin debt (`borrowed`/`interest`) is correct only
     /// if the caller invokes [`ExecutionClient::account_snapshot`] at startup (the `BalanceSnapshot`
     /// that populates `margin`). WS thereafter keeps `free`/`locked` live via `BalanceStreamUpdate`
-    /// but never re-establishes debt; `userLiabilityChange` is logged observably, not applied to
+    /// but never re-establishes debt; `USER_LIABILITY_CHANGE` is logged observably, not applied to
     /// balance state.
     ///
     /// # Startup race window
@@ -1712,9 +1713,10 @@ fn convert_margin_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEv
 /// Each text frame is either an RPC response (`{ "id", "status", "result", … }` — e.g. the
 /// subscribe ack) or a pushed user-data event wrapped as `{ "subscriptionId", "event": { "e", … } }`.
 /// Returns `true` if the exchange signalled stream termination (a reconnect trigger). Unrecognised
-/// frames are ignored and logged by [`log_unrecognised_frame`] (throttled `warn`); unknown event
-/// types are ignored at `trace`. Deserialization of a known event type is defensive: a mismatch is logged and the
-/// event dropped (observable), never silently mis-parsed.
+/// frames are ignored and logged by [`log_unrecognised_frame`] (throttled `warn`); event types with
+/// no arm are ignored and logged by [`log_unhandled_event`] (throttled `warn`), so a renamed event
+/// is seen rather than dropped silently. Deserialization of a known event type is defensive: a
+/// mismatch is logged and the event dropped (observable), never silently mis-parsed.
 ///
 /// The `outboundAccountPosition` (balance) arm is delegated to `handle_position` — the **only** arm
 /// that differs between cross (account-wide `BalanceStreamUpdate`) and isolated (per-instrument
@@ -1772,7 +1774,10 @@ fn convert_margin_user_data_events_with(
             // No log here: this is the per-frame receive hot path (fires on every balance change).
             false
         }
-        "userLiabilityChange" => {
+        // Binance's docs and binance-sdk name these two `USER_LIABILITY_CHANGE` and
+        // `MARGIN_LEVEL_STATUS_CHANGE`. The camelCase spellings are also accepted until a live frame
+        // from the `userListenToken` stream confirms which one it sends (#547).
+        "USER_LIABILITY_CHANGE" | "userLiabilityChange" => {
             // Observable, NOT accumulated into balance state: borrow/repay is a
             // delta, and folding it in would be the position tracking the library refuses. Surfaced
             // via logs; consumers needing exact live debt refresh via account_snapshot. Always
@@ -1787,34 +1792,34 @@ fn convert_margin_user_data_events_with(
                             kind = c.t.as_deref().unwrap_or("?"),
                             principal = c.p.as_deref().unwrap_or("?"),
                             interest = c.i.as_deref().unwrap_or("?"),
-                            "BinanceMargin userLiabilityChange (observable; not applied to balance state)"
+                            "BinanceMargin USER_LIABILITY_CHANGE (observable; not applied to balance state)"
                         );
                     }
                 }
                 Err(e) => warn!(
                     error = %e,
                     frame = frame_excerpt(event_raw),
-                    "BinanceMargin: undeserializable userLiabilityChange, dropping"
+                    "BinanceMargin: undeserializable USER_LIABILITY_CHANGE, dropping"
                 ),
             }
             false
         }
-        "marginLevelStatusChange" => {
+        "MARGIN_LEVEL_STATUS_CHANGE" | "marginLevelStatusChange" => {
             // Liquidation-risk signal — observable, no policy (the library takes no defensive action).
             // The level guard skips the deserialize allocation when WARN is filtered out, mirroring
-            // userLiabilityChange above. A parse failure on a liquidation-risk frame is surfaced
+            // USER_LIABILITY_CHANGE above. A parse failure on a liquidation-risk frame is surfaced
             // rather than dropped silently (observable failures over silent ones).
             if tracing::enabled!(tracing::Level::WARN) {
                 match serde_json::from_str::<MarginLevelStatusChange>(event_raw) {
                     Ok(c) => warn!(
                         margin_level = c.l.as_deref().unwrap_or("?"),
                         status = c.s.as_deref().unwrap_or("?"),
-                        "BinanceMargin marginLevelStatusChange (liquidation risk; observable, no policy)"
+                        "BinanceMargin MARGIN_LEVEL_STATUS_CHANGE (liquidation risk; observable, no policy)"
                     ),
                     Err(e) => warn!(
                         error = %e,
                         frame = frame_excerpt(event_raw),
-                        "BinanceMargin: undeserializable marginLevelStatusChange, dropping"
+                        "BinanceMargin: undeserializable MARGIN_LEVEL_STATUS_CHANGE, dropping"
                     ),
                 }
             }
@@ -1824,11 +1829,15 @@ fn convert_margin_user_data_events_with(
             warn!("BinanceMargin user data stream terminated by exchange, signalling reconnect");
             true
         }
+        "listStatus" => {
+            // OCO/OTO list status: this client places no order lists, and each leg's own
+            // executionReport carries the order state. Ignored knowingly.
+            trace!("BinanceMargin ignoring listStatus user data event");
+            false
+        }
         other => {
-            trace!(
-                event_type = other,
-                "BinanceMargin ignoring unhandled user data event"
-            );
+            static SEEN: UnhandledEvents = UnhandledEvents::new();
+            log_unhandled_event("BinanceMargin", &SEEN, other, event_raw);
             false
         }
     }
@@ -5275,18 +5284,143 @@ mod tests {
 
     #[test]
     fn margin_ws_margin_specific_events_are_observable_only() {
-        // userLiabilityChange / marginLevelStatusChange are logged, NOT forwarded as account events
-        // and NOT signalled as reconnects: observable, not accumulated.
+        // USER_LIABILITY_CHANGE / MARGIN_LEVEL_STATUS_CHANGE are logged, NOT forwarded as account
+        // events and NOT signalled as reconnects: observable, not accumulated.
         let mut buf = Vec::new();
-        let liability = push(serde_json::json!({
-            "e": "userLiabilityChange", "a": "USDT", "t": "BORROW", "p": "100", "i": "0.01",
-        }));
-        assert!(!convert_margin_user_data_events(&liability, &mut buf));
-        let level = push(serde_json::json!({
-            "e": "marginLevelStatusChange", "l": "1.5", "s": "MARGIN_LEVEL_2",
-        }));
-        assert!(!convert_margin_user_data_events(&level, &mut buf));
+        assert!(!convert_margin_user_data_events(
+            &push(documented_liability_change("USER_LIABILITY_CHANGE")),
+            &mut buf
+        ));
+        assert!(!convert_margin_user_data_events(
+            &push(documented_margin_level_change("MARGIN_LEVEL_STATUS_CHANGE")),
+            &mut buf
+        ));
         assert!(buf.is_empty());
+    }
+
+    /// `USER_LIABILITY_CHANGE` as Binance documents it, under event name `e`.
+    fn documented_liability_change(e: &str) -> serde_json::Value {
+        serde_json::json!({
+            "e": e, "E": 1_573_200_697_110_i64, "a": "BTC", "t": "BORROW",
+            "p": "1.03453430", "i": "0",
+        })
+    }
+
+    /// `MARGIN_LEVEL_STATUS_CHANGE` as Binance documents it, under event name `e`.
+    fn documented_margin_level_change(e: &str) -> serde_json::Value {
+        serde_json::json!({
+            "e": e, "E": 1_573_200_697_110_i64, "l": "1.25", "s": "MARGIN_CALL",
+        })
+    }
+
+    #[test]
+    fn margin_ws_margin_specific_events_match_their_documented_names() {
+        // Regression (#547): the arms matched only camelCase names, which Binance does not
+        // document, so documented frames fell to the catch-all and were dropped at trace. Each
+        // frame must reach its own arm and decode there: only that arm logs its message, and a
+        // decode failure would log "undeserializable" instead.
+        for (e, frame, expected) in [
+            (
+                "USER_LIABILITY_CHANGE",
+                documented_liability_change("USER_LIABILITY_CHANGE"),
+                "USER_LIABILITY_CHANGE (observable",
+            ),
+            (
+                "MARGIN_LEVEL_STATUS_CHANGE",
+                documented_margin_level_change("MARGIN_LEVEL_STATUS_CHANGE"),
+                "MARGIN_LEVEL_STATUS_CHANGE (liquidation risk",
+            ),
+            // Accepted until a live frame settles which spelling the userListenToken stream sends.
+            (
+                "userLiabilityChange",
+                documented_liability_change("userLiabilityChange"),
+                "USER_LIABILITY_CHANGE (observable",
+            ),
+            (
+                "marginLevelStatusChange",
+                documented_margin_level_change("marginLevelStatusChange"),
+                "MARGIN_LEVEL_STATUS_CHANGE (liquidation risk",
+            ),
+        ] {
+            let mut buf = Vec::new();
+            let (terminated, messages) =
+                log_messages(|| convert_margin_user_data_events(&push(frame), &mut buf));
+            assert!(!terminated, "{e}");
+            assert!(buf.is_empty(), "{e}");
+            assert!(
+                messages.iter().any(|m| m.contains(expected)),
+                "{e}: expected its own arm's log, got {messages:?}"
+            );
+            assert!(
+                !messages.iter().any(|m| m.contains("undeserializable")
+                    || m.contains("unhandled")
+                    || m.contains("does not handle")),
+                "{e}: {messages:?}"
+            );
+        }
+    }
+
+    /// Run `f`, returning its value and the message of every log event it emitted on this thread,
+    /// at any level. These arms report only through logs, so asserting on the return value alone
+    /// could not tell which arm handled a frame.
+    fn log_messages<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Default)]
+        struct Messages(Arc<Mutex<Vec<String>>>);
+
+        struct Message<'a>(&'a mut String);
+
+        impl tracing::field::Visit for Message<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    *self.0 = format!("{value:?}");
+                }
+            }
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Messages {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut message = String::new();
+                event.record(&mut Message(&mut message));
+                self.0.lock().unwrap().push(message);
+            }
+        }
+
+        let layer = Messages::default();
+        let messages = Arc::clone(&layer.0);
+        // Thread-local, so other tests running in parallel are not captured.
+        let value =
+            tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), f);
+        let messages = messages.lock().unwrap().clone();
+        (value, messages)
+    }
+
+    #[test]
+    fn margin_ws_unhandled_event_types_are_ignored_without_teardown() {
+        // listStatus is ignored knowingly; a type with no arm goes to log_unhandled_event. Neither
+        // pushes events or signals a reconnect.
+        for (e, expected) in [
+            ("listStatus", "ignoring listStatus"),
+            // First of its type, so the loud path: a warning naming the unhandled type.
+            ("someFutureEvent", "of a type this client does not handle"),
+        ] {
+            let mut buf = Vec::new();
+            let frame = push(serde_json::json!({ "e": e, "E": 1_700_000_000_000_i64 }));
+            let (terminated, messages) =
+                log_messages(|| convert_margin_user_data_events(&frame, &mut buf));
+            assert!(!terminated, "{e}");
+            assert!(buf.is_empty(), "{e}");
+            assert!(
+                messages.iter().any(|m| m.contains(expected)),
+                "{e}: {messages:?}"
+            );
+        }
     }
 
     // -- User-data stream: dedup -----------------------------------------------------------------
