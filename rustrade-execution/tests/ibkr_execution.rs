@@ -44,6 +44,8 @@
 //! |------|-------------|
 //! | `test_connection` | Connect to IB Gateway |
 //! | `test_contract_registration` | Resolve contracts, and refuse unresolved or duplicate ones |
+//! | `test_connect_refuses_a_configured_contract_it_cannot_register` | Strict connect fails, listing every bad contract, and frees the client ID |
+//! | `test_lenient_connect_reports_the_contracts_it_skips` | Lenient connect registers the rest and returns the skips |
 //! | `test_fetch_balances` | Fetch account balances |
 //! | `test_account_snapshot` | Fetch full account snapshot |
 //! | `test_fetch_open_orders` | Fetch currently open orders |
@@ -76,8 +78,9 @@ use rustrade_execution::{
     client::{
         ExecutionClient, OrderStatusClient,
         ibkr::{
-            ContractConfig, IbkrClient, IbkrConfig,
-            contract::{ResolveContractError, stock_contract},
+            ContractConfig, ContractSkipReason, IbkrClient, IbkrConfig, IbkrConnectError,
+            SkippedContract,
+            contract::{ContractConfigError, ResolveContractError, stock_contract},
         },
     },
     order::{
@@ -146,6 +149,47 @@ fn resolved_aapl_config(client_id_offset: i32) -> IbkrConfig {
 
 fn aapl_instrument() -> InstrumentNameExchange {
     "AAPL".into()
+}
+
+/// AAPL, which registers, then a stock IB has no contract for and a future with no expiry, which
+/// do not.
+fn partly_registrable_config(client_id_offset: i32) -> IbkrConfig {
+    let mut config = resolved_aapl_config(client_id_offset);
+    let aapl = config.contracts[0].clone();
+    config.contracts.extend([
+        ContractConfig {
+            name: "NOSUCH".to_string(),
+            symbol: "NOSUCHSYMBOLXQZ".to_string(),
+            ..aapl.clone()
+        },
+        ContractConfig {
+            name: "ES-NODATE".to_string(),
+            symbol: "ES".to_string(),
+            security_type: "FUT".to_string(),
+            exchange: "CME".to_string(),
+            ..aapl
+        },
+    ]);
+    config
+}
+
+/// Check `skipped` lists the two contracts [`partly_registrable_config`] cannot register, in
+/// config order, and that neither failure is transient.
+fn assert_partly_registrable_skips(skipped: &[SkippedContract]) {
+    let names: Vec<_> = skipped
+        .iter()
+        .map(|skip| skip.name.name().as_str())
+        .collect();
+    assert_eq!(names, ["NOSUCH", "ES-NODATE"], "{skipped:?}");
+    assert_eq!(
+        skipped[0].reason,
+        ContractSkipReason::Resolve(ResolveContractError::NoMatch)
+    );
+    assert_eq!(
+        skipped[1].reason,
+        ContractSkipReason::Config(ContractConfigError::MissingLastTradeDate)
+    );
+    assert!(skipped.iter().all(|skip| !skip.reason.is_transient()));
 }
 
 /// Connect to IB, wrapping the blocking call in spawn_blocking.
@@ -241,6 +285,48 @@ async fn test_contract_registration() {
         }
         other => panic!("expected an ambiguous description, got {other:?}"),
     }
+}
+
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_connect_refuses_a_configured_contract_it_cannot_register() {
+    init_logging();
+
+    let refused = tokio::task::spawn_blocking(|| {
+        IbkrClient::connect_sync(partly_registrable_config(23)).map(|_| ())
+    })
+    .await
+    .unwrap();
+    match refused {
+        Err(IbkrConnectError::Contracts(skipped)) => assert_partly_registrable_skips(&skipped),
+        other => panic!("expected the bad contracts to fail the connect, got {other:?}"),
+    }
+
+    // The refused connect dropped its connection, so the same client ID connects again.
+    let client = connect_client(resolved_aapl_config(23))
+        .await
+        .expect("the client ID was freed");
+    assert_eq!(client.contract_registry().len(), 1);
+}
+
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_lenient_connect_reports_the_contracts_it_skips() {
+    init_logging();
+
+    let outcome = tokio::task::spawn_blocking(|| {
+        IbkrClient::connect_sync_lenient(partly_registrable_config(24))
+    })
+    .await
+    .unwrap()
+    .expect("connection failed");
+
+    assert_partly_registrable_skips(&outcome.skipped);
+    let registry = outcome.client.contract_registry();
+    assert_eq!(registry.len(), 1);
+    assert!(registry.contains(&aapl_instrument()));
 }
 
 // ============================================================================

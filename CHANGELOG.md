@@ -255,6 +255,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`IbkrClient::connect_sync` fails when a configured contract cannot be registered, and the
+  new `connect_sync_lenient` reports the ones it skips** (`rustrade-execution`, feature `ibkr`).
+  **Breaking.**
+  - A contract in `IbkrConfig::contracts` that could not be built, resolved or registered was
+    skipped with only a `warn!`, and the client connected without it. Orders for it were then
+    refused as unregistered, possibly long after startup.
+  - `connect_sync` now returns `Result<IbkrClient, IbkrConnectError>`. `IbkrConnectError` is
+    `Connect(UnindexedClientError)` when TWS/Gateway cannot be reached, or
+    `Contracts(Vec<SkippedContract>)`, listing every contract that failed, not just the first.
+    On `Contracts`, the connection is dropped, so its client ID is free again.
+  - New `connect_sync_lenient` returns `ConnectOutcome { client, skipped }`: it connects without
+    each contract that fails, and returns those in `skipped`.
+  - `SkippedContract { name, reason }` carries a `ContractSkipReason` of `Config`, `Resolve` or
+    `Register`, wrapping the error of the step that failed. `is_transient()` is true only for a
+    transient `Resolve` failure, such as a dropped connection. The library does not retry. To
+    retry one contract, call `resolve_contract` and `register_contract` on the connected client.
+  - `ExecutionClient::new`, which `ExecutionBuilder` calls, uses `connect_sync`, so it now panics
+    on a configured contract that cannot be registered, as it already did on a failed
+    connection.
+
 - **`ConnectivityError::Timeout` displays as "request timed out"** (`rustrade-execution`). It said
   "ExecutionRequest timed out", which read wrongly for the requests besides order placement that
   report it, such as IBKR contract resolution.
@@ -504,9 +524,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - `Failed` otherwise, as for a client that has shut down or given up reconnecting.
   - `IbkrClient::connect_sync` resolves `IbkrConfig::contracts` the same way. It used to register
     the first of several matching contracts, which could be the wrong one, and skipped one with
-    no match without a warning. Both are now skipped with a `warn!`, as a contract IB fails to
-    resolve was already. Its rustdoc said a failed resolution failed the connection. It never
-    did, and the rustdoc now says so.
+    no match without a warning. Both now count as a contract that failed to resolve, which fails
+    the connection: see the `connect_sync` entry under Changed.
   - New `ContractRegistry::register_by_name_only` keeps the old behaviour for uses that only look
     contracts up by name. `rustrade-data`'s `IbkrMarketStream` is one: IB resolves each market
     data request's contract itself. A contract registered this way is never found by contract id.
@@ -948,7 +967,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an option routed that instrument's orders as stock orders. Built through `ExecutionBuilder`,
   `IbkrClient` now fails the build when an entry's `security_type` contradicts its instrument's
   kind (`STK` or `CASH` for spot, `FUT` for a future, `OPT` for an option), and when an entry is
-  invalid, such as a `FUT` with no `last_trade_date`, which `connect_sync` only logs and skips.
+  invalid, such as a `FUT` with no `last_trade_date`, which `connect_sync` finds only once connected.
   Every problem is reported at once. An entry naming no configured instrument is still accepted.
 - **A simulated venue could mint an `OrderId` its seeded account state already used**
   (`rustrade-execution`). `SimulatedVenue` counted its order ids from zero whatever its
