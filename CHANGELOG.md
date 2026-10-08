@@ -65,6 +65,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `OrderError::InvalidPrecision`, before anything is sent, rather than trailing by a different
   distance than asked. An offset too large to send, which `BinanceSpot` reported as
   `OrderError::UnsupportedOrderType`, is now `InvalidPrecision` too.
+- **Binance account streams read an order report without an order type as a `Limit` order**
+  (`rustrade-execution`). An `executionReport` missing `o` produced an order snapshot of kind
+  `Limit`, without a warning. Its snapshot is now dropped with a warning, as a REST order row
+  without a type already is. A fill the report carries is still emitted.
+- **Binance account streams logged an undecodable event without its content**
+  (`rustrade-execution`). The warning for a user-data event that fails to decode, such as an
+  `executionReport` with a key in an unexpected shape, now includes the first 200 characters of
+  the event, as the warning for an unrecognised frame already did.
 
 ## [0.9.0] - 2026-10-08
 

@@ -41,8 +41,8 @@ use super::shared::{
     SharedDedupCache, UnrecoveredFills, UserDataFrame, WeightPool, binance_filled_qty,
     classify_order_kind_tif, classify_rest_query_error, classify_ws_order_error,
     convert_ended_order, convert_execution_report, convert_open_order_listing,
-    convert_open_order_owned_symbol, dedup_key_from_event, drop_after, gap_failed, gap_time,
-    is_duplicate, is_handshake_rate_limit, is_unknown_order, log_unrecognised_frame,
+    convert_open_order_owned_symbol, dedup_key_from_event, drop_after, frame_excerpt, gap_failed,
+    gap_time, is_duplicate, is_handshake_rate_limit, is_unknown_order, log_unrecognised_frame,
     new_dedup_cache, parse_user_data_frame, placed_order_state, recovered_order_totals,
     response_decode_error, rest_call_with_retry, trailing_delta_basis_points, unix_ms,
 };
@@ -2261,7 +2261,7 @@ fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -
                     convert_execution_report(&report, ExchangeId::BinanceSpot, buf);
                 }
                 Err(e) => {
-                    warn!(error = %e, "BinanceSpot: undeserializable executionReport, dropping")
+                    warn!(error = %e, frame = frame_excerpt(event), "BinanceSpot: undeserializable executionReport, dropping")
                 }
             }
             false
@@ -2272,7 +2272,7 @@ fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -
             ) {
                 Ok(position) => convert_account_position(position, buf),
                 Err(e) => {
-                    warn!(error = %e, "BinanceSpot: undeserializable outboundAccountPosition, dropping")
+                    warn!(error = %e, frame = frame_excerpt(event), "BinanceSpot: undeserializable outboundAccountPosition, dropping")
                 }
             }
             false
@@ -3357,6 +3357,52 @@ mod tests {
             }
             other => panic!("NEW should yield OrderSnapshot, got {other:?}"),
         }
+    }
+
+    /// A report without its order type (`o`) cannot say what kind the order is, so its snapshot
+    /// is dropped, as a REST row without one is, rather than read as a `Limit`. A fill it reports
+    /// is still emitted.
+    #[test]
+    fn a_report_without_an_order_type_has_no_order_snapshot() {
+        let new = ExecutionReport {
+            execution_type: Some("NEW".to_string()),
+            side: Some("BUY".to_string()),
+            price: Some("50000.00".to_string()),
+            order_quantity: Some("0.01".to_string()),
+            ..make_base_report()
+        };
+        assert!(convert(new).is_empty());
+
+        let fill = ExecutionReport {
+            execution_type: Some("TRADE".to_string()),
+            order_status: Some("PARTIALLY_FILLED".to_string()),
+            side: Some("BUY".to_string()),
+            trade_id: Some(9999),
+            last_executed_price: Some("50000.00".to_string()),
+            last_executed_quantity: Some("0.005".to_string()),
+            commission_amount: Some("0".to_string()),
+            cumulative_filled_quantity: Some("0.005".to_string()),
+            order_type: Some("LIMIT".to_string()),
+            price: Some("50000.00".to_string()),
+            order_quantity: Some("0.01".to_string()),
+            ..make_base_report()
+        };
+        let kinds = |report| {
+            convert(report)
+                .into_iter()
+                .map(|event| match event.kind {
+                    AccountEventKind::Trade(_) => "trade",
+                    AccountEventKind::OrderSnapshot(_) => "snapshot",
+                    _ => "other",
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(kinds(fill.clone()), ["trade", "snapshot"]);
+        let untyped = ExecutionReport {
+            order_type: None,
+            ..fill
+        };
+        assert_eq!(kinds(untyped), ["trade"]);
     }
 
     #[test]

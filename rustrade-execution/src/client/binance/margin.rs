@@ -58,9 +58,9 @@ use super::shared::{
     binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
     classify_rest_query_error, convert_ended_order, convert_execution_report,
     convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event, drop_after,
-    gap_failed, gap_time, is_duplicate, is_unknown_order, log_unrecognised_frame, new_dedup_cache,
-    parse_user_data_frame, placed_order_state, recovered_order_totals, response_decode_error,
-    rest_call_with_retry, trailing_delta_basis_points,
+    frame_excerpt, gap_failed, gap_time, is_duplicate, is_unknown_order, log_unrecognised_frame,
+    new_dedup_cache, parse_user_data_frame, placed_order_state, recovered_order_totals,
+    response_decode_error, rest_call_with_retry, trailing_delta_basis_points,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
@@ -1751,7 +1751,7 @@ fn convert_margin_user_data_events_with(
             match serde_json::from_str::<ExecutionReport>(event_raw) {
                 Ok(report) => convert_execution_report(&report, ExchangeId::BinanceMargin, buf),
                 Err(e) => {
-                    warn!(error = %e, "BinanceMargin: undeserializable executionReport, dropping")
+                    warn!(error = %e, frame = frame_excerpt(event_raw), "BinanceMargin: undeserializable executionReport, dropping")
                 }
             }
             false
@@ -1761,7 +1761,7 @@ fn convert_margin_user_data_events_with(
                 // Balance arm is the one cross/isolated divergence — delegate to the handler.
                 Ok(position) => handle_position(position, subscription_id, buf),
                 Err(e) => {
-                    warn!(error = %e, "BinanceMargin: undeserializable outboundAccountPosition, dropping")
+                    warn!(error = %e, frame = frame_excerpt(event_raw), "BinanceMargin: undeserializable outboundAccountPosition, dropping")
                 }
             }
             false
@@ -1793,6 +1793,7 @@ fn convert_margin_user_data_events_with(
                 }
                 Err(e) => warn!(
                     error = %e,
+                    frame = frame_excerpt(event_raw),
                     "BinanceMargin: undeserializable userLiabilityChange, dropping"
                 ),
             }
@@ -1812,6 +1813,7 @@ fn convert_margin_user_data_events_with(
                     ),
                     Err(e) => warn!(
                         error = %e,
+                        frame = frame_excerpt(event_raw),
                         "BinanceMargin: undeserializable marginLevelStatusChange, dropping"
                     ),
                 }
