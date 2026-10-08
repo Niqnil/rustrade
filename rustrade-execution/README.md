@@ -6,12 +6,12 @@ Execution client library for streaming private account data and executing orders
 
 | Exchange | Constructor | InstrumentKinds | Features |
 |:--------:|:-----------:|:---------------:|:--------:|
-| **BinanceSpot** | `BinanceSpot::new(BinanceSpotConfig)` | Spot | Orders, Balances |
-| **BinanceMargin** | `BinanceMargin::new(BinanceMarginConfig)` | Spot (cross/isolated margin) | Orders, Balances |
-| **Alpaca** | `AlpacaClient::new(AlpacaConfig)` | Spot (Equities, Crypto), Option | Orders, Balances, Positions, BracketOrders |
-| **Hyperliquid** | `HyperliquidClient::connect(HyperliquidConfig)` | Perpetual | Orders, Balances, Positions |
-| **HyperliquidSpot** | `HyperliquidSpotClient::connect(HyperliquidConfig)` | Spot | Orders, Balances |
-| **IBKR** | `IbkrClient::connect_sync(IbkrConfig)` | Spot, Future, Option | Orders, Balances, Positions, BracketOrders |
+| **BinanceSpot** | `BinanceSpot::new(BinanceSpotConfig)` | Spot | Orders, Balances, OrderRecovery |
+| **BinanceMargin** | `BinanceMargin::new(BinanceMarginConfig)` | Spot (cross/isolated margin) | Orders, Balances, OrderRecovery |
+| **Alpaca** | `AlpacaClient::new(AlpacaConfig)` | Spot (Equities, Crypto), Option | Orders, Balances, Positions, BracketOrders, OrderRecovery |
+| **Hyperliquid** | `HyperliquidClient::connect(HyperliquidConfig)` | Perpetual | Orders, Balances, Positions, OrderRecovery |
+| **HyperliquidSpot** | `HyperliquidSpotClient::connect(HyperliquidConfig)` | Spot | Orders, Balances, OrderRecovery |
+| **IBKR** | `IbkrClient::connect_sync(IbkrConfig)` | Spot, Future, Option | Orders, Balances, Positions, BracketOrders, OrderRecovery |
 
 **Positions** means `account_snapshot` reports each open position in
 `InstrumentAccountSnapshot::position`: signed quantity, entry price and unrealised PnL, plus
@@ -32,9 +32,21 @@ Margin) and Hyperliquid Spot a holding is an asset balance instead, and `positio
   contract multiplier, commissions included). It reports no unrealised PnL. With several
   accounts, the first account holding an instrument is kept; positions are never summed.
 
+**OrderRecovery** means the client implements `OrderStatusClient::fetch_ended_orders`, which
+reads how the listed orders ended at the venue. After an account-stream outage, each client uses
+it to report the orders that ended while the stream was down.
+
 The `new` constructors are `ExecutionClient::new`. Each connector is behind a Cargo feature, and
 none is enabled by default: `alpaca`, `binance` (Spot and Margin), `hyperliquid` (perpetuals and
 spot), and `ibkr`. The mock client is always available.
+
+- **Hyperliquid** perpetuals are named `{coin}-{collateral}-PERP` (`BTC-USDC-PERP`,
+  `xyz:TSLA-USDC-PERP`). `HyperliquidClient::connect` reads the default DEX, plus each
+  builder-deployed (HIP-3) DEX in `HyperliquidConfig::dexes` (`with_dexes`, or `HYPERLIQUID_DEXES`
+  for `from_env`), on the configured `network`.
+- **IBKR** `connect_sync` fails if any contract in `IbkrConfig::contracts` cannot be built,
+  resolved or registered, listing every one. `connect_sync_lenient` connects without them and
+  returns them instead.
 
 ## Order Types
 

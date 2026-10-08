@@ -4,6 +4,11 @@ Integration library for streaming public market data from exchanges and data pro
 
 ## Supported Exchanges
 
+Binance, Bitfinex, Bitmex, Bybit, Coinbase, Gate.io, Kraken and OKX are always available. The other
+exchanges and the data providers are each behind a Cargo feature, none enabled by default:
+`alpaca`, `databento`, `hyperliquid`, `ibkr`, `lse` (`lse-parquet` adds Parquet export decoding)
+and `massive`.
+
 | Exchange | Constructor | InstrumentKinds | SubscriptionKinds |
 |:--------:|:-----------:|:---------------:|:-----------------:|
 | **BinanceSpot** | `BinanceSpot::default()` | Spot | PublicTrades, OrderBooksL1, OrderBooksL2, Candles |
@@ -35,6 +40,13 @@ Integration library for streaming public market data from exchanges and data pro
 > (`@forceOrder`) and `Candles` (`@continuousKline_`) are served only on the `/market` tier, exposed as
 > `BinanceFuturesUsdMarket`; trades and order books stay on `BinanceFuturesUsd`. The `DynamicStreams` /
 > `ExchangeId` path handles this routing automatically.
+
+> **Hyperliquid coins:** Hyperliquid sends no data for a coin it does not list and then closes the
+> connection, ending the other subscriptions on it. A `MarketDataInstrument` derives the coin from
+> its asset names, which gets mixed-case perpetuals (`kPEPE`) and builder-deployed (HIP-3)
+> perpetuals (`xyz:TSLA`) wrong, and names no spot pair but PURR/USDC unless its base is given
+> as `@{index}`. Read the coins with `HyperliquidMeta::fetch(network, deployers)` and build
+> instruments with `MarketInstrumentData::hyperliquid_perp` or `hyperliquid_spot`.
 
 > **Authenticated feeds:** Alpaca, Massive and London Strategic Edge each take a subscriber that
 > carries the credentials (`AlpacaSubscriber`, `MassiveSubscriber`, `LseSubscriber`, each with

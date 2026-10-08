@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-08
+
 ### Added
 
 - **The engine flags an order whose request stays in flight past a deadline** (`rustrade`,
@@ -145,7 +147,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clients report under its oid, is looked up by that oid. Refs #370.
 - **IBKR reports how orders ended while its account stream was disconnected, implements
   `OrderStatusClient`, and lists open orders in its account snapshot** (`rustrade-execution`,
-  feature `ibkr`), as the other venues do (above). Closes #370 and #371.
+  feature `ibkr`), as the other venues do (above). Closes #370 and #371. The **Breaking** changes
+  that came with it (client order id limits, and an account stream that no longer ends when fill
+  recovery keeps failing) are listed under Changed.
   - Every order, bracket legs included, now carries its client order id as its IB order
     reference, which IB lists with the order, its executions and its completion. So
     `fetch_open_orders` and `account_snapshot` list an order this client does not track, such
@@ -370,6 +374,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`N`) nullable, distinguishing an absent key from `null`. Both still read as no commission asset,
   as before. The margin stream's report is unchanged. 74.0.0 changes only the dual-investment
   module, which the `binance` feature does not compile.
+
+- **`databento` 0.62.0 → 0.63.0** (`rustrade-data`, `databento` feature). Its live client decodes
+  records in batches, and it moves to DBN 0.71.0 and zstd 0.14. No change to this crate's API.
+
+- **A reconnect's check of the orders it holds reads each instrument's own orders**
+  (`rustrade-execution`). The known-live orders are indexed by instrument, so the check no longer
+  scans every held order for each instrument it covers. No API change. Closes #468.
 
 - **An Alpaca fill's `TradeId` is Alpaca's execution id on every path** (`rustrade-execution`).
   **Breaking.** The account stream and reconnect recovery gave a fill the id
