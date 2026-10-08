@@ -65,7 +65,7 @@
 use super::common::{
     CLOID_REQUIRED, CancelOnDropStream, OpenOrder, OpenOrderListing, UserFill, cancel_outcome,
     cid_to_cloid, instrument_to_spot_coin, map_tif, millis_to_datetime, open_order_to_order,
-    open_orders, parse_decimal, parse_side, round_to_5_sig_figs, span_millis, spot_balances,
+    open_orders, parse_decimal, parse_side, span_millis, spot_balances, spot_base_quote,
     spot_pair_to_instrument, user_fills_by_time,
 };
 use super::config::HyperliquidConfig;
@@ -74,6 +74,7 @@ use super::order_recovery::{
     ReconnectWatch, fetch_order_record, listed_cids, lookup_from_record, remember_open,
     remember_snapshot, send_fills, send_observed, spawn_order_checks,
 };
+use super::precision::{OrderPrecision, WireOrderError, wire_order};
 use super::spot_coins::{SpotCoins, spot_pair};
 use crate::client::dedup::new_dedup_cache;
 use crate::client::order_recovery::{
@@ -182,6 +183,25 @@ impl HyperliquidSpotClient {
     /// Returns the wallet address as a hex string (for logging/debugging).
     pub fn wallet_address(&self) -> String {
         self.config.wallet_address_hex()
+    }
+
+    /// The precision rules for orders on the spot pair `instrument` (`BASE-QUOTE-SPOT`), from
+    /// its base token's `szDecimals`.
+    ///
+    /// [`open_order`](ExecutionClient::open_order) refuses an order that breaks them with
+    /// [`OrderError::InvalidPrecision`] and sends nothing. Round with these rules first. See
+    /// [`OrderPrecision`].
+    ///
+    /// `None` when `instrument` is not of that form, or Hyperliquid lists no such pair. A pair
+    /// missing from the pairs this client holds is looked for in `spotMeta` again first, at most
+    /// once every 10 seconds, so a pair listed since the client connected is found.
+    pub async fn order_precision(
+        &self,
+        instrument: &InstrumentNameExchange,
+    ) -> Option<OrderPrecision> {
+        let (base, quote) = spot_base_quote(instrument)?;
+        let pair = self.spot_coins.find(base, quote).await?;
+        Some(OrderPrecision::spot(pair.base_sz_decimals()))
     }
 
     /// Returns the wallet address as ethers H160.
@@ -715,12 +735,11 @@ impl ExecutionClient for HyperliquidSpotClient {
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
     ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
         use hyperliquid_rust_sdk::{
-            ClientLimit, ClientOrder, ClientOrderRequest, ClientTrigger, ExchangeDataStatus,
-            ExchangeResponseStatus,
+            ClientOrderRequest, ExchangeDataStatus, ExchangeResponseStatus,
         };
 
-        let make_rejected =
-            |msg: String| -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
+        let make_inactive =
+            |error: UnindexedOrderError| -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
                 Order {
                     key: OrderKey {
                         exchange: ExchangeId::HyperliquidSpot,
@@ -733,29 +752,15 @@ impl ExecutionClient for HyperliquidSpotClient {
                     quantity: request.state.quantity,
                     kind: request.state.kind,
                     time_in_force: request.state.time_in_force,
-                    state: OrderState::inactive(OrderError::Rejected(
-                        crate::error::ApiError::OrderRejected(msg),
-                    )),
+                    state: OrderState::inactive(error),
                 }
             };
-
-        let make_unsupported =
-            |msg: String| -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
-                Order {
-                    key: OrderKey {
-                        exchange: ExchangeId::HyperliquidSpot,
-                        instrument: request.key.instrument.clone(),
-                        strategy: request.key.strategy.clone(),
-                        cid: request.key.cid.clone(),
-                    },
-                    side: request.state.side,
-                    price: request.state.price,
-                    quantity: request.state.quantity,
-                    kind: request.state.kind,
-                    time_in_force: request.state.time_in_force,
-                    state: OrderState::inactive(OrderError::UnsupportedOrderType(msg)),
-                }
-            };
+        let make_rejected = |msg: String| {
+            make_inactive(OrderError::Rejected(crate::error::ApiError::OrderRejected(
+                msg,
+            )))
+        };
+        let make_unsupported = |msg: String| make_inactive(OrderError::UnsupportedOrderType(msg));
 
         let coin = match instrument_to_spot_coin(request.key.instrument) {
             Some(c) => c,
@@ -797,23 +802,46 @@ impl ExecutionClient for HyperliquidSpotClient {
             return make_rejected(CLOID_REQUIRED.to_string());
         };
 
-        let limit_px = match request.state.kind {
-            // Market triggers: SDK uses trigger_px as limit_px
-            OrderKind::Stop { trigger_price } | OrderKind::TakeProfit { trigger_price } => {
-                round_to_5_sig_figs(trigger_price)
-            }
-            _ => match request.state.price {
-                Some(p) => round_to_5_sig_figs(p),
-                None => {
-                    return make_rejected(
-                        "Hyperliquid requires limit price for Limit/StopLimit/TakeProfitLimit orders"
-                            .to_string(),
-                    );
-                }
-            },
-        };
+        if matches!(request.state.time_in_force, TimeInForce::FillOrKill) {
+            warn!(
+                instrument = %request.key.instrument,
+                "FillOrKill not supported by Hyperliquid, using ImmediateOrCancel (may result in partial fills)"
+            );
+        }
+        let tif = map_tif(&request.state.time_in_force).to_string();
 
-        let sz = round_to_5_sig_figs(request.state.quantity);
+        let Some(precision) = self.order_precision(request.key.instrument).await else {
+            return make_inactive(OrderError::Rejected(
+                crate::error::ApiError::InstrumentInvalid(
+                    request.key.instrument.clone(),
+                    format!("Hyperliquid's spotMeta lists no spot pair {coin}"),
+                ),
+            ));
+        };
+        let wire = match wire_order(
+            &precision,
+            request.state.kind,
+            tif,
+            request.state.price,
+            request.state.quantity,
+        ) {
+            Ok(wire) => wire,
+            Err(WireOrderError::Precision(violation)) => {
+                return make_inactive(OrderError::InvalidPrecision(violation));
+            }
+            Err(WireOrderError::MissingPrice) => {
+                return make_rejected(
+                    "Hyperliquid requires limit price for Limit/StopLimit/TakeProfitLimit orders"
+                        .to_string(),
+                );
+            }
+            Err(WireOrderError::UnsupportedKind) => {
+                return make_unsupported(format!(
+                    "Hyperliquid does not support {} orders",
+                    request.state.kind
+                ));
+            }
+        };
 
         // Hyperliquid spot requires minimum $10 notional value
         // For market triggers, use trigger_price for notional calculation
@@ -833,53 +861,14 @@ impl ExecutionClient for HyperliquidSpotClient {
             return make_rejected(format!("Spot order notional ${notional} below $10 minimum"));
         }
 
-        if matches!(request.state.time_in_force, TimeInForce::FillOrKill) {
-            warn!(
-                instrument = %request.key.instrument,
-                "FillOrKill not supported by Hyperliquid, using ImmediateOrCancel (may result in partial fills)"
-            );
-        }
-        let tif = map_tif(&request.state.time_in_force).to_string();
-
-        // Build order_type based on OrderKind
-        let order_type = match request.state.kind {
-            OrderKind::Limit => ClientOrder::Limit(ClientLimit { tif }),
-            OrderKind::Stop { trigger_price } => ClientOrder::Trigger(ClientTrigger {
-                is_market: true,
-                trigger_px: round_to_5_sig_figs(trigger_price),
-                tpsl: "sl".to_string(),
-            }),
-            OrderKind::StopLimit { trigger_price } => ClientOrder::Trigger(ClientTrigger {
-                is_market: false,
-                trigger_px: round_to_5_sig_figs(trigger_price),
-                tpsl: "sl".to_string(),
-            }),
-            OrderKind::TakeProfit { trigger_price } => ClientOrder::Trigger(ClientTrigger {
-                is_market: true,
-                trigger_px: round_to_5_sig_figs(trigger_price),
-                tpsl: "tp".to_string(),
-            }),
-            OrderKind::TakeProfitLimit { trigger_price } => ClientOrder::Trigger(ClientTrigger {
-                is_market: false,
-                trigger_px: round_to_5_sig_figs(trigger_price),
-                tpsl: "tp".to_string(),
-            }),
-            // Already rejected above
-            OrderKind::Market
-            | OrderKind::TrailingStop { .. }
-            | OrderKind::TrailingStopLimit { .. } => {
-                unreachable!("unsupported order kinds rejected earlier")
-            }
-        };
-
         let order_request = ClientOrderRequest {
             asset: coin,
             is_buy,
             reduce_only: request.state.reduce_only,
-            limit_px,
-            sz,
+            limit_px: wire.limit_px,
+            sz: wire.sz,
             cloid: Some(cloid),
-            order_type,
+            order_type: wire.order_type,
         };
 
         let response = match self.exchange_client.order(order_request, None).await {
@@ -1448,6 +1437,177 @@ mod tests {
             assert_eq!(
                 listed.into_iter().collect::<Vec<_>>(),
                 [ClientOrderId::new(CID)]
+            );
+        }
+    }
+
+    mod precision {
+        use super::super::super::common::info_tests::{
+            exchange_client_against, info_client_against, test_wallet,
+        };
+        use super::super::super::config::Network;
+        use super::super::super::spot_coins::TEST_SPOT_META;
+        use super::*;
+        use crate::error::{OrderField, PrecisionLimit, PrecisionViolation};
+        use crate::order::{OrderEvent, request::RequestOpen, state::InactiveOrderState};
+        use std::collections::HashMap;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// A spot client on [`TEST_SPOT_META`]'s pairs whose exchange endpoint rests every order.
+        async fn resting_client() -> (MockServer, HyperliquidSpotClient) {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/info"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(TEST_SPOT_META, "application/json"),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/exchange"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "status": "ok",
+                    "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 77}}]}},
+                })))
+                .mount(&server)
+                .await;
+            let info_client = Arc::new(info_client_against(server.uri()).await);
+            let client = HyperliquidSpotClient {
+                config: HyperliquidConfig::new(test_wallet(), Network::Testnet),
+                spot_coins: SpotCoins::fetch(info_client.clone()).await.unwrap(),
+                info_client,
+                exchange_client: Arc::new(
+                    exchange_client_against(
+                        server.uri(),
+                        HashMap::from([("HYPE/USDC".to_owned(), 10_107)]),
+                    )
+                    .await,
+                ),
+                known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidSpot),
+            };
+            (server, client)
+        }
+
+        async fn place_hype(
+            client: &HyperliquidSpotClient,
+            price: Decimal,
+            quantity: Decimal,
+        ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
+            let instrument = InstrumentNameExchange::new("HYPE-USDC-SPOT");
+            client
+                .open_order(OrderEvent {
+                    key: OrderKey {
+                        exchange: ExchangeId::HyperliquidSpot,
+                        instrument: &instrument,
+                        strategy: StrategyId::new("strategy"),
+                        cid: ClientOrderId::uuid(),
+                    },
+                    state: RequestOpen {
+                        side: Side::Buy,
+                        price: Some(price),
+                        quantity,
+                        kind: OrderKind::Limit,
+                        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                        position_id: None,
+                        reduce_only: false,
+                        market: None,
+                    },
+                })
+                .await
+        }
+
+        /// The orders the server was sent, as the SDK wrote them.
+        async fn sent_orders(server: &MockServer) -> Vec<serde_json::Value> {
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|request| request.url.path() == "/exchange")
+                .map(|request| {
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    body["action"]["orders"][0].clone()
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn a_spot_pairs_precision_is_its_base_tokens() {
+            let (_server, client) = resting_client().await;
+
+            assert_eq!(
+                client
+                    .order_precision(&InstrumentNameExchange::new("HYPE-USDC-SPOT"))
+                    .await,
+                Some(OrderPrecision::spot(2))
+            );
+            assert_eq!(
+                client
+                    .order_precision(&InstrumentNameExchange::new("PURR-USDC-SPOT"))
+                    .await,
+                Some(OrderPrecision::spot(0))
+            );
+            assert_eq!(
+                client
+                    .order_precision(&InstrumentNameExchange::new("BTC-USDC-PERP"))
+                    .await,
+                None
+            );
+        }
+
+        #[tokio::test]
+        async fn a_spot_order_breaking_the_precision_rules_is_refused_unsent() {
+            let (server, client) = resting_client().await;
+
+            // HYPE's szDecimals is 2, so a size has at most 2 decimal places and a price 6.
+            for (price, quantity, violation) in [
+                (
+                    dec!(25),
+                    dec!(1.234),
+                    PrecisionViolation {
+                        field: OrderField::Quantity,
+                        value: dec!(1.234),
+                        limit: PrecisionLimit::DecimalPlaces { max: 2 },
+                    },
+                ),
+                (
+                    dec!(25.1234567),
+                    dec!(1),
+                    PrecisionViolation {
+                        field: OrderField::Price,
+                        value: dec!(25.1234567),
+                        limit: PrecisionLimit::DecimalPlaces { max: 6 },
+                    },
+                ),
+            ] {
+                let order = place_hype(&client, price, quantity).await;
+                assert_eq!(
+                    order.state,
+                    OrderState::Inactive(InactiveOrderState::OpenFailed(
+                        OrderError::InvalidPrecision(violation)
+                    ))
+                );
+            }
+            assert_eq!(sent_orders(&server).await, Vec::<serde_json::Value>::new());
+        }
+
+        #[tokio::test]
+        async fn a_valid_spot_order_is_sent_unchanged() {
+            let (server, client) = resting_client().await;
+
+            let order = place_hype(&client, dec!(25.123), dec!(1.25)).await;
+            assert!(
+                matches!(order.state, OrderState::Active(_)),
+                "{:?}",
+                order.state
+            );
+
+            let sent = sent_orders(&server).await;
+            assert_eq!(sent.len(), 1);
+            assert_eq!(
+                (&sent[0]["p"], &sent[0]["s"]),
+                (&serde_json::json!("25.123"), &serde_json::json!("1.25"))
             );
         }
     }

@@ -12,6 +12,7 @@
 //! evolve while `is_transient()` semantics remain stable.
 
 use derive_more::Constructor;
+use rust_decimal::Decimal;
 use rustrade_instrument::{
     asset::{AssetIndex, name::AssetNameExchange},
     exchange::ExchangeId,
@@ -20,6 +21,7 @@ use rustrade_instrument::{
 };
 use rustrade_integration::error::SocketError;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use thiserror::Error;
 
 /// Type alias for a [`ClientError`] that is keyed on [`AssetNameExchange`] and
@@ -365,6 +367,94 @@ pub enum OrderError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// trailing stop orders on a connector that only supports market/limit).
     #[error("unsupported order type: {0}")]
     UnsupportedOrderType(String),
+
+    /// A quantity or price in the request has more precision than the venue accepts, so the
+    /// client refused it without sending it.
+    ///
+    /// Non-transient — change the request. A client that refuses this way never rounds a value
+    /// itself, because rounding would place a different order than the one requested; it
+    /// documents how to read the venue's precision so the caller can round first.
+    #[error("invalid precision: {0}")]
+    InvalidPrecision(PrecisionViolation),
+}
+
+/// A value in an order request with more precision than the venue accepts.
+///
+/// Carried by [`OrderError::InvalidPrecision`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub struct PrecisionViolation {
+    /// Which value of the request broke the rule.
+    pub field: OrderField,
+    /// The value as requested.
+    pub value: Decimal,
+    /// The rule it broke.
+    pub limit: PrecisionLimit,
+}
+
+impl fmt::Display for PrecisionViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            field,
+            value,
+            limit,
+        } = self;
+        write!(f, "{field} {value} ")?;
+        match limit {
+            PrecisionLimit::DecimalPlaces { max } => {
+                write!(f, "has more than {max} decimal places")
+            }
+            PrecisionLimit::SignificantFigures { max } => {
+                write!(
+                    f,
+                    "is not an integer and has more than {max} significant figures"
+                )
+            }
+            PrecisionLimit::NotRepresentable => {
+                write!(f, "cannot be sent exactly in the venue's number format")
+            }
+        }
+    }
+}
+
+/// A value of an order request, as named by a [`PrecisionViolation`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub enum OrderField {
+    /// The order's quantity.
+    Quantity,
+    /// The order's limit price.
+    Price,
+    /// The price that triggers a stop or take-profit order.
+    TriggerPrice,
+}
+
+impl fmt::Display for OrderField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Quantity => "quantity",
+            Self::Price => "price",
+            Self::TriggerPrice => "trigger price",
+        })
+    }
+}
+
+/// A venue's precision rule, as broken by a [`PrecisionViolation`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub enum PrecisionLimit {
+    /// The value may have at most `max` decimal places.
+    DecimalPlaces {
+        /// The most decimal places allowed.
+        max: u32,
+    },
+    /// The value may have at most `max` significant figures, unless it is an integer.
+    SignificantFigures {
+        /// The most significant figures allowed.
+        max: u32,
+    },
+    /// The value cannot be sent exactly: the venue's client library converts it to a number
+    /// format that would change it.
+    NotRepresentable,
 }
 
 impl<AssetKey, InstrumentKey> OrderError<AssetKey, InstrumentKey> {
@@ -377,12 +467,14 @@ impl<AssetKey, InstrumentKey> OrderError<AssetKey, InstrumentKey> {
     ///
     /// # Non-transient errors
     /// - Other [`Rejected`](Self::Rejected) errors (invalid instrument, insufficient balance, etc.)
+    /// - [`UnsupportedOrderType`](Self::UnsupportedOrderType) and
+    ///   [`InvalidPrecision`](Self::InvalidPrecision)
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Connectivity(e) => e.is_transient(),
             Self::Rejected(ApiError::RateLimit) => true,
             Self::Rejected(_) => false,
-            Self::UnsupportedOrderType(_) => false,
+            Self::UnsupportedOrderType(_) | Self::InvalidPrecision(_) => false,
         }
     }
 }

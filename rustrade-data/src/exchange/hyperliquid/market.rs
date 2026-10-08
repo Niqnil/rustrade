@@ -156,7 +156,7 @@ mod tests {
         let spot_pairs: SpotPairs = serde_json::from_str(
             r#"{
                 "universe": [{"name": "@107", "tokens": [150, 0], "index": 107}],
-                "tokens": [{"name": "USDC", "index": 0}, {"name": "HYPE", "index": 150}]
+                "tokens": [{"name": "USDC", "szDecimals": 8, "index": 0}, {"name": "HYPE", "szDecimals": 2, "index": 150}]
             }"#,
         )
         .unwrap();
